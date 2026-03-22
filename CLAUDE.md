@@ -484,3 +484,80 @@ aws cognito-idp admin-create-user --user-pool-id ap-southeast-2_ps7XIQGHB \
   Name=email_verified,Value=true Name=name,Value="Full Name" \
   --temporary-password "FieldSight2026!" --region ap-southeast-2
 ```
+
+---
+
+## Windows Git Bash + AWS CLI 部署注意事项
+
+本项目在 Windows 11 + Git Bash 环境下操作 AWS CLI，有以下已验证的陷阱：
+
+### BUG-27: `fileb://` 路径必须用 Windows 格式
+```bash
+# WRONG — Git Bash /tmp 映射不被 AWS CLI 识别
+aws lambda create-function --zip-file fileb:///tmp/code.zip
+
+# CORRECT — 用 cygpath 转换
+aws lambda create-function --zip-file "fileb://$(cygpath -w /tmp/code.zip)"
+```
+
+### BUG-28: MSYS 路径转换破坏 API 参数
+```bash
+# WRONG — /name 被转成 C:/Program Files/Git/name
+aws apigateway update-rest-api --patch-operations op=replace,path=/name,value=x
+
+# CORRECT — 禁用路径转换
+export MSYS_NO_PATHCONV=1
+aws apigateway update-rest-api --patch-operations op=replace,path=/name,value=x
+```
+
+### BUG-29: python3 是 Windows Store 占位符 (exit 49)
+本机无 Python 安装。`python3` 返回 exit 49。所有 JSON 处理使用 Node.js：
+```bash
+# 用 node 替代 python 做 JSON 处理
+echo "$JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.parse(d).key))"
+```
+
+### BUG-30: Node.js 的 /tmp 路径与 Git Bash 不同
+Node.js `fs.readFileSync('/tmp/x')` 解析为 `C:\tmp\x`（不是 Git Bash 的 temp）。
+**Fix**: 用 stdin/stdout 管道传数据，不用文件路径。
+
+### BUG-31: eval 吃掉 Windows 路径反斜杠
+```bash
+# WRONG — eval 二次解析消灭反斜杠
+CMD="aws lambda create-function --zip-file fileb://$(cygpath -w /tmp/x.zip)"
+eval "$CMD"
+
+# CORRECT — 直接执行，不用 eval
+aws lambda create-function --zip-file "fileb://$(cygpath -w /tmp/x.zip)"
+```
+
+### BUG-32: EventBridge Scheduler 自定义 Group
+Scheduler 可能不在 default group。`get-schedule` 返回空不代表不存在。
+```bash
+# 先查 group
+aws scheduler list-schedules --query 'Schedules[].{Name:Name,Group:GroupName}'
+# 再指定 group
+aws scheduler get-schedule --name X --group-name sitesync
+```
+
+### BUG-33: SAM S3 Event 不支持外部 Bucket
+SAM `Events.S3.Bucket` 必须 `!Ref` 同 template 内的 `AWS::S3::Bucket`。外部 bucket 需手动配置：
+```bash
+aws s3api put-bucket-notification-configuration --bucket BUCKET --notification-configuration '{...}'
+```
+
+### BUG-34: SAM deploy 无法创建已存在资源
+已在 stack 外存在的 S3/DynamoDB 会导致 deploy 失败。改为 Parameter 引用：
+```yaml
+# WRONG — 资源已存在会冲突
+StorageBucket:
+  Type: AWS::S3::Bucket
+  Properties:
+    BucketName: fieldsight-data-xxx
+
+# CORRECT — 参数引用外部资源
+Parameters:
+  DataBucketName:
+    Type: String
+    Default: fieldsight-data-509194952652
+```
