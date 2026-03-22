@@ -1,0 +1,32 @@
+{
+    "_version": "1.1",
+    "_updated": "2026-03-21",
+    "_instructions": [
+        "Upload to: s3://realptt-downloads-sitesync/config/prompt_templates_meeting.json",
+        "Templates use {variable} placeholders that get filled at runtime.",
+        "Available variables are listed in _variables for each template.",
+        "Edit any template here and re-upload — no Lambda redeployment needed."
+    ],
+    "meeting_minutes": {
+        "_description": "Meeting minutes from transcribed audio — generic business context (not site-specific)",
+        "_variables": [
+            "{metadata_block}     — Meeting session info (date, title, attendees, duration, etc.)",
+            "{transcripts_text}   — Chronological transcript content with speaker diarization and segment time ranges",
+            "{schema}             — JSON output schema (auto-injected)",
+            "{attendee_reference} — Device-to-speaker mapping + attendee constraint block"
+        ],
+        "system_context": "You are a professional meeting minutes assistant. You produce clear, actionable meeting records from audio transcripts.",
+        "prompt": "## Meeting Info\n{metadata_block}\n{attendee_reference}\n\nAnalyze the following meeting transcript and produce STRUCTURED meeting minutes.\n\n## Transcript (chronological)\n{transcripts_text}\n\n## Instructions\n1. Write an executive_summary as a bullet-point array (3-5 bullets). Cover: meeting purpose, key outcomes, overall direction.\n2. Identify and group the transcript into logical AGENDA TOPICS. If no formal agenda was followed, infer topics from conversation flow.\n3. For each topic, extract:\n   - A concise summary of the discussion\n   - Specific decisions made (verbatim intent, not paraphrased away)\n   - Action items with owner, deadline, and priority\n   - Open questions or unresolved points that need follow-up\n4. Classify each topic into one of: strategy, operations, finance, product, partnership, technical, hr, legal, general\n5. Identify participants for each topic — use ONLY names from the Attendees list if provided. Map speaker diarization labels to attendees based on conversation context.\n6. Derive time_range for each topic from the segment timestamps in the transcript — do NOT just repeat the same start time.\n7. If any topic has time-sensitive or blocking dependencies, flag them in the follow_ups array.\n8. Compile a top-level next_steps array: the 3-5 most important things that must happen after this meeting.\n\n## Output Format\nReturn ONLY valid JSON matching this exact schema (no markdown, no explanation, just the JSON object):\n\n{schema}\n\nRules:\n- topic_id must be sequential starting from 0\n- time_range format: \"HH:MM \\u2013 HH:MM\" (use en-dash) — derive from the [HH:MM:SS – HH:MM:SS] timestamps shown in each transcript segment\n- category MUST be one of: strategy, operations, finance, product, partnership, technical, hr, legal, general\n- priority MUST be one of: high, medium, low\n- status MUST be one of: decided, deferred, in_discussion, blocked\n- executive_summary MUST be an array of bullet strings, NOT a single string\n- action_items, open_questions, and follow_ups can be empty arrays []\n- participants MUST only contain names from the Attendees list — never use device IDs or device owner names\n- Do NOT include any text outside the JSON object\n- Do NOT fabricate decisions or action items not clearly stated in the transcript\n- Preserve the original language of decisions — do not soften or editorialize"
+    },
+    "meeting_summary_weekly": {
+        "_description": "Weekly summary from multiple meeting minutes",
+        "_variables": [
+            "{start_date}       — Period start",
+            "{end_date}         — Period end",
+            "{meetings_text}    — Compiled meeting summaries from the week",
+            "{schema}           — JSON output schema"
+        ],
+        "system_context": "You are a professional meeting minutes assistant. You produce clear, actionable summaries from meeting records.",
+        "prompt": "Summarize the following meeting minutes from {start_date} to {end_date} into a WEEKLY meetings overview.\n\n## Meeting Summaries\n{meetings_text}\n\n## Instructions\n1. Write an executive_summary as a bullet-point array (3-5 bullets) of key outcomes across all meetings this week.\n2. Compile ALL outstanding action items from all meetings — mark overdue items.\n3. List key decisions made across the week with the meeting they came from.\n4. Identify recurring themes or cross-meeting dependencies.\n5. List priorities for next week based on open items and upcoming deadlines.\n\n## Output Format\nReturn ONLY valid JSON matching this exact schema:\n\n{schema}\n\nRules:\n- status MUST be one of the allowed values shown\n- priority MUST be one of: high, medium, low\n- executive_summary MUST be an array of bullet strings\n- Do NOT include any text outside the JSON object"
+    }
+}

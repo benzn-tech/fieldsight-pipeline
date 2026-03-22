@@ -1,0 +1,60 @@
+{
+    "_version": "3.0",
+    "_updated": "2026-03-18",
+    "_instructions": [
+        "Upload to: s3://realptt-downloads-fieldsight/config/prompt_templates.json",
+        "Templates use {variable} placeholders that get filled at runtime.",
+        "Available variables are listed in _variables for each template.",
+        "Edit any template here and re-upload — no Lambda redeployment needed.",
+        "Note: \\n in prompt strings become actual line breaks when rendered."
+    ],
+    "_changelog": [
+        "v3.0: executive_summary changed from string to array of bullet points",
+        "v3.0: critical_dates_and_deadlines moved to 2nd section (after exec summary)",
+        "v2.0: initial structured prompt with schema"
+    ],
+    "daily_report": {
+        "_description": "Per-user or combined daily report from transcripts",
+        "_variables": [
+            "{metadata_block}   — Recording session info (date, site, worker, role, duration, etc.)",
+            "{transcripts_text} — Chronological transcript content (auto-truncated to 15000 chars)",
+            "{schema}           — JSON output schema (auto-injected)",
+            "{name_reference}   — Device-to-name mapping block (auto-generated from user_mapping.json)"
+        ],
+        "system_context": "You are a construction site documentation assistant for a New Zealand construction company.",
+        "prompt": "## Recording Session Info\n{metadata_block}\n{name_reference}\n\nAnalyze the following radio transcript recordings and produce a STRUCTURED daily report.\n\n## Raw Transcript Recordings (chronological)\n{transcripts_text}\n\n## Instructions\n1. Write an executive_summary as a list of 4-8 bullet points. Each bullet should be a concise, actionable statement covering one key activity, decision, or outcome from the day. Start each bullet with a verb or key noun. Prioritize: safety incidents first, then critical deadlines, then progress milestones, then other items.\n2. Extract critical_dates_and_deadlines: any dates, deadlines, inspections, deliveries, or time-sensitive items mentioned in conversation. This is the SECOND most important section after the executive summary.\n3. Extract quality_and_compliance items: testing, inspections, code compliance, certifications mentioned.\n4. Extract safety_observations: any hazards, near-misses, PPE issues, or safety concerns raised. Include who raised it and where on site.\n5. Group the recordings into logical TOPICS (e.g. \"Morning Safety Briefing\", \"Block C Concrete Pour\", \"Scaffold Inspection\").\n6. For each topic, classify as safety/progress/quality, list participants by name, and extract decisions and action items.\n7. Photo filenames are provided where available — include them in the relevant topic's related_photos.\n\n## Output Format\nReturn ONLY valid JSON matching this exact schema (no markdown, no explanation, just the JSON object):\n\n{schema}\n\nRules:\n- executive_summary MUST be an array of strings, each string is one bullet point (no bullet character, just the text)\n- topic_id must be sequential starting from 0\n- time_range format: \"HH:MM \\u2013 HH:MM\" (use en-dash)\n- category MUST be one of: safety, progress, quality\n- priority MUST be one of: high, medium, low\n- risk_level MUST be one of: high, medium, low\n- urgency MUST be one of: high, medium, low\n- status MUST be one of: pending, in_progress, completed, concern\n- type MUST be one of: deadline, inspection, delivery, weather, meeting, other\n- participants should list names of people involved in each topic\n- action_items, safety_flags, and all arrays can be empty []\n- related_photos should contain filenames from the photo lines above\n- Do NOT include any text outside the JSON object"
+    },
+    "weekly_report": {
+        "_description": "Weekly summary from daily reports — supports user/site/all scopes",
+        "_variables": [
+            "{scope_intro}         — Auto-generated intro based on scope (user/site/all)",
+            "{all_summaries}       — Compiled daily report summaries",
+            "{extra_instructions}  — Role-specific or scope-specific extra instructions",
+            "{schema}              — JSON output schema"
+        ],
+        "system_context": "You are a construction site documentation assistant for a New Zealand construction company.",
+        "prompt": "{scope_intro}\n\n## Daily Report Summaries\n{all_summaries}\n\n## Instructions\n1. Write an executive_summary as 5-10 bullet points covering the week's key outcomes.\n2. Identify safety TRENDS across the week (recurring issues, improvements, new risks).\n3. List progress highlights with completion status.\n4. Compile outstanding action items — mark overdue items.\n5. Summarize quality observations.\n6. Suggest priorities for next week.{extra_instructions}\n\n## Output Format\nReturn ONLY valid JSON matching this exact schema:\n\n{schema}\n\nRules:\n- executive_summary MUST be an array of bullet point strings\n- status MUST be one of the allowed values shown\n- risk_level and priority MUST be one of: high, medium, low\n- Do NOT include any text outside the JSON object"
+    },
+    "monthly_report": {
+        "_description": "Monthly overview from weekly/daily reports",
+        "_variables": [
+            "{site_name}    — Site display name",
+            "{start_date}   — Period start",
+            "{end_date}     — Period end",
+            "{source_label} — 'Weekly Report Summaries' or 'Daily Report Summaries'",
+            "{source_text}  — Compiled source summaries",
+            "{schema}       — JSON output schema"
+        ],
+        "system_context": "You are a construction site documentation assistant for a New Zealand construction company.",
+        "prompt": "Summarize the following reports from {start_date} to {end_date} at site \"{site_name}\" into a MONTHLY overview.\n\n## {source_label}\n{source_text}\n\n## Output Format\nReturn ONLY valid JSON matching this schema:\n\n{schema}\n\nAdditional: Include month-level trends and patterns. \"next_week_priorities\" should be \"next_month_priorities\".\n\nRules:\n- executive_summary MUST be an array of bullet point strings\n- Do NOT include any text outside the JSON object"
+    },
+    "scope_intros": {
+        "_description": "Intro paragraphs for weekly/monthly scoped reports",
+        "user": "Summarize the following daily reports for **{scope_label}**{role_context} from {start_date} to {end_date} at site \"{site_name}\" into a personal WEEKLY overview report.",
+        "user_extra": "\n7. Focus on this individual's activities, responsibilities, and action items.\n8. Highlight their personal safety observations and quality contributions.",
+        "user_manager_extra": "\n9. As a manager/PM, emphasize supervisory decisions, team coordination, and items requiring their follow-up or escalation.",
+        "site": "Summarize the following daily reports for site \"{scope_label}\" from {start_date} to {end_date} into a site-level WEEKLY overview report.",
+        "site_extra": "\n7. Aggregate across all workers on this site.\n8. Identify cross-team coordination issues or dependencies.",
+        "all": "Summarize the following daily reports from {start_date} to {end_date} at site \"{site_name}\" into a WEEKLY overview report."
+    }
+}

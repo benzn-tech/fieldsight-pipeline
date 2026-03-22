@@ -1,0 +1,29 @@
+# Secrets
+.env
+*.pem
+*.key
+
+# Claude Code local settings
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# AWS SAM
+.aws-sam/
+samconfig.toml
+
+# Temp
+*.zip
+*.bak-*
+/tmp/

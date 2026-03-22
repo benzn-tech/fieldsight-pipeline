@@ -1,0 +1,94 @@
+{
+    "_version": "2.1",
+    "_updated": "2026-02-22",
+    "_instructions": [
+        "Upload to: s3://nottag-bs-manual-1/config/user_mapping.json",
+        "When a device changes user: update mapping entry + add old entry to reassignment_log",
+        "cross-site workers: add multiple site IDs to sites[] array"
+    ],
+
+    "sites": {
+        "sb1108-ellesmere": {
+            "name": "SB1108 Ellesmere College",
+            "location": "Christchurch",
+            "client": "Ministry of Education"
+        },
+        "mpi": {
+            "name": "MPI",
+            "location": "Auckland",
+            "client": "Ministry for Primary Industries"
+        },
+        "sb1131-northbrook-wanaka":{
+            "name": "SB1131 - Northbrook Wanaka",
+            "location": "Wanaka",
+            "client": "Northbrook"
+        }
+    },
+
+    "mapping": {
+        "Benl1": {
+            "name": "Jarley Trainor",
+            "role": "site_manager",
+            "primary_site": "sb1108-ellesmere",
+            "sites": ["sb1108-ellesmere"]
+        },
+        "Benl2": {
+            "name": "MPI1",
+            "role": "worker",
+            "primary_site": "mpi",
+            "sites": ["mpi"]
+        },
+        "Benl3": {
+            "name": "David Barillaro",
+            "role": "site_manager",
+            "primary_site": "sb1108-ellesmere",
+            "sites": ["sb1108-ellesmere"]
+        },
+        "Benl4": {
+            "name": "MPI2",
+            "role": "worker",
+            "primary_site": "mpi",
+            "sites": ["mpi"]
+        },
+        "Benl5": {
+            "name": "James Lamb",
+            "role": "site_manager",
+            "primary_site": "sb1131-northbrook-wanaka",
+            "sites": ["sb1131-northbrook-wanaka"]
+        },
+        "Benl6": {
+            "name": "Jack Gibson",
+            "role": "site_manager",
+            "primary_site": "sb1131-northbrook-wanaka",
+            "sites": ["sb1131-northbrook-wanaka"]
+        }
+    },
+
+    "reassignment_log": [
+        {
+            "_example": true,
+            "device": "Benl5",
+            "previous_user": "MPI3",
+            "new_user": "James Lamb",
+            "changed_date": "2026-02-25",
+            "reason": "Device reassigned to Queenstown/Wanaka team"
+        },
+        {
+            "_example": true,
+            "device": "Benl6",
+            "previous_user": "Andrew McMillan",
+            "new_user": "Jack Gibson",
+            "changed_date": "2026-03-01",
+            "reason": "Device reassigned to Queenstown/Wanaka team"
+        }
+    ],
+
+    "_reassignment_notes": [
+        "When device changes hands:",
+        "1. Update the mapping entry above with new name/role/site",
+        "2. Add a log entry to reassignment_log (for audit trail)",
+        "3. Re-upload this file to S3",
+        "4. Old recordings keep their original folder name in S3",
+        "5. New recordings will use the new user name going forward"
+    ]
+}

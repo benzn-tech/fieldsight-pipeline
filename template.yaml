@@ -1,0 +1,678 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  FieldSight Pipeline v2 - Auto download files to S3, transcribe, and generate reports.
+  Uses web scraping endpoints (realptt.com) for complete data extraction. Includes Fargate, VAD, API, and meeting minutes.
+  Includes Fargate for large file downloads that exceed Lambda 15-min limit.
+
+# ============================================================
+# Parameters - Configure during deployment
+# ============================================================
+Parameters:
+  RealPTTAccount:
+    Type: String
+    Description: RealPTT platform account (external service)
+    NoEcho: false
+
+  RealPTTPassword:
+    Type: String
+    Description: RealPTT platform password (external service)
+    NoEcho: true
+
+  DataBucketName:
+    Type: String
+    Description: Existing S3 bucket name (created outside this stack)
+    Default: fieldsight-data-509194952652
+
+  StartDaysAgo:
+    Type: Number
+    Description: Query data from N days ago
+    Default: 1
+    MinValue: 1
+    MaxValue: 30
+
+  DownloadAudio:
+    Type: String
+    Description: Download audio files
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  DownloadVideo:
+    Type: String
+    Description: Download video files
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  DownloadFiles:
+    Type: String
+    Description: Download uploaded files (photos, body cam, etc.)
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableTranscribe:
+    Type: String
+    Description: Enable speech-to-text transcription
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  TimeDifferenceMs:
+    Type: Number
+    Description: >
+      Client-to-server time offset in milliseconds.
+      NZ (NZDT) = 46800000 (13 hours). Used for audio download URL construction
+      and video time conversion.
+    Default: 46800000
+
+  LanguageOptions:
+    Type: String
+    Description: Comma-separated language codes for Transcribe auto-detection
+    Default: en-NZ,en-AU,en-GB,en-US,zh-CN
+
+  MaxSpeakers:
+    Type: Number
+    Description: Max speakers for Transcribe diarization (2-10)
+    Default: 5
+    MinValue: 2
+    MaxValue: 10
+
+  AlertEmail:
+    Type: String
+    Description: Email address for failure alerts (leave empty to skip)
+    Default: ''
+
+  ClaudeApiKey:
+    Type: String
+    Description: Anthropic Claude API key (sk-ant-xxx) for report generation
+    NoEcho: true
+    Default: ''
+
+  ScheduleExpression:
+    Type: String
+    Description: Download schedule (Cron in UTC)
+    Default: cron(0 7 * * ? *)  # UTC 07:00 = NZDT 20:00
+
+  # --- DynamoDB table names (existing, created outside this stack) ---
+  ItemsTableName:
+    Type: String
+    Description: Existing DynamoDB table for items
+    Default: fieldsight-items
+
+  ReportsTableName:
+    Type: String
+    Description: Existing DynamoDB table for reports
+    Default: fieldsight-reports
+
+  AuditTableName:
+    Type: String
+    Description: Existing DynamoDB table for audit log
+    Default: fieldsight-audit
+
+  # --- Fargate parameters ---
+  FargateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Public subnet(s) for Fargate tasks (must have internet access via IGW).
+      VPC Console -> Subnets -> pick 1-2 subnets from your default VPC.
+
+  FargateVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for Fargate security group (usually your default VPC)
+
+# ============================================================
+# Conditions
+# ============================================================
+Conditions:
+  ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
+  ShouldCreateAlerts: !Not [!Equals [!Ref AlertEmail, '']]
+
+# ============================================================
+# Global Settings
+# ============================================================
+Globals:
+  Function:
+    Runtime: python3.11
+    Architectures:
+      - x86_64
+    Timeout: 300
+    MemorySize: 256
+
+# ============================================================
+# Resources
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # S3 Bucket Policy (bucket itself is managed outside this stack)
+  # ----------------------------------------------------------
+  StorageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldEnableTranscribe
+    Properties:
+      Bucket: !Ref DataBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowTranscribeRead
+            Effect: Allow
+            Principal:
+              Service: transcribe.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${DataBucketName}/*
+          - Sid: AllowTranscribeWrite
+            Effect: Allow
+            Principal:
+              Service: transcribe.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${DataBucketName}/transcripts/*
+
+  # ----------------------------------------------------------
+  # Lambda 1: Orchestrator v2 (Web Scraping)
+  # ----------------------------------------------------------
+  OrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: fieldsight-orchestrator
+      CodeUri: src/
+      Handler: lambda_orchestrator.lambda_handler
+      Timeout: 900  # 15 minutes
+      MemorySize: 256
+      Environment:
+        Variables:
+          REALPTT_ACCOUNT: !Ref RealPTTAccount
+          REALPTT_PASSWORD: !Ref RealPTTPassword
+          S3_BUCKET: !Ref DataBucketName
+          DOWNLOADER_FUNCTION: !Ref DownloaderFunction
+          START_DAYS_AGO: !Ref StartDaysAgo
+          DOWNLOAD_AUDIO: !Ref DownloadAudio
+          DOWNLOAD_VIDEO: !Ref DownloadVideo
+          DOWNLOAD_FILES: !Ref DownloadFiles
+          TIME_DIFFERENCE_MS: !Ref TimeDifferenceMs
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucketName
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DownloaderFunction
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:HeadObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/*
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+            Description: Daily sync trigger (8 PM NZDT)
+            Enabled: true
+
+  # ----------------------------------------------------------
+  # Lambda 2: Downloader (small/medium files)
+  # ----------------------------------------------------------
+  DownloaderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: fieldsight-downloader
+      CodeUri: src/
+      Handler: lambda_downloader.lambda_handler
+      Timeout: 900  # 15 minutes
+      MemorySize: 512
+      EphemeralStorage:
+        Size: 1024
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref DataBucketName
+
+  # ----------------------------------------------------------
+  # Lambda 3: Transcribe Trigger
+  # NOTE: S3 event trigger must be configured manually since
+  #       the bucket is managed outside this stack.
+  #       aws s3api put-bucket-notification-configuration ...
+  # ----------------------------------------------------------
+  TranscribeFunction:
+    Type: AWS::Serverless::Function
+    Condition: ShouldEnableTranscribe
+    Properties:
+      FunctionName: fieldsight-transcribe
+      CodeUri: src/
+      Handler: lambda_transcribe.lambda_handler
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          LANGUAGE_OPTIONS: !Ref LanguageOptions
+          OUTPUT_PREFIX: transcripts/
+          MAX_SPEAKERS: !Ref MaxSpeakers
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucketName
+        - S3WritePolicy:
+            BucketName: !Ref DataBucketName
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - transcribe:StartTranscriptionJob
+                - transcribe:GetTranscriptionJob
+              Resource: '*'
+
+  # ----------------------------------------------------------
+  # Lambda 5: Report Generator
+  # ----------------------------------------------------------
+  ReportGeneratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: fieldsight-report-generator
+      CodeUri: src/
+      Handler: lambda_report_generator.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DataBucketName
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          CLAUDE_MODEL: claude-sonnet-4-5-20250929
+          REPORT_PREFIX: reports/
+          SITE_NAME: 'SB1108 Ellesmere College'
+          ITEMS_TABLE: !Ref ItemsTableName
+          REPORTS_TABLE: !Ref ReportsTableName
+          AUDIT_TABLE: !Ref AuditTableName
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucketName
+        - S3WritePolicy:
+            BucketName: !Ref DataBucketName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTableName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReportsTableName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditTableName
+      Events:
+        DailyReportSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 16 * * ? *)
+            Description: Daily report generation (5 AM NZDT)
+            Enabled: true
+            Input: '{"report_type": "daily"}'
+        WeeklyReportSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 5 ? * FRI *)
+            Description: Weekly report generation (Friday 6 PM NZDT)
+            Enabled: true
+            Input: '{"report_type": "weekly"}'
+        MonthlyReportSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 17 L * ? *)
+            Description: Monthly report generation (last day of month)
+            Enabled: true
+            Input: '{"report_type": "monthly"}'
+
+  # ==========================================================
+  # FARGATE - Large File Downloads (no time limit)
+  # ==========================================================
+
+  # ----------------------------------------------------------
+  # ECS Cluster
+  # ----------------------------------------------------------
+  DownloaderCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: fieldsight-downloader-cluster
+      CapacityProviders:
+        - FARGATE_SPOT
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+
+  # ----------------------------------------------------------
+  # Fargate Execution Role (pull image + write logs)
+  # ----------------------------------------------------------
+  FargateExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub fieldsight-fargate-execution-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # ----------------------------------------------------------
+  # Fargate Task Role (S3 access for the running container)
+  # ----------------------------------------------------------
+  FargateTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub fieldsight-fargate-task-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:CreateMultipartUpload
+                  - s3:UploadPart
+                  - s3:CompleteMultipartUpload
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !Sub arn:aws:s3:::${DataBucketName}
+                  - !Sub arn:aws:s3:::${DataBucketName}/*
+
+  # ----------------------------------------------------------
+  # Security Group (outbound internet only)
+  # ----------------------------------------------------------
+  FargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate downloader - outbound internet only
+      VpcId: !Ref FargateVpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # ----------------------------------------------------------
+  # Fargate Task Definition
+  # ----------------------------------------------------------
+  FargateDownloaderTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: fieldsight-fargate-downloader
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '256'       # 0.25 vCPU (cheapest)
+      Memory: '512'    # 512 MB
+      ExecutionRoleArn: !GetAtt FargateExecutionRole.Arn
+      TaskRoleArn: !GetAtt FargateTaskRole.Arn
+      ContainerDefinitions:
+        - Name: downloader
+          Image: python:3.11-slim
+          Essential: true
+          Environment:
+            - Name: S3_BUCKET
+              Value: !Ref DataBucketName
+          Command:
+            - sh
+            - -c
+            - |
+              pip install -q boto3 urllib3 &&
+              aws s3 cp s3://$S3_BUCKET/scripts/fargate_downloader.py /tmp/dl.py &&
+              python /tmp/dl.py
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/fieldsight-fargate-downloader
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: download
+
+  # ----------------------------------------------------------
+  # Lambda: Fargate Trigger (checks pending + launches task)
+  # ----------------------------------------------------------
+  FargateTriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: fieldsight-fargate-trigger
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DataBucketName
+          CLUSTER: !Ref DownloaderCluster
+          TASK_DEF: !Ref FargateDownloaderTask
+          SUBNETS: !Join [',', !Ref FargateSubnetIds]
+          SECURITY_GROUP: !GetAtt FargateSecurityGroup.GroupId
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucketName
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ecs:RunTask
+              Resource: !Ref FargateDownloaderTask
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource:
+                - !GetAtt FargateExecutionRole.Arn
+                - !GetAtt FargateTaskRole.Arn
+      Events:
+        # Run 30 min after orchestrator to pick up Lambda failures
+        FargateSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(30 7 * * ? *)  # UTC 07:30 = NZDT 20:30
+            Description: Check for pending large downloads (8:30 PM NZDT)
+            Enabled: true
+      InlineCode: |
+        import os, json, boto3
+
+        def handler(event, context):
+            s3 = boto3.client('s3')
+            bucket = os.environ['S3_BUCKET']
+
+            # Check if any pending downloads exist
+            resp = s3.list_objects_v2(
+                Bucket=bucket, Prefix='pending_downloads/', MaxKeys=1
+            )
+            pending_count = resp.get('KeyCount', 0)
+
+            if pending_count == 0:
+                print('No pending downloads. Skipping Fargate.')
+                return {'triggered': False, 'reason': 'no pending downloads'}
+
+            print(f'Found pending downloads. Launching Fargate task...')
+
+            ecs = boto3.client('ecs')
+            subnets = os.environ['SUBNETS'].split(',')
+
+            response = ecs.run_task(
+                cluster=os.environ['CLUSTER'],
+                taskDefinition=os.environ['TASK_DEF'],
+                launchType='FARGATE',
+                networkConfiguration={
+                    'awsvpcConfiguration': {
+                        'subnets': subnets,
+                        'securityGroups': [os.environ['SECURITY_GROUP']],
+                        'assignPublicIp': 'ENABLED',
+                    }
+                },
+                count=1,
+            )
+
+            tasks = response.get('tasks', [])
+            if tasks:
+                task_arn = tasks[0]['taskArn']
+                print(f'Fargate task started: {task_arn}')
+                return {'triggered': True, 'task_arn': task_arn}
+            else:
+                failures = response.get('failures', [])
+                print(f'Failed to start task: {failures}')
+                return {'triggered': False, 'failures': str(failures)}
+
+  # ----------------------------------------------------------
+  # CloudWatch Log Groups
+  # ----------------------------------------------------------
+  OrchestratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${OrchestratorFunction}
+      RetentionInDays: 30
+
+  DownloaderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${DownloaderFunction}
+      RetentionInDays: 14
+
+  TranscribeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ShouldEnableTranscribe
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${TranscribeFunction}
+      RetentionInDays: 14
+
+  ReportLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ReportGeneratorFunction}
+      RetentionInDays: 30
+
+  FargateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/fieldsight-fargate-downloader
+      RetentionInDays: 14
+
+  FargateTriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${FargateTriggerFunction}
+      RetentionInDays: 14
+
+  # ----------------------------------------------------------
+  # SNS Topic for Alerts
+  # ----------------------------------------------------------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: ShouldCreateAlerts
+    Properties:
+      TopicName: fieldsight-pipeline-alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ----------------------------------------------------------
+  # CloudWatch Alarms
+  # ----------------------------------------------------------
+  OrchestratorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlerts
+    Properties:
+      AlarmName: fieldsight-orchestrator-errors
+      AlarmDescription: Orchestrator Lambda has errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OrchestratorFunction
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+
+  DownloaderErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlerts
+    Properties:
+      AlarmName: fieldsight-downloader-errors
+      AlarmDescription: Downloader Lambda has more than 5 errors in a day
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DownloaderFunction
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+
+  ReportErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlerts
+    Properties:
+      AlarmName: fieldsight-report-errors
+      AlarmDescription: Report Generator Lambda has errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReportGeneratorFunction
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  BucketName:
+    Description: S3 bucket name
+    Value: !Ref DataBucketName
+
+  OrchestratorFunctionArn:
+    Description: Orchestrator Lambda ARN
+    Value: !GetAtt OrchestratorFunction.Arn
+
+  DownloaderFunctionArn:
+    Description: Downloader Lambda ARN
+    Value: !GetAtt DownloaderFunction.Arn
+
+  TranscribeFunctionArn:
+    Description: Transcribe Lambda ARN
+    Condition: ShouldEnableTranscribe
+    Value: !GetAtt TranscribeFunction.Arn
+
+  ReportGeneratorFunctionArn:
+    Description: Report Generator Lambda ARN
+    Value: !GetAtt ReportGeneratorFunction.Arn
+
+  FargateClusterArn:
+    Description: ECS Cluster for large file downloads
+    Value: !GetAtt DownloaderCluster.Arn
+
+  FargateTaskDefArn:
+    Description: Fargate task definition ARN
+    Value: !Ref FargateDownloaderTask
+
+  ConsoleUrl:
+    Description: View S3 bucket in console
+    Value: !Sub https://s3.console.aws.amazon.com/s3/buckets/${DataBucketName}
+
+  LogsUrl:
+    Description: View Orchestrator logs
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Flambda$252Ffieldsight-orchestrator
+
+  FargateLogsUrl:
+    Description: View Fargate download logs
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Fecs$252Ffieldsight-fargate-downloader
+
+  MonitoringDashboard:
+    Description: Quick monitoring links
+    Value: !Sub >
+      Lambda: https://${AWS::Region}.console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions
+      Logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups
+      ECS: https://${AWS::Region}.console.aws.amazon.com/ecs/v2/clusters/fieldsight-downloader-cluster
+      Alarms: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#alarmsV2:
