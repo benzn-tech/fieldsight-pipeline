@@ -2,7 +2,7 @@
     "_version": "2.1",
     "_updated": "2026-02-22",
     "_instructions": [
-        "Upload to: s3://nottag-bs-manual-1/config/user_mapping.json",
+        "Upload to: s3://fieldsight-data-509194952652/config/user_mapping.json",
         "When a device changes user: update mapping entry + add old entry to reassignment_log",
         "cross-site workers: add multiple site IDs to sites[] array"
     ],

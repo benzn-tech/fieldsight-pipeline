@@ -2,7 +2,7 @@
     "_version": "3.0",
     "_updated": "2026-03-18",
     "_instructions": [
-        "Upload to: s3://realptt-downloads-fieldsight/config/prompt_templates.json",
+        "Upload to: s3://fieldsight-data-509194952652/config/prompt_templates.json",
         "Templates use {variable} placeholders that get filled at runtime.",
         "Available variables are listed in _variables for each template.",
         "Edit any template here and re-upload — no Lambda redeployment needed.",

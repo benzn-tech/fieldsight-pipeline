@@ -108,6 +108,11 @@ OUTPUT_PREFIX = os.environ.get('OUTPUT_PREFIX', 'transcripts/')
 # Speaker diarization
 MAX_SPEAKERS = int(os.environ.get('MAX_SPEAKERS', '5'))
 
+# Custom Vocabulary (improves recognition of construction/NZ terms)
+# Set via env var; leave empty to skip.
+# Must be created first via: aws transcribe create-vocabulary ...
+VOCABULARY_NAME = os.environ.get('VOCABULARY_NAME', '')
+
 # Supported audio/video formats for Transcribe
 SUPPORTED_FORMATS = {
     '.wav': 'wav',
@@ -196,6 +201,11 @@ def build_transcribe_params(job_name, media_uri, media_format, bucket, output_ke
     Combines:
     - Automatic language detection (IdentifyLanguage + LanguageOptions)
     - Speaker diarization (ShowSpeakerLabels + MaxSpeakerLabels)
+    - Custom Vocabulary (if VOCABULARY_NAME is set)
+    
+    Note on Custom Vocabulary + IdentifyLanguage:
+        When using IdentifyLanguage, VocabularyName cannot go in Settings.
+        Instead, use LanguageIdSettings to map vocabulary per language code.
     
     Returns:
         dict: Complete parameter set for start_transcription_job()
@@ -208,26 +218,45 @@ def build_transcribe_params(job_name, media_uri, media_format, bucket, output_ke
         'OutputKey': output_key,
     }
     
+    # Speaker diarization
+    settings = {
+        'ShowSpeakerLabels': True,
+        'MaxSpeakerLabels': min(max(MAX_SPEAKERS, 2), 10)
+    }
+    
     # Automatic language detection
-    # Note: IdentifyLanguage and LanguageCode are mutually exclusive
     if len(LANGUAGE_OPTIONS) > 1:
         params['IdentifyLanguage'] = True
         params['LanguageOptions'] = LANGUAGE_OPTIONS
         logger.info(f"  Auto-detect from: {LANGUAGE_OPTIONS}")
+        
+        # Custom Vocabulary with IdentifyLanguage:
+        # Map vocabulary to each English variant via LanguageIdSettings
+        if VOCABULARY_NAME:
+            lang_id_settings = {}
+            for lang in LANGUAGE_OPTIONS:
+                if lang.startswith('en-'):
+                    lang_id_settings[lang] = {
+                        'VocabularyName': VOCABULARY_NAME
+                    }
+            if lang_id_settings:
+                params['LanguageIdSettings'] = lang_id_settings
+                logger.info(f"  Custom vocabulary '{VOCABULARY_NAME}' mapped to: "
+                            f"{list(lang_id_settings.keys())}")
     else:
-        # Single language specified â€” use LanguageCode directly
+        # Single language -- use LanguageCode directly
         params['LanguageCode'] = LANGUAGE_OPTIONS[0]
         logger.info(f"  Fixed language: {LANGUAGE_OPTIONS[0]}")
+        
+        # Custom Vocabulary with single LanguageCode: set in Settings
+        if VOCABULARY_NAME:
+            settings['VocabularyName'] = VOCABULARY_NAME
+            logger.info(f"  Custom vocabulary: {VOCABULARY_NAME}")
     
-    # Speaker diarization
-    params['Settings'] = {
-        'ShowSpeakerLabels': True,
-        'MaxSpeakerLabels': min(max(MAX_SPEAKERS, 2), 10)  # Clamp to valid range
-    }
+    params['Settings'] = settings
     logger.info(f"  Speaker diarization: max {MAX_SPEAKERS} speakers")
     
     return params
-
 
 def write_ledger_record(display_name, file_date, base_name, job_name,
                         media_uri, output_key):

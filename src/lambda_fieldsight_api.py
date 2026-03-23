@@ -54,6 +54,7 @@ REPORTS_TABLE = os.environ.get('REPORTS_TABLE', 'fieldsight-reports')
 AUDIT_TABLE = os.environ.get('AUDIT_TABLE', 'fieldsight-audit')
 USERS_TABLE = os.environ.get('USERS_TABLE', 'fieldsight-users')
 REPORT_FUNCTION = os.environ.get('REPORT_FUNCTION', 'fieldsight-report-generator')
+ASK_AGENT_FUNCTION = os.environ.get('ASK_AGENT_FUNCTION', 'fieldsight-ask-agent')
 PRESIGNED_URL_EXPIRY = 900
 
 _user_mapping_cache = None
@@ -366,13 +367,31 @@ def get_dates(params, caller):
 
 # ── GET /api/media/presigned-url ─────────────────────────────
 
-def get_presigned_url(params):
+def get_presigned_url(params, caller=None):
     s3_key = unquote_plus(params.get('key', ''))
     if not s3_key:
         return error('Missing key')
-    allowed = ['users/', 'audio_segments/', 'transcripts/', 'reports/']
+    allowed = ['users/', 'audio_segments/', 'transcripts/', 'reports/', 'web_video/']
     if not any(s3_key.startswith(p) for p in allowed):
         return error('Access denied', 403)
+
+    # Permission check: extract user folder from key and verify caller can access
+    if caller and caller.get('role') not in ('admin', 'gm'):
+        # Extract user folder name from common path patterns:
+        #   users/{name}/...  audio_segments/{name}/...  transcripts/{name}/...
+        #   reports/{date}/{name}/...  web_video/{name}/...
+        key_parts = s3_key.split('/')
+        target_user = None
+        if len(key_parts) >= 2 and key_parts[0] in ('users', 'audio_segments', 'transcripts', 'web_video'):
+            target_user = key_parts[1]
+        elif len(key_parts) >= 3 and key_parts[0] == 'reports':
+            # reports/{date}/{user}/...  — but skip summary_report.json at date level
+            candidate = key_parts[2] if len(key_parts) > 3 else None
+            if candidate and candidate not in ('summary_report.json', 'sites'):
+                target_user = candidate
+
+        if target_user and not can_access_user_data(caller, target_user):
+            return error('Access denied to this user\'s media', 403)
     try:
         url = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': s3_key}, ExpiresIn=PRESIGNED_URL_EXPIRY)
         return ok({'url': url, 'expires_in': PRESIGNED_URL_EXPIRY})
@@ -808,6 +827,61 @@ def trigger_report_generation(body, caller):
     except Exception as e:
         return error(f'Failed: {e}', 500)
 
+
+# ── POST /api/ask ───────────────────────────────────────────
+
+def ask_question(body, caller):
+    """Proxy question to Ask Agent Lambda with permission checks."""
+    question = body.get('question', '').strip()
+    date = body.get('date', '')
+    user = body.get('user', '')
+    scope = body.get('scope', 'both')
+    topic_id = body.get('topic_id', None)
+
+    if not question:
+        return error('Missing question')
+    if not date:
+        return error('Missing date')
+
+    # Resolve user from caller if not specified
+    if not user:
+        user = resolve_user_display_name(caller)
+    if not user:
+        return error('Missing user')
+
+    # Permission check: workers can only ask about their own data
+    if caller['role'] == 'worker':
+        user = resolve_user_display_name(caller)
+    elif user and not can_access_user_data(caller, user):
+        return error('Access denied to this user', 403)
+
+    payload = {
+        'date': date,
+        'user': user,
+        'question': question,
+        'scope': scope,
+    }
+    if topic_id is not None:
+        payload['topic_id'] = topic_id
+
+    try:
+        resp = lambda_client.invoke(
+            FunctionName=ASK_AGENT_FUNCTION,
+            InvocationType='RequestResponse',
+            Payload=json.dumps(payload)
+        )
+        result = json.loads(resp['Payload'].read().decode('utf-8'))
+
+        # The Ask Agent returns API Gateway format {statusCode, body}
+        if 'body' in result:
+            return result
+        # Or direct invocation format
+        return ok(result)
+    except Exception as e:
+        logger.error(f"Ask agent invocation failed: {e}")
+        return error(f'Ask agent error: {e}', 500)
+
+
 def get_users(params):
     try:
         mapping = load_user_mapping()
@@ -881,7 +955,7 @@ def lambda_handler(event, context):
     try:
         if path == '/api/timeline': return get_timeline(params, caller)
         elif path == '/api/dates': return get_dates(params, caller)
-        elif path == '/api/media/presigned-url': return get_presigned_url(params)
+        elif path == '/api/media/presigned-url': return get_presigned_url(params, caller)
         elif path == '/api/reports/history': return get_report_history(params, caller)
         elif path == '/api/reports/generate' and method == 'POST': return trigger_report_generation(body, caller)
         elif path == '/api/users': return get_users(params)
@@ -893,6 +967,7 @@ def lambda_handler(event, context):
         elif path == '/api/recording-stats': return get_recording_stats(params, caller)
         elif path == '/api/actions/toggle' and method == 'POST': return toggle_action(body, caller)
         elif path == '/api/actions': return get_actions(params, caller)
+        elif path == '/api/ask' and method == 'POST': return ask_question(body, caller)
         else: return error(f'Not found: {method} {path}', 404)
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)

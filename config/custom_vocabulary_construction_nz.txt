@@ -1,0 +1,130 @@
+Phrase	SoundsLike	IPA	DisplayAs
+GIB		dʒɪb	GIB
+GIB board	gib-board		GIB board
+BRANZ		bɹænz	BRANZ
+dwang		dwæŋ	dwang
+dwangs		dwæŋz	dwangs
+nog		nɒɡ	nog
+nogging		nɒɡɪŋ	nogging
+purlin		pɜːlɪn	purlin
+purlins		pɜːlɪnz	purlins
+soffit		sɒfɪt	soffit
+soffits		sɒfɪts	soffits
+fascia		fæʃə	fascia
+sarking	sark-ing		sarking
+DPM	dee-pee-em		DPM
+weathertightness	weather-tight-ness		weathertightness
+boxing	bok-sing		boxing
+falsework	falls-work		falsework
+formwork	form-work		formwork
+rebar	ree-bar		rebar
+rebars	ree-bars		rebars
+lintel	lin-tel		lintel
+lintels	lin-tels		lintels
+Hiab		haɪæb	Hiab
+Acrow		ækɹəʊ	Acrow
+Acrow props	ack-row-props		Acrow props
+strongback	strong-back		strongback
+strongbacks	strong-backs		strongbacks
+H1	aitch-one		H1
+H3	aitch-three		H3
+H3.2	aitch-three-point-two		H3.2
+H5	aitch-five		H5
+NZBC	en-zed-bee-see		NZBC
+NZS 3604	en-zed-ess-thirty-six-oh-four		NZS 3604
+NZS 4402	en-zed-ess-forty-four-oh-two		NZS 4402
+E2/AS1	ee-two-ay-ess-one		E2/AS1
+B1/AS1	bee-one-ay-ess-one		B1/AS1
+CCC	see-see-see		CCC
+code compliance certificate	code-compliance-certificate		code compliance certificate
+PS1	pee-ess-one		PS1
+PS4	pee-ess-four		PS4
+LBP	el-bee-pee		LBP
+licensed building practitioner	licensed-building-practitioner		licensed building practitioner
+PIR	pee-eye-are		PIR
+producer statement	producer-statement		producer statement
+PIMs		pɪmz	PIMs
+RFI	are-eff-eye		RFI
+request for information	request-for-information		request for information
+EOT	ee-oh-tee		EOT
+extension of time	extension-of-time		extension of time
+PC sum	pee-see-sum		PC sum
+PC sums	pee-see-sums		PC sums
+provisional sum	provisional-sum		provisional sum
+provisional sums	provisional-sums		provisional sums
+variations	var-ee-ay-shuns		variations
+defects liability	defects-li-a-bill-itty		defects liability
+defects liability period	defects-li-a-bill-itty-period		defects liability period
+practical completion	practical-completion		practical completion
+substrata	sub-stray-ta		substrata
+substrate	sub-straight		substrate
+Roskill		ɹɒskɪl	Roskill
+Ellesmere		ɛlzmɪə	Ellesmere
+Northbrook	north-brook		Northbrook
+Wanaka		wɒnəkɑː	Wanaka
+Queenstown	queens-town		Queenstown
+nuclear density test	new-clear-density-test		nuclear density test
+nuclear density testing	new-clear-density-testing		nuclear density testing
+beam test	beam-test		beam test
+beam testing	beam-testing		beam testing
+slump test	slump-test		slump test
+concrete pour	con-creet-pour		concrete pour
+concrete pours	con-creet-pours		concrete pours
+scaff		skæf	scaff
+scaffold	scaff-old		scaffold
+scaffolding	scaff-old-ing		scaffolding
+precast	pre-cast		precast
+precast panel	pre-cast-panel		precast panel
+precast panels	pre-cast-panels		precast panels
+tilt slab	tilt-slab		tilt slab
+tilt up	tilt-up		tilt-up
+blockwork	block-work		blockwork
+brickwork	brick-work		brickwork
+steelfixer	steel-fixer		steelfixer
+steelfixers	steel-fixers		steelfixers
+subbies		sʌbiːz	subbies
+subcontractor	sub-con-track-tor		subcontractor
+subcontractors	sub-con-track-tors		subcontractors
+site manager	site-manager		site manager
+foreman	fore-man		foreman
+main contractor	main-con-track-tor		main contractor
+head contractor	head-con-track-tor		head contractor
+quantity surveyor	quantity-sir-vay-or		quantity surveyor
+QS	cue-ess		QS
+PPE	pee-pee-ee		PPE
+high-vis	high-viz		high-vis
+hard hat	hard-hat		hard hat
+harness	har-ness		harness
+toolbox talk	tool-box-talk		toolbox talk
+toolbox	tool-box		toolbox
+SWMS		swɪmz	SWMS
+safe work method statement	safe-work-method-statement		safe work method statement
+JSA	jay-ess-ay		JSA
+job safety analysis	job-safety-analysis		job safety analysis
+site induction	site-in-duck-shun		site induction
+setout	set-out		setout
+set out	set-out		set out
+EQC	ee-cue-see		EQC
+plasterboard	plaster-board		plasterboard
+cladding	clad-ing		cladding
+weatherboard	weather-board		weatherboard
+weatherboards	weather-boards		weatherboards
+battens	bat-ens		battens
+batten	bat-en		batten
+flashing	flash-ing		flashing
+flashings	flash-ings		flashings
+downpipe	down-pipe		downpipe
+downpipes	down-pipes		downpipes
+spouting	spout-ing		spouting
+piles	piles		piles
+pile cap	pile-cap		pile cap
+pile caps	pile-caps		pile caps
+foundation	found-ay-shun		foundation
+foundations	found-ay-shuns		foundations
+slab on grade	slab-on-grade		slab on grade
+slab edge	slab-edge		slab edge
+thickening	thick-en-ing		thickening
+thickenings	thick-en-ings		thickenings
+FieldSight		fiːldsaɪt	FieldSight
+SiteSync		saɪtsɪŋk	SiteSync
+RealPTT	real-pee-tee-tee		RealPTT
