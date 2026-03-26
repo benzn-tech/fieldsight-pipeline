@@ -37,6 +37,7 @@ import json
 import logging
 import re
 import boto3
+from boto3.dynamodb.conditions import Key
 from datetime import datetime, timedelta
 from urllib.parse import unquote_plus
 
@@ -56,6 +57,9 @@ USERS_TABLE = os.environ.get('USERS_TABLE', 'fieldsight-users')
 REPORT_FUNCTION = os.environ.get('REPORT_FUNCTION', 'fieldsight-report-generator')
 ASK_AGENT_FUNCTION = os.environ.get('ASK_AGENT_FUNCTION', 'fieldsight-ask-agent')
 PRESIGNED_URL_EXPIRY = 900
+
+# Rate limiting for /api/ask: {user_sub: [timestamp, ...]}
+_ask_rate_limit = {}
 
 _user_mapping_cache = None
 _user_mapping_ts = 0
@@ -367,31 +371,13 @@ def get_dates(params, caller):
 
 # ── GET /api/media/presigned-url ─────────────────────────────
 
-def get_presigned_url(params, caller=None):
+def get_presigned_url(params):
     s3_key = unquote_plus(params.get('key', ''))
     if not s3_key:
         return error('Missing key')
-    allowed = ['users/', 'audio_segments/', 'transcripts/', 'reports/', 'web_video/']
+    allowed = ['users/', 'audio_segments/', 'transcripts/', 'reports/']
     if not any(s3_key.startswith(p) for p in allowed):
         return error('Access denied', 403)
-
-    # Permission check: extract user folder from key and verify caller can access
-    if caller and caller.get('role') not in ('admin', 'gm'):
-        # Extract user folder name from common path patterns:
-        #   users/{name}/...  audio_segments/{name}/...  transcripts/{name}/...
-        #   reports/{date}/{name}/...  web_video/{name}/...
-        key_parts = s3_key.split('/')
-        target_user = None
-        if len(key_parts) >= 2 and key_parts[0] in ('users', 'audio_segments', 'transcripts', 'web_video'):
-            target_user = key_parts[1]
-        elif len(key_parts) >= 3 and key_parts[0] == 'reports':
-            # reports/{date}/{user}/...  — but skip summary_report.json at date level
-            candidate = key_parts[2] if len(key_parts) > 3 else None
-            if candidate and candidate not in ('summary_report.json', 'sites'):
-                target_user = candidate
-
-        if target_user and not can_access_user_data(caller, target_user):
-            return error('Access denied to this user\'s media', 403)
     try:
         url = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': s3_key}, ExpiresIn=PRESIGNED_URL_EXPIRY)
         return ok({'url': url, 'expires_in': PRESIGNED_URL_EXPIRY})
@@ -827,61 +813,6 @@ def trigger_report_generation(body, caller):
     except Exception as e:
         return error(f'Failed: {e}', 500)
 
-
-# ── POST /api/ask ───────────────────────────────────────────
-
-def ask_question(body, caller):
-    """Proxy question to Ask Agent Lambda with permission checks."""
-    question = body.get('question', '').strip()
-    date = body.get('date', '')
-    user = body.get('user', '')
-    scope = body.get('scope', 'both')
-    topic_id = body.get('topic_id', None)
-
-    if not question:
-        return error('Missing question')
-    if not date:
-        return error('Missing date')
-
-    # Resolve user from caller if not specified
-    if not user:
-        user = resolve_user_display_name(caller)
-    if not user:
-        return error('Missing user')
-
-    # Permission check: workers can only ask about their own data
-    if caller['role'] == 'worker':
-        user = resolve_user_display_name(caller)
-    elif user and not can_access_user_data(caller, user):
-        return error('Access denied to this user', 403)
-
-    payload = {
-        'date': date,
-        'user': user,
-        'question': question,
-        'scope': scope,
-    }
-    if topic_id is not None:
-        payload['topic_id'] = topic_id
-
-    try:
-        resp = lambda_client.invoke(
-            FunctionName=ASK_AGENT_FUNCTION,
-            InvocationType='RequestResponse',
-            Payload=json.dumps(payload)
-        )
-        result = json.loads(resp['Payload'].read().decode('utf-8'))
-
-        # The Ask Agent returns API Gateway format {statusCode, body}
-        if 'body' in result:
-            return result
-        # Or direct invocation format
-        return ok(result)
-    except Exception as e:
-        logger.error(f"Ask agent invocation failed: {e}")
-        return error(f'Ask agent error: {e}', 500)
-
-
 def get_users(params):
     try:
         mapping = load_user_mapping()
@@ -936,6 +867,126 @@ def health_check(params):
                'bucket': S3_BUCKET, 'timestamp': datetime.utcnow().isoformat() + 'Z'})
 
 
+# ── POST /api/ask ─────────────────────────────────────────────
+
+def ask_agent(body, caller):
+    question = (body.get('question') or '').strip()
+    date = (body.get('date') or '').strip()
+    scope = body.get('scope', 'both')
+    topic_id = body.get('topic_id')
+
+    if not question:
+        return error('Missing question')
+    if not date:
+        return error('Missing date')
+
+    # Resolve user
+    if caller['role'] == 'worker':
+        user = resolve_user_display_name(caller)
+    else:
+        user = body.get('user', '') or resolve_user_display_name(caller)
+        if body.get('user') and not can_access_user_data(caller, body['user']):
+            return error('Access denied', 403)
+    if not user:
+        return error('Missing user')
+
+    # Simple rate limit: 5 asks per minute per user
+    sub = caller.get('sub', caller.get('name', 'unknown'))
+    now = datetime.utcnow().timestamp()
+    recent = [t for t in _ask_rate_limit.get(sub, []) if now - t < 60]
+    if len(recent) >= 5:
+        return error('Rate limit: max 5 questions per minute', 429)
+    _ask_rate_limit[sub] = recent + [now]
+
+    payload = {'date': date, 'user': user.replace(' ', '_'), 'question': question, 'scope': scope}
+    if topic_id is not None:
+        payload['topic_id'] = topic_id
+
+    try:
+        resp = lambda_client.invoke(
+            FunctionName=ASK_AGENT_FUNCTION,
+            InvocationType='RequestResponse',
+            Payload=json.dumps(payload)
+        )
+        raw = json.loads(resp['Payload'].read().decode('utf-8'))
+        # Ask Agent returns {statusCode, body} — unwrap
+        if isinstance(raw, dict) and 'body' in raw:
+            inner = raw['body']
+            result = json.loads(inner) if isinstance(inner, str) else inner
+            return ok(result)
+        return ok(raw)
+    except Exception as e:
+        return error(f'Ask agent failed: {e}', 500)
+
+
+# ── GET /api/search ───────────────────────────────────────────
+
+def search_items(params, caller):
+    q = (params.get('q') or '').strip().lower()
+    start_date = params.get('start_date', '')
+    end_date = params.get('end_date', '')
+    category = params.get('category', '')
+
+    if not start_date or not end_date:
+        return error('Missing start_date or end_date')
+
+    try:
+        start = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end = datetime.strptime(end_date, '%Y-%m-%d').date()
+    except ValueError:
+        return error('Invalid date format, use YYYY-MM-DD')
+
+    if (end - start).days > 90:
+        return error('Date range too large (max 90 days)')
+    if end < start:
+        return error('end_date must be >= start_date')
+
+    accessible_sites = get_accessible_sites(caller)
+    if not accessible_sites:
+        return ok({'items': [], 'count': 0, 'truncated': False})
+
+    table = dynamodb.Table(ITEMS_TABLE)
+    results = []
+    current = start
+    while current <= end:
+        date_str = current.strftime('%Y-%m-%d')
+        for site_id in accessible_sites:
+            pk = f"SITE#{site_id}#DATE#{date_str}"
+            try:
+                resp = table.query(
+                    KeyConditionExpression=Key('PK').eq(pk) & Key('SK').begins_with('ITEM#')
+                )
+                for item in resp.get('Items', []):
+                    if q:
+                        searchable = f"{item.get('topic_title','')} {item.get('summary','')} {item.get('category','')}".lower()
+                        if q not in searchable:
+                            continue
+                    if category and item.get('category') != category:
+                        continue
+                    item_user = item.get('user_name', '')
+                    if item_user and not can_access_user_data(caller, item_user):
+                        continue
+                    results.append({
+                        'date': date_str,
+                        'site_id': site_id,
+                        'topic_id': item.get('topic_id'),
+                        'topic_title': item.get('topic_title', ''),
+                        'category': item.get('category', ''),
+                        'summary': item.get('summary', ''),
+                        'time_range': item.get('time_range', ''),
+                        'user_name': item.get('user_name', ''),
+                        'safety_flags': item.get('safety_flags', []),
+                        'action_items': item.get('action_items', []),
+                    })
+            except Exception as e:
+                logger.warning(f"Search query failed for {pk}: {e}")
+        current += timedelta(days=1)
+
+    results.sort(key=lambda r: r['date'], reverse=True)
+    truncated = len(results) > 200
+    return ok({'items': results[:200], 'count': len(results), 'truncated': truncated})
+
+
 # ── Router ───────────────────────────────────────────────────
 
 def lambda_handler(event, context):
@@ -955,7 +1006,7 @@ def lambda_handler(event, context):
     try:
         if path == '/api/timeline': return get_timeline(params, caller)
         elif path == '/api/dates': return get_dates(params, caller)
-        elif path == '/api/media/presigned-url': return get_presigned_url(params, caller)
+        elif path == '/api/media/presigned-url': return get_presigned_url(params)
         elif path == '/api/reports/history': return get_report_history(params, caller)
         elif path == '/api/reports/generate' and method == 'POST': return trigger_report_generation(body, caller)
         elif path == '/api/users': return get_users(params)
@@ -967,7 +1018,8 @@ def lambda_handler(event, context):
         elif path == '/api/recording-stats': return get_recording_stats(params, caller)
         elif path == '/api/actions/toggle' and method == 'POST': return toggle_action(body, caller)
         elif path == '/api/actions': return get_actions(params, caller)
-        elif path == '/api/ask' and method == 'POST': return ask_question(body, caller)
+        elif path == '/api/ask' and method == 'POST': return ask_agent(body, caller)
+        elif path == '/api/search': return search_items(params, caller)
         else: return error(f'Not found: {method} {path}', 404)
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
