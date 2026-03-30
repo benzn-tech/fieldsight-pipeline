@@ -36,6 +36,7 @@ import os
 import json
 import logging
 import re
+import uuid
 import boto3
 from boto3.dynamodb.conditions import Key
 from datetime import datetime, timedelta
@@ -902,6 +903,8 @@ def ask_agent(body, caller):
     if topic_id is not None:
         payload['topic_id'] = topic_id
 
+    import time as _time
+    t0 = _time.time()
     try:
         resp = lambda_client.invoke(
             FunctionName=ASK_AGENT_FUNCTION,
@@ -909,6 +912,12 @@ def ask_agent(body, caller):
             Payload=json.dumps(payload)
         )
         raw = json.loads(resp['Payload'].read().decode('utf-8'))
+        elapsed = round(_time.time() - t0, 2)
+        log_analytics_event('ask_agent', {
+            'user': user, 'date': date, 'question': question,
+            'scope': scope, 'topic_id': topic_id,
+            'caller_sub': sub, 'response_time_s': elapsed,
+        })
         # Ask Agent returns {statusCode, body} — unwrap
         if isinstance(raw, dict) and 'body' in raw:
             inner = raw['body']
@@ -984,7 +993,69 @@ def search_items(params, caller):
 
     results.sort(key=lambda r: r['date'], reverse=True)
     truncated = len(results) > 200
+    log_analytics_event('search', {
+        'query': q, 'start_date': start_date, 'end_date': end_date,
+        'category': category, 'result_count': len(results),
+        'truncated': truncated,
+        'caller_sub': caller.get('sub', ''),
+    })
     return ok({'items': results[:200], 'count': len(results), 'truncated': truncated})
+
+
+# ── Analytics Logging ─────────────────────────────────────────
+
+def log_analytics_event(event_type, data):
+    """Write analytics event to S3. Non-fatal on failure."""
+    try:
+        now = datetime.utcnow()
+        date_str = now.strftime('%Y-%m-%d')
+        ts = now.strftime('%Y%m%dT%H%M%S')
+        short_id = uuid.uuid4().hex[:8]
+        key = f"analytics/{event_type}/{date_str}/{ts}_{short_id}.json"
+        s3_client.put_object(
+            Bucket=S3_BUCKET, Key=key,
+            Body=json.dumps({**data, 'event_type': event_type, 'timestamp': now.isoformat() + 'Z'}, default=str),
+            ContentType='application/json',
+        )
+    except Exception as e:
+        logger.warning(f"Analytics log failed ({event_type}): {e}")
+
+
+# ── POST /api/analytics/events ────────────────────────────────
+
+def ingest_analytics_events(body, caller):
+    events = body.get('events', [])
+    if not isinstance(events, list) or len(events) == 0:
+        return error('Missing or empty events array')
+    if len(events) > 50:
+        return error('Max 50 events per batch')
+
+    now = datetime.utcnow()
+    date_str = now.strftime('%Y-%m-%d')
+    ts = now.strftime('%Y%m%dT%H%M%S')
+    short_id = uuid.uuid4().hex[:8]
+    key = f"analytics/events/{date_str}/{ts}_{short_id}.json"
+
+    sub = caller.get('sub', 'unknown')
+    payload = {
+        'user_sub': sub,
+        'user_name': caller.get('name', ''),
+        'role': caller.get('role', ''),
+        'batch_size': len(events),
+        'received_at': now.isoformat() + 'Z',
+        'events': events,
+    }
+
+    try:
+        s3_client.put_object(
+            Bucket=S3_BUCKET, Key=key,
+            Body=json.dumps(payload, default=str),
+            ContentType='application/json',
+        )
+        return ok({'status': 'ok', 'count': len(events)})
+    except Exception as e:
+        logger.error(f"Analytics ingest failed: {e}")
+        return error(f'Failed to store events: {e}', 500)
 
 
 # ── Router ───────────────────────────────────────────────────
@@ -1020,6 +1091,7 @@ def lambda_handler(event, context):
         elif path == '/api/actions': return get_actions(params, caller)
         elif path == '/api/ask' and method == 'POST': return ask_agent(body, caller)
         elif path == '/api/search': return search_items(params, caller)
+        elif path == '/api/analytics/events' and method == 'POST': return ingest_analytics_events(body, caller)
         else: return error(f'Not found: {method} {path}', 404)
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)

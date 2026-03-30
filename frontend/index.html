@@ -53,6 +53,30 @@
       compliance: { label: "Compliance", icon: "✓", bg: `${T.primary}0D`, color: T.primary },
     };
 
+    /* ─── EventTracker ─── */
+    const _eventQueue = [];
+    let _flushTimer = null;
+    let _trackToken = null;
+    function setTrackToken(token) { _trackToken = token; }
+    function trackEvent(eventType, meta = {}) {
+      _eventQueue.push({ event: eventType, timestamp: new Date().toISOString(), ...meta });
+      if (_eventQueue.length >= 10) flushEvents();
+      else if (!_flushTimer) _flushTimer = setTimeout(flushEvents, 30000);
+    }
+    function flushEvents() {
+      if (_flushTimer) { clearTimeout(_flushTimer); _flushTimer = null; }
+      if (_eventQueue.length === 0 || !_trackToken) return;
+      const batch = _eventQueue.splice(0, 50);
+      fetch((CONFIG.apiBase || '') + '/api/analytics/events', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': _trackToken },
+        body: JSON.stringify({ events: batch }),
+      }).catch(() => {});
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', flushEvents);
+    }
+
     /* ─── DragDivider ─── */
     function DragDivider({ direction = 'vertical', onDrag, style: extraStyle }) {
       const isV = direction === 'vertical';
@@ -579,7 +603,7 @@
     }
 
     /* ─── TopicDetail ─── */
-    function TopicDetail({ topic, date, token, user, allTopics, onTopicChange }) {
+    function TopicDetail({ topic, date, token, user, allTopics, onTopicChange, onAskAbout }) {
       const [showT, setShowT] = useState(false);
       const [transcript, setTranscript] = useState(null);
       const [tLoading, setTLoading] = useState(false);
@@ -592,9 +616,6 @@
       const [isAudioPlaying, setIsAudioPlaying] = useState(false);
       const audioRef = useRef(null);
       const progTimer = useRef(null);
-      const [askQ, setAskQ] = useState('');
-      const [askAnswer, setAskAnswer] = useState(null);
-      const [askLoading, setAskLoading] = useState(false);
 
       // Parse topic time range to seconds
       const parseTopicTime = () => {
@@ -605,7 +626,7 @@
       };
       const topicTime = parseTopicTime();
 
-      useEffect(() => { setChecked(new Set()); setCheckedMeta({}); setShowT(false); setTranscript(null); setAudioSegs([]); setVideoSegs([]); setPlayingIdx(-1); setIsAudioPlaying(false); setActiveVideo(null); if(audioRef.current){audioRef.current.pause();audioRef.current=null;} clearInterval(progTimer.current); setAskQ(''); setAskAnswer(null); setAskLoading(false); }, [topic?.topic_id, date]);
+      useEffect(() => { setChecked(new Set()); setCheckedMeta({}); setShowT(false); setTranscript(null); setAudioSegs([]); setVideoSegs([]); setPlayingIdx(-1); setIsAudioPlaying(false); setActiveVideo(null); if(audioRef.current){audioRef.current.pause();audioRef.current=null;} clearInterval(progTimer.current); }, [topic?.topic_id, date]);
 
       // Load actions + audio + video when topic changes
       useEffect(() => {
@@ -637,17 +658,9 @@
         api('/api/actions/toggle', token, { method:'POST', body:JSON.stringify({ date, topic_id:topic.topic_id, action_index:i, checked:nc, action_text:actionText })}).catch(()=>{});
       };
 
-      const handleAsk = () => {
-        if (!askQ.trim() || askLoading) return;
-        setAskLoading(true); setAskAnswer(null);
-        api('/api/ask', token, { method:'POST', body:JSON.stringify({ date, user, question:askQ.trim(), scope:'both', topic_id:topic?.topic_id }) })
-          .then(data => setAskAnswer(data))
-          .catch(e => setAskAnswer({ answer:`Error: ${e.message}`, grounded:false }))
-          .finally(() => setAskLoading(false));
-      };
-
       const loadTranscript = () => {
         setShowT(!showT);
+        if (!showT) trackEvent('transcript_expand', { topic_id: topic?.topic_id });
         if (!showT && !transcript && topic?.time_range && token) {
           setTLoading(true);
           const [startStr] = (topic.time_range || '').split('–').map(s => s.trim());
@@ -676,9 +689,9 @@
       };
       const togglePlay = () => {
         if (playingIdx >= 0 && audioRef.current) {
-          if (audioRef.current.paused) { audioRef.current.play(); setIsAudioPlaying(true); }
+          if (audioRef.current.paused) { audioRef.current.play(); setIsAudioPlaying(true); trackEvent('audio_play', { topic_id: topic?.topic_id }); }
           else { audioRef.current.pause(); setIsAudioPlaying(false); }
-        } else { playSegment(0); }
+        } else { playSegment(0); trackEvent('audio_play', { topic_id: topic?.topic_id }); }
       };
 
       if (!topic) return <div style={{ flex:1,display:"flex",alignItems:"center",justifyContent:"center",background:T.bg }}><div style={{ textAlign:"center" }}><div style={{ fontSize:48,opacity:0.12 }}>📋</div><div style={{ fontSize:15,color:T.textTertiary,fontWeight:600,marginTop:12 }}>Select a topic</div></div></div>;
@@ -699,7 +712,8 @@
               <span style={{ fontSize:16,fontWeight:700,color:T.text }}>{topic.topic_title}</span>
               {cat&&<span style={{ fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:10,background:cat.bg,color:cat.color }}>{cat.icon} {cat.label}</span>}
               {hs.length>0&&<span style={{ fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:10,background:T.dangerBg,color:T.danger }}>⚠ HIGH RISK</span>}
-              {videoSegs.length>0&&<button onClick={()=>setActiveVideo(true)} style={{ fontSize:9,fontWeight:700,padding:"3px 10px",borderRadius:10,background:`${T.accent}15`,color:T.accent,border:`1px solid ${T.accent}30`,cursor:'pointer',display:'flex',alignItems:'center',gap:3 }}>📹 Watch Video{videoSegs.length>1?` (${videoSegs.length})`:''}</button>}
+              {videoSegs.length>0&&<button onClick={()=>{setActiveVideo(true);trackEvent('video_play',{topic_id:topic?.topic_id});}} style={{ fontSize:9,fontWeight:700,padding:"3px 10px",borderRadius:10,background:`${T.accent}15`,color:T.accent,border:`1px solid ${T.accent}30`,cursor:'pointer',display:'flex',alignItems:'center',gap:3 }}>📹 Watch Video{videoSegs.length>1?` (${videoSegs.length})`:''}</button>}
+              {onAskAbout&&<button onClick={()=>onAskAbout(topic)} style={{ fontSize:9,fontWeight:700,padding:"3px 10px",borderRadius:10,background:`${T.primaryLight}15`,color:T.primaryLight,border:`1px solid ${T.primaryLight}30`,cursor:'pointer' }}>💬 Ask about this</button>}
             </div>
             <div style={{ fontSize:11,color:T.textSecondary,marginTop:4 }}>{topic.time_range}</div>
             {(topic.participants||[]).length>0&&<div style={{ display:"flex",gap:4,marginTop:6,flexWrap:"wrap" }}>
@@ -773,28 +787,7 @@
               </div>}
             </Section>
 
-            <Section title="ASK ABOUT THIS TOPIC">
-              <div style={{ background:T.surface,border:`1px solid ${T.borderLight}`,borderRadius:8,padding:14 }}>
-                <div style={{ display:"flex",gap:8 }}>
-                  <input
-                    value={askQ} onChange={e=>setAskQ(e.target.value)}
-                    onKeyDown={e=>e.key==='Enter'&&handleAsk()}
-                    placeholder="e.g. What was decided about the concrete pour?"
-                    style={{ flex:1,padding:"8px 12px",border:`1px solid ${T.border}`,borderRadius:6,fontSize:12,fontFamily:T.font,background:T.bg,color:T.text,outline:"none" }}
-                  />
-                  <button onClick={handleAsk} disabled={askLoading||!askQ.trim()} style={{ padding:"8px 16px",background:askLoading||!askQ.trim()?T.textTertiary:T.accent,color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:600,cursor:askLoading||!askQ.trim()?"default":"pointer",flexShrink:0 }}>
-                    {askLoading?"...":"Ask"}
-                  </button>
-                </div>
-                {askAnswer&&<div style={{ marginTop:12,padding:"10px 14px",background:T.bg,borderRadius:6,border:`1px solid ${askAnswer.grounded?T.success:T.border}` }}>
-                  <div style={{ display:"flex",alignItems:"center",gap:6,marginBottom:6 }}>
-                    <span style={{ fontSize:9,fontWeight:700,padding:"2px 7px",borderRadius:8,background:askAnswer.grounded?`${T.success}20`:`${T.textTertiary}20`,color:askAnswer.grounded?T.success:T.textTertiary }}>{askAnswer.grounded?"Grounded":"Not grounded"}</span>
-                    {askAnswer.model&&<span style={{ fontSize:9,color:T.textTertiary }}>{askAnswer.model}</span>}
-                  </div>
-                  <p style={{ fontSize:12,color:T.text,lineHeight:1.7,margin:0,whiteSpace:"pre-wrap" }}>{askAnswer.answer}</p>
-                </div>}
-              </div>
-            </Section>
+            {/* Ask Agent moved to GlobalAskPanel — use "Ask about this" button in header */}
           </div>
         </div>
       );
@@ -833,6 +826,7 @@
       const doSearch = () => {
         if (!startDate || !endDate) { setError('Select a date range'); return; }
         setLoading(true); setError(''); setResults(null);
+        trackEvent('search_query', { query: q.trim(), category, start_date: startDate, end_date: endDate });
         const params = new URLSearchParams({ start_date: startDate, end_date: endDate });
         if (q.trim()) params.append('q', q.trim());
         if (category) params.append('category', category);
@@ -981,7 +975,7 @@
             <div style={{ padding:"8px 18px 4px",fontSize:10,fontWeight:700,color:T.textTertiary,letterSpacing:0.8 }}>TOPICS ({vis.length}){hidden.size>0&&<span style={{ fontWeight:400,marginLeft:6 }}>· {hidden.size} hidden</span>}</div>
             {topics.map((t,i)=>{
               const isH=hidden.has(i);const isSel=selected===i;const cat=topicColors[t.category];const hh=t.safety_flags?.some(f=>f.risk_level==="high");
-              return <div key={i} onClick={()=>!isH&&setSelected(i)} style={{ padding:"11px 18px",cursor:isH?"default":"pointer",background:isSel?T.primaryFaded:"transparent",borderLeft:`3px solid ${isSel?T.primary:"transparent"}`,borderBottom:`1px solid ${T.borderLight}`,opacity:isH?0.2:1 }}>
+              return <div key={i} onClick={()=>{if(!isH){setSelected(i);trackEvent('topic_click',{topic_id:t.topic_id,category:t.category});}}} style={{ padding:"11px 18px",cursor:isH?"default":"pointer",background:isSel?T.primaryFaded:"transparent",borderLeft:`3px solid ${isSel?T.primary:"transparent"}`,borderBottom:`1px solid ${T.borderLight}`,opacity:isH?0.2:1 }}>
                 <div style={{ display:"flex",gap:8,alignItems:"flex-start" }}>
                   <span style={{ fontSize:11,fontWeight:700,color:T.text,fontFamily:T.mono,minWidth:42 }}>{(t.time_range||"").split("–")[0]?.trim()}</span>
                   <div style={{ flex:1,minWidth:0 }}>
@@ -989,7 +983,7 @@
                     <div style={{ display:"flex",gap:4,marginTop:3,flexWrap:"wrap" }}>
                       {cat&&<span style={{ fontSize:8,fontWeight:700,padding:"1px 6px",borderRadius:8,background:cat.bg,color:cat.color }}>{cat.icon} {cat.label}</span>}
                       {hh&&<span style={{ fontSize:8,fontWeight:700,padding:"1px 6px",borderRadius:8,background:T.dangerBg,color:T.danger }}>⚠ HIGH</span>}
-                      {(t.participants||[]).map((p,pi)=><span key={pi} style={{ fontSize:8,fontWeight:600,padding:"1px 6px",borderRadius:8,background:`${T.primaryLight}15`,color:T.primaryLight,border:`1px solid ${T.primaryLight}25` }}>{p}</span>)}
+                      {(t.participants||[]).length>0&&<span style={{ fontSize:8,fontWeight:600,padding:"1px 6px",borderRadius:8,background:`${T.primaryLight}15`,color:T.primaryLight,border:`1px solid ${T.primaryLight}25` }}>{t.participants[0]}{t.participants.length>1?` · ${t.participants.length} people`:''}</span>}
                     </div>
                     <div style={{ fontSize:10,color:T.textSecondary,marginTop:3,lineHeight:1.4,overflow:"hidden",textOverflow:"ellipsis",display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical" }}>{t.summary}</div>
                   </div>
@@ -999,6 +993,89 @@
             })}
           </div>}
           {report&&<div style={{ padding:"10px 18px",borderTop:`1px solid ${T.border}`,background:T.surface }}><button onClick={onRegenerate} style={{ width:"100%",background:T.primary,color:"#fff",border:"none",fontSize:11,fontWeight:600,padding:"9px 0",borderRadius:6,cursor:"pointer" }}>🔄 Regenerate Report</button></div>}
+        </div>
+      );
+    }
+
+    /* ─── GlobalAskPanel ─── */
+    function GlobalAskPanel({ token, date, user, topic, open, onToggle }) {
+      const [q, setQ] = useState('');
+      const [answer, setAnswer] = useState(null);
+      const [loading, setLoading] = useState(false);
+      const [scope, setScope] = useState('both');
+
+      // When topic context is injected via "Ask about this", pre-fill
+      const [contextTopic, setContextTopic] = useState(null);
+      useEffect(() => {
+        if (topic && open) setContextTopic(topic);
+      }, [topic, open]);
+
+      const contextLabel = contextTopic
+        ? `${date} / ${user} / Topic #${contextTopic.topic_id}: ${contextTopic.topic_title}`
+        : date ? `${date} / ${user || 'all'}` : 'No context';
+
+      const handleAsk = () => {
+        if (!q.trim() || loading) return;
+        setLoading(true); setAnswer(null);
+        const payload = { date, user, question: q.trim(), scope };
+        if (contextTopic?.topic_id != null) payload.topic_id = contextTopic.topic_id;
+        trackEvent('ask_agent_query', { question: q.trim(), scope, topic_id: contextTopic?.topic_id });
+        api('/api/ask', token, { method: 'POST', body: JSON.stringify(payload) })
+          .then(data => setAnswer(data))
+          .catch(e => setAnswer({ answer: `Error: ${e.message}`, grounded: false }))
+          .finally(() => setLoading(false));
+      };
+
+      const clearContext = () => { setContextTopic(null); };
+
+      if (!open) {
+        return (
+          <button onClick={onToggle} style={{ position:'fixed',bottom:20,right:20,width:48,height:48,borderRadius:'50%',background:T.accent,color:'#fff',border:'none',fontSize:20,cursor:'pointer',boxShadow:'0 4px 16px rgba(0,0,0,0.2)',zIndex:900,display:'flex',alignItems:'center',justifyContent:'center' }}>
+            💬
+          </button>
+        );
+      }
+
+      return (
+        <div style={{ position:'fixed',bottom:20,right:20,width:420,maxHeight:'60vh',background:T.surface,borderRadius:14,boxShadow:'0 8px 32px rgba(0,0,0,0.18)',zIndex:900,display:'flex',flexDirection:'column',overflow:'hidden',border:`1px solid ${T.border}` }}>
+          {/* Header */}
+          <div style={{ display:'flex',justifyContent:'space-between',alignItems:'center',padding:'10px 14px',background:T.navBg,flexShrink:0 }}>
+            <span style={{ color:T.navActive,fontSize:12,fontWeight:700 }}>💬 Ask Agent</span>
+            <div style={{ display:'flex',gap:6,alignItems:'center' }}>
+              <select value={scope} onChange={e=>setScope(e.target.value)} style={{ fontSize:9,padding:'2px 4px',borderRadius:4,border:`1px solid ${T.navText}40`,background:'transparent',color:T.navText,cursor:'pointer' }}>
+                <option value="both">Both</option>
+                <option value="report">Report only</option>
+                <option value="transcript">Transcript only</option>
+              </select>
+              <button onClick={onToggle} style={{ background:'none',border:'none',color:T.navText,fontSize:14,cursor:'pointer' }}>✕</button>
+            </div>
+          </div>
+          {/* Context label */}
+          <div style={{ padding:'6px 14px',background:T.surfaceAlt,fontSize:9,color:T.textTertiary,display:'flex',alignItems:'center',gap:6,borderBottom:`1px solid ${T.borderLight}` }}>
+            <span>Grounded on: {contextLabel}</span>
+            {contextTopic&&<button onClick={clearContext} style={{ background:'none',border:'none',fontSize:9,color:T.textTertiary,cursor:'pointer',textDecoration:'underline' }}>clear topic</button>}
+          </div>
+          {/* Answer area */}
+          <div style={{ flex:1,overflowY:'auto',padding:14 }}>
+            {answer&&<div style={{ padding:'10px 14px',background:T.bg,borderRadius:6,border:`1px solid ${answer.grounded?T.success:T.border}`,marginBottom:10 }}>
+              <div style={{ display:'flex',alignItems:'center',gap:6,marginBottom:6 }}>
+                <span style={{ fontSize:9,fontWeight:700,padding:'2px 7px',borderRadius:8,background:answer.grounded?`${T.success}20`:`${T.textTertiary}20`,color:answer.grounded?T.success:T.textTertiary }}>{answer.grounded?"Grounded":"Not grounded"}</span>
+                {answer.model&&<span style={{ fontSize:9,color:T.textTertiary }}>{answer.model}</span>}
+              </div>
+              <p style={{ fontSize:12,color:T.text,lineHeight:1.7,margin:0,whiteSpace:'pre-wrap' }}>{answer.answer}</p>
+            </div>}
+            {!answer&&!loading&&<p style={{ fontSize:11,color:T.textTertiary,margin:0 }}>Ask a question about the current report or transcript data.</p>}
+            {loading&&<p style={{ fontSize:11,color:T.textTertiary,margin:0 }}>Thinking...</p>}
+          </div>
+          {/* Input */}
+          <div style={{ padding:'10px 14px',borderTop:`1px solid ${T.borderLight}`,display:'flex',gap:8,flexShrink:0 }}>
+            <input value={q} onChange={e=>setQ(e.target.value)} onKeyDown={e=>e.key==='Enter'&&handleAsk()}
+              placeholder="e.g. What safety issues were raised today?"
+              style={{ flex:1,padding:'8px 12px',border:`1px solid ${T.border}`,borderRadius:6,fontSize:12,fontFamily:T.font,background:T.bg,color:T.text,outline:'none' }} />
+            <button onClick={handleAsk} disabled={loading||!q.trim()} style={{ padding:'8px 16px',background:loading||!q.trim()?T.textTertiary:T.accent,color:'#fff',border:'none',borderRadius:6,fontSize:11,fontWeight:600,cursor:loading||!q.trim()?'default':'pointer',flexShrink:0 }}>
+              {loading?"...":"Ask"}
+            </button>
+          </div>
         </div>
       );
     }
@@ -1019,16 +1096,20 @@
       const [msg,setMsg]=useState("");
       const [leftW,setLeftW]=useState(380);
       const [showChangePw,setShowChangePw]=useState(false);
+      const [askOpen,setAskOpen]=useState(false);
+      const [askTopic,setAskTopic]=useState(null);
       const mainRef=useRef(null);
+
+      const openAskAbout = (topic) => { setAskTopic(topic); setAskOpen(true); };
 
       // Site management
       const [sites,setSites]=useState([]);
       const [selectedSite,setSelectedSite]=useState("");
 
       // Restore session
-      useEffect(()=>{const s=sessionStorage.getItem("ss_auth");if(s){try{const p=JSON.parse(s);const c=parseJwt(p.idToken);if(c.exp*1000>Date.now()){setAuth(p);setUser({name:c.name||c.email,email:c.email})}}catch{}}},[] );
+      useEffect(()=>{const s=sessionStorage.getItem("ss_auth");if(s){try{const p=JSON.parse(s);const c=parseJwt(p.idToken);if(c.exp*1000>Date.now()){setAuth(p);setUser({name:c.name||c.email,email:c.email});setTrackToken(p.idToken);}}catch{}}},[] );
 
-      const login=t=>{const c=parseJwt(t.idToken);setAuth(t);setUser({name:c.name||c.email,email:c.email});sessionStorage.setItem("ss_auth",JSON.stringify(t))};
+      const login=t=>{const c=parseJwt(t.idToken);setAuth(t);setUser({name:c.name||c.email,email:c.email});sessionStorage.setItem("ss_auth",JSON.stringify(t));setTrackToken(t.idToken);trackEvent('session_start');};
       const logout=()=>{setAuth(null);setUser({name:"",email:""});setCallerRole("worker");setSites([]);setSelectedSite("");sessionStorage.removeItem("ss_auth")};
 
       // On login: fetch sites + role
@@ -1095,9 +1176,10 @@
             {tab==="day"?<>
               <LeftPanel report={report} loading={rLoading} error={rError} selected={sel} setSelected={setSel} hidden={hidden} toggleHide={toggleHide} selectedDate={date} setSelectedDate={setDate} dateData={dateData} onRegenerate={regen} token={auth?.idToken} user={viewingUser} width={leftW}/>
               <DragDivider direction="vertical" onDrag={dragLeft}/>
-              <TopicDetail topic={sel!=null&&report?.topics?report.topics[sel]:null} date={date} token={auth?.idToken} user={viewingUser} allTopics={report?.topics||[]} onTopicChange={(idx)=>{if(idx>=0&&idx<(report?.topics||[]).length) setSel(idx);}}/>
+              <TopicDetail topic={sel!=null&&report?.topics?report.topics[sel]:null} date={date} token={auth?.idToken} user={viewingUser} allTopics={report?.topics||[]} onTopicChange={(idx)=>{if(idx>=0&&idx<(report?.topics||[]).length) setSel(idx);}} onAskAbout={openAskAbout}/>
             </>:tab==="search"?<SearchTab token={auth.idToken} onNavigate={d=>{setDate(d);setTab('day');}}/>:<ReportsTab token={auth.idToken} user={user}/>}
           </div>
+          <GlobalAskPanel token={auth?.idToken} date={date} user={viewingUser} topic={askTopic} open={askOpen} onToggle={()=>{setAskOpen(!askOpen);if(askOpen)setAskTopic(null);}}/>
         </div>
       );
     }
