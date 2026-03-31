@@ -1,6 +1,6 @@
 # FieldSight Product Roadmap
 
-> Last updated: 2026-03-22
+> Last updated: 2026-03-25
 > Owner: Ben
 > Status tracking: ⬜ Not started | 🔲 Blocked | 🟡 In progress | ✅ Done
 
@@ -10,65 +10,33 @@
 
 **Goal:** Users can ask questions about any report/meeting minutes and get answers grounded in transcript + report data.
 
-**Status:** ⬜ Not started
+**Status:** ✅ Done
 
-**Model choice:** Use cheaper model (Haiku 4.5 or equivalent) — this is retrieval + summarization, not complex reasoning. Reserve Sonnet for report generation.
+**Model choice:** Claude Haiku 4.5 (retrieval + summarization, not complex reasoning)
 
-**Architecture:**
-```
-Frontend chat input → API Gateway → lambda_ask_agent.py
-  1. Load report JSON from S3: reports/{date}/{user}/daily_report.json
-  2. Load raw transcript(s) from S3: transcripts/{user}/{date}/*.json
-  3. Normalize via transcript_utils.normalize_transcript()
-  4. Build prompt: system context + report JSON + transcript text + user question
-  5. Call Claude Haiku → return answer
-  6. Stateless — no conversation memory needed (each question is independent)
-```
-
-**Key decisions needed:**
-- [ ] Scope: per-report only, or cross-date search?
-- [ ] Frontend: inline chat panel in report view, or separate page?
-- [ ] Rate limiting: per-user query cap?
-
-**Estimated effort:** 1-2 days (Lambda + API Gateway + frontend chat input)
-
-**Dependencies:** None — all infrastructure exists
+**Completed:**
+- ✅ `/api/ask` route in API Lambda (proxies to fieldsight-ask-agent)
+- ✅ Frontend: inline "ASK ABOUT THIS TOPIC" panel in TopicDetail view
+- ✅ Rate limiting: 5 asks/minute per user (in-memory)
 
 ---
 
 ## P0 — Knowledge Base Search (知识库检索)
 
-**Goal:** Global search across all reports — find any topic, action item, safety flag, decision by keyword across all dates and users.
+**Goal:** Global search across all reports.
 
-**Status:** ⬜ Not started
+**Status:** ✅ Done (Phase 1 + 2)
 
-**Current state of DynamoDB:**
-- ⚠️ `ENABLE_DYNAMODB` = **false** (default in code, not set in template.yaml)
-- Tables defined in SAM template: `fieldsight-items`, `fieldsight-reports`, `fieldsight-audit`
-- Write functions exist in `lambda_report_generator.py` (lines 736-820) — gated behind flag
-- **No data has been written yet** — turning on only affects future reports
+**Completed:**
+- ✅ DynamoDB enabled (`ENABLE_DYNAMODB=true`)
+- ✅ Backfill triggered: past 30 days async invoked (2026-02-24 to 2026-03-25)
+- ✅ `GET /api/search?q=...&start_date=...&end_date=...&category=...` in API Lambda
+- ✅ Frontend: Search tab (🔍 Search) with date range, text, category filters + result cards
 
-**Phase 1 — Enable + Backfill:**
-- [ ] Set `ENABLE_DYNAMODB=true` in Lambda env vars (report generator + meeting minutes)
-- [ ] Run backfill: invoke report generator with `{"report_type": "daily", "force": true}` for past 30 days
-- [ ] Verify items appear in DynamoDB console
-
-**Phase 2 — Search API:**
-```
-GET /api/search?q=concrete+pour&from=2026-01&to=2026-03
-→ lambda_search.py
-→ DynamoDB scan with FilterExpression on topic_title, summary, key_decisions
-→ Return matching topics with report links
-```
-
-**Phase 3 — Flat Knowledge Base (长期):**
-- OpenSearch or PostgreSQL full-text search for cross-date, cross-site retrieval
-- Embedding-based semantic search if keyword matching isn't enough
-- Feed into Ask Agent for grounded cross-report Q&A
-
-**Estimated effort:** Phase 1: 2 hours | Phase 2: 1 day | Phase 3: 1 week
-
-**Dependencies:** Phase 1 is prerequisite for Phase 2
+**Phase 3 — Semantic Search (长期):** ⬜
+- [ ] OpenSearch or PostgreSQL full-text search
+- [ ] Embedding-based semantic search
+- [ ] Feed into Ask Agent for grounded cross-report Q&A
 
 ---
 
@@ -76,126 +44,287 @@ GET /api/search?q=concrete+pour&from=2026-01&to=2026-03
 
 **Goal:** Improve transcription accuracy for NZ/AU construction terminology.
 
-**Status:** ⬜ Not started
+**Status:** ✅ TSV built (129 entries), ✅ lambda_transcribe.py supports VOCABULARY_NAME
 
-**How it works:**
-- AWS Transcribe supports [Custom Vocabulary](https://docs.aws.amazon.com/transcribe/latest/dg/custom-vocabulary.html)
-- Upload a vocabulary table (TSV) to S3
-- Add `VocabularyName` parameter to `lambda_transcribe.py` `build_transcribe_params()`
-- Zero code change beyond one parameter addition
-
-**TODO:**
-- [ ] Research NZ/AU construction terminology (BRANZ, NZS standards, trade terms)
-- [ ] Build vocabulary TSV: columns = Phrase, SoundsLike, IPA, DisplayAs
-- [ ] Terms needed: GIB, BRANZ, dwang, nog, purlin, soffit, fascia, sarking, DPM, H1/H3/H5, NZBC, CCC, PS1/PS4, LBP, PIR, PIMs, RFI, EOT, PC Sum, Provisional Sum, variations, defects liability, practical completion, weathertightness, E2/AS1, Roskill, Hiab, Acrow props, boxing, falsework
-- [ ] Upload to S3: `config/custom_vocabulary_construction_nz.txt`
-- [ ] Add to transcribe params: `VocabularyName` in `lambda_transcribe.py`
+**Remaining:**
+- [ ] Upload TSV to S3: `config/custom_vocabulary_construction_nz.txt`
+- [ ] Create vocabulary: `aws transcribe create-vocabulary ...`
+- [ ] Set `CustomVocabularyName` parameter in deployment
 - [ ] Test on 5 diverse recordings, compare before/after
 
-**Estimated effort:** Research: 2 hours | Implementation: 30 min | Validation: 1 hour
+**Estimated effort:** 1 hour (deploy + validate)
 
-**Dependencies:** None
+---
+
+## P1 — Critical Dates Calendar Integration
+
+**Goal:** Auto-link critical dates from reports to the calendar view with visual indicators.
+
+**Status:** ⬜ Not started
+
+**Architecture:**
+```
+Report Generator extracts critical_dates_and_deadlines
+  → DynamoDB fieldsight-items: PK=SITE#{site}#DATE#{deadline_date}, SK=DEADLINE#...
+  → New API: GET /api/calendar-events?from=YYYY-MM-DD&to=YYYY-MM-DD
+  → CalendarPicker renders: ⚠ (high urgency), 📋 (inspection), 📦 (delivery)
+  → Click date → side panel with all events for that date
+```
+
+**Estimated effort:** 1 day (DynamoDB writes already exist, need API route + calendar UI)
+
+---
+
+## P1 — Topic Priority User Override
+
+**Goal:** Users can adjust topic priority (override Claude's classification).
+
+**Status:** ⬜ Not started
+
+**Architecture:**
+```
+Topic header: priority selector [▲ High] [— Med] [▼ Low]
+  → POST /api/topics/priority → DynamoDB update
+  → Weekly report reads user-adjusted priorities as input
+```
+
+Same pattern as action item toggle — user override stored in DynamoDB, original preserved in report JSON.
+
+**Estimated effort:** 1 day
 
 ---
 
 ## P1 — One-Pager Report (HTML)
 
-**Goal:** Auto-generate a single-page visual summary — executive-friendly, scannable, embeddable in frontend.
+**Goal:** Single-page visual summary, executive-friendly, embeddable in frontend.
 
 **Status:** ⬜ Not started
 
-**Ben's direction:** HTML over PPT — better fit for frontend embed, no download required, responsive, printable.
+**Approach:** HTML one-pager via Jinja2 template → `reports/{date}/{user}/daily_onepager.html` → frontend iframe embed or direct link, browser print = PDF.
 
-**Approach: HTML one-pager served via CloudFront**
+**Estimated effort:** 1.5 days
+
+---
+
+## P2 — Site Dashboard View (站点总览)
+
+**Goal:** Login → see all sites as cards with today's summary → click into timeline.
+
+**Status:** ⬜ Not started
+
+**Architecture:**
 ```
-report JSON exists
-  → lambda_onepager.py reads JSON
-  → Renders Jinja2 HTML template:
-     - Executive summary bullets
-     - Safety risk heatmap (high/med/low counts)
-     - Top 3 action items with owners
-     - Timeline bar (topics across the day)
-     - Key decisions
-  → Saves: reports/{date}/{user}/daily_onepager.html
-  → Frontend: iframe embed or link, direct print support
+App renders <SiteDashboard> when no site selected:
+  - Card per site: site name, today's topic count, safety flags, key action items
+  - Click card → setSelectedSite() → timeline view
 ```
 
-**Why HTML > PPT:**
-- Direct frontend embed — no download step
-- Responsive on mobile
-- Browser print = PDF export for free
-- Interactive (collapsible sections, links to full report)
-- Zero new dependencies (vs python-pptx)
+Better UX for PM/Admin managing multiple sites.
 
-**Estimated effort:** Template: 1 day | Lambda: half day | Frontend link: 1 hour
+**Estimated effort:** 2 days
 
-**Dependencies:** None — reads existing report JSON
+---
+
+## P2 — PM/Admin Digest Reports (Agent 5)
+
+**Goal:** Role-specific daily digest tailored to PM/Admin priorities.
+
+**Status:** ⬜ Not started
+
+**Hierarchy:**
+```
+Worker        → detailed daily topics (existing)
+Site Manager  → site daily summary (existing)
+PM            → cross-site digest: blocking items, overdue actions, safety trends (NEW)
+Admin/GM      → global dashboard + anomaly alerts (NEW)
+```
+
+**Architecture:**
+```
+New report_type: "digest"
+  → Input: multiple daily reports across sites
+  → Output: prioritized executive view
+  → Storage: reports/{date}/digest/{role}/{user}.json
+  → Optional: email/Slack push via SNS
+```
+
+**Estimated effort:** 2-3 days
+
+---
+
+## P2 — QA/QC Content Correction System (Agent 3)
+
+**Goal:** Users can correct report errors, corrections propagate to weekly/monthly reports, system learns from corrections.
+
+**Status:** ⬜ Not started
+
+**Three layers:**
+
+**Layer 1 — User Corrections:**
+```
+User clicks "Edit" on topic → modifies text → saves
+  → POST /api/reports/correction
+  → DynamoDB fieldsight-corrections table
+  → Frontend merges corrections on load, shows "✏ Corrected" badge
+```
+
+**Layer 2 — Upward Propagation:**
+```
+Weekly report generator checks corrections for source daily reports
+  → Injects into prompt: "NOTE: corrected items: ..."
+  → Weekly/monthly auto-include latest corrections
+```
+
+**Layer 3 — System Memory:**
+```
+Corrections accumulate → periodic pattern analysis:
+  - Transcription errors → add to Custom Vocabulary
+  - Classification errors → add to prompt_templates rules
+  - config/prompt_corrections.json (append-only rule list)
+```
+
+**Scalability:** Minimal impact — corrections are sparse data (<1KB each), prompt additions <500 tokens.
+
+**Estimated effort:** 3-5 days
 
 ---
 
 ## P2 — Near Real-Time Processing + Voice Feedback
 
-**Goal:** Reduce latency from overnight batch to <15 min. Long-term: live voice agent with eyes, ears, brain, and mouth.
+**Goal:** Reduce latency from overnight batch to <15 min.
 
-**Status:** ⬜ Not started (conceptual)
+**Status:** ⬜ Phase 1 ready (callback deployed, needs function name fix)
 
-**Phase 1 — Event-Driven Minutes (~15 min latency):**
-- `lambda_transcribe_callback` already deployed (Steps 1-4 done)
-- On Transcribe completion → auto-invoke `lambda_meeting_minutes`
-- Fix needed: Step 5 function name mismatch (`fieldsight-transcribe` vs `fieldsight-transcribe`)
-- Result: meeting ends → 10-15 min → minutes available
-
-**Phase 2 — Streaming Transcribe (~30s latency):**
-- AWS Transcribe Streaming API (WebSocket)
-- Device streams audio → handler → real-time transcript accumulation
-- Trigger incremental analysis every N minutes
-
-**Phase 3 — Voice Agent (Ben's full vision):**
-```
-Camera (eyes)    → video stream → frame analysis (safety, context)
-Mic (ears)       → audio stream → real-time transcribe → conversation understanding
-Claude (brain)   → synthesize visual + audio → generate insights/warnings
-Earpiece (mouth) → TTS feedback → "注意: Block C scaffold inspection overdue"
-                                → "Reminder: concrete pour in 30min"
-                                → Real-time meeting participation & feedback
-```
-
-**Architecture considerations:**
-- Persistent connection (WebSocket/gRPC), not request/response
-- Edge compute for latency (AWS Wavelength or on-device inference)
-- Cost: streaming Transcribe ~2x batch pricing
-- Privacy: continuous analysis vs triggered recording
-- Agent meeting participation: Claude joins as a "participant" providing real-time input
-
-**Estimated effort:** Phase 1: 2 hours | Phase 2: 1 week | Phase 3: multi-month R&D
-
-**Dependencies:** Phase 1 needs callback fix. Phase 3 needs device independence from RealPTT.
+**Phase 1 — Event-Driven Minutes (~15 min):** 2 hours
+**Phase 2 — Streaming Transcribe (~30s):** 1 week
+**Phase 3 — Voice Agent (full vision):** multi-month R&D
 
 ---
 
-## Completed Items (2026-03-22 session)
+## P3 — Analytics Agent (Agent 4)
 
-- ✅ `lambda_meeting_minutes.py` v1.1 — generic meeting minutes generator
-- ✅ `transcript_utils.py` — shared transcript normalization (unified time extraction)
-- ✅ `prompt_templates_meeting.json` v1.1 — meeting prompt templates
+**Goal:** User behavior analysis — click heatmaps, feature usage, user personas.
+
+**Status:** ⬜ Not started
+
+**Architecture:**
+```
+Frontend event tracking (clicks, dwell time, feature usage)
+  → S3 raw events → Athena / CloudWatch RUM
+  → Weekly analytics digest: most-used features, drop-off points
+  → User persona clustering: power users, scan readers, deep divers
+```
+
+**Estimated effort:** 1-2 weeks
+
+---
+
+## P3 — Official Website + Custom Domain
+
+**Goal:** Separate marketing site from product app.
+
+**Status:** ⬜ Not started
+
+**Architecture:**
+```
+www.fieldsight.co.nz  → marketing (static, GitHub Pages / Vercel)
+app.fieldsight.co.nz  → product (CloudFront → S3, current app)
+Route53: manage both subdomains
+ACM: SSL certificates for both
+```
+
+**Estimated effort:** 1-2 days
+
+---
+
+## P3 — Face Blurring Pipeline
+
+**Status:** ⬜ Designed, not built. Fargate-based.
+
+---
+
+## P3 — Batch H264 Conversion
+
+**Status:** ⬜ Script ready (`batch_convert_h264.py`), not deployed
+
+---
+
+## P3 — Audio Normalization (EBU R128)
+
+**Status:** ⬜ Designed, needs validation
+
+---
+
+## Completed Items
+
+### 2026-03-25 session (P0 completion)
+- ✅ `/api/ask` route in API Lambda — proxies to fieldsight-ask-agent (sync invoke)
+- ✅ `/api/search` route in API Lambda — DynamoDB per-date queries with text/category filter
+- ✅ Ask Agent chat panel in TopicDetail ("ASK ABOUT THIS TOPIC" section)
+- ✅ Search tab (🔍 Search) in NavBar with SearchTab component
+- ✅ Rate limiting: 5 asks/minute per user
+- ✅ DynamoDB backfill triggered for 2026-02-24 to 2026-03-25
+- ✅ Cleanup: deleted 9 legacy realptt-*/sitesync-* Lambdas, EventBridge rule, Cognito pool
+- ✅ Cognito migration: `sitesync-users` → `fieldsight-users` (new pool)
+- ✅ API Gateway authorizer updated to new pool
+- ✅ DynamoDB user profiles migrated (Ben/Jarley/David with correct subs)
+- ✅ S3 web bucket: `sitesync-web` → `fieldsight-web-509194952652`
+- ✅ CloudFront origin updated to new web bucket
+- ✅ Lambda handler fix: `lambda_sitesync_api` → `lambda_fieldsight_api`
+- ✅ Change Password UI (ChangePasswordModal + NavBar button)
+- ✅ DragDivider component (reusable vertical/horizontal)
+- ✅ LeftPanel ↔ TopicDetail resizable (drag divider)
+- ✅ VideoPopup multi-video sequential playback (auto-advance on ended)
+- ✅ VideoPopup video/transcript resizable (drag divider)
+- ✅ Site filter in /api/timeline (selectedSite passed to API)
+- ✅ Participant labels on topic list + TopicDetail header
+- ✅ Executive Summary resizable height (DragDivider)
+- ✅ `lambda_ask_agent.py` — Haiku-powered report Q&A
+- ✅ `custom_vocabulary_construction_nz.txt` — 129 NZ construction terms
+- ✅ `lambda_transcribe.py` — Custom Vocabulary support (LanguageIdSettings)
+- ✅ Cleanup script for legacy resources (realptt-*/sitesync-*)
+
+### 2026-03-23 session
+- ✅ template.yaml — 10 Lambda definitions, all resources unified under fieldsight-*
+- ✅ Presigned URL permission check (RBAC enforcement)
+- ✅ ENABLE_DYNAMODB=true in report generator
+- ✅ SITE_NAME parameterized (not hardcoded)
+- ✅ CLAUDE_MODEL unified to claude-sonnet-4-6
+
+### 2026-03-22 session
+- ✅ `lambda_meeting_minutes.py` v1.1
+- ✅ `transcript_utils.py` — shared transcript normalization
+- ✅ `prompt_templates_meeting.json` v1.1
 - ✅ Offset-aware timestamp extraction (VAD segments + full audio)
-- ✅ Per-speaker-turn absolute timestamps from Transcribe word items
-- ✅ Attendee name constraint (explicit attendees override device mapping)
+- ✅ Per-speaker-turn absolute timestamps
 - ✅ Executive summary as bullet array
-- ✅ Daily report compat layer (meeting minutes → frontend-compatible JSON)
 - ✅ Full audio re-transcription workflow (bypass VAD for meetings)
-- ✅ Transcript truncation fix (20K → 120K chars, dynamic max_tokens)
 
 ---
 
 ## Infrastructure Status
 
-| Resource | Status | Action needed |
+| Resource | Status | Notes |
 |---|---|---|
-| DynamoDB tables | ⚠️ Defined, OFF | Set `ENABLE_DYNAMODB=true` + backfill |
-| transcript_utils.py | ✅ Deployed | Bundled with meeting minutes Lambda |
-| Report generator v3.4 | ✅ Production | Needs transcript_utils migration later |
-| Transcribe callback | ⚠️ Partial | Step 5 function name mismatch |
-| Face blurring pipeline | ⬜ Designed | Fargate-based, not built |
-| Batch H264 conversion | ⬜ Script ready | `batch_convert_h264.py` |
-| Audio normalization | ⬜ Designed | EBU R128, needs validation |
+| S3 data bucket | ✅ `fieldsight-data-509194952652` | Production |
+| S3 web bucket | ✅ `fieldsight-web-509194952652` | Production |
+| CloudFront | ✅ `E12IVML224YUEE` | Points to new web bucket |
+| Cognito | ✅ `fieldsight-users` (q88pd6XXr) | 3 users: Ben (admin), Jarley (site_mgr), David (site_mgr) |
+| API Gateway | ✅ `khfj3p1fkb` | Authorizer: 7npn3y → new pool |
+| DynamoDB tables | ✅ Created | `ENABLE_DYNAMODB=true` |
+| EventBridge | ✅ `fieldsight-transcribe-state-change` | Active |
+| Lambda (10) | ✅ All fieldsight-* | Handlers verified |
+| Legacy resources | ✅ Cleaned up | realptt-*/sitesync-* deleted |
+| Custom Vocabulary | ⬜ Not deployed | TSV ready, needs `create-vocabulary` |
+
+---
+
+## Agent Architecture (Future)
+
+| Agent | Name | Status | Function |
+|---|---|---|---|
+| 1 | Pipeline Agent | ✅ Existing | Download → VAD → Transcribe → Report |
+| 2 | Ask Agent | ✅ Backend done | Report Q&A (Haiku) |
+| 3 | QA Agent | ⬜ P2 | Auto-detect report anomalies, learn from corrections |
+| 4 | Analytics Agent | ⬜ P3 | User behavior analysis, personas, usage patterns |
+| 5 | Digest Agent | ⬜ P2 | Role-specific daily/weekly digests for PM/Admin |
