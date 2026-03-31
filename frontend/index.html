@@ -240,7 +240,7 @@
     function Card({ children, borderColor }) { return <div style={{ background: T.surface, borderRadius: 10, padding: "14px 16px", border: `1px solid ${borderColor||T.borderLight}`, borderLeft: borderColor?`3px solid ${borderColor}`:undefined, boxShadow: T.shadow }}>{children}</div>; }
 
     /* ─── Calendar ─── */
-    function CalendarPicker({ selectedDate, onSelect, onClose, dateData }) {
+    function CalendarPicker({ selectedDate, onSelect, onClose, dateData, calendarEvents }) {
       const sel = new Date(selectedDate+"T12:00:00");
       const [vy, setVy] = useState(sel.getFullYear());
       const [vm, setVm] = useState(sel.getMonth());
@@ -265,8 +265,11 @@
               if(!day) return <div key={`e${i}`}/>;
               const ds=`${vy}-${String(vm+1).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
               const data=dateData[ds]; const isSel=ds===selectedDate; const isFut=ds>todayStr;
-              return <div key={ds} onClick={()=>!isFut&&(onSelect(ds),onClose())} style={{ textAlign:"center",padding:"6px 0",borderRadius:8,cursor:isFut?"default":"pointer",background:isSel?T.primary:"transparent",color:isSel?"#fff":isFut?T.borderLight:T.text,fontSize:12,fontWeight:isSel?700:500 }}>
-                {day}<div style={{display:"flex",gap:2,justifyContent:"center",marginTop:2,height:5}}>{data?.hasReport&&<div style={{width:5,height:5,borderRadius:"50%",background:isSel?"#fff":T.success}}/>}{data?.safety>0&&<div style={{width:5,height:5,borderRadius:"50%",background:isSel?"#FFB4B4":T.danger}}/>}</div>
+              const evts=(calendarEvents||[]).filter(e=>e.date===ds);
+              const hasHigh=evts.some(e=>e.urgency==='high');
+              const hasDeadline=evts.length>0;
+              return <div key={ds} onClick={()=>!isFut&&(onSelect(ds),onClose())} title={hasDeadline?evts.map(e=>e.context).join('; '):''} style={{ textAlign:"center",padding:"6px 0",borderRadius:8,cursor:isFut?"default":"pointer",background:isSel?T.primary:hasHigh?T.dangerBg:"transparent",color:isSel?"#fff":isFut?T.borderLight:T.text,fontSize:12,fontWeight:isSel?700:500 }}>
+                {day}<div style={{display:"flex",gap:2,justifyContent:"center",marginTop:2,height:5}}>{data?.hasReport&&<div style={{width:5,height:5,borderRadius:"50%",background:isSel?"#fff":T.success}}/>}{data?.safety>0&&<div style={{width:5,height:5,borderRadius:"50%",background:isSel?"#FFB4B4":T.danger}}/>}{hasDeadline&&<div style={{width:5,height:5,borderRadius:hasHigh?2:"50%",background:isSel?"#FFD700":T.warning}}/>}</div>
               </div>;
             })}
           </div>
@@ -612,6 +615,7 @@
       const [activeVideo, setActiveVideo] = useState(null);
       const [checked, setChecked] = useState(new Set());
       const [checkedMeta, setCheckedMeta] = useState({});
+      const [topicPriority, setTopicPriority] = useState(null);
       const [playingIdx, setPlayingIdx] = useState(-1);
       const [isAudioPlaying, setIsAudioPlaying] = useState(false);
       const audioRef = useRef(null);
@@ -626,7 +630,7 @@
       };
       const topicTime = parseTopicTime();
 
-      useEffect(() => { setChecked(new Set()); setCheckedMeta({}); setShowT(false); setTranscript(null); setAudioSegs([]); setVideoSegs([]); setPlayingIdx(-1); setIsAudioPlaying(false); setActiveVideo(null); if(audioRef.current){audioRef.current.pause();audioRef.current=null;} clearInterval(progTimer.current); }, [topic?.topic_id, date]);
+      useEffect(() => { setChecked(new Set()); setCheckedMeta({}); setShowT(false); setTranscript(null); setAudioSegs([]); setVideoSegs([]); setPlayingIdx(-1); setIsAudioPlaying(false); setActiveVideo(null); setTopicPriority(null); if(audioRef.current){audioRef.current.pause();audioRef.current=null;} clearInterval(progTimer.current); }, [topic?.topic_id, date]);
 
       // Load actions + audio + video when topic changes
       useEffect(() => {
@@ -715,7 +719,21 @@
               {videoSegs.length>0&&<button onClick={()=>{setActiveVideo(true);trackEvent('video_play',{topic_id:topic?.topic_id});}} style={{ fontSize:9,fontWeight:700,padding:"3px 10px",borderRadius:10,background:`${T.accent}15`,color:T.accent,border:`1px solid ${T.accent}30`,cursor:'pointer',display:'flex',alignItems:'center',gap:3 }}>📹 Watch Video{videoSegs.length>1?` (${videoSegs.length})`:''}</button>}
               {onAskAbout&&<button onClick={()=>onAskAbout(topic)} style={{ fontSize:9,fontWeight:700,padding:"3px 10px",borderRadius:10,background:`${T.primaryLight}15`,color:T.primaryLight,border:`1px solid ${T.primaryLight}30`,cursor:'pointer' }}>💬 Ask about this</button>}
             </div>
-            <div style={{ fontSize:11,color:T.textSecondary,marginTop:4 }}>{topic.time_range}</div>
+            <div style={{ display:"flex",alignItems:"center",gap:12,marginTop:4 }}>
+              <span style={{ fontSize:11,color:T.textSecondary }}>{topic.time_range}</span>
+              {/* Priority override selector */}
+              <div style={{ display:"flex",gap:2 }}>
+                {['high','medium','low'].map(p=>{
+                  const cur=topicPriority||topic.priority||'medium';
+                  const active=cur===p;
+                  const colors={high:{bg:T.dangerBg,c:T.danger,l:'▲'},medium:{bg:T.surfaceAlt,c:T.textSecondary,l:'—'},low:{bg:`${T.primaryLight}10`,c:T.primaryLight,l:'▼'}};
+                  const s=colors[p];
+                  return <button key={p} onClick={()=>{setTopicPriority(p);api('/api/topics/priority',token,{method:'POST',body:JSON.stringify({date,topic_id:topic.topic_id,priority:p,original_priority:topic.priority||'medium',user})}).catch(()=>{});}} style={{ fontSize:8,fontWeight:700,padding:"2px 6px",borderRadius:6,background:active?s.bg:'transparent',color:active?s.c:T.textTertiary,border:`1px solid ${active?s.c+'40':'transparent'}`,cursor:'pointer' }}>{s.l} {p.charAt(0).toUpperCase()+p.slice(1)}</button>;
+                })}
+              </div>
+              {/* One-pager button */}
+              <button onClick={()=>window.open(`${CONFIG.apiBase}/api/onepager?date=${date}&user=${encodeURIComponent(user)}`,'_blank')} style={{ fontSize:8,fontWeight:700,padding:"2px 8px",borderRadius:6,background:`${T.accent}10`,color:T.accent,border:`1px solid ${T.accent}30`,cursor:'pointer',marginLeft:'auto' }}>📄 One-Pager</button>
+            </div>
             {(topic.participants||[]).length>0&&<div style={{ display:"flex",gap:4,marginTop:6,flexWrap:"wrap" }}>
               <span style={{ fontSize:9,color:T.textTertiary }}>Participants:</span>
               {topic.participants.map((p,i)=><span key={i} style={{ fontSize:9,fontWeight:600,padding:"2px 8px",borderRadius:10,background:`${T.primaryLight}15`,color:T.primaryLight,border:`1px solid ${T.primaryLight}25` }}>{p}</span>)}
@@ -890,7 +908,7 @@
     }
 
     /* ─── LeftPanel ─── */
-    function LeftPanel({ report, loading, error, selected, setSelected, hidden, toggleHide, selectedDate, setSelectedDate, dateData, onRegenerate, token, user, width }) {
+    function LeftPanel({ report, loading, error, selected, setSelected, hidden, toggleHide, selectedDate, setSelectedDate, dateData, calendarEvents, onRegenerate, token, user, width }) {
       const [calOpen,setCalOpen]=useState(false); const calRef=useRef(null);
       const [recStats, setRecStats] = useState(null);
       const [execH, setExecH] = useState(160);
@@ -936,7 +954,7 @@
                 </div>
                 <button onClick={()=>{const[y,m,dy]=selectedDate.split('-').map(Number);const n=new Date(Date.UTC(y,m-1,dy+1));setSelectedDate(n.toISOString().slice(0,10))}} style={{ background:T.inputBg,border:`1px solid ${T.borderLight}`,borderRadius:6,padding:"4px 10px",fontSize:14,cursor:"pointer",color:T.textSecondary }}>›</button>
               </div>
-              {calOpen&&<CalendarPicker selectedDate={selectedDate} onSelect={setSelectedDate} onClose={()=>setCalOpen(false)} dateData={dateData}/>}
+              {calOpen&&<CalendarPicker selectedDate={selectedDate} onSelect={setSelectedDate} onClose={()=>setCalOpen(false)} dateData={dateData} calendarEvents={calendarEvents}/>}
             </div>
             {report&&<div style={{ display:"flex",gap:5,marginTop:10,flexWrap:"wrap" }}>
               {recStats?<>
@@ -1150,6 +1168,16 @@
         api(url,auth.idToken).then(d=>setDD(d.dates||{})).catch(()=>{});
       },[auth,selectedSite]);
 
+      // Fetch calendar events (deadlines)
+      const [calEvents,setCalEvents]=useState([]);
+      useEffect(()=>{
+        if(!auth) return;
+        const now=new Date(); const from=new Date(now); from.setDate(from.getDate()-30);
+        const to=new Date(now); to.setDate(to.getDate()+60);
+        api(`/api/calendar-events?from=${from.toISOString().slice(0,10)}&to=${to.toISOString().slice(0,10)}`,auth.idToken)
+          .then(d=>setCalEvents(d.events||[])).catch(()=>{});
+      },[auth,selectedSite]);
+
       const toggleHide=i=>{const n=new Set(hidden);n.has(i)?n.delete(i):n.add(i);setHidden(n);if(sel===i)setSel(null)};
       const dragLeft=useCallback((clientX)=>{
         if(!mainRef.current) return;
@@ -1174,7 +1202,7 @@
           {msg&&<div style={{ background:T.warningBg,padding:"6px 20px",fontSize:11,color:T.warning,display:"flex",justifyContent:"space-between" }}><span>{msg}</span><button onClick={()=>setMsg("")} style={{ background:"none",border:"none",color:T.warning,cursor:"pointer" }}>✕</button></div>}
           <div ref={mainRef} style={{ flex:1,display:"flex",overflow:"hidden" }}>
             {tab==="day"?<>
-              <LeftPanel report={report} loading={rLoading} error={rError} selected={sel} setSelected={setSel} hidden={hidden} toggleHide={toggleHide} selectedDate={date} setSelectedDate={setDate} dateData={dateData} onRegenerate={regen} token={auth?.idToken} user={viewingUser} width={leftW}/>
+              <LeftPanel report={report} loading={rLoading} error={rError} selected={sel} setSelected={setSel} hidden={hidden} toggleHide={toggleHide} selectedDate={date} setSelectedDate={setDate} dateData={dateData} calendarEvents={calEvents} onRegenerate={regen} token={auth?.idToken} user={viewingUser} width={leftW}/>
               <DragDivider direction="vertical" onDrag={dragLeft}/>
               <TopicDetail topic={sel!=null&&report?.topics?report.topics[sel]:null} date={date} token={auth?.idToken} user={viewingUser} allTopics={report?.topics||[]} onTopicChange={(idx)=>{if(idx>=0&&idx<(report?.topics||[]).length) setSel(idx);}} onAskAbout={openAskAbout}/>
             </>:tab==="search"?<SearchTab token={auth.idToken} onNavigate={d=>{setDate(d);setTab('day');}}/>:<ReportsTab token={auth.idToken} user={user}/>}
