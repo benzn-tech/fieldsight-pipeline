@@ -1370,6 +1370,136 @@ def generate_onepager_html(report, date, user):
 </html>'''
 
 
+# ── GET /api/dashboard ────────────────────────────────────────
+
+def get_site_dashboard(params, caller):
+    """Return summary cards for all accessible sites on today's date."""
+    date = params.get('date', '')
+    if not date:
+        nz_now = datetime.utcnow() + timedelta(hours=13)
+        date = nz_now.strftime('%Y-%m-%d')
+
+    accessible_sites = get_accessible_sites(caller)
+    if not accessible_sites:
+        return ok({'sites': [], 'date': date})
+
+    table = dynamodb.Table(ITEMS_TABLE)
+    site_cards = []
+
+    for site_id in accessible_sites:
+        pk = f"SITE#{site_id}#DATE#{date}"
+        topics = []
+        safety_count = 0
+        action_count = 0
+        categories = {}
+
+        try:
+            resp = table.query(
+                KeyConditionExpression=Key('PK').eq(pk) & Key('SK').begins_with('ITEM#')
+            )
+            for item in resp.get('Items', []):
+                topics.append(item)
+                cat = item.get('category', 'general')
+                categories[cat] = categories.get(cat, 0) + 1
+                safety_count += len(item.get('safety_flags', []))
+                action_count += len(item.get('action_items', []))
+        except Exception as e:
+            logger.warning(f"Dashboard query failed for {pk}: {e}")
+
+        # Check for deadlines
+        deadlines = []
+        try:
+            resp = table.query(
+                KeyConditionExpression=Key('PK').eq(pk) & Key('SK').begins_with('DEADLINE#')
+            )
+            deadlines = [{'context': d.get('context', ''), 'urgency': d.get('urgency', 'medium')} for d in resp.get('Items', [])]
+        except Exception:
+            pass
+
+        # Get site display name from first topic or site_id
+        site_name = site_id
+        if topics:
+            site_name = topics[0].get('site_name', site_id)
+
+        site_cards.append({
+            'site_id': site_id,
+            'site_name': site_name,
+            'date': date,
+            'topic_count': len(topics),
+            'safety_count': safety_count,
+            'action_count': action_count,
+            'categories': categories,
+            'deadlines': deadlines,
+            'top_topics': [
+                {'topic_title': t.get('topic_title', ''), 'category': t.get('category', ''), 'summary': t.get('summary', '')[:100]}
+                for t in topics[:3]
+            ],
+        })
+
+    return ok({'sites': site_cards, 'date': date})
+
+
+# ── POST /api/digest ──────────────────────────────────────────
+
+DIGEST_FUNCTION = os.environ.get('DIGEST_FUNCTION', 'fieldsight-report-generator')
+
+def trigger_digest(body, caller):
+    """Trigger digest report generation for PM/Admin role."""
+    role = caller.get('role', '')
+    if role not in ('admin', 'gm', 'pm'):
+        return error('Digest reports are only available for PM/Admin roles', 403)
+
+    date = body.get('date', '')
+    if not date:
+        nz_now = datetime.utcnow() + timedelta(hours=13)
+        date = nz_now.strftime('%Y-%m-%d')
+
+    digest_type = body.get('digest_type', 'daily')  # daily | weekly
+    if digest_type not in ('daily', 'weekly'):
+        return error('digest_type must be daily or weekly')
+
+    payload = {
+        'report_type': 'digest',
+        'date': date,
+        'digest_type': digest_type,
+        'role': role,
+        'user': caller.get('name', ''),
+        'sites': [s for s in get_accessible_sites(caller)],
+    }
+
+    try:
+        lambda_client.invoke(
+            FunctionName=DIGEST_FUNCTION,
+            InvocationType='Event',  # async
+            Payload=json.dumps(payload),
+        )
+        return ok({'status': 'triggered', 'date': date, 'digest_type': digest_type})
+    except Exception as e:
+        return error(f'Failed to trigger digest: {e}', 500)
+
+
+def get_digest(params, caller):
+    """Retrieve a generated digest report."""
+    date = params.get('date', '')
+    if not date:
+        return error('Missing date')
+
+    role = caller.get('role', 'worker')
+    user_folder = caller.get('name', '').replace(' ', '_')
+
+    # Try role-specific digest
+    for path_suffix in [f'digest/{role}/{user_folder}.json', f'digest/{role}/combined.json', f'digest/combined.json']:
+        key = f"{REPORT_PREFIX}{date}/{path_suffix}"
+        try:
+            resp = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+            data = json.loads(resp['Body'].read().decode('utf-8'))
+            return ok(data)
+        except Exception:
+            continue
+
+    return ok({'_notFound': True, 'message': f'No digest for {date}'})
+
+
 # ── Analytics Logging ─────────────────────────────────────────
 
 def log_analytics_event(event_type, data):
@@ -1465,6 +1595,9 @@ def lambda_handler(event, context):
         elif path == '/api/reports/correction' and method == 'POST': return submit_correction(body, caller)
         elif path == '/api/corrections': return get_corrections(params, caller)
         elif path == '/api/onepager': return get_onepager(params, caller)
+        elif path == '/api/dashboard': return get_site_dashboard(params, caller)
+        elif path == '/api/digest' and method == 'POST': return trigger_digest(body, caller)
+        elif path == '/api/digest': return get_digest(params, caller)
         elif path == '/api/analytics/events' and method == 'POST': return ingest_analytics_events(body, caller)
         else: return error(f'Not found: {method} {path}', 404)
     except Exception as e:

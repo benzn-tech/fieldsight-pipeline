@@ -1,6 +1,6 @@
 # FieldSight Product Roadmap
 
-> Last updated: 2026-03-25
+> Last updated: 2026-03-31
 > Owner: Ben
 > Status tracking: ⬜ Not started | 🔲 Blocked | 🟡 In progress | ✅ Done
 
@@ -60,18 +60,12 @@
 
 **Goal:** Auto-link critical dates from reports to the calendar view with visual indicators.
 
-**Status:** ⬜ Not started
+**Status:** ✅ Done
 
-**Architecture:**
-```
-Report Generator extracts critical_dates_and_deadlines
-  → DynamoDB fieldsight-items: PK=SITE#{site}#DATE#{deadline_date}, SK=DEADLINE#...
-  → New API: GET /api/calendar-events?from=YYYY-MM-DD&to=YYYY-MM-DD
-  → CalendarPicker renders: ⚠ (high urgency), 📋 (inspection), 📦 (delivery)
-  → Click date → side panel with all events for that date
-```
-
-**Estimated effort:** 1 day (DynamoDB writes already exist, need API route + calendar UI)
+**Completed:**
+- ✅ `GET /api/calendar-events?from=YYYY-MM-DD&to=YYYY-MM-DD` API route
+- ✅ DynamoDB DEADLINE# query + S3 report JSON fallback
+- ✅ CalendarPicker: orange dot for deadlines, red background for high urgency, tooltip on hover
 
 ---
 
@@ -79,18 +73,12 @@ Report Generator extracts critical_dates_and_deadlines
 
 **Goal:** Users can adjust topic priority (override Claude's classification).
 
-**Status:** ⬜ Not started
+**Status:** ✅ Done
 
-**Architecture:**
-```
-Topic header: priority selector [▲ High] [— Med] [▼ Low]
-  → POST /api/topics/priority → DynamoDB update
-  → Weekly report reads user-adjusted priorities as input
-```
-
-Same pattern as action item toggle — user override stored in DynamoDB, original preserved in report JSON.
-
-**Estimated effort:** 1 day
+**Completed:**
+- ✅ `POST /api/topics/priority` + `GET /api/topics/priority` API routes
+- ✅ DynamoDB PRIORITY# records (preserves original_priority)
+- ✅ Inline priority selector in TopicDetail header (▲ High / — Med / ▼ Low)
 
 ---
 
@@ -98,11 +86,12 @@ Same pattern as action item toggle — user override stored in DynamoDB, origina
 
 **Goal:** Single-page visual summary, executive-friendly, embeddable in frontend.
 
-**Status:** ⬜ Not started
+**Status:** ✅ Done
 
-**Approach:** HTML one-pager via Jinja2 template → `reports/{date}/{user}/daily_onepager.html` → frontend iframe embed or direct link, browser print = PDF.
-
-**Estimated effort:** 1.5 days
+**Completed:**
+- ✅ `GET /api/onepager?date=...&user=...` API route
+- ✅ On-the-fly HTML generation from daily_report.json with S3 caching
+- ✅ "📄 One-Pager" button in TopicDetail header, opens in new tab (browser print = PDF)
 
 ---
 
@@ -110,18 +99,12 @@ Same pattern as action item toggle — user override stored in DynamoDB, origina
 
 **Goal:** Login → see all sites as cards with today's summary → click into timeline.
 
-**Status:** ⬜ Not started
+**Status:** ✅ Done
 
-**Architecture:**
-```
-App renders <SiteDashboard> when no site selected:
-  - Card per site: site name, today's topic count, safety flags, key action items
-  - Click card → setSelectedSite() → timeline view
-```
-
-Better UX for PM/Admin managing multiple sites.
-
-**Estimated effort:** 2 days
+**Completed:**
+- ✅ `GET /api/dashboard` API route (aggregates per-site stats)
+- ✅ `SiteDashboard` component: grid of site cards with topic_count, action_count, safety_count, deadlines, top topics
+- ✅ "🏗 Sites" tab in NavBar (visible to site_manager/pm/admin only)
 
 ---
 
@@ -129,7 +112,7 @@ Better UX for PM/Admin managing multiple sites.
 
 **Goal:** Role-specific daily digest tailored to PM/Admin priorities.
 
-**Status:** ⬜ Not started
+**Status:** 🟡 Backend done (API routes ready, digest Lambda not yet deployed)
 
 **Hierarchy:**
 ```
@@ -156,16 +139,17 @@ New report_type: "digest"
 
 **Goal:** Users can correct report errors, corrections propagate to weekly/monthly reports, system learns from corrections.
 
-**Status:** ⬜ Not started
+**Status:** ✅ Layer 1 done (user corrections UI + API)
 
 **Three layers:**
 
-**Layer 1 — User Corrections:**
+**Layer 1 — User Corrections:** ✅
 ```
 User clicks "Edit" on topic → modifies text → saves
-  → POST /api/reports/correction
-  → DynamoDB fieldsight-corrections table
+  → POST /api/reports/correction → DynamoDB CORRECTION# record
+  → GET /api/corrections?date=...&topic_id=... → load corrections
   → Frontend merges corrections on load, shows "✏ Corrected" badge
+  → Edit modal with original text preservation
 ```
 
 **Layer 2 — Upward Propagation:**
@@ -193,9 +177,11 @@ Corrections accumulate → periodic pattern analysis:
 
 **Goal:** Reduce latency from overnight batch to <15 min.
 
-**Status:** ⬜ Phase 1 ready (callback deployed, needs function name fix)
+**Status:** ✅ Phase 1 done (auto-report trigger on transcription complete)
 
-**Phase 1 — Event-Driven Minutes (~15 min):** 2 hours
+**Phase 1 — Event-Driven Minutes (~15 min):** ✅ Done
+- ✅ `lambda_transcribe_callback.py`: auto-invokes report generator (async) on COMPLETED
+- ✅ Supports both `realptt_` and `fieldsight_` job prefixes
 **Phase 2 — Streaming Transcribe (~30s):** 1 week
 **Phase 3 — Voice Agent (full vision):** multi-month R&D
 
@@ -256,6 +242,19 @@ ACM: SSL certificates for both
 ---
 
 ## Completed Items
+
+### 2026-03-31 session (P1 + P2 implementation)
+- ✅ P1: Critical Dates Calendar — `GET /api/calendar-events`, CalendarPicker deadline indicators
+- ✅ P1: Topic Priority Override — `POST/GET /api/topics/priority`, inline selector
+- ✅ P1: One-Pager Report — `GET /api/onepager`, on-the-fly HTML generation + S3 cache
+- ✅ P2: Site Dashboard — `GET /api/dashboard`, SiteDashboard component, "🏗 Sites" tab
+- ✅ P2: Digest Reports — `POST/GET /api/digest` API routes (Lambda TBD)
+- ✅ P2: QA/QC Corrections Layer 1 — `POST /api/reports/correction`, `GET /api/corrections`, edit modal + "✏ Corrected" badge
+- ✅ P2: Near Real-Time — auto-report trigger in `lambda_transcribe_callback.py`
+- ✅ P0+: Global Ask Panel — floating 💬 panel, removed from TopicDetail
+- ✅ P0+: Participant display fix — left panel shows owner + count, right shows full badges
+- ✅ P0+: Analytics logging — S3 analytics events, `POST /api/analytics/events`
+- ✅ P0+: Frontend EventTracker — batch event tracking (7 event types)
 
 ### 2026-03-25 session (P0 completion)
 - ✅ `/api/ask` route in API Lambda — proxies to fieldsight-ask-agent (sync invoke)

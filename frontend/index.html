@@ -346,7 +346,7 @@
             )}
           </div>
           <div style={{ display:"flex",gap:2,background:`${T.navText}15`,borderRadius:8,padding:2 }}>
-            {[["day","📋 My Day"],["reports","📄 Reports"],["search","🔍 Search"]].map(([k,l])=>
+            {[...(isManager?[["dashboard","🏗 Sites"]]:[]),["day","📋 My Day"],["reports","📄 Reports"],["search","🔍 Search"]].map(([k,l])=>
               <button key={k} onClick={()=>setTab(k)} style={{ background:tab===k?`${T.navActive}18`:"transparent",color:tab===k?T.navActive:T.navText,border:"none",fontSize:11,fontWeight:600,padding:"5px 16px",borderRadius:6,cursor:"pointer" }}>{l}</button>
             )}
           </div>
@@ -616,6 +616,10 @@
       const [checked, setChecked] = useState(new Set());
       const [checkedMeta, setCheckedMeta] = useState({});
       const [topicPriority, setTopicPriority] = useState(null);
+      const [corrections, setCorrections] = useState([]);
+      const [editField, setEditField] = useState(null); // {field, original_text}
+      const [editText, setEditText] = useState('');
+      const [editSubmitting, setEditSubmitting] = useState(false);
       const [playingIdx, setPlayingIdx] = useState(-1);
       const [isAudioPlaying, setIsAudioPlaying] = useState(false);
       const audioRef = useRef(null);
@@ -630,7 +634,7 @@
       };
       const topicTime = parseTopicTime();
 
-      useEffect(() => { setChecked(new Set()); setCheckedMeta({}); setShowT(false); setTranscript(null); setAudioSegs([]); setVideoSegs([]); setPlayingIdx(-1); setIsAudioPlaying(false); setActiveVideo(null); setTopicPriority(null); if(audioRef.current){audioRef.current.pause();audioRef.current=null;} clearInterval(progTimer.current); }, [topic?.topic_id, date]);
+      useEffect(() => { setChecked(new Set()); setCheckedMeta({}); setShowT(false); setTranscript(null); setAudioSegs([]); setVideoSegs([]); setPlayingIdx(-1); setIsAudioPlaying(false); setActiveVideo(null); setTopicPriority(null); setCorrections([]); setEditField(null); if(audioRef.current){audioRef.current.pause();audioRef.current=null;} clearInterval(progTimer.current); }, [topic?.topic_id, date]);
 
       // Load actions + audio + video when topic changes
       useEffect(() => {
@@ -653,6 +657,8 @@
           .then(data => setAudioSegs(data.segments || [])).catch(() => {});
         api(`/api/video-segments?date=${date}${uParam}&start=${startStr}&end=${endStr}`, token)
           .then(data => setVideoSegs(data.videos || [])).catch(() => {});
+        api(`/api/corrections?date=${date}${uParam}&topic_id=${topic.topic_id}`, token)
+          .then(data => setCorrections(data.corrections || [])).catch(() => {});
       }, [token, date, topic?.topic_id]);
 
       const toggleCheck = (i, actionText) => {
@@ -698,12 +704,25 @@
         } else { playSegment(0); trackEvent('audio_play', { topic_id: topic?.topic_id }); }
       };
 
+      const getCorrection = (field) => corrections.find(c => c.field === field);
+      const submitCorrection = () => {
+        if (!editField || !editText.trim() || editSubmitting) return;
+        setEditSubmitting(true);
+        api('/api/reports/correction', token, { method:'POST', body:JSON.stringify({
+          date, topic_id: topic.topic_id, field: editField.field,
+          original_text: editField.original_text, corrected_text: editText.trim(), user
+        })}).then(() => {
+          setCorrections(prev => [...prev.filter(c => c.field !== editField.field), { field: editField.field, corrected_text: editText.trim(), corrected_by: 'You', corrected_at: new Date().toISOString() }]);
+          setEditField(null); setEditText('');
+        }).catch(() => {}).finally(() => setEditSubmitting(false));
+      };
+
       if (!topic) return <div style={{ flex:1,display:"flex",alignItems:"center",justifyContent:"center",background:T.bg }}><div style={{ textAlign:"center" }}><div style={{ fontSize:48,opacity:0.12 }}>📋</div><div style={{ fontSize:15,color:T.textTertiary,fontWeight:600,marginTop:12 }}>Select a topic</div></div></div>;
       const cat=topicColors[topic.category]; const hs=topic.safety_flags?.filter(f=>f.risk_level==="high")||[];
       const totalAudioDur = audioSegs.reduce((s,seg) => s + seg.duration, 0);
 
       return (
-        <div style={{ flex:1,display:"flex",flexDirection:"column",background:T.bg,overflow:"hidden" }}>
+        <div style={{ flex:1,display:"flex",flexDirection:"column",background:T.bg,overflow:"hidden",position:"relative" }}>
           {activeVideo && <VideoPopup videoSegs={videoSegs} onClose={()=>setActiveVideo(null)}
             topicStart={topicTime.start} topicEnd={topicTime.end}
             audioSegs={audioSegs} allTopics={allTopics}
@@ -761,7 +780,7 @@
 
           {/* Content */}
           <div style={{ flex:1,overflowY:"auto",padding:"18px 24px" }}>
-            <Section title="SUMMARY"><Card><p style={{ fontSize:13,color:T.text,lineHeight:1.7,margin:0 }}>{topic.summary}</p></Card></Section>
+            <Section title={<span style={{display:'flex',alignItems:'center',gap:6}}>SUMMARY {getCorrection('summary')&&<span style={{fontSize:8,fontWeight:700,padding:'1px 6px',borderRadius:6,background:`${T.warning}20`,color:T.warning||'#e67e22'}}>✏ Corrected</span>} <button onClick={()=>{setEditField({field:'summary',original_text:topic.summary});setEditText(getCorrection('summary')?.corrected_text||topic.summary);}} style={{fontSize:8,fontWeight:600,padding:'1px 6px',borderRadius:6,background:'transparent',color:T.textTertiary,border:`1px solid ${T.borderLight}`,cursor:'pointer'}}>Edit</button></span>}><Card><p style={{ fontSize:13,color:T.text,lineHeight:1.7,margin:0 }}>{getCorrection('summary')?.corrected_text||topic.summary}</p></Card></Section>
             {hs.length>0&&<Section title="SAFETY ALERTS">{hs.map((sf,i)=><Card key={i} borderColor={T.danger}><div style={{ fontSize:12,fontWeight:600,color:T.danger,marginBottom:4 }}>⚠ {sf.observation}</div><div style={{ fontSize:11,color:T.textSecondary }}>Recommended: {sf.recommended_action}</div></Card>)}</Section>}
             {topic.key_decisions?.length>0&&<Section title="KEY DECISIONS"><Card>{topic.key_decisions.map((d,i)=><div key={i} style={{ display:"flex",gap:8,marginBottom:i<topic.key_decisions.length-1?8:0 }}><span style={{ color:T.primary,fontSize:11 }}>→</span><span style={{ fontSize:12,color:T.text,lineHeight:1.5 }}>{d}</span></div>)}</Card></Section>}
             {topic.action_items?.length>0&&<Section title={`ACTION ITEMS (${topic.action_items.length})`}><Card>{topic.action_items.map((ai,i)=><div key={i} style={{ display:"flex",gap:10,padding:"8px 0",borderBottom:i<topic.action_items.length-1?`1px solid ${T.borderLight}`:"none",opacity:checked.has(i)?0.5:1,transition:"opacity 0.2s" }}>
@@ -807,6 +826,19 @@
 
             {/* Ask Agent moved to GlobalAskPanel — use "Ask about this" button in header */}
           </div>
+
+          {/* Correction Edit Modal */}
+          {editField && <div style={{ position:'absolute',inset:0,background:'rgba(0,0,0,0.5)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:100 }} onClick={()=>setEditField(null)}>
+            <div onClick={e=>e.stopPropagation()} style={{ background:T.surface,borderRadius:12,padding:20,width:'90%',maxWidth:500,maxHeight:'80vh',display:'flex',flexDirection:'column',gap:12,boxShadow:'0 8px 32px rgba(0,0,0,0.3)' }}>
+              <div style={{ fontSize:14,fontWeight:700,color:T.text }}>Edit: {editField.field}</div>
+              <div style={{ fontSize:10,color:T.textTertiary }}>Original text is preserved. Your correction will be applied on top.</div>
+              <textarea value={editText} onChange={e=>setEditText(e.target.value)} style={{ width:'100%',minHeight:120,padding:10,fontSize:12,lineHeight:1.6,fontFamily:T.font,borderRadius:8,border:`1px solid ${T.borderLight}`,background:T.bg,color:T.text,resize:'vertical',boxSizing:'border-box' }} />
+              <div style={{ display:'flex',gap:8,justifyContent:'flex-end' }}>
+                <button onClick={()=>setEditField(null)} style={{ fontSize:11,padding:'6px 14px',borderRadius:6,background:'transparent',color:T.textSecondary,border:`1px solid ${T.borderLight}`,cursor:'pointer' }}>Cancel</button>
+                <button onClick={submitCorrection} disabled={editSubmitting} style={{ fontSize:11,fontWeight:700,padding:'6px 14px',borderRadius:6,background:T.primary,color:'#fff',border:'none',cursor:editSubmitting?'wait':'pointer',opacity:editSubmitting?0.6:1 }}>{editSubmitting?'Saving...':'Save Correction'}</button>
+              </div>
+            </div>
+          </div>}
         </div>
       );
     }
@@ -1015,6 +1047,58 @@
       );
     }
 
+    /* ─── SiteDashboard ─── */
+    function SiteDashboard({ token, sites, onSelectSite }) {
+      const [dashboard, setDashboard] = useState(null);
+      const [loading, setLoading] = useState(true);
+      useEffect(() => {
+        api('/api/dashboard', token).then(d => setDashboard(d)).catch(() => {}).finally(() => setLoading(false));
+      }, [token]);
+
+      if (loading) return <div style={{ flex:1,display:'flex',alignItems:'center',justifyContent:'center',background:T.bg }}><div style={{ fontSize:12,color:T.textTertiary }}>Loading dashboard...</div></div>;
+
+      const siteCards = dashboard?.sites || [];
+      return (
+        <div style={{ flex:1,padding:32,overflowY:'auto',background:T.bg }}>
+          <div style={{ maxWidth:900,margin:'0 auto' }}>
+            <div style={{ fontSize:22,fontWeight:700,color:T.text,marginBottom:4 }}>Site Dashboard</div>
+            <div style={{ fontSize:12,color:T.textSecondary,marginBottom:24 }}>{dashboard?.date || 'Today'} — {siteCards.length} site{siteCards.length!==1?'s':''}</div>
+            {siteCards.length===0&&<div style={{ textAlign:'center',padding:40,color:T.textTertiary }}>No site data for today. Reports may not have been generated yet.</div>}
+            <div style={{ display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(280px,1fr))',gap:16 }}>
+              {siteCards.map((s,i) => {
+                const hasHighDeadline = s.deadlines?.some(d=>d.urgency==='high');
+                return (
+                  <div key={i} onClick={() => onSelectSite(s.site_id)} style={{ background:T.surface,borderRadius:12,padding:'18px 20px',border:`1px solid ${hasHighDeadline?T.danger+'40':T.borderLight}`,cursor:'pointer',boxShadow:T.shadow,transition:'box-shadow 0.2s' }}
+                    onMouseEnter={e=>e.currentTarget.style.boxShadow='0 4px 12px rgba(27,58,92,0.12)'} onMouseLeave={e=>e.currentTarget.style.boxShadow=T.shadow}>
+                    <div style={{ display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10 }}>
+                      <div style={{ fontSize:14,fontWeight:700,color:T.text }}>{s.site_name}</div>
+                      <div style={{ display:'flex',gap:4 }}>
+                        {s.safety_count>0&&<span style={{ fontSize:9,fontWeight:700,padding:'2px 7px',borderRadius:8,background:T.dangerBg,color:T.danger }}>⚠ {s.safety_count}</span>}
+                        {s.deadlines?.length>0&&<span style={{ fontSize:9,fontWeight:700,padding:'2px 7px',borderRadius:8,background:T.warningBg,color:T.warning }}>📅 {s.deadlines.length}</span>}
+                      </div>
+                    </div>
+                    <div style={{ display:'flex',gap:12,marginBottom:10 }}>
+                      <div style={{ textAlign:'center' }}><div style={{ fontSize:20,fontWeight:700,color:T.primary }}>{s.topic_count}</div><div style={{ fontSize:9,color:T.textTertiary }}>Topics</div></div>
+                      <div style={{ textAlign:'center' }}><div style={{ fontSize:20,fontWeight:700,color:T.accent }}>{s.action_count}</div><div style={{ fontSize:9,color:T.textTertiary }}>Actions</div></div>
+                    </div>
+                    {Object.keys(s.categories||{}).length>0&&<div style={{ display:'flex',gap:4,flexWrap:'wrap',marginBottom:8 }}>
+                      {Object.entries(s.categories).map(([cat,cnt])=>{
+                        const c=topicColors[cat.toLowerCase()];
+                        return <span key={cat} style={{ fontSize:8,fontWeight:700,padding:'1px 6px',borderRadius:8,background:c?.bg||T.surfaceAlt,color:c?.color||T.textSecondary }}>{cat} ({cnt})</span>;
+                      })}
+                    </div>}
+                    {s.top_topics?.length>0&&<div style={{ borderTop:`1px solid ${T.borderLight}`,paddingTop:8 }}>
+                      {s.top_topics.map((t,ti)=><div key={ti} style={{ fontSize:10,color:T.textSecondary,marginBottom:3,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap' }}>{t.topic_title}</div>)}
+                    </div>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     /* ─── GlobalAskPanel ─── */
     function GlobalAskPanel({ token, date, user, topic, open, onToggle }) {
       const [q, setQ] = useState('');
@@ -1201,7 +1285,8 @@
           {showChangePw && <ChangePasswordModal accessToken={auth?.accessToken} onClose={()=>setShowChangePw(false)} />}
           {msg&&<div style={{ background:T.warningBg,padding:"6px 20px",fontSize:11,color:T.warning,display:"flex",justifyContent:"space-between" }}><span>{msg}</span><button onClick={()=>setMsg("")} style={{ background:"none",border:"none",color:T.warning,cursor:"pointer" }}>✕</button></div>}
           <div ref={mainRef} style={{ flex:1,display:"flex",overflow:"hidden" }}>
-            {tab==="day"?<>
+            {tab==="dashboard"?<SiteDashboard token={auth.idToken} sites={sites} onSelectSite={(sid)=>{setSelectedSite(sid);setTab('day');}}/>
+            :tab==="day"?<>
               <LeftPanel report={report} loading={rLoading} error={rError} selected={sel} setSelected={setSel} hidden={hidden} toggleHide={toggleHide} selectedDate={date} setSelectedDate={setDate} dateData={dateData} calendarEvents={calEvents} onRegenerate={regen} token={auth?.idToken} user={viewingUser} width={leftW}/>
               <DragDivider direction="vertical" onDrag={dragLeft}/>
               <TopicDetail topic={sel!=null&&report?.topics?report.topics[sel]:null} date={date} token={auth?.idToken} user={viewingUser} allTopics={report?.topics||[]} onTopicChange={(idx)=>{if(idx>=0&&idx<(report?.topics||[]).length) setSel(idx);}} onAskAbout={openAskAbout}/>
