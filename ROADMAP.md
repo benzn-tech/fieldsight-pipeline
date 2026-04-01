@@ -1,6 +1,6 @@
 # FieldSight Product Roadmap
 
-> Last updated: 2026-03-31
+> Last updated: 2026-04-01
 > Owner: Ben
 > Status tracking: ⬜ Not started | 🔲 Blocked | 🟡 In progress | ✅ Done
 
@@ -187,6 +187,116 @@ Corrections accumulate → periodic pattern analysis:
 
 ---
 
+## P2 — Deep Analysis Agent (Agent 8: 深度解构分析)
+
+**Goal:** Cross-day, cross-person, cross-topic pattern recognition. Reveal systemic patterns beyond daily summaries — recurring issues, personnel bottlenecks, root cause chains.
+
+**Status:** ⬜ Not started (data foundation ready)
+
+**Architecture (2-step):**
+```
+Step 1 — Aggregation Lambda:
+  DynamoDB ITEMS_TABLE (90-day range) → statistical aggregation
+    - safety_flag frequency (observation → count, dates, risk_levels)
+    - action_item completion rate (responsible → total, completed, overdue)
+    - category distribution trend (safety/progress/quality per day)
+    - recurring topic clustering (by keyword overlap)
+    - personnel patterns (involvement, decisions, assigned actions)
+
+Step 2 — Claude Reasoning:
+  Aggregated stats → Claude Sonnet (200K context)
+    → pattern detection + root cause hypothesis + trend forecast
+    → Output: mind map JSON (nodes/edges/insights)
+
+API:
+  POST /api/analyze → { site, date_range: "7d|30d|90d", analysis_type: "patterns|conflicts|trends" }
+  GET  /api/analyze/cached → cached latest analysis from S3
+
+Output: analysis/{site}/{range}/latest.json
+Frontend: Analysis panel (text cards MVP → react-flow mind map Phase 2)
+```
+
+**Data foundation already available:**
+- `search_items()` supports 90-day cross-date queries (api.py:934-1003)
+- `get_site_dashboard()` has per-site aggregation pattern (api.py:1375-1439)
+- DynamoDB ITEMS_TABLE: topics with safety_flags[], action_items[], participants[], category
+
+**New files:** `src/lambda_analysis_agent.py`
+**Estimated effort:** 7-9 days
+
+---
+
+## P3 — Template Agent (Agent 6: 模板读取与适配)
+
+**Goal:** Read customer DOCX/PDF templates, map to report JSON fields, generate output matching each customer's own format. Integrates with One-Pager flow: upload → AI analyze → preview → adjust → solidify.
+
+**Status:** ⬜ Not started
+
+**Architecture:**
+```
+DOCX Templates:
+  Customer uploads DOCX → Claude analyzes structure → mapping.json
+  → python-docxtpl fills placeholders → customer-branded DOCX output
+
+PDF Templates:
+  Customer uploads PDF → Landing AI AWE extracts structure/colors/layout
+  → Claude maps AWE output to report JSON schema
+  → HTML/DOCX reconstruction preserving layout
+
+Flow (extends One-Pager):
+  POST /api/templates/upload    → S3: templates/{customer_id}/original.{ext}
+  POST /api/templates/analyze   → Claude + AWE → mapping.json
+  GET  /api/templates/preview   → HTML preview with real report data
+  POST /api/templates/mapping   → customer adjusts field mapping
+  GET  /api/onepager?template=  → customer-formatted output (solidified)
+
+Storage:
+  templates/{customer_id}/original.docx
+  templates/{customer_id}/mapping.json
+  templates/{customer_id}/processed.docx
+  reports/{date}/{user}/daily_report_{customer_id}.docx
+```
+
+**New files:** `src/lambda_template_agent.py`
+**Estimated effort:** 7-10 days (DOCX MVP), +5 days (PDF via AWE Phase 2)
+
+---
+
+## P3 — Platform Integration Agent (Agent 7: Procore MVP)
+
+**Goal:** Connect to customer project platforms (Procore first) to auto-push FieldSight reports and pull project info. Reduce manual data entry.
+
+**Status:** ⬜ Not started
+
+**Architecture (Adapter Pattern):**
+```
+PlatformAdapter base class → per-platform subclass
+  ProcoreAdapter (MVP)  — REST API, OAuth2, public docs
+  AconexAdapter (P3+)   — REST API, OAuth2, enterprise auth
+  SafeBaseAdapter (P4)   — needs Southbase IT cooperation
+
+Procore Field Mapping (FieldSight → Procore Daily Log):
+  executive_summary        → daily_log.notes
+  safety_observations[]    → daily_log.safety_violations[]
+  topics[].action_items[]  → daily_log.plan_for_next_day
+  recording_session.date   → daily_log.log_date
+
+API:
+  POST /api/integration/connect     ← OAuth2 authorize URL
+  GET  /api/integration/callback    ← code → token exchange
+  POST /api/integration/push        ← push report to platform
+  GET  /api/integration/pull        ← pull project info
+  GET  /api/integration/status      ← connection health
+
+Auth: OAuth2 tokens in AWS Secrets Manager
+Auto-sync: EventBridge daily trigger after report generation
+```
+
+**New files:** `src/lambda_platform_agent.py`
+**Estimated effort:** 10-12 days (Procore MVP), +7 days (Aconex Phase 2)
+
+---
+
 ## P3 — Analytics Agent (Agent 4)
 
 **Goal:** User behavior analysis — click heatmaps, feature usage, user personas.
@@ -318,12 +428,15 @@ ACM: SSL certificates for both
 
 ---
 
-## Agent Architecture (Future)
+## Agent Architecture
 
 | Agent | Name | Status | Function |
 |---|---|---|---|
-| 1 | Pipeline Agent | ✅ Existing | Download → VAD → Transcribe → Report |
-| 2 | Ask Agent | ✅ Backend done | Report Q&A (Haiku) |
-| 3 | QA Agent | ⬜ P2 | Auto-detect report anomalies, learn from corrections |
-| 4 | Analytics Agent | ⬜ P3 | User behavior analysis, personas, usage patterns |
-| 5 | Digest Agent | ⬜ P2 | Role-specific daily/weekly digests for PM/Admin |
+| 1 | Pipeline Agent | ✅ Production | Download → VAD → Transcribe → Report |
+| 2 | Ask Agent | ✅ Production | Report Q&A (Haiku) + Global Ask Panel |
+| 3 | QA Agent | ✅ Layer 1 done | User corrections UI + API; Layer 2-3 pending |
+| 4 | Analytics Agent | 🟡 Tracking ready | Frontend EventTracker deployed; backend analysis ⬜ |
+| 5 | Digest Agent | 🟡 API ready | POST/GET /api/digest routes; Lambda TBD |
+| 6 | Template Agent | ⬜ P3 | Customer DOCX/PDF template adaptation |
+| 7 | Platform Agent | ⬜ P3 | Procore/Aconex/SafeBase integration |
+| 8 | Analysis Agent | ⬜ P2 | Deep pattern recognition + mind map |
