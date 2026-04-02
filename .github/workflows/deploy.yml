@@ -1,0 +1,96 @@
+name: Deploy FieldSight
+
+# ============================================================
+# Trigger: push to develop → deploy test
+#          push to main    → deploy prod
+# ============================================================
+on:
+  push:
+    branches: [develop, main]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - 'ROADMAP.md'
+      - 'ARCHITECTURE.md'
+      - 'MONITORING.md'
+
+# OIDC permissions (no stored AWS keys needed)
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # 1. Checkout code
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. AWS credentials via OIDC (no secrets stored)
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-southeast-2
+
+      # 3. Install SAM CLI
+      - name: Setup SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      # 4. Python 3.11 (matches Lambda runtime)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 5. Build
+      - name: SAM Build
+        run: sam build
+
+      # 6. Deploy to TEST (develop branch)
+      - name: Deploy to TEST
+        if: github.ref == 'refs/heads/develop'
+        run: |
+          sam deploy --config-env test \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              "RealPTTAccount=${{ secrets.REALPTT_ACCOUNT }}" \
+              "RealPTTPassword=${{ secrets.REALPTT_PASSWORD }}" \
+              "ClaudeApiKey=${{ secrets.CLAUDE_API_KEY }}" \
+              "FargateSubnetIds=${{ secrets.FARGATE_SUBNET_IDS }}" \
+              "FargateVpcId=${{ secrets.FARGATE_VPC_ID }}"
+
+      # 7. Deploy to PROD (main branch)
+      - name: Deploy to PROD
+        if: github.ref == 'refs/heads/main'
+        run: |
+          sam deploy --config-env prod \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              "RealPTTAccount=${{ secrets.REALPTT_ACCOUNT }}" \
+              "RealPTTPassword=${{ secrets.REALPTT_PASSWORD }}" \
+              "ClaudeApiKey=${{ secrets.CLAUDE_API_KEY }}" \
+              "FargateSubnetIds=${{ secrets.FARGATE_SUBNET_IDS }}" \
+              "FargateVpcId=${{ secrets.FARGATE_VPC_ID }}"
+
+      # 8. Show outputs
+      - name: Show Stack Outputs
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            STACK="fieldsight-test"
+          else
+            STACK="fieldsight-pipeline"
+          fi
+          echo "=== $STACK outputs ==="
+          aws cloudformation describe-stacks \
+            --stack-name $STACK \
+            --query 'Stacks[0].Outputs' \
+            --output table \
+            --region ap-southeast-2 || echo "Stack not found"
