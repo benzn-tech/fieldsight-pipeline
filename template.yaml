@@ -4,11 +4,22 @@ Description: >
   FieldSight Pipeline v2 - Auto download files to S3, transcribe, and generate reports.
   Uses web scraping endpoints (realptt.com) for complete data extraction. Includes Fargate, VAD, API, and meeting minutes.
   Includes Fargate for large file downloads that exceed Lambda 15-min limit.
+  Supports multi-environment deployment via Stage parameter (test/prod).
 
 # ============================================================
 # Parameters - Configure during deployment
 # ============================================================
 Parameters:
+
+  # --- NEW: Environment stage ---
+  Stage:
+    Type: String
+    Default: prod
+    AllowedValues: ['test', 'prod']
+    Description: >
+      Environment stage. 'prod' keeps all existing resource names unchanged.
+      'test' creates a parallel stack with 'fieldsight-test-*' naming.
+
   RealPTTAccount:
     Type: String
     Description: RealPTT platform account (external service)
@@ -21,7 +32,9 @@ Parameters:
 
   DataBucketName:
     Type: String
-    Description: Existing S3 bucket name (created outside this stack)
+    Description: >
+      S3 bucket for all data. Use different buckets per environment:
+      prod: fieldsight-data-509194952652, test: fieldsight-data-test-509194952652
     Default: fieldsight-data-509194952652
 
   StartDaysAgo:
@@ -52,6 +65,15 @@ Parameters:
   EnableTranscribe:
     Type: String
     Description: Enable speech-to-text transcription
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  # --- NEW: Control scheduled jobs per environment ---
+  EnableSchedules:
+    Type: String
+    Description: >
+      Enable EventBridge scheduled triggers (download, report generation).
+      Set to 'false' for test environments to avoid unintended pipeline runs.
     Default: 'true'
     AllowedValues: ['true', 'false']
 
@@ -94,17 +116,17 @@ Parameters:
   # --- DynamoDB table names (existing, created outside this stack) ---
   ItemsTableName:
     Type: String
-    Description: Existing DynamoDB table for items
+    Description: DynamoDB table for items (use fieldsight-test-items for test)
     Default: fieldsight-items
 
   ReportsTableName:
     Type: String
-    Description: Existing DynamoDB table for reports
+    Description: DynamoDB table for reports (use fieldsight-test-reports for test)
     Default: fieldsight-reports
 
   AuditTableName:
     Type: String
-    Description: Existing DynamoDB table for audit log
+    Description: DynamoDB table for audit log (use fieldsight-test-audit for test)
     Default: fieldsight-audit
 
   # --- Fargate parameters ---
@@ -119,11 +141,28 @@ Parameters:
     Description: VPC for Fargate security group (usually your default VPC)
 
 # ============================================================
+# Mappings - Environment-specific naming
+# ============================================================
+# Prod keeps the exact current names (no rename, no risk).
+# Test gets 'fieldsight-test-*' prefix for full isolation.
+Mappings:
+  StageConfig:
+    prod:
+      Prefix: fieldsight
+    test:
+      Prefix: fieldsight-test
+
+# ============================================================
 # Conditions
 # ============================================================
 Conditions:
   ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
   ShouldCreateAlerts: !Not [!Equals [!Ref AlertEmail, '']]
+  IsProd: !Equals [!Ref Stage, 'prod']
+  IsTest: !Equals [!Ref Stage, 'test']
+  # Schedules: enabled for prod by default, disabled for test by default,
+  # but can be overridden via EnableSchedules parameter
+  ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
 
 # ============================================================
 # Global Settings
@@ -171,13 +210,18 @@ Resources:
   OrchestratorFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-orchestrator
+      # prod: fieldsight-orchestrator (unchanged)
+      # test: fieldsight-test-orchestrator
+      FunctionName: !Sub
+        - "${Prefix}-orchestrator"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       CodeUri: src/
       Handler: lambda_orchestrator.lambda_handler
       Timeout: 900  # 15 minutes
       MemorySize: 256
       Environment:
         Variables:
+          STAGE: !Ref Stage  # NEW: lets code know which environment
           REALPTT_ACCOUNT: !Ref RealPTTAccount
           REALPTT_PASSWORD: !Ref RealPTTPassword
           S3_BUCKET: !Ref DataBucketName
@@ -203,7 +247,9 @@ Resources:
           Properties:
             Schedule: !Ref ScheduleExpression
             Description: Daily sync trigger (8 PM NZDT)
-            Enabled: true
+            # Schedule is controlled by EnableSchedules parameter
+            # prod default: enabled, test default: disabled
+            Enabled: !If [ShouldEnableSchedules, true, false]
 
   # ----------------------------------------------------------
   # Lambda 2: Downloader (small/medium files)
@@ -211,13 +257,18 @@ Resources:
   DownloaderFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-downloader
+      FunctionName: !Sub
+        - "${Prefix}-downloader"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       CodeUri: src/
       Handler: lambda_downloader.lambda_handler
       Timeout: 900  # 15 minutes
       MemorySize: 512
       EphemeralStorage:
         Size: 1024
+      Environment:
+        Variables:
+          STAGE: !Ref Stage
       Policies:
         - S3WritePolicy:
             BucketName: !Ref DataBucketName
@@ -232,13 +283,16 @@ Resources:
     Type: AWS::Serverless::Function
     Condition: ShouldEnableTranscribe
     Properties:
-      FunctionName: fieldsight-transcribe
+      FunctionName: !Sub
+        - "${Prefix}-transcribe"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       CodeUri: src/
       Handler: lambda_transcribe.lambda_handler
       Timeout: 60
       MemorySize: 128
       Environment:
         Variables:
+          STAGE: !Ref Stage
           LANGUAGE_OPTIONS: !Ref LanguageOptions
           OUTPUT_PREFIX: transcripts/
           MAX_SPEAKERS: !Ref MaxSpeakers
@@ -261,13 +315,16 @@ Resources:
   ReportGeneratorFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-report-generator
+      FunctionName: !Sub
+        - "${Prefix}-report-generator"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       CodeUri: src/
       Handler: lambda_report_generator.lambda_handler
       Timeout: 300
       MemorySize: 512
       Environment:
         Variables:
+          STAGE: !Ref Stage
           S3_BUCKET: !Ref DataBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-5-20250929
@@ -293,21 +350,21 @@ Resources:
           Properties:
             Schedule: cron(0 16 * * ? *)
             Description: Daily report generation (5 AM NZDT)
-            Enabled: true
+            Enabled: !If [ShouldEnableSchedules, true, false]
             Input: '{"report_type": "daily"}'
         WeeklyReportSchedule:
           Type: Schedule
           Properties:
             Schedule: cron(0 5 ? * FRI *)
             Description: Weekly report generation (Friday 6 PM NZDT)
-            Enabled: true
+            Enabled: !If [ShouldEnableSchedules, true, false]
             Input: '{"report_type": "weekly"}'
         MonthlyReportSchedule:
           Type: Schedule
           Properties:
             Schedule: cron(0 17 L * ? *)
             Description: Monthly report generation (last day of month)
-            Enabled: true
+            Enabled: !If [ShouldEnableSchedules, true, false]
             Input: '{"report_type": "monthly"}'
 
   # ==========================================================
@@ -320,7 +377,9 @@ Resources:
   DownloaderCluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: fieldsight-downloader-cluster
+      ClusterName: !Sub
+        - "${Prefix}-downloader-cluster"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       CapacityProviders:
         - FARGATE_SPOT
         - FARGATE
@@ -334,7 +393,9 @@ Resources:
   FargateExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub fieldsight-fargate-execution-${AWS::Region}
+      RoleName: !Sub
+        - "${Prefix}-fargate-execution-${AWS::Region}"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -351,7 +412,9 @@ Resources:
   FargateTaskRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub fieldsight-fargate-task-${AWS::Region}
+      RoleName: !Sub
+        - "${Prefix}-fargate-task-${AWS::Region}"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -384,7 +447,9 @@ Resources:
   FargateSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Fargate downloader - outbound internet only
+      GroupDescription: !Sub
+        - "${Prefix} Fargate downloader - outbound internet only"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       VpcId: !Ref FargateVpcId
       SecurityGroupEgress:
         - IpProtocol: -1
@@ -396,7 +461,9 @@ Resources:
   FargateDownloaderTask:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: fieldsight-fargate-downloader
+      Family: !Sub
+        - "${Prefix}-fargate-downloader"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       RequiresCompatibilities:
         - FARGATE
       NetworkMode: awsvpc
@@ -411,6 +478,8 @@ Resources:
           Environment:
             - Name: S3_BUCKET
               Value: !Ref DataBucketName
+            - Name: STAGE
+              Value: !Ref Stage
           Command:
             - sh
             - -c
@@ -421,7 +490,9 @@ Resources:
           LogConfiguration:
             LogDriver: awslogs
             Options:
-              awslogs-group: /ecs/fieldsight-fargate-downloader
+              awslogs-group: !Sub
+                - "/ecs/${Prefix}-fargate-downloader"
+                - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: download
 
@@ -431,13 +502,16 @@ Resources:
   FargateTriggerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-fargate-trigger
+      FunctionName: !Sub
+        - "${Prefix}-fargate-trigger"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       Runtime: python3.11
       Handler: index.handler
       Timeout: 30
       MemorySize: 128
       Environment:
         Variables:
+          STAGE: !Ref Stage
           S3_BUCKET: !Ref DataBucketName
           CLUSTER: !Ref DownloaderCluster
           TASK_DEF: !Ref FargateDownloaderTask
@@ -465,7 +539,7 @@ Resources:
           Properties:
             Schedule: cron(30 7 * * ? *)  # UTC 07:30 = NZDT 20:30
             Description: Check for pending large downloads (8:30 PM NZDT)
-            Enabled: true
+            Enabled: !If [ShouldEnableSchedules, true, false]
       InlineCode: |
         import os, json, boto3
 
@@ -543,7 +617,10 @@ Resources:
   FargateLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /ecs/fieldsight-fargate-downloader
+      # Must match the awslogs-group in FargateDownloaderTask
+      LogGroupName: !Sub
+        - "/ecs/${Prefix}-fargate-downloader"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       RetentionInDays: 14
 
   FargateTriggerLogGroup:
@@ -559,7 +636,9 @@ Resources:
     Type: AWS::SNS::Topic
     Condition: ShouldCreateAlerts
     Properties:
-      TopicName: fieldsight-pipeline-alerts
+      TopicName: !Sub
+        - "${Prefix}-pipeline-alerts"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       Subscription:
         - Protocol: email
           Endpoint: !Ref AlertEmail
@@ -571,7 +650,9 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: ShouldCreateAlerts
     Properties:
-      AlarmName: fieldsight-orchestrator-errors
+      AlarmName: !Sub
+        - "${Prefix}-orchestrator-errors"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       AlarmDescription: Orchestrator Lambda has errors
       Namespace: AWS/Lambda
       MetricName: Errors
@@ -590,7 +671,9 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: ShouldCreateAlerts
     Properties:
-      AlarmName: fieldsight-downloader-errors
+      AlarmName: !Sub
+        - "${Prefix}-downloader-errors"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       AlarmDescription: Downloader Lambda has more than 5 errors in a day
       Namespace: AWS/Lambda
       MetricName: Errors
@@ -609,7 +692,9 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: ShouldCreateAlerts
     Properties:
-      AlarmName: fieldsight-report-errors
+      AlarmName: !Sub
+        - "${Prefix}-report-errors"
+        - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
       AlarmDescription: Report Generator Lambda has errors
       Namespace: AWS/Lambda
       MetricName: Errors
@@ -628,6 +713,11 @@ Resources:
 # Outputs
 # ============================================================
 Outputs:
+  # NEW: Show which environment this stack is
+  Environment:
+    Description: Deployment environment
+    Value: !Ref Stage
+
   BucketName:
     Description: S3 bucket name
     Value: !Ref DataBucketName
@@ -663,16 +753,22 @@ Outputs:
 
   LogsUrl:
     Description: View Orchestrator logs
-    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Flambda$252Ffieldsight-orchestrator
+    Value: !Sub
+      - "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Flambda$252F${Prefix}-orchestrator"
+      - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
 
   FargateLogsUrl:
     Description: View Fargate download logs
-    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Fecs$252Ffieldsight-fargate-downloader
+    Value: !Sub
+      - "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Fecs$252F${Prefix}-fargate-downloader"
+      - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]
 
   MonitoringDashboard:
     Description: Quick monitoring links
-    Value: !Sub >
-      Lambda: https://${AWS::Region}.console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions
-      Logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups
-      ECS: https://${AWS::Region}.console.aws.amazon.com/ecs/v2/clusters/fieldsight-downloader-cluster
-      Alarms: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#alarmsV2:
+    Value: !Sub
+      - >
+        Lambda: https://${AWS::Region}.console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions
+        Logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups
+        ECS: https://${AWS::Region}.console.aws.amazon.com/ecs/v2/clusters/${Prefix}-downloader-cluster
+        Alarms: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#alarmsV2:
+      - Prefix: !FindInMap [StageConfig, !Ref Stage, Prefix]

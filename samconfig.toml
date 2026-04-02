@@ -1,0 +1,79 @@
+# ============================================================
+# FieldSight SAM Configuration
+# ============================================================
+# Usage:
+#   sam deploy --config-env test    → deploys to test stack
+#   sam deploy --config-env prod    → deploys to prod stack
+#   sam deploy                      → uses [default] = prod
+#
+# IMPORTANT: Sensitive values (RealPTTPassword, ClaudeApiKey)
+# should NOT be stored here if this file is committed to Git.
+# Instead, pass them via --parameter-overrides in CLI or
+# GitHub Actions secrets. See .github/workflows/deploy.yml
+# ============================================================
+
+version = 0.1
+
+# --- Shared build settings ---
+[default.build.parameters]
+use_container = false
+
+# ============================================================
+# PROD environment (default)
+# ============================================================
+# Deploys to existing stack. All resource names unchanged.
+# ============================================================
+[default.deploy.parameters]
+stack_name = "fieldsight-pipeline"
+region = "ap-southeast-2"
+capabilities = "CAPABILITY_NAMED_IAM"
+confirm_changeset = true
+resolve_s3 = true
+parameter_overrides = [
+    "Stage=prod",
+    "DataBucketName=fieldsight-data-509194952652",
+    "EnableSchedules=true",
+    "ItemsTableName=fieldsight-items",
+    "ReportsTableName=fieldsight-reports",
+    "AuditTableName=fieldsight-audit",
+]
+
+# ============================================================
+# PROD (explicit alias for --config-env prod)
+# ============================================================
+[prod.deploy.parameters]
+stack_name = "fieldsight-pipeline"
+region = "ap-southeast-2"
+capabilities = "CAPABILITY_NAMED_IAM"
+confirm_changeset = true
+resolve_s3 = true
+parameter_overrides = [
+    "Stage=prod",
+    "DataBucketName=fieldsight-data-509194952652",
+    "EnableSchedules=true",
+    "ItemsTableName=fieldsight-items",
+    "ReportsTableName=fieldsight-reports",
+    "AuditTableName=fieldsight-audit",
+]
+
+# ============================================================
+# TEST environment
+# ============================================================
+# Creates a brand-new stack. All resources get 'test' prefix.
+# Schedules DISABLED by default - trigger pipeline manually.
+# Uses separate S3 bucket and DynamoDB tables.
+# ============================================================
+[test.deploy.parameters]
+stack_name = "fieldsight-test"
+region = "ap-southeast-2"
+capabilities = "CAPABILITY_NAMED_IAM"
+confirm_changeset = false
+resolve_s3 = true
+parameter_overrides = [
+    "Stage=test",
+    "DataBucketName=fieldsight-data-test-509194952652",
+    "EnableSchedules=false",
+    "ItemsTableName=fieldsight-test-items",
+    "ReportsTableName=fieldsight-test-reports",
+    "AuditTableName=fieldsight-test-audit",
+]
