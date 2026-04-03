@@ -29,7 +29,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. AWS credentials via OIDC (no secrets stored)
+      # 2. AWS credentials via OIDC
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -52,8 +52,10 @@ jobs:
       - name: SAM Build
         run: sam build
 
-      # 6. Deploy to TEST (develop branch)
-      - name: Deploy to TEST
+      # ============================================================
+      # TEST deployment (develop branch)
+      # ============================================================
+      - name: Deploy Backend to TEST
         if: github.ref == 'refs/heads/develop'
         run: |
           sam deploy --config-env test \
@@ -66,8 +68,21 @@ jobs:
               "FargateSubnetIds=${{ secrets.FARGATE_SUBNET_IDS }}" \
               "FargateVpcId=${{ secrets.FARGATE_VPC_ID }}"
 
-      # 7. Deploy to PROD (main branch)
-      - name: Deploy to PROD
+      - name: Deploy Frontend to TEST
+        if: github.ref == 'refs/heads/develop'
+        run: |
+          aws s3 sync frontend/ s3://${{ secrets.TEST_FRONTEND_BUCKET }}/ \
+            --delete \
+            --cache-control "max-age=60"
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.TEST_CLOUDFRONT_ID }} \
+            --paths "/*"
+          echo "✅ Test frontend deployed"
+
+      # ============================================================
+      # PROD deployment (main branch)
+      # ============================================================
+      - name: Deploy Backend to PROD
         if: github.ref == 'refs/heads/main'
         run: |
           sam deploy --config-env prod \
@@ -80,7 +95,20 @@ jobs:
               "FargateSubnetIds=${{ secrets.FARGATE_SUBNET_IDS }}" \
               "FargateVpcId=${{ secrets.FARGATE_VPC_ID }}"
 
-      # 8. Show outputs
+      - name: Deploy Frontend to PROD
+        if: github.ref == 'refs/heads/main'
+        run: |
+          aws s3 sync frontend/ s3://${{ secrets.PROD_FRONTEND_BUCKET }}/ \
+            --delete \
+            --cache-control "max-age=3600"
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.PROD_CLOUDFRONT_ID }} \
+            --paths "/*"
+          echo "✅ Prod frontend deployed"
+
+      # ============================================================
+      # Show outputs
+      # ============================================================
       - name: Show Stack Outputs
         run: |
           if [ "${{ github.ref }}" = "refs/heads/develop" ]; then
