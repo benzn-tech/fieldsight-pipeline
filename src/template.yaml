@@ -132,6 +132,11 @@ Parameters:
     Description: Existing DynamoDB table for user profiles (API auth)
     Default: fieldsight-users
 
+  CorrectionsTableName:
+    Type: String
+    Description: Existing DynamoDB table for user corrections (QA/QC)
+    Default: fieldsight-corrections
+
   TranscriptTableName:
     Type: String
     Description: Existing DynamoDB table for transcript ledger
@@ -362,6 +367,7 @@ Resources:
           REPORTS_TABLE: !Ref ReportsTableName
           AUDIT_TABLE: !Ref AuditTableName
           ENABLE_DYNAMODB: 'true'
+          CORRECTIONS_TABLE: !Ref CorrectionsTableName
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
@@ -373,6 +379,8 @@ Resources:
             TableName: !Ref ReportsTableName
         - DynamoDBCrudPolicy:
             TableName: !Ref AuditTableName
+        - DynamoDBReadPolicy:
+            TableName: !Ref CorrectionsTableName
       Events:
         DailyReportSchedule:
           Type: Schedule

@@ -62,6 +62,7 @@ import json
 import logging
 import re
 import boto3
+from boto3.dynamodb.conditions import Key
 import urllib3
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -91,6 +92,7 @@ AUDIT_TABLE = os.environ.get('AUDIT_TABLE', 'fieldsight-audit')
 BACKFILL_DAYS = int(os.environ.get('BACKFILL_DAYS', '7'))
 ENABLE_DYNAMODB = os.environ.get('ENABLE_DYNAMODB', 'false').lower() == 'true'
 PROMPT_TEMPLATES_KEY = os.environ.get('PROMPT_TEMPLATES_KEY', 'config/prompt_templates.json')
+CORRECTIONS_TABLE = os.environ.get('CORRECTIONS_TABLE', 'fieldsight-corrections')
 
 # Prompt template cache (loaded once per invocation)
 _prompt_templates_cache = None
@@ -117,6 +119,61 @@ def get_template(template_name, field='prompt'):
     templates = _prompt_templates_cache or {}
     section = templates.get(template_name, {})
     return section.get(field)
+
+
+# ============================================================
+# Corrections helpers (QA/QC Layer 2)
+# ============================================================
+
+def fetch_corrections_for_range(start_date, end_date):
+    """Fetch all active corrections for a date range from DynamoDB.
+    Returns dict: {date: {(topic_id, field): correction_item}}
+    """
+    corrections = {}
+    try:
+        table = dynamodb.Table(CORRECTIONS_TABLE)
+        for date_str in dates_in_range(start_date, end_date):
+            resp = table.query(
+                KeyConditionExpression=Key('PK').eq(f'DATE#{date_str}') & Key('SK').begins_with('CORRECTION#')
+            )
+            items = resp.get('Items', [])
+            while resp.get('LastEvaluatedKey'):
+                resp = table.query(
+                    KeyConditionExpression=Key('PK').eq(f'DATE#{date_str}') & Key('SK').begins_with('CORRECTION#'),
+                    ExclusiveStartKey=resp['LastEvaluatedKey']
+                )
+                items.extend(resp.get('Items', []))
+
+            for item in items:
+                if item.get('status') != 'active':
+                    continue
+                tid = int(item.get('topic_id', -1))
+                field = item.get('field', '')
+                key = (tid, field)
+                date_corrections = corrections.setdefault(date_str, {})
+                existing = date_corrections.get(key)
+                if not existing or item.get('submitted_at', '') > existing.get('submitted_at', ''):
+                    date_corrections[key] = item
+    except Exception as e:
+        logger.warning(f"Failed to fetch corrections: {e}")
+    return corrections
+
+
+def apply_corrections_to_reports(daily_reports, corrections_map):
+    """Apply corrections to daily report data in-place. Returns count applied."""
+    total_applied = 0
+    for report in daily_reports:
+        date = report.get('report_date', '')
+        date_corrections = corrections_map.get(date, {})
+        if not date_corrections:
+            continue
+        for topic in report.get('topics', []):
+            topic_id = topic.get('topic_id')
+            for (corr_tid, corr_field), corr_item in date_corrections.items():
+                if corr_tid == topic_id and topic.get(corr_field) is not None:
+                    topic[corr_field] = corr_item['corrected']
+                    total_applied += 1
+    return total_applied
 
 
 # Check python-docx availability once at import time
@@ -610,7 +667,8 @@ Rules:
 
 
 def build_weekly_prompt(daily_reports, site_name, start_date, end_date,
-                       scope_label=None, scope_type='site', user_role=None):
+                       scope_label=None, scope_type='site', user_role=None,
+                       corrections_applied=0):
     summaries = []
     for report in daily_reports:
         date = report.get('report_date', '?')
@@ -675,6 +733,14 @@ def build_weekly_prompt(daily_reports, site_name, start_date, end_date,
         )
         extra_instructions = ""
 
+    corrections_note = ""
+    if corrections_applied > 0:
+        corrections_note = (
+            f"\n\n**Note:** {corrections_applied} user correction(s) have been applied to the "
+            f"daily reports above. The corrected values are already reflected in the summaries. "
+            f"Treat corrected content as authoritative."
+        )
+
     template = get_template('weekly_report', 'prompt')
     system_ctx = get_template('weekly_report', 'system_context') or \
         "You are a construction site documentation assistant for a New Zealand construction company."
@@ -683,6 +749,7 @@ def build_weekly_prompt(daily_reports, site_name, start_date, end_date,
         body = template.format(
             scope_intro=scope_intro,
             all_summaries=all_summaries[:15000],
+            corrections_note=corrections_note,
             extra_instructions=extra_instructions,
             schema=WEEKLY_REPORT_SCHEMA,
         )
@@ -693,7 +760,7 @@ def build_weekly_prompt(daily_reports, site_name, start_date, end_date,
 {scope_intro}
 
 ## Daily Report Summaries
-{all_summaries[:15000]}
+{all_summaries[:15000]}{corrections_note}
 
 ## Instructions
 1. Identify safety TRENDS across the week (recurring issues, improvements, new risks).
@@ -713,7 +780,8 @@ Rules:
 - Do NOT include any text outside the JSON object"""
 
 
-def build_monthly_prompt(daily_reports, weekly_reports, site_name, start_date, end_date):
+def build_monthly_prompt(daily_reports, weekly_reports, site_name, start_date, end_date,
+                        corrections_applied=0):
     if weekly_reports:
         source_text = "\n\n".join([
             f"### Week of {r.get('period', {}).get('start', '?')} to {r.get('period', {}).get('end', '?')}\n"
@@ -728,6 +796,13 @@ def build_monthly_prompt(daily_reports, weekly_reports, site_name, start_date, e
         ])
         source_label = "Daily Report Summaries"
 
+    corrections_note = ""
+    if corrections_applied > 0:
+        corrections_note = (
+            f"\n\n**Note:** {corrections_applied} user correction(s) have been applied to the "
+            f"source reports. Treat corrected content as authoritative."
+        )
+
     template = get_template('monthly_report', 'prompt')
     system_ctx = get_template('monthly_report', 'system_context') or \
         "You are a construction site documentation assistant for a New Zealand construction company."
@@ -736,6 +811,7 @@ def build_monthly_prompt(daily_reports, weekly_reports, site_name, start_date, e
         body = template.format(
             site_name=site_name, start_date=start_date, end_date=end_date,
             source_label=source_label, source_text=source_text[:15000],
+            corrections_note=corrections_note,
             schema=WEEKLY_REPORT_SCHEMA,
         )
         return f"{system_ctx}\n\n{body}"
@@ -745,7 +821,7 @@ def build_monthly_prompt(daily_reports, weekly_reports, site_name, start_date, e
 Summarize the following reports from {start_date} to {end_date} at site "{site_name}" into a MONTHLY overview.
 
 ## {source_label}
-{source_text[:15000]}
+{source_text[:15000]}{corrections_note}
 
 ## Output Format
 Return ONLY valid JSON matching this schema:
@@ -1561,6 +1637,18 @@ def generate_periodic_report(report_type, start_date, end_date):
         logger.warning("  No daily reports found for period")
         return {'report_type': report_type, 'status': 'no_data'}
 
+    # Fetch and apply user corrections (QA/QC Layer 2)
+    corrections_applied = 0
+    try:
+        corrections_map = fetch_corrections_for_range(start_date, end_date)
+        if corrections_map:
+            total_corrections = sum(len(v) for v in corrections_map.values())
+            logger.info(f"  Fetched {total_corrections} corrections across {len(corrections_map)} dates")
+            corrections_applied = apply_corrections_to_reports(all_daily_reports, corrections_map)
+            logger.info(f"  Applied {corrections_applied} corrections to daily reports")
+    except Exception as e:
+        logger.warning(f"  Corrections fetch/apply failed (continuing without): {e}")
+
     weekly_reports = []
     if report_type == 'monthly':
         for obj in list_s3_objects(S3_BUCKET, REPORT_PREFIX):
@@ -1583,9 +1671,11 @@ def generate_periodic_report(report_type, start_date, end_date):
 
         if report_type == 'weekly':
             prompt = build_weekly_prompt(user_reports, user_site_name, start_date, end_date,
-                scope_label=user_name, scope_type='user', user_role=user_role)
+                scope_label=user_name, scope_type='user', user_role=user_role,
+                corrections_applied=corrections_applied)
         else:
-            prompt = build_monthly_prompt(user_reports, [], user_site_name, start_date, end_date)
+            prompt = build_monthly_prompt(user_reports, [], user_site_name, start_date, end_date,
+                corrections_applied=corrections_applied)
 
         raw_response, error = call_claude_structured(prompt, max_tokens=6000)
         if error:
@@ -1605,6 +1695,7 @@ def generate_periodic_report(report_type, start_date, end_date):
             '_report_metadata': {
                 'version': 'v3.5', 'generated_at': now_iso, 'generated_by': 'system',
                 'scope': 'user', 'daily_reports_used': len(user_reports), 'model': CLAUDE_MODEL,
+                'corrections_applied': corrections_applied,
             }
         }
 
@@ -1655,9 +1746,11 @@ def generate_periodic_report(report_type, start_date, end_date):
 
         if report_type == 'weekly':
             prompt = build_weekly_prompt(site_reports, site_display_name, start_date, end_date,
-                scope_label=site_label_for_prompt, scope_type='site')
+                scope_label=site_label_for_prompt, scope_type='site',
+                corrections_applied=corrections_applied)
         else:
-            prompt = build_monthly_prompt(site_reports, weekly_reports, site_display_name, start_date, end_date)
+            prompt = build_monthly_prompt(site_reports, weekly_reports, site_display_name, start_date, end_date,
+                corrections_applied=corrections_applied)
 
         raw_response, error = call_claude_structured(prompt, max_tokens=6000)
         if error:
@@ -1679,6 +1772,7 @@ def generate_periodic_report(report_type, start_date, end_date):
             '_report_metadata': {
                 'version': 'v3.5', 'generated_at': now_iso, 'generated_by': 'system',
                 'scope': 'site', 'daily_reports_used': len(site_reports), 'model': CLAUDE_MODEL,
+                'corrections_applied': corrections_applied,
             }
         }
 
@@ -1711,9 +1805,11 @@ def generate_periodic_report(report_type, start_date, end_date):
         logger.info(f"  Generating combined {report_type} summary ({len(all_daily_reports)} total daily reports)")
         if report_type == 'weekly':
             prompt = build_weekly_prompt(all_daily_reports, site_name, start_date, end_date,
-                scope_label=None, scope_type='all')
+                scope_label=None, scope_type='all',
+                corrections_applied=corrections_applied)
         else:
-            prompt = build_monthly_prompt(all_daily_reports, weekly_reports, site_name, start_date, end_date)
+            prompt = build_monthly_prompt(all_daily_reports, weekly_reports, site_name, start_date, end_date,
+                corrections_applied=corrections_applied)
 
         raw_response, error = call_claude_structured(prompt, max_tokens=6000)
         if not error:
@@ -1728,6 +1824,7 @@ def generate_periodic_report(report_type, start_date, end_date):
                     '_report_metadata': {
                         'version': 'v3.5', 'generated_at': now_iso, 'generated_by': 'system',
                         'scope': 'all', 'daily_reports_used': len(all_daily_reports), 'model': CLAUDE_MODEL,
+                        'corrections_applied': corrections_applied,
                     }
                 }
                 json_key = f"{REPORT_PREFIX}{end_date}/{report_type}_report.json"
