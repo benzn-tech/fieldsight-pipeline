@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tools
+        run: pip install ruff
+
+      - name: Python syntax check
+        run: |
+          for f in src/lambda_*.py src/transcript_utils.py; do
+            echo "Checking $f..."
+            python -m py_compile "$f"
+          done
+
+      - name: Ruff lint
+        run: ruff check src/
+
+      - name: SAM validate
+        uses: aws-actions/setup-sam@v2
+      - run: sam validate --template src/template.yaml --lint
+
+      - name: Bundle completeness check
+        run: bash scripts/check-bundle-completeness.sh

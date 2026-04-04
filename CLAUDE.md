@@ -49,6 +49,23 @@ Frontend (CloudFront → S3)
 
 ---
 
+## Agent Architecture (8 Agents)
+
+| # | Agent | Status | Function | Lambda |
+|---|-------|--------|----------|--------|
+| 1 | Pipeline | ✅ Prod | Download→VAD→Transcribe→Report | orchestrator+downloader+vad+transcribe+report-generator |
+| 2 | Ask | ✅ Prod | Report Q&A (Claude Haiku) | lambda_ask_agent |
+| 3 | QA | ✅ L1 | User corrections → DynamoDB | (in lambda_fieldsight_api) |
+| 4 | Analytics | 🟡 FE | User behavior tracking | (in lambda_fieldsight_api) |
+| 5 | Digest | 🟡 API | Role-specific daily digest | (planned in report-generator) |
+| 6 | Template | ⬜ | Customer DOCX/PDF template mapping | lambda_template_agent (planned) |
+| 7 | Platform | ⬜ | Procore/Aconex integration | lambda_platform_agent (planned) |
+| 8 | Analysis | ⬜ | Cross-day pattern recognition | lambda_analysis_agent (planned) |
+
+**Agent 4 vs 8**: Agent 4 analyzes **product user behavior** (click heatmap, feature usage); Agent 8 analyzes **construction site data** (recurring issues, safety trends, root cause chains).
+
+---
+
 ## Key Files
 
 | File | Purpose |
@@ -60,6 +77,58 @@ Frontend (CloudFront → S3)
 | `prompt_templates.json` | Hot-swappable prompt templates (S3: config/) |
 | `prompt_templates_meeting.json` | Meeting-specific prompt templates (S3: config/) |
 | `user_mapping.json` | Device → person name + role + site mapping (S3: config/) |
+| `lambda_ask_agent.py` | Ask Agent — report Q&A via Claude Haiku (Agent 2) |
+| `lambda_fieldsight_api.py` | API Gateway handler — 26 endpoints, role-based access |
+| `lambda_orchestrator.py` | Pipeline orchestrator — schedules download/VAD/transcribe |
+| `lambda_downloader.py` | RealPTT media downloader |
+| `lambda_vad.py` | Voice Activity Detection + H264 preview |
+| `lambda_transcribe_callback.py` | Transcribe completion → auto-trigger report generation |
+| `frontend/index.html` | Single-file React frontend (all 19 components) |
+| `src/template.yaml` | SAM template — all Lambda + API Gateway definitions |
+
+---
+
+## API Routes (lambda_fieldsight_api.py)
+
+### Core
+```
+GET  /api/reports         — Daily/weekly/monthly reports (role-filtered)
+GET  /api/transcripts     — Raw transcript JSON
+GET  /api/video-segments  — Video playback URLs (web_video/ → users/video/ fallback)
+GET  /api/audio-segments  — Audio playback URLs
+```
+
+### Agent 2: Ask
+```
+POST /api/ask             — Q&A against report+transcript (5/min rate limit)
+```
+
+### Agent 3: QA
+```
+POST /api/reports/correction — Submit correction (DynamoDB CORRECTION#)
+GET  /api/corrections        — Query corrections by date/topic
+```
+
+### Search & Calendar
+```
+GET  /api/search           — 90-day cross-date DynamoDB search
+GET  /api/calendar-events  — Deadline/event markers (DynamoDB DEADLINE#)
+```
+
+### Dashboard & Digest
+```
+GET  /api/dashboard        — Cross-site aggregation (managers only)
+POST /api/digest           — Trigger digest generation (admin/gm/pm)
+GET  /api/digest           — Retrieve generated digest
+```
+
+### Other
+```
+POST /api/topics/priority  — Set topic priority (DynamoDB PRIORITY#)
+GET  /api/topics/priority  — Get topic priorities
+GET  /api/onepager         — Generate/cache one-pager HTML
+POST /api/analytics/events — Ingest frontend tracking events
+```
 
 ---
 
@@ -76,7 +145,25 @@ meeting_minutes/{date}/{title}.json                                             
 config/user_mapping.json                                                                ← User/device mapping
 config/prompt_templates.json                                                            ← Report generation prompts
 models/silero_vad.onnx                                                                  ← VAD model (ALWAYS use this, not Layer)
+analytics/{date}/events_{batch_id}.json                                                 ← Frontend tracking events (Agent 4)
+digest/{date}/{role}_digest.json                                                        ← Role-specific digest (Agent 5, planned)
 ```
+
+---
+
+## DynamoDB Schema (fieldsight-reports table)
+
+PK patterns:
+- `SITE#{site_id}#DATE#{date}` — Main partition for site+date data
+  - SK: `ITEM#*` — Report items (search results)
+  - SK: `DEADLINE#*` — Calendar events
+  - SK: `PRIORITY#{topic_id}` — Topic priority overrides
+- `DATE#{date}` — Date-level data
+  - SK: `CORRECTION#{topic_id}#{field}#{id}` — User corrections (Agent 3)
+- `ACTIONS#{date}` — Action items
+  - SK: `{user}#{action_id}`
+- `USER#{sub}` — User profiles
+  - SK: `PROFILE`
 
 ---
 
@@ -402,6 +489,10 @@ aws lambda update-function-code --function-name fieldsight-report-generator --zi
 # Meeting minutes
 zip -j mm.zip lambda_meeting_minutes.py transcript_utils.py
 aws lambda update-function-code --function-name fieldsight-meeting-minutes --zip-file fileb://mm.zip
+
+# Ask agent
+zip -j aa.zip lambda_ask_agent.py transcript_utils.py
+aws lambda update-function-code --function-name fieldsight-ask-agent --zip-file fileb://aa.zip
 ```
 
 Always `aws lambda wait function-updated --function-name <name>` before invoking.

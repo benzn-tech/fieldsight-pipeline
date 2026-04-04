@@ -36,7 +36,9 @@ import os
 import json
 import logging
 import re
+import uuid
 import boto3
+from boto3.dynamodb.conditions import Key
 from datetime import datetime, timedelta
 from urllib.parse import unquote_plus
 
@@ -56,6 +58,10 @@ USERS_TABLE = os.environ.get('USERS_TABLE', 'fieldsight-users')
 REPORT_FUNCTION = os.environ.get('REPORT_FUNCTION', 'fieldsight-report-generator')
 ASK_AGENT_FUNCTION = os.environ.get('ASK_AGENT_FUNCTION', 'fieldsight-ask-agent')
 PRESIGNED_URL_EXPIRY = 900
+CORRECTIONS_TABLE = os.environ.get('CORRECTIONS_TABLE', 'fieldsight-corrections')
+
+# Rate limiting for /api/ask: {user_sub: [timestamp, ...]}
+_ask_rate_limit = {}
 
 _user_mapping_cache = None
 _user_mapping_ts = 0
@@ -367,31 +373,13 @@ def get_dates(params, caller):
 
 # ── GET /api/media/presigned-url ─────────────────────────────
 
-def get_presigned_url(params, caller=None):
+def get_presigned_url(params):
     s3_key = unquote_plus(params.get('key', ''))
     if not s3_key:
         return error('Missing key')
-    allowed = ['users/', 'audio_segments/', 'transcripts/', 'reports/', 'web_video/']
+    allowed = ['users/', 'audio_segments/', 'transcripts/', 'reports/']
     if not any(s3_key.startswith(p) for p in allowed):
         return error('Access denied', 403)
-
-    # Permission check: extract user folder from key and verify caller can access
-    if caller and caller.get('role') not in ('admin', 'gm'):
-        # Extract user folder name from common path patterns:
-        #   users/{name}/...  audio_segments/{name}/...  transcripts/{name}/...
-        #   reports/{date}/{name}/...  web_video/{name}/...
-        key_parts = s3_key.split('/')
-        target_user = None
-        if len(key_parts) >= 2 and key_parts[0] in ('users', 'audio_segments', 'transcripts', 'web_video'):
-            target_user = key_parts[1]
-        elif len(key_parts) >= 3 and key_parts[0] == 'reports':
-            # reports/{date}/{user}/...  — but skip summary_report.json at date level
-            candidate = key_parts[2] if len(key_parts) > 3 else None
-            if candidate and candidate not in ('summary_report.json', 'sites'):
-                target_user = candidate
-
-        if target_user and not can_access_user_data(caller, target_user):
-            return error('Access denied to this user\'s media', 403)
     try:
         url = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': s3_key}, ExpiresIn=PRESIGNED_URL_EXPIRY)
         return ok({'url': url, 'expires_in': PRESIGNED_URL_EXPIRY})
@@ -827,61 +815,6 @@ def trigger_report_generation(body, caller):
     except Exception as e:
         return error(f'Failed: {e}', 500)
 
-
-# ── POST /api/ask ───────────────────────────────────────────
-
-def ask_question(body, caller):
-    """Proxy question to Ask Agent Lambda with permission checks."""
-    question = body.get('question', '').strip()
-    date = body.get('date', '')
-    user = body.get('user', '')
-    scope = body.get('scope', 'both')
-    topic_id = body.get('topic_id', None)
-
-    if not question:
-        return error('Missing question')
-    if not date:
-        return error('Missing date')
-
-    # Resolve user from caller if not specified
-    if not user:
-        user = resolve_user_display_name(caller)
-    if not user:
-        return error('Missing user')
-
-    # Permission check: workers can only ask about their own data
-    if caller['role'] == 'worker':
-        user = resolve_user_display_name(caller)
-    elif user and not can_access_user_data(caller, user):
-        return error('Access denied to this user', 403)
-
-    payload = {
-        'date': date,
-        'user': user,
-        'question': question,
-        'scope': scope,
-    }
-    if topic_id is not None:
-        payload['topic_id'] = topic_id
-
-    try:
-        resp = lambda_client.invoke(
-            FunctionName=ASK_AGENT_FUNCTION,
-            InvocationType='RequestResponse',
-            Payload=json.dumps(payload)
-        )
-        result = json.loads(resp['Payload'].read().decode('utf-8'))
-
-        # The Ask Agent returns API Gateway format {statusCode, body}
-        if 'body' in result:
-            return result
-        # Or direct invocation format
-        return ok(result)
-    except Exception as e:
-        logger.error(f"Ask agent invocation failed: {e}")
-        return error(f'Ask agent error: {e}', 500)
-
-
 def get_users(params):
     try:
         mapping = load_user_mapping()
@@ -936,6 +869,693 @@ def health_check(params):
                'bucket': S3_BUCKET, 'timestamp': datetime.utcnow().isoformat() + 'Z'})
 
 
+# ── POST /api/ask ─────────────────────────────────────────────
+
+def ask_agent(body, caller):
+    question = (body.get('question') or '').strip()
+    date = (body.get('date') or '').strip()
+    scope = body.get('scope', 'both')
+    topic_id = body.get('topic_id')
+
+    if not question:
+        return error('Missing question')
+    if not date:
+        return error('Missing date')
+
+    # Resolve user
+    if caller['role'] == 'worker':
+        user = resolve_user_display_name(caller)
+    else:
+        user = body.get('user', '') or resolve_user_display_name(caller)
+        if body.get('user') and not can_access_user_data(caller, body['user']):
+            return error('Access denied', 403)
+    if not user:
+        return error('Missing user')
+
+    # Simple rate limit: 5 asks per minute per user
+    sub = caller.get('sub', caller.get('name', 'unknown'))
+    now = datetime.utcnow().timestamp()
+    recent = [t for t in _ask_rate_limit.get(sub, []) if now - t < 60]
+    if len(recent) >= 5:
+        return error('Rate limit: max 5 questions per minute', 429)
+    _ask_rate_limit[sub] = recent + [now]
+
+    payload = {'date': date, 'user': user.replace(' ', '_'), 'question': question, 'scope': scope}
+    if topic_id is not None:
+        payload['topic_id'] = topic_id
+
+    import time as _time
+    t0 = _time.time()
+    try:
+        resp = lambda_client.invoke(
+            FunctionName=ASK_AGENT_FUNCTION,
+            InvocationType='RequestResponse',
+            Payload=json.dumps(payload)
+        )
+        raw = json.loads(resp['Payload'].read().decode('utf-8'))
+        elapsed = round(_time.time() - t0, 2)
+        log_analytics_event('ask_agent', {
+            'user': user, 'date': date, 'question': question,
+            'scope': scope, 'topic_id': topic_id,
+            'caller_sub': sub, 'response_time_s': elapsed,
+        })
+        # Ask Agent returns {statusCode, body} — unwrap
+        if isinstance(raw, dict) and 'body' in raw:
+            inner = raw['body']
+            result = json.loads(inner) if isinstance(inner, str) else inner
+            return ok(result)
+        return ok(raw)
+    except Exception as e:
+        return error(f'Ask agent failed: {e}', 500)
+
+
+# ── GET /api/search ───────────────────────────────────────────
+
+def search_items(params, caller):
+    q = (params.get('q') or '').strip().lower()
+    start_date = params.get('start_date', '')
+    end_date = params.get('end_date', '')
+    category = params.get('category', '')
+
+    if not start_date or not end_date:
+        return error('Missing start_date or end_date')
+
+    try:
+        start = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end = datetime.strptime(end_date, '%Y-%m-%d').date()
+    except ValueError:
+        return error('Invalid date format, use YYYY-MM-DD')
+
+    if (end - start).days > 90:
+        return error('Date range too large (max 90 days)')
+    if end < start:
+        return error('end_date must be >= start_date')
+
+    accessible_sites = get_accessible_sites(caller)
+    if not accessible_sites:
+        return ok({'items': [], 'count': 0, 'truncated': False})
+
+    table = dynamodb.Table(ITEMS_TABLE)
+    results = []
+    current = start
+    while current <= end:
+        date_str = current.strftime('%Y-%m-%d')
+        for site_id in accessible_sites:
+            pk = f"SITE#{site_id}#DATE#{date_str}"
+            try:
+                resp = table.query(
+                    KeyConditionExpression=Key('PK').eq(pk) & Key('SK').begins_with('ITEM#')
+                )
+                for item in resp.get('Items', []):
+                    if q:
+                        searchable = f"{item.get('topic_title','')} {item.get('summary','')} {item.get('category','')}".lower()
+                        if q not in searchable:
+                            continue
+                    if category and item.get('category') != category:
+                        continue
+                    item_user = item.get('user_name', '')
+                    if item_user and not can_access_user_data(caller, item_user):
+                        continue
+                    results.append({
+                        'date': date_str,
+                        'site_id': site_id,
+                        'topic_id': item.get('topic_id'),
+                        'topic_title': item.get('topic_title', ''),
+                        'category': item.get('category', ''),
+                        'summary': item.get('summary', ''),
+                        'time_range': item.get('time_range', ''),
+                        'user_name': item.get('user_name', ''),
+                        'safety_flags': item.get('safety_flags', []),
+                        'action_items': item.get('action_items', []),
+                    })
+            except Exception as e:
+                logger.warning(f"Search query failed for {pk}: {e}")
+        current += timedelta(days=1)
+
+    results.sort(key=lambda r: r['date'], reverse=True)
+    truncated = len(results) > 200
+    log_analytics_event('search', {
+        'query': q, 'start_date': start_date, 'end_date': end_date,
+        'category': category, 'result_count': len(results),
+        'truncated': truncated,
+        'caller_sub': caller.get('sub', ''),
+    })
+    return ok({'items': results[:200], 'count': len(results), 'truncated': truncated})
+
+
+# ── GET /api/calendar-events ──────────────────────────────────
+
+def get_calendar_events(params, caller):
+    """Return critical dates/deadlines for a date range from DynamoDB items."""
+    from_date = params.get('from', '')
+    to_date = params.get('to', '')
+    if not from_date or not to_date:
+        return error('Missing from or to date')
+    try:
+        start = datetime.strptime(from_date, '%Y-%m-%d').date()
+        end = datetime.strptime(to_date, '%Y-%m-%d').date()
+    except ValueError:
+        return error('Invalid date format')
+    if (end - start).days > 90:
+        return error('Date range too large (max 90 days)')
+
+    accessible_sites = get_accessible_sites(caller)
+    if not accessible_sites:
+        return ok({'events': []})
+
+    table = dynamodb.Table(ITEMS_TABLE)
+    events = []
+    current = start
+    while current <= end:
+        date_str = current.strftime('%Y-%m-%d')
+        for site_id in accessible_sites:
+            pk = f"SITE#{site_id}#DATE#{date_str}"
+            try:
+                resp = table.query(
+                    KeyConditionExpression=Key('PK').eq(pk) & Key('SK').begins_with('DEADLINE#')
+                )
+                for item in resp.get('Items', []):
+                    events.append({
+                        'date': date_str,
+                        'site_id': site_id,
+                        'type': item.get('type', 'deadline'),
+                        'urgency': item.get('urgency', 'medium'),
+                        'context': item.get('context', ''),
+                        'date_mentioned': item.get('date_mentioned', ''),
+                        'source_topic': item.get('source_topic', ''),
+                        'source_date': item.get('source_date', ''),
+                    })
+            except Exception as e:
+                logger.warning(f"Calendar query failed for {pk}: {e}")
+        current += timedelta(days=1)
+
+    # Also scan report-level critical_dates from S3 reports if no DynamoDB data
+    if not events:
+        for site_id in accessible_sites:
+            current = start
+            while current <= end:
+                date_str = current.strftime('%Y-%m-%d')
+                prefix = f"{REPORT_PREFIX}{date_str}/"
+                try:
+                    paginator = s3_client.get_paginator('list_objects_v2')
+                    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix, MaxKeys=20):
+                        for obj in page.get('Contents', []):
+                            if obj['Key'].endswith('/daily_report.json'):
+                                resp = s3_client.get_object(Bucket=S3_BUCKET, Key=obj['Key'])
+                                report = json.loads(resp['Body'].read().decode('utf-8'))
+                                for cd in report.get('critical_dates_and_deadlines', []):
+                                    events.append({
+                                        'date': cd.get('date_mentioned', date_str),
+                                        'site_id': site_id,
+                                        'type': cd.get('type', 'deadline'),
+                                        'urgency': cd.get('urgency', 'medium'),
+                                        'context': cd.get('context', ''),
+                                        'date_mentioned': cd.get('date_mentioned', ''),
+                                        'source_date': date_str,
+                                    })
+                except Exception:
+                    pass
+                current += timedelta(days=1)
+
+    events.sort(key=lambda e: e.get('date', ''))
+    return ok({'events': events, 'count': len(events)})
+
+
+# ── POST /api/topics/priority ─────────────────────────────────
+
+def set_topic_priority(body, caller):
+    """User overrides a topic's priority classification."""
+    date = body.get('date', '')
+    topic_id = body.get('topic_id')
+    priority = body.get('priority', '')
+    user = body.get('user', '')
+
+    if not date or topic_id is None or not priority:
+        return error('Missing date, topic_id, or priority')
+    if priority not in ('high', 'medium', 'low'):
+        return error('Priority must be high, medium, or low')
+
+    # Store override in DynamoDB items table
+    accessible_sites = get_accessible_sites(caller)
+    if not accessible_sites:
+        return error('No accessible sites', 403)
+
+    site_id = accessible_sites[0]
+    table = dynamodb.Table(ITEMS_TABLE)
+    pk = f"SITE#{site_id}#DATE#{date}"
+    sk = f"PRIORITY#{topic_id}"
+
+    try:
+        table.put_item(Item={
+            'PK': pk, 'SK': sk,
+            'topic_id': topic_id,
+            'priority': priority,
+            'original_priority': body.get('original_priority', ''),
+            'set_by': caller.get('name', ''),
+            'set_by_sub': caller.get('sub', ''),
+            'set_at': datetime.utcnow().isoformat() + 'Z',
+            'user_name': user,
+        })
+        logger.info(f"Priority override: topic {topic_id} on {date} → {priority}")
+        return ok({'status': 'ok', 'topic_id': topic_id, 'priority': priority})
+    except Exception as e:
+        return error(f'Failed to set priority: {e}', 500)
+
+
+def get_topic_priorities(params, caller):
+    """Load all priority overrides for a date."""
+    date = params.get('date', '')
+    if not date:
+        return error('Missing date')
+
+    accessible_sites = get_accessible_sites(caller)
+    if not accessible_sites:
+        return ok({'priorities': {}})
+
+    table = dynamodb.Table(ITEMS_TABLE)
+    priorities = {}
+    for site_id in accessible_sites:
+        pk = f"SITE#{site_id}#DATE#{date}"
+        try:
+            resp = table.query(
+                KeyConditionExpression=Key('PK').eq(pk) & Key('SK').begins_with('PRIORITY#')
+            )
+            for item in resp.get('Items', []):
+                tid = item.get('topic_id')
+                if tid is not None:
+                    priorities[str(tid)] = {
+                        'priority': item.get('priority', 'medium'),
+                        'set_by': item.get('set_by', ''),
+                        'set_at': item.get('set_at', ''),
+                    }
+        except Exception as e:
+            logger.warning(f"Priority query failed for {pk}: {e}")
+
+    return ok({'priorities': priorities, 'date': date})
+
+
+# ── POST /api/reports/correction ──────────────────────────────
+
+def submit_correction(body, caller):
+    """User submits a correction to a topic's content."""
+    date = body.get('date', '')
+    topic_id = body.get('topic_id')
+    field = body.get('field', '')  # e.g. 'summary', 'topic_title', 'action_items'
+    original = body.get('original', '')
+    corrected = body.get('corrected', '')
+    user = body.get('user', '')
+
+    if not date or topic_id is None or not field or not corrected:
+        return error('Missing required fields (date, topic_id, field, corrected)')
+
+    table = dynamodb.Table(CORRECTIONS_TABLE)
+    correction_id = uuid.uuid4().hex[:12]
+    now = datetime.utcnow().isoformat() + 'Z'
+
+    try:
+        table.put_item(Item={
+            'PK': f'DATE#{date}',
+            'SK': f'CORRECTION#{topic_id}#{field}#{correction_id}',
+            'correction_id': correction_id,
+            'date': date,
+            'topic_id': topic_id,
+            'field': field,
+            'original': original,
+            'corrected': corrected,
+            'user_name': user,
+            'submitted_by': caller.get('name', ''),
+            'submitted_by_sub': caller.get('sub', ''),
+            'submitted_at': now,
+            'status': 'active',
+        })
+        logger.info(f"Correction submitted: {date} topic {topic_id} field {field}")
+        return ok({'status': 'ok', 'correction_id': correction_id})
+    except Exception as e:
+        return error(f'Failed to save correction: {e}', 500)
+
+
+def get_corrections(params, caller):
+    """Load all corrections for a date."""
+    date = params.get('date', '')
+    if not date:
+        return error('Missing date')
+
+    table = dynamodb.Table(CORRECTIONS_TABLE)
+    corrections = []
+    try:
+        resp = table.query(
+            KeyConditionExpression=Key('PK').eq(f'DATE#{date}') & Key('SK').begins_with('CORRECTION#')
+        )
+        for item in resp.get('Items', []):
+            corrections.append({
+                'correction_id': item.get('correction_id', ''),
+                'topic_id': item.get('topic_id'),
+                'field': item.get('field', ''),
+                'original': item.get('original', ''),
+                'corrected': item.get('corrected', ''),
+                'submitted_by': item.get('submitted_by', ''),
+                'submitted_at': item.get('submitted_at', ''),
+                'status': item.get('status', 'active'),
+            })
+    except Exception as e:
+        logger.warning(f"Corrections query failed for {date}: {e}")
+
+    return ok({'corrections': corrections, 'date': date})
+
+
+# ── GET /api/onepager ─────────────────────────────────────────
+
+def get_onepager(params, caller):
+    """Generate or retrieve HTML one-pager report for a date/user."""
+    date = params.get('date', '')
+    user = params.get('user', '')
+    if not date:
+        return error('Missing date')
+    if not user:
+        user = resolve_user_display_name(caller)
+    if not user:
+        return error('Missing user')
+
+    user_folder = user.replace(' ', '_')
+
+    # Check for pre-generated one-pager
+    for name_variant in [user_folder, user]:
+        key = f"{REPORT_PREFIX}{date}/{name_variant}/daily_onepager.html"
+        try:
+            resp = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+            html = resp['Body'].read().decode('utf-8')
+            return {
+                'statusCode': 200,
+                'headers': {
+                    'Content-Type': 'text/html',
+                    'Access-Control-Allow-Origin': '*',
+                },
+                'body': html,
+            }
+        except Exception:
+            pass
+
+    # Generate on-the-fly from daily report JSON
+    for name_variant in [user_folder, user]:
+        key = f"{REPORT_PREFIX}{date}/{name_variant}/daily_report.json"
+        try:
+            resp = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+            report = json.loads(resp['Body'].read().decode('utf-8'))
+            html = generate_onepager_html(report, date, user)
+            # Cache to S3
+            cache_key = f"{REPORT_PREFIX}{date}/{user_folder}/daily_onepager.html"
+            s3_client.put_object(Bucket=S3_BUCKET, Key=cache_key, Body=html.encode('utf-8'), ContentType='text/html')
+            return {
+                'statusCode': 200,
+                'headers': {
+                    'Content-Type': 'text/html',
+                    'Access-Control-Allow-Origin': '*',
+                },
+                'body': html,
+            }
+        except s3_client.exceptions.NoSuchKey:
+            continue
+        except Exception as e:
+            logger.warning(f"One-pager generation failed for {key}: {e}")
+
+    return error('No report found for this date/user', 404)
+
+
+def generate_onepager_html(report, date, user):
+    """Generate a single-page HTML summary from report JSON."""
+    session = report.get('recording_session', {})
+    site = session.get('site', 'Unknown Site')
+    worker = session.get('worker', user)
+    topics = report.get('topics', [])
+    exec_sum = report.get('executive_summary', [])
+    safety = report.get('safety_observations', [])
+    critical_dates = report.get('critical_dates_and_deadlines', [])
+
+    # Executive summary bullets
+    exec_html = ''
+    if isinstance(exec_sum, list):
+        exec_html = ''.join(f'<li>{b}</li>' for b in exec_sum)
+    elif exec_sum:
+        exec_html = f'<li>{exec_sum}</li>'
+
+    # Topics
+    topics_html = ''
+    for t in topics[:10]:
+        priority_cls = 'high' if any(sf.get('risk_level') == 'high' for sf in t.get('safety_flags', [])) else ''
+        actions_html = ''.join(
+            f'<div class="action">→ {a.get("action","")} <span class="owner">({a.get("responsible","?")})</span></div>'
+            for a in t.get('action_items', [])[:3]
+        )
+        topics_html += f'''
+        <div class="topic {priority_cls}">
+          <div class="topic-header">
+            <span class="time">{t.get("time_range","")}</span>
+            <span class="cat">{t.get("category","").upper()}</span>
+            <strong>{t.get("topic_title","")}</strong>
+          </div>
+          <p>{t.get("summary","")}</p>
+          {actions_html}
+        </div>'''
+
+    # Safety
+    safety_html = ''
+    for s in safety[:5]:
+        risk = s.get('risk_level', 'low').upper()
+        safety_html += f'<div class="safety-item risk-{risk.lower()}"><strong>[{risk}]</strong> {s.get("observation","")} — {s.get("location","")}</div>'
+
+    # Critical dates
+    dates_html = ''
+    for cd in critical_dates[:5]:
+        urg = cd.get('urgency', 'medium').upper()
+        dates_html += f'<div class="date-item urg-{urg.lower()}">{cd.get("date_mentioned","?")} — {cd.get("context","")}</div>'
+
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FieldSight Daily Report — {date}</title>
+<style>
+  *{{margin:0;padding:0;box-sizing:border-box}}
+  body{{font-family:'Segoe UI',system-ui,sans-serif;font-size:11px;color:#1A2332;max-width:800px;margin:0 auto;padding:20px}}
+  .header{{display:flex;justify-content:space-between;align-items:center;border-bottom:3px solid #D4740E;padding-bottom:10px;margin-bottom:16px}}
+  .header h1{{font-size:18px;color:#1B3A5C}} .header .meta{{text-align:right;font-size:10px;color:#5A6B7F}}
+  .section{{margin-bottom:14px}} .section h2{{font-size:13px;color:#1B3A5C;border-bottom:1px solid #D1DAE6;padding-bottom:4px;margin-bottom:8px}}
+  ul{{padding-left:18px}} li{{margin-bottom:4px;line-height:1.5}}
+  .topic{{border-left:3px solid #2A5F8F;padding:6px 10px;margin-bottom:8px;background:#F7F9FC;border-radius:0 6px 6px 0}}
+  .topic.high{{border-color:#C0392B;background:#FFF5F5}}
+  .topic-header{{display:flex;gap:8px;align-items:center;margin-bottom:4px}}
+  .time{{font-family:monospace;font-size:10px;color:#5A6B7F}} .cat{{font-size:9px;font-weight:700;background:#EDF1F7;padding:1px 6px;border-radius:8px;color:#1B3A5C}}
+  .topic p{{line-height:1.5;margin-bottom:4px}}
+  .action{{font-size:10px;color:#1B3A5C;padding:2px 0}} .owner{{color:#5A6B7F}}
+  .safety-item{{padding:4px 8px;margin-bottom:4px;border-radius:4px;background:#FFF5F5}}
+  .risk-high{{border-left:3px solid #C0392B}} .risk-medium{{border-left:3px solid #D4740E}} .risk-low{{border-left:3px solid #2A5F8F}}
+  .date-item{{padding:3px 8px;margin-bottom:3px;border-radius:4px;background:#FFF9F0}}
+  .urg-high{{border-left:3px solid #C0392B}} .urg-medium{{border-left:3px solid #D4740E}} .urg-low{{border-left:3px solid #1B3A5C}}
+  .footer{{margin-top:20px;border-top:1px solid #D1DAE6;padding-top:8px;font-size:9px;color:#94A5B9;text-align:center}}
+  @media print{{body{{padding:10px}} .footer{{page-break-before:avoid}}}}
+</style>
+</head>
+<body>
+  <div class="header">
+    <div><h1>FieldSight Daily Report</h1><div style="font-size:11px;color:#5A6B7F;margin-top:2px">{site}</div></div>
+    <div class="meta"><div style="font-size:14px;font-weight:700;color:#1B3A5C">{date}</div><div>{worker}</div></div>
+  </div>
+  <div class="section"><h2>Executive Summary</h2><ul>{exec_html}</ul></div>
+  {f'<div class="section"><h2>Safety Observations</h2>{safety_html}</div>' if safety_html else ''}
+  <div class="section"><h2>Topics ({len(topics)})</h2>{topics_html}</div>
+  {f'<div class="section"><h2>Critical Dates</h2>{dates_html}</div>' if dates_html else ''}
+  <div class="footer">Generated by FieldSight · {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC</div>
+</body>
+</html>'''
+
+
+# ── GET /api/dashboard ────────────────────────────────────────
+
+def get_site_dashboard(params, caller):
+    """Return summary cards for all accessible sites on today's date."""
+    date = params.get('date', '')
+    if not date:
+        nz_now = datetime.utcnow() + timedelta(hours=13)
+        date = nz_now.strftime('%Y-%m-%d')
+
+    accessible_sites = get_accessible_sites(caller)
+    if not accessible_sites:
+        return ok({'sites': [], 'date': date})
+
+    table = dynamodb.Table(ITEMS_TABLE)
+    site_cards = []
+
+    for site_id in accessible_sites:
+        pk = f"SITE#{site_id}#DATE#{date}"
+        topics = []
+        safety_count = 0
+        action_count = 0
+        categories = {}
+
+        try:
+            resp = table.query(
+                KeyConditionExpression=Key('PK').eq(pk) & Key('SK').begins_with('ITEM#')
+            )
+            for item in resp.get('Items', []):
+                topics.append(item)
+                cat = item.get('category', 'general')
+                categories[cat] = categories.get(cat, 0) + 1
+                safety_count += len(item.get('safety_flags', []))
+                action_count += len(item.get('action_items', []))
+        except Exception as e:
+            logger.warning(f"Dashboard query failed for {pk}: {e}")
+
+        # Check for deadlines
+        deadlines = []
+        try:
+            resp = table.query(
+                KeyConditionExpression=Key('PK').eq(pk) & Key('SK').begins_with('DEADLINE#')
+            )
+            deadlines = [{'context': d.get('context', ''), 'urgency': d.get('urgency', 'medium')} for d in resp.get('Items', [])]
+        except Exception:
+            pass
+
+        # Get site display name from first topic or site_id
+        site_name = site_id
+        if topics:
+            site_name = topics[0].get('site_name', site_id)
+
+        site_cards.append({
+            'site_id': site_id,
+            'site_name': site_name,
+            'date': date,
+            'topic_count': len(topics),
+            'safety_count': safety_count,
+            'action_count': action_count,
+            'categories': categories,
+            'deadlines': deadlines,
+            'top_topics': [
+                {'topic_title': t.get('topic_title', ''), 'category': t.get('category', ''), 'summary': t.get('summary', '')[:100]}
+                for t in topics[:3]
+            ],
+        })
+
+    return ok({'sites': site_cards, 'date': date})
+
+
+# ── POST /api/digest ──────────────────────────────────────────
+
+DIGEST_FUNCTION = os.environ.get('DIGEST_FUNCTION', 'fieldsight-report-generator')
+
+def trigger_digest(body, caller):
+    """Trigger digest report generation for PM/Admin role."""
+    role = caller.get('role', '')
+    if role not in ('admin', 'gm', 'pm'):
+        return error('Digest reports are only available for PM/Admin roles', 403)
+
+    date = body.get('date', '')
+    if not date:
+        nz_now = datetime.utcnow() + timedelta(hours=13)
+        date = nz_now.strftime('%Y-%m-%d')
+
+    digest_type = body.get('digest_type', 'daily')  # daily | weekly
+    if digest_type not in ('daily', 'weekly'):
+        return error('digest_type must be daily or weekly')
+
+    payload = {
+        'report_type': 'digest',
+        'date': date,
+        'digest_type': digest_type,
+        'role': role,
+        'user': caller.get('name', ''),
+        'sites': [s for s in get_accessible_sites(caller)],
+    }
+
+    try:
+        lambda_client.invoke(
+            FunctionName=DIGEST_FUNCTION,
+            InvocationType='Event',  # async
+            Payload=json.dumps(payload),
+        )
+        return ok({'status': 'triggered', 'date': date, 'digest_type': digest_type})
+    except Exception as e:
+        return error(f'Failed to trigger digest: {e}', 500)
+
+
+def get_digest(params, caller):
+    """Retrieve a generated digest report."""
+    date = params.get('date', '')
+    if not date:
+        return error('Missing date')
+
+    role = caller.get('role', 'worker')
+    user_folder = caller.get('name', '').replace(' ', '_')
+
+    # Try role-specific digest
+    for path_suffix in [f'digest/{role}/{user_folder}.json', f'digest/{role}/combined.json', f'digest/combined.json']:
+        key = f"{REPORT_PREFIX}{date}/{path_suffix}"
+        try:
+            resp = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+            data = json.loads(resp['Body'].read().decode('utf-8'))
+            return ok(data)
+        except Exception:
+            continue
+
+    return ok({'_notFound': True, 'message': f'No digest for {date}'})
+
+
+# ── Analytics Logging ─────────────────────────────────────────
+
+def log_analytics_event(event_type, data):
+    """Write analytics event to S3. Non-fatal on failure."""
+    try:
+        now = datetime.utcnow()
+        date_str = now.strftime('%Y-%m-%d')
+        ts = now.strftime('%Y%m%dT%H%M%S')
+        short_id = uuid.uuid4().hex[:8]
+        key = f"analytics/{event_type}/{date_str}/{ts}_{short_id}.json"
+        s3_client.put_object(
+            Bucket=S3_BUCKET, Key=key,
+            Body=json.dumps({**data, 'event_type': event_type, 'timestamp': now.isoformat() + 'Z'}, default=str),
+            ContentType='application/json',
+        )
+    except Exception as e:
+        logger.warning(f"Analytics log failed ({event_type}): {e}")
+
+
+# ── POST /api/analytics/events ────────────────────────────────
+
+def ingest_analytics_events(body, caller):
+    events = body.get('events', [])
+    if not isinstance(events, list) or len(events) == 0:
+        return error('Missing or empty events array')
+    if len(events) > 50:
+        return error('Max 50 events per batch')
+
+    now = datetime.utcnow()
+    date_str = now.strftime('%Y-%m-%d')
+    ts = now.strftime('%Y%m%dT%H%M%S')
+    short_id = uuid.uuid4().hex[:8]
+    key = f"analytics/events/{date_str}/{ts}_{short_id}.json"
+
+    sub = caller.get('sub', 'unknown')
+    payload = {
+        'user_sub': sub,
+        'user_name': caller.get('name', ''),
+        'role': caller.get('role', ''),
+        'batch_size': len(events),
+        'received_at': now.isoformat() + 'Z',
+        'events': events,
+    }
+
+    try:
+        s3_client.put_object(
+            Bucket=S3_BUCKET, Key=key,
+            Body=json.dumps(payload, default=str),
+            ContentType='application/json',
+        )
+        return ok({'status': 'ok', 'count': len(events)})
+    except Exception as e:
+        logger.error(f"Analytics ingest failed: {e}")
+        return error(f'Failed to store events: {e}', 500)
+
+
 # ── Router ───────────────────────────────────────────────────
 
 def lambda_handler(event, context):
@@ -955,7 +1575,7 @@ def lambda_handler(event, context):
     try:
         if path == '/api/timeline': return get_timeline(params, caller)
         elif path == '/api/dates': return get_dates(params, caller)
-        elif path == '/api/media/presigned-url': return get_presigned_url(params, caller)
+        elif path == '/api/media/presigned-url': return get_presigned_url(params)
         elif path == '/api/reports/history': return get_report_history(params, caller)
         elif path == '/api/reports/generate' and method == 'POST': return trigger_report_generation(body, caller)
         elif path == '/api/users': return get_users(params)
@@ -967,7 +1587,18 @@ def lambda_handler(event, context):
         elif path == '/api/recording-stats': return get_recording_stats(params, caller)
         elif path == '/api/actions/toggle' and method == 'POST': return toggle_action(body, caller)
         elif path == '/api/actions': return get_actions(params, caller)
-        elif path == '/api/ask' and method == 'POST': return ask_question(body, caller)
+        elif path == '/api/ask' and method == 'POST': return ask_agent(body, caller)
+        elif path == '/api/search': return search_items(params, caller)
+        elif path == '/api/calendar-events': return get_calendar_events(params, caller)
+        elif path == '/api/topics/priority' and method == 'POST': return set_topic_priority(body, caller)
+        elif path == '/api/topics/priority': return get_topic_priorities(params, caller)
+        elif path == '/api/reports/correction' and method == 'POST': return submit_correction(body, caller)
+        elif path == '/api/corrections': return get_corrections(params, caller)
+        elif path == '/api/onepager': return get_onepager(params, caller)
+        elif path == '/api/dashboard': return get_site_dashboard(params, caller)
+        elif path == '/api/digest' and method == 'POST': return trigger_digest(body, caller)
+        elif path == '/api/digest': return get_digest(params, caller)
+        elif path == '/api/analytics/events' and method == 'POST': return ingest_analytics_events(body, caller)
         else: return error(f'Not found: {method} {path}', 404)
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)

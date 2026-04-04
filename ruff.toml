@@ -1,0 +1,21 @@
+target-version = "py312"
+line-length = 120
+
+[lint]
+# Start permissive, tighten over time
+select = ["E", "F", "W"]
+ignore = [
+    "E402",   # module import not at top — existing code pattern
+    "E501",   # line too long — existing code has long lines
+    "E701",   # multiple statements on one line — existing code pattern
+    "E722",   # bare except — existing code uses this pattern
+    "F401",   # unused import — clean up separately
+    "F541",   # f-string without placeholders — existing code pattern
+    "F841",   # local variable assigned but never used
+    "W291",   # trailing whitespace
+    "W292",   # no newline at end of file
+    "W293",   # whitespace before ':'
+]
+
+[lint.per-file-ignores]
+"src/deploy_*.py" = ["ALL"]
