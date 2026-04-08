@@ -28,7 +28,7 @@
     const CONFIG = {
       apiBase: "",
       cognitoRegion: "ap-southeast-2",
-      cognitoClientId: "5npb81jbj1hgh9tsck25kan3os",
+      cognitoClientId: "4ratjdjonqm17tln6bs2761ci3",
     };
 
     /* ─── Theme ─── */
@@ -52,6 +52,72 @@
       quality: { label: "Quality", icon: "◆", bg: `${T.primary}0D`, color: T.primary },
       compliance: { label: "Compliance", icon: "✓", bg: `${T.primary}0D`, color: T.primary },
     };
+
+    /* ─── EventTracker ─── */
+    const _eventQueue = [];
+    let _flushTimer = null;
+    let _trackToken = null;
+    function setTrackToken(token) { _trackToken = token; }
+    function trackEvent(eventType, meta = {}) {
+      _eventQueue.push({ event: eventType, timestamp: new Date().toISOString(), ...meta });
+      if (_eventQueue.length >= 10) flushEvents();
+      else if (!_flushTimer) _flushTimer = setTimeout(flushEvents, 30000);
+    }
+    function flushEvents() {
+      if (_flushTimer) { clearTimeout(_flushTimer); _flushTimer = null; }
+      if (_eventQueue.length === 0 || !_trackToken) return;
+      const batch = _eventQueue.splice(0, 50);
+      fetch((CONFIG.apiBase || '') + '/api/analytics/events', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': _trackToken },
+        body: JSON.stringify({ events: batch }),
+      }).catch(() => {});
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', flushEvents);
+    }
+
+    /* ─── DragDivider ─── */
+    function DragDivider({ direction = 'vertical', onDrag, style: extraStyle }) {
+      const isV = direction === 'vertical';
+      const [dragging, setDragging] = useState(false);
+      const [hovered, setHovered] = useState(false);
+
+      const onMouseDown = useCallback((e) => {
+        e.preventDefault();
+        setDragging(true);
+        const move = (ev) => onDrag(isV ? ev.clientX : ev.clientY);
+        const up = () => { setDragging(false); document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); document.body.style.cursor = ''; document.body.style.userSelect = ''; };
+        document.addEventListener('mousemove', move);
+        document.addEventListener('mouseup', up);
+        document.body.style.cursor = isV ? 'col-resize' : 'row-resize';
+        document.body.style.userSelect = 'none';
+      }, [onDrag, isV]);
+
+      const active = dragging || hovered;
+      const base = {
+        flexShrink: 0, position: 'relative', zIndex: 5,
+        [isV ? 'width' : 'height']: 7,
+        cursor: isV ? 'col-resize' : 'row-resize',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        background: active ? `${T.primary}12` : 'transparent',
+        transition: 'background 0.15s',
+      };
+      const grip = {
+        [isV ? 'width' : 'height']: 3,
+        [isV ? 'height' : 'width']: 36,
+        borderRadius: 2,
+        background: active ? T.primary : T.border,
+        transition: 'background 0.15s',
+        opacity: active ? 1 : 0.5,
+      };
+      return (
+        <div style={{ ...base, ...extraStyle }} onMouseDown={onMouseDown}
+          onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}>
+          <div style={grip} />
+        </div>
+      );
+    }
 
     /* ─── Cognito Auth ─── */
     const COGNITO_URL = `https://cognito-idp.${CONFIG.cognitoRegion}.amazonaws.com/`;
@@ -82,6 +148,14 @@
         ChallengeResponses: { USERNAME: email, NEW_PASSWORD: newPassword }, Session: session,
       });
       return { idToken: result.AuthenticationResult.IdToken, accessToken: result.AuthenticationResult.AccessToken, refreshToken: result.AuthenticationResult.RefreshToken };
+    }
+
+    async function changePassword(accessToken, oldPassword, newPassword) {
+      await cognitoCall("ChangePassword", {
+        PreviousPassword: oldPassword,
+        ProposedPassword: newPassword,
+        AccessToken: accessToken,
+      });
     }
 
     function parseJwt(token) {
@@ -166,7 +240,7 @@
     function Card({ children, borderColor }) { return <div style={{ background: T.surface, borderRadius: 10, padding: "14px 16px", border: `1px solid ${borderColor||T.borderLight}`, borderLeft: borderColor?`3px solid ${borderColor}`:undefined, boxShadow: T.shadow }}>{children}</div>; }
 
     /* ─── Calendar ─── */
-    function CalendarPicker({ selectedDate, onSelect, onClose, dateData }) {
+    function CalendarPicker({ selectedDate, onSelect, onClose, dateData, calendarEvents }) {
       const sel = new Date(selectedDate+"T12:00:00");
       const [vy, setVy] = useState(sel.getFullYear());
       const [vm, setVm] = useState(sel.getMonth());
@@ -191,8 +265,11 @@
               if(!day) return <div key={`e${i}`}/>;
               const ds=`${vy}-${String(vm+1).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
               const data=dateData[ds]; const isSel=ds===selectedDate; const isFut=ds>todayStr;
-              return <div key={ds} onClick={()=>!isFut&&(onSelect(ds),onClose())} style={{ textAlign:"center",padding:"6px 0",borderRadius:8,cursor:isFut?"default":"pointer",background:isSel?T.primary:"transparent",color:isSel?"#fff":isFut?T.borderLight:T.text,fontSize:12,fontWeight:isSel?700:500 }}>
-                {day}<div style={{display:"flex",gap:2,justifyContent:"center",marginTop:2,height:5}}>{data?.hasReport&&<div style={{width:5,height:5,borderRadius:"50%",background:isSel?"#fff":T.success}}/>}{data?.safety>0&&<div style={{width:5,height:5,borderRadius:"50%",background:isSel?"#FFB4B4":T.danger}}/>}</div>
+              const evts=(calendarEvents||[]).filter(e=>e.date===ds);
+              const hasHigh=evts.some(e=>e.urgency==='high');
+              const hasDeadline=evts.length>0;
+              return <div key={ds} onClick={()=>!isFut&&(onSelect(ds),onClose())} title={hasDeadline?evts.map(e=>e.context).join('; '):''} style={{ textAlign:"center",padding:"6px 0",borderRadius:8,cursor:isFut?"default":"pointer",background:isSel?T.primary:hasHigh?T.dangerBg:"transparent",color:isSel?"#fff":isFut?T.borderLight:T.text,fontSize:12,fontWeight:isSel?700:500 }}>
+                {day}<div style={{display:"flex",gap:2,justifyContent:"center",marginTop:2,height:5}}>{data?.hasReport&&<div style={{width:5,height:5,borderRadius:"50%",background:isSel?"#fff":T.success}}/>}{data?.safety>0&&<div style={{width:5,height:5,borderRadius:"50%",background:isSel?"#FFB4B4":T.danger}}/>}{hasDeadline&&<div style={{width:5,height:5,borderRadius:hasHigh?2:"50%",background:isSel?"#FFD700":T.warning}}/>}</div>
               </div>;
             })}
           </div>
@@ -200,8 +277,59 @@
       );
     }
 
+    /* ─── Change Password Modal ─── */
+    function ChangePasswordModal({ accessToken, onClose }) {
+      const [oldPw, setOldPw] = useState("");
+      const [newPw, setNewPw] = useState("");
+      const [confirmPw, setConfirmPw] = useState("");
+      const [error, setError] = useState("");
+      const [success, setSuccess] = useState(false);
+      const [loading, setLoading] = useState(false);
+
+      const handleSubmit = async (e) => {
+        e.preventDefault();
+        setError("");
+        if (newPw !== confirmPw) { setError("New passwords don't match"); return; }
+        if (newPw.length < 8) { setError("Password must be at least 8 characters"); return; }
+        setLoading(true);
+        try {
+          await changePassword(accessToken, oldPw, newPw);
+          setSuccess(true);
+          setTimeout(onClose, 1500);
+        } catch (err) { setError(err.message); }
+        setLoading(false);
+      };
+
+      const inp = { width:"100%",padding:"10px 12px",fontSize:13,border:`1px solid ${T.border}`,borderRadius:8,background:T.inputBg,fontFamily:T.font,color:T.text,outline:"none",boxSizing:"border-box" };
+
+      return (
+        <div style={{ position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,0.5)',zIndex:2000,display:'flex',alignItems:'center',justifyContent:'center' }} onClick={onClose}>
+          <div style={{ background:T.surface,borderRadius:14,padding:"28px 32px",width:360,boxShadow:"0 20px 60px rgba(0,0,0,0.3)" }} onClick={e=>e.stopPropagation()}>
+            <div style={{ display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:20 }}>
+              <div style={{ fontSize:16,fontWeight:700,color:T.text }}>Change Password</div>
+              <button onClick={onClose} style={{ background:'none',border:'none',fontSize:18,color:T.textTertiary,cursor:'pointer' }}>✕</button>
+            </div>
+            {success ? (
+              <div style={{ textAlign:'center',padding:'20px 0' }}>
+                <div style={{ fontSize:32,marginBottom:8 }}>✓</div>
+                <div style={{ fontSize:14,fontWeight:600,color:T.success }}>Password changed</div>
+              </div>
+            ) : (
+              <form onSubmit={handleSubmit}>
+                <div style={{ marginBottom:12 }}><label style={{ fontSize:11,fontWeight:600,color:T.textSecondary,marginBottom:4,display:'block' }}>Current Password</label><input type="password" value={oldPw} onChange={e=>setOldPw(e.target.value)} style={inp} required /></div>
+                <div style={{ marginBottom:12 }}><label style={{ fontSize:11,fontWeight:600,color:T.textSecondary,marginBottom:4,display:'block' }}>New Password</label><input type="password" value={newPw} onChange={e=>setNewPw(e.target.value)} style={inp} placeholder="Min 8 chars" required minLength={8} /></div>
+                <div style={{ marginBottom:16 }}><label style={{ fontSize:11,fontWeight:600,color:T.textSecondary,marginBottom:4,display:'block' }}>Confirm New Password</label><input type="password" value={confirmPw} onChange={e=>setConfirmPw(e.target.value)} style={inp} required minLength={8} /></div>
+                {error && <div style={{ fontSize:12,color:T.danger,marginBottom:12,padding:"8px 12px",background:T.dangerBg,borderRadius:6 }}>{error}</div>}
+                <button type="submit" disabled={loading} style={{ width:"100%",padding:"10px",background:loading?T.textTertiary:T.primary,color:"#fff",border:"none",borderRadius:8,fontSize:13,fontWeight:600,cursor:loading?"wait":"pointer",fontFamily:T.font }}>{loading?"Changing...":"Change Password"}</button>
+              </form>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     /* ─── NavBar ─── */
-    function NavBar({ tab, setTab, user, callerRole, sites, selectedSite, setSelectedSite, onLogout }) {
+    function NavBar({ tab, setTab, user, callerRole, sites, selectedSite, setSelectedSite, onLogout, onChangePassword }) {
       const ini = (user.name||"?").split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase();
       const isManager = ['admin','gm','pm','site_manager'].includes(callerRole);
       const roleBadge = {admin:'Admin',gm:'GM',pm:'PM',site_manager:'Site Mgr',worker:'Worker'}[callerRole]||callerRole;
@@ -218,7 +346,7 @@
             )}
           </div>
           <div style={{ display:"flex",gap:2,background:`${T.navText}15`,borderRadius:8,padding:2 }}>
-            {[["day","📋 My Day"],["reports","📄 Reports"]].map(([k,l])=>
+            {[...(isManager?[["dashboard","🏗 Sites"]]:[]),["day","📋 My Day"],["reports","📄 Reports"],["search","🔍 Search"]].map(([k,l])=>
               <button key={k} onClick={()=>setTab(k)} style={{ background:tab===k?`${T.navActive}18`:"transparent",color:tab===k?T.navActive:T.navText,border:"none",fontSize:11,fontWeight:600,padding:"5px 16px",borderRadius:6,cursor:"pointer" }}>{l}</button>
             )}
           </div>
@@ -227,6 +355,7 @@
               <div style={{ width:28,height:28,borderRadius:"50%",background:T.primaryLight,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,color:"#fff",fontWeight:700 }}>{ini}</div>
               <div><div style={{ fontSize:11,fontWeight:600,color:T.navActive }}>{user.name}</div><div style={{ fontSize:9,color:T.navText }}>{roleBadge} · {user.email}</div></div>
             </div>
+            <button onClick={onChangePassword} style={{ background:"none",border:`1px solid ${T.navText}40`,color:T.navText,fontSize:10,cursor:"pointer",padding:"4px 8px",borderRadius:4 }}>🔑 Password</button>
             <button onClick={onLogout} style={{ background:"none",border:"none",color:T.navText,fontSize:10,cursor:"pointer",padding:"4px 8px" }}>↪ Out</button>
           </div>
         </div>
@@ -244,10 +373,12 @@
     const spkColors = {spk_0:'#1B3A5C', spk_1:'#D4740E', spk_2:'#1D7A3F', spk_3:'#C0392B', spk_4:'#7B2D8E'};
     const spkNames = {spk_0:'Speaker A', spk_1:'Speaker B', spk_2:'Speaker C', spk_3:'Speaker D', spk_4:'Speaker E'};
 
-    /* ─── Enhanced Video Popup ─── */
-    function VideoPopup({ video, onClose, topicStart, topicEnd, videoStartSec, audioSegs, allTopics, currentTopicIdx, onTopicChange, token, date, user }) {
+    /* ─── Enhanced Video Popup (multi-video + resizable) ─── */
+    function VideoPopup({ videoSegs, onClose, topicStart, topicEnd, audioSegs, allTopics, currentTopicIdx, onTopicChange, token, date, user }) {
       const vidRef = useRef(null);
       const transcriptRef = useRef(null);
+      const popupRef = useRef(null);
+      const [vidIdx, setVidIdx] = useState(0);
       const [currentTime, setCurrentTime] = useState(0);
       const [duration, setDuration] = useState(600);
       const [isPlaying, setIsPlaying] = useState(false);
@@ -255,41 +386,58 @@
       const [spkSegs, setSpkSegs] = useState([]);
       const [spkLoading, setSpkLoading] = useState(true);
       const [activeSpkIdx, setActiveSpkIdx] = useState(-1);
+      const [vidPanelW, setVidPanelW] = useState(null); // null = auto flex
 
-      const vidStart = videoStartSec || video.video_start_sec || 0;
+      const videos = videoSegs || [];
+      const video = videos[vidIdx] || videos[0];
+      if (!video) return null;
+      const vidStart = video.video_start_sec || 0;
 
-      // Load full transcript for this recording on mount
+      // Compute total span across all videos for the unified timeline
+      const allVidStart = videos.length ? Math.min(...videos.map(v => v.video_start_sec || 0)) : 0;
+      const allVidEnd = videos.length ? Math.max(...videos.map(v => (v.video_start_sec || 0) + 600)) : 600;
+      const totalSpan = allVidEnd - allVidStart;
+
+      // Load transcript covering ALL videos' time range
       useEffect(() => {
-        if (!token || !date) return;
+        if (!token || !date || !videos.length) return;
         setSpkLoading(true);
-        const vh = Math.floor(vidStart/3600), vm = Math.floor((vidStart%3600)/60), vs = vidStart%60;
-        const startStr = `${String(vh).padStart(2,'0')}:${String(vm).padStart(2,'0')}:${String(vs).padStart(2,'0')}`;
-        const endSec = vidStart + 660;
-        const eh = Math.floor(endSec/3600), em = Math.floor((endSec%3600)/60), es = endSec%60;
-        const endStr = `${String(eh).padStart(2,'0')}:${String(em).padStart(2,'0')}:${String(es).padStart(2,'0')}`;
+        const fmt = s => { const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60; return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`; };
+        const startStr = fmt(allVidStart);
+        const endStr = fmt(allVidEnd);
         const uParam = user ? `&user=${encodeURIComponent(user)}` : '';
         api(`/api/transcripts?date=${date}${uParam}&start=${startStr}&end=${endStr}`, token)
           .then(data => setSpkSegs(data.speaker_segments || []))
           .catch(() => setSpkSegs([]))
           .finally(() => setSpkLoading(false));
-      }, [token, date, video]);
+      }, [token, date, videos.length]);
 
-      // Seek to topic start when loaded
+      // Wire up video element events
       useEffect(() => {
         const v = vidRef.current;
         if (!v) return;
+        setVideoError(null);
         const onMeta = () => { setDuration(v.duration); v.currentTime = video.offset_sec || 0; v.play().catch(()=>{}); };
         const onTime = () => { setCurrentTime(v.currentTime); setIsPlaying(!v.paused); };
-        const onErr = () => setVideoError('Video codec not supported in this browser. Try Safari for H265, or wait for H264 preview conversion.');
+        const onErr = () => setVideoError('Video codec not supported. Try Safari for H265, or wait for H264 preview conversion.');
         const onPlay = () => setIsPlaying(true);
         const onPause = () => setIsPlaying(false);
+        const onEnd = () => {
+          // Auto-advance to next video in sequence
+          if (vidIdx < videos.length - 1) {
+            setVidIdx(vidIdx + 1);
+          } else {
+            setIsPlaying(false);
+          }
+        };
         v.addEventListener('loadedmetadata', onMeta);
         v.addEventListener('timeupdate', onTime);
         v.addEventListener('error', onErr);
         v.addEventListener('play', onPlay);
         v.addEventListener('pause', onPause);
-        return () => { v.removeEventListener('loadedmetadata',onMeta); v.removeEventListener('timeupdate',onTime); v.removeEventListener('error',onErr); v.removeEventListener('play',onPlay); v.removeEventListener('pause',onPause); };
-      }, [video]);
+        v.addEventListener('ended', onEnd);
+        return () => { v.removeEventListener('loadedmetadata',onMeta); v.removeEventListener('timeupdate',onTime); v.removeEventListener('error',onErr); v.removeEventListener('play',onPlay); v.removeEventListener('pause',onPause); v.removeEventListener('ended',onEnd); };
+      }, [video, vidIdx]);
 
       // Sync active speaker segment
       useEffect(() => {
@@ -298,51 +446,73 @@
         const idx = spkSegs.findIndex(s => absTime >= s.start && absTime <= s.end);
         if (idx !== activeSpkIdx && idx >= 0) {
           setActiveSpkIdx(idx);
-          // Auto-scroll transcript
           const el = document.getElementById(`vp-spk-${idx}`);
           if (el && transcriptRef.current) el.scrollIntoView({ behavior:'smooth', block:'center' });
         }
       }, [currentTime, spkSegs]);
 
-      // ESC to close
       useEffect(() => { const h = e => { if(e.key==='Escape') onClose(); }; window.addEventListener('keydown',h); return ()=>window.removeEventListener('keydown',h); }, []);
 
       const seekTo = (sec) => { if(vidRef.current) vidRef.current.currentTime = sec; };
       const togglePlay = () => { if(vidRef.current) vidRef.current.paused ? vidRef.current.play() : vidRef.current.pause(); };
 
-      // Topic time range relative to video start
+      // Seek within the unified timeline: find the right video + offset
+      const seekAbsolute = (absSec) => {
+        for (let i = 0; i < videos.length; i++) {
+          const vs = videos[i].video_start_sec || 0;
+          if (absSec >= vs && absSec < vs + 660) {
+            if (i !== vidIdx) setVidIdx(i);
+            setTimeout(() => { if(vidRef.current) vidRef.current.currentTime = absSec - vs; }, i !== vidIdx ? 200 : 0);
+            return;
+          }
+        }
+        // Fallback: seek in current video
+        seekTo(Math.max(0, absSec - vidStart));
+      };
+
       const topicRelStart = Math.max(0, (topicStart||0) - vidStart);
       const topicRelEnd = Math.min(duration, (topicEnd||duration) - vidStart);
+      const absCurrentTime = vidStart + currentTime;
 
-      // Build audio segment positions relative to video
-      const vadBlocks = (audioSegs||[]).map(seg => ({
-        left: Math.max(0, (seg.absolute_start - vidStart) / duration * 100),
-        width: Math.max(0.5, (seg.duration / duration) * 100),
-      }));
+      // Drag handler for video/transcript split
+      const dragVidPanel = useCallback((clientX) => {
+        if (!popupRef.current) return;
+        const rect = popupRef.current.getBoundingClientRect();
+        const newW = Math.min(Math.max(clientX - rect.left, 300), rect.width - 200);
+        setVidPanelW(newW);
+      }, []);
 
       return (
         <div style={{ position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,0.85)',zIndex:1000,display:'flex',alignItems:'center',justifyContent:'center',padding:20 }} onClick={onClose}>
-          <div style={{ background:T.surface,borderRadius:14,overflow:'hidden',width:'90vw',maxWidth:1000,maxHeight:'92vh',display:'flex',flexDirection:'column' }} onClick={e=>e.stopPropagation()}>
+          <div ref={popupRef} style={{ background:T.surface,borderRadius:14,overflow:'hidden',width:'92vw',maxWidth:1100,maxHeight:'92vh',display:'flex',flexDirection:'column' }} onClick={e=>e.stopPropagation()}>
             {/* Header */}
             <div style={{ display:'flex',justifyContent:'space-between',alignItems:'center',padding:'10px 18px',background:T.navBg,flexShrink:0 }}>
               <div style={{ display:'flex',alignItems:'center',gap:12 }}>
                 <span style={{ color:T.navActive,fontSize:12,fontWeight:600 }}>📹 {video.filename}</span>
-                <span style={{ color:T.navText,fontSize:10 }}>{video.time_label} · {video.size_mb} MB{video.is_preview?' · H264 preview':''}</span>
+                <span style={{ color:T.navText,fontSize:10 }}>{video.time_label} · {video.size_mb} MB{video.is_preview?' · H264':''}</span>
+                {videos.length > 1 && <span style={{ fontSize:9,fontWeight:700,padding:'2px 8px',borderRadius:8,background:`${T.accent}30`,color:'#fff' }}>
+                  Video {vidIdx+1}/{videos.length}
+                </span>}
               </div>
               <div style={{ display:'flex',alignItems:'center',gap:8 }}>
+                {videos.length > 1 && <>
+                  <button onClick={()=>setVidIdx(Math.max(0,vidIdx-1))} disabled={vidIdx<=0} style={{ background:'none',border:`1px solid ${T.navText}40`,color:vidIdx<=0?T.navText+'40':T.navActive,borderRadius:4,padding:'2px 8px',fontSize:10,cursor:vidIdx<=0?'default':'pointer' }}>◀ Prev Vid</button>
+                  <button onClick={()=>setVidIdx(Math.min(videos.length-1,vidIdx+1))} disabled={vidIdx>=videos.length-1} style={{ background:'none',border:`1px solid ${T.navText}40`,color:vidIdx>=videos.length-1?T.navText+'40':T.navActive,borderRadius:4,padding:'2px 8px',fontSize:10,cursor:vidIdx>=videos.length-1?'default':'pointer' }}>Next Vid ▶</button>
+                  <span style={{ width:1,height:16,background:T.navText+'30' }}/>
+                </>}
                 {allTopics && allTopics.length > 1 && <>
-                  <button onClick={()=>onTopicChange && onTopicChange(currentTopicIdx-1)} disabled={currentTopicIdx<=0} style={{ background:'none',border:`1px solid ${T.navText}40`,color:currentTopicIdx<=0?T.navText+'40':T.navActive,borderRadius:4,padding:'2px 8px',fontSize:10,cursor:currentTopicIdx<=0?'default':'pointer' }}>◀ Prev</button>
+                  <button onClick={()=>onTopicChange && onTopicChange(currentTopicIdx-1)} disabled={currentTopicIdx<=0} style={{ background:'none',border:`1px solid ${T.navText}40`,color:currentTopicIdx<=0?T.navText+'40':T.navActive,borderRadius:4,padding:'2px 8px',fontSize:10,cursor:currentTopicIdx<=0?'default':'pointer' }}>◀ Topic</button>
                   <span style={{ color:T.navText,fontSize:10 }}>Topic {(currentTopicIdx||0)+1}/{allTopics.length}</span>
-                  <button onClick={()=>onTopicChange && onTopicChange(currentTopicIdx+1)} disabled={currentTopicIdx>=allTopics.length-1} style={{ background:'none',border:`1px solid ${T.navText}40`,color:currentTopicIdx>=allTopics.length-1?T.navText+'40':T.navActive,borderRadius:4,padding:'2px 8px',fontSize:10,cursor:currentTopicIdx>=allTopics.length-1?'default':'pointer' }}>Next ▶</button>
+                  <button onClick={()=>onTopicChange && onTopicChange(currentTopicIdx+1)} disabled={currentTopicIdx>=allTopics.length-1} style={{ background:'none',border:`1px solid ${T.navText}40`,color:currentTopicIdx>=allTopics.length-1?T.navText+'40':T.navActive,borderRadius:4,padding:'2px 8px',fontSize:10,cursor:currentTopicIdx>=allTopics.length-1?'default':'pointer' }}>Topic ▶</button>
                 </>}
                 <button onClick={onClose} style={{ background:'none',border:'none',color:T.navText,fontSize:18,cursor:'pointer',marginLeft:8 }}>✕</button>
               </div>
             </div>
 
-            {/* Video + Transcript side by side */}
+            {/* Video + Transcript side by side with drag divider */}
             <div style={{ display:'flex',flex:1,overflow:'hidden',minHeight:0 }}>
               {/* Video side */}
-              <div style={{ flex:3,display:'flex',flexDirection:'column',background:'#000',minWidth:0 }}>
+              <div style={{ width: vidPanelW || undefined, flex: vidPanelW ? 'none' : 3, display:'flex',flexDirection:'column',background:'#000',minWidth:300,overflow:'hidden' }}>
                 {videoError ? (
                   <div style={{ flex:1,display:'flex',alignItems:'center',justifyContent:'center',padding:40 }}>
                     <div style={{ textAlign:'center' }}>
@@ -352,34 +522,50 @@
                     </div>
                   </div>
                 ) : (
-                  <video ref={vidRef} style={{ flex:1,width:'100%',minHeight:0,objectFit:'contain',background:'#000' }} src={video.url} playsInline />
+                  <video ref={vidRef} key={video.url} style={{ flex:1,width:'100%',minHeight:0,objectFit:'contain',background:'#000' }} src={video.url} playsInline />
                 )}
 
-                {/* Timeline bar */}
+                {/* Unified timeline bar spanning all videos */}
                 <div style={{ padding:'8px 16px',background:'#111',flexShrink:0 }}>
                   <div style={{ position:'relative',height:32,background:'#222',borderRadius:4,cursor:'pointer',overflow:'hidden' }}
-                    onClick={e => { const r = e.currentTarget.getBoundingClientRect(); seekTo((e.clientX-r.left)/r.width*duration); }}>
-                    {/* VAD speech blocks (gray) */}
-                    {vadBlocks.map((b,i) => <div key={`v${i}`} style={{ position:'absolute',top:4,bottom:4,left:`${b.left}%`,width:`${b.width}%`,background:'#555',borderRadius:2 }} />)}
-                    {/* Topic highlight (orange) */}
-                    <div style={{ position:'absolute',top:0,bottom:0,left:`${topicRelStart/duration*100}%`,width:`${(topicRelEnd-topicRelStart)/duration*100}%`,background:`${T.accent}40`,borderLeft:`2px solid ${T.accent}`,borderRight:`2px solid ${T.accent}` }} />
+                    onClick={e => { const r = e.currentTarget.getBoundingClientRect(); const pct=(e.clientX-r.left)/r.width; seekAbsolute(allVidStart + pct * totalSpan); }}>
+                    {/* Video segment boundaries */}
+                    {videos.map((v,i) => {
+                      const vs = v.video_start_sec||0;
+                      const left = (vs - allVidStart) / totalSpan * 100;
+                      const w = 600 / totalSpan * 100;
+                      return <div key={`seg${i}`} style={{ position:'absolute',top:2,bottom:2,left:`${left}%`,width:`${w}%`,background:i===vidIdx?'#444':'#333',borderRadius:2,borderRight:'1px solid #555' }}>
+                        {videos.length>1&&<span style={{ position:'absolute',top:2,left:4,fontSize:7,color:'#777' }}>{i+1}</span>}
+                      </div>;
+                    })}
+                    {/* VAD speech blocks */}
+                    {(audioSegs||[]).map((seg,i) => {
+                      const left = (seg.absolute_start - allVidStart) / totalSpan * 100;
+                      const w = Math.max(0.3, seg.duration / totalSpan * 100);
+                      return <div key={`vad${i}`} style={{ position:'absolute',top:6,bottom:6,left:`${left}%`,width:`${w}%`,background:'#6a6',borderRadius:1,opacity:0.5 }} />;
+                    })}
+                    {/* Topic highlight */}
+                    {topicStart!=null&&<div style={{ position:'absolute',top:0,bottom:0,left:`${((topicStart||0)-allVidStart)/totalSpan*100}%`,width:`${((topicEnd||topicStart||0)-(topicStart||0))/totalSpan*100}%`,background:`${T.accent}30`,borderLeft:`2px solid ${T.accent}`,borderRight:`2px solid ${T.accent}` }} />}
                     {/* Playhead */}
-                    <div style={{ position:'absolute',top:0,bottom:0,left:`${currentTime/duration*100}%`,width:2,background:'#fff',zIndex:2 }} />
+                    <div style={{ position:'absolute',top:0,bottom:0,left:`${(absCurrentTime-allVidStart)/totalSpan*100}%`,width:2,background:'#fff',zIndex:2 }} />
                   </div>
-                  {/* Time labels */}
                   <div style={{ display:'flex',justifyContent:'space-between',marginTop:4 }}>
-                    <span style={{ fontSize:9,fontFamily:T.mono,color:'#888' }}>{Math.floor(currentTime/60)}:{String(Math.floor(currentTime%60)).padStart(2,'0')}</span>
+                    <span style={{ fontSize:9,fontFamily:T.mono,color:'#888' }}>{Math.floor(absCurrentTime/3600)}:{String(Math.floor((absCurrentTime%3600)/60)).padStart(2,'0')}:{String(Math.floor(absCurrentTime%60)).padStart(2,'0')}</span>
                     <span style={{ fontSize:9,color:'#666' }}>
-                      <span style={{ color:T.accent }}>■</span> topic range &nbsp;
-                      <span style={{ color:'#555' }}>■</span> speech detected
+                      <span style={{ color:T.accent }}>■</span> topic &nbsp;
+                      <span style={{ color:'#6a6' }}>■</span> speech &nbsp;
+                      {videos.length>1&&<><span style={{ color:'#444' }}>■</span> video segments</>}
                     </span>
-                    <span style={{ fontSize:9,fontFamily:T.mono,color:'#888' }}>{Math.floor(duration/60)}:{String(Math.floor(duration%60)).padStart(2,'0')}</span>
+                    <span style={{ fontSize:9,fontFamily:T.mono,color:'#888' }}>{Math.floor(allVidEnd/3600)}:{String(Math.floor((allVidEnd%3600)/60)).padStart(2,'0')}:{String(Math.floor(allVidEnd%60)).padStart(2,'0')}</span>
                   </div>
                 </div>
               </div>
 
+              {/* Drag divider */}
+              <DragDivider direction="vertical" onDrag={dragVidPanel} style={{ background:'#1a1a1a' }} />
+
               {/* Transcript side */}
-              <div style={{ flex:2,display:'flex',flexDirection:'column',borderLeft:`1px solid ${T.border}`,minWidth:0 }}>
+              <div style={{ flex: vidPanelW ? 1 : 2, display:'flex',flexDirection:'column',minWidth:180,overflow:'hidden' }}>
                 <div style={{ padding:'10px 14px',background:T.surfaceAlt,borderBottom:`1px solid ${T.borderLight}`,flexShrink:0 }}>
                   <div style={{ fontSize:10,fontWeight:700,color:T.textTertiary,letterSpacing:0.5 }}>LIVE TRANSCRIPT</div>
                   <div style={{ fontSize:9,color:T.textTertiary,marginTop:2 }}>{spkSegs.length} segments · click to jump</div>
@@ -390,10 +576,9 @@
                   {spkSegs.map((seg,i) => {
                     const isActive = i === activeSpkIdx;
                     const isInTopic = seg.start >= (topicStart||0) && seg.start <= (topicEnd||99999);
-                    const segRelTime = seg.start - vidStart;
                     return (
                       <div id={`vp-spk-${i}`} key={i}
-                        onClick={() => seekTo(Math.max(0, segRelTime))}
+                        onClick={() => seekAbsolute(seg.start)}
                         style={{ padding:'6px 14px',cursor:'pointer',background:isActive?`${T.accent}15`:isInTopic?`${T.primary}08`:'transparent',borderLeft:`3px solid ${isActive?T.accent:isInTopic?T.primary:'transparent'}`,transition:'background 0.2s' }}>
                         <div style={{ display:'flex',gap:6,alignItems:'center',marginBottom:2 }}>
                           <span style={{ width:8,height:8,borderRadius:'50%',background:spkColors[seg.speaker]||T.primary,flexShrink:0 }} />
@@ -412,7 +597,8 @@
             {/* Bottom controls */}
             <div style={{ display:'flex',alignItems:'center',justifyContent:'center',gap:12,padding:'8px 16px',background:T.surfaceAlt,borderTop:`1px solid ${T.borderLight}`,flexShrink:0 }}>
               <button onClick={togglePlay} style={{ padding:'6px 20px',background:isPlaying?T.textSecondary:T.primary,color:'#fff',border:'none',borderRadius:6,fontSize:11,fontWeight:600,cursor:'pointer' }}>{isPlaying?'⏸ Pause':'▶ Play'}</button>
-              <button onClick={()=>seekTo(topicRelStart)} style={{ padding:'6px 14px',background:T.accent,color:'#fff',border:'none',borderRadius:6,fontSize:11,fontWeight:600,cursor:'pointer' }}>↺ Jump to Topic</button>
+              <button onClick={()=>seekAbsolute(topicStart||0)} style={{ padding:'6px 14px',background:T.accent,color:'#fff',border:'none',borderRadius:6,fontSize:11,fontWeight:600,cursor:'pointer' }}>↺ Jump to Topic</button>
+              {videos.length>1&&<span style={{ fontSize:9,color:T.textTertiary }}>Video {vidIdx+1} of {videos.length} · auto-advances</span>}
             </div>
           </div>
         </div>
@@ -420,7 +606,7 @@
     }
 
     /* ─── TopicDetail ─── */
-    function TopicDetail({ topic, date, token, user, allTopics, onTopicChange }) {
+    function TopicDetail({ topic, date, token, user, allTopics, onTopicChange, onAskAbout }) {
       const [showT, setShowT] = useState(false);
       const [transcript, setTranscript] = useState(null);
       const [tLoading, setTLoading] = useState(false);
@@ -429,6 +615,11 @@
       const [activeVideo, setActiveVideo] = useState(null);
       const [checked, setChecked] = useState(new Set());
       const [checkedMeta, setCheckedMeta] = useState({});
+      const [topicPriority, setTopicPriority] = useState(null);
+      const [corrections, setCorrections] = useState([]);
+      const [editField, setEditField] = useState(null); // {field, original_text}
+      const [editText, setEditText] = useState('');
+      const [editSubmitting, setEditSubmitting] = useState(false);
       const [playingIdx, setPlayingIdx] = useState(-1);
       const [isAudioPlaying, setIsAudioPlaying] = useState(false);
       const audioRef = useRef(null);
@@ -443,7 +634,7 @@
       };
       const topicTime = parseTopicTime();
 
-      useEffect(() => { setChecked(new Set()); setCheckedMeta({}); setShowT(false); setTranscript(null); setAudioSegs([]); setVideoSegs([]); setPlayingIdx(-1); setIsAudioPlaying(false); setActiveVideo(null); if(audioRef.current){audioRef.current.pause();audioRef.current=null;} clearInterval(progTimer.current); }, [topic?.topic_id, date]);
+      useEffect(() => { setChecked(new Set()); setCheckedMeta({}); setShowT(false); setTranscript(null); setAudioSegs([]); setVideoSegs([]); setPlayingIdx(-1); setIsAudioPlaying(false); setActiveVideo(null); setTopicPriority(null); setCorrections([]); setEditField(null); if(audioRef.current){audioRef.current.pause();audioRef.current=null;} clearInterval(progTimer.current); }, [topic?.topic_id, date]);
 
       // Load actions + audio + video when topic changes
       useEffect(() => {
@@ -466,6 +657,8 @@
           .then(data => setAudioSegs(data.segments || [])).catch(() => {});
         api(`/api/video-segments?date=${date}${uParam}&start=${startStr}&end=${endStr}`, token)
           .then(data => setVideoSegs(data.videos || [])).catch(() => {});
+        api(`/api/corrections?date=${date}${uParam}&topic_id=${topic.topic_id}`, token)
+          .then(data => setCorrections(data.corrections || [])).catch(() => {});
       }, [token, date, topic?.topic_id]);
 
       const toggleCheck = (i, actionText) => {
@@ -477,6 +670,7 @@
 
       const loadTranscript = () => {
         setShowT(!showT);
+        if (!showT) trackEvent('transcript_expand', { topic_id: topic?.topic_id });
         if (!showT && !transcript && topic?.time_range && token) {
           setTLoading(true);
           const [startStr] = (topic.time_range || '').split('–').map(s => s.trim());
@@ -505,9 +699,22 @@
       };
       const togglePlay = () => {
         if (playingIdx >= 0 && audioRef.current) {
-          if (audioRef.current.paused) { audioRef.current.play(); setIsAudioPlaying(true); }
+          if (audioRef.current.paused) { audioRef.current.play(); setIsAudioPlaying(true); trackEvent('audio_play', { topic_id: topic?.topic_id }); }
           else { audioRef.current.pause(); setIsAudioPlaying(false); }
-        } else { playSegment(0); }
+        } else { playSegment(0); trackEvent('audio_play', { topic_id: topic?.topic_id }); }
+      };
+
+      const getCorrection = (field) => corrections.find(c => c.field === field);
+      const submitCorrection = () => {
+        if (!editField || !editText.trim() || editSubmitting) return;
+        setEditSubmitting(true);
+        api('/api/reports/correction', token, { method:'POST', body:JSON.stringify({
+          date, topic_id: topic.topic_id, field: editField.field,
+          original_text: editField.original_text, corrected_text: editText.trim(), user
+        })}).then(() => {
+          setCorrections(prev => [...prev.filter(c => c.field !== editField.field), { field: editField.field, corrected_text: editText.trim(), corrected_by: 'You', corrected_at: new Date().toISOString() }]);
+          setEditField(null); setEditText('');
+        }).catch(() => {}).finally(() => setEditSubmitting(false));
       };
 
       if (!topic) return <div style={{ flex:1,display:"flex",alignItems:"center",justifyContent:"center",background:T.bg }}><div style={{ textAlign:"center" }}><div style={{ fontSize:48,opacity:0.12 }}>📋</div><div style={{ fontSize:15,color:T.textTertiary,fontWeight:600,marginTop:12 }}>Select a topic</div></div></div>;
@@ -515,10 +722,9 @@
       const totalAudioDur = audioSegs.reduce((s,seg) => s + seg.duration, 0);
 
       return (
-        <div style={{ flex:1,display:"flex",flexDirection:"column",background:T.bg,overflow:"hidden" }}>
-          {activeVideo && <VideoPopup video={activeVideo} onClose={()=>setActiveVideo(null)}
+        <div style={{ flex:1,display:"flex",flexDirection:"column",background:T.bg,overflow:"hidden",position:"relative" }}>
+          {activeVideo && <VideoPopup videoSegs={videoSegs} onClose={()=>setActiveVideo(null)}
             topicStart={topicTime.start} topicEnd={topicTime.end}
-            videoStartSec={activeVideo.video_start_sec}
             audioSegs={audioSegs} allTopics={allTopics}
             currentTopicIdx={topic?.topic_id} onTopicChange={onTopicChange}
             token={token} date={date} user={user} />}
@@ -529,9 +735,28 @@
               <span style={{ fontSize:16,fontWeight:700,color:T.text }}>{topic.topic_title}</span>
               {cat&&<span style={{ fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:10,background:cat.bg,color:cat.color }}>{cat.icon} {cat.label}</span>}
               {hs.length>0&&<span style={{ fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:10,background:T.dangerBg,color:T.danger }}>⚠ HIGH RISK</span>}
-              {videoSegs.length>0&&<button onClick={()=>setActiveVideo(videoSegs[0])} style={{ fontSize:9,fontWeight:700,padding:"3px 10px",borderRadius:10,background:`${T.accent}15`,color:T.accent,border:`1px solid ${T.accent}30`,cursor:'pointer',display:'flex',alignItems:'center',gap:3 }}>📹 Watch Video</button>}
+              {videoSegs.length>0&&<button onClick={()=>{setActiveVideo(true);trackEvent('video_play',{topic_id:topic?.topic_id});}} style={{ fontSize:9,fontWeight:700,padding:"3px 10px",borderRadius:10,background:`${T.accent}15`,color:T.accent,border:`1px solid ${T.accent}30`,cursor:'pointer',display:'flex',alignItems:'center',gap:3 }}>📹 Watch Video{videoSegs.length>1?` (${videoSegs.length})`:''}</button>}
+              {onAskAbout&&<button onClick={()=>onAskAbout(topic)} style={{ fontSize:9,fontWeight:700,padding:"3px 10px",borderRadius:10,background:`${T.primaryLight}15`,color:T.primaryLight,border:`1px solid ${T.primaryLight}30`,cursor:'pointer' }}>💬 Ask about this</button>}
             </div>
-            <div style={{ fontSize:11,color:T.textSecondary,marginTop:4 }}>{topic.time_range}</div>
+            <div style={{ display:"flex",alignItems:"center",gap:12,marginTop:4 }}>
+              <span style={{ fontSize:11,color:T.textSecondary }}>{topic.time_range}</span>
+              {/* Priority override selector */}
+              <div style={{ display:"flex",gap:2 }}>
+                {['high','medium','low'].map(p=>{
+                  const cur=topicPriority||topic.priority||'medium';
+                  const active=cur===p;
+                  const colors={high:{bg:T.dangerBg,c:T.danger,l:'▲'},medium:{bg:T.surfaceAlt,c:T.textSecondary,l:'—'},low:{bg:`${T.primaryLight}10`,c:T.primaryLight,l:'▼'}};
+                  const s=colors[p];
+                  return <button key={p} onClick={()=>{setTopicPriority(p);api('/api/topics/priority',token,{method:'POST',body:JSON.stringify({date,topic_id:topic.topic_id,priority:p,original_priority:topic.priority||'medium',user})}).catch(()=>{});}} style={{ fontSize:8,fontWeight:700,padding:"2px 6px",borderRadius:6,background:active?s.bg:'transparent',color:active?s.c:T.textTertiary,border:`1px solid ${active?s.c+'40':'transparent'}`,cursor:'pointer' }}>{s.l} {p.charAt(0).toUpperCase()+p.slice(1)}</button>;
+                })}
+              </div>
+              {/* One-pager button */}
+              <button onClick={()=>window.open(`${CONFIG.apiBase}/api/onepager?date=${date}&user=${encodeURIComponent(user)}`,'_blank')} style={{ fontSize:8,fontWeight:700,padding:"2px 8px",borderRadius:6,background:`${T.accent}10`,color:T.accent,border:`1px solid ${T.accent}30`,cursor:'pointer',marginLeft:'auto' }}>📄 One-Pager</button>
+            </div>
+            {(topic.participants||[]).length>0&&<div style={{ display:"flex",gap:4,marginTop:6,flexWrap:"wrap" }}>
+              <span style={{ fontSize:9,color:T.textTertiary }}>Participants:</span>
+              {topic.participants.map((p,i)=><span key={i} style={{ fontSize:9,fontWeight:600,padding:"2px 8px",borderRadius:10,background:`${T.primaryLight}15`,color:T.primaryLight,border:`1px solid ${T.primaryLight}25` }}>{p}</span>)}
+            </div>}
 
             {/* Unified Audio Player */}
             {audioSegs.length > 0 && (
@@ -555,7 +780,7 @@
 
           {/* Content */}
           <div style={{ flex:1,overflowY:"auto",padding:"18px 24px" }}>
-            <Section title="SUMMARY"><Card><p style={{ fontSize:13,color:T.text,lineHeight:1.7,margin:0 }}>{topic.summary}</p></Card></Section>
+            <Section title={<span style={{display:'flex',alignItems:'center',gap:6}}>SUMMARY {getCorrection('summary')&&<span style={{fontSize:8,fontWeight:700,padding:'1px 6px',borderRadius:6,background:`${T.warning}20`,color:T.warning||'#e67e22'}}>✏ Corrected</span>} <button onClick={()=>{setEditField({field:'summary',original_text:topic.summary});setEditText(getCorrection('summary')?.corrected_text||topic.summary);}} style={{fontSize:8,fontWeight:600,padding:'1px 6px',borderRadius:6,background:'transparent',color:T.textTertiary,border:`1px solid ${T.borderLight}`,cursor:'pointer'}}>Edit</button></span>}><Card><p style={{ fontSize:13,color:T.text,lineHeight:1.7,margin:0 }}>{getCorrection('summary')?.corrected_text||topic.summary}</p></Card></Section>
             {hs.length>0&&<Section title="SAFETY ALERTS">{hs.map((sf,i)=><Card key={i} borderColor={T.danger}><div style={{ fontSize:12,fontWeight:600,color:T.danger,marginBottom:4 }}>⚠ {sf.observation}</div><div style={{ fontSize:11,color:T.textSecondary }}>Recommended: {sf.recommended_action}</div></Card>)}</Section>}
             {topic.key_decisions?.length>0&&<Section title="KEY DECISIONS"><Card>{topic.key_decisions.map((d,i)=><div key={i} style={{ display:"flex",gap:8,marginBottom:i<topic.key_decisions.length-1?8:0 }}><span style={{ color:T.primary,fontSize:11 }}>→</span><span style={{ fontSize:12,color:T.text,lineHeight:1.5 }}>{d}</span></div>)}</Card></Section>}
             {topic.action_items?.length>0&&<Section title={`ACTION ITEMS (${topic.action_items.length})`}><Card>{topic.action_items.map((ai,i)=><div key={i} style={{ display:"flex",gap:10,padding:"8px 0",borderBottom:i<topic.action_items.length-1?`1px solid ${T.borderLight}`:"none",opacity:checked.has(i)?0.5:1,transition:"opacity 0.2s" }}>
@@ -598,7 +823,22 @@
                 ):(!tLoading&&transcript&&<div style={{ background:T.surface,borderRadius:8,padding:"14px 16px",border:`1px solid ${T.borderLight}` }}><p style={{ fontSize:12,color:T.textTertiary,margin:0 }}>No transcript found for this time range.</p></div>)}
               </div>}
             </Section>
+
+            {/* Ask Agent moved to GlobalAskPanel — use "Ask about this" button in header */}
           </div>
+
+          {/* Correction Edit Modal */}
+          {editField && <div style={{ position:'absolute',inset:0,background:'rgba(0,0,0,0.5)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:100 }} onClick={()=>setEditField(null)}>
+            <div onClick={e=>e.stopPropagation()} style={{ background:T.surface,borderRadius:12,padding:20,width:'90%',maxWidth:500,maxHeight:'80vh',display:'flex',flexDirection:'column',gap:12,boxShadow:'0 8px 32px rgba(0,0,0,0.3)' }}>
+              <div style={{ fontSize:14,fontWeight:700,color:T.text }}>Edit: {editField.field}</div>
+              <div style={{ fontSize:10,color:T.textTertiary }}>Original text is preserved. Your correction will be applied on top.</div>
+              <textarea value={editText} onChange={e=>setEditText(e.target.value)} style={{ width:'100%',minHeight:120,padding:10,fontSize:12,lineHeight:1.6,fontFamily:T.font,borderRadius:8,border:`1px solid ${T.borderLight}`,background:T.bg,color:T.text,resize:'vertical',boxSizing:'border-box' }} />
+              <div style={{ display:'flex',gap:8,justifyContent:'flex-end' }}>
+                <button onClick={()=>setEditField(null)} style={{ fontSize:11,padding:'6px 14px',borderRadius:6,background:'transparent',color:T.textSecondary,border:`1px solid ${T.borderLight}`,cursor:'pointer' }}>Cancel</button>
+                <button onClick={submitCorrection} disabled={editSubmitting} style={{ fontSize:11,fontWeight:700,padding:'6px 14px',borderRadius:6,background:T.primary,color:'#fff',border:'none',cursor:editSubmitting?'wait':'pointer',opacity:editSubmitting?0.6:1 }}>{editSubmitting?'Saving...':'Save Correction'}</button>
+              </div>
+            </div>
+          </div>}
         </div>
       );
     }
@@ -621,10 +861,90 @@
       );
     }
 
+    /* ─── SearchTab ─── */
+    function SearchTab({ token, onNavigate }) {
+      const today = new Date().toISOString().slice(0,10);
+      const thirtyAgo = (()=>{ const d=new Date(); d.setDate(d.getDate()-30); return d.toISOString().slice(0,10); })();
+      const [q, setQ] = useState('');
+      const [startDate, setStartDate] = useState(thirtyAgo);
+      const [endDate, setEndDate] = useState(today);
+      const [category, setCategory] = useState('');
+      const [results, setResults] = useState(null);
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState('');
+
+      const doSearch = () => {
+        if (!startDate || !endDate) { setError('Select a date range'); return; }
+        setLoading(true); setError(''); setResults(null);
+        trackEvent('search_query', { query: q.trim(), category, start_date: startDate, end_date: endDate });
+        const params = new URLSearchParams({ start_date: startDate, end_date: endDate });
+        if (q.trim()) params.append('q', q.trim());
+        if (category) params.append('category', category);
+        api(`/api/search?${params}`, token)
+          .then(data => setResults(data))
+          .catch(e => setError(e.message))
+          .finally(() => setLoading(false));
+      };
+
+      const categories = ['Safety','Progress','Quality','Planning','Compliance','General'];
+
+      return (
+        <div style={{ flex:1,padding:24,overflowY:"auto",background:T.bg }}>
+          <div style={{ maxWidth:740 }}>
+            <div style={{ fontSize:18,fontWeight:700,color:T.text,marginBottom:4 }}>Knowledge Base Search</div>
+            <div style={{ fontSize:12,color:T.textSecondary,marginBottom:20 }}>Search across all reports and topics</div>
+
+            {/* Search controls */}
+            <div style={{ background:T.surface,borderRadius:10,padding:16,border:`1px solid ${T.borderLight}`,marginBottom:16 }}>
+              <div style={{ display:"flex",gap:8,flexWrap:"wrap",marginBottom:8 }}>
+                <input value={q} onChange={e=>setQ(e.target.value)} onKeyDown={e=>e.key==='Enter'&&doSearch()} placeholder="Search topics, summaries..." style={{ flex:1,minWidth:180,padding:"8px 12px",border:`1px solid ${T.border}`,borderRadius:6,fontSize:12,fontFamily:T.font,background:T.bg,color:T.text }} />
+                <select value={category} onChange={e=>setCategory(e.target.value)} style={{ padding:"8px 10px",border:`1px solid ${T.border}`,borderRadius:6,fontSize:11,fontFamily:T.font,background:T.bg,color:T.text }}>
+                  <option value="">All categories</option>
+                  {categories.map(c=><option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+              <div style={{ display:"flex",gap:8,alignItems:"center",flexWrap:"wrap" }}>
+                <span style={{ fontSize:11,color:T.textSecondary }}>From</span>
+                <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)} style={{ padding:"6px 10px",border:`1px solid ${T.border}`,borderRadius:6,fontSize:11,fontFamily:T.font,background:T.bg,color:T.text }} />
+                <span style={{ fontSize:11,color:T.textSecondary }}>to</span>
+                <input type="date" value={endDate} onChange={e=>setEndDate(e.target.value)} style={{ padding:"6px 10px",border:`1px solid ${T.border}`,borderRadius:6,fontSize:11,fontFamily:T.font,background:T.bg,color:T.text }} />
+                <button onClick={doSearch} disabled={loading} style={{ padding:"8px 20px",background:loading?T.textTertiary:T.primary,color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:600,cursor:loading?"default":"pointer" }}>{loading?"Searching...":"Search"}</button>
+              </div>
+            </div>
+
+            {error&&<div style={{ padding:"10px 14px",background:T.dangerBg,color:T.danger,borderRadius:6,fontSize:12,marginBottom:12 }}>{error}</div>}
+
+            {results&&<div>
+              <div style={{ fontSize:11,color:T.textTertiary,marginBottom:10 }}>{results.count} result{results.count!==1?"s":""} {results.truncated?"(showing top 200)":""}</div>
+              {results.items.length===0&&<div style={{ padding:24,textAlign:"center",color:T.textTertiary,fontSize:12 }}>No results found</div>}
+              {results.items.map((item,i)=>{
+                const cat=topicColors[item.category];
+                const hasHighRisk=(item.safety_flags||[]).some(f=>f.risk_level==="high");
+                return <div key={i} onClick={()=>onNavigate(item.date)} style={{ background:T.surface,borderRadius:8,padding:"12px 14px",marginBottom:6,border:`1px solid ${T.borderLight}`,cursor:"pointer",transition:"border-color 0.15s" }}
+                  onMouseEnter={e=>e.currentTarget.style.borderColor=T.primary}
+                  onMouseLeave={e=>e.currentTarget.style.borderColor=T.borderLight}>
+                  <div style={{ display:"flex",alignItems:"center",gap:6,marginBottom:4,flexWrap:"wrap" }}>
+                    <span style={{ fontSize:12,fontWeight:600,color:T.text }}>{item.topic_title}</span>
+                    {cat&&<span style={{ fontSize:9,fontWeight:700,padding:"2px 7px",borderRadius:8,background:cat.bg,color:cat.color }}>{cat.icon} {cat.label}</span>}
+                    {hasHighRisk&&<span style={{ fontSize:9,fontWeight:700,padding:"2px 7px",borderRadius:8,background:T.dangerBg,color:T.danger }}>⚠ HIGH RISK</span>}
+                    <span style={{ fontSize:9,color:T.textTertiary,marginLeft:"auto" }}>{item.date} · {item.time_range}</span>
+                  </div>
+                  <div style={{ fontSize:11,color:T.textSecondary,lineHeight:1.5,overflow:"hidden",textOverflow:"ellipsis",display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical" }}>{item.summary}</div>
+                  {item.action_items?.length>0&&<div style={{ fontSize:10,color:T.textTertiary,marginTop:4 }}>📌 {item.action_items.length} action item{item.action_items.length!==1?"s":""}</div>}
+                </div>;
+              })}
+            </div>}
+          </div>
+        </div>
+      );
+    }
+
     /* ─── LeftPanel ─── */
-    function LeftPanel({ report, loading, error, selected, setSelected, hidden, toggleHide, selectedDate, setSelectedDate, dateData, onRegenerate, token, user }) {
+    function LeftPanel({ report, loading, error, selected, setSelected, hidden, toggleHide, selectedDate, setSelectedDate, dateData, calendarEvents, onRegenerate, token, user, width }) {
       const [calOpen,setCalOpen]=useState(false); const calRef=useRef(null);
       const [recStats, setRecStats] = useState(null);
+      const [execH, setExecH] = useState(160);
+      const leftPanelRef = useRef(null);
 
       useEffect(()=>{ const h=e=>{if(calRef.current&&!calRef.current.contains(e.target))setCalOpen(false)}; document.addEventListener("mousedown",h); return()=>document.removeEventListener("mousedown",h); },[]);
 
@@ -645,8 +965,17 @@
       const ac=vis.reduce((s,t)=>s+(t.action_items?.length||0),0);
       const pc=vis.reduce((s,t)=>s+(t.photo_count||0),0);
 
+      const dragExec = useCallback((clientY) => {
+        if (!leftPanelRef.current) return;
+        const rect = leftPanelRef.current.getBoundingClientRect();
+        // Account for the header area (~120px for date picker + pills)
+        const headerOffset = 140;
+        const newH = Math.min(Math.max(clientY - rect.top - headerOffset, 60), 400);
+        setExecH(newH);
+      }, []);
+
       return (
-        <div style={{ width:380,minWidth:380,borderRight:`1px solid ${T.border}`,display:"flex",flexDirection:"column",background:T.bg }}>
+        <div ref={leftPanelRef} style={{ width:width||380,minWidth:260,maxWidth:600,borderRight:'none',display:"flex",flexDirection:"column",background:T.bg,overflow:"hidden" }}>
           <div style={{ padding:"14px 18px 12px",background:T.surface,borderBottom:`1px solid ${T.borderLight}` }}>
             <div ref={calRef} style={{ position:"relative" }}>
               <div style={{ display:"flex",alignItems:"center",gap:8 }}>
@@ -657,7 +986,7 @@
                 </div>
                 <button onClick={()=>{const[y,m,dy]=selectedDate.split('-').map(Number);const n=new Date(Date.UTC(y,m-1,dy+1));setSelectedDate(n.toISOString().slice(0,10))}} style={{ background:T.inputBg,border:`1px solid ${T.borderLight}`,borderRadius:6,padding:"4px 10px",fontSize:14,cursor:"pointer",color:T.textSecondary }}>›</button>
               </div>
-              {calOpen&&<CalendarPicker selectedDate={selectedDate} onSelect={setSelectedDate} onClose={()=>setCalOpen(false)} dateData={dateData}/>}
+              {calOpen&&<CalendarPicker selectedDate={selectedDate} onSelect={setSelectedDate} onClose={()=>setCalOpen(false)} dateData={dateData} calendarEvents={calendarEvents}/>}
             </div>
             {report&&<div style={{ display:"flex",gap:5,marginTop:10,flexWrap:"wrap" }}>
               {recStats?<>
@@ -673,7 +1002,7 @@
           {loading&&<div style={{ padding:40,textAlign:"center" }}><div style={{ fontSize:12,color:T.textTertiary }}>Loading report...</div></div>}
           {error&&<div style={{ padding:20 }}><div style={{ background:T.dangerBg,borderRadius:8,padding:"12px 16px",fontSize:12,color:T.danger }}>{error}</div></div>}
           {!loading&&!error&&!report&&<div style={{ padding:40,textAlign:"center" }}><div style={{ fontSize:32,opacity:0.15 }}>📋</div><div style={{ fontSize:13,color:T.textTertiary,marginTop:8 }}>No report for this date</div><button onClick={onRegenerate} style={{ marginTop:12,padding:"8px 16px",background:T.accent,color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:600,cursor:"pointer" }}>Generate Report</button></div>}
-          {report?.executive_summary&&<div style={{ padding:"10px 18px",borderBottom:`1px solid ${T.borderLight}`,background:T.surface }}>
+          {report?.executive_summary&&<div style={{ maxHeight:execH,minHeight:50,overflowY:'auto',padding:"10px 18px",borderBottom:'none',background:T.surface,flexShrink:0 }}>
           <div style={{ display:"flex",alignItems:"center",gap:6,marginBottom:5 }}>
             <div style={{ width:3,height:14,borderRadius:2,background:T.accent }}/>
             <span style={{ fontSize:10,fontWeight:700,color:T.accent,letterSpacing:0.5 }}>EXECUTIVE SUMMARY</span>
@@ -691,11 +1020,12 @@
             <p style={{ fontSize:11,color:T.textSecondary,lineHeight:1.65,margin:0 }}>{report.executive_summary}</p>
           )}
         </div>}
+          {report?.executive_summary&&<DragDivider direction="horizontal" onDrag={dragExec} />}
           {topics.length>0&&<div style={{ flex:1,overflowY:"auto" }}>
             <div style={{ padding:"8px 18px 4px",fontSize:10,fontWeight:700,color:T.textTertiary,letterSpacing:0.8 }}>TOPICS ({vis.length}){hidden.size>0&&<span style={{ fontWeight:400,marginLeft:6 }}>· {hidden.size} hidden</span>}</div>
             {topics.map((t,i)=>{
               const isH=hidden.has(i);const isSel=selected===i;const cat=topicColors[t.category];const hh=t.safety_flags?.some(f=>f.risk_level==="high");
-              return <div key={i} onClick={()=>!isH&&setSelected(i)} style={{ padding:"11px 18px",cursor:isH?"default":"pointer",background:isSel?T.primaryFaded:"transparent",borderLeft:`3px solid ${isSel?T.primary:"transparent"}`,borderBottom:`1px solid ${T.borderLight}`,opacity:isH?0.2:1 }}>
+              return <div key={i} onClick={()=>{if(!isH){setSelected(i);trackEvent('topic_click',{topic_id:t.topic_id,category:t.category});}}} style={{ padding:"11px 18px",cursor:isH?"default":"pointer",background:isSel?T.primaryFaded:"transparent",borderLeft:`3px solid ${isSel?T.primary:"transparent"}`,borderBottom:`1px solid ${T.borderLight}`,opacity:isH?0.2:1 }}>
                 <div style={{ display:"flex",gap:8,alignItems:"flex-start" }}>
                   <span style={{ fontSize:11,fontWeight:700,color:T.text,fontFamily:T.mono,minWidth:42 }}>{(t.time_range||"").split("–")[0]?.trim()}</span>
                   <div style={{ flex:1,minWidth:0 }}>
@@ -703,6 +1033,7 @@
                     <div style={{ display:"flex",gap:4,marginTop:3,flexWrap:"wrap" }}>
                       {cat&&<span style={{ fontSize:8,fontWeight:700,padding:"1px 6px",borderRadius:8,background:cat.bg,color:cat.color }}>{cat.icon} {cat.label}</span>}
                       {hh&&<span style={{ fontSize:8,fontWeight:700,padding:"1px 6px",borderRadius:8,background:T.dangerBg,color:T.danger }}>⚠ HIGH</span>}
+                      {(t.participants||[]).length>0&&<span style={{ fontSize:8,fontWeight:600,padding:"1px 6px",borderRadius:8,background:`${T.primaryLight}15`,color:T.primaryLight,border:`1px solid ${T.primaryLight}25` }}>{t.participants[0]}{t.participants.length>1?` · ${t.participants.length} people`:''}</span>}
                     </div>
                     <div style={{ fontSize:10,color:T.textSecondary,marginTop:3,lineHeight:1.4,overflow:"hidden",textOverflow:"ellipsis",display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical" }}>{t.summary}</div>
                   </div>
@@ -712,6 +1043,141 @@
             })}
           </div>}
           {report&&<div style={{ padding:"10px 18px",borderTop:`1px solid ${T.border}`,background:T.surface }}><button onClick={onRegenerate} style={{ width:"100%",background:T.primary,color:"#fff",border:"none",fontSize:11,fontWeight:600,padding:"9px 0",borderRadius:6,cursor:"pointer" }}>🔄 Regenerate Report</button></div>}
+        </div>
+      );
+    }
+
+    /* ─── SiteDashboard ─── */
+    function SiteDashboard({ token, sites, onSelectSite }) {
+      const [dashboard, setDashboard] = useState(null);
+      const [loading, setLoading] = useState(true);
+      useEffect(() => {
+        api('/api/dashboard', token).then(d => setDashboard(d)).catch(() => {}).finally(() => setLoading(false));
+      }, [token]);
+
+      if (loading) return <div style={{ flex:1,display:'flex',alignItems:'center',justifyContent:'center',background:T.bg }}><div style={{ fontSize:12,color:T.textTertiary }}>Loading dashboard...</div></div>;
+
+      const siteCards = dashboard?.sites || [];
+      return (
+        <div style={{ flex:1,padding:32,overflowY:'auto',background:T.bg }}>
+          <div style={{ maxWidth:900,margin:'0 auto' }}>
+            <div style={{ fontSize:22,fontWeight:700,color:T.text,marginBottom:4 }}>Site Dashboard</div>
+            <div style={{ fontSize:12,color:T.textSecondary,marginBottom:24 }}>{dashboard?.date || 'Today'} — {siteCards.length} site{siteCards.length!==1?'s':''}</div>
+            {siteCards.length===0&&<div style={{ textAlign:'center',padding:40,color:T.textTertiary }}>No site data for today. Reports may not have been generated yet.</div>}
+            <div style={{ display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(280px,1fr))',gap:16 }}>
+              {siteCards.map((s,i) => {
+                const hasHighDeadline = s.deadlines?.some(d=>d.urgency==='high');
+                return (
+                  <div key={i} onClick={() => onSelectSite(s.site_id)} style={{ background:T.surface,borderRadius:12,padding:'18px 20px',border:`1px solid ${hasHighDeadline?T.danger+'40':T.borderLight}`,cursor:'pointer',boxShadow:T.shadow,transition:'box-shadow 0.2s' }}
+                    onMouseEnter={e=>e.currentTarget.style.boxShadow='0 4px 12px rgba(27,58,92,0.12)'} onMouseLeave={e=>e.currentTarget.style.boxShadow=T.shadow}>
+                    <div style={{ display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10 }}>
+                      <div style={{ fontSize:14,fontWeight:700,color:T.text }}>{s.site_name}</div>
+                      <div style={{ display:'flex',gap:4 }}>
+                        {s.safety_count>0&&<span style={{ fontSize:9,fontWeight:700,padding:'2px 7px',borderRadius:8,background:T.dangerBg,color:T.danger }}>⚠ {s.safety_count}</span>}
+                        {s.deadlines?.length>0&&<span style={{ fontSize:9,fontWeight:700,padding:'2px 7px',borderRadius:8,background:T.warningBg,color:T.warning }}>📅 {s.deadlines.length}</span>}
+                      </div>
+                    </div>
+                    <div style={{ display:'flex',gap:12,marginBottom:10 }}>
+                      <div style={{ textAlign:'center' }}><div style={{ fontSize:20,fontWeight:700,color:T.primary }}>{s.topic_count}</div><div style={{ fontSize:9,color:T.textTertiary }}>Topics</div></div>
+                      <div style={{ textAlign:'center' }}><div style={{ fontSize:20,fontWeight:700,color:T.accent }}>{s.action_count}</div><div style={{ fontSize:9,color:T.textTertiary }}>Actions</div></div>
+                    </div>
+                    {Object.keys(s.categories||{}).length>0&&<div style={{ display:'flex',gap:4,flexWrap:'wrap',marginBottom:8 }}>
+                      {Object.entries(s.categories).map(([cat,cnt])=>{
+                        const c=topicColors[cat.toLowerCase()];
+                        return <span key={cat} style={{ fontSize:8,fontWeight:700,padding:'1px 6px',borderRadius:8,background:c?.bg||T.surfaceAlt,color:c?.color||T.textSecondary }}>{cat} ({cnt})</span>;
+                      })}
+                    </div>}
+                    {s.top_topics?.length>0&&<div style={{ borderTop:`1px solid ${T.borderLight}`,paddingTop:8 }}>
+                      {s.top_topics.map((t,ti)=><div key={ti} style={{ fontSize:10,color:T.textSecondary,marginBottom:3,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap' }}>{t.topic_title}</div>)}
+                    </div>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    /* ─── GlobalAskPanel ─── */
+    function GlobalAskPanel({ token, date, user, topic, open, onToggle }) {
+      const [q, setQ] = useState('');
+      const [answer, setAnswer] = useState(null);
+      const [loading, setLoading] = useState(false);
+      const [scope, setScope] = useState('both');
+
+      // When topic context is injected via "Ask about this", pre-fill
+      const [contextTopic, setContextTopic] = useState(null);
+      useEffect(() => {
+        if (topic && open) setContextTopic(topic);
+      }, [topic, open]);
+
+      const contextLabel = contextTopic
+        ? `${date} / ${user} / Topic #${contextTopic.topic_id}: ${contextTopic.topic_title}`
+        : date ? `${date} / ${user || 'all'}` : 'No context';
+
+      const handleAsk = () => {
+        if (!q.trim() || loading) return;
+        setLoading(true); setAnswer(null);
+        const payload = { date, user, question: q.trim(), scope };
+        if (contextTopic?.topic_id != null) payload.topic_id = contextTopic.topic_id;
+        trackEvent('ask_agent_query', { question: q.trim(), scope, topic_id: contextTopic?.topic_id });
+        api('/api/ask', token, { method: 'POST', body: JSON.stringify(payload) })
+          .then(data => setAnswer(data))
+          .catch(e => setAnswer({ answer: `Error: ${e.message}`, grounded: false }))
+          .finally(() => setLoading(false));
+      };
+
+      const clearContext = () => { setContextTopic(null); };
+
+      if (!open) {
+        return (
+          <button onClick={onToggle} style={{ position:'fixed',bottom:20,right:20,width:48,height:48,borderRadius:'50%',background:T.accent,color:'#fff',border:'none',fontSize:20,cursor:'pointer',boxShadow:'0 4px 16px rgba(0,0,0,0.2)',zIndex:900,display:'flex',alignItems:'center',justifyContent:'center' }}>
+            💬
+          </button>
+        );
+      }
+
+      return (
+        <div style={{ position:'fixed',bottom:20,right:20,width:420,maxHeight:'60vh',background:T.surface,borderRadius:14,boxShadow:'0 8px 32px rgba(0,0,0,0.18)',zIndex:900,display:'flex',flexDirection:'column',overflow:'hidden',border:`1px solid ${T.border}` }}>
+          {/* Header */}
+          <div style={{ display:'flex',justifyContent:'space-between',alignItems:'center',padding:'10px 14px',background:T.navBg,flexShrink:0 }}>
+            <span style={{ color:T.navActive,fontSize:12,fontWeight:700 }}>💬 Ask Agent</span>
+            <div style={{ display:'flex',gap:6,alignItems:'center' }}>
+              <select value={scope} onChange={e=>setScope(e.target.value)} style={{ fontSize:9,padding:'2px 4px',borderRadius:4,border:`1px solid ${T.navText}40`,background:'transparent',color:T.navText,cursor:'pointer' }}>
+                <option value="both">Both</option>
+                <option value="report">Report only</option>
+                <option value="transcript">Transcript only</option>
+              </select>
+              <button onClick={onToggle} style={{ background:'none',border:'none',color:T.navText,fontSize:14,cursor:'pointer' }}>✕</button>
+            </div>
+          </div>
+          {/* Context label */}
+          <div style={{ padding:'6px 14px',background:T.surfaceAlt,fontSize:9,color:T.textTertiary,display:'flex',alignItems:'center',gap:6,borderBottom:`1px solid ${T.borderLight}` }}>
+            <span>Grounded on: {contextLabel}</span>
+            {contextTopic&&<button onClick={clearContext} style={{ background:'none',border:'none',fontSize:9,color:T.textTertiary,cursor:'pointer',textDecoration:'underline' }}>clear topic</button>}
+          </div>
+          {/* Answer area */}
+          <div style={{ flex:1,overflowY:'auto',padding:14 }}>
+            {answer&&<div style={{ padding:'10px 14px',background:T.bg,borderRadius:6,border:`1px solid ${answer.grounded?T.success:T.border}`,marginBottom:10 }}>
+              <div style={{ display:'flex',alignItems:'center',gap:6,marginBottom:6 }}>
+                <span style={{ fontSize:9,fontWeight:700,padding:'2px 7px',borderRadius:8,background:answer.grounded?`${T.success}20`:`${T.textTertiary}20`,color:answer.grounded?T.success:T.textTertiary }}>{answer.grounded?"Grounded":"Not grounded"}</span>
+                {answer.model&&<span style={{ fontSize:9,color:T.textTertiary }}>{answer.model}</span>}
+              </div>
+              <p style={{ fontSize:12,color:T.text,lineHeight:1.7,margin:0,whiteSpace:'pre-wrap' }}>{answer.answer}</p>
+            </div>}
+            {!answer&&!loading&&<p style={{ fontSize:11,color:T.textTertiary,margin:0 }}>Ask a question about the current report or transcript data.</p>}
+            {loading&&<p style={{ fontSize:11,color:T.textTertiary,margin:0 }}>Thinking...</p>}
+          </div>
+          {/* Input */}
+          <div style={{ padding:'10px 14px',borderTop:`1px solid ${T.borderLight}`,display:'flex',gap:8,flexShrink:0 }}>
+            <input value={q} onChange={e=>setQ(e.target.value)} onKeyDown={e=>e.key==='Enter'&&handleAsk()}
+              placeholder="e.g. What safety issues were raised today?"
+              style={{ flex:1,padding:'8px 12px',border:`1px solid ${T.border}`,borderRadius:6,fontSize:12,fontFamily:T.font,background:T.bg,color:T.text,outline:'none' }} />
+            <button onClick={handleAsk} disabled={loading||!q.trim()} style={{ padding:'8px 16px',background:loading||!q.trim()?T.textTertiary:T.accent,color:'#fff',border:'none',borderRadius:6,fontSize:11,fontWeight:600,cursor:loading||!q.trim()?'default':'pointer',flexShrink:0 }}>
+              {loading?"...":"Ask"}
+            </button>
+          </div>
         </div>
       );
     }
@@ -730,15 +1196,22 @@
       const [rError,setRE]=useState("");
       const [dateData,setDD]=useState({});
       const [msg,setMsg]=useState("");
+      const [leftW,setLeftW]=useState(380);
+      const [showChangePw,setShowChangePw]=useState(false);
+      const [askOpen,setAskOpen]=useState(false);
+      const [askTopic,setAskTopic]=useState(null);
+      const mainRef=useRef(null);
+
+      const openAskAbout = (topic) => { setAskTopic(topic); setAskOpen(true); };
 
       // Site management
       const [sites,setSites]=useState([]);
       const [selectedSite,setSelectedSite]=useState("");
 
       // Restore session
-      useEffect(()=>{const s=sessionStorage.getItem("ss_auth");if(s){try{const p=JSON.parse(s);const c=parseJwt(p.idToken);if(c.exp*1000>Date.now()){setAuth(p);setUser({name:c.name||c.email,email:c.email})}}catch{}}},[] );
+      useEffect(()=>{const s=sessionStorage.getItem("ss_auth");if(s){try{const p=JSON.parse(s);const c=parseJwt(p.idToken);if(c.exp*1000>Date.now()){setAuth(p);setUser({name:c.name||c.email,email:c.email});setTrackToken(p.idToken);}}catch{}}},[] );
 
-      const login=t=>{const c=parseJwt(t.idToken);setAuth(t);setUser({name:c.name||c.email,email:c.email});sessionStorage.setItem("ss_auth",JSON.stringify(t))};
+      const login=t=>{const c=parseJwt(t.idToken);setAuth(t);setUser({name:c.name||c.email,email:c.email});sessionStorage.setItem("ss_auth",JSON.stringify(t));setTrackToken(t.idToken);trackEvent('session_start');};
       const logout=()=>{setAuth(null);setUser({name:"",email:""});setCallerRole("worker");setSites([]);setSelectedSite("");sessionStorage.removeItem("ss_auth")};
 
       // On login: fetch sites + role
@@ -758,6 +1231,7 @@
         setRL(true);setRE("");setReport(null);setSel(null);setHidden(new Set());
         
         let url = `/api/timeline?date=${date}`;
+        if(selectedSite) url += `&site=${selectedSite}`;
         
         api(url,auth.idToken).then(d=>{
           if(d._notFound || !d.topics){
@@ -768,7 +1242,7 @@
             setReport(null);
           } else setReport(d);
         }).catch(e=>{if(e.message==="UNAUTHORIZED")logout();else setRE("")}).finally(()=>setRL(false));
-      },[date,auth]);
+      },[date,auth,selectedSite]);
 
       // Fetch date index
       useEffect(()=>{
@@ -778,7 +1252,23 @@
         api(url,auth.idToken).then(d=>setDD(d.dates||{})).catch(()=>{});
       },[auth,selectedSite]);
 
+      // Fetch calendar events (deadlines)
+      const [calEvents,setCalEvents]=useState([]);
+      useEffect(()=>{
+        if(!auth) return;
+        const now=new Date(); const from=new Date(now); from.setDate(from.getDate()-30);
+        const to=new Date(now); to.setDate(to.getDate()+60);
+        api(`/api/calendar-events?from=${from.toISOString().slice(0,10)}&to=${to.toISOString().slice(0,10)}`,auth.idToken)
+          .then(d=>setCalEvents(d.events||[])).catch(()=>{});
+      },[auth,selectedSite]);
+
       const toggleHide=i=>{const n=new Set(hidden);n.has(i)?n.delete(i):n.add(i);setHidden(n);if(sel===i)setSel(null)};
+      const dragLeft=useCallback((clientX)=>{
+        if(!mainRef.current) return;
+        const rect=mainRef.current.getBoundingClientRect();
+        const newW=Math.min(Math.max(clientX-rect.left, 260), 600);
+        setLeftW(newW);
+      },[]);
       const regen=()=>{if(!auth)return;setMsg("Generating...");
         const body={report_type:"daily",date,force:true};
         api("/api/reports/generate",auth.idToken,{method:"POST",body:JSON.stringify(body)})
@@ -791,14 +1281,18 @@
 
       return (
         <div style={{ height:"100vh",display:"flex",flexDirection:"column",fontFamily:T.font,background:T.bg,overflow:"hidden" }}>
-          <NavBar tab={tab} setTab={setTab} user={user} callerRole={callerRole} sites={sites} selectedSite={selectedSite} setSelectedSite={setSelectedSite} onLogout={logout}/>
+          <NavBar tab={tab} setTab={setTab} user={user} callerRole={callerRole} sites={sites} selectedSite={selectedSite} setSelectedSite={setSelectedSite} onLogout={logout} onChangePassword={()=>setShowChangePw(true)}/>
+          {showChangePw && <ChangePasswordModal accessToken={auth?.accessToken} onClose={()=>setShowChangePw(false)} />}
           {msg&&<div style={{ background:T.warningBg,padding:"6px 20px",fontSize:11,color:T.warning,display:"flex",justifyContent:"space-between" }}><span>{msg}</span><button onClick={()=>setMsg("")} style={{ background:"none",border:"none",color:T.warning,cursor:"pointer" }}>✕</button></div>}
-          <div style={{ flex:1,display:"flex",overflow:"hidden" }}>
-            {tab==="day"?<>
-              <LeftPanel report={report} loading={rLoading} error={rError} selected={sel} setSelected={setSel} hidden={hidden} toggleHide={toggleHide} selectedDate={date} setSelectedDate={setDate} dateData={dateData} onRegenerate={regen} token={auth?.idToken} user={viewingUser}/>
-              <TopicDetail topic={sel!=null&&report?.topics?report.topics[sel]:null} date={date} token={auth?.idToken} user={viewingUser} allTopics={report?.topics||[]} onTopicChange={(idx)=>{if(idx>=0&&idx<(report?.topics||[]).length) setSel(idx);}}/>
-            </>:<ReportsTab token={auth.idToken} user={user}/>}
+          <div ref={mainRef} style={{ flex:1,display:"flex",overflow:"hidden" }}>
+            {tab==="dashboard"?<SiteDashboard token={auth.idToken} sites={sites} onSelectSite={(sid)=>{setSelectedSite(sid);setTab('day');}}/>
+            :tab==="day"?<>
+              <LeftPanel report={report} loading={rLoading} error={rError} selected={sel} setSelected={setSel} hidden={hidden} toggleHide={toggleHide} selectedDate={date} setSelectedDate={setDate} dateData={dateData} calendarEvents={calEvents} onRegenerate={regen} token={auth?.idToken} user={viewingUser} width={leftW}/>
+              <DragDivider direction="vertical" onDrag={dragLeft}/>
+              <TopicDetail topic={sel!=null&&report?.topics?report.topics[sel]:null} date={date} token={auth?.idToken} user={viewingUser} allTopics={report?.topics||[]} onTopicChange={(idx)=>{if(idx>=0&&idx<(report?.topics||[]).length) setSel(idx);}} onAskAbout={openAskAbout}/>
+            </>:tab==="search"?<SearchTab token={auth.idToken} onNavigate={d=>{setDate(d);setTab('day');}}/>:<ReportsTab token={auth.idToken} user={user}/>}
           </div>
+          <GlobalAskPanel token={auth?.idToken} date={date} user={viewingUser} topic={askTopic} open={askOpen} onToggle={()=>{setAskOpen(!askOpen);if(askOpen)setAskTopic(null);}}/>
         </div>
       );
     }

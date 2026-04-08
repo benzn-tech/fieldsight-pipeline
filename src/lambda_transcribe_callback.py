@@ -37,10 +37,13 @@ logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
 transcribe_client = boto3.client('transcribe')
+lambda_client = boto3.client('lambda')
 
 TRANSCRIPT_TABLE = os.environ.get('TRANSCRIPT_TABLE', 'fieldsight-transcripts')
 MAX_ATTEMPTS = int(os.environ.get('MAX_ATTEMPTS', '3'))
 S3_BUCKET = os.environ.get('S3_BUCKET', '')
+REPORT_FUNCTION = os.environ.get('REPORT_FUNCTION', 'fieldsight-report-generator')
+AUTO_REPORT = os.environ.get('AUTO_REPORT', 'true').lower() == 'true'
 
 
 def find_ledger_record(job_name):
@@ -139,6 +142,25 @@ def handle_completed(job_name, job_detail):
     attempts = item.get('attempts', 1)
     logger.info(f"✓ Transcription COMPLETED: {user} on {date} "
                 f"(attempt {attempts}) → status: pending")
+
+    # Auto-trigger report generation for near-real-time processing
+    if AUTO_REPORT and date != '?' and user != '?':
+        try:
+            payload = {
+                'report_type': 'daily',
+                'date': date,
+                'force': False,
+                'users_filter': [user.replace('_', ' ')],
+                'triggered_by': 'transcribe_callback',
+            }
+            lambda_client.invoke(
+                FunctionName=REPORT_FUNCTION,
+                InvocationType='Event',  # async — don't wait
+                Payload=json.dumps(payload),
+            )
+            logger.info(f"  → Auto-triggered report generation for {user} on {date}")
+        except Exception as e:
+            logger.warning(f"  → Auto-report trigger failed (non-fatal): {e}")
 
 
 def handle_failed(job_name, job_detail):

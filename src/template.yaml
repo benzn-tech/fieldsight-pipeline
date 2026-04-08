@@ -9,6 +9,14 @@ Description: >
 # Parameters - Configure during deployment
 # ============================================================
 Parameters:
+  Environment:
+    Type: String
+    Description: "Environment prefix for resource names (empty for prod, 'test-' for test)"
+    Default: ""
+    AllowedValues:
+      - ""
+      - "test-"
+
   RealPTTAccount:
     Type: String
     Description: RealPTT platform account (external service)
@@ -132,6 +140,11 @@ Parameters:
     Description: Existing DynamoDB table for user profiles (API auth)
     Default: fieldsight-users
 
+  CorrectionsTableName:
+    Type: String
+    Description: Existing DynamoDB table for user corrections (QA/QC)
+    Default: fieldsight-corrections
+
   TranscriptTableName:
     Type: String
     Description: Existing DynamoDB table for transcript ledger
@@ -212,7 +225,7 @@ Resources:
   OrchestratorFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-orchestrator
+      FunctionName: !Sub "${Environment}fieldsight-orchestrator"
       CodeUri: src/
       Handler: lambda_orchestrator.lambda_handler
       Timeout: 900  # 15 minutes
@@ -252,7 +265,7 @@ Resources:
   DownloaderFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-downloader
+      FunctionName: !Sub "${Environment}fieldsight-downloader"
       CodeUri: src/
       Handler: lambda_downloader.lambda_handler
       Timeout: 900  # 15 minutes
@@ -273,7 +286,7 @@ Resources:
     Type: AWS::Serverless::Function
     Condition: ShouldEnableTranscribe
     Properties:
-      FunctionName: fieldsight-transcribe
+      FunctionName: !Sub "${Environment}fieldsight-transcribe"
       CodeUri: src/
       Handler: lambda_transcribe.lambda_handler
       Timeout: 60
@@ -311,7 +324,7 @@ Resources:
     Type: AWS::Serverless::Function
     Condition: HasVadLayer
     Properties:
-      FunctionName: fieldsight-vad
+      FunctionName: !Sub "${Environment}fieldsight-vad"
       CodeUri: src/
       Handler: lambda_vad.lambda_handler
       Timeout: 900
@@ -342,7 +355,7 @@ Resources:
   ReportGeneratorFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-report-generator
+      FunctionName: !Sub "${Environment}fieldsight-report-generator"
       CodeUri: src/
       Handler: lambda_report_generator.lambda_handler
       Timeout: 300
@@ -362,6 +375,7 @@ Resources:
           REPORTS_TABLE: !Ref ReportsTableName
           AUDIT_TABLE: !Ref AuditTableName
           ENABLE_DYNAMODB: 'true'
+          CORRECTIONS_TABLE: !Ref CorrectionsTableName
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
@@ -373,6 +387,8 @@ Resources:
             TableName: !Ref ReportsTableName
         - DynamoDBCrudPolicy:
             TableName: !Ref AuditTableName
+        - DynamoDBReadPolicy:
+            TableName: !Ref CorrectionsTableName
       Events:
         DailyReportSchedule:
           Type: Schedule
@@ -403,7 +419,7 @@ Resources:
     Type: AWS::Serverless::Function
     Condition: ShouldEnableTranscribe
     Properties:
-      FunctionName: fieldsight-transcribe-callback
+      FunctionName: !Sub "${Environment}fieldsight-transcribe-callback"
       CodeUri: src/
       Handler: lambda_transcribe_callback.lambda_handler
       Timeout: 60
@@ -442,7 +458,7 @@ Resources:
   MeetingMinutesFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-meeting-minutes
+      FunctionName: !Sub "${Environment}fieldsight-meeting-minutes"
       CodeUri: src/
       Handler: lambda_meeting_minutes.lambda_handler
       Timeout: 300
@@ -470,7 +486,7 @@ Resources:
   AskAgentFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-ask-agent
+      FunctionName: !Sub "${Environment}fieldsight-ask-agent"
       CodeUri: src/
       Handler: lambda_ask_agent.lambda_handler
       Timeout: 60
@@ -492,7 +508,7 @@ Resources:
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
-      UserPoolName: fieldsight-users
+      UserPoolName: !Sub "${Environment}fieldsight-users"
       AutoVerifiedAttributes:
         - email
       UsernameAttributes:
@@ -515,7 +531,7 @@ Resources:
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
     Properties:
-      ClientName: fieldsight-web-client
+      ClientName: !Sub "${Environment}fieldsight-web-client"
       UserPoolId: !Ref UserPool
       GenerateSecret: false
       ExplicitAuthFlows:
@@ -540,7 +556,7 @@ Resources:
   UserPoolDomain:
     Type: AWS::Cognito::UserPoolDomain
     Properties:
-      Domain: !Sub fieldsight-${AWS::AccountId}
+      Domain: !Sub "${Environment}fieldsight-${AWS::AccountId}"
       UserPoolId: !Ref UserPool
 
   # ==========================================================
@@ -568,7 +584,7 @@ Resources:
   ApiFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-api
+      FunctionName: !Sub "${Environment}fieldsight-api"
       CodeUri: src/
       Handler: lambda_fieldsight_api.lambda_handler
       Timeout: 30
@@ -626,7 +642,7 @@ Resources:
   DownloaderCluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: fieldsight-downloader-cluster
+      ClusterName: !Sub "${Environment}fieldsight-downloader-cluster"
       CapacityProviders:
         - FARGATE_SPOT
         - FARGATE
@@ -640,7 +656,7 @@ Resources:
   FargateExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub fieldsight-fargate-execution-${AWS::Region}
+      RoleName: !Sub "${Environment}fieldsight-fargate-execution-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -657,7 +673,7 @@ Resources:
   FargateTaskRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub fieldsight-fargate-task-${AWS::Region}
+      RoleName: !Sub "${Environment}fieldsight-fargate-task-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -702,7 +718,7 @@ Resources:
   FargateDownloaderTask:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: fieldsight-fargate-downloader
+      Family: !Sub "${Environment}fieldsight-fargate-downloader"
       RequiresCompatibilities:
         - FARGATE
       NetworkMode: awsvpc
@@ -727,7 +743,7 @@ Resources:
           LogConfiguration:
             LogDriver: awslogs
             Options:
-              awslogs-group: /ecs/fieldsight-fargate-downloader
+              awslogs-group: !Sub "/ecs/${Environment}fieldsight-fargate-downloader"
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: download
 
@@ -737,7 +753,7 @@ Resources:
   FargateTriggerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-fargate-trigger
+      FunctionName: !Sub "${Environment}fieldsight-fargate-trigger"
       Runtime: python3.11
       Handler: index.handler
       Timeout: 30
@@ -881,7 +897,7 @@ Resources:
   FargateLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /ecs/fieldsight-fargate-downloader
+      LogGroupName: !Sub "/ecs/${Environment}fieldsight-fargate-downloader"
       RetentionInDays: 14
 
   FargateTriggerLogGroup:
@@ -897,7 +913,7 @@ Resources:
     Type: AWS::SNS::Topic
     Condition: ShouldCreateAlerts
     Properties:
-      TopicName: fieldsight-pipeline-alerts
+      TopicName: !Sub "${Environment}fieldsight-pipeline-alerts"
       Subscription:
         - Protocol: email
           Endpoint: !Ref AlertEmail
@@ -909,7 +925,7 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: ShouldCreateAlerts
     Properties:
-      AlarmName: fieldsight-orchestrator-errors
+      AlarmName: !Sub "${Environment}fieldsight-orchestrator-errors"
       AlarmDescription: Orchestrator Lambda has errors
       Namespace: AWS/Lambda
       MetricName: Errors
@@ -928,7 +944,7 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: ShouldCreateAlerts
     Properties:
-      AlarmName: fieldsight-downloader-errors
+      AlarmName: !Sub "${Environment}fieldsight-downloader-errors"
       AlarmDescription: Downloader Lambda has more than 5 errors in a day
       Namespace: AWS/Lambda
       MetricName: Errors
@@ -947,7 +963,7 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: ShouldCreateAlerts
     Properties:
-      AlarmName: fieldsight-report-errors
+      AlarmName: !Sub "${Environment}fieldsight-report-errors"
       AlarmDescription: Report Generator Lambda has errors
       Namespace: AWS/Lambda
       MetricName: Errors
