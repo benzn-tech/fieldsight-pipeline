@@ -11,7 +11,7 @@
 
   <link rel="stylesheet" href="styles/tokens.css" />
   <link rel="stylesheet" href="styles/app-shell.css" />
-  <link rel="stylesheet" href="styles/components.css?v=4" />
+  <link rel="stylesheet" href="styles/components.css?v=5" />
 
   <style>
     html, body { overflow: auto; height: auto; }
@@ -81,11 +81,12 @@
   <script type="text/babel" src="scripts/components/button.js?v=1"></script>
   <script type="text/babel" src="scripts/components/input.js?v=1"></script>
   <script type="text/babel" src="scripts/components/card.js?v=1"></script>
-  <script type="text/babel" src="scripts/components/badge.js?v=1"></script>
-  <script type="text/babel" src="scripts/components/avatar.js?v=1"></script>
+  <script type="text/babel" src="scripts/components/badge.js?v=2"></script>
+  <script type="text/babel" src="scripts/components/avatar.js?v=2"></script>
 
   <script type="text/babel">
-    const { Button, IconButton, Input, Textarea, Select, Card, Badge, Avatar, AvatarGroup } = window.FieldSight;
+    const { Button, IconButton, Input, Textarea, Select, Card,
+            Badge, NotificationDot, Avatar, AvatarGroup } = window.FieldSight;
 
     function Section({ title, children }) {
       return (
@@ -657,76 +658,76 @@
 
           <Section title="Badge · subtle (default variant)">
             <Row label="colors">
-              <Badge color="neutral">Neutral</Badge>
-              <Badge color="accent">Accent</Badge>
-              <Badge color="info">Info</Badge>
-              <Badge color="success">Success</Badge>
-              <Badge color="warning">Warning</Badge>
-              <Badge color="danger">Danger</Badge>
+              <Badge tone="neutral">Neutral</Badge>
+              <Badge tone="accent">Accent</Badge>
+              <Badge tone="info">Info</Badge>
+              <Badge tone="success">Success</Badge>
+              <Badge tone="warning">Warning</Badge>
+              <Badge tone="danger">Danger</Badge>
             </Row>
             <Row label="with dot">
-              <Badge color="success" dot>Active</Badge>
-              <Badge color="warning" dot>Pending</Badge>
-              <Badge color="danger" dot>Overdue</Badge>
-              <Badge color="info" dot>Open</Badge>
+              <Badge tone="success" prefixDot>Active</Badge>
+              <Badge tone="warning" prefixDot>Pending</Badge>
+              <Badge tone="danger" prefixDot>Overdue</Badge>
+              <Badge tone="info" prefixDot>Open</Badge>
             </Row>
             <Row label="with icon">
-              <Badge color="danger" icon="shield-alert">Safety</Badge>
-              <Badge color="info" icon="clock">Scheduled</Badge>
-              <Badge color="success" icon="check">Approved</Badge>
-              <Badge color="warning" icon="alert-triangle">Caution</Badge>
+              <Badge tone="danger" leftIcon="shield-alert">Safety</Badge>
+              <Badge tone="info" leftIcon="clock">Scheduled</Badge>
+              <Badge tone="success" leftIcon="check">Approved</Badge>
+              <Badge tone="warning" leftIcon="alert-triangle">Caution</Badge>
             </Row>
             <Row label="sizes">
-              <Badge size="sm" color="accent">Small</Badge>
-              <Badge size="md" color="accent">Medium</Badge>
-              <Badge size="lg" color="accent">Large</Badge>
+              <Badge size="sm" tone="accent">Small</Badge>
+              <Badge size="md" tone="accent">Medium</Badge>
+              <Badge size="lg" tone="accent">Large</Badge>
             </Row>
           </Section>
 
           <Section title="Badge · solid variant">
             <Row label="colors">
-              <Badge variant="solid" color="neutral">Neutral</Badge>
-              <Badge variant="solid" color="accent">Accent</Badge>
-              <Badge variant="solid" color="info">Info</Badge>
-              <Badge variant="solid" color="success">Done</Badge>
-              <Badge variant="solid" color="warning">Warning</Badge>
-              <Badge variant="solid" color="danger">Critical</Badge>
+              <Badge variant="solid" tone="neutral">Neutral</Badge>
+              <Badge variant="solid" tone="accent">Accent</Badge>
+              <Badge variant="solid" tone="info">Info</Badge>
+              <Badge variant="solid" tone="success">Done</Badge>
+              <Badge variant="solid" tone="warning">Warning</Badge>
+              <Badge variant="solid" tone="danger">Critical</Badge>
             </Row>
             <Row label="with dot">
-              <Badge variant="solid" color="danger" dot>Incident</Badge>
-              <Badge variant="solid" color="success" dot>Completed</Badge>
+              <Badge variant="solid" tone="danger" prefixDot>Incident</Badge>
+              <Badge variant="solid" tone="success" prefixDot>Completed</Badge>
             </Row>
           </Section>
 
           <Section title="Badge · outline variant">
             <Row label="colors">
-              <Badge variant="outline" color="neutral">Draft</Badge>
-              <Badge variant="outline" color="accent">New</Badge>
-              <Badge variant="outline" color="info">Review</Badge>
-              <Badge variant="outline" color="success">Passed</Badge>
-              <Badge variant="outline" color="warning">Pending</Badge>
-              <Badge variant="outline" color="danger">Rejected</Badge>
+              <Badge variant="outline" tone="neutral">Draft</Badge>
+              <Badge variant="outline" tone="accent">New</Badge>
+              <Badge variant="outline" tone="info">Review</Badge>
+              <Badge variant="outline" tone="success">Passed</Badge>
+              <Badge variant="outline" tone="warning">Pending</Badge>
+              <Badge variant="outline" tone="danger">Rejected</Badge>
             </Row>
           </Section>
 
           <Section title="Badge · real-world usage">
             <Row label="task priorities">
-              <Badge color="danger" dot>Critical</Badge>
-              <Badge color="warning" dot>High</Badge>
-              <Badge color="info" dot>Medium</Badge>
-              <Badge color="neutral" dot>Low</Badge>
+              <Badge tone="danger" prefixDot>Critical</Badge>
+              <Badge tone="warning" prefixDot>High</Badge>
+              <Badge tone="info" prefixDot>Medium</Badge>
+              <Badge tone="neutral" prefixDot>Low</Badge>
             </Row>
             <Row label="report states">
-              <Badge variant="outline" color="neutral">Draft</Badge>
-              <Badge color="info">Submitted</Badge>
-              <Badge color="success" icon="check">Approved</Badge>
-              <Badge variant="solid" color="danger">Rejected</Badge>
+              <Badge variant="outline" tone="neutral">Draft</Badge>
+              <Badge tone="info">Submitted</Badge>
+              <Badge tone="success" leftIcon="check">Approved</Badge>
+              <Badge variant="solid" tone="danger">Rejected</Badge>
             </Row>
             <Row label="categories">
-              <Badge color="danger" icon="shield-alert">Safety</Badge>
-              <Badge color="info" icon="badge-check">Quality</Badge>
-              <Badge color="accent" icon="gantt-chart">Programme</Badge>
-              <Badge color="neutral" icon="cloud-sun">Weather</Badge>
+              <Badge tone="danger" leftIcon="shield-alert">Safety</Badge>
+              <Badge tone="info" leftIcon="badge-check">Quality</Badge>
+              <Badge tone="accent" leftIcon="gantt-chart">Programme</Badge>
+              <Badge tone="neutral" leftIcon="cloud-sun">Weather</Badge>
             </Row>
           </Section>
 
@@ -759,8 +760,8 @@
               <Avatar name="Ana Garcia" size="lg" />
             </Row>
             <Row label="explicit initials">
-              <Avatar initials="FS" name="FieldSight System" size="lg" color="#FF6B35" />
-              <Avatar initials="AI" name="AI Suggestion" size="lg" color="#7C3AED" />
+              <Avatar initials="FS" name="FieldSight System" size="lg" bgColor="#FF6B35" />
+              <Avatar initials="AI" name="AI Suggestion" size="lg" bgColor="#7C3AED" />
             </Row>
           </Section>
 
@@ -805,7 +806,7 @@
                   <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--text-primary)' }}>Jarley Trainor</div>
                   <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>Site Manager</div>
                 </div>
-                <Badge color="success" dot size="sm">Online</Badge>
+                <Badge tone="success" prefixDot size="sm">Online</Badge>
               </div>
             </Row>
             <Row label="task assignees">
@@ -816,7 +817,7 @@
                   <Avatar name="Mike O'Brien" />
                   <Avatar name="Priya Sharma" />
                 </AvatarGroup>
-                <Badge color="warning" size="sm">4 assigned</Badge>
+                <Badge tone="warning" size="sm">4 assigned</Badge>
               </div>
             </Row>
             <Row label="card with avatar">
@@ -829,10 +830,132 @@
                         <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)' }}>David Barillaro</div>
                         <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>Submitted daily report · 2h ago</div>
                       </div>
-                      <Badge color="info" size="sm">Submitted</Badge>
+                      <Badge tone="info" size="sm">Submitted</Badge>
                     </div>
                   </Card.Body>
                 </Card>
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Badge · pill shape">
+            <Row label="default vs pill (subtle)">
+              <Badge tone="success">Default</Badge>
+              <Badge tone="success" pill>Pill shape</Badge>
+              <Badge tone="accent" pill leftIcon="zap">Pill + icon</Badge>
+            </Row>
+            <Row label="all sizes, pill">
+              <Badge tone="info" pill size="sm">Small pill</Badge>
+              <Badge tone="info" pill size="md">Medium pill</Badge>
+              <Badge tone="info" pill size="lg">Large pill</Badge>
+            </Row>
+          </Section>
+
+          <Section title="Badge · dot mode (label-less indicator)">
+            <Row label="standalone dots">
+              <Badge tone="success" dot size="sm" />
+              <Badge tone="warning" dot size="sm" />
+              <Badge tone="danger" dot size="sm" />
+              <Badge tone="info" dot size="sm" />
+              <span style={{ fontSize: 13, color: 'var(--text-tertiary)', marginLeft: 12 }}>
+                ← inline indicators next to text
+              </span>
+            </Row>
+            <Row label="all sizes (danger)">
+              <Badge tone="danger" dot size="sm" />
+              <Badge tone="danger" dot size="md" />
+              <Badge tone="danger" dot size="lg" />
+            </Row>
+            <Row label="next to a list item">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Badge tone="accent" dot size="sm" />
+                <span style={{ fontSize: 14, color: 'var(--text-primary)' }}>
+                  New report from Jarley
+                </span>
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Badge · prefixDot (status-style)">
+            <Row label="status badges with leading dot">
+              <Badge tone="success" prefixDot>Active</Badge>
+              <Badge tone="warning" prefixDot>Pending</Badge>
+              <Badge tone="danger" prefixDot>Overdue</Badge>
+              <Badge tone="info" prefixDot>Open</Badge>
+            </Row>
+          </Section>
+
+          <Section title="NotificationDot">
+            <Row label="empty (no count)">
+              <NotificationDot />
+              <NotificationDot tone="warning" />
+              <NotificationDot tone="info" />
+              <NotificationDot tone="success" />
+            </Row>
+            <Row label="with count">
+              <NotificationDot count={3} />
+              <NotificationDot count={12} />
+              <NotificationDot count={99} />
+              <NotificationDot count={150} />
+              <NotificationDot count={9999} max={999} />
+            </Row>
+            <Row label="anchored on icon buttons">
+              <div style={{ position: 'relative', display: 'inline-block' }}>
+                <IconButton icon="bell" ariaLabel="Notifications" />
+                <span style={{ position: 'absolute', top: -2, right: -2 }}>
+                  <NotificationDot count={5} size="sm" />
+                </span>
+              </div>
+              <div style={{ position: 'relative', display: 'inline-block' }}>
+                <IconButton icon="mail" ariaLabel="Inbox" />
+                <span style={{ position: 'absolute', top: -2, right: -2 }}>
+                  <NotificationDot count={28} size="sm" />
+                </span>
+              </div>
+              <div style={{ position: 'relative', display: 'inline-block' }}>
+                <IconButton icon="bell" ariaLabel="Alerts" />
+                <span style={{ position: 'absolute', top: -2, right: -2 }}>
+                  <NotificationDot size="sm" />
+                </span>
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Avatar · clickable">
+            <Row label="onClick → renders as button">
+              <Avatar
+                name="Ben Lin"
+                onClick={() => console.log('Avatar clicked: Ben Lin')}
+                size="lg"
+              />
+              <Avatar
+                name="Jarley Trainor"
+                onClick={() => console.log('Avatar clicked: Jarley')}
+                size="lg"
+              />
+              <span style={{ fontSize: 13, color: 'var(--text-tertiary)', marginLeft: 12 }}>
+                ← Tab to focus, hover lifts, focus shows orange ring
+              </span>
+            </Row>
+          </Section>
+
+          <Section title="Avatar · initials edge cases">
+            <Row label="single word / multi word / punctuation / empty">
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                <Avatar name="Ben Lin" size="md" />
+                <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>"Ben Lin" → BL</span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                <Avatar name="admin" size="md" />
+                <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>"admin" → AD</span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                <Avatar name="Mary-Jane O'Connor" size="md" />
+                <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>"Mary-Jane O'Connor" → MO</span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                <Avatar name="" size="md" />
+                <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>(empty) → ?</span>
               </div>
             </Row>
           </Section>
