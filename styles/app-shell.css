@@ -197,3 +197,14 @@ button:focus-visible,
   font-variant-numeric: tabular-nums;
   /* Numbers in monospace-ish width so they don't shift on hover */
 }
+
+/* =========================================================================
+   Page-level layout helpers (Sprint 1.6+)
+   ========================================================================= */
+
+.fs-page {
+  width: 100%;
+}
+
+/* Middle column page body padding is set by app-shell.js inline (.contentStyle).
+   Pages should NOT add their own outer padding — they live inside that. */

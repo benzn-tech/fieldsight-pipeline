@@ -47,8 +47,17 @@ function WeatherIndicator() {
 const MIDDLE_WIDTH_MIN     = 280;
 const MIDDLE_WIDTH_MAX     = 480;
 
+/* ---------- Date subtitle helper ------------------------------------------ */
+function formatTodayDate() {
+  var d = new Date();
+  var days   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  var months = ['Jan','Feb','Mar','Apr','May','Jun',
+                'Jul','Aug','Sep','Oct','Nov','Dec'];
+  return days[d.getDay()] + ' · ' + d.getDate() + ' ' + months[d.getMonth()];
+}
+
 /* ---------- MiddleColumn -------------------------------------------------- */
-function MiddleColumn({ route, width, onWidthChange }) {
+function MiddleColumn({ route, width, onWidthChange, onSelect }) {
   const t = window.FS.tokens;
 
   const routeLabel = (route || '/').replace(/^\//, '') || 'today';
@@ -80,19 +89,24 @@ function MiddleColumn({ route, width, onWidthChange }) {
     gap: '8px',
   };
 
-  const placeholders = Array.from({ length: 6 }, function(_, i) { return i; });
-
   return React.createElement('div', { style: style, className: 'middle-column' },
 
     React.createElement('div', { style: headerStyle, className: 'middle-column__header' },
-      React.createElement('span', {
-        style: {
-          fontWeight: t.typography.fontWeight.semibold,
-          fontSize: t.typography.fontSize.base,
-          color: t.text.primary,
-          flex: 1,
-        },
-      }, title),
+      React.createElement('div', {
+        style: { display: 'flex', flexDirection: 'column', flex: 1, gap: '2px' },
+      },
+        React.createElement('span', {
+          style: {
+            fontWeight: t.typography.fontWeight.semibold,
+            fontSize: t.typography.fontSize.base,
+            color: t.text.primary,
+            lineHeight: 1.2,
+          },
+        }, title),
+        route === '/today' ? React.createElement('span', {
+          style: { fontSize: '11px', color: t.text.tertiary, lineHeight: 1.2 },
+        }, formatTodayDate()) : null,
+      ),
 
       /* Right-side utility area: weather + future bell etc. */
       React.createElement('div', { className: 'middle-column__utility' },
@@ -101,30 +115,24 @@ function MiddleColumn({ route, width, onWidthChange }) {
     ),
 
     React.createElement('div', { style: contentStyle },
-      React.createElement('p', {
-        style: {
-          fontSize: t.typography.fontSize.sm,
-          color: t.text.tertiary,
-          margin: '0 0 16px',
-          padding: '12px 16px',
-          background: t.surface.panelMuted,
-          borderRadius: '8px',
-          border: '1px dashed ' + t.border.subtle,
-        },
-      }, 'Sprint 1 placeholder — ' + title + ' content coming soon.'),
-
-      placeholders.map(function(i) {
-        return React.createElement('div', {
-          key: i,
+      (function() {
+        var page = window.FieldSight.getPageForRoute && window.FieldSight.getPageForRoute(route);
+        if (page && page.Middle) {
+          return React.createElement(page.Middle, { onSelect: onSelect });
+        }
+        /* Fallback placeholder for unregistered routes */
+        return React.createElement('p', {
           style: {
-            height: '64px',
-            borderRadius: '8px',
+            fontSize: t.typography.fontSize.sm,
+            color: t.text.tertiary,
+            margin: '0',
+            padding: '12px 16px',
             background: t.surface.panelMuted,
-            border: '1px solid ' + t.border.subtle,
-            flexShrink: 0,
+            borderRadius: '8px',
+            border: '1px dashed ' + t.border.subtle,
           },
-        });
-      }),
+        }, 'Page coming soon — ' + title);
+      })(),
     ),
 
     /* Drag handle on right edge — controlled by AppShell */
@@ -143,14 +151,23 @@ function MiddleColumn({ route, width, onWidthChange }) {
 }
 
 /* ---------- RightDetail --------------------------------------------------- */
-function RightDetail() {
+function RightDetail({ route, selectedItem, onClose }) {
   const t = window.FS.tokens;
 
-  const style = {
-    background: t.surface.app,
-    color: t.text.tertiary,
-  };
+  var page = window.FieldSight.getPageForRoute && window.FieldSight.getPageForRoute(route);
+  if (page && page.Right) {
+    return React.createElement('div', {
+      className: 'right-detail',
+      style: { background: t.surface.app, height: '100%', overflow: 'hidden' },
+    },
+      React.createElement(page.Right, {
+        selectedItem: selectedItem,
+        onClose: onClose,
+      }),
+    );
+  }
 
+  /* Default empty state for unregistered routes */
   const iconWrapStyle = {
     width: '60px', height: '60px', borderRadius: '50%',
     background: t.surface.panel,
@@ -159,13 +176,14 @@ function RightDetail() {
     boxShadow: t.shadow.sm,
   };
 
-  return React.createElement('div', { style: style, className: 'right-detail' },
+  return React.createElement('div', {
+    style: { background: t.surface.app, color: t.text.tertiary },
+    className: 'right-detail',
+  },
     React.createElement('div', { style: iconWrapStyle },
       window.FieldSight && window.FieldSight.NavIcon
         ? React.createElement(window.FieldSight.NavIcon, {
-            name: 'panel-right-open',
-            size: 28,
-            color: t.text.disabled,
+            name: 'panel-right-open', size: 28, color: t.text.disabled,
           })
         : null,
     ),
@@ -177,10 +195,7 @@ function RightDetail() {
       },
     }, 'Select an item'),
     React.createElement('div', {
-      style: {
-        fontSize: t.typography.fontSize.sm,
-        color: t.text.tertiary,
-      },
+      style: { fontSize: t.typography.fontSize.sm, color: t.text.tertiary },
     }, 'Choose from the list to view details'),
   );
 }
@@ -205,6 +220,14 @@ function AppShell({ showDevSwitcher = false }) {
   const [middleWidth, setMiddleWidth] = React.useState(function() {
     return (dd && dd.read(STORAGE_KEYS.middleWidth, MIDDLE_WIDTH_DEFAULT)) || MIDDLE_WIDTH_DEFAULT;
   });
+
+  /* Selected item for right detail panel */
+  const [selectedItem, setSelectedItem] = React.useState(null);
+
+  /* Clear selection on route change — different page = fresh selection */
+  React.useEffect(function() {
+    setSelectedItem(null);
+  }, [route]);
 
   React.useEffect(function() {
     return window.AuthMock.onChange(function(u) { setUser(Object.assign({}, u)); });
@@ -284,9 +307,14 @@ function AppShell({ showDevSwitcher = false }) {
       route: route,
       width: middleWidth,
       onWidthChange: setMiddleWidth,
+      onSelect: setSelectedItem,
     }),
 
-    React.createElement(RightDetail),
+    React.createElement(RightDetail, {
+      route: route,
+      selectedItem: selectedItem,
+      onClose: function() { setSelectedItem(null); },
+    }),
 
     showDevSwitcher && window.FieldSight.DevRoleSwitcher
       ? React.createElement(window.FieldSight.DevRoleSwitcher)
