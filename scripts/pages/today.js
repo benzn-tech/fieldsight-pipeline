@@ -41,6 +41,20 @@
     }, props.children);
   }
 
+  /* ---------- SubsectionLabel (in-section grouping, smaller) ------------- */
+  function SubsectionLabel(props) {
+    return React.createElement('div', {
+      style: {
+        fontSize: '11px',
+        fontWeight: 600,
+        color: 'var(--text-secondary)',
+        margin: '8px 0 4px',
+        padding: '0 4px',
+        letterSpacing: '0.02em',
+      },
+    }, props.children);
+  }
+
   /* ---------- Morning Brief Card ----------------------------------------- */
   function MorningBriefCard(props) {
     var c = getComponents();
@@ -54,6 +68,9 @@
           icon: 'chevron-up',
           ariaLabel: 'Collapse brief',
           size: 'sm',
+          onClick: function() {
+            console.log('[Brief] toggle collapse — Sprint 2 wires this');
+          },
         }),
       }),
       React.createElement(c.Card.Body, null,
@@ -75,7 +92,14 @@
         ),
       ),
       React.createElement(c.Card.Footer, { align: 'start' },
-        React.createElement(c.Button, { variant: 'tertiary', size: 'sm' }, 'Read full brief'),
+        React.createElement(c.Button, {
+          variant: 'tertiary',
+          size: 'sm',
+          rightIcon: 'arrow-right',
+          onClick: function() {
+            console.log('[Brief] open full brief — Sprint 2 wires this');
+          },
+        }, 'Read full brief'),
       ),
     );
   }
@@ -110,10 +134,12 @@
   function TaskRow(props) {
     var c = getComponents();
     var task = props.task;
+    var isMine = props.isMine;
 
     return React.createElement(c.Card, {
       padding: 'sm',
       onClick: function() { props.onSelect(task); },
+      className: isMine ? 'fs-task-row fs-task-row--mine' : 'fs-task-row',
     },
       React.createElement(c.Card.Body, null,
         React.createElement('div', {
@@ -128,9 +154,12 @@
                 fontSize: '14px',
                 fontWeight: 500,
                 color: 'var(--text-primary)',
+                lineHeight: 1.35,
+                display: '-webkit-box',
+                WebkitBoxOrient: 'vertical',
+                WebkitLineClamp: 2,
                 overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
+                wordBreak: 'break-word',
               },
             }, task.title),
           ),
@@ -240,16 +269,38 @@
           )
         : null,
 
+      /* TASKS TODAY — split: my tasks first, then team's */
       React.createElement(SectionLabel, null, 'Tasks today'),
-      React.createElement('div', {
-        style: { display: 'flex', flexDirection: 'column', gap: '6px' },
-      },
-        data.tasks.map(function(task) {
-          return React.createElement(TaskRow, {
-            key: task.id, task: task, onSelect: onSelect,
-          });
-        })
-      ),
+
+      /* My tasks */
+      data.myTasks && data.myTasks.length > 0 ? React.createElement(React.Fragment, null,
+        React.createElement(SubsectionLabel, null,
+          'My tasks · ' + data.myTasks.length),
+        React.createElement('div', {
+          style: { display: 'flex', flexDirection: 'column', gap: '6px' },
+        },
+          data.myTasks.map(function(task) {
+            return React.createElement(TaskRow, {
+              key: task.id, task: task, onSelect: onSelect, isMine: true,
+            });
+          })
+        ),
+      ) : null,
+
+      /* Team's tasks — visible when user has site-level visibility */
+      data.teamTasks && data.teamTasks.length > 0 ? React.createElement(React.Fragment, null,
+        React.createElement(SubsectionLabel, null,
+          'Team · ' + data.teamTasks.length),
+        React.createElement('div', {
+          style: { display: 'flex', flexDirection: 'column', gap: '6px' },
+        },
+          data.teamTasks.map(function(task) {
+            return React.createElement(TaskRow, {
+              key: task.id, task: task, onSelect: onSelect, isMine: false,
+            });
+          })
+        ),
+      ) : null,
 
       React.createElement(SectionLabel, null, 'Recent activity'),
       React.createElement('div', {
@@ -304,22 +355,26 @@
         ['Assignee', item.assignee],
         ['Due',      item.dueTime],
         ['Status',   item.status],
-        ['Notes',    'No notes added.'],
+        ['Priority', item.priority || 'Medium'],
       ];
     } else if (item.kind === 'urgent') {
       rows = [
-        ['Severity', item.badgeLabel],
-        ['Detail',   item.body],
-        ['Action',   'Pending operator confirmation.'],
+        ['Severity',     item.badgeLabel],
+        ['Triggered by', item.triggeredBy || 'Manual flag'],
+        ['Detail',       item.body],
+        ['Action',       'Pending operator confirmation.'],
       ];
     } else if (item.kind === 'activity') {
       rows = [
-        ['Speaker', item.speaker],
-        ['When',    item.timeAgo],
-        ['Source',  'PTT transcript'],
-        ['Snippet', item.snippet],
+        ['Speaker',  item.speaker],
+        ['When',     item.timeAgo],
+        ['Source',   'PTT transcript'],
+        ['Channel',  item.channel || 'General'],
       ];
     }
+
+    var related  = window.FieldSight.MockData.getRelated(item)  || [];
+    var timeline = window.FieldSight.MockData.getTimeline(item) || [];
 
     return React.createElement('div', {
       style: {
@@ -327,7 +382,7 @@
         height: '100%',
         display: 'flex',
         flexDirection: 'column',
-        gap: '16px',
+        gap: '20px',
         overflowY: 'auto',
         boxSizing: 'border-box',
       },
@@ -349,6 +404,13 @@
             fontWeight: 600,
             color: 'var(--text-primary)',
             lineHeight: 1.3,
+            flex: 1,
+            minWidth: 0,
+            display: '-webkit-box',
+            WebkitBoxOrient: 'vertical',
+            WebkitLineClamp: 3,
+            overflow: 'hidden',
+            wordBreak: 'break-word',
           },
         }, item.title || item.snippet || '(item)'),
         React.createElement(c.IconButton, {
@@ -360,6 +422,21 @@
           },
         }),
       ),
+
+      /* Status badges row (kind-specific) */
+      item.kind === 'urgent' ? React.createElement('div', { style: { display: 'flex', gap: '6px' } },
+        React.createElement(c.Badge, {
+          tone: item.badgeTone, size: 'sm', prefixDot: true,
+        }, item.badgeLabel),
+      ) : null,
+
+      item.kind === 'task' ? React.createElement('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
+        React.createElement(c.Badge, { tone: item.statusTone, size: 'sm' }, item.status),
+        item.priority ? React.createElement(c.Badge, {
+          tone: item.priority === 'High' ? 'danger' : item.priority === 'Low' ? 'neutral' : 'warning',
+          size: 'sm', variant: 'outline',
+        }, item.priority) : null,
+      ) : null,
 
       /* Key/value field rows */
       React.createElement('div', {
@@ -377,22 +454,89 @@
           },
             React.createElement('div', {
               style: {
-                fontSize: '12px',
+                fontSize: '11px',
                 color: 'var(--text-tertiary)',
-                fontWeight: 500,
+                fontWeight: 600,
                 width: '88px',
                 flexShrink: 0,
                 textTransform: 'uppercase',
-                letterSpacing: '0.04em',
-                paddingTop: '1px',
+                letterSpacing: '0.06em',
+                paddingTop: '2px',
               },
             }, r[0]),
             React.createElement('div', {
-              style: { fontSize: '14px', color: 'var(--text-primary)', flex: 1 },
+              style: { fontSize: '14px', color: 'var(--text-primary)', flex: 1, lineHeight: 1.45 },
             }, r[1]),
           );
         })
       ),
+
+      /* Related section */
+      related.length > 0 ? React.createElement(React.Fragment, null,
+        React.createElement('div', {
+          style: {
+            fontSize: '11px', fontWeight: 600,
+            color: 'var(--text-tertiary)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+            marginTop: '4px',
+          },
+        }, 'Related'),
+        React.createElement('div', {
+          style: { display: 'flex', flexDirection: 'column', gap: '6px' },
+        },
+          related.map(function(r, i) {
+            return React.createElement(c.Card, {
+              key: i, padding: 'sm', variant: 'ghost',
+              onClick: function() {
+                console.log('[Right] navigate to related:', r.id);
+              },
+            },
+              React.createElement(c.Card.Body, null,
+                React.createElement('div', {
+                  style: { fontSize: '13px', color: 'var(--text-primary)', fontWeight: 500 },
+                }, r.title),
+                React.createElement('div', {
+                  style: { fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' },
+                }, r.subtitle),
+              ),
+            );
+          })
+        ),
+      ) : null,
+
+      /* Timeline section */
+      timeline.length > 0 ? React.createElement(React.Fragment, null,
+        React.createElement('div', {
+          style: {
+            fontSize: '11px', fontWeight: 600,
+            color: 'var(--text-tertiary)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+            marginTop: '4px',
+          },
+        }, 'Timeline'),
+        React.createElement('div', {
+          style: { display: 'flex', flexDirection: 'column', gap: '8px',
+                   paddingLeft: '8px',
+                   borderLeft: '2px solid var(--border-subtle)' },
+        },
+          timeline.map(function(t, i) {
+            return React.createElement('div', {
+              key: i,
+              style: { display: 'flex', flexDirection: 'column', gap: '2px',
+                       paddingLeft: '8px' },
+            },
+              React.createElement('div', {
+                style: { fontSize: '13px', color: 'var(--text-primary)' },
+              }, t.label),
+              React.createElement('div', {
+                style: { fontSize: '11px', color: 'var(--text-tertiary)' },
+              }, t.actor + ' · ' + t.time),
+            );
+          })
+        ),
+      ) : null,
 
       /* Action buttons pinned to bottom */
       React.createElement('div', {

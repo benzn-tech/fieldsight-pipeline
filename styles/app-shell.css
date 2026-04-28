@@ -120,16 +120,26 @@ body.fs-dragging object {
 
   .middle-column {
     width: 100% !important;
+    min-width: 0 !important;
     max-width: none !important;
     flex: 1;
   }
 
   .resize-handle { display: none; }   /* no resize on mobile */
-  .right-detail  { display: none; }   /* hidden until item selected */
+
+  /* Mobile pane swap — show middle by default, swap to right detail
+     when something is selected. AppShell toggles `has-selection` on
+     the shell root. */
+  .app-shell:not(.has-selection) .right-detail { display: none; }
+  .app-shell.has-selection      .middle-column { display: none; }
+  .app-shell.has-selection      .right-detail  { flex: 1; width: 100%; }
 }
 
 /* ---------- Focus rings --------------------------------------------------- */
-button:focus-visible,
+/* Scoped to bare/unstyled buttons. Component buttons (.fs-btn,
+   .fs-utility-item, etc.) own their own focus styling so this rule
+   doesn't conflict with theirs. */
+button:not([class*="fs-"]):focus-visible,
 [role="menuitem"]:focus-visible {
   outline: none;
   box-shadow: 0 0 0 2px var(--surface-app),
@@ -208,3 +218,170 @@ button:focus-visible,
 
 /* Middle column page body padding is set by app-shell.js inline (.contentStyle).
    Pages should NOT add their own outer padding — they live inside that. */
+
+/* =========================================================================
+   Weather popover (Sprint 1.6 hotfix)
+   ========================================================================= */
+
+.fs-utility-item--active {
+  background: var(--surface-panel-muted);
+  color: var(--text-primary);
+}
+
+.fs-weather-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 320px;
+  max-width: 360px;
+  background: var(--surface-panel);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: 16px;
+  z-index: 200;
+  font-family: var(--font-sans);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.fs-weather-popover__current {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.fs-weather-popover__current-icon {
+  width: 56px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+}
+
+.fs-weather-popover__current-temp {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1;
+}
+
+.fs-weather-popover__current-label {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.fs-weather-popover__current-meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin-top: 2px;
+}
+
+.fs-weather-popover__section-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.fs-weather-popover__hourly {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.fs-weather-popover__hourly::-webkit-scrollbar {
+  height: 4px;
+}
+
+.fs-weather-popover__hour {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-width: 38px;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+}
+
+.fs-weather-popover__hour-time {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-weather-popover__hour-temp {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-weather-popover__daily {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.fs-weather-popover__day {
+  display: grid;
+  grid-template-columns: 36px 56px 20px 1fr;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.fs-weather-popover__day:last-child {
+  border-bottom: none;
+}
+
+.fs-weather-popover__day-name {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.fs-weather-popover__day-date {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-weather-popover__day-range {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+/* =========================================================================
+   Page card refinements (Sprint 1.6 hotfix)
+   ========================================================================= */
+
+/* "My tasks" subtle accent — left border in accent color. The Card
+   component already has its own border; we strengthen the left edge. */
+.fs-task-row--mine {
+  border-left: 3px solid var(--color-accent-300) !important;
+}
+
+.fs-task-row--mine:hover {
+  border-left-color: var(--color-accent-500) !important;
+}
+
+/* =========================================================================
+   Dev role switcher — native <select> dropdown options
+   ========================================================================= */
+
+/* The closed state is styled inline; option styling has to come from
+   CSS so the open dropdown picks up our dark theme. */
+.fs-dev-switcher select option {
+  background: #1a1a1a;
+  color: #fff;
+}

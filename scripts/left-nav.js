@@ -172,11 +172,15 @@ function SubgroupLabel({ label, isCollapsed }) {
   }
   return React.createElement('div', {
     style: {
-      padding: '8px 20px 2px',
-      fontSize: '10px',
-      fontWeight: 500,
-      letterSpacing: '0.04em',
-      color: 'rgba(255,255,255,0.30)',
+      /* Same horizontal as SectionLabel so it sits flush with WORKSPACE etc.
+         Smaller font + uppercase + lower opacity make it visually
+         subordinate; sub-items further indent via NavItem.isSubItem. */
+      padding: '12px 20px 4px',
+      fontSize: '9px',
+      fontWeight: 600,
+      letterSpacing: '0.10em',
+      textTransform: 'uppercase',
+      color: 'rgba(255,255,255,0.28)',
     },
   }, label);
 }
