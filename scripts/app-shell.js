@@ -12,43 +12,145 @@ const STORAGE_KEYS = {
 
 const MIDDLE_WIDTH_DEFAULT = 320;
 
-/* ---------- Tiny inline weather indicator ------------------------------- */
-/* Mock data for now — Sprint 2 wires the real API.
-   Render only inside the MiddleColumn header utility area. */
+/* ---------- Weather Indicator + Popover -------------------------------- */
+/* Click reveals a popover with current conditions, next 12h hourly,
+   and a 7-day daily forecast. Mock data only — Sprint 2 wires the
+   real MetService API. */
 function WeatherIndicator() {
-  const t = window.FS.tokens;
   const NavIcon = window.FieldSight && window.FieldSight.NavIcon;
+  const weatherData = window.FieldSight.MockData
+    ? window.FieldSight.MockData.WEATHER
+    : null;
 
-  /* Mock: 17°C, partly cloudy, light wind */
-  const temp = 17;
-  const condition = 'cloud-sun';
-  const wind = '12 km/h';
+  const [open, setOpen] = React.useState(false);
+  const wrapRef = React.useRef(null);
 
-  function handleClick() {
-    console.log('[Weather] open detail panel (Sprint 2 wires this)');
-  }
+  /* Close on outside click */
+  React.useEffect(function() {
+    if (!open) return;
+    function onClick(e) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', onClick);
+    return function() { document.removeEventListener('mousedown', onClick); };
+  }, [open]);
 
-  return React.createElement('button', {
-    type: 'button',
-    onClick: handleClick,
-    className: 'fs-utility-item',
-    title: 'Site weather · ' + temp + '°C · ' + wind,
-    'aria-label': 'Site weather, ' + temp + ' degrees, wind ' + wind,
+  /* Close on Escape */
+  React.useEffect(function() {
+    if (!open) return;
+    function onKey(e) { if (e.key === 'Escape') setOpen(false); }
+    document.addEventListener('keydown', onKey);
+    return function() { document.removeEventListener('keydown', onKey); };
+  }, [open]);
+
+  if (!weatherData) return null;
+
+  const current = weatherData.current;
+
+  return React.createElement('div', {
+    ref: wrapRef,
+    style: { position: 'relative', display: 'inline-block' },
   },
-    NavIcon && React.createElement(NavIcon, {
-      name: condition,
-      size: 16,
-    }),
-    React.createElement('span', {
-      className: 'fs-utility-item__text',
-    }, temp + '°'),
+    React.createElement('button', {
+      type: 'button',
+      onClick: function() { setOpen(function(o) { return !o; }); },
+      className: 'fs-utility-item' + (open ? ' fs-utility-item--active' : ''),
+      title: 'Site weather · ' + current.temp + '°C · ' + current.wind,
+      'aria-label': 'Site weather, ' + current.temp + ' degrees',
+      'aria-expanded': open,
+    },
+      NavIcon && React.createElement(NavIcon, { name: current.condition, size: 16 }),
+      React.createElement('span', { className: 'fs-utility-item__text' },
+        current.temp + '°'),
+    ),
+
+    open ? React.createElement(WeatherPopover, {
+      data: weatherData,
+      onClose: function() { setOpen(false); },
+    }) : null,
+  );
+}
+
+/* ---------- Weather popover content ----------------------------------- */
+function WeatherPopover(props) {
+  const NavIcon = window.FieldSight && window.FieldSight.NavIcon;
+  const data = props.data;
+  const current = data.current;
+
+  return React.createElement('div', {
+    className: 'fs-weather-popover',
+    role: 'dialog',
+    'aria-label': 'Weather forecast',
+  },
+
+    /* Current */
+    React.createElement('div', { className: 'fs-weather-popover__current' },
+      React.createElement('div', { className: 'fs-weather-popover__current-icon' },
+        NavIcon && React.createElement(NavIcon, { name: current.condition, size: 36 }),
+      ),
+      React.createElement('div', null,
+        React.createElement('div', { className: 'fs-weather-popover__current-temp' },
+          current.temp + '°'),
+        React.createElement('div', { className: 'fs-weather-popover__current-label' },
+          current.conditionLabel),
+        React.createElement('div', { className: 'fs-weather-popover__current-meta' },
+          'Wind ' + current.wind + ' · Humidity ' + current.humidity),
+      ),
+    ),
+
+    /* Next 12h hourly strip */
+    React.createElement('div', { className: 'fs-weather-popover__section-label' },
+      'Next 12 hours'),
+    React.createElement('div', { className: 'fs-weather-popover__hourly' },
+      data.hourly.map(function(h, i) {
+        return React.createElement('div', {
+          key: i, className: 'fs-weather-popover__hour',
+        },
+          React.createElement('div', { className: 'fs-weather-popover__hour-time' },
+            h.hour),
+          NavIcon && React.createElement(NavIcon, { name: h.condition, size: 16 }),
+          React.createElement('div', { className: 'fs-weather-popover__hour-temp' },
+            h.temp + '°'),
+        );
+      }),
+    ),
+
+    /* 7-day daily */
+    React.createElement('div', { className: 'fs-weather-popover__section-label' },
+      '7-day forecast'),
+    React.createElement('div', { className: 'fs-weather-popover__daily' },
+      data.daily.map(function(d, i) {
+        return React.createElement('div', {
+          key: i, className: 'fs-weather-popover__day',
+        },
+          React.createElement('span', { className: 'fs-weather-popover__day-name' },
+            d.day),
+          React.createElement('span', { className: 'fs-weather-popover__day-date' },
+            d.date),
+          NavIcon && React.createElement(NavIcon, { name: d.condition, size: 16 }),
+          React.createElement('span', { className: 'fs-weather-popover__day-range' },
+            d.high + '° / ' + d.low + '°'),
+        );
+      }),
+    ),
   );
 }
 const MIDDLE_WIDTH_MIN     = 280;
 const MIDDLE_WIDTH_MAX     = 480;
 
+/* ---------- Date subtitle helper ------------------------------------------ */
+function formatTodayDate() {
+  var d = new Date();
+  var days   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  var months = ['Jan','Feb','Mar','Apr','May','Jun',
+                'Jul','Aug','Sep','Oct','Nov','Dec'];
+  return days[d.getDay()] + ' · ' + d.getDate() + ' ' + months[d.getMonth()];
+}
+
 /* ---------- MiddleColumn -------------------------------------------------- */
-function MiddleColumn({ route, width, onWidthChange }) {
+function MiddleColumn({ route, width, onWidthChange, onSelect }) {
   const t = window.FS.tokens;
 
   const routeLabel = (route || '/').replace(/^\//, '') || 'today';
@@ -80,19 +182,24 @@ function MiddleColumn({ route, width, onWidthChange }) {
     gap: '8px',
   };
 
-  const placeholders = Array.from({ length: 6 }, function(_, i) { return i; });
-
   return React.createElement('div', { style: style, className: 'middle-column' },
 
     React.createElement('div', { style: headerStyle, className: 'middle-column__header' },
-      React.createElement('span', {
-        style: {
-          fontWeight: t.typography.fontWeight.semibold,
-          fontSize: t.typography.fontSize.base,
-          color: t.text.primary,
-          flex: 1,
-        },
-      }, title),
+      React.createElement('div', {
+        style: { display: 'flex', flexDirection: 'column', flex: 1, gap: '2px' },
+      },
+        React.createElement('span', {
+          style: {
+            fontWeight: t.typography.fontWeight.semibold,
+            fontSize: t.typography.fontSize.base,
+            color: t.text.primary,
+            lineHeight: 1.2,
+          },
+        }, title),
+        route === '/today' ? React.createElement('span', {
+          style: { fontSize: '11px', color: t.text.tertiary, lineHeight: 1.2 },
+        }, formatTodayDate()) : null,
+      ),
 
       /* Right-side utility area: weather + future bell etc. */
       React.createElement('div', { className: 'middle-column__utility' },
@@ -101,30 +208,56 @@ function MiddleColumn({ route, width, onWidthChange }) {
     ),
 
     React.createElement('div', { style: contentStyle },
-      React.createElement('p', {
-        style: {
-          fontSize: t.typography.fontSize.sm,
-          color: t.text.tertiary,
-          margin: '0 0 16px',
-          padding: '12px 16px',
-          background: t.surface.panelMuted,
-          borderRadius: '8px',
-          border: '1px dashed ' + t.border.subtle,
-        },
-      }, 'Sprint 1 placeholder — ' + title + ' content coming soon.'),
-
-      placeholders.map(function(i) {
+      (function() {
+        var page = window.FieldSight.getPageForRoute && window.FieldSight.getPageForRoute(route);
+        if (page && page.Middle) {
+          return React.createElement(page.Middle, { onSelect: onSelect });
+        }
+        /* Fallback placeholder for unregistered routes — Sprint 2 fills in
+           remaining pages; until then, visualise the route as a friendly
+           coming-soon state rather than a bare line of text. */
+        var NavIcon = window.FieldSight && window.FieldSight.NavIcon;
         return React.createElement('div', {
-          key: i,
+          className: 'fs-page-placeholder',
           style: {
-            height: '64px',
-            borderRadius: '8px',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            textAlign: 'center',
+            gap: '12px',
+            padding: '40px 24px',
+            margin: '24px 0',
             background: t.surface.panelMuted,
-            border: '1px solid ' + t.border.subtle,
-            flexShrink: 0,
+            border: '1px dashed ' + t.border.subtle,
+            borderRadius: '12px',
+            color: t.text.tertiary,
           },
-        });
-      }),
+        },
+          React.createElement('div', {
+            style: {
+              width: '48px', height: '48px', borderRadius: '50%',
+              background: t.surface.panel,
+              border: '1px solid ' + t.border.subtle,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            },
+          },
+            NavIcon ? React.createElement(NavIcon, {
+              name: 'hammer', size: 22, color: t.text.disabled,
+            }) : null,
+          ),
+          React.createElement('div', {
+            style: {
+              fontSize: t.typography.fontSize.base,
+              fontWeight: t.typography.fontWeight.semibold,
+              color: t.text.secondary,
+            },
+          }, title),
+          React.createElement('div', {
+            style: { fontSize: t.typography.fontSize.sm, lineHeight: 1.5 },
+          }, 'Coming in Sprint 2 — this page is not yet wired up.'),
+        );
+      })(),
     ),
 
     /* Drag handle on right edge — controlled by AppShell */
@@ -143,14 +276,23 @@ function MiddleColumn({ route, width, onWidthChange }) {
 }
 
 /* ---------- RightDetail --------------------------------------------------- */
-function RightDetail() {
+function RightDetail({ route, selectedItem, onClose }) {
   const t = window.FS.tokens;
 
-  const style = {
-    background: t.surface.app,
-    color: t.text.tertiary,
-  };
+  var page = window.FieldSight.getPageForRoute && window.FieldSight.getPageForRoute(route);
+  if (page && page.Right) {
+    return React.createElement('div', {
+      className: 'right-detail',
+      style: { background: t.surface.app, height: '100%', overflow: 'hidden' },
+    },
+      React.createElement(page.Right, {
+        selectedItem: selectedItem,
+        onClose: onClose,
+      }),
+    );
+  }
 
+  /* Default empty state for unregistered routes */
   const iconWrapStyle = {
     width: '60px', height: '60px', borderRadius: '50%',
     background: t.surface.panel,
@@ -159,13 +301,14 @@ function RightDetail() {
     boxShadow: t.shadow.sm,
   };
 
-  return React.createElement('div', { style: style, className: 'right-detail' },
+  return React.createElement('div', {
+    style: { background: t.surface.app, color: t.text.tertiary },
+    className: 'right-detail',
+  },
     React.createElement('div', { style: iconWrapStyle },
       window.FieldSight && window.FieldSight.NavIcon
         ? React.createElement(window.FieldSight.NavIcon, {
-            name: 'panel-right-open',
-            size: 28,
-            color: t.text.disabled,
+            name: 'panel-right-open', size: 28, color: t.text.disabled,
           })
         : null,
     ),
@@ -177,10 +320,7 @@ function RightDetail() {
       },
     }, 'Select an item'),
     React.createElement('div', {
-      style: {
-        fontSize: t.typography.fontSize.sm,
-        color: t.text.tertiary,
-      },
+      style: { fontSize: t.typography.fontSize.sm, color: t.text.tertiary },
     }, 'Choose from the list to view details'),
   );
 }
@@ -205,6 +345,14 @@ function AppShell({ showDevSwitcher = false }) {
   const [middleWidth, setMiddleWidth] = React.useState(function() {
     return (dd && dd.read(STORAGE_KEYS.middleWidth, MIDDLE_WIDTH_DEFAULT)) || MIDDLE_WIDTH_DEFAULT;
   });
+
+  /* Selected item for right detail panel */
+  const [selectedItem, setSelectedItem] = React.useState(null);
+
+  /* Clear selection on route change — different page = fresh selection */
+  React.useEffect(function() {
+    setSelectedItem(null);
+  }, [route]);
 
   React.useEffect(function() {
     return window.AuthMock.onChange(function(u) { setUser(Object.assign({}, u)); });
@@ -270,7 +418,11 @@ function AppShell({ showDevSwitcher = false }) {
     color: window.FS.tokens.text.primary,
   };
 
-  return React.createElement('div', { style: shellStyle, className: 'app-shell' },
+  /* `has-selection` lets the mobile media query swap which pane is
+     visible: middle when nothing is selected, right detail when something is. */
+  var shellClassName = 'app-shell' + (selectedItem ? ' has-selection' : '');
+
+  return React.createElement('div', { style: shellStyle, className: shellClassName },
 
     React.createElement(window.FieldSight.LeftNav, {
       user: user,
@@ -284,9 +436,14 @@ function AppShell({ showDevSwitcher = false }) {
       route: route,
       width: middleWidth,
       onWidthChange: setMiddleWidth,
+      onSelect: setSelectedItem,
     }),
 
-    React.createElement(RightDetail),
+    React.createElement(RightDetail, {
+      route: route,
+      selectedItem: selectedItem,
+      onClose: function() { setSelectedItem(null); },
+    }),
 
     showDevSwitcher && window.FieldSight.DevRoleSwitcher
       ? React.createElement(window.FieldSight.DevRoleSwitcher)

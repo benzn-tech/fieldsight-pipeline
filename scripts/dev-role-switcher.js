@@ -138,7 +138,7 @@ function DevRoleSwitcher() {
 
   const metaLanding = window.FS.ROLES[selectedRole]?.defaultLanding || '/today';
 
-  return React.createElement('div', { style: panelStyle },
+  return React.createElement('div', { style: panelStyle, className: 'fs-dev-switcher' },
 
     /* Header — click to minimize */
     React.createElement('div', {
