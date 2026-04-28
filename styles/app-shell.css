@@ -362,20 +362,6 @@ button:not([class*="fs-"]):focus-visible,
 }
 
 /* =========================================================================
-   Page card refinements (Sprint 1.6 hotfix)
-   ========================================================================= */
-
-/* "My tasks" subtle accent — left border in accent color. The Card
-   component already has its own border; we strengthen the left edge. */
-.fs-task-row--mine {
-  border-left: 3px solid var(--color-accent-300) !important;
-}
-
-.fs-task-row--mine:hover {
-  border-left-color: var(--color-accent-500) !important;
-}
-
-/* =========================================================================
    Dev role switcher — native <select> dropdown options
    ========================================================================= */
 

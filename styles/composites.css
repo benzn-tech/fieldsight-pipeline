@@ -1,0 +1,223 @@
+/* ==========================================================================
+   FieldSight · Composite Layer (Layer 5)
+   --------------------------------------------------------------------------
+   Each composite wraps Layer 4 atoms (Card, Avatar, Badge, Button) and
+   adds page-shaped layout. Class names follow .fs-{component}__{element}
+   --{modifier} BEM, like Layer 4. All values come from CSS custom
+   properties in styles/tokens.css.
+   ========================================================================== */
+
+
+/* =========================================================================
+   TaskCard — avatar + title (2-line) + status badge + due time
+   ========================================================================= */
+
+.fs-task-card__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.fs-task-card__main {
+  flex: 1;
+  min-width: 0;
+}
+
+.fs-task-card__title {
+  font-size: 14px;
+  font-weight: var(--font-weight-medium);
+  color: var(--text-primary);
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.fs-task-card__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.fs-task-card__due {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  min-width: 36px;
+  text-align: right;
+}
+
+/* "Mine" accent — left edge in safety orange so a user's own tasks
+   stand out among the team's. */
+.fs-task-card--mine {
+  border-left: 3px solid var(--color-accent-300) !important;
+}
+.fs-task-card--mine:hover {
+  border-left-color: var(--color-accent-500) !important;
+}
+
+
+/* =========================================================================
+   UrgentCard — title + tone badge in header, body line below
+   ========================================================================= */
+
+.fs-urgent-card__body {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+
+/* =========================================================================
+   ActivityCard — avatar + full-wrap snippet + speaker · time
+   ========================================================================= */
+
+.fs-activity-card__row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.fs-activity-card__main {
+  flex: 1;
+  min-width: 0;
+}
+
+.fs-activity-card__snippet {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+
+.fs-activity-card__meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin-top: 4px;
+}
+
+
+/* =========================================================================
+   MorningBriefCard — elevated card with bullet list + Read full brief
+   ========================================================================= */
+
+.fs-morning-brief-card__bullets {
+  margin: 0;
+  padding: 0 0 0 18px;
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.fs-morning-brief-card__bullet {
+  margin-bottom: 6px;
+}
+.fs-morning-brief-card__bullet:last-child {
+  margin-bottom: 0;
+}
+
+
+/* =========================================================================
+   OnSiteCard — AvatarGroup + count
+   ========================================================================= */
+
+.fs-on-site-card__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.fs-on-site-card__count {
+  font-size: 13px;
+  color: var(--text-tertiary);
+}
+
+
+/* =========================================================================
+   Timeline — vertical event log
+   ========================================================================= */
+
+.fs-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border-subtle);
+}
+
+.fs-timeline__entry {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 8px;
+}
+
+.fs-timeline__label {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.fs-timeline__meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+
+/* =========================================================================
+   StatCard — single-value KPI tile
+   ========================================================================= */
+
+.fs-stat-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px;
+  background: var(--surface-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  flex: 1;
+  min-width: 0;
+}
+
+.fs-stat-card__value {
+  font-size: 28px;
+  font-weight: var(--font-weight-bold);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+
+.fs-stat-card__label {
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.fs-stat-card__trend {
+  font-size: 12px;
+  font-weight: var(--font-weight-medium);
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.fs-stat-card__trend--up   { color: var(--color-success-600); }
+.fs-stat-card__trend--down { color: var(--color-danger-600); }
+
+/* Tone variants colour the headline value */
+.fs-stat-card--tone-accent  .fs-stat-card__value { color: var(--color-accent-600); }
+.fs-stat-card--tone-success .fs-stat-card__value { color: var(--color-success-600); }
+.fs-stat-card--tone-warning .fs-stat-card__value { color: var(--color-warning-600); }
+.fs-stat-card--tone-danger  .fs-stat-card__value { color: var(--color-danger-600); }
+
+
+/* =========================================================================
+   KpiStrip — flex row of StatCards
+   ========================================================================= */
+
+.fs-kpi-strip {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}

@@ -10,8 +10,9 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
 
   <link rel="stylesheet" href="styles/tokens.css" />
-  <link rel="stylesheet" href="styles/app-shell.css" />
+  <link rel="stylesheet" href="styles/app-shell.css?v=2" />
   <link rel="stylesheet" href="styles/components.css?v=5" />
+  <link rel="stylesheet" href="styles/composites.css?v=1" />
 
   <style>
     html, body { overflow: auto; height: auto; }
@@ -66,8 +67,8 @@
 </head>
 <body>
   <h1>FieldSight · Components</h1>
-  <p class="subtitle">Layer 4 base components</p>
-  <p class="version">Sprint 1.5 · Badge + Avatar</p>
+  <p class="subtitle">Layer 4 base components + Layer 5 composites</p>
+  <p class="version">Sprint 2.0 · Composite extraction</p>
 
   <div id="root"></div>
 
@@ -84,9 +85,21 @@
   <script type="text/babel" src="scripts/components/badge.js?v=2"></script>
   <script type="text/babel" src="scripts/components/avatar.js?v=2"></script>
 
+  <!-- Layer 5 composites (depend on L4 atoms above) -->
+  <script type="text/babel" src="scripts/composites/task-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/urgent-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/activity-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/morning-brief-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/on-site-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/timeline.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/stat-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/kpi-strip.js?v=1"></script>
+
   <script type="text/babel">
     const { Button, IconButton, Input, Textarea, Select, Card,
-            Badge, NotificationDot, Avatar, AvatarGroup } = window.FieldSight;
+            Badge, NotificationDot, Avatar, AvatarGroup,
+            TaskCard, UrgentCard, ActivityCard, MorningBriefCard,
+            OnSiteCard, Timeline, StatCard, KpiStrip } = window.FieldSight;
 
     function Section({ title, children }) {
       return (
@@ -956,6 +969,139 @@
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
                 <Avatar name="" size="md" />
                 <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>(empty) → ?</span>
+              </div>
+            </Row>
+          </Section>
+
+          {/* ============================================================
+              Layer 5 — Composites (Sprint 2.0)
+              ============================================================ */}
+
+          <h2 style={{ marginTop: 56, color: 'var(--color-accent-600)' }}>
+            Layer 5 · Composites
+          </h2>
+
+          <Section title="StatCard / KpiStrip">
+            <Row label="3-up KPI">
+              <KpiStrip>
+                <StatCard label="Tasks today" value="6" />
+                <StatCard label="On time"     value="83%" tone="success"
+                          trend={{ direction: 'up', delta: '+12%' }} />
+                <StatCard label="Urgent"      value="2"   tone="danger" />
+              </KpiStrip>
+            </Row>
+            <Row label="single">
+              <StatCard label="Revenue MTD" value="$1.2M" tone="accent" />
+            </Row>
+          </Section>
+
+          <Section title="TaskCard">
+            <Row label="default">
+              <div style={{ flex: 1 }}>
+                <TaskCard task={{
+                  id: 'demo-1',
+                  title: 'Pour concrete — Block 4 footing',
+                  assignee: 'Jarley Trainor',
+                  status: 'In progress', statusTone: 'warning',
+                  dueTime: '08:30',
+                }} onSelect={t => console.log('select', t.id)} />
+              </div>
+            </Row>
+            <Row label="--mine (accent)">
+              <div style={{ flex: 1 }}>
+                <TaskCard isMine task={{
+                  id: 'demo-2',
+                  title: 'Daily toolbox talk — fall protection (long task name to verify wrapping)',
+                  assignee: 'Ben Lin',
+                  status: 'Open', statusTone: 'info',
+                  dueTime: '15:30',
+                }} onSelect={t => console.log('select', t.id)} />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="UrgentCard">
+            <Row label="overdue">
+              <div style={{ flex: 1 }}>
+                <UrgentCard item={{
+                  id: 'u-demo',
+                  title: 'Crane inspection — Block 4',
+                  body: 'Booked 7:00 AM, status not confirmed by operator.',
+                  badgeTone: 'danger', badgeLabel: 'Overdue by 2h',
+                }} onSelect={i => console.log('select', i.id)} />
+              </div>
+            </Row>
+            <Row label="warning">
+              <div style={{ flex: 1 }}>
+                <UrgentCard item={{
+                  id: 'u-demo-2',
+                  title: 'Wind warning — secure tarps',
+                  body: 'MetService alert: gusts to 65 km/h after midday.',
+                  badgeTone: 'warning', badgeLabel: 'Action by 14:00',
+                }} onSelect={i => console.log('select', i.id)} />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="ActivityCard">
+            <Row label="snippet">
+              <div style={{ flex: 1 }}>
+                <ActivityCard item={{
+                  id: 'a-demo',
+                  speaker: 'Jarley Trainor',
+                  snippet: 'Concrete crew finished the south footing, moving to north.',
+                  timeAgo: '12m ago',
+                }} onSelect={i => console.log('select', i.id)} />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="MorningBriefCard">
+            <Row label="expanded">
+              <div style={{ flex: 1 }}>
+                <MorningBriefCard brief={{
+                  generatedAt: '5:42 AM',
+                  bullets: [
+                    'Pour at Block 4 completed at 11:30 PM',
+                    'Crane inspection pending — booked 7:00 AM',
+                    'Wind warning expected from 14:00; secure tarps',
+                  ],
+                }} />
+              </div>
+            </Row>
+            <Row label="collapsed">
+              <div style={{ flex: 1 }}>
+                <MorningBriefCard collapsed brief={{
+                  generatedAt: '5:42 AM',
+                  bullets: ['…hidden until expanded'],
+                }} />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="OnSiteCard">
+            <Row label="6 people">
+              <div style={{ flex: 1 }}>
+                <OnSiteCard people={[
+                  { id: 's1', name: 'Jarley Trainor' },
+                  { id: 's2', name: 'Ben Lin' },
+                  { id: 's3', name: 'David Barillaro' },
+                  { id: 's4', name: 'Sarah Chen' },
+                  { id: 's5', name: 'Mike OBrien' },
+                  { id: 's6', name: 'Priya Sharma' },
+                ]} />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Timeline">
+            <Row label="3 events">
+              <div style={{ flex: 1 }}>
+                <Timeline events={[
+                  { label: 'Created',    actor: 'Jarley Trainor', time: 'Yesterday 6:42 PM' },
+                  { label: 'Assigned to Ben Lin', actor: 'Jarley Trainor', time: 'Yesterday 6:43 PM' },
+                  { label: 'Status: In progress', actor: 'Ben Lin', time: 'Today 7:15 AM' },
+                ]} />
               </div>
             </Row>
           </Section>

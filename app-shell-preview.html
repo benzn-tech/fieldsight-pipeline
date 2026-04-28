@@ -12,8 +12,9 @@
 
   <!-- Design tokens + AppShell CSS -->
   <link rel="stylesheet" href="styles/tokens.css" />
-  <link rel="stylesheet" href="styles/app-shell.css" />
+  <link rel="stylesheet" href="styles/app-shell.css?v=2" />
   <link rel="stylesheet" href="styles/components.css?v=4" />
+  <link rel="stylesheet" href="styles/composites.css?v=1" />
 
   <style>
     /* Ensure full-bleed with no scroll */
@@ -48,10 +49,20 @@
   <script type="text/babel" src="scripts/components/badge.js?v=1"></script>
   <script type="text/babel" src="scripts/components/avatar.js?v=2"></script>
 
+  <!-- Layer 5 composites (depend on L4 atoms above) -->
+  <script type="text/babel" src="scripts/composites/task-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/urgent-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/activity-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/morning-brief-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/on-site-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/timeline.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/stat-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/kpi-strip.js?v=1"></script>
+
   <!-- Mock data + page registry + pages -->
   <script type="text/babel" src="scripts/mock-data.js?v=2"></script>
   <script type="text/babel" src="scripts/pages/_page-registry.js?v=1"></script>
-  <script type="text/babel" src="scripts/pages/today.js?v=2"></script>
+  <script type="text/babel" src="scripts/pages/today.js?v=3"></script>
 
   <script type="text/babel" src="scripts/dev-role-switcher.js?v=3"></script>
   <script type="text/babel" src="scripts/app-shell.js?v=4"></script>

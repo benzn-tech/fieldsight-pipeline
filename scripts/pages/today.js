@@ -1,29 +1,19 @@
 /* ==========================================================================
-   FieldSight Today Page — Sprint 1.6 lo-fi wireframe
+   FieldSight Today Page — Sprint 2.0 (Layer 5 composition)
    --------------------------------------------------------------------------
    Two exports: a Middle column component and a Right detail component.
    Both registered into window.FieldSight.PAGES under the '/today' key.
 
-   Lo-fi: real Layer 4 components, mock data, minimal custom styling.
-   Sprint 2 takes this layout to high-fidelity.
+   This page composes Layer 5 composites — TaskCard / UrgentCard /
+   ActivityCard / MorningBriefCard / OnSiteCard / Timeline — instead
+   of inlining their JSX. Sprint 2.1 takes the layout to high-fidelity
+   (KpiStrip, time-aware greeting, Brief truly collapses).
    ========================================================================== */
 
 /* global React, window */
 
 (function () {
   'use strict';
-
-  function getComponents() {
-    var fs = window.FieldSight;
-    return {
-      Card:        fs.Card,
-      Badge:       fs.Badge,
-      Avatar:      fs.Avatar,
-      AvatarGroup: fs.AvatarGroup,
-      Button:      fs.Button,
-      IconButton:  fs.IconButton,
-    };
-  }
 
   /* ---------- SectionLabel (small uppercase heading) --------------------- */
   function SectionLabel(props) {
@@ -55,196 +45,10 @@
     }, props.children);
   }
 
-  /* ---------- Morning Brief Card ----------------------------------------- */
-  function MorningBriefCard(props) {
-    var c = getComponents();
-    var brief = props.brief;
-
-    return React.createElement(c.Card, { variant: 'elevated', padding: 'md' },
-      React.createElement(c.Card.Header, {
-        title: 'Morning Brief',
-        subtitle: 'Generated from overnight transcripts · ' + brief.generatedAt,
-        actions: React.createElement(c.IconButton, {
-          icon: 'chevron-up',
-          ariaLabel: 'Collapse brief',
-          size: 'sm',
-          onClick: function() {
-            console.log('[Brief] toggle collapse — Sprint 2 wires this');
-          },
-        }),
-      }),
-      React.createElement(c.Card.Body, null,
-        React.createElement('ul', {
-          style: {
-            margin: 0,
-            padding: '0 0 0 18px',
-            color: 'var(--text-secondary)',
-            fontSize: '14px',
-            lineHeight: 1.55,
-          },
-        },
-          brief.bullets.map(function(b, i) {
-            return React.createElement('li', {
-              key: i,
-              style: { marginBottom: i < brief.bullets.length - 1 ? '6px' : 0 },
-            }, b);
-          })
-        ),
-      ),
-      React.createElement(c.Card.Footer, { align: 'start' },
-        React.createElement(c.Button, {
-          variant: 'tertiary',
-          size: 'sm',
-          rightIcon: 'arrow-right',
-          onClick: function() {
-            console.log('[Brief] open full brief — Sprint 2 wires this');
-          },
-        }, 'Read full brief'),
-      ),
-    );
-  }
-
-  /* ---------- Urgent Card ------------------------------------------------- */
-  function UrgentCard(props) {
-    var c = getComponents();
-    var item = props.item;
-
-    return React.createElement(c.Card, {
-      variant: 'default',
-      padding: 'sm',
-      onClick: function() { props.onSelect(item); },
-    },
-      React.createElement(c.Card.Header, {
-        title: item.title,
-        actions: React.createElement(c.Badge, {
-          tone: item.badgeTone,
-          size: 'sm',
-          prefixDot: true,
-        }, item.badgeLabel),
-      }),
-      React.createElement(c.Card.Body, null,
-        React.createElement('div', {
-          style: { fontSize: '13px', color: 'var(--text-secondary)' },
-        }, item.body),
-      ),
-    );
-  }
-
-  /* ---------- Task Row Card ----------------------------------------------- */
-  function TaskRow(props) {
-    var c = getComponents();
-    var task = props.task;
-    var isMine = props.isMine;
-
-    return React.createElement(c.Card, {
-      padding: 'sm',
-      onClick: function() { props.onSelect(task); },
-      className: isMine ? 'fs-task-row fs-task-row--mine' : 'fs-task-row',
-    },
-      React.createElement(c.Card.Body, null,
-        React.createElement('div', {
-          style: { display: 'flex', alignItems: 'center', gap: '10px' },
-        },
-          React.createElement(c.Avatar, { name: task.assignee, size: 'sm' }),
-          React.createElement('div', {
-            style: { flex: 1, minWidth: 0 },
-          },
-            React.createElement('div', {
-              style: {
-                fontSize: '14px',
-                fontWeight: 500,
-                color: 'var(--text-primary)',
-                lineHeight: 1.35,
-                display: '-webkit-box',
-                WebkitBoxOrient: 'vertical',
-                WebkitLineClamp: 2,
-                overflow: 'hidden',
-                wordBreak: 'break-word',
-              },
-            }, task.title),
-          ),
-          React.createElement('div', {
-            style: { display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 },
-          },
-            React.createElement(c.Badge, { tone: task.statusTone, size: 'sm' }, task.status),
-            React.createElement('span', {
-              style: {
-                fontSize: '12px',
-                color: 'var(--text-tertiary)',
-                fontFamily: 'var(--font-mono)',
-                minWidth: '36px',
-                textAlign: 'right',
-              },
-            }, task.dueTime),
-          ),
-        ),
-      ),
-    );
-  }
-
-  /* ---------- Activity Row ------------------------------------------------ */
-  function ActivityRow(props) {
-    var c = getComponents();
-    var item = props.item;
-
-    return React.createElement(c.Card, {
-      padding: 'sm',
-      onClick: function() { props.onSelect(item); },
-    },
-      React.createElement(c.Card.Body, null,
-        React.createElement('div', {
-          style: { display: 'flex', alignItems: 'flex-start', gap: '10px' },
-        },
-          React.createElement(c.Avatar, { name: item.speaker, size: 'sm' }),
-          React.createElement('div', { style: { flex: 1, minWidth: 0 } },
-            React.createElement('div', {
-              style: {
-                fontSize: '13px',
-                color: 'var(--text-primary)',
-                lineHeight: 1.4,
-              },
-            }, item.snippet),
-            React.createElement('div', {
-              style: {
-                fontSize: '11px',
-                color: 'var(--text-tertiary)',
-                marginTop: '4px',
-              },
-            }, item.speaker + ' · ' + item.timeAgo),
-          ),
-        ),
-      ),
-    );
-  }
-
-  /* ---------- On Site Card ------------------------------------------------ */
-  function OnSiteCard(props) {
-    var c = getComponents();
-    return React.createElement(c.Card, { padding: 'md' },
-      React.createElement(c.Card.Body, null,
-        React.createElement('div', {
-          style: {
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-          },
-        },
-          React.createElement(c.AvatarGroup, { size: 'md', max: 5 },
-            props.people.map(function(p) {
-              return React.createElement(c.Avatar, { key: p.id, name: p.name });
-            })
-          ),
-          React.createElement('span', {
-            style: { fontSize: '13px', color: 'var(--text-tertiary)' },
-          }, props.people.length + ' on site'),
-        ),
-      ),
-    );
-  }
-
   /* ---------- Today Middle Column ----------------------------------------- */
   function TodayMiddleColumn(props) {
-    var data = window.FieldSight.MockData.TODAY;
+    var fs       = window.FieldSight;
+    var data     = fs.MockData.TODAY;
     var onSelect = props.onSelect || function() {};
 
     return React.createElement('div', {
@@ -252,8 +56,10 @@
       className: 'fs-page fs-page--today',
     },
 
-      React.createElement(MorningBriefCard, { brief: data.morningBrief }),
+      /* MORNING BRIEF */
+      React.createElement(fs.MorningBriefCard, { brief: data.morningBrief }),
 
+      /* URGENT */
       data.urgent && data.urgent.length > 0
         ? React.createElement(React.Fragment, null,
             React.createElement(SectionLabel, { color: 'var(--color-danger-700)' }, 'Urgent now'),
@@ -261,7 +67,7 @@
               style: { display: 'flex', flexDirection: 'column', gap: '6px' },
             },
               data.urgent.map(function(item) {
-                return React.createElement(UrgentCard, {
+                return React.createElement(fs.UrgentCard, {
                   key: item.id, item: item, onSelect: onSelect,
                 });
               })
@@ -269,10 +75,9 @@
           )
         : null,
 
-      /* TASKS TODAY — split: my tasks first, then team's */
+      /* TASKS — split into My + Team */
       React.createElement(SectionLabel, null, 'Tasks today'),
 
-      /* My tasks */
       data.myTasks && data.myTasks.length > 0 ? React.createElement(React.Fragment, null,
         React.createElement(SubsectionLabel, null,
           'My tasks · ' + data.myTasks.length),
@@ -280,14 +85,13 @@
           style: { display: 'flex', flexDirection: 'column', gap: '6px' },
         },
           data.myTasks.map(function(task) {
-            return React.createElement(TaskRow, {
+            return React.createElement(fs.TaskCard, {
               key: task.id, task: task, onSelect: onSelect, isMine: true,
             });
           })
         ),
       ) : null,
 
-      /* Team's tasks — visible when user has site-level visibility */
       data.teamTasks && data.teamTasks.length > 0 ? React.createElement(React.Fragment, null,
         React.createElement(SubsectionLabel, null,
           'Team · ' + data.teamTasks.length),
@@ -295,33 +99,41 @@
           style: { display: 'flex', flexDirection: 'column', gap: '6px' },
         },
           data.teamTasks.map(function(task) {
-            return React.createElement(TaskRow, {
+            return React.createElement(fs.TaskCard, {
               key: task.id, task: task, onSelect: onSelect, isMine: false,
             });
           })
         ),
       ) : null,
 
+      /* ACTIVITY */
       React.createElement(SectionLabel, null, 'Recent activity'),
       React.createElement('div', {
         style: { display: 'flex', flexDirection: 'column', gap: '6px' },
       },
         data.activity.map(function(item) {
-          return React.createElement(ActivityRow, {
+          return React.createElement(fs.ActivityCard, {
             key: item.id, item: item, onSelect: onSelect,
           });
         })
       ),
 
+      /* ON SITE */
       React.createElement(SectionLabel, null, 'On site now'),
-      React.createElement(OnSiteCard, { people: data.onSite }),
+      React.createElement(fs.OnSiteCard, { people: data.onSite }),
 
     );
   }
 
   /* ---------- Today Right Detail ------------------------------------------ */
   function TodayRightDetail(props) {
-    var c = getComponents();
+    var fs       = window.FieldSight;
+    var Card     = fs.Card;
+    var Badge    = fs.Badge;
+    var Button   = fs.Button;
+    var IconBtn  = fs.IconButton;
+    var Timeline = fs.Timeline;
+
     var sel = props.selectedItem;
 
     /* Empty state */
@@ -346,7 +158,7 @@
       );
     }
 
-    var item = window.FieldSight.MockData.findItemById(sel.id);
+    var item = fs.MockData.findItemById(sel.id);
     if (!item) return null;
 
     var rows = [];
@@ -373,8 +185,8 @@
       ];
     }
 
-    var related  = window.FieldSight.MockData.getRelated(item)  || [];
-    var timeline = window.FieldSight.MockData.getTimeline(item) || [];
+    var related  = fs.MockData.getRelated(item)  || [];
+    var timeline = fs.MockData.getTimeline(item) || [];
 
     return React.createElement('div', {
       style: {
@@ -388,7 +200,7 @@
       },
     },
 
-      /* Header row: title + close button */
+      /* Header row: title + close */
       React.createElement('div', {
         style: {
           display: 'flex',
@@ -413,7 +225,7 @@
             wordBreak: 'break-word',
           },
         }, item.title || item.snippet || '(item)'),
-        React.createElement(c.IconButton, {
+        React.createElement(IconBtn, {
           icon: 'x',
           ariaLabel: 'Close detail',
           size: 'sm',
@@ -423,22 +235,26 @@
         }),
       ),
 
-      /* Status badges row (kind-specific) */
-      item.kind === 'urgent' ? React.createElement('div', { style: { display: 'flex', gap: '6px' } },
-        React.createElement(c.Badge, {
+      /* Status badges (kind-specific) */
+      item.kind === 'urgent' ? React.createElement('div', {
+        style: { display: 'flex', gap: '6px' },
+      },
+        React.createElement(Badge, {
           tone: item.badgeTone, size: 'sm', prefixDot: true,
         }, item.badgeLabel),
       ) : null,
 
-      item.kind === 'task' ? React.createElement('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
-        React.createElement(c.Badge, { tone: item.statusTone, size: 'sm' }, item.status),
-        item.priority ? React.createElement(c.Badge, {
+      item.kind === 'task' ? React.createElement('div', {
+        style: { display: 'flex', gap: '6px', flexWrap: 'wrap' },
+      },
+        React.createElement(Badge, { tone: item.statusTone, size: 'sm' }, item.status),
+        item.priority ? React.createElement(Badge, {
           tone: item.priority === 'High' ? 'danger' : item.priority === 'Low' ? 'neutral' : 'warning',
           size: 'sm', variant: 'outline',
         }, item.priority) : null,
       ) : null,
 
-      /* Key/value field rows */
+      /* Field rows */
       React.createElement('div', {
         style: { display: 'flex', flexDirection: 'column', gap: 0 },
       },
@@ -471,7 +287,7 @@
         })
       ),
 
-      /* Related section */
+      /* Related */
       related.length > 0 ? React.createElement(React.Fragment, null,
         React.createElement('div', {
           style: {
@@ -486,13 +302,13 @@
           style: { display: 'flex', flexDirection: 'column', gap: '6px' },
         },
           related.map(function(r, i) {
-            return React.createElement(c.Card, {
+            return React.createElement(Card, {
               key: i, padding: 'sm', variant: 'ghost',
               onClick: function() {
                 console.log('[Right] navigate to related:', r.id);
               },
             },
-              React.createElement(c.Card.Body, null,
+              React.createElement(Card.Body, null,
                 React.createElement('div', {
                   style: { fontSize: '13px', color: 'var(--text-primary)', fontWeight: 500 },
                 }, r.title),
@@ -505,7 +321,7 @@
         ),
       ) : null,
 
-      /* Timeline section */
+      /* Timeline (L5 composite) */
       timeline.length > 0 ? React.createElement(React.Fragment, null,
         React.createElement('div', {
           style: {
@@ -516,26 +332,7 @@
             marginTop: '4px',
           },
         }, 'Timeline'),
-        React.createElement('div', {
-          style: { display: 'flex', flexDirection: 'column', gap: '8px',
-                   paddingLeft: '8px',
-                   borderLeft: '2px solid var(--border-subtle)' },
-        },
-          timeline.map(function(t, i) {
-            return React.createElement('div', {
-              key: i,
-              style: { display: 'flex', flexDirection: 'column', gap: '2px',
-                       paddingLeft: '8px' },
-            },
-              React.createElement('div', {
-                style: { fontSize: '13px', color: 'var(--text-primary)' },
-              }, t.label),
-              React.createElement('div', {
-                style: { fontSize: '11px', color: 'var(--text-tertiary)' },
-              }, t.actor + ' · ' + t.time),
-            );
-          })
-        ),
+        React.createElement(Timeline, { events: timeline }),
       ) : null,
 
       /* Action buttons pinned to bottom */
@@ -549,14 +346,14 @@
           borderTop: '1px solid var(--border-subtle)',
         },
       },
-        React.createElement(c.Button, {
+        React.createElement(Button, {
           variant: 'secondary',
           size: 'sm',
           onClick: function() {
             console.log('[Today] secondary action on', item.id);
           },
         }, 'Reassign'),
-        React.createElement(c.Button, {
+        React.createElement(Button, {
           size: 'sm',
           leftIcon: 'check',
           onClick: function() {
