@@ -328,17 +328,9 @@
         ),
       ) : null,
 
-      /* ACTIVITY */
-      React.createElement(SectionLabel, null, 'Recent activity'),
-      React.createElement('div', {
-        style: { display: 'flex', flexDirection: 'column', gap: '6px' },
-      },
-        (data.activity || []).map(function (item) {
-          return React.createElement(fs.ActivityCard, {
-            key: item.id, item: item, onSelect: onSelect,
-          });
-        })
-      ),
+      /* (Sprint 3, P-02) Recent activity removed — the same topics are
+         now reachable on /timeline as the canonical surface. Today
+         stays a quick dashboard: brief → urgent → tasks → on-site. */
 
       /* ON SITE */
       React.createElement(SectionLabel, null, 'On site now'),

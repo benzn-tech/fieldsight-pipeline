@@ -116,18 +116,24 @@
       bullets:     bullets,
     };
 
-    /* ---- urgent: safety topics + non-empty safety_flags + high obs ---- */
+    /* ---- urgent: safety topics + non-empty safety_flags + high obs ----
+       P-01 (Sprint 3): expose riskLevel + recommendedAction on every
+       urgent item so UrgentCard can render the action plan inline
+       without a click-through to the right detail. */
     var urgent = [];
     (report.topics || []).forEach(function (t) {
       var hasSafetyFlags = (t.safety_flags || []).length > 0;
       if (t.category === 'safety' || hasSafetyFlags) {
+        var firstFlag = hasSafetyFlags ? t.safety_flags[0] : null;
         urgent.push({
           id:          'topic_' + t.topic_id,
           title:       t.topic_title,
-          badgeLabel:  hasSafetyFlags ? (t.safety_flags[0].risk_level || 'medium') + ' risk' : 'Safety topic',
-          badgeTone:   hasSafetyFlags && t.safety_flags[0].risk_level === 'high' ? 'danger' : 'warning',
+          badgeLabel:  hasSafetyFlags ? (firstFlag.risk_level || 'medium') + ' risk' : 'Safety topic',
+          badgeTone:   hasSafetyFlags && firstFlag.risk_level === 'high' ? 'danger' : 'warning',
           body:        urgentBodyForTopic(t),
-          triggeredBy: hasSafetyFlags ? 'Safety flag · ' + (t.safety_flags[0].risk_level || 'medium') : 'Topic category · safety',
+          triggeredBy: hasSafetyFlags ? 'Safety flag · ' + (firstFlag.risk_level || 'medium') : 'Topic category · safety',
+          riskLevel:   firstFlag ? (firstFlag.risk_level || 'medium') : null,
+          recommendedAction: firstFlag ? firstFlag.recommended_action : null,
           kind:        'urgent',
         });
       }
@@ -135,13 +141,19 @@
     (report.safety_observations || []).forEach(function (obs, i) {
       if (obs.risk_level !== 'high') return;
       urgent.push({
-        id:          'safety_obs_' + i,
-        title:       obs.observation,
-        badgeLabel:  'High risk',
-        badgeTone:   'danger',
-        body:        obs.recommended_action || '',
-        triggeredBy: 'Site safety observation · ' + (obs.location || 'site'),
-        kind:        'urgent',
+        id:                'safety_obs_' + i,
+        title:             obs.observation,
+        badgeLabel:        'High risk',
+        badgeTone:         'danger',
+        /* For site-wide observations, the title already IS the
+           observation — keep body empty so the recommendedAction
+           below isn't duplicated by the body line. */
+        body:              null,
+        triggeredBy:       'Site safety observation · ' + (obs.location || 'site'),
+        riskLevel:         'high',
+        recommendedAction: obs.recommended_action || null,
+        location:          obs.location || null,
+        kind:              'urgent',
       });
     });
 

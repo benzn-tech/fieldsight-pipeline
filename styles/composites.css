@@ -125,13 +125,43 @@
 
 
 /* =========================================================================
-   UrgentCard — title + tone badge in header, body line below
+   UrgentCard — title + tone badge in header, body line + action below
    ========================================================================= */
 
 .fs-urgent-card__body {
   font-size: 13px;
   color: var(--text-secondary);
+  line-height: 1.5;
 }
+
+/* P-01 — recommended action shown inline under the observation. */
+.fs-urgent-card__action {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border-subtle);
+  font-size: 12px;
+  color: var(--text-primary);
+  line-height: 1.45;
+}
+
+.fs-urgent-card__action-label {
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+}
+
+.fs-urgent-card__caption {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+/* Risk-level left edge — supplements the in-header badge. */
+.fs-urgent-card--risk-high   { border-left: 3px solid var(--color-danger-500); }
+.fs-urgent-card--risk-medium { border-left: 3px solid var(--color-warning-500); }
+.fs-urgent-card--risk-low    { border-left: 3px solid var(--border-default); }
 
 
 /* =========================================================================

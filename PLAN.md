@@ -228,27 +228,20 @@ starting the sprint.
 
 ### From end-to-end UI review
 
-- **P-01 · Urgent now: surface risk + recommended action inline.**
-  `urgent-card.js` already renders `item.body` (which carries
-  `safety_flags[0].observation`), but the **risk-level badge** and
-  **recommended_action** are only visible after opening the right
-  detail. Reuse `safety-flag-row.js` (dense mode) or extend UrgentCard
-  with a one-line action caption. ~30 min.
-  Files: `scripts/composites/urgent-card.js`, `scripts/api/today-adapter.js`,
-  `styles/composites.css`.
+- **P-01 · Urgent now: surface risk + recommended action inline.** ✅ done
+  Shipped on `claude/today-polish-p01-p02`. `today-adapter.js` now
+  exposes `riskLevel` + `recommendedAction` on every urgent item;
+  `urgent-card.js` renders the risk pill (high/medium/low) in the
+  header and the recommended action under the observation. Risk-level
+  left edge supplements the badge for safety items.
 
-- **P-02 · Recent activity: clarify purpose or remove.**
-  Today's `Recent activity` reads from the same topics as `/timeline`
-  (todayAdapter just remaps `topics → {speaker, snippet, timeAgo,
-  channel}` desc). Two viable directions, pick one before building:
-    - **(A) Live feed**: only show topics from the last ~90 minutes
-      plus latest PTT chatter, so it functions as a "what's happening
-      now" stream that complements (not duplicates) /timeline.
-    - **(B) Remove**: Today already has morning brief / urgent / my
-      tasks / on site — drop the activity section to tighten the
-      dashboard.
-  Decision required before implementation.
-  Files: `scripts/pages/today.js`, `scripts/api/today-adapter.js`.
+- **P-02 · Recent activity: removed.** ✅ done — chose (B).
+  Decision: drop the section. The data was a remap of the same topics
+  on `/timeline` (which is the canonical surface), so keeping both
+  diluted Today's job as a quick dashboard. Today is now: brief →
+  urgent → my/team tasks → on site. `todayAdapter` still emits
+  `activity` so the field is available if a future "live feed"
+  iteration wants it.
 
 - **P-03 · Left-nav collapsed: logo + chevron overlap.**
   When `isCollapsed`, `logoAreaStyle` lays out a 28 px logo + 28 px
