@@ -223,7 +223,28 @@
         if (cancelled) return;
         var report  = results[0];
         var actions = results[1].actions || {};
-        var meeting = results[2] && results[2]._notFound ? null : results[2];
+        var meeting = results[2];
+
+        /* P-12 — page-level access-denied. If the daily-report endpoint
+           rejected this caller (§8.4: non-admin querying another user),
+           short-circuit to AccessDenied. We don't downgrade to a meeting
+           view — if the timeline call was forbidden, the meeting fetch
+           against the same folder almost certainly was too. */
+        if (report && report._accessDenied) {
+          setState({
+            status:  'access_denied',
+            message: report.error,
+            scope:   user ? unfolder(user) + "'s daily report" : "this report",
+          });
+          return;
+        }
+
+        /* Meeting minutes fetched via the generic media presigner;
+           a 403 there should NOT block the daily report from rendering.
+           Strip access-denied / not-found responses to null. */
+        if (meeting && (meeting._notFound || meeting._accessDenied)) {
+          meeting = null;
+        }
 
         var hasReport  = !!(report && !report._notFound && !report.available_users);
         var hasMeeting = !!meeting;
@@ -265,6 +286,20 @@
         React.createElement(NoReportState, {
           message: 'Could not load report. ' + (state.error && state.error.message || ''),
         }),
+      );
+    }
+
+    /* P-12 — empathetic 403 (BACKEND-CONTEXT §8.4). */
+    if (state.status === 'access_denied') {
+      var AccessDenied = window.FieldSight.AccessDenied;
+      return React.createElement('div', { className: 'fs-timeline-page' },
+        React.createElement(PageHeader, { date: date, user: user }),
+        AccessDenied
+          ? React.createElement(AccessDenied, {
+              scope:   state.scope,
+              message: state.message,
+            })
+          : React.createElement(NoReportState, { message: state.message || 'Access denied.' }),
       );
     }
 

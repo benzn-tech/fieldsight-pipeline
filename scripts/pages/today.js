@@ -118,6 +118,12 @@
           if (cancelled) return null;
           var report  = results[0];
           var actions = results[1].actions || {};
+          /* P-12: 403 from the timeline endpoint surfaces as a
+             page-level access-denied state. Worker / site-manager
+             querying another user's report hits this. */
+          if (report && report._accessDenied) {
+            return { accessDenied: true, message: report.error };
+          }
           if (!report || report._notFound || report.available_users) {
             return { ok: false, report: report };
           }
@@ -135,6 +141,10 @@
 
       loadFor(today, false).then(function (first) {
         if (cancelled || !first) return;
+        if (first.accessDenied) {
+          setState({ status: 'access_denied', message: first.message, today: today });
+          return;
+        }
         if (first.ok) {
           setState(Object.assign({ status: 'ok' }, first));
           return;
@@ -142,6 +152,10 @@
         /* No report for today — try the latest available. */
         return window.FS.api.dates.getDates({ months: 3 }).then(function (res) {
           if (cancelled) return;
+          if (res && res._accessDenied) {
+            setState({ status: 'access_denied', message: res.error, today: today });
+            return;
+          }
           var latest = findLatestReportDate(res.dates || {});
           if (!latest || latest === today) {
             setState({ status: 'empty', report: first.report, today: today });
@@ -149,6 +163,10 @@
           }
           return loadFor(latest, true).then(function (second) {
             if (cancelled || !second) return;
+            if (second.accessDenied) {
+              setState({ status: 'access_denied', message: second.message, today: today });
+              return;
+            }
             if (second.ok) {
               setState(Object.assign({ status: 'ok' }, second));
             } else {
@@ -290,6 +308,21 @@
       return React.createElement('div', { className: 'fs-page fs-page--today' },
         React.createElement('div', { style: { padding: '24px', color: 'var(--text-tertiary)', fontSize: '13px' } },
           'Could not load today. ' + (state.error && state.error.message || '')),
+      );
+    }
+
+    /* P-12 — empathetic 403. The api/_fetch helper marks 403 responses
+       with `_accessDenied: true`; today.js relays that to the
+       AccessDenied composite (BACKEND-CONTEXT §8.4). */
+    if (state.status === 'access_denied') {
+      var AccessDenied = fs.AccessDenied;
+      return React.createElement('div', { className: 'fs-page fs-page--today' },
+        AccessDenied
+          ? React.createElement(AccessDenied, {
+              scope:   "today's report",
+              message: state.message,
+            })
+          : React.createElement('div', null, 'Access denied.'),
       );
     }
 

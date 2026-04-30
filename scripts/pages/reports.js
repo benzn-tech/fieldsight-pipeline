@@ -104,6 +104,13 @@
       var cancelled = false;
       window.FS.api.reports.getReportsHistory(50).then(function (res) {
         if (cancelled) return;
+        /* P-12 — surface 403 as an empathetic state instead of a
+           generic error. The reports archive is broadly readable for
+           admin/pm/site_manager but a worker / viewer can be denied. */
+        if (res && res._accessDenied) {
+          setState({ status: 'access_denied', message: res.error, rows: [] });
+          return;
+        }
         var sorted = (res.reports || []).slice().sort(function (a, b) {
           return (b.generated_at || '').localeCompare(a.generated_at || '');
         });
@@ -220,6 +227,14 @@
         ? React.createElement('div', { className: 'fs-reports__loading' }, 'Loading reports…')
         : state.status === 'error'
         ? React.createElement('div', { className: 'fs-reports__empty' }, 'Could not load reports.')
+        : state.status === 'access_denied'
+        ? (window.FieldSight.AccessDenied
+            ? React.createElement(window.FieldSight.AccessDenied, {
+                scope:   'the report archive',
+                message: state.message,
+              })
+            : React.createElement('div', { className: 'fs-reports__empty' },
+                'Access denied.'))
         : filtered.length === 0
         ? React.createElement('div', { className: 'fs-reports__empty' },
             'No ' + (filter === 'all' ? '' : filter + ' ') + 'reports yet.')
