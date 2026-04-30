@@ -455,6 +455,50 @@ function AppShell({ showDevSwitcher = false }) {
   );
 }
 
+/* ---------- SessionGate (Sprint 3, P-08) ---------------------------------- */
+/* Decides whether to mount the main AppShell or the LoginScreen.
+   • useMocks=true (preview default): always renders AppShell. The
+     mock auth-mock.js still drives roles for the dev switcher.
+   • useMocks=false: renders LoginScreen until FS.session.isSignedIn(),
+     then re-renders AppShell. Subscribes to session.onChange so a
+     successful sign-in (or a refresh failure that clears the session)
+     swaps the screen in place.
+
+   Captured at first mount: which mode we're in. Flipping useMocks at
+   runtime requires a refresh — fine for development. */
+function SessionGate(opts) {
+  const useMocks = window.FS && window.FS.api && window.FS.api.useMocks !== false;
+  const session  = window.FS && window.FS.session;
+  const Login    = window.FieldSight && window.FieldSight.LoginScreen;
+
+  /* Short-circuit when running against fixtures: no session needed. */
+  if (useMocks || !session) {
+    return React.createElement(AppShell, opts);
+  }
+
+  const [signedIn, setSignedIn] = React.useState(function () {
+    return session.isSignedIn();
+  });
+
+  React.useEffect(function () {
+    return session.onChange(function () {
+      setSignedIn(session.isSignedIn());
+    });
+  }, []);
+
+  if (!signedIn) {
+    if (!Login) {
+      console.error('[SessionGate] LoginScreen composite missing');
+      return null;
+    }
+    return React.createElement(Login, {
+      onSignedIn: function () { setSignedIn(true); },
+    });
+  }
+
+  return React.createElement(AppShell, opts);
+}
+
 /* ---------- Mount helper -------------------------------------------------- */
 function mountAppShell(containerId, opts) {
   containerId = containerId || 'root';
@@ -462,8 +506,14 @@ function mountAppShell(containerId, opts) {
   var el = document.getElementById(containerId);
   if (!el) { console.error('[AppShell] No element #' + containerId); return; }
   var root = ReactDOM.createRoot(el);
-  root.render(React.createElement(AppShell, opts));
+  root.render(React.createElement(SessionGate, opts));
 }
 
 if (!window.FieldSight) window.FieldSight = {};
-Object.assign(window.FieldSight, { AppShell: AppShell, MiddleColumn: MiddleColumn, RightDetail: RightDetail, mountAppShell: mountAppShell });
+Object.assign(window.FieldSight, {
+  AppShell:       AppShell,
+  SessionGate:    SessionGate,
+  MiddleColumn:   MiddleColumn,
+  RightDetail:    RightDetail,
+  mountAppShell:  mountAppShell,
+});

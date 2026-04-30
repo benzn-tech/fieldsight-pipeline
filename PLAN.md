@@ -286,16 +286,14 @@ starting the sprint.
   provider mounted by the Today page.
   Files: `scripts/pages/today.js`.
 
-- **P-08 · Session gate not wired.**
-  Phase I ships `LoginScreen` + `FS.session` + `_fetch.js` but the
-  shell never decides between them. When `FS.api.useMocks=false`,
-  AppShell should mount `LoginScreen` whenever
-  `FS.session.isSignedIn() === false` and re-mount the main shell on
-  `session.onChange`. Currently flipping `useMocks=false` would render
-  the main shell with no auth header → 401 cascade. Add the gate
-  before any real-auth attempt.
-  Files: `scripts/app-shell.js`, `app-shell-preview.html` (or a new
-  `app.html` for the live build).
+- **P-08 · Session gate not wired.** ✅ done
+  Shipped on `claude/auth-gates-p08-p12`. New `SessionGate` wrapper
+  in `scripts/app-shell.js` decides between `LoginScreen` and
+  `AppShell` based on `FS.api.useMocks` + `FS.session.isSignedIn()`.
+  Subscribes to `session.onChange` so a successful sign-in (or a
+  refresh failure that clears the session) swaps screens in place.
+  In mock mode it short-circuits to `AppShell` directly — no auth
+  needed. `mountAppShell` now mounts `SessionGate` as the root.
 
 - **P-09 · Meeting topic right-detail.**
   `TimelineRightDetail` only handles `selectedItem.kind === 'topic'`.
@@ -321,13 +319,15 @@ starting the sprint.
   (date-picker dot pulses, login-screen focus rings).
   Files: `styles/composites.css`.
 
-- **P-12 · 403 path coverage.**
-  Pages currently treat `_accessDenied: true` responses as generic
-  errors. Wire `AccessDenied` composite into `today.js`, `timeline.js`,
-  and `reports.js` empty branches so the empathetic 403 actually
-  renders when the API rejects a cross-user request (BACKEND-CONTEXT
-  §8.4). The composite exists; just needs hookup.
-  Files: `scripts/pages/{today,timeline,reports}.js`.
+- **P-12 · 403 path coverage.** ✅ done
+  Shipped on `claude/auth-gates-p08-p12`. Each page-level fetch in
+  `today.js`, `timeline.js`, and `reports.js` now inspects the
+  response for `_accessDenied: true` and routes to a new
+  `state.status === 'access_denied'` branch that renders the
+  `AccessDenied` composite. Special handling in `timeline.js`:
+  meeting-minutes 403 (fetched via the generic media presigner)
+  is downgraded to "no meeting" rather than blocking the daily
+  report — the two surfaces are independently authorised.
 
 After P-01 through P-12, the prototype is ready for handoff to a real
 auth + fetch flip (Phase I activation) without UI surprises.
