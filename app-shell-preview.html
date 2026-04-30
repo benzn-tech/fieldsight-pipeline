@@ -14,7 +14,7 @@
   <link rel="stylesheet" href="styles/tokens.css" />
   <link rel="stylesheet" href="styles/app-shell.css?v=2" />
   <link rel="stylesheet" href="styles/components.css?v=4" />
-  <link rel="stylesheet" href="styles/composites.css?v=7" />
+  <link rel="stylesheet" href="styles/composites.css?v=8" />
 
   <style>
     /* Ensure full-bleed with no scroll */
@@ -73,6 +73,8 @@
   <script type="text/babel" src="scripts/composites/date-picker.js?v=1"></script>
   <!-- Sprint 2.7 (Phase G) Ask Agent chat strip -->
   <script type="text/babel" src="scripts/composites/ask-chat.js?v=1"></script>
+  <!-- Sprint 2.8 (Phase H) Meeting Minutes -->
+  <script type="text/babel" src="scripts/composites/meeting-topic-card.js?v=1"></script>
 
   <!-- Backend-shaped data layer (Sprint 2.1, Phase A): fixtures → api modules → adapter -->
   <!--   1. FS.api namespace + helpers (must precede every api/* and adapter) -->
@@ -83,6 +85,7 @@
   <script src="scripts/mock/actions.fixture.js?v=1"></script>
   <script src="scripts/mock/daily-report.fixture.js?v=1"></script>
   <script src="scripts/mock/media.fixture.js?v=1"></script>
+  <script src="scripts/mock/meeting-minutes.fixture.js?v=1"></script>
   <!--   3. Per-endpoint api modules (read fixtures via FS.api.*) -->
   <script src="scripts/api/sites.js?v=1"></script>
   <script src="scripts/api/dates.js?v=1"></script>
@@ -94,6 +97,7 @@
   <script src="scripts/api/ask.js?v=1"></script>
   <script src="scripts/api/reports.js?v=1"></script>
   <script src="scripts/api/media.js?v=1"></script>
+  <script src="scripts/api/meetings.js?v=1"></script>
   <!--   4. Today adapter (PLAN Phase D sketch — feeds mock-data.js shim) -->
   <script src="scripts/api/today-adapter.js?v=1"></script>
 
@@ -101,7 +105,7 @@
   <script type="text/babel" src="scripts/mock-data.js?v=4"></script>
   <script type="text/babel" src="scripts/pages/_page-registry.js?v=1"></script>
   <script type="text/babel" src="scripts/pages/today.js?v=4"></script>
-  <script type="text/babel" src="scripts/pages/timeline.js?v=4"></script>
+  <script type="text/babel" src="scripts/pages/timeline.js?v=5"></script>
   <script type="text/babel" src="scripts/pages/reports.js?v=1"></script>
 
   <script type="text/babel" src="scripts/dev-role-switcher.js?v=3"></script>

@@ -637,6 +637,112 @@
 .fs-timeline-page__user:hover { background: var(--surface-panel-muted); }
 
 
+/* ---- Daily / Meeting view toggle (Phase H) ---- */
+
+.fs-timeline-page__view-toggle {
+  display: inline-flex;
+  align-self: flex-start;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  padding: 2px;
+  background: var(--surface-panel-muted);
+}
+.fs-timeline-page__view-tab {
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 12px;
+  border: none;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--easing-out),
+              color var(--duration-fast) var(--easing-out);
+}
+.fs-timeline-page__view-tab:hover { color: var(--text-primary); }
+.fs-timeline-page__view-tab--active {
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  font-weight: var(--font-weight-medium);
+  box-shadow: var(--shadow-sm);
+}
+
+.fs-timeline-page__meeting-title {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  padding: 0 4px;
+}
+
+.fs-timeline-page__list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+.fs-timeline-page__list li { margin-bottom: 4px; }
+
+
+/* ---- Meeting topic card body ---- */
+
+.fs-meeting-decisions { display: flex; flex-direction: column; gap: 10px; }
+
+.fs-meeting-decision {
+  padding: 10px 12px;
+  border-left: 3px solid var(--color-info-300);
+  background: var(--surface-panel-muted);
+  border-radius: var(--radius-md);
+}
+.fs-meeting-decision__text {
+  font-size: 13px;
+  font-weight: var(--font-weight-medium);
+  color: var(--text-primary);
+  line-height: 1.45;
+}
+.fs-meeting-decision__rationale {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.fs-meeting-decision__rationale-label {
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+}
+.fs-meeting-decision__by {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.fs-meeting-actions { display: flex; flex-direction: column; gap: 6px; }
+
+.fs-meeting-action {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--surface-panel);
+  border: 1px solid var(--border-subtle);
+}
+.fs-meeting-action__main { flex: 1; min-width: 0; }
+.fs-meeting-action__text {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+.fs-meeting-action__meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin-top: 2px;
+}
+
+
 /* =========================================================================
    TopicDetail (right panel) — header, tabs, body
    ========================================================================= */

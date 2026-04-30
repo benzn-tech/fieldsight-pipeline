@@ -206,15 +206,41 @@
     var state    = refState[0];
     var setState = refState[1];
 
+    /* Sprint 2.8 (Phase H) — when both a daily report and meeting
+       minutes exist for the date, the user picks which to view. */
+    var refView = React.useState('daily');
+    var view    = refView[0];
+    var setView = refView[1];
+
     React.useEffect(function () {
       var cancelled = false;
       setState({ status: 'loading' });
       Promise.all([
         window.FS.api.timeline.getTimeline({ date: date, user: user }),
         window.FS.api.actions.getActions(date),
+        window.FS.api.meetings.getMeetingMinutes({ date: date, user: user }),
       ]).then(function (results) {
         if (cancelled) return;
-        setState({ status: 'ok', report: results[0], actions: results[1].actions || {} });
+        var report  = results[0];
+        var actions = results[1].actions || {};
+        var meeting = results[2] && results[2]._notFound ? null : results[2];
+
+        var hasReport  = !!(report && !report._notFound && !report.available_users);
+        var hasMeeting = !!meeting;
+
+        /* Default to daily if it exists, otherwise meeting. The toggle
+           UI surfaces only when both are present (§5.5). */
+        setView(function (cur) {
+          if (hasReport && hasMeeting) return cur;
+          if (hasMeeting && !hasReport) return 'meeting';
+          return 'daily';
+        });
+        setState({
+          status:  'ok',
+          report:  report,
+          actions: actions,
+          meeting: meeting,
+        });
       }).catch(function (err) {
         if (cancelled) return;
         setState({ status: 'error', error: err });
@@ -242,10 +268,13 @@
       );
     }
 
-    var report = state.report;
+    var report  = state.report;
+    var meeting = state.meeting;
+    var hasReport  = !!(report  && !report._notFound  && !report.available_users);
+    var hasMeeting = !!meeting;
 
     /* Admin disambiguation shape: { date, available_users:[...] } */
-    if (report && report.available_users) {
+    if (report && report.available_users && !hasMeeting) {
       return React.createElement('div', { className: 'fs-timeline-page' },
         React.createElement(PageHeader, { date: date, user: null }),
         React.createElement(AvailableUsersState, {
@@ -254,8 +283,8 @@
       );
     }
 
-    /* No-report shape: 404-body OR { message, date } 200-body */
-    if (!report || report._notFound) {
+    /* No-anything shape */
+    if (!hasReport && !hasMeeting) {
       return React.createElement('div', { className: 'fs-timeline-page' },
         React.createElement(PageHeader, { date: date, user: user }),
         React.createElement(NoReportState, {
@@ -264,18 +293,110 @@
       );
     }
 
-    /* Happy path */
+    /* View toggle — surfaces only when both exist for the date (§5.5). */
+    var bothExist = hasReport && hasMeeting;
+    var effectiveView = view;
+    if (effectiveView === 'meeting' && !hasMeeting) effectiveView = 'daily';
+    if (effectiveView === 'daily'   && !hasReport)  effectiveView = 'meeting';
+
     var actionState = state.actions || {};
     var selectedTopicId = props.selectedItem && props.selectedItem.kind === 'topic'
       ? props.selectedItem.topic_id
       : null;
 
-    var AskChat = window.FieldSight.AskChat;
+    var AskChat            = window.FieldSight.AskChat;
+    var MeetingTopicCard   = window.FieldSight.MeetingTopicCard;
 
+    function ViewToggle() {
+      if (!bothExist) return null;
+      return React.createElement('div', { className: 'fs-timeline-page__view-toggle', role: 'tablist' },
+        React.createElement('button', {
+          type: 'button', role: 'tab',
+          className: 'fs-timeline-page__view-tab' + (effectiveView === 'daily'   ? ' fs-timeline-page__view-tab--active' : ''),
+          'aria-selected': effectiveView === 'daily',
+          onClick: function () { setView('daily'); },
+        }, 'Daily report'),
+        React.createElement('button', {
+          type: 'button', role: 'tab',
+          className: 'fs-timeline-page__view-tab' + (effectiveView === 'meeting' ? ' fs-timeline-page__view-tab--active' : ''),
+          'aria-selected': effectiveView === 'meeting',
+          onClick: function () { setView('meeting'); },
+        }, 'Meeting minutes'),
+      );
+    }
+
+    /* ---- Meeting view ---- */
+    if (effectiveView === 'meeting') {
+      return React.createElement('div', { className: 'fs-timeline-page' },
+        React.createElement(PageHeader, { date: date, user: user, report: report || meeting }),
+        React.createElement(ViewToggle),
+
+        meeting.meeting_title ? React.createElement('div', {
+          className: 'fs-timeline-page__meeting-title',
+        }, meeting.meeting_title) : null,
+
+        React.createElement(ExecutiveSummaryCard, {
+          bullets: meeting.executive_summary,
+          label:   'Meeting summary',
+        }),
+
+        React.createElement('div', { className: 'fs-timeline-page__section-label' },
+          'Topics'),
+        React.createElement('div', { className: 'fs-timeline-page__topics' },
+          (meeting.topics || []).map(function (topic) {
+            return React.createElement(MeetingTopicCard, {
+              key:      topic.topic_id,
+              topic:    topic,
+              selected: selectedTopicId === topic.topic_id,
+              onSelect: function () {
+                if (props.onSelect) {
+                  props.onSelect({
+                    kind:       'meeting_topic',
+                    id:         'meeting_topic_' + topic.topic_id,
+                    topic_id:   topic.topic_id,
+                    topic:      topic,
+                    date:       date,
+                    user:       user,
+                    user_name:  meeting.user_name,
+                  });
+                }
+              },
+            });
+          }),
+        ),
+
+        (meeting.next_steps || []).length > 0
+          ? React.createElement(React.Fragment, null,
+              React.createElement('div', { className: 'fs-timeline-page__section-label' },
+                'Next steps'),
+              React.createElement('ul', { className: 'fs-timeline-page__list' },
+                meeting.next_steps.map(function (s, i) {
+                  return React.createElement('li', { key: i }, s);
+                })
+              ),
+            )
+          : null,
+
+        (meeting.parking_lot || []).length > 0
+          ? React.createElement(React.Fragment, null,
+              React.createElement('div', { className: 'fs-timeline-page__section-label' },
+                'Parking lot'),
+              React.createElement('ul', { className: 'fs-timeline-page__list' },
+                meeting.parking_lot.map(function (s, i) {
+                  return React.createElement('li', { key: i }, s);
+                })
+              ),
+            )
+          : null,
+      );
+    }
+
+    /* ---- Daily report view (default) ---- */
     return React.createElement('div', {
       className: 'fs-timeline-page',
     },
       React.createElement(PageHeader, { date: date, user: user, report: report }),
+      React.createElement(ViewToggle),
       React.createElement(ReportKpis, { report: report }),
       React.createElement(ExecutiveSummaryCard, {
         bullets: report.executive_summary,
