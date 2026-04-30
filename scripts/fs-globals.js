@@ -339,6 +339,7 @@
   const NAV_ITEMS = {
     /* DAILY */
     today:      { permission: P('dashboard','view'),  label: 'Today',      path: '/today' },
+    timeline:   { permission: P('report','view'),     label: 'Timeline',   path: '/timeline' },
     activity:   { permission: P('report','view'),     label: 'Activity',   path: '/activity' },
 
     /* WORKSPACE */

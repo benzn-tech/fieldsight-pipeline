@@ -221,3 +221,523 @@
   gap: 8px;
   width: 100%;
 }
+
+
+/* =========================================================================
+   CategoryBadge — opinionated tone wrapper over Badge
+   ========================================================================= */
+
+/* The Badge atom carries the actual colour via its tone. The class here
+   is a hook for future per-category iconography or weight tweaks. */
+.fs-category-badge { letter-spacing: 0.02em; }
+
+
+/* =========================================================================
+   ExecutiveSummaryCard — bullet list inside a Card
+   ========================================================================= */
+
+.fs-executive-summary__label {
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 8px;
+}
+
+.fs-executive-summary__bullets {
+  margin: 0;
+  padding: 0 0 0 18px;
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.fs-executive-summary__bullet {
+  margin-bottom: 6px;
+}
+.fs-executive-summary__bullet:last-child { margin-bottom: 0; }
+
+
+/* =========================================================================
+   ActionItemRow — checkbox + text + meta + priority pill
+   ========================================================================= */
+
+.fs-action-item-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--easing-out);
+}
+.fs-action-item-row:hover { background: var(--surface-panel-muted); }
+
+.fs-action-item-row__checkbox {
+  margin-top: 3px;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--color-accent-500);
+  cursor: pointer;
+}
+
+.fs-action-item-row__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fs-action-item-row__text {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.fs-action-item-row__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.fs-action-item-row__meta-item--audit { color: var(--color-success-700); }
+
+.fs-action-item-row__priority { flex-shrink: 0; }
+
+.fs-action-item-row--checked .fs-action-item-row__text {
+  color: var(--text-tertiary);
+  text-decoration: line-through;
+}
+
+
+/* =========================================================================
+   SafetyFlagRow — risk badge + observation + recommended action
+   ========================================================================= */
+
+.fs-safety-flag-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--surface-panel);
+  border: 1px solid var(--border-subtle);
+}
+
+.fs-safety-flag-row--dense { padding: 8px 10px; }
+
+.fs-safety-flag-row--high   { border-left: 3px solid var(--color-danger-500); }
+.fs-safety-flag-row--medium { border-left: 3px solid var(--color-warning-500); }
+.fs-safety-flag-row--low    { border-left: 3px solid var(--border-default); }
+
+.fs-safety-flag-row__risk { flex-shrink: 0; }
+
+.fs-safety-flag-row__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.fs-safety-flag-row__obs {
+  font-size: 13px;
+  color: var(--text-primary);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.4;
+}
+
+.fs-safety-flag-row__caption {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.fs-safety-flag-row__action {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.fs-safety-flag-row__action-label {
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+}
+
+
+/* =========================================================================
+   TopicCard — collapsible header + body
+   ========================================================================= */
+
+.fs-topic-card {
+  margin-bottom: 6px;
+  transition: border-color var(--duration-fast) var(--easing-out);
+}
+
+.fs-topic-card--selected {
+  border-color: var(--color-accent-400) !important;
+  box-shadow: 0 0 0 2px var(--color-accent-100);
+}
+
+.fs-topic-card__header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  cursor: pointer;
+  user-select: none;
+}
+.fs-topic-card__header:hover { background: var(--surface-panel-muted); }
+.fs-topic-card__header:focus { outline: 2px solid var(--border-focus); outline-offset: -2px; }
+
+.fs-topic-card__time {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+  min-width: 90px;
+  padding-top: 2px;
+}
+
+.fs-topic-card__title-wrap { flex: 1; min-width: 0; }
+
+.fs-topic-card__title {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.fs-topic-card__metaline {
+  margin-top: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.fs-topic-card__participants {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  line-height: 1.3;
+}
+
+.fs-topic-card__chev {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  width: 28px; height: 28px;
+  display: inline-flex;
+  align-items: center; justify-content: center;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--easing-out);
+}
+.fs-topic-card__chev:hover { background: var(--surface-panel-muted); }
+
+.fs-topic-card__counts {
+  padding: 0 14px 12px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.fs-topic-card__body {
+  border-top: 1px solid var(--border-subtle);
+  padding: 12px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.fs-topic-card__summary {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.fs-topic-card__section { display: flex; flex-direction: column; gap: 6px; }
+
+.fs-topic-card__section-label {
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.fs-topic-card__section-label--danger { color: var(--color-danger-700); }
+
+.fs-topic-card__decisions {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-primary);
+}
+.fs-topic-card__decision { margin-bottom: 4px; }
+
+.fs-topic-card__actions { display: flex; flex-direction: column; gap: 2px; }
+
+.fs-topic-card__flags { display: flex; flex-direction: column; gap: 6px; }
+
+
+/* =========================================================================
+   Timeline page (L6) — header, KPIs, topic list, empty states
+   ========================================================================= */
+
+.fs-timeline-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.fs-timeline-page__header { padding: 0 4px; }
+
+.fs-timeline-page__title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+
+.fs-timeline-page__subtitle {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.fs-timeline-page__section-label {
+  margin: 4px 4px 0;
+  font-size: 10px;
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.fs-timeline-page__topics { display: flex; flex-direction: column; gap: 6px; }
+
+.fs-timeline-page__loading {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+.fs-timeline-page__empty,
+.fs-timeline-page__picker { margin-top: 8px; }
+
+.fs-timeline-page__empty-title {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+
+.fs-timeline-page__empty-body {
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.fs-timeline-page__users {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.fs-timeline-page__user {
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--surface-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--easing-out);
+}
+.fs-timeline-page__user:hover { background: var(--surface-panel-muted); }
+
+
+/* =========================================================================
+   TopicDetail (right panel) — header, tabs, body
+   ========================================================================= */
+
+.fs-topic-detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.fs-topic-detail__header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 20px 24px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.fs-topic-detail__header-main { flex: 1; min-width: 0; }
+
+.fs-topic-detail__time {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-topic-detail__title {
+  margin: 4px 0 0;
+  font-size: 18px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  line-height: 1.3;
+  word-break: break-word;
+}
+
+.fs-topic-detail__metaline {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.fs-topic-detail__participants {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.fs-topic-detail__tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+
+.fs-topic-detail__tab {
+  padding: 10px 12px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--duration-fast) var(--easing-out),
+              border-color var(--duration-fast) var(--easing-out);
+}
+.fs-topic-detail__tab:hover { color: var(--text-primary); }
+.fs-topic-detail__tab--active {
+  color: var(--text-primary);
+  border-bottom-color: var(--color-accent-500);
+}
+
+.fs-topic-detail__body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+  box-sizing: border-box;
+}
+
+.fs-topic-detail__placeholder,
+.fs-topic-detail__empty,
+.fs-topic-detail__coming-soon {
+  padding: 24px;
+  color: var(--text-tertiary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.fs-topic-detail__placeholder-title,
+.fs-topic-detail__coming-soon-title {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.fs-topic-detail__overview { display: flex; flex-direction: column; gap: 18px; }
+
+.fs-topic-detail__summary {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--text-primary);
+}
+
+.fs-topic-detail__section { display: flex; flex-direction: column; gap: 8px; }
+
+.fs-topic-detail__section-label {
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.fs-topic-detail__section-label--danger { color: var(--color-danger-700); }
+
+.fs-topic-detail__decisions {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+
+
+/* =========================================================================
+   PhotoGrid — thumbnail grid for topic.related_photos
+   ========================================================================= */
+
+.fs-photo-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.fs-photo-grid__cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--surface-panel-muted);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 6px;
+  min-height: 100px;
+}
+
+.fs-photo-grid__img {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  background: var(--surface-panel);
+}
+
+.fs-photo-grid__caption {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-tertiary);
+  word-break: break-all;
+  line-height: 1.3;
+}
