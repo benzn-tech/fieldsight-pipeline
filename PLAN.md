@@ -217,3 +217,127 @@ For each phase:
 | New (Phase B) timeline composites | `scripts/composites/{executive-summary-card,topic-card,action-item-row,safety-flag-row,category-badge}.js` |
 | New (Phase B) timeline page | `scripts/pages/timeline.js` |
 | Preview entry | `app-shell-preview.html`, `components-preview.html` |
+
+## Sprint 3 — Polish backlog (post-Phase-I review)
+
+Items raised during the post-Phase-I review pass. Phases A–I are merged
+and shipped; this section captures everything that should land in
+**Sprint 5 (Flows + polish)** per the CLAUDE.md roadmap, plus a few
+loose ends from the build itself. Reorder / cull as needed before
+starting the sprint.
+
+### From end-to-end UI review
+
+- **P-01 · Urgent now: surface risk + recommended action inline.**
+  `urgent-card.js` already renders `item.body` (which carries
+  `safety_flags[0].observation`), but the **risk-level badge** and
+  **recommended_action** are only visible after opening the right
+  detail. Reuse `safety-flag-row.js` (dense mode) or extend UrgentCard
+  with a one-line action caption. ~30 min.
+  Files: `scripts/composites/urgent-card.js`, `scripts/api/today-adapter.js`,
+  `styles/composites.css`.
+
+- **P-02 · Recent activity: clarify purpose or remove.**
+  Today's `Recent activity` reads from the same topics as `/timeline`
+  (todayAdapter just remaps `topics → {speaker, snippet, timeAgo,
+  channel}` desc). Two viable directions, pick one before building:
+    - **(A) Live feed**: only show topics from the last ~90 minutes
+      plus latest PTT chatter, so it functions as a "what's happening
+      now" stream that complements (not duplicates) /timeline.
+    - **(B) Remove**: Today already has morning brief / urgent / my
+      tasks / on site — drop the activity section to tighten the
+      dashboard.
+  Decision required before implementation.
+  Files: `scripts/pages/today.js`, `scripts/api/today-adapter.js`.
+
+- **P-03 · Left-nav collapsed: logo + chevron overlap.**
+  When `isCollapsed`, `logoAreaStyle` lays out a 28 px logo + 28 px
+  chevron with `space-between` inside a 64 px column (40 px usable
+  after padding) → they overlap. Fix: hide the F mark when collapsed
+  and centre the chevron.
+  Files: `scripts/left-nav.js` (logoAreaStyle + render).
+
+- **P-04 · Left-nav collapsed: NavItem icons drift right.**
+  `NavItem` carries `borderLeft: 3px solid transparent` for the active
+  indicator. When the row is collapsed and centred (`justifyContent:
+  center`), the 3 px border eats space inside the flex, so every icon
+  visually shifts right of true centre. Fix: move the active indicator
+  to a `box-shadow inset` or absolutely-positioned ::before, so it
+  doesn't consume layout width.
+  Files: `scripts/left-nav.js` (itemStyle).
+
+- **P-05 · Dev role switcher dropdown chrome.**
+  The native `<select>` opens a UA-chrome dropdown that (a) doesn't
+  match the dev panel's translucent dark blue and (b) renders the
+  selected row in the same colour as the menu background, killing
+  visibility. Two options:
+    - Quick: add `color-scheme: dark` + `option { background: ... }`
+      for partial cross-browser improvement.
+    - Proper: replace with a custom dropdown (mirror the timeline
+      view-toggle / date-picker month-nav pattern).
+  Dev-only surface, lowest priority.
+  Files: `scripts/dev-role-switcher.js`.
+
+### Loose ends from the build
+
+- **P-06 · Today's date is hard-coded.**
+  `scripts/pages/today.js` uses `FIXTURE_DATE = '2026-04-29'` to anchor
+  the prototype on the fixture report. Production needs an NZDT
+  "today" computed via `FS.api.addDaysISO(...)` against the user's
+  clock. Trivial replacement — guarded by the fact the fixture only
+  has one date, so flipping requires either generating more fixtures
+  or wiring real fetch.
+  Files: `scripts/pages/today.js`.
+
+- **P-07 · `window.FieldSight._todayCache` should be a Context.**
+  Phase D shares the live Today snapshot from Middle to Right via a
+  window slot. Works, but breaks under SSR / multiple instances and
+  is invisible to React DevTools. Replace with a small React Context
+  provider mounted by the Today page.
+  Files: `scripts/pages/today.js`.
+
+- **P-08 · Session gate not wired.**
+  Phase I ships `LoginScreen` + `FS.session` + `_fetch.js` but the
+  shell never decides between them. When `FS.api.useMocks=false`,
+  AppShell should mount `LoginScreen` whenever
+  `FS.session.isSignedIn() === false` and re-mount the main shell on
+  `session.onChange`. Currently flipping `useMocks=false` would render
+  the main shell with no auth header → 401 cascade. Add the gate
+  before any real-auth attempt.
+  Files: `scripts/app-shell.js`, `app-shell-preview.html` (or a new
+  `app.html` for the live build).
+
+- **P-09 · Meeting topic right-detail.**
+  `TimelineRightDetail` only handles `selectedItem.kind === 'topic'`.
+  Selecting a meeting topic emits `kind: 'meeting_topic'`, which
+  falls through to the placeholder. Add a meeting topic detail panel
+  (Overview / Decisions / Open questions; no media tabs since meeting
+  audio/video isn't part of the daily report's recording bundle).
+  Files: `scripts/pages/timeline.js`.
+
+- **P-10 · Meeting action items are read-only by design.**
+  `/api/actions/toggle` keys off the daily report's topic_id. Meeting
+  action items live in a different schema and have no toggle endpoint.
+  `MeetingTopicCard` currently renders them as plain rows — add a
+  visible caption ("Read-only — meeting actions are tracked in
+  minutes") so users don't expect to check them off.
+  Files: `scripts/composites/meeting-topic-card.js`.
+
+- **P-11 · Reduced-motion audit.**
+  Sprint 2.4's task check-off animation respects
+  `prefers-reduced-motion`. The Sprint 2.7 ask-pending dots animation
+  also does. Sweep the rest of `composites.css` for any keyframes /
+  transitions added in 2.5+ that don't have a reduced-motion fallback
+  (date-picker dot pulses, login-screen focus rings).
+  Files: `styles/composites.css`.
+
+- **P-12 · 403 path coverage.**
+  Pages currently treat `_accessDenied: true` responses as generic
+  errors. Wire `AccessDenied` composite into `today.js`, `timeline.js`,
+  and `reports.js` empty branches so the empathetic 403 actually
+  renders when the API rejects a cross-user request (BACKEND-CONTEXT
+  §8.4). The composite exists; just needs hookup.
+  Files: `scripts/pages/{today,timeline,reports}.js`.
+
+After P-01 through P-12, the prototype is ready for handoff to a real
+auth + fetch flip (Phase I activation) without UI surprises.
