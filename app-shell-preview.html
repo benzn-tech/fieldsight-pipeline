@@ -14,7 +14,7 @@
   <link rel="stylesheet" href="styles/tokens.css" />
   <link rel="stylesheet" href="styles/app-shell.css?v=2" />
   <link rel="stylesheet" href="styles/components.css?v=4" />
-  <link rel="stylesheet" href="styles/composites.css?v=16" />
+  <link rel="stylesheet" href="styles/composites.css?v=17" />
 
   <style>
     /* Ensure full-bleed with no scroll */
@@ -84,6 +84,8 @@
   <script type="text/babel" src="scripts/composites/site-card.js?v=1"></script>
   <!-- Sprint 4.1 — Activity feed -->
   <script type="text/babel" src="scripts/composites/activity-feed-row.js?v=1"></script>
+  <!-- Sprint 4.2 — Tasks filter chips -->
+  <script type="text/babel" src="scripts/composites/tasks-filter-chips.js?v=1"></script>
 
   <!-- Auth scaffolding (Phase I) — Cognito IDP wrapper + session store.
        Loaded before FS.api so api/_fetch.js can use FS.session for
@@ -116,6 +118,8 @@
   <script src="scripts/api/meetings.js?v=1"></script>
   <!--   4. Today adapter (PLAN Phase D sketch — feeds mock-data.js shim) -->
   <script src="scripts/api/today-adapter.js?v=3"></script>
+  <!-- Sprint 4.2 — Tasks aggregator (cross-day join: timeline + actions) -->
+  <script src="scripts/api/tasks-aggregator.js?v=1"></script>
 
   <!-- Mock data shim (weather only) + page registry + pages -->
   <script type="text/babel" src="scripts/mock-data.js?v=4"></script>
@@ -125,6 +129,7 @@
   <script type="text/babel" src="scripts/pages/reports.js?v=2"></script>
   <script type="text/babel" src="scripts/pages/sites.js?v=1"></script>
   <script type="text/babel" src="scripts/pages/activity.js?v=1"></script>
+  <script type="text/babel" src="scripts/pages/tasks.js?v=1"></script>
 
   <script type="text/babel" src="scripts/dev-role-switcher.js?v=4"></script>
   <script type="text/babel" src="scripts/app-shell.js?v=8"></script>

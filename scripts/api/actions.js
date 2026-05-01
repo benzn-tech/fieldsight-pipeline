@@ -65,10 +65,48 @@
     return { message: 'Updated', checked: !!opts.checked };
   }
 
+  /* Sprint 4.2 — additive helper for cross-day audit aggregation.
+     Backend exposes only single-date /api/actions (BACKEND-CONTEXT
+     §4.10); this wraps a Promise.all over a date range and merges
+     into a flat map keyed by date. PLAN.md Q-1 commits us to this
+     fan-out approach for the prototype; a future
+     `/api/actions/all?from=&to=` aggregator can drop in behind the
+     same return shape. */
+  async function getActionsRange(opts) {
+    opts = opts || {};
+    var from = opts.from, to = opts.to;
+    if (!from || !to) return { byDate: {}, dates: [] };
+
+    /* Build the date list inclusive (UTC arithmetic — BUG-19 safe). */
+    var dates = [];
+    var cursor = from;
+    while (cursor <= to) {
+      dates.push(cursor);
+      cursor = window.FS.api.addDaysISO(cursor, 1);
+    }
+
+    var perDay = await Promise.all(dates.map(function (d) {
+      return getActions(d).then(function (res) { return { date: d, res: res }; });
+    }));
+
+    var byDate = {};
+    var anyDenied = null;
+    perDay.forEach(function (x) {
+      if (x.res && x.res._accessDenied) { anyDenied = x.res; return; }
+      byDate[x.date] = (x.res && x.res.actions) || {};
+    });
+
+    if (anyDenied) {
+      return { _accessDenied: true, error: anyDenied.error || 'Access denied' };
+    }
+    return { byDate: byDate, dates: dates };
+  }
+
   window.FS.api.actions = {
-    getActions:   getActions,
-    toggleAction: toggleAction,
-    actionKey:    actionKey,
+    getActions:      getActions,
+    getActionsRange: getActionsRange,
+    toggleAction:    toggleAction,
+    actionKey:       actionKey,
   };
 
 })();

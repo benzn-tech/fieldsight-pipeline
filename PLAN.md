@@ -383,7 +383,22 @@ Five sub-sprints, one PR each. See the Sprint 4 plan file
   Wed 28 Apr) group rows desc. Selected event opens a right-pane
   preview (counts strip + summary + "Open in timeline" CTA). Worker
   rule honoured client-side.
-- **Sprint 4.2 · Tasks page (`/tasks`)** ⏳ pending
+- **Sprint 4.2 · Tasks page (`/tasks`)** ✅ done — Q-1 commitment via fan-out
+  Shipped on `claude/sprint4-00-sites` (stacked on 4.1). New
+  `getActionsRange({from,to})` helper on `FS.api.actions` (additive,
+  doesn't change `getActions(date)` shape), new
+  `FS.api.tasks.getActionsResolvedRange` aggregator that joins
+  timeline action source with audit overlay into a flat row contract.
+  New `TasksFilterChips` composite (All / Mine / Open / Overdue /
+  Done with counts) and `/tasks` page with `TasksProvider` (P-07
+  pattern). Default range = trailing 14 days; default filter = Mine
+  (or All for admin/gm). Right detail wires "Mark complete" through
+  the existing `toggleAction` + optimistic-removal flow used by
+  TaskCard. Heuristic deadline parser handles "Today HH:MM",
+  "Tomorrow HH:MM", "DD MMM" — unparseable deadlines never count
+  as overdue. Page header carries an explicit perf caveat:
+  "Aggregated client-side — slow at scale until backend ships
+  /api/actions/all".
 - **Sprint 4.3 · Evidence library (`/evidence`)** ⏳ pending
 - **Sprint 4.4 · Programme MVP (`/programme`)** ⏳ pending
 
