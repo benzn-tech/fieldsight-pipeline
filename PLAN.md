@@ -520,7 +520,26 @@ branch (PR #14) until the user merges.
   Tasks / Reports / Evidence keep the original 3-pane behaviour.
   Cache busters: app-shell.css v=3, app-shell.js v=9, programme.js
   v=2, right-drawer.js v=1 (new).
-- **Sprint 4.8 · Jira-style 4-column kanban replaces ProgrammeTodoList** ⏳ pending
+- **Sprint 4.8 · Jira-style 4-column kanban replaces ProgrammeTodoList** ✅ done
+  Programme's Board view (renamed from "TO-DO") is now a four-column
+  status grid modelled on the Jira active-sprint screenshot the user
+  shared. Columns: Not started · In progress · Blocked or Delayed
+  (combined to keep the board 4-wide) · Done. Rows = WBS parent
+  groups (Earthworks & Foundations / Structure / Envelope / Services /
+  Fit-out). Cards distribute into the column matching their
+  `status`. Per-card chrome: WBS code top-left, Critical badge
+  top-right, task name (semibold), inline progress bar in the
+  In-progress column only, assignee Avatar + first name, date
+  range footer. Top-of-board status totals strip and per-row
+  group header with collapsible chevron (collapsed-set shared
+  with the Gantt view via `ProgrammeProvider.collapsed`). Empty
+  cells render as 45° hatched panels for visual rhythm.
+  Old `programme-todo-list.js` composite and its `.fs-prog-todo*`
+  CSS deleted (no remaining references after the swap). Smoke
+  test: distribution across the 14 fixture leaves = 10 Not started
+  / 2 In progress / 0 Blocked / 2 Done; rows × columns matrix
+  prints expected 5×4. Cache busters: composites.css v=22,
+  programme.js v=3, programme-kanban-board.js v=1 (new).
 - **Sprint 4.9 · Gantt drag (L1 move + L2 edge resize)** ⏳ pending
 
 ## Sprint 4+ — Open product questions

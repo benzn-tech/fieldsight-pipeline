@@ -11,7 +11,10 @@
      • Header: programme name + range + view toggle (Gantt / TO-DO)
      • Tier toggle (Day / Week / Month) when on Gantt
      • Gantt: left WBS tree (sticky) + scrollable timeline
-     • TO-DO: ProgrammeTodoList (This Week / Next Week / Later)
+     • Board (Sprint 4.8): ProgrammeKanbanBoard — 4-column status
+       grid (Not started / In progress / Blocked or Delayed / Done)
+       with rows = WBS group; replaces the older bucketed
+       This-Week / Next-Week / Later list from 4.4
 
    Right detail:
      • Selected task: WBS, name, status, dates, baseline, progress,
@@ -264,10 +267,12 @@
   /* ---------- ProgrammeMiddleColumn ----------------------------------- */
 
   function ProgrammeMiddleColumn(props) {
-    var fs                = window.FieldSight;
-    var ProgrammeTodoList = fs.ProgrammeTodoList;
-    var Button            = fs.Button;
-    var onSelect          = props.onSelect || function () {};
+    var fs                    = window.FieldSight;
+    /* Sprint 4.8 — Jira-style 4-column kanban board replaces the
+       This-Week / Next-Week / Later bucket list from 4.4. */
+    var ProgrammeKanbanBoard  = fs.ProgrammeKanbanBoard;
+    var Button                = fs.Button;
+    var onSelect              = props.onSelect || function () {};
 
     var ctx = React.useContext(ProgrammeContext);
     if (!ctx) {
@@ -327,7 +332,7 @@
               type:      'button',
               className: 'fs-programme__toggle' + (ctx.view === 'todo' ? ' fs-programme__toggle--active' : ''),
               onClick:   function () { ctx.setView('todo'); },
-            }, 'TO-DO'),
+            }, 'Board'),
           ),
 
           ctx.view === 'gantt'
@@ -352,12 +357,15 @@
             selectedItem: props.selectedItem,
             onSelect:     onSelect,
           })
-        : React.createElement(ProgrammeTodoList, {
-            tasks:       s.leaves,
-            today:       s.today,
-            criticalSet: s.critical,
-            selectedId:  selectedId,
-            onSelect:    function (t) {
+        : React.createElement(ProgrammeKanbanBoard, {
+            parents:       s.parents,
+            leaves:        s.leaves,
+            today:         s.today,
+            selectedId:    selectedId,
+            criticalSet:   s.critical,
+            collapsedSet:  ctx.collapsed,
+            onToggleGroup: ctx.toggleGroup,
+            onSelect:      function (t) {
               onSelect({
                 kind:    'programme_task',
                 id:      'task_' + t.task_id,

@@ -14,7 +14,7 @@
   <link rel="stylesheet" href="styles/tokens.css" />
   <link rel="stylesheet" href="styles/app-shell.css?v=3" />
   <link rel="stylesheet" href="styles/components.css?v=4" />
-  <link rel="stylesheet" href="styles/composites.css?v=21" />
+  <link rel="stylesheet" href="styles/composites.css?v=22" />
 
   <style>
     /* Ensure full-bleed with no scroll */
@@ -94,7 +94,8 @@
   <script type="text/babel" src="scripts/composites/gantt-strip.js?v=1"></script>
   <script type="text/babel" src="scripts/composites/task-tree-cell.js?v=1"></script>
   <script type="text/babel" src="scripts/composites/gantt-row.js?v=1"></script>
-  <script type="text/babel" src="scripts/composites/programme-todo-list.js?v=1"></script>
+  <!-- Sprint 4.8 — replaces 4.4's programme-todo-list with a Jira-style board -->
+  <script type="text/babel" src="scripts/composites/programme-kanban-board.js?v=1"></script>
 
   <!-- Auth scaffolding (Phase I) — Cognito IDP wrapper + session store.
        Loaded before FS.api so api/_fetch.js can use FS.session for
@@ -146,7 +147,7 @@
   <script type="text/babel" src="scripts/pages/activity.js?v=2"></script>
   <script type="text/babel" src="scripts/pages/tasks.js?v=2"></script>
   <script type="text/babel" src="scripts/pages/evidence.js?v=1"></script>
-  <script type="text/babel" src="scripts/pages/programme.js?v=2"></script>
+  <script type="text/babel" src="scripts/pages/programme.js?v=3"></script>
 
   <script type="text/babel" src="scripts/dev-role-switcher.js?v=4"></script>
   <script type="text/babel" src="scripts/app-shell.js?v=9"></script>
