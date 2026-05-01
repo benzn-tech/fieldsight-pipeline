@@ -483,7 +483,26 @@ branch (PR #14) until the user merges.
   Touched `today.js`, `timeline.js`, `tasks.js`, plus a small CSS
   block. Cache busters: today.js v=11, timeline.js v=9, tasks.js
   v=2, composites.css v=20.
-- **Sprint 4.6 · Activity → user activity stream** ⏳ pending (direction C)
+- **Sprint 4.6 · Activity → user activity stream** ✅ done (direction C)
+  Old chronological topic feed (4.1) replaced. New aggregator
+  `FS.api.userActivity.getUserActivityRange({from,to})` joins
+  per-user timelines + audit overlays into a per-user view that
+  attributes events to whoever's named in
+  `topic.participants` / `action.responsible` / `report.user_name`,
+  regardless of which report each datum came from. Counts: Topics ·
+  Actions · Photos · Safety. New `UserActivityCard` composite
+  (avatar + name + 4-count strip + top-3 event preview). Right
+  pane = full chronological event timeline grouped by date with
+  border-coded kind colour and "Open in /timeline" click-through
+  (carries `&from=activity` to surface a back-nav next sub-sprint).
+  Worker scope = caller-only; site_manager / pm = primary_site
+  scope; admin / gm = full visibility. Fixture verification:
+  admin sees 8 users, 4 with non-zero counts; site_manager (Jarley)
+  sees 4 users (sb1108-ellesmere); worker (Sarah Chen) sees only
+  herself. Old `scripts/composites/activity-feed-row.js` deleted
+  (no remaining references). Cache busters: composites.css v=21,
+  pages/activity.js v=2, user-activity-aggregator.js v=1 (new),
+  user-activity-card.js v=1 (new).
 - **Sprint 4.7 · Programme full-width layout + slide-in drawer** ⏳ pending
 - **Sprint 4.8 · Jira-style 4-column kanban replaces ProgrammeTodoList** ⏳ pending
 - **Sprint 4.9 · Gantt drag (L1 move + L2 edge resize)** ⏳ pending

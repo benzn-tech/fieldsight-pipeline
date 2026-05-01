@@ -2316,59 +2316,12 @@
 
 
 /* =========================================================================
-   Sub-sprint 4.1 — Activity feed page + ActivityFeedRow
+   Sub-sprint 4.6 — Activity page (user activity stream, direction C)
+   Replaces the chronological feed from 4.1. Old .fs-activity-feed-row
+   classes were removed when activity.js was rebuilt; old detail pane
+   classes (.fs-activity-detail*) are kept where the new detail pane
+   reuses them (counts, header), and extended below.
    ========================================================================= */
-
-/* ActivityFeedRow ---------------------------------------------------------- */
-.fs-activity-feed-row { margin-bottom: 4px; cursor: pointer; }
-.fs-activity-feed-row--selected {
-  border-color: var(--color-accent-500);
-  box-shadow: 0 0 0 2px var(--color-accent-100);
-}
-
-.fs-activity-feed-row__layout {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-}
-
-.fs-activity-feed-row__time {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-tertiary);
-  font-variant-numeric: tabular-nums;
-  flex-shrink: 0;
-  width: 42px;
-  padding-top: 4px;
-}
-
-.fs-activity-feed-row__main { flex: 1; min-width: 0; }
-.fs-activity-feed-row__snippet {
-  font-size: 13px;
-  color: var(--text-primary);
-  line-height: 1.45;
-  word-break: break-word;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  overflow: hidden;
-}
-.fs-activity-feed-row__meta {
-  margin-top: 4px;
-  font-size: 11px;
-  color: var(--text-tertiary);
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.fs-activity-feed-row__meta > span:not(:last-child)::after {
-  content: '·';
-  margin-left: 8px;
-  color: var(--border-default);
-}
-
-.fs-activity-feed-row__badge { flex-shrink: 0; padding-top: 2px; }
-
 
 /* Activity page (middle) --------------------------------------------------- */
 .fs-activity { display: flex; flex-direction: column; gap: 12px; }
@@ -2382,28 +2335,17 @@
 }
 .fs-activity__subtitle {
   margin-top: 2px;
-  font-size: 12px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.fs-activity__meta {
+  margin-top: 4px;
+  font-size: 11px;
   color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
 }
 
-.fs-activity__feed { display: flex; flex-direction: column; gap: 4px; }
-
-.fs-activity__date-header {
-  font-size: 10px;
-  font-weight: var(--font-weight-semibold);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-tertiary);
-  padding: 12px 4px 4px;
-  position: sticky;
-  top: -1px;
-  background: linear-gradient(to bottom,
-    var(--surface-panel) 80%,
-    transparent);
-  z-index: 1;
-}
-
-.fs-activity__group { display: flex; flex-direction: column; gap: 4px; }
+.fs-activity__list { display: flex; flex-direction: column; gap: 8px; }
 
 .fs-activity__load-more {
   display: flex;
@@ -2420,6 +2362,136 @@
 }
 
 
+/* UserActivityCard --------------------------------------------------------- */
+.fs-user-activity-card { cursor: pointer; }
+.fs-user-activity-card--selected {
+  border-color: var(--color-accent-500);
+  box-shadow: 0 0 0 2px var(--color-accent-100);
+}
+.fs-user-activity-card--quiet { opacity: 0.7; }
+
+.fs-user-activity-card__header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.fs-user-activity-card__id { flex: 1; min-width: 0; }
+.fs-user-activity-card__name {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+.fs-user-activity-card__sub {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  margin-top: 2px;
+}
+.fs-user-activity-card__chev {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.fs-user-activity-card__counts {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border-subtle);
+}
+.fs-user-activity-card__count {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: center;
+  padding: 6px 4px;
+  border-radius: var(--radius-sm);
+}
+.fs-user-activity-card__count--danger {
+  background: var(--color-danger-50);
+}
+.fs-user-activity-card__count-value {
+  font-size: 16px;
+  font-weight: var(--font-weight-bold);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.fs-user-activity-card__count--danger .fs-user-activity-card__count-value {
+  color: var(--color-danger-700);
+}
+.fs-user-activity-card__count-label {
+  font-size: 9px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.fs-user-activity-card__preview {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.fs-user-activity-card__preview-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+.fs-user-activity-card__preview-icon {
+  flex-shrink: 0;
+  width: 14px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+.fs-user-activity-card__preview-row--safety .fs-user-activity-card__preview-icon {
+  color: var(--color-danger-600);
+}
+.fs-user-activity-card__preview-row--action .fs-user-activity-card__preview-icon {
+  color: var(--color-success-600);
+}
+.fs-user-activity-card__preview-when {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  width: 70px;
+}
+.fs-user-activity-card__preview-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fs-user-activity-card__preview-more {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  text-align: right;
+}
+
+.fs-user-activity-card__empty {
+  margin-top: 10px;
+  padding: 8px;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-tertiary);
+  text-align: center;
+  background: var(--surface-panel-muted);
+  border-radius: var(--radius-sm);
+}
+
+
 /* Activity right detail ---------------------------------------------------- */
 .fs-activity-detail {
   display: flex;
@@ -2430,7 +2502,6 @@
   box-sizing: border-box;
   overflow-y: auto;
 }
-
 .fs-activity-detail__placeholder {
   padding: 32px;
   color: var(--text-tertiary);
@@ -2448,44 +2519,23 @@
   max-width: 320px;
   margin: 0 auto;
 }
-
 .fs-activity-detail__header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 12px;
 }
-.fs-activity-detail__header-main { flex: 1; min-width: 0; }
-.fs-activity-detail__time {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-tertiary);
-  font-variant-numeric: tabular-nums;
-}
-.fs-activity-detail__title {
-  margin: 4px 0 0;
+.fs-activity-detail__id { flex: 1; min-width: 0; }
+.fs-activity-detail__name {
+  margin: 0;
   font-size: 18px;
   font-weight: var(--font-weight-semibold);
   color: var(--text-primary);
-  line-height: 1.3;
-  word-break: break-word;
 }
-.fs-activity-detail__metaline {
-  margin-top: 8px;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-}
-.fs-activity-detail__participants {
+.fs-activity-detail__sub {
+  margin-top: 4px;
   font-size: 11px;
   color: var(--text-tertiary);
-}
-
-.fs-activity-detail__summary {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.55;
-  color: var(--text-primary);
+  font-family: var(--font-mono);
 }
 
 .fs-activity-detail__counts {
@@ -2525,13 +2575,76 @@
   letter-spacing: 0.06em;
 }
 
-.fs-activity-detail__actions {
-  margin-top: auto;
+.fs-activity-detail__timeline { display: flex; flex-direction: column; gap: 12px; }
+.fs-activity-detail__date-header {
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  padding: 8px 0 2px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.fs-activity-detail__group { display: flex; flex-direction: column; gap: 4px; }
+
+.fs-activity-detail__event {
   display: flex;
-  gap: 8px;
-  justify-content: flex-start;
-  padding-top: 12px;
-  border-top: 1px solid var(--border-subtle);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-panel);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: background var(--duration-fast) var(--easing-out),
+              border-color var(--duration-fast) var(--easing-out);
+}
+.fs-activity-detail__event:hover {
+  background: var(--surface-panel-muted);
+  border-color: var(--color-accent-300);
+}
+.fs-activity-detail__event--safety {
+  border-left: 3px solid var(--color-danger-500);
+}
+.fs-activity-detail__event--action {
+  border-left: 3px solid var(--color-success-500);
+}
+.fs-activity-detail__event--photo {
+  border-left: 3px solid var(--color-info-500);
+}
+.fs-activity-detail__event--topic {
+  border-left: 3px solid var(--color-accent-500);
+}
+
+.fs-activity-detail__event-icon {
+  flex-shrink: 0;
+  width: 18px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 14px;
+}
+.fs-activity-detail__event-main { flex: 1; min-width: 0; }
+.fs-activity-detail__event-text {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.4;
+  word-break: break-word;
+}
+.fs-activity-detail__event-meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.fs-activity-detail__empty {
+  padding: 24px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-tertiary);
+  background: var(--surface-panel-muted);
+  border-radius: var(--radius-md);
 }
 
 

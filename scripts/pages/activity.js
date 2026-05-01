@@ -1,30 +1,34 @@
 /* ==========================================================================
-   FieldSight Activity Page — Sprint 4.1
+   FieldSight Activity Page — Sprint 4.6 (rebuild on direction C)
    --------------------------------------------------------------------------
-   /activity — time-sorted feed of "what just happened" across recent
-   days. Distinct from /timeline (which is one structured report per
-   date+user); Activity is a scannable stream with date-header
-   grouping.
+   /activity — *user-centred* activity stream. Each visible user gets
+   a card showing what they contributed in the time window: topics
+   participated in, actions owned, photos uploaded, safety flags
+   raised. Click any card → right pane opens the full chronological
+   event timeline for that user.
+
+   Replaces the original Sprint 4.1 implementation (chronological
+   topic feed across days), which had high overlap with /timeline.
+   The kept-but-not-chosen alternatives (A: kill /activity entirely,
+   B: raw on-site stream) live in PLAN.md under
+   "Design alternatives held for revisit".
 
    Middle column:
-     • Header: title + range caption + "Load more" affordance
-     • Date-grouped feed rows (one ActivityFeedRow per topic), most
-       recent date at the top, most recent time at the top within each
-       group.
+     • Header: "Activity" + range caption + "Load more" (extends
+       the time window backward by 14 days)
+     • One UserActivityCard per visible user, sorted by total event
+       count desc
 
    Right detail:
-     • Selected topic preview: time, title, summary, participants,
-       counts (decisions / actions / safety flags / photos)
-     • CTA: "Open in timeline" → /timeline?date=…&user=…
+     • Selected user's full chronological event timeline
+     • Click any event → /timeline?date=…&user=…&from=activity
 
    Architecture:
-     • ActivityProvider owns the page state via ActivityContext —
-       mirrors SitesProvider / TodayProvider (Sprint 3 P-07 pattern).
-     • Default range: last 5 days with reports (cap protects perf —
-       fans out N getTimeline calls). "Load more" extends N by 5.
-
-   Worker rule (BACKEND-CONTEXT §3): user is forced to caller's
-   folder name client-side here too (mock api doesn't enforce it).
+     • ActivityProvider fetches once via the new
+       FS.api.userActivity.getUserActivityRange aggregator
+     • Worker rule: aggregator returns just caller's own row
+     • site_manager / pm: scoped to caller's primary_site
+     • admin / gm: full visibility
 
    Registers as window.FieldSight.PAGES['/activity']
    ========================================================================== */
@@ -34,38 +38,27 @@
 (function () {
   'use strict';
 
-  var INITIAL_DAYS = 5;
-  var LOAD_STEP    = 5;
+  var DEFAULT_DAYS = 14;
+  var LOAD_STEP    = 14;
+
+  var KIND_ICON = {
+    topic:  '◇',
+    action: '✓',
+    photo:  '▤',
+    safety: '⚠',
+  };
+
+  var KIND_LABEL = {
+    topic:  'Participated in topic',
+    action: 'Owned action item',
+    photo:  'Uploaded photo',
+    safety: 'Raised safety flag',
+  };
 
   /* ---------- Helpers --------------------------------------------------- */
 
-  function callerFolder() {
-    var u = (window.AuthMock && window.AuthMock.currentUser) || {};
-    if (!u.name) return null;
-    return window.FS.api.folderName(u.name);
-  }
-
-  function isAdminLike(user) {
-    return user && (user.role === 'admin' || user.role === 'gm' || user.isAdmin);
-  }
-
-  /* Topic time_range uses an en-dash: "07:00 – 07:30". Returns "07:00"
-     or '—' for unparseable strings. */
-  function startTime(time_range) {
-    if (!time_range) return '—';
-    var m = String(time_range).match(/(\d{1,2}):(\d{2})/);
-    if (!m) return '—';
-    var h = m[1].length === 1 ? '0' + m[1] : m[1];
-    return h + ':' + m[2];
-  }
-
-  function dateLabel(yyyymmdd, today) {
+  function fmtDate(yyyymmdd) {
     if (!yyyymmdd) return '';
-    if (today && yyyymmdd === today) return 'Today';
-    if (today) {
-      var prev = window.FS.api.addDaysISO(today, -1);
-      if (yyyymmdd === prev) return 'Yesterday';
-    }
     var p = String(yyyymmdd).split('-').map(Number);
     if (p.length !== 3) return yyyymmdd;
     var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -74,7 +67,14 @@
     return days[d.getUTCDay()] + ' ' + p[2] + ' ' + months[p[1] - 1];
   }
 
-  /* ---------- ActivityContext ------------------------------------------ */
+  function fmtDateShort(yyyymmdd) {
+    if (!yyyymmdd) return '';
+    var p = String(yyyymmdd).split('-').map(Number);
+    var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return p[2] + ' ' + months[p[1] - 1];
+  }
+
+  /* ---------- ActivityContext ----------------------------------------- */
 
   var ActivityContext = React.createContext(null);
 
@@ -82,8 +82,7 @@
     var caller = (window.AuthMock && window.AuthMock.currentUser) || {};
     var depKey = (caller.name || '') + '|' + (caller.role || '') + '|' + (caller.isAdmin ? 'admin' : '');
 
-    /* `daysToLoad` is the cap: 5 by default, +5 each "Load more". */
-    var refDays = React.useState(INITIAL_DAYS);
+    var refDays = React.useState(DEFAULT_DAYS);
     var daysToLoad    = refDays[0];
     var setDaysToLoad = refDays[1];
 
@@ -95,72 +94,29 @@
       var cancelled = false;
       setState({ status: 'loading' });
 
-      var user = caller.role === 'worker' || !isAdminLike(caller)
-        ? callerFolder()
-        : null;
+      var today = window.FS.api.todayNZDT();
+      var from  = window.FS.api.addDaysISO(today, -(daysToLoad - 1));
 
-      window.FS.api.dates.getDates({ months: 1 }).then(function (datesRes) {
-        if (cancelled) return null;
-        if (datesRes && datesRes._accessDenied) {
-          setState({ status: 'access_denied', message: datesRes.error });
-          return null;
+      window.FS.api.userActivity.getUserActivityRange({
+        from: from, to: today,
+      }).then(function (res) {
+        if (cancelled) return;
+        if (res && res._accessDenied) {
+          setState({ status: 'access_denied', message: res.error });
+          return;
         }
-        var datesMap = (datesRes && datesRes.dates) || {};
-        var datesWithReports = Object.keys(datesMap)
-          .filter(function (d) { return datesMap[d] && datesMap[d].hasReport; })
-          .sort()
-          .reverse()
-          .slice(0, daysToLoad);
-
-        if (datesWithReports.length === 0) {
-          setState({ status: 'ok', rows: [], dates: [], today: window.FS.api.todayNZDT() });
-          return null;
-        }
-
-        return Promise.all(datesWithReports.map(function (d) {
-          return window.FS.api.timeline.getTimeline({ date: d, user: user })
-            .then(function (r) { return { date: d, report: r }; });
-        })).then(function (perDay) {
-          if (cancelled) return;
-
-          var rows = [];
-          var anyDenied = perDay.some(function (x) { return x.report && x.report._accessDenied; });
-          if (anyDenied) {
-            setState({ status: 'access_denied', message: 'Some reports denied for your role' });
-            return;
-          }
-
-          perDay.forEach(function (x) {
-            var r = x.report;
-            if (!r || r._notFound || r.available_users) return;
-            (r.topics || []).forEach(function (t) {
-              rows.push({
-                id:           x.date + '_topic_' + t.topic_id,
-                date:         x.date,
-                time_label:   startTime(t.time_range),
-                topic_id:     t.topic_id,
-                topic:        t,
-                speaker:      (t.participants || [])[0] || r.user_name,
-                snippet:      t.summary || t.topic_title,
-                category:     t.category,
-                user_name:    r.user_name,
-                user_folder:  r.user_name ? window.FS.api.folderName(r.user_name) : null,
-              });
-            });
-          });
-
-          /* Sort desc by (date, time). */
-          rows.sort(function (a, b) {
-            if (a.date !== b.date) return a.date < b.date ? 1 : -1;
-            return a.time_label < b.time_label ? 1 : -1;
-          });
-
-          setState({
-            status: 'ok',
-            rows:   rows,
-            dates:  datesWithReports,
-            today:  window.FS.api.todayNZDT(),
-          });
+        var users = (res && res.users) || [];
+        users.sort(function (a, b) {
+          var ta = a.counts.topics + a.counts.actions + a.counts.photos + a.counts.safety_flags;
+          var tb = b.counts.topics + b.counts.actions + b.counts.photos + b.counts.safety_flags;
+          return tb - ta;
+        });
+        setState({
+          status: 'ok',
+          users:  users,
+          from:   from,
+          to:     today,
+          dates:  res.dates || [],
         });
       }).catch(function (err) {
         if (cancelled) return;
@@ -180,10 +136,10 @@
   /* ---------- ActivityMiddleColumn ------------------------------------- */
 
   function ActivityMiddleColumn(props) {
-    var fs              = window.FieldSight;
-    var ActivityFeedRow = fs.ActivityFeedRow;
-    var Button          = fs.Button;
-    var onSelect        = props.onSelect || function () {};
+    var fs                = window.FieldSight;
+    var UserActivityCard  = fs.UserActivityCard;
+    var Button            = fs.Button;
+    var onSelect          = props.onSelect || function () {};
 
     var ctx = React.useContext(ActivityContext);
     if (!ctx) {
@@ -195,93 +151,69 @@
     if (state.status === 'loading') {
       return React.createElement('div', { className: 'fs-activity' },
         React.createElement('div', { className: 'fs-activity__loading' },
-          'Loading activity…'),
+          'Aggregating user activity…'),
       );
     }
-
     if (state.status === 'error') {
       return React.createElement('div', { className: 'fs-activity' },
         React.createElement('div', { className: 'fs-activity__empty' },
           'Could not load activity. ' + (state.error && state.error.message || '')),
       );
     }
-
     if (state.status === 'access_denied') {
       var AccessDenied = fs.AccessDenied;
       return React.createElement('div', { className: 'fs-activity' },
         AccessDenied
           ? React.createElement(AccessDenied, {
-              scope:   'this activity feed',
+              scope:   'this activity stream',
               message: state.message,
             })
           : React.createElement('div', null, 'Access denied.'),
       );
     }
 
-    var rows  = state.rows  || [];
-    var today = state.today || null;
-    var selectedId = props.selectedItem && props.selectedItem.kind === 'activity_topic'
-      ? props.selectedItem.id
+    var users = state.users || [];
+    var selectedFolder = props.selectedItem && props.selectedItem.kind === 'activity_user'
+      ? props.selectedItem.user_folder
       : null;
-
-    if (rows.length === 0) {
-      return React.createElement('div', { className: 'fs-activity' },
-        React.createElement(Header, {
-          rowCount: 0, dayCount: (state.dates || []).length, ctx: ctx,
-        }),
-        React.createElement('div', { className: 'fs-activity__empty' },
-          'No activity in the last ' + ctx.daysToLoad + ' days.'),
-      );
-    }
-
-    /* Group rows by date, preserving order. */
-    var groups = [];
-    var currentDate = null;
-    rows.forEach(function (row) {
-      if (row.date !== currentDate) {
-        groups.push({ date: row.date, rows: [] });
-        currentDate = row.date;
-      }
-      groups[groups.length - 1].rows.push(row);
-    });
 
     return React.createElement('div', { className: 'fs-activity' },
 
-      React.createElement(Header, {
-        rowCount: rows.length, dayCount: (state.dates || []).length, ctx: ctx,
-      }),
-
-      React.createElement('div', { className: 'fs-activity__feed' },
-        groups.map(function (g) {
-          return React.createElement(React.Fragment, { key: g.date },
-            React.createElement('div', { className: 'fs-activity__date-header' },
-              dateLabel(g.date, today)),
-            React.createElement('div', { className: 'fs-activity__group' },
-              g.rows.map(function (row) {
-                return React.createElement(ActivityFeedRow, {
-                  key:      row.id,
-                  row:      row,
-                  selected: selectedId === row.id,
-                  onSelect: function () {
-                    onSelect({
-                      kind:        'activity_topic',
-                      id:          row.id,
-                      topic_id:    row.topic_id,
-                      topic:       row.topic,
-                      date:        row.date,
-                      user:        row.user_folder,
-                      user_name:   row.user_name,
-                    });
-                  },
-                });
-              }),
-            ),
-          );
-        }),
+      /* Header */
+      React.createElement('div', { className: 'fs-activity__header' },
+        React.createElement('h2', { className: 'fs-activity__title' }, 'Activity'),
+        React.createElement('div', { className: 'fs-activity__subtitle' },
+          'What each person on your team has been doing recently'),
+        React.createElement('div', { className: 'fs-activity__meta' },
+          users.length + ' ' + (users.length === 1 ? 'person' : 'people')
+            + ' · last ' + ctx.daysToLoad + ' days'
+            + ' (' + fmtDateShort(state.from) + ' → ' + fmtDateShort(state.to) + ')'),
       ),
 
-      /* Load more — only show if we got back as many days as we asked for. */
-      (state.dates || []).length >= ctx.daysToLoad
+      /* User list */
+      users.length === 0
+        ? React.createElement('div', { className: 'fs-activity__empty' },
+            'No users visible to your role.')
+        : React.createElement('div', { className: 'fs-activity__list' },
+            users.map(function (u) {
+              return React.createElement(UserActivityCard, {
+                key:      u.user_folder,
+                user:     u,
+                selected: selectedFolder === u.user_folder,
+                onSelect: function () {
+                  onSelect({
+                    kind:        'activity_user',
+                    id:          'user_' + u.user_folder,
+                    user_folder: u.user_folder,
+                    user:        u,
+                  });
+                },
+              });
+            }),
+          ),
+
+      /* Load more */
+      users.length > 0
         ? React.createElement('div', { className: 'fs-activity__load-more' },
             React.createElement(Button, {
               variant: 'secondary', size: 'sm',
@@ -292,72 +224,58 @@
     );
   }
 
-  function Header(props) {
-    return React.createElement('div', { className: 'fs-activity__header' },
-      React.createElement('h2', { className: 'fs-activity__title' }, 'Activity'),
-      React.createElement('div', { className: 'fs-activity__subtitle' },
-        props.rowCount + ' '
-          + (props.rowCount === 1 ? 'event' : 'events')
-          + ' across last ' + props.ctx.daysToLoad + ' days'
-          + (props.dayCount < props.ctx.daysToLoad
-              ? ' · ' + props.dayCount + ' with reports'
-              : '')),
-    );
-  }
-
   /* ---------- ActivityRightDetail -------------------------------------- */
 
   function ActivityRightDetail(props) {
-    var fs            = window.FieldSight;
-    var Card          = fs.Card;
-    var Badge         = fs.Badge;
-    var Button        = fs.Button;
-    var IconBtn       = fs.IconButton;
-    var CategoryBadge = fs.CategoryBadge;
+    var fs       = window.FieldSight;
+    var Card     = fs.Card;
+    var Avatar   = fs.Avatar;
+    var Badge    = fs.Badge;
+    var Button   = fs.Button;
+    var IconBtn  = fs.IconButton;
 
     var sel = props.selectedItem;
 
-    if (!sel || sel.kind !== 'activity_topic') {
+    if (!sel || sel.kind !== 'activity_user') {
       return React.createElement('div', { className: 'fs-activity-detail__placeholder' },
         React.createElement('div', { className: 'fs-activity-detail__placeholder-title' },
-          'Select an event'),
+          'Select a person'),
         React.createElement('div', { className: 'fs-activity-detail__placeholder-body' },
-          'Pick any row in the feed for a quick preview, then jump into the full timeline.'),
+          'Pick any card to see the full timeline of what that person has been doing — every topic they joined, every action they own, every photo they uploaded, every safety flag they raised.'),
       );
     }
 
-    var topic = sel.topic || {};
-    var counts = {
-      decisions:    (topic.key_decisions  || []).length,
-      actions:      (topic.action_items   || []).length,
-      safety_flags: (topic.safety_flags   || []).length,
-      photos:       (topic.related_photos || []).length,
-    };
+    var u = sel.user;
+    var counts = u.counts;
+    var events = u.events || [];
 
-    function openInTimeline() {
-      var qs = '?date=' + encodeURIComponent(sel.date);
-      if (sel.user) qs += '&user=' + encodeURIComponent(sel.user);
+    function openInTimeline(ev) {
+      var qs = '?date=' + encodeURIComponent(ev.date)
+             + '&user=' + encodeURIComponent(u.user_folder)
+             + '&from=activity';
       window.FS.Router.navigate('/timeline' + qs);
     }
 
+    /* Group events by date for visual rhythm. */
+    var groups = [];
+    var current = null;
+    events.forEach(function (ev) {
+      if (ev.date !== current) {
+        groups.push({ date: ev.date, events: [] });
+        current = ev.date;
+      }
+      groups[groups.length - 1].events.push(ev);
+    });
+
     return React.createElement('div', { className: 'fs-activity-detail' },
 
+      /* Header */
       React.createElement('div', { className: 'fs-activity-detail__header' },
-        React.createElement('div', { className: 'fs-activity-detail__header-main' },
-          React.createElement('div', { className: 'fs-activity-detail__time' },
-            (topic.time_range || '—') + '  ·  ' + (sel.date || '')),
-          React.createElement('h2', { className: 'fs-activity-detail__title' },
-            topic.topic_title || '(untitled topic)'),
-          React.createElement('div', { className: 'fs-activity-detail__metaline' },
-            CategoryBadge && topic.category
-              ? React.createElement(CategoryBadge, { category: topic.category })
-              : null,
-            (topic.participants || []).length
-              ? React.createElement('span', {
-                  className: 'fs-activity-detail__participants',
-                }, (topic.participants || []).join(' · '))
-              : null,
-          ),
+        React.createElement(Avatar, { name: u.user_name, size: 'lg' }),
+        React.createElement('div', { className: 'fs-activity-detail__id' },
+          React.createElement('h2', { className: 'fs-activity-detail__name' }, u.user_name),
+          React.createElement('div', { className: 'fs-activity-detail__sub' },
+            [u.role, u.primary_site].filter(Boolean).join(' · ')),
         ),
         IconBtn ? React.createElement(IconBtn, {
           icon: 'x', ariaLabel: 'Close detail', size: 'sm',
@@ -365,46 +283,63 @@
         }) : null,
       ),
 
-      topic.summary
-        ? React.createElement('p', { className: 'fs-activity-detail__summary' },
-            topic.summary)
-        : null,
-
-      /* Counts strip */
+      /* Counts repeated for context */
       React.createElement('div', { className: 'fs-activity-detail__counts' },
-        React.createElement(CountChip, {
-          label: 'Decisions', value: counts.decisions,
-        }),
-        React.createElement(CountChip, {
-          label: 'Actions',   value: counts.actions,
-        }),
-        React.createElement(CountChip, {
-          label: 'Safety',    value: counts.safety_flags,
-          tone:  counts.safety_flags > 0 ? 'danger' : 'neutral',
-        }),
-        React.createElement(CountChip, {
-          label: 'Photos',    value: counts.photos,
+        ['topics', 'actions', 'photos', 'safety_flags'].map(function (k) {
+          var label = ({ topics: 'Topics', actions: 'Actions',
+                         photos: 'Photos', safety_flags: 'Safety' })[k];
+          return React.createElement('div', {
+            key:       k,
+            className: 'fs-activity-detail__count'
+              + (k === 'safety_flags' && counts[k] > 0 ? ' fs-activity-detail__count--danger' : ''),
+          },
+            React.createElement('div', { className: 'fs-activity-detail__count-value' },
+              counts[k]),
+            React.createElement('div', { className: 'fs-activity-detail__count-label' },
+              label),
+          );
         }),
       ),
 
-      /* Action footer */
-      React.createElement('div', { className: 'fs-activity-detail__actions' },
-        React.createElement(Button, {
-          size: 'sm', leftIcon: 'arrow-right',
-          onClick: openInTimeline,
-        }, 'Open in timeline'),
-      ),
-    );
-  }
-
-  function CountChip(props) {
-    var className = 'fs-activity-detail__count'
-      + (props.tone === 'danger' ? ' fs-activity-detail__count--danger' : '');
-    return React.createElement('div', { className: className },
-      React.createElement('div', { className: 'fs-activity-detail__count-value' },
-        props.value),
-      React.createElement('div', { className: 'fs-activity-detail__count-label' },
-        props.label),
+      /* Event timeline */
+      events.length === 0
+        ? React.createElement('div', { className: 'fs-activity-detail__empty' },
+            'No activity for this person in the selected window.')
+        : React.createElement('div', { className: 'fs-activity-detail__timeline' },
+            groups.map(function (g) {
+              return React.createElement(React.Fragment, { key: g.date },
+                React.createElement('div', {
+                  className: 'fs-activity-detail__date-header',
+                }, fmtDate(g.date)),
+                React.createElement('div', { className: 'fs-activity-detail__group' },
+                  g.events.map(function (ev, i) {
+                    return React.createElement('button', {
+                      key:       g.date + '_' + i,
+                      type:      'button',
+                      className: 'fs-activity-detail__event'
+                                  + ' fs-activity-detail__event--' + ev.kind,
+                      onClick:   function () { openInTimeline(ev); },
+                      title:     'Open in /timeline',
+                    },
+                      React.createElement('span', {
+                        className: 'fs-activity-detail__event-icon',
+                      }, KIND_ICON[ev.kind] || '·'),
+                      React.createElement('div', { className: 'fs-activity-detail__event-main' },
+                        React.createElement('div', { className: 'fs-activity-detail__event-text' },
+                          ev.summary || ev.topic_title),
+                        React.createElement('div', { className: 'fs-activity-detail__event-meta' },
+                          (KIND_LABEL[ev.kind] || ev.kind)
+                            + (ev.time_label ? ' · ' + ev.time_label : '')
+                            + (ev.topic_title ? ' · ' + ev.topic_title : '')
+                            + (ev.kind === 'action' && ev.extra && ev.extra.checked
+                                ? ' · ✓ done' : '')),
+                      ),
+                    );
+                  }),
+                ),
+              );
+            }),
+          ),
     );
   }
 
