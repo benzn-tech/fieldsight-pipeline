@@ -358,6 +358,25 @@ starting the sprint.
 After P-01 through P-12, the prototype is ready for handoff to a real
 auth + fetch flip (Phase I activation) without UI surprises.
 
+## Sprint 4 — Core operational pages + Programme MVP
+
+Five sub-sprints, one PR each. See the Sprint 4 plan file
+(`/root/.claude/plans/`) for detailed scope and risk mitigations.
+
+- **Sprint 4.0 · Sites page (`/sites`)** ✅ done
+  Shipped on `claude/sprint4-00-sites`. New `SiteCard` composite +
+  `/sites` page with `SitesProvider` (Context shared between Middle
+  and Right via the Sprint 3 P-07 page-Provider slot). Middle = list
+  of sites with KPI mini-strip (users · reports · latest); right =
+  selected site detail (recent reports + users on site, both
+  click-through to `/timeline?date=…&user=…`). Worker role gates
+  the list to `caller.primary_site` only.
+
+- **Sprint 4.1 · Activity feed (`/activity`)** ⏳ pending
+- **Sprint 4.2 · Tasks page (`/tasks`)** ⏳ pending
+- **Sprint 4.3 · Evidence library (`/evidence`)** ⏳ pending
+- **Sprint 4.4 · Programme MVP (`/programme`)** ⏳ pending
+
 ## Sprint 4+ — Open product questions
 
 Surfaced during the second-pass review of merged main. These aren't
