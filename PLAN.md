@@ -1,5 +1,31 @@
 # Plan — Aligning the Prototype With Backend Reality
 
+## Design alternatives held for revisit
+
+Quick recall: `grep -n "Design alternatives" PLAN.md`. Each entry below is
+a candidate that was *not* chosen during a sub-sprint but is still
+considered viable enough to come back to if the chosen direction proves
+wrong.
+
+### Activity page (`/activity`) — direction not chosen Sprint 4.6
+
+The Sprint 4.6 redesign settled on **direction C — user activity stream**
+(group events by user, "what each person did this week"). The two
+alternatives below were rejected for now, but kept on file:
+
+- **A — Kill `/activity` entirely.** It's coverable by `/timeline` (single
+  day, structured) + `/tasks` (cross-day action tracker). Simplest path:
+  remove the route + nav slot, delete the page + composite. Recall if
+  user-activity-stream proves redundant in usage testing.
+- **B — Repositioned as "raw on-site stream".** Show *unstructured* field
+  signals before AI processing: PTT audio chunks just uploaded, photos
+  mid-classification, voice notes, safety flags raised in real time —
+  i.e., the raw event stream that feeds the daily-report pipeline. This
+  is conceptually stronger but needs backend endpoints we don't have
+  (per BACKEND-CONTEXT §10 the device→S3 path is one-way; there's no
+  `/api/feed/raw` endpoint). Worth revisiting once backend exposes that
+  stream.
+
 ## Context
 
 The prototype was built (Sprints 0–2.0) before the backend's data shapes were
@@ -357,6 +383,236 @@ starting the sprint.
 
 After P-01 through P-12, the prototype is ready for handoff to a real
 auth + fetch flip (Phase I activation) without UI surprises.
+
+## Sprint 4 — Core operational pages + Programme MVP
+
+Five sub-sprints, one PR each. See the Sprint 4 plan file
+(`/root/.claude/plans/`) for detailed scope and risk mitigations.
+
+- **Sprint 4.0 · Sites page (`/sites`)** ✅ done
+  Shipped on `claude/sprint4-00-sites`. New `SiteCard` composite +
+  `/sites` page with `SitesProvider` (Context shared between Middle
+  and Right via the Sprint 3 P-07 page-Provider slot). Middle = list
+  of sites with KPI mini-strip (users · reports · latest); right =
+  selected site detail (recent reports + users on site, both
+  click-through to `/timeline?date=…&user=…`). Worker role gates
+  the list to `caller.primary_site` only.
+
+- **Sprint 4.1 · Activity feed (`/activity`)** ✅ done
+  Shipped on `claude/sprint4-00-sites` (stacked on 4.0). New
+  `ActivityFeedRow` composite (multi-day variant of `ActivityCard` —
+  drops "Xm ago" relative time in favour of HH:MM clock time so date
+  grouping happens upstream). New `/activity` page with
+  `ActivityProvider` running the same Sprint 3 P-07 page-Provider
+  pattern. Default range = 5 most recent days with reports; "Load
+  more" extends by 5 each click. Date headers (Today / Yesterday /
+  Wed 28 Apr) group rows desc. Selected event opens a right-pane
+  preview (counts strip + summary + "Open in timeline" CTA). Worker
+  rule honoured client-side.
+- **Sprint 4.2 · Tasks page (`/tasks`)** ✅ done — Q-1 commitment via fan-out
+  Shipped on `claude/sprint4-00-sites` (stacked on 4.1). New
+  `getActionsRange({from,to})` helper on `FS.api.actions` (additive,
+  doesn't change `getActions(date)` shape), new
+  `FS.api.tasks.getActionsResolvedRange` aggregator that joins
+  timeline action source with audit overlay into a flat row contract.
+  New `TasksFilterChips` composite (All / Mine / Open / Overdue /
+  Done with counts) and `/tasks` page with `TasksProvider` (P-07
+  pattern). Default range = trailing 14 days; default filter = Mine
+  (or All for admin/gm). Right detail wires "Mark complete" through
+  the existing `toggleAction` + optimistic-removal flow used by
+  TaskCard. Heuristic deadline parser handles "Today HH:MM",
+  "Tomorrow HH:MM", "DD MMM" — unparseable deadlines never count
+  as overdue. Page header carries an explicit perf caveat:
+  "Aggregated client-side — slow at scale until backend ships
+  /api/actions/all".
+- **Sprint 4.3 · Evidence library (`/evidence`)** ✅ done
+  Shipped on `claude/sprint4-00-sites` (stacked on 4.2). New
+  `EvidenceTabs` composite (Photos / Audio / Video / Transcripts
+  with optional counts) and `/evidence` page with `EvidenceProvider`
+  (P-07 page-Provider pattern). Default range = trailing 7 days
+  with reports; "Load more" extends by 7. Tab activation drives
+  rendering — Photos tab uses an aggregated count + central fetch
+  (extracts `topic.related_photos` from per-day timelines and feeds
+  one `PhotoGrid` per day); Audio / Video / Transcripts tabs render
+  one Phase C composite per day, each fetching its own slice
+  (parallel internal fetches, no central coordination needed).
+  Right detail = read-only summary card (active tab name + range +
+  found-count + tab blurb). Worker rule honoured (forced-self
+  client-side).
+- **Sprint 4.4 · Programme MVP (`/programme`)** ✅ done — biggest sub-sprint
+  Shipped on `claude/sprint4-00-sites` (stacked on 4.3). New
+  `FS.api.programme` module (`getProgramme` + `getProgrammeTasksForRange`,
+  mock-only branch reads from `programme.fixture.js`; backend branch
+  is a stub with documented endpoint contracts), new
+  `programme.fixture.js` (1 programme · 5 WBS groups · 14 leaf tasks
+  · 8 critical-path tasks · 4 linked report actions), and four new
+  composites: `GanttStrip`, `TaskTreeCell`, `GanttRow`, and
+  `ProgrammeTodoList`. New `/programme` page with `ProgrammeProvider`
+  (P-07 page-Provider pattern) supporting Gantt/TO-DO view toggle,
+  Day/Week/Month tier toggle, sticky WBS tree on the left, scrollable
+  timeline on the right, today-marker overlay, group expand/collapse,
+  critical-path highlighting (border), status-coloured bars, progress
+  fill. TO-DO mode renders Jira-style buckets (This week / Next week /
+  Later) with clickable rows. Right detail = full task fields + lazy
+  linked-actions fetch (one `getTimeline` per unique linked date),
+  click-through to `/timeline?date=…&user=…`. Worker rule applied
+  inside the api module. Sprint 5 picks up imports / native edit /
+  cascade engine.
+
+  Sprint 4 complete. 5/14 nav slots → 9/14. Programme follow-ups
+  (imports + native edit + cascade) tracked for Sprint 5; Compliance/
+  admin (Safety/Quality/Team/Settings) tracked for Sprint 6;
+  Strategic dashboards (Portfolio/Regional/Executive) tracked for
+  Sprint 7.
+
+## Sprint 4 follow-up sub-sprints (post-review feedback)
+
+Five follow-up sub-sprints opened on top of 4.4 in response to the
+post-walkthrough feedback. All stack on the same `claude/sprint4-00-sites`
+branch (PR #14) until the user merges.
+
+- **Sprint 4.10 · Today × Programme integration + Board Mine/All filter** ✅ done
+  Connects the planning layer (Programme) to the execution layer
+  (Today). Eight surgical pieces:
+
+  1. `ProgrammeMiddleColumn` reads `?task=T-XXX` from the URL on
+     mount and auto-selects the task (RightDrawer slides in
+     automatically). Used by 4.10.6 click-throughs.
+  2. New `FS.api.todayProgramme.getTodayProgrammeTasks` adapter
+     module — finds programme tasks where today ∈ task.start..end
+     AND caller ∈ task.assignees, returns rows shaped for the
+     Today UI with Day-N-of-M + progress + critical flag.
+  3. `TodayProvider` now fans the adapter in parallel with the
+     daily-report load; result lives at `state.data.programmeTasks`.
+     Empty-state still shows programme tasks if any (programme is
+     not gated on a daily report existing).
+  4. New `ProgrammeTaskCard` composite — Today-page variant of
+     TaskCard for programme rows. WBS code prefix, accent left
+     border (danger when critical), Day N of M, dominant progress
+     bar. No checkbox (programme progress is multi-day).
+  5. Today's My-tasks region splits into two visually-distinct
+     subgroups: "From your programme · N" (above) and "From recent
+     reports · N" (below). Same parent SectionLabel, so the user
+     reads them as ONE list with provenance.
+  6. Click any programme card on Today → navigates to
+     `/programme?task=T-XXX&from=today`. Drawer auto-opens via 4.10.1.
+  7. Timeline `← Back to Today` link restyled — now a full-width
+     dark-navy CTA matching `fs-today__view-report-cta` so the
+     round-trip looks symmetrical from both ends.
+  8. `ProgrammeKanbanBoard` adds a Mine/All chip toggle (workers
+     hidden — api already enforces the scope; site_manager / pm /
+     admin / gm see it). Counts on each chip; column totals
+     refresh against the filtered set.
+
+  Fixture tweak: T-003 Foundation pour end-date extended from
+  2026-04-30 → 2026-05-01 so the demo date carries both a wrap-up
+  (T-003 95%) and a kickoff (T-004 12%) for Jarley — exactly the
+  scenario described in the original product question.
+
+  Smoke (node, mock mode):
+    • Jarley (site_manager) → 2 today programme tasks
+      (T-003 wrap-up + T-004 kickoff, both critical)
+    • Sarah (worker) → 1 task (T-003 only — she joins T-005
+      starting 2026-05-04)
+  Cache busters: composites.css v=24, today.js v=12, timeline.js
+  v=10, programme.js v=5, programme-kanban-board.js v=2,
+  today-programme-adapter.js v=1 (new), programme-task-card.js
+  v=1 (new).
+
+- **Sprint 4.5 · Today back-nav + Tasks subtitle clarity** ✅ done
+  Two tiny UX fixes from the review:
+  (1) `/today`'s "View daily report" CTA now appends `&from=today`
+      to the timeline URL; `TimelineMiddleColumn`'s header detects
+      that flag and renders a `← Back to Today` link above the
+      title (no more digging for the left-nav).
+  (2) `/tasks` subtitle replaced — verbose perf caveat lifted into
+      a hover-tooltip on a small ⓘ icon. New subtitle: "Action items
+      assigned across reports — yours, your team's, by status."
+  Touched `today.js`, `timeline.js`, `tasks.js`, plus a small CSS
+  block. Cache busters: today.js v=11, timeline.js v=9, tasks.js
+  v=2, composites.css v=20.
+- **Sprint 4.6 · Activity → user activity stream** ✅ done (direction C)
+  Old chronological topic feed (4.1) replaced. New aggregator
+  `FS.api.userActivity.getUserActivityRange({from,to})` joins
+  per-user timelines + audit overlays into a per-user view that
+  attributes events to whoever's named in
+  `topic.participants` / `action.responsible` / `report.user_name`,
+  regardless of which report each datum came from. Counts: Topics ·
+  Actions · Photos · Safety. New `UserActivityCard` composite
+  (avatar + name + 4-count strip + top-3 event preview). Right
+  pane = full chronological event timeline grouped by date with
+  border-coded kind colour and "Open in /timeline" click-through
+  (carries `&from=activity` to surface a back-nav next sub-sprint).
+  Worker scope = caller-only; site_manager / pm = primary_site
+  scope; admin / gm = full visibility. Fixture verification:
+  admin sees 8 users, 4 with non-zero counts; site_manager (Jarley)
+  sees 4 users (sb1108-ellesmere); worker (Sarah Chen) sees only
+  herself. Old `scripts/composites/activity-feed-row.js` deleted
+  (no remaining references). Cache busters: composites.css v=21,
+  pages/activity.js v=2, user-activity-aggregator.js v=1 (new),
+  user-activity-card.js v=1 (new).
+- **Sprint 4.7 · Programme full-width layout + slide-in drawer** ✅ done
+  AppShell now respects a `layout: 'full-width'` flag on page registry
+  entries. Programme declares it; other pages keep the 3-pane shell.
+  Effects on `/programme`:
+    • Middle column ignores the resize-handle width and flexes to
+      fill the entire content area (~1300+ px on a typical desktop)
+    • Static RightDetail pane is suppressed
+    • Drag handle hidden (no neighbouring column to resize against)
+    • New `RightDrawer` composite slides in from the right edge
+      (440px wide, max 90vw) whenever a task is selected
+    • Backdrop dims everything except the drawer; click closes
+    • ESC key closes (only listens while open, so other pages
+      unaffected)
+  No changes to other pages — Today / Timeline / Sites / Activity /
+  Tasks / Reports / Evidence keep the original 3-pane behaviour.
+  Cache busters: app-shell.css v=3, app-shell.js v=9, programme.js
+  v=2, right-drawer.js v=1 (new).
+- **Sprint 4.8 · Jira-style 4-column kanban replaces ProgrammeTodoList** ✅ done
+  Programme's Board view (renamed from "TO-DO") is now a four-column
+  status grid modelled on the Jira active-sprint screenshot the user
+  shared. Columns: Not started · In progress · Blocked or Delayed
+  (combined to keep the board 4-wide) · Done. Rows = WBS parent
+  groups (Earthworks & Foundations / Structure / Envelope / Services /
+  Fit-out). Cards distribute into the column matching their
+  `status`. Per-card chrome: WBS code top-left, Critical badge
+  top-right, task name (semibold), inline progress bar in the
+  In-progress column only, assignee Avatar + first name, date
+  range footer. Top-of-board status totals strip and per-row
+  group header with collapsible chevron (collapsed-set shared
+  with the Gantt view via `ProgrammeProvider.collapsed`). Empty
+  cells render as 45° hatched panels for visual rhythm.
+  Old `programme-todo-list.js` composite and its `.fs-prog-todo*`
+  CSS deleted (no remaining references after the swap). Smoke
+  test: distribution across the 14 fixture leaves = 10 Not started
+  / 2 In progress / 0 Blocked / 2 Done; rows × columns matrix
+  prints expected 5×4. Cache busters: composites.css v=22,
+  programme.js v=3, programme-kanban-board.js v=1 (new).
+- **Sprint 4.9 · Gantt drag (L1 move + L2 edge resize)** ✅ done
+  Last sub-sprint of the post-review batch. Programme Gantt bars
+  are now interactive — three drag modes:
+    • **L1 move** — pointerdown on bar body → translate whole bar
+    • **L2 resize-start** — pointerdown on first 8 px → only `start` moves
+    • **L2 resize-end** — pointerdown on last 8 px → only `end` moves
+  Drag is gated to leaf tasks (group rows + completed tasks aren't
+  draggable). Snap is implicit: `Math.round(deltaPx / pixelsPerDay)`
+  → days. Bounds clamp to `programme.start_date` / `end_date`;
+  start ≤ end enforced. Optimistic preview updates the bar position
+  in flight; commit happens on `pointerup` via the new
+  `ProgrammeProvider.updateTask({task_id, start, end})` which
+  mutates the in-memory leaves[] and re-publishes state. Cursor
+  affordances (grab / grabbing / ew-resize) on the bar plus a
+  body-level `fs-gantt-dragging` lock on selection during drag.
+  Pointer capture so the drag survives the cursor leaving the bar.
+  Cascade engine explicitly out of scope — Sprint 5.2 owns it.
+  Cache busters: composites.css v=23, gantt-row.js v=2,
+  programme.js v=4. Smoke math: +60px @ 24ppd → +3 days; -36px
+  resize-end @ 24ppd → -1 day; snap rounds correctly across
+  12/24/35/36 px boundaries.
+
+  Sprint 4 follow-up batch complete (4.5–4.9). Total post-review
+  cost: 5 sub-sprints, ~13 new files, 2 deleted, no nav-slot
+  changes. PR #14 ready for review/merge.
 
 ## Sprint 4+ — Open product questions
 

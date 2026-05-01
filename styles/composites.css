@@ -687,6 +687,51 @@
 
 .fs-timeline-page__header { padding: 0 4px; }
 
+/* Sprint 4.5 — back link surfaced when arriving from /today.
+   Sprint 4.10 — restyled to match the "View daily report" CTA on
+   /today: full-width, dark navy primary button, with the arrow
+   on the left and text following. Visually parallel to the
+   CTA so users perceive the round-trip as one symmetrical action. */
+.fs-timeline-page__back {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 12px;
+  width: 100%;
+  margin: 0 0 12px;
+  padding: 12px 16px;
+  font: inherit;
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: #fff;
+  background: var(--color-primary-900);
+  border: 1px solid var(--color-primary-800);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  text-align: left;
+  transition: background var(--duration-fast) var(--easing-out),
+              transform var(--duration-fast) var(--easing-out);
+}
+.fs-timeline-page__back:hover {
+  background: var(--color-primary-800);
+}
+.fs-timeline-page__back:active {
+  transform: translateY(1px);
+}
+.fs-timeline-page__back:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+.fs-timeline-page__back-arrow {
+  font-size: 16px;
+  line-height: 1;
+  opacity: 0.85;
+  transition: transform var(--duration-fast) var(--easing-out);
+}
+.fs-timeline-page__back:hover .fs-timeline-page__back-arrow {
+  transform: translateX(-2px);
+}
+
 .fs-timeline-page__title {
   margin: 0;
   font-size: 18px;
@@ -2040,4 +2085,1828 @@
 .fs-ask-chat__send:disabled {
   background: var(--border-default);
   cursor: not-allowed;
+}
+
+
+/* =========================================================================
+   Sub-sprint 4.0 — Sites page + SiteCard
+   ========================================================================= */
+
+/* SiteCard ----------------------------------------------------------------- */
+.fs-site-card { margin-bottom: 8px; cursor: pointer; }
+.fs-site-card--selected {
+  border-color: var(--color-accent-500);
+  box-shadow: 0 0 0 2px var(--color-accent-100);
+}
+
+.fs-site-card__header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.fs-site-card__main { flex: 1; min-width: 0; }
+.fs-site-card__name {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  line-height: 1.3;
+}
+.fs-site-card__sub {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.fs-site-card__chev {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  font-size: 18px;
+  line-height: 1.2;
+  padding: 0 2px;
+}
+
+.fs-site-card__kpis {
+  display: flex;
+  gap: 16px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border-subtle);
+}
+.fs-site-card__kpi {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.fs-site-card__kpi-value {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+.fs-site-card__kpi-value--mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: var(--font-weight-medium);
+}
+.fs-site-card__kpi-label {
+  font-size: 10px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+
+/* Sites page (middle column) ---------------------------------------------- */
+.fs-sites { display: flex; flex-direction: column; gap: 12px; }
+
+.fs-sites__header { padding: 0 4px; }
+.fs-sites__title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+.fs-sites__subtitle {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.fs-sites__list { display: flex; flex-direction: column; gap: 0; }
+
+.fs-sites__loading,
+.fs-sites__empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+
+/* Sites right detail ------------------------------------------------------- */
+.fs-sites-detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 24px;
+  gap: 18px;
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+
+.fs-sites-detail__placeholder {
+  padding: 32px;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+.fs-sites-detail__placeholder-title {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.fs-sites-detail__placeholder-body { font-size: 13px; }
+
+.fs-sites-detail__header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.fs-sites-detail__header-main { flex: 1; min-width: 0; }
+.fs-sites-detail__title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  line-height: 1.3;
+}
+.fs-sites-detail__metaline {
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.fs-sites-detail__metaline > span:not(:last-child)::after {
+  content: '·';
+  margin-left: 8px;
+  color: var(--border-default);
+}
+
+.fs-sites-detail__section { display: flex; flex-direction: column; gap: 8px; }
+.fs-sites-detail__section-label {
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.fs-sites-detail__empty {
+  padding: 12px;
+  font-size: 13px;
+  color: var(--text-tertiary);
+  background: var(--surface-panel-muted);
+  border-radius: var(--radius-md);
+}
+
+.fs-sites-detail__reports { display: flex; flex-direction: column; gap: 4px; }
+
+.fs-sites-detail__report {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-panel);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: background var(--duration-fast) var(--easing-out),
+              border-color var(--duration-fast) var(--easing-out);
+}
+.fs-sites-detail__report:hover:not(:disabled) {
+  background: var(--surface-panel-muted);
+  border-color: var(--border-default);
+}
+.fs-sites-detail__report:disabled { cursor: default; }
+
+.fs-sites-detail__report-main { flex: 1; min-width: 0; }
+.fs-sites-detail__report-date {
+  font-size: 13px;
+  font-weight: var(--font-weight-medium);
+  color: var(--text-primary);
+}
+.fs-sites-detail__report-meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+
+.fs-sites-detail__users { display: flex; flex-direction: column; gap: 4px; }
+
+.fs-sites-detail__user {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-panel);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: background var(--duration-fast) var(--easing-out),
+              border-color var(--duration-fast) var(--easing-out);
+}
+.fs-sites-detail__user:hover:not(:disabled) {
+  background: var(--surface-panel-muted);
+  border-color: var(--color-accent-300);
+}
+
+.fs-sites-detail__user-main { flex: 1; min-width: 0; }
+.fs-sites-detail__user-name {
+  font-size: 13px;
+  font-weight: var(--font-weight-medium);
+  color: var(--text-primary);
+}
+.fs-sites-detail__user-meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+}
+
+.fs-sites-detail__user-arrow {
+  color: var(--text-tertiary);
+  font-size: 14px;
+  transition: transform var(--duration-fast) var(--easing-out),
+              color var(--duration-fast) var(--easing-out);
+}
+.fs-sites-detail__user:hover:not(:disabled) .fs-sites-detail__user-arrow {
+  color: var(--color-accent-500);
+  transform: translateX(2px);
+}
+
+
+/* =========================================================================
+   Sub-sprint 4.6 — Activity page (user activity stream, direction C)
+   Replaces the chronological feed from 4.1. Old .fs-activity-feed-row
+   classes were removed when activity.js was rebuilt; old detail pane
+   classes (.fs-activity-detail*) are kept where the new detail pane
+   reuses them (counts, header), and extended below.
+   ========================================================================= */
+
+/* Activity page (middle) --------------------------------------------------- */
+.fs-activity { display: flex; flex-direction: column; gap: 12px; }
+
+.fs-activity__header { padding: 0 4px; }
+.fs-activity__title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+.fs-activity__subtitle {
+  margin-top: 2px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.fs-activity__meta {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-activity__list { display: flex; flex-direction: column; gap: 8px; }
+
+.fs-activity__load-more {
+  display: flex;
+  justify-content: center;
+  padding: 12px 0 4px;
+}
+
+.fs-activity__loading,
+.fs-activity__empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+
+/* UserActivityCard --------------------------------------------------------- */
+.fs-user-activity-card { cursor: pointer; }
+.fs-user-activity-card--selected {
+  border-color: var(--color-accent-500);
+  box-shadow: 0 0 0 2px var(--color-accent-100);
+}
+.fs-user-activity-card--quiet { opacity: 0.7; }
+
+.fs-user-activity-card__header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.fs-user-activity-card__id { flex: 1; min-width: 0; }
+.fs-user-activity-card__name {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+.fs-user-activity-card__sub {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  margin-top: 2px;
+}
+.fs-user-activity-card__chev {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.fs-user-activity-card__counts {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border-subtle);
+}
+.fs-user-activity-card__count {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: center;
+  padding: 6px 4px;
+  border-radius: var(--radius-sm);
+}
+.fs-user-activity-card__count--danger {
+  background: var(--color-danger-50);
+}
+.fs-user-activity-card__count-value {
+  font-size: 16px;
+  font-weight: var(--font-weight-bold);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.fs-user-activity-card__count--danger .fs-user-activity-card__count-value {
+  color: var(--color-danger-700);
+}
+.fs-user-activity-card__count-label {
+  font-size: 9px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.fs-user-activity-card__preview {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.fs-user-activity-card__preview-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+.fs-user-activity-card__preview-icon {
+  flex-shrink: 0;
+  width: 14px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+.fs-user-activity-card__preview-row--safety .fs-user-activity-card__preview-icon {
+  color: var(--color-danger-600);
+}
+.fs-user-activity-card__preview-row--action .fs-user-activity-card__preview-icon {
+  color: var(--color-success-600);
+}
+.fs-user-activity-card__preview-when {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  width: 70px;
+}
+.fs-user-activity-card__preview-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fs-user-activity-card__preview-more {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  text-align: right;
+}
+
+.fs-user-activity-card__empty {
+  margin-top: 10px;
+  padding: 8px;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-tertiary);
+  text-align: center;
+  background: var(--surface-panel-muted);
+  border-radius: var(--radius-sm);
+}
+
+
+/* Activity right detail ---------------------------------------------------- */
+.fs-activity-detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 24px;
+  gap: 16px;
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+.fs-activity-detail__placeholder {
+  padding: 32px;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+.fs-activity-detail__placeholder-title {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.fs-activity-detail__placeholder-body {
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 320px;
+  margin: 0 auto;
+}
+.fs-activity-detail__header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.fs-activity-detail__id { flex: 1; min-width: 0; }
+.fs-activity-detail__name {
+  margin: 0;
+  font-size: 18px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+.fs-activity-detail__sub {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+}
+
+.fs-activity-detail__counts {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+.fs-activity-detail__count {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 8px;
+  background: var(--surface-panel-muted);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  text-align: center;
+}
+.fs-activity-detail__count--danger {
+  background: var(--color-danger-50);
+  border-color: var(--color-danger-200);
+}
+.fs-activity-detail__count-value {
+  font-size: 18px;
+  font-weight: var(--font-weight-bold);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.fs-activity-detail__count--danger .fs-activity-detail__count-value {
+  color: var(--color-danger-700);
+}
+.fs-activity-detail__count-label {
+  font-size: 10px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.fs-activity-detail__timeline { display: flex; flex-direction: column; gap: 12px; }
+.fs-activity-detail__date-header {
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  padding: 8px 0 2px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.fs-activity-detail__group { display: flex; flex-direction: column; gap: 4px; }
+
+.fs-activity-detail__event {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-panel);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: background var(--duration-fast) var(--easing-out),
+              border-color var(--duration-fast) var(--easing-out);
+}
+.fs-activity-detail__event:hover {
+  background: var(--surface-panel-muted);
+  border-color: var(--color-accent-300);
+}
+.fs-activity-detail__event--safety {
+  border-left: 3px solid var(--color-danger-500);
+}
+.fs-activity-detail__event--action {
+  border-left: 3px solid var(--color-success-500);
+}
+.fs-activity-detail__event--photo {
+  border-left: 3px solid var(--color-info-500);
+}
+.fs-activity-detail__event--topic {
+  border-left: 3px solid var(--color-accent-500);
+}
+
+.fs-activity-detail__event-icon {
+  flex-shrink: 0;
+  width: 18px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 14px;
+}
+.fs-activity-detail__event-main { flex: 1; min-width: 0; }
+.fs-activity-detail__event-text {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.4;
+  word-break: break-word;
+}
+.fs-activity-detail__event-meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.fs-activity-detail__empty {
+  padding: 24px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-tertiary);
+  background: var(--surface-panel-muted);
+  border-radius: var(--radius-md);
+}
+
+
+/* =========================================================================
+   Sub-sprint 4.2 — Tasks page + TasksFilterChips
+   ========================================================================= */
+
+/* Tasks page (middle column) ----------------------------------------------- */
+.fs-tasks { display: flex; flex-direction: column; gap: 12px; }
+
+.fs-tasks__header { padding: 0 4px; }
+.fs-tasks__title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+.fs-tasks__subtitle {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+/* Sprint 4.5 — replace the verbose perf caveat with a compact meta
+   line + an info icon that exposes the same caveat on hover. */
+.fs-tasks__meta {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.fs-tasks__meta-info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: var(--radius-full);
+  background: var(--surface-panel-muted);
+  color: var(--text-tertiary);
+  font-size: 10px;
+  cursor: help;
+}
+
+/* Filter chips ------------------------------------------------------------- */
+.fs-tasks__chips {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding: 0 4px;
+}
+.fs-tasks__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 12px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-panel);
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: background var(--duration-fast) var(--easing-out),
+              border-color var(--duration-fast) var(--easing-out);
+}
+.fs-tasks__chip:hover { background: var(--surface-panel-muted); }
+.fs-tasks__chip--active {
+  border-color: var(--color-accent-400);
+  background: var(--color-accent-50);
+  color: var(--color-accent-800);
+}
+.fs-tasks__chip--overdue.fs-tasks__chip--active {
+  border-color: var(--color-danger-400);
+  background: var(--color-danger-50);
+  color: var(--color-danger-800);
+}
+.fs-tasks__chip-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  background: var(--surface-panel-muted);
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+}
+.fs-tasks__chip--active .fs-tasks__chip-count {
+  background: var(--color-accent-100);
+  color: var(--color-accent-700);
+}
+.fs-tasks__chip--overdue.fs-tasks__chip--active .fs-tasks__chip-count {
+  background: var(--color-danger-100);
+  color: var(--color-danger-700);
+}
+
+.fs-tasks__list { display: flex; flex-direction: column; gap: 4px; }
+
+.fs-tasks__loading,
+.fs-tasks__empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+
+/* Tasks right detail ------------------------------------------------------- */
+.fs-tasks-detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 24px;
+  gap: 16px;
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+
+.fs-tasks-detail__placeholder {
+  padding: 32px;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+.fs-tasks-detail__placeholder-title {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.fs-tasks-detail__placeholder-body { font-size: 13px; max-width: 320px; margin: 0 auto; }
+
+.fs-tasks-detail__header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.fs-tasks-detail__header-main { flex: 1; min-width: 0; }
+.fs-tasks-detail__title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  line-height: 1.4;
+  word-break: break-word;
+}
+.fs-tasks-detail__metaline {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.fs-tasks-detail__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.fs-tasks-detail__row {
+  display: flex;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.fs-tasks-detail__row:last-child { border-bottom: none; }
+.fs-tasks-detail__row-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-weight: var(--font-weight-semibold);
+  width: 96px;
+  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding-top: 2px;
+}
+.fs-tasks-detail__row-value {
+  font-size: 13px;
+  color: var(--text-primary);
+  flex: 1;
+  word-break: break-word;
+}
+
+.fs-tasks-detail__audit {
+  background: var(--color-success-50);
+  border: 1px solid var(--color-success-200);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+}
+.fs-tasks-detail__audit-label {
+  font-size: 10px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-success-700);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 4px;
+}
+.fs-tasks-detail__audit-body {
+  font-size: 12px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+}
+
+.fs-tasks-detail__actions {
+  margin-top: auto;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+
+/* =========================================================================
+   Sub-sprint 4.3 — Evidence library + EvidenceTabs
+   ========================================================================= */
+
+/* EvidenceTabs ------------------------------------------------------------- */
+.fs-evidence-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 4px;
+  border-bottom: 1px solid var(--border-subtle);
+  overflow-x: auto;
+}
+.fs-evidence-tabs__tab {
+  padding: 10px 14px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: color var(--duration-fast) var(--easing-out),
+              border-color var(--duration-fast) var(--easing-out);
+}
+.fs-evidence-tabs__tab:hover { color: var(--text-primary); }
+.fs-evidence-tabs__tab--active {
+  color: var(--text-primary);
+  border-bottom-color: var(--color-accent-500);
+  font-weight: var(--font-weight-medium);
+}
+.fs-evidence-tabs__count {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  background: var(--surface-panel-muted);
+  color: var(--text-tertiary);
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+}
+.fs-evidence-tabs__tab--active .fs-evidence-tabs__count {
+  background: var(--color-accent-100);
+  color: var(--color-accent-700);
+}
+
+
+/* Evidence page (middle column) ------------------------------------------- */
+.fs-evidence { display: flex; flex-direction: column; gap: 12px; }
+
+.fs-evidence__header { padding: 0 4px; }
+.fs-evidence__title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+.fs-evidence__subtitle {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.fs-evidence__sections { display: flex; flex-direction: column; gap: 16px; }
+
+.fs-evidence__section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.fs-evidence__section-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 4px 0;
+}
+.fs-evidence__section-date {
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.fs-evidence__section-count {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-evidence__load-more {
+  display: flex;
+  justify-content: center;
+  padding: 12px 0 4px;
+}
+
+.fs-evidence__loading,
+.fs-evidence__empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+
+/* Evidence right detail --------------------------------------------------- */
+.fs-evidence-detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 24px;
+  gap: 18px;
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+
+.fs-evidence-detail__placeholder {
+  padding: 32px;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+.fs-evidence-detail__placeholder-title {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.fs-evidence-detail__placeholder-body {
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 320px;
+  margin: 0 auto;
+}
+
+.fs-evidence-detail__header { display: flex; flex-direction: column; gap: 4px; }
+.fs-evidence-detail__title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+.fs-evidence-detail__blurb {
+  font-size: 13px;
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+
+.fs-evidence-detail__stats {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.fs-evidence-detail__stat {
+  display: flex;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.fs-evidence-detail__stat:last-child { border-bottom: none; }
+.fs-evidence-detail__stat-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-weight: var(--font-weight-semibold);
+  width: 120px;
+  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding-top: 2px;
+}
+.fs-evidence-detail__stat-value {
+  font-size: 13px;
+  color: var(--text-primary);
+  flex: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-evidence-detail__note {
+  margin-top: auto;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-tertiary);
+  line-height: 1.5;
+  padding: 10px 12px;
+  background: var(--surface-panel-muted);
+  border-left: 2px solid var(--border-default);
+  border-radius: var(--radius-sm);
+}
+
+
+/* =========================================================================
+   Sub-sprint 4.4 — Programme MVP (Gantt + WBS + TO-DO + linked actions)
+   ========================================================================= */
+
+/* Programme page (middle column) ------------------------------------------ */
+.fs-programme {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+}
+.fs-programme__header { padding: 0 4px; }
+.fs-programme__title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+.fs-programme__subtitle {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.fs-programme__loading,
+.fs-programme__empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+.fs-programme__toolbar {
+  margin-top: 10px;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.fs-programme__view-toggle,
+.fs-programme__tier-toggle {
+  display: inline-flex;
+  background: var(--surface-panel-muted);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 2px;
+  gap: 0;
+}
+.fs-programme__toggle {
+  padding: 6px 12px;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: calc(var(--radius-md) - 2px);
+  transition: background var(--duration-fast) var(--easing-out),
+              color var(--duration-fast) var(--easing-out);
+}
+.fs-programme__toggle--small { padding: 4px 10px; font-size: 11px; }
+.fs-programme__toggle:hover { color: var(--text-primary); }
+.fs-programme__toggle--active {
+  background: var(--surface-panel);
+  color: var(--color-accent-700);
+  font-weight: var(--font-weight-medium);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+
+/* Gantt -------------------------------------------------------------------- */
+.fs-gantt {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  flex: 1;
+  min-height: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-panel);
+  overflow: hidden;
+}
+
+.fs-gantt__tree {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border-subtle);
+  overflow-y: auto;
+  background: var(--surface-panel);
+}
+.fs-gantt__tree-head {
+  padding: 8px 10px;
+  font-size: 10px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: var(--surface-panel-muted);
+  border-bottom: 1px solid var(--border-subtle);
+  position: sticky;
+  top: 0;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  z-index: 1;
+}
+
+.fs-gantt-tree__cell {
+  height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 12px;
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--easing-out);
+}
+.fs-gantt-tree__cell:hover { background: var(--surface-panel-muted); }
+.fs-gantt-tree__cell--group {
+  background: var(--surface-panel-muted);
+  font-weight: var(--font-weight-semibold);
+}
+.fs-gantt-tree__cell--selected {
+  background: var(--color-accent-50);
+  border-left: 3px solid var(--color-accent-500);
+  padding-left: calc(var(--paddingLeft, 10px) - 3px) !important;
+}
+.fs-gantt-tree__cell--critical .fs-gantt-tree__name {
+  color: var(--color-danger-700);
+}
+
+.fs-gantt-tree__chev {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform var(--duration-fast) var(--easing-out);
+}
+.fs-gantt-tree__chev--open { transform: rotate(90deg); }
+.fs-gantt-tree__chev-spacer {
+  width: 18px;
+  flex-shrink: 0;
+}
+
+.fs-gantt-tree__wbs {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+.fs-gantt-tree__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fs-gantt-tree__assignees {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-style: italic;
+}
+
+.fs-gantt__timeline {
+  overflow-x: auto;
+  overflow-y: auto;
+  background: var(--surface-panel);
+}
+.fs-gantt__timeline-inner {
+  position: relative;
+  /* Min-height grows with rows; the rows lay out via flow. */
+}
+
+.fs-gantt-strip {
+  height: 32px;
+  position: sticky;
+  top: 0;
+  background: var(--surface-panel-muted);
+  border-bottom: 1px solid var(--border-subtle);
+  z-index: 1;
+}
+.fs-gantt-strip__marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  align-items: center;
+  padding-left: 4px;
+  border-left: 1px solid var(--border-subtle);
+  white-space: nowrap;
+}
+.fs-gantt-strip__marker--label {
+  font-size: 10px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-secondary);
+  background: var(--surface-panel);
+  padding-right: 6px;
+}
+
+.fs-gantt-row {
+  position: relative;
+  height: 36px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.fs-gantt-bar {
+  position: absolute;
+  top: 8px;
+  height: 20px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  padding: 0 6px;
+  cursor: pointer;
+  overflow: hidden;
+  background: var(--color-info-100);
+  border: 1px solid var(--color-info-300);
+  transition: filter var(--duration-fast) var(--easing-out);
+}
+.fs-gantt-bar:hover { filter: brightness(1.05); }
+.fs-gantt-bar__label {
+  font-size: 10px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  position: relative;
+  z-index: 1;
+}
+.fs-gantt-bar__progress {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: rgba(0, 0, 0, 0.12);
+  border-radius: 3px;
+  pointer-events: none;
+}
+
+.fs-gantt-bar--completed   { background: var(--color-success-100); border-color: var(--color-success-300); }
+.fs-gantt-bar--in_progress { background: var(--color-info-100);    border-color: var(--color-info-300); }
+.fs-gantt-bar--not_started { background: var(--surface-panel-muted); border-color: var(--border-default); }
+.fs-gantt-bar--blocked     { background: var(--color-danger-100);  border-color: var(--color-danger-300); }
+.fs-gantt-bar--delayed     { background: var(--color-warning-100); border-color: var(--color-warning-300); }
+.fs-gantt-bar--group {
+  top: 12px; height: 12px;
+  background: var(--text-secondary);
+  border-color: var(--text-secondary);
+  border-radius: 2px;
+}
+.fs-gantt-bar--group .fs-gantt-bar__label {
+  color: var(--surface-panel);
+  font-weight: var(--font-weight-semibold);
+}
+.fs-gantt-bar--critical {
+  box-shadow: 0 0 0 1px var(--color-danger-500);
+}
+.fs-gantt-bar--selected {
+  box-shadow: 0 0 0 2px var(--color-accent-500);
+  z-index: 2;
+}
+
+/* Sprint 4.9 — drag affordances on Gantt bars.
+   Cursor changes hint at the three drag modes:
+     • bar body  → grab / grabbing
+     • left 8 px → ew-resize (move start)
+     • right 8 px→ ew-resize (move end)
+   Edge regions are rendered via ::before / ::after pseudo-elements
+   that overlay the bar; they have higher z-index than the bar's
+   content and let the cursor change without blocking drag (which is
+   captured at the parent .fs-gantt-bar level). */
+.fs-gantt-bar--draggable {
+  cursor: grab;
+  touch-action: none;
+}
+.fs-gantt-bar--draggable::before,
+.fs-gantt-bar--draggable::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: ew-resize;
+  z-index: 3;
+}
+.fs-gantt-bar--draggable::before { left: 0; }
+.fs-gantt-bar--draggable::after  { right: 0; }
+.fs-gantt-bar--dragging {
+  cursor: grabbing;
+  opacity: 0.85;
+  z-index: 5;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  transition: none;          /* immediate visual response while dragging */
+}
+
+/* While ANY drag is in progress, lock the body cursor + suppress
+   selection so the entire viewport doesn't flicker. The page sets
+   `fs-gantt-dragging` (+ a mode suffix) on document.body. */
+body.fs-gantt-dragging,
+body.fs-gantt-dragging * {
+  user-select: none !important;
+}
+body.fs-gantt-dragging--move          { cursor: grabbing !important; }
+body.fs-gantt-dragging--resize-start,
+body.fs-gantt-dragging--resize-end    { cursor: ew-resize !important; }
+
+.fs-gantt__today {
+  position: absolute;
+  top: 32px;
+  bottom: 0;
+  width: 0;
+  border-left: 2px solid var(--color-accent-500);
+  pointer-events: none;
+  z-index: 0;
+}
+
+
+/* Programme kanban board (Sprint 4.8) ------------------------------------- */
+/* Replaces the bucketed ProgrammeTodoList from 4.4. Four status columns,
+   one row per WBS group, cards distribute into the matching column. */
+
+.fs-prog-kanban {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Top-of-board status totals */
+.fs-prog-kanban__totals {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  padding: 0 4px;
+}
+.fs-prog-kanban__total {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-panel);
+}
+.fs-prog-kanban__total--neutral { border-left: 3px solid var(--text-tertiary); }
+.fs-prog-kanban__total--info    { border-left: 3px solid var(--color-info-500); }
+.fs-prog-kanban__total--warning { border-left: 3px solid var(--color-warning-500); }
+.fs-prog-kanban__total--success { border-left: 3px solid var(--color-success-500); }
+
+.fs-prog-kanban__total-value {
+  font-size: 18px;
+  font-weight: var(--font-weight-bold);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+.fs-prog-kanban__total-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-weight: var(--font-weight-medium);
+}
+
+/* Column header row */
+.fs-prog-kanban__columns-header {
+  display: grid;
+  grid-template-columns: 32px repeat(4, 1fr);
+  gap: 8px;
+  padding: 4px;
+  position: sticky;
+  top: 0;
+  background: var(--surface-app);
+  z-index: 1;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.fs-prog-kanban__column-header {
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  padding: 4px 8px;
+  background: var(--surface-panel-muted);
+  border-radius: var(--radius-sm);
+}
+.fs-prog-kanban__column-header--neutral { color: var(--text-tertiary); }
+.fs-prog-kanban__column-header--info    { color: var(--color-info-700); }
+.fs-prog-kanban__column-header--warning { color: var(--color-warning-700); }
+.fs-prog-kanban__column-header--success { color: var(--color-success-700); }
+
+.fs-prog-kanban__group-spacer { width: 32px; }
+
+/* Rows by WBS group */
+.fs-prog-kanban__rows { display: flex; flex-direction: column; gap: 8px; padding: 0 4px 8px; }
+
+.fs-prog-kanban__row { display: flex; flex-direction: column; gap: 4px; }
+
+.fs-prog-kanban__group-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 4px;
+  font-size: 12px;
+  border-bottom: 1px dashed var(--border-subtle);
+}
+.fs-prog-kanban__group-chev {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform var(--duration-fast) var(--easing-out);
+}
+.fs-prog-kanban__group-chev--open { transform: rotate(90deg); }
+.fs-prog-kanban__group-wbs {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+.fs-prog-kanban__group-name {
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+.fs-prog-kanban__group-count {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Group body — 4-column grid of cells */
+.fs-prog-kanban__group-body {
+  display: grid;
+  grid-template-columns: 32px repeat(4, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.fs-prog-kanban__cell {
+  min-height: 60px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-radius: var(--radius-md);
+}
+.fs-prog-kanban__cell--empty {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--surface-panel-muted),
+    var(--surface-panel-muted) 4px,
+    transparent 4px,
+    transparent 10px
+  );
+  opacity: 0.4;
+}
+
+/* Card */
+.fs-prog-kanban-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-panel);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: box-shadow var(--duration-fast) var(--easing-out),
+              border-color var(--duration-fast) var(--easing-out),
+              transform var(--duration-fast) var(--easing-out);
+}
+.fs-prog-kanban-card:hover {
+  border-color: var(--color-accent-300);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
+  transform: translateY(-1px);
+}
+.fs-prog-kanban-card--selected {
+  border-color: var(--color-accent-500);
+  box-shadow: 0 0 0 2px var(--color-accent-100);
+}
+.fs-prog-kanban-card--critical {
+  border-left: 3px solid var(--color-danger-500);
+}
+
+.fs-prog-kanban-card--not_started { background: var(--surface-panel); }
+.fs-prog-kanban-card--in_progress { background: var(--color-info-50); }
+.fs-prog-kanban-card--blocked     { background: var(--color-warning-50); }
+.fs-prog-kanban-card--done        { background: var(--color-success-50); opacity: 0.85; }
+
+.fs-prog-kanban-card__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.fs-prog-kanban-card__wbs {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-tertiary);
+}
+.fs-prog-kanban-card__critical {
+  font-size: 9px;
+  font-weight: var(--font-weight-bold);
+  color: var(--color-danger-700);
+  background: var(--color-danger-100);
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.fs-prog-kanban-card__name {
+  font-size: 12px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  line-height: 1.3;
+  word-break: break-word;
+}
+
+.fs-prog-kanban-card__progress {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.fs-prog-kanban-card__progress-bar {
+  flex: 1;
+  height: 4px;
+  background: var(--color-info-300);
+  border-radius: 2px;
+  position: relative;
+}
+.fs-prog-kanban-card__progress-bar::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--color-info-200);
+  border-radius: 2px;
+  z-index: -1;
+}
+.fs-prog-kanban-card__progress-text {
+  font-size: 10px;
+  color: var(--color-info-700);
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--font-weight-semibold);
+  min-width: 28px;
+  text-align: right;
+}
+
+.fs-prog-kanban-card__footer {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 2px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border-subtle);
+}
+.fs-prog-kanban-card__assignee {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+.fs-prog-kanban-card__dates {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+
+/* Programme right detail --------------------------------------------------- */
+.fs-programme-detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 24px;
+  gap: 16px;
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+
+.fs-programme-detail__placeholder {
+  padding: 32px;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+.fs-programme-detail__placeholder-title {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.fs-programme-detail__placeholder-body {
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 320px;
+  margin: 0 auto;
+}
+
+.fs-programme-detail__header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.fs-programme-detail__header-main { flex: 1; min-width: 0; }
+.fs-programme-detail__wbs {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+.fs-programme-detail__title {
+  margin: 4px 0 0;
+  font-size: 18px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  line-height: 1.3;
+}
+.fs-programme-detail__metaline {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.fs-programme-detail__rows { display: flex; flex-direction: column; gap: 0; }
+.fs-programme-detail__row {
+  display: flex;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.fs-programme-detail__row:last-child { border-bottom: none; }
+.fs-programme-detail__row-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-weight: var(--font-weight-semibold);
+  width: 120px;
+  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding-top: 2px;
+}
+.fs-programme-detail__row-value {
+  font-size: 13px;
+  color: var(--text-primary);
+  flex: 1;
+  word-break: break-word;
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-programme-detail__links { display: flex; flex-direction: column; gap: 6px; }
+.fs-programme-detail__links-label {
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.fs-programme-detail__links-list { display: flex; flex-direction: column; gap: 4px; }
+.fs-programme-detail__link {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-panel);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: background var(--duration-fast) var(--easing-out),
+              border-color var(--duration-fast) var(--easing-out);
+}
+.fs-programme-detail__link:hover {
+  background: var(--surface-panel-muted);
+  border-color: var(--color-accent-300);
+}
+.fs-programme-detail__link-text {
+  font-size: 13px;
+  color: var(--text-primary);
+  word-break: break-word;
+}
+.fs-programme-detail__link-meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.fs-programme-detail__empty {
+  padding: 12px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  background: var(--surface-panel-muted);
+  border-radius: var(--radius-md);
+  font-style: italic;
+}
+
+
+/* =========================================================================
+   Sub-sprint 4.10 — Today × Programme integration
+     • ProgrammeTaskCard (Today My-tasks subgroup variant)
+     • Programme Board Mine / All filter chips
+   ========================================================================= */
+
+/* ProgrammeTaskCard — Today variant ---------------------------------------- */
+.fs-programme-task-card {
+  cursor: pointer;
+  border-left: 3px solid var(--color-accent-500);
+  transition: background var(--duration-fast) var(--easing-out),
+              border-color var(--duration-fast) var(--easing-out);
+}
+.fs-programme-task-card:hover {
+  background: var(--surface-panel-muted);
+}
+.fs-programme-task-card--critical {
+  border-left-color: var(--color-danger-500);
+}
+
+.fs-programme-task-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.fs-programme-task-card__wbs {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  background: var(--surface-panel-muted);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+}
+.fs-programme-task-card__name {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  flex: 1;
+  min-width: 0;
+}
+.fs-programme-task-card__badges {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.fs-programme-task-card__day {
+  margin-top: 6px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+}
+.fs-programme-task-card__progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.fs-programme-task-card__progress-track {
+  flex: 1;
+  height: 6px;
+  background: var(--surface-panel-muted);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.fs-programme-task-card__progress-fill {
+  height: 100%;
+  background: var(--color-accent-500);
+  border-radius: 3px;
+  transition: width var(--duration-base) var(--easing-out);
+}
+.fs-programme-task-card--critical .fs-programme-task-card__progress-fill {
+  background: var(--color-danger-500);
+}
+.fs-programme-task-card__progress-text {
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  min-width: 32px;
+  text-align: right;
+}
+
+
+/* Programme Board — Mine / All filter chips -------------------------------- */
+.fs-prog-kanban__filter {
+  display: flex;
+  gap: 6px;
+  padding: 0 4px;
+}
+.fs-prog-kanban__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font: inherit;
+  font-size: 12px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-panel);
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: background var(--duration-fast) var(--easing-out),
+              border-color var(--duration-fast) var(--easing-out);
+}
+.fs-prog-kanban__chip:hover:not(:disabled) {
+  background: var(--surface-panel-muted);
+}
+.fs-prog-kanban__chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.fs-prog-kanban__chip--active {
+  border-color: var(--color-accent-400);
+  background: var(--color-accent-50);
+  color: var(--color-accent-800);
+  font-weight: var(--font-weight-medium);
+}
+.fs-prog-kanban__chip-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  background: var(--surface-panel-muted);
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+}
+.fs-prog-kanban__chip--active .fs-prog-kanban__chip-count {
+  background: var(--color-accent-100);
+  color: var(--color-accent-700);
 }

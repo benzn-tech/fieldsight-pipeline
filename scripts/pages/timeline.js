@@ -89,6 +89,11 @@
     if (user) subtitleParts.push(unfolder(user));
     if (report && report.site) subtitleParts.push(report.site);
 
+    /* Sprint 4.5 — when the URL carries `from=today`, the user arrived
+       here by clicking "View daily report" on /today. Surface an
+       explicit back link so they don't have to dig for the left-nav. */
+    var fromToday = (readRouteParams().from === 'today');
+
     /* Navigate the timeline route to a new date while preserving the
        active user query param (Sprint 2.5 / Phase E). */
     function onChangeDate(newDate) {
@@ -101,6 +106,15 @@
     return React.createElement('div', {
       className: 'fs-timeline-page__header',
     },
+      fromToday ? React.createElement('button', {
+        type:      'button',
+        className: 'fs-timeline-page__back',
+        onClick:   function () { window.FS.Router.navigate('/today'); },
+      },
+        React.createElement('span', { className: 'fs-timeline-page__back-arrow' },
+          '←'),
+        React.createElement('span', null, 'Back to Today'),
+      ) : null,
       React.createElement('h2', { className: 'fs-timeline-page__title' },
         'Daily Report'),
       React.createElement('div', { className: 'fs-timeline-page__subtitle' },

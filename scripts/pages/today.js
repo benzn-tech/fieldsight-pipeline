@@ -121,6 +121,19 @@
       var today    = window.FS.api.todayNZDT();
       var folder   = window.FS.api.folderName(caller.name);
 
+      /* Sprint 4.10.3 — Programme tasks for today run in parallel
+         with the daily-report load. They live under data.programmeTasks
+         so the My Tasks renderer can split them into a sub-group and
+         render the ProgrammeTaskCard variant. Promise resolves with
+         { rows: [...] } regardless of role / fixture state, so we
+         can pass it straight through Promise.all without bailout
+         logic. */
+      var programmePromise = (window.FS.api.todayProgramme
+        ? window.FS.api.todayProgramme.getTodayProgrammeTasks({ today: today, user: folder })
+        : Promise.resolve({ rows: [] })
+      ).then(function (r) { return (r && r.rows) || []; })
+       .catch(function () { return []; });
+
       function loadFor(date, isFallback) {
         return Promise.all([
           window.FS.api.timeline.getTimeline({ date: date, user: folder }),
@@ -150,45 +163,74 @@
         });
       }
 
-      loadFor(today, false).then(function (first) {
-        if (cancelled || !first) return;
-        if (first.accessDenied) {
-          setState({ status: 'access_denied', message: first.message, today: today });
-          return;
-        }
-        if (first.ok) {
-          setState(Object.assign({ status: 'ok' }, first));
-          return;
-        }
-        /* No report for today — try the latest available. */
-        return window.FS.api.dates.getDates({ months: 3 }).then(function (res) {
+      /* Helper — merges the programme rows into the data envelope so
+         every setState site below can compose the same shape without
+         repeating the await. */
+      function withProgramme(envelope, programmeRows) {
+        if (!envelope || !envelope.data) return envelope;
+        return Object.assign({}, envelope, {
+          data: Object.assign({}, envelope.data, {
+            programmeTasks: programmeRows || [],
+          }),
+        });
+      }
+
+      Promise.all([loadFor(today, false), programmePromise])
+        .then(function (results) {
           if (cancelled) return;
-          if (res && res._accessDenied) {
-            setState({ status: 'access_denied', message: res.error, today: today });
+          var first          = results[0];
+          var programmeRows  = results[1];
+
+          if (!first) return;
+          if (first.accessDenied) {
+            setState({ status: 'access_denied', message: first.message, today: today });
             return;
           }
-          var latest = findLatestReportDate(res.dates || {});
-          if (!latest || latest === today) {
-            setState({ status: 'empty', report: first.report, today: today });
+          if (first.ok) {
+            setState(Object.assign({ status: 'ok' }, withProgramme(first, programmeRows)));
             return;
           }
-          return loadFor(latest, true).then(function (second) {
-            if (cancelled || !second) return;
-            if (second.accessDenied) {
-              setState({ status: 'access_denied', message: second.message, today: today });
+          /* No report for today — try the latest available. */
+          return window.FS.api.dates.getDates({ months: 3 }).then(function (res) {
+            if (cancelled) return;
+            if (res && res._accessDenied) {
+              setState({ status: 'access_denied', message: res.error, today: today });
               return;
             }
-            if (second.ok) {
-              setState(Object.assign({ status: 'ok' }, second));
-            } else {
-              setState({ status: 'empty', report: second.report, today: today });
+            var latest = findLatestReportDate(res.dates || {});
+            if (!latest || latest === today) {
+              /* Empty-state still shows today's programme tasks if any —
+                 the programme is not gated on a daily report existing. */
+              setState({
+                status:         'empty',
+                report:         first.report,
+                today:          today,
+                programmeTasks: programmeRows,
+              });
+              return;
             }
+            return loadFor(latest, true).then(function (second) {
+              if (cancelled || !second) return;
+              if (second.accessDenied) {
+                setState({ status: 'access_denied', message: second.message, today: today });
+                return;
+              }
+              if (second.ok) {
+                setState(Object.assign({ status: 'ok' }, withProgramme(second, programmeRows)));
+              } else {
+                setState({
+                  status:         'empty',
+                  report:         second.report,
+                  today:          today,
+                  programmeTasks: programmeRows,
+                });
+              }
+            });
           });
+        }).catch(function (err) {
+          if (cancelled) return;
+          setState({ status: 'error', error: err, today: today });
         });
-      }).catch(function (err) {
-        if (cancelled) return;
-        setState({ status: 'error', error: err, today: today });
-      });
 
       return function () { cancelled = true; };
     }, [depKey]);
@@ -398,7 +440,9 @@
       /* "View daily report" CTA — full-width banner above the brief.
          Lifted out of MorningBriefCard so the action stands on its
          own (post-merge review feedback). Navigates to the canonical
-         /timeline view scoped to the brief's (date, user). */
+         /timeline view scoped to the brief's (date, user). The
+         &from=today flag tells TimelineMiddleColumn to render a
+         "← Back to today" link in its header (Sprint 4.5). */
       React.createElement('button', {
         type:      'button',
         className: 'fs-today__view-report-cta',
@@ -406,6 +450,7 @@
           var qs = '?date=' + encodeURIComponent(effectiveDate);
           var u  = data.morningBrief && data.morningBrief.userFolder;
           if (u) qs += '&user=' + encodeURIComponent(u);
+          qs += '&from=today';
           window.FS.Router.navigate('/timeline' + qs);
         },
       },
@@ -434,28 +479,62 @@
           )
         : null,
 
-      /* TASKS — split into My + Team */
+      /* TASKS — Sprint 4.10: My-tasks list now mixes two sources:
+         (1) programme tasks scheduled on today (from FS.api.todayProgramme),
+         (2) action items derived from yesterday's daily report.
+         Same parent SectionLabel, two visually distinct sub-groups so the
+         user reads them as ONE list with provenance, not two lists. */
       React.createElement(SectionLabel, null, 'Tasks today'),
 
-      data.myTasks && data.myTasks.length > 0 ? React.createElement(React.Fragment, null,
-        React.createElement(SubsectionLabel, null,
-          'My tasks · ' + data.myTasks.length),
-        React.createElement('div', {
-          style: { display: 'flex', flexDirection: 'column', gap: '6px' },
-        },
-          data.myTasks.map(function (task) {
-            return React.createElement(fs.TaskCard, {
-              key:           task.id,
-              task:          task,
-              onSelect:      onSelect,
-              isMine:        true,
-              checkable:     task.topic_id != null && task.actionIndex != null,
-              date:          effectiveDate,
-              onCheckedOff:  onCheckedOff,
-            });
-          })
-        ),
-      ) : null,
+      /* Sub-group 1 — Programme tasks (rendered FIRST since the
+         programme work is the structural context for the day; action
+         items are reactive details inside it). */
+      data.programmeTasks && data.programmeTasks.length > 0
+        ? React.createElement(React.Fragment, null,
+            React.createElement(SubsectionLabel, null,
+              'From your programme · ' + data.programmeTasks.length),
+            React.createElement('div', {
+              style: { display: 'flex', flexDirection: 'column', gap: '6px' },
+            },
+              data.programmeTasks.map(function (row) {
+                return React.createElement(fs.ProgrammeTaskCard, {
+                  key:      row.task_id,
+                  row:      row,
+                  onSelect: function () {
+                    /* 4.10.6 — navigate to /programme with deep-link
+                       so the right drawer opens on the same task. */
+                    window.FS.Router.navigate(
+                      '/programme?task=' + encodeURIComponent(row.task_id)
+                        + '&from=today');
+                  },
+                });
+              })
+            ),
+          )
+        : null,
+
+      /* Sub-group 2 — Action items from the daily report. */
+      data.myTasks && data.myTasks.length > 0
+        ? React.createElement(React.Fragment, null,
+            React.createElement(SubsectionLabel, null,
+              'From recent reports · ' + data.myTasks.length),
+            React.createElement('div', {
+              style: { display: 'flex', flexDirection: 'column', gap: '6px' },
+            },
+              data.myTasks.map(function (task) {
+                return React.createElement(fs.TaskCard, {
+                  key:           task.id,
+                  task:          task,
+                  onSelect:      onSelect,
+                  isMine:        true,
+                  checkable:     task.topic_id != null && task.actionIndex != null,
+                  date:          effectiveDate,
+                  onCheckedOff:  onCheckedOff,
+                });
+              })
+            ),
+          )
+        : null,
 
       data.teamTasks && data.teamTasks.length > 0 ? React.createElement(React.Fragment, null,
         React.createElement(SubsectionLabel, null,

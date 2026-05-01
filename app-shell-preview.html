@@ -12,9 +12,9 @@
 
   <!-- Design tokens + AppShell CSS -->
   <link rel="stylesheet" href="styles/tokens.css" />
-  <link rel="stylesheet" href="styles/app-shell.css?v=2" />
+  <link rel="stylesheet" href="styles/app-shell.css?v=3" />
   <link rel="stylesheet" href="styles/components.css?v=4" />
-  <link rel="stylesheet" href="styles/composites.css?v=14" />
+  <link rel="stylesheet" href="styles/composites.css?v=24" />
 
   <style>
     /* Ensure full-bleed with no scroll */
@@ -80,6 +80,24 @@
   <!-- Sprint 2.9 (Phase I) Auth scaffolding — Login + 403 -->
   <script type="text/babel" src="scripts/composites/login-screen.js?v=1"></script>
   <script type="text/babel" src="scripts/composites/access-denied.js?v=1"></script>
+  <!-- Sprint 4.7 — Slide-in drawer used by full-width pages (Programme) -->
+  <script type="text/babel" src="scripts/composites/right-drawer.js?v=1"></script>
+  <!-- Sprint 4.0 — Sites composites -->
+  <script type="text/babel" src="scripts/composites/site-card.js?v=1"></script>
+  <!-- Sprint 4.6 — User-activity card (replaces 4.1's activity-feed-row, which is no longer loaded) -->
+  <script type="text/babel" src="scripts/composites/user-activity-card.js?v=1"></script>
+  <!-- Sprint 4.2 — Tasks filter chips -->
+  <script type="text/babel" src="scripts/composites/tasks-filter-chips.js?v=1"></script>
+  <!-- Sprint 4.3 — Evidence tabs -->
+  <script type="text/babel" src="scripts/composites/evidence-tabs.js?v=1"></script>
+  <!-- Sprint 4.4 — Programme MVP composites (Gantt + TO-DO) -->
+  <script type="text/babel" src="scripts/composites/gantt-strip.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/task-tree-cell.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/gantt-row.js?v=2"></script>
+  <!-- Sprint 4.8 — replaces 4.4's programme-todo-list with a Jira-style board -->
+  <script type="text/babel" src="scripts/composites/programme-kanban-board.js?v=2"></script>
+  <!-- Sprint 4.10 — Today's My-tasks variant for programme-sourced rows -->
+  <script type="text/babel" src="scripts/composites/programme-task-card.js?v=1"></script>
 
   <!-- Auth scaffolding (Phase I) — Cognito IDP wrapper + session store.
        Loaded before FS.api so api/_fetch.js can use FS.session for
@@ -98,6 +116,8 @@
   <script src="scripts/mock/daily-report.fixture.js?v=1"></script>
   <script src="scripts/mock/media.fixture.js?v=1"></script>
   <script src="scripts/mock/meeting-minutes.fixture.js?v=1"></script>
+  <!-- Sprint 4.4 — Programme MVP fixture -->
+  <script src="scripts/mock/programme.fixture.js?v=1"></script>
   <!--   3. Per-endpoint api modules (read fixtures via FS.api.*) -->
   <script src="scripts/api/sites.js?v=1"></script>
   <script src="scripts/api/dates.js?v=1"></script>
@@ -112,16 +132,29 @@
   <script src="scripts/api/meetings.js?v=1"></script>
   <!--   4. Today adapter (PLAN Phase D sketch — feeds mock-data.js shim) -->
   <script src="scripts/api/today-adapter.js?v=3"></script>
+  <!-- Sprint 4.2 — Tasks aggregator (cross-day join: timeline + actions) -->
+  <script src="scripts/api/tasks-aggregator.js?v=1"></script>
+  <!-- Sprint 4.4 — Programme api -->
+  <script src="scripts/api/programme.js?v=1"></script>
+  <!-- Sprint 4.6 — User-activity aggregator -->
+  <script src="scripts/api/user-activity-aggregator.js?v=1"></script>
+  <!-- Sprint 4.10 — Today-Programme adapter (today's programme tasks for caller) -->
+  <script src="scripts/api/today-programme-adapter.js?v=1"></script>
 
   <!-- Mock data shim (weather only) + page registry + pages -->
   <script type="text/babel" src="scripts/mock-data.js?v=4"></script>
   <script type="text/babel" src="scripts/pages/_page-registry.js?v=1"></script>
-  <script type="text/babel" src="scripts/pages/today.js?v=10"></script>
-  <script type="text/babel" src="scripts/pages/timeline.js?v=8"></script>
+  <script type="text/babel" src="scripts/pages/today.js?v=12"></script>
+  <script type="text/babel" src="scripts/pages/timeline.js?v=10"></script>
   <script type="text/babel" src="scripts/pages/reports.js?v=2"></script>
+  <script type="text/babel" src="scripts/pages/sites.js?v=1"></script>
+  <script type="text/babel" src="scripts/pages/activity.js?v=2"></script>
+  <script type="text/babel" src="scripts/pages/tasks.js?v=2"></script>
+  <script type="text/babel" src="scripts/pages/evidence.js?v=1"></script>
+  <script type="text/babel" src="scripts/pages/programme.js?v=5"></script>
 
   <script type="text/babel" src="scripts/dev-role-switcher.js?v=4"></script>
-  <script type="text/babel" src="scripts/app-shell.js?v=8"></script>
+  <script type="text/babel" src="scripts/app-shell.js?v=9"></script>
 
   <!-- Bootstrap: set default route then mount -->
   <script>
