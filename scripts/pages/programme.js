@@ -137,12 +137,50 @@
       });
     }
 
+    /* Sprint 4.9 — drag in Gantt commits through this. Mock-only;
+       the real backend equivalent would be PATCH /api/programmes/
+       :id/tasks/:task_id with { start, end }. We mutate the
+       in-memory leaves[] (already a deep-copy from the api module)
+       and re-publish the state object so React re-renders. The
+       page snapshot stays consistent until reload — refresh
+       resets to fixture defaults, which is the prototype's known
+       limitation for any optimistic action (toggleAction works
+       the same way). */
+    function updateTask(opts) {
+      opts = opts || {};
+      var task_id = opts.task_id;
+      var start   = opts.start;
+      var end     = opts.end;
+      if (!task_id || !start || !end) return;
+
+      setState(function (s) {
+        if (s.status !== 'ok') return s;
+        /* Clamp to programme bounds — backend would do this server-side. */
+        var pStart = s.programme.start_date;
+        var pEnd   = s.programme.end_date;
+        if (start < pStart) start = pStart;
+        if (end   > pEnd)   end   = pEnd;
+        if (end < start) end = start;
+
+        var nextLeaves = s.leaves.map(function (t) {
+          if (t.task_id !== task_id) return t;
+          return Object.assign({}, t, {
+            start:         start,
+            end:           end,
+            duration_days: diffDays(start, end) + 1,
+          });
+        });
+        return Object.assign({}, s, { leaves: nextLeaves });
+      });
+    }
+
     var ctx = {
       state:        state,
       view:         view,    setView:    setView,
       tier:         tier,    setTier:    setTier,
       collapsed:    collapsed,
       toggleGroup:  toggleGroup,
+      updateTask:   updateTask,
     };
     return React.createElement(ProgrammeContext.Provider, { value: ctx },
       props.children);
@@ -193,6 +231,77 @@
       ? props.selectedItem.task_id
       : null;
 
+    /* ---- Sprint 4.9 — drag controller --------------------------------
+       We hold one in-flight drag at a time. The active drag lives in
+       useRef so move handlers see the latest origin without stale
+       closures, and a parallel useState forces re-render when the
+       preview shifts. */
+    var dragRefHook = React.useState({ taskId: null, mode: null,
+                                       originX: 0, origStart: '',
+                                       origEnd: '', start: '', end: '' });
+    var dragState   = dragRefHook[0];
+    var setDragState = dragRefHook[1];
+    var dragRef     = React.useRef(dragState);
+    dragRef.current = dragState;
+
+    function dragStart(task, mode, clientX) {
+      var next = {
+        taskId:    task.task_id,
+        mode:      mode,
+        originX:   clientX,
+        origStart: task.start,
+        origEnd:   task.end,
+        start:     task.start,
+        end:       task.end,
+      };
+      setDragState(next);
+      document.body.classList.add('fs-gantt-dragging');
+      document.body.classList.add('fs-gantt-dragging--' + mode);
+    }
+
+    function dragMove(clientX) {
+      var d = dragRef.current;
+      if (!d.taskId) return;
+      var deltaPx   = clientX - d.originX;
+      var deltaDays = Math.round(deltaPx / ppd);
+      var nextStart = d.origStart;
+      var nextEnd   = d.origEnd;
+
+      if (d.mode === 'move') {
+        nextStart = window.FS.api.addDaysISO(d.origStart, deltaDays);
+        nextEnd   = window.FS.api.addDaysISO(d.origEnd,   deltaDays);
+      } else if (d.mode === 'resize-start') {
+        nextStart = window.FS.api.addDaysISO(d.origStart, deltaDays);
+        if (nextStart > d.origEnd) nextStart = d.origEnd;
+      } else if (d.mode === 'resize-end') {
+        nextEnd = window.FS.api.addDaysISO(d.origEnd, deltaDays);
+        if (nextEnd < d.origStart) nextEnd = d.origStart;
+      }
+
+      /* Clamp to programme bounds. */
+      if (nextStart < prog.start_date) nextStart = prog.start_date;
+      if (nextEnd   > prog.end_date)   nextEnd   = prog.end_date;
+
+      if (nextStart === d.start && nextEnd === d.end) return;
+      setDragState(Object.assign({}, d, { start: nextStart, end: nextEnd }));
+    }
+
+    function dragEnd() {
+      var d = dragRef.current;
+      document.body.classList.remove('fs-gantt-dragging');
+      document.body.classList.remove('fs-gantt-dragging--move');
+      document.body.classList.remove('fs-gantt-dragging--resize-start');
+      document.body.classList.remove('fs-gantt-dragging--resize-end');
+      if (!d.taskId) return;
+
+      /* Only commit if anything actually changed. */
+      if (d.start !== d.origStart || d.end !== d.origEnd) {
+        ctx.updateTask({ task_id: d.taskId, start: d.start, end: d.end });
+      }
+      setDragState({ taskId: null, mode: null, originX: 0,
+                     origStart: '', origEnd: '', start: '', end: '' });
+    }
+
     return React.createElement('div', { className: 'fs-gantt' },
 
       /* Sticky left tree */
@@ -233,14 +342,21 @@
           }),
 
           rows.map(function (r) {
+            var isDragging = dragState.taskId === r.task.task_id;
             return React.createElement(GanttRow, {
-              key:           r.task.task_id,
-              task:          r.task,
+              key:            r.task.task_id,
+              task:           r.task,
               programmeStart: prog.start_date,
-              pixelsPerDay:  ppd,
-              critical:      r.kind === 'leaf' && s.critical.has(r.task.task_id),
-              selected:      selectedId === r.task.task_id,
-              onSelect:      function () {
+              pixelsPerDay:   ppd,
+              critical:       r.kind === 'leaf' && s.critical.has(r.task.task_id),
+              selected:       selectedId === r.task.task_id,
+              dragPreview:    isDragging
+                                ? { start: dragState.start, end: dragState.end }
+                                : null,
+              onDragStart:    r.kind === 'leaf' ? dragStart : null,
+              onDragMove:     r.kind === 'leaf' ? dragMove  : null,
+              onDragEnd:      r.kind === 'leaf' ? dragEnd   : null,
+              onSelect:       function () {
                 if (r.kind === 'group') return;
                 props.onSelect({
                   kind:     'programme_task',

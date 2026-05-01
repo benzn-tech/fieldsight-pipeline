@@ -3319,6 +3319,50 @@
   z-index: 2;
 }
 
+/* Sprint 4.9 — drag affordances on Gantt bars.
+   Cursor changes hint at the three drag modes:
+     • bar body  → grab / grabbing
+     • left 8 px → ew-resize (move start)
+     • right 8 px→ ew-resize (move end)
+   Edge regions are rendered via ::before / ::after pseudo-elements
+   that overlay the bar; they have higher z-index than the bar's
+   content and let the cursor change without blocking drag (which is
+   captured at the parent .fs-gantt-bar level). */
+.fs-gantt-bar--draggable {
+  cursor: grab;
+  touch-action: none;
+}
+.fs-gantt-bar--draggable::before,
+.fs-gantt-bar--draggable::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: ew-resize;
+  z-index: 3;
+}
+.fs-gantt-bar--draggable::before { left: 0; }
+.fs-gantt-bar--draggable::after  { right: 0; }
+.fs-gantt-bar--dragging {
+  cursor: grabbing;
+  opacity: 0.85;
+  z-index: 5;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  transition: none;          /* immediate visual response while dragging */
+}
+
+/* While ANY drag is in progress, lock the body cursor + suppress
+   selection so the entire viewport doesn't flicker. The page sets
+   `fs-gantt-dragging` (+ a mode suffix) on document.body. */
+body.fs-gantt-dragging,
+body.fs-gantt-dragging * {
+  user-select: none !important;
+}
+body.fs-gantt-dragging--move          { cursor: grabbing !important; }
+body.fs-gantt-dragging--resize-start,
+body.fs-gantt-dragging--resize-end    { cursor: ew-resize !important; }
+
 .fs-gantt__today {
   position: absolute;
   top: 32px;

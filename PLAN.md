@@ -540,7 +540,31 @@ branch (PR #14) until the user merges.
   / 2 In progress / 0 Blocked / 2 Done; rows × columns matrix
   prints expected 5×4. Cache busters: composites.css v=22,
   programme.js v=3, programme-kanban-board.js v=1 (new).
-- **Sprint 4.9 · Gantt drag (L1 move + L2 edge resize)** ⏳ pending
+- **Sprint 4.9 · Gantt drag (L1 move + L2 edge resize)** ✅ done
+  Last sub-sprint of the post-review batch. Programme Gantt bars
+  are now interactive — three drag modes:
+    • **L1 move** — pointerdown on bar body → translate whole bar
+    • **L2 resize-start** — pointerdown on first 8 px → only `start` moves
+    • **L2 resize-end** — pointerdown on last 8 px → only `end` moves
+  Drag is gated to leaf tasks (group rows + completed tasks aren't
+  draggable). Snap is implicit: `Math.round(deltaPx / pixelsPerDay)`
+  → days. Bounds clamp to `programme.start_date` / `end_date`;
+  start ≤ end enforced. Optimistic preview updates the bar position
+  in flight; commit happens on `pointerup` via the new
+  `ProgrammeProvider.updateTask({task_id, start, end})` which
+  mutates the in-memory leaves[] and re-publishes state. Cursor
+  affordances (grab / grabbing / ew-resize) on the bar plus a
+  body-level `fs-gantt-dragging` lock on selection during drag.
+  Pointer capture so the drag survives the cursor leaving the bar.
+  Cascade engine explicitly out of scope — Sprint 5.2 owns it.
+  Cache busters: composites.css v=23, gantt-row.js v=2,
+  programme.js v=4. Smoke math: +60px @ 24ppd → +3 days; -36px
+  resize-end @ 24ppd → -1 day; snap rounds correctly across
+  12/24/35/36 px boundaries.
+
+  Sprint 4 follow-up batch complete (4.5–4.9). Total post-review
+  cost: 5 sub-sprints, ~13 new files, 2 deleted, no nav-slot
+  changes. PR #14 ready for review/merge.
 
 ## Sprint 4+ — Open product questions
 
