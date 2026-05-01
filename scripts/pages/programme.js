@@ -608,6 +608,11 @@
     Middle:   ProgrammeMiddleColumn,
     Right:    ProgrammeRightDetail,
     Provider: ProgrammeProvider,
+    /* Sprint 4.7 — Programme uses the entire content area (Gantt is
+       wider than the default middle column will ever be). The right
+       detail comes in as a slide-in drawer when a task is selected;
+       AppShell wires it via window.FieldSight.RightDrawer. */
+    layout:   'full-width',
   };
 
 })();

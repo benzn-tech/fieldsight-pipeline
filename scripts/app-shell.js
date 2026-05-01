@@ -150,18 +150,30 @@ function formatTodayDate() {
 }
 
 /* ---------- MiddleColumn -------------------------------------------------- */
-function MiddleColumn({ route, width, onWidthChange, onSelect, selectedItem }) {
+function MiddleColumn({ route, width, onWidthChange, onSelect, selectedItem, fullWidth }) {
   const t = window.FS.tokens;
 
   const routeLabel = (route || '/').replace(/^\//, '') || 'today';
   const title = routeLabel
     .split('-').map(w => w[0].toUpperCase() + w.slice(1)).join(' ');
 
-  const style = {
-    width: width + 'px',
-    background: t.surface.panel,
-    borderRight: '1px solid ' + t.border.subtle,
-  };
+  /* Sprint 4.7 — full-width pages (currently /programme) ignore the
+     middle-column width slider and let the column flex to fill the
+     entire content area. The static right detail is suppressed at
+     the AppShell level; a slide-in drawer takes its place when the
+     user selects something. */
+  const style = fullWidth
+    ? {
+        flex: 1,
+        minWidth: 0,
+        background: t.surface.panel,
+        borderRight: '1px solid ' + t.border.subtle,
+      }
+    : {
+        width: width + 'px',
+        background: t.surface.panel,
+        borderRight: '1px solid ' + t.border.subtle,
+      };
 
   const headerStyle = {
     height: '56px',
@@ -263,8 +275,10 @@ function MiddleColumn({ route, width, onWidthChange, onSelect, selectedItem }) {
       })(),
     ),
 
-    /* Drag handle on right edge — controlled by AppShell */
-    window.FieldSight.DragDivider ? React.createElement(
+    /* Drag handle on right edge — controlled by AppShell.
+       Sprint 4.7: hidden on full-width pages (no neighbouring column
+       to resize against). */
+    !fullWidth && window.FieldSight.DragDivider ? React.createElement(
       window.FieldSight.DragDivider,
       {
         value: width,
@@ -421,19 +435,31 @@ function AppShell({ showDevSwitcher = false }) {
     color: window.FS.tokens.text.primary,
   };
 
-  /* `has-selection` lets the mobile media query swap which pane is
-     visible: middle when nothing is selected, right detail when something is. */
-  var shellClassName = 'app-shell' + (selectedItem ? ' has-selection' : '');
-
   /* Sprint 3 P-07 — pages may declare a `Provider` slot in the page
      registry. AppShell wraps Middle + Right in it so the two columns
      share state through React Context (replaces the old window slot
      pattern). Provider's a Context.Provider under the hood — no DOM
      element — so the flex layout of LeftNav / Middle / Right is
      unchanged. Pages without a Provider get React.Fragment, which is
-     equally transparent. */
+     equally transparent.
+
+     Sprint 4.7 — pages may also declare `layout: 'full-width'`.
+     When set, the static RightDetail pane is suppressed and the
+     middle column flexes to fill the entire content area. A
+     RightDrawer component slides in from the right edge whenever a
+     selection is made; ESC / backdrop click / close button dismisses
+     it. Currently used by /programme so the Gantt and kanban have
+     room to breathe. */
   var pageEntry    = window.FieldSight.getPageForRoute && window.FieldSight.getPageForRoute(route);
   var PageProvider = (pageEntry && pageEntry.Provider) || React.Fragment;
+  var fullWidth    = !!(pageEntry && pageEntry.layout === 'full-width');
+
+  /* `has-selection` lets the mobile media query swap which pane is
+     visible: middle when nothing is selected, right detail when something is.
+     Suppressed on full-width pages — drawer handles selection there. */
+  var shellClassName = 'app-shell'
+    + ((selectedItem && !fullWidth) ? ' has-selection' : '')
+    + (fullWidth ? ' app-shell--full-width' : '');
 
   return React.createElement('div', { style: shellStyle, className: shellClassName },
 
@@ -452,12 +478,27 @@ function AppShell({ showDevSwitcher = false }) {
         onWidthChange: setMiddleWidth,
         onSelect: setSelectedItem,
         selectedItem: selectedItem,
+        fullWidth: fullWidth,
       }),
-      React.createElement(RightDetail, {
+
+      /* Static right pane only in normal (3-pane) mode. */
+      !fullWidth ? React.createElement(RightDetail, {
         route: route,
         selectedItem: selectedItem,
         onClose: function() { setSelectedItem(null); },
-      }),
+      }) : null,
+
+      /* Slide-in drawer for full-width pages. Always mounted so
+         transitions can animate on open/close; opacity + transform
+         driven by the `open` prop. */
+      fullWidth && window.FieldSight.RightDrawer
+        ? React.createElement(window.FieldSight.RightDrawer, {
+            open:         !!selectedItem,
+            route:        route,
+            selectedItem: selectedItem,
+            onClose:      function() { setSelectedItem(null); },
+          })
+        : null,
     ),
 
     showDevSwitcher && window.FieldSight.DevRoleSwitcher

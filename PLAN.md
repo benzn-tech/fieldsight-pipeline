@@ -503,7 +503,23 @@ branch (PR #14) until the user merges.
   (no remaining references). Cache busters: composites.css v=21,
   pages/activity.js v=2, user-activity-aggregator.js v=1 (new),
   user-activity-card.js v=1 (new).
-- **Sprint 4.7 · Programme full-width layout + slide-in drawer** ⏳ pending
+- **Sprint 4.7 · Programme full-width layout + slide-in drawer** ✅ done
+  AppShell now respects a `layout: 'full-width'` flag on page registry
+  entries. Programme declares it; other pages keep the 3-pane shell.
+  Effects on `/programme`:
+    • Middle column ignores the resize-handle width and flexes to
+      fill the entire content area (~1300+ px on a typical desktop)
+    • Static RightDetail pane is suppressed
+    • Drag handle hidden (no neighbouring column to resize against)
+    • New `RightDrawer` composite slides in from the right edge
+      (440px wide, max 90vw) whenever a task is selected
+    • Backdrop dims everything except the drawer; click closes
+    • ESC key closes (only listens while open, so other pages
+      unaffected)
+  No changes to other pages — Today / Timeline / Sites / Activity /
+  Tasks / Reports / Evidence keep the original 3-pane behaviour.
+  Cache busters: app-shell.css v=3, app-shell.js v=9, programme.js
+  v=2, right-drawer.js v=1 (new).
 - **Sprint 4.8 · Jira-style 4-column kanban replaces ProgrammeTodoList** ⏳ pending
 - **Sprint 4.9 · Gantt drag (L1 move + L2 edge resize)** ⏳ pending
 
