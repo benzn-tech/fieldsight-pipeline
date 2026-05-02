@@ -105,8 +105,9 @@
     var task     = props.task || null;
     var leaves   = props.leaves || [];
     var parents  = props.parents || [];
-    var onClose  = props.onClose || function () {};
+    var onClose  = props.onClose  || function () {};
     var onSubmit = props.onSubmit || function () {};
+    var onDelete = props.onDelete || null;
 
     /* Form state — string-only.
        Edit mode: mirrored from props.task on each open.
@@ -146,7 +147,17 @@
     var errors    = refErrors[0];
     var setErrors = refErrors[1];
 
-    React.useEffect(function () { setForm(initial); setErrors({}); }, [initial]);
+    /* Sprint 5.3 — two-click delete confirmation.
+       Resets to false whenever the modal opens or closes (via initial dep). */
+    var refDeleteConfirm = React.useState(false);
+    var deleteConfirm    = refDeleteConfirm[0];
+    var setDeleteConfirm = refDeleteConfirm[1];
+
+    React.useEffect(function () {
+      setForm(initial);
+      setErrors({});
+      setDeleteConfirm(false);
+    }, [initial]);
 
     /* In edit mode we require a task; in create mode we don't. */
     if (!open || (mode !== 'create' && !task) || !form) {
@@ -352,10 +363,28 @@
               }),
         ),
 
-        /* Footer */
+        /* Footer — delete is left-anchored (edit mode + onDelete prop only);
+           Cancel/Save stay right-anchored. marginRight:auto on the delete
+           wrapper pushes the remaining buttons to the right end of the
+           flex row without any new CSS. */
         React.createElement('div', { className: 'fs-task-editor__footer' },
+          mode === 'edit' && onDelete
+            ? React.createElement('div', { style: { marginRight: 'auto' } },
+                deleteConfirm
+                  ? React.createElement(Button, {
+                      variant: 'danger',
+                      onClick: function () { onDelete(task.task_id); onClose(); },
+                    }, 'Confirm delete?')
+                  : React.createElement(Button, {
+                      variant: 'ghost',
+                      style:   { color: 'var(--color-danger-600)' },
+                      onClick: function () { setDeleteConfirm(true); },
+                    }, 'Delete'),
+              )
+            : null,
           React.createElement(Button, {
-            variant: 'ghost', onClick: onClose,
+            variant: 'ghost',
+            onClick: function () { setDeleteConfirm(false); onClose(); },
           }, 'Cancel'),
           React.createElement(Button, {
             variant: 'primary', onClick: commit,

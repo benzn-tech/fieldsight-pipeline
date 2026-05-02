@@ -270,6 +270,32 @@
       });
     }
 
+    /* Sprint 5.3 — delete a leaf task by id.
+       Scrubs the id from every other leaf's depends_on[] so dangling
+       references can't cause cascade infinite-loops. Recomputes CPM
+       over the remaining leaves. */
+    function deleteTask(taskId) {
+      setState(function (s) {
+        if (s.status !== 'ok') return s;
+        var nextLeaves = s.leaves
+          .filter(function (t) { return t.task_id !== taskId; })
+          .map(function (t) {
+            if (!t.depends_on || t.depends_on.indexOf(taskId) === -1) return t;
+            return Object.assign({}, t, {
+              depends_on: t.depends_on.filter(function (id) { return id !== taskId; }),
+            });
+          });
+        var sched = window.FieldSight && window.FieldSight.programmeSchedule;
+        var critIds = sched
+          ? sched.computeCriticalPath(nextLeaves, s.programme.start_date)
+          : Array.from(s.critical).filter(function (id) { return id !== taskId; });
+        return Object.assign({}, s, {
+          leaves:   nextLeaves,
+          critical: new Set(critIds),
+        });
+      });
+    }
+
     /* Sprint 5.2 — create a new leaf task from editor form data.
        Mints task_id and WBS, appends to leaves[], recomputes CPM.
        No cascade needed (new task has no dependents yet). */
@@ -326,6 +352,7 @@
       updateTask:   updateTask,
       editTask:     editTask,
       addTask:      addTask,
+      deleteTask:   deleteTask,
     };
     return React.createElement(ProgrammeContext.Provider, { value: ctx },
       props.children);
@@ -928,7 +955,7 @@
             ),
       ),
 
-      /* Sprint 5.1 — task editor modal */
+      /* Sprint 5.1 / 5.3 — task editor modal */
       Editor ? React.createElement(Editor, {
         open:    editing,
         task:    t,
@@ -938,6 +965,11 @@
         onSubmit: function (opts) {
           ctx.editTask(opts);
           setEdit(false);
+        },
+        onDelete: function (taskId) {
+          ctx.deleteTask(taskId);
+          setEdit(false);
+          if (props.onClose) props.onClose();
         },
       }) : null,
     );
