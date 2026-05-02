@@ -866,6 +866,145 @@ bolted on later.
 | Persistent edits (write-through to backend) | `PATCH /api/programmes/...` doesn't exist yet — currently mock-only |
 | Resource pool conflict detection | Needs a separate sub-sprint after deep cascade lands |
 
+## Sprint 6 — Compliance pair (`/safety` + `/quality`) (active)
+
+Sprint 5 closed Programme operability (PR #15 merged). Sprint 6 turns
+on the next two highest-value nav slots — `/safety` and `/quality` —
+which are reserved in `fs-globals.js:339-364` but currently render
+the app-shell placeholder. They share fixture surface
+(`safety_observations` + `safety_flags` per topic; `quality_and_compliance`
+per report; `category: 'safety' | 'quality' | 'progress'` on every
+topic), share an audience (site_managers, project_managers, HSE +
+Quality specialists), and share a UX shape (cross-day rollup). Built
+together so the L5 composites pull double duty rather than two
+parallel stacks.
+
+Note on roadmap: CLAUDE.md schedules Sprint 6 as "Mobile + dark mode."
+We're swapping that to **compliance pair** per the Sprint 5+ user
+decision — the read-only aggregation work fits more naturally on top
+of the Sprint 5 patterns (cross-day fan-out, page provider, KPI strip),
+while dark mode pairs better with `/settings` in Sprint 7.
+
+### Scope decisions (locked)
+
+| Question | Choice |
+|---|---|
+| Sprint 6 scope | **Compliance pair only** (Safety + Quality) — Team + Settings deferred |
+| Range view | **7-day default + date-picker** on both pages |
+| /team scope (Sprint 7) | Read-only directory grouped by site, role badges |
+| /settings scope (Sprint 7) | Full prefs (notifications + default landing + density + theme) |
+
+### Constraints carried forward
+
+- No build step (UMD/CDN only).
+- Mock-only persistence — both pages are pure read in this sprint.
+- No new backend endpoints; aggregator fans out existing
+  `getTimeline(date)` over a date range, mirrors `tasks-aggregator.js`.
+- No new L4 atoms — every list/form element comes from Sprint 1
+  primitives + Sprint 4–5 composites.
+
+### Sub-sprints
+
+- **Sprint 6.0 · Compliance aggregator + fixture audit** ⏳ pending
+
+  New pure module `scripts/api/compliance-aggregator.js` (~120 LoC).
+  Two parallel call paths: `getSafetyRange({from, to})` and
+  `getQualityRange({from, to})`. Both share one underlying
+  `fanoutDates()` helper (mirrors `tasks-aggregator.js` exactly:
+  `Promise.all` over the date range + flatten). Worker scope clamping
+  delegated to `timeline.js` upstream.
+
+  Audit deliverable: confirm every report fixture has
+  `safety_observations`, `safety_flags`, `quality_and_compliance`,
+  and `category`. Document any gaps in an `_AUDIT` block at the top
+  of the aggregator. **No fixture changes** — audit-only.
+
+  Smoke test (node): import the aggregator, feed 2026-04-29 fixture,
+  assert each return shape, assert flag counts match
+  `dates.fixture.js`'s totals.
+
+- **Sprint 6.1 · `/safety` middle column** ⏳ pending
+
+  New `scripts/pages/safety.js` (~280 LoC) + page registry entry.
+  Provider holds `{ status, range: 'today'|'week', date|fromTo,
+  byDate, totals, selectedFlag }`. Default range: last 7 days that
+  have reports (queried via `FS.api.dates.getDates({months: 1})`,
+  take top 7).
+
+  Middle column structure:
+  - Toolbar: title + range chips (`Today` / `Last 7 days` / date-picker
+    chip) — same pattern as `/programme` view-toggle.
+  - KPI strip: total flags · high-risk count · sites affected ·
+    open vs closed.
+  - Body: grouped by date desc, each group is a date header +
+    N `safety-flag-row` items (existing composite). Click → set
+    `selectedFlag`.
+  - Empty / loading / error states reuse the standard pattern.
+
+  New CSS: `.fs-safety-*` block in `composites.css` (~80 LoC).
+
+- **Sprint 6.2 · `/safety` right detail** ⏳ pending
+
+  Right column renders the selected flag with full context: risk
+  badge, observation, recommended action, location, who raised,
+  source-report link → `/timeline?date=…&user=…&topic=…`. If
+  `linked_action_items` exist, surface them as click-through chips
+  (mirrors Programme right-detail's linked actions block from 4.4).
+  No new composites — `Card` + `Badge` + `Button`.
+
+- **Sprint 6.3 · `/quality` middle column** ⏳ pending
+
+  Mirrors 6.1 file-for-file. New `scripts/pages/quality.js`
+  (~270 LoC). Provider has the same shape but `byDate` flattens
+  `quality_and_compliance` items + topics where
+  `category === 'quality'`. KPI strip swaps: total items ·
+  failing/follow-up · sites affected · resolved this week. List
+  rows reuse generic `Card` (quality items shape simpler than
+  safety — no new composite needed).
+
+  CSS: `.fs-quality-*` block in `composites.css` (~70 LoC).
+
+- **Sprint 6.4 · `/quality` right detail** ⏳ pending
+
+  Mirrors 6.2: selected quality item with details, status,
+  follow-up flag, source-report link, linked actions.
+
+- **Sprint 6.5 · Wire-up + cache-buster sweep + role walkthrough** ⏳ pending
+
+  - Bump `?v=N` on every touched file.
+  - `prefers-reduced-motion` audit (no new keyframes expected).
+  - `node --check` sweep (~91 JS files post-sprint).
+  - Browser walkthrough at five roles: `worker` (gated out by
+    `safety:view` / `quality:view`), `foreman` (also gated out),
+    `site_manager` (own-site clamp), `hse_manager` (org-wide
+    safety), `quality_manager` (org-wide quality), `admin`
+    (everything).
+  - Flip Sprint 6 entries above to ✅ done with implementation
+    notes.
+
+### Critical files
+
+| Path | Role | Status |
+|---|---|---|
+| `scripts/api/compliance-aggregator.js` | Cross-day fan-out for safety + quality | NEW (6.0) |
+| `scripts/pages/safety.js` | Provider + Middle + Right | NEW (6.1, 6.2) |
+| `scripts/pages/quality.js` | Provider + Middle + Right | NEW (6.3, 6.4) |
+| `app-shell-preview.html` | Script tag registrations + cache-buster bumps | MODIFIED each sub-sprint |
+| `styles/composites.css` | New `.fs-safety-*` and `.fs-quality-*` blocks | MODIFIED |
+| `scripts/api/tasks-aggregator.js` | Reference pattern | READ-ONLY |
+| `scripts/composites/{category-badge,safety-flag-row,kpi-strip,stat-card,card,badge,date-picker}.js` | All reused as-is | READ-ONLY |
+| `scripts/api/{timeline,dates}.js` | Underlying fetchers | READ-ONLY |
+
+### Deferred to Sprint 7+
+
+| Item | Why deferred |
+|---|---|
+| `/team` (read-only directory) | Narrower audience (gm + director only via `user:manage`) |
+| `/settings` (full prefs + theme + density) | Pairs naturally with dark-mode work |
+| Safety/quality write actions (raise flag, mark resolved) | No backend `POST /api/safety` exists; mock-only-mutation lesson from Sprint 5 |
+| Trend/heatmap views (flags-per-site over time) | Needs >7 day fixture data; revisit when backend lands |
+| Vocabulary-aware tagging (Q-2 backend) | Already in §Q-2; not blocking Sprint 6 |
+
 ## Sprint 4+ — Open product questions
 
 Surfaced during the second-pass review of merged main. These aren't
