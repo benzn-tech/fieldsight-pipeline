@@ -1279,9 +1279,9 @@ Tasks-side wiring (~15 LoC in `scripts/pages/tasks.js`):
 - `resolveUser` in `tasks-aggregator.js:46-55` already accepts
   explicit user — no aggregator change
 
-#### 7.3 — `/settings` page
+#### 7.3 — `/settings` page ✅ done
 
-New `scripts/pages/settings.js` (~280 LoC). Provider holds prefs
+New `scripts/pages/settings.js` (~230 LoC). Provider holds prefs
 state, syncs to localStorage on change.
 
 Middle column has two sections:
@@ -1297,58 +1297,72 @@ Middle column has two sections:
    - First option: "Use my role's default
      (`<role.defaultLanding>`)" → unsets the override
    - Persists to `localStorage.fs.settings.defaultLanding`
-   - AppShell login-flow needs a tiny extension: on initial
-     navigation (when route is empty), prefer
-     `localStorage.fs.settings.defaultLanding` over
-     `FS.getDefaultLanding(user)`. ~5 LoC.
+   - Bootstrap block in `app-shell-preview.html` extended: on
+     initial navigation (when route is empty), prefers the stored
+     override over `FS.getDefaultLanding(user)`. ~5 LoC.
 
-Right column: a static summary card ("Your preferences" with the
-3 active values) — no interactions, just confirms what's set.
+Right column: static "Your preferences" summary card showing
+theme preference, resolved theme, and effective landing page.
 
-CSS: append `.fs-settings-*` block (~80 LoC, sections layout +
-form rows).
+CSS: `.fs-settings-*` + `.fs-settings-summary` appended to
+`composites.css` (~160 LoC, sections layout + form rows +
+summary card + reduced-motion block).
 
-#### 7.4 — Dark mode polish audit (per-page)
+`app-shell-preview.html` updated: `settings.js?v=1` registered,
+`composites.css?v=31`, `app-shell.css?v=4` cache-busted.
 
-Open each existing page in dark mode, identify hardcoded colours
-and contrast issues, fix per-page. **Single sub-sprint, multiple
-small commits inside it** — one commit per page touched.
+#### 7.4 — Dark mode polish audit (per-page) ✅ done
 
-Audit method (since no headless browser):
-1. Grep `composites.css` + `components.css` + `app-shell.css` for
-   `#[0-9a-f]{3,6}` and `rgb(`, `rgba(` outside of token
-   definitions — every hardcoded colour is a candidate fix.
-2. Grep for inline `style={{` with colour properties in
-   `scripts/composites/` and `scripts/pages/`.
-3. For each find: replace with appropriate `var(--*)` token. If
-   no token fits, document in PLAN.md and skip (token addition
-   is its own micro-sprint).
+Audit method (grep-based, no headless browser):
+1. Grepped `composites.css` + `components.css` + `app-shell.css`
+   for `#[0-9a-f]{3,6}`, `rgb(`, `rgba(`.
+2. Grepped inline `style=` with colour values in
+   `scripts/composites/` and `scripts/pages/` — no hits.
+3. For each find: replaced with `var(--*)` token, or categorised
+   and documented below.
 
-Pages with highest expected debt (from research):
-- **Programme** (`scripts/pages/programme.js` + Gantt CSS) —
-  Gantt status colours, kanban columns
-- **Safety** + **Quality** — risk badges should already be
-  token-driven, verify
-- **Today** — KPI strip backgrounds, urgent cards
-- **Timeline** — TopicCard backgrounds, action item rows
+**Fixed:**
+- `composites.css` `.fs-modal__backdrop` — `rgba(15, 23, 42, 0.5)`
+  → `var(--surface-overlay)` (uses the dark-aware token).
+- `app-shell.css` `.fs-right-drawer__backdrop` — `rgba(15, 23, 42, 0.4)`
+  → `var(--surface-overlay)`.
+- `app-shell.css` `.fs-dev-switcher select option` — `#1a1a1a` / `#fff`
+  → `var(--surface-tooltip)` / `var(--text-primary)`.
 
-Expected ~3-6 file touches across all pages.
+**Intentional / kept as-is:**
+- `color: #fff` on solid badge + button variants — white text on
+  coloured backgrounds; correct in both modes.
+- `background: #000` on `.fs-video-player__media` — video
+  letterbox; intentional.
+- `rgba(0, 0, 0, ...)` shadows and overlays (gantt bar progress,
+  kanban card hover, dragging) — alpha-transparent, theme-neutral.
+- `rgba(255, 255, 255, 0.06)` sidebar borders in `app-shell.css`
+  — sidebar background is always dark navy (`--surface-sidebar`),
+  so translucent white borders are correct in both themes.
+- `rgba(255, 107, 53, ...)` accent tints — accent colour is fixed
+  across themes; no change needed.
 
-#### 7.5 — Wrap-up
+**Skipped / deferred to Sprint 8:**
+- `scripts/composites/transcript-list.js` speaker palette
+  (`#1E40AF/#DBEAFE`, `#15803D/#DCFCE7`, etc.) — no design-system
+  token set for arbitrary speaker slots; needs Sprint 8 token
+  additions (`--color-speaker-{1..6}-{fg,bg}`).
 
-- Cache-buster bumps on touched files
-- `node --check` sweep (~95 JS files post-sprint after `theme.js`,
-  `team.js`, `settings.js`)
-- Reduced-motion audit (no new keyframes expected from Sprint 7;
-  document if any added)
-- Browser walkthrough at four roles:
-  - **worker** (no /team in nav, can see /settings, theme toggle
-    works)
-  - **site_manager** (no /team, /settings normal)
-  - **gm** (sees /team, can browse all users)
-  - **admin** (sees everything, can override default landing to
-    any nav item)
-- Update PLAN.md: flip Sprint 7 entries to ✅ done
+#### 7.5 — Wrap-up ✅ done
+
+- Cache busters bumped: `composites.css?v=31`, `app-shell.css?v=4`,
+  `settings.js?v=1` (new file).
+- `node --check` sweep across all ~95 JS files — zero errors.
+- Reduced-motion audit: two new `@media (prefers-reduced-motion)`
+  blocks added in `composites.css` (one for `.fs-settings__radio-row`
+  + `.fs-settings__select` transitions).
+- No new keyframe animations introduced in Sprint 7.3–7.5.
+- Browser walkthrough deferred to user — note role expectations:
+  - **worker** — no /team in nav, /settings accessible, theme
+    toggle works.
+  - **site_manager** — same as worker.
+  - **gm** / **admin** — /team visible in nav, /settings shows
+    all nav items in the landing dropdown.
 
 ### Recommended execution order
 

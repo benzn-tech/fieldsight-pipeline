@@ -12,9 +12,9 @@
 
   <!-- Design tokens + AppShell CSS -->
   <link rel="stylesheet" href="styles/tokens.css" />
-  <link rel="stylesheet" href="styles/app-shell.css?v=3" />
+  <link rel="stylesheet" href="styles/app-shell.css?v=4" />
   <link rel="stylesheet" href="styles/components.css?v=4" />
-  <link rel="stylesheet" href="styles/composites.css?v=30" />
+  <link rel="stylesheet" href="styles/composites.css?v=31" />
 
   <style>
     /* Ensure full-bleed with no scroll */
@@ -172,6 +172,8 @@
   <script type="text/babel" src="scripts/pages/quality.js?v=4"></script>
   <!-- Sprint 7.1+7.2 — /team page -->
   <script type="text/babel" src="scripts/pages/team.js?v=1"></script>
+  <!-- Sprint 7.3 — /settings page -->
+  <script type="text/babel" src="scripts/pages/settings.js?v=1"></script>
 
   <script type="text/babel" src="scripts/dev-role-switcher.js?v=4"></script>
   <script type="text/babel" src="scripts/app-shell.js?v=10"></script>
@@ -179,9 +181,13 @@
   <!-- Bootstrap: set default route then mount -->
   <script>
     (function () {
-      // If no hash is set, navigate to the default landing for the initial user
+      // If no hash is set, navigate to the effective default landing.
+      // Prefer the user's stored override (fs.settings.defaultLanding)
+      // over the role default — Sprint 7.3 settings page writes this key.
       if (!location.hash || location.hash === '#' || location.hash === '#/') {
-        var landing = window.FS.getDefaultLanding(window.AuthMock.currentUser);
+        var stored;
+        try { stored = localStorage.getItem('fs.settings.defaultLanding'); } catch (_) {}
+        var landing = stored || window.FS.getDefaultLanding(window.AuthMock.currentUser);
         location.hash = landing;
       }
     })();

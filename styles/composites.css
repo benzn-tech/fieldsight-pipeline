@@ -3982,7 +3982,7 @@ body.fs-gantt-dragging--resize-end    { cursor: ew-resize !important; }
 .fs-modal__backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.5);
+  background: var(--surface-overlay);
   z-index: var(--z-backdrop);
   opacity: 0;
   pointer-events: none;
@@ -5324,6 +5324,231 @@ body.fs-gantt-dragging--resize-end    { cursor: ew-resize !important; }
 @media (prefers-reduced-motion: reduce) {
   .fs-team__user-row,
   .fs-team-detail__action-btn {
+    transition: none;
+  }
+}
+
+
+/* ==========================================================================
+   Sprint 7.3 · Settings page
+   --------------------------------------------------------------------------
+   .fs-settings       — middle column
+   .fs-settings-summary — right detail (static summary card)
+   ========================================================================== */
+
+.fs-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: var(--space-4) var(--space-5);
+}
+
+.fs-settings__header {
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: var(--space-2);
+}
+
+.fs-settings__title {
+  font-size: var(--font-size-xl);
+  font-weight: var(--font-weight-bold);
+  color: var(--text-primary);
+  margin: 0 0 var(--space-1);
+}
+
+.fs-settings__subtitle {
+  font-size: var(--font-size-sm);
+  color: var(--text-tertiary);
+}
+
+/* ---- Sections ---- */
+
+.fs-settings__section {
+  padding: var(--space-5) 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.fs-settings__section:last-child {
+  border-bottom: none;
+}
+
+.fs-settings__section-title {
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  margin-bottom: var(--space-1);
+}
+
+.fs-settings__section-desc {
+  font-size: var(--font-size-sm);
+  color: var(--text-tertiary);
+  margin-bottom: var(--space-4);
+}
+
+/* ---- Theme radio group ---- */
+
+.fs-settings__radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.fs-settings__radio-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  background: var(--surface-panel);
+  transition: border-color var(--duration-fast) var(--easing-out),
+              background  var(--duration-fast) var(--easing-out);
+}
+
+.fs-settings__radio-row:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+
+.fs-settings__radio-row--checked {
+  border-color: var(--color-accent-500);
+  background: var(--surface-highlight);
+}
+
+.fs-settings__radio-input {
+  margin-top: 2px;
+  flex-shrink: 0;
+  accent-color: var(--color-accent-500);
+}
+
+.fs-settings__radio-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fs-settings__radio-label {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--text-primary);
+}
+
+.fs-settings__radio-caption {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+}
+
+/* ---- Default landing field ---- */
+
+.fs-settings__field-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.fs-settings__label {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--text-secondary);
+}
+
+.fs-settings__select {
+  appearance: none;
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  background: var(--surface-input) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%239CA3AF' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right var(--space-3) center;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: border-color var(--duration-fast) var(--easing-out);
+  min-height: 40px;
+}
+
+.fs-settings__select:hover {
+  border-color: var(--border-strong);
+}
+
+.fs-settings__select:focus {
+  outline: none;
+  border-color: var(--color-accent-500);
+  box-shadow: var(--focus-ring);
+}
+
+.fs-settings__field-hint {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  margin-top: var(--space-1);
+}
+
+/* ==========================================================================
+   Settings right detail — summary card
+   ========================================================================== */
+
+.fs-settings-summary {
+  padding: var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.fs-settings-summary--empty {
+  color: var(--text-tertiary);
+  font-size: var(--font-size-sm);
+}
+
+.fs-settings-summary__title {
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.fs-settings-summary__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.fs-settings-summary__row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--border-subtle);
+  gap: var(--space-3);
+}
+
+.fs-settings-summary__row:last-child {
+  border-bottom: none;
+}
+
+.fs-settings-summary__label {
+  font-size: var(--font-size-sm);
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.fs-settings-summary__value {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--text-primary);
+  text-align: right;
+}
+
+.fs-settings-summary__note {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  line-height: var(--line-height-relaxed);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fs-settings__radio-row,
+  .fs-settings__select {
     transition: none;
   }
 }

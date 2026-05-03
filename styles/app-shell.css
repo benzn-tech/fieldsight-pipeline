@@ -125,7 +125,7 @@ body {
 .fs-right-drawer__backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.4);
+  background: var(--surface-overlay);
   z-index: 49;
   opacity: 0;
   pointer-events: none;
@@ -424,6 +424,6 @@ button:not([class*="fs-"]):focus-visible,
 /* The closed state is styled inline; option styling has to come from
    CSS so the open dropdown picks up our dark theme. */
 .fs-dev-switcher select option {
-  background: #1a1a1a;
-  color: #fff;
+  background: var(--surface-tooltip);
+  color: var(--text-primary);
 }
