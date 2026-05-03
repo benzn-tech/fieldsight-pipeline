@@ -431,11 +431,21 @@
          timeline page lands in focus mode (target topic auto-opens
          and flashes; others force-collapse). Observation rows skip
          the topic param since they're report-level — the user lands
-         on the daily report's overview without a focal point. */
+         on the daily report's overview without a focal point.
+
+         Sprint 6.7.2 — for topic_flag source, also append &flag=<idx>
+         so the precision spotlight lands on the specific flag inside
+         the topic's safety_flags[] (not just the whole topic card).
+         Flag idx is the trailing number in the row id, format
+         '<date>_<topic_id>_flag_<idx>'. */
       var qs = '?date=' + encodeURIComponent(sel.date);
       if (sel.user_folder) qs += '&user=' + encodeURIComponent(sel.user_folder);
       if (sel.topic_id != null && sel.topic_id >= 0) {
         qs += '&topic=' + encodeURIComponent(sel.topic_id);
+        if (sel.source === 'topic_flag') {
+          var m = String(sel.id || '').match(/_flag_(\d+)$/);
+          if (m) qs += '&flag=' + encodeURIComponent(m[1]);
+        }
       }
       window.FS.Router.navigate('/timeline' + qs);
     }

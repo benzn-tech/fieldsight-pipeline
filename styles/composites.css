@@ -574,8 +574,11 @@
    Total ~1.8s. The flash class lands on the inner Card (which carries
    .fs-topic-card); the wrapper just exists for the ref / scrollIntoView
    target. Uses accent-100 for the pulse — same token the --selected
-   state uses, so no new palette work. */
-.fs-topic-card-wrap > .fs-topic-card--flash {
+   state uses, so no new palette work.
+   Sprint 6.7.2 — same animation reused by .fs-safety-flag-row--flash
+   for precision spotlight on a single flag inside an open topic. */
+.fs-topic-card-wrap > .fs-topic-card--flash,
+.fs-safety-flag-row--flash {
   animation: fs-topic-card-flash 1800ms ease-out 1;
 }
 @keyframes fs-topic-card-flash {
@@ -587,7 +590,8 @@
   83%      { background: var(--color-accent-100); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .fs-topic-card-wrap > .fs-topic-card--flash {
+  .fs-topic-card-wrap > .fs-topic-card--flash,
+  .fs-safety-flag-row--flash {
     animation: none;
     background: var(--color-accent-100);
   }

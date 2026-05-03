@@ -226,6 +226,15 @@
       : null;
     if (targetTopicId !== null && isNaN(targetTopicId)) targetTopicId = null;
 
+    /* Sprint 6.7.2 — deeper precision: when /safety includes
+       &flag=<idx>, highlight that specific safety_flag inside the
+       target topic (not the whole topic card). null = whole-topic
+       flash from 6.6.4. */
+    var targetFlagIdx = params.flag != null && params.flag !== ''
+      ? parseInt(params.flag, 10)
+      : null;
+    if (targetFlagIdx !== null && isNaN(targetFlagIdx)) targetFlagIdx = null;
+
     /* Resolve effective (date, user) honouring worker-forced-self rule. */
     var caller = (window.AuthMock && window.AuthMock.currentUser) || {};
     var date   = params.date;            /* may be undefined → bootstrap resolves */
@@ -574,6 +583,10 @@
             selected:    selectedTopicId === topic.topic_id,
             defaultOpen: defaultOpenProp,
             highlight:   isTarget,
+            /* Sprint 6.7.2 — only the matched topic gets a flagHighlight;
+               others ignore. When targetFlagIdx is null, the topic-level
+               flash from 6.6.4 owns the spotlight. */
+            flagHighlight: isTarget ? targetFlagIdx : null,
             onSelect:    function () {
               if (props.onSelect) {
                 props.onSelect({

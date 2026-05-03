@@ -27,6 +27,12 @@
                    a 3-pulse background flash (via .fs-topic-card--flash
                    class). Respects prefers-reduced-motion. Toggling
                    from false→true also re-triggers the flash.
+     flagHighlight number — Sprint 6.7.2 precision spotlight. When set,
+                   the SafetyFlagRow at this index inside this topic's
+                   safety_flags[] gets highlight=true (its own
+                   scrollIntoView + flash). Used together with
+                   highlight=true so the topic auto-opens AND the
+                   specific flag draws focus.
 
    Exported to:
      window.FieldSight.TopicCard
@@ -233,8 +239,14 @@
               }, 'Safety flags'),
               React.createElement('div', { className: 'fs-topic-card__flags' },
                 flags.map(function (f, i) {
+                  /* Sprint 6.7.2 — flag-level highlight. When the
+                     enclosing TopicCard receives flagHighlight=N,
+                     pass highlight=true to the matching SafetyFlagRow
+                     so the precision spotlight lands on one flag,
+                     not the whole topic. */
                   return React.createElement(SafetyFlagRow, {
                     key: i, flag: f, dense: true,
+                    highlight: props.flagHighlight === i,
                   });
                 }),
               ),

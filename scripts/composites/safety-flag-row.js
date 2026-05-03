@@ -19,6 +19,9 @@
      flag  { observation, risk_level, recommended_action,
              location?, who_raised? }
      dense  boolean — tighter padding when used in a list
+     highlight  boolean — Sprint 6.7.2 precision spotlight. When set,
+       scrolls into view and runs a 3-pulse flash (.fs-safety-flag-row--flash).
+       Respects prefers-reduced-motion. Toggling false→true re-triggers.
 
    Exported to:
      window.FieldSight.SafetyFlagRow
@@ -37,15 +40,35 @@
     var risk  = (flag.risk_level || 'medium').toLowerCase();
     var tone  = RISK_TONE[risk] || 'neutral';
 
+    /* Sprint 6.7.2 — precision spotlight. Same shape as TopicCard's
+       highlight handling (Sprint 6.6.4): rootRef + flashing state +
+       useEffect that fires on highlight prop change. */
+    var rootRef = React.useRef(null);
+    var refFlash = React.useState(false);
+    var flashing    = refFlash[0];
+    var setFlashing = refFlash[1];
+
+    React.useEffect(function () {
+      if (!props.highlight) return undefined;
+      var node = rootRef.current;
+      if (node && typeof node.scrollIntoView === 'function') {
+        node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+      setFlashing(true);
+      var t = setTimeout(function () { setFlashing(false); }, 1900);
+      return function () { clearTimeout(t); };
+    }, [props.highlight]);
+
     var className = 'fs-safety-flag-row'
       + (props.dense ? ' fs-safety-flag-row--dense' : '')
-      + ' fs-safety-flag-row--' + risk;
+      + ' fs-safety-flag-row--' + risk
+      + (flashing ? ' fs-safety-flag-row--flash' : '');
 
     var captionParts = [];
     if (flag.location)   captionParts.push(flag.location);
     if (flag.who_raised) captionParts.push('raised by ' + flag.who_raised);
 
-    return React.createElement('div', { className: className },
+    return React.createElement('div', { className: className, ref: rootRef },
       React.createElement(Badge, {
         tone:      tone,
         size:      'sm',
