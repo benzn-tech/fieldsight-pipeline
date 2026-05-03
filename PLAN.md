@@ -866,6 +866,297 @@ bolted on later.
 | Persistent edits (write-through to backend) | `PATCH /api/programmes/...` doesn't exist yet — currently mock-only |
 | Resource pool conflict detection | Needs a separate sub-sprint after deep cascade lands |
 
+## Sprint 6 — Compliance pair (`/safety` + `/quality`) ✅ done
+
+Sprint 5 closed Programme operability (PR #15 merged). Sprint 6 turns
+on the next two highest-value nav slots — `/safety` and `/quality` —
+which are reserved in `fs-globals.js:339-364` but currently render
+the app-shell placeholder. They share fixture surface
+(`safety_observations` + `safety_flags` per topic; `quality_and_compliance`
+per report; `category: 'safety' | 'quality' | 'progress'` on every
+topic), share an audience (site_managers, project_managers, HSE +
+Quality specialists), and share a UX shape (cross-day rollup). Built
+together so the L5 composites pull double duty rather than two
+parallel stacks.
+
+Note on roadmap: CLAUDE.md schedules Sprint 6 as "Mobile + dark mode."
+We're swapping that to **compliance pair** per the Sprint 5+ user
+decision — the read-only aggregation work fits more naturally on top
+of the Sprint 5 patterns (cross-day fan-out, page provider, KPI strip),
+while dark mode pairs better with `/settings` in Sprint 7.
+
+### Scope decisions (locked)
+
+| Question | Choice |
+|---|---|
+| Sprint 6 scope | **Compliance pair only** (Safety + Quality) — Team + Settings deferred |
+| Range view | **7-day default + date-picker** on both pages |
+| /team scope (Sprint 7) | Read-only directory grouped by site, role badges |
+| /settings scope (Sprint 7) | Full prefs (notifications + default landing + density + theme) |
+
+### Constraints carried forward
+
+- No build step (UMD/CDN only).
+- Mock-only persistence — both pages are pure read in this sprint.
+- No new backend endpoints; aggregator fans out existing
+  `getTimeline(date)` over a date range, mirrors `tasks-aggregator.js`.
+- No new L4 atoms — every list/form element comes from Sprint 1
+  primitives + Sprint 4–5 composites.
+
+### Sub-sprints
+
+- **Sprint 6.0 · Compliance aggregator + fixture audit** ✅ done
+
+  Shipped: new `scripts/api/compliance-aggregator.js` (~290 LoC).
+  `getSafetyRange` + `getQualityRange` parallel exports. Internal
+  `fanoutDates` mirrors `tasks-aggregator.js:57-87` exactly. Worker
+  scope clamping via shared `resolveUser` (intentional parity with
+  tasks aggregator). _AUDIT block at top documents four gaps:
+  fixture sparsity (only 2026-04-29 has real content), no `status`
+  field on safety_observations, hse_manager fan-out parity, and
+  field-shape verification. Smoke-tested in node: 5 safety rows
+  (2 obs + 3 topic flags, 2 high-risk) + 3 quality rows (2 QC items
+  + 1 quality topic, 1 follow-up) — matches fixture totals.
+
+  New pure module `scripts/api/compliance-aggregator.js` (~120 LoC).
+  Two parallel call paths: `getSafetyRange({from, to})` and
+  `getQualityRange({from, to})`. Both share one underlying
+  `fanoutDates()` helper (mirrors `tasks-aggregator.js` exactly:
+  `Promise.all` over the date range + flatten). Worker scope clamping
+  delegated to `timeline.js` upstream.
+
+  Audit deliverable: confirm every report fixture has
+  `safety_observations`, `safety_flags`, `quality_and_compliance`,
+  and `category`. Document any gaps in an `_AUDIT` block at the top
+  of the aggregator. **No fixture changes** — audit-only.
+
+  Smoke test (node): import the aggregator, feed 2026-04-29 fixture,
+  assert each return shape, assert flag counts match
+  `dates.fixture.js`'s totals.
+
+- **Sprint 6.1 · `/safety` middle column** ✅ done
+
+  Shipped: new `scripts/pages/safety.js` Provider + Middle (~360 LoC
+  for the middle-column slice of the file). Range toolbar with three
+  chips (Today / Last 7 days / Pick date), DatePicker dropdown for
+  single-day mode. KPI strip: Total flags · High risk (danger
+  tone) · Sites affected · Open / closed (warning when any open).
+  Date-grouped list with dense `SafetyFlagRow` per item. Header
+  always visible so the toolbar stays reachable during loading
+  / empty / error states. CSS additions to `composites.css` (~165
+  LoC) under `.fs-safety` namespace.
+
+  New `scripts/pages/safety.js` (~280 LoC) + page registry entry.
+  Provider holds `{ status, range: 'today'|'week', date|fromTo,
+  byDate, totals, selectedFlag }`. Default range: last 7 days that
+  have reports (queried via `FS.api.dates.getDates({months: 1})`,
+  take top 7).
+
+  Middle column structure:
+  - Toolbar: title + range chips (`Today` / `Last 7 days` / date-picker
+    chip) — same pattern as `/programme` view-toggle.
+  - KPI strip: total flags · high-risk count · sites affected ·
+    open vs closed.
+  - Body: grouped by date desc, each group is a date header +
+    N `safety-flag-row` items (existing composite). Click → set
+    `selectedFlag`.
+  - Empty / loading / error states reuse the standard pattern.
+
+  New CSS: `.fs-safety-*` block in `composites.css` (~80 LoC).
+
+- **Sprint 6.2 · `/safety` right detail** ✅ done
+
+  Shipped: full inspection panel replaces the 6.1 placeholder
+  (~200 LoC added to `safety.js`). Header carries observation as
+  title + risk-tone Badge + status Badge. Field rows adapt to the
+  source shape — observation rows expose location + raised-by;
+  topic_flag rows skip those nulls. Lazy-fetches related action_items
+  from the source topic via `FS.api.timeline.getTimeline` and
+  surfaces them as click-through chips with text + responsible +
+  priority (only for topic_flag source — observation source has no
+  topic to lift actions from). 'Open source report' button →
+  `/timeline?date=…&user=…`. Close (X) clears `selectedFlag`.
+  CSS additions to `composites.css` (~90 LoC) under
+  `.fs-safety-detail` namespace. `safety.js` cache buster bumped
+  v=1 → v=2.
+
+  Right column renders the selected flag with full context: risk
+  badge, observation, recommended action, location, who raised,
+  source-report link → `/timeline?date=…&user=…&topic=…`. If
+  `linked_action_items` exist, surface them as click-through chips
+  (mirrors Programme right-detail's linked actions block from 4.4).
+  No new composites — `Card` + `Badge` + `Button`.
+
+- **Sprint 6.3 · `/quality` middle column** ✅ done
+
+  Shipped together with 6.4 (single commit, single file —
+  `scripts/pages/quality.js` ~545 LoC). Mirrors safety middle column
+  with three intentional deltas: status comes from the fixture, not
+  synthesised (statusTone() maps completed/pass → success, concern →
+  warning, fail/blocked → danger, observed → info); KPI swaps to
+  Total · Follow-up · Sites · Completed; rows render as
+  title + details + status badge stack instead of `SafetyFlagRow`
+  (quality items don't carry a risk_level so the coloured-border
+  treatment doesn't apply).
+
+  Mirrors 6.1 file-for-file. New `scripts/pages/quality.js`
+  (~270 LoC). Provider has the same shape but `byDate` flattens
+  `quality_and_compliance` items + topics where
+  `category === 'quality'`. KPI strip swaps: total items ·
+  failing/follow-up · sites affected · resolved this week. List
+  rows reuse generic `Card` (quality items shape simpler than
+  safety — no new composite needed).
+
+  CSS: `.fs-quality-*` block in `composites.css` (~70 LoC).
+
+- **Sprint 6.4 · `/quality` right detail** ✅ done
+
+  Shipped together with 6.3 in a single commit (combining was
+  cleaner — same file, same context, no review value in splitting).
+  Same lazy-fetch pattern as 6.2 for related action_items. Skips
+  the lookup for report-level qc_items (topic_id = -1). 'Open source
+  report' button mirrors safety. CSS additions to `composites.css`
+  (~250 LoC) under `.fs-quality` / `.fs-quality-detail`.
+
+  Mirrors 6.2: selected quality item with details, status,
+  follow-up flag, source-report link, linked actions.
+
+- **Sprint 6.5 · Wire-up + cache-buster sweep + role walkthrough** ✅ done
+
+  - Cache busters: only the touched files were bumped — `safety.js`
+    v=1 → v=2 inside Sprint 6.2; everything else carries fresh v=1
+    from first introduction. Existing pages untouched in this sprint
+    (their cache busters intentionally not bumped).
+  - Reduced-motion audit: `git diff origin/main..HEAD -- styles/`
+    shows **0 new `@keyframes`**. Clean by construction — both
+    pages reuse existing transition variables (`--duration-fast`,
+    `--easing-out`).
+  - `node --check` sweep: 92 JS files (was 89 before sprint), all
+    pass.
+  - Browser walkthrough at five roles **deferred to user** — no
+    headless browser in this environment. Expected behaviour
+    documented in §Sprint 6 / Scope decisions and codified by the
+    nav permission gates (`canSeeNav('safety', user)`,
+    `canSeeNav('quality', user)`). Worker/foreman: gated out at
+    nav. site_manager: nav visible, list will show their accessible
+    site only (clamped via aggregator's resolveUser). hse_manager,
+    quality_manager, admin: full visibility.
+  - Sprint 6 entries above flipped to ✅ done.
+
+### Sprint 6.6 polish round (post browser-verification feedback)
+
+User ran the merged Sprint 6 in the browser and reported four
+issues. All four addressed in a single PR-additive batch:
+
+- **Sprint 6.6.1 · DatePicker `inline` mode** ✅ done
+
+  Bug: clicking the < or > arrows on the 7-day strip in /safety +
+  /quality date-picker committed a single-day selection instead of
+  sliding the visible window. Fix: extend DatePicker with an
+  `inline` prop. When set: skip the strip entirely, render the
+  month grid + month-nav header inline (not modal), arrows nav
+  months without committing, cell click commits. Timeline page
+  unchanged — keeps its original strip + modal flow.
+
+- **Sprint 6.6.2 · /safety KPI Closed/Open swap** ✅ done
+
+  Reorder of the open/closed StatCard. Closed reads first
+  (desirable end-state), open second. Tone still keys on
+  `totals.open` so colour semantics unchanged.
+
+- **Sprint 6.6.3 · Inline photo carousel** ✅ done
+
+  Eliminates the round-trip to /timeline that users hit when they
+  want to see "what does this flag actually look like." Three
+  pieces: (a) compliance-aggregator surfaces `related_photos` on
+  topic_flag + topic_quality rows; (b) PhotoGrid gains
+  `variant='carousel'` (flex + scroll-snap, default 2 cells
+  visible at right-panel widths, 4:3 aspect-ratio thumbs);
+  (c) safety + quality right panels render <PhotoGrid
+  variant='carousel'> below field rows when present. Report-level
+  rows (observation, qc_item) skip — no specific topic to lift
+  photos from.
+
+- **Sprint 6.6.4 · Deep-link to topic + focus mode + flash** ✅ done
+
+  "Open source report" now appends `&topic=N`, timeline reads it
+  and force-opens just the target topic (others auto-collapse =
+  focus mode), scrolls the topic into view, runs a 3-pulse accent
+  flash. TopicCard gained `highlight` and made `defaultOpen`
+  reactive to prop changes (was: read once at mount); also wrapped
+  in a transparent <div> for ref / scrollIntoView since L4 Card
+  doesn't forwardRef. New @keyframes `fs-topic-card-flash`
+  (1800ms, ease-out, accent-100 pulse). prefers-reduced-motion
+  fallback: animation:none + steady accent background — affordance
+  preserved.
+
+  Sprint 6 audit note: Sprint 6.0–6.5 was 0 new @keyframes; 6.6.4
+  adds 1. Acceptable — explicit user-requested UX with motion
+  fallback in place.
+
+### Sprint 6.7 polish round (post-6.6 verification feedback)
+
+After the 6.6 round shipped, user identified two more refinements:
+
+- **Sprint 6.7.1 · Action checkbox sync (middle ↔ right)** ✅ done
+
+  Bug: same action_item rendered twice on /timeline (middle
+  TopicCard + right OverviewTab) didn't sync — toggling one didn't
+  strike-through the other. Each ActionItemRow held its own local
+  React state seeded from a parent state slot that never crossed
+  the middle/right boundary.
+
+  Fix: tiny pub/sub bus. New `scripts/api/actions-bus.js` (~30
+  LoC) exposes `window.FS.actionsBus.{ emit, subscribe }`. No
+  React context, no AppShell prop drilling. ActionItemRow:
+  (a) syncs local state when `initialChecked` prop changes
+  (skipped while pendingRef set, so no clobber of in-flight
+  optimistic updates), (b) subscribes to bus, on matching key
+  syncs to server-truth payload, (c) emits on toggleAction
+  success. timeline.js MiddleColumn + RightDetail both subscribe
+  to mirror events into their own state slots so subsequent
+  re-mounts see fresh data.
+
+- **Sprint 6.7.2 · Precision spotlight — flag-level highlight** ✅ done
+
+  Refines 6.6.4: when /safety opens a `topic_flag` row, the
+  spotlight now lands on the exact flag inside that topic's
+  `safety_flags[]` (not the whole topic card). Solves "topic has
+  3 flags, which one was I looking at?" ambiguity.
+
+  Five-piece change: SafetyFlagRow gains `highlight` prop with
+  the same scrollIntoView + flash treatment; TopicCard gains
+  `flagHighlight` (number index) prop that drills into one
+  SafetyFlagRow; CSS adds `.fs-safety-flag-row--flash` selector
+  to the existing 6.6.4 keyframes (no new keyframes); timeline.js
+  parses `&flag=<idx>` from URL; safety.js extracts flag idx from
+  `sel.id` via `/_flag_(\d+)$/` regex (verified against all 6 row
+  id shapes — only topic_flag matches). Topic-quality +
+  observation + qc_item keep 6.6.4 / no-anchor behaviour.
+
+### Critical files
+
+| Path | Role | Status |
+|---|---|---|
+| `scripts/api/compliance-aggregator.js` | Cross-day fan-out for safety + quality | NEW (6.0) |
+| `scripts/pages/safety.js` | Provider + Middle + Right | NEW (6.1, 6.2) |
+| `scripts/pages/quality.js` | Provider + Middle + Right | NEW (6.3, 6.4) |
+| `app-shell-preview.html` | Script tag registrations + cache-buster bumps | MODIFIED each sub-sprint |
+| `styles/composites.css` | New `.fs-safety-*` and `.fs-quality-*` blocks | MODIFIED |
+| `scripts/api/tasks-aggregator.js` | Reference pattern | READ-ONLY |
+| `scripts/composites/{category-badge,safety-flag-row,kpi-strip,stat-card,card,badge,date-picker}.js` | All reused as-is | READ-ONLY |
+| `scripts/api/{timeline,dates}.js` | Underlying fetchers | READ-ONLY |
+
+### Deferred to Sprint 7+
+
+| Item | Why deferred |
+|---|---|
+| `/team` (read-only directory) | Narrower audience (gm + director only via `user:manage`) |
+| `/settings` (full prefs + theme + density) | Pairs naturally with dark-mode work |
+| Safety/quality write actions (raise flag, mark resolved) | No backend `POST /api/safety` exists; mock-only-mutation lesson from Sprint 5 |
+| Trend/heatmap views (flags-per-site over time) | Needs >7 day fixture data; revisit when backend lands |
+| Vocabulary-aware tagging (Q-2 backend) | Already in §Q-2; not blocking Sprint 6 |
+
 ## Sprint 4+ — Open product questions
 
 Surfaced during the second-pass review of merged main. These aren't

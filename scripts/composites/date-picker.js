@@ -259,6 +259,48 @@
       });
     }
 
+    /* Inline mode (Sprint 6.6.1) — skips the 7-day strip and renders
+       just the month grid + month-nav header inline, not as a modal.
+       Used by /safety and /quality where the goal is "browse and pick"
+       (commit only on cell click). The default mode keeps timeline.js's
+       "step-through" UX (strip arrows shift AND commit by ±1 day). */
+    if (props.inline) {
+      return React.createElement('div', {
+        className: 'fs-date-picker fs-date-picker--inline',
+      },
+        React.createElement('div', { className: 'fs-date-picker__inline-header' },
+          React.createElement('button', {
+            type: 'button', onClick: function () { shiftMonth(-1); },
+            className: 'fs-date-picker__month-nav',
+            'aria-label': 'Previous month',
+          }, '‹'),
+          React.createElement('div', { className: 'fs-date-picker__month-label' },
+            MONTH_NAMES[month.month0] + ' ' + month.year),
+          React.createElement('button', {
+            type: 'button', onClick: function () { shiftMonth(1); },
+            className: 'fs-date-picker__month-nav',
+            'aria-label': 'Next month',
+          }, '›'),
+        ),
+        React.createElement(MonthGrid, {
+          date:     date,
+          month:    month,
+          dates:    datesS.map,
+          onSelect: function (iso) { props.onChange(iso); },
+        }),
+        React.createElement('div', { className: 'fs-date-picker__legend' },
+          React.createElement('span', null,
+            React.createElement('span', { className: 'fs-date-picker__cell-dot fs-date-picker__cell-dot--i1' }), ' light'),
+          React.createElement('span', null,
+            React.createElement('span', { className: 'fs-date-picker__cell-dot fs-date-picker__cell-dot--i2' }), ' busy'),
+          React.createElement('span', null,
+            React.createElement('span', { className: 'fs-date-picker__cell-dot fs-date-picker__cell-dot--i3' }), ' heavy'),
+          React.createElement('span', null,
+            React.createElement('span', { className: 'fs-date-picker__cell-dot fs-date-picker__cell-dot--safety' }), ' safety'),
+        ),
+      );
+    }
+
     return React.createElement('div', { className: 'fs-date-picker' },
       React.createElement(DateStrip, {
         date:  date,

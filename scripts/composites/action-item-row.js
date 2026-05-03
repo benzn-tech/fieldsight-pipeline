@@ -49,6 +49,32 @@
 
     var pendingRef  = React.useRef(false);
 
+    /* Sprint 6.7.1 — sync local checked state when initialChecked
+       prop changes (e.g., parent state was updated by a sibling
+       ActionItemRow's toggle). Skip while a request is in flight to
+       avoid clobbering an optimistic update. */
+    React.useEffect(function () {
+      if (pendingRef.current) return;
+      setChecked(!!props.initialChecked);
+    }, [props.initialChecked]);
+
+    /* Sprint 6.7.1 — listen for cross-component toggles via the bus.
+       When ANOTHER ActionItemRow with the same key successfully
+       toggles, sync our state to match. The bus emits server-truth
+       (post-API success) so this also corrects any drift. */
+    React.useEffect(function () {
+      var bus = window.FS && window.FS.actionsBus;
+      if (!bus) return undefined;
+      var myKey = date + '|' + topicId + '_' + actionIndex;
+      return bus.subscribe(function (payload) {
+        if (!payload) return;
+        var theirKey = payload.date + '|' + payload.topic_id + '_' + payload.action_index;
+        if (theirKey !== myKey) return;
+        if (pendingRef.current) return;
+        setChecked(!!payload.checked);
+      });
+    }, [date, topicId, actionIndex]);
+
     function onChange(e) {
       if (pendingRef.current) return;
       var next = !!e.target.checked;
@@ -65,8 +91,21 @@
         action_text:  action.action,
       }) : Promise.resolve();
 
-      p.then(function () {
+      p.then(function (res) {
         pendingRef.current = false;
+        /* Sprint 6.7.1 — broadcast server truth so sibling
+           ActionItemRows + parent state slots can sync. */
+        var bus = window.FS && window.FS.actionsBus;
+        if (bus) {
+          bus.emit({
+            date:         date,
+            topic_id:     topicId,
+            action_index: actionIndex,
+            checked:      next,
+            checked_by:   (res && res.checked_by) || null,
+            checked_at:   (res && res.checked_at) || null,
+          });
+        }
         if (props.onToggled) props.onToggled({ checked: next });
       }).catch(function (err) {
         console.error('[ActionItemRow] toggle failed, reverting', err);

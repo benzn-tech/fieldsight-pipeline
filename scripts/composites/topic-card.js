@@ -22,6 +22,17 @@
      defaultOpen   boolean
      onSelect      (topic) => void  — open in right detail
      selected      boolean — applies a selected style to the card
+     highlight     boolean — Sprint 6.6.4 deep-link spotlight. When set,
+                   the card scrolls itself into view on mount and runs
+                   a 3-pulse background flash (via .fs-topic-card--flash
+                   class). Respects prefers-reduced-motion. Toggling
+                   from false→true also re-triggers the flash.
+     flagHighlight number — Sprint 6.7.2 precision spotlight. When set,
+                   the SafetyFlagRow at this index inside this topic's
+                   safety_flags[] gets highlight=true (its own
+                   scrollIntoView + flash). Used together with
+                   highlight=true so the topic auto-opens AND the
+                   specific flag draws focus.
 
    Exported to:
      window.FieldSight.TopicCard
@@ -52,6 +63,40 @@
     var open    = ref[0];
     var setOpen = ref[1];
 
+    /* Sprint 6.6.4 — highlight handling. rootRef points at the Card's
+       outer div; when highlight goes truthy we (a) scroll into view
+       and (b) toggle a .fs-topic-card--flash class for the duration
+       of the keyframe animation, then strip it. The duration matches
+       the @keyframes (~1800ms for 3 pulses). */
+    var rootRef = React.useRef(null);
+    var refFlash = React.useState(false);
+    var flashing    = refFlash[0];
+    var setFlashing = refFlash[1];
+
+    React.useEffect(function () {
+      if (!props.highlight) return undefined;
+      var node = rootRef.current;
+      if (node && typeof node.scrollIntoView === 'function') {
+        node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+      setFlashing(true);
+      var t = setTimeout(function () { setFlashing(false); }, 1900);
+      return function () { clearTimeout(t); };
+    }, [props.highlight]);
+
+    /* Sprint 6.6.4 — sync open state with defaultOpen when the prop is
+       a definite boolean (used by the deep-link focus mode). When
+       defaultOpen is undefined (no deep link active), this effect is
+       skipped and the user is free to toggle individual topics with
+       the chevron. The effect fires only when the prop value changes,
+       not on every render — so collapsing a focused topic stays
+       collapsed until a fresh deep-link arrives. */
+    React.useEffect(function () {
+      if (typeof props.defaultOpen === 'boolean') {
+        setOpen(props.defaultOpen);
+      }
+    }, [props.defaultOpen]);
+
     function toggle(e) {
       if (e) e.stopPropagation();
       setOpen(function (o) { return !o; });
@@ -76,9 +121,17 @@
 
     var className = 'fs-topic-card'
       + (open ? ' fs-topic-card--open' : '')
-      + (props.selected ? ' fs-topic-card--selected' : '');
+      + (props.selected ? ' fs-topic-card--selected' : '')
+      + (flashing ? ' fs-topic-card--flash' : '');
 
-    return React.createElement(Card, {
+    /* Wrap in a div so we can attach rootRef without depending on the
+       Layer 4 Card atom forwarding refs. The wrapper inherits no
+       styling — it's a transparent shell purely for scrollIntoView
+       targetting (Sprint 6.6.4). */
+    return React.createElement('div', {
+      ref:       rootRef,
+      className: 'fs-topic-card-wrap',
+    }, React.createElement(Card, {
       padding:   'none',
       className: className,
     },
@@ -186,8 +239,14 @@
               }, 'Safety flags'),
               React.createElement('div', { className: 'fs-topic-card__flags' },
                 flags.map(function (f, i) {
+                  /* Sprint 6.7.2 — flag-level highlight. When the
+                     enclosing TopicCard receives flagHighlight=N,
+                     pass highlight=true to the matching SafetyFlagRow
+                     so the precision spotlight lands on one flag,
+                     not the whole topic. */
                   return React.createElement(SafetyFlagRow, {
                     key: i, flag: f, dense: true,
+                    highlight: props.flagHighlight === i,
                   });
                 }),
               ),
@@ -208,7 +267,7 @@
           : null,
 
       ) : null,
-    );
+    ));
   }
 
   if (!window.FieldSight) window.FieldSight = {};

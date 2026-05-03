@@ -63,16 +63,16 @@
   <!-- Sprint 2.2 (Phase B) Timeline composites -->
   <script type="text/babel" src="scripts/composites/category-badge.js?v=1"></script>
   <script type="text/babel" src="scripts/composites/executive-summary-card.js?v=1"></script>
-  <script type="text/babel" src="scripts/composites/safety-flag-row.js?v=1"></script>
-  <script type="text/babel" src="scripts/composites/action-item-row.js?v=1"></script>
-  <script type="text/babel" src="scripts/composites/topic-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/safety-flag-row.js?v=2"></script>
+  <script type="text/babel" src="scripts/composites/action-item-row.js?v=2"></script>
+  <script type="text/babel" src="scripts/composites/topic-card.js?v=3"></script>
   <!-- Sprint 2.3 (Phase C) Topic-detail media composites -->
-  <script type="text/babel" src="scripts/composites/photo-grid.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/photo-grid.js?v=2"></script>
   <script type="text/babel" src="scripts/composites/transcript-list.js?v=1"></script>
   <script type="text/babel" src="scripts/composites/audio-playlist.js?v=1"></script>
   <script type="text/babel" src="scripts/composites/video-player.js?v=1"></script>
   <!-- Sprint 2.5 (Phase E) Calendar/date picker -->
-  <script type="text/babel" src="scripts/composites/date-picker.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/date-picker.js?v=2"></script>
   <!-- Sprint 2.7 (Phase G) Ask Agent chat strip -->
   <script type="text/babel" src="scripts/composites/ask-chat.js?v=1"></script>
   <!-- Sprint 2.8 (Phase H) Meeting Minutes -->
@@ -132,6 +132,8 @@
   <script src="scripts/api/audio.js?v=1"></script>
   <script src="scripts/api/video.js?v=1"></script>
   <script src="scripts/api/actions.js?v=1"></script>
+  <!-- Sprint 6.7.1 — actions cross-component sync bus -->
+  <script src="scripts/api/actions-bus.js?v=1"></script>
   <script src="scripts/api/ask.js?v=1"></script>
   <script src="scripts/api/reports.js?v=1"></script>
   <script src="scripts/api/media.js?v=1"></script>
@@ -140,6 +142,8 @@
   <script src="scripts/api/today-adapter.js?v=3"></script>
   <!-- Sprint 4.2 — Tasks aggregator (cross-day join: timeline + actions) -->
   <script src="scripts/api/tasks-aggregator.js?v=1"></script>
+  <!-- Sprint 6.0 — Compliance aggregator (cross-day fan-out for /safety + /quality) -->
+  <script src="scripts/api/compliance-aggregator.js?v=2"></script>
   <!-- Sprint 4.4 — Programme api -->
   <script src="scripts/api/programme.js?v=1"></script>
   <!-- Sprint 5.6 — Cascade + CPM engine (pure module, node-importable) -->
@@ -155,13 +159,15 @@
   <script type="text/babel" src="scripts/mock-data.js?v=4"></script>
   <script type="text/babel" src="scripts/pages/_page-registry.js?v=1"></script>
   <script type="text/babel" src="scripts/pages/today.js?v=12"></script>
-  <script type="text/babel" src="scripts/pages/timeline.js?v=10"></script>
+  <script type="text/babel" src="scripts/pages/timeline.js?v=13"></script>
   <script type="text/babel" src="scripts/pages/reports.js?v=2"></script>
   <script type="text/babel" src="scripts/pages/sites.js?v=1"></script>
   <script type="text/babel" src="scripts/pages/activity.js?v=2"></script>
   <script type="text/babel" src="scripts/pages/tasks.js?v=2"></script>
   <script type="text/babel" src="scripts/pages/evidence.js?v=1"></script>
   <script type="text/babel" src="scripts/pages/programme.js?v=12"></script>
+  <script type="text/babel" src="scripts/pages/safety.js?v=7"></script>
+  <script type="text/babel" src="scripts/pages/quality.js?v=4"></script>
 
   <script type="text/babel" src="scripts/dev-role-switcher.js?v=4"></script>
   <script type="text/babel" src="scripts/app-shell.js?v=9"></script>

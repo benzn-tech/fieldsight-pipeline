@@ -30,6 +30,12 @@
     var photos   = props.photos || [];
     var userName = props.userDisplayName;
     var date     = props.date;
+    /* Sprint 6.6.3 — variant='carousel' switches the layout to a
+       horizontal-scrolling row (default 2 cells visible, swipe/scroll
+       for more). Used by /safety + /quality right panels where we
+       embed photos inline as supporting context. variant='grid'
+       (default) keeps the classic auto-fill grid used by topic-card. */
+    var variant = props.variant === 'carousel' ? 'carousel' : 'grid';
 
     var refLight = React.useState(null);
     var lightbox    = refLight[0];
@@ -41,7 +47,9 @@
     }
 
     return React.createElement(React.Fragment, null,
-      React.createElement('div', { className: 'fs-photo-grid' },
+      React.createElement('div', {
+        className: 'fs-photo-grid fs-photo-grid--' + variant,
+      },
         photos.map(function (filename, i) {
           var s3Key = window.FS.api.media.photoKey({
             userDisplayName: userName, date: date, filename: filename,

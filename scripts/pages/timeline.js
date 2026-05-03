@@ -217,6 +217,24 @@
       });
     }, []);
 
+    /* Sprint 6.6.4 — deep-link target topic. When /safety or /quality
+       launches into /timeline?topic=N, we auto-open + flash that
+       topic; all other topics auto-collapse (focus mode). Parsed
+       once per params change so navigating again resets the focus. */
+    var targetTopicId = params.topic != null && params.topic !== ''
+      ? parseInt(params.topic, 10)
+      : null;
+    if (targetTopicId !== null && isNaN(targetTopicId)) targetTopicId = null;
+
+    /* Sprint 6.7.2 — deeper precision: when /safety includes
+       &flag=<idx>, highlight that specific safety_flag inside the
+       target topic (not the whole topic card). null = whole-topic
+       flash from 6.6.4. */
+    var targetFlagIdx = params.flag != null && params.flag !== ''
+      ? parseInt(params.flag, 10)
+      : null;
+    if (targetFlagIdx !== null && isNaN(targetFlagIdx)) targetFlagIdx = null;
+
     /* Resolve effective (date, user) honouring worker-forced-self rule. */
     var caller = (window.AuthMock && window.AuthMock.currentUser) || {};
     var date   = params.date;            /* may be undefined → bootstrap resolves */
@@ -320,6 +338,61 @@
       });
       return function () { cancelled = true; };
     }, [date, user]);
+
+    /* Sprint 6.7.1 — keep state.actions in sync with cross-component
+       toggles (the right-detail OverviewTab also renders the same
+       action_items via its own ActionItemRow instances). When any
+       sibling fires a successful toggle, mirror it into our local
+       actions map so re-renders here see the new check state. */
+    React.useEffect(function () {
+      var bus = window.FS && window.FS.actionsBus;
+      if (!bus) return undefined;
+      return bus.subscribe(function (payload) {
+        if (!payload || payload.date !== date) return;
+        setState(function (s) {
+          if (s.status !== 'ok') return s;
+          var key = payload.topic_id + '_' + payload.action_index;
+          var nextActions = Object.assign({}, s.actions || {});
+          nextActions[key] = {
+            checked:    !!payload.checked,
+            checked_by: payload.checked_by,
+            checked_at: payload.checked_at,
+          };
+          return Object.assign({}, s, { actions: nextActions });
+        });
+      });
+    }, [date]);
+
+    /* Sprint 6.6.4 — auto-select the deep-linked topic once per
+       (date, topicId) pair. Fires after the report loads; finds the
+       matching topic, asks the AppShell to open the right panel via
+       props.onSelect. We track via ref so subsequent re-renders or
+       state churn don't re-trigger. The ref resets when the target
+       topic id changes (user clicked a different deep-link). */
+    var autoSelectKeyRef = React.useRef(null);
+    React.useEffect(function () {
+      if (state.status !== 'ok' || targetTopicId === null) return;
+      var report = state.report;
+      if (!report || report._notFound || report.available_users) return;
+      var key = date + '|' + targetTopicId;
+      if (autoSelectKeyRef.current === key) return;
+      var topic = (report.topics || []).filter(function (t) {
+        return t.topic_id === targetTopicId;
+      })[0];
+      if (!topic) return;
+      autoSelectKeyRef.current = key;
+      if (props.onSelect) {
+        props.onSelect({
+          kind:      'topic',
+          id:        'topic_' + topic.topic_id,
+          topic_id:  topic.topic_id,
+          topic:     topic,
+          date:      date,
+          user:      user,
+          user_name: report.user_name,
+        });
+      }
+    }, [state.status, targetTopicId, date]);
 
     /* Loading */
     if (state.status === 'loading') {
@@ -492,12 +565,28 @@
         'Topics'),
       React.createElement('div', { className: 'fs-timeline-page__topics' },
         (report.topics || []).map(function (topic) {
+          /* Sprint 6.6.4 — focus mode + flash. When a deep-link target
+             is set, the matching topic auto-opens (via defaultOpen
+             boolean) and gets highlight=true (scrollIntoView + 3-pulse
+             flash). Other topics force-collapse (defaultOpen=false)
+             so the target reads as the focal point. When no target,
+             defaultOpen=undefined leaves user-toggled state alone. */
+          var isTarget = targetTopicId !== null && topic.topic_id === targetTopicId;
+          var defaultOpenProp = targetTopicId === null
+            ? undefined
+            : isTarget;
           return React.createElement(TopicCard, {
             key:         topic.topic_id,
             topic:       topic,
             date:        date,
             actionState: actionState,
             selected:    selectedTopicId === topic.topic_id,
+            defaultOpen: defaultOpenProp,
+            highlight:   isTarget,
+            /* Sprint 6.7.2 — only the matched topic gets a flagHighlight;
+               others ignore. When targetFlagIdx is null, the topic-level
+               flash from 6.6.4 owns the spotlight. */
+            flagHighlight: isTarget ? targetFlagIdx : null,
             onSelect:    function () {
               if (props.onSelect) {
                 props.onSelect({
@@ -752,6 +841,30 @@
         if (!cancelled) setActions(res.actions || {});
       });
       return function () { cancelled = true; };
+    }, [isDaily, sel && sel.date]);
+
+    /* Sprint 6.7.1 — same bus subscription as MiddleColumn but for
+       this right-detail's action map. Keeps the OverviewTab's
+       ActionItemRows synced when the user toggles in the middle
+       column. */
+    React.useEffect(function () {
+      if (!isDaily || !sel || !sel.date) return undefined;
+      var bus = window.FS && window.FS.actionsBus;
+      if (!bus) return undefined;
+      var myDate = sel.date;
+      return bus.subscribe(function (payload) {
+        if (!payload || payload.date !== myDate) return;
+        setActions(function (cur) {
+          var key = payload.topic_id + '_' + payload.action_index;
+          var next = Object.assign({}, cur || {});
+          next[key] = {
+            checked:    !!payload.checked,
+            checked_by: payload.checked_by,
+            checked_at: payload.checked_at,
+          };
+          return next;
+        });
+      });
     }, [isDaily, sel && sel.date]);
 
     /* Reset to overview tab whenever a new topic is selected. */
