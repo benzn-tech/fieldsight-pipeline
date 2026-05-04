@@ -118,7 +118,12 @@
     var retryCount = retryRef[0];
     var setRetry   = retryRef[1];
 
-    var refView   = React.useState('gantt');
+    /* Sprint 8.4.2 — default to Board on mobile (Gantt needs width to breathe).
+       We check once at mount; user can still switch to Gantt via the toggle. */
+    var isMobileInit = typeof window !== 'undefined' && window.matchMedia
+      ? window.matchMedia('(max-width: 47.9375rem)').matches
+      : false;
+    var refView   = React.useState(isMobileInit ? 'todo' : 'gantt');
     var view      = refView[0];
     var setView   = refView[1];
 
@@ -645,6 +650,9 @@
                 onDragStart:    r.kind === 'leaf' ? dragStart : null,
                 onDragMove:     r.kind === 'leaf' ? dragMove  : null,
                 onDragEnd:      r.kind === 'leaf' ? dragEnd   : null,
+                /* Sprint 8.5.5 — keyboard move commits directly via updateTask */
+                onKeyboardMove: r.kind === 'leaf' ? function (opts) { ctx.updateTask(opts); } : null,
+                programmeDurationDays: diffDays(prog.start_date, prog.end_date) + 1,
                 /* Sprint 8.3.1 — float */
                 showFloat:  ctx.showFloat && r.kind === 'leaf',
                 floatDays:  ctx.showFloat && r.kind === 'leaf'

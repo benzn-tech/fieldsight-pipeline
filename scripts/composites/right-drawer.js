@@ -39,14 +39,51 @@
     var sel      = props.selectedItem;
     var onClose  = props.onClose || function () {};
 
-    /* ESC handler — only listen while open so we don't intercept
-       Escape on other pages. */
+    var drawerRef   = React.useRef(null);
+    var triggerRef  = React.useRef(null);
+
+    /* Sprint 8.5.2 — focus management: move focus into drawer on open,
+       return focus to trigger on close. */
+    React.useEffect(function () {
+      if (open) {
+        triggerRef.current = document.activeElement;
+        var drawer = drawerRef.current;
+        if (drawer) {
+          var focusable = drawer.querySelector(
+            'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+          );
+          if (focusable) focusable.focus();
+          else drawer.focus();
+        }
+      } else {
+        var trigger = triggerRef.current;
+        if (trigger && typeof trigger.focus === 'function') trigger.focus();
+      }
+    }, [open]);
+
+    /* Sprint 8.5.2 — keyboard: ESC closes, Tab trapped inside drawer while open. */
     React.useEffect(function () {
       if (!open) return undefined;
       function onKey(e) {
         if (e.key === 'Escape') {
           e.stopPropagation();
           onClose();
+          return;
+        }
+        if (e.key !== 'Tab') return;
+        var drawer = drawerRef.current;
+        if (!drawer) return;
+        var focusables = Array.prototype.slice.call(drawer.querySelectorAll(
+          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), ' +
+          'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        ));
+        if (!focusables.length) return;
+        var first = focusables[0];
+        var last  = focusables[focusables.length - 1];
+        if (e.shiftKey) {
+          if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+        } else {
+          if (document.activeElement === last) { e.preventDefault(); first.focus(); }
         }
       }
       window.addEventListener('keydown', onKey);
@@ -62,13 +99,16 @@
       React.createElement('div', {
         className: 'fs-right-drawer__backdrop' + (open ? ' fs-right-drawer__backdrop--open' : ''),
         onClick:   onClose,
-        'aria-hidden': !open,
+        'aria-hidden': true,
       }),
       React.createElement('aside', {
+        ref:          drawerRef,
         className:    'fs-right-drawer' + (open ? ' fs-right-drawer--open' : ''),
-        role:         'complementary',
+        role:         'dialog',
+        'aria-modal': true,
         'aria-label': 'Detail panel',
         'aria-hidden': !open,
+        tabIndex:     -1,
       },
         Right
           ? React.createElement(Right, {

@@ -180,6 +180,56 @@
       if (props.onSelect) props.onSelect(t);
     }
 
+    /* Sprint 8.5.5 — keyboard operability for Gantt bar.
+       ArrowLeft/Right: shift whole task by 1 day (move mode).
+       Shift+ArrowLeft/Right: extend/shrink end date by 1 day.
+       Enter/Space: select the task (opens editor in parent). */
+    function onBarKeyDown(e) {
+      if (!draggable) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          if (props.onSelect) props.onSelect(t);
+        }
+        return;
+      }
+      var handled = false;
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault();
+        handled = true;
+        var delta = e.key === 'ArrowLeft' ? -1 : 1;
+        var api   = window.FS && window.FS.api;
+        if (!api) return;
+        if (e.shiftKey) {
+          /* Extend/shrink end date */
+          var newEnd = api.addDaysISO(effEnd, delta);
+          if (newEnd >= effStart && onDragStart && onDragEnd) {
+            onDragStart(t, 'resize-end', 0);
+            /* Commit directly via updateTask if available on context */
+            if (props.onKeyboardMove) {
+              props.onKeyboardMove({ task_id: t.task_id, start: effStart, end: newEnd });
+            }
+            onDragEnd();
+          }
+        } else {
+          /* Move whole task */
+          var ns = api.addDaysISO(effStart, delta);
+          var ne = api.addDaysISO(effEnd,   delta);
+          if (props.onKeyboardMove) {
+            props.onKeyboardMove({ task_id: t.task_id, start: ns, end: ne });
+          }
+        }
+      }
+      if (!handled && (e.key === 'Enter' || e.key === ' ')) {
+        e.preventDefault();
+        if (props.onSelect) props.onSelect(t);
+      }
+    }
+
+    /* Sprint 8.5.5 — aria-value bounds: days from programme start */
+    var ariaMin   = 0;
+    var ariaMax   = props.programmeDurationDays || 365;
+    var ariaStart = Math.max(0, diffDays(origin, effStart));
+
     return React.createElement('div', {
       className: 'fs-gantt-row',
     },
@@ -191,9 +241,18 @@
         className:    barClass,
         style:        { left: startOffset + 'px', width: width + 'px' },
         title:        t.name + '  (' + effStart + ' → ' + effEnd + ')'
-                       + (draggable ? '  · drag to reschedule' : ''),
+                       + (draggable ? '  · drag or use arrow keys to reschedule' : ''),
+        /* Sprint 8.5.5 — keyboard accessibility */
+        tabIndex:     isGroup ? -1 : 0,
+        role:         isGroup ? undefined : 'slider',
+        'aria-label': t.name + ', ' + effStart + ' to ' + effEnd,
+        'aria-valuemin':  ariaMin,
+        'aria-valuemax':  ariaMax,
+        'aria-valuenow':  ariaStart,
+        'aria-valuetext': effStart + ' to ' + effEnd,
         onPointerDown: onPointerDown,
         onClick:       onBarClick,
+        onKeyDown:     onBarKeyDown,
       },
         progress > 0 && !isGroup ? React.createElement('div', {
           className: 'fs-gantt-bar__progress',

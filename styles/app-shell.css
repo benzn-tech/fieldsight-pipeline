@@ -427,3 +427,229 @@ button:not([class*="fs-"]):focus-visible,
   background: var(--surface-tooltip);
   color: var(--text-primary);
 }
+
+/* =========================================================================
+   Sprint 8.5.3 — Skip-navigation link
+   ========================================================================= */
+
+.fs-skip-nav {
+  position: absolute;
+  top: -9999px;
+  left: 0;
+  z-index: var(--z-max);
+  padding: 8px 16px;
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  border: 2px solid var(--focus-ring-color);
+  border-radius: var(--radius-md);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.fs-skip-nav:focus {
+  top: 8px;
+  left: 8px;
+}
+
+/* =========================================================================
+   Sprint 8.5.4 — Live-region announcer (visually hidden)
+   ========================================================================= */
+
+.fs-live-region {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* =========================================================================
+   Sprint 8.4.1 — Bottom navigation bar (mobile ≤ 767px)
+   ========================================================================= */
+
+.fs-bottom-nav {
+  display: none; /* shown only on mobile via media query below */
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 56px;
+  background: var(--surface-sidebar);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  z-index: var(--z-fixed);
+  flex-direction: row;
+  align-items: stretch;
+  padding-bottom: env(safe-area-inset-bottom, 0);
+}
+
+.fs-bottom-nav__item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.55);
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-weight: var(--font-weight-medium);
+  padding: 6px 4px;
+  -webkit-tap-highlight-color: transparent;
+  transition: color 100ms ease-out;
+  position: relative;
+}
+.fs-bottom-nav__item--active {
+  color: var(--color-accent-500);
+}
+.fs-bottom-nav__item--active::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 24px;
+  height: 2px;
+  background: var(--color-accent-500);
+  border-radius: 2px 2px 0 0;
+}
+.fs-bottom-nav__item:focus-visible {
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: -2px;
+}
+
+/* More-sheet (slide-up drawer listing remaining nav items) */
+.fs-bottom-nav__more-sheet {
+  position: fixed;
+  bottom: 56px;
+  left: 0;
+  right: 0;
+  background: var(--surface-sidebar);
+  border-top: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+  z-index: calc(var(--z-fixed) + 1);
+  padding: 16px 0 env(safe-area-inset-bottom, 0);
+  transform: translateY(100%);
+  transition: transform 260ms cubic-bezier(0.16, 1, 0.3, 1);
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.fs-bottom-nav__more-sheet--open {
+  transform: translateY(0);
+}
+.fs-bottom-nav__more-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--surface-overlay);
+  z-index: var(--z-fixed);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 220ms ease-out;
+}
+.fs-bottom-nav__more-sheet-backdrop--open {
+  opacity: 1;
+  pointer-events: auto;
+}
+.fs-bottom-nav__more-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 20px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.75);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-medium);
+  text-align: left;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 100ms ease-out, color 100ms ease-out;
+  min-height: var(--touch-target-default);
+}
+.fs-bottom-nav__more-item--active {
+  color: var(--color-accent-500);
+  background: rgba(255, 107, 53, 0.10);
+}
+.fs-bottom-nav__more-item:hover,
+.fs-bottom-nav__more-item:focus-visible {
+  background: var(--surface-sidebar-hover);
+  color: var(--color-neutral-0);
+}
+
+/* Back button inside mobile right-detail panel */
+.fs-mobile-back {
+  display: none; /* only visible on mobile */
+  align-items: center;
+  gap: 8px;
+  height: 48px;
+  padding: 0 16px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-accent-500);
+  width: 100%;
+  text-align: left;
+  flex-shrink: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fs-bottom-nav__more-sheet,
+  .fs-bottom-nav__more-sheet-backdrop {
+    transition: none;
+  }
+}
+
+/* =========================================================================
+   Sprint 8.4.1 — Mobile layout overrides (≤ 767px)
+   ========================================================================= */
+
+@media (max-width: 47.9375rem) {  /* 767px */
+  /* Hide desktop left nav entirely on mobile */
+  .left-nav { display: none !important; }
+
+  /* Show bottom nav */
+  .fs-bottom-nav { display: flex; }
+
+  /* Middle column fills full viewport height minus bottom nav */
+  .middle-column {
+    padding-bottom: 56px;
+  }
+
+  /* Mobile right-detail: full-screen slide-over */
+  .app-shell:not(.has-selection) .right-detail { display: none; }
+  .app-shell.has-selection .middle-column       { display: none; }
+  .app-shell.has-selection .right-detail {
+    display: flex;
+    flex-direction: column;
+    position: fixed;
+    inset: 0;
+    bottom: 56px;
+    z-index: calc(var(--z-fixed) - 1);
+    overflow-y: auto;
+    background: var(--surface-app);
+  }
+
+  /* Show back button inside right-detail on mobile */
+  .fs-mobile-back { display: flex; }
+
+  /* Right drawer (full-width pages like /programme) also gets back button */
+  .fs-right-drawer {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  /* Resize handle invisible on mobile */
+  .resize-handle { display: none; }
+}

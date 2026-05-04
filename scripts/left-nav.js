@@ -170,7 +170,8 @@ function SectionLabel({ label, isCollapsed }) {
       fontWeight: 600,
       letterSpacing: '0.08em',
       textTransform: 'uppercase',
-      color: 'rgba(255,255,255,0.35)',
+      /* Sprint 8.5.1 — bumped from 0.35 to 0.52 to meet WCAG 4.5:1 on sidebar */
+      color: 'rgba(255,255,255,0.52)',
     },
   }, label);
 }
@@ -190,13 +191,14 @@ function SubgroupLabel({ label, isCollapsed }) {
     style: {
       /* Same horizontal as SectionLabel so it sits flush with WORKSPACE etc.
          Smaller font + uppercase + lower opacity make it visually
-         subordinate; sub-items further indent via NavItem.isSubItem. */
+         subordinate; sub-items further indent via NavItem.isSubItem.
+         Sprint 8.5.1 — bumped from 0.28 to 0.48 for WCAG 4.5:1 on sidebar */
       padding: '12px 20px 4px',
       fontSize: '9px',
       fontWeight: 600,
       letterSpacing: '0.10em',
       textTransform: 'uppercase',
-      color: 'rgba(255,255,255,0.28)',
+      color: 'rgba(255,255,255,0.48)',
     },
   }, label);
 }

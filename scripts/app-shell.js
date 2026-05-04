@@ -14,6 +14,119 @@ const STORAGE_KEYS = {
 
 const MIDDLE_WIDTH_DEFAULT = 320;
 
+/* ---------- Mobile bottom-nav item icons (mirrors NAV_ICONS in left-nav.js) */
+const NAV_ICONS_BOTTOM = {
+  today:     'calendar-check',
+  timeline:  'gantt-chart',
+  tasks:     'check-square',
+  safety:    'shield-alert',
+  programme: 'gantt-chart',
+  quality:   'badge-check',
+  evidence:  'folder-open',
+  reports:   'file-text',
+  sites:     'map-pin',
+  team:      'users',
+  activity:  'activity',
+  settings:  'settings',
+  portfolio: 'layout-dashboard',
+  regional:  'map',
+  executive: 'briefcase',
+};
+
+/* ---------- BottomNav (mobile only — rendered by AppShell) -------------- */
+/* Top 5 visible nav items shown as tabs; remainder accessible via More drawer. */
+function BottomNav({ user, currentRoute, onNavigate }) {
+  const NavIcon   = window.FieldSight && window.FieldSight.NavIcon;
+  const [moreOpen, setMoreOpen] = React.useState(false);
+
+  const visibleItems = (window.FS.getVisibleNavItems ? window.FS.getVisibleNavItems(user) : [])
+    .filter(function (i) { return i.key !== 'settings'; });
+
+  const primary = visibleItems.slice(0, 4);
+  const overflow = visibleItems.slice(4);
+  const anyOverflowActive = overflow.some(function (i) { return i.path === currentRoute; });
+
+  function closeMore() { setMoreOpen(false); }
+
+  return React.createElement(React.Fragment, null,
+    /* Backdrop for more-sheet */
+    React.createElement('div', {
+      className: 'fs-bottom-nav__more-sheet-backdrop' + (moreOpen ? ' fs-bottom-nav__more-sheet-backdrop--open' : ''),
+      onClick:   closeMore,
+      'aria-hidden': true,
+    }),
+
+    /* More sheet */
+    React.createElement('div', {
+      className:    'fs-bottom-nav__more-sheet' + (moreOpen ? ' fs-bottom-nav__more-sheet--open' : ''),
+      role:         'menu',
+      'aria-label': 'More navigation items',
+    },
+      overflow.map(function (item) {
+        var active = currentRoute === item.path;
+        return React.createElement('button', {
+          key:          item.key,
+          type:         'button',
+          className:    'fs-bottom-nav__more-item' + (active ? ' fs-bottom-nav__more-item--active' : ''),
+          role:         'menuitem',
+          onClick:      function () { onNavigate(item.path); closeMore(); },
+        },
+          NavIcon ? React.createElement(NavIcon, {
+            name: NAV_ICONS_BOTTOM[item.key] || 'circle',
+            size: 18,
+            color: active ? 'var(--color-accent-500)' : 'rgba(255,255,255,0.65)',
+          }) : null,
+          item.label,
+        );
+      }),
+    ),
+
+    /* Bottom tab bar */
+    React.createElement('nav', {
+      className:    'fs-bottom-nav',
+      role:         'navigation',
+      'aria-label': 'Main navigation',
+    },
+      primary.map(function (item) {
+        var active = currentRoute === item.path;
+        return React.createElement('button', {
+          key:          item.key,
+          type:         'button',
+          className:    'fs-bottom-nav__item' + (active ? ' fs-bottom-nav__item--active' : ''),
+          'aria-label': item.label,
+          'aria-current': active ? 'page' : undefined,
+          onClick:      function () { onNavigate(item.path); },
+        },
+          NavIcon ? React.createElement(NavIcon, {
+            name: NAV_ICONS_BOTTOM[item.key] || 'circle',
+            size: 20,
+            color: active ? 'var(--color-accent-500)' : 'rgba(255,255,255,0.55)',
+          }) : null,
+          React.createElement('span', null, item.label),
+        );
+      }),
+
+      /* More button — only if there are overflow items */
+      overflow.length > 0
+        ? React.createElement('button', {
+            type:         'button',
+            className:    'fs-bottom-nav__item' + (anyOverflowActive ? ' fs-bottom-nav__item--active' : ''),
+            'aria-label': 'More navigation items',
+            'aria-expanded': moreOpen,
+            onClick:      function () { setMoreOpen(function (o) { return !o; }); },
+          },
+            NavIcon ? React.createElement(NavIcon, {
+              name: 'more-horizontal',
+              size: 20,
+              color: anyOverflowActive ? 'var(--color-accent-500)' : 'rgba(255,255,255,0.55)',
+            }) : null,
+            React.createElement('span', null, 'More'),
+          )
+        : null,
+    ),
+  );
+}
+
 /* ---------- Weather Indicator + Popover -------------------------------- */
 /* Click reveals a popover with current conditions, next 12h hourly,
    and a 7-day daily forecast. Mock data only — Sprint 2 wires the
@@ -196,7 +309,11 @@ function MiddleColumn({ route, width, onWidthChange, onSelect, selectedItem, ful
     gap: '8px',
   };
 
-  return React.createElement('div', { style: style, className: 'middle-column' },
+  return React.createElement('div', {
+    style: style, className: 'middle-column',
+    id: 'fs-main-content',   /* Sprint 8.5.3 — skip-nav target */
+    tabIndex: -1,
+  },
 
     React.createElement('div', { style: headerStyle, className: 'middle-column__header' },
       React.createElement('div', {
@@ -294,6 +411,20 @@ function MiddleColumn({ route, width, onWidthChange, onSelect, selectedItem, ful
   );
 }
 
+/* ---------- MobileBack — ← Back button shown inside right-detail on mobile */
+function MobileBack({ onClose }) {
+  var NavIcon = window.FieldSight && window.FieldSight.NavIcon;
+  return React.createElement('button', {
+    type:      'button',
+    className: 'fs-mobile-back',
+    onClick:   onClose,
+    'aria-label': 'Back to list',
+  },
+    NavIcon ? React.createElement(NavIcon, { name: 'chevron-left', size: 16, color: 'var(--color-accent-500)' }) : null,
+    'Back',
+  );
+}
+
 /* ---------- RightDetail --------------------------------------------------- */
 function RightDetail({ route, selectedItem, onClose }) {
   const t = window.FS.tokens;
@@ -302,12 +433,16 @@ function RightDetail({ route, selectedItem, onClose }) {
   if (page && page.Right) {
     return React.createElement('div', {
       className: 'right-detail',
-      style: { background: 'var(--surface-app)', height: '100%', overflow: 'hidden' },
+      style: { background: 'var(--surface-app)', height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' },
     },
-      React.createElement(page.Right, {
-        selectedItem: selectedItem,
-        onClose: onClose,
-      }),
+      /* Sprint 8.4.1 — back button visible only on mobile via CSS */
+      React.createElement(MobileBack, { onClose: onClose }),
+      React.createElement('div', { style: { flex: 1, overflow: 'hidden' } },
+        React.createElement(page.Right, {
+          selectedItem: selectedItem,
+          onClose: onClose,
+        }),
+      ),
     );
   }
 
@@ -371,6 +506,15 @@ function AppShell({ showDevSwitcher = false }) {
   /* Clear selection on route change — different page = fresh selection */
   React.useEffect(function() {
     setSelectedItem(null);
+  }, [route]);
+
+  /* Sprint 8.5.4 — announce page title to screen readers + update document.title */
+  React.useEffect(function() {
+    var label = (route || '/').replace(/^\//, '') || 'today';
+    var title = label.split('-').map(function(w) { return w[0].toUpperCase() + w.slice(1); }).join(' ');
+    document.title = title + ' · FieldSight';
+    var region = document.getElementById('fs-live-region');
+    if (region) region.textContent = 'Navigated to ' + title;
   }, [route]);
 
   React.useEffect(function() {
@@ -463,7 +607,29 @@ function AppShell({ showDevSwitcher = false }) {
     + ((selectedItem && !fullWidth) ? ' has-selection' : '')
     + (fullWidth ? ' app-shell--full-width' : '');
 
+  /* Expose closeDetail globally so MobileBack button (and swipe handler)
+     can close the right-detail panel without prop-drilling. */
+  React.useEffect(function () {
+    if (!window.FS) window.FS = {};
+    window.FS.shell = { closeDetail: function () { setSelectedItem(null); } };
+    return function () { delete window.FS.shell; };
+  });
+
   return React.createElement('div', { style: shellStyle, className: shellClassName },
+
+    /* Sprint 8.5.3 — skip navigation link (visually hidden until focused) */
+    React.createElement('a', {
+      href:      '#fs-main-content',
+      className: 'fs-skip-nav',
+    }, 'Skip to main content'),
+
+    /* Sprint 8.5.4 — polite live region for route + action announcements */
+    React.createElement('div', {
+      id:           'fs-live-region',
+      className:    'fs-live-region',
+      'aria-live':  'polite',
+      'aria-atomic': true,
+    }),
 
     React.createElement(window.FieldSight.LeftNav, {
       user: user,
@@ -502,6 +668,14 @@ function AppShell({ showDevSwitcher = false }) {
           })
         : null,
     ),
+
+    /* Sprint 8.4.1 — bottom navigation bar (rendered outside PageProvider
+       so it's always present regardless of page layout mode). */
+    React.createElement(BottomNav, {
+      user:         user,
+      currentRoute: route,
+      onNavigate:   navigate,
+    }),
 
     showDevSwitcher && window.FieldSight.DevRoleSwitcher
       ? React.createElement(window.FieldSight.DevRoleSwitcher)

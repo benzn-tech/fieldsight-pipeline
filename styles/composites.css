@@ -6352,3 +6352,184 @@ body.fs-gantt-dragging--resize-end    { cursor: ew-resize !important; }
   border-color: var(--color-warning-700, #b45309);
   color:        var(--color-warning-300, #fcd34d);
 }
+
+/* ==========================================================================
+   Sprint 8.4 — Mobile Breakpoint Audit + Gantt Mobile (≤ 767px)
+   All rules use max-width: 47.9375rem (767px) for consistency with
+   the bottom-nav breakpoint in app-shell.css.
+   ========================================================================== */
+
+/* ---------- 8.4.2 — Gantt on mobile ------------------------------------ */
+
+@media (max-width: 47.9375rem) {
+  /* WBS tree column shrinks to 160px with truncation */
+  .fs-gantt {
+    grid-template-columns: 160px 1fr;
+  }
+  .fs-gantt-tree__name {
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Timeline scrolls horizontally; header is already sticky via top:0 */
+  .fs-gantt__timeline {
+    -webkit-overflow-scrolling: touch;
+  }
+  /* No drag handles on mobile — shown as tappable bars only */
+  .fs-gantt-bar--draggable {
+    cursor: pointer;
+  }
+}
+
+/* ---------- 8.4.3 — /today -------------------------------------------- */
+
+@media (max-width: 47.9375rem) {
+  /* KpiStrip wraps to 2-column grid */
+  .fs-kpi-strip {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .fs-kpi-strip .fs-stat-card {
+    flex: 1 1 calc(50% - 4px);
+    min-width: 0;
+  }
+  /* Morning brief full width */
+  .fs-morning-brief-card {
+    width: 100%;
+  }
+}
+
+/* ---------- 8.4.3 — /timeline ----------------------------------------- */
+
+@media (max-width: 47.9375rem) {
+  /* TopicCard sections stack with full width */
+  .fs-topic-card {
+    width: 100%;
+  }
+  /* Transcript line length — break long words */
+  .fs-transcript-list__item {
+    word-break: break-word;
+  }
+}
+
+/* ---------- 8.4.3 — /sites -------------------------------------------- */
+
+@media (max-width: 47.9375rem) {
+  /* SiteCard grid → single column */
+  .fs-sites__grid {
+    grid-template-columns: 1fr !important;
+  }
+  .fs-site-card {
+    width: 100%;
+  }
+}
+
+/* ---------- 8.4.3 — /activity ----------------------------------------- */
+
+@media (max-width: 47.9375rem) {
+  /* UserActivityCard 4-count strip → 2-column grid */
+  .fs-user-activity-card__counts {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+  }
+}
+
+/* ---------- 8.4.3 — /tasks -------------------------------------------- */
+
+@media (max-width: 47.9375rem) {
+  /* FilterChips wrap gracefully */
+  .fs-tasks-filter-chips {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .fs-tasks-filter-chips .fs-chip {
+    flex-shrink: 0;
+  }
+}
+
+/* ---------- 8.4.3 — /evidence ----------------------------------------- */
+
+@media (max-width: 47.9375rem) {
+  /* Tab labels — truncate gracefully */
+  .fs-evidence-tabs__tab {
+    font-size: var(--font-size-xs);
+    padding: 8px 8px;
+    min-width: 0;
+  }
+  /* PhotoGrid 2-col → 1-col */
+  .fs-photo-grid {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+/* ---------- 8.4.3 — /safety + /quality -------------------------------- */
+
+@media (max-width: 47.9375rem) {
+  /* SafetyFlagRow right-truncation — prevent overflow */
+  .fs-safety-flag-row {
+    min-width: 0;
+  }
+  .fs-safety-flag-row__body,
+  .fs-safety-flag-row__observation {
+    white-space: normal;
+    word-break: break-word;
+  }
+  .fs-safety-flag-row__meta {
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+}
+
+/* ---------- 8.4.3 — /reports ------------------------------------------ */
+
+@media (max-width: 47.9375rem) {
+  /* Reports table → card list */
+  .fs-reports__table {
+    display: none;
+  }
+  .fs-reports__card-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  /* If table-only view exists, make it scroll horizontally */
+  .fs-reports__table-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+/* ---------- 8.4.3 — /team (Sprint 7) ---------------------------------- */
+
+@media (max-width: 47.9375rem) {
+  /* Team grid → single column */
+  .fs-team__grid {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+/* ---------- 8.4.3 — /settings (Sprint 7) ------------------------------ */
+
+@media (max-width: 47.9375rem) {
+  /* Settings form — stack labels above inputs */
+  .fs-settings__field {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+  .fs-settings__label {
+    width: auto;
+    min-width: 0;
+  }
+}
+
+/* ---------- 8.5.5 — Gantt bar keyboard focus ring ---------------------- */
+
+.fs-gantt-bar:focus-visible {
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+  z-index: 2;
+}

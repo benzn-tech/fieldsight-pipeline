@@ -56,8 +56,11 @@
           'aria-pressed': active,
         },
           f.label,
-          React.createElement('span', { className: 'fs-tasks__chip-count' },
-            counts[f.key] != null ? counts[f.key] : 0),
+          React.createElement('span', {
+            className:   'fs-tasks__chip-count',
+            'aria-live': 'polite',
+            'aria-label': (counts[f.key] != null ? counts[f.key] : 0) + ' items',
+          }, counts[f.key] != null ? counts[f.key] : 0),
         );
       }),
     );

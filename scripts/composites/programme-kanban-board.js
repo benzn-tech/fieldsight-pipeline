@@ -217,20 +217,26 @@
                       key:       col.key,
                       className: 'fs-prog-kanban__cell'
                                   + (items.length === 0 ? ' fs-prog-kanban__cell--empty' : ''),
+                      role:      'list',
+                      'aria-label': col.label + ' tasks',
                     },
                       items.map(function (t) {
                         var isCritical = criticalSet.has(t.task_id);
                         var isSelected = selectedId === t.task_id;
                         var first = (t.assignees || [])[0];
                         return React.createElement('button', {
-                          key:       t.task_id,
-                          type:      'button',
-                          className: 'fs-prog-kanban-card'
-                                      + ' fs-prog-kanban-card--' + col.key
-                                      + (isCritical ? ' fs-prog-kanban-card--critical' : '')
-                                      + (isSelected ? ' fs-prog-kanban-card--selected' : ''),
-                          onClick:   function () { onSelect(t); },
-                          title:     t.name + ' (' + t.start + ' → ' + t.end + ')',
+                          key:          t.task_id,
+                          type:         'button',
+                          role:         'listitem',
+                          className:    'fs-prog-kanban-card'
+                                          + ' fs-prog-kanban-card--' + col.key
+                                          + (isCritical ? ' fs-prog-kanban-card--critical' : '')
+                                          + (isSelected ? ' fs-prog-kanban-card--selected' : ''),
+                          onClick:      function () { onSelect(t); },
+                          title:        t.name + ' (' + t.start + ' → ' + t.end + ')',
+                          'aria-label': t.name
+                                          + (isCritical ? ', critical path' : '')
+                                          + ', ' + t.start + ' to ' + t.end,
                         },
                           /* Top row: WBS + critical badge */
                           React.createElement('div', { className: 'fs-prog-kanban-card__top' },
