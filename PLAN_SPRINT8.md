@@ -585,7 +585,10 @@ Add:
 
 ---
 
-### Sprint 8.9 — Fixture Expansion & Demo Quality
+### Sprint 8.9 — Fixture Expansion & Demo Quality  ✅ shipped
+
+**Status (2026-05-04):** Done — fixtures expanded (`dates`, `daily-report`,
+`programme`); `DemoTour` composite ships with `?demo=1` activation.
 
 **Goal:** The mock dataset is rich enough for credible demos with any role, across multiple sites and dates.
 
@@ -638,7 +641,11 @@ DemoTour:
 
 ---
 
-### Sprint 8.10 — Print / Export / Share
+### Sprint 8.10 — Print / Export / Share  ✅ shipped
+
+**Status (2026-05-04):** Done — `@media print` rules in `app-shell.css`,
+copy-link / share button in middle-column header, batch export of the
+month's reports on `/reports`.
 
 **Goal:** Reports and safety summaries can be printed or shared via link.
 
@@ -679,7 +686,12 @@ Add:
 
 ---
 
-### Sprint 8.11 — In-App Help & Onboarding
+### Sprint 8.11 — In-App Help & Onboarding  ✅ shipped
+
+**Status (2026-05-04):** Done — `OnboardingOverlay` (3-step welcome,
+role-aware copy, dismissible, resettable from `/settings`); `?` opens a
+keyboard shortcut reference modal; `Tooltip` composite available for
+contextual hints. Single-key navigation (T/S/P) wired in `AppShell`.
 
 **Goal:** New users can orient themselves without external documentation.
 

@@ -225,6 +225,59 @@
       linked_action_items: [],
       tags: [],
     },
+
+    /* ----------------------------------------------------------------------
+       Sprint 8.9.1 — fixture variants for richer demos:
+         T-021 — overdue (end-date in the past, status not 'done')
+         T-022 — blocked (status 'blocked', user double-booked vs T-005)
+         T-031 / T-032 — completed sub-group so the Board "Done" column
+                          renders real work instead of an empty state
+       Hung off existing parents to avoid breaking the WBS hierarchy.
+       ---------------------------------------------------------------------- */
+    {
+      task_id: 'T-021', wbs: '1.4', parent_id: 'T-100',
+      name: 'Drainage rough-in (overdue)',
+      start: '2026-04-12', end: '2026-04-22',
+      duration_days: 11, progress_pct: 60, status: 'in_progress',
+      depends_on: ['T-002'],
+      assignees: ['David_Barillaro'],
+      resource_pool: ['Subcontractor-Drain'],
+      linked_action_items: [],
+      tags: ['overdue'],
+    },
+    {
+      task_id: 'T-022', wbs: '2.4', parent_id: 'T-200',
+      name: 'Anchor bolt set-out (blocked — awaiting survey)',
+      start: '2026-05-04', end: '2026-05-08',
+      duration_days: 5, progress_pct: 10, status: 'blocked',
+      depends_on: ['T-003'],
+      assignees: ['Sarah_Chen'],
+      resource_pool: ['Crew-B'],
+      linked_action_items: [],
+      tags: ['blocked'],
+    },
+    {
+      task_id: 'T-031', wbs: '1.5', parent_id: 'T-100',
+      name: 'Survey peg & site setout',
+      start: '2026-04-01', end: '2026-04-04',
+      duration_days: 4, progress_pct: 100, status: 'completed',
+      depends_on: [],
+      assignees: ['Jarley_Trainor'],
+      resource_pool: ['Surveyor'],
+      linked_action_items: [],
+      tags: [],
+    },
+    {
+      task_id: 'T-032', wbs: '1.6', parent_id: 'T-100',
+      name: 'Temporary fencing & site signage',
+      start: '2026-04-02', end: '2026-04-06',
+      duration_days: 5, progress_pct: 100, status: 'completed',
+      depends_on: ['T-031'],
+      assignees: ['Ben_Lin'],
+      resource_pool: ['Crew-A'],
+      linked_action_items: [],
+      tags: [],
+    },
   ];
 
   /* Apply baseline = planned (i.e. the original plan matches current

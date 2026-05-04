@@ -240,6 +240,26 @@
           : null,
       ),
 
+      /* ---- Section 4: Help (Sprint 8.11.1) ---- */
+      React.createElement('section', { className: 'fs-settings__section' },
+        React.createElement('div', { className: 'fs-settings__section-title' }, 'Help'),
+        React.createElement('div', { className: 'fs-settings__section-desc' },
+          'Replay the welcome tour the next time you open the app.'),
+        React.createElement('button', {
+          type:      'button',
+          className: 'fs-settings__link-btn',
+          onClick:   function () {
+            try { localStorage.removeItem('fs.onboarded'); } catch (_) {}
+            if (window.FS && window.FS.toast) {
+              window.FS.toast.show({
+                message: 'Onboarding will run on next reload',
+                tone:    'info',
+              });
+            }
+          },
+        }, 'Reset onboarding'),
+      ),
+
     );
   }
 

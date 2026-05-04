@@ -1766,7 +1766,17 @@
   gap: 12px;
 }
 
-.fs-reports__header { padding: 0 4px; }
+.fs-reports__header {
+  padding: 0 4px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.fs-reports__header-main {
+  flex: 1;
+  min-width: 0;
+}
 
 .fs-reports__title {
   margin: 0;
@@ -6719,4 +6729,247 @@ body.fs-gantt-dragging--resize-end    { cursor: ew-resize !important; }
     border-radius: 0 0 var(--radius-xl, 16px) var(--radius-xl, 16px);
     max-height:    85vh;
   }
+}
+
+/* =========================================================================
+   §SPRINT-8.9.2 · DEMO TOUR
+   Bottom-centre tooltip card guiding the user through key surfaces.
+   ========================================================================= */
+
+.fs-demo-tour {
+  position:      fixed;
+  bottom:        24px;
+  left:          50%;
+  transform:     translateX(-50%);
+  z-index:       var(--z-popover, 600);
+  width:         min(420px, calc(100vw - 32px));
+  background:    var(--surface-panel);
+  color:         var(--text-primary);
+  border:        1px solid var(--border-subtle);
+  border-radius: var(--radius-lg, 12px);
+  box-shadow:    var(--shadow-lg, 0 12px 28px rgba(0, 0, 0, 0.18));
+  padding:       16px 18px;
+  font-family:   var(--font-sans);
+  display:       flex;
+  flex-direction: column;
+  gap:           8px;
+}
+
+.fs-demo-tour__counter {
+  font-size:   11px;
+  font-weight: var(--font-weight-medium);
+  color:       var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.fs-demo-tour__title {
+  font-size:   15px;
+  font-weight: var(--font-weight-semibold);
+  color:       var(--text-primary);
+}
+.fs-demo-tour__text {
+  font-size: 13px;
+  line-height: 1.5;
+  color:     var(--text-secondary);
+}
+
+.fs-demo-tour__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.fs-demo-tour__btn {
+  appearance: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md, 8px);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: var(--font-weight-medium);
+  padding: 6px 12px;
+  cursor: pointer;
+  background: transparent;
+  color: var(--text-secondary);
+  transition: background 100ms ease-out, color 100ms ease-out, border-color 100ms ease-out;
+}
+.fs-demo-tour__btn--ghost { color: var(--text-tertiary); }
+.fs-demo-tour__btn--ghost:hover { color: var(--text-primary); }
+
+.fs-demo-tour__btn--secondary {
+  border-color: var(--border-subtle);
+  color: var(--text-primary);
+  background: var(--surface-panel-muted);
+}
+.fs-demo-tour__btn--secondary:hover {
+  background: var(--surface-app);
+}
+
+.fs-demo-tour__btn--primary {
+  background: var(--color-accent-500);
+  color: #ffffff;
+  border-color: var(--color-accent-500);
+}
+.fs-demo-tour__btn--primary:hover {
+  background: var(--color-accent-600, var(--color-accent-500));
+  border-color: var(--color-accent-600, var(--color-accent-500));
+}
+
+/* Highlight ring on tour-targeted element */
+.fs-demo-highlight {
+  position: relative;
+  z-index: 2;
+  box-shadow: 0 0 0 3px var(--color-accent-500),
+              0 0 0 7px rgba(255, 107, 53, 0.25);
+  border-radius: var(--radius-md, 8px);
+  animation: fs-demo-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes fs-demo-pulse {
+  0%, 100% { box-shadow: 0 0 0 3px var(--color-accent-500),
+                          0 0 0 7px rgba(255, 107, 53, 0.25); }
+  50%      { box-shadow: 0 0 0 3px var(--color-accent-500),
+                          0 0 0 12px rgba(255, 107, 53, 0.10); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fs-demo-highlight { animation: none; }
+}
+
+/* =========================================================================
+   §SPRINT-8.11.1 · ONBOARDING OVERLAY
+   ========================================================================= */
+
+.fs-onboarding {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 4px 0 0;
+}
+
+.fs-onboarding__progress {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.fs-onboarding__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--border-subtle);
+  transition: background 120ms ease-out;
+}
+.fs-onboarding__dot--active {
+  background: var(--color-accent-500);
+}
+
+.fs-onboarding__body {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.fs-onboarding__actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+}
+.fs-onboarding__skip {
+  appearance: none;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--text-tertiary);
+  padding: 6px 4px;
+}
+.fs-onboarding__skip:hover { color: var(--text-primary); }
+
+.fs-onboarding__primary {
+  appearance: none;
+  border: 1px solid var(--color-accent-500);
+  background: var(--color-accent-500);
+  color: #ffffff;
+  border-radius: var(--radius-md, 8px);
+  padding: 6px 14px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+/* Settings — reset onboarding link button */
+.fs-settings__link-btn {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md, 8px);
+  padding: 6px 12px;
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--text-primary);
+  transition: background 100ms ease-out, border-color 100ms ease-out;
+}
+.fs-settings__link-btn:hover {
+  background: var(--surface-panel-muted);
+  border-color: var(--text-tertiary);
+}
+
+/* =========================================================================
+   §SPRINT-8.11.3 · TOOLTIP
+   Lightweight CSS-positioned tooltip used by Tooltip composite.
+   ========================================================================= */
+
+.fs-tooltip-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.fs-tooltip {
+  position: absolute;
+  z-index: var(--z-tooltip, 800);
+  background: var(--text-primary);
+  color: var(--surface-panel);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: var(--font-weight-medium);
+  line-height: 1.4;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm, 4px);
+  max-width: 240px;
+  white-space: normal;
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity 120ms ease-out;
+}
+
+.fs-tooltip--top {
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+}
+.fs-tooltip--bottom {
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+}
+.fs-tooltip--left {
+  right: calc(100% + 6px);
+  top: 50%;
+  transform: translateY(-50%);
+}
+.fs-tooltip--right {
+  left: calc(100% + 6px);
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fs-tooltip { transition: none; }
 }

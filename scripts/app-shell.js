@@ -264,6 +264,32 @@ function formatTodayDate() {
   return days[d.getDay()] + ' · ' + d.getDate() + ' ' + months[d.getMonth()];
 }
 
+/* ---------- Share / copy-link helper (Sprint 8.10.2) -------------------- */
+async function shareCurrentLink() {
+  var url = window.location.href;
+  /* Prefer Web Share API on mobile when available. */
+  if (navigator.share && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent || '')) {
+    try {
+      await navigator.share({ title: document.title, url: url });
+      return;
+    } catch (_) { /* user dismissed — fall through to clipboard */ }
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+    if (window.FS && window.FS.toast) {
+      window.FS.toast.show({ message: 'Link copied to clipboard', tone: 'success' });
+    }
+  } catch (_) {
+    if (window.FS && window.FS.toast) {
+      window.FS.toast.show({
+        message: 'Copy failed — URL: ' + url,
+        tone:    'warning',
+        duration: 8000,
+      });
+    }
+  }
+}
+
 /* ---------- MiddleColumn -------------------------------------------------- */
 function MiddleColumn({ route, width, onWidthChange, onSelect, selectedItem, fullWidth, onSearchOpen }) {
   const t = window.FS.tokens;
@@ -332,7 +358,7 @@ function MiddleColumn({ route, width, onWidthChange, onSelect, selectedItem, ful
         }, formatTodayDate()) : null,
       ),
 
-      /* Right-side utility area: search + weather */
+      /* Right-side utility area: search + share + weather */
       React.createElement('div', { className: 'middle-column__utility' },
         onSearchOpen ? React.createElement('button', {
           type:         'button',
@@ -345,6 +371,18 @@ function MiddleColumn({ route, width, onWidthChange, onSelect, selectedItem, ful
             name: 'search', size: 16,
           }),
         ) : null,
+        /* Sprint 8.10.2 — copy-link / share button */
+        React.createElement('button', {
+          type:         'button',
+          className:    'fs-utility-item fs-share-btn',
+          onClick:      shareCurrentLink,
+          title:        'Copy link to this view',
+          'aria-label': 'Copy link to this view',
+        },
+          window.FieldSight.NavIcon && React.createElement(window.FieldSight.NavIcon, {
+            name: 'share-2', size: 16,
+          }),
+        ),
         React.createElement(WeatherIndicator),
       ),
     ),
@@ -517,6 +555,24 @@ function AppShell({ showDevSwitcher = false }) {
   /* Sprint 8.6 — global search palette */
   const [searchOpen, setSearchOpen] = React.useState(false);
 
+  /* Sprint 8.11.2 — keyboard shortcut reference modal */
+  const [shortcutsOpen, setShortcutsOpen] = React.useState(false);
+
+  /* Sprint 8.11.1 — first-run onboarding overlay */
+  const [onboardingOpen, setOnboardingOpen] = React.useState(function () {
+    try {
+      var p = new URLSearchParams(window.location.search);
+      if (p.get('onboarding') === '1') return true;        /* dev override */
+      return localStorage.getItem('fs.onboarded') !== '1';
+    } catch (_) { return false; }
+  });
+
+  /* Sprint 8.9.2 — product tour */
+  const [demoTourOpen, setDemoTourOpen] = React.useState(function () {
+    return !!(window.FieldSight && window.FieldSight.shouldRunDemoTour
+              && window.FieldSight.shouldRunDemoTour());
+  });
+
   /* Sprint 8.7 — offline detection */
   const [isOnline, setIsOnline] = React.useState(function () {
     return typeof navigator !== 'undefined' ? navigator.onLine !== false : true;
@@ -527,13 +583,21 @@ function AppShell({ showDevSwitcher = false }) {
     setSelectedItem(null);
   }, [route]);
 
-  /* Sprint 8.5.4 — announce page title to screen readers + update document.title */
+  /* Sprint 8.5.4 — announce page title to screen readers + update document.title.
+     Sprint 8.10.1 — also expose printable date on #fs-main-content for @media print. */
   React.useEffect(function() {
     var label = (route || '/').replace(/^\//, '') || 'today';
     var title = label.split('-').map(function(w) { return w[0].toUpperCase() + w.slice(1); }).join(' ');
     document.title = title + ' · FieldSight';
     var region = document.getElementById('fs-live-region');
     if (region) region.textContent = 'Navigated to ' + title;
+    var main = document.getElementById('fs-main-content');
+    if (main) {
+      var d = new Date();
+      main.setAttribute('data-print-date',
+        d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0')
+        + '-' + String(d.getDate()).padStart(2, '0'));
+    }
   }, [route]);
 
   React.useEffect(function() {
@@ -571,6 +635,22 @@ function AppShell({ showDevSwitcher = false }) {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setSearchOpen(true);
+      }
+      /* Sprint 8.11.2 — single-key navigation + help (skipped in inputs) */
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (inInput) return;
+      if (e.key === '?') {
+        e.preventDefault();
+        setShortcutsOpen(function (s) { return !s; });
+      } else if (e.key.toLowerCase() === 't') {
+        e.preventDefault();
+        window.FS.Router.navigate('/today');
+      } else if (e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        window.FS.Router.navigate('/safety');
+      } else if (e.key.toLowerCase() === 'p') {
+        e.preventDefault();
+        window.FS.Router.navigate('/programme');
       }
     }
     window.addEventListener('keydown', onKey);
@@ -732,6 +812,52 @@ function AppShell({ showDevSwitcher = false }) {
     searchOpen && window.FieldSight.SearchPalette
       ? React.createElement(window.FieldSight.SearchPalette, {
           onClose: function () { setSearchOpen(false); },
+        })
+      : null,
+
+    /* Sprint 8.11.2 — keyboard shortcut reference modal */
+    shortcutsOpen && window.FieldSight.ModalOverlay
+      ? React.createElement(window.FieldSight.ModalOverlay, {
+          open:    true,
+          onClose: function () { setShortcutsOpen(false); },
+          title:   'Keyboard shortcuts',
+          size:    'sm',
+        },
+          React.createElement('table', { className: 'fs-shortcuts' },
+            React.createElement('tbody', null,
+              [
+                ['Cmd / Ctrl + K', 'Open search palette'],
+                ['?',              'Show this shortcut reference'],
+                ['Escape',         'Close modal / drawer / detail'],
+                ['T',              'Go to Today'],
+                ['S',              'Go to Safety'],
+                ['P',              'Go to Programme'],
+                ['Cmd / Ctrl + B', 'Toggle the navigation sidebar'],
+                ['← / →',          'Shift Gantt task date (when bar focused)'],
+              ].map(function (row, i) {
+                return React.createElement('tr', { key: i },
+                  React.createElement('th', { scope: 'row' },
+                    React.createElement('kbd', { className: 'fs-shortcuts__key' }, row[0])),
+                  React.createElement('td', null, row[1]),
+                );
+              }),
+            ),
+          ),
+        )
+      : null,
+
+    /* Sprint 8.11.1 — first-run onboarding overlay */
+    onboardingOpen && window.FieldSight.OnboardingOverlay
+      ? React.createElement(window.FieldSight.OnboardingOverlay, {
+          user:    user,
+          onClose: function () { setOnboardingOpen(false); },
+        })
+      : null,
+
+    /* Sprint 8.9.2 — product tour (?demo=1) */
+    demoTourOpen && window.FieldSight.DemoTour
+      ? React.createElement(window.FieldSight.DemoTour, {
+          onClose: function () { setDemoTourOpen(false); },
         })
       : null,
   );

@@ -246,6 +246,221 @@
     },
   };
 
+  /* ------------------------------------------------------------------------
+     Sprint 8.9.1 — additional fixture reports for richer demos.
+     Four extra dates so the heatmap-driven Timeline + Today archive have
+     more than one day of clickable content. Each report is intentionally
+     lighter than the marquee 04-29 fixture (1–2 topics) to keep the
+     bundle small.
+     ------------------------------------------------------------------------ */
+
+  /* 04-28 — high-risk day (3 high-risk safety flags, urgent open action) */
+  var REPORT_2026_04_28_JARLEY = {
+    report_date: '2026-04-28',
+    report_type: 'daily',
+    user_name:   'Jarley Trainor',
+    device:      'Benl1',
+    site:        'SB1108 Ellesmere College',
+
+    executive_summary: [
+      'Three high-risk safety flags raised on Block C scaffold; all activity paused pending re-inspection.',
+      'Foundation pour for north footing deferred 24 h pending engineer sign-off on rebar coverage.',
+      'Crane ground-support pads showed bearing failure under load — exclusion zone widened to 6 m.',
+    ],
+    critical_dates_and_deadlines: [
+      { date_mentioned: 'Tomorrow 07:00', context: 'Re-inspection of Block C scaffold by independent inspector',
+        who_mentioned: 'Jarley Trainor', urgency: 'high', type: 'inspection' },
+    ],
+    quality_and_compliance: [
+      { item: 'Rebar coverage check — north footing', status: 'concern',
+        details: 'Engineer requested 50 mm cover, measured 38 mm in three locations. Pour deferred.',
+        follow_up_needed: true },
+    ],
+    safety_observations: [
+      { observation: 'Loose bracing on Block C scaffold (level 3)', risk_level: 'high',
+        location: 'Block C, level 3', who_raised: 'Jarley Trainor',
+        recommended_action: 'Cease access, replace bracing, retag.' },
+      { observation: 'Crane ground pad sinking under counterweight', risk_level: 'high',
+        location: 'Crane pad east', who_raised: 'David Barillaro',
+        recommended_action: 'Stop crane operations, install timber mats, recertify.' },
+      { observation: 'Unsecured rebar bundle near edge of pour bay', risk_level: 'high',
+        location: 'Block 4 north footing', who_raised: 'Sarah Chen',
+        recommended_action: 'Restrap and chock to prevent rolling.' },
+    ],
+    topics: [
+      {
+        topic_id: 0, time_range: '07:30 ' + EN + ' 08:00',
+        topic_title: 'Block C scaffold — STOP work',
+        category: 'safety',
+        participants: ['Jarley Trainor', 'Jack Gibson', 'Independent inspector'],
+        summary: 'Three independent issues identified during morning walk. Decision to cease all access pending external inspection.',
+        key_decisions: ['STOP work order issued for Block C until 04-29 re-inspection (Jarley Trainor)'],
+        action_items: [
+          { action: 'Issue STOP work notice to all subbies', responsible: 'Jarley Trainor',
+            deadline: 'Today 08:30', priority: 'high' },
+          { action: 'Book independent scaffold inspector for 04-29 07:00', responsible: 'Jack Gibson',
+            deadline: 'Today 12:00', priority: 'high' },
+        ],
+        safety_flags: [
+          { observation: 'Three high-risk findings on Block C scaffold', risk_level: 'high',
+            recommended_action: 'No access until cleared by independent inspector.' },
+        ],
+        related_photos: [],
+      },
+    ],
+    _report_metadata: {
+      version: 'v3.5', generated_at: '2026-04-28T16:00:00Z', generated_by: 'system',
+      recordings_processed: 9, total_words: 2100, model: 'claude-sonnet-4-6',
+      parse_success: true,
+    },
+  };
+
+  /* 04-25 — quiet "all clear" Saturday (no safety flags, all actions done) */
+  var REPORT_2026_04_25_DAVID = {
+    report_date: '2026-04-25',
+    report_type: 'daily',
+    user_name:   'David Barillaro',
+    device:      'Benl2',
+    site:        'SB1108 Ellesmere College',
+
+    executive_summary: [
+      'Clean weekend shift — small crew finished form-stripping on the south footing without incident.',
+      'All open actions from the week closed out before knock-off; no carryover into Monday.',
+    ],
+    critical_dates_and_deadlines: [],
+    quality_and_compliance: [
+      { item: 'Form-stripping — south footing', status: 'completed',
+        details: 'Forms stripped, surface inspected, no honeycombing observed.',
+        follow_up_needed: false },
+    ],
+    safety_observations: [],
+    topics: [
+      {
+        topic_id: 0, time_range: '08:00 ' + EN + ' 08:15',
+        topic_title: 'Saturday safety check-in',
+        category: 'safety',
+        participants: ['David Barillaro', 'Ben Lin'],
+        summary: 'Quick toolbox talk; site quiet, weather settled. No new hazards.',
+        key_decisions: [],
+        action_items: [],
+        safety_flags: [],
+        related_photos: [],
+      },
+      {
+        topic_id: 1, time_range: '11:00 ' + EN + ' 11:30',
+        topic_title: 'Form strip — south footing',
+        category: 'progress',
+        participants: ['David Barillaro', 'Ben Lin'],
+        summary: 'Forms removed cleanly; surface finish to spec.',
+        key_decisions: [],
+        action_items: [],
+        safety_flags: [],
+        related_photos: ['Benl2_2026-04-25_11-12-00.jpg'],
+      },
+    ],
+    _report_metadata: {
+      version: 'v3.5', generated_at: '2026-04-25T15:30:00Z', generated_by: 'system',
+      recordings_processed: 4, total_words: 980, model: 'claude-sonnet-4-6',
+      parse_success: true,
+    },
+  };
+
+  /* 04-24 — varied: progress + quality, mid-risk */
+  var REPORT_2026_04_24_JARLEY = {
+    report_date: '2026-04-24',
+    report_type: 'daily',
+    user_name:   'Jarley Trainor',
+    device:      'Benl1',
+    site:        'SB1108 Ellesmere College',
+
+    executive_summary: [
+      'Steel deliveries arrived on schedule; offload coordinated with crane crew.',
+      'One trip hazard cleared at gate 2; no injuries reported.',
+    ],
+    critical_dates_and_deadlines: [
+      { date_mentioned: 'Monday 28 Apr', context: 'Steel frame kick-off',
+        who_mentioned: 'Jarley Trainor', urgency: 'medium', type: 'milestone' },
+    ],
+    quality_and_compliance: [
+      { item: 'Steel mill certs reviewed', status: 'completed',
+        details: 'All AS/NZS 3679 grades match drawings.', follow_up_needed: false },
+    ],
+    safety_observations: [
+      { observation: 'Trip hazard at gate 2 (extension cord)', risk_level: 'low',
+        location: 'Gate 2', who_raised: 'Sarah Chen',
+        recommended_action: 'Coil and route along fence.' },
+    ],
+    topics: [
+      {
+        topic_id: 0, time_range: '09:00 ' + EN + ' 09:30',
+        topic_title: 'Steel offload coordination',
+        category: 'progress',
+        participants: ['Jarley Trainor', 'David Barillaro'],
+        summary: 'Two truckloads of beams offloaded to staging. Tag-line positions briefed.',
+        key_decisions: [],
+        action_items: [
+          { action: 'Receipt-in steel against PO and certs', responsible: 'David Barillaro',
+            deadline: 'Today 12:00', priority: 'medium' },
+        ],
+        safety_flags: [],
+        related_photos: ['Benl1_2026-04-24_09-15-00.jpg'],
+      },
+    ],
+    _report_metadata: {
+      version: 'v3.5', generated_at: '2026-04-24T16:00:00Z', generated_by: 'system',
+      recordings_processed: 6, total_words: 1450, model: 'claude-sonnet-4-6',
+      parse_success: true,
+    },
+  };
+
+  /* 04-23 — high-risk variant on a different user (Sarah Chen) */
+  var REPORT_2026_04_23_SARAH = {
+    report_date: '2026-04-23',
+    report_type: 'daily',
+    user_name:   'Sarah Chen',
+    device:      'Benl4',
+    site:        'SB1108 Ellesmere College',
+
+    executive_summary: [
+      'Wind event Mid-afternoon: gusts to 75 km/h. All elevated work suspended for two hours.',
+      'No damage observed once site re-opened; tarps and edge protection held.',
+    ],
+    critical_dates_and_deadlines: [],
+    quality_and_compliance: [],
+    safety_observations: [
+      { observation: 'Heavy wind warning — all elevated work suspended', risk_level: 'high',
+        location: 'Site-wide', who_raised: 'Sarah Chen',
+        recommended_action: 'Resume after MetService all-clear and visual check.' },
+      { observation: 'One unsecured tarp flapping near west elevation', risk_level: 'medium',
+        location: 'Block C west', who_raised: 'Ben Lin',
+        recommended_action: 'Tie down with extra straps before next gust front.' },
+    ],
+    topics: [
+      {
+        topic_id: 0, time_range: '14:30 ' + EN + ' 16:30',
+        topic_title: 'Wind event — site-wide stand-down',
+        category: 'safety',
+        participants: ['Sarah Chen', 'Jarley Trainor', 'Ben Lin'],
+        summary: 'MetService gust warning issued at 14:25; all elevated work paused. Site reopened at 16:30 after wind dropped.',
+        key_decisions: ['Site-wide stand-down for elevated work (Sarah Chen)'],
+        action_items: [
+          { action: 'Walk site and tie off any loose tarps', responsible: 'Ben Lin',
+            deadline: 'Today 15:00', priority: 'high' },
+        ],
+        safety_flags: [
+          { observation: 'Gust warning — windborne debris risk', risk_level: 'high',
+            recommended_action: 'Stand down all elevated work until cleared.' },
+        ],
+        related_photos: [],
+      },
+    ],
+    _report_metadata: {
+      version: 'v3.5', generated_at: '2026-04-23T17:00:00Z', generated_by: 'system',
+      recordings_processed: 7, total_words: 1820, model: 'claude-sonnet-4-6',
+      parse_success: true,
+    },
+  };
+
   /* Index per (date, folder_name). Phase B (Timeline page) iterates this map
      directly; Phase D (today-adapter) reads the report for the current
      user as the source of truth for the Today page. */
@@ -255,6 +470,18 @@
 
   window.FieldSight.fixtures.reports['2026-04-29'] = {
     Jarley_Trainor: REPORT_2026_04_29_JARLEY,
+  };
+  window.FieldSight.fixtures.reports['2026-04-28'] = {
+    Jarley_Trainor: REPORT_2026_04_28_JARLEY,
+  };
+  window.FieldSight.fixtures.reports['2026-04-25'] = {
+    David_Barillaro: REPORT_2026_04_25_DAVID,
+  };
+  window.FieldSight.fixtures.reports['2026-04-24'] = {
+    Jarley_Trainor: REPORT_2026_04_24_JARLEY,
+  };
+  window.FieldSight.fixtures.reports['2026-04-23'] = {
+    Sarah_Chen: REPORT_2026_04_23_SARAH,
   };
 
   /* Reports archive fixture — feeds /api/reports/history (Phase F).
