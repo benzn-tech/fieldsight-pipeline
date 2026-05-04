@@ -515,6 +515,14 @@
     0 0 0 4px var(--color-accent-500);
 }
 
+/* Sprint 7 follow-up — when a clickable card is also --selected, the
+   inner accent border + tinted bg already provide a clear visual cue.
+   Stack a focus halo on top of that and the user reads it as a double
+   border (issue caught in /today's UrgentCard with risk + selected). */
+.fs-card--clickable.fs-card--selected:focus-visible {
+  box-shadow: none;
+}
+
 
 /* ---------- States ------------------------------------------------------- */
 
