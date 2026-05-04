@@ -107,6 +107,10 @@
     var state    = refState[0];
     var setState = refState[1];
 
+    var retryRef   = React.useState(0);
+    var retryCount = retryRef[0];
+    var setRetry   = retryRef[1];
+
     var today = window.FS.api.todayNZDT();
     var range;
     if (mode === 'week') {
@@ -142,24 +146,32 @@
         });
       }).catch(function (err) {
         if (cancelled) return;
-        setState({ status: 'error', error: err });
+        setState({ status: 'error', error: { code: (err && err.status) || 0, message: (err && err.message) || 'Could not load quality data', retryable: true }, retry: function () { setRetry(function (n) { return n + 1; }); } });
       });
 
       return function () { cancelled = true; };
-    }, [depKey, mode, day]);
+    }, [depKey, mode, day, retryCount]);
 
     var refSel = React.useState(null);
     var sel    = refSel[0];
     var setSel = refSel[1];
 
+    var refCreate  = React.useState(false);
+    var showCreate = refCreate[0];
+    var setShowCreate = refCreate[1];
+
     var ctx = {
-      state:        state,
-      mode:         mode,
-      day:          day,
-      setMode:      function (m) { setSel(null); setMode(m); },
-      setDay:       function (d) { setSel(null); setDay(d); setMode('day'); },
-      selectedItem: sel,
-      setSelected:  setSel,
+      state:         state,
+      setState:      setState,
+      mode:          mode,
+      day:           day,
+      setMode:       function (m) { setSel(null); setMode(m); },
+      setDay:        function (d) { setSel(null); setDay(d); setMode('day'); },
+      selectedItem:  sel,
+      setSelected:   setSel,
+      showCreate:    showCreate,
+      setShowCreate: setShowCreate,
+      caller:        caller,
     };
     return React.createElement(QualityContext.Provider, { value: ctx },
       props.children);
@@ -212,24 +224,45 @@
   /* ---------- Middle column -------------------------------------------- */
 
   function QualityMiddleColumn(props) {
-    var fs           = window.FieldSight;
-    var KpiStrip     = fs.KpiStrip;
-    var StatCard     = fs.StatCard;
-    var Badge        = fs.Badge;
-    var AccessDenied = fs.AccessDenied;
+    var fs                  = window.FieldSight;
+    var KpiStrip            = fs.KpiStrip;
+    var StatCard            = fs.StatCard;
+    var Badge               = fs.Badge;
+    var AccessDenied        = fs.AccessDenied;
+    var QualityCreateModal  = fs.QualityCreateModal;
+    var Button              = fs.Button;
 
     var ctx = React.useContext(QualityContext);
     if (!ctx) {
       console.warn('[QualityMiddleColumn] QualityContext missing');
       return null;
     }
-    var state = ctx.state;
+    var state    = ctx.state;
     var onSelect = props.onSelect || function () {};
 
+    var caller    = ctx.caller || {};
+    var canCreate = !!(window.FS && window.FS.can &&
+      (window.FS.can(caller, 'quality:manage') ||
+       window.FS.can(caller, 'site:manage') ||
+       (caller.isAdmin)));
+
+    var logBtn = (canCreate && QualityCreateModal)
+      ? React.createElement('button', {
+          type:      'button',
+          className: 'fs-quality__log-btn',
+          onClick:   function () { ctx.setShowCreate(true); },
+        }, '+ Log Item')
+      : null;
+
     var header = React.createElement('div', { className: 'fs-quality__header' },
-      React.createElement('h2', { className: 'fs-quality__title' }, 'Quality'),
-      React.createElement('div', { className: 'fs-quality__subtitle' },
-        'Quality & compliance items across your accessible reports'),
+      React.createElement('div', { className: 'fs-quality__header-top' },
+        React.createElement('div', null,
+          React.createElement('h2', { className: 'fs-quality__title' }, 'Quality'),
+          React.createElement('div', { className: 'fs-quality__subtitle' },
+            'Quality & compliance items across your accessible reports'),
+        ),
+        logBtn,
+      ),
     );
     var toolbar = React.createElement(RangeToolbar, { ctx: ctx });
 
@@ -241,10 +274,17 @@
       );
     }
     if (state.status === 'error') {
+      var ErrorBanner = window.FieldSight.ErrorBanner;
       return React.createElement('div', { className: 'fs-quality' },
         header, toolbar,
-        React.createElement('div', { className: 'fs-quality__empty' },
-          'Could not load quality data. ' + (state.error && state.error.message || '')),
+        ErrorBanner
+          ? React.createElement(ErrorBanner, {
+              message:   (state.error && state.error.message) || 'Could not load quality data',
+              retryable: true,
+              onRetry:   state.retry,
+            })
+          : React.createElement('div', { className: 'fs-quality__empty' },
+              (state.error && state.error.message) || 'Could not load quality data'),
       );
     }
     if (state.status === 'access_denied') {
@@ -265,9 +305,33 @@
       ? fmtDate(state.from)
       : fmtDate(state.from) + ' → ' + fmtDate(state.to);
 
+    function handleNewItem(newItem) {
+      ctx.setShowCreate(false);
+      if (ctx.setState && newItem) {
+        ctx.setState(function (s) {
+          if (s.status !== 'ok') return s;
+          var updatedRows = [newItem].concat(s.rows || []);
+          return Object.assign({}, s, {
+            rows:   updatedRows,
+            totals: totalsFromRows(updatedRows),
+            groups: groupByDate(updatedRows),
+          });
+        });
+      }
+    }
+
     return React.createElement('div', { className: 'fs-quality' },
       header,
       toolbar,
+
+      /* Create item modal (Sprint 8.1.3) */
+      ctx.showCreate && QualityCreateModal
+        ? React.createElement(QualityCreateModal, {
+            siteId:    state.user || '',
+            onSuccess: handleNewItem,
+            onCancel:  function () { ctx.setShowCreate(false); },
+          })
+        : null,
 
       React.createElement('div', { className: 'fs-quality__meta' },
         totals.total + (totals.total === 1 ? ' item · ' : ' items · ') + rangeLabel),

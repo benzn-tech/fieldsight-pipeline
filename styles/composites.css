@@ -5760,3 +5760,369 @@ body.fs-gantt-dragging--resize-end    { cursor: ew-resize !important; }
   background: var(--surface-selected);
   border-color: var(--color-accent-400);
 }
+
+
+/* ==========================================================================
+   §SPRINT-8.0 · ERROR BANNER
+   --------------------------------------------------------------------------
+   Inline error state for page middle-columns and right-detail panels.
+   Sprint 8.0.3 / 8.7.1
+   ========================================================================== */
+
+.fs-error-banner {
+  display:         flex;
+  align-items:     center;
+  gap:             10px;
+  padding:         14px 16px;
+  margin:          16px;
+  border-radius:   var(--radius-md);
+  background:      var(--surface-danger-subtle, #fff1f2);
+  border:          1px solid var(--color-danger-200, #fecdd3);
+  color:           var(--text-primary);
+  font-size:       var(--text-sm);
+}
+
+.fs-error-banner--mini {
+  margin:    8px 0;
+  padding:   8px 12px;
+  font-size: var(--text-xs);
+}
+
+.fs-error-banner__icon {
+  flex-shrink:  0;
+  color:        var(--color-danger-600, #dc2626);
+  font-size:    1.1em;
+}
+
+.fs-error-banner__message {
+  flex:    1;
+  line-height: 1.4;
+}
+
+.fs-error-banner__retry {
+  flex-shrink:     0;
+  padding:         4px 10px;
+  border:          1px solid var(--border-default);
+  border-radius:   var(--radius-sm);
+  background:      transparent;
+  color:           var(--text-primary);
+  font-size:       var(--text-xs);
+  font-weight:     500;
+  cursor:          pointer;
+  transition:      background 120ms ease;
+}
+
+.fs-error-banner__retry:hover {
+  background: var(--surface-hover);
+}
+
+[data-theme="dark"] .fs-error-banner {
+  background: var(--surface-danger-subtle, rgba(239,68,68,.12));
+  border-color: var(--color-danger-700, rgba(239,68,68,.3));
+}
+
+
+/* ==========================================================================
+   §SPRINT-8.1.4 · TOAST NOTIFICATION STACK
+   --------------------------------------------------------------------------
+   Sprint 8.1.4
+   ========================================================================== */
+
+.fs-toast-stack {
+  position:       fixed;
+  bottom:         24px;
+  right:          24px;
+  z-index:        var(--z-overlay, 600);
+  display:        flex;
+  flex-direction: column;
+  gap:            8px;
+  max-width:      360px;
+  width:          calc(100vw - 48px);
+  pointer-events: none;
+}
+
+.fs-toast {
+  display:        flex;
+  align-items:    center;
+  gap:            10px;
+  padding:        12px 14px;
+  border-radius:  var(--radius-md);
+  background:     var(--surface-overlay, #fff);
+  box-shadow:     var(--shadow-md);
+  font-size:      var(--text-sm);
+  color:          var(--text-primary);
+  pointer-events: all;
+  border-left:    4px solid transparent;
+  animation:      fs-toast-in 180ms ease;
+}
+
+@keyframes fs-toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0);   }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fs-toast { animation: none; }
+}
+
+.fs-toast--dismissing {
+  animation: fs-toast-out 200ms ease forwards;
+}
+
+@keyframes fs-toast-out {
+  from { opacity: 1; transform: translateY(0);   }
+  to   { opacity: 0; transform: translateY(-6px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fs-toast--dismissing { animation: none; opacity: 0; }
+}
+
+.fs-toast--success { border-left-color: var(--color-success-500, #22c55e); }
+.fs-toast--error   { border-left-color: var(--color-danger-500, #ef4444);  }
+.fs-toast--warning { border-left-color: var(--color-warning-500, #f59e0b); }
+.fs-toast--info    { border-left-color: var(--color-info-500, #3b82f6);    }
+
+.fs-toast__icon {
+  flex-shrink: 0;
+  font-size:   1em;
+  font-style:  normal;
+}
+
+.fs-toast--success .fs-toast__icon { color: var(--color-success-600, #16a34a); }
+.fs-toast--error   .fs-toast__icon { color: var(--color-danger-600,  #dc2626); }
+.fs-toast--warning .fs-toast__icon { color: var(--color-warning-600, #d97706); }
+.fs-toast--info    .fs-toast__icon { color: var(--color-info-600,    #2563eb); }
+
+.fs-toast__message {
+  flex:        1;
+  line-height: 1.4;
+}
+
+.fs-toast__close {
+  flex-shrink:  0;
+  width:        20px;
+  height:       20px;
+  border:       none;
+  background:   transparent;
+  cursor:       pointer;
+  color:        var(--text-tertiary);
+  font-size:    16px;
+  line-height:  1;
+  padding:      0;
+  border-radius: var(--radius-sm);
+  display:      flex;
+  align-items:  center;
+  justify-content: center;
+}
+
+.fs-toast__close:hover { color: var(--text-primary); }
+
+[data-theme="dark"] .fs-toast {
+  background:   var(--surface-overlay, #1e2d3d);
+  box-shadow:   var(--shadow-md);
+}
+
+
+/* ==========================================================================
+   §SPRINT-8.1 · SAFETY CREATE MODAL
+   --------------------------------------------------------------------------
+   Sprint 8.1.2
+   ========================================================================== */
+
+.fs-safety-create-modal,
+.fs-quality-create-modal {
+  width:      100%;
+  max-width:  480px;
+  padding:    24px;
+  background: var(--surface-panel);
+  border-radius: var(--radius-lg);
+  display:    flex;
+  flex-direction: column;
+  gap:        16px;
+}
+
+.fs-safety-create-modal__title,
+.fs-quality-create-modal__title {
+  font-size:   var(--text-lg);
+  font-weight: 600;
+  color:       var(--text-primary);
+  margin:      0;
+}
+
+.fs-safety-create-modal__field,
+.fs-quality-create-modal__field {
+  display:        flex;
+  flex-direction: column;
+  gap:            6px;
+}
+
+.fs-quality-create-modal__field--inline {
+  flex-direction: row;
+  align-items:    center;
+  gap:            10px;
+}
+
+.fs-safety-create-modal__label,
+.fs-quality-create-modal__label {
+  font-size:   var(--text-sm);
+  font-weight: 500;
+  color:       var(--text-secondary);
+}
+
+.fs-safety-create-modal__required,
+.fs-quality-create-modal__required {
+  color: var(--color-danger-500, #ef4444);
+  margin-left: 2px;
+}
+
+.fs-safety-create-modal__hint,
+.fs-quality-create-modal__hint {
+  font-size:  var(--text-xs);
+  color:      var(--text-tertiary);
+  font-weight: 400;
+}
+
+.fs-safety-create-modal__textarea,
+.fs-quality-create-modal__textarea {
+  width:           100%;
+  padding:         8px 10px;
+  border:          1px solid var(--border-default);
+  border-radius:   var(--radius-sm);
+  background:      var(--surface-input, var(--surface-base));
+  color:           var(--text-primary);
+  font-size:       var(--text-sm);
+  font-family:     var(--font-sans);
+  resize:          vertical;
+  line-height:     1.5;
+  box-sizing:      border-box;
+  transition:      border-color 120ms ease;
+}
+
+.fs-safety-create-modal__textarea:focus,
+.fs-quality-create-modal__textarea:focus {
+  outline:       none;
+  border-color:  var(--color-accent-500);
+  box-shadow:    0 0 0 2px var(--focus-ring, rgba(59,130,246,.25));
+}
+
+.fs-safety-create-modal__select,
+.fs-quality-create-modal__select,
+.fs-safety-create-modal__input,
+.fs-quality-create-modal__input {
+  width:           100%;
+  padding:         8px 10px;
+  border:          1px solid var(--border-default);
+  border-radius:   var(--radius-sm);
+  background:      var(--surface-input, var(--surface-base));
+  color:           var(--text-primary);
+  font-size:       var(--text-sm);
+  font-family:     var(--font-sans);
+  box-sizing:      border-box;
+  transition:      border-color 120ms ease;
+}
+
+.fs-safety-create-modal__select:focus,
+.fs-quality-create-modal__select:focus,
+.fs-safety-create-modal__input:focus,
+.fs-quality-create-modal__input:focus {
+  outline:      none;
+  border-color: var(--color-accent-500);
+  box-shadow:   0 0 0 2px var(--focus-ring, rgba(59,130,246,.25));
+}
+
+.fs-safety-create-modal__checkbox,
+.fs-quality-create-modal__checkbox {
+  width:  16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--color-accent-500);
+}
+
+.fs-safety-create-modal__file,
+.fs-quality-create-modal__file {
+  font-size: var(--text-sm);
+  color:     var(--text-secondary);
+}
+
+.fs-safety-create-modal__file-count,
+.fs-quality-create-modal__file-count {
+  font-size: var(--text-xs);
+  color:     var(--text-tertiary);
+  margin-top: 2px;
+}
+
+.fs-safety-create-modal__error,
+.fs-quality-create-modal__error {
+  font-size:  var(--text-sm);
+  color:      var(--color-danger-600, #dc2626);
+  background: var(--surface-danger-subtle, #fff1f2);
+  border:     1px solid var(--color-danger-200, #fecdd3);
+  border-radius: var(--radius-sm);
+  padding:    8px 10px;
+}
+
+.fs-safety-create-modal__actions,
+.fs-quality-create-modal__actions {
+  display:         flex;
+  justify-content: flex-end;
+  gap:             10px;
+  padding-top:     4px;
+}
+
+
+/* ==========================================================================
+   §SPRINT-8.1 · SAFETY + QUALITY HEADER WITH RAISE BUTTON
+   ========================================================================== */
+
+.fs-safety__header-top,
+.fs-quality__header-top {
+  display:         flex;
+  align-items:     flex-start;
+  justify-content: space-between;
+  gap:             12px;
+}
+
+.fs-safety__raise-btn,
+.fs-quality__log-btn {
+  flex-shrink:     0;
+  padding:         7px 14px;
+  background:      var(--color-safety-500, #ff6b35);
+  color:           #fff;
+  border:          none;
+  border-radius:   var(--radius-sm);
+  font-size:       var(--text-sm);
+  font-weight:     600;
+  cursor:          pointer;
+  white-space:     nowrap;
+  transition:      background 120ms ease, box-shadow 120ms ease;
+}
+
+.fs-quality__log-btn {
+  background: var(--color-accent-600, #2563eb);
+}
+
+.fs-safety__raise-btn:hover  { background: var(--color-safety-600, #e55a27); box-shadow: var(--shadow-sm); }
+.fs-quality__log-btn:hover   { background: var(--color-accent-700, #1d4ed8); box-shadow: var(--shadow-sm); }
+
+.fs-safety__raise-btn:focus-visible,
+.fs-quality__log-btn:focus-visible {
+  outline:    2px solid var(--fs-focus-ring, var(--color-accent-400));
+  outline-offset: 2px;
+}
+
+[data-theme="dark"] .fs-safety-create-modal,
+[data-theme="dark"] .fs-quality-create-modal {
+  background: var(--surface-panel);
+}
+
+[data-theme="dark"] .fs-safety-create-modal__textarea,
+[data-theme="dark"] .fs-quality-create-modal__textarea,
+[data-theme="dark"] .fs-safety-create-modal__select,
+[data-theme="dark"] .fs-quality-create-modal__select,
+[data-theme="dark"] .fs-safety-create-modal__input,
+[data-theme="dark"] .fs-quality-create-modal__input {
+  background:   var(--surface-input, var(--surface-raised));
+  border-color: var(--border-default);
+  color:        var(--text-primary);
+}

@@ -90,6 +90,10 @@
     var state    = refState[0];
     var setState = refState[1];
 
+    var retryRef   = React.useState(0);
+    var retryCount = retryRef[0];
+    var setRetry   = retryRef[1];
+
     React.useEffect(function () {
       var cancelled = false;
       setState({ status: 'loading' });
@@ -133,11 +137,11 @@
         });
       }).catch(function (err) {
         if (cancelled) return;
-        setState({ status: 'error', error: err });
+        setState({ status: 'error', error: { code: (err && err.status) || 0, message: (err && err.message) || 'Could not load sites', retryable: true }, retry: function () { setRetry(function (n) { return n + 1; }); } });
       });
 
       return function () { cancelled = true; };
-    }, [depKey]);
+    }, [depKey, retryCount]);
 
     var ctx = { state: state };
     return React.createElement(SitesContext.Provider, { value: ctx },
@@ -166,9 +170,16 @@
     }
 
     if (state.status === 'error') {
+      var ErrorBanner = window.FieldSight.ErrorBanner;
       return React.createElement('div', { className: 'fs-sites' },
-        React.createElement('div', { className: 'fs-sites__empty' },
-          'Could not load sites. ' + (state.error && state.error.message || '')),
+        ErrorBanner
+          ? React.createElement(ErrorBanner, {
+              message:   (state.error && state.error.message) || 'Could not load sites',
+              retryable: true,
+              onRetry:   state.retry,
+            })
+          : React.createElement('div', { className: 'fs-sites__empty' },
+              (state.error && state.error.message) || 'Could not load sites'),
       );
     }
 

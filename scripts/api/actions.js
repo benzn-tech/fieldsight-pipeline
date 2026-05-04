@@ -1,18 +1,29 @@
 /* ==========================================================================
-   FieldSight API · Action items — BACKEND-CONTEXT §4.10
+   FieldSight API · Action items — BACKEND-CONTEXT §4.10  (Sprint 8.1.1)
    --------------------------------------------------------------------------
-   GET  /api/actions?date=YYYY-MM-DD                → { date, actions: { '<topic_id>_<action_index>': { checked, checked_by, checked_at } } }
-   POST /api/actions/toggle  body { date, topic_id, action_index, checked, action_text }
+   GET    /api/actions?date=YYYY-MM-DD
+          → { date, actions: { '<topic_id>_<action_index>': { checked, checked_by, checked_at } } }
 
-   Backed by an in-memory copy of fixtures.actions during Sprint 2.1, so
-   mutations persist for the lifetime of the page (good enough to demo
-   the optimistic-update pattern).
+   PATCH  /api/actions/{id}            (useMocks=false — Sprint 8.1.1)
+          body { done: true/false }
+          → { id, done, checked_by, checked_at }
+
+   POST   /api/actions                 (useMocks=false — Sprint 8.1.1)
+          body { date, topic_id, action_index, action_text, responsible, ... }
+          → { id, ...action }
+
+   Mock path: in-memory copy of fixtures.actions, mutations persist for the
+   lifetime of the page (good enough to demo the optimistic-update pattern).
+
+   On real-backend failure:
+     • Emits a revert event to FS.actionsBus so sibling ActionItemRows
+       can roll back to previous state.
+     • Shows a toast via FS.toast.show (if available).
    ========================================================================== */
 
 (function () {
   'use strict';
 
-  /* Mutable copy — initial state seeded from fixtures the first time. */
   var state = null;
 
   function ensureState() {
@@ -36,48 +47,111 @@
 
   async function toggleAction(opts) {
     opts = opts || {};
+    var date         = opts.date;
+    var topic_id     = opts.topic_id;
+    var action_index = opts.action_index;
+    var checked      = !!opts.checked;
+
+    /* --- Real backend path (Sprint 8.1.1) --------------------------------
+       Optimistic flow:
+         1. ActionItemRow already flips its local checkbox state.
+         2. We fire PATCH /api/actions/{id}.
+         3. On success: emit confirmed bus event (sibling rows sync).
+         4. On failure: emit revert bus event + show toast error.
+       The id follows the BACKEND-CONTEXT §4.10 key format:
+         {date}_{topic_id}_{action_index}
+    */
     if (!window.FS.api.useMocks) {
-      return window.FS.api.request('/actions/toggle', {
-        method: 'POST',
-        body: {
-          date:         opts.date,
-          topic_id:     opts.topic_id,
-          action_index: opts.action_index,
-          checked:      opts.checked,
-          action_text:  opts.action_text,
-        },
+      var id = date + '_' + actionKey(topic_id, action_index);
+      return window.FS.api.request('/actions/' + encodeURIComponent(id), {
+        method: 'PATCH',
+        body:   { done: checked },
+      }).then(function (res) {
+        /* Emit confirmed bus event so any sibling row with the same key
+           updates to the server-truth value. */
+        var bus = window.FS && window.FS.actionsBus;
+        if (bus) {
+          bus.emit({
+            date:         date,
+            topic_id:     topic_id,
+            action_index: action_index,
+            checked:      checked,
+            checked_by:   (res && res.checked_by) || null,
+            checked_at:   (res && res.checked_at) || null,
+          });
+        }
+        return res;
+      }).catch(function (err) {
+        /* Emit revert event so ActionItemRow rolls back. */
+        var bus = window.FS && window.FS.actionsBus;
+        if (bus) {
+          bus.emit({
+            date:         date,
+            topic_id:     topic_id,
+            action_index: action_index,
+            checked:      !checked,  /* revert */
+            checked_by:   null,
+            checked_at:   null,
+            _revert:      true,
+          });
+        }
+        /* Toast the failure. */
+        var toast = window.FS && window.FS.toast;
+        if (toast) {
+          toast.show({
+            message:  'Could not update action item' + ((err && err.message) ? ': ' + err.message : ''),
+            tone:     'error',
+            duration: 5000,
+          });
+        }
+        throw err;
       });
     }
+
+    /* --- Mock path ------------------------------------------------------- */
     await window.FS.api.delay(60);
     ensureState();
 
-    var date  = opts.date;
-    var key   = actionKey(opts.topic_id, opts.action_index);
-    var who   = (window.AuthMock && window.AuthMock.currentUser && window.AuthMock.currentUser.name) || 'system';
+    var key = actionKey(topic_id, action_index);
+    var who = (window.AuthMock && window.AuthMock.currentUser && window.AuthMock.currentUser.name) || 'system';
 
     if (!state[date]) state[date] = {};
     state[date][key] = {
-      checked:    !!opts.checked,
+      checked:    checked,
       checked_by: who,
       checked_at: new Date().toISOString(),
     };
 
-    return { message: 'Updated', checked: !!opts.checked };
+    return { message: 'Updated', checked: checked };
   }
 
-  /* Sprint 4.2 — additive helper for cross-day audit aggregation.
-     Backend exposes only single-date /api/actions (BACKEND-CONTEXT
-     §4.10); this wraps a Promise.all over a date range and merges
-     into a flat map keyed by date. PLAN.md Q-1 commits us to this
-     fan-out approach for the prototype; a future
-     `/api/actions/all?from=&to=` aggregator can drop in behind the
-     same return shape. */
+  /* Sprint 8.1.1 — create a new action item. Used by future write flows. */
+  async function createAction(payload) {
+    if (!window.FS.api.useMocks) {
+      return window.FS.api.request('/actions', {
+        method: 'POST',
+        body:   payload,
+      });
+    }
+    await window.FS.api.delay(80);
+    ensureState();
+    var date = payload.date;
+    var key  = actionKey(payload.topic_id, payload.action_index || 0);
+    if (!state[date]) state[date] = {};
+    state[date][key] = {
+      checked:    false,
+      checked_by: null,
+      checked_at: null,
+    };
+    return { id: date + '_' + key, created: true };
+  }
+
+  /* Sprint 4.2 — cross-day audit aggregation. */
   async function getActionsRange(opts) {
     opts = opts || {};
     var from = opts.from, to = opts.to;
     if (!from || !to) return { byDate: {}, dates: [] };
 
-    /* Build the date list inclusive (UTC arithmetic — BUG-19 safe). */
     var dates = [];
     var cursor = from;
     while (cursor <= to) {
@@ -106,6 +180,7 @@
     getActions:      getActions,
     getActionsRange: getActionsRange,
     toggleAction:    toggleAction,
+    createAction:    createAction,
     actionKey:       actionKey,
   };
 

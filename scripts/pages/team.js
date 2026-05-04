@@ -90,6 +90,10 @@
     var state    = refState[0];
     var setState = refState[1];
 
+    var retryRef   = React.useState(0);
+    var retryCount = retryRef[0];
+    var setRetry   = retryRef[1];
+
     React.useEffect(function () {
       /* Permission gate */
       if (!window.FS.can(caller, 'user:manage')) {
@@ -120,11 +124,11 @@
         });
       }).catch(function (err) {
         if (cancelled) return;
-        setState({ status: 'error', error: err });
+        setState({ status: 'error', error: { code: (err && err.status) || 0, message: (err && err.message) || 'Could not load team', retryable: true }, retry: function () { setRetry(function (n) { return n + 1; }); } });
       });
 
       return function () { cancelled = true; };
-    }, [depKey]);
+    }, [depKey, retryCount]);
 
     var ctx = { state: state };
     return React.createElement(TeamContext.Provider, { value: ctx }, props.children);
@@ -151,9 +155,16 @@
     }
 
     if (state.status === 'error') {
+      var ErrorBanner = window.FieldSight.ErrorBanner;
       return React.createElement('div', { className: 'fs-team' },
-        React.createElement('div', { className: 'fs-team__empty' },
-          'Could not load team. ' + (state.error && state.error.message || '')));
+        ErrorBanner
+          ? React.createElement(ErrorBanner, {
+              message:   (state.error && state.error.message) || 'Could not load team',
+              retryable: true,
+              onRetry:   state.retry,
+            })
+          : React.createElement('div', { className: 'fs-team__empty' },
+              (state.error && state.error.message) || 'Could not load team'));
     }
 
     if (state.status === 'access_denied') {

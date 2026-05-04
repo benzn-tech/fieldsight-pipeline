@@ -1,5 +1,5 @@
 /* ==========================================================================
-   FieldSight Auth · Session — token store + auto-refresh
+   FieldSight Auth · Session — token store + auto-refresh  (Sprint 8.0.2)
    --------------------------------------------------------------------------
    Holds the live Cognito tokens for the duration of a tab. Tokens live
    in MEMORY plus sessionStorage (cleared on tab close); we deliberately
@@ -9,28 +9,29 @@
 
    Auto-refresh: the token-bearing fetch helper (api/_fetch.js) calls
    ensureFresh() before each request. If the id token is within the
-   refresh window (default 90s before expiry) we refresh proactively
+   refresh window (default 60 s before expiry) we refresh proactively
    so the request goes out with a fresh token.
 
    On a 401 response, callers should hit refresh() once and retry; if
    the refresh itself fails we clear() and require a fresh signIn.
 
    Exported to:
-     window.FS.session.{ idToken, accessToken, refreshToken, expiresAt,
-                         user,
-                         set(), clear(), ensureFresh(), onChange() }
+     window.FS.session.{
+       idToken, accessToken, refreshToken, expiresAt, user,
+       isSignedIn(),
+       getAccessToken(),
+       set(), clear(), refresh(), ensureFresh(), onChange()
+     }
    ========================================================================== */
 
 (function () {
   'use strict';
 
   var KEY = 'fs.session.v1';
-  var REFRESH_LEAD_MS = 90 * 1000;
+  var REFRESH_LEAD_MS = 60 * 1000;  /* refresh when <60 s until expiry */
 
   var listeners = new Set();
 
-  /* In-memory state mirrored to sessionStorage on writes. Reads after
-     reload come from sessionStorage. */
   var state = readFromStorage();
 
   function readFromStorage() {
@@ -86,13 +87,19 @@
     emit();
   }
 
-  /* If the id token is within REFRESH_LEAD_MS of expiry (or already
-     expired), refresh it. Returns the (possibly new) idToken or null
-     if no session is available. */
+  /* Returns the idToken (or null) after proactively refreshing if
+     the token is within REFRESH_LEAD_MS of expiry. */
   async function ensureFresh() {
     if (!state.idToken) return null;
     if (Date.now() < state.expiresAt - REFRESH_LEAD_MS) return state.idToken;
     return refresh();
+  }
+
+  /* Returns the current accessToken (non-refreshing — call ensureFresh
+     first if you need a guaranteed-fresh token). Used by api/_fetch.js
+     to supply the Authorization: Bearer header. */
+  function getAccessToken() {
+    return state.accessToken;
   }
 
   async function refresh() {
@@ -101,7 +108,7 @@
       return null;
     }
     try {
-      var res = await window.FS.cognito.refreshTokens(state.refreshToken);
+      var res  = await window.FS.cognito.refreshTokens(state.refreshToken);
       var auth = res.AuthenticationResult || {};
       set({
         idToken:     auth.IdToken     || state.idToken,
@@ -131,7 +138,8 @@
     get refreshToken() { return state.refreshToken; },
     get expiresAt()    { return state.expiresAt; },
     get user()         { return state.user; },
-    isSignedIn:        function () { return !!state.idToken && Date.now() < state.expiresAt; },
+    isSignedIn:     function () { return !!state.idToken && Date.now() < state.expiresAt; },
+    getAccessToken: getAccessToken,
 
     /* Mutations */
     set:          set,

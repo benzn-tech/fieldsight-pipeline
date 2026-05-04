@@ -114,6 +114,10 @@
     var state     = refState[0];
     var setState  = refState[1];
 
+    var retryRef   = React.useState(0);
+    var retryCount = retryRef[0];
+    var setRetry   = retryRef[1];
+
     var refView   = React.useState('gantt');
     var view      = refView[0];
     var setView   = refView[1];
@@ -165,11 +169,11 @@
         });
       }).catch(function (err) {
         if (cancelled) return;
-        setState({ status: 'error', error: err });
+        setState({ status: 'error', error: { code: (err && err.status) || 0, message: (err && err.message) || 'Could not load programme', retryable: true }, retry: function () { setRetry(function (n) { return n + 1; }); } });
       });
 
       return function () { cancelled = true; };
-    }, [depKey]);
+    }, [depKey, retryCount]);
 
     function toggleGroup(groupId) {
       setCollapsed(function (prev) {
@@ -652,9 +656,16 @@
       );
     }
     if (s.status === 'error') {
+      var ErrorBanner = fs.ErrorBanner;
       return React.createElement('div', { className: 'fs-programme' },
-        React.createElement('div', { className: 'fs-programme__empty' },
-          'Could not load programme. ' + (s.error && s.error.message || '')),
+        ErrorBanner
+          ? React.createElement(ErrorBanner, {
+              message:   (s.error && s.error.message) || 'Could not load programme',
+              retryable: true,
+              onRetry:   s.retry,
+            })
+          : React.createElement('div', { className: 'fs-programme__empty' },
+              (s.error && s.error.message) || 'Could not load programme'),
       );
     }
     if (s.status === 'access_denied') {

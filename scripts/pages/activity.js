@@ -90,6 +90,10 @@
     var state    = refState[0];
     var setState = refState[1];
 
+    var retryRef   = React.useState(0);
+    var retryCount = retryRef[0];
+    var setRetry   = retryRef[1];
+
     React.useEffect(function () {
       var cancelled = false;
       setState({ status: 'loading' });
@@ -120,11 +124,11 @@
         });
       }).catch(function (err) {
         if (cancelled) return;
-        setState({ status: 'error', error: err });
+        setState({ status: 'error', error: { code: (err && err.status) || 0, message: (err && err.message) || 'Could not load activity', retryable: true }, retry: function () { setRetry(function (n) { return n + 1; }); } });
       });
 
       return function () { cancelled = true; };
-    }, [depKey, daysToLoad]);
+    }, [depKey, daysToLoad, retryCount]);
 
     function loadMore() { setDaysToLoad(function (n) { return n + LOAD_STEP; }); }
 
@@ -155,9 +159,16 @@
       );
     }
     if (state.status === 'error') {
+      var ErrorBanner = window.FieldSight.ErrorBanner;
       return React.createElement('div', { className: 'fs-activity' },
-        React.createElement('div', { className: 'fs-activity__empty' },
-          'Could not load activity. ' + (state.error && state.error.message || '')),
+        ErrorBanner
+          ? React.createElement(ErrorBanner, {
+              message:   (state.error && state.error.message) || 'Could not load activity',
+              retryable: true,
+              onRetry:   state.retry,
+            })
+          : React.createElement('div', { className: 'fs-activity__empty' },
+              (state.error && state.error.message) || 'Could not load activity'),
       );
     }
     if (state.status === 'access_denied') {

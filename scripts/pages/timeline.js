@@ -246,6 +246,10 @@
     var state    = refState[0];
     var setState = refState[1];
 
+    var retryRef   = React.useState(0);
+    var retryCount = retryRef[0];
+    var setRetry   = retryRef[1];
+
     /* Sprint 2.8 (Phase H) — when both a daily report and meeting
        minutes exist for the date, the user picks which to view. */
     var refView = React.useState('daily');
@@ -334,10 +338,10 @@
         });
       }).catch(function (err) {
         if (cancelled) return;
-        setState({ status: 'error', error: err });
+        setState({ status: 'error', error: { code: (err && err.status) || 0, message: (err && err.message) || 'Could not load report', retryable: true }, retry: function () { setRetry(function (n) { return n + 1; }); } });
       });
       return function () { cancelled = true; };
-    }, [date, user]);
+    }, [date, user, retryCount]);
 
     /* Sprint 6.7.1 — keep state.actions in sync with cross-component
        toggles (the right-detail OverviewTab also renders the same
@@ -406,11 +410,18 @@
     }
 
     if (state.status === 'error') {
+      var ErrorBanner = window.FieldSight.ErrorBanner;
       return React.createElement('div', { className: 'fs-timeline-page' },
         React.createElement(PageHeader, { date: date, user: user }),
-        React.createElement(NoReportState, {
-          message: 'Could not load report. ' + (state.error && state.error.message || ''),
-        }),
+        ErrorBanner
+          ? React.createElement(ErrorBanner, {
+              message:   (state.error && state.error.message) || 'Could not load report',
+              retryable: true,
+              onRetry:   state.retry,
+            })
+          : React.createElement(NoReportState, {
+              message: (state.error && state.error.message) || 'Could not load report',
+            }),
       );
     }
 

@@ -232,6 +232,17 @@ function DevRoleSwitcher() {
     },
       React.createElement('span', { style: labelStyle }, '⚙ Dev · Role Switcher'),
       React.createElement('span', {
+        style: {
+          fontSize: '10px',
+          fontWeight: '600',
+          padding: '1px 5px',
+          borderRadius: '3px',
+          marginRight: '4px',
+          background: (window.FS && window.FS.api && !window.FS.api.useMocks) ? '#22c55e' : 'rgba(255,255,255,0.15)',
+          color: (window.FS && window.FS.api && !window.FS.api.useMocks) ? '#fff' : 'rgba(255,255,255,0.5)',
+        },
+      }, (window.FS && window.FS.api && !window.FS.api.useMocks) ? 'LIVE' : 'MOCK'),
+      React.createElement('span', {
         style: { color: 'rgba(255,255,255,0.4)', fontSize: '11px' },
       }, minimized ? '▲' : '▼'),
     ),

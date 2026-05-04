@@ -92,6 +92,10 @@
     var state    = refState[0];
     var setState = refState[1];
 
+    var retryRef   = React.useState(0);
+    var retryCount = retryRef[0];
+    var setRetry   = retryRef[1];
+
     /* Photos cache — populated when the Photos tab activates (first
        open) and shared with the right-pane summary. */
     var refPhotos = React.useState({ status: 'idle', perDay: [], totalCount: 0 });
@@ -123,11 +127,11 @@
         setState({ status: 'ok', dates: dates, user: user });
       }).catch(function (err) {
         if (cancelled) return;
-        setState({ status: 'error', error: err });
+        setState({ status: 'error', error: { code: (err && err.status) || 0, message: (err && err.message) || 'Could not load evidence', retryable: true }, retry: function () { setRetry(function (n) { return n + 1; }); } });
       });
 
       return function () { cancelled = true; };
-    }, [depKey, daysToLoad]);
+    }, [depKey, daysToLoad, retryCount]);
 
     /* Lazy-load photos when the Photos tab is the active one and we
        don't yet have data for it. Other tabs are populated by their
@@ -287,9 +291,16 @@
       );
     }
     if (state.status === 'error') {
+      var ErrorBanner = window.FieldSight.ErrorBanner;
       return React.createElement('div', { className: 'fs-evidence' },
-        React.createElement('div', { className: 'fs-evidence__empty' },
-          'Could not load evidence. ' + (state.error && state.error.message || '')),
+        ErrorBanner
+          ? React.createElement(ErrorBanner, {
+              message:   (state.error && state.error.message) || 'Could not load evidence',
+              retryable: true,
+              onRetry:   state.retry,
+            })
+          : React.createElement('div', { className: 'fs-evidence__empty' },
+              (state.error && state.error.message) || 'Could not load evidence'),
       );
     }
     if (state.status === 'access_denied') {

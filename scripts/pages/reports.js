@@ -91,6 +91,10 @@
     var state    = refState[0];
     var setState = refState[1];
 
+    var retryRef   = React.useState(0);
+    var retryCount = retryRef[0];
+    var setRetry   = retryRef[1];
+
     var refFilter = React.useState('all');
     var filter    = refFilter[0];
     var setFilter = refFilter[1];
@@ -117,10 +121,10 @@
         setState({ status: 'ok', rows: sorted });
       }).catch(function (err) {
         if (cancelled) return;
-        setState({ status: 'error', error: err, rows: [] });
+        setState({ status: 'error', error: { code: (err && err.status) || 0, message: (err && err.message) || 'Could not load reports', retryable: true }, retry: function () { setRetry(function (n) { return n + 1; }); }, rows: [] });
       });
       return function () { cancelled = true; };
-    }, []);
+    }, [retryCount]);
 
     function regenerate(type) {
       setReg({ phase: 'submitting', type: type });
@@ -226,7 +230,13 @@
       state.status === 'loading'
         ? React.createElement('div', { className: 'fs-reports__loading' }, 'Loading reports…')
         : state.status === 'error'
-        ? React.createElement('div', { className: 'fs-reports__empty' }, 'Could not load reports.')
+        ? (window.FieldSight.ErrorBanner
+            ? React.createElement(window.FieldSight.ErrorBanner, {
+                message:   (state.error && state.error.message) || 'Could not load reports',
+                retryable: true,
+                onRetry:   state.retry,
+              })
+            : React.createElement('div', { className: 'fs-reports__empty' }, 'Could not load reports.'))
         : state.status === 'access_denied'
         ? (window.FieldSight.AccessDenied
             ? React.createElement(window.FieldSight.AccessDenied, {

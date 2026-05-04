@@ -110,6 +110,10 @@
     var state    = refState[0];
     var setState = refState[1];
 
+    var retryRef   = React.useState(0);
+    var retryCount = retryRef[0];
+    var setRetry   = retryRef[1];
+
     /* Re-key the effect on the caller name+role: dev role switcher
        changes role → teamTasks visibility flips; reload to recompute. */
     var depKey = (caller && caller.name) + '|' + (caller && caller.role) + '|' + (caller && caller.isAdmin);
@@ -229,11 +233,11 @@
           });
         }).catch(function (err) {
           if (cancelled) return;
-          setState({ status: 'error', error: err, today: today });
+          setState({ status: 'error', error: { code: (err && err.status) || 0, message: (err && err.message) || 'Could not load today', retryable: true }, retry: function () { setRetry(function (n) { return n + 1; }); }, today: today });
         });
 
       return function () { cancelled = true; };
-    }, [depKey]);
+    }, [depKey, retryCount]);
 
     /* Local optimistic removal — used after the check-off animation
        finishes to drop a task out of the rendered list without a
@@ -373,9 +377,16 @@
     }
 
     if (state.status === 'error') {
+      var ErrorBanner = fs.ErrorBanner;
       return React.createElement('div', { className: 'fs-page fs-page--today' },
-        React.createElement('div', { style: { padding: '24px', color: 'var(--text-tertiary)', fontSize: '13px' } },
-          'Could not load today. ' + (state.error && state.error.message || '')),
+        ErrorBanner
+          ? React.createElement(ErrorBanner, {
+              message:   (state.error && state.error.message) || 'Could not load today',
+              retryable: true,
+              onRetry:   state.retry,
+            })
+          : React.createElement('div', { style: { padding: '24px', color: 'var(--text-tertiary)', fontSize: '13px' } },
+              (state.error && state.error.message) || 'Could not load today'),
       );
     }
 

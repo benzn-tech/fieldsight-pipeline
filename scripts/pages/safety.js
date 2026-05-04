@@ -105,6 +105,10 @@
     var state    = refState[0];
     var setState = refState[1];
 
+    var retryRef   = React.useState(0);
+    var retryCount = retryRef[0];
+    var setRetry   = retryRef[1];
+
     /* Compute the from/to range for the current mode + day. */
     var today = window.FS.api.todayNZDT();
     var range;
@@ -141,24 +145,32 @@
         });
       }).catch(function (err) {
         if (cancelled) return;
-        setState({ status: 'error', error: err });
+        setState({ status: 'error', error: { code: (err && err.status) || 0, message: (err && err.message) || 'Could not load safety data', retryable: true }, retry: function () { setRetry(function (n) { return n + 1; }); } });
       });
 
       return function () { cancelled = true; };
-    }, [depKey, mode, day]);
+    }, [depKey, mode, day, retryCount]);
 
     var refSel = React.useState(null);
     var sel    = refSel[0];
     var setSel = refSel[1];
 
+    var refCreate = React.useState(false);
+    var showCreate = refCreate[0];
+    var setShowCreate = refCreate[1];
+
     var ctx = {
-      state:        state,
-      mode:         mode,
-      day:          day,
-      setMode:      function (m) { setSel(null); setMode(m); },
-      setDay:       function (d) { setSel(null); setDay(d); setMode('day'); },
-      selectedFlag: sel,
-      setSelected:  setSel,
+      state:         state,
+      setState:      setState,
+      mode:          mode,
+      day:           day,
+      setMode:       function (m) { setSel(null); setMode(m); },
+      setDay:        function (d) { setSel(null); setDay(d); setMode('day'); },
+      selectedFlag:  sel,
+      setSelected:   setSel,
+      showCreate:    showCreate,
+      setShowCreate: setShowCreate,
+      caller:        caller,
     };
     return React.createElement(SafetyContext.Provider, { value: ctx },
       props.children);
@@ -211,27 +223,49 @@
   /* ---------- Middle column -------------------------------------------- */
 
   function SafetyMiddleColumn(props) {
-    var fs            = window.FieldSight;
-    var KpiStrip      = fs.KpiStrip;
-    var StatCard      = fs.StatCard;
-    var SafetyFlagRow = fs.SafetyFlagRow;
-    var Badge         = fs.Badge;
-    var AccessDenied  = fs.AccessDenied;
+    var fs                 = window.FieldSight;
+    var KpiStrip           = fs.KpiStrip;
+    var StatCard           = fs.StatCard;
+    var SafetyFlagRow      = fs.SafetyFlagRow;
+    var SafetyCreateModal  = fs.SafetyCreateModal;
+    var Badge              = fs.Badge;
+    var AccessDenied       = fs.AccessDenied;
+    var Button             = fs.Button;
 
     var ctx = React.useContext(SafetyContext);
     if (!ctx) {
       console.warn('[SafetyMiddleColumn] SafetyContext missing');
       return null;
     }
-    var state = ctx.state;
+    var state    = ctx.state;
     var onSelect = props.onSelect || function () {};
+
+    /* Gate: only hse_manager or site_manager (or admin) can raise new observations. */
+    var caller  = ctx.caller || {};
+    var canCreate = !!(window.FS && window.FS.can &&
+      (window.FS.can(caller, 'safety:manage') ||
+       window.FS.can(caller, 'site:manage') ||
+       (caller.isAdmin)));
 
     /* Header is always visible — toolbar should be reachable even
        during loading/empty states. */
+    var raiseBtn = (canCreate && SafetyCreateModal)
+      ? React.createElement('button', {
+          type:      'button',
+          className: 'fs-safety__raise-btn',
+          onClick:   function () { ctx.setShowCreate(true); },
+        }, '+ Raise Observation')
+      : null;
+
     var header = React.createElement('div', { className: 'fs-safety__header' },
-      React.createElement('h2', { className: 'fs-safety__title' }, 'Safety'),
-      React.createElement('div', { className: 'fs-safety__subtitle' },
-        'Flags and observations across your accessible reports'),
+      React.createElement('div', { className: 'fs-safety__header-top' },
+        React.createElement('div', null,
+          React.createElement('h2', { className: 'fs-safety__title' }, 'Safety'),
+          React.createElement('div', { className: 'fs-safety__subtitle' },
+            'Flags and observations across your accessible reports'),
+        ),
+        raiseBtn,
+      ),
     );
     var toolbar = React.createElement(RangeToolbar, { ctx: ctx });
 
@@ -243,10 +277,17 @@
       );
     }
     if (state.status === 'error') {
+      var ErrorBanner = window.FieldSight.ErrorBanner;
       return React.createElement('div', { className: 'fs-safety' },
         header, toolbar,
-        React.createElement('div', { className: 'fs-safety__empty' },
-          'Could not load safety data. ' + (state.error && state.error.message || '')),
+        ErrorBanner
+          ? React.createElement(ErrorBanner, {
+              message:   (state.error && state.error.message) || 'Could not load safety data',
+              retryable: true,
+              onRetry:   state.retry,
+            })
+          : React.createElement('div', { className: 'fs-safety__empty' },
+              (state.error && state.error.message) || 'Could not load safety data'),
       );
     }
     if (state.status === 'access_denied') {
@@ -267,9 +308,35 @@
       ? fmtDate(state.from)
       : fmtDate(state.from) + ' → ' + fmtDate(state.to);
 
+    /* Callback when a new observation is successfully created: prepend
+       to the provider's list so it appears immediately without a reload. */
+    function handleNewFlag(newFlag) {
+      ctx.setShowCreate(false);
+      if (ctx.setState && newFlag) {
+        ctx.setState(function (s) {
+          if (s.status !== 'ok') return s;
+          var updatedRows = [newFlag].concat(s.rows || []);
+          return Object.assign({}, s, {
+            rows:   updatedRows,
+            totals: totalsFromRows(updatedRows),
+            groups: groupByDate(updatedRows),
+          });
+        });
+      }
+    }
+
     return React.createElement('div', { className: 'fs-safety' },
       header,
       toolbar,
+
+      /* Create observation modal (Sprint 8.1.2) */
+      ctx.showCreate && SafetyCreateModal
+        ? React.createElement(SafetyCreateModal, {
+            siteId:    state.user || '',
+            onSuccess: handleNewFlag,
+            onCancel:  function () { ctx.setShowCreate(false); },
+          })
+        : null,
 
       /* Meta line */
       React.createElement('div', { className: 'fs-safety__meta' },
