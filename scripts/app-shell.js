@@ -265,7 +265,7 @@ function formatTodayDate() {
 }
 
 /* ---------- MiddleColumn -------------------------------------------------- */
-function MiddleColumn({ route, width, onWidthChange, onSelect, selectedItem, fullWidth }) {
+function MiddleColumn({ route, width, onWidthChange, onSelect, selectedItem, fullWidth, onSearchOpen }) {
   const t = window.FS.tokens;
 
   const routeLabel = (route || '/').replace(/^\//, '') || 'today';
@@ -332,8 +332,19 @@ function MiddleColumn({ route, width, onWidthChange, onSelect, selectedItem, ful
         }, formatTodayDate()) : null,
       ),
 
-      /* Right-side utility area: weather + future bell etc. */
+      /* Right-side utility area: search + weather */
       React.createElement('div', { className: 'middle-column__utility' },
+        onSearchOpen ? React.createElement('button', {
+          type:         'button',
+          className:    'fs-utility-item fs-search-btn',
+          onClick:      onSearchOpen,
+          title:        'Search  (⌘K)',
+          'aria-label': 'Open search (Cmd+K)',
+        },
+          window.FieldSight.NavIcon && React.createElement(window.FieldSight.NavIcon, {
+            name: 'search', size: 16,
+          }),
+        ) : null,
         React.createElement(WeatherIndicator),
       ),
     ),
@@ -503,6 +514,14 @@ function AppShell({ showDevSwitcher = false }) {
   /* Selected item for right detail panel */
   const [selectedItem, setSelectedItem] = React.useState(null);
 
+  /* Sprint 8.6 — global search palette */
+  const [searchOpen, setSearchOpen] = React.useState(false);
+
+  /* Sprint 8.7 — offline detection */
+  const [isOnline, setIsOnline] = React.useState(function () {
+    return typeof navigator !== 'undefined' ? navigator.onLine !== false : true;
+  });
+
   /* Clear selection on route change — different page = fresh selection */
   React.useEffect(function() {
     setSelectedItem(null);
@@ -537,20 +556,38 @@ function AppShell({ showDevSwitcher = false }) {
     }
   }, [user, route]);
 
-  /* Keyboard shortcut ⌘/Ctrl+B — ignored when typing in text fields */
+  /* Keyboard shortcuts — ignored when typing in text fields */
   React.useEffect(function() {
     function onKey(e) {
       var target = e.target;
       var tag = target && target.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || (target && target.isContentEditable)) return;
+      var inInput = tag === 'INPUT' || tag === 'TEXTAREA' || (target && target.isContentEditable);
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'b') {
+        if (inInput) return;
         e.preventDefault();
         toggleCollapse();
+      }
+      /* Sprint 8.6 — ⌘K / Ctrl+K opens search palette */
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setSearchOpen(true);
       }
     }
     window.addEventListener('keydown', onKey);
     return function() { window.removeEventListener('keydown', onKey); };
   });
+
+  /* Sprint 8.7 — online / offline detection */
+  React.useEffect(function () {
+    function onOnline()  { setIsOnline(true); }
+    function onOffline() { setIsOnline(false); }
+    window.addEventListener('online',  onOnline);
+    window.addEventListener('offline', onOffline);
+    return function () {
+      window.removeEventListener('online',  onOnline);
+      window.removeEventListener('offline', onOffline);
+    };
+  }, []);
 
   /* Auto-collapse on viewport changes — only if user has no stored preference */
   React.useEffect(function() {
@@ -647,6 +684,7 @@ function AppShell({ showDevSwitcher = false }) {
         onSelect: setSelectedItem,
         selectedItem: selectedItem,
         fullWidth: fullWidth,
+        onSearchOpen: function () { setSearchOpen(true); },
       }),
 
       /* Static right pane only in normal (3-pane) mode. */
@@ -679,6 +717,22 @@ function AppShell({ showDevSwitcher = false }) {
 
     showDevSwitcher && window.FieldSight.DevRoleSwitcher
       ? React.createElement(window.FieldSight.DevRoleSwitcher)
+      : null,
+
+    /* Sprint 8.7 — offline banner (fixed, above all content) */
+    !isOnline
+      ? React.createElement('div', {
+          className:   'fs-offline-banner',
+          role:        'status',
+          'aria-live': 'polite',
+        }, '⚠️ You’re offline — changes won’t sync')
+      : null,
+
+    /* Sprint 8.6 — global search palette */
+    searchOpen && window.FieldSight.SearchPalette
+      ? React.createElement(window.FieldSight.SearchPalette, {
+          onClose: function () { setSearchOpen(false); },
+        })
       : null,
   );
 }

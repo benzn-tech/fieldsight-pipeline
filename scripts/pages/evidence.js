@@ -35,8 +35,8 @@
 (function () {
   'use strict';
 
-  var DEFAULT_DAYS = 7;
-  var LOAD_STEP    = 7;
+  var DEFAULT_DAYS = 3;  /* Sprint 8.8.2 — start with 3 days; load-more adds 3 more */
+  var LOAD_STEP    = 3;
 
   /* ---------- Helpers --------------------------------------------------- */
 

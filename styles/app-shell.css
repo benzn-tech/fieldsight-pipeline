@@ -653,3 +653,37 @@ button:not([class*="fs-"]):focus-visible,
   /* Resize handle invisible on mobile */
   .resize-handle { display: none; }
 }
+
+
+/* ==========================================================================
+   §SPRINT-8.6 · SEARCH BUTTON (middle-column utility bar)
+   ========================================================================== */
+
+/* .fs-search-btn inherits .fs-utility-item base — no extra overrides needed */
+
+/* ==========================================================================
+   §SPRINT-8.7 · OFFLINE BANNER
+   ========================================================================== */
+
+.fs-offline-banner {
+  position:      fixed;
+  top:           0;
+  left:          0;
+  right:         0;
+  z-index:       400;
+  padding:       9px 16px;
+  background:    var(--color-warning-100, #fef3c7);
+  border-bottom: 1px solid var(--color-warning-300, #fcd34d);
+  color:         var(--color-warning-900, #78350f);
+  font-family:   var(--font-sans);
+  font-size:     var(--fs-text-sm, 13px);
+  font-weight:   500;
+  text-align:    center;
+  pointer-events: none;
+}
+
+[data-theme="dark"] .fs-offline-banner {
+  background:   var(--color-warning-900, #451a03);
+  border-color: var(--color-warning-700, #b45309);
+  color:        var(--color-warning-200, #fde68a);
+}

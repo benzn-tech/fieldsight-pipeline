@@ -12,9 +12,9 @@
 
   <!-- Design tokens + AppShell CSS -->
   <link rel="stylesheet" href="styles/tokens.css" />
-  <link rel="stylesheet" href="styles/app-shell.css?v=5" />
-  <link rel="stylesheet" href="styles/components.css?v=5" />
-  <link rel="stylesheet" href="styles/composites.css?v=38" />
+  <link rel="stylesheet" href="styles/app-shell.css?v=6" />
+  <link rel="stylesheet" href="styles/components.css?v=6" />
+  <link rel="stylesheet" href="styles/composites.css?v=39" />
 
   <style>
     /* Ensure full-bleed with no scroll */
@@ -95,6 +95,8 @@
   <script type="text/babel" src="scripts/composites/programme-task-editor.js?v=4"></script>
   <!-- Sprint 5.4/5.5/8.2.2 — CSV + XML + XLSX import modal -->
   <script type="text/babel" src="scripts/composites/programme-import-modal.js?v=3"></script>
+  <!-- Sprint 8.6 — SearchPalette (global search overlay, ⌘K / Ctrl+K) -->
+  <script type="text/babel" src="scripts/composites/search-palette.js?v=1"></script>
   <!-- Sprint 8.0.3 — ErrorBanner (used by all page providers on fetch failure) -->
   <script type="text/babel" src="scripts/composites/error-banner.js?v=1"></script>
   <!-- Sprint 8.1.4 — Toast notification stack (vanilla JS, no React) -->
@@ -153,7 +155,7 @@
   <script src="scripts/api/actions-bus.js?v=1"></script>
   <script src="scripts/api/ask.js?v=1"></script>
   <script src="scripts/api/reports.js?v=1"></script>
-  <script src="scripts/api/media.js?v=1"></script>
+  <script src="scripts/api/media.js?v=2"></script>
   <script src="scripts/api/meetings.js?v=1"></script>
   <!--   4. Today adapter (PLAN Phase D sketch — feeds mock-data.js shim) -->
   <script src="scripts/api/today-adapter.js?v=3"></script>
@@ -180,9 +182,9 @@
   <script type="text/babel" src="scripts/pages/reports.js?v=3"></script>
   <script type="text/babel" src="scripts/pages/sites.js?v=2"></script>
   <script type="text/babel" src="scripts/pages/activity.js?v=3"></script>
-  <script type="text/babel" src="scripts/pages/tasks.js?v=5"></script>
-  <script type="text/babel" src="scripts/pages/evidence.js?v=2"></script>
-  <script type="text/babel" src="scripts/pages/programme.js?v=14"></script>
+  <script type="text/babel" src="scripts/pages/tasks.js?v=6"></script>
+  <script type="text/babel" src="scripts/pages/evidence.js?v=3"></script>
+  <script type="text/babel" src="scripts/pages/programme.js?v=15"></script>
   <script type="text/babel" src="scripts/pages/safety.js?v=8"></script>
   <script type="text/babel" src="scripts/pages/quality.js?v=5"></script>
   <!-- Sprint 7.1+7.2 — /team page -->
@@ -191,7 +193,7 @@
   <script type="text/babel" src="scripts/pages/settings.js?v=2"></script>
 
   <script type="text/babel" src="scripts/dev-role-switcher.js?v=5"></script>
-  <script type="text/babel" src="scripts/app-shell.js?v=13"></script>
+  <script type="text/babel" src="scripts/app-shell.js?v=14"></script>
 
   <!-- Sprint 8.0.4 — backend mode bootstrap.
        ?mocks=0        → sets FS.api.useMocks = false (requires a real API)

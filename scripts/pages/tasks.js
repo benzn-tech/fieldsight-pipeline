@@ -36,6 +36,7 @@
   'use strict';
 
   var DEFAULT_DAYS = 14;
+  var PAGE_SIZE    = 25;
 
   /* ---------- Helpers --------------------------------------------------- */
 
@@ -195,6 +196,13 @@
     var filter    = refFilter[0];
     var setFilter = refFilter[1];
 
+    /* 8.8.1 — visible count; reset to PAGE_SIZE when filter changes */
+    var refVisible  = React.useState(PAGE_SIZE);
+    var visibleCount = refVisible[0];
+    var setVisible   = refVisible[1];
+
+    React.useEffect(function () { setVisible(PAGE_SIZE); }, [filter]);
+
     var ctx = React.useContext(TasksContext);
     if (!ctx) {
       console.warn('[TasksMiddleColumn] TasksContext missing');
@@ -203,9 +211,32 @@
     var state = ctx.state;
 
     if (state.status === 'loading') {
+      /* Sprint 8.7.3 — skeleton rows while aggregating */
+      var skeletonWidths = ['75%', '55%', '90%', '65%', '80%'];
       return React.createElement('div', { className: 'fs-tasks' },
-        React.createElement('div', { className: 'fs-tasks__loading' },
-          'Aggregating last ' + DEFAULT_DAYS + ' days…'),
+        React.createElement('div', { className: 'fs-tasks__skeleton' },
+          skeletonWidths.map(function (w, i) {
+            return React.createElement('div', {
+              key: i, className: 'fs-skeleton-row',
+            },
+              React.createElement('span', {
+                className: 'fs-skeleton fs-skeleton-row__check',
+              }),
+              React.createElement('div', { className: 'fs-skeleton-row__body' },
+                React.createElement('span', {
+                  className: 'fs-skeleton fs-skeleton-row__title',
+                  style:     { width: w },
+                }),
+                React.createElement('span', {
+                  className: 'fs-skeleton fs-skeleton-row__sub',
+                }),
+              ),
+              React.createElement('span', {
+                className: 'fs-skeleton fs-skeleton-row__badge',
+              }),
+            );
+          }),
+        ),
       );
     }
 
@@ -264,6 +295,11 @@
       if (a.date !== b.date) return a.date < b.date ? 1 : -1;
       return (a.action || '').localeCompare(b.action || '');
     });
+
+    /* Sprint 8.8.1 — client-side pagination */
+    var totalVisible = visible.length;
+    var hasMore      = visibleCount < totalVisible;
+    visible          = visible.slice(0, visibleCount);
 
     var selectedId = props.selectedItem && props.selectedItem.kind === 'task_row'
       ? props.selectedItem.id
@@ -328,6 +364,17 @@
               });
             }),
           ),
+
+      /* Sprint 8.8.1 — load more */
+      hasMore
+        ? React.createElement('div', { className: 'fs-tasks__load-more' },
+            React.createElement('button', {
+              type:      'button',
+              className: 'fs-tasks__load-more-btn',
+              onClick:   function () { setVisible(function (n) { return n + PAGE_SIZE; }); },
+            }, 'Load more (' + (totalVisible - visibleCount) + ' remaining)'),
+          )
+        : null,
     );
   }
 

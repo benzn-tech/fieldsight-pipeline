@@ -510,6 +510,38 @@
       ? props.selectedItem.task_id
       : null;
 
+    /* Sprint 8.8.3 — virtual list (only engaged when rows > 50) */
+    var ROW_H    = 44;
+    var OVERSCAN = 200;
+    var DO_VIRT  = rows.length > 50;
+
+    var scrollRef  = React.useRef(null);
+    var refSTop    = React.useState(0);
+    var sTop       = refSTop[0]; var setSTop = refSTop[1];
+    var refVpH     = React.useState(600);
+    var vpH        = refVpH[0];  var setVpH  = refVpH[1];
+
+    React.useEffect(function () {
+      if (!DO_VIRT) return;
+      var el = scrollRef.current;
+      if (!el) return;
+      setVpH(el.clientHeight || 600);
+      function onScroll() { setSTop(el.scrollTop); }
+      function onResize() { setVpH(el.clientHeight || 600); }
+      el.addEventListener('scroll', onScroll, { passive: true });
+      window.addEventListener('resize', onResize);
+      return function () {
+        el.removeEventListener('scroll', onScroll);
+        window.removeEventListener('resize', onResize);
+      };
+    }, [DO_VIRT]);
+
+    var first   = DO_VIRT ? Math.max(0, Math.floor((sTop - OVERSCAN) / ROW_H)) : 0;
+    var last    = DO_VIRT ? Math.min(rows.length - 1, Math.ceil((sTop + vpH + OVERSCAN) / ROW_H)) : rows.length - 1;
+    var vRows   = DO_VIRT ? rows.slice(first, last + 1) : rows;
+    var topSpc  = DO_VIRT ? first * ROW_H : 0;
+    var botSpc  = DO_VIRT ? Math.max(0, (rows.length - 1 - last) * ROW_H) : 0;
+
     /* ---- Sprint 4.9 — drag controller --------------------------------
        We hold one in-flight drag at a time. The active drag lives in
        useRef so move handlers see the latest origin without stale
@@ -595,12 +627,22 @@
           })
         : null,
 
-      React.createElement('div', { className: 'fs-gantt' },
+      React.createElement('div', {
+        ref:       DO_VIRT ? scrollRef : null,
+        className: 'fs-gantt',
+        style:     DO_VIRT ? { maxHeight: '70vh', overflowY: 'auto' } : undefined,
+      },
 
         /* Sticky left tree */
         React.createElement('div', { className: 'fs-gantt__tree' },
-          React.createElement('div', { className: 'fs-gantt__tree-head' }, 'WBS · Task'),
-          rows.map(function (r) {
+          React.createElement('div', {
+            className: 'fs-gantt__tree-head',
+            style:     DO_VIRT ? { position: 'sticky', top: 0, zIndex: 2 } : undefined,
+          }, 'WBS \xb7 Task'),
+          DO_VIRT && topSpc > 0
+            ? React.createElement('div', { style: { height: topSpc + 'px', flexShrink: 0 } })
+            : null,
+          vRows.map(function (r) {
             return React.createElement(TaskTreeCell, {
               key:        r.task.task_id,
               task:       r.task,
@@ -621,6 +663,9 @@
               },
             });
           }),
+          DO_VIRT && botSpc > 0
+            ? React.createElement('div', { style: { height: botSpc + 'px', flexShrink: 0 } })
+            : null,
         ),
 
         /* Right scrollable timeline */
@@ -633,8 +678,11 @@
               from: prog.start_date, to: prog.end_date,
               pixelsPerDay: ppd, tier: ctx.tier,
             }),
+            DO_VIRT && topSpc > 0
+              ? React.createElement('div', { style: { height: topSpc + 'px' } })
+              : null,
 
-            rows.map(function (r) {
+            vRows.map(function (r) {
               var isDragging = dragState.taskId === r.task.task_id;
               var bLine = (r.kind === 'leaf') ? (baselineLookup[r.task.task_id] || null) : null;
               return React.createElement(GanttRow, {
@@ -673,6 +721,10 @@
                 },
               });
             }),
+
+            DO_VIRT && botSpc > 0
+              ? React.createElement('div', { style: { height: botSpc + 'px' } })
+              : null,
 
             todayOffset != null
               ? React.createElement('div', {
