@@ -107,6 +107,13 @@
   <script type="text/babel" src="scripts/composites/onboarding-overlay.js?v=1"></script>
   <script type="text/babel" src="scripts/composites/demo-tour.js?v=1"></script>
 
+  <!-- Sprint 9 — new L5 composites (insights + strategic dashboards) -->
+  <script type="text/babel" src="scripts/composites/bar-stack.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/spark-line.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/trend-pill.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/health-score.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/rollup-table.js?v=1"></script>
+
   <script type="text/babel">
     const { Button, IconButton, Input, Textarea, Select, Card,
             Badge, NotificationDot, Avatar, AvatarGroup,
@@ -115,7 +122,10 @@
             /* Sprint 8 — new L5 composites */
             ErrorBanner, OverAllocationBanner, Tooltip,
             SafetyCreateModal, QualityCreateModal, SearchPalette,
-            OnboardingOverlay, DemoTour } = window.FieldSight;
+            OnboardingOverlay, DemoTour,
+            /* Sprint 9 — new L5 composites */
+            BarStack, SparkLine, TrendPill,
+            HealthScore, RollupTable } = window.FieldSight;
 
     function Section({ title, children }) {
       return (
@@ -1192,6 +1202,140 @@
               <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
                 DemoTour is page-level — activate via <code>?demo=1</code> on app-shell-preview.html.
               </span>
+            </Row>
+          </Section>
+
+          {/* ========================================================== */}
+          {/* Sprint 9 — Insights + Strategic dashboard composites      */}
+          {/* ========================================================== */}
+
+          <Section title="Sprint 9 · BarStack">
+            <Row label="risk-segmented">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {BarStack && <BarStack data={[
+                  { key: 'sub-apex',     label: 'Apex Scaffolding', meta: 'Scaffolding', value: 8,
+                    segments: [{ value: 4, tone: 'danger' }, { value: 3, tone: 'warning' }, { value: 1, tone: 'success' }] },
+                  { key: 'sub-mainline', label: 'Mainline Civil',   meta: 'Civil',       value: 5,
+                    segments: [{ value: 1, tone: 'danger' }, { value: 4, tone: 'warning' }] },
+                  { key: 'sub-hartco',   label: 'Hartco Electrical',meta: 'Electrical',  value: 3,
+                    segments: [{ value: 0, tone: 'danger' }, { value: 1, tone: 'warning' }, { value: 2, tone: 'success' }] },
+                ]} onSelect={(row) => alert('clicked: ' + row.label)} />}
+              </div>
+            </Row>
+            <Row label="single-tone">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {BarStack && <BarStack data={[
+                  { key: 'ppe',          label: 'PPE',                 value: 12, tone: 'danger',  segments: [{ value: 12, tone: 'danger' }] },
+                  { key: 'fall',         label: 'Fall from height',    value: 8,  tone: 'danger',  segments: [{ value: 8,  tone: 'danger' }] },
+                  { key: 'house',        label: 'Housekeeping',        value: 5,  tone: 'warning', segments: [{ value: 5,  tone: 'warning' }] },
+                ]} />}
+              </div>
+            </Row>
+            <Row label="empty">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {BarStack && <BarStack data={[]} emptyText="No issues in this range — clean week!" />}
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Sprint 9 · SparkLine">
+            <Row label="14-day · danger tone">
+              {SparkLine && <SparkLine
+                points={[
+                  { date: '2026-04-22', value: 1 }, { date: '2026-04-23', value: 0 },
+                  { date: '2026-04-24', value: 2 }, { date: '2026-04-25', value: 3 },
+                  { date: '2026-04-26', value: 1 }, { date: '2026-04-27', value: 0 },
+                  { date: '2026-04-28', value: 4 }, { date: '2026-04-29', value: 2 },
+                  { date: '2026-04-30', value: 1 }, { date: '2026-05-01', value: 3 },
+                  { date: '2026-05-02', value: 5 }, { date: '2026-05-03', value: 2 },
+                  { date: '2026-05-04', value: 1 }, { date: '2026-05-05', value: 2 },
+                ]}
+                tone="danger" width={280} height={56} showLastValue
+              />}
+            </Row>
+            <Row label="info tone (quality)">
+              {SparkLine && <SparkLine
+                points={[
+                  { date: 'd1', value: 0 }, { date: 'd2', value: 1 }, { date: 'd3', value: 2 },
+                  { date: 'd4', value: 1 }, { date: 'd5', value: 0 }, { date: 'd6', value: 2 },
+                  { date: 'd7', value: 3 },
+                ]}
+                tone="info" width={200} height={48}
+              />}
+            </Row>
+          </Section>
+
+          <Section title="Sprint 9 · TrendPill">
+            <Row label="lower_better polarity">
+              {TrendPill && <TrendPill delta={5}  unit="issues" polarity="lower_better" />}
+              {TrendPill && <TrendPill delta={-3} unit="issues" polarity="lower_better" />}
+              {TrendPill && <TrendPill delta={0}  unit="issues" polarity="lower_better" />}
+            </Row>
+            <Row label="higher_better polarity">
+              {TrendPill && <TrendPill delta={12} unit="%" polarity="higher_better" />}
+              {TrendPill && <TrendPill delta={-7} unit="%" polarity="higher_better" />}
+            </Row>
+            <Row label="hideZero">
+              {TrendPill && <TrendPill delta={0} hideZero />}
+            </Row>
+          </Section>
+
+          <Section title="Sprint 9 · HealthScore">
+            <Row label="A B C D · sm">
+              {HealthScore && <HealthScore grade="A" size="sm" />}
+              {HealthScore && <HealthScore grade="B" size="sm" />}
+              {HealthScore && <HealthScore grade="C" size="sm" />}
+              {HealthScore && <HealthScore grade="D" size="sm" />}
+            </Row>
+            <Row label="md + label">
+              {HealthScore && <HealthScore grade="A" size="md" label="Health" />}
+              {HealthScore && <HealthScore grade="B" size="md" label="Health" />}
+              {HealthScore && <HealthScore grade="C" size="md" label="Health" />}
+              {HealthScore && <HealthScore grade="D" size="md" label="Health" />}
+            </Row>
+            <Row label="lg">
+              {HealthScore && <HealthScore grade="B" size="lg" label="Worst-of" />}
+            </Row>
+          </Section>
+
+          <Section title="Sprint 9 · RollupTable">
+            <Row label="3 projects, sortable">
+              <div style={{ flex: 1, minWidth: 0, overflowX: 'auto' }}>
+                {RollupTable && <RollupTable
+                  columns={[
+                    { key: 'name',           label: 'Project',  type: 'text',    align: 'left' },
+                    { key: 'health',         label: 'Health',   type: 'health',  align: 'center' },
+                    { key: 'safety_count',   label: 'Safety',   type: 'num',     align: 'right' },
+                    { key: 'quality_count',  label: 'Quality',  type: 'num',     align: 'right' },
+                    { key: 'completion_rate',label: 'Done',     type: 'percent', align: 'right' },
+                    { key: 'value',          label: 'Value',    type: 'currency',align: 'right' },
+                    { key: 'trend',          label: '14-day',   type: 'trend',   tone: 'danger' },
+                  ]}
+                  rows={[
+                    { id: 'p1', name: 'SB1108 Ellesmere', health: 'B', safety_count: 5, quality_count: 2,
+                      completion_rate: 0.78, value: 12_400_000,
+                      trend: [{date:'a',value:0},{date:'b',value:1},{date:'c',value:2},{date:'d',value:1},{date:'e',value:0},{date:'f',value:2},{date:'g',value:1}] },
+                    { id: 'p2', name: 'MPI', health: 'D', safety_count: 9, quality_count: 4,
+                      completion_rate: 0.42, value: 8_900_000,
+                      trend: [{date:'a',value:3},{date:'b',value:4},{date:'c',value:5},{date:'d',value:3},{date:'e',value:4},{date:'f',value:6},{date:'g',value:5}] },
+                    { id: 'p3', name: 'SB1131 Wanaka', health: 'A', safety_count: 1, quality_count: 0,
+                      completion_rate: 0.91, value: 6_700_000,
+                      trend: [{date:'a',value:0},{date:'b',value:1},{date:'c',value:0},{date:'d',value:0},{date:'e',value:1},{date:'f',value:0},{date:'g',value:0}] },
+                  ]}
+                  onSelect={(row) => alert('selected: ' + row.name)}
+                />}
+              </div>
+            </Row>
+            <Row label="empty">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {RollupTable && <RollupTable
+                  columns={[
+                    { key: 'name', label: 'Project', type: 'text', align: 'left' },
+                    { key: 'health', label: 'Health', type: 'health', align: 'center' },
+                  ]}
+                  rows={[]}
+                />}
+              </div>
             </Row>
           </Section>
 
