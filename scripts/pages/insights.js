@@ -278,13 +278,18 @@
     var kindLabel = props.kindLabel;
     if (!BarStack) return null;
 
+    /* Sprint 9.5.7 — pull each tag's categorical hue from
+       TAG_VOCAB.color so the 5 bars are distinguishable by hue
+       (red / orange / amber / green / blue / etc.) rather than
+       by 5 shades of the same tone family. */
     var data = section.byTag.slice(0, 5).map(function (b) {
       var topSub = b.top_subcontractor && ins
         ? ins.subcontractorById(b.top_subcontractor)
         : null;
       var meta = topSub ? 'Most-often: ' + topSub.name : null;
       var voc  = (ins ? ins.TAG_VOCAB : []).filter(function (v) { return v.slug === b.tag; })[0];
-      var tone = voc ? voc.tone : 'accent';
+      var tone     = voc ? voc.tone  : 'accent';
+      var tagColor = voc ? voc.color : null;
       return {
         key:      b.tag,
         label:    b.label,
@@ -293,7 +298,7 @@
         tone:     tone,
         selected: ctx.selection && ctx.selection.kind === 'tag'
                   && ctx.selection.id === b.tag,
-        segments: [{ value: b.count, tone: tone }],
+        segments: [{ value: b.count, tone: tone, color: tagColor }],
       };
     });
 

@@ -571,20 +571,26 @@
   --fs-chart-info:    var(--color-info-700);
   --fs-chart-accent:  var(--color-accent-700);
 
-  /* Per-tag palette — light mode (deepened by ~200 shades from
-     prior single-mode mapping) */
-  --fs-tag-ppe:                  var(--color-danger-900);
-  --fs-tag-fall_from_height:     var(--color-danger-700);
-  --fs-tag-electrical:           var(--color-danger-600);
-  --fs-tag-hazardous_substances: var(--color-danger-800);
-  --fs-tag-lockout_tagout:       var(--color-danger-500);
-  --fs-tag-housekeeping:         var(--color-warning-700);
-  --fs-tag-plant_machinery:      var(--color-warning-900);
-  --fs-tag-lifting:              var(--color-warning-800);
-  --fs-tag-traffic_pedestrian:   var(--color-warning-600);
-  --fs-tag-working_hot:          var(--color-warning-500);
-  --fs-tag-quality_workmanship:  var(--color-info-700);
-  --fs-tag-quality_compliance:   var(--color-info-900);
+  /* Per-tag palette — Sprint 9.5.7: 12 CATEGORICAL hues at
+     uniform luminance (≈ Tailwind -700) so each tag is
+     distinguishable by hue alone. Earlier (9.5.6) revs spread
+     shades within danger/warning families, but the resulting
+     reds were indistinguishable from each other and from
+     oranges. These hex values are deliberately raw (NOT aliases
+     of --color-{tone}-{shade}) — chart categorical fills are a
+     different design concern from semantic status colours. */
+  --fs-tag-ppe:                  #B91C1C;  /* red-700        */
+  --fs-tag-fall_from_height:     #C2410C;  /* orange-700     */
+  --fs-tag-electrical:           #B45309;  /* amber-700      */
+  --fs-tag-hazardous_substances: #A16207;  /* yellow-700     */
+  --fs-tag-lockout_tagout:       #4D7C0F;  /* lime-700       */
+  --fs-tag-housekeeping:         #15803D;  /* green-700      */
+  --fs-tag-plant_machinery:      #0F766E;  /* teal-700       */
+  --fs-tag-lifting:              #0E7490;  /* cyan-700       */
+  --fs-tag-traffic_pedestrian:   #1D4ED8;  /* blue-700       */
+  --fs-tag-working_hot:          #4338CA;  /* indigo-700     */
+  --fs-tag-quality_workmanship:  #7E22CE;  /* purple-700     */
+  --fs-tag-quality_compliance:   #BE185D;  /* pink-700       */
 }
 
 [data-theme="dark"] {
@@ -596,19 +602,20 @@
   --fs-chart-info:    var(--color-info-300);
   --fs-chart-accent:  var(--color-accent-300);
 
-  /* Per-tag palette — dark mode (lightened by ~200 shades) */
-  --fs-tag-ppe:                  var(--color-danger-300);
-  --fs-tag-fall_from_height:     var(--color-danger-300);
-  --fs-tag-electrical:           var(--color-danger-200);
-  --fs-tag-hazardous_substances: var(--color-danger-400);
-  --fs-tag-lockout_tagout:       var(--color-danger-100);
-  --fs-tag-housekeeping:         var(--color-warning-300);
-  --fs-tag-plant_machinery:      var(--color-warning-500);
-  --fs-tag-lifting:              var(--color-warning-400);
-  --fs-tag-traffic_pedestrian:   var(--color-warning-200);
-  --fs-tag-working_hot:          var(--color-warning-100);
-  --fs-tag-quality_workmanship:  var(--color-info-300);
-  --fs-tag-quality_compliance:   var(--color-info-500);
+  /* Per-tag palette — dark mode: same 12 hues at -300 luminance
+     for low-saturation pastels that read calm on near-black. */
+  --fs-tag-ppe:                  #FCA5A5;  /* red-300        */
+  --fs-tag-fall_from_height:     #FDBA74;  /* orange-300     */
+  --fs-tag-electrical:           #FCD34D;  /* amber-300      */
+  --fs-tag-hazardous_substances: #FDE68A;  /* yellow-300     */
+  --fs-tag-lockout_tagout:       #BEF264;  /* lime-300       */
+  --fs-tag-housekeeping:         #86EFAC;  /* green-300      */
+  --fs-tag-plant_machinery:      #5EEAD4;  /* teal-300       */
+  --fs-tag-lifting:              #67E8F9;  /* cyan-300       */
+  --fs-tag-traffic_pedestrian:   #93C5FD;  /* blue-300       */
+  --fs-tag-working_hot:          #A5B4FC;  /* indigo-300     */
+  --fs-tag-quality_workmanship:  #D8B4FE;  /* purple-300     */
+  --fs-tag-quality_compliance:   #F9A8D4;  /* pink-300       */
 }
 
 .interactive:focus-visible,

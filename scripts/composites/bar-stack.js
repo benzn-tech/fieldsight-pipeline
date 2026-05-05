@@ -97,12 +97,18 @@
             },
               segs.map(function (s, j) {
                 var segPct = ((s.value || 0) / totalSeg) * 100;
+                /* Sprint 9.5.7 — explicit segment.color wins over
+                   the tone-based fallback. Used by /insights's
+                   TopTags so each tag bar paints in its own
+                   categorical hue from the new --fs-tag-{slug}
+                   palette. */
+                var fill = s.color || toneVar(s.tone);
                 return React.createElement('span', {
                   key:   j,
                   className: 'fs-bar-stack__seg',
                   style: {
                     width:      segPct + '%',
-                    background: toneVar(s.tone),
+                    background: fill,
                   },
                   title: s.label || (s.tone + ': ' + s.value),
                 });
