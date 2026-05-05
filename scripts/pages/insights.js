@@ -603,6 +603,7 @@
     Provider: InsightsProvider,
     Middle:   InsightsMiddleColumn,
     Right:    InsightsRightDetail,
+    layout:   'full-width',   /* Sprint 9.5.1 — 2-panel canvas, drill-down via RightDrawer */
   };
 
 })();

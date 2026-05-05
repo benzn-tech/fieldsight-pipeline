@@ -226,6 +226,7 @@
     Provider: Provider,
     Middle:   MiddleColumn,
     Right:    RightDetail,
+    layout:   'full-width',   /* Sprint 9.5.1 — 2-panel canvas, drill-down via RightDrawer */
   };
 
 })();

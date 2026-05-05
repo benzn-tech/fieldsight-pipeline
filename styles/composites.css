@@ -367,7 +367,9 @@
 }
 
 .fs-stat-card__value {
-  font-size: 28px;
+  /* Sprint 9.5.2 — shrunk 28→22 for dense dashboards (still
+     prominent via bold + tabular-nums; 28 was shouting). */
+  font-size: 22px;
   font-weight: var(--font-weight-bold);
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
@@ -7062,7 +7064,7 @@ body.fs-gantt-dragging--resize-end    { cursor: ew-resize !important; }
 }
 .fs-insights__title {
   margin: 0;
-  font-size: 22px;
+  font-size: 18px;             /* Sprint 9.5.2 — shrunk 22→18 */
   font-weight: var(--font-weight-bold);
   color: var(--text-primary);
 }
@@ -7250,7 +7252,7 @@ body.fs-gantt-dragging--resize-end    { cursor: ew-resize !important; }
 .fs-insights-detail__header { display: flex; flex-direction: column; gap: 4px; }
 .fs-insights-detail__name {
   margin: 0;
-  font-size: 18px;
+  font-size: 15px;             /* Sprint 9.5.2 — shrunk 18→15 (drawer is narrow) */
   font-weight: var(--font-weight-bold);
   color: var(--text-primary);
 }
@@ -7586,7 +7588,7 @@ body.fs-gantt-dragging--resize-end    { cursor: ew-resize !important; }
 .fs-strategic__header { padding: 0 4px; }
 .fs-strategic__title {
   margin: 0;
-  font-size: 22px;
+  font-size: 18px;             /* Sprint 9.5.2 — shrunk 22→18 */
   font-weight: var(--font-weight-bold);
   color: var(--text-primary);
 }
@@ -7710,7 +7712,7 @@ body.fs-gantt-dragging--resize-end    { cursor: ew-resize !important; }
 .fs-strategic-detail__header-text { display: flex; flex-direction: column; gap: 4px; }
 .fs-strategic-detail__name {
   margin: 0;
-  font-size: 18px;
+  font-size: 15px;             /* Sprint 9.5.2 — shrunk 18→15 */
   font-weight: var(--font-weight-bold);
   color: var(--text-primary);
 }
@@ -7799,7 +7801,7 @@ body.fs-gantt-dragging--resize-end    { cursor: ew-resize !important; }
 .fs-executive__banner-meta { display: flex; flex-direction: column; gap: 2px; }
 .fs-executive__banner-value {
   font-family: var(--font-mono);
-  font-size: 24px;
+  font-size: 20px;             /* Sprint 9.5.2 — shrunk 24→20 */
   font-weight: var(--font-weight-bold);
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
