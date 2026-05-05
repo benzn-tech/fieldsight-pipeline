@@ -197,6 +197,27 @@ re-introducing one is the most common way to break the prototype.
 - **Cache busters**: bump `?v=N` in preview HTMLs whenever a loaded
   `.js` / `.css` changes.
 
+### Mobile-only floating UI clusters
+
+- **Wrap a React.Fragment of `position: fixed` siblings in a single
+  portal `<div>`** (`display: none` desktop, `display: contents`
+  mobile). BottomNav was a Fragment of backdrop + sheet + nav;
+  hiding only the `<nav>` left the sheet visibly leaking into the
+  desktop sidebar. One container = one toggle = no gaps.
+
+### Admin permission flow
+
+- **Aggregator pages must explicitly fan out across all users when
+  the caller is admin.** `getTimeline(date, user=null)` for
+  admin returns the `available_users` disambiguation envelope, NOT
+  data — naive `.map(date => getTimeline(date, null))` then drops
+  every report. Pattern lives in `compliance-aggregator.fanoutDates`
+  and `tasks-aggregator.getActionsResolvedRange`: when admin + no
+  user, build `(date × fixtures.sites.users)` cross-product.
+- **Modal `siteId` falls back to `fixtures.sites.sites[0].site_id`**
+  when `state.user` is null (admin path), otherwise the modal mounts
+  with `siteId=''` and silently no-ops on submit.
+
 ### Showcase
 
 - **`components-preview.html` lag**: every new L5 composite must be

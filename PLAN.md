@@ -37,6 +37,9 @@ ledger.
 - ✅ 8.9 fixtures: 3 sites · 8 users · 30 days April 2026 + DemoTour `?demo=1`
 - ✅ 8.10 print CSS + copy-link/share + batch export
 - ✅ 8.11 onboarding overlay + `?` shortcut modal + Tooltip composite
+- ✅ Sprint 8 follow-ups (browser walkthrough fixes):
+  - Round 1 (`fbec744`): action-toggle aria-live announcer; components-preview.html registers all 9 new L5 composites
+  - Round 2 (`4b43615`): BottomNav portal wrap (kills Programme leak in desktop sidebar); admin fan-out across all users for `/tasks` `/safety` `/quality` `/evidence`; modal `siteId` fallback to first fixture site so admin's "+ Raise Observation" / "+ Log Item" buttons actually open; dark-mode tint overrides for badge subtle / safety+quality range chips / activity-card counters
 - 📋 **Pending** — see §2 below
 
 ---
@@ -95,9 +98,14 @@ synchronised.
 - **Status colour tokens are intentionally not theme-flipped**
   (`--color-success-100` / `--color-info-50` etc. are brand-semantic).
   In dark mode their light-pastel backgrounds + global white text =
-  unreadable. Pin foreground via `[data-theme="dark"] .fs-X { color:
-  var(--color-neutral-900) }` overrides — see Programme dark block in
-  `composites.css §PROG-DARK`.
+  unreadable. Two patterns to use:
+  - **Light pastel bg** (Gantt bar, kanban card): pin foreground to
+    `var(--color-neutral-900)` via `[data-theme="dark"]` override.
+    See `composites.css §PROG-DARK`.
+  - **Light pastel chip / badge / counter on a dark panel** (badge
+    subtle, range chip --active, activity-card count): swap the bg
+    to a translucent `rgba(...)` tint and bump text to
+    `var(--color-{tone}-200/300)`. See `composites.css §DARK-BADGES`.
 
 ### Selection / focus
 
@@ -128,6 +136,34 @@ synchronised.
 - **Cache busters**: bump `?v=N` query strings in preview HTMLs
   whenever a loaded `.js` / `.css` file changes. `file://` and dev
   servers won't pick up changes otherwise.
+
+### Mobile-only floating UI clusters
+
+- **React.Fragment of `position: fixed` siblings leaks into desktop
+  layout** (Sprint 8 follow-up 2). `BottomNav` was a Fragment of
+  backdrop + sheet + nav. The `<nav>` was hidden via `display: none`,
+  but the sheet's `transform: translateY(100%)` + `overflow-y: auto`
+  rendered visibly under specific viewport / parent-container
+  conditions. **Wrap any mobile-only floating cluster in a single
+  portal `<div>`** with `display: none` on desktop and
+  `display: contents` in the mobile media query. One toggle, no gaps.
+
+### Admin permission flow
+
+- **`getTimeline(date, user=null)` for admin returns the
+  `available_users` disambiguation envelope, NOT data.** Aggregator
+  pages that fanned out per-date with `user=null` got 0 rows because
+  the loop skipped `available_users` responses. Sprint 8 follow-up 2
+  added explicit admin fan-out: when `caller.isAdmin / role==='admin'
+  / role==='gm'` AND no explicit user, build a `(date × all-users)`
+  cross-product from `fixtures.sites.users`. Pattern lives in
+  `compliance-aggregator.fanoutDates`, `tasks-aggregator
+  .getActionsResolvedRange`, and `evidence.js`'s photos load — copy
+  it for any new aggregator page.
+- **Modal `siteId` defaults to `''` for admin** since admin has no
+  primary site. Always fall back to the first site from
+  `fixtures.sites.sites[0].site_id` so the modal mounts with a real
+  context.
 
 ### Showcase
 
