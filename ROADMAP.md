@@ -1,8 +1,10 @@
 # FieldSight Product Roadmap
 
-> Last updated: 2026-03-22
+> Last updated: 2026-05-06
 > Owner: Ben
 > Status tracking: ⬜ Not started | 🔲 Blocked | 🟡 In progress | ✅ Done
+
+> **Companion runbook:** [`INTEGRATION_PLAN.md`](./INTEGRATION_PLAN.md) — step-by-step execution plan for the dual-repo UI integration described in P3.
 
 ---
 
@@ -170,6 +172,78 @@ Earpiece (mouth) → TTS feedback → "注意: Block C scaffold inspection overd
 **Estimated effort:** Phase 1: 2 hours | Phase 2: 1 week | Phase 3: multi-month R&D
 
 **Dependencies:** Phase 1 needs callback fix. Phase 3 needs device independence from RealPTT.
+
+---
+
+## P3 — UI Integration (新前端仓接入)
+
+**Goal:** Cut over from the legacy single-file `frontend/index.html` to the new `benzn-tech/fieldsight-ui` repo as the production frontend. Backend stays in this repo; the UI repo becomes the source of truth for everything served by CloudFront.
+
+**Status:** ⬜ Not started — plan committed 2026-05-06 in [`INTEGRATION_PLAN.md`](./INTEGRATION_PLAN.md)
+
+**Why P3 not P2:** Dependent on P0/P1/P2 backend features being merged to `develop` first; integration is plumbing, not new product surface.
+
+### Stage A — Backend merge prerequisite
+- [ ] Merge `claude/review-feature-content-hsaO3` → `develop` (pulls in P0+P1+P2+QA/QC L2+CI in one merge — branches are stacked)
+- [ ] Merge `main` (deploy infra) → `develop`
+- [ ] Tag `pre-ui-integration-YYYYMMDD` as rollback point
+- [ ] Add `PATCH /api/actions/{id}` and `POST /api/actions` adapters in `src/lambda_fieldsight_api.py` (decision #1 in INTEGRATION_PLAN.md)
+- [ ] Keep legacy `POST /api/actions/toggle` for one sprint as a compat shim, then remove
+
+### Stage B — Dev environment minimum-viable connection (~1 sprint)
+- [ ] User runs B.0 AWS diagnostics (CloudFormation, Lambda, S3, CloudFront, Cognito, GitHub secrets) — output decides path A/B/C
+- [ ] Land `scripts/deploy_ui_from_external_repo.sh` (cross-repo S3 sync + CloudFront invalidation)
+- [ ] Verify UI shell `?baseUrl=` + `?mocks=0` URL params (already wired in `app-shell-preview.html:215-223`)
+- [ ] Verify Cognito user pool ID + client ID match between repos (or parameterize with `?cognitoPool=`)
+- [ ] Local browser test: `useMocks=false`, login round-trip, `/today` populates from real `/api/timeline`
+- [ ] Deploy new UI to dev S3 + CloudFront; full 12-page tour
+- [ ] Sign-off checklist: legacy frontend on prod still works, dev UI degrades gracefully on missing endpoints
+
+### Stage C — 9 P1/P2 endpoints UI接入 (~2-3 sprints)
+
+**Sprint 9.1 (small)** — UI surfaces backend already exposes:
+- [ ] `GET /api/calendar-events` → date-picker red-dot for due dates
+- [ ] `GET /api/onepager` → reports page "open one-pager" button
+- [ ] `GET/POST /api/topics/priority` → topic-card priority override
+
+**Sprint 9.2 (medium)** — write paths (drops UI's read-only assumption):
+- [ ] `POST /api/reports/correction` + `GET /api/corrections` → inline edit modal + "✏ Corrected" badge (pairs with UI PLAN.md Q-2)
+- [ ] `POST /api/analytics/events` → wire existing UI `EventTracker` from mock to live
+
+**Sprint 9.3 (medium)** — admin views:
+- [ ] `GET /api/dashboard` → replace `/sites` mock adapter
+- [ ] `GET /api/search` → server-side search scope in UI search panel
+- [ ] `POST /api/ask` global scope → cross-day Ask (pairs with UI PLAN.md Q-4)
+
+**Deferred** — `GET/POST /api/digest` (backend Lambda not built yet)
+
+### Stage D — Programme domain backend (~1.5-2 sprints)
+
+UI已实现完整 Programme 页面 (Gantt + Kanban + 文件导入) 走在 mock fixture 上。后端要补 6 个 endpoint：
+
+- [ ] DynamoDB table `fieldsight-programmes` (PK=`PROGRAMME#{id}`, SK=`META` or `TASK#{task_id}`)
+- [ ] `GET /api/programmes/{id}` (site_manager+ read)
+- [ ] `GET /api/programmes/{id}/tasks?from=&to=` (site_manager+ read)
+- [ ] `POST /api/programmes/{id}/tasks` (pm+ write)
+- [ ] `PATCH /api/programmes/{id}/tasks/{task_id}` (pm+ write)
+- [ ] `DELETE /api/programmes/{id}/tasks/{task_id}` (pm+ write)
+- [ ] `POST /api/programmes/{id}/tasks/bulk` (pm+ write — accepts JSON `tasks[]`, browser parses XLSX/CSV/XML via SheetJS)
+- [ ] Schema source of truth = `fieldsight-ui/scripts/fixtures/programme.fixture.js` (task_id, parent_id, name, start, end, duration_days, assignees, depends_on, is_group, progress_pct, baseline_*, float_days)
+
+### Stage E — Other UI domains (small)
+- [ ] `GET /api/meetings` — Lambda wrapping `s3:ListObjectsV2` on `meeting_minutes/` prefix (~½ day)
+- [ ] Safety / Quality writes — new DynamoDB table + 2 POST routes (~3 days)
+- [ ] Aggregators (`/api/today/summary` etc) — no backend work; UI已 client-side fan-out
+
+### Stage F — Production cutover
+- [ ] Dev UI runs ≥2 weeks without regressions
+- [ ] Tag both repos `prod-cutover-YYYY-MM-DD`
+- [ ] Switch prod CloudFront origin to new UI bucket (legacy bucket retained as fallback origin for 30 days)
+- [ ] Remove legacy `frontend/index.html` from this repo after fallback period
+
+**Estimated total effort:** Stage A: 1 day | Stage B: 1 sprint | Stage C: 2-3 sprints | Stage D: 1.5-2 sprints | Stage E: 1 sprint | Stage F: 1 week observation + cutover
+
+**Dependencies:** Stage A blocks B; B blocks C/D/E; A-E all green before F.
 
 ---
 
