@@ -170,6 +170,8 @@ cat /tmp/test.json | head -50
 
 **Goal:** new UI runs against live (dev-tier) API, all 12 pages render (some may degrade), full Cognito login round-trip works.
 
+> **2026-05-09 update:** B.0 diagnostics revealed the dev backend stack does not exist (no SAM stack ever deployed; naming conventions inconsistent across DynamoDB / Cognito / template). Stage B has been broken into 5 sub-steps with a full runbook in **[`docs/STAGE_B_EXECUTION.md`](docs/STAGE_B_EXECUTION.md)**. The §6 below is the original plan; the runbook supersedes it for execution.
+
 ### B.0 Environment diagnostic (user runs these)
 
 This Claude session has **no AWS CLI access**. The user must run these read-only commands and share the output before stage B can proceed:

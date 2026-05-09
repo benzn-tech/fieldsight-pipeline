@@ -191,13 +191,15 @@ Earpiece (mouth) → TTS feedback → "注意: Block C scaffold inspection overd
 - [ ] Keep legacy `POST /api/actions/toggle` for one sprint as a compat shim, then remove
 
 ### Stage B — Dev environment minimum-viable connection (~1 sprint)
-- [ ] User runs B.0 AWS diagnostics (CloudFormation, Lambda, S3, CloudFront, Cognito, GitHub secrets) — output decides path A/B/C
-- [ ] Land `scripts/deploy_ui_from_external_repo.sh` (cross-repo S3 sync + CloudFront invalidation)
-- [ ] Verify UI shell `?baseUrl=` + `?mocks=0` URL params (already wired in `app-shell-preview.html:215-223`)
-- [ ] Verify Cognito user pool ID + client ID match between repos (or parameterize with `?cognitoPool=`)
-- [ ] Local browser test: `useMocks=false`, login round-trip, `/today` populates from real `/api/timeline`
-- [ ] Deploy new UI to dev S3 + CloudFront; full 12-page tour
-- [ ] Sign-off checklist: legacy frontend on prod still works, dev UI degrades gracefully on missing endpoints
+
+> **Detailed runbook:** [`docs/STAGE_B_EXECUTION.md`](docs/STAGE_B_EXECUTION.md) — covers B.0 diagnostic findings, naming-convention unification (infix `fieldsight-test-*`), AWS state prep, SAM test stack deploy, UI dev deploy, and B.5 acceptance gate.
+
+- [x] **B.0** — User ran AWS diagnostics 2026-05-09; findings F1–F8 captured in execution doc §1
+- [ ] **B.1** — Code: rename `Environment` → `EnvSuffix` in `src/template.yaml`; fix `samconfig.toml` test parameter overrides; add `scripts/aws/create_test_dynamodb_tables.sh`
+- [ ] **B.2** — AWS prep: create 3 missing test DynamoDB tables; delete legacy `fieldsight-users-test` Cognito pool
+- [ ] **B.3** — `sam deploy --config-env test --guided` → stack `fieldsight-test` (CREATE_COMPLETE)
+- [ ] **B.4** — Land `scripts/deploy_ui_from_external_repo.sh` already committed; deploy UI to dev S3 + CloudFront; 12-page tour
+- [ ] **B.5** — Acceptance gate (drift IN_SYNC, prod untouched, login round-trip succeeds)
 
 ### Stage C — 9 P1/P2 endpoints UI接入 (~2-3 sprints)
 
