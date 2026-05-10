@@ -73,7 +73,8 @@
     },
     text: {
       primary: '#111827', secondary: '#4B5563', tertiary: '#6B7280',
-      disabled: '#9CA3AF', placeholder: '#9CA3AF', link: '#2563EB',
+      /* Sprint 11 A.2 — bumped to neutral-500 for AA 4.5:1 (was -400 = 2.85:1) */
+      disabled: '#6B7280', placeholder: '#6B7280', link: '#2563EB',
       linkHover: '#1D4ED8', inverse: '#FFFFFF', inverseMuted: '#D1D5DB',
       danger: '#B91C1C', success: '#15803D', warning: '#B45309',
     },
@@ -178,7 +179,8 @@
     border: { subtle: '#1F2937', default: '#374151', strong: '#4B5563' },
     text: {
       primary: '#F9FAFB', secondary: '#D1D5DB', tertiary: '#9CA3AF',
-      disabled: '#6B7280', placeholder: '#6B7280', inverse: '#111827',
+      /* Sprint 11 A.2 — bumped to #9CA3AF for AA 4.5:1 on dark surface */
+      disabled: '#9CA3AF', placeholder: '#9CA3AF', inverse: '#111827',
       inverseMuted: '#4B5563', danger: '#F87171', success: '#4ADE80',
       warning: '#FBBF24', link: '#60A5FA', linkHover: '#93C5FD',
     },

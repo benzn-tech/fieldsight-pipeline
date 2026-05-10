@@ -37,7 +37,7 @@
   <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 
   <!-- FieldSight globals: tokens + roles (load order matters) -->
-  <script src="scripts/fs-globals.js?v=2"></script>
+  <script src="scripts/fs-globals.js?v=3"></script>
   <!-- Sprint 7.0 — theme module (must load after fs-globals, before app-shell) -->
   <script src="scripts/theme.js?v=1"></script>
   <!-- Sprint 7.6 — density module (must load after fs-globals, before app-shell) -->
@@ -238,6 +238,9 @@
        ?mocks=0        → sets FS.api.useMocks = false (requires a real API)
        ?baseUrl=https… → sets FS.api.baseUrl to point at staging or local backend
        ?dev=1          → shows the role switcher (always on in preview; kept for parity)
+       ?axe=1          → Sprint 11 A.1: load axe-core via CDN + run on each
+                         route change, log WCAG 2.1 AA violations to console.
+                         One-off audit tool — never on by default (Q-S11-4).
 
        The MOCK / LIVE badge in the dev panel is rendered by dev-role-switcher.js
        which reads FS.api.useMocks after this block runs. -->
@@ -254,6 +257,47 @@
       /* ?mocks=0 flips to live-backend mode. */
       if (params.get('mocks') === '0' && window.FS && window.FS.api) {
         window.FS.api.useMocks = false;
+      }
+
+      /* Sprint 11 A.1 — ?axe=1 loads axe-core dynamically + runs the
+         WCAG 2.1 AA audit on every route change. Findings logged to
+         the console in an `[axe]` group with violation count + per-
+         issue summary. Hidden by default to keep production previews
+         clean (Q-S11-4: one-off audit, not permanent). */
+      if (params.get('axe') === '1') {
+        var s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/axe-core@4.10.0/axe.min.js';
+        s.onload = function () {
+          function runAudit() {
+            if (!window.axe) return;
+            window.axe.run(document, {
+              runOnly: { type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21aa'] },
+            }).then(function (res) {
+              if (!res.violations || res.violations.length === 0) {
+                console.log('%c[axe] ✓ no WCAG 2.1 AA violations on this page',
+                  'color: #15803D; font-weight: bold');
+                return;
+              }
+              console.group('%c[axe] ' + res.violations.length + ' WCAG 2.1 AA violations',
+                'color: #B91C1C; font-weight: bold');
+              res.violations.forEach(function (v) {
+                console.warn('• ' + v.id + ' (' + v.impact + '): ' + v.help
+                  + '\n  affects ' + v.nodes.length + ' node(s) — ' + v.helpUrl);
+              });
+              console.groupEnd();
+            });
+          }
+          /* Run on initial load + every hash route change. Debounce
+             so a single render-cycle doesn't trigger N audits. */
+          var pending = null;
+          function schedule() {
+            if (pending) clearTimeout(pending);
+            pending = setTimeout(runAudit, 600);
+          }
+          schedule();
+          window.addEventListener('hashchange', schedule);
+        };
+        document.head.appendChild(s);
       }
 
       /* Default landing navigation. */
