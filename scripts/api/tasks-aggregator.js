@@ -160,10 +160,78 @@
     return { rows: rows, from: from, to: to, user: user, dates: datesInRange };
   }
 
+  /* ────────────────────────────────────────────────────────────────────
+     Sprint 11 C.1 — getCrossDayAudit({from, to, user})
+     --------------------------------------------------------------------
+     Mock spec for the future endpoint
+       GET /api/actions/all?from=YYYY-MM-DD&to=YYYY-MM-DD&user=<folder>
+     Returns: { entries: [...], from, to, user }
+       entry = {
+         action_id:        '<date>_<topic_id>_<action_index>',  // unique
+         topic_action_key: '<topic_id>_<action_index>',          // groups
+                                                                 // same logical
+                                                                 // action across
+                                                                 // dates
+         date:             'YYYY-MM-DD',
+         topic_id, action_index,
+         checked, checked_by, checked_at,
+       }
+
+     Cross-day flatten of `actions.getActionsRange`'s `{byDate}` shape so
+     /today's WeeklyCompletionKpi and /tasks's history drawer can iterate
+     a single flat array. Pure data — no timeline / report join (use
+     `getActionsResolvedRange` for that).
+
+     Backend wiring (Sprint 12+): drop the localStorage-backed
+     `actions.getActionsRange` fan-out and replace with one
+     `GET /api/actions/all` call returning the same shape. UI is
+     unchanged.
+     ────────────────────────────────────────────────────────────────── */
+
+  async function getCrossDayAudit(opts) {
+    opts = opts || {};
+    var from = opts.from;
+    var to   = opts.to;
+    if (!from || !to) {
+      return { entries: [], from: from, to: to };
+    }
+
+    var user      = resolveUser(opts.user);
+    var auditRes  = await window.FS.api.actions.getActionsRange({
+      from: from, to: to,
+    });
+    if (auditRes && auditRes._accessDenied) {
+      return { _accessDenied: true, error: auditRes.error };
+    }
+
+    var byDate  = (auditRes && auditRes.byDate) || {};
+    var entries = [];
+    Object.keys(byDate).sort().forEach(function (date) {
+      var dayActions = byDate[date] || {};
+      Object.keys(dayActions).forEach(function (key) {
+        var rec   = dayActions[key] || {};
+        var parts = key.split('_');
+        entries.push({
+          action_id:        date + '_' + key,
+          topic_action_key: key,
+          date:             date,
+          topic_id:         parseInt(parts[0], 10),
+          action_index:     parseInt(parts[1], 10),
+          checked:          !!rec.checked,
+          checked_by:       rec.checked_by || null,
+          checked_at:       rec.checked_at || null,
+        });
+      });
+    });
+
+    return { entries: entries, from: from, to: to, user: user };
+  }
+
   if (!window.FS) window.FS = {};
   if (!window.FS.api) window.FS.api = {};
   window.FS.api.tasks = {
     getActionsResolvedRange: getActionsResolvedRange,
+    getCrossDayAudit:        getCrossDayAudit,
   };
 
 })();

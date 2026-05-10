@@ -9490,3 +9490,108 @@ body.fs-gantt-dragging--resize-end    { cursor: ew-resize !important; }
   background: var(--surface-panel-muted);
   border-color: var(--border-subtle);
 }
+
+
+/* ==========================================================================
+   §S11-C · Sprint 11 Track C — weekly KPI on /today + history drawer
+   --------------------------------------------------------------------------
+   1. .fs-today__week-kpi — slim horizontal tile above the Urgent block,
+      shows X / Y closed + % + 7-day SparkLine.
+   2. .fs-tasks-detail__history-* — cross-day audit trail in /tasks
+      right detail; replaces the prior single-event "Audit" stub.
+   ========================================================================== */
+
+.fs-today__week-kpi {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 8px 0 4px;
+  padding: 10px 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-panel);
+}
+.fs-today__week-kpi-text { display: flex; flex-direction: column; gap: 2px; }
+.fs-today__week-kpi-headline {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+.fs-today__week-kpi-sub {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.fs-tasks-detail__history {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+  margin-top: 12px;
+}
+.fs-tasks-detail__history-label {
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-tertiary);
+}
+.fs-tasks-detail__history-empty {
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-tertiary);
+  padding: 4px 0;
+}
+.fs-tasks-detail__history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.fs-tasks-detail__history-event {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-panel);
+  border: 1px solid var(--border-subtle);
+}
+.fs-tasks-detail__history-event--checked {
+  background: var(--surface-selected);
+  border-color: var(--color-success-300);
+}
+.fs-tasks-detail__history-marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  flex-shrink: 0;
+  font-weight: 700;
+  color: var(--text-tertiary);
+}
+.fs-tasks-detail__history-event--checked .fs-tasks-detail__history-marker {
+  color: var(--color-success-600);
+}
+[data-theme="dark"] .fs-tasks-detail__history-event--checked .fs-tasks-detail__history-marker {
+  color: var(--color-success-300);
+}
+.fs-tasks-detail__history-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.fs-tasks-detail__history-date {
+  font-size: 12px;
+  font-weight: var(--font-weight-medium);
+  color: var(--text-primary);
+}
+.fs-tasks-detail__history-by {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}

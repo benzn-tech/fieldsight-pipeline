@@ -351,6 +351,95 @@
   }
 
   /* =====================================================================
+     Sprint 11 C.2 · WeeklyCompletionKpi
+     ─────────────────────────────────────────────────────────────────────
+     Mini KPI tile shown above the Urgent block on /today. Calls
+     `tasks.getCrossDayAudit` for [Mon..today] (Q-S11-1 default) and
+     reports closed/total + a 7-day SparkLine of daily-closed counts.
+
+     Hidden when both totals are zero (demo dataset edge case + first-
+     boot avoid).
+     ===================================================================== */
+
+  function WeeklyCompletionKpi() {
+    var fs        = window.FieldSight;
+    var SparkLine = fs.SparkLine;
+
+    var dataRef = React.useState({ status: 'loading' });
+    var data    = dataRef[0]; var setData = dataRef[1];
+
+    React.useEffect(function () {
+      var cancelled = false;
+      var today = window.FS.api.todayNZDT();
+      /* Q-S11-1 default: calendar week Mon→today. Day-of-week
+         is computed from Date.UTC parse of the ISO string to dodge
+         BUG-19 (NZDT timezone drift). */
+      function mondayOf(iso) {
+        var p = iso.split('-').map(Number);
+        var d = new Date(Date.UTC(p[0], p[1] - 1, p[2]));
+        var dow = d.getUTCDay();          /* 0 = Sun, 1 = Mon, ... */
+        var offset = dow === 0 ? -6 : 1 - dow;
+        return window.FS.api.addDaysISO(iso, offset);
+      }
+      var weekStart = mondayOf(today);
+
+      window.FS.api.tasks.getCrossDayAudit({
+        from: weekStart, to: today,
+      }).then(function (res) {
+        if (cancelled) return;
+        if (!res || res._accessDenied) {
+          setData({ status: 'hidden' });
+          return;
+        }
+        var entries = res.entries || [];
+        var total   = entries.length;
+        var closed  = entries.filter(function (e) { return e.checked; }).length;
+        if (total === 0) { setData({ status: 'hidden' }); return; }
+
+        /* Daily closed-count for the SparkLine — fill missing days
+           with zero so the curve always shows the full week. */
+        var byDay = {};
+        var d = weekStart;
+        while (d && d <= today) {
+          byDay[d] = 0;
+          d = window.FS.api.addDaysISO(d, 1);
+        }
+        entries.forEach(function (e) {
+          if (e.checked && byDay[e.date] != null) byDay[e.date] += 1;
+        });
+        var trend = Object.keys(byDay).sort().map(function (date) {
+          return { date: date, value: byDay[date] };
+        });
+
+        setData({
+          status: 'ok', total: total, closed: closed, trend: trend,
+          weekStart: weekStart, today: today,
+        });
+      }).catch(function () {
+        if (!cancelled) setData({ status: 'hidden' });
+      });
+
+      return function () { cancelled = true; };
+    }, []);
+
+    if (data.status !== 'ok') return null;
+
+    var pct = data.total > 0 ? Math.round((data.closed / data.total) * 100) : 0;
+
+    return React.createElement('div', { className: 'fs-today__week-kpi' },
+      React.createElement('div', { className: 'fs-today__week-kpi-text' },
+        React.createElement('div', { className: 'fs-today__week-kpi-headline' },
+          data.closed + ' / ' + data.total + ' actions resolved this week'),
+        React.createElement('div', { className: 'fs-today__week-kpi-sub' },
+          pct + '% complete · since Mon ' + (data.weekStart.split('-')[2] || '')),
+      ),
+      SparkLine ? React.createElement(SparkLine, {
+        points: data.trend, tone: 'success', width: 140, height: 32,
+      }) : null,
+    );
+  }
+
+  /* =====================================================================
      Today Middle Column
      ===================================================================== */
   function TodayMiddleColumn(props) {
@@ -477,6 +566,11 @@
 
       /* MORNING BRIEF */
       React.createElement(fs.MorningBriefCard, { brief: data.morningBrief }),
+
+      /* Sprint 11 C.2 — Weekly completion KPI tile.
+         Hidden when nothing closed/open in the current week (avoids
+         a "0 / 0" empty state on a fresh demo install). */
+      React.createElement(WeeklyCompletionKpi, null),
 
       /* URGENT */
       data.urgent && data.urgent.length > 0

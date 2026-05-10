@@ -360,8 +360,12 @@
   --text-primary:       var(--color-neutral-900);
   --text-secondary:     var(--color-neutral-600);
   --text-tertiary:      var(--color-neutral-500);
-  --text-disabled:      var(--color-neutral-400);
-  --text-placeholder:   var(--color-neutral-400);
+  /* Sprint 11 A.2 — bumped from -400 (#9CA3AF, 2.85:1 on white) to
+     -500 (#6B7280, 4.83:1) to clear WCAG 2.1 AA 4.5:1 for normal
+     text. Disabled state is exempt by spec (1.4.3) but axe-core
+     flags it; placeholder text is required to meet AA. */
+  --text-disabled:      var(--color-neutral-500);
+  --text-placeholder:   var(--color-neutral-500);
   --text-link:          var(--color-info-600);
   --text-link-hover:    var(--color-info-700);
   --text-inverse:       var(--color-neutral-0);
@@ -664,8 +668,12 @@
   --text-primary:       #F9FAFB;
   --text-secondary:     #D1D5DB;
   --text-tertiary:      #9CA3AF;
-  --text-disabled:      #6B7280;
-  --text-placeholder:   #6B7280;
+  /* Sprint 11 A.2 — bumped from #6B7280 (4.05:1 on dark surface,
+     just shy of AA 4.5:1) to #9CA3AF (8.5:1). Loses some visual
+     hierarchy vs --text-tertiary but they were already close;
+     accessibility wins. */
+  --text-disabled:      #9CA3AF;
+  --text-placeholder:   #9CA3AF;
   --text-inverse:       #111827;
   --text-inverse-muted: #4B5563;
 

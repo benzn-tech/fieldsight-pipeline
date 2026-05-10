@@ -23,7 +23,8 @@ ledger.
 | **7** | `/team` + `/settings` + dark-mode polish (theme + density + default-landing prefs) | ✅ | PR [#17](https://github.com/benzn-tech/fieldsight-ui/pull/17) |
 | **8** | Backend integration foundation, write flows, programme deep features, mobile bottom-nav, a11y, search, error/offline, performance, fixture expansion, demo tour, print/share, onboarding | ✅ | PR [#18](https://github.com/benzn-tech/fieldsight-ui/pull/18) |
 | **9** | Insights dashboard (PM-facing safety/quality analytics) + PM-scoped Team page + Strategic dashboards (Portfolio / Regional / Executive) | ✅ | PR [#19](https://github.com/benzn-tech/fieldsight-ui/pull/19) |
-| **10** | Library / Template UI (B.0–B.6) + 3-panel → 2-panel migration (A) | 🟡 | branch `claude/sprint10-prep` |
+| **10** | Library / Template UI (B.0–B.6) + 3-panel → 2-panel migration (A) + follow-up polish | 🟡 | branch `claude/sprint10-prep` (awaiting review) |
+| **11** | A11y hardening (axe-core gate + contrast + SR checklist) + XLSX column-mapper partial mapping + Tasks cross-day audit (Q-1) | 🟡 | branch `claude/sprint11` (stacked on sprint10-prep) |
 
 **Sprint 8 sub-sprint coverage** (audit on `claude/sprint8`):
 
@@ -107,6 +108,27 @@ defaults documented; locked at Track-A start.
   - DemoTour step 7: `/library` → highlight `.fs-library__list`
   - `SchemaEditor` + `VersionHistoryPanel` registered in `components-preview.html` with fixture-data demos
   - composites.css v50; demo-tour.js v3; library.js v2; reports.js v5
+- ✅ **Sprint 10 follow-up · /library polish** — `e4fc8df`
+  - Test render: `max-height: 480px` + `overflow-y: auto`; "↗ Full preview" button → ModalOverlay full-screen view
+  - Tab order changed to All / Organisation / Personal (label only; scope key `'org'` preserved for backwards-compat); default tab `'all'`
+  - Favourites pin shelf above template list (Heidi pattern): per-user `localStorage['fs.lib.favourites']`, max 6, ☆/★ button per row, × unpin on tile, empty-state hint
+  - SchemaEditor drag-and-drop + 1-level nesting: ⋮⋮ handle, three drop zones (before / into / after), accent-line indicators, delete-promotes-children safety; replaces previous ↑↓ button reorder
+  - Heidi-style document view + chatbot recorded as Sprint 11+ candidate in §6 backlog (deterministic schema-driven render kept as canonical path)
+
+**Sprint 11 sub-sprint coverage** (in flight on `claude/sprint11`):
+
+- ✅ **Track A · A11y hardening** — `4634761`
+  - A.1 axe-core via CDN gated on `?axe=1`; runs on every hashchange; logs WCAG 2.1 AA violations to console (Q-S11-4: one-off, not permanent)
+  - A.2 contrast fixes — `--text-disabled` + `--text-placeholder` bumped both themes (light: 2.85→4.83:1, dark: 4.05→8.5:1); `fs-globals.js` JS mirror synced
+  - A.3 new `ACCESSIBILITY.md` — NVDA/VoiceOver checklists for `/today` (6 steps) + `/programme` (4 steps) + common pitfalls + WCAG criterion legend
+- ✅ **Track B · XLSX column-mapper partial mapping** — `e47a061`
+  - B.1 partial-mapping per Q-S11-2 default: removed disabled gate; warning becomes informational note; button label shows skip count
+  - B.2 mapping flow already wired in 8.2.2; this commit just unblocks the UX
+- ✅ **Track C · Tasks cross-day audit (Q-1)** — `5d5562e`
+  - C.1 `tasks.getCrossDayAudit({from,to,user})` flat-array variant of `actions.getActionsRange`
+  - C.2 `WeeklyCompletionKpi` on `/today` (Mon→today per Q-S11-1 default; SparkLine; hidden on empty)
+  - C.3 `ActionHistoryPanel` on `/tasks` right-detail — every check event for the same `topic_action_key` over 90 days; Q-S11-3 role-aware visibility (admin sees all, users see own)
+  - C.4 mock API spec inlined as docblock on `getCrossDayAudit` for Sprint 12 backend handoff
 
 ---
 

@@ -487,16 +487,14 @@
         }),
       ),
 
-      /* Audit history (only when checked) */
-      row.audit.checked
-        ? React.createElement('div', { className: 'fs-tasks-detail__audit' },
-            React.createElement('div', { className: 'fs-tasks-detail__audit-label' },
-              'Audit'),
-            React.createElement('div', { className: 'fs-tasks-detail__audit-body' },
-              'Checked by ' + (row.audit.checked_by || '—')
-                + ' · ' + (fmtTimestamp(row.audit.checked_at) || '—')),
-          )
-        : null,
+      /* Sprint 11 C.3 — Cross-day history drawer.
+         Pulls every audit entry (any date) for the same logical
+         action (matched by topic_id + action_index) so the drawer
+         can show "this action was opened 3 May, closed 5 May, re-
+         opened 6 May…". Q-S11-3 default: role-aware visibility —
+         admin/gm see all check events; regular users see only
+         their own resolutions. */
+      React.createElement(ActionHistoryPanel, { row: row }),
 
       /* Actions */
       React.createElement('div', { className: 'fs-tasks-detail__actions' },
@@ -520,6 +518,89 @@
         props.label),
       React.createElement('div', { className: 'fs-tasks-detail__row-value' },
         props.value),
+    );
+  }
+
+  /* ─── Sprint 11 C.3 · ActionHistoryPanel ───────────────────────────── */
+
+  function ActionHistoryPanel(props) {
+    var row = props.row;
+    var key = row.topic_id + '_' + row.action_index;
+
+    var dataRef = React.useState({ status: 'loading' });
+    var data    = dataRef[0]; var setData = dataRef[1];
+
+    React.useEffect(function () {
+      var cancelled = false;
+      /* Fan-out covers the whole 3-month dates window so we catch
+         re-opens / re-closes from earlier dates too. */
+      var today = window.FS.api.todayNZDT();
+      var from  = window.FS.api.addDaysISO(today, -90);
+      window.FS.api.tasks.getCrossDayAudit({
+        from: from, to: today,
+      }).then(function (res) {
+        if (cancelled) return;
+        if (!res || res._accessDenied) {
+          setData({ status: 'hidden' });
+          return;
+        }
+        var entries = (res.entries || []).filter(function (e) {
+          return e.topic_action_key === key;
+        });
+
+        /* Q-S11-3 — admin/gm see all events; regular users see only
+           their own resolutions. */
+        var caller = (window.AuthMock && window.AuthMock.currentUser) || {};
+        var isAdminLike = caller.role === 'admin' || caller.role === 'gm'
+          || caller.role === 'director' || caller.isAdmin;
+        if (!isAdminLike) {
+          entries = entries.filter(function (e) {
+            return !e.checked_by || e.checked_by === caller.name;
+          });
+        }
+        /* Newest first. */
+        entries.sort(function (a, b) {
+          return a.date < b.date ? 1 : a.date > b.date ? -1 : 0;
+        });
+        setData({ status: 'ok', entries: entries });
+      }).catch(function () {
+        if (!cancelled) setData({ status: 'hidden' });
+      });
+      return function () { cancelled = true; };
+    }, [key]);
+
+    if (data.status !== 'ok') return null;
+
+    var anyChecked = data.entries.some(function (e) { return e.checked; });
+
+    return React.createElement('div', { className: 'fs-tasks-detail__history' },
+      React.createElement('div', { className: 'fs-tasks-detail__history-label' },
+        'History · ' + data.entries.length + ' event' + (data.entries.length === 1 ? '' : 's')),
+      data.entries.length === 0 || !anyChecked
+        ? React.createElement('div', { className: 'fs-tasks-detail__history-empty' },
+            'No check-off events recorded yet.')
+        : React.createElement('ol', { className: 'fs-tasks-detail__history-list' },
+            data.entries.map(function (e) {
+              return React.createElement('li', {
+                key:       e.action_id,
+                className: 'fs-tasks-detail__history-event'
+                           + (e.checked ? ' fs-tasks-detail__history-event--checked' : ''),
+              },
+                React.createElement('span', { className: 'fs-tasks-detail__history-marker' },
+                  e.checked ? '✓' : '○'),
+                React.createElement('div', { className: 'fs-tasks-detail__history-meta' },
+                  React.createElement('span', { className: 'fs-tasks-detail__history-date' },
+                    fmtDate(e.date)),
+                  e.checked
+                    ? React.createElement('span', { className: 'fs-tasks-detail__history-by' },
+                        'by ' + (e.checked_by || '—')
+                          + (fmtTimestamp(e.checked_at) ? ' · ' + fmtTimestamp(e.checked_at) : ''))
+                    : React.createElement('span', { className: 'fs-tasks-detail__history-by' },
+                        'opened (no resolution recorded yet)'),
+                ),
+              );
+            }),
+          ),
     );
   }
 

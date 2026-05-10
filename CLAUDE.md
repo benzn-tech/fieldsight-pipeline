@@ -132,13 +132,15 @@ supported are evergreen).
 | **7** | `/team` + `/settings` + dark-mode polish (theme + density + default-landing prefs) | ✅ done (PR #17) |
 | **8** | Backend integration foundation, write flows, programme deep features, mobile bottom-nav, a11y, search, error/offline, performance, fixture expansion, demo tour, print/share, onboarding | ✅ done (PR #18) |
 | **9** | Insights dashboard (PM-facing safety/quality analytics) + PM-scoped Team page + Strategic dashboards (Portfolio / Regional / Executive) | ✅ done (PR #19) |
+| **10** | Library / Template UI (B.0–B.6) + 3-panel → 2-panel migration + /library polish (Test render scroll/modal, tab reorder, Favourites shelf, drag-nest editor) | 🟡 on `claude/sprint10-prep` (awaiting review) |
+| **11** | A11y hardening (axe-core gate + contrast + SR checklist) + XLSX column-mapper partial mapping + Tasks cross-day audit (Q-1: weekly KPI + history drawer) | 🟡 on `claude/sprint11` (stacked on sprint10-prep) |
 
 Detailed completed/pending/next-phase tracking lives in **`PLAN.md`**.
 
 ## Current State
 
-- **Active branch**: `claude/sprint10-prep` — planning Sprint 10 (3-panel→2-panel migration + Library/Template UI prototype)
-- **Open PRs**: none — Sprint 9 merged via PR #19; Sprint 10 not yet started
+- **Active branches**: `claude/sprint10-prep` (Sprint 10 + follow-up polish, awaiting review) and `claude/sprint11` stacked on top (A11y / XLSX partial / Tasks Q-1)
+- **Open PRs**: none — Sprint 10 + 11 ready to PR when user calls them
 - **Next**: see `PLAN.md` §6 Next phase candidates
 
 ## Known traps & guardrails

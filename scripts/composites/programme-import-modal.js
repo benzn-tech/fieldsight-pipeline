@@ -194,9 +194,19 @@
           }),
         ),
       ),
+      /* Sprint 11 B.1 — partial mapping allowed (Q-S11-2 default).
+         Required columns left unmapped still let the user proceed;
+         downstream `parseXLSXWithMap` fills nulls + the existing
+         ValidationReport flags the resulting rows. The warning copy
+         is now non-blocking — it informs rather than gates. */
       missingRequired.length > 0 && React.createElement('div', {
         className: 'fs-prog-import__mapper-warn',
-      }, 'Required columns not yet mapped: ' + missingRequired.join(', ')),
+        role:      'note',
+      },
+        React.createElement('strong', null, 'Heads-up · ' + missingRequired.length + ' required column' + (missingRequired.length === 1 ? '' : 's') + ' unmapped: '),
+        missingRequired.join(', '),
+        '. You can still proceed — those fields will be empty on every row, and the next step will flag them as warnings.',
+      ),
       React.createElement('div', { className: 'fs-prog-import__footer' },
         Button
           ? React.createElement(Button, { variant: 'secondary', size: 'sm', onClick: onBack }, '← Back')
@@ -204,11 +214,12 @@
         Button
           ? React.createElement(Button, {
               variant: 'primary', size: 'sm',
-              disabled: missingRequired.length > 0,
               onClick:  handleConfirm,
-            }, 'Apply mapping')
+            }, missingRequired.length > 0
+                ? 'Apply mapping (' + missingRequired.length + ' field' + (missingRequired.length === 1 ? '' : 's') + ' skipped)'
+                : 'Apply mapping')
           : React.createElement('button', {
-              type: 'button', disabled: missingRequired.length > 0,
+              type: 'button',
               onClick: handleConfirm,
             }, 'Apply mapping'),
       ),
