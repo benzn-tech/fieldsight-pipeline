@@ -564,14 +564,39 @@ function AppShell({ showDevSwitcher = false }) {
   /* Sprint 8.11.2 — keyboard shortcut reference modal */
   const [shortcutsOpen, setShortcutsOpen] = React.useState(false);
 
-  /* Sprint 8.11.1 — first-run onboarding overlay */
+  /* Sprint 8.11.1 — first-run onboarding overlay.
+     Sprint 10 follow-up: only auto-open on the landing route (root or
+     /today). A deep link to /programme, /tasks, /safety, etc. means the
+     user knows where they're going — interrupting them with a tutorial
+     modal that ends in "Open Today →" navigated them away from the page
+     they actually wanted (reproduced on /programme: modal covers Gantt,
+     user clicks "Open Today →" thinking it's a task, lands on /today
+     with no way back to their import workflow). The `?onboarding=1`
+     dev override still forces it on any route. */
   const [onboardingOpen, setOnboardingOpen] = React.useState(function () {
     try {
       var p = new URLSearchParams(window.location.search);
       if (p.get('onboarding') === '1') return true;        /* dev override */
-      return localStorage.getItem('fs.onboarded') !== '1';
+      if (localStorage.getItem('fs.onboarded') === '1') return false;
+      var hash = (window.location.hash || '').replace(/^#/, '').split('?')[0];
+      var onLanding = (hash === '' || hash === '/' || hash === '/today');
+      return onLanding;
     } catch (_) { return false; }
   });
+
+  /* Sprint 10 follow-up — close the onboarding overlay automatically
+     when the user navigates off the landing route. Sibling case to the
+     init guard above: if the modal opened on /today and the user clicks
+     a sidebar link to /programme without dismissing, we don't want the
+     overlay to "follow" them and block their workflow on the new page.
+     We don't persist `fs.onboarded` here — they didn't finish the tour;
+     next visit to /today will re-show it. */
+  React.useEffect(function () {
+    if (!onboardingOpen) return;
+    var hash = (route || '/today').split('?')[0];
+    var onLanding = (hash === '/' || hash === '/today');
+    if (!onLanding) setOnboardingOpen(false);
+  }, [route, onboardingOpen]);
 
   /* Sprint 8.9.2 — product tour */
   const [demoTourOpen, setDemoTourOpen] = React.useState(function () {
