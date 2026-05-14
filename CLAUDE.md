@@ -132,15 +132,25 @@ supported are evergreen).
 | **7** | `/team` + `/settings` + dark-mode polish (theme + density + default-landing prefs) | ✅ done (PR #17) |
 | **8** | Backend integration foundation, write flows, programme deep features, mobile bottom-nav, a11y, search, error/offline, performance, fixture expansion, demo tour, print/share, onboarding | ✅ done (PR #18) |
 | **9** | Insights dashboard (PM-facing safety/quality analytics) + PM-scoped Team page + Strategic dashboards (Portfolio / Regional / Executive) | ✅ done (PR #19) |
-| **10** | Library / Template UI (B.0–B.6) + 3-panel → 2-panel migration + /library polish (Test render scroll/modal, tab reorder, Favourites shelf, drag-nest editor) | 🟡 on `claude/sprint10-prep` (awaiting review) |
-| **11** | A11y hardening (axe-core gate + contrast + SR checklist) + XLSX column-mapper partial mapping + Tasks cross-day audit (Q-1: weekly KPI + history drawer) | 🟡 on `claude/sprint11` (stacked on sprint10-prep) |
+| **10** | Library / Template UI (B.0–B.6) + 3-panel → 2-panel migration + /library polish (Test render scroll/modal, tab reorder, Favourites shelf, drag-nest editor) | 🟡 on `claude/sprint10-prep` (Sprint 10 + follow-up fixes) |
+| **11** | A11y hardening (axe-core gate + contrast + SR checklist) + XLSX column-mapper partial mapping + Tasks cross-day audit (Q-1: weekly KPI + history drawer) | 🟡 on `claude/sprint11` (rebased onto latest sprint10-prep) |
 
 Detailed completed/pending/next-phase tracking lives in **`PLAN.md`**.
 
 ## Current State
 
-- **Active branches**: `claude/sprint10-prep` (Sprint 10 + follow-up polish, awaiting review) and `claude/sprint11` stacked on top (A11y / XLSX partial / Tasks Q-1)
-- **Open PRs**: none — Sprint 10 + 11 ready to PR when user calls them
+- **Active branches**:
+  - `claude/sprint10-prep` — Sprint 10 + Sprint 10 follow-up fixes (library
+    drag/promote, today CTA + 3-panel revert, activity width cap, insights
+    warning hue, onboarding route-gate). HEAD `3ecdd49`.
+  - `claude/sprint11` — fast-forwarded onto `sprint10-prep` HEAD so it now
+    carries **both** the Sprint 11 work (A11y axe-core gate + contrast
+    tokens, XLSX partial column-mapping, Tasks cross-day audit Q-1) **and**
+    every Sprint 10 follow-up fix above. The two branches currently point
+    at the same tree; future Sprint 11.x work continues on `sprint11`.
+- **Open PRs**: none — Sprint 10 follow-ups + Sprint 11 ready to PR when
+  the user calls them. (Sprint 11's original sub-sprint commits already
+  landed on `sprint10-prep` via PR #20.)
 - **Next**: see `PLAN.md` §6 Next phase candidates
 
 ## Known traps & guardrails

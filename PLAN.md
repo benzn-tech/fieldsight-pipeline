@@ -23,8 +23,8 @@ ledger.
 | **7** | `/team` + `/settings` + dark-mode polish (theme + density + default-landing prefs) | ✅ | PR [#17](https://github.com/benzn-tech/fieldsight-ui/pull/17) |
 | **8** | Backend integration foundation, write flows, programme deep features, mobile bottom-nav, a11y, search, error/offline, performance, fixture expansion, demo tour, print/share, onboarding | ✅ | PR [#18](https://github.com/benzn-tech/fieldsight-ui/pull/18) |
 | **9** | Insights dashboard (PM-facing safety/quality analytics) + PM-scoped Team page + Strategic dashboards (Portfolio / Regional / Executive) | ✅ | PR [#19](https://github.com/benzn-tech/fieldsight-ui/pull/19) |
-| **10** | Library / Template UI (B.0–B.6) + 3-panel → 2-panel migration (A) + follow-up polish | 🟡 | branch `claude/sprint10-prep` (awaiting review) |
-| **11** | A11y hardening (axe-core gate + contrast + SR checklist) + XLSX column-mapper partial mapping + Tasks cross-day audit (Q-1) | 🟡 | branch `claude/sprint11` (stacked on sprint10-prep) |
+| **10** | Library / Template UI (B.0–B.6) + 3-panel → 2-panel migration (A) + follow-up polish | 🟡 | branch `claude/sprint10-prep` (Sprint 10 + follow-up fixes, HEAD `3ecdd49`) |
+| **11** | A11y hardening (axe-core gate + contrast + SR checklist) + XLSX column-mapper partial mapping + Tasks cross-day audit (Q-1) | 🟡 | branch `claude/sprint11` (fast-forwarded onto latest `sprint10-prep` — carries Sprint 11 work **+** all Sprint 10 follow-up fixes) |
 
 **Sprint 8 sub-sprint coverage** (audit on `claude/sprint8`):
 
@@ -115,7 +115,8 @@ defaults documented; locked at Track-A start.
   - SchemaEditor drag-and-drop + 1-level nesting: ⋮⋮ handle, three drop zones (before / into / after), accent-line indicators, delete-promotes-children safety; replaces previous ↑↓ button reorder
   - Heidi-style document view + chatbot recorded as Sprint 11+ candidate in §6 backlog (deterministic schema-driven render kept as canonical path)
 
-**Sprint 11 sub-sprint coverage** (in flight on `claude/sprint11`):
+**Sprint 11 sub-sprint coverage** (on `claude/sprint11`, fast-forwarded onto
+latest `sprint10-prep` — see §1 branch note):
 
 - ✅ **Track A · A11y hardening** — `4634761`
   - A.1 axe-core via CDN gated on `?axe=1`; runs on every hashchange; logs WCAG 2.1 AA violations to console (Q-S11-4: one-off, not permanent)
