@@ -360,6 +360,17 @@ Sprint 9 merged via PR #19 (Insights + PM Team scope + Strategic
 dashboards + 9.5 redesign pass). Sprint 10 candidates below — primary
 contenders at the top, longer-tail items below.
 
+### Dashboard-first backend fusion (Sprint 12+ spine) — added 2026-06
+
+The backend is inverting to **dashboard-first** (item store = source of truth; report = on-demand frozen export). This reframes the backend-integration waves; the concrete items are **B-10..B-15** in `SPRINT11-PLAN.md §2.2`. UI-facing summary:
+- `/api/timeline` (+ new `/api/dashboard`) go **item-backed but byte-compatible** → `today-adapter.js` unaffected.
+- New `GET /api/today` optimistic feed (poll ~30–60s); add `scripts/api/today.js`.
+- Real freshness (`_report_metadata.generated_at`) replaces the hardcoded `'5:42 AM'`.
+- Shared `ExportButton` → `POST /api/export` (frozen snapshot + SES + audit).
+- Fast Mode provisional cards (draft / 待复核); drag&drop upload + coarse date+half-day input; Ask / Search elevated to primary interface (hybrid + RAG).
+
+Contract detail: `BACKEND-CONTEXT.md`. Backend rationale + risks: pipeline `DASHBOARD-FIRST-INVERSION.md`.
+
 ### Primary candidates (front-of-queue for Sprint 10)
 
 #### A · 3-panel → 2-panel migration (4 pages)

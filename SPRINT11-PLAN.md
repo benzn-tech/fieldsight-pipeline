@@ -60,6 +60,12 @@ actionable now vs. later.
 | **B-7** | Q-3 Photo lifecycle — soft-delete + permission gate + UI upload (multipart/chunked for 200–300 MB video) | Backend: permission gate + soft-delete + upload path; device-only assumption changes | Sprint 13 |
 | **B-8** | Q-4 Global / cross-day Ask | Backend: `POST /api/ask/global` or frontend fan-out + aggregate | Sprint 13 |
 | **B-9** | BI embed (Looker / Metabase / Power BI on `/insights`) | Auth federation (Cognito SSO); justified only when cross-month/cross-portfolio analytics land | Sprint 14+ |
+| **B-10** | Today live feed + optimistic processing cards (`GET /api/today`, poll ~30–60s) | Backend: item-backed `/api/today` + ledger `'reported'` state (pipeline BUG-40) | Sprint 12 (dashboard-first Phase 0/1) |
+| **B-11** | Real freshness on Morning Brief — drop hardcoded `'5:42 AM'` in `today-adapter.js`, read `_report_metadata.generated_at` | Backend already returns it; UI-only read | Sprint 11 (frontend-unblocked) |
+| **B-12** | Shared `ExportButton` (send-to-email / share, contextual across panels) | Backend `POST /api/export` (frozen snapshot + SES + audit) | Sprint 12 |
+| **B-13** | Fast Mode provisional cards (draft / 待复核 badge, share-to-crew), reconciled on authoritative item | Backend: provisional `ITEM#` rows (`provisional:true`,`confidence`) + idempotent reconcile | Sprint 12–13 |
+| **B-14** | Drag&drop upload UI + coarse time-range (date + half-day) input + normalizer handshake | Backend: presigned multipart + ingest-normalizer Lambda | Sprint 13 |
+| **B-15** | Ask / Search elevated to primary interface (hybrid retrieval + RAG over item store) | Backend: item store + OpenSearch / Bedrock KB + grounded Ask | Sprint 13 |
 
 ### 2.3 Permanently deferred (no action planned)
 
@@ -144,6 +150,7 @@ _Assumes backend team is ready to expose new endpoints._
 | **12-B** | Sprint 9 backend wiring | B-3: `subcontractor_id` + `tags[]` into real DB; `/api/insights/safety` + `/api/insights/quality` rollup |
 | **12-C** | Per-site timeline endpoint | B-2: Swap `strategic-aggregator.js` to per-site fetch when backend exposes it |
 | **12-D** | Q-2 Editable reports phase 1 | B-4: Inline edit UI for daily report fields + PATCH shape + diff viewer |
+| **12-E** | Dashboard-first inversion (backend spine) | B-10 / B-11 / B-12: item-backed `/api/today` + real freshness + `ExportButton`; see pipeline `DASHBOARD-FIRST-INVERSION.md` |
 
 ### Sprint 13 — Backend integration wave 2 + UX expansion
 
@@ -178,3 +185,5 @@ answer before the Sprint 12 kick-off spec is written.
 | **Q-3 photo delete** | Soft-delete only (recoverable by admin), or hard-delete after N days? | Product + Legal |
 | **Q-3 photo upload** | Accept only images (current device assumption), or extend to video (200–300 MB chunked)? | Product + Backend |
 | **Q-4 Ask scope** | Cross-day (fan-out existing `/api/ask` per date), or new `POST /api/ask/global` with server-side aggregation? | Backend |
+| **Fast-mode transcription** | v1 = AWS Transcribe batch + VAD-chunk parallel (minute-level), or jump straight to v2 streaming/Whisper (sub-minute, higher cost/ops)? | Product + Backend |
+| **Provisional visibility** | Can workers see Fast-Mode *provisional* (draft) to-do items, or only the site manager until the authoritative item lands? | Product |

@@ -153,6 +153,18 @@ Detailed completed/pending/next-phase tracking lives in **`PLAN.md`**.
   landed on `sprint10-prep` via PR #20.)
 - **Next**: see `PLAN.md` §6 Next phase candidates
 
+## Backend fusion — incoming contract changes (in-flight)
+
+The backend is moving to a **dashboard-first** model (item store = source of truth; the report becomes an on-demand frozen export). Full contract detail lives in **`BACKEND-CONTEXT.md`**; backend rationale + risks are in the pipeline repo's `DASHBOARD-FIRST-INVERSION.md`. What this means for this UI:
+
+- **`/api/timeline` (and a new `/api/dashboard`) become item-backed, but the response stays byte-compatible** — `today-adapter.js` and `timeline.js` need no change.
+- **New `GET /api/today`** (optimistic feed: materialized items + "processing" cards) — the surface the Today page polls (~30–60s). Add a `scripts/api/today.js` module with the usual real-fetch branch.
+- **Real freshness**: replace the hardcoded `generatedAt: '5:42 AM'` in `today-adapter.js` (~line 118) with the real `_report_metadata.generated_at`.
+- **Action-write verb mismatch to reconcile**: `scripts/api/actions.js` fires `PATCH /api/actions/{id}` + `POST /api/actions`, but the backend only implements `POST /api/actions/toggle`. Repoint the module or add a backend alias.
+- **New shared `ExportButton`** (one-click send-to-email / share, embedded contextually across Today / dashboard / report / meeting / search). Backend `POST /api/export` renders a frozen snapshot.
+- **Fast Mode** delivers *provisional* cards (draft badge) before full analysis finishes — design the Today card to carry a "draft / 待复核" state, reconciled when the authoritative item lands.
+- **When the API is live**: flip `useMocks` in `scripts/api/index.js` (~line 75). Honour the Sprint-5 lesson — don't ship write actions ahead of their backend.
+
 ## Known traps & guardrails
 
 Mirrors `PLAN.md` §3. Each is a real bug that shipped and got fixed;
