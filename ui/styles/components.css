@@ -1,0 +1,1073 @@
+/* ==========================================================================
+   FieldSight · Component Layer (Layer 4)
+   --------------------------------------------------------------------------
+   Conventions:
+     .fs-{component}                — block
+     .fs-{component}--{modifier}    — variant / size / state modifier
+     .fs-{component}__{element}     — element inside block
+   All values come from CSS custom properties in styles/tokens.css.
+   ========================================================================== */
+
+
+/* =========================================================================
+   Button (.fs-btn) — also used by IconButton via .fs-btn--icon-only
+   ========================================================================= */
+
+.fs-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+  user-select: none;
+  cursor: pointer;
+  text-decoration: none;
+  line-height: 1;
+  transition:
+    background-color  100ms cubic-bezier(0, 0, 0.2, 1),
+    border-color      100ms cubic-bezier(0, 0, 0.2, 1),
+    color             100ms cubic-bezier(0, 0, 0.2, 1),
+    box-shadow        100ms cubic-bezier(0, 0, 0.2, 1),
+    transform          80ms cubic-bezier(0, 0, 0.2, 1);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.fs-btn:active:not([disabled]):not([aria-disabled="true"]) {
+  transform: translateY(0.5px);
+}
+
+.fs-btn:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--surface-app),
+    0 0 0 4px var(--color-accent-500);
+}
+
+.fs-btn[disabled],
+.fs-btn[aria-disabled="true"]:not(.fs-btn--loading) {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.fs-btn--loading { cursor: wait; }
+.fs-btn--loading .fs-btn__label { opacity: 0.7; }
+
+.fs-btn--full-width { width: 100%; }
+
+.fs-btn__label {
+  display: inline-block;
+  min-width: 0;
+}
+
+
+/* ---------- Sizes -------------------------------------------------------- */
+
+.fs-btn--sm { height: 32px; padding: 0 12px; font-size: 13px; gap: 6px; }
+.fs-btn--md { height: 40px; padding: 0 16px; font-size: 14px; gap: 8px; }
+.fs-btn--lg { height: 48px; padding: 0 20px; font-size: 16px; gap: 10px; }
+
+
+/* ---------- Variants ----------------------------------------------------- */
+
+/* primary — solid accent (safety orange) */
+.fs-btn--primary {
+  background: var(--color-accent-500);
+  color: #fff;
+  border-color: var(--color-accent-500);
+}
+.fs-btn--primary:hover:not([disabled]):not([aria-disabled="true"]) {
+  background: var(--color-accent-600);
+  border-color: var(--color-accent-600);
+}
+.fs-btn--primary:active:not([disabled]):not([aria-disabled="true"]) {
+  background: var(--color-accent-700);
+  border-color: var(--color-accent-700);
+}
+
+/* secondary — light, with border */
+.fs-btn--secondary {
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  border-color: var(--border-default);
+}
+.fs-btn--secondary:hover:not([disabled]):not([aria-disabled="true"]) {
+  background: var(--surface-panel-muted);
+  border-color: var(--border-strong);
+}
+.fs-btn--secondary:active:not([disabled]):not([aria-disabled="true"]) {
+  background: var(--surface-panel-muted);
+}
+
+/* tertiary — flat, no border */
+.fs-btn--tertiary {
+  background: transparent;
+  color: var(--text-primary);
+  border-color: transparent;
+}
+.fs-btn--tertiary:hover:not([disabled]):not([aria-disabled="true"]) {
+  background: var(--surface-panel-muted);
+}
+.fs-btn--tertiary:active:not([disabled]):not([aria-disabled="true"]) {
+  background: var(--border-subtle);
+}
+
+/* ghost — for IconButton (same as tertiary visually) */
+.fs-btn--ghost {
+  background: transparent;
+  color: var(--text-secondary);
+  border-color: transparent;
+}
+.fs-btn--ghost:hover:not([disabled]):not([aria-disabled="true"]) {
+  background: var(--surface-panel-muted);
+  color: var(--text-primary);
+}
+.fs-btn--ghost:active:not([disabled]):not([aria-disabled="true"]) {
+  background: var(--border-subtle);
+}
+
+/* danger — solid red */
+.fs-btn--danger {
+  background: var(--color-danger-600);
+  color: #fff;
+  border-color: var(--color-danger-600);
+}
+.fs-btn--danger:hover:not([disabled]):not([aria-disabled="true"]) {
+  background: var(--color-danger-700);
+  border-color: var(--color-danger-700);
+}
+.fs-btn--danger:active:not([disabled]):not([aria-disabled="true"]) {
+  background: var(--color-danger-800);
+  border-color: var(--color-danger-800);
+}
+
+/* link — looks like a hyperlink */
+.fs-btn--link {
+  background: transparent;
+  color: var(--text-link);
+  border-color: transparent;
+  padding: 0;
+  height: auto;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
+}
+.fs-btn--link:hover:not([disabled]):not([aria-disabled="true"]) {
+  color: var(--text-link-hover);
+  text-decoration-thickness: 2px;
+}
+.fs-btn--link:active { transform: none; }
+
+.fs-btn--link.fs-btn--sm { font-size: 13px; }
+.fs-btn--link.fs-btn--md { font-size: 14px; }
+.fs-btn--link.fs-btn--lg { font-size: 16px; }
+
+.fs-btn--link:focus-visible {
+  box-shadow: none;
+  outline: 2px solid var(--color-accent-500);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+.fs-btn--link[disabled],
+.fs-btn--link[aria-disabled="true"] {
+  text-decoration: none;
+  color: var(--text-disabled);
+}
+
+
+/* ---------- Icon-only modifier ------------------------------------------- */
+
+.fs-btn--icon-only {
+  padding: 0;
+  flex-shrink: 0;
+}
+.fs-btn--icon-only.fs-btn--sm { width: 32px;  height: 32px; }
+.fs-btn--icon-only.fs-btn--md { width: 40px;  height: 40px; }
+.fs-btn--icon-only.fs-btn--lg { width: 48px;  height: 48px; }
+
+
+/* ---------- Spinner ------------------------------------------------------ */
+
+.fs-btn__spinner {
+  display: inline-block;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: fs-btn-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes fs-btn-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Respect reduced-motion preference */
+@media (prefers-reduced-motion: reduce) {
+  .fs-btn__spinner { animation-duration: 1.6s; }
+  .fs-btn { transition: none; }
+}
+
+
+/* ---------- Mobile touch-target floor ------------------------------------ */
+@media (max-width: 48rem) {
+  .fs-btn--sm { min-height: 40px; }
+  .fs-btn--icon-only.fs-btn--sm {
+    min-width: 40px;
+    min-height: 40px;
+  }
+}
+
+
+/* =========================================================================
+   Field (.fs-field) — shared shell for Input, Textarea, Select
+   ========================================================================= */
+
+.fs-field {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 6px;
+  font-family: var(--font-sans);
+  text-align: left;
+  min-width: 0;
+}
+
+.fs-field--full-width {
+  display: flex;
+  width: 100%;
+}
+
+/* ---------- Label -------------------------------------------------------- */
+
+.fs-field__label {
+  font-size: 13px;
+  font-weight: var(--font-weight-medium);
+  color: var(--text-secondary);
+  line-height: 1.3;
+  user-select: none;
+}
+
+.fs-field__required {
+  color: var(--color-danger-600);
+  font-weight: 600;
+}
+
+/* ---------- Control wrap (positions adornments) -------------------------- */
+
+.fs-field__control-wrap {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  width: 100%;
+  min-width: 0;
+}
+
+/* ---------- Base control (input / textarea / select) -------------------- */
+
+.fs-field__control {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.4;
+  color: var(--text-primary);
+  background: var(--surface-panel);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 0 12px;
+  transition:
+    border-color 100ms cubic-bezier(0, 0, 0.2, 1),
+    box-shadow   100ms cubic-bezier(0, 0, 0.2, 1),
+    background   100ms cubic-bezier(0, 0, 0.2, 1);
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+}
+
+.fs-field__control::placeholder {
+  color: var(--text-tertiary);
+  opacity: 1;
+}
+
+.fs-field__control:hover:not([disabled]):not([readonly]) {
+  border-color: var(--border-strong);
+}
+
+.fs-field__control:focus,
+.fs-field__control:focus-visible {
+  outline: none;
+  border-color: var(--color-accent-500);
+  box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.20);
+}
+
+.fs-field__control[readonly] {
+  background: var(--surface-panel-muted);
+  cursor: default;
+}
+
+.fs-field__control[disabled] {
+  background: var(--surface-panel-muted);
+  color: var(--text-disabled);
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ---------- Sizes -------------------------------------------------------- */
+
+.fs-field--sm .fs-field__control { height: 32px; padding: 0 10px; font-size: 13px; }
+.fs-field--md .fs-field__control { height: 40px; padding: 0 12px; font-size: 14px; }
+.fs-field--lg .fs-field__control { height: 48px; padding: 0 14px; font-size: 16px; }
+
+.fs-field--sm .fs-field__control--textarea { height: auto; min-height: 32px; padding: 6px 10px; }
+.fs-field--md .fs-field__control--textarea { height: auto; min-height: 40px; padding: 8px 12px; }
+.fs-field--lg .fs-field__control--textarea { height: auto; min-height: 48px; padding: 10px 14px; }
+
+/* ---------- Error state -------------------------------------------------- */
+
+.fs-field--error .fs-field__control,
+.fs-field--error .fs-field__control:hover {
+  border-color: var(--color-danger-500);
+}
+.fs-field--error .fs-field__control:focus,
+.fs-field--error .fs-field__control:focus-visible {
+  border-color: var(--color-danger-500);
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.18);
+}
+
+/* ---------- Hint / error text ------------------------------------------- */
+
+.fs-field__hint {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-tertiary);
+  min-height: 16px;
+}
+
+.fs-field__hint--error {
+  color: var(--color-danger-600);
+  font-weight: var(--font-weight-medium);
+}
+
+/* ---------- Left icon adornment (Input only) ---------------------------- */
+
+.fs-field__left-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  color: var(--text-tertiary);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.fs-field__control--has-left-icon { padding-left: 36px; }
+.fs-field--sm .fs-field__control--has-left-icon { padding-left: 32px; }
+.fs-field--lg .fs-field__control--has-left-icon { padding-left: 42px; }
+
+.fs-field--sm .fs-field__left-icon { left: 10px; }
+.fs-field--lg .fs-field__left-icon { left: 14px; }
+
+/* ---------- Right addon adornment (Input only) -------------------------- */
+
+.fs-field__right-addon {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  z-index: 1;
+}
+
+.fs-field__control--has-right-addon { padding-right: 44px; }
+.fs-field--sm .fs-field__control--has-right-addon { padding-right: 38px; }
+.fs-field--lg .fs-field__control--has-right-addon { padding-right: 48px; }
+
+/* ---------- Select chevron ---------------------------------------------- */
+
+.fs-field__control--select {
+  padding-right: 36px;
+  cursor: pointer;
+}
+
+.fs-field__select-chevron {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  color: var(--text-tertiary);
+  pointer-events: none;
+  transition: color 100ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.fs-field__control--select:focus + .fs-field__select-chevron,
+.fs-field__control--select:focus-visible + .fs-field__select-chevron {
+  color: var(--color-accent-500);
+}
+
+.fs-field--sm .fs-field__select-chevron { right: 10px; }
+.fs-field--lg .fs-field__select-chevron { right: 14px; }
+
+.fs-field__control--select::-ms-expand { display: none; }
+
+/* ---------- Mobile touch-target floor ----------------------------------- */
+
+@media (max-width: 48rem) {
+  .fs-field--sm .fs-field__control { min-height: 40px; }
+  .fs-field--sm .fs-field__control--textarea { min-height: 40px; }
+}
+
+
+/* =========================================================================
+   Card (.fs-card) — structural container with compound subcomponents
+   ========================================================================= */
+
+.fs-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  font-family: var(--font-sans);
+  overflow: hidden;
+  text-decoration: none;
+  color: inherit;
+  /* Reset native button styles when rendered as <button> */
+  text-align: left;
+  font-size: inherit;
+  line-height: inherit;
+  padding: 0;
+  margin: 0;
+  width: 100%;
+}
+
+/* ---------- Variants ----------------------------------------------------- */
+
+/* default — quiet at rest, subtle border, no shadow */
+.fs-card--default {
+  box-shadow: none;
+}
+
+/* elevated — white bg, no border, shadow at rest */
+.fs-card--elevated {
+  border-color: transparent;
+  box-shadow: var(--shadow-sm);
+}
+
+/* outline — slightly stronger border for emphasis */
+.fs-card--outline {
+  border-color: var(--border-default);
+}
+
+/* ghost — no border, no bg (for flat inline grouping) */
+.fs-card--ghost {
+  background: transparent;
+  border-color: transparent;
+  border-radius: 0;
+}
+
+
+/* ---------- Clickable modifier (derived from onClick/href, not variant) -- */
+
+.fs-card--clickable {
+  cursor: pointer;
+  user-select: none;
+  transition:
+    box-shadow    150ms cubic-bezier(0, 0, 0.2, 1),
+    border-color  150ms cubic-bezier(0, 0, 0.2, 1),
+    transform      80ms cubic-bezier(0, 0, 0.2, 1);
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Default / outline clickable — lift on hover */
+.fs-card--clickable:hover {
+  border-color: var(--border-default);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Elevated clickable — deepen shadow on hover */
+.fs-card--elevated.fs-card--clickable:hover {
+  box-shadow: var(--shadow-md);
+}
+
+.fs-card--clickable:active:not(.fs-card--disabled) {
+  transform: translateY(0.5px);
+  box-shadow: var(--shadow-xs);
+}
+
+.fs-card--elevated.fs-card--clickable:active:not(.fs-card--disabled) {
+  box-shadow: var(--shadow-sm);
+}
+
+.fs-card--clickable:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--surface-app),
+    0 0 0 4px var(--color-accent-500);
+}
+
+/* Sprint 7 follow-up — when a clickable card is also --selected, the
+   inner accent border + tinted bg already provide a clear visual cue.
+   Stack a focus halo on top of that and the user reads it as a double
+   border (issue caught in /today's UrgentCard with risk + selected). */
+.fs-card--clickable.fs-card--selected:focus-visible {
+  box-shadow: none;
+}
+
+
+/* ---------- States ------------------------------------------------------- */
+
+/* selected — deferred to Layer 5 (list-with-selection) */
+
+.fs-card--disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ---------- Padding modifiers -------------------------------------------- */
+
+.fs-card--pad-none .fs-card__header,
+.fs-card--pad-none .fs-card__body,
+.fs-card--pad-none .fs-card__footer { padding-left: 0; padding-right: 0; }
+.fs-card--pad-none .fs-card__header { padding-top: 0; }
+.fs-card--pad-none .fs-card__footer { padding-bottom: 0; }
+
+.fs-card--pad-sm .fs-card__header,
+.fs-card--pad-sm .fs-card__body,
+.fs-card--pad-sm .fs-card__footer { padding-left: 12px; padding-right: 12px; }
+.fs-card--pad-sm .fs-card__header { padding-top: 10px; padding-bottom: 10px; }
+.fs-card--pad-sm .fs-card__body   { padding-top: 10px; padding-bottom: 10px; }
+.fs-card--pad-sm .fs-card__footer { padding-top: 10px; padding-bottom: 10px; }
+
+.fs-card--pad-lg .fs-card__header,
+.fs-card--pad-lg .fs-card__body,
+.fs-card--pad-lg .fs-card__footer { padding-left: 24px; padding-right: 24px; }
+.fs-card--pad-lg .fs-card__header { padding-top: 20px; padding-bottom: 16px; }
+.fs-card--pad-lg .fs-card__body   { padding-top: 16px; padding-bottom: 16px; }
+.fs-card--pad-lg .fs-card__footer { padding-top: 16px; padding-bottom: 20px; }
+
+
+/* ---------- Card.Header -------------------------------------------------- */
+
+.fs-card__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 16px 12px;
+  min-height: 0;
+}
+
+/* When followed by body, no bottom padding (body has its own top) */
+.fs-card__header + .fs-card__body {
+  padding-top: 0;
+}
+
+.fs-card__header-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fs-card__title {
+  font-size: 14px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  line-height: 1.35;
+}
+
+.fs-card__subtitle {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  line-height: 1.4;
+}
+
+.fs-card__header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  margin-top: -2px;
+}
+
+
+/* ---------- Card.Body ---------------------------------------------------- */
+
+.fs-card__body {
+  padding: 12px 16px;
+  flex: 1;
+  min-height: 0;
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+/* Body as only child (no header/footer) */
+.fs-card__body:first-child { padding-top: 16px; }
+.fs-card__body:last-child  { padding-bottom: 16px; }
+
+
+/* ---------- Card.Footer -------------------------------------------------- */
+
+.fs-card__footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px 16px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* When footer directly follows header (no body), add border */
+.fs-card__header + .fs-card__footer {
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* Footer alignment variants */
+.fs-card__footer--start   { justify-content: flex-start; }
+.fs-card__footer--center  { justify-content: center; }
+.fs-card__footer--between { justify-content: space-between; }
+
+
+/* ---------- Reduced motion ----------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .fs-card--clickable { transition: none; }
+}
+
+
+/* ---------- Mobile ------------------------------------------------------- */
+
+@media (max-width: 48rem) {
+  .fs-card { border-radius: var(--radius-md); }
+}
+
+
+/* =========================================================================
+   Badge (.fs-badge) — status / tag / count indicator
+   ========================================================================= */
+
+.fs-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-sans);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+  user-select: none;
+  line-height: 1;
+  vertical-align: middle;
+  border-radius: var(--radius-sm);
+}
+
+.fs-badge--pill { border-radius: 9999px; }
+
+/* Standalone dot mode: no padding, no label, just a colored circle.
+   Triggered by <Badge dot/> with no children. */
+.fs-badge--dot {
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  height: auto;
+}
+.fs-badge--dot.fs-badge--sm { width: 6px;  height: 6px;  }
+.fs-badge--dot.fs-badge--md { width: 8px;  height: 8px;  }
+.fs-badge--dot.fs-badge--lg { width: 10px; height: 10px; }
+
+/* NotificationDot pill (with count) — overrides Badge--solid--lg defaults
+   to be visually crisp at small icon-anchor sizes. */
+.fs-notification-dot--with-count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: var(--font-weight-semibold);
+  line-height: 1;
+}
+
+
+/* ---------- Sizes -------------------------------------------------------- */
+
+.fs-badge--sm { height: 18px; padding: 0 6px;  font-size: 11px; gap: 3px; }
+.fs-badge--md { height: 22px; padding: 0 8px;  font-size: 12px; gap: 4px; }
+.fs-badge--lg { height: 26px; padding: 0 10px; font-size: 13px; gap: 5px; }
+
+
+/* ---------- Prefix dot indicator (status-style leading dot) -------------- */
+
+.fs-badge__prefix-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+}
+
+
+/* ---------- Variant × Color ---------------------------------------------- */
+/* Subtle (default): soft bg (50/100 shade) + dark text (700/800 shade)
+   Solid: saturated bg (500/600 shade) + white text
+   Outline: transparent bg + border + text color */
+
+/* ---- neutral ---- */
+.fs-badge--subtle.fs-badge--neutral {
+  background: var(--color-neutral-100);
+  color: var(--color-neutral-700);
+}
+.fs-badge--subtle.fs-badge--neutral .fs-badge__prefix-dot { background: var(--color-neutral-500); }
+
+.fs-badge--solid.fs-badge--neutral {
+  background: var(--color-neutral-600);
+  color: #fff;
+}
+.fs-badge--solid.fs-badge--neutral .fs-badge__prefix-dot { background: #fff; }
+
+.fs-badge--outline.fs-badge--neutral {
+  background: transparent;
+  color: var(--color-neutral-600);
+  box-shadow: inset 0 0 0 1px var(--border-default);
+}
+.fs-badge--outline.fs-badge--neutral .fs-badge__prefix-dot { background: var(--color-neutral-500); }
+
+/* ---- accent ---- */
+.fs-badge--subtle.fs-badge--accent {
+  background: var(--color-accent-50);
+  color: var(--color-accent-800);
+}
+.fs-badge--subtle.fs-badge--accent .fs-badge__prefix-dot { background: var(--color-accent-500); }
+
+.fs-badge--solid.fs-badge--accent {
+  background: var(--color-accent-500);
+  color: #fff;
+}
+.fs-badge--solid.fs-badge--accent .fs-badge__prefix-dot { background: #fff; }
+
+.fs-badge--outline.fs-badge--accent {
+  background: transparent;
+  color: var(--color-accent-700);
+  box-shadow: inset 0 0 0 1px var(--color-accent-300);
+}
+.fs-badge--outline.fs-badge--accent .fs-badge__prefix-dot { background: var(--color-accent-500); }
+
+/* ---- danger ---- */
+.fs-badge--subtle.fs-badge--danger {
+  background: var(--color-danger-50);
+  color: var(--color-danger-800);
+}
+.fs-badge--subtle.fs-badge--danger .fs-badge__prefix-dot { background: var(--color-danger-500); }
+
+.fs-badge--solid.fs-badge--danger {
+  background: var(--color-danger-600);
+  color: #fff;
+}
+.fs-badge--solid.fs-badge--danger .fs-badge__prefix-dot { background: #fff; }
+
+.fs-badge--outline.fs-badge--danger {
+  background: transparent;
+  color: var(--color-danger-700);
+  box-shadow: inset 0 0 0 1px var(--color-danger-300);
+}
+.fs-badge--outline.fs-badge--danger .fs-badge__prefix-dot { background: var(--color-danger-500); }
+
+/* ---- warning ---- */
+.fs-badge--subtle.fs-badge--warning {
+  background: var(--color-warning-50);
+  color: var(--color-warning-800);
+}
+.fs-badge--subtle.fs-badge--warning .fs-badge__prefix-dot { background: var(--color-warning-500); }
+
+.fs-badge--solid.fs-badge--warning {
+  background: var(--color-warning-600);
+  color: #fff;
+}
+.fs-badge--solid.fs-badge--warning .fs-badge__prefix-dot { background: #fff; }
+
+.fs-badge--outline.fs-badge--warning {
+  background: transparent;
+  color: var(--color-warning-700);
+  box-shadow: inset 0 0 0 1px var(--color-warning-300);
+}
+.fs-badge--outline.fs-badge--warning .fs-badge__prefix-dot { background: var(--color-warning-500); }
+
+/* ---- success ---- */
+.fs-badge--subtle.fs-badge--success {
+  background: var(--color-success-50);
+  color: var(--color-success-800);
+}
+.fs-badge--subtle.fs-badge--success .fs-badge__prefix-dot { background: var(--color-success-500); }
+
+.fs-badge--solid.fs-badge--success {
+  background: var(--color-success-600);
+  color: #fff;
+}
+.fs-badge--solid.fs-badge--success .fs-badge__prefix-dot { background: #fff; }
+
+.fs-badge--outline.fs-badge--success {
+  background: transparent;
+  color: var(--color-success-700);
+  box-shadow: inset 0 0 0 1px var(--color-success-300);
+}
+.fs-badge--outline.fs-badge--success .fs-badge__prefix-dot { background: var(--color-success-500); }
+
+/* ---- info ---- */
+.fs-badge--subtle.fs-badge--info {
+  background: var(--color-info-50);
+  color: var(--color-info-800);
+}
+.fs-badge--subtle.fs-badge--info .fs-badge__prefix-dot { background: var(--color-info-500); }
+
+.fs-badge--solid.fs-badge--info {
+  background: var(--color-info-600);
+  color: #fff;
+}
+.fs-badge--solid.fs-badge--info .fs-badge__prefix-dot { background: #fff; }
+
+.fs-badge--outline.fs-badge--info {
+  background: transparent;
+  color: var(--color-info-700);
+  box-shadow: inset 0 0 0 1px var(--color-info-300);
+}
+.fs-badge--outline.fs-badge--info .fs-badge__prefix-dot { background: var(--color-info-500); }
+
+
+/* =========================================================================
+   Avatar (.fs-avatar) — user identity indicator
+   ========================================================================= */
+
+.fs-avatar {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  color: #fff;
+  font-family: var(--font-sans);
+  font-weight: var(--font-weight-semibold);
+  flex-shrink: 0;
+  user-select: none;
+  vertical-align: middle;
+  line-height: 1;
+}
+
+.fs-avatar--square {
+  border-radius: var(--radius-md);
+}
+
+
+/* ---------- Clickable modifier (renders as <button>) -------------------- */
+
+.fs-avatar--clickable {
+  cursor: pointer;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;          /* native button reset */
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    transform 100ms cubic-bezier(0, 0, 0.2, 1),
+    box-shadow 120ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.fs-avatar--clickable:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm);
+}
+
+.fs-avatar--clickable:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--surface-app),
+    0 0 0 4px var(--color-accent-500);
+}
+
+
+/* ---------- Initials layer ----------------------------------------------- */
+
+.fs-avatar__initials {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  letter-spacing: 0.02em;
+}
+
+
+/* ---------- Image layer (on top of initials) ----------------------------- */
+
+.fs-avatar__img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+  opacity: 0;
+  transition: opacity 200ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.fs-avatar__img--loaded {
+  opacity: 1;
+}
+
+
+/* ---------- Overflow badge (in AvatarGroup) ------------------------------ */
+
+.fs-avatar--overflow {
+  background: var(--color-neutral-200);
+  color: var(--text-secondary);
+  font-weight: var(--font-weight-medium);
+}
+
+
+/* ---------- AvatarGroup -------------------------------------------------- */
+
+.fs-avatar-group {
+  display: inline-flex;
+  align-items: center;
+  /* No flex-direction reverse — use natural DOM order */
+}
+
+.fs-avatar-group > .fs-avatar,
+.fs-avatar-group > .fs-avatar--overflow {
+  border: 2px solid var(--surface-panel);
+  box-sizing: content-box;
+  position: relative;       /* enable z-index */
+}
+
+/* Overlap: each subsequent avatar shifts left.
+   First-on-top stacking via descending z-index. */
+.fs-avatar-group--normal > * + * { margin-left: -10px; }
+.fs-avatar-group--tight  > * + * { margin-left: -14px; }
+
+/* xs avatars overlap less */
+.fs-avatar-group--xs.fs-avatar-group--normal > * + * { margin-left: -6px;  }
+.fs-avatar-group--xs.fs-avatar-group--tight  > * + * { margin-left: -10px; }
+.fs-avatar-group--sm.fs-avatar-group--normal > * + * { margin-left: -8px;  }
+.fs-avatar-group--sm.fs-avatar-group--tight  > * + * { margin-left: -12px; }
+.fs-avatar-group--lg.fs-avatar-group--normal > * + * { margin-left: -12px; }
+.fs-avatar-group--lg.fs-avatar-group--tight  > * + * { margin-left: -16px; }
+.fs-avatar-group--xl.fs-avatar-group--normal > * + * { margin-left: -14px; }
+.fs-avatar-group--xl.fs-avatar-group--tight  > * + * { margin-left: -18px; }
+
+/* First avatar on top, rest descending */
+.fs-avatar-group > *:nth-child(1)  { z-index: 10; }
+.fs-avatar-group > *:nth-child(2)  { z-index: 9;  }
+.fs-avatar-group > *:nth-child(3)  { z-index: 8;  }
+.fs-avatar-group > *:nth-child(4)  { z-index: 7;  }
+.fs-avatar-group > *:nth-child(5)  { z-index: 6;  }
+.fs-avatar-group > *:nth-child(n+6) { z-index: 5; }
+
+/* Hover — bring to front */
+.fs-avatar-group > *:hover {
+  z-index: 20;
+  transform: translateY(-1px);
+}
+
+.fs-avatar-group > * {
+  transition: transform 100ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+
+/* ---------- Reduced motion ----------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .fs-avatar__img { transition: none; }
+}
+
+
+/* ==========================================================================
+   §SPRINT-8.7 · SKELETON LOADERS
+   ========================================================================== */
+
+@keyframes fs-skeleton-shimmer {
+  from { background-position: 200% 0; }
+  to   { background-position: -200% 0; }
+}
+
+.fs-skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--surface-subtle, #e2e8f0) 25%,
+    var(--surface-raised, #f1f5f9) 50%,
+    var(--surface-subtle, #e2e8f0) 75%
+  );
+  background-size: 400% 100%;
+  animation: fs-skeleton-shimmer 1.5s ease-in-out infinite;
+  border-radius: var(--radius-sm, 4px);
+  display: block;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fs-skeleton {
+    animation: none;
+    background: var(--surface-subtle, #e2e8f0);
+  }
+}
+
+[data-theme="dark"] .fs-skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--surface-raised, #1e293b) 25%,
+    var(--surface-panel, #273549)  50%,
+    var(--surface-raised, #1e293b) 75%
+  );
+  background-size: 400% 100%;
+  animation: fs-skeleton-shimmer 1.5s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="dark"] .fs-skeleton {
+    animation: none;
+    background: var(--surface-raised, #1e293b);
+  }
+}
+
+.fs-skeleton--text    { height: 13px; }
+.fs-skeleton--text-sm { height: 10px; }
+.fs-skeleton--avatar  { border-radius: 50%; }
+.fs-skeleton--card    { border-radius: var(--radius-md, 8px); height: 80px; }
+
+/* Skeleton task row — mirrors action-item-row dimensions */
+.fs-skeleton-row {
+  display:       flex;
+  align-items:   center;
+  gap:           12px;
+  padding:       10px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.fs-skeleton-row__check {
+  width:       18px;
+  height:      18px;
+  flex-shrink: 0;
+}
+
+.fs-skeleton-row__body {
+  flex:           1;
+  min-width:      0;
+  display:        flex;
+  flex-direction: column;
+  gap:            6px;
+}
+
+.fs-skeleton-row__title { height: 13px; }
+.fs-skeleton-row__sub   { height: 10px; width: 55%; }
+
+.fs-skeleton-row__badge {
+  width:        52px;
+  height:       20px;
+  flex-shrink:  0;
+  border-radius: 10px;
+}
