@@ -13,6 +13,7 @@ name: Deploy FieldSight TEST (SAM)
 # ============================================================
 
 on:
+  workflow_dispatch:        # manual "Run workflow" button (Actions tab, after merge)
   push:
     branches: [develop]
     paths-ignore:

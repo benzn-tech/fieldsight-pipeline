@@ -11,6 +11,7 @@ name: Deploy PROD Lambda code
 # ============================================================
 
 on:
+  workflow_dispatch:        # manual "Run workflow" button (Actions tab)
   push:
     branches: [main]
     paths:
