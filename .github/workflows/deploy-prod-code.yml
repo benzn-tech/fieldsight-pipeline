@@ -1,0 +1,51 @@
+name: Deploy PROD Lambda code
+
+# ============================================================
+# main → update the EXISTING prod lambdas' CODE (no infra changes).
+#
+# Prod is hand-assembled (no CloudFormation stack), so we automate the
+# documented manual process instead of SAM: zip handler + transcript_utils,
+# `aws lambda update-function-code`. Gated by the `production` Environment
+# (required reviewers). Infra (roles, layers, EventBridge Scheduler crons,
+# API Gateway) is unchanged and stays managed by hand for now.
+# ============================================================
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'scripts/deploy-lambda-code.sh'
+      - '.github/workflows/deploy-prod-code.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-2
+
+jobs:
+  deploy-prod-code:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production       # ← required-reviewer approval gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update prod lambda code
+        run: bash scripts/deploy-lambda-code.sh fieldsight ${{ env.AWS_REGION }}
+
+      - name: Smoke test prod /api/health
+        run: |
+          URL="https://khfj3p1fkb.execute-api.${AWS_REGION}.amazonaws.com/prod/api/health"
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /tmp/h.json -w '%{http_code}' "$URL" || echo 000)
+            if [ "$code" = "200" ]; then echo "✅ prod health 200"; cat /tmp/h.json; exit 0; fi
+            echo "attempt $i: HTTP $code (retry in 5s)"; sleep 5
+          done
+          echo "❌ prod health check failed"; cat /tmp/h.json 2>/dev/null || true; exit 1

@@ -1,18 +1,20 @@
-name: Deploy FieldSight (SAM backend)
+name: Deploy FieldSight TEST (SAM)
 
 # ============================================================
-# develop → TEST stack (fieldsight-test, isolated resources)
-# main    → PROD stack (fieldsight-pipeline) — gated by the
-#           `production` GitHub Environment (required reviewers)
+# develop → TEST stack (fieldsight-test) via full SAM deploy.
+#
+# PROD is NOT deployed by SAM: the prod backend was hand-assembled
+# (shared IAM role, EventBridge Scheduler crons, manual API Gateway —
+# no CloudFormation stack), so `sam deploy` would collide with it.
+# Prod code updates are handled by deploy-prod-code.yml instead.
 # ============================================================
 # Canonical template: src/template.yaml (built with base_dir "." via samconfig).
-# Secrets come from GitHub Actions; all env params are passed explicitly on the
-# CLI so a TEST deploy can never fall back to PROD defaults.
+# All env params are passed explicitly so a TEST deploy can never touch PROD data.
 # ============================================================
 
 on:
   push:
-    branches: [develop, main]
+    branches: [develop]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
@@ -27,9 +29,7 @@ env:
   AWS_REGION: ap-southeast-2
 
 jobs:
-  # ----------------------------------------------------------
   deploy-test:
-    if: github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -41,7 +41,7 @@ jobs:
       - uses: aws-actions/setup-sam@v2
         with: { use-installer: true }
       - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
+        with: { python-version: '3.12' }
 
       - name: SAM validate
         run: sam validate --template-file src/template.yaml --lint --region ${{ env.AWS_REGION }}
@@ -71,49 +71,3 @@ jobs:
 
       - name: Smoke test /api/health (TEST)
         run: bash scripts/smoke-test.sh fieldsight-test ${{ env.AWS_REGION }}
-
-  # ----------------------------------------------------------
-  deploy-prod:
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment: production    # ← required reviewers gate the prod deploy
-    steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-      - uses: aws-actions/setup-sam@v2
-        with: { use-installer: true }
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-
-      - name: SAM validate
-        run: sam validate --template-file src/template.yaml --lint --region ${{ env.AWS_REGION }}
-
-      - name: SAM build
-        run: sam build --template-file src/template.yaml --base-dir .
-
-      - name: SAM deploy (PROD)
-        run: |
-          sam deploy --config-env prod \
-            --no-confirm-changeset --no-fail-on-empty-changeset \
-            --parameter-overrides \
-              "Stage=prod" \
-              "DataBucketName=fieldsight-data-509194952652" \
-              "EnableSchedules=true" \
-              "ItemsTableName=fieldsight-items" \
-              "ReportsTableName=fieldsight-reports" \
-              "AuditTableName=fieldsight-audit" \
-              "RealPTTAccount=${{ secrets.REALPTT_ACCOUNT }}" \
-              "RealPTTPassword=${{ secrets.REALPTT_PASSWORD }}" \
-              "ClaudeApiKey=${{ secrets.CLAUDE_API_KEY }}" \
-              "FargateSubnetIds=${{ secrets.FARGATE_SUBNET_IDS }}" \
-              "FargateVpcId=${{ secrets.FARGATE_VPC_ID }}"
-
-      - name: Wire S3 events (PROD bucket)
-        run: bash scripts/wire-s3-events.sh fieldsight-data-509194952652 prod ${{ env.AWS_REGION }}
-
-      - name: Smoke test /api/health (PROD)
-        run: bash scripts/smoke-test.sh fieldsight-pipeline ${{ env.AWS_REGION }}
