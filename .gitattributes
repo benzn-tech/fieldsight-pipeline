@@ -1,0 +1,6 @@
+# Shell scripts and CI/infra configs MUST stay LF, or bash/CI breaks on CRLF.
+*.sh            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+samconfig.toml  text eol=lf
+amplify.yml     text eol=lf

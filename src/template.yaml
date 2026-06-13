@@ -9,6 +9,16 @@ Description: >
 # Parameters - Configure during deployment
 # ============================================================
 Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedValues: [test, prod]
+    Description: Deployment stage. prod keeps legacy fieldsight-* names; test prefixes fieldsight-test-*.
+  EnableSchedules:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Disable in test to avoid polling RealPTT / generating reports on cron.
   RealPTTAccount:
     Type: String
     Description: RealPTT platform account (external service)
@@ -160,7 +170,15 @@ Parameters:
 # ============================================================
 # Conditions
 # ============================================================
+Mappings:
+  StageConfig:
+    prod:
+      Prefix: fieldsight
+    test:
+      Prefix: fieldsight-test
+
 Conditions:
+  ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
   ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
   ShouldCreateAlerts: !Not [!Equals [!Ref AlertEmail, '']]
   HasVadLayer: !Not [!Equals [!Ref VadLayerArn, '']]
@@ -212,7 +230,7 @@ Resources:
   OrchestratorFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-orchestrator
+      FunctionName: !Sub ["${P}-orchestrator", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_orchestrator.lambda_handler
       Timeout: 900  # 15 minutes
@@ -244,7 +262,7 @@ Resources:
           Properties:
             Schedule: !Ref ScheduleExpression
             Description: Daily sync trigger (8 PM NZDT)
-            Enabled: true
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
 
   # ----------------------------------------------------------
   # Lambda 2: Downloader (small/medium files)
@@ -252,7 +270,7 @@ Resources:
   DownloaderFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-downloader
+      FunctionName: !Sub ["${P}-downloader", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_downloader.lambda_handler
       Timeout: 900  # 15 minutes
@@ -273,7 +291,7 @@ Resources:
     Type: AWS::Serverless::Function
     Condition: ShouldEnableTranscribe
     Properties:
-      FunctionName: fieldsight-transcribe
+      FunctionName: !Sub ["${P}-transcribe", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_transcribe.lambda_handler
       Timeout: 60
@@ -311,7 +329,7 @@ Resources:
     Type: AWS::Serverless::Function
     Condition: HasVadLayer
     Properties:
-      FunctionName: fieldsight-vad
+      FunctionName: !Sub ["${P}-vad", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_vad.lambda_handler
       Timeout: 900
@@ -342,7 +360,7 @@ Resources:
   ReportGeneratorFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-report-generator
+      FunctionName: !Sub ["${P}-report-generator", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_report_generator.lambda_handler
       Timeout: 300
@@ -379,21 +397,21 @@ Resources:
           Properties:
             Schedule: cron(0 16 * * ? *)
             Description: Daily report generation (5 AM NZDT)
-            Enabled: true
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
             Input: '{"report_type": "daily"}'
         WeeklyReportSchedule:
           Type: Schedule
           Properties:
             Schedule: cron(0 5 ? * FRI *)
             Description: Weekly report generation (Friday 6 PM NZDT)
-            Enabled: true
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
             Input: '{"report_type": "weekly"}'
         MonthlyReportSchedule:
           Type: Schedule
           Properties:
             Schedule: cron(0 17 L * ? *)
             Description: Monthly report generation (last day of month)
-            Enabled: true
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
             Input: '{"report_type": "monthly"}'
 
   # ----------------------------------------------------------
@@ -403,7 +421,7 @@ Resources:
     Type: AWS::Serverless::Function
     Condition: ShouldEnableTranscribe
     Properties:
-      FunctionName: fieldsight-transcribe-callback
+      FunctionName: !Sub ["${P}-transcribe-callback", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_transcribe_callback.lambda_handler
       Timeout: 60
@@ -442,7 +460,7 @@ Resources:
   MeetingMinutesFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-meeting-minutes
+      FunctionName: !Sub ["${P}-meeting-minutes", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_meeting_minutes.lambda_handler
       Timeout: 300
@@ -470,7 +488,7 @@ Resources:
   AskAgentFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-ask-agent
+      FunctionName: !Sub ["${P}-ask-agent", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_ask_agent.lambda_handler
       Timeout: 60
@@ -492,7 +510,7 @@ Resources:
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
-      UserPoolName: fieldsight-users
+      UserPoolName: !Sub ["${P}-users", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       AutoVerifiedAttributes:
         - email
       UsernameAttributes:
@@ -515,7 +533,7 @@ Resources:
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
     Properties:
-      ClientName: fieldsight-web-client
+      ClientName: !Sub ["${P}-web-client", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       UserPoolId: !Ref UserPool
       GenerateSecret: false
       ExplicitAuthFlows:
@@ -568,7 +586,7 @@ Resources:
   ApiFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-api
+      FunctionName: !Sub ["${P}-api", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_fieldsight_api.lambda_handler
       Timeout: 30
@@ -626,7 +644,7 @@ Resources:
   DownloaderCluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: fieldsight-downloader-cluster
+      ClusterName: !Sub ["${P}-downloader-cluster", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CapacityProviders:
         - FARGATE_SPOT
         - FARGATE
@@ -640,7 +658,7 @@ Resources:
   FargateExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub fieldsight-fargate-execution-${AWS::Region}
+      RoleName: !Sub ["${P}-fargate-execution-${AWS::Region}", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -657,7 +675,7 @@ Resources:
   FargateTaskRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub fieldsight-fargate-task-${AWS::Region}
+      RoleName: !Sub ["${P}-fargate-task-${AWS::Region}", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -702,7 +720,7 @@ Resources:
   FargateDownloaderTask:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: fieldsight-fargate-downloader
+      Family: !Sub ["${P}-fargate-downloader", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       RequiresCompatibilities:
         - FARGATE
       NetworkMode: awsvpc
@@ -727,7 +745,7 @@ Resources:
           LogConfiguration:
             LogDriver: awslogs
             Options:
-              awslogs-group: /ecs/fieldsight-fargate-downloader
+              awslogs-group: !Sub ["/ecs/${P}-fargate-downloader", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: download
 
@@ -737,7 +755,7 @@ Resources:
   FargateTriggerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: fieldsight-fargate-trigger
+      FunctionName: !Sub ["${P}-fargate-trigger", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       Runtime: python3.11
       Handler: index.handler
       Timeout: 30
@@ -771,7 +789,7 @@ Resources:
           Properties:
             Schedule: cron(30 7 * * ? *)  # UTC 07:30 = NZDT 20:30
             Description: Check for pending large downloads (8:30 PM NZDT)
-            Enabled: true
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
       InlineCode: |
         import os, json, boto3
 
@@ -881,7 +899,7 @@ Resources:
   FargateLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /ecs/fieldsight-fargate-downloader
+      LogGroupName: !Sub ["/ecs/${P}-fargate-downloader", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       RetentionInDays: 14
 
   FargateTriggerLogGroup:
@@ -897,7 +915,7 @@ Resources:
     Type: AWS::SNS::Topic
     Condition: ShouldCreateAlerts
     Properties:
-      TopicName: fieldsight-pipeline-alerts
+      TopicName: !Sub ["${P}-pipeline-alerts", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       Subscription:
         - Protocol: email
           Endpoint: !Ref AlertEmail
@@ -909,7 +927,7 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: ShouldCreateAlerts
     Properties:
-      AlarmName: fieldsight-orchestrator-errors
+      AlarmName: !Sub ["${P}-orchestrator-errors", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       AlarmDescription: Orchestrator Lambda has errors
       Namespace: AWS/Lambda
       MetricName: Errors
@@ -928,7 +946,7 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: ShouldCreateAlerts
     Properties:
-      AlarmName: fieldsight-downloader-errors
+      AlarmName: !Sub ["${P}-downloader-errors", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       AlarmDescription: Downloader Lambda has more than 5 errors in a day
       Namespace: AWS/Lambda
       MetricName: Errors
@@ -947,7 +965,7 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: ShouldCreateAlerts
     Properties:
-      AlarmName: fieldsight-report-errors
+      AlarmName: !Sub ["${P}-report-errors", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       AlarmDescription: Report Generator Lambda has errors
       Namespace: AWS/Lambda
       MetricName: Errors

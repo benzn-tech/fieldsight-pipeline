@@ -1,0 +1,25 @@
+name: CI (PR validation)
+
+# Lints the SAM template on every PR to develop/main. No AWS credentials needed.
+on:
+  pull_request:
+    branches: [develop, main]
+    paths-ignore:
+      - '**/*.md'
+      - 'ui/**'
+      - 'frontend/**'
+
+permissions:
+  contents: read
+
+jobs:
+  validate-template:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install cfn-lint
+        run: pip install cfn-lint
+      - name: Lint SAM template (handles the SAM transform)
+        run: cfn-lint src/template.yaml
