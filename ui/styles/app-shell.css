@@ -1,0 +1,827 @@
+/* ==========================================================================
+   FieldSight AppShell — CSS
+   Uses CSS custom properties from styles/tokens.css.
+   ========================================================================== */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--surface-app);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ---------- App Shell ----------------------------------------------------- */
+.app-shell {
+  display: flex;
+  flex-direction: row;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ---------- Left Nav ------------------------------------------------------ */
+.left-nav {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  flex-shrink: 0;
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
+}
+.left-nav ::-webkit-scrollbar { display: none; }
+
+/* ---------- Middle column ------------------------------------------------- */
+.middle-column {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  flex-shrink: 0;
+  position: relative;
+  min-width: 280px;
+  max-width: 480px;
+  overflow: hidden;
+}
+
+/* ---------- Resize handle ------------------------------------------------- */
+.resize-handle {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  margin-right: -3px;           /* center hit area on column edge */
+  cursor: col-resize;
+  background: transparent;
+  transition: background 100ms cubic-bezier(0, 0, 0.2, 1);
+  z-index: 10;
+}
+.resize-handle:hover,
+.resize-handle.dragging {
+  background: rgba(255, 107, 53, 0.35);
+}
+.resize-handle:focus-visible {
+  outline: none;
+  background: var(--color-accent-500);
+  opacity: 0.6;
+}
+
+/* ---------- Right detail -------------------------------------------------- */
+.right-detail {
+  flex: 1;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 12px;
+  overflow: hidden;
+}
+
+/* ---------- Full-width pages (Sprint 4.7) --------------------------------- */
+/* Pages that declare layout: 'full-width' in the page registry get the
+   full content area for their middle column; the static right pane is
+   suppressed at the JS level and a slide-in RightDrawer takes over.
+   Currently only /programme uses this. */
+.app-shell--full-width .middle-column {
+  flex: 1;
+  width: auto !important;
+  min-width: 0 !important;
+  max-width: none !important;
+}
+.app-shell--full-width .right-detail { display: none; }
+.app-shell--full-width .resize-handle { display: none; }
+
+
+/* ---------- RightDrawer (Sprint 4.7) -------------------------------------- */
+.fs-right-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 440px;
+  max-width: 90vw;
+  background: var(--surface-panel);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.12);
+  z-index: 50;
+  transform: translateX(100%);
+  transition: transform 220ms cubic-bezier(0.16, 1, 0.3, 1);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.fs-right-drawer--open { transform: translateX(0); }
+
+.fs-right-drawer__backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--surface-overlay);
+  z-index: 49;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms ease-out;
+}
+.fs-right-drawer__backdrop--open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fs-right-drawer,
+  .fs-right-drawer__backdrop {
+    transition: none;
+  }
+}
+
+
+/* ---------- Body class while dragging ------------------------------------- */
+body.fs-dragging,
+body.fs-dragging * {
+  user-select: none !important;
+  cursor: col-resize !important;
+}
+body.fs-dragging iframe,
+body.fs-dragging embed,
+body.fs-dragging object {
+  pointer-events: none;
+}
+
+/* ---------- Responsive: lg (auto-collapse handled in JS) ------------------ */
+@media (max-width: 64rem) {
+  /* nothing here — JS toggles isCollapsed via matchMedia */
+}
+
+/* ---------- Responsive: mobile (best-effort fallback) --------------------- */
+@media (max-width: 48rem) {
+  .app-shell { flex-direction: column; }
+
+  .left-nav {
+    width: 100% !important;
+    height: auto !important;
+    max-height: 56px;
+    flex-direction: row !important;
+    border-right: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  }
+
+  .middle-column {
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    flex: 1;
+  }
+
+  .resize-handle { display: none; }   /* no resize on mobile */
+
+  /* Mobile pane swap — show middle by default, swap to right detail
+     when something is selected. AppShell toggles `has-selection` on
+     the shell root. */
+  .app-shell:not(.has-selection) .right-detail { display: none; }
+  .app-shell.has-selection      .middle-column { display: none; }
+  .app-shell.has-selection      .right-detail  { flex: 1; width: 100%; }
+}
+
+/* ---------- Focus rings --------------------------------------------------- */
+/* Scoped to bare/unstyled buttons. Component buttons (.fs-btn,
+   .fs-utility-item, etc.) own their own focus styling so this rule
+   doesn't conflict with theirs. */
+button:not([class*="fs-"]):focus-visible,
+[role="menuitem"]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--surface-app),
+              0 0 0 4px var(--color-accent-500);
+}
+
+/* ---------- Scrollbars ---------------------------------------------------- */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: var(--radius-full);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
+
+/* =========================================================================
+   MiddleColumn header utility area (right-side icons / weather / bell)
+   ========================================================================= */
+
+.middle-column__header {
+  /* Existing inline styles still drive layout — these only style the
+     internal utility row. */
+}
+
+.middle-column__utility {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.fs-utility-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: var(--font-weight-medium);
+  color: var(--text-secondary);
+  transition:
+    background 100ms cubic-bezier(0, 0, 0.2, 1),
+    color      100ms cubic-bezier(0, 0, 0.2, 1),
+    border-color 100ms cubic-bezier(0, 0, 0.2, 1);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.fs-utility-item:hover {
+  background: var(--surface-panel-muted);
+  color: var(--text-primary);
+}
+
+.fs-utility-item:focus-visible {
+  outline: none;
+  border-color: var(--color-accent-500);
+  box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.20);
+}
+
+.fs-utility-item__text {
+  font-variant-numeric: tabular-nums;
+  /* Numbers in monospace-ish width so they don't shift on hover */
+}
+
+/* =========================================================================
+   Page-level layout helpers (Sprint 1.6+)
+   ========================================================================= */
+
+.fs-page {
+  width: 100%;
+}
+
+/* Middle column page body padding is set by app-shell.js inline (.contentStyle).
+   Pages should NOT add their own outer padding — they live inside that. */
+
+/* =========================================================================
+   Weather popover (Sprint 1.6 hotfix)
+   ========================================================================= */
+
+.fs-utility-item--active {
+  background: var(--surface-panel-muted);
+  color: var(--text-primary);
+}
+
+.fs-weather-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 320px;
+  max-width: 360px;
+  background: var(--surface-panel);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: 16px;
+  z-index: 200;
+  font-family: var(--font-sans);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.fs-weather-popover__current {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.fs-weather-popover__current-icon {
+  width: 56px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+}
+
+.fs-weather-popover__current-temp {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1;
+}
+
+.fs-weather-popover__current-label {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.fs-weather-popover__current-meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin-top: 2px;
+}
+
+.fs-weather-popover__section-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.fs-weather-popover__hourly {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.fs-weather-popover__hourly::-webkit-scrollbar {
+  height: 4px;
+}
+
+.fs-weather-popover__hour {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-width: 38px;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+}
+
+.fs-weather-popover__hour-time {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-weather-popover__hour-temp {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-weather-popover__daily {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.fs-weather-popover__day {
+  display: grid;
+  grid-template-columns: 36px 56px 20px 1fr;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.fs-weather-popover__day:last-child {
+  border-bottom: none;
+}
+
+.fs-weather-popover__day-name {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.fs-weather-popover__day-date {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-weather-popover__day-range {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+/* =========================================================================
+   Dev role switcher — native <select> dropdown options
+   ========================================================================= */
+
+/* The closed state is styled inline; option styling has to come from
+   CSS so the open dropdown picks up our dark theme. */
+.fs-dev-switcher select option {
+  background: var(--surface-tooltip);
+  color: var(--text-primary);
+}
+
+/* =========================================================================
+   Sprint 8.5.3 — Skip-navigation link
+   ========================================================================= */
+
+.fs-skip-nav {
+  position: absolute;
+  top: -9999px;
+  left: 0;
+  z-index: var(--z-max);
+  padding: 8px 16px;
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  border: 2px solid var(--focus-ring-color);
+  border-radius: var(--radius-md);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.fs-skip-nav:focus {
+  top: 8px;
+  left: 8px;
+}
+
+/* =========================================================================
+   Sprint 8.5.4 — Live-region announcer (visually hidden)
+   ========================================================================= */
+
+.fs-live-region {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* =========================================================================
+   Sprint 8.4.1 — Bottom navigation bar (mobile ≤ 767px)
+   ========================================================================= */
+
+/* Sprint 8 follow-up — single portal toggle. Hidden by default on
+   desktop; the mobile media query at 767px flips to display:contents
+   so the inner sheet/backdrop/nav participate in layout normally. */
+.fs-bottom-nav-portal {
+  display: none;
+}
+
+.fs-bottom-nav {
+  display: none; /* shown only on mobile via media query below */
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 56px;
+  background: var(--surface-sidebar);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  z-index: var(--z-fixed);
+  flex-direction: row;
+  align-items: stretch;
+  padding-bottom: env(safe-area-inset-bottom, 0);
+}
+
+.fs-bottom-nav__item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.55);
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-weight: var(--font-weight-medium);
+  padding: 6px 4px;
+  -webkit-tap-highlight-color: transparent;
+  transition: color 100ms ease-out;
+  position: relative;
+}
+.fs-bottom-nav__item--active {
+  color: var(--color-accent-500);
+}
+.fs-bottom-nav__item--active::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 24px;
+  height: 2px;
+  background: var(--color-accent-500);
+  border-radius: 2px 2px 0 0;
+}
+.fs-bottom-nav__item:focus-visible {
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: -2px;
+}
+
+/* More-sheet (slide-up drawer listing remaining nav items) */
+.fs-bottom-nav__more-sheet {
+  position: fixed;
+  bottom: 56px;
+  left: 0;
+  right: 0;
+  background: var(--surface-sidebar);
+  border-top: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+  z-index: calc(var(--z-fixed) + 1);
+  padding: 16px 0 env(safe-area-inset-bottom, 0);
+  transform: translateY(100%);
+  transition: transform 260ms cubic-bezier(0.16, 1, 0.3, 1);
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.fs-bottom-nav__more-sheet--open {
+  transform: translateY(0);
+}
+.fs-bottom-nav__more-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--surface-overlay);
+  z-index: var(--z-fixed);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 220ms ease-out;
+}
+.fs-bottom-nav__more-sheet-backdrop--open {
+  opacity: 1;
+  pointer-events: auto;
+}
+.fs-bottom-nav__more-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 20px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.75);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-medium);
+  text-align: left;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 100ms ease-out, color 100ms ease-out;
+  min-height: var(--touch-target-default);
+}
+.fs-bottom-nav__more-item--active {
+  color: var(--color-accent-500);
+  background: rgba(255, 107, 53, 0.10);
+}
+.fs-bottom-nav__more-item:hover,
+.fs-bottom-nav__more-item:focus-visible {
+  background: var(--surface-sidebar-hover);
+  color: var(--color-neutral-0);
+}
+
+/* Back button inside mobile right-detail panel */
+.fs-mobile-back {
+  display: none; /* only visible on mobile */
+  align-items: center;
+  gap: 8px;
+  height: 48px;
+  padding: 0 16px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-accent-500);
+  width: 100%;
+  text-align: left;
+  flex-shrink: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fs-bottom-nav__more-sheet,
+  .fs-bottom-nav__more-sheet-backdrop {
+    transition: none;
+  }
+}
+
+/* =========================================================================
+   Sprint 8.4.1 — Mobile layout overrides (≤ 767px)
+   ========================================================================= */
+
+@media (max-width: 47.9375rem) {  /* 767px */
+  /* Hide desktop left nav entirely on mobile */
+  .left-nav { display: none !important; }
+
+  /* Show bottom nav */
+  .fs-bottom-nav-portal { display: contents; }
+  .fs-bottom-nav { display: flex; }
+
+  /* Middle column fills full viewport height minus bottom nav */
+  .middle-column {
+    padding-bottom: 56px;
+  }
+
+  /* Mobile right-detail: full-screen slide-over */
+  .app-shell:not(.has-selection) .right-detail { display: none; }
+  .app-shell.has-selection .middle-column       { display: none; }
+  .app-shell.has-selection .right-detail {
+    display: flex;
+    flex-direction: column;
+    position: fixed;
+    inset: 0;
+    bottom: 56px;
+    z-index: calc(var(--z-fixed) - 1);
+    overflow-y: auto;
+    background: var(--surface-app);
+  }
+
+  /* Show back button inside right-detail on mobile */
+  .fs-mobile-back { display: flex; }
+
+  /* Right drawer (full-width pages like /programme) also gets back button */
+  .fs-right-drawer {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  /* Resize handle invisible on mobile */
+  .resize-handle { display: none; }
+}
+
+
+/* ==========================================================================
+   §SPRINT-8.6 · SEARCH BUTTON (middle-column utility bar)
+   ========================================================================== */
+
+/* .fs-search-btn inherits .fs-utility-item base — no extra overrides needed */
+
+/* ==========================================================================
+   §SPRINT-8.7 · OFFLINE BANNER
+   ========================================================================== */
+
+.fs-offline-banner {
+  position:      fixed;
+  top:           0;
+  left:          0;
+  right:         0;
+  z-index:       400;
+  padding:       9px 16px;
+  background:    var(--color-warning-100, #fef3c7);
+  border-bottom: 1px solid var(--color-warning-300, #fcd34d);
+  color:         var(--color-warning-900, #78350f);
+  font-family:   var(--font-sans);
+  font-size:     var(--fs-text-sm, 13px);
+  font-weight:   500;
+  text-align:    center;
+  pointer-events: none;
+}
+
+[data-theme="dark"] .fs-offline-banner {
+  background:   var(--color-warning-900, #451a03);
+  border-color: var(--color-warning-700, #b45309);
+  color:        var(--color-warning-200, #fde68a);
+}
+
+/* ==========================================================================
+   §SPRINT-8.10.2 · COPY-LINK / SHARE BUTTON
+   .fs-share-btn inherits .fs-utility-item base — no extra overrides needed
+   ========================================================================== */
+
+/* ==========================================================================
+   §SPRINT-8.11.2 · KEYBOARD SHORTCUTS REFERENCE TABLE
+   ========================================================================== */
+
+.fs-shortcuts {
+  width:           100%;
+  border-collapse: collapse;
+  font-size:       var(--font-size-sm);
+  color:           var(--text-primary);
+}
+
+.fs-shortcuts th,
+.fs-shortcuts td {
+  padding:        8px 0;
+  vertical-align: middle;
+  text-align:     left;
+  border-bottom:  1px solid var(--border-subtle);
+}
+
+.fs-shortcuts tr:last-child th,
+.fs-shortcuts tr:last-child td {
+  border-bottom: none;
+}
+
+.fs-shortcuts th {
+  width:       45%;
+  font-weight: var(--font-weight-medium);
+}
+
+.fs-shortcuts__key {
+  display:        inline-block;
+  font-family:    var(--font-mono);
+  font-size:      11px;
+  padding:        2px 8px;
+  border:         1px solid var(--border-subtle);
+  border-bottom-width: 2px;
+  border-radius:  4px;
+  background:     var(--surface-panel-muted);
+  color:          var(--text-primary);
+  white-space:    nowrap;
+}
+
+/* ==========================================================================
+   §SPRINT-8.10.1 · PRINT STYLES
+   --------------------------------------------------------------------------
+   Hides chrome (left nav, right detail, drag divider, dev panel, bottom nav,
+   toast stack), forces a single-column light layout, and adds a print
+   header on the main content. Pages where this matters most: /timeline,
+   /reports, /safety, /quality.
+   ========================================================================== */
+
+@media print {
+  /* Force light surfaces — printers don't render dark mode well. */
+  html, body, .app-shell {
+    color-scheme: light !important;
+    background:   #ffffff !important;
+    color:        #000000 !important;
+    overflow:     visible !important;
+    height:       auto !important;
+  }
+
+  /* Hide non-content chrome */
+  .fs-left-nav,
+  .right-detail,
+  .fs-drag-divider,
+  .fs-dev-role-switcher,
+  .fs-bottom-nav,
+  .fs-bottom-nav__more-sheet,
+  .fs-bottom-nav__more-sheet-backdrop,
+  .fs-toast-stack,
+  .fs-offline-banner,
+  .fs-search-palette,
+  .fs-skip-nav,
+  .fs-mobile-back,
+  .middle-column__utility,
+  .fs-demo-tour {
+    display: none !important;
+  }
+
+  .app-shell {
+    display:  block !important;
+    width:    100% !important;
+  }
+
+  /* Middle column fills the page */
+  .middle-column {
+    width:        100% !important;
+    max-width:    none !important;
+    flex:         none !important;
+    border:       none !important;
+    background:   #ffffff !important;
+    overflow:     visible !important;
+  }
+  .middle-column__header {
+    border-bottom: 1px solid #cccccc !important;
+  }
+
+  /* Print header — page title pulled from <title>; date driven by JS */
+  #fs-main-content::before {
+    content:       "FieldSight  ·  " attr(data-print-date);
+    display:       block;
+    font-size:     11px;
+    color:         #555;
+    border-bottom: 1px solid #cccccc;
+    margin-bottom: 12px;
+    padding:       6px 20px;
+  }
+
+  /* Strip cosmetic shadows / radii — printer-safe */
+  * {
+    box-shadow:    none !important;
+    border-radius: 0 !important;
+    text-shadow:   none !important;
+  }
+
+  /* Page-break hints for cards that should stay together */
+  .fs-topic-card,
+  .fs-safety-flag-row,
+  .fs-stat-card,
+  .fs-reports__row {
+    page-break-inside: avoid;
+    break-inside:      avoid;
+  }
+}

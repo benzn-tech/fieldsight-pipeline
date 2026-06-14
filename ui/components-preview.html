@@ -1,0 +1,1533 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FieldSight · Components Preview</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="styles/tokens.css" />
+  <link rel="stylesheet" href="styles/app-shell.css?v=2" />
+  <link rel="stylesheet" href="styles/components.css?v=5" />
+  <link rel="stylesheet" href="styles/composites.css?v=1" />
+
+  <style>
+    html, body { overflow: auto; height: auto; }
+    #root { height: auto; }
+    body {
+      padding: 32px 40px 80px;
+      max-width: 1100px;
+      margin: 0 auto;
+      background: var(--surface-app);
+    }
+    h1 {
+      font-size: 24px; font-weight: 700; margin: 0 0 4px;
+      color: var(--text-primary);
+    }
+    h2 {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--text-tertiary);
+      font-weight: 600;
+      margin: 32px 0 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border-subtle);
+    }
+    .subtitle { color: var(--text-tertiary); font-size: 14px; margin: 0 0 8px; }
+    .version  { color: var(--color-accent-600); font-size: 12px; font-weight: 600;
+                letter-spacing: 0.05em; text-transform: uppercase; margin: 0 0 32px; }
+    .row {
+      display: flex; flex-wrap: wrap; gap: 10px;
+      align-items: center;
+      padding: 14px 16px;
+      background: var(--surface-panel);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      margin-bottom: 6px;
+    }
+    .row-label {
+      width: 110px;
+      font-size: 11px;
+      color: var(--text-tertiary);
+      font-weight: 600;
+      flex-shrink: 0;
+      letter-spacing: 0.03em;
+      font-family: var(--font-mono);
+    }
+    .divider {
+      width: 1px;
+      height: 20px;
+      background: var(--border-subtle);
+    }
+  </style>
+</head>
+<body>
+  <h1>FieldSight · Components</h1>
+  <p class="subtitle">Layer 4 base components + Layer 5 composites</p>
+  <p class="version">Sprint 2.0 · Composite extraction</p>
+
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+
+  <script src="scripts/fs-globals.js"></script>
+  <script type="text/babel" src="scripts/left-nav.js?v=2"></script>
+  <script type="text/babel" src="scripts/components/button.js?v=1"></script>
+  <script type="text/babel" src="scripts/components/input.js?v=1"></script>
+  <script type="text/babel" src="scripts/components/card.js?v=1"></script>
+  <script type="text/babel" src="scripts/components/badge.js?v=2"></script>
+  <script type="text/babel" src="scripts/components/avatar.js?v=2"></script>
+
+  <!-- Layer 5 composites (depend on L4 atoms above) -->
+  <script type="text/babel" src="scripts/composites/task-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/urgent-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/activity-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/morning-brief-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/on-site-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/timeline.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/stat-card.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/kpi-strip.js?v=1"></script>
+
+  <!-- Sprint 8 — new L5 composites -->
+  <script type="text/babel" src="scripts/composites/error-banner.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/over-allocation-banner.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/tooltip.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/toast.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/modal-overlay.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/safety-create-modal.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/quality-create-modal.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/search-palette.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/onboarding-overlay.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/demo-tour.js?v=1"></script>
+
+  <!-- Sprint 9 — new L5 composites (insights + strategic dashboards) -->
+  <script type="text/babel" src="scripts/composites/bar-stack.js?v=3"></script>
+  <script type="text/babel" src="scripts/composites/spark-line.js?v=2"></script>
+  <script type="text/babel" src="scripts/composites/trend-pill.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/health-score.js?v=1"></script>
+  <script type="text/babel" src="scripts/composites/rollup-table.js?v=1"></script>
+  <!-- Sprint 9.5 — dashboard-redesign chart primitives -->
+  <script type="text/babel" src="scripts/composites/word-cloud.js?v=2"></script>
+  <script type="text/babel" src="scripts/composites/column-chart.js?v=2"></script>
+  <script type="text/babel" src="scripts/composites/heatmap-grid.js?v=2"></script>
+
+  <!-- Sprint 10 B.0 — template fixture + store (needed for SchemaEditor / VersionHistoryPanel demos) -->
+  <script src="scripts/mock/templates.fixture.js?v=1"></script>
+  <script src="scripts/api/template-store.js?v=1"></script>
+  <!-- Sprint 10 B.4/B.5 — SchemaEditor + VersionHistoryPanel (exported from library.js) -->
+  <script type="text/babel" src="scripts/pages/library.js?v=2"></script>
+
+  <script type="text/babel">
+    const { Button, IconButton, Input, Textarea, Select, Card,
+            Badge, NotificationDot, Avatar, AvatarGroup,
+            TaskCard, UrgentCard, ActivityCard, MorningBriefCard,
+            OnSiteCard, Timeline, StatCard, KpiStrip,
+            /* Sprint 8 — new L5 composites */
+            ErrorBanner, OverAllocationBanner, Tooltip,
+            SafetyCreateModal, QualityCreateModal, SearchPalette,
+            OnboardingOverlay, DemoTour,
+            /* Sprint 9 — new L5 composites */
+            BarStack, SparkLine, TrendPill,
+            HealthScore, RollupTable,
+            /* Sprint 9.5 — new L5 composites */
+            WordCloud, ColumnChart, HeatmapGrid,
+            /* Sprint 10 B.4/B.5 — library editor composites */
+            SchemaEditor, VersionHistoryPanel } = window.FieldSight;
+
+    function Section({ title, children }) {
+      return (
+        <React.Fragment>
+          <h2>{title}</h2>
+          {children}
+        </React.Fragment>
+      );
+    }
+
+    function Row({ label, children }) {
+      return (
+        <div className="row">
+          <div className="row-label">{label}</div>
+          {children}
+        </div>
+      );
+    }
+
+    function Showcase() {
+      const [loadingId, setLoadingId] = React.useState(null);
+      function fakeAsync(id) {
+        setLoadingId(id);
+        setTimeout(() => setLoadingId(null), 1500);
+      }
+
+      return (
+        <React.Fragment>
+
+          <Section title="Variants · md size (default)">
+            <Row label="primary">
+              <Button>Save changes</Button>
+              <Button leftIcon="check">Approve</Button>
+              <Button rightIcon="arrow-right">Continue</Button>
+              <Button disabled>Disabled</Button>
+              <Button
+                loading={loadingId === 'p1'}
+                onClick={() => fakeAsync('p1')}
+              >Submit</Button>
+            </Row>
+            <Row label="secondary">
+              <Button variant="secondary">Cancel</Button>
+              <Button variant="secondary" leftIcon="download">Export</Button>
+              <Button variant="secondary" rightIcon="chevron-down">Options</Button>
+              <Button variant="secondary" disabled>Disabled</Button>
+            </Row>
+            <Row label="tertiary">
+              <Button variant="tertiary">More info</Button>
+              <Button variant="tertiary" leftIcon="filter">Filter</Button>
+              <Button variant="tertiary" disabled>Disabled</Button>
+            </Row>
+            <Row label="danger">
+              <Button variant="danger">Delete report</Button>
+              <Button variant="danger" leftIcon="trash-2">Remove</Button>
+              <Button
+                variant="danger"
+                loading={loadingId === 'd1'}
+                onClick={() => fakeAsync('d1')}
+              >Reject</Button>
+              <Button variant="danger" disabled>Disabled</Button>
+            </Row>
+            <Row label="link">
+              <Button variant="link">View transcript</Button>
+              <Button variant="link" rightIcon="external-link">Open docs</Button>
+              <Button variant="link" disabled>Disabled</Button>
+            </Row>
+          </Section>
+
+          <Section title="Sizes (primary variant)">
+            <Row label="sm · 32px">
+              <Button size="sm">Small</Button>
+              <Button size="sm" leftIcon="check">Approve</Button>
+              <Button size="sm" loading>Loading</Button>
+              <Button size="sm" disabled>Disabled</Button>
+            </Row>
+            <Row label="md · 40px">
+              <Button size="md">Medium</Button>
+              <Button size="md" leftIcon="check">Approve</Button>
+              <Button size="md" loading>Loading</Button>
+              <Button size="md" disabled>Disabled</Button>
+            </Row>
+            <Row label="lg · 48px">
+              <Button size="lg">Large</Button>
+              <Button size="lg" leftIcon="check">Approve</Button>
+              <Button size="lg" loading>Loading</Button>
+              <Button size="lg" disabled>Disabled</Button>
+            </Row>
+          </Section>
+
+          <Section title="Full width">
+            <div style={{
+              display: 'flex', flexDirection: 'column', gap: '8px',
+              padding: '16px',
+              background: 'var(--surface-panel)',
+              border: '1px solid var(--border-subtle)',
+              borderRadius: 'var(--radius-lg)',
+            }}>
+              <Button fullWidth>Primary full width</Button>
+              <Button variant="secondary" fullWidth leftIcon="download">Secondary full width</Button>
+              <Button variant="danger" fullWidth>Danger full width</Button>
+            </div>
+          </Section>
+
+          <Section title="IconButton">
+            <Row label="ghost (default)">
+              <IconButton icon="settings"       ariaLabel="Settings" size="sm" />
+              <IconButton icon="settings"       ariaLabel="Settings" size="md" />
+              <IconButton icon="settings"       ariaLabel="Settings" size="lg" />
+              <div className="divider" />
+              <IconButton icon="bell"           ariaLabel="Notifications" />
+              <IconButton icon="more-vertical"  ariaLabel="More options" />
+              <IconButton icon="search"         ariaLabel="Search" />
+              <div className="divider" />
+              <IconButton icon="loader"         ariaLabel="Loading" loading />
+              <IconButton icon="settings"       ariaLabel="Settings" disabled />
+            </Row>
+            <Row label="primary">
+              <IconButton icon="plus"  ariaLabel="Add task"   variant="primary" size="sm" />
+              <IconButton icon="plus"  ariaLabel="Add task"   variant="primary" size="md" />
+              <IconButton icon="plus"  ariaLabel="Add task"   variant="primary" size="lg" />
+            </Row>
+            <Row label="secondary">
+              <IconButton icon="filter"     ariaLabel="Filter"    variant="secondary" />
+              <IconButton icon="sliders"    ariaLabel="Adjust"    variant="secondary" />
+              <IconButton icon="download"   ariaLabel="Download"  variant="secondary" disabled />
+            </Row>
+            <Row label="danger">
+              <IconButton icon="trash-2"    ariaLabel="Delete"    variant="danger" size="sm" />
+              <IconButton icon="trash-2"    ariaLabel="Delete"    variant="danger" size="md" />
+              <IconButton icon="x"          ariaLabel="Dismiss"   variant="danger" size="lg" />
+            </Row>
+          </Section>
+
+          <Section title="Real-world compositions">
+            <Row label="form actions">
+              <Button variant="secondary">Cancel</Button>
+              <Button leftIcon="save">Save report</Button>
+            </Row>
+            <Row label="destructive">
+              <Button variant="tertiary">Keep record</Button>
+              <Button variant="danger" leftIcon="trash-2">Delete report</Button>
+            </Row>
+            <Row label="toolbar group">
+              <IconButton icon="filter"        ariaLabel="Filter"      variant="secondary" size="sm" />
+              <IconButton icon="sort-asc"      ariaLabel="Sort"        variant="secondary" size="sm" />
+              <IconButton icon="layout-list"   ariaLabel="List view"   variant="secondary" size="sm" />
+              <IconButton icon="layout-grid"   ariaLabel="Grid view"   variant="secondary" size="sm" />
+              <div className="divider" />
+              <IconButton icon="download"      ariaLabel="Export"      variant="ghost"     size="sm" />
+            </Row>
+            <Row label="async upload">
+              <Button
+                size="lg"
+                leftIcon="upload"
+                loading={loadingId === 'submit'}
+                onClick={() => fakeAsync('submit')}
+              >
+                Upload evidence
+              </Button>
+            </Row>
+            <Row label="approve flow">
+              <Button
+                size="lg"
+                variant="secondary"
+              >Request changes</Button>
+              <Button
+                size="lg"
+                leftIcon="check-circle"
+                loading={loadingId === 'approve'}
+                onClick={() => fakeAsync('approve')}
+              >
+                Approve report
+              </Button>
+            </Row>
+          </Section>
+
+          <Section title="Input · variants">
+            <Row label="default">
+              <div style={{ width: 320 }}>
+                <Input label="Site name" placeholder="e.g. Ellesmere Block 4" />
+              </div>
+              <div style={{ width: 320 }}>
+                <Input
+                  label="Email"
+                  type="email"
+                  required
+                  placeholder="you@company.com"
+                  hint="We'll send report digests here"
+                />
+              </div>
+            </Row>
+            <Row label="with left icon">
+              <div style={{ width: 320 }}>
+                <Input label="Search" leftIcon="search" placeholder="Search reports..." />
+              </div>
+            </Row>
+            <Row label="with right addon">
+              <div style={{ width: 320 }}>
+                <Input
+                  label="Password"
+                  type="password"
+                  defaultValue="hunter2"
+                  rightAddon={<IconButton icon="eye" ariaLabel="Show password" size="sm" />}
+                />
+              </div>
+            </Row>
+            <Row label="error state">
+              <div style={{ width: 320 }}>
+                <Input
+                  label="Project code"
+                  defaultValue="ABC"
+                  error="Project code must be at least 6 characters"
+                />
+              </div>
+            </Row>
+            <Row label="disabled / readonly">
+              <div style={{ width: 320 }}>
+                <Input label="Site ID" defaultValue="ELL-2024-04" readOnly hint="System-generated" />
+              </div>
+              <div style={{ width: 320 }}>
+                <Input label="Archived field" defaultValue="cannot edit" disabled />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Input · sizes">
+            <Row label="sm · 32px">
+              <div style={{ width: 280 }}>
+                <Input size="sm" label="Small" placeholder="Dense form field" />
+              </div>
+            </Row>
+            <Row label="md · 40px">
+              <div style={{ width: 280 }}>
+                <Input size="md" label="Medium" placeholder="Default size" />
+              </div>
+            </Row>
+            <Row label="lg · 48px">
+              <div style={{ width: 280 }}>
+                <Input size="lg" label="Large" placeholder="Mobile / primary" />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Textarea">
+            <Row label="default">
+              <div style={{ width: 480 }}>
+                <Textarea
+                  label="Daily notes"
+                  placeholder="What happened on site today?"
+                  hint="Pulled into the daily report summary"
+                  rows={4}
+                />
+              </div>
+            </Row>
+            <Row label="error">
+              <div style={{ width: 480 }}>
+                <Textarea
+                  label="Incident description"
+                  required
+                  defaultValue="brief"
+                  error="Incident description must be at least 20 characters"
+                  rows={3}
+                />
+              </div>
+            </Row>
+            <Row label="disabled">
+              <div style={{ width: 480 }}>
+                <Textarea label="Locked notes" defaultValue="Read-only history" disabled rows={2} />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Select">
+            <Row label="default">
+              <div style={{ width: 280 }}>
+                <Select
+                  label="Site"
+                  placeholder="Choose a site..."
+                  options={[
+                    { value: 'ell', label: 'Ellesmere' },
+                    { value: 'rol', label: 'Rolleston' },
+                    { value: 'syd', label: 'Sydenham' },
+                  ]}
+                />
+              </div>
+              <div style={{ width: 280 }}>
+                <Select
+                  label="Severity"
+                  defaultValue="med"
+                  hint="Determines escalation path"
+                  options={[
+                    { value: 'low',  label: 'Low' },
+                    { value: 'med',  label: 'Medium' },
+                    { value: 'high', label: 'High' },
+                    { value: 'crit', label: 'Critical', disabled: true },
+                  ]}
+                />
+              </div>
+            </Row>
+            <Row label="error">
+              <div style={{ width: 280 }}>
+                <Select
+                  label="Assignee"
+                  required
+                  placeholder="Select assignee..."
+                  error="Assignee is required"
+                  options={[
+                    { value: 'ben', label: 'Ben Lin' },
+                    { value: 'jar', label: 'Jarley Trainor' },
+                    { value: 'dav', label: 'David Barillaro' },
+                  ]}
+                />
+              </div>
+            </Row>
+            <Row label="sizes">
+              <div style={{ width: 200 }}>
+                <Select size="sm" label="sm" defaultValue="a"
+                        options={[{value:'a', label:'Option A'},{value:'b', label:'Option B'}]} />
+              </div>
+              <div style={{ width: 200 }}>
+                <Select size="md" label="md" defaultValue="a"
+                        options={[{value:'a', label:'Option A'},{value:'b', label:'Option B'}]} />
+              </div>
+              <div style={{ width: 200 }}>
+                <Select size="lg" label="lg" defaultValue="a"
+                        options={[{value:'a', label:'Option A'},{value:'b', label:'Option B'}]} />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Real-world form composition">
+            <div style={{
+              display: 'flex', flexDirection: 'column', gap: 16,
+              padding: 24, maxWidth: 560,
+              background: 'var(--surface-panel)',
+              border: '1px solid var(--border-subtle)',
+              borderRadius: 'var(--radius-lg)',
+            }}>
+              <Input label="Report title" required placeholder="Daily site report — 27 Apr" />
+              <div style={{ display: 'flex', gap: 12 }}>
+                <Select label="Site" required placeholder="Choose..."
+                        options={[{value:'ell', label:'Ellesmere'},{value:'rol', label:'Rolleston'}]} />
+                <Select label="Shift" defaultValue="day"
+                        options={[{value:'day', label:'Day'},{value:'night', label:'Night'}]} />
+              </div>
+              <Textarea label="Summary" required rows={4}
+                        placeholder="What happened on site today?" />
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 8 }}>
+                <Button variant="secondary">Save draft</Button>
+                <Button leftIcon="check">Submit report</Button>
+              </div>
+            </div>
+          </Section>
+
+          <Section title="Card · variants">
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'flex-start' }}>
+              <div style={{ width: 280 }}>
+                <Card>
+                  <Card.Header title="Default" subtitle="Subtle border, no shadow" />
+                  <Card.Body>
+                    <p style={{ margin: 0 }}>Quiet at rest — the workhorse for dense lists.</p>
+                  </Card.Body>
+                  <Card.Footer>
+                    <Button variant="secondary" size="sm">Edit</Button>
+                    <Button size="sm" leftIcon="check">Approve</Button>
+                  </Card.Footer>
+                </Card>
+              </div>
+              <div style={{ width: 280 }}>
+                <Card variant="elevated">
+                  <Card.Header title="Elevated" subtitle="Shadow at rest, no border" />
+                  <Card.Body>
+                    <p style={{ margin: 0 }}>Floats above the surface. Use for featured content.</p>
+                  </Card.Body>
+                </Card>
+              </div>
+              <div style={{ width: 280 }}>
+                <Card variant="outline">
+                  <Card.Header
+                    title="Outline"
+                    subtitle="Stronger border"
+                    actions={<IconButton icon="more-vertical" ariaLabel="Options" size="sm" />}
+                  />
+                  <Card.Body>
+                    <p style={{ margin: 0 }}>Emphasised border for cards that need more definition.</p>
+                  </Card.Body>
+                </Card>
+              </div>
+              <div style={{ width: 280 }}>
+                <Card variant="ghost">
+                  <Card.Header title="Ghost" subtitle="No border, no background" />
+                  <Card.Body>
+                    <p style={{ margin: 0 }}>Transparent — for flat inline grouping.</p>
+                  </Card.Body>
+                </Card>
+              </div>
+            </div>
+          </Section>
+
+          <Section title="Card · elevated variant">
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'flex-start' }}>
+              <div style={{ width: 300 }}>
+                <Card variant="elevated">
+                  <Card.Header title="Elevated card" subtitle="Shadow at rest, no border" />
+                  <Card.Body>
+                    <p style={{ margin: 0 }}>Floats above the surface with a subtle shadow. Use for featured or promoted content.</p>
+                  </Card.Body>
+                </Card>
+              </div>
+              <div style={{ width: 300 }}>
+                <Card variant="elevated" onClick={() => console.log('Clicked elevated')}>
+                  <Card.Header title="Elevated + clickable" subtitle="Deeper shadow on hover" />
+                  <Card.Body>
+                    <p style={{ margin: 0 }}>Interactive elevated cards deepen their shadow on hover.</p>
+                  </Card.Body>
+                </Card>
+              </div>
+            </div>
+          </Section>
+
+          <Section title="Card · clickable (derived from onClick)">
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'flex-start' }}>
+              <div style={{ width: 300 }}>
+                <Card onClick={() => console.log('Clicked task card')}>
+                  <Card.Header title="Install temporary fencing" subtitle="Due tomorrow · High priority" />
+                  <Card.Body>
+                    <p style={{ margin: 0 }}>Perimeter fencing required before crane mobilisation on Wednesday. Renders as native button.</p>
+                  </Card.Body>
+                </Card>
+              </div>
+              <div style={{ width: 300 }}>
+                <Card variant="outline" onClick={() => console.log('Clicked outline')}>
+                  <Card.Header
+                    title="Outline + clickable"
+                    subtitle="Any variant can be interactive"
+                    actions={<IconButton icon="chevron-right" ariaLabel="Open" size="sm" />}
+                  />
+                  <Card.Body>
+                    <p style={{ margin: 0 }}>Interactivity is orthogonal to variant — onClick makes any card clickable.</p>
+                  </Card.Body>
+                </Card>
+              </div>
+              <div style={{ width: 300 }}>
+                <Card onClick={() => {}} disabled>
+                  <Card.Header title="Disabled interactive card" subtitle="Cannot be interacted with" />
+                  <Card.Body>
+                    <p style={{ margin: 0 }}>Archived or locked items render as disabled. JS blocks the click handler.</p>
+                  </Card.Body>
+                </Card>
+              </div>
+            </div>
+          </Section>
+
+          <Section title="Card · padding sizes">
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'flex-start' }}>
+              <div style={{ width: 220 }}>
+                <Card padding="sm">
+                  <Card.Header title="Small padding" />
+                  <Card.Body>Dense layout for compact lists.</Card.Body>
+                </Card>
+              </div>
+              <div style={{ width: 220 }}>
+                <Card>
+                  <Card.Header title="Default padding" />
+                  <Card.Body>Standard padding (md).</Card.Body>
+                </Card>
+              </div>
+              <div style={{ width: 220 }}>
+                <Card padding="lg">
+                  <Card.Header title="Large padding" />
+                  <Card.Body>Spacious layout for featured content.</Card.Body>
+                </Card>
+              </div>
+            </div>
+          </Section>
+
+          <Section title="Card · composition with form elements">
+            <div style={{ width: 420 }}>
+              <Card padding="lg">
+                <Card.Header title="Quick task" subtitle="Assign a task from the field" />
+                <Card.Body>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                    <Input label="Task name" required placeholder="What needs to be done?" />
+                    <div style={{ display: 'flex', gap: 12 }}>
+                      <Select label="Priority" defaultValue="med"
+                              options={[{value:'low', label:'Low'},{value:'med', label:'Medium'},{value:'high', label:'High'}]} />
+                      <Select label="Assign to" placeholder="Choose..."
+                              options={[{value:'ben', label:'Ben Lin'},{value:'jar', label:'Jarley Trainor'}]} />
+                    </div>
+                    <Textarea label="Notes" rows={2} placeholder="Additional context..." />
+                  </div>
+                </Card.Body>
+                <Card.Footer>
+                  <Button variant="tertiary" size="sm">Cancel</Button>
+                  <Button size="sm" leftIcon="plus">Create task</Button>
+                </Card.Footer>
+              </Card>
+            </div>
+          </Section>
+
+          <Section title="Card · body-only and header+footer only">
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'flex-start' }}>
+              <div style={{ width: 280 }}>
+                <Card>
+                  <Card.Body>
+                    <p style={{ margin: 0, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>Body-only card</p>
+                    <p style={{ margin: 0 }}>Simple content container with no header or footer structure.</p>
+                  </Card.Body>
+                </Card>
+              </div>
+              <div style={{ width: 280 }}>
+                <Card>
+                  <Card.Header title="Header + footer" subtitle="No body needed" />
+                  <Card.Footer align="between">
+                    <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>2 items pending</span>
+                    <Button variant="link" size="sm">View all</Button>
+                  </Card.Footer>
+                </Card>
+              </div>
+              <div style={{ width: 280 }}>
+                <Card>
+                  <Card.Header
+                    title="Actions in header"
+                    actions={
+                      <React.Fragment>
+                        <IconButton icon="edit" ariaLabel="Edit" size="sm" />
+                        <IconButton icon="trash-2" ariaLabel="Delete" size="sm" variant="danger" />
+                      </React.Fragment>
+                    }
+                  />
+                  <Card.Body>
+                    Card with action buttons in the header area.
+                  </Card.Body>
+                </Card>
+              </div>
+            </div>
+          </Section>
+
+          <Section title="Card · real-world list composition">
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 420 }}>
+              {[
+                { title: 'Pour concrete — Block 4', status: 'Done', statusColor: 'var(--color-success-600)', time: '08:30' },
+                { title: 'Install edge protection L2', status: 'In progress', statusColor: 'var(--color-warning-600)', time: '10:15' },
+                { title: 'Crane pre-start inspection', status: 'Blocked', statusColor: '#C026D3', time: '—' },
+                { title: 'Site cleanup & waste removal', status: 'Open', statusColor: 'var(--color-info-500)', time: '14:00' },
+              ].map((task, i) => (
+                <Card key={i} padding="sm" onClick={() => console.log('Clicked:', task.title)}>
+                  <Card.Body>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {task.title}
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                        <span style={{
+                          fontSize: 11, fontWeight: 600, color: task.statusColor,
+                          padding: '2px 8px', borderRadius: 4,
+                          background: 'var(--surface-panel-muted)',
+                        }}>{task.status}</span>
+                        <span style={{ fontSize: 12, color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)', minWidth: 36, textAlign: 'right' }}>{task.time}</span>
+                      </div>
+                    </div>
+                  </Card.Body>
+                </Card>
+              ))}
+            </div>
+          </Section>
+
+          <Section title="Badge · subtle (default variant)">
+            <Row label="colors">
+              <Badge tone="neutral">Neutral</Badge>
+              <Badge tone="accent">Accent</Badge>
+              <Badge tone="info">Info</Badge>
+              <Badge tone="success">Success</Badge>
+              <Badge tone="warning">Warning</Badge>
+              <Badge tone="danger">Danger</Badge>
+            </Row>
+            <Row label="with dot">
+              <Badge tone="success" prefixDot>Active</Badge>
+              <Badge tone="warning" prefixDot>Pending</Badge>
+              <Badge tone="danger" prefixDot>Overdue</Badge>
+              <Badge tone="info" prefixDot>Open</Badge>
+            </Row>
+            <Row label="with icon">
+              <Badge tone="danger" leftIcon="shield-alert">Safety</Badge>
+              <Badge tone="info" leftIcon="clock">Scheduled</Badge>
+              <Badge tone="success" leftIcon="check">Approved</Badge>
+              <Badge tone="warning" leftIcon="alert-triangle">Caution</Badge>
+            </Row>
+            <Row label="sizes">
+              <Badge size="sm" tone="accent">Small</Badge>
+              <Badge size="md" tone="accent">Medium</Badge>
+              <Badge size="lg" tone="accent">Large</Badge>
+            </Row>
+          </Section>
+
+          <Section title="Badge · solid variant">
+            <Row label="colors">
+              <Badge variant="solid" tone="neutral">Neutral</Badge>
+              <Badge variant="solid" tone="accent">Accent</Badge>
+              <Badge variant="solid" tone="info">Info</Badge>
+              <Badge variant="solid" tone="success">Done</Badge>
+              <Badge variant="solid" tone="warning">Warning</Badge>
+              <Badge variant="solid" tone="danger">Critical</Badge>
+            </Row>
+            <Row label="with dot">
+              <Badge variant="solid" tone="danger" prefixDot>Incident</Badge>
+              <Badge variant="solid" tone="success" prefixDot>Completed</Badge>
+            </Row>
+          </Section>
+
+          <Section title="Badge · outline variant">
+            <Row label="colors">
+              <Badge variant="outline" tone="neutral">Draft</Badge>
+              <Badge variant="outline" tone="accent">New</Badge>
+              <Badge variant="outline" tone="info">Review</Badge>
+              <Badge variant="outline" tone="success">Passed</Badge>
+              <Badge variant="outline" tone="warning">Pending</Badge>
+              <Badge variant="outline" tone="danger">Rejected</Badge>
+            </Row>
+          </Section>
+
+          <Section title="Badge · real-world usage">
+            <Row label="task priorities">
+              <Badge tone="danger" prefixDot>Critical</Badge>
+              <Badge tone="warning" prefixDot>High</Badge>
+              <Badge tone="info" prefixDot>Medium</Badge>
+              <Badge tone="neutral" prefixDot>Low</Badge>
+            </Row>
+            <Row label="report states">
+              <Badge variant="outline" tone="neutral">Draft</Badge>
+              <Badge tone="info">Submitted</Badge>
+              <Badge tone="success" leftIcon="check">Approved</Badge>
+              <Badge variant="solid" tone="danger">Rejected</Badge>
+            </Row>
+            <Row label="categories">
+              <Badge tone="danger" leftIcon="shield-alert">Safety</Badge>
+              <Badge tone="info" leftIcon="badge-check">Quality</Badge>
+              <Badge tone="accent" leftIcon="gantt-chart">Programme</Badge>
+              <Badge tone="neutral" leftIcon="cloud-sun">Weather</Badge>
+            </Row>
+          </Section>
+
+          <Section title="Avatar · sizes">
+            <Row label="circle">
+              <Avatar name="Jarley Trainor" size="xs" />
+              <Avatar name="Jarley Trainor" size="sm" />
+              <Avatar name="Jarley Trainor" size="md" />
+              <Avatar name="Jarley Trainor" size="lg" />
+              <Avatar name="Jarley Trainor" size="xl" />
+            </Row>
+            <Row label="square">
+              <Avatar name="Ben Lin" size="xs" shape="square" />
+              <Avatar name="Ben Lin" size="sm" shape="square" />
+              <Avatar name="Ben Lin" size="md" shape="square" />
+              <Avatar name="Ben Lin" size="lg" shape="square" />
+              <Avatar name="Ben Lin" size="xl" shape="square" />
+            </Row>
+          </Section>
+
+          <Section title="Avatar · deterministic colors">
+            <Row label="different names">
+              <Avatar name="Jarley Trainor" size="lg" />
+              <Avatar name="Ben Lin" size="lg" />
+              <Avatar name="David Barillaro" size="lg" />
+              <Avatar name="Sarah Chen" size="lg" />
+              <Avatar name="Mike O'Brien" size="lg" />
+              <Avatar name="Priya Sharma" size="lg" />
+              <Avatar name="Tom Wilson" size="lg" />
+              <Avatar name="Ana Garcia" size="lg" />
+            </Row>
+            <Row label="explicit initials">
+              <Avatar initials="FS" name="FieldSight System" size="lg" bgColor="#FF6B35" />
+              <Avatar initials="AI" name="AI Suggestion" size="lg" bgColor="#7C3AED" />
+            </Row>
+          </Section>
+
+          <Section title="AvatarGroup">
+            <Row label="default (max 4)">
+              <AvatarGroup size="md">
+                <Avatar name="Jarley Trainor" />
+                <Avatar name="Ben Lin" />
+                <Avatar name="David Barillaro" />
+                <Avatar name="Sarah Chen" />
+                <Avatar name="Mike O'Brien" />
+                <Avatar name="Priya Sharma" />
+              </AvatarGroup>
+            </Row>
+            <Row label="max 3, lg">
+              <AvatarGroup size="lg" max={3}>
+                <Avatar name="Jarley Trainor" />
+                <Avatar name="Ben Lin" />
+                <Avatar name="David Barillaro" />
+                <Avatar name="Sarah Chen" />
+                <Avatar name="Mike O'Brien" />
+              </AvatarGroup>
+            </Row>
+            <Row label="max 5, sm">
+              <AvatarGroup size="sm" max={5}>
+                <Avatar name="Jarley Trainor" />
+                <Avatar name="Ben Lin" />
+                <Avatar name="David Barillaro" />
+                <Avatar name="Sarah Chen" />
+                <Avatar name="Mike O'Brien" />
+                <Avatar name="Priya Sharma" />
+                <Avatar name="Tom Wilson" />
+              </AvatarGroup>
+            </Row>
+          </Section>
+
+          <Section title="Avatar + Badge · real-world compositions">
+            <Row label="user + status">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <Avatar name="Jarley Trainor" size="lg" />
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--text-primary)' }}>Jarley Trainor</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>Site Manager</div>
+                </div>
+                <Badge tone="success" prefixDot size="sm">Online</Badge>
+              </div>
+            </Row>
+            <Row label="task assignees">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <AvatarGroup size="sm" max={3}>
+                  <Avatar name="Ben Lin" />
+                  <Avatar name="Sarah Chen" />
+                  <Avatar name="Mike O'Brien" />
+                  <Avatar name="Priya Sharma" />
+                </AvatarGroup>
+                <Badge tone="warning" size="sm">4 assigned</Badge>
+              </div>
+            </Row>
+            <Row label="card with avatar">
+              <div style={{ width: 360 }}>
+                <Card padding="sm">
+                  <Card.Body>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <Avatar name="David Barillaro" size="md" />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)' }}>David Barillaro</div>
+                        <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>Submitted daily report · 2h ago</div>
+                      </div>
+                      <Badge tone="info" size="sm">Submitted</Badge>
+                    </div>
+                  </Card.Body>
+                </Card>
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Badge · pill shape">
+            <Row label="default vs pill (subtle)">
+              <Badge tone="success">Default</Badge>
+              <Badge tone="success" pill>Pill shape</Badge>
+              <Badge tone="accent" pill leftIcon="zap">Pill + icon</Badge>
+            </Row>
+            <Row label="all sizes, pill">
+              <Badge tone="info" pill size="sm">Small pill</Badge>
+              <Badge tone="info" pill size="md">Medium pill</Badge>
+              <Badge tone="info" pill size="lg">Large pill</Badge>
+            </Row>
+          </Section>
+
+          <Section title="Badge · dot mode (label-less indicator)">
+            <Row label="standalone dots">
+              <Badge tone="success" dot size="sm" />
+              <Badge tone="warning" dot size="sm" />
+              <Badge tone="danger" dot size="sm" />
+              <Badge tone="info" dot size="sm" />
+              <span style={{ fontSize: 13, color: 'var(--text-tertiary)', marginLeft: 12 }}>
+                ← inline indicators next to text
+              </span>
+            </Row>
+            <Row label="all sizes (danger)">
+              <Badge tone="danger" dot size="sm" />
+              <Badge tone="danger" dot size="md" />
+              <Badge tone="danger" dot size="lg" />
+            </Row>
+            <Row label="next to a list item">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Badge tone="accent" dot size="sm" />
+                <span style={{ fontSize: 14, color: 'var(--text-primary)' }}>
+                  New report from Jarley
+                </span>
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Badge · prefixDot (status-style)">
+            <Row label="status badges with leading dot">
+              <Badge tone="success" prefixDot>Active</Badge>
+              <Badge tone="warning" prefixDot>Pending</Badge>
+              <Badge tone="danger" prefixDot>Overdue</Badge>
+              <Badge tone="info" prefixDot>Open</Badge>
+            </Row>
+          </Section>
+
+          <Section title="NotificationDot">
+            <Row label="empty (no count)">
+              <NotificationDot />
+              <NotificationDot tone="warning" />
+              <NotificationDot tone="info" />
+              <NotificationDot tone="success" />
+            </Row>
+            <Row label="with count">
+              <NotificationDot count={3} />
+              <NotificationDot count={12} />
+              <NotificationDot count={99} />
+              <NotificationDot count={150} />
+              <NotificationDot count={9999} max={999} />
+            </Row>
+            <Row label="anchored on icon buttons">
+              <div style={{ position: 'relative', display: 'inline-block' }}>
+                <IconButton icon="bell" ariaLabel="Notifications" />
+                <span style={{ position: 'absolute', top: -2, right: -2 }}>
+                  <NotificationDot count={5} size="sm" />
+                </span>
+              </div>
+              <div style={{ position: 'relative', display: 'inline-block' }}>
+                <IconButton icon="mail" ariaLabel="Inbox" />
+                <span style={{ position: 'absolute', top: -2, right: -2 }}>
+                  <NotificationDot count={28} size="sm" />
+                </span>
+              </div>
+              <div style={{ position: 'relative', display: 'inline-block' }}>
+                <IconButton icon="bell" ariaLabel="Alerts" />
+                <span style={{ position: 'absolute', top: -2, right: -2 }}>
+                  <NotificationDot size="sm" />
+                </span>
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Avatar · clickable">
+            <Row label="onClick → renders as button">
+              <Avatar
+                name="Ben Lin"
+                onClick={() => console.log('Avatar clicked: Ben Lin')}
+                size="lg"
+              />
+              <Avatar
+                name="Jarley Trainor"
+                onClick={() => console.log('Avatar clicked: Jarley')}
+                size="lg"
+              />
+              <span style={{ fontSize: 13, color: 'var(--text-tertiary)', marginLeft: 12 }}>
+                ← Tab to focus, hover lifts, focus shows orange ring
+              </span>
+            </Row>
+          </Section>
+
+          <Section title="Avatar · initials edge cases">
+            <Row label="single word / multi word / punctuation / empty">
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                <Avatar name="Ben Lin" size="md" />
+                <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>"Ben Lin" → BL</span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                <Avatar name="admin" size="md" />
+                <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>"admin" → AD</span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                <Avatar name="Mary-Jane O'Connor" size="md" />
+                <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>"Mary-Jane O'Connor" → MO</span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                <Avatar name="" size="md" />
+                <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>(empty) → ?</span>
+              </div>
+            </Row>
+          </Section>
+
+          {/* ============================================================
+              Layer 5 — Composites (Sprint 2.0)
+              ============================================================ */}
+
+          <h2 style={{ marginTop: 56, color: 'var(--color-accent-600)' }}>
+            Layer 5 · Composites
+          </h2>
+
+          <Section title="StatCard / KpiStrip">
+            <Row label="3-up KPI">
+              <KpiStrip>
+                <StatCard label="Tasks today" value="6" />
+                <StatCard label="On time"     value="83%" tone="success"
+                          trend={{ direction: 'up', delta: '+12%' }} />
+                <StatCard label="Urgent"      value="2"   tone="danger" />
+              </KpiStrip>
+            </Row>
+            <Row label="single">
+              <StatCard label="Revenue MTD" value="$1.2M" tone="accent" />
+            </Row>
+          </Section>
+
+          <Section title="TaskCard">
+            <Row label="default">
+              <div style={{ flex: 1 }}>
+                <TaskCard task={{
+                  id: 'demo-1',
+                  title: 'Pour concrete — Block 4 footing',
+                  assignee: 'Jarley Trainor',
+                  status: 'In progress', statusTone: 'warning',
+                  dueTime: '08:30',
+                }} onSelect={t => console.log('select', t.id)} />
+              </div>
+            </Row>
+            <Row label="--mine (accent)">
+              <div style={{ flex: 1 }}>
+                <TaskCard isMine task={{
+                  id: 'demo-2',
+                  title: 'Daily toolbox talk — fall protection (long task name to verify wrapping)',
+                  assignee: 'Ben Lin',
+                  status: 'Open', statusTone: 'info',
+                  dueTime: '15:30',
+                }} onSelect={t => console.log('select', t.id)} />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="UrgentCard">
+            <Row label="overdue">
+              <div style={{ flex: 1 }}>
+                <UrgentCard item={{
+                  id: 'u-demo',
+                  title: 'Crane inspection — Block 4',
+                  body: 'Booked 7:00 AM, status not confirmed by operator.',
+                  badgeTone: 'danger', badgeLabel: 'Overdue by 2h',
+                }} onSelect={i => console.log('select', i.id)} />
+              </div>
+            </Row>
+            <Row label="warning">
+              <div style={{ flex: 1 }}>
+                <UrgentCard item={{
+                  id: 'u-demo-2',
+                  title: 'Wind warning — secure tarps',
+                  body: 'MetService alert: gusts to 65 km/h after midday.',
+                  badgeTone: 'warning', badgeLabel: 'Action by 14:00',
+                }} onSelect={i => console.log('select', i.id)} />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="ActivityCard">
+            <Row label="snippet">
+              <div style={{ flex: 1 }}>
+                <ActivityCard item={{
+                  id: 'a-demo',
+                  speaker: 'Jarley Trainor',
+                  snippet: 'Concrete crew finished the south footing, moving to north.',
+                  timeAgo: '12m ago',
+                }} onSelect={i => console.log('select', i.id)} />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="MorningBriefCard">
+            <Row label="expanded">
+              <div style={{ flex: 1 }}>
+                <MorningBriefCard brief={{
+                  generatedAt: '5:42 AM',
+                  bullets: [
+                    'Pour at Block 4 completed at 11:30 PM',
+                    'Crane inspection pending — booked 7:00 AM',
+                    'Wind warning expected from 14:00; secure tarps',
+                  ],
+                }} />
+              </div>
+            </Row>
+            <Row label="collapsed">
+              <div style={{ flex: 1 }}>
+                <MorningBriefCard collapsed brief={{
+                  generatedAt: '5:42 AM',
+                  bullets: ['…hidden until expanded'],
+                }} />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="OnSiteCard">
+            <Row label="6 people">
+              <div style={{ flex: 1 }}>
+                <OnSiteCard people={[
+                  { id: 's1', name: 'Jarley Trainor' },
+                  { id: 's2', name: 'Ben Lin' },
+                  { id: 's3', name: 'David Barillaro' },
+                  { id: 's4', name: 'Sarah Chen' },
+                  { id: 's5', name: 'Mike OBrien' },
+                  { id: 's6', name: 'Priya Sharma' },
+                ]} />
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Timeline">
+            <Row label="3 events">
+              <div style={{ flex: 1 }}>
+                <Timeline events={[
+                  { label: 'Created',    actor: 'Jarley Trainor', time: 'Yesterday 6:42 PM' },
+                  { label: 'Assigned to Ben Lin', actor: 'Jarley Trainor', time: 'Yesterday 6:43 PM' },
+                  { label: 'Status: In progress', actor: 'Ben Lin', time: 'Today 7:15 AM' },
+                ]} />
+              </div>
+            </Row>
+          </Section>
+
+          {/* ========================================================== */}
+          {/* Sprint 8 — new L5 composites                              */}
+          {/* ========================================================== */}
+
+          <Section title="Sprint 8 · ErrorBanner">
+            <Row label="full">
+              <div style={{ flex: 1 }}>
+                {ErrorBanner && <ErrorBanner
+                  message="Could not load today's report"
+                  retryable={true}
+                  onRetry={() => alert('retry fired')}
+                />}
+              </div>
+            </Row>
+            <Row label="mini">
+              <div style={{ flex: 1 }}>
+                {ErrorBanner && <ErrorBanner
+                  message="Detail fetch failed"
+                  retryable={true}
+                  onRetry={() => alert('retry fired')}
+                  mini={true}
+                />}
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Sprint 8 · OverAllocationBanner">
+            <Row label="2 conflicts">
+              <div style={{ flex: 1 }}>
+                {OverAllocationBanner && <OverAllocationBanner
+                  conflicts={[
+                    { user: 'Maria Chen', dates: ['2026-05-03', '2026-05-04', '2026-05-05'] },
+                    { user: 'Ben Lin',    dates: ['2026-05-08'] },
+                  ]}
+                />}
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Sprint 8 · Tooltip">
+            <Row label="hover / focus">
+              {Tooltip && <Tooltip content="Press ⌘K to search" placement="top">
+                <Button variant="ghost">Hover me</Button>
+              </Tooltip>}
+              {Tooltip && <Tooltip content="Saves a snapshot of current task dates" placement="bottom">
+                <Button variant="secondary" leftIcon="bookmark">Save baseline</Button>
+              </Tooltip>}
+            </Row>
+          </Section>
+
+          <Section title="Sprint 8 · Toast (FS.toast.show)">
+            <Row label="tones">
+              <Button onClick={() => window.FS.toast.show({ message: 'Saved', tone: 'success' })}>Success</Button>
+              <Button onClick={() => window.FS.toast.show({ message: 'Could not save', tone: 'error' })}>Error</Button>
+              <Button onClick={() => window.FS.toast.show({ message: 'Network slow', tone: 'warning' })}>Warning</Button>
+              <Button onClick={() => window.FS.toast.show({ message: 'Link copied', tone: 'info' })}>Info</Button>
+            </Row>
+          </Section>
+
+          <Section title="Sprint 8 · Modals & overlays (live triggers)">
+            <Row label="open">
+              <ModalTrigger label="Safety create" Modal={SafetyCreateModal} props={{ siteId: 'sb1108-ellesmere' }} />
+              <ModalTrigger label="Quality create" Modal={QualityCreateModal} props={{ siteId: 'sb1108-ellesmere' }} />
+              <ModalTrigger label="Search palette" Modal={SearchPalette} />
+              <ModalTrigger label="Onboarding"     Modal={OnboardingOverlay} />
+            </Row>
+            <Row label="note">
+              <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                DemoTour is page-level — activate via <code>?demo=1</code> on app-shell-preview.html.
+              </span>
+            </Row>
+          </Section>
+
+          {/* ========================================================== */}
+          {/* Sprint 9 — Insights + Strategic dashboard composites      */}
+          {/* ========================================================== */}
+
+          <Section title="Sprint 9 · BarStack">
+            <Row label="risk-segmented">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {BarStack && <BarStack data={[
+                  { key: 'sub-apex',     label: 'Apex Scaffolding', meta: 'Scaffolding', value: 8,
+                    segments: [{ value: 4, tone: 'danger' }, { value: 3, tone: 'warning' }, { value: 1, tone: 'success' }] },
+                  { key: 'sub-mainline', label: 'Mainline Civil',   meta: 'Civil',       value: 5,
+                    segments: [{ value: 1, tone: 'danger' }, { value: 4, tone: 'warning' }] },
+                  { key: 'sub-hartco',   label: 'Hartco Electrical',meta: 'Electrical',  value: 3,
+                    segments: [{ value: 0, tone: 'danger' }, { value: 1, tone: 'warning' }, { value: 2, tone: 'success' }] },
+                ]} onSelect={(row) => alert('clicked: ' + row.label)} />}
+              </div>
+            </Row>
+            <Row label="single-tone">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {BarStack && <BarStack data={[
+                  { key: 'ppe',          label: 'PPE',                 value: 12, tone: 'danger',  segments: [{ value: 12, tone: 'danger' }] },
+                  { key: 'fall',         label: 'Fall from height',    value: 8,  tone: 'danger',  segments: [{ value: 8,  tone: 'danger' }] },
+                  { key: 'house',        label: 'Housekeeping',        value: 5,  tone: 'warning', segments: [{ value: 5,  tone: 'warning' }] },
+                ]} />}
+              </div>
+            </Row>
+            <Row label="empty">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {BarStack && <BarStack data={[]} emptyText="No issues in this range — clean week!" />}
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Sprint 9 · SparkLine">
+            <Row label="14-day · danger tone">
+              {SparkLine && <SparkLine
+                points={[
+                  { date: '2026-04-22', value: 1 }, { date: '2026-04-23', value: 0 },
+                  { date: '2026-04-24', value: 2 }, { date: '2026-04-25', value: 3 },
+                  { date: '2026-04-26', value: 1 }, { date: '2026-04-27', value: 0 },
+                  { date: '2026-04-28', value: 4 }, { date: '2026-04-29', value: 2 },
+                  { date: '2026-04-30', value: 1 }, { date: '2026-05-01', value: 3 },
+                  { date: '2026-05-02', value: 5 }, { date: '2026-05-03', value: 2 },
+                  { date: '2026-05-04', value: 1 }, { date: '2026-05-05', value: 2 },
+                ]}
+                tone="danger" width={280} height={56} showLastValue
+              />}
+            </Row>
+            <Row label="info tone (quality)">
+              {SparkLine && <SparkLine
+                points={[
+                  { date: 'd1', value: 0 }, { date: 'd2', value: 1 }, { date: 'd3', value: 2 },
+                  { date: 'd4', value: 1 }, { date: 'd5', value: 0 }, { date: 'd6', value: 2 },
+                  { date: 'd7', value: 3 },
+                ]}
+                tone="info" width={200} height={48}
+              />}
+            </Row>
+          </Section>
+
+          <Section title="Sprint 9 · TrendPill">
+            <Row label="lower_better polarity">
+              {TrendPill && <TrendPill delta={5}  unit="issues" polarity="lower_better" />}
+              {TrendPill && <TrendPill delta={-3} unit="issues" polarity="lower_better" />}
+              {TrendPill && <TrendPill delta={0}  unit="issues" polarity="lower_better" />}
+            </Row>
+            <Row label="higher_better polarity">
+              {TrendPill && <TrendPill delta={12} unit="%" polarity="higher_better" />}
+              {TrendPill && <TrendPill delta={-7} unit="%" polarity="higher_better" />}
+            </Row>
+            <Row label="hideZero">
+              {TrendPill && <TrendPill delta={0} hideZero />}
+            </Row>
+          </Section>
+
+          <Section title="Sprint 9 · HealthScore">
+            <Row label="A B C D · sm">
+              {HealthScore && <HealthScore grade="A" size="sm" />}
+              {HealthScore && <HealthScore grade="B" size="sm" />}
+              {HealthScore && <HealthScore grade="C" size="sm" />}
+              {HealthScore && <HealthScore grade="D" size="sm" />}
+            </Row>
+            <Row label="md + label">
+              {HealthScore && <HealthScore grade="A" size="md" label="Health" />}
+              {HealthScore && <HealthScore grade="B" size="md" label="Health" />}
+              {HealthScore && <HealthScore grade="C" size="md" label="Health" />}
+              {HealthScore && <HealthScore grade="D" size="md" label="Health" />}
+            </Row>
+            <Row label="lg">
+              {HealthScore && <HealthScore grade="B" size="lg" label="Worst-of" />}
+            </Row>
+          </Section>
+
+          <Section title="Sprint 9 · RollupTable">
+            <Row label="3 projects, sortable">
+              <div style={{ flex: 1, minWidth: 0, overflowX: 'auto' }}>
+                {RollupTable && <RollupTable
+                  columns={[
+                    { key: 'name',           label: 'Project',  type: 'text',    align: 'left' },
+                    { key: 'health',         label: 'Health',   type: 'health',  align: 'center' },
+                    { key: 'safety_count',   label: 'Safety',   type: 'num',     align: 'right' },
+                    { key: 'quality_count',  label: 'Quality',  type: 'num',     align: 'right' },
+                    { key: 'completion_rate',label: 'Done',     type: 'percent', align: 'right' },
+                    { key: 'value',          label: 'Value',    type: 'currency',align: 'right' },
+                    { key: 'trend',          label: '14-day',   type: 'trend',   tone: 'danger' },
+                  ]}
+                  rows={[
+                    { id: 'p1', name: 'SB1108 Ellesmere', health: 'B', safety_count: 5, quality_count: 2,
+                      completion_rate: 0.78, value: 12_400_000,
+                      trend: [{date:'a',value:0},{date:'b',value:1},{date:'c',value:2},{date:'d',value:1},{date:'e',value:0},{date:'f',value:2},{date:'g',value:1}] },
+                    { id: 'p2', name: 'MPI', health: 'D', safety_count: 9, quality_count: 4,
+                      completion_rate: 0.42, value: 8_900_000,
+                      trend: [{date:'a',value:3},{date:'b',value:4},{date:'c',value:5},{date:'d',value:3},{date:'e',value:4},{date:'f',value:6},{date:'g',value:5}] },
+                    { id: 'p3', name: 'SB1131 Wanaka', health: 'A', safety_count: 1, quality_count: 0,
+                      completion_rate: 0.91, value: 6_700_000,
+                      trend: [{date:'a',value:0},{date:'b',value:1},{date:'c',value:0},{date:'d',value:0},{date:'e',value:1},{date:'f',value:0},{date:'g',value:0}] },
+                  ]}
+                  onSelect={(row) => alert('selected: ' + row.name)}
+                />}
+              </div>
+            </Row>
+            <Row label="empty">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {RollupTable && <RollupTable
+                  columns={[
+                    { key: 'name', label: 'Project', type: 'text', align: 'left' },
+                    { key: 'health', label: 'Health', type: 'health', align: 'center' },
+                  ]}
+                  rows={[]}
+                />}
+              </div>
+            </Row>
+          </Section>
+
+          {/* ========================================================== */}
+          {/* Sprint 9.5 — Dashboard redesign primitives                */}
+          {/* ========================================================== */}
+
+          <Section title="Sprint 9.5 · WordCloud">
+            <Row label="frequency-sized · monochrome">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {WordCloud && <WordCloud data={[
+                  { slug: 'ppe',                 label: 'PPE',                count: 18 },
+                  { slug: 'fall_from_height',    label: 'Fall from height',   count: 12 },
+                  { slug: 'electrical',          label: 'Electrical',         count: 7  },
+                  { slug: 'housekeeping',        label: 'Housekeeping',       count: 11 },
+                  { slug: 'plant_machinery',     label: 'Plant & machinery',  count: 5  },
+                  { slug: 'lifting',             label: 'Lifting',            count: 9  },
+                  { slug: 'traffic_pedestrian',  label: 'Traffic',            count: 4  },
+                  { slug: 'lockout_tagout',      label: 'Lockout',            count: 3  },
+                  { slug: 'working_hot',         label: 'Hot works',          count: 2  },
+                  { slug: 'quality_workmanship', label: 'Workmanship',        count: 6  },
+                  { slug: 'quality_compliance',  label: 'Compliance',         count: 8  },
+                  { slug: 'hazardous_substances',label: 'Hazardous',          count: 1  },
+                ]} onSelect={(slug) => alert('clicked tag: ' + slug)} />}
+              </div>
+            </Row>
+            <Row label="with selection">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {WordCloud && <WordCloud
+                  data={[
+                    { slug: 'ppe', label: 'PPE', count: 18 },
+                    { slug: 'fall_from_height', label: 'Fall from height', count: 12 },
+                    { slug: 'electrical', label: 'Electrical', count: 7 },
+                    { slug: 'housekeeping', label: 'Housekeeping', count: 11 },
+                  ]}
+                  selected="ppe"
+                  onSelect={(slug) => alert('clicked tag: ' + slug)}
+                />}
+              </div>
+            </Row>
+            <Row label="empty">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {WordCloud && <WordCloud data={[]} emptyText="No tagged issues this week — clean!" />}
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Sprint 9.5 · ColumnChart">
+            <Row label="health distribution (A/B/C/D)">
+              <div style={{ flex: 1, minWidth: 0, maxWidth: 400 }}>
+                {ColumnChart && <ColumnChart data={[
+                  { key: 'A', label: 'A', value: 4, tone: 'success' },
+                  { key: 'B', label: 'B', value: 7, tone: 'info' },
+                  { key: 'C', label: 'C', value: 3, tone: 'warning' },
+                  { key: 'D', label: 'D', value: 1, tone: 'danger' },
+                ]} height={140} />}
+              </div>
+            </Row>
+            <Row label="weeks (stacked safety risk)">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {ColumnChart && <ColumnChart data={[
+                  { key: 'w1', label: 'W1', value: 9,
+                    segments: [{ value: 2, tone: 'danger' }, { value: 4, tone: 'warning' }, { value: 3, tone: 'success' }] },
+                  { key: 'w2', label: 'W2', value: 6,
+                    segments: [{ value: 1, tone: 'danger' }, { value: 3, tone: 'warning' }, { value: 2, tone: 'success' }] },
+                  { key: 'w3', label: 'W3', value: 12,
+                    segments: [{ value: 5, tone: 'danger' }, { value: 4, tone: 'warning' }, { value: 3, tone: 'success' }] },
+                  { key: 'w4', label: 'W4', value: 4,
+                    segments: [{ value: 0, tone: 'danger' }, { value: 1, tone: 'warning' }, { value: 3, tone: 'success' }] },
+                ]} height={160} onSelect={(row) => alert('week: ' + row.label)} />}
+              </div>
+            </Row>
+            <Row label="empty">
+              <div style={{ flex: 1, minWidth: 0, maxWidth: 400 }}>
+                {ColumnChart && <ColumnChart data={[]} height={120} emptyText="No data for this range." />}
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Sprint 9.5 · HeatmapGrid">
+            <Row label="3 subs × 6 tags">
+              <div style={{ flex: 1, minWidth: 0, overflowX: 'auto' }}>
+                {HeatmapGrid && <HeatmapGrid
+                  rows={[
+                    { id: 'sub-apex',     label: 'Apex Scaffolding', sub: 'Scaffolding' },
+                    { id: 'sub-mainline', label: 'Mainline Civil',   sub: 'Civil' },
+                    { id: 'sub-hartco',   label: 'Hartco Electrical',sub: 'Electrical' },
+                  ]}
+                  cols={[
+                    { id: 'ppe',                 label: 'PPE',         color: 'var(--fs-tag-ppe)' },
+                    { id: 'fall_from_height',    label: 'Fall',        color: 'var(--fs-tag-fall_from_height)' },
+                    { id: 'electrical',          label: 'Electrical',  color: 'var(--fs-tag-electrical)' },
+                    { id: 'housekeeping',        label: 'Housekeeping',color: 'var(--fs-tag-housekeeping)' },
+                    { id: 'lifting',             label: 'Lifting',     color: 'var(--fs-tag-lifting)' },
+                    { id: 'quality_workmanship', label: 'Workmanship', color: 'var(--fs-tag-quality_workmanship)' },
+                  ]}
+                  matrix={{
+                    'sub-apex':     { ppe: 5, fall_from_height: 4, housekeeping: 1 },
+                    'sub-mainline': { ppe: 1, housekeeping: 3, lifting: 2 },
+                    'sub-hartco':   { electrical: 6, ppe: 1, quality_workmanship: 2 },
+                  }}
+                  onSelect={(rowId, colId, count) => alert(rowId + ' × ' + colId + ' = ' + count)}
+                />}
+              </div>
+            </Row>
+            <Row label="empty">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {HeatmapGrid && <HeatmapGrid rows={[]} cols={[]} matrix={{}} />}
+              </div>
+            </Row>
+          </Section>
+
+          {/* Sprint 10 B.4/B.5 — Library editor composites */}
+
+          <Section title="Sprint 10 · SchemaEditor (B.4)">
+            <Row label="daily template sections">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {SchemaEditor && <SchemaEditor
+                  templateId="tpl-org-daily-standard"
+                  schema={{
+                    sections: [
+                      { title: 'Daily Summary',   kind: 'narrative', fields: [],                                  prompt_hint: 'Summarise the day' },
+                      { title: 'Workforce',        kind: 'kpi',      fields: ['headcount', 'subcontractors'],    prompt_hint: 'Labour numbers' },
+                      { title: 'Key Decisions',   kind: 'list',      fields: [],                                  prompt_hint: 'Decisions affecting programme' },
+                      { title: 'Open Actions',    kind: 'table',     fields: ['action', 'owner', 'due_date'],    prompt_hint: 'Outstanding tasks' },
+                      { title: 'Photos',          kind: 'photos',    fields: [],                                  prompt_hint: 'Progress photos' },
+                    ],
+                  }}
+                  onSaved={(updated) => alert('Saved! Template now has ' + (updated.versions || []).length + ' version(s)')}
+                  onCancel={() => alert('Cancelled')}
+                />}
+              </div>
+            </Row>
+          </Section>
+
+          <Section title="Sprint 10 · VersionHistoryPanel (B.5)">
+            <Row label="org daily template (1 version)">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {VersionHistoryPanel && <VersionHistoryPanel
+                  templateId="tpl-org-daily-standard"
+                  latestSchema={{
+                    sections: [
+                      { title: 'Daily Summary', kind: 'narrative', fields: [], prompt_hint: '' },
+                      { title: 'Workforce',      kind: 'kpi',      fields: ['headcount'], prompt_hint: '' },
+                      { title: 'Open Actions',  kind: 'table',     fields: ['action', 'owner'], prompt_hint: '' },
+                    ],
+                  }}
+                  canManage={true}
+                  onRestored={(updated) => alert('Restored! Template now has ' + (updated.versions || []).length + ' version(s)')}
+                />}
+              </div>
+            </Row>
+          </Section>
+
+        </React.Fragment>
+      );
+    }
+
+    /* Small helper for the Sprint 8 modal showcase row. Renders a button
+       that opens the supplied Modal component on click; closes on the
+       modal's onClose / onCancel / onSuccess callbacks. */
+    function ModalTrigger({ label, Modal, props }) {
+      const [open, setOpen] = React.useState(false);
+      const close = () => setOpen(false);
+      if (!Modal) {
+        return <span style={{ fontSize: '12px', color: 'var(--text-disabled)' }}>{label} (not loaded)</span>;
+      }
+      return (
+        <React.Fragment>
+          <Button variant="secondary" onClick={() => setOpen(true)}>{label}</Button>
+          {open && <Modal {...(props || {})} onCancel={close} onClose={close} onSuccess={close} />}
+        </React.Fragment>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(
+      React.createElement(Showcase)
+    );
+  </script>
+</body>
+</html>

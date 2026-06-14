@@ -1,0 +1,84 @@
+# ============================================================
+# FieldSight SAM Configuration (committed — NO secrets here)
+# ============================================================
+# Secrets (RealPTTPassword, ClaudeApiKey, Fargate VPC/subnets) are NOT stored
+# here. They are injected at deploy time from GitHub Actions secrets via
+# --parameter-overrides. See .github/workflows/deploy.yml.
+#
+# Canonical template = src/template.yaml (the complete 9-Lambda + API stack).
+# CodeUri inside it is "src/" relative to the REPO ROOT, so base_dir = "." is
+# required for `sam build` to resolve the handler code correctly.
+#
+# Usage:
+#   sam build                        # uses [default] build params below
+#   sam deploy --config-env test     # → fieldsight-test stack (isolated resources)
+#   sam deploy --config-env prod     # → fieldsight-pipeline stack (prod)
+# ============================================================
+
+version = 0.1
+
+[default.build.parameters]
+template_file = "src/template.yaml"
+base_dir = "."
+use_container = false
+
+# ------------------------------------------------------------
+# PROD (default) — existing stack, legacy fieldsight-* names
+# ------------------------------------------------------------
+[default.deploy.parameters]
+stack_name = "fieldsight-pipeline"
+region = "ap-southeast-2"
+capabilities = "CAPABILITY_NAMED_IAM"
+confirm_changeset = true
+resolve_s3 = true
+parameter_overrides = [
+    "Stage=prod",
+    "DataBucketName=fieldsight-data-509194952652",
+    "EnableSchedules=true",
+    "ItemsTableName=fieldsight-items",
+    "ReportsTableName=fieldsight-reports",
+    "AuditTableName=fieldsight-audit",
+]
+
+[prod.build.parameters]
+template_file = "src/template.yaml"
+base_dir = "."
+use_container = false
+
+[prod.deploy.parameters]
+stack_name = "fieldsight-pipeline"
+region = "ap-southeast-2"
+capabilities = "CAPABILITY_NAMED_IAM"
+confirm_changeset = false
+resolve_s3 = true
+parameter_overrides = [
+    "Stage=prod",
+    "DataBucketName=fieldsight-data-509194952652",
+    "EnableSchedules=true",
+    "ItemsTableName=fieldsight-items",
+    "ReportsTableName=fieldsight-reports",
+    "AuditTableName=fieldsight-audit",
+]
+
+# ------------------------------------------------------------
+# TEST — parallel stack, fieldsight-test-* names, schedules OFF
+# ------------------------------------------------------------
+[test.build.parameters]
+template_file = "src/template.yaml"
+base_dir = "."
+use_container = false
+
+[test.deploy.parameters]
+stack_name = "fieldsight-test"
+region = "ap-southeast-2"
+capabilities = "CAPABILITY_NAMED_IAM"
+confirm_changeset = false
+resolve_s3 = true
+parameter_overrides = [
+    "Stage=test",
+    "DataBucketName=fieldsight-data-test-509194952652",
+    "EnableSchedules=false",
+    "ItemsTableName=fieldsight-test-items",
+    "ReportsTableName=fieldsight-test-reports",
+    "AuditTableName=fieldsight-test-audit",
+]

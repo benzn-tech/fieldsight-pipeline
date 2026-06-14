@@ -1,0 +1,721 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FieldSight · Design Tokens</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles/tokens.css" />
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    font-family: var(--font-sans);
+    background: var(--surface-app);
+    color: var(--text-primary);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Topbar */
+  .topbar {
+    position: sticky; top: 0; z-index: var(--z-sticky);
+    background: color-mix(in srgb, var(--surface-app) 88%, transparent);
+    backdrop-filter: saturate(140%) blur(10px);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .topbar-inner {
+    max-width: 1200px; margin: 0 auto;
+    padding: var(--space-4) var(--space-8);
+    display: flex; align-items: center; gap: var(--space-6);
+  }
+  .brand { display: flex; align-items: center; gap: var(--space-3); }
+  .brand-mark {
+    width: 32px; height: 32px; border-radius: var(--radius-md);
+    background: var(--color-primary-900); color: var(--color-accent-500);
+    display: grid; place-items: center;
+    font-weight: var(--font-weight-bold);
+    box-shadow: var(--shadow-sm);
+  }
+  .brand-name { font-weight: var(--font-weight-semibold); letter-spacing: -0.01em; }
+  .brand-tag { color: var(--text-tertiary); font-size: var(--font-size-sm); }
+  .topbar-right { margin-left: auto; }
+
+  .theme-toggle {
+    display: inline-flex; background: var(--surface-panel-muted);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-full); padding: 3px;
+  }
+  .theme-toggle button {
+    appearance: none; border: 0; background: transparent;
+    padding: var(--space-1-5) var(--space-3);
+    font: inherit; font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
+    color: var(--text-secondary);
+    border-radius: var(--radius-full); cursor: pointer;
+    min-height: var(--touch-target-min); min-width: 64px;
+    transition: var(--transition-colors);
+  }
+  .theme-toggle button[aria-pressed="true"] {
+    background: var(--surface-panel); color: var(--text-primary);
+    box-shadow: var(--shadow-xs);
+  }
+
+  /* Page */
+  .page { max-width: 1200px; margin: 0 auto; padding: var(--space-12) var(--space-8) var(--space-24); }
+
+  .hero { padding: var(--space-8) 0 var(--space-12); }
+  .eyebrow {
+    font-size: var(--font-size-xs); font-weight: var(--font-weight-semibold);
+    letter-spacing: var(--letter-spacing-wider); text-transform: uppercase;
+    color: var(--color-accent-600);
+  }
+  .hero h1 {
+    margin: var(--space-2) 0 var(--space-4);
+    font-size: var(--font-size-4xl); font-weight: var(--font-weight-bold);
+    letter-spacing: var(--letter-spacing-tight); line-height: var(--line-height-tight);
+  }
+  .hero p { margin: 0; max-width: 60ch; color: var(--text-secondary); font-size: var(--font-size-lg); line-height: var(--line-height-relaxed); }
+
+  section.block { padding: var(--space-12) 0; border-top: 1px solid var(--border-subtle); }
+  .block-head { margin-bottom: var(--space-8); display: flex; flex-wrap: wrap; gap: var(--space-4); align-items: baseline; }
+  .block-head .num {
+    font-family: var(--font-mono); font-size: var(--font-size-sm);
+    color: var(--color-accent-600); font-weight: var(--font-weight-semibold);
+  }
+  .block-head h2 {
+    margin: 0; font-size: var(--font-size-2xl);
+    font-weight: var(--font-weight-bold); letter-spacing: -0.01em;
+  }
+  .block-head p { margin: 0; color: var(--text-secondary); max-width: 56ch; }
+
+  .subhead {
+    font-size: var(--font-size-xs); font-weight: var(--font-weight-semibold);
+    letter-spacing: var(--letter-spacing-wider); text-transform: uppercase;
+    color: var(--text-tertiary);
+    margin: var(--space-8) 0 var(--space-4);
+  }
+  .subhead:first-child { margin-top: 0; }
+
+  /* Color ramps */
+  .ramp-row { margin-bottom: var(--space-6); }
+  .ramp-label-row {
+    display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: var(--space-3); gap: var(--space-4);
+  }
+  .ramp-name { font-size: var(--font-size-sm); font-weight: var(--font-weight-semibold); }
+  .ramp-note { color: var(--text-tertiary); font-size: var(--font-size-xs); font-style: italic; }
+  .swatches { display: grid; gap: var(--space-1); }
+  .swatch {
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    border: 1px solid var(--border-subtle);
+    background: var(--surface-panel);
+  }
+  .swatch .chip { aspect-ratio: 1 / 1.1; }
+  .swatch .meta { padding: var(--space-2); border-top: 1px solid var(--border-subtle); }
+  .swatch .shade { font-family: var(--font-mono); font-size: 11px; font-weight: var(--font-weight-semibold); color: var(--text-primary); }
+  .swatch .hex { font-family: var(--font-mono); font-size: 10px; color: var(--text-tertiary); }
+
+  /* Category cards */
+  .cat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: var(--space-4); }
+  .cat-card {
+    background: var(--surface-panel);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: var(--space-4);
+    display: flex; flex-direction: column; gap: var(--space-3);
+    box-shadow: var(--shadow-xs);
+  }
+  .cat-row { display: flex; align-items: center; gap: var(--space-3); }
+  .cat-dot { width: 28px; height: 28px; border-radius: var(--radius-sm); flex-shrink: 0; box-shadow: var(--shadow-inner); }
+  .cat-name { font-weight: var(--font-weight-semibold); font-size: var(--font-size-sm); }
+  .cat-hex { font-family: var(--font-mono); font-size: 11px; color: var(--text-tertiary); }
+  .cat-bg-chip {
+    align-self: flex-start;
+    padding: var(--space-1-5) var(--space-3);
+    border-radius: var(--radius-sm);
+    font-size: 10px; font-weight: var(--font-weight-semibold);
+    letter-spacing: var(--letter-spacing-wider); text-transform: uppercase;
+  }
+
+  /* Surfaces */
+  .surfaces { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: var(--space-4); }
+  .surface-card {
+    border-radius: var(--radius-lg); padding: var(--space-4);
+    border: 1px solid var(--border-subtle);
+    display: flex; flex-direction: column; gap: var(--space-2);
+    min-height: 110px;
+  }
+  .surface-card .surface-name { font-weight: var(--font-weight-semibold); font-size: var(--font-size-sm); }
+  .surface-card .token-name { font-family: var(--font-mono); font-size: 11px; opacity: 0.7; }
+
+  /* Text roles panel */
+  .text-roles {
+    background: var(--surface-panel); padding: var(--space-6);
+    border: 1px solid var(--border-subtle); border-radius: var(--radius-lg);
+    display: grid; gap: var(--space-2);
+  }
+  .text-roles .row { display: flex; justify-content: space-between; align-items: baseline; gap: var(--space-4); }
+  .text-roles .row .token { font-family: var(--font-mono); font-size: 11px; color: var(--text-tertiary); }
+
+  /* Type specimens */
+  .type-row {
+    display: grid; grid-template-columns: 220px 1fr auto;
+    gap: var(--space-6); padding: var(--space-4) 0;
+    border-bottom: 1px solid var(--border-subtle);
+    align-items: baseline;
+  }
+  .type-row:last-child { border-bottom: 0; }
+  .type-name { font-family: var(--font-mono); font-size: var(--font-size-sm); color: var(--text-tertiary); }
+  .type-meta { font-family: var(--font-mono); font-size: 11px; color: var(--text-tertiary); text-align: right; }
+
+  /* Spacing */
+  .space-row {
+    display: grid; grid-template-columns: 130px 90px 1fr;
+    gap: var(--space-4); align-items: center;
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .space-row:last-child { border-bottom: 0; }
+  .space-token { font-family: var(--font-mono); font-size: var(--font-size-sm); }
+  .space-value { font-family: var(--font-mono); font-size: var(--font-size-sm); color: var(--text-tertiary); }
+  .space-bar { height: 24px; background: var(--color-accent-500); border-radius: var(--radius-sm); max-width: 100%; }
+
+  /* Touch targets */
+  .touch-demo { display: flex; gap: var(--space-4); align-items: flex-end; flex-wrap: wrap; }
+  .touch-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 0 var(--space-5);
+    background: var(--color-accent-500); color: var(--color-neutral-0);
+    border: 0; border-radius: var(--radius-md);
+    font: inherit; font-weight: var(--font-weight-semibold);
+    font-size: var(--font-size-sm);
+    cursor: pointer; transition: var(--transition-all);
+    box-shadow: var(--shadow-sm);
+  }
+  .touch-btn:hover { background: var(--color-accent-600); transform: translateY(-1px); box-shadow: var(--shadow-md); }
+  .touch-btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+  /* Radius */
+  .radius-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: var(--space-4); }
+  .radius-card {
+    background: var(--color-primary-900); color: var(--color-neutral-0);
+    aspect-ratio: 1.3 / 1;
+    display: flex; flex-direction: column; justify-content: flex-end;
+    padding: var(--space-3); box-shadow: var(--shadow-sm);
+  }
+  .radius-card .r-name { font-size: var(--font-size-sm); font-weight: var(--font-weight-semibold); }
+  .radius-card .r-value { font-family: var(--font-mono); font-size: 11px; opacity: 0.7; }
+
+  /* Shadows */
+  .shadow-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: var(--space-8); padding: var(--space-6) var(--space-4);
+  }
+  .shadow-card {
+    background: var(--surface-panel); border-radius: var(--radius-lg);
+    aspect-ratio: 1.4 / 1;
+    display: flex; flex-direction: column; justify-content: flex-end;
+    padding: var(--space-4);
+  }
+  .shadow-card .s-name { font-weight: var(--font-weight-semibold); font-size: var(--font-size-sm); }
+  .shadow-card .s-meta { font-family: var(--font-mono); font-size: 11px; color: var(--text-tertiary); }
+
+  /* Motion */
+  .motion-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: var(--space-4); }
+  .motion-card {
+    background: var(--surface-panel); border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg); padding: var(--space-4);
+    display: flex; flex-direction: column; gap: var(--space-3);
+    box-shadow: var(--shadow-xs);
+  }
+  .motion-label { display: flex; justify-content: space-between; align-items: baseline; }
+  .motion-name { font-weight: var(--font-weight-semibold); font-size: var(--font-size-sm); }
+  .motion-value { font-family: var(--font-mono); font-size: 11px; color: var(--text-tertiary); }
+  .motion-track {
+    height: 36px; background: var(--surface-panel-muted);
+    border-radius: var(--radius-full); position: relative; overflow: hidden;
+  }
+  .motion-ball {
+    position: absolute; top: 50%; left: 4px; transform: translateY(-50%);
+    width: 28px; height: 28px; border-radius: var(--radius-full);
+    background: var(--color-accent-500); box-shadow: var(--shadow-sm);
+    animation-name: slide; animation-iteration-count: infinite;
+    animation-direction: alternate;
+  }
+  @keyframes slide { from { left: 4px; } to { left: calc(100% - 32px); } }
+
+  /* Pills */
+  .pill-row { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+  .pill {
+    display: inline-flex; align-items: center; gap: var(--space-2);
+    padding: var(--space-1) var(--space-3);
+    border-radius: var(--radius-full);
+    font-size: var(--font-size-xs); font-weight: var(--font-weight-semibold);
+    background: var(--surface-panel-muted); color: var(--text-primary);
+    border: 1px solid var(--border-subtle);
+  }
+  .pill .dot { width: 8px; height: 8px; border-radius: var(--radius-full); }
+  .pill .dot.pulse { animation: status-pulse 1.6s ease-in-out infinite; }
+  @keyframes status-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
+    50%      { box-shadow: 0 0 0 4px transparent; opacity: 0.55; }
+  }
+
+  /* Z-index table */
+  .z-table { width: 100%; border-collapse: collapse; }
+  .z-table th, .z-table td {
+    text-align: left; padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .z-table th {
+    font-size: var(--font-size-xs); font-weight: var(--font-weight-semibold);
+    letter-spacing: var(--letter-spacing-wider); text-transform: uppercase;
+    color: var(--text-tertiary);
+  }
+  .z-table td.mono { font-family: var(--font-mono); font-size: var(--font-size-sm); }
+
+  /* Breakpoints */
+  .bp-row {
+    display: grid; grid-template-columns: 130px 110px 1fr;
+    gap: var(--space-4); align-items: center;
+    padding: var(--space-2) 0; border-bottom: 1px solid var(--border-subtle);
+  }
+  .bp-row:last-child { border: 0; }
+  .bp-token { font-family: var(--font-mono); font-size: var(--font-size-sm); }
+  .bp-value { font-family: var(--font-mono); font-size: var(--font-size-sm); color: var(--text-tertiary); }
+  .bp-bar { height: 6px; background: var(--color-primary-200); border-radius: var(--radius-full); position: relative; overflow: hidden; }
+  .bp-bar .fill { position: absolute; inset: 0 auto 0 0; background: var(--color-primary-700); }
+
+  /* Focus demo */
+  .focus-demo { display: flex; gap: var(--space-4); flex-wrap: wrap; }
+  .focus-demo button {
+    appearance: none; font: inherit; cursor: pointer;
+    padding: var(--space-3) var(--space-5);
+    background: var(--surface-panel); color: var(--text-primary);
+    border: 1px solid var(--border-default); border-radius: var(--radius-md);
+    font-weight: var(--font-weight-semibold);
+    min-height: var(--touch-target-min);
+  }
+  .focus-demo button:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+  /* Applied examples */
+  .preview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--space-6); }
+  .kpi {
+    background: var(--surface-panel); border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg); padding: var(--space-6);
+    display: flex; flex-direction: column; gap: var(--space-2);
+    box-shadow: var(--shadow-sm);
+  }
+  .kpi-eyebrow {
+    font-size: var(--font-size-xs); font-weight: var(--font-weight-semibold);
+    letter-spacing: var(--letter-spacing-wider); text-transform: uppercase;
+    color: var(--text-tertiary);
+  }
+  .kpi-number {
+    font-size: var(--font-size-4xl); font-weight: var(--font-weight-bold);
+    line-height: 1; letter-spacing: var(--letter-spacing-tight);
+    font-variant-numeric: tabular-nums;
+  }
+  .kpi-delta { font-size: var(--font-size-sm); color: var(--text-success); font-weight: var(--font-weight-medium); }
+
+  .form-demo { display: grid; gap: var(--space-4); max-width: 420px; }
+  .form-demo label {
+    display: grid; gap: var(--space-2);
+    font-size: var(--font-size-sm); font-weight: var(--font-weight-medium);
+    color: var(--text-secondary);
+  }
+  .form-demo input, .form-demo select {
+    height: var(--touch-target-default); padding: 0 var(--space-4);
+    border-radius: var(--radius-md); border: 1px solid var(--border-default);
+    background: var(--surface-input); color: var(--text-primary);
+    font: inherit; font-size: var(--font-size-base);
+    transition: var(--transition-colors);
+  }
+  .form-demo input:focus, .form-demo select:focus {
+    outline: none; border-color: var(--border-focus);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent-500) 25%, transparent);
+  }
+
+  /* Two-col layout helper */
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-8); align-items: start; }
+  @media (max-width: 800px) { .two-col { grid-template-columns: 1fr; } }
+
+  /* Roles */
+  .roles-stack { display: flex; flex-direction: column; gap: 0; max-width: 800px; }
+  .role-card {
+    background: var(--surface-panel);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: var(--space-5) var(--space-6);
+    display: grid;
+    grid-template-columns: 56px 1fr auto;
+    gap: var(--space-4);
+    align-items: center;
+    cursor: default;
+    transition: var(--transition-all);
+  }
+  .role-card[data-tier="low"]    { background: var(--surface-panel-muted); }
+  .role-card[data-tier="mid"]    { background: var(--surface-panel); }
+  .role-card[data-tier="high"]   { background: var(--surface-panel-elevated); box-shadow: var(--shadow-sm); }
+  .role-card:hover { box-shadow: var(--shadow-md); transform: translateX(2px); border-color: var(--color-accent-500); }
+  .role-card .level {
+    width: 40px; height: 40px; border-radius: var(--radius-full);
+    background: var(--color-primary-900); color: var(--color-accent-500);
+    display: grid; place-items: center;
+    font-family: var(--font-mono); font-size: var(--font-size-base); font-weight: var(--font-weight-bold);
+  }
+  .role-card .role-label { font-weight: var(--font-weight-semibold); font-size: var(--font-size-base); }
+  .role-card .role-meta { font-size: var(--font-size-xs); color: var(--text-tertiary); margin-top: 2px; }
+  .role-card .role-meta code { font-family: var(--font-mono); color: var(--text-secondary); background: var(--surface-panel-muted); padding: 1px 6px; border-radius: var(--radius-sm); }
+  .role-card .feature-count {
+    display: inline-flex; align-items: baseline; gap: var(--space-1);
+    padding: var(--space-1-5) var(--space-3);
+    border-radius: var(--radius-full);
+    background: var(--color-accent-500); color: var(--color-neutral-0);
+    font-size: var(--font-size-xs); font-weight: var(--font-weight-semibold);
+  }
+  .role-card .feature-count .num { font-family: var(--font-mono); font-size: var(--font-size-sm); }
+  .role-card .feature-list {
+    grid-column: 1 / -1;
+    display: none;
+    margin-top: var(--space-4);
+    padding-top: var(--space-4);
+    border-top: 1px dashed var(--border-subtle);
+    font-family: var(--font-mono); font-size: 11px; color: var(--text-tertiary);
+    columns: 2; column-gap: var(--space-6); column-rule: 1px solid var(--border-subtle);
+  }
+  @media (min-width: 700px) { .role-card .feature-list { columns: 3; } }
+  .role-card.expanded .feature-list { display: block; }
+  .role-card .feature-list li { list-style: none; padding: 2px 0; break-inside: avoid; }
+  .role-card .feature-list li.inherited { opacity: 0.55; }
+
+  .role-arrow {
+    text-align: center; color: var(--text-tertiary);
+    font-size: var(--font-size-xs); padding: var(--space-2) 0;
+    font-style: italic;
+  }
+
+  .role-divider {
+    margin: var(--space-6) 0 var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    border-top: 1px solid var(--border-subtle);
+    border-bottom: 1px solid var(--border-subtle);
+    background: var(--surface-panel-muted);
+    border-radius: var(--radius-md);
+  }
+  .role-divider > span:first-child {
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--letter-spacing-wider);
+    color: var(--text-secondary);
+    font-weight: var(--font-weight-semibold);
+  }
+  .role-divider-note {
+    font-size: var(--font-size-xs);
+    color: var(--text-tertiary);
+    margin-top: 2px;
+  }
+  .role-card[data-role="hse_manager"] .level,
+  .role-card[data-role="quality_manager"] .level {
+    background: var(--color-warning-100);
+    color: var(--color-warning-700);
+  }
+  .role-card[data-role="client_viewer"] .level {
+    background: var(--color-info-100);
+    color: var(--color-info-700);
+  }
+
+  /* Nav matrix */
+  .nav-matrix { width: 100%; border-collapse: separate; border-spacing: 0; }
+  .nav-matrix th, .nav-matrix td {
+    padding: var(--space-3) var(--space-3);
+    border-bottom: 1px solid var(--border-subtle);
+    text-align: center;
+    font-size: var(--font-size-sm);
+  }
+  .nav-matrix th { font-weight: var(--font-weight-semibold); color: var(--text-secondary); font-size: var(--font-size-xs); letter-spacing: var(--letter-spacing-wider); text-transform: uppercase; }
+  .nav-matrix td:first-child, .nav-matrix th:first-child { text-align: left; padding-left: var(--space-4); font-family: var(--font-mono); color: var(--text-primary); white-space: nowrap; }
+  .nav-matrix .nav-perm {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-tertiary);
+    margin-top: 2px;
+    font-weight: var(--font-weight-regular);
+  }
+  .nav-matrix .check { color: var(--color-success-600); font-weight: var(--font-weight-bold); }
+  .nav-matrix .miss  { color: var(--text-disabled); }
+  .nav-matrix tr:hover td { background: var(--surface-panel-muted); }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <div class="brand-mark">F</div>
+      <div>
+        <div class="brand-name">FieldSight</div>
+        <div class="brand-tag">Design Tokens · v1.0</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="theme-toggle" role="group" aria-label="Theme">
+        <button id="theme-light" aria-pressed="true">Light</button>
+        <button id="theme-dark"  aria-pressed="false">Dark</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<main class="page">
+
+  <header class="hero">
+    <div class="eyebrow">Sprint 0 · Foundation</div>
+    <h1>Construction-grade clarity.<br />Evidence-first tone.</h1>
+    <p>Every token below is tuned for outdoor sunlight, gloved hands, dusty screens, and tired PMs. Safety color conventions are sacred. Breathing room over density.</p>
+  </header>
+
+  <!-- §1 COLORS -->
+  <section class="block">
+    <div class="block-head">
+      <span class="num">§1</span>
+      <h2>Colors</h2>
+      <p>Primitive ramps feed semantic tokens. Components consume the semantics.</p>
+    </div>
+
+    <div class="subhead">Brand · Primary Navy</div>
+    <div class="ramp-row" data-ramp="primary" data-note="Trust, authority, construction industry norm — Procore / Aconex lineage."></div>
+
+    <div class="subhead">Accent · Safety Orange</div>
+    <div class="ramp-row" data-ramp="accent" data-note="Hi-vis construction signature. Reserved for CTAs and key highlights."></div>
+
+    <div class="subhead">Semantic · Status</div>
+    <div class="ramp-row" data-ramp="danger"  data-note="Hazards, errors, stop conditions, critical incidents."></div>
+    <div class="ramp-row" data-ramp="warning" data-note="Caution, incomplete, pending, weather alerts."></div>
+    <div class="ramp-row" data-ramp="success" data-note="Completed tasks, safe conditions, passed QA."></div>
+    <div class="ramp-row" data-ramp="info"    data-note="Informational, neutral updates, system messages."></div>
+
+    <div class="subhead">Neutrals</div>
+    <div class="ramp-row" data-ramp="neutral" data-note="Cool-neutral scale — avoids warm grays that read dated."></div>
+
+    <div class="subhead">Category Colors · Construction-specific</div>
+    <div class="cat-grid" id="cat-grid"></div>
+
+    <div class="subhead">Semantic Surfaces</div>
+    <div class="surfaces" id="surface-grid"></div>
+
+    <div class="subhead">Text Roles</div>
+    <div class="text-roles" id="text-roles"></div>
+  </section>
+
+  <!-- §2 TYPOGRAPHY -->
+  <section class="block">
+    <div class="block-head">
+      <span class="num">§2</span>
+      <h2>Typography</h2>
+      <p>Inter across the system. 16px base, modular scale 1.25. Tabular numerals and slashed zeros are available for data and IDs.</p>
+    </div>
+
+    <div class="subhead">Presets</div>
+    <div id="type-specimens"></div>
+
+    <div class="subhead">Construction-specific features</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:var(--space-4);">
+      <div class="surface-card" style="background:var(--surface-panel)">
+        <div class="surface-name">Tabular numerals</div>
+        <div class="token-name">font-variant-numeric: tabular-nums</div>
+        <div class="tabular-nums" style="font-size:var(--font-size-lg);line-height:1.5">
+          111,111<br>888,888<br>1,234,567
+        </div>
+      </div>
+      <div class="surface-card" style="background:var(--surface-panel)">
+        <div class="surface-name">Slashed zero · technical IDs</div>
+        <div class="token-name">font-feature-settings: "ss01", "zero"</div>
+        <div class="technical-id" style="font-size:var(--font-size-lg);line-height:1.5">
+          SITE-0042-A<br>TASK-10890<br>DEV-00O0
+        </div>
+      </div>
+      <div class="surface-card" style="background:var(--surface-panel)">
+        <div class="surface-name">Monospace · code / data</div>
+        <div class="token-name">--font-mono · JetBrains Mono</div>
+        <div class="type-code" style="font-size:var(--font-size-sm)">
+          const status = "in_progress";<br>assert(task.due &gt; now);
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- §3 SPACING -->
+  <section class="block">
+    <div class="block-head">
+      <span class="num">§3</span>
+      <h2>Spacing</h2>
+      <p>4px base. Use semantic aliases (component-*, section-*) inside components.</p>
+    </div>
+
+    <div class="subhead">Scale</div>
+    <div id="spacing-rows"></div>
+
+    <div class="subhead">Touch Targets · Field use</div>
+    <div class="touch-demo">
+      <button class="touch-btn" style="height:var(--touch-target-min)">44px · iOS min</button>
+      <button class="touch-btn" style="height:var(--touch-target-default)">48px · gloved-safe default</button>
+      <button class="touch-btn" style="height:var(--touch-target-large);font-size:var(--font-size-base);padding:0 var(--space-6)">56px · critical actions</button>
+    </div>
+  </section>
+
+  <!-- §4 RADIUS + SHADOW -->
+  <section class="block">
+    <div class="block-head">
+      <span class="num">§4</span>
+      <h2>Radius &amp; Elevation</h2>
+      <p>Rounded but restrained. Shadows are navy-tinted (primary-900) so elevation stays on-palette.</p>
+    </div>
+
+    <div class="subhead">Border Radius</div>
+    <div class="radius-grid" id="radius-grid"></div>
+
+    <div class="subhead">Shadows · navy-tinted</div>
+    <div class="shadow-grid" id="shadow-grid"></div>
+  </section>
+
+  <!-- §5 MOTION -->
+  <section class="block">
+    <div class="block-head">
+      <span class="num">§5</span>
+      <h2>Motion</h2>
+      <p>Ease-out is the default. Spring is reserved for celebratory moments. Reduced-motion is honored automatically.</p>
+    </div>
+    <div class="subhead">Durations &amp; Easings</div>
+    <div class="motion-grid" id="motion-grid"></div>
+  </section>
+
+  <!-- §6 LAYERING + BREAKPOINTS -->
+  <section class="block">
+    <div class="block-head">
+      <span class="num">§6</span>
+      <h2>Layering &amp; Breakpoints</h2>
+    </div>
+
+    <div class="subhead">Z-Index Scale</div>
+    <table class="z-table">
+      <thead><tr><th>Token</th><th>Value</th><th>Use</th></tr></thead>
+      <tbody id="z-body"></tbody>
+    </table>
+
+    <div class="subhead">Breakpoints</div>
+    <div id="bp-rows"></div>
+  </section>
+
+  <!-- §7 FOCUS RINGS -->
+  <section class="block">
+    <div class="block-head">
+      <span class="num">§7</span>
+      <h2>Focus Rings</h2>
+      <p>Tab through these — the orange ring is maximally visible against the navy palette.</p>
+    </div>
+    <div class="focus-demo">
+      <button>Primary action</button>
+      <button>Secondary</button>
+      <button>Tertiary</button>
+    </div>
+  </section>
+
+  <!-- §8 CONSTRUCTION-SPECIFIC -->
+  <section class="block">
+    <div class="block-head">
+      <span class="num">§8</span>
+      <h2>Construction-Specific Tokens</h2>
+      <p>Priority levels, status states, and source indicators. Components consume these — not the raw color primitives.</p>
+    </div>
+
+    <div class="subhead">Priority</div>
+    <div class="pill-row" id="priority-pills"></div>
+
+    <div class="subhead">Status</div>
+    <div class="pill-row" id="status-pills"></div>
+
+    <div class="subhead">Source Indicators</div>
+    <div class="pill-row" id="source-pills"></div>
+  </section>
+
+  <!-- §9 APPLIED -->
+  <section class="block">
+    <div class="block-head">
+      <span class="num">§9</span>
+      <h2>Applied examples</h2>
+      <p>Tokens composed into familiar shapes — to show the system at work.</p>
+    </div>
+
+    <div class="preview-grid">
+      <div class="kpi">
+        <div class="kpi-eyebrow">Open tasks</div>
+        <div class="kpi-number">42</div>
+        <div class="kpi-delta">▲ 8 this week</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-eyebrow">Hours on site</div>
+        <div class="kpi-number">1,284</div>
+        <div class="kpi-delta" style="color:var(--text-secondary)">No change</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-eyebrow">Safety score</div>
+        <div class="kpi-number" style="color:var(--color-success-600)">96<span style="font-size:var(--font-size-xl);color:var(--text-tertiary);font-weight:var(--font-weight-medium)">/100</span></div>
+        <div class="kpi-delta">▲ 2 vs. last month</div>
+      </div>
+    </div>
+
+    <div class="two-col" style="margin-top:var(--space-8)">
+      <div>
+        <div class="subhead">Input field · focus state</div>
+        <form class="form-demo" onsubmit="event.preventDefault()">
+          <label>
+            Site ID
+            <input type="text" class="technical-id" value="SITE-0042-A" />
+          </label>
+          <label>
+            Category
+            <select>
+              <option>Safety</option>
+              <option>Quality</option>
+              <option>Programme</option>
+              <option>Commercial</option>
+              <option>Weather</option>
+            </select>
+          </label>
+        </form>
+      </div>
+      <div>
+        <div class="subhead">Category chips</div>
+        <div class="pill-row" id="cat-pills"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- §10 ROLE SYSTEM -->
+  <section class="block">
+    <div class="block-head">
+      <span class="num">§10</span>
+      <h2>Role System v2</h2>
+      <p>Permission-driven authorization. Three role types: <b>line-of-authority hierarchy</b> (cumulative inheritance), <b>cross-cutting specialists</b> (functional, no inheritance), and an <b>external client</b> tier. Permissions follow <code>resource:action:scope</code>; nav visibility is derived. Click any card to expand its full permission set.</p>
+    </div>
+
+    <div class="subhead">Roles · hierarchy first (highest tier on top), then specialists, then external</div>
+    <div class="roles-stack" id="roles-stack"></div>
+
+    <div class="subhead">Navigation Visibility Matrix · derived from <code>can(role, permission)</code></div>
+    <div style="overflow-x:auto;">
+      <table class="nav-matrix" id="nav-matrix"></table>
+    </div>
+  </section>
+
+</main>
+
+<script src="scripts/tokens-reference.js?v=9"></script>
+</body>
+</html>
