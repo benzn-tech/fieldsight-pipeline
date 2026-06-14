@@ -51,7 +51,17 @@ jobs:
         run: sam build --template-file src/template.yaml --base-dir .
 
       - name: SAM deploy (TEST)
+        env:
+          REALPTT_ACCOUNT: ${{ secrets.REALPTT_ACCOUNT }}
+          REALPTT_PASSWORD: ${{ secrets.REALPTT_PASSWORD }}
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+          FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
+          FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
         run: |
+          # A space inside any --parameter-overrides "Key=Value" breaks SAM's parser.
+          # Trim the VPC id; normalize the subnet list (space- OR comma-separated) to clean commas.
+          VPC="$(echo "$FARGATE_VPC_ID" | xargs)"
+          SUBNETS="$(echo "$FARGATE_SUBNET_IDS" | tr ',' ' ' | xargs | tr ' ' ',')"
           sam deploy --config-env test \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -61,11 +71,11 @@ jobs:
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \
-              "RealPTTAccount=${{ secrets.REALPTT_ACCOUNT }}" \
-              "RealPTTPassword=${{ secrets.REALPTT_PASSWORD }}" \
-              "ClaudeApiKey=${{ secrets.CLAUDE_API_KEY }}" \
-              "FargateSubnetIds=${{ secrets.FARGATE_SUBNET_IDS }}" \
-              "FargateVpcId=${{ secrets.FARGATE_VPC_ID }}"
+              "RealPTTAccount=$REALPTT_ACCOUNT" \
+              "RealPTTPassword=$REALPTT_PASSWORD" \
+              "ClaudeApiKey=$CLAUDE_API_KEY" \
+              "FargateSubnetIds=$SUBNETS" \
+              "FargateVpcId=$VPC"
 
       - name: Wire S3 events (TEST bucket)
         run: bash scripts/wire-s3-events.sh fieldsight-data-test-509194952652 test ${{ env.AWS_REGION }} --apply
