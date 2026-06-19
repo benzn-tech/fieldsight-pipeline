@@ -1,0 +1,7 @@
+[server]
+maxUploadSize = 500          # MB — allow long audio uploads (Cartesia smart-VAD test)
+headless = true
+
+[theme]
+base = "dark"
+primaryColor = "#FF8A4C"     # FieldSight orange

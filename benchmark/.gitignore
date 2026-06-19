@@ -1,0 +1,12 @@
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Stored runs (audio + results + sqlite db)
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

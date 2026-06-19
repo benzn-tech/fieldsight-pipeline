@@ -1,0 +1,17 @@
+{
+  "name": "FieldSight ASR Benchmark",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/ffmpeg-apt-get:1": {}
+  },
+  "postCreateCommand": "pip install -r benchmark/requirements.txt",
+  "forwardPorts": [8501],
+  "portsAttributes": {
+    "8501": { "label": "ASR Benchmark UI", "onAutoForward": "openPreview" }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python"]
+    }
+  }
+}
