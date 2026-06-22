@@ -1,4 +1,4 @@
-"""Alibaba DashScope Paraformer-v2 / Fun-ASR — recording file recognition.
+"""Alibaba DashScope Fun-ASR — recording file recognition.
 
 This API only accepts a PUBLIC file URL (no local upload / base64), so we push
 the WAV to S3 and hand DashScope a presigned GET URL. It handles long audio and
@@ -24,20 +24,20 @@ _REGION_URL = {
 }
 
 
-class ParaformerProvider(ASRProvider):
-    key = "paraformer"
-    label = "Ali Paraformer"
+class FunASRProvider(ASRProvider):
+    key = "funasr"
+    label = "Ali Fun-ASR"
     supports_diarization = True
     max_audio_seconds = None          # designed for long recordings
     needs_public_url = True
     homepage = "https://www.alibabacloud.com/help/en/model-studio/recording-file-recognition"
-    notes = "Fun-ASR/Paraformer. Needs a public URL → uses your S3 to presign."
+    notes = "Fun-ASR (FunAudioLLM). Needs a public URL → uses your S3 to presign."
 
     def __init__(self, config: dict):
         super().__init__(config)
         self.api_key = config.get("DASHSCOPE_API_KEY", "")
         self.region = (config.get("DASHSCOPE_REGION") or "intl").lower()
-        self.model = config.get("PARAFORMER_MODEL", "paraformer-v2")
+        self.model = config.get("FUNASR_MODEL", "fun-asr")
         # S3 reused for presigning the public URL.
         self.aws_region = config.get("AWS_REGION", "ap-southeast-2")
         self.bucket = config.get("AWS_TRANSCRIBE_BUCKET", "")
@@ -56,7 +56,7 @@ class ParaformerProvider(ASRProvider):
             kwargs["aws_access_key_id"] = self.access_key
             kwargs["aws_secret_access_key"] = self.secret_key
         s3 = boto3.session.Session(**kwargs).client("s3")
-        key = f"{self.prefix}paraformer-{uuid.uuid4().hex[:16]}.wav"
+        key = f"{self.prefix}funasr-{uuid.uuid4().hex[:16]}.wav"
         s3.upload_file(wav_path, self.bucket, key)
         url = s3.generate_presigned_url(
             "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=3600
@@ -85,10 +85,8 @@ class ParaformerProvider(ASRProvider):
         kwargs = {"model": self.model, "file_urls": [url]}
         if diarize:
             kwargs["diarization_enabled"] = True
-        if language:
-            kwargs["language_hints"] = [language]
-        elif self.model == "paraformer-v2":
-            kwargs["language_hints"] = ["zh", "en"]
+        # Fun-ASR is zh/en focused; hint both unless the caller fixes a language.
+        kwargs["language_hints"] = [language] if language else ["zh", "en"]
 
         try:
             task = Transcription.async_call(**kwargs)

@@ -21,7 +21,7 @@ run is saved and replayable.
 | **AWS Transcribe** | batch | ✅ | native | Incumbent baseline; async via S3 |
 | **Zhipu GLM-ASR** | `glm-asr-2512` | — | auto-chunked (>30s) | Strong Mandarin/dialect CER |
 | **Qwen3-ASR** | `qwen3-asr-flash` | — | auto-chunked (>3min) | Alibaba DashScope |
-| **Ali Paraformer** | `paraformer-v2` / `fun-asr` | ✅ | native | Needs a public URL → presigns via your S3 |
+| **Ali Fun-ASR** | `fun-asr` | ✅ | native | Needs a public URL → presigns via your S3 |
 | **iFlytek LFASR** | 语音转写 v2 | ✅ | native | Long-form 转写, role separation |
 
 Length-limited engines are **automatically chunked and recombined**, so you can
@@ -74,17 +74,20 @@ Fill `.env` (copied from `.env.example`) **or** paste keys into the sidebar at
 runtime. Any provider left blank shows as ⚪ *not configured* and is skipped —
 the app runs fine with just one provider.
 
+> 💰 **Pricing, free tiers, sign-up portals, and which keys need a card /
+> real-name:** see [`docs/providers_and_pricing.md`](docs/providers_and_pricing.md).
+
 | Env var | For |
 |---|---|
 | `ANTHROPIC_API_KEY` | LLM-as-judge (reference-free scoring) |
 | `CARTESIA_API_KEY` | Cartesia Ink |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_TRANSCRIBE_BUCKET` | AWS Transcribe **and** Paraformer's presigned URL |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_TRANSCRIBE_BUCKET` | AWS Transcribe **and** Fun-ASR's presigned URL |
 | `ZHIPU_API_KEY` | Zhipu GLM-ASR |
-| `DASHSCOPE_API_KEY` | Qwen3-ASR **and** Paraformer (one key) |
+| `DASHSCOPE_API_KEY` | Qwen3-ASR **and** Fun-ASR (one key) |
 | `XFYUN_APPID` / `XFYUN_SECRET_KEY` | iFlytek |
 
 `AWS_TRANSCRIBE_BUCKET` defaults to the FieldSight data bucket; AWS and
-Paraformer only light up 🟢 when credentials are actually resolvable (explicit
+Fun-ASR only light up 🟢 when credentials are actually resolvable (explicit
 keys, env, `~/.aws`, profile, or role) — not just because a bucket name exists.
 
 ---

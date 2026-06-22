@@ -15,7 +15,7 @@
     diarization needed).
   - **AWS Transcribe** (or another diarizing engine) for **meetings** that need
     `speaker_labels`.
-  - A **Chinese engine** (GLM-ASR / Paraformer) for **Mandarin** audio Cartesia
+  - A **Chinese engine** (GLM-ASR / Fun-ASR) for **Mandarin** audio Cartesia
     can't handle — exactly what the benchmark compares.
 - The cleanest integration keeps the rest of the pipeline untouched by making
   any new engine **emit the AWS-Transcribe JSON shape** the pipeline already
@@ -109,7 +109,7 @@ whole pipeline stage. Re-base timestamps the same way using Ink word times.
 Pick the engine per recording:
 - `attendees`/meeting context **or** `MaxSpeakers>1` needed → **AWS** (diarization).
 - English + single speaker → **Cartesia** (cheap/fast).
-- Detected/declared Mandarin → **GLM-ASR / Paraformer**.
+- Detected/declared Mandarin → **GLM-ASR / Fun-ASR**.
 
 Keep the AWS-shape JSON contract for all of them so reports don't care which
 engine ran.
@@ -132,12 +132,12 @@ engine ran.
 
 ## Migration checklist
 
-- [ ] **Benchmark** Ink vs AWS vs GLM-ASR/Paraformer/Qwen/iFlytek on real
+- [ ] **Benchmark** Ink vs AWS vs GLM-ASR/Fun-ASR/Qwen/iFlytek on real
       `audio_segments/` WAVs — WER/CER + latency (this tool).
 - [ ] Confirm Cartesia accuracy on **NZ accents** + **construction proper nouns**
       vs the AWS custom vocabulary.
 - [ ] Decide diarization policy for **meetings** (keep AWS / add a diarizer).
-- [ ] Decide **Mandarin** engine (GLM-ASR vs Paraformer) and language routing.
+- [ ] Decide **Mandarin** engine (GLM-ASR vs Fun-ASR) and language routing.
 - [ ] Implement `cartesia_to_aws_shape()` + a Cartesia path in
       `lambda_transcribe.py` behind an env flag (e.g. `STT_ENGINE=cartesia`).
 - [ ] Verify `transcript_utils.normalize_transcript()` output is identical on a

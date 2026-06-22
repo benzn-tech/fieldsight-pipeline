@@ -1,6 +1,6 @@
 """Shared AWS credential detection (no network calls).
 
-Used so the UI only shows AWS Transcribe / Paraformer as "configured" (🟢) when
+Used so the UI only shows AWS Transcribe / Fun-ASR as "configured" (🟢) when
 credentials can actually be resolved — not just because a default bucket name is
 present. Avoids the misleading "green but fails at runtime" trap.
 """

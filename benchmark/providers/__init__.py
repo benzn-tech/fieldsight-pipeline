@@ -11,7 +11,7 @@ from .cartesia import CartesiaProvider
 from .aws_transcribe import AWSTranscribeProvider
 from .zhipu import ZhipuProvider
 from .qwen import QwenProvider
-from .aliyun_paraformer import ParaformerProvider
+from .aliyun_funasr import FunASRProvider
 from .iflytek import IFlytekProvider
 
 # Order here is the column order in the UI.
@@ -20,7 +20,7 @@ PROVIDER_CLASSES = [
     AWSTranscribeProvider,
     ZhipuProvider,
     QwenProvider,
-    ParaformerProvider,
+    FunASRProvider,
     IFlytekProvider,
 ]
 

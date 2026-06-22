@@ -112,11 +112,11 @@ def test_providers():
     check("all unconfigured w/o keys", all(not p.is_configured() for p in ps))
     labels = {p.label for p in ps}
     for expect in ["Cartesia Ink", "AWS Transcribe", "Zhipu GLM-ASR", "Qwen3-ASR",
-                   "Ali Paraformer", "iFlytek LFASR"]:
+                   "Ali Fun-ASR", "iFlytek LFASR"]:
         check(f"has {expect}", expect in labels)
     diar = {p.label for p in ps if p.supports_diarization}
     check("diarization set correct",
-          diar == {"AWS Transcribe", "Ali Paraformer", "iFlytek LFASR"})
+          diar == {"AWS Transcribe", "Ali Fun-ASR", "iFlytek LFASR"})
 
 
 # --- runner orchestration (fake provider, no network) -----------------------

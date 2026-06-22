@@ -32,7 +32,7 @@ SIDEBAR_KEYS = [  # (env key, label, is_secret)
     ("ANTHROPIC_API_KEY", "Anthropic key (judge)", True),
     ("CARTESIA_API_KEY", "Cartesia key", True),
     ("ZHIPU_API_KEY", "Zhipu / z.ai key", True),
-    ("DASHSCOPE_API_KEY", "DashScope key (Qwen+Paraformer)", True),
+    ("DASHSCOPE_API_KEY", "DashScope key (Qwen+Fun-ASR)", True),
     ("XFYUN_APPID", "iFlytek AppID", False),
     ("XFYUN_SECRET_KEY", "iFlytek SecretKey", True),
     ("AWS_ACCESS_KEY_ID", "AWS access key id", False),
@@ -402,7 +402,7 @@ def main():
     providers, selected = provider_picker(cfg)
     st.title("FieldSight ASR Benchmark")
     st.caption("Cartesia · AWS Transcribe · Zhipu GLM-ASR · Qwen3-ASR · "
-               "Ali Paraformer · iFlytek — accuracy, speed & speakers, side by side.")
+               "Ali Fun-ASR · iFlytek — accuracy, speed & speakers, side by side.")
     t1, t2, t3 = st.tabs(["🎤 Run", "📊 History", "ℹ️ Providers & Integration"])
     with t1:
         tab_run(cfg, opts, selected)
