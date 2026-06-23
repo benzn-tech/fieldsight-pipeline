@@ -132,7 +132,7 @@ engine ran.
 
 ## Migration checklist
 
-- [ ] **Benchmark** Ink vs AWS vs GLM-ASR/Fun-ASR/Qwen/iFlytek on real
+- [ ] **Benchmark** Ink vs AWS vs GLM-ASR/Fun-ASR/Qwen on real
       `audio_segments/` WAVs — WER/CER + latency (this tool).
 - [ ] Confirm Cartesia accuracy on **NZ accents** + **construction proper nouns**
       vs the AWS custom vocabulary.

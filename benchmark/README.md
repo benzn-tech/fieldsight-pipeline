@@ -22,7 +22,6 @@ run is saved and replayable.
 | **Zhipu GLM-ASR** | `glm-asr-2512` | — | auto-chunked (>30s) | Strong Mandarin/dialect CER |
 | **Qwen3-ASR** | `qwen3-asr-flash` | — | auto-chunked (>3min) | Alibaba DashScope |
 | **Ali Fun-ASR** | `fun-asr` | ✅ | native | Needs a public URL → presigns via your S3 |
-| **iFlytek LFASR** | 语音转写 v2 | ✅ | native | Long-form 转写, role separation |
 
 Length-limited engines are **automatically chunked and recombined**, so you can
 upload a long file and still compare everyone. Cartesia gets the whole file so
@@ -84,7 +83,6 @@ the app runs fine with just one provider.
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_TRANSCRIBE_BUCKET` | AWS Transcribe **and** Fun-ASR's presigned URL |
 | `ZHIPU_API_KEY` | Zhipu GLM-ASR |
 | `DASHSCOPE_API_KEY` | Qwen3-ASR **and** Fun-ASR (one key) |
-| `XFYUN_APPID` / `XFYUN_SECRET_KEY` | iFlytek |
 
 `AWS_TRANSCRIBE_BUCKET` defaults to the FieldSight data bucket; AWS and
 Fun-ASR only light up 🟢 when credentials are actually resolvable (explicit

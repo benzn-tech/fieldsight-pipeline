@@ -12,7 +12,6 @@ from .aws_transcribe import AWSTranscribeProvider
 from .zhipu import ZhipuProvider
 from .qwen import QwenProvider
 from .aliyun_funasr import FunASRProvider
-from .iflytek import IFlytekProvider
 
 # Order here is the column order in the UI.
 PROVIDER_CLASSES = [
@@ -21,7 +20,6 @@ PROVIDER_CLASSES = [
     ZhipuProvider,
     QwenProvider,
     FunASRProvider,
-    IFlytekProvider,
 ]
 
 

@@ -108,15 +108,15 @@ def test_storage():
 def test_providers():
     print("\n[providers]")
     ps = build_providers({})  # empty config -> nothing configured (deterministic)
-    check("6 providers built", len(ps) == 6)
+    check("5 providers built", len(ps) == 5)
     check("all unconfigured w/o keys", all(not p.is_configured() for p in ps))
     labels = {p.label for p in ps}
     for expect in ["Cartesia Ink", "AWS Transcribe", "Zhipu GLM-ASR", "Qwen3-ASR",
-                   "Ali Fun-ASR", "iFlytek LFASR"]:
+                   "Ali Fun-ASR"]:
         check(f"has {expect}", expect in labels)
     diar = {p.label for p in ps if p.supports_diarization}
     check("diarization set correct",
-          diar == {"AWS Transcribe", "Ali Fun-ASR", "iFlytek LFASR"})
+          diar == {"AWS Transcribe", "Ali Fun-ASR"})
 
 
 # --- runner orchestration (fake provider, no network) -----------------------
