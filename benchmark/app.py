@@ -31,6 +31,7 @@ COLS_PER_ROW = 3
 SIDEBAR_KEYS = [  # (env key, label, is_secret)
     ("ANTHROPIC_API_KEY", "Anthropic key (judge)", True),
     ("CARTESIA_API_KEY", "Cartesia key", True),
+    ("ELEVENLABS_API_KEY", "ElevenLabs key", True),
     ("ZHIPU_API_KEY", "Zhipu / z.ai key", True),
     ("DASHSCOPE_API_KEY", "DashScope key (Qwen+Fun-ASR)", True),
     ("AWS_ACCESS_KEY_ID", "AWS access key id", False),
@@ -399,8 +400,8 @@ def main():
     cfg, opts = sidebar()
     providers, selected = provider_picker(cfg)
     st.title("FieldSight ASR Benchmark")
-    st.caption("Cartesia · AWS Transcribe · Zhipu GLM-ASR · Qwen3-ASR · "
-               "Ali Fun-ASR — accuracy, speed & speakers, side by side.")
+    st.caption("Cartesia · ElevenLabs Scribe · AWS Transcribe · Zhipu GLM-ASR · "
+               "Qwen3-ASR · Ali Fun-ASR — accuracy, speed & speakers, side by side.")
     t1, t2, t3 = st.tabs(["🎤 Run", "📊 History", "ℹ️ Providers & Integration"])
     with t1:
         tab_run(cfg, opts, selected)

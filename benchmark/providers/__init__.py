@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from .base import ASRProvider, ASRResult, Segment
 from .cartesia import CartesiaProvider
+from .elevenlabs import ElevenLabsProvider
 from .aws_transcribe import AWSTranscribeProvider
 from .zhipu import ZhipuProvider
 from .qwen import QwenProvider
@@ -16,6 +17,7 @@ from .aliyun_funasr import FunASRProvider
 # Order here is the column order in the UI.
 PROVIDER_CLASSES = [
     CartesiaProvider,
+    ElevenLabsProvider,
     AWSTranscribeProvider,
     ZhipuProvider,
     QwenProvider,

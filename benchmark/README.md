@@ -18,6 +18,7 @@ run is saved and replayable.
 | Provider | Model | Diarization | Long audio | Notes |
 |---|---|:--:|---|---|
 | **Cartesia Ink** | `ink-2` (streaming) | — | native (turn detection) | Real-time candidate to replace AWS; `ink-whisper` also selectable (batch) |
+| **ElevenLabs Scribe** | `scribe_v2` | ✅ | native (≤10 h) | 90+ langs auto-detect (en+zh in one model), word timestamps; strong AWS alternative |
 | **AWS Transcribe** | batch | ✅ | native | Incumbent baseline; async via S3 |
 | **Zhipu GLM-ASR** | `glm-asr-2512` | — | auto-chunked (>30s) | Strong Mandarin/dialect CER |
 | **Qwen3-ASR** | `qwen3-asr-flash` | — | auto-chunked (>3min) | Alibaba DashScope |
@@ -80,6 +81,7 @@ the app runs fine with just one provider.
 |---|---|
 | `ANTHROPIC_API_KEY` | LLM-as-judge (reference-free scoring) |
 | `CARTESIA_API_KEY` | Cartesia Ink |
+| `ELEVENLABS_API_KEY` | ElevenLabs Scribe |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_TRANSCRIBE_BUCKET` | AWS Transcribe **and** Fun-ASR's presigned URL |
 | `ZHIPU_API_KEY` | Zhipu GLM-ASR |
 | `DASHSCOPE_API_KEY` | Qwen3-ASR **and** Fun-ASR (one key) |
