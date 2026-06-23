@@ -17,7 +17,7 @@ run is saved and replayable.
 
 | Provider | Model | Diarization | Long audio | Notes |
 |---|---|:--:|---|---|
-| **Cartesia Ink** | `ink-whisper` | — | native (smart VAD) | Real-time focused; the candidate to replace AWS |
+| **Cartesia Ink** | `ink-2` (streaming) | — | native (turn detection) | Real-time candidate to replace AWS; `ink-whisper` also selectable (batch) |
 | **AWS Transcribe** | batch | ✅ | native | Incumbent baseline; async via S3 |
 | **Zhipu GLM-ASR** | `glm-asr-2512` | — | auto-chunked (>30s) | Strong Mandarin/dialect CER |
 | **Qwen3-ASR** | `qwen3-asr-flash` | — | auto-chunked (>3min) | Alibaba DashScope |

@@ -21,7 +21,7 @@ CONFIG_KEYS = [
 _DEFAULTS = {
     "JUDGE_MODEL": "claude-sonnet-4-6",
     "CARTESIA_VERSION": "2025-04-16",
-    "CARTESIA_MODEL": "ink-whisper",
+    "CARTESIA_MODEL": "ink-2",
     "AWS_REGION": "ap-southeast-2",
     "AWS_TRANSCRIBE_BUCKET": "fieldsight-data-509194952652",
     "AWS_TRANSCRIBE_PREFIX": "asr-benchmark/",
