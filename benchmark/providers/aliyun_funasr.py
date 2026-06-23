@@ -51,11 +51,22 @@ class FunASRProvider(ASRProvider):
 
     def _presign(self, wav_path: str) -> tuple[str, object, str]:
         import boto3
-        kwargs = {"region_name": self.aws_region}
+        from botocore.config import Config as BotoConfig
+
+        sess_kwargs = {"region_name": self.aws_region}
         if self.access_key and self.secret_key:
-            kwargs["aws_access_key_id"] = self.access_key
-            kwargs["aws_secret_access_key"] = self.secret_key
-        s3 = boto3.session.Session(**kwargs).client("s3")
+            sess_kwargs["aws_access_key_id"] = self.access_key
+            sess_kwargs["aws_secret_access_key"] = self.secret_key
+        # Force SigV4 + the regional virtual-hosted endpoint. boto3's default here
+        # yields a SigV2 global "s3.amazonaws.com" URL; a remote fetcher (DashScope's
+        # server) can't follow it for an ap-southeast-2 bucket and downloads an S3
+        # redirect XML instead of audio -> ASR_RESPONSE_HAVE_NO_WORDS.
+        s3 = boto3.session.Session(**sess_kwargs).client(
+            "s3",
+            region_name=self.aws_region,
+            endpoint_url=f"https://s3.{self.aws_region}.amazonaws.com",
+            config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+        )
         key = f"{self.prefix}funasr-{uuid.uuid4().hex[:16]}.wav"
         s3.upload_file(wav_path, self.bucket, key)
         url = s3.generate_presigned_url(
