@@ -1,0 +1,221 @@
+"""Plaud ASR (Transcription API) — async submit + poll.
+
+Plaud's Transcription API takes a **URL** to the audio (not a file upload), runs
+as an async job, and you poll for the result. We hold a local WAV, so we first
+turn it into a URL one of two ways:
+
+  * **S3 presign** (default, simplest): upload the WAV to your S3 bucket and hand
+    Plaud a presigned GET URL — needs only ``PLAUD_CLIENT_ID`` + ``PLAUD_API_KEY``
+    plus the AWS creds already used by AWS Transcribe / Fun-ASR.
+  * **Plaud native upload** (fallback, no AWS): multipart-upload through Plaud's
+    own File Upload API (needs ``PLAUD_SECRET_KEY``) to get a 24 h DownloadUrl.
+
+Auth gotcha: the Transcription API uses ``X-Client-Id`` + ``X-Client-Api-Key``,
+where the api-key is generated in the Plaud portal (App Settings -> API Keys) and
+is **NOT** the client_secret. The secret_key only mints the upload token.
+
+Diarization returns per-segment ``speaker`` labels (e.g. "Speaker 1").
+"""
+from __future__ import annotations
+
+import base64
+import os
+import time
+import uuid
+
+import requests
+
+from .base import ASRProvider, ASRResult, Segment
+from ._aws import aws_creds_available
+
+_POLL_TIMEOUT_S = 900
+_DONE = {"SUCCESS"}
+_FAIL = {"FAILURE", "REVOKED"}
+_PENDING = {"PENDING", "RECEIVED", "STARTED", "PROGRESS"}
+
+
+class PlaudProvider(ASRProvider):
+    key = "plaud"
+    label = "Plaud"
+    supports_diarization = True
+    max_audio_seconds = None          # async job, handles long audio server-side
+    homepage = "https://docs.plaud.ai/plaud-embedded/starter-app-guide"
+    notes = "Transcription API (plaud-fast-whisper). Async submit+poll on an audio URL (S3 presign or Plaud upload)."
+
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self.client_id = config.get("PLAUD_CLIENT_ID", "")
+        self.api_key = config.get("PLAUD_API_KEY", "")
+        self.secret_key = config.get("PLAUD_SECRET_KEY", "")
+        self.host = config.get("PLAUD_REGION_HOST",
+                               "https://platform-us.plaud.ai/developer/api").rstrip("/")
+        self.model = config.get("PLAUD_MODEL", "plaud-fast-whisper")
+        # S3 (reused to presign a public URL, same as Fun-ASR).
+        self.aws_region = config.get("AWS_REGION", "ap-southeast-2")
+        self.bucket = config.get("AWS_TRANSCRIBE_BUCKET", "")
+        self.prefix = config.get("AWS_TRANSCRIBE_PREFIX", "asr-benchmark/")
+        self.access_key = config.get("AWS_ACCESS_KEY_ID", "")
+        self.secret = config.get("AWS_SECRET_ACCESS_KEY", "")
+
+    def _can_s3(self) -> bool:
+        return bool(self.bucket) and aws_creds_available(self.config)
+
+    def is_configured(self) -> bool:
+        # Transcription needs client_id + api_key, plus *some* way to get a URL.
+        return bool(self.client_id and self.api_key) and (self._can_s3() or bool(self.secret_key))
+
+    # ----------------------------------------------------------------- run -- #
+    def transcribe_file(self, wav_path, language=None, diarize=False) -> ASRResult:
+        if not (self.client_id and self.api_key):
+            return self._fail("PLAUD_CLIENT_ID / PLAUD_API_KEY not set")
+
+        cleanup = None
+        try:
+            if self._can_s3():
+                url, cleanup = self._presign_s3(wav_path)
+            elif self.secret_key:
+                url = self._plaud_upload(wav_path)
+            else:
+                return self._fail("no audio URL source: set AWS creds+bucket (S3 presign) or PLAUD_SECRET_KEY (Plaud upload)")
+        except Exception as exc:  # noqa: BLE001
+            return self._fail(f"audio upload failed: {type(exc).__name__}: {exc}")
+
+        try:
+            return self._transcribe_url(url, language, diarize)
+        finally:
+            if cleanup:
+                cleanup()
+
+    # ----------------------------------------------------- Flow A: ASR ------ #
+    def _headers(self) -> dict:
+        return {"X-Client-Id": self.client_id, "X-Client-Api-Key": self.api_key}
+
+    def _transcribe_url(self, url, language, diarize) -> ASRResult:
+        body = {
+            "file_url": url,
+            "params": {
+                "transcribe": {"language": language or "auto", "model": self.model},
+                "vad": {"decode_silence": False},
+                "diarization": {"enabled": bool(diarize), "return_embedding": False},
+            },
+        }
+        try:
+            r = requests.post(f"{self.host}/open/partner/ai/transcriptions/",
+                              headers={**self._headers(), "Content-Type": "application/json"},
+                              json=body, timeout=60)
+            if r.status_code >= 400:
+                return self._fail(f"submit HTTP {r.status_code}: {r.text[:300]}")
+            tid = r.json().get("transcription_id")
+        except Exception as exc:  # noqa: BLE001
+            return self._fail(f"submit failed: {type(exc).__name__}: {exc}")
+        if not tid:
+            return self._fail("no transcription_id returned")
+
+        payload = self._poll(tid)
+        if payload is None:
+            return self._fail("transcription timed out")
+        status = payload.get("status")
+        if status in _FAIL:
+            return self._fail(f"transcription {status}")
+        data = payload.get("data") or {}
+
+        text = (data.get("text") or "").strip()
+        segments = [
+            Segment(start=float(s.get("start", 0.0) or 0.0),
+                    end=float(s.get("end", 0.0) or 0.0),
+                    text=s.get("text", "") or "",
+                    speaker=s.get("speaker"))
+            for s in (data.get("segments") or [])
+        ]
+        has_diar = bool(diarize and any(s.speaker for s in segments))
+        return self._result(ok=True, text=text, segments=segments,
+                            has_diarization=has_diar, raw=payload)
+
+    def _poll(self, tid):
+        url = f"{self.host}/open/partner/ai/transcriptions/{tid}"
+        deadline = time.time() + _POLL_TIMEOUT_S
+        delay = 1.0
+        while time.time() < deadline:
+            time.sleep(delay)
+            delay = min(delay * 2, 10.0)
+            try:
+                r = requests.get(url, headers=self._headers(), timeout=60)
+                if r.status_code >= 400:
+                    continue
+                payload = r.json()
+            except Exception:  # noqa: BLE001
+                continue
+            if payload.get("status") in _DONE | _FAIL:
+                return payload
+        return None
+
+    # ------------------------------------------- URL source 1: S3 presign --- #
+    def _presign_s3(self, wav_path):
+        import boto3
+        from botocore.config import Config as BotoConfig
+
+        sess = {"region_name": self.aws_region}
+        if self.access_key and self.secret:
+            sess["aws_access_key_id"] = self.access_key
+            sess["aws_secret_access_key"] = self.secret
+        s3 = boto3.session.Session(**sess).client(
+            "s3", region_name=self.aws_region,
+            endpoint_url=f"https://s3.{self.aws_region}.amazonaws.com",
+            config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+        )
+        key = f"{self.prefix}plaud-{uuid.uuid4().hex[:16]}.wav"
+        s3.upload_file(wav_path, self.bucket, key)
+        url = s3.generate_presigned_url(
+            "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=3600)
+
+        def _cleanup():
+            try:
+                s3.delete_object(Bucket=self.bucket, Key=key)
+            except Exception:  # noqa: BLE001
+                pass
+        return url, _cleanup
+
+    # ------------------------------------- URL source 2: Plaud native upload  #
+    def _plaud_upload(self, wav_path) -> str:
+        # B0: partner token (Basic base64(client_id:secret_key))
+        basic = base64.b64encode(f"{self.client_id}:{self.secret_key}".encode()).decode()
+        r = requests.post(f"{self.host}/oauth/partner/access-token",
+                         headers={"Authorization": f"Basic {basic}",
+                                  "Content-Type": "application/x-www-form-urlencoded"},
+                         data={"grant_type": "client_credentials"}, timeout=30)
+        r.raise_for_status()
+        partner = r.json()["access_token"]
+
+        # B1: user token (Bearer partner token)
+        r = requests.post(f"{self.host}/open/partner/users/access-token",
+                         headers={"Authorization": f"Bearer {partner}",
+                                  "Content-Type": "application/json"},
+                         json={"user_id": "fieldsight-benchmark", "expires_in": 86400}, timeout=30)
+        r.raise_for_status()
+        user = r.json()["access_token"]
+        bearer = {"Authorization": f"Bearer {user}", "Content-Type": "application/json"}
+
+        # B2: presigned multipart URLs
+        size = os.path.getsize(wav_path)
+        r = requests.post(f"{self.host}/open/partner/files/upload/generate-presigned-urls",
+                         headers=bearer, json={"filesize": size, "filetype": "wav"}, timeout=30)
+        r.raise_for_status()
+        up = r.json()
+        chunk = int(up.get("ChunkSize") or 5 * 1024 * 1024)
+
+        # B3: PUT each chunk straight to S3, capture ETag
+        part_list = []
+        with open(wav_path, "rb") as f:
+            for part in sorted(up["Parts"], key=lambda p: p["PartNumber"]):
+                data = f.read(chunk)
+                pr = requests.put(part["PresignedUrl"], data=data, timeout=300)
+                pr.raise_for_status()
+                part_list.append({"PartNumber": part["PartNumber"], "ETag": pr.headers.get("ETag")})
+
+        # B4: complete upload -> DownloadUrl
+        r = requests.post(f"{self.host}/open/partner/files/upload/complete-upload",
+                         headers=bearer,
+                         json={"file_id": up["FileId"], "upload_id": up["UploadId"],
+                               "filetype": "wav", "part_list": part_list}, timeout=60)
+        r.raise_for_status()
+        return r.json()["DownloadUrl"]

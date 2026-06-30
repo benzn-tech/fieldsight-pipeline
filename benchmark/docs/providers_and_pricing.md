@@ -21,6 +21,7 @@ transcript for scoring).
 |---|---|:--:|---|
 | **Cartesia Ink** (candidate) | `CARTESIA_API_KEY` | — | bytes (multipart) |
 | **ElevenLabs Scribe** (candidate) | `ELEVENLABS_API_KEY` | — | bytes (multipart) |
+| **Plaud** (candidate) | `PLAUD_CLIENT_ID` + `PLAUD_API_KEY` | ✅ presign (or Plaud upload) | audio URL (async) |
 | **AWS Transcribe** (incumbent baseline) | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_TRANSCRIBE_BUCKET` | ✅ stages WAV in S3 | `s3://` URI |
 | **Anthropic Claude** (LLM judge — optional) | `ANTHROPIC_API_KEY` | — | n/a (scores text) |
 | **Zhipu GLM-ASR** | `ZHIPU_API_KEY` | — | bytes (base64) |
@@ -44,6 +45,7 @@ app scores WER/CER locally and Anthropic is not needed.
 |---|---|---|---|
 | **Cartesia** | play.cartesia.ai → API Keys (docs.cartesia.ai) | one bearer key | needs `Cartesia-Version` header (default `2025-04-16`) |
 | **ElevenLabs** | elevenlabs.io → API Keys | one key (`xi-api-key` header) | Scribe v2; 90+ langs auto-detect (en+zh); free tier, likely no card |
+| **Plaud** | dev.plaud.ai → portal → App Settings → API Keys | `client_id` + `api_key` (api-key **≠** secret) | regional host (US / Japan); `secret_key` only for Plaud's own upload |
 | **AWS** | Console → IAM (account `509194952652` exists) | IAM user access key id + secret | keys are global; use `AWS_REGION=ap-southeast-2`. Min policy below. |
 | **Anthropic** | console.anthropic.com → API Keys | one key | reuse the existing FieldSight Claude key |
 | **Zhipu GLM-ASR** | intl: z.ai · China: open.bigmodel.cn | one key | the two platforms' keys are **not** interchangeable. Limit: wav/mp3, ≤25 MB, **≤30 s** per request |
@@ -86,6 +88,7 @@ aws iam create-access-key --user-name "$USER" --output table   # copy the secret
 |---|---|---|---|
 | **Cartesia** Ink Whisper | ~**$0.13/hr** (Scale tier) | ✅ free plan $0/mo, 20k credits/mo ≈ **~5.5 h STT/mo**, API included | ❌ **no card** |
 | **ElevenLabs** Scribe v2 | ~**$0.40/hr** ($0.0067/min) ⚠️ confirm on /pricing/api | ✅ free plan (10k credits/mo; exact STT minutes ⚠️ unspecified) | ❌ likely no card (⚠️ unverified) |
+| **Plaud** (plaud-fast-whisper) | ⚠️ see Plaud developer portal (not public) | ⚠️ check portal | ⚠️ unverified |
 | **AWS Transcribe** | ~$0.024/min ≈ **$1.44/hr** (US) | ✅ **60 min/mo for 12 mo** | ⚠️ **card required** to open the account |
 | **Anthropic** (judge, optional) | Sonnet 4.6 $3 / $15 per 1M tok; judge calls ≈ cents | ✅ ~**$5** trial credit | ❌ no card to start (phone verify) |
 | **Zhipu GLM-ASR** | **¥0.06/min ≈ ¥3.6/hr** (~$0.5/hr, bigmodel.cn) | ⚠️ new-user token grant (whether it covers ASR unverified) | 🔴 bigmodel.cn needs **China real-name + prepaid**; z.ai = email + intl card, no real-name |

@@ -9,6 +9,7 @@ from __future__ import annotations
 from .base import ASRProvider, ASRResult, Segment
 from .cartesia import CartesiaProvider
 from .elevenlabs import ElevenLabsProvider
+from .plaud import PlaudProvider
 from .aws_transcribe import AWSTranscribeProvider
 from .zhipu import ZhipuProvider
 from .qwen import QwenProvider
@@ -18,6 +19,7 @@ from .aliyun_funasr import FunASRProvider
 PROVIDER_CLASSES = [
     CartesiaProvider,
     ElevenLabsProvider,
+    PlaudProvider,
     AWSTranscribeProvider,
     ZhipuProvider,
     QwenProvider,

@@ -19,6 +19,7 @@ run is saved and replayable.
 |---|---|:--:|---|---|
 | **Cartesia Ink** | `ink-2` (streaming) | — | native (turn detection) | Real-time candidate to replace AWS; `ink-whisper` also selectable (batch) |
 | **ElevenLabs Scribe** | `scribe_v2` | ✅ | native (≤10 h) | 90+ langs auto-detect (en+zh in one model), word timestamps; strong AWS alternative |
+| **Plaud** | `plaud-fast-whisper` | ✅ | native (async) | Transcription API: submit an audio URL + poll. Needs S3 presign (or Plaud's own upload) for the URL |
 | **AWS Transcribe** | batch | ✅ | native | Incumbent baseline; async via S3 |
 | **Zhipu GLM-ASR** | `glm-asr-2512` | — | auto-chunked (>30s) | Strong Mandarin/dialect CER |
 | **Qwen3-ASR** | `qwen3-asr-flash` | — | auto-chunked (>3min) | Alibaba DashScope |
@@ -82,6 +83,8 @@ the app runs fine with just one provider.
 | `ANTHROPIC_API_KEY` | LLM-as-judge (reference-free scoring) |
 | `CARTESIA_API_KEY` | Cartesia Ink |
 | `ELEVENLABS_API_KEY` | ElevenLabs Scribe |
+| `PLAUD_CLIENT_ID` / `PLAUD_API_KEY` | Plaud Transcription API (api-key from portal, **≠** the secret) |
+| `PLAUD_SECRET_KEY` | Plaud's own file upload only (skip if audio is presigned to S3) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_TRANSCRIBE_BUCKET` | AWS Transcribe **and** Fun-ASR's presigned URL |
 | `ZHIPU_API_KEY` | Zhipu GLM-ASR |
 | `DASHSCOPE_API_KEY` | Qwen3-ASR **and** Fun-ASR (one key) |
