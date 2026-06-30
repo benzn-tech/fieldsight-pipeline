@@ -50,6 +50,7 @@ class PlaudProvider(ASRProvider):
         self.host = config.get("PLAUD_REGION_HOST",
                                "https://platform-us.plaud.ai/developer/api").rstrip("/")
         self.model = config.get("PLAUD_MODEL", "plaud-fast-whisper")
+        self.audio_source = (config.get("PLAUD_AUDIO_SOURCE") or "auto").lower()  # auto | s3 | upload
         # S3 (reused to presign a public URL, same as Fun-ASR).
         self.aws_region = config.get("AWS_REGION", "ap-southeast-2")
         self.bucket = config.get("AWS_TRANSCRIBE_BUCKET", "")
@@ -71,12 +72,15 @@ class PlaudProvider(ASRProvider):
 
         cleanup = None
         try:
-            if self._can_s3():
-                url, cleanup = self._presign_s3(wav_path)
-            elif self.secret_key:
+            use_upload = self.audio_source == "upload" or (self.audio_source == "auto" and not self._can_s3())
+            if use_upload:
+                if not self.secret_key:
+                    return self._fail("Plaud upload needs PLAUD_SECRET_KEY (or set AWS creds for S3 presign)")
                 url = self._plaud_upload(wav_path)
             else:
-                return self._fail("no audio URL source: set AWS creds+bucket (S3 presign) or PLAUD_SECRET_KEY (Plaud upload)")
+                if not self._can_s3():
+                    return self._fail("S3 presign needs AWS creds + bucket (or PLAUD_SECRET_KEY + PLAUD_AUDIO_SOURCE=upload)")
+                url, cleanup = self._presign_s3(wav_path)
         except Exception as exc:  # noqa: BLE001
             return self._fail(f"audio upload failed: {type(exc).__name__}: {exc}")
 
@@ -104,7 +108,10 @@ class PlaudProvider(ASRProvider):
                               headers={**self._headers(), "Content-Type": "application/json"},
                               json=body, timeout=60)
             if r.status_code >= 400:
-                return self._fail(f"submit HTTP {r.status_code}: {r.text[:300]}")
+                rid = (r.headers.get("x-request-id") or r.headers.get("X-Request-Id")
+                       or r.headers.get("X-Amzn-Trace-Id") or "")
+                return self._fail(f"submit HTTP {r.status_code}: {r.text[:400]} "
+                                  f"| req-id={rid} | file_url={url.split('?', 1)[0]}")
             tid = r.json().get("transcription_id")
         except Exception as exc:  # noqa: BLE001
             return self._fail(f"submit failed: {type(exc).__name__}: {exc}")
