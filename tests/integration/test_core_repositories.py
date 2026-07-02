@@ -28,3 +28,20 @@ def test_membership_unique_user_site(db):
     db.execute("INSERT INTO memberships (user_id, site_id, role) VALUES (%s,%s,'worker')", (uid, sid))
     with pytest.raises(Exception):
         db.execute("INSERT INTO memberships (user_id, site_id, role) VALUES (%s,%s,'pm')", (uid, sid))
+
+
+from repositories import companies, users, sites
+
+
+def test_company_user_site_roundtrip(db):
+    co = companies.create_company(db, "Acme", industry="construction")
+    assert co["name"] == "Acme" and co["id"]
+
+    u1 = users.upsert_user(db, "sub-9", "a@acme.com", company_id=co["id"], global_role="pm")
+    u2 = users.upsert_user(db, "sub-9", "a@acme.com", company_id=co["id"], first_name="Ann")
+    assert u1["id"] == u2["id"], "upsert by cognito_sub must not create a duplicate"
+    assert users.get_user_by_sub(db, "sub-9")["first_name"] == "Ann"
+
+    s = sites.create_site(db, co["id"], "North Wharf", location="Auckland")
+    assert sites.get_site(db, s["id"])["name"] == "North Wharf"
+    assert [x["id"] for x in sites.list_company_sites(db, co["id"])] == [s["id"]]
