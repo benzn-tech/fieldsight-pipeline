@@ -45,3 +45,13 @@ def test_company_user_site_roundtrip(db):
     s = sites.create_site(db, co["id"], "North Wharf", location="Auckland")
     assert sites.get_site(db, s["id"])["name"] == "North Wharf"
     assert [x["id"] for x in sites.list_company_sites(db, co["id"])] == [s["id"]]
+
+
+def test_upsert_user_partial_update_preserves_role_and_company(db):
+    co = companies.create_company(db, "Acme")
+    u1 = users.upsert_user(db, "sub-pm", "pm@acme.com", company_id=co["id"], global_role="pm")
+    assert u1["global_role"] == "pm"
+    # login-sync style call: only sub + email — must not demote or detach
+    u2 = users.upsert_user(db, "sub-pm", "pm@acme.com")
+    assert u2["global_role"] == "pm", "partial upsert must not demote role"
+    assert u2["company_id"] == co["id"], "partial upsert must not clear company"
