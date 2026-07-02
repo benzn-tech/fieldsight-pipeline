@@ -174,6 +174,10 @@ report_chunks(id pk, site_id fk, user_id fk, source_s3_key, topic_id fk null,
 2. UI:`scripts/api/sites.js` 等把 `useMocks=false` 分支指向真端点(形状已按 BACKEND-CONTEXT 写好)。
 3. 权限:写操作 gate 到 `user:manage`/admin(UI 已有 `?dev=1` 角色开关做联调)。
 
+**已定语义(2026-07-03 拍板,Phase 2A 分支已实现 + 测试):**
+- **`upsert_user`:None = 不改动**。`company_id`/`global_role` 传 None 保留旧值('worker' 仅新建时默认)——登录同步只传 sub+email 不会降级/脱离公司。改角色是显式操作:Phase 3 加带 ACL 的 `set_role` 端点,**绝不**直接透传客户端 role。
+- **admin/gm = 公司级**,`accessible_site_ids` 按调用者 `company_id` JOIN 限界(无公司 = 看不到任何站点,deny-by-default)。**App 权限天花板就是公司 admin,不设平台角色**;运营方排障走基础设施层(IAM+CloudTrail 审计下的 psql 直连/RDS Query Editor,break-glass 模式)。将来有客服团队再加"审计化 impersonation(view-as)"。
+
 **验证:** admin 在 dev 上新建项目/加成员/改角色/传图,刷新后**真实持久**(数据在 Postgres/S3,非内存);非 admin 被 403。
 
 **取舍:** 这一步才真正"消灭 localStorage 权宜之计"——数据有了真家。
