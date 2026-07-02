@@ -27,7 +27,8 @@ def apply_migrations(conn, migrations_dir: str) -> list[str]:
     for fname in pending_versions(all_files, done):
         with open(os.path.join(migrations_dir, fname), "r", encoding="utf-8") as fh:
             sql = fh.read()
-        conn.execute(sql)  # no params -> simple query protocol -> multi-statement OK
-        conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (fname,))
+        with conn.transaction():  # atomic: file DDL + version row commit together
+            conn.execute(sql)  # no params -> simple query protocol -> multi-statement OK
+            conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (fname,))
         applied_now.append(fname)
     return applied_now

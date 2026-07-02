@@ -7,6 +7,9 @@ _TOPIC_COLS = ("id, site_id, user_id, source_s3_key, report_date, occurred_at, "
 def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_key=None,
                  occurred_at=None, category=None, summary=None,
                  action_items=None, safety=None, photos=None) -> dict:
+    """Insert a topic with its children. NOTE: currently insert-only —
+    no ON CONFLICT dedup; re-running extraction will duplicate topics
+    (dedup key TBD in Phase 4)."""
     cur = conn.cursor(row_factory=dict_row)
     topic = cur.execute(
         f"INSERT INTO topics (site_id, user_id, source_s3_key, report_date, occurred_at, "
