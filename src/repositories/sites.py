@@ -1,0 +1,24 @@
+from psycopg.rows import dict_row
+
+_COLS = "id, company_id, name, location, client, industry, icon_s3_key, created_at"
+
+
+def create_site(conn, company_id, name, location=None, client=None,
+                industry=None, icon_s3_key=None) -> dict:
+    return conn.cursor(row_factory=dict_row).execute(
+        f"INSERT INTO sites (company_id, name, location, client, industry, icon_s3_key) "
+        f"VALUES (%s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
+        (company_id, name, location, client, industry, icon_s3_key),
+    ).fetchone()
+
+
+def get_site(conn, site_id) -> dict | None:
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM sites WHERE id=%s", (site_id,)
+    ).fetchone()
+
+
+def list_company_sites(conn, company_id) -> list[dict]:
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM sites WHERE company_id=%s ORDER BY created_at", (company_id,)
+    ).fetchall()
