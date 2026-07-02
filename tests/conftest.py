@@ -2,6 +2,7 @@ import os
 import pytest
 
 TEST_DB_URL = os.environ.get("TEST_DATABASE_URL")
+collect_ignore_glob = [] if TEST_DB_URL else ["integration/*"]
 _needs_db = pytest.mark.skipif(
     not TEST_DB_URL, reason="TEST_DATABASE_URL not set; skipping DB integration test"
 )
