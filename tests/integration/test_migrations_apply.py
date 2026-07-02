@@ -29,3 +29,14 @@ def test_apply_is_idempotent_and_records_versions():
         assert "0001_extensions.sql" in applied_versions(conn)
     finally:
         conn.close()
+
+
+def test_extensions_installed():
+    conn = _fresh_conn()
+    try:
+        apply_migrations(conn, MIGRATIONS_DIR)
+        names = {r[0] for r in conn.execute("SELECT extname FROM pg_extension").fetchall()}
+        assert "vector" in names
+        assert "pgcrypto" in names
+    finally:
+        conn.close()
