@@ -45,6 +45,8 @@ JSON
 )
 
 CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --output json 2>/dev/null || echo '{}')
+# A bucket with NO notification config returns EMPTY stdout (success) — not JSON.
+[ -n "$CURRENT" ] || CURRENT='{}'
 
 # Keep every non-"fs-" lambda config + all SNS/SQS/EventBridge entries; replace our fs-* set.
 MERGED=$(jq -n --argjson cur "$CURRENT" --argjson des "$DESIRED" '
