@@ -67,9 +67,12 @@ def sidebar() -> tuple[dict, dict]:
         help="Auto lets each engine decide. Forcing a language can improve accuracy.",
     )
     language = {"Auto-detect": None, "English": "en", "中文": "zh"}[lang_choice]
-    diarize = st.sidebar.toggle("Speaker diarization (where supported)", value=True)
+    # Diarization is always requested from every engine that supports it
+    # (AWS · ElevenLabs · Plaud · Fun-ASR). Cartesia/Qwen/Zhipu have no
+    # diarization in their APIs and simply ignore the flag.
+    st.sidebar.caption("🗣️ Speaker diarization: always on (engines that support it)")
 
-    opts = {"language": language, "diarize": diarize}
+    opts = {"language": language, "diarize": True}
     return cfg, opts
 
 
