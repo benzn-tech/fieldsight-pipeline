@@ -87,7 +87,7 @@ Resources:
     Properties:
       Engine: aurora-postgresql
       # 16.4+ is required for ServerlessV2ScalingConfiguration MinCapacity 0
-      # (scale-to-zero). Earlier 16.x releases only support min ACU 0.5.
+      # (scale-to-zero). scale-to-zero requires 16.3+; 16.4 pinned for margin.
       EngineVersion: '16.4'
       EngineMode: provisioned
       DatabaseName: !Ref DBName
@@ -130,34 +130,34 @@ Outputs:
     Description: Aurora cluster writer endpoint (host only)
     Value: !GetAtt DbCluster.Endpoint.Address
     Export:
-      Name: FieldsightDbTest-ClusterEndpoint
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
 
   ClusterArn:
     Description: Aurora cluster ARN (for Data API / rds-data calls)
     Value: !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DbCluster}
     Export:
-      Name: FieldsightDbTest-ClusterArn
+      Name: !Sub '${AWS::StackName}-ClusterArn'
 
   SecretArn:
     Description: RDS-managed master user secret ARN (Secrets Manager)
     Value: !GetAtt DbCluster.MasterUserSecret.SecretArn
     Export:
-      Name: FieldsightDbTest-SecretArn
+      Name: !Sub '${AWS::StackName}-SecretArn'
 
   DbSG:
     Description: Security group id for the DB (ingress 5432 from LambdaSG)
     Value: !GetAtt DbSG.GroupId
     Export:
-      Name: FieldsightDbTest-DbSG
+      Name: !Sub '${AWS::StackName}-DbSG'
 
   LambdaSG:
     Description: Security group id to attach to in-VPC Lambdas that talk to the DB
     Value: !GetAtt LambdaSG.GroupId
     Export:
-      Name: FieldsightDbTest-LambdaSG
+      Name: !Sub '${AWS::StackName}-LambdaSG'
 
   DbName:
     Description: Database name created on the cluster
     Value: !Ref DBName
     Export:
-      Name: FieldsightDbTest-DbName
+      Name: !Sub '${AWS::StackName}-DbName'

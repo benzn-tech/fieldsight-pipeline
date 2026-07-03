@@ -23,8 +23,12 @@ def _dsn_from_secret() -> str | None:
     db_name = os.environ.get("DB_NAME", "fieldsight")
     client = boto3.client("secretsmanager")
     secret = json.loads(client.get_secret_value(SecretId=secret_arn)["SecretString"])
-    username = secret.get("username", "postgres")
-    password = secret["password"]
+    from urllib.parse import quote
+
+    # RDS-managed secrets may contain URI-reserved chars (#, ?, %, & ...);
+    # unescaped they corrupt the DSN psycopg parses.
+    username = quote(secret.get("username", "postgres"), safe="")
+    password = quote(secret["password"], safe="")
     return f"postgresql://{username}:{password}@{db_host}:5432/{db_name}"
 
 
