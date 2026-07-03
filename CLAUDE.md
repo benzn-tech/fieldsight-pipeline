@@ -561,3 +561,12 @@ Parameters:
     Type: String
     Default: fieldsight-data-509194952652
 ```
+### BUG-35: 中文 Windows 下 AWS CLI 用 GBK 读文件
+`aws cloudformation deploy --template-file ...` 在中文 locale 下用 GBK 解码模板,遇 UTF-8 字符即
+`'gbk' codec can't decode byte ...`。**Fix**: 命令前 `export AWS_CLI_FILE_ENCODING=UTF-8 PYTHONUTF8=1`。
+
+### BUG-36: VPC Lambda 无出口时调用 AWS API 会静默挂死
+无 NAT/无 VPC endpoint 的 VPC Lambda,任何 AWS API 调用(如 Secrets Manager)都会黑洞直到超时,
+**日志零输出**(看起来像函数本身挂了)。**Fix**: 凭据在部署时经 CloudFormation 动态引用注入
+(`PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'`,ARN 走
+Parameter 而非 ImportValue);或为所需服务加 VPC interface endpoint。运行时零外呼是首选。
