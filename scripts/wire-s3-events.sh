@@ -32,17 +32,34 @@ TRANSCRIBE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-transc
 echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe"
 
 # ---- desired LambdaFunctionConfigurations (our managed entries, Id prefix fs-) ----
-DESIRED=$(cat <<JSON
-[
-  {"Id":"fs-vad-wav","LambdaFunctionArn":"${VAD_ARN}","Events":["s3:ObjectCreated:*"],
-   "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"users/"},{"Name":"suffix","Value":".wav"}]}}},
-  {"Id":"fs-vad-mp4","LambdaFunctionArn":"${VAD_ARN}","Events":["s3:ObjectCreated:*"],
-   "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"users/"},{"Name":"suffix","Value":".mp4"}]}}},
-  {"Id":"fs-transcribe-wav","LambdaFunctionArn":"${TRANSCRIBE_ARN}","Events":["s3:ObjectCreated:*"],
-   "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"audio_segments/"},{"Name":"suffix","Value":".wav"}]}}}
-]
-JSON
-)
+# Only wire functions that actually exist: VadFunction is conditional in the
+# template (HasVadLayer), so a stack deployed without VadLayerArn has no VAD —
+# including a nonexistent ARN makes PutBucketNotificationConfiguration fail
+# with "Unable to validate the following destination configurations".
+fn_exists() { aws lambda get-function --function-name "$1" --region "$REGION" >/dev/null 2>&1; }
+
+DESIRED='[]'
+WIRE_FNS=()
+if fn_exists "${PREFIX}-vad"; then
+  WIRE_FNS+=("${PREFIX}-vad")
+  DESIRED=$(jq -c --arg arn "$VAD_ARN" '. + [
+    {"Id":"fs-vad-wav","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"users/"},{"Name":"suffix","Value":".wav"}]}}},
+    {"Id":"fs-vad-mp4","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"users/"},{"Name":"suffix","Value":".mp4"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-vad not deployed (no VadLayerArn) — skipping VAD triggers"
+fi
+if fn_exists "${PREFIX}-transcribe"; then
+  WIRE_FNS+=("${PREFIX}-transcribe")
+  DESIRED=$(jq -c --arg arn "$TRANSCRIBE_ARN" '. + [
+    {"Id":"fs-transcribe-wav","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"audio_segments/"},{"Name":"suffix","Value":".wav"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-transcribe not deployed — skipping transcribe trigger"
+fi
 
 CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --output json 2>/dev/null || echo '{}')
 # A bucket with NO notification config returns EMPTY stdout (success) — not JSON.
@@ -65,8 +82,8 @@ if [ "$APPLY" != "--apply" ]; then
   exit 0
 fi
 
-# Grant S3 permission to invoke each lambda (idempotent — ignore AlreadyExists).
-for fn in "${PREFIX}-vad" "${PREFIX}-transcribe"; do
+# Grant S3 permission to invoke each EXISTING lambda (idempotent — ignore AlreadyExists).
+for fn in "${WIRE_FNS[@]}"; do
   aws lambda add-permission --function-name "$fn" \
     --statement-id "s3invoke-${BUCKET}" --action lambda:InvokeFunction \
     --principal s3.amazonaws.com --source-arn "arn:aws:s3:::${BUCKET}" \
