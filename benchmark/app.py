@@ -22,7 +22,7 @@ from core import audio as A
 from core import storage
 from core.config import load_config
 from core.runner import prepare_audio, run_benchmark
-from providers import build_providers
+from providers import PROVIDER_CLASSES, build_providers
 
 st.set_page_config(page_title="FieldSight ASR Benchmark", page_icon="🎙️", layout="wide")
 storage.init_db()
@@ -169,6 +169,9 @@ def render_charts(results: list[dict], reference: str):
             st.bar_chart(df, horizontal=True)
 
 
+_DIAR_CAPABLE = {cls.label: cls.supports_diarization for cls in PROVIDER_CLASSES}
+
+
 def _transcript_with_speakers(r: dict) -> str:
     segs = r.get("segments") or []
     if r.get("has_diarization") and any(s.get("speaker") for s in segs):
@@ -221,6 +224,9 @@ def render_cards(results: list[dict], reference: str):
                     m3.metric("Chars", r.get("char_count") or len(r.get("text") or ""))
                 if r.get("chunked"):
                     st.caption(f"🔪 auto-chunked into {r.get('n_chunks')} parts")
+                if _DIAR_CAPABLE.get(r["provider"]) and not r.get("has_diarization"):
+                    st.caption("🗣️ diarization requested — engine returned no speaker labels "
+                               "(check the raw JSON in data/runs/<id>/)")
                 if r.get("judge_comment"):
                     st.caption("🧑‍⚖️ " + r["judge_comment"])
                 st.text_area(

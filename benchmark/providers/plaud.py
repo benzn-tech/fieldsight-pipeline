@@ -35,6 +35,17 @@ _FAIL = {"FAILURE", "REVOKED", "FAILED", "ERROR"}
 _PENDING = {"PENDING", "RECEIVED", "STARTED", "PROGRESS"}
 
 
+def _speaker_of(seg: dict):
+    """Docs say segments[].speaker ("Speaker 1"), but tolerate variants and
+    numeric ids (0 is falsy — check None explicitly, never truthiness)."""
+    for k in ("speaker", "speaker_id", "speaker_label"):
+        v = seg.get(k)
+        if v is None or v == "":
+            continue
+        return v if isinstance(v, str) else f"Speaker {v}"
+    return None
+
+
 def _ok(r, step):
     """Raise with the response body (not just the status) so 4xx/5xx are diagnosable."""
     if r.status_code >= 400:
@@ -144,7 +155,7 @@ class PlaudProvider(ASRProvider):
             Segment(start=float(s.get("start", 0.0) or 0.0),
                     end=float(s.get("end", 0.0) or 0.0),
                     text=s.get("text", "") or "",
-                    speaker=s.get("speaker"))
+                    speaker=_speaker_of(s))
             for s in raw_segs
         ]
         text = (data.get("text") or " ".join(s.text for s in segments)).strip()
