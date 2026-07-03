@@ -2,13 +2,14 @@
 
 Plaud's Transcription API takes a **URL** to the audio (not a file upload), runs
 as an async job, and you poll for the result. We hold a local WAV, so we first
-turn it into a URL one of two ways:
+turn it into a URL. Plaud's transcription backend wants a **Plaud-hosted** URL —
+external URLs (S3 presign / public) come back as HTTP 500 — so:
 
-  * **S3 presign** (default, simplest): upload the WAV to your S3 bucket and hand
-    Plaud a presigned GET URL — needs only ``PLAUD_CLIENT_ID`` + ``PLAUD_API_KEY``
-    plus the AWS creds already used by AWS Transcribe / Fun-ASR.
-  * **Plaud native upload** (fallback, no AWS): multipart-upload through Plaud's
-    own File Upload API (needs ``PLAUD_SECRET_KEY``) to get a 24 h DownloadUrl.
+  * **Plaud native upload** (default): multipart-upload through Plaud's own File
+    Upload API (needs ``PLAUD_SECRET_KEY``) to get a 24 h DownloadUrl, then
+    transcribe that. Mirrors the official developer-playground flow.
+  * **S3 presign** (opt-in via ``PLAUD_AUDIO_SOURCE=s3``): hand Plaud a presigned
+    URL from your S3 — kept for if/when external URLs get accepted.
 
 Auth gotcha: the Transcription API uses ``X-Client-Id`` + ``X-Client-Api-Key``,
 where the api-key is generated in the Plaud portal (App Settings -> API Keys) and
@@ -30,7 +31,7 @@ from ._aws import aws_creds_available
 
 _POLL_TIMEOUT_S = 900
 _DONE = {"SUCCESS"}
-_FAIL = {"FAILURE", "REVOKED"}
+_FAIL = {"FAILURE", "REVOKED", "FAILED", "ERROR"}
 _PENDING = {"PENDING", "RECEIVED", "STARTED", "PROGRESS"}
 
 
@@ -72,14 +73,17 @@ class PlaudProvider(ASRProvider):
 
         cleanup = None
         try:
-            use_upload = self.audio_source == "upload" or (self.audio_source == "auto" and not self._can_s3())
+            # Plaud transcription wants a Plaud-hosted URL (external URLs 500), so
+            # default to Plaud's own upload when a secret_key is present; S3 is
+            # opt-in via PLAUD_AUDIO_SOURCE=s3.
+            use_upload = self.audio_source == "upload" or (self.audio_source == "auto" and bool(self.secret_key))
             if use_upload:
                 if not self.secret_key:
-                    return self._fail("Plaud upload needs PLAUD_SECRET_KEY (or set AWS creds for S3 presign)")
+                    return self._fail("Plaud upload needs PLAUD_SECRET_KEY")
                 url = self._plaud_upload(wav_path)
             else:
                 if not self._can_s3():
-                    return self._fail("S3 presign needs AWS creds + bucket (or PLAUD_SECRET_KEY + PLAUD_AUDIO_SOURCE=upload)")
+                    return self._fail("no audio URL: set PLAUD_SECRET_KEY (Plaud upload) or AWS creds (S3 presign)")
                 url, cleanup = self._presign_s3(wav_path)
         except Exception as exc:  # noqa: BLE001
             return self._fail(f"audio upload failed: {type(exc).__name__}: {exc}")
@@ -126,14 +130,15 @@ class PlaudProvider(ASRProvider):
             return self._fail(f"transcription {status}")
         data = payload.get("data") or {}
 
-        text = (data.get("text") or "").strip()
+        raw_segs = data.get("segments") or data.get("results") or []
         segments = [
             Segment(start=float(s.get("start", 0.0) or 0.0),
                     end=float(s.get("end", 0.0) or 0.0),
                     text=s.get("text", "") or "",
                     speaker=s.get("speaker"))
-            for s in (data.get("segments") or [])
+            for s in raw_segs
         ]
+        text = (data.get("text") or " ".join(s.text for s in segments)).strip()
         has_diar = bool(diarize and any(s.speaker for s in segments))
         return self._result(ok=True, text=text, segments=segments,
                             has_diarization=has_diar, raw=payload)
@@ -184,12 +189,14 @@ class PlaudProvider(ASRProvider):
 
     # ------------------------------------- URL source 2: Plaud native upload  #
     def _plaud_upload(self, wav_path) -> str:
-        # B0: partner token (Basic base64(client_id:secret_key))
+        filetype = os.path.splitext(wav_path)[1].lstrip(".").lower() or "wav"
+
+        # B0: partner token (Basic base64(client_id:secret_key), no body — matches playground)
         basic = base64.b64encode(f"{self.client_id}:{self.secret_key}".encode()).decode()
         r = requests.post(f"{self.host}/oauth/partner/access-token",
                          headers={"Authorization": f"Basic {basic}",
                                   "Content-Type": "application/x-www-form-urlencoded"},
-                         data={"grant_type": "client_credentials"}, timeout=30)
+                         timeout=30)
         r.raise_for_status()
         partner = r.json()["access_token"]
 
@@ -205,7 +212,7 @@ class PlaudProvider(ASRProvider):
         # B2: presigned multipart URLs
         size = os.path.getsize(wav_path)
         r = requests.post(f"{self.host}/open/partner/files/upload/generate-presigned-urls",
-                         headers=bearer, json={"filesize": size, "filetype": "wav"}, timeout=30)
+                         headers=bearer, json={"filesize": size, "filetype": filetype}, timeout=30)
         r.raise_for_status()
         up = r.json()
         chunk = int(up.get("ChunkSize") or 5 * 1024 * 1024)
@@ -223,6 +230,6 @@ class PlaudProvider(ASRProvider):
         r = requests.post(f"{self.host}/open/partner/files/upload/complete-upload",
                          headers=bearer,
                          json={"file_id": up["FileId"], "upload_id": up["UploadId"],
-                               "filetype": "wav", "part_list": part_list}, timeout=60)
+                               "filetype": filetype, "part_list": part_list}, timeout=60)
         r.raise_for_status()
         return r.json()["DownloadUrl"]
