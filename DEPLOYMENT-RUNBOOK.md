@@ -21,7 +21,7 @@ Two independent tracks, both branch-driven:
 | Backend Lambda code | GitHub Actions | push (non-`ui/`, non-docs) | **`develop`**: full SAM → `fieldsight-test` stack (`deploy.yml`) | **`main`**: code-only `update-function-code` to the existing prod lambdas (`deploy-prod-code.yml`, approval gate) |
 | Frontend (`ui/`, static) | S3 + CloudFront (this account; `scripts/deploy-ui.sh`, run manually) | — | `fieldsight-web-test-*` + CF `E34AAK2PCGPWVZ` | `fieldsight-web-*` + CF `E12IVML224YUEE` |
 
-- **Canonical SAM template** = `src/template.yaml` (the complete 9-Lambda stack; `CodeUri: src/` resolves via `base_dir = "."`). The old root `template.yaml` is legacy.
+- **Canonical SAM template** = `src/template.yaml` (the complete 9-Lambda stack; `CodeUri: src/` resolves via `base_dir = "."`). The legacy root `template.yaml` has been removed — `src/template.yaml` is the only template in the repo.
 - **`samconfig.toml` is committed** (no secrets; secrets injected from GitHub secrets via `--parameter-overrides`).
 - **PROD is NOT in CloudFormation.** The prod backend was hand-assembled (10 lambdas sharing `fieldsight-lambda-role`, crons in EventBridge Scheduler group `sitesync`, a manual `fieldsight-api` Gateway). A `sam deploy` to prod would collide with all of it, so **prod ships CODE-ONLY** via `deploy-prod-code.yml` (`update-function-code`, the documented manual process, automated). Full SAM adoption of prod is a separate migration (not done here). TEST is full SAM (fresh, isolated).
 

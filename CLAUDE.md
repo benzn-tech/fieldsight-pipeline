@@ -39,7 +39,7 @@ S3 Upload (video/audio)
     → Upload to reports/{date}/{user}/
 
 Frontend (CloudFront → S3)
-  → Cognito auth (user pool ap-southeast-2_ps7XIQGHB)
+  → Cognito auth (user pool ap-southeast-2_q88pd6XXr) (fieldsight-users; old pool ps7XIQGHB deleted)
   → API Gateway → fieldsight-api Lambda
     → Role hierarchy: admin/gm > pm > site_manager > worker
     → Time regex: ALWAYS \d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})
@@ -478,8 +478,8 @@ aws lambda get-function-configuration --function-name NAME \
 aws lambda get-function --function-name <name> --query 'Code.Location' --output text | xargs curl -sL -o /tmp/current.zip
 unzip -l /tmp/current.zip  # check contents
 
-# Create Cognito user
-aws cognito-idp admin-create-user --user-pool-id ap-southeast-2_ps7XIQGHB \
+# Create Cognito user (pool: fieldsight-users; old pool ps7XIQGHB deleted)
+aws cognito-idp admin-create-user --user-pool-id ap-southeast-2_q88pd6XXr \
   --username "email@domain.com" --user-attributes Name=email,Value="email@domain.com" \
   Name=email_verified,Value=true Name=name,Value="Full Name" \
   --temporary-password "FieldSight2026!" --region ap-southeast-2

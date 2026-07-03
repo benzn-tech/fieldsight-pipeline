@@ -63,7 +63,7 @@ Phase 6  规模门槛:多行业 prompt overlay · WhisperX 自建转录  ── 
 
 **已核实的接线点(无需改造,只配置):**
 - 开关:`fieldsight-ui/scripts/api/index.js` → `window.FS.api.useMocks`、`baseUrl`(现 `true` / `'/api'`)。
-- Cognito 覆盖 seam:`scripts/auth/cognito.js`(读 `window.FS_COGNITO_CONFIG`)。真实值:pool `ap-southeast-2_ps7XIQGHB`、client `5npb81jbj1hgh9tsck25kan3os`、region `ap-southeast-2`。
+- Cognito 覆盖 seam:`scripts/auth/cognito.js`(读 `window.FS_COGNITO_CONFIG`)。真实值:pool `ap-southeast-2_q88pd6XXr`(fieldsight-users)、client `4ratjdjonqm17tln6bs2761ci3`(fieldsight-web-client)、region `ap-southeast-2`。(旧 pool `ps7XIQGHB`/client `5npb81jbj1hgh9tsck25kan3os` 已删除)
 - 运行时覆盖:`app-shell-preview.html` 已支持 `?baseUrl=…&mocks=0`。
 - 真实后端契约:`fieldsight-ui/BACKEND-CONTEXT.md`(端点/schema/坑,已与 UI 数据层一一对应)。
 
