@@ -75,7 +75,9 @@ jobs:
               "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \
               "FargateSubnetIds=$SUBNETS" \
-              "FargateVpcId=$VPC"
+              "FargateVpcId=$VPC" \
+              "DbStackName=fieldsight-db-test" \
+              "DbSubnetIds=subnet-082dd4480f7e20014,subnet-08b15b36113e542d4,subnet-05fb05613cf529121"
 
       - name: Wire S3 events (TEST bucket)
         run: bash scripts/wire-s3-events.sh fieldsight-data-test-509194952652 test ${{ env.AWS_REGION }} --apply

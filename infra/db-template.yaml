@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  FieldSight Aurora Serverless v2 (PostgreSQL 16 + pgvector) — dedicated DB stack.
+  Deployed separately from the app stack (src/template.yaml) so DB lifecycle
+  (create/rotate/pause/delete) never shares blast radius with app deploys.
+  Plain CloudFormation — no SAM transform needed (no Lambda/API resources here).
+
+# ============================================================
+# Parameters
+# ============================================================
+Parameters:
+  Stage:
+    Type: String
+    Default: test
+    AllowedValues: [test, prod]
+    Description: Deployment stage. Only 'test' is provisioned in Phase 2B.
+
+  DBName:
+    Type: String
+    Default: fieldsight
+    Description: Initial database name created on the cluster.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to place the Aurora cluster and security groups in (default VPC).
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Subnet ids for the DB subnet group (>=2 AZs required by RDS).
+      Pass the 3 default-VPC subnets via samconfig parameter_overrides — never
+      hardcode account-specific subnet ids in this template.
+
+# ============================================================
+# Resources
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # Security Groups
+  # ----------------------------------------------------------
+  # Lambda-side SG: no ingress rules (Lambdas don't need to accept inbound
+  # traffic), egress-all so it can reach the DB (and anything else it needs).
+  LambdaSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub fieldsight-lambda-sg (${Stage}) - egress-only, attached to in-VPC Lambdas
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (DB + any future in-VPC calls)
+      Tags:
+        - Key: Name
+          Value: !Sub fieldsight-lambda-sg-${Stage}
+
+  # DB-side SG: ingress 5432 ONLY from LambdaSG (source = security group, not CIDR).
+  DbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub fieldsight-db-sg (${Stage}) - ingress 5432 from LambdaSG only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !GetAtt LambdaSG.GroupId
+          Description: Postgres from FieldSight in-VPC Lambdas
+      Tags:
+        - Key: Name
+          Value: !Sub fieldsight-db-sg-${Stage}
+
+  # ----------------------------------------------------------
+  # DB Subnet Group
+  # ----------------------------------------------------------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub Subnet group for fieldsight-db-${Stage} (default VPC subnets)
+      SubnetIds: !Ref SubnetIds
+
+  # ----------------------------------------------------------
+  # Aurora Serverless v2 Cluster (PostgreSQL 16, pgvector-capable)
+  # ----------------------------------------------------------
+  DbCluster:
+    # test stack: no data yet -> Delete is intentional; prod stack must use Snapshot
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-postgresql
+      # 16.4+ is required for ServerlessV2ScalingConfiguration MinCapacity 0
+      # (scale-to-zero). scale-to-zero requires 16.3+; 16.4 pinned for margin.
+      EngineVersion: '16.4'
+      EngineMode: provisioned
+      DatabaseName: !Ref DBName
+      MasterUsername: postgres
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds:
+        - !GetAtt DbSG.GroupId
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0
+        MaxCapacity: 2
+      EnableHttpEndpoint: true
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub fieldsight-db-${Stage}
+
+  # ----------------------------------------------------------
+  # Serverless v2 DB Instance (writer)
+  # ----------------------------------------------------------
+  DbInstance:
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref DbCluster
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub fieldsight-db-${Stage}-instance
+
+# ============================================================
+# Outputs (Exports consumed by src/template.yaml MigrateFunction)
+# ============================================================
+Outputs:
+  ClusterEndpoint:
+    Description: Aurora cluster writer endpoint (host only)
+    Value: !GetAtt DbCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterArn:
+    Description: Aurora cluster ARN (for Data API / rds-data calls)
+    Value: !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DbCluster}
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  SecretArn:
+    Description: RDS-managed master user secret ARN (Secrets Manager)
+    Value: !GetAtt DbCluster.MasterUserSecret.SecretArn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecretArn'
+
+  DbSG:
+    Description: Security group id for the DB (ingress 5432 from LambdaSG)
+    Value: !GetAtt DbSG.GroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-DbSG'
+
+  LambdaSG:
+    Description: Security group id to attach to in-VPC Lambdas that talk to the DB
+    Value: !GetAtt LambdaSG.GroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaSG'
+
+  DbName:
+    Description: Database name created on the cluster
+    Value: !Ref DBName
+    Export:
+      Name: !Sub '${AWS::StackName}-DbName'
