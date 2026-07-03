@@ -43,7 +43,7 @@ Frontend chat input → API Gateway → lambda_ask_agent.py
 **Status:** ⬜ Not started
 
 **Current state of DynamoDB:**
-- ⚠️ `ENABLE_DYNAMODB` = **false** (default in code, not set in template.yaml)
+- ⚠️ `ENABLE_DYNAMODB` = **false** (default in code, not set in src/template.yaml)
 - Tables defined in SAM template: `fieldsight-items`, `fieldsight-reports`, `fieldsight-audit`
 - Write functions exist in `lambda_report_generator.py` (lines 736-820) — gated behind flag
 - **No data has been written yet** — turning on only affects future reports

@@ -107,7 +107,7 @@ cat output.json
 ├── docs/
 │   ├── ARCHITECTURE.md              # System architecture diagram
 │   └── MONITORING.md                # Monitoring & debugging guide
-├── template.yaml                    # SAM template (all AWS resources)
+├── src/template.yaml                # SAM template (canonical)
 ├── CLAUDE.md                        # Claude Code project rules
 ├── ROADMAP.md                       # Product roadmap
 └── README.md                        # This file
