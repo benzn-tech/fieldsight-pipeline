@@ -82,3 +82,27 @@ parameter_overrides = [
     "ReportsTableName=fieldsight-test-reports",
     "AuditTableName=fieldsight-test-audit",
 ]
+
+# ------------------------------------------------------------
+# DB-TEST — dedicated Aurora Serverless v2 stack (infra/db-template.yaml)
+# Separate lifecycle from the app stack: create/rotate/pause/delete here
+# never touches fieldsight-test. Plain CloudFormation, no SAM transform.
+# ------------------------------------------------------------
+[db-test.build.parameters]
+template_file = "infra/db-template.yaml"
+base_dir = "."
+use_container = false
+
+[db-test.deploy.parameters]
+stack_name = "fieldsight-db-test"
+region = "ap-southeast-2"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+resolve_s3 = true
+template_file = "infra/db-template.yaml"
+parameter_overrides = [
+    "Stage=test",
+    "DBName=fieldsight",
+    "VpcId=vpc-0791974a474386d1c",
+    "SubnetIds=subnet-082dd4480f7e20014,subnet-08b15b36113e542d4,subnet-05fb05613cf529121",
+]
