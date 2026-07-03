@@ -189,6 +189,15 @@ Parameters:
       to skip MigrateFunction entirely — prod/default deploys are unaffected.
     Default: ''
 
+  DbSecretArn:
+    Type: String
+    Description: >
+      Full ARN of the DB cluster's RDS-managed master secret. Passed as a
+      plain parameter (deploy.yml reads the db stack's SecretArn export)
+      because {{resolve:secretsmanager:...}} dynamic references compose with
+      Parameters but not with Fn::ImportValue. Only used when HasDb.
+    Default: ''
+
   DbSubnetIds:
     Type: CommaDelimitedList
     Description: >
@@ -574,21 +583,21 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
-          DB_HOST: !ImportValue
+          # libpq-standard env vars: psycopg.connect("") picks these up.
+          # PGPASSWORD is resolved AT DEPLOY TIME via a dynamic reference —
+          # a VPC Lambda with no NAT/endpoints cannot call Secrets Manager
+          # at runtime (first attempt hung to timeout, 2026-07-04).
+          # DbSecretArn is a plain Parameter because {{resolve:...}} only
+          # composes with parameters, not ImportValue (deploy.yml fetches
+          # the export and passes it through).
+          PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          DB_SECRET_ARN: !ImportValue
-            Fn::Sub: "${DbStackName}-SecretArn"
-          DB_NAME: !ImportValue
+          PGDATABASE: !ImportValue
             Fn::Sub: "${DbStackName}-DbName"
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
       Policies:
         - VPCAccessPolicy: {}
-        - Version: '2012-10-17'
-          Statement:
-            - Effect: Allow
-              Action:
-                - secretsmanager:GetSecretValue
-              Resource: !ImportValue
-                Fn::Sub: "${DbStackName}-SecretArn"
 
   # ==========================================================
   # COGNITO - User Authentication

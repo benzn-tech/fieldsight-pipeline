@@ -48,10 +48,18 @@ def get_connection(dsn: str | None = None, autocommit: bool = False):
     use `with get_connection() as conn:` (commits on clean exit) or pass
     autocommit=True. A bare get_connection() + close() ROLLS BACK writes.
     """
-    dsn = dsn or os.environ.get("DATABASE_URL") or _dsn_from_secret()
-    if not dsn:
+    dsn = dsn or os.environ.get("DATABASE_URL")
+    if dsn is None and os.environ.get("PGHOST"):
+        # libpq-standard env vars (PGHOST/PGDATABASE/PGUSER/PGPASSWORD):
+        # the in-VPC MigrateFunction uses these — deploy-time injected, so
+        # no runtime Secrets Manager call (which would hang without NAT).
+        dsn = ""
+    if dsn is None:
+        dsn = _dsn_from_secret()
+    if dsn is None:
         raise RuntimeError(
-            "No DSN available: set DATABASE_URL, or DB_SECRET_ARN + DB_HOST."
+            "No DSN available: set DATABASE_URL, PGHOST env vars, or "
+            "DB_SECRET_ARN + DB_HOST."
         )
     conn = psycopg.connect(dsn, autocommit=autocommit)
     if register_vector is not None:

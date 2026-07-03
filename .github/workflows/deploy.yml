@@ -62,6 +62,10 @@ jobs:
           # Trim the VPC id; normalize the subnet list (space- OR comma-separated) to clean commas.
           VPC="$(echo "$FARGATE_VPC_ID" | xargs)"
           SUBNETS="$(echo "$FARGATE_SUBNET_IDS" | tr ',' ' ' | xargs | tr ' ' ',')"
+          # DB secret ARN: read from the db stack's export; passed as a plain
+          # parameter because {{resolve:secretsmanager:...}} can't compose
+          # with Fn::ImportValue (only with Parameters).
+          DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
           sam deploy --config-env test \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -77,7 +81,8 @@ jobs:
               "FargateSubnetIds=$SUBNETS" \
               "FargateVpcId=$VPC" \
               "DbStackName=fieldsight-db-test" \
-              "DbSubnetIds=subnet-082dd4480f7e20014,subnet-08b15b36113e542d4,subnet-05fb05613cf529121"
+              "DbSubnetIds=subnet-082dd4480f7e20014,subnet-08b15b36113e542d4,subnet-05fb05613cf529121" \
+              "DbSecretArn=$DB_SECRET_ARN"
 
       - name: Wire S3 events (TEST bucket)
         run: bash scripts/wire-s3-events.sh fieldsight-data-test-509194952652 test ${{ env.AWS_REGION }} --apply
