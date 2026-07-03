@@ -48,7 +48,7 @@ class PlaudProvider(ASRProvider):
     supports_diarization = True
     max_audio_seconds = None          # async job, handles long audio server-side
     homepage = "https://docs.plaud.ai/plaud-embedded/starter-app-guide"
-    notes = "Transcription API (plaud-fast-whisper). Async submit+poll on an audio URL (S3 presign or Plaud upload)."
+    notes = "Transcription API (plaud-fast-whisper). Async submit+poll; uploads via Plaud (wav auto-transcoded to mp3 — upload API rejects wav)."
 
     def __init__(self, config: dict):
         super().__init__(config)
@@ -196,8 +196,25 @@ class PlaudProvider(ASRProvider):
 
     # ------------------------------------- URL source 2: Plaud native upload  #
     def _plaud_upload(self, wav_path) -> str:
+        # Plaud's upload API rejects "wav" (FILE_TYPE_INVALID); mp3/m4a/opus pass.
+        # Our runner hands every provider the normalized 16k WAV, so transcode it.
         filetype = os.path.splitext(wav_path)[1].lstrip(".").lower() or "wav"
+        tmp_mp3 = None
+        if filetype not in {"mp3", "m4a", "opus"}:
+            from core.audio import transcode_to_mp3
+            tmp_mp3 = wav_path + ".plaud.mp3"
+            transcode_to_mp3(wav_path, tmp_mp3)
+            wav_path, filetype = tmp_mp3, "mp3"
+        try:
+            return self._plaud_upload_raw(wav_path, filetype)
+        finally:
+            if tmp_mp3:
+                try:
+                    os.remove(tmp_mp3)
+                except OSError:
+                    pass
 
+    def _plaud_upload_raw(self, wav_path, filetype) -> str:
         # B0: partner token (Basic base64(client_id:secret_key), no body — matches playground)
         basic = base64.b64encode(f"{self.client_id}:{self.secret_key}".encode()).decode()
         r = _ok(requests.post(f"{self.host}/oauth/partner/access-token",

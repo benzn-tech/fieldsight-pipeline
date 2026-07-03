@@ -65,6 +65,21 @@ def normalize_to_wav16k(src_path: str, dst_path: str) -> str:
     return dst_path
 
 
+def transcode_to_mp3(src_path: str, dst_path: str, bitrate: str = "128k") -> str:
+    """Transcode any audio to 16 kHz mono MP3. Plaud's upload API rejects wav
+    (FILE_TYPE_INVALID) — every documented example uploads mp3."""
+    _require_ffmpeg()
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", src_path,
+            "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", bitrate,
+            "-vn", dst_path,
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    return dst_path
+
+
 @dataclass
 class Chunk:
     path: str
