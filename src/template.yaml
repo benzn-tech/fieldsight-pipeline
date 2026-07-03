@@ -194,8 +194,8 @@ Parameters:
     Description: >
       Full ARN of the DB cluster's RDS-managed master secret. Passed as a
       plain parameter (deploy.yml reads the db stack's SecretArn export)
-      because {{resolve:secretsmanager:...}} dynamic references compose with
-      Parameters but not with Fn::ImportValue. Only used when HasDb.
+      because secretsmanager dynamic references compose with Parameters but
+      not with Fn::ImportValue. Only used when HasDb.
     Default: ''
 
   DbSubnetIds:
