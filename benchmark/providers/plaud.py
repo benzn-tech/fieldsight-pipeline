@@ -110,6 +110,8 @@ class PlaudProvider(ASRProvider):
             "file_url": url,
             "params": {
                 "transcribe": {"language": language or "auto", "model": self.model},
+                # VAD on: decode_silence=False means silent stretches are detected
+                # and skipped rather than force-decoded.
                 "vad": {"decode_silence": False},
                 "diarization": {"enabled": bool(diarize), "return_embedding": False},
             },

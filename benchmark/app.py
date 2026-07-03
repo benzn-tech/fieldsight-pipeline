@@ -71,6 +71,8 @@ def sidebar() -> tuple[dict, dict]:
     # (AWS · ElevenLabs · Plaud · Fun-ASR). Cartesia/Qwen/Zhipu have no
     # diarization in their APIs and simply ignore the flag.
     st.sidebar.caption("🗣️ Speaker diarization: always on (engines that support it)")
+    st.sidebar.caption("🔇 VAD: always on where it exists — Plaud (skip silence) and "
+                       "Cartesia ink-2 (built-in). Other engines expose no VAD option.")
 
     opts = {"language": language, "diarize": True}
     return cfg, opts
