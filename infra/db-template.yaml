@@ -83,6 +83,9 @@ Resources:
   # Aurora Serverless v2 Cluster (PostgreSQL 16, pgvector-capable)
   # ----------------------------------------------------------
   DbCluster:
+    # test stack: no data yet -> Delete is intentional; prod stack must use Snapshot
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
     Type: AWS::RDS::DBCluster
     Properties:
       Engine: aurora-postgresql
@@ -111,6 +114,8 @@ Resources:
   # Serverless v2 DB Instance (writer)
   # ----------------------------------------------------------
   DbInstance:
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
     Type: AWS::RDS::DBInstance
     Properties:
       Engine: aurora-postgresql
