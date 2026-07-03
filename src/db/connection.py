@@ -2,7 +2,16 @@
 import json
 import os
 import psycopg
-from pgvector.psycopg import register_vector
+
+# pgvector is optional at import time: the migrate Lambda's slim layer ships
+# psycopg only (pgvector hard-requires numpy, which SAM's layer builder can't
+# resolve for py3.11). Migrations are plain SQL — no vector binding needed.
+# Functions that DO bind vectors (Phase 4/5) must ship pgvector and will get
+# registration automatically here.
+try:
+    from pgvector.psycopg import register_vector
+except ImportError:  # slim runtime without pgvector
+    register_vector = None
 
 
 def _dsn_from_secret() -> str | None:
@@ -45,5 +54,6 @@ def get_connection(dsn: str | None = None, autocommit: bool = False):
             "No DSN available: set DATABASE_URL, or DB_SECRET_ARN + DB_HOST."
         )
     conn = psycopg.connect(dsn, autocommit=autocommit)
-    register_vector(conn)
+    if register_vector is not None:
+        register_vector(conn)
     return conn

@@ -1,3 +1,5 @@
 psycopg[binary]>=3.1
-pgvector>=0.3
-numpy<2.4  # pgvector hard-dep; numpy 2.4+ has no cp311 wheels (Lambda runtime is 3.11)
+# NOTE: pgvector deliberately EXCLUDED — it hard-requires numpy, which SAM's
+# PythonPipBuilder fails to resolve for py3.11. The migrate Lambda only runs
+# SQL text (no vector binding); connection.py treats pgvector as optional.
+# Phase 3/4 functions that bind vectors revisit this (own layer or container).
