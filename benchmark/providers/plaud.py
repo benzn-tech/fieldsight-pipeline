@@ -35,6 +35,13 @@ _FAIL = {"FAILURE", "REVOKED", "FAILED", "ERROR"}
 _PENDING = {"PENDING", "RECEIVED", "STARTED", "PROGRESS"}
 
 
+def _ok(r, step):
+    """Raise with the response body (not just the status) so 4xx/5xx are diagnosable."""
+    if r.status_code >= 400:
+        raise RuntimeError(f"{step} HTTP {r.status_code}: {r.text[:400]}")
+    return r
+
+
 class PlaudProvider(ASRProvider):
     key = "plaud"
     label = "Plaud"
@@ -193,27 +200,26 @@ class PlaudProvider(ASRProvider):
 
         # B0: partner token (Basic base64(client_id:secret_key), no body — matches playground)
         basic = base64.b64encode(f"{self.client_id}:{self.secret_key}".encode()).decode()
-        r = requests.post(f"{self.host}/oauth/partner/access-token",
-                         headers={"Authorization": f"Basic {basic}",
-                                  "Content-Type": "application/x-www-form-urlencoded"},
-                         timeout=30)
-        r.raise_for_status()
+        r = _ok(requests.post(f"{self.host}/oauth/partner/access-token",
+                             headers={"Authorization": f"Basic {basic}",
+                                      "Content-Type": "application/x-www-form-urlencoded"},
+                             timeout=30), "partner-token")
         partner = r.json()["access_token"]
 
         # B1: user token (Bearer partner token)
-        r = requests.post(f"{self.host}/open/partner/users/access-token",
-                         headers={"Authorization": f"Bearer {partner}",
-                                  "Content-Type": "application/json"},
-                         json={"user_id": "fieldsight-benchmark", "expires_in": 86400}, timeout=30)
-        r.raise_for_status()
+        r = _ok(requests.post(f"{self.host}/open/partner/users/access-token",
+                             headers={"Authorization": f"Bearer {partner}",
+                                      "Content-Type": "application/json"},
+                             json={"user_id": "fieldsight-benchmark", "expires_in": 86400},
+                             timeout=30), "user-token")
         user = r.json()["access_token"]
         bearer = {"Authorization": f"Bearer {user}", "Content-Type": "application/json"}
 
         # B2: presigned multipart URLs
         size = os.path.getsize(wav_path)
-        r = requests.post(f"{self.host}/open/partner/files/upload/generate-presigned-urls",
-                         headers=bearer, json={"filesize": size, "filetype": filetype}, timeout=30)
-        r.raise_for_status()
+        r = _ok(requests.post(f"{self.host}/open/partner/files/upload/generate-presigned-urls",
+                             headers=bearer, json={"filesize": size, "filetype": filetype},
+                             timeout=30), "generate-presigned-urls")
         up = r.json()
         chunk = int(up.get("ChunkSize") or 5 * 1024 * 1024)
 
@@ -222,14 +228,13 @@ class PlaudProvider(ASRProvider):
         with open(wav_path, "rb") as f:
             for part in sorted(up["Parts"], key=lambda p: p["PartNumber"]):
                 data = f.read(chunk)
-                pr = requests.put(part["PresignedUrl"], data=data, timeout=300)
-                pr.raise_for_status()
+                pr = _ok(requests.put(part["PresignedUrl"], data=data, timeout=300), "upload-part")
                 part_list.append({"PartNumber": part["PartNumber"], "ETag": pr.headers.get("ETag")})
 
         # B4: complete upload -> DownloadUrl
-        r = requests.post(f"{self.host}/open/partner/files/upload/complete-upload",
-                         headers=bearer,
-                         json={"file_id": up["FileId"], "upload_id": up["UploadId"],
-                               "filetype": filetype, "part_list": part_list}, timeout=60)
-        r.raise_for_status()
+        r = _ok(requests.post(f"{self.host}/open/partner/files/upload/complete-upload",
+                             headers=bearer,
+                             json={"file_id": up["FileId"], "upload_id": up["UploadId"],
+                                   "filetype": filetype, "part_list": part_list},
+                             timeout=60), "complete-upload")
         return r.json()["DownloadUrl"]
