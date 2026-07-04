@@ -1,6 +1,6 @@
 from psycopg.rows import dict_row
 
-_COLS = "id, cognito_sub, company_id, email, first_name, last_name, avatar_s3_key, global_role, created_at"
+_COLS = "id, cognito_sub, company_id, email, first_name, last_name, avatar_s3_key, global_role, created_at, archived_at"
 
 
 def upsert_user(conn, cognito_sub, email, company_id=None, first_name=None,
@@ -35,9 +35,10 @@ def get_user_by_sub(conn, cognito_sub) -> dict | None:
     ).fetchone()
 
 
-def list_company_users(conn, company_id) -> list[dict]:
+def list_company_users(conn, company_id, include_archived=False) -> list[dict]:
+    guard = "" if include_archived else "AND archived_at IS NULL "
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_COLS} FROM users WHERE company_id=%s ORDER BY created_at",
+        f"SELECT {_COLS} FROM users WHERE company_id=%s {guard}ORDER BY created_at",
         (company_id,),
     ).fetchall()
 
@@ -64,4 +65,38 @@ def update_profile(conn, cognito_sub, first_name=None, last_name=None,
         f"WHERE cognito_sub=%(sub)s RETURNING {_COLS}",
         {"sub": cognito_sub, "first": first_name, "last": last_name,
          "avatar": avatar_s3_key},
+    ).fetchone()
+
+
+def archive_user(conn, cognito_sub, company_id) -> dict | None:
+    """Soft-delete a user (company-guarded) and cascade-archive their
+    memberships. Cognito login is NOT touched (design). Returns None if not
+    found / wrong company / already archived."""
+    cur = conn.cursor(row_factory=dict_row)
+    row = cur.execute(
+        f"UPDATE users SET archived_at=now() "
+        f"WHERE cognito_sub=%s AND company_id=%s AND archived_at IS NULL RETURNING {_COLS}",
+        (cognito_sub, company_id),
+    ).fetchone()
+    if row is None:
+        return None
+    cur.execute(
+        "UPDATE memberships SET archived_at=now() "
+        "WHERE user_id=%s AND archived_at IS NULL", (row["id"],))
+    return row
+
+
+def unarchive_user(conn, cognito_sub, company_id) -> dict | None:
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE users SET archived_at=NULL "
+        f"WHERE cognito_sub=%s AND company_id=%s AND archived_at IS NOT NULL RETURNING {_COLS}",
+        (cognito_sub, company_id),
+    ).fetchone()
+
+
+def clear_avatar(conn, cognito_sub) -> dict | None:
+    """Explicit avatar removal (update_profile's COALESCE can't set NULL)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE users SET avatar_s3_key=NULL WHERE cognito_sub=%s RETURNING {_COLS}",
+        (cognito_sub,),
     ).fetchone()

@@ -103,7 +103,7 @@ def test_malformed_json_400(wired):
 
 def test_list_sites_admin_gets_company_sites(wired):
     wired.setattr(org.sites, "list_company_sites",
-                  lambda conn, cid: [{"id": "s-1", "name": "Alpha"}])
+                  lambda conn, cid, include_archived=False: [{"id": "s-1", "name": "Alpha"}])
     res = org.lambda_handler(make_event("GET", "/api/org/sites"), None)
     assert res["statusCode"] == 200
     assert body_of(res)["sites"] == [{"id": "s-1", "name": "Alpha"}]
@@ -149,7 +149,7 @@ def test_create_site_requires_name(wired):
 
 
 def test_list_members_joins_memberships(wired):
-    wired.setattr(org.users, "list_company_users", lambda conn, cid: [
+    wired.setattr(org.users, "list_company_users", lambda conn, cid, include_archived=False: [
         {"id": "u-1", "cognito_sub": "sub-1", "email": "a@x.nz"},
         {"id": "u-2", "cognito_sub": "sub-2", "email": "b@x.nz"},
     ])
@@ -342,10 +342,118 @@ def test_create_member_non_admin_403(member_wired):
     assert res["statusCode"] == 403
 
 
+def test_create_member_rejects_archived_site(member_wired):
+    wired, fake = member_wired
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": "c-uuid-1", "archived_at": "2026-07-01"})
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz", "memberships": [{"site_id": "s-arch", "role": "worker"}],
+    }), None)
+    assert res["statusCode"] == 409
+
+
+def test_archived_caller_blocked_except_get_me(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "archived_at": "2026-07-04"})
+    wired.setattr(org.memberships, "accessible_site_ids", lambda *a: [])
+    assert org.lambda_handler(make_event("GET", "/api/org/me"), None)["statusCode"] == 200
+    assert org.lambda_handler(make_event("GET", "/api/org/sites"), None)["statusCode"] == 403
+    assert org.lambda_handler(make_event("POST", "/api/org/sites", body={"name": "X"}), None)["statusCode"] == 403
+
+
+def test_archive_site_admin_ok_and_404(wired):
+    seen = {}
+    wired.setattr(org.sites, "archive_site",
+                  lambda conn, sid, cid: (seen.update(sid=sid, cid=cid)
+                                          or {"id": sid, "archived_at": "2026-07-04"}))
+    res = org.lambda_handler(make_event("POST", "/api/org/sites/s-1/archive"), None)
+    assert res["statusCode"] == 200
+    assert seen == {"sid": "s-1", "cid": "c-uuid-1"}
+    wired.setattr(org.sites, "archive_site", lambda conn, sid, cid: None)
+    assert org.lambda_handler(make_event("POST", "/api/org/sites/s-9/archive"), None)["statusCode"] == 404
+
+
+def test_unarchive_site_routes(wired):
+    wired.setattr(org.sites, "unarchive_site",
+                  lambda conn, sid, cid: {"id": sid, "archived_at": None})
+    res = org.lambda_handler(make_event("POST", "/api/org/sites/s-1/unarchive"), None)
+    assert res["statusCode"] == 200 and body_of(res)["archived_at"] is None
+
+
+def test_archive_site_worker_403(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    assert org.lambda_handler(make_event("POST", "/api/org/sites/s-1/archive"), None)["statusCode"] == 403
+
+
+def test_archive_member_ok_but_never_self(wired):
+    wired.setattr(org.users, "archive_user",
+                  lambda conn, sub, cid: {"cognito_sub": sub, "archived_at": "x"})
+    assert org.lambda_handler(make_event("POST", "/api/org/members/sub-2/archive"), None)["statusCode"] == 200
+    # self-archive is always blocked (you can't lock yourself out)
+    assert org.lambda_handler(make_event("POST", "/api/org/members/sub-1/archive"), None)["statusCode"] == 400
+    # unarchive self is fine (row can't be reached anyway while archived, but no self-guard needed)
+    wired.setattr(org.users, "unarchive_user", lambda conn, sub, cid: {"cognito_sub": sub, "archived_at": None})
+    assert org.lambda_handler(make_event("POST", "/api/org/members/sub-2/unarchive"), None)["statusCode"] == 200
+
+
+def test_include_archived_param_admin_only(wired):
+    seen = {}
+
+    def fake_list(conn, cid, include_archived=False):
+        seen["inc"] = include_archived
+        return []
+
+    wired.setattr(org.sites, "list_company_sites", fake_list)
+    ev = make_event("GET", "/api/org/sites")
+    ev["queryStringParameters"] = {"include_archived": "1"}
+    org.lambda_handler(ev, None)
+    assert seen["inc"] is True
+    # workers never get archived rows (membership path has no include flag)
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    wired.setattr(org.memberships, "accessible_site_ids", lambda *a: [])
+    wired.setattr(org.sites, "list_sites_by_ids", lambda conn, ids: [])
+    ev2 = make_event("GET", "/api/org/sites")
+    ev2["queryStringParameters"] = {"include_archived": "1"}
+    assert org.lambda_handler(ev2, None)["statusCode"] == 200  # ignored, not honored
+
+
+def test_create_member_archived_same_company_409(member_wired):
+    wired, fake = member_wired
+    fake.exists = True
+
+    def by_sub(conn, sub):
+        if sub == "sub-1":
+            return dict(CALLER)
+        if sub == "sub-existing":
+            return {**CALLER, "cognito_sub": "sub-existing", "archived_at": "2026-07-01"}
+        return None
+
+    wired.setattr(org.users, "get_user_by_sub", by_sub)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "back@x.nz"}), None)
+    assert res["statusCode"] == 409
+
+
 class FakeS3:
+    def __init__(self):
+        self.copied = []
+        self.deleted = []
+        self.missing_source = False
+
     def generate_presigned_url(self, op, Params=None, ExpiresIn=0):
         self.last = {"op": op, "params": Params, "expires": ExpiresIn}
         return "https://s3.example/" + Params["Key"]
+
+    def copy_object(self, Bucket=None, CopySource=None, Key=None):
+        if self.missing_source:
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "CopyObject")
+        self.copied.append((CopySource["Key"], Key))
+
+    def delete_object(self, Bucket=None, Key=None):
+        self.deleted.append(Key)
 
 
 @pytest.fixture
@@ -361,18 +469,18 @@ def test_upload_url_avatar(presign_wired):
         "kind": "avatar", "content_type": "image/png"}), None)
     assert res["statusCode"] == 200
     b = body_of(res)
-    assert b["key"].startswith("org-assets/avatars/sub-1/")
+    assert b["key"].startswith("org-assets/pending/sub-1/")
     assert b["key"].endswith(".png")
     assert fake.last["op"] == "put_object"
     assert fake.last["params"]["ContentType"] == "image/png"
 
 
-def test_upload_url_site_icon_admin_gets_owner_scoped_key(presign_wired):
+def test_upload_url_site_icon_admin_gets_pending_key(presign_wired):
     wired, fake = presign_wired
     res = org.lambda_handler(make_event("POST", "/api/org/upload-url", body={
         "kind": "site_icon", "content_type": "image/webp"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res)["key"].startswith("org-assets/site-icons/sub-1/")
+    assert body_of(res)["key"].startswith("org-assets/pending/sub-1/")
 
 
 def test_upload_url_site_icon_worker_403(presign_wired):
@@ -401,6 +509,13 @@ def test_asset_url_prefix_guard(presign_wired):
     assert body_of(res2)["url"].endswith("a.png")
 
 
+def test_asset_url_rejects_pending_reads(presign_wired):
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/asset-url",
+        params={"key": "org-assets/pending/sub-1/x.png"}), None)
+    assert res["statusCode"] == 400
+
+
 def test_patch_me_avatar_must_be_caller_scoped(wired):
     res = org.lambda_handler(make_event("PATCH", "/api/org/me", body={
         "avatar_s3_key": "org-assets/avatars/sub-OTHER/x.png"}), None)
@@ -414,3 +529,100 @@ def test_non_string_inputs_get_400_not_500(wired):
     res2 = org.lambda_handler(make_event(
         "POST", "/api/org/sites", body={"name": 123}), None)
     assert res2["statusCode"] == 400
+
+
+def test_patch_me_relocates_pending_avatar_and_deletes_old(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "avatar_s3_key": "org-assets/avatars/sub-1/old.png"})
+    captured = {}
+    wired.setattr(org.users, "update_profile",
+                  lambda conn, sub, **kw: (captured.update(kw) or {**CALLER, **kw}))
+    pending = "org-assets/pending/sub-1/newhex.png"
+    res = org.lambda_handler(make_event("PATCH", "/api/org/me",
+                                        body={"avatar_s3_key": pending}), None)
+    assert res["statusCode"] == 200
+    assert captured["avatar_s3_key"] == "org-assets/avatars/sub-1/newhex.png"
+    assert fake.copied == [(pending, "org-assets/avatars/sub-1/newhex.png")]
+    assert pending in fake.deleted and "org-assets/avatars/sub-1/old.png" in fake.deleted
+
+
+def test_patch_me_expired_pending_400(presign_wired):
+    wired, fake = presign_wired
+    fake.missing_source = True
+    res = org.lambda_handler(make_event("PATCH", "/api/org/me",
+        body={"avatar_s3_key": "org-assets/pending/sub-1/gone.png"}), None)
+    assert res["statusCode"] == 400
+    assert "expired" in body_of(res)["error"]
+
+
+def test_patch_me_explicit_null_clears_avatar(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "avatar_s3_key": "org-assets/avatars/sub-1/old.png"})
+    wired.setattr(org.users, "update_profile",
+                  lambda conn, sub, **kw: {**CALLER, **kw})
+    wired.setattr(org.users, "clear_avatar",
+                  lambda conn, sub: {**CALLER, "avatar_s3_key": None})
+    res = org.lambda_handler(make_event("PATCH", "/api/org/me",
+                                        body={"avatar_s3_key": None}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["avatar_s3_key"] is None
+    assert "org-assets/avatars/sub-1/old.png" in fake.deleted
+    assert fake.copied == []
+
+
+def test_create_site_relocates_pending_icon(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.sites, "create_site",
+                  lambda conn, cid, name, **kw: {"id": "s-new", "name": name})
+    seticon = {}
+    wired.setattr(org.sites, "set_site_icon",
+                  lambda conn, sid, key: (seticon.update(sid=sid, key=key)
+                                          or {"id": sid, "icon_s3_key": key}))
+    pending = "org-assets/pending/sub-1/ic.png"
+    res = org.lambda_handler(make_event("POST", "/api/org/sites",
+        body={"name": "New", "icon_s3_key": pending}), None)
+    assert res["statusCode"] == 201
+    assert fake.copied == [(pending, "org-assets/site-icons/s-new/ic.png")]
+    assert seticon == {"sid": "s-new", "key": "org-assets/site-icons/s-new/ic.png"}
+    assert pending in fake.deleted
+
+
+def test_patch_site_updates_fields(wired):
+    seen = {}
+    wired.setattr(org.sites, "update_site",
+                  lambda conn, sid, cid, **kw: (seen.update(sid=sid, cid=cid, **kw)
+                                                or {"id": sid, "name": kw.get("name") or "Old",
+                                                    "icon_s3_key": None}))
+    res = org.lambda_handler(make_event("PATCH", "/api/org/sites/s-1",
+                                        body={"name": "Renamed", "location": "Akl"}), None)
+    assert res["statusCode"] == 200
+    assert seen["sid"] == "s-1" and seen["cid"] == "c-uuid-1"
+    assert seen["name"] == "Renamed" and seen["location"] == "Akl"
+
+
+def test_patch_site_worker_403_and_missing_404(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    assert org.lambda_handler(make_event("PATCH", "/api/org/sites/s-1",
+                                         body={"name": "X"}), None)["statusCode"] == 403
+    wired.setattr(org.users, "get_user_by_sub", lambda conn, sub: dict(CALLER))
+    wired.setattr(org.sites, "update_site", lambda conn, sid, cid, **kw: None)
+    assert org.lambda_handler(make_event("PATCH", "/api/org/sites/s-9",
+                                         body={"name": "X"}), None)["statusCode"] == 404
+
+
+def test_patch_site_swaps_icon_and_deletes_old(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.sites, "update_site",
+                  lambda conn, sid, cid, **kw: {"id": sid, "name": "S",
+                                                "icon_s3_key": "org-assets/site-icons/s-1/old.png"})
+    wired.setattr(org.sites, "set_site_icon",
+                  lambda conn, sid, key: {"id": sid, "icon_s3_key": key})
+    pending = "org-assets/pending/sub-1/new.png"
+    res = org.lambda_handler(make_event("PATCH", "/api/org/sites/s-1",
+                                        body={"icon_s3_key": pending}), None)
+    assert res["statusCode"] == 200
+    assert fake.copied == [(pending, "org-assets/site-icons/s-1/new.png")]
+    assert pending in fake.deleted and "org-assets/site-icons/s-1/old.png" in fake.deleted
