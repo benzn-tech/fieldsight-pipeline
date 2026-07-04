@@ -31,6 +31,21 @@ Parameters:
       Pass the 3 default-VPC subnets via samconfig parameter_overrides — never
       hardcode account-specific subnet ids in this template.
 
+  RouteTableIds:
+    Type: CommaDelimitedList
+    Description: >
+      Route table ids for the S3 gateway endpoint (the default VPC's main
+      route table). Gateway endpoints attach to route tables, not subnets.
+      Pass via parameter-overrides — never hardcode.
+
+  EndpointSubnetIds:
+    Type: CommaDelimitedList
+    Description: >
+      Subnet ids for the cognito-idp interface endpoint. Interface endpoints
+      bill per AZ (~$7.3/month each) — test passes ONE subnet to stay on the
+      approved ~$8/month budget; in-VPC Lambdas in other AZs still reach the
+      endpoint ENI. Pass via parameter-overrides.
+
 # ============================================================
 # Resources
 # ============================================================
@@ -69,6 +84,51 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub fieldsight-db-sg-${Stage}
+
+  # ----------------------------------------------------------
+  # VPC Endpoints (Phase 3)
+  # In-VPC Lambdas have no NAT: any AWS API call without an endpoint
+  # black-holes until timeout with zero logs (BUG-36). OrgApiFunction
+  # needs cognito-idp (admin-create/list users); the seed function also
+  # reads S3 config. Interface endpoint bills per AZ (test: 1 subnet ~$8/month); gateway endpoint free.
+  # NOTE: PrivateDnsEnabled rewires cognito-idp DNS for the WHOLE VPC —
+  # any future in-VPC caller NOT in LambdaSG will be blocked by EndpointSG
+  # and black-hole per BUG-36. Add its SG to EndpointSG ingress if needed.
+  # ----------------------------------------------------------
+  # Endpoint-side SG: ingress 443 ONLY from LambdaSG.
+  EndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub fieldsight-endpoint-sg (${Stage}) - ingress 443 from LambdaSG only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !GetAtt LambdaSG.GroupId
+          Description: HTTPS from FieldSight in-VPC Lambdas (interface endpoints)
+      Tags:
+        - Key: Name
+          Value: !Sub fieldsight-endpoint-sg-${Stage}
+
+  CognitoIdpEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.cognito-idp
+      VpcId: !Ref VpcId
+      SubnetIds: !Ref EndpointSubnetIds
+      SecurityGroupIds:
+        - !GetAtt EndpointSG.GroupId
+      PrivateDnsEnabled: true
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcId: !Ref VpcId
+      RouteTableIds: !Ref RouteTableIds
 
   # ----------------------------------------------------------
   # DB Subnet Group

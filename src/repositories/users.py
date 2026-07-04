@@ -33,3 +33,35 @@ def get_user_by_sub(conn, cognito_sub) -> dict | None:
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_COLS} FROM users WHERE cognito_sub=%s", (cognito_sub,)
     ).fetchone()
+
+
+def list_company_users(conn, company_id) -> list[dict]:
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM users WHERE company_id=%s ORDER BY created_at",
+        (company_id,),
+    ).fetchall()
+
+
+def set_global_role(conn, cognito_sub, company_id, global_role) -> dict | None:
+    """Explicit role SET (admin action). Company-guarded: refuses to touch a
+    row outside the caller's company (cross-tenant write = returns None)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE users SET global_role=%s "
+        f"WHERE cognito_sub=%s AND company_id=%s RETURNING {_COLS}",
+        (global_role, cognito_sub, company_id),
+    ).fetchone()
+
+
+def update_profile(conn, cognito_sub, first_name=None, last_name=None,
+                   avatar_s3_key=None) -> dict | None:
+    """Self-service profile update. None = leave unchanged (same semantics
+    as upsert_user). Role/company are NOT touchable here by design."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE users SET "
+        f"  first_name=COALESCE(%(first)s, first_name), "
+        f"  last_name=COALESCE(%(last)s, last_name), "
+        f"  avatar_s3_key=COALESCE(%(avatar)s, avatar_s3_key) "
+        f"WHERE cognito_sub=%(sub)s RETURNING {_COLS}",
+        {"sub": cognito_sub, "first": first_name, "last": last_name,
+         "avatar": avatar_s3_key},
+    ).fetchone()

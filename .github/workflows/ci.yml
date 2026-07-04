@@ -21,5 +21,5 @@ jobs:
         with: { python-version: '3.11' }
       - name: Install cfn-lint
         run: pip install cfn-lint
-      - name: Lint SAM template (handles the SAM transform)
-        run: cfn-lint src/template.yaml
+      - name: Lint CloudFormation templates (SAM transform + plain CFN)
+        run: cfn-lint src/template.yaml infra/db-template.yaml

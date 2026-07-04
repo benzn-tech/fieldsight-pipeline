@@ -22,3 +22,19 @@ def list_company_sites(conn, company_id) -> list[dict]:
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_COLS} FROM sites WHERE company_id=%s ORDER BY created_at", (company_id,)
     ).fetchall()
+
+
+def list_sites_by_ids(conn, site_ids) -> list[dict]:
+    if not site_ids:
+        return []  # ANY('{}') is valid SQL but skip the round-trip
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM sites WHERE id = ANY(%s) ORDER BY created_at",
+        (list(site_ids),),
+    ).fetchall()
+
+
+def get_company_site_by_name(conn, company_id, name) -> dict | None:
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM sites WHERE company_id=%s AND name=%s",
+        (company_id, name),
+    ).fetchone()

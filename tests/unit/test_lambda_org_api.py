@@ -1,0 +1,416 @@
+import json
+
+import pytest
+
+org = pytest.importorskip("lambda_org_api", reason="requires psycopg (installed in CI)")
+
+
+def make_event(method, path, sub="sub-1", body=None, params=None):
+    return {
+        "httpMethod": method,
+        "path": path,
+        "queryStringParameters": params,
+        "body": json.dumps(body) if body is not None else None,
+        "requestContext": {"authorizer": {"claims": {"sub": sub} if sub else {}}},
+    }
+
+
+class FakeConn:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+CALLER = {
+    "id": "u-uuid-1", "cognito_sub": "sub-1", "company_id": "c-uuid-1",
+    "email": "a@x.nz", "first_name": "Ada", "last_name": "L",
+    "avatar_s3_key": None, "global_role": "admin", "created_at": "2026-07-04",
+}
+
+
+@pytest.fixture
+def wired(monkeypatch):
+    """Wire a FakeConn and a default admin caller; tests override as needed."""
+    monkeypatch.setattr(org, "get_connection", lambda *a, **k: FakeConn())
+    monkeypatch.setattr(org.users, "get_user_by_sub",
+                        lambda conn, sub: dict(CALLER) if sub == "sub-1" else None)
+    return monkeypatch
+
+
+def body_of(res):
+    return json.loads(res["body"])
+
+
+def test_unknown_caller_403(wired):
+    res = org.lambda_handler(make_event("GET", "/api/org/me", sub="sub-ghost"), None)
+    assert res["statusCode"] == 403
+
+
+def test_caller_without_company_403(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "company_id": None})
+    res = org.lambda_handler(make_event("GET", "/api/org/me"), None)
+    assert res["statusCode"] == 403
+
+
+def test_get_me_returns_profile_and_sites(wired):
+    wired.setattr(org.memberships, "accessible_site_ids",
+                  lambda conn, uid, role: ["s-uuid-1", "s-uuid-2"])
+    res = org.lambda_handler(make_event("GET", "/api/org/me"), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["cognito_sub"] == "sub-1"
+    assert b["global_role"] == "admin"
+    assert b["site_ids"] == ["s-uuid-1", "s-uuid-2"]
+    assert res["headers"]["Access-Control-Allow-Origin"] == "*"
+
+
+def test_patch_me_updates_profile_fields_only(wired):
+    seen = {}
+
+    def fake_update(conn, sub, first_name=None, last_name=None, avatar_s3_key=None):
+        seen.update(sub=sub, first=first_name, last=last_name, avatar=avatar_s3_key)
+        return {**CALLER, "first_name": first_name or CALLER["first_name"]}
+
+    wired.setattr(org.users, "update_profile", fake_update)
+    wired.setattr(org.memberships, "accessible_site_ids", lambda *a: [])
+    res = org.lambda_handler(make_event("PATCH", "/api/org/me", body={
+        "first_name": "Grace", "global_role": "admin"}), None)
+    assert res["statusCode"] == 200
+    assert seen["first"] == "Grace"
+    assert seen["avatar"] is None  # role key ignored, not smuggled anywhere
+
+
+def test_patch_me_rejects_foreign_avatar_key(wired):
+    res = org.lambda_handler(make_event("PATCH", "/api/org/me", body={
+        "avatar_s3_key": "reports/2026-03-02/evil.json"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_unknown_route_404(wired):
+    res = org.lambda_handler(make_event("GET", "/api/org/nope"), None)
+    assert res["statusCode"] == 404
+
+
+def test_malformed_json_400(wired):
+    ev = make_event("PATCH", "/api/org/me")
+    ev["body"] = "{not json"
+    res = org.lambda_handler(ev, None)
+    assert res["statusCode"] == 400
+
+
+def test_list_sites_admin_gets_company_sites(wired):
+    wired.setattr(org.sites, "list_company_sites",
+                  lambda conn, cid: [{"id": "s-1", "name": "Alpha"}])
+    res = org.lambda_handler(make_event("GET", "/api/org/sites"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["sites"] == [{"id": "s-1", "name": "Alpha"}]
+
+
+def test_list_sites_worker_gets_membership_sites(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    wired.setattr(org.memberships, "accessible_site_ids",
+                  lambda conn, uid, role: ["s-2"])
+    wired.setattr(org.sites, "list_sites_by_ids",
+                  lambda conn, ids: [{"id": i, "name": "Beta"} for i in ids])
+    res = org.lambda_handler(make_event("GET", "/api/org/sites"), None)
+    assert body_of(res)["sites"] == [{"id": "s-2", "name": "Beta"}]
+
+
+def test_create_site_admin_ok(wired):
+    created = {}
+
+    def fake_create(conn, company_id, name, location=None, client=None,
+                    industry=None, icon_s3_key=None):
+        created.update(company_id=company_id, name=name, location=location)
+        return {"id": "s-new", "company_id": company_id, "name": name}
+
+    wired.setattr(org.sites, "create_site", fake_create)
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "New Site", "location": "Chch"}), None)
+    assert res["statusCode"] == 201
+    assert created == {"company_id": "c-uuid-1", "name": "New Site", "location": "Chch"}
+
+
+def test_create_site_worker_403(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res = org.lambda_handler(make_event("POST", "/api/org/sites",
+                                        body={"name": "X"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_create_site_requires_name(wired):
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={}), None)
+    assert res["statusCode"] == 400
+
+
+def test_list_members_joins_memberships(wired):
+    wired.setattr(org.users, "list_company_users", lambda conn, cid: [
+        {"id": "u-1", "cognito_sub": "sub-1", "email": "a@x.nz"},
+        {"id": "u-2", "cognito_sub": "sub-2", "email": "b@x.nz"},
+    ])
+    wired.setattr(org.memberships, "list_company_memberships", lambda conn, cid: [
+        {"user_id": "u-1", "cognito_sub": "sub-1", "site_id": "s-1", "role": "worker"},
+    ])
+    res = org.lambda_handler(make_event("GET", "/api/org/members"), None)
+    assert res["statusCode"] == 200
+    members = body_of(res)["members"]
+    assert members[0]["memberships"] == [{"site_id": "s-1", "role": "worker"}]
+    assert members[1]["memberships"] == []
+
+
+def test_list_members_worker_403(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res = org.lambda_handler(make_event("GET", "/api/org/members"), None)
+    assert res["statusCode"] == 403
+
+
+def test_patch_role_admin_ok(wired):
+    seen = {}
+
+    def fake_set(conn, sub, company_id, role):
+        seen.update(sub=sub, company_id=company_id, role=role)
+        return {**CALLER, "cognito_sub": sub, "global_role": role}
+
+    wired.setattr(org.users, "set_global_role", fake_set)
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/role", body={"global_role": "pm"}), None)
+    assert res["statusCode"] == 200
+    assert seen == {"sub": "sub-2", "company_id": "c-uuid-1", "role": "pm"}
+
+
+def test_patch_role_rejects_unknown_role(wired):
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/role", body={"global_role": "root"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_patch_role_gm_403(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "gm"})
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/role", body={"global_role": "pm"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_patch_role_unknown_target_404(wired):
+    wired.setattr(org.users, "set_global_role", lambda *a: None)
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-ghost/role", body={"global_role": "pm"}), None)
+    assert res["statusCode"] == 404
+
+
+class FakeCognito:
+    def __init__(self, exists=False):
+        self.exists = exists
+        self.created = []
+
+    def admin_create_user(self, **kw):
+        if self.exists:
+            raise self.exceptions.UsernameExistsException(
+                {"Error": {"Code": "UsernameExistsException", "Message": "exists"}},
+                "AdminCreateUser")
+        self.created.append(kw)
+        return {"User": {"Attributes": [
+            {"Name": "sub", "Value": "sub-new"},
+            {"Name": "email", "Value": kw["Username"]},
+        ]}}
+
+    def admin_get_user(self, **kw):
+        return {"UserAttributes": [{"Name": "sub", "Value": "sub-existing"}]}
+
+    class exceptions:
+        class UsernameExistsException(Exception):
+            def __init__(self, *a, **k):
+                super().__init__("exists")
+
+
+@pytest.fixture
+def member_wired(wired):
+    fake = FakeCognito()
+    wired.setattr(org, "_cognito_client", fake)
+    wired.setattr(org.users, "upsert_user",
+                  lambda conn, sub, email, **kw: {
+                      "id": "u-new", "cognito_sub": sub, "email": email, **kw})
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": "c-uuid-1"})
+    wired.setattr(org.memberships, "ensure_membership",
+                  lambda conn, uid, sid, role: {
+                      "user_id": uid, "site_id": sid, "role": role})
+    return wired, fake
+
+
+def test_create_member_creates_and_enrolls(member_wired):
+    wired, fake = member_wired
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@x.nz", "first_name": "New", "global_role": "site_manager",
+        "memberships": [{"site_id": "s-1", "role": "site_manager"}],
+    }), None)
+    assert res["statusCode"] == 201
+    b = body_of(res)
+    assert b["user"]["cognito_sub"] == "sub-new"
+    assert b["memberships"] == [{"user_id": "u-new", "site_id": "s-1",
+                                 "role": "site_manager"}]
+    assert fake.created[0]["Username"] == "new@x.nz"
+    assert fake.created[0]["UserPoolId"] == org.COGNITO_USER_POOL_ID
+
+
+def test_create_member_existing_cognito_user_is_idempotent(member_wired):
+    wired, fake = member_wired
+    fake.exists = True
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "old@x.nz"}), None)
+    assert res["statusCode"] == 201
+    assert body_of(res)["user"]["cognito_sub"] == "sub-existing"
+
+
+def test_create_member_rejects_bad_global_role(member_wired):
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz", "global_role": "superuser"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_create_member_rejects_foreign_site(member_wired):
+    wired, fake = member_wired
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": "OTHER-company"})
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz", "memberships": [{"site_id": "s-9", "role": "worker"}],
+    }), None)
+    assert res["statusCode"] == 403
+
+
+def test_create_member_rejects_bad_membership_role(member_wired):
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz", "memberships": [{"site_id": "s-1", "role": "admin"}],
+    }), None)
+    assert res["statusCode"] == 400
+
+
+def test_create_member_rejects_cross_company_existing_user(member_wired):
+    wired, fake = member_wired
+    fake.exists = True
+
+    def by_sub(conn, sub):
+        if sub == "sub-1":
+            return dict(CALLER)
+        if sub == "sub-existing":
+            return {**CALLER, "cognito_sub": "sub-existing", "company_id": "OTHER-co"}
+        return None
+
+    wired.setattr(org.users, "get_user_by_sub", by_sub)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "taken@x.nz"}), None)
+    assert res["statusCode"] == 409
+
+
+def test_create_member_same_company_reinvite_preserves_role(member_wired):
+    wired, fake = member_wired
+    fake.exists = True
+    seen = {}
+
+    def by_sub(conn, sub):
+        if sub == "sub-1":
+            return dict(CALLER)
+        if sub == "sub-existing":
+            return {**CALLER, "cognito_sub": "sub-existing", "global_role": "pm"}
+        return None
+
+    def fake_upsert(conn, sub, email, **kw):
+        seen.update(kw)
+        return {"id": "u-x", "cognito_sub": sub, "email": email}
+
+    wired.setattr(org.users, "get_user_by_sub", by_sub)
+    wired.setattr(org.users, "upsert_user", fake_upsert)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "taken@x.nz"}), None)
+    assert res["statusCode"] == 201
+    assert seen["global_role"] is None  # not demoted to "worker"
+
+
+def test_create_member_non_admin_403(member_wired):
+    wired, fake = member_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "gm"})
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz"}), None)
+    assert res["statusCode"] == 403
+
+
+class FakeS3:
+    def generate_presigned_url(self, op, Params=None, ExpiresIn=0):
+        self.last = {"op": op, "params": Params, "expires": ExpiresIn}
+        return "https://s3.example/" + Params["Key"]
+
+
+@pytest.fixture
+def presign_wired(wired):
+    fake = FakeS3()
+    wired.setattr(org, "_s3_client", fake)
+    return wired, fake
+
+
+def test_upload_url_avatar(presign_wired):
+    wired, fake = presign_wired
+    res = org.lambda_handler(make_event("POST", "/api/org/upload-url", body={
+        "kind": "avatar", "content_type": "image/png"}), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["key"].startswith("org-assets/avatars/sub-1/")
+    assert b["key"].endswith(".png")
+    assert fake.last["op"] == "put_object"
+    assert fake.last["params"]["ContentType"] == "image/png"
+
+
+def test_upload_url_site_icon_admin_gets_owner_scoped_key(presign_wired):
+    wired, fake = presign_wired
+    res = org.lambda_handler(make_event("POST", "/api/org/upload-url", body={
+        "kind": "site_icon", "content_type": "image/webp"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["key"].startswith("org-assets/site-icons/sub-1/")
+
+
+def test_upload_url_site_icon_worker_403(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res = org.lambda_handler(make_event("POST", "/api/org/upload-url", body={
+        "kind": "site_icon", "content_type": "image/png"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_upload_url_rejects_content_type(presign_wired):
+    res = org.lambda_handler(make_event("POST", "/api/org/upload-url", body={
+        "kind": "avatar", "content_type": "application/x-sh"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_asset_url_prefix_guard(presign_wired):
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/asset-url", params={"key": "reports/2026/secret.json"}), None)
+    assert res["statusCode"] == 400
+    res2 = org.lambda_handler(make_event(
+        "GET", "/api/org/asset-url",
+        params={"key": "org-assets/avatars/sub-1/a.png"}), None)
+    assert res2["statusCode"] == 200
+    assert body_of(res2)["url"].endswith("a.png")
+
+
+def test_patch_me_avatar_must_be_caller_scoped(wired):
+    res = org.lambda_handler(make_event("PATCH", "/api/org/me", body={
+        "avatar_s3_key": "org-assets/avatars/sub-OTHER/x.png"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_non_string_inputs_get_400_not_500(wired):
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/role", body={"global_role": ["admin"]}), None)
+    assert res["statusCode"] == 400
+    res2 = org.lambda_handler(make_event(
+        "POST", "/api/org/sites", body={"name": 123}), None)
+    assert res2["statusCode"] == 400
