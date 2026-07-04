@@ -38,6 +38,14 @@ Parameters:
       route table). Gateway endpoints attach to route tables, not subnets.
       Pass via parameter-overrides — never hardcode.
 
+  EndpointSubnetIds:
+    Type: CommaDelimitedList
+    Description: >
+      Subnet ids for the cognito-idp interface endpoint. Interface endpoints
+      bill per AZ (~$7.3/month each) — test passes ONE subnet to stay on the
+      approved ~$8/month budget; in-VPC Lambdas in other AZs still reach the
+      endpoint ENI. Pass via parameter-overrides.
+
 # ============================================================
 # Resources
 # ============================================================
@@ -82,7 +90,7 @@ Resources:
   # In-VPC Lambdas have no NAT: any AWS API call without an endpoint
   # black-holes until timeout with zero logs (BUG-36). OrgApiFunction
   # needs cognito-idp (admin-create/list users); the seed function also
-  # reads S3 config. Interface endpoint ~$8/month; gateway endpoint free.
+  # reads S3 config. Interface endpoint bills per AZ (test: 1 subnet ~$8/month); gateway endpoint free.
   # ----------------------------------------------------------
   # Endpoint-side SG: ingress 443 ONLY from LambdaSG.
   EndpointSG:
@@ -106,7 +114,7 @@ Resources:
       VpcEndpointType: Interface
       ServiceName: !Sub com.amazonaws.${AWS::Region}.cognito-idp
       VpcId: !Ref VpcId
-      SubnetIds: !Ref SubnetIds
+      SubnetIds: !Ref EndpointSubnetIds
       SecurityGroupIds:
         - !GetAtt EndpointSG.GroupId
       PrivateDnsEnabled: true
