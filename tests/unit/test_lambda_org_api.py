@@ -103,7 +103,7 @@ def test_malformed_json_400(wired):
 
 def test_list_sites_admin_gets_company_sites(wired):
     wired.setattr(org.sites, "list_company_sites",
-                  lambda conn, cid: [{"id": "s-1", "name": "Alpha"}])
+                  lambda conn, cid, include_archived=False: [{"id": "s-1", "name": "Alpha"}])
     res = org.lambda_handler(make_event("GET", "/api/org/sites"), None)
     assert res["statusCode"] == 200
     assert body_of(res)["sites"] == [{"id": "s-1", "name": "Alpha"}]
@@ -149,7 +149,7 @@ def test_create_site_requires_name(wired):
 
 
 def test_list_members_joins_memberships(wired):
-    wired.setattr(org.users, "list_company_users", lambda conn, cid: [
+    wired.setattr(org.users, "list_company_users", lambda conn, cid, include_archived=False: [
         {"id": "u-1", "cognito_sub": "sub-1", "email": "a@x.nz"},
         {"id": "u-2", "cognito_sub": "sub-2", "email": "b@x.nz"},
     ])
@@ -340,6 +340,90 @@ def test_create_member_non_admin_403(member_wired):
     res = org.lambda_handler(make_event("POST", "/api/org/members", body={
         "email": "x@x.nz"}), None)
     assert res["statusCode"] == 403
+
+
+def test_archived_caller_blocked_except_get_me(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "archived_at": "2026-07-04"})
+    wired.setattr(org.memberships, "accessible_site_ids", lambda *a: [])
+    assert org.lambda_handler(make_event("GET", "/api/org/me"), None)["statusCode"] == 200
+    assert org.lambda_handler(make_event("GET", "/api/org/sites"), None)["statusCode"] == 403
+    assert org.lambda_handler(make_event("POST", "/api/org/sites", body={"name": "X"}), None)["statusCode"] == 403
+
+
+def test_archive_site_admin_ok_and_404(wired):
+    seen = {}
+    wired.setattr(org.sites, "archive_site",
+                  lambda conn, sid, cid: (seen.update(sid=sid, cid=cid)
+                                          or {"id": sid, "archived_at": "2026-07-04"}))
+    res = org.lambda_handler(make_event("POST", "/api/org/sites/s-1/archive"), None)
+    assert res["statusCode"] == 200
+    assert seen == {"sid": "s-1", "cid": "c-uuid-1"}
+    wired.setattr(org.sites, "archive_site", lambda conn, sid, cid: None)
+    assert org.lambda_handler(make_event("POST", "/api/org/sites/s-9/archive"), None)["statusCode"] == 404
+
+
+def test_unarchive_site_routes(wired):
+    wired.setattr(org.sites, "unarchive_site",
+                  lambda conn, sid, cid: {"id": sid, "archived_at": None})
+    res = org.lambda_handler(make_event("POST", "/api/org/sites/s-1/unarchive"), None)
+    assert res["statusCode"] == 200 and body_of(res)["archived_at"] is None
+
+
+def test_archive_site_worker_403(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    assert org.lambda_handler(make_event("POST", "/api/org/sites/s-1/archive"), None)["statusCode"] == 403
+
+
+def test_archive_member_ok_but_never_self(wired):
+    wired.setattr(org.users, "archive_user",
+                  lambda conn, sub, cid: {"cognito_sub": sub, "archived_at": "x"})
+    assert org.lambda_handler(make_event("POST", "/api/org/members/sub-2/archive"), None)["statusCode"] == 200
+    # self-archive -> 400 (last-admin lockout guard)
+    assert org.lambda_handler(make_event("POST", "/api/org/members/sub-1/archive"), None)["statusCode"] == 400
+    # unarchive self is fine (row can't be reached anyway while archived, but no self-guard needed)
+    wired.setattr(org.users, "unarchive_user", lambda conn, sub, cid: {"cognito_sub": sub, "archived_at": None})
+    assert org.lambda_handler(make_event("POST", "/api/org/members/sub-2/unarchive"), None)["statusCode"] == 200
+
+
+def test_include_archived_param_admin_only(wired):
+    seen = {}
+
+    def fake_list(conn, cid, include_archived=False):
+        seen["inc"] = include_archived
+        return []
+
+    wired.setattr(org.sites, "list_company_sites", fake_list)
+    ev = make_event("GET", "/api/org/sites")
+    ev["queryStringParameters"] = {"include_archived": "1"}
+    org.lambda_handler(ev, None)
+    assert seen["inc"] is True
+    # workers never get archived rows (membership path has no include flag)
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    wired.setattr(org.memberships, "accessible_site_ids", lambda *a: [])
+    wired.setattr(org.sites, "list_sites_by_ids", lambda conn, ids: [])
+    ev2 = make_event("GET", "/api/org/sites")
+    ev2["queryStringParameters"] = {"include_archived": "1"}
+    assert org.lambda_handler(ev2, None)["statusCode"] == 200  # ignored, not honored
+
+
+def test_create_member_archived_same_company_409(member_wired):
+    wired, fake = member_wired
+    fake.exists = True
+
+    def by_sub(conn, sub):
+        if sub == "sub-1":
+            return dict(CALLER)
+        if sub == "sub-existing":
+            return {**CALLER, "cognito_sub": "sub-existing", "archived_at": "2026-07-01"}
+        return None
+
+    wired.setattr(org.users, "get_user_by_sub", by_sub)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "back@x.nz"}), None)
+    assert res["statusCode"] == 409
 
 
 class FakeS3:

@@ -111,6 +111,8 @@ def dispatch(conn, event, method, route):
         return error("caller not provisioned in org database (run seed?)", 403)
     if not caller["company_id"]:
         return error("caller has no company", 403)
+    if caller.get("archived_at") is not None and not (route == "/me" and method == "GET"):
+        return error("account archived", 403)
 
     if route == "/me":
         if method == "GET":
@@ -120,18 +122,24 @@ def dispatch(conn, event, method, route):
 
     if route == "/sites":
         if method == "GET":
-            return list_org_sites(conn, caller)
+            return list_org_sites(conn, caller, event)
         if method == "POST":
             return create_org_site(conn, caller, parse_body(event))
 
     if route == "/members":
         if method == "GET":
-            return list_members(conn, caller)
+            return list_members(conn, caller, event)
         if method == "POST":
             return create_member(conn, caller, parse_body(event))
     m = re.match(r"^/members/([^/]+)/role$", route)
     if m and method == "PATCH":
         return patch_member_role(conn, caller, m.group(1), parse_body(event))
+    m_sa = re.match(r"^/sites/([^/]+)/(archive|unarchive)$", route)
+    if m_sa and method == "POST":
+        return archive_site_endpoint(conn, caller, m_sa.group(1), m_sa.group(2))
+    m_ma = re.match(r"^/members/([^/]+)/(archive|unarchive)$", route)
+    if m_ma and method == "POST":
+        return archive_member_endpoint(conn, caller, m_ma.group(1), m_ma.group(2))
 
     if route == "/upload-url" and method == "POST":
         return create_upload_url(conn, caller, parse_body(event))
@@ -173,10 +181,14 @@ def patch_me(conn, caller, body):
 # ----------------------------------------------------------
 # /sites
 # ----------------------------------------------------------
-def list_org_sites(conn, caller):
+def list_org_sites(conn, caller, event):
+    include_archived = ((event.get("queryStringParameters") or {})
+                        .get("include_archived") == "1")
     if resolve_scope(caller["global_role"]) == "ALL":
-        rows = sites.list_company_sites(conn, caller["company_id"])
+        rows = sites.list_company_sites(conn, caller["company_id"],
+                                        include_archived=include_archived)
     else:
+        # membership scope never includes archived rows (param ignored)
         ids = memberships.accessible_site_ids(
             conn, caller["id"], caller["global_role"])
         rows = sites.list_sites_by_ids(conn, ids)
@@ -208,10 +220,13 @@ def create_org_site(conn, caller, body):
 # ----------------------------------------------------------
 # /members
 # ----------------------------------------------------------
-def list_members(conn, caller):
+def list_members(conn, caller, event):
     if resolve_scope(caller["global_role"]) != "ALL":
         return error("admin or gm role required", 403)
-    rows = users.list_company_users(conn, caller["company_id"])
+    include_archived = ((event.get("queryStringParameters") or {})
+                        .get("include_archived") == "1")
+    rows = users.list_company_users(conn, caller["company_id"],
+                                    include_archived=include_archived)
     per_user = {}
     for mem in memberships.list_company_memberships(conn, caller["company_id"]):
         per_user.setdefault(mem["user_id"], []).append(
@@ -289,6 +304,8 @@ def create_member(conn, caller, body):
     existing = users.get_user_by_sub(conn, sub)
     if existing and existing["company_id"] and existing["company_id"] != caller["company_id"]:
         return error("user already belongs to another company", 409)
+    if existing and existing["company_id"] == caller["company_id"] and existing.get("archived_at"):
+        return error("user is archived — unarchive them instead", 409)
 
     user = users.upsert_user(
         conn, sub, email,
@@ -300,6 +317,31 @@ def create_member(conn, caller, body):
     created = [memberships.ensure_membership(conn, user["id"], mem["site_id"],
                                              mem["role"]) for mem in wanted]
     return ok({"user": user, "memberships": created}, 201)
+
+
+# ----------------------------------------------------------
+# archive / unarchive (admin/gm, company-guarded)
+# ----------------------------------------------------------
+def archive_site_endpoint(conn, caller, site_id, action):
+    if resolve_scope(caller["global_role"]) != "ALL":
+        return error("admin or gm role required", 403)
+    fn = sites.archive_site if action == "archive" else sites.unarchive_site
+    row = fn(conn, site_id, caller["company_id"])
+    if row is None:
+        return error("site not found in your company", 404)
+    return ok(row)
+
+
+def archive_member_endpoint(conn, caller, target_sub, action):
+    if resolve_scope(caller["global_role"]) != "ALL":
+        return error("admin or gm role required", 403)
+    if action == "archive" and target_sub == caller["cognito_sub"]:
+        return error("cannot archive yourself", 400)
+    fn = users.archive_user if action == "archive" else users.unarchive_user
+    row = fn(conn, target_sub, caller["company_id"])
+    if row is None:
+        return error("member not found in your company", 404)
+    return ok(row)
 
 
 # ----------------------------------------------------------
