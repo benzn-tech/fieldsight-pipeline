@@ -22,4 +22,4 @@ jobs:
       - name: Install cfn-lint
         run: pip install cfn-lint
       - name: Lint SAM template (handles the SAM transform)
-        run: cfn-lint src/template.yaml
+        run: cfn-lint src/template.yaml infra/db-template.yaml
