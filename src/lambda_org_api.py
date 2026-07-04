@@ -118,6 +118,12 @@ def dispatch(conn, event, method, route):
         if method == "PATCH":
             return patch_me(conn, caller, parse_body(event))
 
+    if route == "/sites":
+        if method == "GET":
+            return list_org_sites(conn, caller)
+        if method == "POST":
+            return create_org_site(conn, caller, parse_body(event))
+
     return error("not found", 404)
 
 
@@ -146,3 +152,35 @@ def patch_me(conn, caller, body):
     if row is None:
         return error("user not found", 404)
     return ok(row)
+
+
+# ----------------------------------------------------------
+# /sites
+# ----------------------------------------------------------
+def list_org_sites(conn, caller):
+    if resolve_scope(caller["global_role"]) == "ALL":
+        rows = sites.list_company_sites(conn, caller["company_id"])
+    else:
+        ids = memberships.accessible_site_ids(
+            conn, caller["id"], caller["global_role"])
+        rows = sites.list_sites_by_ids(conn, ids)
+    return ok({"sites": rows})
+
+
+def create_org_site(conn, caller, body):
+    if caller["global_role"] not in ("admin", "gm"):
+        return error("admin or gm role required", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    name = (body.get("name") or "").strip()
+    if not name:
+        return error("name is required", 400)
+    icon = body.get("icon_s3_key")
+    if icon is not None and not str(icon).startswith(ORG_ASSETS_PREFIX):
+        return error(f"icon_s3_key must start with {ORG_ASSETS_PREFIX}", 400)
+    row = sites.create_site(
+        conn, caller["company_id"], name,
+        location=body.get("location"), client=body.get("client"),
+        industry=body.get("industry"), icon_s3_key=icon,
+    )
+    return ok(row, 201)

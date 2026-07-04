@@ -99,3 +99,50 @@ def test_malformed_json_400(wired):
     ev["body"] = "{not json"
     res = org.lambda_handler(ev, None)
     assert res["statusCode"] == 400
+
+
+def test_list_sites_admin_gets_company_sites(wired):
+    wired.setattr(org.sites, "list_company_sites",
+                  lambda conn, cid: [{"id": "s-1", "name": "Alpha"}])
+    res = org.lambda_handler(make_event("GET", "/api/org/sites"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["sites"] == [{"id": "s-1", "name": "Alpha"}]
+
+
+def test_list_sites_worker_gets_membership_sites(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    wired.setattr(org.memberships, "accessible_site_ids",
+                  lambda conn, uid, role: ["s-2"])
+    wired.setattr(org.sites, "list_sites_by_ids",
+                  lambda conn, ids: [{"id": i, "name": "Beta"} for i in ids])
+    res = org.lambda_handler(make_event("GET", "/api/org/sites"), None)
+    assert body_of(res)["sites"] == [{"id": "s-2", "name": "Beta"}]
+
+
+def test_create_site_admin_ok(wired):
+    created = {}
+
+    def fake_create(conn, company_id, name, location=None, client=None,
+                    industry=None, icon_s3_key=None):
+        created.update(company_id=company_id, name=name, location=location)
+        return {"id": "s-new", "company_id": company_id, "name": name}
+
+    wired.setattr(org.sites, "create_site", fake_create)
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "New Site", "location": "Chch"}), None)
+    assert res["statusCode"] == 201
+    assert created == {"company_id": "c-uuid-1", "name": "New Site", "location": "Chch"}
+
+
+def test_create_site_worker_403(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res = org.lambda_handler(make_event("POST", "/api/org/sites",
+                                        body={"name": "X"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_create_site_requires_name(wired):
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={}), None)
+    assert res["statusCode"] == 400
