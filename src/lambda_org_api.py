@@ -427,7 +427,14 @@ def _relocate_asset(pending_key, final_key):
                          CopySource={"Bucket": S3_BUCKET, "Key": pending_key},
                          Key=final_key)
     except ClientError as e:
-        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+        # A missing copy source normally surfaces as NoSuchKey/404, but this
+        # role holds no s3:ListBucket (least-privilege), so S3 returns
+        # AccessDenied/403 for a nonexistent source rather than leaking its
+        # existence. Within org-assets/* (where we DO hold object perms), any
+        # of these means the pending upload is gone → caller returns 400
+        # ("upload expired"). Verified against live S3 in the 3b smoke test.
+        if e.response.get("Error", {}).get("Code") in (
+                "NoSuchKey", "404", "AccessDenied", "403"):
             return False
         raise
     s3().delete_object(Bucket=S3_BUCKET, Key=pending_key)

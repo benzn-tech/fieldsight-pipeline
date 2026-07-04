@@ -449,7 +449,9 @@ class FakeS3:
     def copy_object(self, Bucket=None, CopySource=None, Key=None):
         if self.missing_source:
             from botocore.exceptions import ClientError
-            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "CopyObject")
+            # Real S3 returns AccessDenied (not NoSuchKey) for a missing copy
+            # source when the role lacks s3:ListBucket — confirmed in 3b smoke.
+            raise ClientError({"Error": {"Code": "AccessDenied"}}, "CopyObject")
         self.copied.append((CopySource["Key"], Key))
 
     def delete_object(self, Bucket=None, Key=None):
