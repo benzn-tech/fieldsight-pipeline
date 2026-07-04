@@ -186,6 +186,8 @@ report_chunks(id pk, site_id fk, user_id fk, source_s3_key, topic_id fk null,
 
 ## Phase 4 — 事件驱动抽取 + Dashboard 时效性
 
+> **入场门(用户 2026-07-04 增设):** 正式开建前,先用真实报告(如 2026-03-02,19 topics)按已定切片策略产出**切片样例**(topic 块 + transcript 窗口 + metadata,含超长切分与 overlap 演示),交用户审核通过后才动工。
+
 **目标:** 会议/巡场结束后**一小时内(通常几分钟)**内容出现在 Dashboard,SM/PM 可即刻复制发部门;日报降级为夜间归档。
 
 **关键步骤:**
@@ -241,3 +243,4 @@ report_chunks(id pk, site_id fk, user_id fk, source_s3_key, topic_id fk null,
 - **地基:** Phase 2 Aurora+pgvector+schema。
 - **并行推进:** Phase 3(写流程)‖ Phase 4(Dashboard 时效)。
 - **之后:** Phase 5 Ask agent;Phase 6 规模门槛项。
+- **备选(用户 2026-07-03 提出,未决):** 两仓合并为 monorepo(以 fieldsight-pipeline 为主,fieldsight-ui 迁入)。做的话需迁移 Amplify 源(webhook 指向新仓+子目录 build spec)与两套 CI 的路径过滤;不影响账号/数据(全在 AWS,不在仓里)。建议等 Phase 1 IaC 理顺后再评估。
