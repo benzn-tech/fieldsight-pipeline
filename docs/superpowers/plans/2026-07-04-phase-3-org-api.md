@@ -1414,12 +1414,15 @@ with:
             # deployed UI with its prod-pool token. NB: this trusts prod
             # tokens on ALL /api/* routes of the TEST gateway; test-stage
             # data only, acceptable by design (2026-07-04).
-            UserPoolArn: !If
-              - HasOrgPool
-              - - !GetAtt UserPool.Arn
-                - !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${OrgUserPoolId}
+            UserPoolArn:
               - !GetAtt UserPool.Arn
+              - !If
+                - HasOrgPool
+                - !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${OrgUserPoolId}
+                - !Ref AWS::NoValue
 ```
+
+AMENDED 2026-07-04: original !If-wraps-list form produced nested providerARNs through the SAM transform (review-caught); literal list + AWS::NoValue element is the verified correct encoding.
 
 - [ ] **Step 4: Add OrgApiFunction + log group**
 

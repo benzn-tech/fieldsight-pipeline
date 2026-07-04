@@ -12,20 +12,11 @@ Description: >
 # parameter-overrides whenever DbStackName is set. Parameters have no
 # per-item Metadata, so this is suppressed template-wide (the only
 # List/CommaDelimitedList param with an empty default in this template).
-#
-# W1028 (Phase 3): OrgApiFunction is the first Conditioned (HasOrgApi)
-# AWS::Serverless::Function with an implicit Api event in this template.
-# SAM's transform wraps the generated swagger method body in a nested
-# Fn::If for the Condition; cfn-lint's reachability checker then flags an
-# inner branch as unreachable. The nesting is SAM-generated, not authored
-# here, and the deployed template resolves correctly either way — false
-# positive, suppressed template-wide.
 Metadata:
   cfn-lint:
     config:
       ignore_checks:
         - W1030
-        - W1028
 
 # ============================================================
 # Parameters - Configure during deployment
@@ -739,6 +730,16 @@ Resources:
 
   FieldSightApi:
     Type: AWS::Serverless::Api
+    Metadata:
+      # W1028 (unreachable Fn::If branch) fires on SAM's OWN Swagger-merge
+      # output: the unconditioned Api body conditionally splices the
+      # HasOrgApi-gated OrgApiFunction path, nesting Fn::If in generated
+      # boilerplate. Suppressed here (resource-level) so a real unreachable
+      # Fn::If elsewhere in the template still lints.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1028
     Properties:
       StageName: prod
       Cors:
@@ -755,11 +756,12 @@ Resources:
             # deployed UI with its prod-pool token. NB: this trusts prod
             # tokens on ALL /api/* routes of the TEST gateway; test-stage
             # data only, acceptable by design (2026-07-04).
-            UserPoolArn: !If
-              - HasOrgPool
-              - - !GetAtt UserPool.Arn
-                - !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${OrgUserPoolId}
+            UserPoolArn:
               - !GetAtt UserPool.Arn
+              - !If
+                - HasOrgPool
+                - !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${OrgUserPoolId}
+                - !Ref AWS::NoValue
 
   # ----------------------------------------------------------
   # Lambda 7: REST API Backend
