@@ -445,7 +445,7 @@ def test_upload_url_avatar(presign_wired):
         "kind": "avatar", "content_type": "image/png"}), None)
     assert res["statusCode"] == 200
     b = body_of(res)
-    assert b["key"].startswith("org-assets/avatars/sub-1/")
+    assert b["key"].startswith("org-assets/pending/sub-1/")
     assert b["key"].endswith(".png")
     assert fake.last["op"] == "put_object"
     assert fake.last["params"]["ContentType"] == "image/png"
@@ -456,7 +456,7 @@ def test_upload_url_site_icon_admin_gets_owner_scoped_key(presign_wired):
     res = org.lambda_handler(make_event("POST", "/api/org/upload-url", body={
         "kind": "site_icon", "content_type": "image/webp"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res)["key"].startswith("org-assets/site-icons/sub-1/")
+    assert body_of(res)["key"].startswith("org-assets/pending/sub-1/")
 
 
 def test_upload_url_site_icon_worker_403(presign_wired):
@@ -483,6 +483,13 @@ def test_asset_url_prefix_guard(presign_wired):
         params={"key": "org-assets/avatars/sub-1/a.png"}), None)
     assert res2["statusCode"] == 200
     assert body_of(res2)["url"].endswith("a.png")
+
+
+def test_asset_url_rejects_pending_reads(presign_wired):
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/asset-url",
+        params={"key": "org-assets/pending/sub-1/x.png"}), None)
+    assert res["statusCode"] == 400
 
 
 def test_patch_me_avatar_must_be_caller_scoped(wired):

@@ -359,16 +359,19 @@ def create_upload_url(conn, caller, body):
         return error(f"content_type must be one of {sorted(ALLOWED_IMAGE_TYPES)}", 400)
     kind = body.get("kind")
     if kind == "avatar":
-        key = f"{ORG_ASSETS_PREFIX}avatars/{caller['cognito_sub']}/{uuid.uuid4().hex}.{ext}"
+        pass
     elif kind == "site_icon":
         # Icons are uploaded BEFORE the site row exists (the UI create-modal
         # picks the image during creation), so keys scope by uploader sub,
         # not site id; POST /sites then stores the returned key.
         if caller["global_role"] not in ("admin", "gm"):
             return error("admin or gm role required", 403)
-        key = f"{ORG_ASSETS_PREFIX}site-icons/{caller['cognito_sub']}/{uuid.uuid4().hex}.{ext}"
     else:
         return error("kind must be avatar or site_icon", 400)
+    # Upload lands in a pending prefix; patch_me / site create+patch relocate
+    # it to the permanent key on commit. Abandoned uploads are swept by the
+    # 1-day S3 lifecycle rule on org-assets/pending/.
+    key = f"{ORG_ASSETS_PREFIX}pending/{caller['cognito_sub']}/{uuid.uuid4().hex}.{ext}"
     url = s3().generate_presigned_url(
         "put_object",
         Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": content_type},
@@ -381,6 +384,8 @@ def get_asset_url(event):
     key = (event.get("queryStringParameters") or {}).get("key", "")
     if not key.startswith(ORG_ASSETS_PREFIX):
         return error(f"key must start with {ORG_ASSETS_PREFIX}", 400)
+    if key.startswith(f"{ORG_ASSETS_PREFIX}pending/"):
+        return error("pending uploads are not readable — commit them first", 400)
     url = s3().generate_presigned_url(
         "get_object",
         Params={"Bucket": S3_BUCKET, "Key": key},
