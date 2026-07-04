@@ -15,6 +15,9 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   PATCH /api/org/members/{sub}/role       → explicit global role set (admin)
   POST  /api/org/upload-url               → presigned PUT for avatar / site icon
   GET   /api/org/asset-url?key=…          → presigned GET for an org asset
+  PATCH /api/org/sites/{id}               → update site fields / swap icon (admin/gm)
+  POST  /api/org/sites/{id}/(un)archive   → soft-delete / restore site (admin/gm)
+  POST  /api/org/members/{sub}/(un)archive→ soft-delete / restore member (admin/gm, never self)
 
 Credentials: PG* env vars injected at deploy time (BUG-36 — no runtime
 Secrets Manager call from a NAT-less VPC). Cognito calls need the
@@ -135,6 +138,9 @@ def dispatch(conn, event, method, route):
     m = re.match(r"^/members/([^/]+)/role$", route)
     if m and method == "PATCH":
         return patch_member_role(conn, caller, m.group(1), parse_body(event))
+    m_sp = re.match(r"^/sites/([^/]+)$", route)
+    if m_sp and method == "PATCH":
+        return patch_org_site(conn, caller, m_sp.group(1), parse_body(event))
     m_sa = re.match(r"^/sites/([^/]+)/(archive|unarchive)$", route)
     if m_sa and method == "POST":
         return archive_site_endpoint(conn, caller, m_sa.group(1), m_sa.group(2))
@@ -240,6 +246,40 @@ def create_org_site(conn, caller, body):
             return error("upload expired or missing — please re-upload the image", 400)
         row = sites.set_site_icon(conn, row["id"], final_icon)
     return ok(row, 201)
+
+
+def patch_org_site(conn, caller, site_id, body):
+    if caller["global_role"] not in ("admin", "gm"):
+        return error("admin or gm role required", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    name = body.get("name")
+    if name is not None:
+        if not isinstance(name, str) or not name.strip():
+            return error("name must be a non-empty string", 400)
+        name = name.strip()
+    icon = body.get("icon_s3_key")
+    if icon is not None:
+        pending_prefix = f"{ORG_ASSETS_PREFIX}pending/{caller['cognito_sub']}/"
+        if not isinstance(icon, str) or not icon.startswith(pending_prefix):
+            return error(f"icon_s3_key must be your pending upload ({pending_prefix}…)", 400)
+    row = sites.update_site(
+        conn, site_id, caller["company_id"],
+        name=name, location=body.get("location"),
+        client=body.get("client"), industry=body.get("industry"),
+    )
+    if row is None:
+        return error("site not found in your company", 404)
+    if icon is not None:
+        old_icon = row.get("icon_s3_key")
+        fname = icon.rsplit("/", 1)[-1]
+        final_icon = f"{ORG_ASSETS_PREFIX}site-icons/{site_id}/{fname}"
+        if not _relocate_asset(icon, final_icon):
+            return error("upload expired or missing — please re-upload the image", 400)
+        row = sites.set_site_icon(conn, site_id, final_icon)
+        if old_icon and old_icon != final_icon:
+            _delete_asset(old_icon)
+    return ok(row)
 
 
 # ----------------------------------------------------------

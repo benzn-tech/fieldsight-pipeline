@@ -577,3 +577,42 @@ def test_create_site_relocates_pending_icon(presign_wired):
     assert fake.copied == [(pending, "org-assets/site-icons/s-new/ic.png")]
     assert seticon == {"sid": "s-new", "key": "org-assets/site-icons/s-new/ic.png"}
     assert pending in fake.deleted
+
+
+def test_patch_site_updates_fields(wired):
+    seen = {}
+    wired.setattr(org.sites, "update_site",
+                  lambda conn, sid, cid, **kw: (seen.update(sid=sid, cid=cid, **kw)
+                                                or {"id": sid, "name": kw.get("name") or "Old",
+                                                    "icon_s3_key": None}))
+    res = org.lambda_handler(make_event("PATCH", "/api/org/sites/s-1",
+                                        body={"name": "Renamed", "location": "Akl"}), None)
+    assert res["statusCode"] == 200
+    assert seen["sid"] == "s-1" and seen["cid"] == "c-uuid-1"
+    assert seen["name"] == "Renamed" and seen["location"] == "Akl"
+
+
+def test_patch_site_worker_403_and_missing_404(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    assert org.lambda_handler(make_event("PATCH", "/api/org/sites/s-1",
+                                         body={"name": "X"}), None)["statusCode"] == 403
+    wired.setattr(org.users, "get_user_by_sub", lambda conn, sub: dict(CALLER))
+    wired.setattr(org.sites, "update_site", lambda conn, sid, cid, **kw: None)
+    assert org.lambda_handler(make_event("PATCH", "/api/org/sites/s-9",
+                                         body={"name": "X"}), None)["statusCode"] == 404
+
+
+def test_patch_site_swaps_icon_and_deletes_old(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.sites, "update_site",
+                  lambda conn, sid, cid, **kw: {"id": sid, "name": "S",
+                                                "icon_s3_key": "org-assets/site-icons/s-1/old.png"})
+    wired.setattr(org.sites, "set_site_icon",
+                  lambda conn, sid, key: {"id": sid, "icon_s3_key": key})
+    pending = "org-assets/pending/sub-1/new.png"
+    res = org.lambda_handler(make_event("PATCH", "/api/org/sites/s-1",
+                                        body={"icon_s3_key": pending}), None)
+    assert res["statusCode"] == 200
+    assert fake.copied == [(pending, "org-assets/site-icons/s-1/new.png")]
+    assert pending in fake.deleted and "org-assets/site-icons/s-1/old.png" in fake.deleted
