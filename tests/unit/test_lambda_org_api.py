@@ -146,3 +146,60 @@ def test_create_site_worker_403(wired):
 def test_create_site_requires_name(wired):
     res = org.lambda_handler(make_event("POST", "/api/org/sites", body={}), None)
     assert res["statusCode"] == 400
+
+
+def test_list_members_joins_memberships(wired):
+    wired.setattr(org.users, "list_company_users", lambda conn, cid: [
+        {"id": "u-1", "cognito_sub": "sub-1", "email": "a@x.nz"},
+        {"id": "u-2", "cognito_sub": "sub-2", "email": "b@x.nz"},
+    ])
+    wired.setattr(org.memberships, "list_company_memberships", lambda conn, cid: [
+        {"user_id": "u-1", "cognito_sub": "sub-1", "site_id": "s-1", "role": "worker"},
+    ])
+    res = org.lambda_handler(make_event("GET", "/api/org/members"), None)
+    assert res["statusCode"] == 200
+    members = body_of(res)["members"]
+    assert members[0]["memberships"] == [{"site_id": "s-1", "role": "worker"}]
+    assert members[1]["memberships"] == []
+
+
+def test_list_members_worker_403(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res = org.lambda_handler(make_event("GET", "/api/org/members"), None)
+    assert res["statusCode"] == 403
+
+
+def test_patch_role_admin_ok(wired):
+    seen = {}
+
+    def fake_set(conn, sub, company_id, role):
+        seen.update(sub=sub, company_id=company_id, role=role)
+        return {**CALLER, "cognito_sub": sub, "global_role": role}
+
+    wired.setattr(org.users, "set_global_role", fake_set)
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/role", body={"global_role": "pm"}), None)
+    assert res["statusCode"] == 200
+    assert seen == {"sub": "sub-2", "company_id": "c-uuid-1", "role": "pm"}
+
+
+def test_patch_role_rejects_unknown_role(wired):
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/role", body={"global_role": "root"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_patch_role_gm_403(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "gm"})
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/role", body={"global_role": "pm"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_patch_role_unknown_target_404(wired):
+    wired.setattr(org.users, "set_global_role", lambda *a: None)
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-ghost/role", body={"global_role": "pm"}), None)
+    assert res["statusCode"] == 404

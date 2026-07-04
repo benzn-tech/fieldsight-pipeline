@@ -124,6 +124,15 @@ def dispatch(conn, event, method, route):
         if method == "POST":
             return create_org_site(conn, caller, parse_body(event))
 
+    if route == "/members":
+        if method == "GET":
+            return list_members(conn, caller)
+        if method == "POST":
+            return create_member(conn, caller, parse_body(event))
+    m = re.match(r"^/members/([^/]+)/role$", route)
+    if m and method == "PATCH":
+        return patch_member_role(conn, caller, m.group(1), parse_body(event))
+
     return error("not found", 404)
 
 
@@ -184,3 +193,37 @@ def create_org_site(conn, caller, body):
         industry=body.get("industry"), icon_s3_key=icon,
     )
     return ok(row, 201)
+
+
+# ----------------------------------------------------------
+# /members
+# ----------------------------------------------------------
+def list_members(conn, caller):
+    if resolve_scope(caller["global_role"]) != "ALL":
+        return error("admin or gm role required", 403)
+    rows = users.list_company_users(conn, caller["company_id"])
+    per_user = {}
+    for mem in memberships.list_company_memberships(conn, caller["company_id"]):
+        per_user.setdefault(mem["user_id"], []).append(
+            {"site_id": mem["site_id"], "role": mem["role"]})
+    for row in rows:
+        row["memberships"] = per_user.get(row["id"], [])
+    return ok({"members": rows})
+
+
+def patch_member_role(conn, caller, target_sub, body):
+    if caller["global_role"] != "admin":
+        return error("admin role required", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    role = body.get("global_role")
+    if role not in ALLOWED_GLOBAL_ROLES:
+        return error(f"global_role must be one of {sorted(ALLOWED_GLOBAL_ROLES)}", 400)
+    row = users.set_global_role(conn, target_sub, caller["company_id"], role)
+    if row is None:
+        return error("member not found in your company", 404)
+    return ok(row)
+
+
+def create_member(conn, caller, body):
+    return error("not implemented", 501)
