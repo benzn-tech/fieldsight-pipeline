@@ -76,3 +76,18 @@ def test_get_company_by_name(db):
     companies.create_company(db, "FindMe Ltd")
     assert get_company_by_name(db, "FindMe Ltd")["name"] == "FindMe Ltd"
     assert get_company_by_name(db, "Ghost Co") is None
+
+
+@pytest.mark.integration
+def test_list_company_memberships_excludes_cross_company_user(db):
+    """Defense-in-depth: a user from company B wrongly enrolled in a
+    company-A site must NOT appear in company A's membership listing."""
+    ca = companies.create_company(db, "XTen A")
+    cb = companies.create_company(db, "XTen B")
+    ua = users.upsert_user(db, "sub-xt-a", "a@xt.nz", company_id=ca["id"])
+    ub = users.upsert_user(db, "sub-xt-b", "b@xt.nz", company_id=cb["id"])
+    sa = sites.create_site(db, ca["id"], "XTen Site A")
+    ensure_membership(db, ua["id"], sa["id"], "worker")
+    ensure_membership(db, ub["id"], sa["id"], "worker")  # bad data simulation
+    rows = list_company_memberships(db, ca["id"])
+    assert [r["cognito_sub"] for r in rows] == ["sub-xt-a"]

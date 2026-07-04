@@ -46,7 +46,7 @@ def list_company_memberships(conn, company_id) -> list[dict]:
         "FROM memberships m "
         "JOIN users u ON u.id = m.user_id "
         "JOIN sites s ON s.id = m.site_id "
-        "WHERE s.company_id = %s "
+        "WHERE s.company_id = %s AND u.company_id = s.company_id "
         "ORDER BY u.created_at, m.created_at",
         (company_id,),
     ).fetchall()
