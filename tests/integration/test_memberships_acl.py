@@ -1,5 +1,8 @@
 import pytest
 from repositories import companies, users, sites, memberships
+from repositories.memberships import ensure_membership, list_company_memberships
+from repositories.sites import list_sites_by_ids as sites_list_by_ids, get_company_site_by_name
+from repositories.companies import get_company_by_name
 
 pytestmark = pytest.mark.integration
 
@@ -28,3 +31,48 @@ def test_admin_scope_is_company_bounded(db):
     admin_a = users.upsert_user(db, "sub-admin-a", "a@a.com", company_id=co_a["id"], global_role="admin")
     got = set(memberships.accessible_site_ids(db, admin_a["id"], "admin"))
     assert got == {sa["id"]}, "admin must not see other companies' sites"
+
+
+@pytest.mark.integration
+def test_ensure_membership_idempotent_role_update(db):
+    c = companies.create_company(db, "EnsureCo")
+    u = users.upsert_user(db, "sub-en-1", "e@x.nz", company_id=c["id"])
+    s = sites.create_site(db, c["id"], "Ensure Site")
+    m1 = ensure_membership(db, u["id"], s["id"], "worker")
+    m2 = ensure_membership(db, u["id"], s["id"], "site_manager")  # re-run: no raise
+    assert m1["id"] == m2["id"]
+    assert m2["role"] == "site_manager"
+
+
+@pytest.mark.integration
+def test_list_company_memberships_scoped(db):
+    c1 = companies.create_company(db, "MemCo A")
+    c2 = companies.create_company(db, "MemCo B")
+    u1 = users.upsert_user(db, "sub-me-1", "m1@x.nz", company_id=c1["id"])
+    u2 = users.upsert_user(db, "sub-me-2", "m2@x.nz", company_id=c2["id"])
+    s1 = sites.create_site(db, c1["id"], "Mem Site A")
+    s2 = sites.create_site(db, c2["id"], "Mem Site B")
+    ensure_membership(db, u1["id"], s1["id"], "worker")
+    ensure_membership(db, u2["id"], s2["id"], "worker")
+    rows = list_company_memberships(db, c1["id"])
+    assert [r["cognito_sub"] for r in rows] == ["sub-me-1"]
+    assert rows[0]["site_id"] == s1["id"]
+
+
+@pytest.mark.integration
+def test_sites_by_ids_and_by_name(db):
+    c = companies.create_company(db, "SiteLookupCo")
+    s1 = sites.create_site(db, c["id"], "Lookup One")
+    sites.create_site(db, c["id"], "Lookup Two")
+    assert sites_list_by_ids(db, []) == []
+    got = sites_list_by_ids(db, [s1["id"]])
+    assert [g["name"] for g in got] == ["Lookup One"]
+    assert get_company_site_by_name(db, c["id"], "Lookup Two")["name"] == "Lookup Two"
+    assert get_company_site_by_name(db, c["id"], "Nope") is None
+
+
+@pytest.mark.integration
+def test_get_company_by_name(db):
+    companies.create_company(db, "FindMe Ltd")
+    assert get_company_by_name(db, "FindMe Ltd")["name"] == "FindMe Ltd"
+    assert get_company_by_name(db, "Ghost Co") is None

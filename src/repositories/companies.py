@@ -7,3 +7,10 @@ def create_company(conn, name, industry=None) -> dict:
         "RETURNING id, name, industry, created_at",
         (name, industry),
     ).fetchone()
+
+
+def get_company_by_name(conn, name) -> dict | None:
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, name, industry, created_at FROM companies WHERE name=%s",
+        (name,),
+    ).fetchone()
