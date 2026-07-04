@@ -299,3 +299,77 @@ def test_create_member_non_admin_403(member_wired):
     res = org.lambda_handler(make_event("POST", "/api/org/members", body={
         "email": "x@x.nz"}), None)
     assert res["statusCode"] == 403
+
+
+class FakeS3:
+    def generate_presigned_url(self, op, Params=None, ExpiresIn=0):
+        self.last = {"op": op, "params": Params, "expires": ExpiresIn}
+        return "https://s3.example/" + Params["Key"]
+
+
+@pytest.fixture
+def presign_wired(wired):
+    fake = FakeS3()
+    wired.setattr(org, "_s3_client", fake)
+    return wired, fake
+
+
+def test_upload_url_avatar(presign_wired):
+    wired, fake = presign_wired
+    res = org.lambda_handler(make_event("POST", "/api/org/upload-url", body={
+        "kind": "avatar", "content_type": "image/png"}), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["key"].startswith("org-assets/avatars/sub-1/")
+    assert b["key"].endswith(".png")
+    assert fake.last["op"] == "put_object"
+    assert fake.last["params"]["ContentType"] == "image/png"
+
+
+def test_upload_url_site_icon_admin_gets_owner_scoped_key(presign_wired):
+    wired, fake = presign_wired
+    res = org.lambda_handler(make_event("POST", "/api/org/upload-url", body={
+        "kind": "site_icon", "content_type": "image/webp"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["key"].startswith("org-assets/site-icons/sub-1/")
+
+
+def test_upload_url_site_icon_worker_403(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res = org.lambda_handler(make_event("POST", "/api/org/upload-url", body={
+        "kind": "site_icon", "content_type": "image/png"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_upload_url_rejects_content_type(presign_wired):
+    res = org.lambda_handler(make_event("POST", "/api/org/upload-url", body={
+        "kind": "avatar", "content_type": "application/x-sh"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_asset_url_prefix_guard(presign_wired):
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/asset-url", params={"key": "reports/2026/secret.json"}), None)
+    assert res["statusCode"] == 400
+    res2 = org.lambda_handler(make_event(
+        "GET", "/api/org/asset-url",
+        params={"key": "org-assets/avatars/sub-1/a.png"}), None)
+    assert res2["statusCode"] == 200
+    assert body_of(res2)["url"].endswith("a.png")
+
+
+def test_patch_me_avatar_must_be_caller_scoped(wired):
+    res = org.lambda_handler(make_event("PATCH", "/api/org/me", body={
+        "avatar_s3_key": "org-assets/avatars/sub-OTHER/x.png"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_non_string_inputs_get_400_not_500(wired):
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/role", body={"global_role": ["admin"]}), None)
+    assert res["statusCode"] == 400
+    res2 = org.lambda_handler(make_event(
+        "POST", "/api/org/sites", body={"name": 123}), None)
+    assert res2["statusCode"] == 400

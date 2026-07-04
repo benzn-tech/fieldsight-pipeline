@@ -133,6 +133,11 @@ def dispatch(conn, event, method, route):
     if m and method == "PATCH":
         return patch_member_role(conn, caller, m.group(1), parse_body(event))
 
+    if route == "/upload-url" and method == "POST":
+        return create_upload_url(conn, caller, parse_body(event))
+    if route == "/asset-url" and method == "GET":
+        return get_asset_url(event)
+
     return error("not found", 404)
 
 
@@ -150,8 +155,10 @@ def patch_me(conn, caller, body):
     if body is None:
         return error("malformed JSON body", 400)
     avatar = body.get("avatar_s3_key")
-    if avatar is not None and not str(avatar).startswith(ORG_ASSETS_PREFIX):
-        return error(f"avatar_s3_key must start with {ORG_ASSETS_PREFIX}", 400)
+    own_prefix = f"{ORG_ASSETS_PREFIX}avatars/{caller['cognito_sub']}/"
+    if avatar is not None and (
+            not isinstance(avatar, str) or not avatar.startswith(own_prefix)):
+        return error(f"avatar_s3_key must start with {own_prefix}", 400)
     row = users.update_profile(
         conn, caller["cognito_sub"],
         first_name=body.get("first_name"),
@@ -181,7 +188,10 @@ def create_org_site(conn, caller, body):
         return error("admin or gm role required", 403)
     if body is None:
         return error("malformed JSON body", 400)
-    name = (body.get("name") or "").strip()
+    name_raw = body.get("name")
+    if name_raw is not None and not isinstance(name_raw, str):
+        return error("name must be a string", 400)
+    name = (name_raw or "").strip()
     if not name:
         return error("name is required", 400)
     icon = body.get("icon_s3_key")
@@ -217,7 +227,7 @@ def patch_member_role(conn, caller, target_sub, body):
     if body is None:
         return error("malformed JSON body", 400)
     role = body.get("global_role")
-    if role not in ALLOWED_GLOBAL_ROLES:
+    if not isinstance(role, str) or role not in ALLOWED_GLOBAL_ROLES:
         return error(f"global_role must be one of {sorted(ALLOWED_GLOBAL_ROLES)}", 400)
     row = users.set_global_role(conn, target_sub, caller["company_id"], role)
     if row is None:
@@ -238,13 +248,13 @@ def create_member(conn, caller, body):
     if not email or "@" not in email:
         return error("valid email is required", 400)
     global_role = body.get("global_role") or "worker"
-    if global_role not in ALLOWED_GLOBAL_ROLES:
+    if not isinstance(global_role, str) or global_role not in ALLOWED_GLOBAL_ROLES:
         return error(f"global_role must be one of {sorted(ALLOWED_GLOBAL_ROLES)}", 400)
     wanted = body.get("memberships") or []
     for mem in wanted:
         if not isinstance(mem, dict) or not mem.get("site_id"):
             return error("each membership needs a site_id", 400)
-        if mem.get("role") not in ALLOWED_MEMBERSHIP_ROLES:
+        if not isinstance(mem.get("role"), str) or mem.get("role") not in ALLOWED_MEMBERSHIP_ROLES:
             return error(
                 f"membership role must be one of {sorted(ALLOWED_MEMBERSHIP_ROLES)}", 400)
         site = sites.get_site(conn, mem["site_id"])
@@ -281,3 +291,48 @@ def create_member(conn, caller, body):
     created = [memberships.ensure_membership(conn, user["id"], mem["site_id"],
                                              mem["role"]) for mem in wanted]
     return ok({"user": user, "memberships": created}, 201)
+
+
+# ----------------------------------------------------------
+# assets (presigned PUT/GET; signing is offline — no VPC egress needed)
+# ----------------------------------------------------------
+ALLOWED_IMAGE_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+
+
+def create_upload_url(conn, caller, body):
+    if body is None:
+        return error("malformed JSON body", 400)
+    content_type = body.get("content_type")
+    ext = ALLOWED_IMAGE_TYPES.get(content_type) if isinstance(content_type, str) else None
+    if ext is None:
+        return error(f"content_type must be one of {sorted(ALLOWED_IMAGE_TYPES)}", 400)
+    kind = body.get("kind")
+    if kind == "avatar":
+        key = f"{ORG_ASSETS_PREFIX}avatars/{caller['cognito_sub']}/{uuid.uuid4().hex}.{ext}"
+    elif kind == "site_icon":
+        # Icons are uploaded BEFORE the site row exists (the UI create-modal
+        # picks the image during creation), so keys scope by uploader sub,
+        # not site id; POST /sites then stores the returned key.
+        if caller["global_role"] not in ("admin", "gm"):
+            return error("admin or gm role required", 403)
+        key = f"{ORG_ASSETS_PREFIX}site-icons/{caller['cognito_sub']}/{uuid.uuid4().hex}.{ext}"
+    else:
+        return error("kind must be avatar or site_icon", 400)
+    url = s3().generate_presigned_url(
+        "put_object",
+        Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": content_type},
+        ExpiresIn=PRESIGNED_URL_EXPIRY,
+    )
+    return ok({"url": url, "key": key, "expires_in": PRESIGNED_URL_EXPIRY})
+
+
+def get_asset_url(event):
+    key = (event.get("queryStringParameters") or {}).get("key", "")
+    if not key.startswith(ORG_ASSETS_PREFIX):
+        return error(f"key must start with {ORG_ASSETS_PREFIX}", 400)
+    url = s3().generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=PRESIGNED_URL_EXPIRY,
+    )
+    return ok({"url": url, "expires_in": PRESIGNED_URL_EXPIRY})
