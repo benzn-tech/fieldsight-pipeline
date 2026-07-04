@@ -427,9 +427,23 @@ def test_create_member_archived_same_company_409(member_wired):
 
 
 class FakeS3:
+    def __init__(self):
+        self.copied = []
+        self.deleted = []
+        self.missing_source = False
+
     def generate_presigned_url(self, op, Params=None, ExpiresIn=0):
         self.last = {"op": op, "params": Params, "expires": ExpiresIn}
         return "https://s3.example/" + Params["Key"]
+
+    def copy_object(self, Bucket=None, CopySource=None, Key=None):
+        if self.missing_source:
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "CopyObject")
+        self.copied.append((CopySource["Key"], Key))
+
+    def delete_object(self, Bucket=None, Key=None):
+        self.deleted.append(Key)
 
 
 @pytest.fixture
@@ -505,3 +519,61 @@ def test_non_string_inputs_get_400_not_500(wired):
     res2 = org.lambda_handler(make_event(
         "POST", "/api/org/sites", body={"name": 123}), None)
     assert res2["statusCode"] == 400
+
+
+def test_patch_me_relocates_pending_avatar_and_deletes_old(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "avatar_s3_key": "org-assets/avatars/sub-1/old.png"})
+    captured = {}
+    wired.setattr(org.users, "update_profile",
+                  lambda conn, sub, **kw: (captured.update(kw) or {**CALLER, **kw}))
+    pending = "org-assets/pending/sub-1/newhex.png"
+    res = org.lambda_handler(make_event("PATCH", "/api/org/me",
+                                        body={"avatar_s3_key": pending}), None)
+    assert res["statusCode"] == 200
+    assert captured["avatar_s3_key"] == "org-assets/avatars/sub-1/newhex.png"
+    assert fake.copied == [(pending, "org-assets/avatars/sub-1/newhex.png")]
+    assert pending in fake.deleted and "org-assets/avatars/sub-1/old.png" in fake.deleted
+
+
+def test_patch_me_expired_pending_400(presign_wired):
+    wired, fake = presign_wired
+    fake.missing_source = True
+    res = org.lambda_handler(make_event("PATCH", "/api/org/me",
+        body={"avatar_s3_key": "org-assets/pending/sub-1/gone.png"}), None)
+    assert res["statusCode"] == 400
+    assert "expired" in body_of(res)["error"]
+
+
+def test_patch_me_explicit_null_clears_avatar(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "avatar_s3_key": "org-assets/avatars/sub-1/old.png"})
+    wired.setattr(org.users, "update_profile",
+                  lambda conn, sub, **kw: {**CALLER, **kw})
+    wired.setattr(org.users, "clear_avatar",
+                  lambda conn, sub: {**CALLER, "avatar_s3_key": None})
+    res = org.lambda_handler(make_event("PATCH", "/api/org/me",
+                                        body={"avatar_s3_key": None}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["avatar_s3_key"] is None
+    assert "org-assets/avatars/sub-1/old.png" in fake.deleted
+    assert fake.copied == []
+
+
+def test_create_site_relocates_pending_icon(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.sites, "create_site",
+                  lambda conn, cid, name, **kw: {"id": "s-new", "name": name})
+    seticon = {}
+    wired.setattr(org.sites, "set_site_icon",
+                  lambda conn, sid, key: (seticon.update(sid=sid, key=key)
+                                          or {"id": sid, "icon_s3_key": key}))
+    pending = "org-assets/pending/sub-1/ic.png"
+    res = org.lambda_handler(make_event("POST", "/api/org/sites",
+        body={"name": "New", "icon_s3_key": pending}), None)
+    assert res["statusCode"] == 201
+    assert fake.copied == [(pending, "org-assets/site-icons/s-new/ic.png")]
+    assert seticon == {"sid": "s-new", "key": "org-assets/site-icons/s-new/ic.png"}
+    assert pending in fake.deleted

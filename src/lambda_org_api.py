@@ -27,6 +27,7 @@ import re
 import uuid
 
 import boto3
+from botocore.exceptions import ClientError
 
 from db.connection import get_connection
 from repositories import memberships, sites, users
@@ -162,19 +163,35 @@ def get_me(conn, caller):
 def patch_me(conn, caller, body):
     if body is None:
         return error("malformed JSON body", 400)
+    old_avatar = caller.get("avatar_s3_key")
     avatar = body.get("avatar_s3_key")
-    own_prefix = f"{ORG_ASSETS_PREFIX}avatars/{caller['cognito_sub']}/"
-    if avatar is not None and (
-            not isinstance(avatar, str) or not avatar.startswith(own_prefix)):
-        return error(f"avatar_s3_key must start with {own_prefix}", 400)
+    clear = "avatar_s3_key" in body and avatar is None
+    final_avatar = None
+    if avatar is not None:
+        pending_prefix = f"{ORG_ASSETS_PREFIX}pending/{caller['cognito_sub']}/"
+        if not isinstance(avatar, str) or not avatar.startswith(pending_prefix):
+            return error(f"avatar_s3_key must be your pending upload ({pending_prefix}…)", 400)
+        fname = avatar.rsplit("/", 1)[-1]
+        final_avatar = f"{ORG_ASSETS_PREFIX}avatars/{caller['cognito_sub']}/{fname}"
+        # Relocate BEFORE the DB write. A DB failure after this leaves at most
+        # one unreferenced object in avatars/ (rare; retry re-uploads) — same
+        # pragmatic tradeoff as create_member's Cognito orphan.
+        if not _relocate_asset(avatar, final_avatar):
+            return error("upload expired or missing — please re-upload the image", 400)
     row = users.update_profile(
         conn, caller["cognito_sub"],
         first_name=body.get("first_name"),
         last_name=body.get("last_name"),
-        avatar_s3_key=avatar,
+        avatar_s3_key=final_avatar,
     )
     if row is None:
         return error("user not found", 404)
+    if clear:
+        row = users.clear_avatar(conn, caller["cognito_sub"])
+        if old_avatar:
+            _delete_asset(old_avatar)
+    elif final_avatar and old_avatar and old_avatar != final_avatar:
+        _delete_asset(old_avatar)
     return ok(row)
 
 
@@ -207,13 +224,21 @@ def create_org_site(conn, caller, body):
     if not name:
         return error("name is required", 400)
     icon = body.get("icon_s3_key")
-    if icon is not None and not str(icon).startswith(ORG_ASSETS_PREFIX):
-        return error(f"icon_s3_key must start with {ORG_ASSETS_PREFIX}", 400)
+    if icon is not None:
+        pending_prefix = f"{ORG_ASSETS_PREFIX}pending/{caller['cognito_sub']}/"
+        if not isinstance(icon, str) or not icon.startswith(pending_prefix):
+            return error(f"icon_s3_key must be your pending upload ({pending_prefix}…)", 400)
     row = sites.create_site(
         conn, caller["company_id"], name,
         location=body.get("location"), client=body.get("client"),
-        industry=body.get("industry"), icon_s3_key=icon,
+        industry=body.get("industry"), icon_s3_key=None,
     )
+    if icon is not None:
+        fname = icon.rsplit("/", 1)[-1]
+        final_icon = f"{ORG_ASSETS_PREFIX}site-icons/{row['id']}/{fname}"
+        if not _relocate_asset(icon, final_icon):
+            return error("upload expired or missing — please re-upload the image", 400)
+        row = sites.set_site_icon(conn, row["id"], final_icon)
     return ok(row, 201)
 
 
@@ -348,6 +373,28 @@ def archive_member_endpoint(conn, caller, target_sub, action):
 # assets (presigned PUT/GET; signing is offline — no VPC egress needed)
 # ----------------------------------------------------------
 ALLOWED_IMAGE_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+
+
+def _relocate_asset(pending_key, final_key):
+    """Copy a committed upload from pending to its permanent key and delete
+    the pending object. Returns False when the pending object no longer
+    exists (lifecycle-expired or bogus key) — callers turn that into a 400.
+    S3 calls go through the S3 gateway endpoint (in-VPC, no NAT)."""
+    try:
+        s3().copy_object(Bucket=S3_BUCKET,
+                         CopySource={"Bucket": S3_BUCKET, "Key": pending_key},
+                         Key=final_key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return False
+        raise
+    s3().delete_object(Bucket=S3_BUCKET, Key=pending_key)
+    return True
+
+
+def _delete_asset(key):
+    if key and key.startswith(ORG_ASSETS_PREFIX):
+        s3().delete_object(Bucket=S3_BUCKET, Key=key)
 
 
 def create_upload_url(conn, caller, body):
