@@ -89,7 +89,7 @@
 ### 5.2 数据层——新增 org 请求通道
 - `api/_fetch.js` 加 `orgRequest(path, opts)` 薄包装:解析 `orgBaseUrl`,复用同一套认证(**裸 idToken——prod 池 token 经 dual-pool authorizer 在 org 网关一样过**)。不动现有 `request()`。X-Request-Id 的同源守卫天然排除跨源 org 网关(和现有 prod 跨源读同款,已验证可行)。
 - 新建 `api/org.js`:`getMe / updateProfile / getOrgSites / createOrgSite / getMembers / createMember / updateMemberRole / archiveMember / archiveSite / uploadUrl / assetUrl`。
-  - **门控**:org 读 gate on `!useMocks`(live→真实,否则 fixtures);org 写 gate on `!useMocks && orgWrites`(新开关,**不碰** `writeMocks`——programme/safety-create 等仍 mock)。
+  - **门控**(修订 2026-07-04):org 读 gate on `!useMocks && orgBaseUrl 非空`——`FS_ORG_BASEURL` 卸掉/置空 = org 域整体回 mock 的 **kill switch**(org 后端出问题可单独关,不影响报告读);org 写 gate on 读条件 `&& orgWrites`(**不碰** `writeMocks`——programme/safety-create 等仍 mock)。
   - **folder_name 派生**:`getMembers` 返回的每个成员补 `folder_name = name.replace(/ /g, '_')`(供 admin 聚合用)。
 
 ### 5.3 身份 / 会话
@@ -99,7 +99,7 @@
 - **/team**(`pages/team.js`):成员列表 → `org.getMembers`;加成员 → `org.createMember`;改角色 → `org.updateMemberRole`;归档成员 → `org.archiveMember`。公司级总览 + 工地过滤器(按 membership.site_id 过滤)。加成员弹窗**去掉头像选择器**(不能替别人设,决策 3)。
 - **/sites**(`pages/sites.js`):列表 → `org.getOrgSites`;建项目 → `org.createOrgSite`(图标走 presign);归档 → `org.archiveSite`。
 - **/settings**(`pages/settings.js`):`deriveProfile` → `org.getMe`;`saveProfile` 名字 → `org.updateProfile`(PATCH /me);头像走 presign。
-- **admin 聚合**(`api/compliance-aggregator.js`、`api/tasks-aggregator.js`、`pages/evidence.js` 三处):用户源从 `fixtures.sites.users` 换成 `org.getMembers`,`folder_name` 用派生字段。**注意**:报告数据工地归属的已知不一致(见范围),聚合仍按 folder_name 扇出,与现状一致。
+- **admin 聚合**(`api/compliance-aggregator.js`、`api/tasks-aggregator.js`、`pages/evidence.js` 三处):用户源从 `fixtures.sites.users` 换成 **prod 网关已有的 `GET /api/users`**(user_mapping 派生,与报告文件夹同空间)——**不是 org members**!(修订 2026-07-04 Fable 复审:org 库只有 4 登录用户,报告文件夹有 8 人——James Lamb/Jack Gibson/MPI1/MPI2 是设备映射用户非登录用户,换 org members 会让他们的真实报告从 admin 视图消失。登录身份≠报告身份。)org members 只驱动 /team 显示。
 - **归档 UI**:列表默认隐藏 `archived_at != null`;加"查看已归档"开关可恢复(`unarchive`)。
 
 ### 5.5 presign 上传接线
@@ -133,6 +133,28 @@
 - 归档 user 不禁 Cognito → 被归档的人仍能登录(登录后 `/me` 会 403"未在 org 库"吗?不会——users 行还在只是 archived;需决定 `/me` 对 archived caller 的行为:**建议 archived caller 仍能读自己 /me 但 /members 列表不含他**)。
 - pending 搬迁的 CopyObject 在 in-VPC Lambda 需经 S3 gateway endpoint(已就绪)——无 BUG-36 风险。
 - lifecycle 规则下发需 deploy role 加 `s3:PutLifecycleConfiguration`(权限门,给用户命令)。
+
+## 8b. 修订(2026-07-04 Fable 全文复审,用户已批)
+
+**批次 1(后端)增补——全部折进实施计划:**
+1. **归档 caller 语义**:dispatch 检查 `caller.archived_at`——写操作全 403「account archived」;`GET /me` 放行(返回含 `archived_at`,UI 可显示"账号已归档")。
+2. **已归档条目可发现**:`GET /sites`、`GET /members` 支持 `?include_archived=1`(仅 ALL-scope 即 admin/gm 生效),否则 unarchive UI 无数据可显示。
+3. **自我归档守卫**:`POST /members/{sub}/archive` 拒绝 `target == caller`(防唯一 admin 锁死组织)。
+4. **重邀已归档用户**:create_member 对同公司 archived 用户 → 409「user is archived — unarchive them instead」(不产生幽灵 201)。
+5. **ensure_membership 复活语义**:ON CONFLICT 同时 `SET archived_at=NULL`(重新加人=重新激活该 membership;副作用:seed 重跑会复活已归档 membership,并入已记录的 seed quirk)。
+6. **pending 过期防 500**:relocate 捕获 NoSuchKey → 400「upload expired — please re-upload」(用户表单挂过夜是真实路径)。
+7. **`PATCH /api/org/sites/{id}`**:已有站点改 name/location/client/industry + 换图标(pending 搬迁 + 删旧图标),admin/gm,公司守卫——UI 已有 setSiteIcon 交互,原 spec 漏了后端。
+8. **头像可清除**:`PATCH /me` 显式 `"avatar_s3_key": null`(键存在且为 null)→ 删旧对象 + 置 NULL(终审早已标记"无法清字段")。
+9. **asset-url 拒 pending 读**(收掉 §4.2 悬空的开放项):`GET /asset-url` 对 `org-assets/pending/` 前缀 400;UI 预览用本地 FileReader,不需要读 pending。
+10. 明确:unarchive(site/user)**不级联恢复** memberships——显式重加(=重新激活,见 5)。
+
+**批次 2(UI)修订——已改入 §5 正文:**
+- admin 聚合 fan-out 源 = prod `GET /api/users`(**非** org members;登录身份≠报告身份,详见 §5.4 修订注)。
+- org 读 kill switch = `FS_ORG_BASEURL` 非空(见 §5.2 修订注)。
+- **`GET /me` 403 降级**:未 provision/已归档用户登录时,hydrateUser 拿 403 → 不白屏,降级为只读 + 顶部提示「账号未激活/已归档,请联系管理员」,报告读功能照常(prod 网关不受影响)。
+- **ReassignModal(改成员工地归属)descope**:本批保持 mock(加人时已能指定工地;单独改归属留待设备管理批,见 memory 设备转交草图)。
+
+**另立批次(不在 1/2,方向已定,见 memory `fieldsight-recording-site-attribution-gap`):**设备转交管理(devices + device_assignments 生效日期表、assign 端点、自动导出 user_mapping.json、/team 设备页)——admin 在 UI 操作,org 库为 source of truth,管线零改动。
 
 ## 9. 与既有约定的一致性
 - 仓储永不 commit(caller 拥有事务);`with get_connection() as conn:` 提交/回滚。
