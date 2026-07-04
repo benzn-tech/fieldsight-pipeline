@@ -31,10 +31,11 @@ def accessible_site_ids(conn, user_id, global_role) -> list:
 
 def ensure_membership(conn, user_id, site_id, role) -> dict:
     """Idempotent add: re-running updates the role instead of raising on
-    the (user_id, site_id) UNIQUE constraint. Used by seed + member create."""
+    the (user_id, site_id) UNIQUE constraint. Used by seed + member create.
+    Re-adding an archived membership revives it (archived_at reset). NOTE: a seed re-run therefore revives archived memberships — folded into the documented seed re-run quirk."""
     return conn.cursor(row_factory=dict_row).execute(
         "INSERT INTO memberships (user_id, site_id, role) VALUES (%s, %s, %s) "
-        "ON CONFLICT (user_id, site_id) DO UPDATE SET role=EXCLUDED.role "
+        "ON CONFLICT (user_id, site_id) DO UPDATE SET role=EXCLUDED.role, archived_at=NULL "
         "RETURNING id, user_id, site_id, role, created_at",
         (user_id, site_id, role),
     ).fetchone()
