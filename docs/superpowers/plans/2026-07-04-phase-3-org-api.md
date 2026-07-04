@@ -1175,7 +1175,8 @@ git commit -m "feat(3): org api POST /members — cognito invite + upsert + memb
 
 **Interfaces:**
 - Consumes: `s3()` client `generate_presigned_url` (offline signing — no network needed), `sites.get_site`, `uuid`.
-- Produces: `POST /api/org/upload-url` body `{kind: "avatar"|"site_icon", content_type, site_id? (site_icon only)}` → `{url, key, expires_in}`; `GET /api/org/asset-url?key=org-assets/...` → `{url, expires_in}`. Content types limited to `image/jpeg|png|webp`; keys always server-generated under `org-assets/`; site icons require admin/gm + company-owned site.
+- Produces: `POST /api/org/upload-url` body `{kind: "avatar"|"site_icon", content_type}` → `{url, key, expires_in}`; `GET /api/org/asset-url?key=org-assets/...` → `{url, expires_in}`. Content types limited to `image/jpeg|png|webp`; keys always server-generated and OWNER-SCOPED: avatar → `org-assets/avatars/{caller_sub}/…`, site_icon → `org-assets/site-icons/{caller_sub}/…` (admin/gm only; NO site_id — icons upload BEFORE the site row exists in the UI create-modal flow, then `POST /sites` carries the returned `icon_s3_key`).
+- AMENDED 2026-07-04 (review-driven): original plan required site_id for site_icon — dead-end, since no PATCH /sites exists and creation needs the icon first. This task also folds in the reviewers' Minor batch: (a) `patch_me` avatar key must be caller-scoped (`org-assets/avatars/{caller_sub}/`), (b) `create_org_site` casts name via `str()`, (c) `patch_member_role` + `create_member` role checks get `isinstance(…, str)` guards (non-string JSON values must 400, not 500).
 
 - [ ] **Step 1: Write failing tests** (append)
 
@@ -1190,8 +1191,6 @@ class FakeS3:
 def presign_wired(wired):
     fake = FakeS3()
     wired.setattr(org, "_s3_client", fake)
-    wired.setattr(org.sites, "get_site",
-                  lambda conn, sid: {"id": sid, "company_id": "c-uuid-1"})
     return wired, fake
 
 
@@ -1207,12 +1206,20 @@ def test_upload_url_avatar(presign_wired):
     assert fake.last["params"]["ContentType"] == "image/png"
 
 
-def test_upload_url_site_icon_checks_company(presign_wired):
+def test_upload_url_site_icon_admin_gets_owner_scoped_key(presign_wired):
     wired, fake = presign_wired
-    wired.setattr(org.sites, "get_site",
-                  lambda conn, sid: {"id": sid, "company_id": "OTHER"})
     res = org.lambda_handler(make_event("POST", "/api/org/upload-url", body={
-        "kind": "site_icon", "content_type": "image/png", "site_id": "s-9"}), None)
+        "kind": "site_icon", "content_type": "image/webp"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["key"].startswith("org-assets/site-icons/sub-1/")
+
+
+def test_upload_url_site_icon_worker_403(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res = org.lambda_handler(make_event("POST", "/api/org/upload-url", body={
+        "kind": "site_icon", "content_type": "image/png"}), None)
     assert res["statusCode"] == 403
 
 
@@ -1231,6 +1238,21 @@ def test_asset_url_prefix_guard(presign_wired):
         params={"key": "org-assets/avatars/sub-1/a.png"}), None)
     assert res2["statusCode"] == 200
     assert body_of(res2)["url"].endswith("a.png")
+
+
+def test_patch_me_avatar_must_be_caller_scoped(wired):
+    res = org.lambda_handler(make_event("PATCH", "/api/org/me", body={
+        "avatar_s3_key": "org-assets/avatars/sub-OTHER/x.png"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_non_string_inputs_get_400_not_500(wired):
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/role", body={"global_role": ["admin"]}), None)
+    assert res["statusCode"] == 400
+    res2 = org.lambda_handler(make_event(
+        "POST", "/api/org/sites", body={"name": 123}), None)
+    assert res2["statusCode"] == 400
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -1261,23 +1283,20 @@ ALLOWED_IMAGE_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "w
 def create_upload_url(conn, caller, body):
     if body is None:
         return error("malformed JSON body", 400)
-    content_type = body.get("content_type", "")
-    ext = ALLOWED_IMAGE_TYPES.get(content_type)
+    content_type = body.get("content_type")
+    ext = ALLOWED_IMAGE_TYPES.get(content_type) if isinstance(content_type, str) else None
     if ext is None:
         return error(f"content_type must be one of {sorted(ALLOWED_IMAGE_TYPES)}", 400)
     kind = body.get("kind")
     if kind == "avatar":
         key = f"{ORG_ASSETS_PREFIX}avatars/{caller['cognito_sub']}/{uuid.uuid4().hex}.{ext}"
     elif kind == "site_icon":
+        # Icons are uploaded BEFORE the site row exists (the UI create-modal
+        # picks the image during creation), so keys scope by uploader sub,
+        # not site id; POST /sites then stores the returned key.
         if caller["global_role"] not in ("admin", "gm"):
             return error("admin or gm role required", 403)
-        site_id = body.get("site_id")
-        if not site_id:
-            return error("site_id is required for site_icon", 400)
-        site = sites.get_site(conn, site_id)
-        if site is None or site["company_id"] != caller["company_id"]:
-            return error("site not found in your company", 403)
-        key = f"{ORG_ASSETS_PREFIX}site-icons/{site_id}/{uuid.uuid4().hex}.{ext}"
+        key = f"{ORG_ASSETS_PREFIX}site-icons/{caller['cognito_sub']}/{uuid.uuid4().hex}.{ext}"
     else:
         return error("kind must be avatar or site_icon", 400)
     url = s3().generate_presigned_url(
@@ -1299,6 +1318,32 @@ def get_asset_url(event):
     )
     return ok({"url": url, "expires_in": PRESIGNED_URL_EXPIRY})
 ```
+
+- [ ] **Step 3b: Reviewer-batch polish of earlier handlers (same file)**
+
+Three surgical changes in `src/lambda_org_api.py`:
+
+(1) In `patch_me`, replace the avatar guard lines
+
+```python
+    avatar = body.get("avatar_s3_key")
+    if avatar is not None and not str(avatar).startswith(ORG_ASSETS_PREFIX):
+        return error(f"avatar_s3_key must start with {ORG_ASSETS_PREFIX}", 400)
+```
+
+with an owner-scoped guard:
+
+```python
+    avatar = body.get("avatar_s3_key")
+    own_prefix = f"{ORG_ASSETS_PREFIX}avatars/{caller['cognito_sub']}/"
+    if avatar is not None and (
+            not isinstance(avatar, str) or not avatar.startswith(own_prefix)):
+        return error(f"avatar_s3_key must start with {own_prefix}", 400)
+```
+
+(2) In `create_org_site`, change `    name = (body.get("name") or "").strip()` to `    name = str(body.get("name") or "").strip()` (non-string names must 400 via the empty-check, not crash to 500).
+
+(3) In `patch_member_role`, change `    if role not in ALLOWED_GLOBAL_ROLES:` to `    if not isinstance(role, str) or role not in ALLOWED_GLOBAL_ROLES:`. In `create_member`, change `    if global_role not in ALLOWED_GLOBAL_ROLES:` to `    if not isinstance(global_role, str) or global_role not in ALLOWED_GLOBAL_ROLES:` and change `        if mem.get("role") not in ALLOWED_MEMBERSHIP_ROLES:` to `        if not isinstance(mem.get("role"), str) or mem.get("role") not in ALLOWED_MEMBERSHIP_ROLES:` (unhashable JSON values raise TypeError → 500 without these).
 
 - [ ] **Step 4: Run tests**
 
