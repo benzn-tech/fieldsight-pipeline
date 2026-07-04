@@ -118,5 +118,8 @@ def lambda_handler(event, context):
 
     logger.info("seed done: company=%s users=%d sites=%d memberships=%d",
                 company_name, n_users, n_sites, n_memberships)
-    return {"company": company, "users": n_users,
-            "sites": n_sites, "memberships": n_memberships}
+    # company["id"] is a uuid.UUID (psycopg dict_row) — Lambda marshals the
+    # return value with plain json (no default=str, unlike the API's ok()),
+    # so coerce to str or the invoke fails with Runtime.MarshalError.
+    return {"company": {"id": str(company["id"]), "name": company["name"]},
+            "users": n_users, "sites": n_sites, "memberships": n_memberships}

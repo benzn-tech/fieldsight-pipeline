@@ -1,3 +1,6 @@
+import json
+import uuid
+
 import pytest
 
 seed = pytest.importorskip("lambda_org_seed", reason="requires psycopg (installed in CI)")
@@ -47,7 +50,7 @@ def test_handler_seeds_company_users_sites_memberships(monkeypatch):
     monkeypatch.setattr(seed, "list_cognito_users", lambda: COGNITO_USERS)
     monkeypatch.setattr(seed.companies, "get_company_by_name", lambda c, n: None)
     monkeypatch.setattr(seed.companies, "create_company",
-                        lambda c, n: {"id": "c-1", "name": n})
+                        lambda c, n: {"id": uuid.UUID("dc2eafa9-1260-4bd9-8d65-862f47dacb3c"), "name": n})
     monkeypatch.setattr(seed.sites, "get_company_site_by_name", lambda c, cid, n: None)
     monkeypatch.setattr(seed.sites, "create_site",
                         lambda c, cid, name, **kw: (calls["sites"].append(name)
@@ -66,3 +69,5 @@ def test_handler_seeds_company_users_sites_memberships(monkeypatch):
     assert calls["sites"] == ["SB1108 Ellesmere College"]
     assert calls["memberships"] == [("u-sub-jt", "s-SB1108", "site_manager")]
     assert out["users"] == 2 and out["sites"] == 1 and out["memberships"] == 1
+    assert isinstance(out["company"]["id"], str)  # UUID coerced to str
+    json.dumps(out)  # returned dict must be JSON-serializable (Lambda marshals it)

@@ -8,7 +8,7 @@
 
 ## 1. 当前状态一句话
 
-**Phase 0/1/2A/2B 全部完成**:新前端(Amplify dev)跑真实数据真实登录;TEST 后端管线全绿可复现;Postgres+pgvector 数据层代码+真库全部上线。**下一步 = Phase 3(组织写后端),架构已定稿待展开执行;Phase 4 有用户审核门。**
+**Phase 0/1/2A/2B/3(后端)全部完成**:新前端(Amplify dev)跑真实数据真实登录;TEST 后端管线全绿可复现;Postgres+pgvector 数据层代码+真库全部上线;**Phase 3 组织写后端已上线 TEST 并冒烟通过**(OrgApiFunction `/api/org/*` in-VPC 直连 Aurora,种子回填 company+4 用户+4 站点+memberships,`/me`·`/sites`·`/members` 均 200)。**下一步 = Phase 3 的 UI 接线(fieldsight-ui 仓,另起计划)+ Chrome 全流程验证;Phase 4(抽取→Postgres)有用户审核门。**
 
 ## 2. 活着的 Infra(全部 509194952652 / ap-southeast-2)
 
@@ -43,7 +43,19 @@
 7. 本地 checkout 状态:提交前必查 `git branch --show-current`(曾推错分支);用户的未提交 roadmap 笔记(monorepo 备选)在 pipeline 工作区,**保护它**。
 8. gh pr merge 本地脏区会 Abort → 用 `gh api -X PUT .../merge`。
 
-## 5. Phase 3 —— 架构已定稿(2026-07-04),待展开逐任务计划
+## 5. Phase 3 —— 后端已上线 TEST(2026-07-04),UI 接线待起
+
+> **已完成(commit 链 a48d8b6..PR#9 squash 2a23eda + seed fix PR#10)**:计划 `docs/superpowers/plans/2026-07-04-phase-3-org-api.md`(11 任务,逐任务审查 + 全分支终审,抓修 2 个必炸级:SAM transform 嵌套 providerARNs、create_member 跨租户改嫁)。
+> - **DB 栈**:db-template 加 cognito-idp interface(单 AZ ~$8/月)+ S3 gateway endpoints,均 available(BUG-36 出口)。
+> - **OrgApiFunction**(`fieldsight-test-org-api`,in-VPC,PsycopgLayer):`/api/org/{me,sites,members,members/{sub}/role,upload-url,asset-url}` 挂 test `FieldSightApi`;dual-pool authorizer(test 池 + prod 池 `q88pd6XXr`)。
+> - **OrgSeedFunction**(`fieldsight-test-org-seed`,手动 invoke,幂等):已回填 Aurora = company `FieldSight` + 4 用户(benl.tech=admin/+jt·+db=site_manager/+test=worker)+ 4 站点(线上 config 含 Mangere,比 repo 多 1)+ 2 memberships。
+> - **冒烟(合成 admin claims 直接 invoke)**:`/me`(scope=ALL,4 site_ids)、`/sites`(4)、`/members`(4 含 join)全部 200,证明 in-VPC→Aurora 连通 + ACL + join。
+> - **仓储扩展**:users(list/set_global_role 公司守卫/update_profile)、memberships(ensure_membership/list_company_memberships 双 JOIN 防越权)、sites/companies 查询。asset key 服务端生成属主前缀隔离。
+> - **CI/CD**:deploy.yml 加 `OrgUserPoolId` + Wire-bucket-CORS;deploy role 加 `s3:PutBucketCORS`(test 桶);test 桶补 `config/user_mapping.json`。
+>
+> **未做/待办**:① 端到端过网关(真 idToken 走 dual-pool authorizer)—— 留给 UI 计划的 Chrome 验证;② **UI 接线(下一个计划,fieldsight-ui 仓)**:env.js 加 `FS_ORG_BASEURL`(指 test 网关 `wdsgobb7b0`)+ `FS_ORGWRITES` 开关(只放行 org 写,其余仍 mock)、team/settings/sites 页面接真实 org API、admin fan-out 换真实成员源、头像/图标走 presign;③ seed 二跑会重置映射角色(API 改过的会被覆盖);④ post-merge backlog:连接缓存+parse-before-connect、asset-url 租户隔离(第二家公司入库前)、CORS 通配收紧(prod 前);⑤ **test 栈 OrgApi 持有 prod 池 `AdminCreateUser`**——"test 不碰 prod"的唯一有意例外(建真实登录 + 发真实邮件邀请)。
+
+### 原始架构定稿(存档)
 
 **目标**:项目/成员/角色/资料/图片的真实写后端,UI 写流程去 mock。
 
