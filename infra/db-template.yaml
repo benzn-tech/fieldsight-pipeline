@@ -91,6 +91,9 @@ Resources:
   # black-holes until timeout with zero logs (BUG-36). OrgApiFunction
   # needs cognito-idp (admin-create/list users); the seed function also
   # reads S3 config. Interface endpoint bills per AZ (test: 1 subnet ~$8/month); gateway endpoint free.
+  # NOTE: PrivateDnsEnabled rewires cognito-idp DNS for the WHOLE VPC —
+  # any future in-VPC caller NOT in LambdaSG will be blocked by EndpointSG
+  # and black-hole per BUG-36. Add its SG to EndpointSG ingress if needed.
   # ----------------------------------------------------------
   # Endpoint-side SG: ingress 443 ONLY from LambdaSG.
   EndpointSG:

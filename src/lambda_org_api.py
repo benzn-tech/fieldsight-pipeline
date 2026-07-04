@@ -239,7 +239,11 @@ def create_member(conn, caller, body):
     """Admin-only. Creates the Cognito login (email invite w/ temp password),
     the Aurora profile, and site memberships. Idempotent: an existing Cognito
     user is looked up instead of failing, and the DB writes are upserts —
-    safe to retry after a partial failure (Cognito ok, DB rolled back)."""
+    safe to retry after a partial failure (Cognito ok, DB rolled back).
+    An existing user keeps their current global_role unless global_role is
+    explicitly sent in the body (no silent reset to "worker" on re-invite).
+    If the resolved Cognito user already belongs to another company, the
+    request is rejected with 409 rather than re-parenting them."""
     if caller["global_role"] != "admin":
         return error("admin role required", 403)
     if body is None:
@@ -247,8 +251,9 @@ def create_member(conn, caller, body):
     email = (body.get("email") or "").strip().lower()
     if not email or "@" not in email:
         return error("valid email is required", 400)
-    global_role = body.get("global_role") or "worker"
-    if not isinstance(global_role, str) or global_role not in ALLOWED_GLOBAL_ROLES:
+    global_role = body.get("global_role")
+    if global_role is not None and (
+            not isinstance(global_role, str) or global_role not in ALLOWED_GLOBAL_ROLES):
         return error(f"global_role must be one of {sorted(ALLOWED_GLOBAL_ROLES)}", 400)
     wanted = body.get("memberships") or []
     for mem in wanted:
@@ -280,6 +285,10 @@ def create_member(conn, caller, body):
         resp = client.admin_get_user(UserPoolId=COGNITO_USER_POOL_ID, Username=email)
         attrs = resp["UserAttributes"]
     sub = next(a["Value"] for a in attrs if a["Name"] == "sub")
+
+    existing = users.get_user_by_sub(conn, sub)
+    if existing and existing["company_id"] and existing["company_id"] != caller["company_id"]:
+        return error("user already belongs to another company", 409)
 
     user = users.upsert_user(
         conn, sub, email,

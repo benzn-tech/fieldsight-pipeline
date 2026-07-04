@@ -4,7 +4,7 @@ Lambda: fieldsight-org-seed v1.0 — one-shot idempotent org backfill (Phase 3)
 Manual invoke only. Creates the company row, mirrors the Cognito user pool
 (real login users) into Aurora users, creates sites from S3
 config/user_mapping.json, and enrolls mapped users as memberships.
-Re-running changes nothing (get-or-create + upserts).
+Re-running creates nothing new — but it RE-APPLIES mapping/admin-derived roles, overwriting any role changed later via the org API.
 
 Event: {"company_name"?: str, "admin_emails"?: [str]}
 Needs: cognito-idp interface endpoint + S3 gateway endpoint (in-VPC, no NAT).

@@ -137,6 +137,7 @@ aws cloudformation deploy \
     Stage=test \
     "VpcId=$VPC_ID" \
     "SubnetIds=subnet-082dd4480f7e20014,subnet-08b15b36113e542d4,subnet-05fb05613cf529121" \
+    "EndpointSubnetIds=subnet-082dd4480f7e20014" \
     "RouteTableIds=$RT_ID"
 ```
 

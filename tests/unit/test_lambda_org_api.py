@@ -292,6 +292,47 @@ def test_create_member_rejects_bad_membership_role(member_wired):
     assert res["statusCode"] == 400
 
 
+def test_create_member_rejects_cross_company_existing_user(member_wired):
+    wired, fake = member_wired
+    fake.exists = True
+
+    def by_sub(conn, sub):
+        if sub == "sub-1":
+            return dict(CALLER)
+        if sub == "sub-existing":
+            return {**CALLER, "cognito_sub": "sub-existing", "company_id": "OTHER-co"}
+        return None
+
+    wired.setattr(org.users, "get_user_by_sub", by_sub)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "taken@x.nz"}), None)
+    assert res["statusCode"] == 409
+
+
+def test_create_member_same_company_reinvite_preserves_role(member_wired):
+    wired, fake = member_wired
+    fake.exists = True
+    seen = {}
+
+    def by_sub(conn, sub):
+        if sub == "sub-1":
+            return dict(CALLER)
+        if sub == "sub-existing":
+            return {**CALLER, "cognito_sub": "sub-existing", "global_role": "pm"}
+        return None
+
+    def fake_upsert(conn, sub, email, **kw):
+        seen.update(kw)
+        return {"id": "u-x", "cognito_sub": sub, "email": email}
+
+    wired.setattr(org.users, "get_user_by_sub", by_sub)
+    wired.setattr(org.users, "upsert_user", fake_upsert)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "taken@x.nz"}), None)
+    assert res["statusCode"] == 201
+    assert seen["global_role"] is None  # not demoted to "worker"
+
+
 def test_create_member_non_admin_403(member_wired):
     wired, fake = member_wired
     wired.setattr(org.users, "get_user_by_sub",
