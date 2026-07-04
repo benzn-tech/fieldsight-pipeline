@@ -12,11 +12,20 @@ Description: >
 # parameter-overrides whenever DbStackName is set. Parameters have no
 # per-item Metadata, so this is suppressed template-wide (the only
 # List/CommaDelimitedList param with an empty default in this template).
+#
+# W1028 (Phase 3): OrgApiFunction is the first Conditioned (HasOrgApi)
+# AWS::Serverless::Function with an implicit Api event in this template.
+# SAM's transform wraps the generated swagger method body in a nested
+# Fn::If for the Condition; cfn-lint's reachability checker then flags an
+# inner branch as unreachable. The nesting is SAM-generated, not authored
+# here, and the deployed template resolves correctly either way — false
+# positive, suppressed template-wide.
 Metadata:
   cfn-lint:
     config:
       ignore_checks:
         - W1030
+        - W1028
 
 # ============================================================
 # Parameters - Configure during deployment
@@ -206,6 +215,16 @@ Parameters:
       empty default is valid when DbStackName is unset.
     Default: ''
 
+  OrgUserPoolId:
+    Type: String
+    Description: >
+      Existing Cognito user pool id that real app users log in with (the
+      prod pool). When set together with DbStackName, deploys the org API
+      and adds this pool to the FieldSightApi authorizer so the UI's raw
+      idToken is accepted on /api/org/*. Leave empty to skip (prod/default
+      deploys are unaffected).
+    Default: ''
+
 # ============================================================
 # Conditions
 # ============================================================
@@ -223,6 +242,8 @@ Conditions:
   HasVadLayer: !Not [!Equals [!Ref VadLayerArn, '']]
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
   HasDb: !Not [!Equals [!Ref DbStackName, '']]
+  HasOrgPool: !Not [!Equals [!Ref OrgUserPoolId, '']]
+  HasOrgApi: !And [!Condition HasDb, !Condition HasOrgPool]
 
 # ============================================================
 # Global Settings
@@ -599,6 +620,61 @@ Resources:
       Policies:
         - VPCAccessPolicy: {}
 
+  # ----------------------------------------------------------
+  # Lambda 10: Org API (Phase 3) — real write backend for
+  # projects/members/roles/profile/images. In-VPC (psycopg → Aurora).
+  # Gated by HasOrgApi (DbStackName + OrgUserPoolId both set).
+  # ----------------------------------------------------------
+  OrgApiFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasOrgApi
+    Properties:
+      FunctionName: !Sub ["${P}-org-api", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_org_api.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection — see MigrateFunction notes.
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !ImportValue
+            Fn::Sub: "${DbStackName}-DbName"
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          COGNITO_USER_POOL_ID: !Ref OrgUserPoolId
+          S3_BUCKET: !Ref DataBucketName
+          ORG_ASSETS_PREFIX: org-assets/
+      Policies:
+        - VPCAccessPolicy: {}
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminGetUser
+              Resource: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${OrgUserPoolId}
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/org-assets/*
+      Events:
+        OrgProxy:
+          Type: Api
+          Properties:
+            RestApiId: !Ref FieldSightApi
+            Path: /api/org/{proxy+}
+            Method: ANY
+
   # ==========================================================
   # COGNITO - User Authentication
   # ==========================================================
@@ -674,7 +750,16 @@ Resources:
         AddDefaultAuthorizerToCorsPreflight: false
         Authorizers:
           CognitoAuthorizer:
-            UserPoolArn: !GetAtt UserPool.Arn
+            # Accepts idTokens from this stack's own pool AND (test stage)
+            # the prod pool the UI logs into — /api/org/* is called by the
+            # deployed UI with its prod-pool token. NB: this trusts prod
+            # tokens on ALL /api/* routes of the TEST gateway; test-stage
+            # data only, acceptable by design (2026-07-04).
+            UserPoolArn: !If
+              - HasOrgPool
+              - - !GetAtt UserPool.Arn
+                - !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${OrgUserPoolId}
+              - !GetAtt UserPool.Arn
 
   # ----------------------------------------------------------
   # Lambda 7: REST API Backend
@@ -997,6 +1082,13 @@ Resources:
     Condition: HasDb
     Properties:
       LogGroupName: !Sub /aws/lambda/${MigrateFunction}
+      RetentionInDays: 14
+
+  OrgApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasOrgApi
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${OrgApiFunction}
       RetentionInDays: 14
 
   FargateLogGroup:
