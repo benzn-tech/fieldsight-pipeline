@@ -203,3 +203,99 @@ def test_patch_role_unknown_target_404(wired):
     res = org.lambda_handler(make_event(
         "PATCH", "/api/org/members/sub-ghost/role", body={"global_role": "pm"}), None)
     assert res["statusCode"] == 404
+
+
+class FakeCognito:
+    def __init__(self, exists=False):
+        self.exists = exists
+        self.created = []
+
+    def admin_create_user(self, **kw):
+        if self.exists:
+            raise self.exceptions.UsernameExistsException(
+                {"Error": {"Code": "UsernameExistsException", "Message": "exists"}},
+                "AdminCreateUser")
+        self.created.append(kw)
+        return {"User": {"Attributes": [
+            {"Name": "sub", "Value": "sub-new"},
+            {"Name": "email", "Value": kw["Username"]},
+        ]}}
+
+    def admin_get_user(self, **kw):
+        return {"UserAttributes": [{"Name": "sub", "Value": "sub-existing"}]}
+
+    class exceptions:
+        class UsernameExistsException(Exception):
+            def __init__(self, *a, **k):
+                super().__init__("exists")
+
+
+@pytest.fixture
+def member_wired(wired):
+    fake = FakeCognito()
+    wired.setattr(org, "_cognito_client", fake)
+    wired.setattr(org.users, "upsert_user",
+                  lambda conn, sub, email, **kw: {
+                      "id": "u-new", "cognito_sub": sub, "email": email, **kw})
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": "c-uuid-1"})
+    wired.setattr(org.memberships, "ensure_membership",
+                  lambda conn, uid, sid, role: {
+                      "user_id": uid, "site_id": sid, "role": role})
+    return wired, fake
+
+
+def test_create_member_creates_and_enrolls(member_wired):
+    wired, fake = member_wired
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@x.nz", "first_name": "New", "global_role": "site_manager",
+        "memberships": [{"site_id": "s-1", "role": "site_manager"}],
+    }), None)
+    assert res["statusCode"] == 201
+    b = body_of(res)
+    assert b["user"]["cognito_sub"] == "sub-new"
+    assert b["memberships"] == [{"user_id": "u-new", "site_id": "s-1",
+                                 "role": "site_manager"}]
+    assert fake.created[0]["Username"] == "new@x.nz"
+    assert fake.created[0]["UserPoolId"] == org.COGNITO_USER_POOL_ID
+
+
+def test_create_member_existing_cognito_user_is_idempotent(member_wired):
+    wired, fake = member_wired
+    fake.exists = True
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "old@x.nz"}), None)
+    assert res["statusCode"] == 201
+    assert body_of(res)["user"]["cognito_sub"] == "sub-existing"
+
+
+def test_create_member_rejects_bad_global_role(member_wired):
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz", "global_role": "superuser"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_create_member_rejects_foreign_site(member_wired):
+    wired, fake = member_wired
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": "OTHER-company"})
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz", "memberships": [{"site_id": "s-9", "role": "worker"}],
+    }), None)
+    assert res["statusCode"] == 403
+
+
+def test_create_member_rejects_bad_membership_role(member_wired):
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz", "memberships": [{"site_id": "s-1", "role": "admin"}],
+    }), None)
+    assert res["statusCode"] == 400
+
+
+def test_create_member_non_admin_403(member_wired):
+    wired, fake = member_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "gm"})
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz"}), None)
+    assert res["statusCode"] == 403

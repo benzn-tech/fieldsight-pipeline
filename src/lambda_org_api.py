@@ -226,4 +226,58 @@ def patch_member_role(conn, caller, target_sub, body):
 
 
 def create_member(conn, caller, body):
-    return error("not implemented", 501)
+    """Admin-only. Creates the Cognito login (email invite w/ temp password),
+    the Aurora profile, and site memberships. Idempotent: an existing Cognito
+    user is looked up instead of failing, and the DB writes are upserts —
+    safe to retry after a partial failure (Cognito ok, DB rolled back)."""
+    if caller["global_role"] != "admin":
+        return error("admin role required", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    email = (body.get("email") or "").strip().lower()
+    if not email or "@" not in email:
+        return error("valid email is required", 400)
+    global_role = body.get("global_role") or "worker"
+    if global_role not in ALLOWED_GLOBAL_ROLES:
+        return error(f"global_role must be one of {sorted(ALLOWED_GLOBAL_ROLES)}", 400)
+    wanted = body.get("memberships") or []
+    for mem in wanted:
+        if not isinstance(mem, dict) or not mem.get("site_id"):
+            return error("each membership needs a site_id", 400)
+        if mem.get("role") not in ALLOWED_MEMBERSHIP_ROLES:
+            return error(
+                f"membership role must be one of {sorted(ALLOWED_MEMBERSHIP_ROLES)}", 400)
+        site = sites.get_site(conn, mem["site_id"])
+        if site is None or site["company_id"] != caller["company_id"]:
+            return error("site not found in your company", 403)
+
+    client = cognito()
+    display_name = " ".join(
+        p for p in (body.get("first_name"), body.get("last_name")) if p) or email
+    try:
+        resp = client.admin_create_user(
+            UserPoolId=COGNITO_USER_POOL_ID,
+            Username=email,
+            UserAttributes=[
+                {"Name": "email", "Value": email},
+                {"Name": "email_verified", "Value": "true"},
+                {"Name": "name", "Value": display_name},
+            ],
+            DesiredDeliveryMediums=["EMAIL"],
+        )
+        attrs = resp["User"]["Attributes"]
+    except client.exceptions.UsernameExistsException:
+        resp = client.admin_get_user(UserPoolId=COGNITO_USER_POOL_ID, Username=email)
+        attrs = resp["UserAttributes"]
+    sub = next(a["Value"] for a in attrs if a["Name"] == "sub")
+
+    user = users.upsert_user(
+        conn, sub, email,
+        company_id=caller["company_id"],
+        first_name=body.get("first_name"),
+        last_name=body.get("last_name"),
+        global_role=global_role,
+    )
+    created = [memberships.ensure_membership(conn, user["id"], mem["site_id"],
+                                             mem["role"]) for mem in wanted]
+    return ok({"user": user, "memberships": created}, 201)
