@@ -91,5 +91,8 @@ jobs:
       - name: Wire bucket CORS (TEST bucket, org-assets uploads)
         run: bash scripts/wire-bucket-cors.sh fieldsight-data-test-509194952652 ${{ env.AWS_REGION }}
 
+      - name: Wire bucket lifecycle (TEST bucket, expire abandoned pending uploads)
+        run: bash scripts/wire-bucket-lifecycle.sh fieldsight-data-test-509194952652 ${{ env.AWS_REGION }}
+
       - name: Smoke test /api/health (TEST)
         run: bash scripts/smoke-test.sh fieldsight-test ${{ env.AWS_REGION }}
