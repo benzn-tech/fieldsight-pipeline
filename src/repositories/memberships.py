@@ -19,12 +19,12 @@ def accessible_site_ids(conn, user_id, global_role) -> list:
         rows = conn.execute(
             "SELECT s.id FROM sites s "
             "JOIN users u ON u.company_id = s.company_id "
-            "WHERE u.id = %s",
+            "WHERE u.id = %s AND s.archived_at IS NULL",
             (user_id,),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT site_id FROM memberships WHERE user_id=%s", (user_id,)
+            "SELECT site_id FROM memberships WHERE user_id=%s AND archived_at IS NULL", (user_id,)
         ).fetchall()
     return [r[0] for r in rows]
 
@@ -46,7 +46,7 @@ def list_company_memberships(conn, company_id) -> list[dict]:
         "FROM memberships m "
         "JOIN users u ON u.id = m.user_id "
         "JOIN sites s ON s.id = m.site_id "
-        "WHERE s.company_id = %s AND u.company_id = s.company_id "
+        "WHERE s.company_id = %s AND u.company_id = s.company_id AND m.archived_at IS NULL "
         "ORDER BY u.created_at, m.created_at",
         (company_id,),
     ).fetchall()

@@ -1,6 +1,6 @@
 from psycopg.rows import dict_row
 
-_COLS = "id, company_id, name, location, client, industry, icon_s3_key, created_at"
+_COLS = "id, company_id, name, location, client, industry, icon_s3_key, created_at, archived_at"
 
 
 def create_site(conn, company_id, name, location=None, client=None,
@@ -18,9 +18,10 @@ def get_site(conn, site_id) -> dict | None:
     ).fetchone()
 
 
-def list_company_sites(conn, company_id) -> list[dict]:
+def list_company_sites(conn, company_id, include_archived=False) -> list[dict]:
+    guard = "" if include_archived else "AND archived_at IS NULL "
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_COLS} FROM sites WHERE company_id=%s ORDER BY created_at", (company_id,)
+        f"SELECT {_COLS} FROM sites WHERE company_id=%s {guard}ORDER BY created_at", (company_id,)
     ).fetchall()
 
 
@@ -28,7 +29,7 @@ def list_sites_by_ids(conn, site_ids) -> list[dict]:
     if not site_ids:
         return []  # ANY('{}') is valid SQL but skip the round-trip
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_COLS} FROM sites WHERE id = ANY(%s) ORDER BY created_at",
+        f"SELECT {_COLS} FROM sites WHERE id = ANY(%s) AND archived_at IS NULL ORDER BY created_at",
         (list(site_ids),),
     ).fetchall()
 

@@ -1,6 +1,6 @@
 from psycopg.rows import dict_row
 
-_COLS = "id, cognito_sub, company_id, email, first_name, last_name, avatar_s3_key, global_role, created_at"
+_COLS = "id, cognito_sub, company_id, email, first_name, last_name, avatar_s3_key, global_role, created_at, archived_at"
 
 
 def upsert_user(conn, cognito_sub, email, company_id=None, first_name=None,
@@ -35,9 +35,10 @@ def get_user_by_sub(conn, cognito_sub) -> dict | None:
     ).fetchone()
 
 
-def list_company_users(conn, company_id) -> list[dict]:
+def list_company_users(conn, company_id, include_archived=False) -> list[dict]:
+    guard = "" if include_archived else "AND archived_at IS NULL "
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_COLS} FROM users WHERE company_id=%s ORDER BY created_at",
+        f"SELECT {_COLS} FROM users WHERE company_id=%s {guard}ORDER BY created_at",
         (company_id,),
     ).fetchall()
 
