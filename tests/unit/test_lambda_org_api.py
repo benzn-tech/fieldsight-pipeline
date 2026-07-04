@@ -342,6 +342,16 @@ def test_create_member_non_admin_403(member_wired):
     assert res["statusCode"] == 403
 
 
+def test_create_member_rejects_archived_site(member_wired):
+    wired, fake = member_wired
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": "c-uuid-1", "archived_at": "2026-07-01"})
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz", "memberships": [{"site_id": "s-arch", "role": "worker"}],
+    }), None)
+    assert res["statusCode"] == 409
+
+
 def test_archived_caller_blocked_except_get_me(wired):
     wired.setattr(org.users, "get_user_by_sub",
                   lambda conn, sub: {**CALLER, "archived_at": "2026-07-04"})
@@ -380,7 +390,7 @@ def test_archive_member_ok_but_never_self(wired):
     wired.setattr(org.users, "archive_user",
                   lambda conn, sub, cid: {"cognito_sub": sub, "archived_at": "x"})
     assert org.lambda_handler(make_event("POST", "/api/org/members/sub-2/archive"), None)["statusCode"] == 200
-    # self-archive -> 400 (last-admin lockout guard)
+    # self-archive is always blocked (you can't lock yourself out)
     assert org.lambda_handler(make_event("POST", "/api/org/members/sub-1/archive"), None)["statusCode"] == 400
     # unarchive self is fine (row can't be reached anyway while archived, but no self-guard needed)
     wired.setattr(org.users, "unarchive_user", lambda conn, sub, cid: {"cognito_sub": sub, "archived_at": None})
@@ -465,7 +475,7 @@ def test_upload_url_avatar(presign_wired):
     assert fake.last["params"]["ContentType"] == "image/png"
 
 
-def test_upload_url_site_icon_admin_gets_owner_scoped_key(presign_wired):
+def test_upload_url_site_icon_admin_gets_pending_key(presign_wired):
     wired, fake = presign_wired
     res = org.lambda_handler(make_event("POST", "/api/org/upload-url", body={
         "kind": "site_icon", "content_type": "image/webp"}), None)

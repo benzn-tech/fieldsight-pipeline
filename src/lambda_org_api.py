@@ -345,6 +345,8 @@ def create_member(conn, caller, body):
         site = sites.get_site(conn, mem["site_id"])
         if site is None or site["company_id"] != caller["company_id"]:
             return error("site not found in your company", 403)
+        if site.get("archived_at"):
+            return error("site is archived — unarchive it first", 409)
 
     client = cognito()
     display_name = " ".join(
