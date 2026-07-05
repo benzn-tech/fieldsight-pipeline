@@ -651,10 +651,16 @@ Resources:
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref DataBucketName
-          USER_POOL_ID: !If
-            - HasOrgUserPool
-            - !Select [1, !Split ['/', !Ref OrgUserPoolArn]]
-            - !Ref UserPool
+          # Pool id = ARN tail. The !If sits INSIDE the Split input (not
+          # around the Select) because CloudFormation validates Fn::Select
+          # bounds even in untaken Fn::If branches — Split on '' would fail
+          # template processing when OrgUserPoolArn is unset. The fallback
+          # 'x/<poolid>' keeps the Split input always 2 elements.
+          USER_POOL_ID: !Select
+            - 1
+            - !Split
+              - '/'
+              - !If [HasOrgUserPool, !Ref OrgUserPoolArn, !Sub 'x/${UserPool}']
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'

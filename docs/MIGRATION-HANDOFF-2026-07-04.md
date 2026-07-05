@@ -8,7 +8,7 @@
 
 ## 1. 当前状态一句话
 
-**Phase 0/1/2A/2B 全部完成**:新前端(Amplify dev)跑真实数据真实登录;TEST 后端管线全绿可复现;Postgres+pgvector 数据层代码+真库全部上线。**下一步 = Phase 3(组织写后端),架构已定稿待展开执行;Phase 4 有用户审核门。**
+**Phase 0/1/2A/2B 全部完成**:新前端(Amplify dev)跑真实数据真实登录;TEST 后端管线全绿可复现;Postgres+pgvector 数据层代码+真库全部上线。**Phase 3(组织写后端)代码已完成**(见 §5 实施状态,分支 claude/fieldsight-migration-phase-3-vdd7a8)——待部署(db 栈端点 + develop 合并 + Amplify env)+ seed + Chrome 验证。**Phase 4 有用户审核门。**
 
 ## 2. 活着的 Infra(全部 509194952652 / ap-southeast-2)
 
@@ -54,6 +54,22 @@
 - **双基址**:UI env.js 增 `FS_ORG_BASEURL` 指 test 网关(org 数据在 Aurora=唯一 org 库),报告读取仍走 prod;`writeMocks` 保持 true,新增 org 专用开关(如 `FS_ORGWRITES`)只放行已有后端的 org 写,programme/safety-create 等仍 mock。
 - **种子任务**:公司行 + 从 Cognito 池(4 用户)与 user_mapping(4 站点)回填 Aurora,否则 UI org 页面为空。
 - **任务切法(草案,开工时 writing-plans 细化)**:T1 端点/VPC(db 栈加 endpoints)→ T2 OrgApi 骨架+路由+模板接线 → T3 各端点 TDD(handler 层 mock conn;仓储已有集成测试)→ T4 种子回填 → T5 UI 接线+开关 → T6 Chrome 全流程验证(建项目/加成员/改角色/传图,刷新持久)。
+
+### Phase 3 实施状态(2026-07-04,分支 claude/fieldsight-migration-phase-3-vdd7a8,两仓同名)
+
+**T1-T5 代码全部完成**;测试 80 绿(50 org handler 单测 + 新增 9 仓储集成测试,本地真 Postgres16+pgvector 跑过);cfn-lint 两模板全绿。要点:
+
+- **认证修正(重要)**:UI 用 prod 池登录,而 test 网关默认 authorizer 是 test 池 → org 路由挂了**第二个 authorizer**(`OrgCognitoAuthorizer`,ARN 走参数 `OrgUserPoolArn`,deploy.yml 已传 prod 池 ARN)。POST /members 也在 prod 池开号(USER_POOL_ID 从 ARN 派生)。
+- **T4 种子**并入 org api:`POST /api/org/seed`(裸库任何登录者可 bootstrap 并自动成为 admin;之后仅 admin 可重跑;幂等——公司按名查、站点按 (company,name) 查、membership ON CONFLICT)。数据源:Cognito ListUsers + S3 config/user_mapping.json(body 可覆盖 sites/roles)。
+- **上传**:presigned PUT 到 org-assets/(确定性 key,发 URL 时即写库);浏览器直传需要桶 CORS → deploy.yml 新步骤 `scripts/wire-bucket-cors.sh`。
+- **UI**(fieldsight-ui 同名分支):`FS.api.org` 模块 + `_fetch` opts.base 双基址;`FS_ORG_BASEURL`/`FS_ORGWRITES` env 开关;sites.js 四个适配器(getUsers/createSite/createUser/updateUserRole,org uuid/5 角色 ↔ legacy slug/10 角色映射);settings 资料+头像同步。
+
+**剩余(需要用户/带 AWS 环境的会话)**:
+1. db 栈手动更新一次:先查主路由表 `aws ec2 describe-route-tables --filters Name=vpc-id,Values=vpc-0791974a474386d1c Name=association.main,Values=true --query 'RouteTables[0].RouteTableId' --output text`,把 `RouteTableIds=rtb-xxx` 追加进 samconfig db-test 段,然后 `sam deploy --config-env db-test`(建 cognito-idp 接口端点 ~$8/月 + S3 网关端点)。
+2. 合并 develop → deploy.yml 自动部署 OrgApiFunction;Amplify dev 分支加 env vars:`FS_ORG_BASEURL=https://<test-api-id>.execute-api.ap-southeast-2.amazonaws.com/prod/api`、`FS_ORGWRITES=true`(test api id 从 fieldsight-test 栈 ApiEndpoint 输出拿)。
+3. 以 admin(benl.tech@outlook.com)登录后调一次 `POST /api/org/seed`(body 可空,或 `{"company_name":"Southbase"}`)。
+4. **T6 Chrome 全流程验证**(本次会话无浏览器桥):建项目/加成员/改角色/传头像,刷新持久;PM 登录看 /team 应回落 legacy 目录(org members 对非 admin/gm 返回 403 → UI 自动回落)。
+5. 已知取舍:UI 富角色(10 个)→ 后端 5 角色是**有损映射**(`ORG_ROLE_BY_UI_ROLE`);org 站点 uuid 与 user_mapping slug 靠名字对齐(改名会断);admin 聚合 fan-out 仍用 mock 用户列表(§8 旧账,建议 org 上线后下一轮换 org.listMembers)。
 
 ## 6. Phase 4 —— 有用户审核门
 
