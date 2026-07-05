@@ -33,3 +33,43 @@ def get_user_by_sub(conn, cognito_sub) -> dict | None:
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_COLS} FROM users WHERE cognito_sub=%s", (cognito_sub,)
     ).fetchone()
+
+
+def set_global_role(conn, cognito_sub, role) -> dict | None:
+    """Explicit role change (Phase 3 PATCH /members/{sub}/role). The caller
+    is responsible for ACL checks (acl.can_assign_role / can_modify_user) —
+    this function trusts its input. Returns None if the user doesn't exist."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE users SET global_role=%s WHERE cognito_sub=%s RETURNING {_COLS}",
+        (role, cognito_sub),
+    ).fetchone()
+
+
+def update_profile(conn, cognito_sub, first_name=None, last_name=None,
+                   avatar_s3_key=None) -> dict | None:
+    """Self-service profile update. None = leave unchanged (upsert_user
+    semantics). Deliberately CANNOT touch email/global_role/company_id —
+    keep it mass-assignment-safe. Returns None if the user doesn't exist."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE users SET "
+        f"  first_name=COALESCE(%s, first_name), "
+        f"  last_name=COALESCE(%s, last_name), "
+        f"  avatar_s3_key=COALESCE(%s, avatar_s3_key) "
+        f"WHERE cognito_sub=%s RETURNING {_COLS}",
+        (first_name, last_name, avatar_s3_key, cognito_sub),
+    ).fetchone()
+
+
+def list_company_users(conn, company_id) -> list[dict]:
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM users WHERE company_id=%s ORDER BY created_at", (company_id,)
+    ).fetchall()
+
+
+def count_provisioned_users(conn) -> int:
+    """Users already attached to a company. 0 = pristine DB → org seed may
+    bootstrap (the auto-upserted caller row has company_id NULL, so it does
+    not count)."""
+    return conn.execute(
+        "SELECT count(*) FROM users WHERE company_id IS NOT NULL"
+    ).fetchone()[0]

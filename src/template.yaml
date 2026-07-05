@@ -12,11 +12,17 @@ Description: >
 # parameter-overrides whenever DbStackName is set. Parameters have no
 # per-item Metadata, so this is suppressed template-wide (the only
 # List/CommaDelimitedList param with an empty default in this template).
+# W1028 (Phase 3): the condition solver flags OrgApiFunction's
+# !If [HasOrgUserPool, ...] IAM Resource as unreachable "when HasDb=False" —
+# vacuous, since the HasDb-gated function doesn't exist in that scenario.
+# Resource-level Metadata can't suppress it: the SAM transform moves the
+# policy onto the generated OrgApiFunctionRole, which drops the Metadata.
 Metadata:
   cfn-lint:
     config:
       ignore_checks:
         - W1030
+        - W1028
 
 # ============================================================
 # Parameters - Configure during deployment
@@ -206,6 +212,17 @@ Parameters:
       empty default is valid when DbStackName is unset.
     Default: ''
 
+  # --- Phase 3: Org API (write backend for projects/members/roles/assets) ---
+  OrgUserPoolArn:
+    Type: String
+    Description: >
+      ARN of the Cognito pool whose ID tokens the /api/org/* routes accept
+      AND where POST /members provisions accounts. The real users live in
+      the PROD pool while the org backend runs on the TEST stack, so this is
+      normally the prod pool ARN. Leave empty to fall back to this stack's
+      own pool (org routes then only accept test-pool tokens).
+    Default: ''
+
 # ============================================================
 # Conditions
 # ============================================================
@@ -223,6 +240,7 @@ Conditions:
   HasVadLayer: !Not [!Equals [!Ref VadLayerArn, '']]
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
   HasDb: !Not [!Equals [!Ref DbStackName, '']]
+  HasOrgUserPool: !Not [!Equals [!Ref OrgUserPoolArn, '']]
 
 # ============================================================
 # Global Settings
@@ -599,6 +617,75 @@ Resources:
       Policies:
         - VPCAccessPolicy: {}
 
+  # ----------------------------------------------------------
+  # Lambda 10: Org API (Phase 3 — projects/members/roles/assets)
+  # In-VPC like MigrateFunction (psycopg direct to Aurora). Runtime AWS
+  # calls (cognito-idp, S3 seed config) rely on the VPC endpoints added in
+  # infra/db-template.yaml — see BUG-36. Gated by HasDb: prod/default
+  # deploys (DbStackName unset) are completely unaffected.
+  # ----------------------------------------------------------
+  OrgApiFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-org-api", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_org_api.lambda_handler
+      Timeout: 29  # API Gateway integration cap
+      MemorySize: 512
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Same deploy-time credential injection as MigrateFunction (BUG-36:
+          # a VPC Lambda with no NAT cannot call Secrets Manager at runtime).
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !ImportValue
+            Fn::Sub: "${DbStackName}-DbName"
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          S3_BUCKET: !Ref DataBucketName
+          USER_POOL_ID: !If
+            - HasOrgUserPool
+            - !Select [1, !Split ['/', !Ref OrgUserPoolArn]]
+            - !Ref UserPool
+      Policies:
+        - VPCAccessPolicy: {}
+        - Version: '2012-10-17'
+          Statement:
+            # org-assets presigned PUT/GET are signed with this role's creds
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/org-assets/*
+            # seed reads config/user_mapping.json
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/config/user_mapping.json
+            # member provisioning + seed backfill against the org pool
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminGetUser
+                - cognito-idp:ListUsers
+              Resource: !If [HasOrgUserPool, !Ref OrgUserPoolArn, !GetAtt UserPool.Arn]
+      Events:
+        OrgProxy:
+          Type: Api
+          Properties:
+            RestApiId: !Ref FieldSightApi
+            Path: /api/org/{proxy+}
+            Method: ANY
+            Auth:
+              Authorizer: OrgCognitoAuthorizer
+
   # ==========================================================
   # COGNITO - User Authentication
   # ==========================================================
@@ -675,6 +762,11 @@ Resources:
         Authorizers:
           CognitoAuthorizer:
             UserPoolArn: !GetAtt UserPool.Arn
+          # Phase 3: org routes validate tokens from the pool the real users
+          # sign in with (prod pool via OrgUserPoolArn) — the UI's dual-base
+          # setup sends prod ID tokens to this test-stack gateway.
+          OrgCognitoAuthorizer:
+            UserPoolArn: !If [HasOrgUserPool, !Ref OrgUserPoolArn, !GetAtt UserPool.Arn]
 
   # ----------------------------------------------------------
   # Lambda 7: REST API Backend
@@ -997,6 +1089,13 @@ Resources:
     Condition: HasDb
     Properties:
       LogGroupName: !Sub /aws/lambda/${MigrateFunction}
+      RetentionInDays: 14
+
+  OrgApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasDb
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${OrgApiFunction}
       RetentionInDays: 14
 
   FargateLogGroup:
