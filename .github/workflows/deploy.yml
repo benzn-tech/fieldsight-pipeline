@@ -82,10 +82,16 @@ jobs:
               "FargateVpcId=$VPC" \
               "DbStackName=fieldsight-db-test" \
               "DbSubnetIds=subnet-082dd4480f7e20014,subnet-08b15b36113e542d4,subnet-05fb05613cf529121" \
-              "DbSecretArn=$DB_SECRET_ARN"
+              "DbSecretArn=$DB_SECRET_ARN" \
+              "OrgUserPoolArn=arn:aws:cognito-idp:ap-southeast-2:509194952652:userpool/ap-southeast-2_q88pd6XXr"
 
       - name: Wire S3 events (TEST bucket)
         run: bash scripts/wire-s3-events.sh fieldsight-data-test-509194952652 test ${{ env.AWS_REGION }} --apply
+
+      # Phase 3: browsers PUT org-assets (avatars / site icons) straight to S3
+      # via presigned URLs — that's a cross-origin call, so the bucket needs CORS.
+      - name: Wire bucket CORS for org-assets (TEST bucket)
+        run: bash scripts/wire-bucket-cors.sh fieldsight-data-test-509194952652 ${{ env.AWS_REGION }}
 
       - name: Smoke test /api/health (TEST)
         run: bash scripts/smoke-test.sh fieldsight-test ${{ env.AWS_REGION }}
