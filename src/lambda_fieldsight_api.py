@@ -300,8 +300,15 @@ def get_dates(params, caller):
     start_date = nzdt - timedelta(days=months * 30)
     
     role = caller['role']
+    user_param = params.get('user', '')
     # Determine which user folders to check
-    if role == 'worker':
+    if user_param and can_access_user_data(caller, user_param):
+        # Explicit ?user= wins: the timeline date-picker asks for one user's
+        # dates so its dots match the per-user report fetch. Without this the
+        # admin path below marks a dot whenever ANY user has a report that
+        # day — dotted dates with no content for the selected user.
+        user_folders = [user_param]
+    elif role == 'worker':
         user_folders = [resolve_user_display_name(caller)]
     elif site:
         # Filter to specific site's users
