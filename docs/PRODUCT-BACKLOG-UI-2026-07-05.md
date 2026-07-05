@@ -77,8 +77,16 @@
 1. **长期正解**:Phase 4 已建 `report_chunks` + pgvector + HNSW + 库内 ACL——做**语义检索/RAG**:问题→检索跨日期/工地的相关切块→Ask agent 基于检索结果grounded 作答。这正是 Phase 4 向量层的用途。
 2. **搜索框接线**:Phase 4 检索上线后,把搜索框的"Ask"从"跳单报告"改为"走 RAG 问答"(可跨日期回答)。
 3. **交互**:搜索框输入问题 → 顶部给一个"问答"答案卡(带引用的报告/日期),下面仍列关键字命中。
+4. **引用/cited(2026-07-05 用户强调)**:RAG 回答**必须带引用**——具体到哪一段 transcript / 哪份报告,提升准确性与信任度。RAG 天然产出检索到的来源切块,把它们作为 citations 随答案返回。**前端已就绪**:`ask-chat.js` 的消息结构已有 `citations?` 槽位(`ask-chat.js:159` 已渲染),后端 `/api/ask` 走 RAG 后填 `citations`(切块引用 + 报告/日期链接)即可,前端点开跳转对应报告/topic。
 
-**归属**:🔴 依赖 Phase 4(pgvector 检索 + 抽取入库)。搜索框接线是 Phase 4 之后的 UI 收尾。**记入长期路线。**
+**归属**:🔴 依赖 Phase 4(pgvector 检索 + 抽取入库)。搜索框接线 + citations 是 Phase 4 之后的 UI 收尾。**记入长期路线。**
+
+---
+
+## 6. ✅ Ask 回复 markdown 渲染(2026-07-05 用户提出,**已做**)
+
+**现象**:Ask 的 LLM 回复是 markdown,但当作纯文本显示。
+**已做**(PR #26,fieldsight-ui):新增 `scripts/composites/markdown.js`——微型、无依赖、**XSS 安全**的 markdown→HTML(先 HTML 转义,再只产出固定安全标签集 p/br/strong/em/code/pre/ul/ol/li/h1-3/a[http-only],LLM 输出的 HTML/脚本无法存活)。assistant 气泡用它渲染,user 气泡保持纯文本;node 验证过渲染 + XSS 转义。无构建步骤/无库(CSP 禁 CDN)。
 
 ---
 
@@ -86,10 +94,11 @@
 
 | # | 项 | 类型 | 依赖 | 何时 |
 |---|---|---|---|---|
-| 2 | Tasks 时间段工具栏 | 🟢 UI | 无 | 批次 2b/polish |
-| 3 | 时间段选中态 navy/white | 🟢 UI | 无 | 批次 2b/polish |
+| 6 | Ask 回复 markdown 渲染 | ✅ 已做 | 无 | PR #26 |
+| 2 | Tasks 时间段工具栏 | ✅ 已做 | 无 | PR #26 |
+| 3 | 时间段选中态 navy/white | ✅ 已做 | 无 | PR #26 |
 | 1 | Transcript 空(数据) | 🟡 数据 | Phase 4 持久化 | 非阻塞;新数据自愈 |
-| 5 | 搜索自然语言问答 | 🔴 战略 | Phase 4 RAG | Phase 4 后 |
+| 5 | 搜索自然语言问答 + **cited 引用** | 🔴 战略 | Phase 4 RAG | Phase 4 后 |
 | 4 | 跨周完成识别+人工确认 | 🔴 战略 | dashboard-first + Phase 4 | Phase 4 / dashboard-first |
 
 相关记忆:[[fieldsight-dashboard-first-direction]] [[fieldsight-recording-site-attribution-gap]] [[fieldsight-current-progress]]
