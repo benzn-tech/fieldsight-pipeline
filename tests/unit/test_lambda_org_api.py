@@ -393,6 +393,7 @@ def test_post_members_happy_path(conn, s3, as_user, monkeypatch):
 
 
 def test_post_members_existing_cognito_user_reuses_sub(conn, s3, as_user, monkeypatch):
+    """Cognito account exists but has NO app profile yet → adopted."""
     as_user(user_row(role="admin"))
     cognito = FakeCognito(existing={"old@y.co": "existing-sub"})
     monkeypatch.setattr(org, "_cognito", lambda: cognito)
@@ -408,6 +409,68 @@ def test_post_members_existing_cognito_user_reuses_sub(conn, s3, as_user, monkey
     assert status == 201
     assert upserts == ["existing-sub"]
     assert cognito.created == []
+
+
+def _pin_lookup(monkeypatch, rows_by_sub):
+    monkeypatch.setattr(org.users, "get_user_by_sub",
+                        lambda c, sub: rows_by_sub.get(sub))
+
+
+def test_post_members_reinvite_same_company_409(conn, monkeypatch):
+    """Re-adding an already-provisioned member must NOT rewrite their role."""
+    caller = user_row(role="admin")
+    target = user_row(sub="existing-sub", uid="u-2", email="old@y.co", role="gm")
+    _pin_lookup(monkeypatch, {"sub-1": caller, "existing-sub": target})
+    cognito = FakeCognito(existing={"old@y.co": "existing-sub"})
+    monkeypatch.setattr(org, "_cognito", lambda: cognito)
+    monkeypatch.setattr(org.sites, "list_company_sites", lambda c, cid: [])
+    upserts = []
+    monkeypatch.setattr(org.users, "upsert_user",
+                        lambda c, sub, email, **kw: upserts.append(sub))
+
+    status, body = parsed(call(make_event(
+        "POST", "/api/org/members", body={"email": "old@y.co", "global_role": "worker"})))
+    assert status == 409
+    assert upserts == [], "existing profile must not be touched"
+    assert conn.rolled_back
+
+
+def test_post_members_cross_company_grab_409(conn, monkeypatch):
+    """Adding another company's member must not move them across tenants."""
+    caller = user_row(role="admin", company="co-1")
+    target = user_row(sub="existing-sub", uid="u-2", email="theirs@y.co", company="co-OTHER")
+    _pin_lookup(monkeypatch, {"sub-1": caller, "existing-sub": target})
+    cognito = FakeCognito(existing={"theirs@y.co": "existing-sub"})
+    monkeypatch.setattr(org, "_cognito", lambda: cognito)
+    monkeypatch.setattr(org.sites, "list_company_sites", lambda c, cid: [])
+    upserts = []
+    monkeypatch.setattr(org.users, "upsert_user",
+                        lambda c, sub, email, **kw: upserts.append(sub))
+
+    status, _ = parsed(call(make_event(
+        "POST", "/api/org/members", body={"email": "theirs@y.co"})))
+    assert status == 409
+    assert upserts == []
+
+
+def test_post_members_adopts_companyless_profile(conn, s3, monkeypatch):
+    """A profile auto-created at login (company NULL) is legitimately adopted."""
+    caller = user_row(role="admin")
+    floating = user_row(sub="existing-sub", uid="u-2", email="new@y.co", company=None)
+    _pin_lookup(monkeypatch, {"sub-1": caller, "existing-sub": floating})
+    cognito = FakeCognito(existing={"new@y.co": "existing-sub"})
+    monkeypatch.setattr(org, "_cognito", lambda: cognito)
+    monkeypatch.setattr(org.sites, "list_company_sites", lambda c, cid: [])
+    upserts = []
+
+    def fake_upsert(c, sub, email, **kw):
+        upserts.append((sub, kw.get("company_id")))
+        return user_row(sub=sub, email=email, uid="u-2")
+    monkeypatch.setattr(org.users, "upsert_user", fake_upsert)
+
+    status, _ = parsed(call(make_event("POST", "/api/org/members", body={"email": "new@y.co"})))
+    assert status == 201
+    assert upserts == [("existing-sub", "co-1")]
 
 
 # ----------------------------------------------------------------------

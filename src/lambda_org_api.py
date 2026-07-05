@@ -307,6 +307,18 @@ def post_members(conn, event, caller):
     display_name = " ".join(x for x in (first, last) if x) or None
     sub = _cognito_provision(email, display_name)
 
+    # Re-invite guard: an existing, already-provisioned profile must not be
+    # silently rewritten (re-adding an admin with the default role would
+    # demote them; adding another company's member would move them across
+    # tenants). A row WITHOUT a company (someone who logged in before being
+    # invited) is legitimately adopted below.
+    existing = users.get_user_by_sub(conn, sub)
+    if existing and existing.get("company_id"):
+        if str(existing["company_id"]).lower() == str(company_id).lower():
+            raise ApiError("Already a member of your company — use the role "
+                           "endpoint to change their role", 409)
+        raise ApiError("This email is already registered to another organisation", 409)
+
     member = users.upsert_user(conn, sub, email, company_id=company_id,
                                first_name=first, last_name=last, global_role=role)
     added = [memberships.ensure_membership(conn, member["id"], m["site_id"],
