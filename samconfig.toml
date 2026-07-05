@@ -100,9 +100,19 @@ capabilities = "CAPABILITY_IAM"
 confirm_changeset = false
 resolve_s3 = true
 template_file = "infra/db-template.yaml"
+# Phase 3: EndpointSubnetIds = ONE subnet keeps the cognito-idp interface
+# endpoint at ~$8/month (bills per-AZ; private DNS covers the whole VPC).
+# RouteTableIds (S3 gateway endpoint, free) must be looked up once before
+# the first Phase-3 deploy:
+#   aws ec2 describe-route-tables \
+#     --filters Name=vpc-id,Values=vpc-0791974a474386d1c Name=association.main,Values=true \
+#     --query 'RouteTables[0].RouteTableId' --output text --region ap-southeast-2
+# then append "RouteTableIds=rtb-xxxxxxxx" below. Left unset, the S3 endpoint
+# is skipped (org seed then needs sites passed in the request body).
 parameter_overrides = [
     "Stage=test",
     "DBName=fieldsight",
     "VpcId=vpc-0791974a474386d1c",
     "SubnetIds=subnet-082dd4480f7e20014,subnet-08b15b36113e542d4,subnet-05fb05613cf529121",
+    "EndpointSubnetIds=subnet-082dd4480f7e20014",
 ]
