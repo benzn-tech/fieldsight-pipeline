@@ -277,3 +277,23 @@ def test_chunk_transcripts_keeps_unassigned_turns_with_note_and_dedupes_source_f
     # unassigned metadata carries no topic-specific fields
     assert "time_range" not in u["metadata"]
     assert "category" not in u["metadata"]
+
+
+def test_parse_time_range_more_dirty_lake_formats():
+    """Real lake data (2026-07-07 batch prep): seconds-bearing and garbage ranges."""
+    from chunking import parse_time_range
+    assert parse_time_range("09:56:40 - 10:02:11") == (9*3600+56*60+40, 10*3600+2*60+11)
+    assert parse_time_range("09:56:40") == (9*3600+56*60+40,)*2 or parse_time_range("09:56:40") == (9*3600+56*60+40, 9*3600+56*60+40)
+    assert parse_time_range("unknown") is None
+    assert parse_time_range("morning session") is None
+
+
+def test_topic_missing_title_degrades_not_crashes():
+    """Real lake data: 2026-04-07 Ben_Test final topic lacks topic_title."""
+    from chunking import chunk_report
+    report = {"user_name": "U", "site": "S", "report_date": "2026-04-07",
+              "topics": [{"topic_id": 0, "time_range": "09:00 - 09:05",
+                          "category": "general", "summary": "truncated topic"}]}
+    chunks = chunk_report(report)
+    assert len(chunks) == 1
+    assert "(untitled)" in chunks[0]["chunk_text"]
