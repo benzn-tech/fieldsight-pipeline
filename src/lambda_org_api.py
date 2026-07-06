@@ -18,6 +18,10 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   PATCH /api/org/sites/{id}               → update site fields / swap icon (admin/gm)
   POST  /api/org/sites/{id}/(un)archive   → soft-delete / restore site (admin/gm)
   POST  /api/org/members/{sub}/(un)archive→ soft-delete / restore member (admin/gm, never self)
+  POST  /api/org/observations             → create safety/quality observation (any member)
+  GET   /api/org/observations             → list observations (company-scoped filters)
+  PATCH /api/org/observations/{id}        → update status (author or admin/gm)
+  POST  /api/org/observations/{id}/archive→ soft-delete observation (admin/gm)
 
 Credentials: PG* env vars injected at deploy time (BUG-36 — no runtime
 Secrets Manager call from a NAT-less VPC). Cognito calls need the
@@ -28,12 +32,13 @@ import logging
 import os
 import re
 import uuid
+from datetime import datetime, timedelta
 
 import boto3
 from botocore.exceptions import ClientError
 
 from db.connection import get_connection
-from repositories import memberships, sites, users
+from repositories import memberships, observations, sites, users
 from repositories.acl import resolve_scope
 
 logger = logging.getLogger()
@@ -46,6 +51,9 @@ PRESIGNED_URL_EXPIRY = 900
 
 ALLOWED_GLOBAL_ROLES = {"admin", "gm", "pm", "site_manager", "worker"}
 ALLOWED_MEMBERSHIP_ROLES = {"pm", "site_manager", "worker"}
+ALLOWED_OBSERVATION_KINDS = {"safety", "quality"}
+ALLOWED_RISK_LEVELS = {"low", "medium", "high"}
+ALLOWED_OBSERVATION_STATUS = {"open", "closed"}
 
 _s3_client = None
 _cognito_client = None
@@ -152,6 +160,18 @@ def dispatch(conn, event, method, route):
         return create_upload_url(conn, caller, parse_body(event))
     if route == "/asset-url" and method == "GET":
         return get_asset_url(event)
+
+    if route == "/observations":
+        if method == "GET":
+            return list_org_observations(conn, caller, event)
+        if method == "POST":
+            return create_org_observation(conn, caller, parse_body(event))
+    m_op = re.match(r"^/observations/([^/]+)$", route)
+    if m_op and method == "PATCH":
+        return patch_observation_status(conn, caller, m_op.group(1), parse_body(event))
+    m_oa = re.match(r"^/observations/([^/]+)/archive$", route)
+    if m_oa and method == "POST":
+        return archive_observation_endpoint(conn, caller, m_oa.group(1))
 
     return error("not found", 404)
 
@@ -488,3 +508,84 @@ def get_asset_url(event):
         ExpiresIn=PRESIGNED_URL_EXPIRY,
     )
     return ok({"url": url, "expires_in": PRESIGNED_URL_EXPIRY})
+
+
+# ----------------------------------------------------------
+# /observations (any logged-in member may create/list; archived callers
+# are already blocked by the dispatch guard above)
+# ----------------------------------------------------------
+REPORT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def list_org_observations(conn, caller, event):
+    params = event.get("queryStringParameters") or {}
+    kind = params.get("kind")
+    if kind is not None and kind not in ALLOWED_OBSERVATION_KINDS:
+        return error(f"kind must be one of {sorted(ALLOWED_OBSERVATION_KINDS)}", 400)
+    rows = observations.list_observations(
+        conn, caller["company_id"], kind=kind,
+        date_from=params.get("from"), date_to=params.get("to"),
+        site_slug=params.get("site_slug"),
+        include_archived=params.get("include_archived") == "1",
+    )
+    return ok({"observations": rows})
+
+
+def create_org_observation(conn, caller, body):
+    if body is None:
+        return error("malformed JSON body", 400)
+    kind = body.get("kind")
+    if kind not in ALLOWED_OBSERVATION_KINDS:
+        return error(f"kind must be one of {sorted(ALLOWED_OBSERVATION_KINDS)}", 400)
+    site_slug = body.get("site_slug")
+    if not isinstance(site_slug, str) or not site_slug.strip():
+        return error("site_slug is required", 400)
+    observation_text = body.get("observation")
+    if not isinstance(observation_text, str) or not observation_text.strip():
+        return error("observation is required", 400)
+    risk_level = body.get("risk_level")
+    if risk_level is not None and risk_level not in ALLOWED_RISK_LEVELS:
+        return error(f"risk_level must be one of {sorted(ALLOWED_RISK_LEVELS)}", 400)
+    report_date = body.get("report_date")
+    if report_date is not None:
+        if not isinstance(report_date, str) or not REPORT_DATE_RE.match(report_date):
+            return error("report_date must be YYYY-MM-DD", 400)
+    else:
+        # NZ "today" — the codebase-wide UTC+13 display convention (see
+        # BUG-19); this endpoint is the only writer of report_date so the
+        # default lives here, not in the repository layer.
+        report_date = (datetime.utcnow() + timedelta(hours=13)).date().isoformat()
+    author_name = " ".join(
+        p for p in (caller.get("first_name"), caller.get("last_name")) if p
+    ) or caller.get("email")
+    row = observations.create_observation(
+        conn, caller["company_id"], kind, site_slug.strip(),
+        caller["cognito_sub"], author_name, observation_text.strip(),
+        risk_level=risk_level, recommended_action=body.get("recommended_action"),
+        report_date=report_date,
+    )
+    return ok(row, 201)
+
+
+def patch_observation_status(conn, caller, obs_id, body):
+    if body is None:
+        return error("malformed JSON body", 400)
+    status = body.get("status")
+    if status not in ALLOWED_OBSERVATION_STATUS:
+        return error(f"status must be one of {sorted(ALLOWED_OBSERVATION_STATUS)}", 400)
+    row = observations.get_observation(conn, caller["company_id"], obs_id)
+    if row is None:
+        return error("observation not found", 404)
+    if row["author_sub"] != caller["cognito_sub"] and resolve_scope(caller["global_role"]) != "ALL":
+        return error("author or admin/gm role required", 403)
+    updated = observations.set_status(conn, caller["company_id"], obs_id, status)
+    return ok(updated)
+
+
+def archive_observation_endpoint(conn, caller, obs_id):
+    if resolve_scope(caller["global_role"]) != "ALL":
+        return error("admin or gm role required", 403)
+    row = observations.set_archived(conn, caller["company_id"], obs_id, True)
+    if row is None:
+        return error("observation not found or already archived", 404)
+    return ok(row)
