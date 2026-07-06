@@ -725,7 +725,7 @@ Resources:
       FunctionName: !Sub ["${P}-ingest", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_ingest.lambda_handler
-      Timeout: 300
+      Timeout: 900   # backfill sweeps the whole lake in one invoke (Fable minor 5)
       MemorySize: 512
       Layers:
         - !Ref PsycopgLayer

@@ -11,8 +11,9 @@ def insert_chunk(conn, site_id, report_date, chunk_type, chunk_text, embedding, 
         "INSERT INTO report_chunks (site_id, user_id, source_s3_key, topic_id, report_date, "
         "chunk_type, chunk_text, embedding, metadata) "
         # embedding cast to %s::vector for consistency with search_sql's %(q)s::vector; with the
-        # pgvector adapter registered a bound Python list already serializes to vector, so
-        # vector::vector is a no-op cast and existing callers/tests binding a list are unaffected.
+        # A bound Python list arrives as float8[] (register_vector only adds
+        # numpy dumpers), and pgvector casts double precision[] -> vector; a
+        # bound '[...]' string casts text -> vector. Both callers work.
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s::vector,%s) "
         "RETURNING id, site_id, topic_id, chunk_type, report_date, created_at",
         (site_id, user_id, source_s3_key, topic_id, report_date, chunk_type,
@@ -27,16 +28,18 @@ def search_chunks(conn, query_embedding, accessible_site_ids, k=5) -> list[dict]
     ).fetchall()
 
 
-def delete_chunks_for_scope(conn, site_id, report_date, user_id) -> int:
-    """Delete report_chunks rows for a (site_id, report_date, user_id) scope.
+def delete_chunks_for_source(conn, source_s3_key) -> int:
+    """Delete report_chunks rows produced from one source report.
 
-    user_id is nullable: pass None to target rows with no user (user_id IS NULL)
-    rather than matching all users. Used by callers to achieve scope-delete
-    idempotency before re-inserting chunks for a rerun (Phase 4a)."""
-    user_clause = "user_id=%s" if user_id is not None else "user_id IS NULL"
-    params = [site_id, report_date] + ([user_id] if user_id is not None else [])
+    Keyed on source_s3_key — the only key that is UNIQUE per report and
+    immune to identity-resolution drift. A (site, date, user_id) scope key
+    was tried first and failed review: two same-site/same-date reports whose
+    user bridge both miss (user_id NULL — real case: MPI1 + MPI2 share
+    primary_site 'mpi') would silently delete each other's rows, and a
+    remediation rerun after fixing a mapping would duplicate instead of
+    replace (Fable Phase 4a review C1/I1)."""
     cur = conn.execute(
-        f"DELETE FROM report_chunks WHERE site_id=%s AND report_date=%s AND {user_clause}",
-        params,
+        "DELETE FROM report_chunks WHERE source_s3_key=%s",
+        (source_s3_key,),
     )
     return cur.rowcount

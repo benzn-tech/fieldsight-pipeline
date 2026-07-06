@@ -126,7 +126,7 @@ def _display_name(user_folder: str) -> str:
 def resolve_site(conn, company_id, report, user_folder):
     """report['site'] direct match -> user_mapping.json primary_site slug
     fallback -> None (caller skips; never creates a site)."""
-    name = report.get("site")
+    name = (report.get("site") or "").strip()   # tolerate stray whitespace (Fable minor 7)
     if name:
         site = sites.get_company_site_by_name(conn, company_id, name)
         if site:
@@ -207,11 +207,23 @@ def _load_turns(user_folder, date):
                 continue
             filename = key.rsplit("/", 1)[-1]
             raw = s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
-            data = json.loads(raw.decode("utf-8"))
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                # One corrupt transcript file must not fail the whole
+                # report — skip it (makes the docstring's promise true;
+                # Fable review minor 3).
+                logger.warning("unparseable transcript skipped: %s", key)
+                continue
             normalized = normalize_transcript(data, filename)
             if normalized is None:
                 continue
             for turn in normalized["speaker_turns"]:
+                # Turns without a resolvable base time can't be sorted or
+                # assigned — drop them instead of TypeError-ing the report
+                # (Fable review minor 2).
+                if turn.get("abs_start") is None:
+                    continue
                 turns.append({**turn, "src": filename})
     return turns
 
@@ -225,6 +237,12 @@ def ingest_report(date, user_folder, report_key):
 
     with get_connection() as conn:
         company = companies.get_company_by_name(conn, COMPANY_NAME)
+        if company is None:
+            # Unseeded org DB would otherwise surface as an opaque
+            # 'NoneType' subscript error on every report (Fable minor 6).
+            raise RuntimeError(
+                f"org company {COMPANY_NAME!r} not found — run the org seed "
+                "(fieldsight-*-org-seed) before ingesting")
         site = resolve_site(conn, company["id"], report, user_folder)
         if site is None:
             reason = (f"identity bridge miss: report.site={report.get('site')!r}, "
@@ -234,10 +252,13 @@ def ingest_report(date, user_folder, report_key):
 
         user_id = resolve_user(conn, company["id"], user_folder)
 
-        # Scope-delete idempotency: clear this (site, date, user) scope
-        # before re-inserting so reruns never duplicate rows.
-        chunks.delete_chunks_for_scope(conn, site["id"], date, user_id)
-        topics.delete_topics_for_scope(conn, site["id"], date, user_id)
+        # Source-key idempotency: clear everything THIS report produced
+        # before re-inserting. Keyed on source_s3_key, not (site, date,
+        # user_id) — a NULL-user scope key let two same-site/same-date
+        # reports (MPI1 + MPI2, both unresolved users) delete each other,
+        # and identity fixes + rerun would duplicate (Fable review C1/I1).
+        chunks.delete_chunks_for_source(conn, report_key)
+        topics.delete_topics_for_source(conn, report_key)
 
         topic_seq_to_id = {}
         for t in report.get("topics", []):
@@ -248,7 +269,10 @@ def ingest_report(date, user_folder, report_key):
                 action_items=_map_action_items(t.get("action_items")),
                 safety=_map_safety(t.get("safety_flags")),
             )
-            topic_seq_to_id[t.get("topic_id")] = row["id"]
+            # None keys stay out of the map: a literal "topic_id": null topic
+            # must not adopt the unassigned transcript windows (Fable minor 1).
+            if t.get("topic_id") is not None:
+                topic_seq_to_id[t.get("topic_id")] = row["id"]
 
         chunks_n = 0
         for c in chunk_report(report):
@@ -301,6 +325,9 @@ def run_backfill():
     for key in _list_report_keys():
         parsed = _parse_report_key(key)
         if parsed is None:
+            # Bookkeep instead of silently dropping (Fable minor 4): a
+            # daily_report.json at an unexpected depth is worth surfacing.
+            skipped.append({"key": key, "reason": "unexpected key shape (depth)"})
             continue
         date, user_folder = parsed
         try:

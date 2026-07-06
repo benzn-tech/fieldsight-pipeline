@@ -57,17 +57,17 @@ def get_topic_photos(conn, topic_id) -> list[dict]:
     ).fetchall()
 
 
-def delete_topics_for_scope(conn, site_id, report_date, user_id) -> int:
-    """Delete topics rows for a (site_id, report_date, user_id) scope.
+def delete_topics_for_source(conn, source_s3_key) -> int:
+    """Delete topics rows produced from one source report.
 
-    user_id is nullable: pass None to target rows with no user (user_id IS NULL)
-    rather than matching all users. Children (action_items, safety_observations,
-    topic_photos) are removed automatically via ON DELETE CASCADE FKs to topics
-    (see 0003_dashboard_readmodel.sql) — no separate child deletes needed here."""
-    user_clause = "user_id=%s" if user_id is not None else "user_id IS NULL"
-    params = [site_id, report_date] + ([user_id] if user_id is not None else [])
+    Keyed on source_s3_key — unique per report and immune to identity-
+    resolution drift (see chunks.delete_chunks_for_source for the failure
+    modes a (site, date, user_id) scope key had — Fable review C1/I1).
+    Children (action_items, safety_observations, topic_photos) are removed
+    automatically via ON DELETE CASCADE FKs to topics
+    (see 0003_dashboard_readmodel.sql) — no separate child deletes needed."""
     cur = conn.execute(
-        f"DELETE FROM topics WHERE site_id=%s AND report_date=%s AND {user_clause}",
-        params,
+        "DELETE FROM topics WHERE source_s3_key=%s",
+        (source_s3_key,),
     )
     return cur.rowcount

@@ -87,8 +87,8 @@ def wired(monkeypatch):
                         lambda conn, cid, name: {"id": "site-1", "name": name}
                         if name == "Test Site" else None)
     monkeypatch.setattr(ing.users, "list_company_users", lambda conn, cid: [])
-    monkeypatch.setattr(ing.chunks, "delete_chunks_for_scope", lambda *a, **k: 0)
-    monkeypatch.setattr(ing.topics, "delete_topics_for_scope", lambda *a, **k: 0)
+    monkeypatch.setattr(ing.chunks, "delete_chunks_for_source", lambda *a, **k: 0)
+    monkeypatch.setattr(ing.topics, "delete_topics_for_source", lambda *a, **k: 0)
     monkeypatch.setattr(ing.topics, "upsert_topic",
                         lambda *a, **k: {"id": "topic-uuid-0"})
     monkeypatch.setattr(ing.chunks, "insert_chunk", lambda *a, **k: {"id": "chunk-x"})
@@ -166,9 +166,9 @@ def test_site_bridge_miss_skips(wired):
     wired.setattr(ing, "load_mapping", lambda: {"sites": {}, "mapping": {}})
 
     write_calls = []
-    wired.setattr(ing.chunks, "delete_chunks_for_scope",
+    wired.setattr(ing.chunks, "delete_chunks_for_source",
                   lambda *a, **k: write_calls.append("delete_chunks"))
-    wired.setattr(ing.topics, "delete_topics_for_scope",
+    wired.setattr(ing.topics, "delete_topics_for_source",
                   lambda *a, **k: write_calls.append("delete_topics"))
     wired.setattr(ing.topics, "upsert_topic",
                   lambda *a, **k: write_calls.append("upsert_topic") or {"id": "x"})
@@ -183,14 +183,14 @@ def test_site_bridge_miss_skips(wired):
 
 
 # ---------------------------------------------------------------------------
-# Idempotency — scope delete before insert
+# Idempotency — source-key delete before insert
 # ---------------------------------------------------------------------------
 
-def test_idempotent_scope_delete_before_insert(wired):
+def test_idempotent_source_delete_before_insert(wired):
     order = []
-    wired.setattr(ing.chunks, "delete_chunks_for_scope",
+    wired.setattr(ing.chunks, "delete_chunks_for_source",
                   lambda *a, **k: order.append("delete_chunks"))
-    wired.setattr(ing.topics, "delete_topics_for_scope",
+    wired.setattr(ing.topics, "delete_topics_for_source",
                   lambda *a, **k: order.append("delete_topics"))
     wired.setattr(ing.topics, "upsert_topic",
                   lambda *a, **k: order.append("upsert_topic") or {"id": "topic-uuid-0"})
@@ -304,3 +304,35 @@ def test_user_bridge_null_on_miss(wired):
 
     assert result["skipped"] is False
     assert seen_user_ids and all(uid is None for uid in seen_user_ids)
+
+
+# ---------------------------------------------------------------------------
+# C1 regression — NULL-user same-site/same-date reports must NOT delete each
+# other (source-key deletes carry the report's own key, never a shared scope)
+# ---------------------------------------------------------------------------
+
+def test_null_user_reports_do_not_collide(wired, monkeypatch):
+    key_a = "reports/2026-03-02/MPI1/daily_report.json"
+    key_b = "reports/2026-03-02/MPI2/daily_report.json"
+    fake_s3 = FakeS3({
+        key_a: json.dumps(make_report(user_name="MPI1")),
+        key_b: json.dumps(make_report(user_name="MPI2")),
+    })
+    monkeypatch.setattr(ing, "s3", lambda: fake_s3)
+
+    deleted_keys = []
+    wired.setattr(ing.chunks, "delete_chunks_for_source",
+                  lambda conn, key: deleted_keys.append(("chunks", key)) or 0)
+    wired.setattr(ing.topics, "delete_topics_for_source",
+                  lambda conn, key: deleted_keys.append(("topics", key)) or 0)
+    wired.setattr(ing.topics, "upsert_topic", lambda *a, **k: {"id": "t-uuid"})
+    wired.setattr(ing.chunks, "insert_chunk", lambda *a, **k: {"id": "c-uuid"})
+    # user bridge misses for both (wired fixture's list_company_users is empty)
+
+    ing.ingest_report("2026-03-02", "MPI1", key_a)
+    ing.ingest_report("2026-03-02", "MPI2", key_b)
+
+    keys_used = {k for _, k in deleted_keys}
+    assert keys_used == {key_a, key_b}
+    assert deleted_keys.count(("chunks", key_a)) == 1
+    assert deleted_keys.count(("chunks", key_b)) == 1
