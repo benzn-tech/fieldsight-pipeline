@@ -47,6 +47,19 @@ Parameters:
     Description: Existing S3 bucket name (created outside this stack)
     Default: fieldsight-data-509194952652
 
+  IngestBucketName:
+    Type: String
+    Default: fieldsight-data-509194952652
+    Description: >-
+      Bucket the ingest lambda reads (Phase 4a). This is the REAL data lake
+      (prod, hand-assembled pipeline writes reports/transcripts here) — NOT
+      DataBucketName, which is the test stack's own bucket with an empty
+      reports/ prefix. Aurora (fieldsight-db-test) is the single org DB both
+      environments share, so ingest bridges lake -> Aurora. The S3 event
+      notification for this bucket is managed MANUALLY (the lake bucket's
+      notifications are hand-managed alongside vad/transcribe; wire-s3-events.sh
+      only manages DataBucketName).
+
   StartDaysAgo:
     Type: Number
     Description: Query data from N days ago
@@ -743,7 +756,7 @@ Resources:
             Fn::Sub: "${DbStackName}-DbName"
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
-          S3_BUCKET: !Ref DataBucketName
+          S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
           BEDROCK_MODEL_ID: amazon.titan-embed-text-v2:0
       Policies:
@@ -753,12 +766,12 @@ Resources:
             - Effect: Allow
               Action: s3:GetObject
               Resource:
-                - !Sub arn:aws:s3:::${DataBucketName}/reports/*
-                - !Sub arn:aws:s3:::${DataBucketName}/transcripts/*
-                - !Sub arn:aws:s3:::${DataBucketName}/config/user_mapping.json
+                - !Sub arn:aws:s3:::${IngestBucketName}/reports/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
             - Effect: Allow
               Action: s3:ListBucket
-              Resource: !Sub arn:aws:s3:::${DataBucketName}
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
                 StringLike:
                   s3:prefix:
