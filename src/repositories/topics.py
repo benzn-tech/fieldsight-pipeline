@@ -8,8 +8,10 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
                  occurred_at=None, category=None, summary=None,
                  action_items=None, safety=None, photos=None) -> dict:
     """Insert a topic with its children. NOTE: currently insert-only —
-    no ON CONFLICT dedup; re-running extraction will duplicate topics
-    (dedup key TBD in Phase 4)."""
+    no ON CONFLICT dedup. Dedup is instead handled by callers running
+    delete_topics_for_scope() first to clear the (site_id, report_date, user_id)
+    scope before re-inserting (Phase 4a scope-delete idempotency); insert-only
+    semantics here are retained by design."""
     cur = conn.cursor(row_factory=dict_row)
     topic = cur.execute(
         f"INSERT INTO topics (site_id, user_id, source_s3_key, report_date, occurred_at, "
@@ -53,3 +55,19 @@ def get_topic_photos(conn, topic_id) -> list[dict]:
         "WHERE topic_id=%s ORDER BY created_at",
         (topic_id,),
     ).fetchall()
+
+
+def delete_topics_for_scope(conn, site_id, report_date, user_id) -> int:
+    """Delete topics rows for a (site_id, report_date, user_id) scope.
+
+    user_id is nullable: pass None to target rows with no user (user_id IS NULL)
+    rather than matching all users. Children (action_items, safety_observations,
+    topic_photos) are removed automatically via ON DELETE CASCADE FKs to topics
+    (see 0003_dashboard_readmodel.sql) — no separate child deletes needed here."""
+    user_clause = "user_id=%s" if user_id is not None else "user_id IS NULL"
+    params = [site_id, report_date] + ([user_id] if user_id is not None else [])
+    cur = conn.execute(
+        f"DELETE FROM topics WHERE site_id=%s AND report_date=%s AND {user_clause}",
+        params,
+    )
+    return cur.rowcount
