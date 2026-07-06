@@ -8,8 +8,10 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
                  occurred_at=None, category=None, summary=None,
                  action_items=None, safety=None, photos=None) -> dict:
     """Insert a topic with its children. NOTE: currently insert-only —
-    no ON CONFLICT dedup; re-running extraction will duplicate topics
-    (dedup key TBD in Phase 4)."""
+    no ON CONFLICT dedup. Dedup is instead handled by callers running
+    delete_topics_for_scope() first to clear the (site_id, report_date, user_id)
+    scope before re-inserting (Phase 4a scope-delete idempotency); insert-only
+    semantics here are retained by design."""
     cur = conn.cursor(row_factory=dict_row)
     topic = cur.execute(
         f"INSERT INTO topics (site_id, user_id, source_s3_key, report_date, occurred_at, "
@@ -53,3 +55,19 @@ def get_topic_photos(conn, topic_id) -> list[dict]:
         "WHERE topic_id=%s ORDER BY created_at",
         (topic_id,),
     ).fetchall()
+
+
+def delete_topics_for_source(conn, source_s3_key) -> int:
+    """Delete topics rows produced from one source report.
+
+    Keyed on source_s3_key — unique per report and immune to identity-
+    resolution drift (see chunks.delete_chunks_for_source for the failure
+    modes a (site, date, user_id) scope key had — Fable review C1/I1).
+    Children (action_items, safety_observations, topic_photos) are removed
+    automatically via ON DELETE CASCADE FKs to topics
+    (see 0003_dashboard_readmodel.sql) — no separate child deletes needed."""
+    cur = conn.execute(
+        "DELETE FROM topics WHERE source_s3_key=%s",
+        (source_s3_key,),
+    )
+    return cur.rowcount
