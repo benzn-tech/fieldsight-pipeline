@@ -38,20 +38,31 @@ def parse_time_range(tr):
     """
     parts = [x.strip() for x in (tr or "").replace("–", "-").split("-") if x.strip()]
 
-    def sec(hhmm):
-        h, m = hhmm.split(":")
-        return int(h) * 3600 + int(m) * 60
+    def sec(hms):
+        # Real lake data mixes 'HH:MM' and 'HH:MM:SS' — accept both.
+        p = hms.split(":")
+        return int(p[0]) * 3600 + int(p[1]) * 60 + (int(p[2]) if len(p) > 2 else 0)
 
-    if len(parts) == 2:
-        return sec(parts[0]), sec(parts[1])
-    if len(parts) == 1:
-        v = sec(parts[0])
-        return v, v
+    try:
+        if len(parts) == 2:
+            return sec(parts[0]), sec(parts[1])
+        if len(parts) == 1:
+            v = sec(parts[0])
+            return v, v
+    except (ValueError, IndexError):
+        # Unparseable time_range → same rule as empty: topic does not
+        # participate in transcript assignment.
+        return None
     return None
 
 
 def _topic_text(t):
-    parts = [f"[{t['time_range']}] {t['topic_title']} ({t['category']})"]
+    # Defensive .get: one real lake report (2026-04-07 Ben_Test) carries a
+    # truncated final topic with no topic_title — a missing key must degrade
+    # to an untitled chunk, not a KeyError that fails the whole report.
+    header = (f"[{t.get('time_range', '')}] {t.get('topic_title') or '(untitled)'}"
+              f" ({t.get('category', '')})")
+    parts = [header]
     if t.get("participants"):
         parts.append("Participants: " + ", ".join(t["participants"]))
     parts.append(t.get("summary", ""))
@@ -72,10 +83,10 @@ def _topic_text(t):
 
 def _topic_meta(report, t, extra=None):
     m = {
-        "user_name": report["user_name"],
+        "user_name": report.get("user_name", ""),
         "site": report.get("site", ""),
-        "report_date": report["report_date"],
-        "topic_seq": t["topic_id"],
+        "report_date": report.get("report_date", ""),
+        "topic_seq": t.get("topic_id"),
         "time_range": t.get("time_range", ""),
         "category": t.get("category", ""),
         "participants": t.get("participants", []),
@@ -94,7 +105,7 @@ def chunk_report(report):
             chunks.append({
                 "chunk_type": "topic",
                 "chunk_text": text,
-                "topic_seq": t["topic_id"],
+                "topic_seq": t.get("topic_id"),
                 "metadata": _topic_meta(report, t),
             })
         else:
@@ -107,7 +118,7 @@ def chunk_report(report):
                 chunks.append({
                     "chunk_type": "topic",
                     "chunk_text": head + f"  (part {i + 1}/2)\n" + "\n".join(seg),
-                    "topic_seq": t["topic_id"],
+                    "topic_seq": t.get("topic_id"),
                     "metadata": _topic_meta(report, t, {"part": f"{i + 1}/2"}),
                 })
     return chunks
@@ -129,9 +140,9 @@ def _window_metadata(report, topic, index, window):
             "source_files": source_files,
         })
     return {
-        "user_name": report["user_name"],
+        "user_name": report.get("user_name", ""),
         "site": report.get("site", ""),
-        "report_date": report["report_date"],
+        "report_date": report.get("report_date", ""),
         "topic_seq": None,
         "note": "unassigned: no owning topic (gap between topics / casual talk) "
                 "— still ingested, searchable",
@@ -163,7 +174,7 @@ def chunk_transcripts(report, turns):
     for t in report.get("topics", []):
         pr = parse_time_range(t.get("time_range"))
         if pr:
-            topic_ranges.append((t["topic_id"], pr[0], pr[1], t))
+            topic_ranges.append((t.get("topic_id"), pr[0], pr[1], t))
 
     def owner(turn):
         s = _turn_sec(turn)
