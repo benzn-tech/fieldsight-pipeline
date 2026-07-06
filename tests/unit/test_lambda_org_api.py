@@ -1,4 +1,5 @@
 import json
+import re
 
 import pytest
 
@@ -628,3 +629,144 @@ def test_patch_site_swaps_icon_and_deletes_old(presign_wired):
     assert res["statusCode"] == 200
     assert fake.copied == [(pending, "org-assets/site-icons/s-1/new.png")]
     assert pending in fake.deleted and "org-assets/site-icons/s-1/old.png" in fake.deleted
+
+
+# ----------------------------------------------------------
+# /observations
+# ----------------------------------------------------------
+def test_create_observation_ok(wired):
+    # worker-role caller proves there is no role gate on create
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    created = {}
+
+    def fake_create(conn, company_id, kind, site_slug, author_sub, author_name,
+                    observation, risk_level=None, recommended_action=None,
+                    report_date=None):
+        created.update(company_id=company_id, kind=kind, site_slug=site_slug,
+                       author_sub=author_sub, author_name=author_name,
+                       observation=observation, risk_level=risk_level,
+                       recommended_action=recommended_action, report_date=report_date)
+        return {"id": "o-1", "company_id": company_id, "kind": kind,
+                "site_slug": site_slug, "observation": observation}
+
+    wired.setattr(org.observations, "create_observation", fake_create)
+    res = org.lambda_handler(make_event("POST", "/api/org/observations", body={
+        "kind": "safety", "site_slug": "site-a", "observation": "Loose scaffold",
+    }), None)
+    assert res["statusCode"] == 201
+    assert created["company_id"] == "c-uuid-1"
+    assert created["kind"] == "safety"
+    assert created["site_slug"] == "site-a"
+    assert created["author_sub"] == "sub-1"
+    assert created["author_name"] == "Ada L"
+    assert created["observation"] == "Loose scaffold"
+    # report_date has no SQL default — the endpoint must ALWAYS supply it
+    assert created["report_date"] is not None
+    assert re.match(r"^\d{4}-\d{2}-\d{2}$", created["report_date"])
+
+
+def test_create_observation_bad_kind_400(wired):
+    res = org.lambda_handler(make_event("POST", "/api/org/observations", body={
+        "kind": "danger", "site_slug": "site-a", "observation": "text",
+    }), None)
+    assert res["statusCode"] == 400
+
+
+def test_create_observation_missing_text_400(wired):
+    res = org.lambda_handler(make_event("POST", "/api/org/observations", body={
+        "kind": "safety", "site_slug": "site-a", "observation": "",
+    }), None)
+    assert res["statusCode"] == 400
+
+
+def test_list_observations_filters(wired):
+    seen = {}
+
+    def fake_list(conn, company_id, kind=None, date_from=None, date_to=None,
+                  site_slug=None, include_archived=False):
+        seen.update(company_id=company_id, kind=kind, date_from=date_from,
+                    date_to=date_to, site_slug=site_slug,
+                    include_archived=include_archived)
+        return [{"id": "o-1"}]
+
+    wired.setattr(org.observations, "list_observations", fake_list)
+    res = org.lambda_handler(make_event("GET", "/api/org/observations", params={
+        "kind": "quality", "from": "2026-07-01", "to": "2026-07-04",
+        "site_slug": "site-b", "include_archived": "1",
+    }), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["observations"] == [{"id": "o-1"}]
+    assert seen == {"company_id": "c-uuid-1", "kind": "quality",
+                     "date_from": "2026-07-01", "date_to": "2026-07-04",
+                     "site_slug": "site-b", "include_archived": True}
+
+
+def test_patch_status_author_ok(wired):
+    # non-admin caller who IS the author of the observation
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    wired.setattr(org.observations, "get_observation",
+                  lambda conn, cid, oid: {"id": oid, "author_sub": "sub-1",
+                                          "company_id": "c-uuid-1"})
+    seen = {}
+    wired.setattr(org.observations, "set_status",
+                  lambda conn, cid, oid, status: (seen.update(cid=cid, oid=oid, status=status)
+                                                  or {"id": oid, "status": status}))
+    res = org.lambda_handler(make_event("PATCH", "/api/org/observations/o-1",
+                                        body={"status": "closed"}), None)
+    assert res["statusCode"] == 200
+    assert seen == {"cid": "c-uuid-1", "oid": "o-1", "status": "closed"}
+
+
+def test_patch_status_other_worker_403(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    wired.setattr(org.observations, "get_observation",
+                  lambda conn, cid, oid: {"id": oid, "author_sub": "sub-OTHER",
+                                          "company_id": "c-uuid-1"})
+    res = org.lambda_handler(make_event("PATCH", "/api/org/observations/o-1",
+                                        body={"status": "closed"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_patch_status_admin_ok(wired):
+    # default CALLER is admin and NOT the author — role should still allow it
+    wired.setattr(org.observations, "get_observation",
+                  lambda conn, cid, oid: {"id": oid, "author_sub": "sub-OTHER",
+                                          "company_id": "c-uuid-1"})
+    seen = {}
+    wired.setattr(org.observations, "set_status",
+                  lambda conn, cid, oid, status: (seen.update(status=status)
+                                                  or {"id": oid, "status": status}))
+    res = org.lambda_handler(make_event("PATCH", "/api/org/observations/o-1",
+                                        body={"status": "open"}), None)
+    assert res["statusCode"] == 200
+    assert seen["status"] == "open"
+
+
+def test_patch_status_bad_value_400(wired):
+    res = org.lambda_handler(make_event("PATCH", "/api/org/observations/o-1",
+                                        body={"status": "cancelled"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_archive_requires_admin_or_gm(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res = org.lambda_handler(make_event("POST", "/api/org/observations/o-1/archive"), None)
+    assert res["statusCode"] == 403
+
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "gm"})
+    wired.setattr(org.observations, "set_archived",
+                  lambda conn, cid, oid, archived: {"id": oid, "archived_at": "2026-07-06"})
+    res2 = org.lambda_handler(make_event("POST", "/api/org/observations/o-1/archive"), None)
+    assert res2["statusCode"] == 200
+
+
+def test_observation_cross_company_404(wired):
+    wired.setattr(org.observations, "get_observation", lambda conn, cid, oid: None)
+    res = org.lambda_handler(make_event("PATCH", "/api/org/observations/o-9",
+                                        body={"status": "open"}), None)
+    assert res["statusCode"] == 404
