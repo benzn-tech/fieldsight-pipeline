@@ -62,14 +62,13 @@ if fn_exists "${PREFIX}-transcribe"; then
 else
   echo "NOTE: ${PREFIX}-transcribe not deployed — skipping transcribe trigger"
 fi
+# NOTE(Phase 4a): this entry wires DataBucketName (the test bucket, whose
+# reports/ prefix is empty) - harmless. The REAL lake trigger lives on the
+# prod bucket (fieldsight-data-509194952652) and is managed MANUALLY there
+# (that bucket has hand-managed notifications; see IngestBucketName param).
 if fn_exists "${PREFIX}-ingest"; then
   WIRE_FNS+=("${PREFIX}-ingest")
   DESIRED=$(jq -c --arg arn "$INGEST_ARN" '. + [
-  # NOTE(Phase 4a): this entry wires DataBucketName (the test bucket, empty
-  # reports/) — harmless. The REAL lake trigger lives on the prod bucket
-  # (fieldsight-data-509194952652) and is managed MANUALLY there (that
-  # bucket's notifications are hand-managed; see IngestBucketName param).
-
     {"Id":"fs-ingest-report","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
      "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reports/"},{"Name":"suffix","Value":"daily_report.json"}]}}}
   ]' <<<"$DESIRED")
