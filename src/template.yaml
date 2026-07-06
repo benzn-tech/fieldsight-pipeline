@@ -710,6 +710,64 @@ Resources:
               Action: s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/config/user_mapping.json
 
+  # ----------------------------------------------------------
+  # Lambda 12: Ingest (Phase 4a) — reads reports/ + transcripts/,
+  # embeds via Bedrock Titan, writes to pgvector. In-VPC (psycopg →
+  # Aurora) and needs Bedrock (via BedrockRuntimeEndpoint, BUG-36 —
+  # no NAT means no black-holed API calls). Gated by HasDb.
+  # NO Events: S3 wired manually per BUG-33 — see
+  # scripts/wire-s3-events.sh (triggers on reports/*daily_report.json).
+  # ----------------------------------------------------------
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-ingest", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_ingest.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection — see MigrateFunction notes.
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !ImportValue
+            Fn::Sub: "${DbStackName}-DbName"
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          S3_BUCKET: !Ref DataBucketName
+          CONFIG_KEY: config/user_mapping.json
+          BEDROCK_MODEL_ID: amazon.titan-embed-text-v2:0
+      Policies:
+        - VPCAccessPolicy: {}
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/reports/*
+                - !Sub arn:aws:s3:::${DataBucketName}/transcripts/*
+                - !Sub arn:aws:s3:::${DataBucketName}/config/user_mapping.json
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${DataBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - reports/*
+                    - transcripts/*
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+
   # ==========================================================
   # COGNITO - User Authentication
   # ==========================================================

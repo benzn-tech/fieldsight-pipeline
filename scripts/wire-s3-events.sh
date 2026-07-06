@@ -7,6 +7,7 @@
 #
 #   VAD        ← users/**.wav , users/**.mp4   (raw uploads)
 #   Transcribe ← audio_segments/**.wav         (VAD output)
+#   Ingest     ← reports/**daily_report.json   (report generator output)
 #
 # SAFETY:
 #   * MERGE, not clobber: we read the existing notification config and
@@ -28,8 +29,9 @@ ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 PREFIX="fieldsight"; [ "$STAGE" = "test" ] && PREFIX="fieldsight-test"
 VAD_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-vad"
 TRANSCRIBE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-transcribe"
+INGEST_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-ingest"
 
-echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe"
+echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe Ingest=${PREFIX}-ingest"
 
 # ---- desired LambdaFunctionConfigurations (our managed entries, Id prefix fs-) ----
 # Only wire functions that actually exist: VadFunction is conditional in the
@@ -59,6 +61,15 @@ if fn_exists "${PREFIX}-transcribe"; then
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-transcribe not deployed — skipping transcribe trigger"
+fi
+if fn_exists "${PREFIX}-ingest"; then
+  WIRE_FNS+=("${PREFIX}-ingest")
+  DESIRED=$(jq -c --arg arn "$INGEST_ARN" '. + [
+    {"Id":"fs-ingest-report","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reports/"},{"Name":"suffix","Value":"daily_report.json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-ingest not deployed — skipping ingest trigger"
 fi
 
 CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --output json 2>/dev/null || echo '{}')

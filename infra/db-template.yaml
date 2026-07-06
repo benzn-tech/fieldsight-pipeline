@@ -122,6 +122,20 @@ Resources:
         - !GetAtt EndpointSG.GroupId
       PrivateDnsEnabled: true
 
+  # Phase 4a — in-VPC ingest lambda's only route to Bedrock (BUG-36:
+  # no NAT means bedrock:InvokeModel would black-hole to timeout with
+  # zero logs without this endpoint).
+  BedrockRuntimeEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.bedrock-runtime
+      VpcId: !Ref VpcId
+      SubnetIds: !Ref EndpointSubnetIds
+      SecurityGroupIds:
+        - !GetAtt EndpointSG.GroupId
+      PrivateDnsEnabled: true
+
   S3GatewayEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
