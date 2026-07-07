@@ -2,15 +2,25 @@
 Tests for src/lambda_ingest.py — Phase 4a ingest lambda (TDD).
 
 Style mirrors tests/unit/test_lambda_org_api.py: FakeConn + monkeypatch on
-module-level boto3 client globals (_s3_client / _bedrock_client) and on the
+module-level boto3 client globals (_s3_client) and on the
 repositories/chunking/transcript_utils functions the handler calls.
+
+Phase 4d: embeddings now come from an S3 vector sidecar (embed-report writes
+embeddings/{date}/{user}/vectors.json = {sha256(chunk_text[:8000]): [floats]});
+Bedrock is retired from this lambda entirely -- no test here may reference it.
 """
+import hashlib
 import io
 import json
 
 import pytest
 
 ing = pytest.importorskip("lambda_ingest", reason="requires psycopg (installed in CI)")
+
+# Captured before any fixture monkeypatches embed_from_sidecar, so tests that
+# want the REAL sidecar-lookup behavior (not the wired fixture's canned stub)
+# can restore it.
+_real_embed_from_sidecar = ing.embed_from_sidecar
 
 
 class FakeConn:
@@ -21,8 +31,15 @@ class FakeConn:
         return False
 
 
+class _FakeS3Exceptions:
+    class NoSuchKey(Exception):
+        pass
+
+
 class FakeS3:
     """Minimal S3 client double: object store keyed by S3 key."""
+
+    exceptions = _FakeS3Exceptions
 
     def __init__(self, objects=None):
         self.objects = objects or {}
@@ -93,7 +110,9 @@ def wired(monkeypatch):
     monkeypatch.setattr(ing.topics, "upsert_topic",
                         lambda *a, **k: {"id": "topic-uuid-0"})
     monkeypatch.setattr(ing.chunks, "insert_chunk", lambda *a, **k: {"id": "chunk-x"})
-    monkeypatch.setattr(ing, "embed_text", lambda text: "[" + ",".join(["0.0"] * 1024) + "]")
+    monkeypatch.setattr(ing, "_load_vectors", lambda bucket, sidecar_key: {})
+    monkeypatch.setattr(ing, "embed_from_sidecar",
+                        lambda text, vectors: "[" + ",".join(["0.0"] * 1024) + "]")
     monkeypatch.setattr(ing, "_load_turns", lambda user_folder, date: [])
     return monkeypatch
 
@@ -102,7 +121,11 @@ def wired(monkeypatch):
 # S3 event / manual / backfill entry points
 # ---------------------------------------------------------------------------
 
-def test_s3_event_key_parsing(monkeypatch):
+def test_handler_parses_embeddings_event_key(monkeypatch):
+    # Phase 4d: the fs-ingest-report trigger migrated from reports/ to
+    # embeddings/...vectors.json (embed-report writes the sidecar, which is
+    # what now fires ingest). Handler must derive (date, user_folder,
+    # report_key) from THAT shape, not the old reports/ key.
     calls = []
     monkeypatch.setattr(
         ing, "ingest_report",
@@ -112,13 +135,27 @@ def test_s3_event_key_parsing(monkeypatch):
     # S3 event notifications encode spaces as '+' and other specials as %XX —
     # unquote_plus must be applied before the key is used against S3/DB.
     event = {"Records": [{"s3": {"object": {
-        "key": "reports/2026-03-02/Jarley+Trainor/daily_report.json"}}}]}
+        "key": "embeddings/2026-03-02/Jarley+Trainor/vectors.json"}}}]}
 
     result = ing.lambda_handler(event, None)
 
     assert calls == [("2026-03-02", "Jarley Trainor",
                       "reports/2026-03-02/Jarley Trainor/daily_report.json")]
     assert result == {"results": [{"skipped": False, "topics": 1, "chunks": 2}]}
+
+
+def test_handler_ignores_non_embeddings_key(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        ing, "ingest_report",
+        lambda date, user_folder, key: calls.append((date, user_folder, key)),
+    )
+    event = {"Records": [{"s3": {"object": {"key": "audio_segments/foo/2026-03-02/x.wav"}}}]}
+
+    result = ing.lambda_handler(event, None)
+
+    assert calls == []
+    assert result == {"results": []}
 
 
 # ---------------------------------------------------------------------------
@@ -226,28 +263,85 @@ def test_topic_uuid_flows_to_chunks(wired):
 
 
 # ---------------------------------------------------------------------------
-# Embedding format
+# S3 vector-sidecar key derivation (reports/... -> embeddings/...vectors.json)
 # ---------------------------------------------------------------------------
 
-def test_embedding_string_format(monkeypatch):
-    fake_vector = [float(i) / 10 for i in range(1024)]
+def test_sidecar_key_derivation():
+    assert ing._sidecar_key("reports/2026-03-02/Jarley_Trainor/daily_report.json") == \
+        "embeddings/2026-03-02/Jarley_Trainor/vectors.json"
 
-    class FakeBedrock:
-        def invoke_model(self, modelId, body):
-            assert modelId == ing.BEDROCK_MODEL_ID
-            payload = json.loads(body)
-            assert payload["inputText"] == "hello world"
-            return {"body": io.BytesIO(json.dumps({"embedding": fake_vector}).encode("utf-8"))}
 
-    monkeypatch.setattr(ing, "_bedrock_client", FakeBedrock())
+def test_sidecar_key_derivation_bad_shape_raises():
+    with pytest.raises(ValueError):
+        ing._sidecar_key("reports/daily_report.json")
 
-    result = ing.embed_text("hello world")
 
-    assert result.startswith("[")
-    assert result.endswith("]")
-    values = result[1:-1].split(",")
-    assert len(values) == 1024
-    assert float(values[0]) == 0.0
+# ---------------------------------------------------------------------------
+# embed_from_sidecar — sha256(text[:8000]) lookup into the vector-sidecar map
+# ---------------------------------------------------------------------------
+
+def test_embed_from_sidecar_hit():
+    text = "hello world"
+    h = hashlib.sha256(text[:8000].encode("utf-8")).hexdigest()
+    vectors = {h: [0.1, 0.2, 0.3]}
+
+    result = ing.embed_from_sidecar(text, vectors)
+
+    assert result == "[0.1,0.2,0.3]"
+
+
+def test_embed_from_sidecar_truncates_at_8000_chars_before_hashing():
+    # Load-bearing: the embed side hashes the SAME truncated text. A chunk
+    # longer than 8000 chars must hash on the first 8000 chars only, or every
+    # lookup for long chunks would miss.
+    long_text = "x" * 9000
+    h = hashlib.sha256(long_text[:8000].encode("utf-8")).hexdigest()
+    vectors = {h: [9.9]}
+
+    result = ing.embed_from_sidecar(long_text, vectors)
+
+    assert result == "[9.9]"
+
+
+def test_embed_from_sidecar_missing_raises():
+    with pytest.raises(KeyError, match="no precomputed vector for chunk hash"):
+        ing.embed_from_sidecar("some text", {})
+
+
+# ---------------------------------------------------------------------------
+# ingest_report end-to-end: loads the sidecar, looks up real chunk-text
+# hashes, and insert_chunk receives the looked-up vector (not a Bedrock call).
+# ---------------------------------------------------------------------------
+
+def test_ingest_reads_sidecar(wired):
+    report = ing.json.loads(json.dumps(make_report()))
+    expected_chunks = ing.chunk_report(report)  # no transcripts -> topic chunks only
+    vectors = {}
+    for c in expected_chunks:
+        h = hashlib.sha256(c["chunk_text"][:8000].encode("utf-8")).hexdigest()
+        vectors[h] = [0.5, 0.25]
+
+    load_calls = []
+    wired.setattr(ing, "_load_vectors",
+                  lambda bucket, sidecar_key: load_calls.append((bucket, sidecar_key)) or vectors)
+    # Undo the wired fixture's canned embed_from_sidecar stub -- exercise the
+    # REAL sha256 lookup for this test.
+    wired.setattr(ing, "embed_from_sidecar", _real_embed_from_sidecar)
+
+    inserted_embeddings = []
+    wired.setattr(
+        ing.chunks, "insert_chunk",
+        lambda conn, site_id, report_date, chunk_type, chunk_text, embedding, **kw:
+            inserted_embeddings.append(embedding) or {"id": "chunk-x"},
+    )
+
+    result = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert result["skipped"] is False
+    assert load_calls == [(ing.S3_BUCKET, "embeddings/2026-03-02/Jarley_Trainor/vectors.json")]
+    assert inserted_embeddings  # at least the topic chunk was inserted
+    assert all(e == "[0.5,0.25]" for e in inserted_embeddings)
+    assert not hasattr(ing, "bedrock")  # bedrock() removed entirely
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +372,41 @@ def test_backfill_isolates_failures(monkeypatch):
     # {"backfill": true} on lambda_handler must dispatch to run_backfill.
     monkeypatch.setattr(ing, "run_backfill", lambda: {"processed": 9, "skipped": [], "failed": []})
     assert ing.lambda_handler({"backfill": True}, None) == {"processed": 9, "skipped": [], "failed": []}
+
+
+def test_backfill_still_lists_reports(monkeypatch):
+    # The ingest trigger migrated to embeddings/...vectors.json, but backfill
+    # is unchanged: it still lists the reports/ prefix directly (each
+    # ingest_report call derives its own sidecar path from the report key).
+    listed_prefixes = []
+
+    class _FakeBackfillPaginator:
+        def paginate(self, Bucket, Prefix):
+            listed_prefixes.append(Prefix)
+            yield {"Contents": [{"Key": "reports/2026-03-02/A/daily_report.json"},
+                                 {"Key": "embeddings/2026-03-02/A/vectors.json"}]}
+
+    class _FakeBackfillS3:
+        def get_paginator(self, op):
+            assert op == "list_objects_v2"
+            return _FakeBackfillPaginator()
+
+    monkeypatch.setattr(ing, "s3", lambda: _FakeBackfillS3())
+    calls = []
+    monkeypatch.setattr(
+        ing, "ingest_report",
+        lambda date, user_folder, key: calls.append(key)
+        or {"skipped": False, "topics": 0, "chunks": 0},
+    )
+
+    result = ing.run_backfill()
+
+    assert listed_prefixes == [ing.REPORTS_PREFIX]
+    assert ing.REPORTS_PREFIX == "reports/"
+    # Non-report keys under the same listing (e.g. a stray embeddings/ key)
+    # must not be treated as a report.
+    assert calls == ["reports/2026-03-02/A/daily_report.json"]
+    assert result["processed"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -352,3 +481,14 @@ def test_null_user_reports_do_not_collide(wired, monkeypatch):
     assert keys_used == {key_a, key_b}
     assert deleted_keys.count(("chunks", key_a)) == 1
     assert deleted_keys.count(("chunks", key_b)) == 1
+
+
+def test_ingest_missing_sidecar_skips(wired):
+    """M3 (Fable): zero-chunk report has no sidecar -> backfill path's
+    _load_vectors 404s -> clean skip, not a failure."""
+    def _raise(bucket, key):
+        raise ing.s3().exceptions.NoSuchKey("no such key")
+    wired.setattr(ing, "_load_vectors", _raise)
+    res = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+    assert res.get("skipped") is True
+    assert "sidecar" in res.get("reason", "")

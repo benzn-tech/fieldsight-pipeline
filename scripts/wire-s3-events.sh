@@ -5,9 +5,10 @@
 # SAM cannot attach S3 ObjectCreated events to an EXTERNAL bucket
 # (BUG-33), so we wire them here, idempotently, AFTER `sam deploy`.
 #
-#   VAD        ← users/**.wav , users/**.mp4   (raw uploads)
-#   Transcribe ← audio_segments/**.wav         (VAD output)
-#   Ingest     ← reports/**daily_report.json   (report generator output)
+#   VAD         ← users/**.wav , users/**.mp4   (raw uploads)
+#   Transcribe  ← audio_segments/**.wav         (VAD output)
+#   EmbedReport ← reports/**daily_report.json   (report generator output, non-VPC DashScope embed)
+#   Ingest      ← embeddings/**vectors.json     (embed-report output, in-VPC Aurora insert)
 #
 # SAFETY:
 #   * MERGE, not clobber: we read the existing notification config and
@@ -30,10 +31,11 @@ PREFIX="fieldsight"; [ "$STAGE" = "test" ] && PREFIX="fieldsight-test"
 VAD_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-vad"
 TRANSCRIBE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-transcribe"
 INGEST_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-ingest"
+EMBED_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-embed-report"
 EXTRACT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-extract-session"
 ITEM_WRITER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-item-writer"
 
-echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer"
+echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer"
 
 # ---- desired LambdaFunctionConfigurations (our managed entries, Id prefix fs-) ----
 # Only wire functions that actually exist: VadFunction is conditional in the
@@ -64,15 +66,33 @@ if fn_exists "${PREFIX}-transcribe"; then
 else
   echo "NOTE: ${PREFIX}-transcribe not deployed — skipping transcribe trigger"
 fi
-# NOTE(Phase 4a): this entry wires DataBucketName (the test bucket, whose
-# reports/ prefix is empty) - harmless. The REAL lake trigger lives on the
-# prod bucket (fieldsight-data-509194952652) and is managed MANUALLY there
-# (that bucket has hand-managed notifications; see IngestBucketName param).
+# NOTE(Phase 4d): embed-report triggers on reports/*daily_report.json (the
+# report generator output) — non-VPC, calls DashScope over the public
+# internet, chunks the report + transcripts, and writes the
+# {sha256(chunk_text): vector} sidecar to embeddings/. Zero prefix overlap
+# with ingest below (reports/ vs embeddings/), so no double-trigger loop.
+if fn_exists "${PREFIX}-embed-report"; then
+  WIRE_FNS+=("${PREFIX}-embed-report")
+  DESIRED=$(jq -c --arg arn "$EMBED_ARN" '. + [
+    {"Id":"fs-embed-report","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reports/"},{"Name":"suffix","Value":"daily_report.json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-embed-report not deployed — skipping embed-report trigger"
+fi
+# NOTE(Phase 4d): ingest migrated off reports/*daily_report.json onto
+# embeddings/*vectors.json (the embed-report output above) — ingest no
+# longer calls Bedrock, it looks up pre-computed vectors from this sidecar
+# by sha256(chunk_text) and inserts into Aurora. This entry wires
+# DataBucketName (the test bucket, whose embeddings/ prefix is empty) —
+# harmless. The REAL lake trigger lives on the prod bucket
+# (fieldsight-data-509194952652) and is managed MANUALLY there (that
+# bucket has hand-managed notifications; see IngestBucketName param).
 if fn_exists "${PREFIX}-ingest"; then
   WIRE_FNS+=("${PREFIX}-ingest")
   DESIRED=$(jq -c --arg arn "$INGEST_ARN" '. + [
     {"Id":"fs-ingest-report","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
-     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reports/"},{"Name":"suffix","Value":"daily_report.json"}]}}}
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"embeddings/"},{"Name":"suffix","Value":"vectors.json"}]}}}
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-ingest not deployed — skipping ingest trigger"

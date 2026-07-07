@@ -122,6 +122,12 @@ Parameters:
     NoEcho: true
     Default: ''
 
+  DashScopeApiKey:
+    Type: String
+    Description: Alibaba Cloud DashScope API key (Phase 4d) for text-embedding-v4 embeddings
+    NoEcho: true
+    Default: ''
+
   ScheduleExpression:
     Type: String
     Description: Download schedule (Cron in UTC)
@@ -786,11 +792,14 @@ Resources:
 
   # ----------------------------------------------------------
   # Lambda 12: Ingest (Phase 4a) — reads reports/ + transcripts/,
-  # embeds via Bedrock Titan, writes to pgvector. In-VPC (psycopg →
-  # Aurora) and needs Bedrock (via BedrockRuntimeEndpoint, BUG-36 —
-  # no NAT means no black-holed API calls). Gated by HasDb.
+  # looks up chunk embeddings by sha256(chunk_text) from the
+  # embeddings/{date}/{user}/vectors.json sidecar (written by
+  # EmbedReportFunction), writes to pgvector. In-VPC (psycopg →
+  # Aurora). Bedrock retired (Phase 4d) — embedding now happens
+  # non-VPC in EmbedReportFunction; this function does zero outbound
+  # HTTP, only S3 reads + Aurora writes. Gated by HasDb.
   # NO Events: S3 wired manually per BUG-33 — see
-  # scripts/wire-s3-events.sh (triggers on reports/*daily_report.json).
+  # scripts/wire-s3-events.sh (triggers on embeddings/*vectors.json).
   # ----------------------------------------------------------
   IngestFunction:
     Type: AWS::Serverless::Function
@@ -819,7 +828,6 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
-          BEDROCK_MODEL_ID: amazon.titan-embed-text-v2:0
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
@@ -829,6 +837,7 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/reports/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/embeddings/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
             - Effect: Allow
               Action: s3:ListBucket
@@ -838,9 +847,62 @@ Resources:
                   s3:prefix:
                     - reports/*
                     - transcripts/*
+
+  # ----------------------------------------------------------
+  # Lambda 15: Embed Report (Phase 4d) — S3 event on reports/,
+  # chunks the report + its transcripts and calls DashScope
+  # (text-embedding-v4, public internet) directly, writing the
+  # {sha256(chunk_text): vector} sidecar to embeddings/. NOT in
+  # VPC (DashScope needs public internet, unreachable from inside
+  # the VPC — mirrors ReportGeneratorFunction/ExtractSessionFunction's
+  # non-VPC shape). Layers/Condition: HasDb ARE still required even
+  # though this function itself never touches Aurora, because
+  # lambda_embed_report imports lambda_ingest (shared chunking/hash
+  # helpers), which transitively imports psycopg at module load —
+  # without PsycopgLayer this is a cold-start ImportError; PsycopgLayer
+  # only exists when HasDb, so this function must share that Condition.
+  # NO Events: S3 wired manually per BUG-33 — see
+  # scripts/wire-s3-events.sh (fs-embed-report, triggers on
+  # reports/*daily_report.json).
+  # ----------------------------------------------------------
+  EmbedReportFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-embed-report", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_embed_report.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Layers:
+        - !Ref PsycopgLayer
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName
+          CONFIG_KEY: config/user_mapping.json
+          DASHSCOPE_API_KEY: !Ref DashScopeApiKey
+          DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+          DASHSCOPE_EMBED_MODEL: text-embedding-v4
+          DASHSCOPE_EMBED_DIM: '1024'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
             - Effect: Allow
-              Action: bedrock:InvokeModel
-              Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/reports/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/embeddings/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - transcripts/*
 
   # ----------------------------------------------------------
   # Lambda 14: Item Writer (Phase 4b) — S3 event on extractions/,

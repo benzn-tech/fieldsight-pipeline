@@ -55,6 +55,7 @@ jobs:
           REALPTT_ACCOUNT: ${{ secrets.REALPTT_ACCOUNT }}
           REALPTT_PASSWORD: ${{ secrets.REALPTT_PASSWORD }}
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
           FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
         run: |
@@ -78,6 +79,7 @@ jobs:
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \
+              "DashScopeApiKey=$DASHSCOPE_API_KEY" \
               "FargateSubnetIds=$SUBNETS" \
               "FargateVpcId=$VPC" \
               "DbStackName=fieldsight-db-test" \
