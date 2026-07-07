@@ -536,7 +536,11 @@ def _rag_answer(body):
 
     question = (body.get("question") or "").strip()
     caller_sub = body.get("caller_sub")
-    k = int(body.get("k", 8))
+    # k=5 default: fewer chunks -> shorter synthesis prompt -> faster answer.
+    # The user-facing ask round-trip is capped by APIGW's 29s ceiling and the
+    # e2e came in at ~24s with k=8; 5 keeps headroom without hurting recall
+    # on our corpus. rag-search clamps k to [1,32].
+    k = int(body.get("k", 5))
 
     try:
         query_vec = dashscope_utils.embed([question])[0]
