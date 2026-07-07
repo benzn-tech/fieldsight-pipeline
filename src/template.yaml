@@ -328,11 +328,17 @@ Resources:
                 - s3:DeleteObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/download_claims/*
       Events:
-        ScheduleEvent:
+        NightlyEvent:
           Type: Schedule
           Properties:
             Schedule: !Ref ScheduleExpression
             Description: Daily sync trigger (8 PM NZDT)
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+        SweepEvent:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0/15 17-23,0-7 * * ? *)
+            Description: 15-min working-hours sweep NZ ~06:00-19:00 across DST
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
 
   # ----------------------------------------------------------
@@ -736,6 +742,49 @@ Resources:
               Resource: !Sub arn:aws:s3:::${DataBucketName}/config/user_mapping.json
 
   # ----------------------------------------------------------
+  # Lambda 13: Extract Session (Phase 4b) — S3 event on transcripts/,
+  # collects a session's segments, calls Claude directly (mirrors
+  # ReportGenerator's ANTHROPIC_API_KEY/CLAUDE_MODEL env pattern), and
+  # writes the session-extraction JSON to extractions/. NOT in VPC (no
+  # DB access needed, so no Condition -- deploys even without HasDb).
+  # NO Events: S3 wired manually per BUG-33 — see
+  # scripts/wire-s3-events.sh (fs-extract-transcripts, triggers on
+  # transcripts/*.json).
+  # ----------------------------------------------------------
+  ExtractSessionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ["${P}-extract-session", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_extract_session.lambda_handler
+      Timeout: 180
+      MemorySize: 256
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName
+          CONFIG_KEY: config/user_mapping.json
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          CLAUDE_MODEL: claude-sonnet-4-6
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - transcripts/*
+
+  # ----------------------------------------------------------
   # Lambda 12: Ingest (Phase 4a) — reads reports/ + transcripts/,
   # embeds via Bedrock Titan, writes to pgvector. In-VPC (psycopg →
   # Aurora) and needs Bedrock (via BedrockRuntimeEndpoint, BUG-36 —
@@ -792,6 +841,60 @@ Resources:
             - Effect: Allow
               Action: bedrock:InvokeModel
               Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+
+  # ----------------------------------------------------------
+  # Lambda 14: Item Writer (Phase 4b) — S3 event on extractions/,
+  # writes a session-extraction JSON to Aurora topics (reuses
+  # lambda_ingest's identity bridge + topic-child mapping via import,
+  # never copied). In-VPC (psycopg -> Aurora), mirrors IngestFunction's
+  # Layers/VpcConfig/PG env verbatim. Gated by HasDb.
+  # NO Events: S3 wired manually per BUG-33 — see
+  # scripts/wire-s3-events.sh (fs-write-extractions, triggers on
+  # extractions/*.json).
+  # ----------------------------------------------------------
+  ItemWriterFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-item-writer", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_item_writer.lambda_handler
+      Timeout: 120
+      MemorySize: 512
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection — see MigrateFunction notes.
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !ImportValue
+            Fn::Sub: "${DbStackName}-DbName"
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          S3_BUCKET: !Ref IngestBucketName
+          CONFIG_KEY: config/user_mapping.json
+      Policies:
+        - VPCAccessPolicy: {}
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - extractions/*
 
   # ==========================================================
   # COGNITO - User Authentication

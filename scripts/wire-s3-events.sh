@@ -30,8 +30,10 @@ PREFIX="fieldsight"; [ "$STAGE" = "test" ] && PREFIX="fieldsight-test"
 VAD_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-vad"
 TRANSCRIBE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-transcribe"
 INGEST_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-ingest"
+EXTRACT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-extract-session"
+ITEM_WRITER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-item-writer"
 
-echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe Ingest=${PREFIX}-ingest"
+echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer"
 
 # ---- desired LambdaFunctionConfigurations (our managed entries, Id prefix fs-) ----
 # Only wire functions that actually exist: VadFunction is conditional in the
@@ -74,6 +76,28 @@ if fn_exists "${PREFIX}-ingest"; then
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-ingest not deployed — skipping ingest trigger"
+fi
+# NOTE(Phase 4b): extract-session triggers on transcripts/*.json, writing to
+# extractions/ -- distinct prefix from every other trigger in this script.
+if fn_exists "${PREFIX}-extract-session"; then
+  WIRE_FNS+=("${PREFIX}-extract-session")
+  DESIRED=$(jq -c --arg arn "$EXTRACT_ARN" '. + [
+    {"Id":"fs-extract-transcripts","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"transcripts/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-extract-session not deployed — skipping extract-session trigger"
+fi
+# NOTE(Phase 4b): item-writer triggers on extractions/*.json, the output of
+# extract-session above -- a two-stage chain, zero prefix overlap.
+if fn_exists "${PREFIX}-item-writer"; then
+  WIRE_FNS+=("${PREFIX}-item-writer")
+  DESIRED=$(jq -c --arg arn "$ITEM_WRITER_ARN" '. + [
+    {"Id":"fs-write-extractions","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"extractions/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-item-writer not deployed — skipping item-writer trigger"
 fi
 
 CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --output json 2>/dev/null || echo '{}')
