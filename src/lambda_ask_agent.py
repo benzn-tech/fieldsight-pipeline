@@ -578,6 +578,10 @@ def _rag_answer(body):
                 "model": claude_utils.CLAUDE_MODEL,
             }
 
+        # CONTRACT: citations MUST stay in the same order as the prompt's [n]
+        # excerpt numbering above (enumerate(chunks, start=1)) so the UI can
+        # map card [i+1] <-> inline [n] positionally. Do not filter/dedupe/
+        # reorder here without also renumbering the prompt.
         citations = [
             {
                 "source_s3_key": c.get("source_s3_key"),
