@@ -1006,3 +1006,23 @@ def test_read_programme_reraises_accessdenied():
     fake.get_object_error_code = "AccessDenied"
     with pytest.raises(ClientError):
         org.programme.read_programme(fake, "bucket", SITE_ID)
+
+
+def test_allowed_site_ids_stringifies_uuid():
+    """Regression: DB returns uuid.UUID site ids; the ?site= param is a str.
+    _allowed_site_ids must return string ids so the `in` check matches
+    (real-Aurora 403 bug the string-id mocks missed)."""
+    import uuid as _uuid
+    import lambda_org_api as m
+    sid = _uuid.uuid4()
+
+    class _Conn: pass
+    caller = {"global_role": "admin", "company_id": "co-1", "id": "u-1"}
+    orig = m.sites.list_company_sites
+    m.sites.list_company_sites = lambda conn, cid: [{"id": sid}]
+    try:
+        allowed = m._allowed_site_ids(_Conn(), caller)
+    finally:
+        m.sites.list_company_sites = orig
+    assert str(sid) in allowed
+    assert all(isinstance(x, str) for x in allowed)
