@@ -1026,3 +1026,156 @@ def test_allowed_site_ids_stringifies_uuid():
         m.sites.list_company_sites = orig
     assert str(sid) in allowed
     assert all(isinstance(x, str) for x in allowed)
+
+
+# ----------------------------------------------------------
+# /rollup/portfolio (Phase 4c leg-1 — deterministic SQL aggregation)
+#
+# Two test styles:
+#   - repo-level (rollup.portfolio_counts): a SQL-level FakeConn/FakeCursor
+#     double that feeds one canned result list per cursor().execute() call,
+#     in call order — mirrors tests/unit/test_topics_repo.py's FakeConn used
+#     for list_topics_for_date's multi-query pattern (that repo test lives
+#     in a separate file since it captures raw SQL; here we keep it local
+#     since the brief scopes all 9 new tests to this file).
+#   - handler-level (list_portfolio_rollup): the existing `wired` fixture,
+#     monkeypatching org.sites / org.memberships / org.rollup exactly like
+#     the /live-items and /programme tests above.
+# ----------------------------------------------------------
+class _RollupFakeCursor:
+    def __init__(self, conn):
+        self.conn = conn
+        self._rows = []
+
+    def execute(self, sql, params=None):
+        self.conn.calls.append({"sql": sql, "params": params})
+        self._rows = self.conn._pop_result()
+        return self
+
+    def fetchall(self):
+        return self._rows
+
+
+class _RollupFakeConn:
+    """`results` is consumed in call order: one entry (a list of row dicts)
+    per cursor().execute() call — one entry per GROUP BY query."""
+
+    def __init__(self, results=None):
+        self.calls = []
+        self._results = list(results or [])
+
+    def _pop_result(self):
+        return self._results.pop(0) if self._results else []
+
+    def cursor(self, row_factory=None):
+        return _RollupFakeCursor(self)
+
+
+def test_portfolio_counts_merges_three_queries():
+    conn = _RollupFakeConn(results=[
+        [{"site_id": "s-1", "open_safety": 2, "open_high_safety": 1}],
+        [{"site_id": "s-1", "open_actions": 3, "total_actions": 5, "overdue_actions": 1}],
+        [{"site_id": "s-1", "topics_count": 7, "participants": 4}],
+    ])
+    counts = org.rollup.portfolio_counts(conn, ["s-1"])
+    assert len(conn.calls) == 3
+    assert "safety_observations" in conn.calls[0]["sql"]
+    assert "action_items" in conn.calls[1]["sql"]
+    assert "topics" in conn.calls[2]["sql"]
+    assert conn.calls[0]["params"] == (["s-1"],)
+    assert counts == {"s-1": {
+        "open_safety": 2, "open_high_safety": 1,
+        "open_actions": 3, "total_actions": 5, "overdue_actions": 1,
+        "topics_count": 7, "participants": 4,
+    }}
+
+
+def test_zero_count_site_included():
+    # no rows come back from any of the 3 GROUP BY queries for either site
+    conn = _RollupFakeConn(results=[[], [], []])
+    counts = org.rollup.portfolio_counts(conn, ["s-1", "s-2"])
+    zero = {"open_safety": 0, "open_high_safety": 0, "open_actions": 0,
+            "total_actions": 0, "overdue_actions": 0, "topics_count": 0, "participants": 0}
+    assert counts == {"s-1": zero, "s-2": dict(zero)}
+
+
+def test_site_id_keys_are_strings():
+    """Regression: DB returns uuid.UUID site ids from the GROUP BY queries —
+    every merged dict key must be str() (the exact bug that once 403'd
+    /programme; see _allowed_site_ids above)."""
+    import uuid as _uuid
+    sid = _uuid.uuid4()
+    conn = _RollupFakeConn(results=[
+        [{"site_id": sid, "open_safety": 1, "open_high_safety": 0}],
+        [], [],
+    ])
+    counts = org.rollup.portfolio_counts(conn, [sid])
+    assert str(sid) in counts
+    assert all(isinstance(k, str) for k in counts)
+
+
+def test_status_red_on_high_safety():
+    assert org._status({"open_high_safety": 1, "open_safety": 0, "open_actions": 0}) == "red"
+
+
+def test_status_yellow_on_open():
+    assert org._status({"open_high_safety": 0, "open_safety": 1, "open_actions": 0}) == "yellow"
+    assert org._status({"open_high_safety": 0, "open_safety": 0, "open_actions": 2}) == "yellow"
+
+
+def test_status_green_when_zero():
+    assert org._status({"open_high_safety": 0, "open_safety": 0, "open_actions": 0}) == "green"
+
+
+def test_portfolio_rollup_admin_all_sites(wired):
+    wired.setattr(org.sites, "list_company_sites",
+                  lambda conn, cid, **kw: [{"id": "s-1"}, {"id": "s-2"}])
+    wired.setattr(org.rollup, "portfolio_counts",
+                  lambda conn, site_ids: {
+                      "s-1": {"open_safety": 0, "open_high_safety": 0, "open_actions": 0,
+                              "total_actions": 0, "overdue_actions": 0, "topics_count": 0,
+                              "participants": 0},
+                      "s-2": {"open_safety": 1, "open_high_safety": 0, "open_actions": 0,
+                              "total_actions": 0, "overdue_actions": 0, "topics_count": 0,
+                              "participants": 0},
+                  })
+    res = org.lambda_handler(make_event("GET", "/api/org/rollup/portfolio"), None)
+    assert res["statusCode"] == 200
+    sites_by_id = {s["site_id"]: s for s in body_of(res)["sites"]}
+    assert set(sites_by_id) == {"s-1", "s-2"}
+    assert sites_by_id["s-1"]["status"] == "green"
+    assert sites_by_id["s-2"]["status"] == "yellow"
+
+
+def test_portfolio_rollup_worker_memberships_only(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    seen = {}
+    wired.setattr(org.memberships, "accessible_site_ids",
+                  lambda conn, uid, role: (seen.update(uid=uid, role=role) or ["s-3"]))
+    wired.setattr(org.rollup, "portfolio_counts",
+                  lambda conn, site_ids: (seen.update(site_ids=site_ids) or {
+                      "s-3": {"open_safety": 0, "open_high_safety": 0, "open_actions": 0,
+                              "total_actions": 0, "overdue_actions": 0, "topics_count": 0,
+                              "participants": 0},
+                  }))
+    res = org.lambda_handler(make_event("GET", "/api/org/rollup/portfolio"), None)
+    assert res["statusCode"] == 200
+    assert seen["uid"] == "u-uuid-1" and seen["role"] == "worker"
+    assert seen["site_ids"] == {"s-3"}  # _allowed_site_ids returns a set
+    assert body_of(res)["sites"] == [{
+        "site_id": "s-3", "open_safety": 0, "open_high_safety": 0, "open_actions": 0,
+        "total_actions": 0, "overdue_actions": 0, "topics_count": 0, "participants": 0,
+        "status": "green",
+    }]
+
+
+def test_portfolio_rollup_empty_site_ids_empty(wired):
+    # worker with no memberships -> _allowed_site_ids returns an empty set;
+    # the real rollup.portfolio_counts short-circuits on it without a query.
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    wired.setattr(org.memberships, "accessible_site_ids", lambda conn, uid, role: [])
+    res = org.lambda_handler(make_event("GET", "/api/org/rollup/portfolio"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["sites"] == []
