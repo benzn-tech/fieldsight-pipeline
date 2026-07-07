@@ -38,7 +38,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from db.connection import get_connection
-from repositories import memberships, observations, sites, users
+from repositories import memberships, observations, sites, topics, users
 from repositories.acl import resolve_scope
 
 logger = logging.getLogger()
@@ -172,6 +172,10 @@ def dispatch(conn, event, method, route):
     m_oa = re.match(r"^/observations/([^/]+)/archive$", route)
     if m_oa and method == "POST":
         return archive_observation_endpoint(conn, caller, m_oa.group(1))
+
+    if route == "/live-items":
+        if method == "GET":
+            return list_live_items(conn, caller, event)
 
     return error("not found", 404)
 
@@ -589,3 +593,19 @@ def archive_observation_endpoint(conn, caller, obs_id):
     if row is None:
         return error("observation not found or already archived", 404)
     return ok(row)
+
+
+# ----------------------------------------------------------
+# /live-items (Phase 4b — dashboard read, ACL mirrors list_org_sites)
+# ----------------------------------------------------------
+def list_live_items(conn, caller, event):
+    date = (event.get("queryStringParameters") or {}).get("date")
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    if resolve_scope(caller["global_role"]) == "ALL":
+        site_ids = [s["id"] for s in sites.list_company_sites(conn, caller["company_id"])]
+    else:
+        site_ids = memberships.accessible_site_ids(
+            conn, caller["id"], caller["global_role"])
+    rows = topics.list_topics_for_date(conn, site_ids, date)
+    return ok({"topics": rows})
