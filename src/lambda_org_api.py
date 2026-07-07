@@ -635,9 +635,13 @@ def list_live_items(conn, caller, event):
 # object on a site rename.
 # ----------------------------------------------------------
 def _allowed_site_ids(conn, caller):
+    # str() both sides: psycopg returns site ids as uuid.UUID objects, but the
+    # ?site= query param arrives as a string — a UUID-vs-str `in` check is
+    # always False (every request 403'd, incl. admins). Unit mocks used string
+    # ids so this only surfaced against real Aurora (smoke-caught).
     if resolve_scope(caller["global_role"]) == "ALL":
-        return {s["id"] for s in sites.list_company_sites(conn, caller["company_id"])}
-    return set(memberships.accessible_site_ids(conn, caller["id"], caller["global_role"]))
+        return {str(s["id"]) for s in sites.list_company_sites(conn, caller["company_id"])}
+    return {str(x) for x in memberships.accessible_site_ids(conn, caller["id"], caller["global_role"])}
 
 
 def get_programme(conn, caller, event):
