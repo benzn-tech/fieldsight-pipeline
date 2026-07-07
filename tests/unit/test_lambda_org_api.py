@@ -123,6 +123,18 @@ def test_list_sites_worker_gets_membership_sites(wired):
     assert body_of(res)["sites"] == [{"id": "s-2", "name": "Beta"}]
 
 
+def test_list_org_sites_includes_slug(wired):
+    # sites.py's _COLS already includes slug (Task 1) — list_org_sites just
+    # forwards whatever the repository returns, so this proves the field
+    # isn't stripped anywhere between the query and the HTTP response.
+    wired.setattr(org.sites, "list_company_sites",
+                  lambda conn, cid, include_archived=False: [
+                      {"id": "s-1", "name": "Alpha", "slug": "alpha"}])
+    res = org.lambda_handler(make_event("GET", "/api/org/sites"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["sites"][0]["slug"] == "alpha"
+
+
 def test_create_site_admin_ok(wired):
     created = {}
 
@@ -862,8 +874,12 @@ def test_live_items_response_passthrough_with_children(wired):
 # By default both are wired to allow SITE_ID, so individual tests only need
 # to override whichever one is relevant to the scenario.)
 # ----------------------------------------------------------
-SITE_ID = "s-uuid-a"
-OTHER_SITE_ID = "s-uuid-other"
+# Real UUID shape — required now that _resolve_site_param distinguishes a
+# UUID `?site=` value from a slug by regex; a non-UUID-shaped placeholder
+# would be (mis)treated as a slug and go down the get_company_site_by_slug
+# path instead of the plain passthrough these fixtures exercise.
+SITE_ID = "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+OTHER_SITE_ID = "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2"
 
 
 @pytest.fixture
@@ -875,6 +891,49 @@ def programme_wired(wired):
     wired.setattr(org.memberships, "accessible_site_ids",
                   lambda conn, uid, role: [SITE_ID])
     return wired, fake
+
+
+# ----------------------------------------------------------
+# _resolve_site_param — shared helper behind get_programme/put_programme.
+# Accepts a site UUID (original contract, unchanged) OR a slug (new — this
+# unblocks the report side's ?site=<slug> reaching org endpoints). Either
+# way the resolved id still has to clear the same ACL as before.
+# ----------------------------------------------------------
+def test_resolve_site_param_accepts_uuid(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    site_id, err = org._resolve_site_param(FakeConn(), CALLER, SITE_ID)
+    assert err is None
+    assert site_id == SITE_ID
+
+
+def test_resolve_site_param_accepts_slug(wired):
+    seen = {}
+
+    def fake_by_slug(conn, company_id, slug):
+        seen.update(company_id=company_id, slug=slug)
+        return {"id": SITE_ID, "slug": slug} if slug == "alpha" else None
+
+    wired.setattr(org.sites, "get_company_site_by_slug", fake_by_slug)
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    site_id, err = org._resolve_site_param(FakeConn(), CALLER, "alpha")
+    assert err is None
+    assert site_id == SITE_ID
+    assert seen == {"company_id": "c-uuid-1", "slug": "alpha"}
+
+
+def test_resolve_site_param_unknown_slug_404(wired):
+    wired.setattr(org.sites, "get_company_site_by_slug", lambda conn, cid, slug: None)
+    site_id, err = org._resolve_site_param(FakeConn(), CALLER, "ghost-slug")
+    assert site_id is None
+    assert err["statusCode"] == 404
+
+
+def test_resolve_site_param_no_access_403(wired):
+    # a real UUID, correctly parsed, but not in the caller's allowed set
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {OTHER_SITE_ID})
+    site_id, err = org._resolve_site_param(FakeConn(), CALLER, SITE_ID)
+    assert site_id is None
+    assert err["statusCode"] == 403
 
 
 def test_get_programme_hit(programme_wired):
@@ -942,6 +1001,30 @@ def test_admin_any_company_site_ok(programme_wired):
         "GET", "/api/org/programme", params={"site": OTHER_SITE_ID}), None)
     assert res["statusCode"] == 200
     assert body_of(res)["programme"] is None
+
+
+def test_programme_get_by_slug_works(programme_wired):
+    wired, fake = programme_wired
+    wired.setattr(org.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: {"id": SITE_ID} if slug == "alpha" else None)
+    fake.objects[f"programmes/{SITE_ID}/programme.json"] = json.dumps(
+        {"tasks": [{"id": "t-1", "name": "Foundations"}]}).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme", params={"site": "alpha"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["programme"] == {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+
+
+def test_programme_get_by_uuid_still_works(programme_wired):
+    # Backward compat: the S3 key stays UUID-based and the original
+    # ?site=<uuid> contract still resolves without touching get_company_site_by_slug.
+    wired, fake = programme_wired
+    fake.objects[f"programmes/{SITE_ID}/programme.json"] = json.dumps(
+        {"tasks": [{"id": "t-1", "name": "Foundations"}]}).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme", params={"site": SITE_ID}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["programme"] == {"tasks": [{"id": "t-1", "name": "Foundations"}]}
 
 
 def test_put_programme_role_gate(programme_wired):
