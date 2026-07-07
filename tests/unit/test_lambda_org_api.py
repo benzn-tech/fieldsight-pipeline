@@ -770,3 +770,71 @@ def test_observation_cross_company_404(wired):
     res = org.lambda_handler(make_event("PATCH", "/api/org/observations/o-9",
                                         body={"status": "open"}), None)
     assert res["statusCode"] == 404
+
+
+# ----------------------------------------------------------
+# /live-items
+# ----------------------------------------------------------
+def test_live_items_requires_date(wired):
+    res = org.lambda_handler(make_event("GET", "/api/org/live-items"), None)
+    assert res["statusCode"] == 400
+    assert "date" in body_of(res)["error"]
+
+
+def test_live_items_rejects_invalid_date(wired):
+    res = org.lambda_handler(make_event("GET", "/api/org/live-items",
+                                        params={"date": "07-07-2026"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_live_items_admin_uses_company_sites(wired):
+    seen = {}
+    wired.setattr(org.sites, "list_company_sites",
+                  lambda conn, cid, **kw: (seen.update(cid=cid)
+                                           or [{"id": "s-1"}, {"id": "s-2"}]))
+    wired.setattr(org.topics, "list_topics_for_date",
+                  lambda conn, site_ids, date: (seen.update(site_ids=site_ids, date=date)
+                                                or [{"id": "t-1", "is_live": True, "action_items": [],
+                                                     "safety_observations": []}]))
+    res = org.lambda_handler(make_event("GET", "/api/org/live-items",
+                                        params={"date": "2026-07-07"}), None)
+    assert res["statusCode"] == 200
+    assert seen["cid"] == "c-uuid-1"
+    assert seen["site_ids"] == ["s-1", "s-2"]
+    assert seen["date"] == "2026-07-07"
+    assert body_of(res)["topics"] == [{"id": "t-1", "is_live": True, "action_items": [],
+                                       "safety_observations": []}]
+
+
+def test_live_items_worker_uses_accessible_site_ids(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    seen = {}
+    wired.setattr(org.memberships, "accessible_site_ids",
+                  lambda conn, uid, role: (seen.update(uid=uid, role=role) or ["s-3"]))
+    wired.setattr(org.topics, "list_topics_for_date",
+                  lambda conn, site_ids, date: (seen.update(site_ids=site_ids) or []))
+    res = org.lambda_handler(make_event("GET", "/api/org/live-items",
+                                        params={"date": "2026-07-07"}), None)
+    assert res["statusCode"] == 200
+    assert seen["uid"] == "u-uuid-1" and seen["role"] == "worker"
+    assert seen["site_ids"] == ["s-3"]
+    assert body_of(res)["topics"] == []
+
+
+def test_live_items_response_passthrough_with_children(wired):
+    canned = [{
+        "id": "t-1", "site_id": "s-1", "site_name": "Alpha", "user_name": "Ada L",
+        "is_live": True, "source_s3_key": "extractions/Ada_L/2026-07-07/x.json",
+        "action_items": [{"id": "a-1", "text": "fix ladder"}],
+        "safety_observations": [{"id": "so-1", "observation": "loose rail"}],
+    }]
+    wired.setattr(org.sites, "list_company_sites", lambda conn, cid, **kw: [{"id": "s-1"}])
+    wired.setattr(org.topics, "list_topics_for_date", lambda conn, site_ids, date: canned)
+    res = org.lambda_handler(make_event("GET", "/api/org/live-items",
+                                        params={"date": "2026-07-07"}), None)
+    assert res["statusCode"] == 200
+    body = body_of(res)
+    assert body["topics"] == canned
+    assert body["topics"][0]["action_items"] == [{"id": "a-1", "text": "fix ladder"}]
+    assert body["topics"][0]["safety_observations"] == [{"id": "so-1", "observation": "loose rail"}]
