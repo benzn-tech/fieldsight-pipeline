@@ -22,6 +22,9 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/observations             → list observations (company-scoped filters)
   PATCH /api/org/observations/{id}        → update status (author or admin/gm)
   POST  /api/org/observations/{id}/archive→ soft-delete observation (admin/gm)
+  GET   /api/org/live-items?date=…        → live topics dashboard feed (ACL)
+  GET   /api/org/programme?site=…         → read site's Programme JSON (S3-backed, ACL)
+  PUT   /api/org/programme?site=…         → write site's Programme JSON (admin/gm/pm)
 
 Credentials: PG* env vars injected at deploy time (BUG-36 — no runtime
 Secrets Manager call from a NAT-less VPC). Cognito calls need the
@@ -38,7 +41,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from db.connection import get_connection
-from repositories import memberships, observations, sites, topics, users
+from repositories import memberships, observations, programme, sites, topics, users
 from repositories.acl import resolve_scope
 
 logger = logging.getLogger()
@@ -176,6 +179,12 @@ def dispatch(conn, event, method, route):
     if route == "/live-items":
         if method == "GET":
             return list_live_items(conn, caller, event)
+
+    if route == "/programme":
+        if method == "GET":
+            return get_programme(conn, caller, event)
+        if method == "PUT":
+            return put_programme(conn, caller, event, parse_body(event))
 
     return error("not found", 404)
 
@@ -609,3 +618,44 @@ def list_live_items(conn, caller, event):
             conn, caller["id"], caller["global_role"])
     rows = topics.list_topics_for_date(conn, site_ids, date)
     return ok({"topics": rows})
+
+
+# ----------------------------------------------------------
+# /programme (S3-backed JSON blob per site; no SQL table)
+# ----------------------------------------------------------
+def _site_for_caller(conn, caller, site_slug):
+    """Resolve a site slug to its row, scoped to the caller's company —
+    mirrors the create_member membership site-lookup (sites.get_site +
+    company_id equality check), the closest existing "does this
+    id/slug belong to my company" pattern, adapted for a name-based lookup
+    via sites.get_company_site_by_name. Returns None when the site doesn't
+    exist or belongs to another company (caller-facing 403, not 404, so a
+    cross-company probe doesn't leak whether the slug exists elsewhere)."""
+    return sites.get_company_site_by_name(conn, caller["company_id"], site_slug)
+
+
+def get_programme(conn, caller, event):
+    site_slug = (event.get("queryStringParameters") or {}).get("site")
+    if not site_slug:
+        return error("site required", 400)
+    if _site_for_caller(conn, caller, site_slug) is None:
+        return error("access denied", 403)
+    doc = programme.read_programme(s3(), S3_BUCKET, site_slug)
+    return ok({"programme": doc})
+
+
+def put_programme(conn, caller, event, body):
+    site_slug = (event.get("queryStringParameters") or {}).get("site")
+    if not site_slug:
+        return error("site required", 400)
+    if body is None:
+        return error("malformed JSON body", 400)
+    if caller["global_role"] not in ("admin", "gm", "pm"):
+        return error("programme write requires manager role", 403)
+    if _site_for_caller(conn, caller, site_slug) is None:
+        return error("access denied", 403)
+    # NZ "today"/"now" — the codebase-wide UTC+13 display convention (BUG-19
+    # / see create_org_observation's report_date default).
+    updated_at = (datetime.utcnow() + timedelta(hours=13)).isoformat()
+    saved = programme.write_programme(s3(), S3_BUCKET, site_slug, body, updated_at)
+    return ok({"programme": saved})

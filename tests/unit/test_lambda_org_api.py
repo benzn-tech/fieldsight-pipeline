@@ -1,3 +1,4 @@
+import io
 import json
 import re
 
@@ -438,10 +439,15 @@ def test_create_member_archived_same_company_409(member_wired):
 
 
 class FakeS3:
+    class exceptions:
+        class NoSuchKey(Exception):
+            pass
+
     def __init__(self):
         self.copied = []
         self.deleted = []
         self.missing_source = False
+        self.objects = {}  # programme.py get_object/put_object store
 
     def generate_presigned_url(self, op, Params=None, ExpiresIn=0):
         self.last = {"op": op, "params": Params, "expires": ExpiresIn}
@@ -457,6 +463,15 @@ class FakeS3:
 
     def delete_object(self, Bucket=None, Key=None):
         self.deleted.append(Key)
+
+    def get_object(self, Bucket=None, Key=None):
+        if Key not in self.objects:
+            raise self.exceptions.NoSuchKey(
+                {"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def put_object(self, Bucket=None, Key=None, Body=None, ContentType=None):
+        self.objects[Key] = Body
 
 
 @pytest.fixture
@@ -838,3 +853,101 @@ def test_live_items_response_passthrough_with_children(wired):
     assert body["topics"] == canned
     assert body["topics"][0]["action_items"] == [{"id": "a-1", "text": "fix ladder"}]
     assert body["topics"][0]["safety_observations"] == [{"id": "so-1", "observation": "loose rail"}]
+
+
+# ----------------------------------------------------------
+# /programme (S3-backed JSON blob; site-access mirrors the company-scoped
+# resolution used elsewhere for a slug/name lookup — sites.get_company_site_by_name
+# scoped to caller["company_id"]; None (not found / wrong company) -> 403)
+# ----------------------------------------------------------
+@pytest.fixture
+def programme_wired(wired):
+    fake = FakeS3()
+    wired.setattr(org, "_s3_client", fake)
+    wired.setattr(org.sites, "get_company_site_by_name",
+                  lambda conn, cid, slug: {"id": "s-1", "company_id": cid, "name": slug})
+    return wired, fake
+
+
+def test_get_programme_hit(programme_wired):
+    wired, fake = programme_wired
+    fake.objects["programmes/site-a/programme.json"] = json.dumps(
+        {"tasks": [{"id": "t-1", "name": "Foundations"}]}).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme", params={"site": "site-a"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["programme"] == {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+
+
+def test_get_programme_miss_returns_null_200(programme_wired):
+    wired, fake = programme_wired
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme", params={"site": "site-a"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["programme"] is None
+
+
+def test_get_programme_site_required_400(programme_wired):
+    wired, fake = programme_wired
+    res = org.lambda_handler(make_event("GET", "/api/org/programme"), None)
+    assert res["statusCode"] == 400
+    assert "site" in body_of(res)["error"]
+
+
+def test_get_programme_cross_company_403(programme_wired):
+    wired, fake = programme_wired
+    wired.setattr(org.sites, "get_company_site_by_name", lambda conn, cid, slug: None)
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme", params={"site": "other-co-site"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_put_programme_role_gate(programme_wired):
+    wired, fake = programme_wired
+    body = {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": "site-a"}, body=body), None)
+    assert res["statusCode"] == 403
+
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "admin"})
+    res_admin = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": "site-a"}, body=body), None)
+    assert res_admin["statusCode"] == 200
+
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "pm"})
+    res_pm = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": "site-a"}, body=body), None)
+    assert res_pm["statusCode"] == 200
+
+
+def test_put_programme_writes_key_and_updated_at(programme_wired):
+    wired, fake = programme_wired
+    body = {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+    res = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": "site-a"}, body=body), None)
+    assert res["statusCode"] == 200
+    saved = body_of(res)["programme"]
+    assert saved["tasks"] == [{"id": "t-1", "name": "Foundations"}]
+    assert saved["updated_at"]
+    stored = json.loads(fake.objects["programmes/site-a/programme.json"])
+    assert stored == saved
+
+
+def test_put_programme_site_required_400(programme_wired):
+    wired, fake = programme_wired
+    res = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", body={"tasks": []}), None)
+    assert res["statusCode"] == 400
+    assert "site" in body_of(res)["error"]
+
+
+def test_put_programme_malformed_body_400(programme_wired):
+    wired, fake = programme_wired
+    ev = make_event("PUT", "/api/org/programme", params={"site": "site-a"})
+    ev["body"] = "{not json"
+    res = org.lambda_handler(ev, None)
+    assert res["statusCode"] == 400
