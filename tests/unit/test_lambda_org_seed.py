@@ -288,3 +288,46 @@ def test_summary_counts(monkeypatch):
     assert out["login_folder_set"] == 2
     assert out["field_only_enrolled"] == 4
     json.dumps(out)
+
+
+# ---------------------------------------------------------------------------
+# Fable review fixes: F1 (empty-name crash guard), F2 (folder_name from
+# mapping name, not Cognito display name)
+# ---------------------------------------------------------------------------
+
+def test_login_folder_name_uses_mapping_name_not_cognito(monkeypatch):
+    # S3 report folders are mapping-name-derived (report_generator:
+    # info["name"].replace(' ','_')). If the Cognito display name differs in
+    # case/spelling from the mapping name, storing the Cognito-derived folder
+    # would silently break get_by_folder_name-based historical user_id
+    # backfill. The seed must prefer the MAPPING's canonical name whenever
+    # the Cognito user matches a mapping entry (by_name.get(name.lower())).
+    cognito_users = [
+        {"Attributes": [{"Name": "sub", "Value": "sub-jt"},
+                        {"Name": "email", "Value": "jt@example.com"},
+                        {"Name": "name", "Value": "jarley trainor"}]},
+    ]
+    calls, state = _install_fake_repo(monkeypatch, FULL_MAPPING, cognito_users)
+
+    seed.lambda_handler({"company_name": "TestCo"}, None)
+
+    assert ("sub-jt", "Jarley_Trainor") in calls["set_folder_name"]
+    assert ("sub-jt", "jarley_trainor") not in calls["set_folder_name"]
+
+
+def test_empty_cognito_name_skips_set_folder_name(monkeypatch):
+    # An empty Cognito display name would replace(' ','_') to '' -- storing
+    # that would violate idx_users_company_folder (company, folder_name) on
+    # the 2nd empty-name user and roll back the whole seed. set_folder_name
+    # must be skipped entirely when the resolved folder is empty.
+    cognito_users = [
+        {"Attributes": [{"Name": "sub", "Value": "sub-noname"},
+                        {"Name": "email", "Value": "noname@example.com"},
+                        {"Name": "name", "Value": ""}]},
+    ]
+    calls, state = _install_fake_repo(monkeypatch, FULL_MAPPING, cognito_users)
+
+    out = seed.lambda_handler({"company_name": "TestCo"}, None)
+
+    assert calls["set_folder_name"] == []
+    assert out["login_folder_set"] == 0

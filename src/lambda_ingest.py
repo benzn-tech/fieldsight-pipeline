@@ -156,7 +156,13 @@ def resolve_site(conn, company_id, report, user_folder):
             return site
 
     user = users.get_by_folder_name(conn, company_id, user_folder)
-    if user:
+    if user and memberships.resolve_scope(user["global_role"]) != "ALL":
+        # F4 (Fable review): only use this fallback for non-ALL scope
+        # (field_only/worker/site_manager) users. accessible_site_ids
+        # returns EVERY company site for ALL scope (admin/gm) with no
+        # ordering, so site_ids[0] would be an arbitrary site -- an
+        # admin/gm has no single "home" site to attribute a report to, so
+        # skip (None/caller-skips) rather than guess.
         site_ids = memberships.accessible_site_ids(conn, user["id"], user["global_role"])
         if site_ids:
             return sites.get_site(conn, site_ids[0])

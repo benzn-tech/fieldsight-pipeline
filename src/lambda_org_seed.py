@@ -112,12 +112,25 @@ def lambda_handler(event, context):
                                      first_name=first, last_name=last,
                                      global_role=role)
             n_users += 1
-            # folder_name backfill: from the Cognito display name, even when
-            # it doesn't match a mapping entry (e.g. an admin-only login).
-            users.set_folder_name(conn, sub, name.replace(" ", "_"))
-            n_login_folder_set += 1
-            cognito_names_seeded.add(name.lower())
+            # folder_name backfill (F2, Fable review): prefer the MAPPING's
+            # canonical name over the Cognito display name. S3 report
+            # folders are always mapping-name-derived (report_generator:
+            # info["name"].replace(' ','_')) -- a Cognito display name that
+            # differs in case/spelling from the mapping name (e.g. Cognito
+            # "jarley trainor" vs mapping "Jarley Trainor") would otherwise
+            # store a folder_name that never matches the real S3 folder,
+            # silently breaking get_by_folder_name-based historical
+            # user_id backfill for that person. Falls back to the Cognito
+            # name itself when there's no mapping match (e.g. admin-only
+            # login with no device).
             info = by_name.get(name.lower())
+            folder = (info["name"] if info else name).replace(" ", "_")
+            if folder:  # F1: crash guard -- an empty Cognito name would
+                # violate idx_users_company_folder (company, folder_name) on
+                # the 2nd empty-name user and roll back the whole seed.
+                users.set_folder_name(conn, sub, folder)
+                n_login_folder_set += 1
+            cognito_names_seeded.add(name.lower())
             if info:
                 for slug in info.get("sites", []):
                     site = slug_to_site.get(slug)
@@ -129,6 +142,12 @@ def lambda_handler(event, context):
 
         # Second pass: enroll mapping people who never signed in via Cognito
         # (device-only field workers) as kind='field_only' directory rows.
+        # KNOWN LIMITATION (F3, Fable review, Phase 1 scope): if a
+        # field_only person later gets a Cognito login, the NEXT seed run's
+        # users.set_folder_name(sub, folder) collides with the surviving
+        # field_only row on the (company, folder_name) unique index --
+        # the seed crashes until the two rows are manually merged.
+        # Promotion/merge handling is a future task, not Phase 1 scope.
         for info in mapping.get("mapping", {}).values():
             name = info.get("name")
             if not name or name.lower() in cognito_names_seeded:

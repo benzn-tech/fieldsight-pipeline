@@ -203,6 +203,32 @@ def test_resolve_site_fallback_via_slug_or_membership(monkeypatch):
     assert site == {"id": "site-9", "name": "SB1108 Ellesmere College"}
 
 
+def test_resolve_site_fallback_skips_for_all_scope(monkeypatch):
+    # F4 (Fable review): admin/gm have no single "home" site --
+    # accessible_site_ids returns EVERY company site for ALL scope with no
+    # ordering, so falling back to site_ids[0] would attribute the report to
+    # an arbitrary site. The membership fallback must be skipped (None) for
+    # ALL-scope (admin/gm) users -- never called at all.
+    monkeypatch.setattr(ing.sites, "get_company_site_by_name",
+                        lambda conn, cid, name: None)
+    monkeypatch.setattr(
+        ing.users, "get_by_folder_name",
+        lambda conn, cid, folder_name: {"id": "u-admin", "global_role": "admin"}
+        if folder_name == "Ben_Lin" else None,
+    )
+    called = []
+    monkeypatch.setattr(
+        ing.memberships, "accessible_site_ids",
+        lambda conn, user_id, global_role: called.append(user_id) or ["site-1", "site-2"],
+    )
+    report = {"site": "some transcription noise", "topics": []}
+
+    site = ing.resolve_site(None, "co-1", report, "Ben_Lin")
+
+    assert site is None
+    assert called == []  # ALL-scope skip happens before accessible_site_ids is ever called
+
+
 def test_resolve_site_double_miss_skips(monkeypatch):
     # Real 2026-03-20 case: report['site'] is not a real site, and the
     # reporting user has no resolvable site membership either -> None
