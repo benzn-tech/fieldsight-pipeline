@@ -81,6 +81,8 @@ def lambda_handler(event, context):
     cognito_users = list_cognito_users()
 
     n_users = n_sites = n_memberships = 0
+    n_sites_backfilled = n_login_folder_set = n_field_only_enrolled = 0
+    cognito_names_seeded = set()
     with get_connection() as conn:
         company = (companies.get_company_by_name(conn, company_name)
                    or companies.create_company(conn, company_name))
@@ -91,8 +93,12 @@ def lambda_handler(event, context):
             if site is None:
                 site = sites.create_site(conn, company["id"], s["name"],
                                          location=s.get("location"),
-                                         client=s.get("client"))
+                                         client=s.get("client"),
+                                         slug=slug)
                 n_sites += 1
+            else:
+                sites.set_slug(conn, site["id"], slug)
+            n_sites_backfilled += 1
             slug_to_site[slug] = site
 
         for cu in cognito_users:
@@ -106,6 +112,11 @@ def lambda_handler(event, context):
                                      first_name=first, last_name=last,
                                      global_role=role)
             n_users += 1
+            # folder_name backfill: from the Cognito display name, even when
+            # it doesn't match a mapping entry (e.g. an admin-only login).
+            users.set_folder_name(conn, sub, name.replace(" ", "_"))
+            n_login_folder_set += 1
+            cognito_names_seeded.add(name.lower())
             info = by_name.get(name.lower())
             if info:
                 for slug in info.get("sites", []):
@@ -116,10 +127,35 @@ def lambda_handler(event, context):
                             info.get("role", "worker"))
                         n_memberships += 1
 
-    logger.info("seed done: company=%s users=%d sites=%d memberships=%d",
-                company_name, n_users, n_sites, n_memberships)
+        # Second pass: enroll mapping people who never signed in via Cognito
+        # (device-only field workers) as kind='field_only' directory rows.
+        for info in mapping.get("mapping", {}).values():
+            name = info.get("name")
+            if not name or name.lower() in cognito_names_seeded:
+                continue
+            first, last = split_name(name)
+            field_user = users.upsert_field_only_user(
+                conn, company["id"], folder_name=name.replace(" ", "_"),
+                first_name=first, last_name=last,
+                global_role=info.get("role", "worker"))
+            n_field_only_enrolled += 1
+            for slug in info.get("sites", []):
+                site = slug_to_site.get(slug)
+                if site:
+                    memberships.ensure_membership(
+                        conn, field_user["id"], site["id"],
+                        info.get("role", "worker"))
+                    n_memberships += 1
+
+    logger.info("seed done: company=%s users=%d sites=%d memberships=%d "
+                "sites_backfilled=%d login_folder_set=%d field_only_enrolled=%d",
+                company_name, n_users, n_sites, n_memberships,
+                n_sites_backfilled, n_login_folder_set, n_field_only_enrolled)
     # company["id"] is a uuid.UUID (psycopg dict_row) — Lambda marshals the
     # return value with plain json (no default=str, unlike the API's ok()),
     # so coerce to str or the invoke fails with Runtime.MarshalError.
     return {"company": {"id": str(company["id"]), "name": company["name"]},
-            "users": n_users, "sites": n_sites, "memberships": n_memberships}
+            "users": n_users, "sites": n_sites, "memberships": n_memberships,
+            "sites_backfilled": n_sites_backfilled,
+            "login_folder_set": n_login_folder_set,
+            "field_only_enrolled": n_field_only_enrolled}

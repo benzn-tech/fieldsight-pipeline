@@ -72,6 +72,25 @@ def test_get_company_site_by_slug_miss_returns_none():
 
 
 # ---------------------------------------------------------------------------
+# sites.set_slug — Task 2 (seed) backfill helper
+# ---------------------------------------------------------------------------
+
+def test_set_slug_updates_by_id():
+    site_row = {"id": "site-1", "company_id": "c-1", "name": "North Site",
+                "location": None, "client": None, "industry": None,
+                "icon_s3_key": None, "slug": "north-site",
+                "created_at": "2026-07-06", "archived_at": None}
+    conn = FakeConn(results=[[site_row]])
+
+    row = sites.set_slug(conn, "site-1", "north-site")
+
+    assert row == site_row
+    sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
+    assert "UPDATE sites SET slug=%s WHERE id=%s" in sql
+    assert params == ("north-site", "site-1")
+
+
+# ---------------------------------------------------------------------------
 # sites.create_site — slug param
 # ---------------------------------------------------------------------------
 

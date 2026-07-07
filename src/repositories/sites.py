@@ -82,6 +82,16 @@ def set_site_icon(conn, site_id, icon_s3_key) -> dict:
     ).fetchone()
 
 
+def set_slug(conn, site_id, slug) -> dict:
+    """Backfill slug onto an existing site row (seed re-run path — the site
+    already existed via get_company_site_by_name, so slug wasn't set at
+    INSERT time). UPDATE to the same value is idempotent."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE sites SET slug=%s WHERE id=%s RETURNING {_COLS}",
+        (slug, site_id),
+    ).fetchone()
+
+
 def update_site(conn, site_id, company_id, name=None, location=None,
                 client=None, industry=None) -> dict | None:
     """None = leave unchanged (same semantics as users.update_profile).
