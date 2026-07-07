@@ -35,13 +35,23 @@ user_id bridge: match the display name (folder underscores -> spaces)
   stays None (nullable column) -- this does NOT skip the report, unlike a
   site-bridge miss.
 
-Embeddings: amazon.titan-embed-text-v2:0 via boto3 bedrock-runtime (net-new
-client -- the report generator talks to Anthropic directly over HTTPS, not
-comparable here). invoke_model(body={"inputText": text}) -> response body
-JSON 'embedding' (1024 floats) -> formatted as a '[f1,f2,...]' string, bound
+Embeddings (Phase 4d): Bedrock is retired from this lambda. This lambda runs
+in-VPC with no internet egress, so it never calls an embedding API directly.
+Instead, a separate non-VPC `embed-report` lambda pre-computes embeddings
+(DashScope text-embedding-v4) for a report's chunks and writes them to an S3
+"vector sidecar": embeddings/{date}/{user}/vectors.json, a JSON object
+mapping sha256(chunk_text[:8000]) -> a 1024-float vector. This lambda loads
+that sidecar (S3 gateway endpoint, no internet needed) and looks up each
+chunk's embedding by the SAME hash (sha256 of the chunk text truncated to the
+same 8000 chars -- the truncation must match on both sides or every lookup
+misses). The looked-up vector is formatted as a '[f1,f2,...]' string, bound
 through insert_chunk's %s::vector cast (no pgvector/numpy packing, no new
-Lambda layer -- see repositories/chunks.py).
+Lambda layer -- see repositories/chunks.py). A missing hash raises (the
+report_chunks.embedding column is NOT NULL -- there is no "insert with a
+blank embedding" fallback; it means embed-report hasn't run for that chunk
+yet).
 """
+import hashlib
 import json
 import logging
 import os
@@ -60,15 +70,14 @@ logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 CONFIG_KEY = os.environ.get("CONFIG_KEY", "config/user_mapping.json")
-BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "amazon.titan-embed-text-v2:0")
 COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 
 REPORTS_PREFIX = "reports/"
 REPORT_KEY_RE = re.compile(r"^reports/([^/]+)/([^/]+)/daily_report\.json$")
+EMBEDDINGS_KEY_RE = re.compile(r"^embeddings/([^/]+)/([^/]+)/vectors\.json$")
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _s3_client = None
-_bedrock_client = None
 _mapping_cache = None
 
 
@@ -77,13 +86,6 @@ def s3():
     if _s3_client is None:
         _s3_client = boto3.client("s3")
     return _s3_client
-
-
-def bedrock():
-    global _bedrock_client
-    if _bedrock_client is None:
-        _bedrock_client = boto3.client("bedrock-runtime")
-    return _bedrock_client
 
 
 def load_mapping() -> dict:
@@ -97,23 +99,44 @@ def load_mapping() -> dict:
 
 
 # ----------------------------------------------------------
-# Embeddings (Titan V2 via bedrock-runtime)
+# Embeddings (S3 vector sidecar -- Bedrock retired, Phase 4d)
 # ----------------------------------------------------------
-def embed_text(text: str) -> str:
-    """Invoke Titan V2 and format the 1024-float embedding as the '[...]'
-    string insert_chunk binds via ::vector.
+def _sidecar_key(report_key: str) -> str:
+    """reports/{date}/{user}/daily_report.json -> embeddings/{date}/{user}/
+    vectors.json -- the S3 vector-sidecar path the non-VPC embed-report
+    lambda writes and this (in-VPC) lambda reads."""
+    m = REPORT_KEY_RE.match(report_key)
+    if not m:
+        raise ValueError(f"unexpected report key shape: {report_key!r}")
+    date, user_folder = m.group(1), m.group(2)
+    return f"embeddings/{date}/{user_folder}/vectors.json"
 
-    Titan V2's input limit is ~8k tokens; slice defensively at 8000 CHARS
-    (not tokens -- a cheap upper bound that avoids a tokenizer dependency;
-    real chunk_text is bounded well under this by chunking.py's own
-    TARGET_CHARS/TOPIC_SPLIT_CHARS constants, so this is a hard backstop
-    for pathological inputs, not the normal path).
+
+def _load_vectors(bucket: str, sidecar_key: str) -> dict:
+    """Fetch + parse the vector-sidecar JSON: {sha256(chunk_text[:8000]):
+    [1024 floats]}. Plain S3 GET -- reachable in-VPC via the S3 gateway
+    endpoint, no internet required."""
+    obj = s3().get_object(Bucket=bucket, Key=sidecar_key)
+    return json.loads(obj["Body"].read().decode("utf-8"))
+
+
+def embed_from_sidecar(text: str, vectors: dict) -> str:
+    """Look up a chunk's precomputed embedding by sha256(text[:8000]) and
+    format it as the '[...]' string insert_chunk binds via ::vector.
+
+    The 8000-char truncation-before-hash MUST match what embed-report hashes
+    on its side (dashscope_utils / lambda_embed_report) -- if the two sides
+    truncate differently, EVERY lookup here misses (this is the single most
+    load-bearing detail of the sidecar contract).
     """
-    body = json.dumps({"inputText": text[:8000]})
-    resp = bedrock().invoke_model(modelId=BEDROCK_MODEL_ID, body=body)
-    payload = json.loads(resp["body"].read())
-    vector = payload["embedding"]
-    return "[" + ",".join(repr(v) for v in vector) + "]"
+    h = hashlib.sha256(text[:8000].encode("utf-8")).hexdigest()
+    try:
+        vec = vectors[h]
+    except KeyError:
+        raise KeyError(
+            f"no precomputed vector for chunk hash {h[:12]} — embed-report must run first"
+        )
+    return "[" + ",".join(repr(v) for v in vec) + "]"
 
 
 # ----------------------------------------------------------
@@ -236,6 +259,8 @@ def ingest_report(date, user_folder, report_key):
     report = json.loads(raw.decode("utf-8"))
 
     with get_connection() as conn:
+        vectors = _load_vectors(S3_BUCKET, _sidecar_key(report_key))
+
         company = companies.get_company_by_name(conn, COMPANY_NAME)
         if company is None:
             # Unseeded org DB would otherwise surface as an opaque
@@ -279,7 +304,7 @@ def ingest_report(date, user_folder, report_key):
 
         chunks_n = 0
         for c in chunk_report(report):
-            embedding = embed_text(c["chunk_text"])
+            embedding = embed_from_sidecar(c["chunk_text"], vectors)
             chunks.insert_chunk(
                 conn, site["id"], date, c["chunk_type"], c["chunk_text"], embedding,
                 user_id=user_id, source_s3_key=report_key,
@@ -290,7 +315,7 @@ def ingest_report(date, user_folder, report_key):
 
         turns = _load_turns(user_folder, date)
         for c in chunk_transcripts(report, turns):
-            embedding = embed_text(c["chunk_text"])
+            embedding = embed_from_sidecar(c["chunk_text"], vectors)
             chunks.insert_chunk(
                 conn, site["id"], date, c["chunk_type"], c["chunk_text"], embedding,
                 user_id=user_id, source_s3_key=report_key,
@@ -309,6 +334,17 @@ def ingest_report(date, user_folder, report_key):
 # ----------------------------------------------------------
 def _parse_report_key(key):
     m = REPORT_KEY_RE.match(key)
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def _parse_embeddings_key(key):
+    """embeddings/{date}/{user_folder}/vectors.json -> (date, user_folder).
+    This is the S3 event key shape the ingest trigger now fires on (migrated
+    from reports/ -- embed-report writes the sidecar, which is what signals
+    "this report's chunks are ready to ingest")."""
+    m = EMBEDDINGS_KEY_RE.match(key)
     if not m:
         return None
     return m.group(1), m.group(2)
@@ -361,12 +397,13 @@ def lambda_handler(event, context):
         results = []
         for record in event["Records"]:
             key = unquote_plus(record["s3"]["object"]["key"])
-            parsed = _parse_report_key(key)
+            parsed = _parse_embeddings_key(key)
             if parsed is None:
-                logger.warning("skipping non-report S3 key: %s", key)
+                logger.warning("skipping non-embeddings S3 key: %s", key)
                 continue
             date, user_folder = parsed
-            results.append(ingest_report(date, user_folder, key))
+            report_key = f"{REPORTS_PREFIX}{date}/{user_folder}/daily_report.json"
+            results.append(ingest_report(date, user_folder, report_key))
         return {"results": results}
 
     date = event["date"]
