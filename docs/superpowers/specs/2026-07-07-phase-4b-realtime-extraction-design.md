@@ -21,6 +21,7 @@
 
 - **新 Lambda `fieldsight-extract-session`(非 VPC)**,S3 事件触发于 `transcripts/` 前缀 `.json` 后缀(BUG-13:输出写 `extractions/` 前缀,不重叠)。
 - 抽取单元 = **录制 session**(文件名 base,BUG-11 元数据):每个转录段落地即触发,**收集该 session 当前全部转录段**(同 base 前缀 list)→ normalize(transcript_utils)→ 一次 Claude 直连调用(报告生成器的 urllib3 模式 + ANTHROPIC_API_KEY)抽 topics/action_items/safety(小 prompt,单 session)→ 写 `extractions/{user}/{date}/{session_base}.json`(**幂等覆盖**)。
+- **语言 trigger 试点**(身份系分析修订版信号层#4):抽取输出增加 `declared_site` 字段——仅识别**显式到场声明**("我到了/现在在 XX 工地",谈及≠到场),对照站点目录模糊匹配,附 confidence;v1 只随 extraction JSON 存证(item-writer 落 metadata),不改归属——归属消费等身份系阶段③的 recording_sessions 就绪后接入。
 - 同 session 多段陆续到达 = 每段重抽全 session(段数少,单次 ~$0.01-0.05,可接受);防抖(如 90s 内跳过)列为后续优化,v1 不做。
 - **会议纪要互斥(BUG-18)不适用**:session 抽取是运营条目不是文档,meeting manifest 不拦。
 
