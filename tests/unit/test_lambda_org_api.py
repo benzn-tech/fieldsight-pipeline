@@ -1,7 +1,9 @@
+import io
 import json
 import re
 
 import pytest
+from botocore.exceptions import ClientError
 
 org = pytest.importorskip("lambda_org_api", reason="requires psycopg (installed in CI)")
 
@@ -442,6 +444,11 @@ class FakeS3:
         self.copied = []
         self.deleted = []
         self.missing_source = False
+        self.objects = {}  # programme.py get_object/put_object store
+        # Override to make get_object raise ClientError with this code
+        # instead of NoSuchKey when Key is missing (e.g. "AccessDenied" to
+        # simulate a ListBucket-less IAM role — see read_programme).
+        self.get_object_error_code = "NoSuchKey"
 
     def generate_presigned_url(self, op, Params=None, ExpiresIn=0):
         self.last = {"op": op, "params": Params, "expires": ExpiresIn}
@@ -449,7 +456,6 @@ class FakeS3:
 
     def copy_object(self, Bucket=None, CopySource=None, Key=None):
         if self.missing_source:
-            from botocore.exceptions import ClientError
             # Real S3 returns AccessDenied (not NoSuchKey) for a missing copy
             # source when the role lacks s3:ListBucket — confirmed in 3b smoke.
             raise ClientError({"Error": {"Code": "AccessDenied"}}, "CopyObject")
@@ -457,6 +463,15 @@ class FakeS3:
 
     def delete_object(self, Bucket=None, Key=None):
         self.deleted.append(Key)
+
+    def get_object(self, Bucket=None, Key=None):
+        if Key not in self.objects:
+            # Matches real boto3: NoSuchKey is itself a ClientError subclass.
+            raise ClientError({"Error": {"Code": self.get_object_error_code}}, "GetObject")
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def put_object(self, Bucket=None, Key=None, Body=None, ContentType=None):
+        self.objects[Key] = Body
 
 
 @pytest.fixture
@@ -838,3 +853,156 @@ def test_live_items_response_passthrough_with_children(wired):
     assert body["topics"] == canned
     assert body["topics"][0]["action_items"] == [{"id": "a-1", "text": "fix ladder"}]
     assert body["topics"][0]["safety_observations"] == [{"id": "so-1", "observation": "loose rail"}]
+
+
+# ----------------------------------------------------------
+# /programme (S3-backed JSON blob; `site` is the org site's UUID, not a
+# slug — ACL mirrors list_live_items EXACTLY: admin/gm (ALL scope) via
+# sites.list_company_sites, everyone else via memberships.accessible_site_ids.
+# By default both are wired to allow SITE_ID, so individual tests only need
+# to override whichever one is relevant to the scenario.)
+# ----------------------------------------------------------
+SITE_ID = "s-uuid-a"
+OTHER_SITE_ID = "s-uuid-other"
+
+
+@pytest.fixture
+def programme_wired(wired):
+    fake = FakeS3()
+    wired.setattr(org, "_s3_client", fake)
+    wired.setattr(org.sites, "list_company_sites",
+                  lambda conn, cid, **kw: [{"id": SITE_ID}])
+    wired.setattr(org.memberships, "accessible_site_ids",
+                  lambda conn, uid, role: [SITE_ID])
+    return wired, fake
+
+
+def test_get_programme_hit(programme_wired):
+    wired, fake = programme_wired
+    fake.objects[f"programmes/{SITE_ID}/programme.json"] = json.dumps(
+        {"tasks": [{"id": "t-1", "name": "Foundations"}]}).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme", params={"site": SITE_ID}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["programme"] == {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+
+
+def test_get_programme_miss_returns_null_200(programme_wired):
+    wired, fake = programme_wired
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme", params={"site": SITE_ID}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["programme"] is None
+
+
+def test_get_programme_site_required_400(programme_wired):
+    wired, fake = programme_wired
+    res = org.lambda_handler(make_event("GET", "/api/org/programme"), None)
+    assert res["statusCode"] == 400
+    assert "site" in body_of(res)["error"]
+
+
+def test_get_programme_cross_company_403(programme_wired):
+    wired, fake = programme_wired
+    # Requested site isn't in the caller's company at all, so it never
+    # appears in list_company_sites — same denial path as any other id
+    # outside the allowed set (no separate cross-company lookup exists
+    # anymore; list_company_sites is already company-scoped SQL).
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme", params={"site": OTHER_SITE_ID}), None)
+    assert res["statusCode"] == 403
+
+
+def test_non_all_role_non_member_site_403(programme_wired):
+    wired, fake = programme_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "pm"})
+    # accessible_site_ids (membership scope) does NOT include OTHER_SITE_ID
+    wired.setattr(org.memberships, "accessible_site_ids",
+                  lambda conn, uid, role: [SITE_ID])
+    res_get = org.lambda_handler(make_event(
+        "GET", "/api/org/programme", params={"site": OTHER_SITE_ID}), None)
+    assert res_get["statusCode"] == 403
+
+    res_put = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": OTHER_SITE_ID},
+        body={"tasks": []}), None)
+    assert res_put["statusCode"] == 403
+
+
+def test_admin_any_company_site_ok(programme_wired):
+    wired, fake = programme_wired
+    # resolve_scope("admin") == "ALL" -> allowed set comes from
+    # list_company_sites, NOT accessible_site_ids (which we deliberately
+    # leave empty here to prove the ALL-scope path is what's used).
+    wired.setattr(org.memberships, "accessible_site_ids", lambda conn, uid, role: [])
+    wired.setattr(org.sites, "list_company_sites",
+                  lambda conn, cid, **kw: [{"id": SITE_ID}, {"id": OTHER_SITE_ID}])
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme", params={"site": OTHER_SITE_ID}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["programme"] is None
+
+
+def test_put_programme_role_gate(programme_wired):
+    wired, fake = programme_wired
+    body = {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": SITE_ID}, body=body), None)
+    assert res["statusCode"] == 403
+
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "admin"})
+    res_admin = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": SITE_ID}, body=body), None)
+    assert res_admin["statusCode"] == 200
+
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "pm"})
+    res_pm = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": SITE_ID}, body=body), None)
+    assert res_pm["statusCode"] == 200
+
+
+def test_put_programme_writes_key_and_updated_at(programme_wired):
+    wired, fake = programme_wired
+    body = {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+    res = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": SITE_ID}, body=body), None)
+    assert res["statusCode"] == 200
+    saved = body_of(res)["programme"]
+    assert saved["tasks"] == [{"id": "t-1", "name": "Foundations"}]
+    assert saved["updated_at"]
+    stored = json.loads(fake.objects[f"programmes/{SITE_ID}/programme.json"])
+    assert stored == saved
+
+
+def test_put_programme_site_required_400(programme_wired):
+    wired, fake = programme_wired
+    res = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", body={"tasks": []}), None)
+    assert res["statusCode"] == 400
+    assert "site" in body_of(res)["error"]
+
+
+def test_put_programme_malformed_body_400(programme_wired):
+    wired, fake = programme_wired
+    ev = make_event("PUT", "/api/org/programme", params={"site": SITE_ID})
+    ev["body"] = "{not json"
+    res = org.lambda_handler(ev, None)
+    assert res["statusCode"] == 400
+
+
+def test_read_programme_returns_none_on_nosuchkey_clienterror():
+    fake = FakeS3()
+    fake.get_object_error_code = "NoSuchKey"
+    assert org.programme.read_programme(fake, "bucket", SITE_ID) is None
+
+
+def test_read_programme_reraises_accessdenied():
+    fake = FakeS3()
+    fake.get_object_error_code = "AccessDenied"
+    with pytest.raises(ClientError):
+        org.programme.read_programme(fake, "bucket", SITE_ID)

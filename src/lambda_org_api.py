@@ -22,6 +22,9 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/observations             → list observations (company-scoped filters)
   PATCH /api/org/observations/{id}        → update status (author or admin/gm)
   POST  /api/org/observations/{id}/archive→ soft-delete observation (admin/gm)
+  GET   /api/org/live-items?date=…        → live topics dashboard feed (ACL)
+  GET   /api/org/programme?site=<site_id> → read site's Programme JSON (S3-backed, ACL)
+  PUT   /api/org/programme?site=<site_id> → write site's Programme JSON (admin/gm/pm)
 
 Credentials: PG* env vars injected at deploy time (BUG-36 — no runtime
 Secrets Manager call from a NAT-less VPC). Cognito calls need the
@@ -38,7 +41,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from db.connection import get_connection
-from repositories import memberships, observations, sites, topics, users
+from repositories import memberships, observations, programme, sites, topics, users
 from repositories.acl import resolve_scope
 
 logger = logging.getLogger()
@@ -80,7 +83,7 @@ def ok(body, status=200):
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": "Content-Type,Authorization",
-            "Access-Control-Allow-Methods": "GET,POST,PATCH,OPTIONS",
+            "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,OPTIONS",
         },
         "body": json.dumps(body, default=str),
     }
@@ -176,6 +179,12 @@ def dispatch(conn, event, method, route):
     if route == "/live-items":
         if method == "GET":
             return list_live_items(conn, caller, event)
+
+    if route == "/programme":
+        if method == "GET":
+            return get_programme(conn, caller, event)
+        if method == "PUT":
+            return put_programme(conn, caller, event, parse_body(event))
 
     return error("not found", 404)
 
@@ -609,3 +618,52 @@ def list_live_items(conn, caller, event):
             conn, caller["id"], caller["global_role"])
     rows = topics.list_topics_for_date(conn, site_ids, date)
     return ok({"topics": rows})
+
+
+# ----------------------------------------------------------
+# /programme (S3-backed JSON blob per site; no SQL table)
+#
+# `site` is the org site's UUID (NOT a name/slug — a slug can drift from
+# the DB name on rename, which used to 403 every request; see Fable
+# review High #2). The ACL below mirrors list_live_items EXACTLY: admin/gm
+# (resolve_scope == "ALL") may touch any non-archived site in their own
+# company; everyone else is scoped to their own non-archived memberships.
+# Because the id must appear in one of those two company/membership-scoped
+# sets, this also blocks cross-company access and archived sites for free
+# — no separate lookup needed, and the S3 key (programmes/{site_id}/…) has
+# no name/slug in it, so there's no injection surface and no orphaned
+# object on a site rename.
+# ----------------------------------------------------------
+def _allowed_site_ids(conn, caller):
+    if resolve_scope(caller["global_role"]) == "ALL":
+        return {s["id"] for s in sites.list_company_sites(conn, caller["company_id"])}
+    return set(memberships.accessible_site_ids(conn, caller["id"], caller["global_role"]))
+
+
+def get_programme(conn, caller, event):
+    site_id = (event.get("queryStringParameters") or {}).get("site")
+    if not site_id:
+        return error("site required", 400)
+    if site_id not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    doc = programme.read_programme(s3(), S3_BUCKET, site_id)
+    return ok({"programme": doc})
+
+
+def put_programme(conn, caller, event, body):
+    site_id = (event.get("queryStringParameters") or {}).get("site")
+    if not site_id:
+        return error("site required", 400)
+    if body is None:
+        return error("malformed JSON body", 400)
+    if caller["global_role"] not in ("admin", "gm", "pm"):
+        return error("programme write requires manager role", 403)
+    # Write requires BOTH the manager-role gate above AND site access below
+    # — a pm can only write programmes for sites in their own memberships.
+    if site_id not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    # NZ "today"/"now" — the codebase-wide UTC+13 display convention (BUG-19
+    # / see create_org_observation's report_date default).
+    updated_at = (datetime.utcnow() + timedelta(hours=13)).isoformat()
+    saved = programme.write_programme(s3(), S3_BUCKET, site_id, body, updated_at)
+    return ok({"programme": saved})
