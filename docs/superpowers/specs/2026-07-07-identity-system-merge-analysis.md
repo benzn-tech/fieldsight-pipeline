@@ -307,3 +307,23 @@ Fable C1 修复后安全)。
 - `user_mapping.json` — 6 设备/8 人/3 工地;`reassignment_log` 仅 `_example` 且无消费方。
 - migrations 0002/0003/0004 — `topics.user_id`/`report_chunks.user_id` 均可空;`report_chunks.embedding vector(1024)` 与标识列解耦(回填免 re-embed 的依据)。
 - ui `sites.js:575-590`、`team.js:811-818` — 两处注释明确将 UUID↔slug 缺桥 parked 给 device-mgmt 批次;`org.js:27-32 folderName()` 是 B4 桥本体。
+
+---
+
+## 修订(2026-07-07,用户审阅后):归属信号源分层
+
+用户确认方案 A,并提出三个归属触发思路:语言 trigger / georeference / 新移动端 app 显式选项目。三者**不互斥**——`recording_sessions` 覆盖层本就信号无关,三者只是写入同一张表的不同来源。据此细化:
+
+**schema 微调**:`recording_sessions` 增加 `source text`(app | gps | voice | admin | default)与 `confidence numeric` 两列;同一时段多信号冲突时按 source 优先级取值,admin 改判永远最高。
+
+**信号优先级(置信度从高到低):**
+
+| 优先级 | 信号 | 置信 | 时机 | 说明 |
+|---|---|---|---|---|
+| 1 | admin 改判(UI) | 1.0 | 阶段③既定 | 最终覆盖 |
+| 2 | **新 app 显式选项目** | 1.0 | 随 app 重构落地 | 到场一次点选,上传打元数据——解法(a)的最终形态;需与 app 约定上传元数据规格 |
+| 3 | **GPS/geofence** | 高 | 新 app 原生带(与 2 同期);RealPTT 侧不下注 | org sites 加 lat/lng/radius;⚠️ orchestrator 走 realptt.com 爬虫面(JSON API 返回 0 结果被迫如此),其 GPS 端点是否可爬未知——仅列为低优先 spike |
+| 4 | **语言 trigger** | 中 | **4b 即可试点,零硬件/app 改动** | session 抽取 prompt 增加 `declared_site` 字段:仅识别显式到场声明("我到了/现在在 XX 工地"),模糊匹配站点目录;约定固定口令(如"FieldSight 到达 XX")可拉高精度;谈及≠到场("明天去 MPI")必须排除 |
+| 5 | device_assignments 默认层 | 低 | 阶段②既定 | 无任何覆盖信号时的兜底 |
+
+**实施含义**:阶段③的归属解析从"两层查表"扩为"按 source 优先级取最高置信记录";语言 trigger 试点搭 4b 顺风车(一个字段的增量);app 元数据规格在 app 重构定型前给出约定即可,不阻塞。
