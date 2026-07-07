@@ -12,11 +12,26 @@ Description: >
 # parameter-overrides whenever DbStackName is set. Parameters have no
 # per-item Metadata, so this is suppressed template-wide (the only
 # List/CommaDelimitedList param with an empty default in this template).
+#
+# W1001 (Phase 5): AskAgentFunction (unconditional) Refs RagSearchFunction
+# (Condition: HasDb) in its RAG_SEARCH_FUNCTION env var and in the
+# LambdaInvokePolicy SAM synthesizes into AskAgentFunctionRole -- the latter
+# is a transform-generated resource we cannot attach a resource-level
+# ignore_checks Metadata to directly, so this is suppressed template-wide
+# instead (only 2 matches at time of writing, both from this pair).
+# Accepted because it is inert in practice: PROD is NOT deployed via SAM
+# (hand-assembled stack, see .github/workflows/deploy.yml header) and the
+# only real SAM deploy target (TEST, via CI) always passes DbStackName/
+# DbSecretArn/OrgUserPoolId together, so HasDb is always true wherever this
+# template is actually applied. AskAgentFunction is deliberately kept
+# unconditional (not gated on HasDb) so its legacy S3-file Q&A mode keeps
+# working standalone if a future deploy target omits the DB.
 Metadata:
   cfn-lint:
     config:
       ignore_checks:
         - W1030
+        - W1001
 
 # ============================================================
 # Parameters - Configure during deployment
@@ -573,6 +588,14 @@ Resources:
 
   # ----------------------------------------------------------
   # Lambda 8: Ask Agent (Report Q&A)
+  # Phase 5: RAG mode -- embeds the question (DashScope, public
+  # internet, non-VPC) then invokes RagSearchFunction (in-VPC) for
+  # ACL-scoped chunks, and synthesizes a grounded answer + citations
+  # via claude_utils (CLAUDE_MODEL). Legacy S3-file HAIKU_MODEL path
+  # is retained as fallback when caller_sub is absent. RAG_SEARCH_FUNCTION
+  # references RagSearchFunction (Condition HasDb) but this function
+  # itself is unconditional -- see the W1001 note in the top-of-file
+  # Metadata block for why that cross-condition Ref is safe in practice.
   # ----------------------------------------------------------
   AskAgentFunction:
     Type: AWS::Serverless::Function
@@ -588,9 +611,23 @@ Resources:
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           HAIKU_MODEL: claude-haiku-4-5-20251001
           REPORT_PREFIX: reports/
+          RAG_SEARCH_FUNCTION: !Ref RagSearchFunction
+          DASHSCOPE_API_KEY: !Ref DashScopeApiKey
+          DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+          DASHSCOPE_EMBED_MODEL: text-embedding-v4
+          DASHSCOPE_EMBED_DIM: '1024'
+          # I2: haiku, not sonnet. The user-facing ask round-trip is capped by
+          # APIGW's hard 29s integration timeout on ApiFunction (Timeout: 30
+          # above) -- and RAG synthesis adds two extra hops (embed call +
+          # rag-search invoke) on top of the Claude call itself. A 2048-token
+          # sonnet completion risks blowing that budget; haiku is fast and
+          # matches the legacy S3 path's HAIKU_MODEL.
+          CLAUDE_MODEL: claude-haiku-4-5-20251001
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
+        - LambdaInvokePolicy:
+            FunctionName: !Ref RagSearchFunction
 
   # ----------------------------------------------------------
   # Lambda Layer: psycopg[binary] + pgvector (Phase 2B)
@@ -957,6 +994,44 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - extractions/*
+
+  # ----------------------------------------------------------
+  # Lambda 16: RAG Search (Phase 5) — in-VPC ACL-scoped semantic
+  # search over pgvector chunks (search_chunks). Consumed only by
+  # AskAgentFunction via Lambda invoke (query_embedding computed
+  # non-VPC by ask-agent -- this function never calls DashScope/
+  # Claude, so it needs no internet egress, only Aurora). Mirrors
+  # OrgApiFunction's VpcConfig/PsycopgLayer/PG env verbatim. Gated
+  # by HasDb (DbStackName set) -- same condition as PsycopgLayer/
+  # IngestFunction/ItemWriterFunction. NO Events (manual/invoke only).
+  # ----------------------------------------------------------
+  RagSearchFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-rag-search", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_rag_search.lambda_handler
+      Timeout: 30
+      MemorySize: 512
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection — see MigrateFunction notes.
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !ImportValue
+            Fn::Sub: "${DbStackName}-DbName"
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+      Policies:
+        - VPCAccessPolicy: {}
 
   # ==========================================================
   # COGNITO - User Authentication

@@ -847,8 +847,9 @@ def ask_question(body, caller):
 
     if not question:
         return error('Missing question')
-    if not date:
-        return error('Missing date')
+    # NOTE: date is intentionally optional — RAG retrieval (rag-search) is
+    # global across the caller's accessible sites, not filtered by date.
+    # date is still forwarded as soft context when the caller supplies it.
 
     # Resolve user from caller if not specified
     if not user:
@@ -863,11 +864,15 @@ def ask_question(body, caller):
         return error('Access denied to this user', 403)
 
     payload = {
-        'date': date,
         'user': user,
         'question': question,
         'scope': scope,
+        # Cognito sub bridge: rag-search resolves this via get_user_by_sub()
+        # to scope retrieval to the caller's accessible sites (org ACL).
+        'caller_sub': caller.get('sub', ''),
     }
+    if date:
+        payload['date'] = date
     if topic_id is not None:
         payload['topic_id'] = topic_id
 
@@ -877,6 +882,14 @@ def ask_question(body, caller):
             InvocationType='RequestResponse',
             Payload=json.dumps(payload)
         )
+        # An unhandled exception inside the Ask Agent lambda comes back as a
+        # 200 InvocationType response with FunctionError set and a Payload
+        # containing {errorMessage, errorType, stackTrace}. Never pass that
+        # straight through to the client -- it leaks internal stack traces.
+        if resp.get('FunctionError'):
+            logger.error(f"Ask agent returned FunctionError: {resp.get('FunctionError')}")
+            return error('Ask agent error', 500)
+
         result = json.loads(resp['Payload'].read().decode('utf-8'))
 
         # The Ask Agent returns API Gateway format {statusCode, body}
