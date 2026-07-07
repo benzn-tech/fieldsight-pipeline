@@ -89,6 +89,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(ing.users, "list_company_users", lambda conn, cid: [])
     monkeypatch.setattr(ing.chunks, "delete_chunks_for_source", lambda *a, **k: 0)
     monkeypatch.setattr(ing.topics, "delete_topics_for_source", lambda *a, **k: 0)
+    monkeypatch.setattr(ing.topics, "delete_topics_for_source_prefix", lambda *a, **k: 0)
     monkeypatch.setattr(ing.topics, "upsert_topic",
                         lambda *a, **k: {"id": "topic-uuid-0"})
     monkeypatch.setattr(ing.chunks, "insert_chunk", lambda *a, **k: {"id": "chunk-x"})
@@ -304,6 +305,21 @@ def test_user_bridge_null_on_miss(wired):
 
     assert result["skipped"] is False
     assert seen_user_ids and all(uid is None for uid in seen_user_ids)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4b — nightly report supersedes that day's session-sourced (live
+# extraction) items
+# ---------------------------------------------------------------------------
+
+def test_ingest_supersedes_session_items(wired):
+    calls = []
+    wired.setattr(ing.topics, "delete_topics_for_source_prefix",
+                  lambda conn, prefix: calls.append(prefix) or 0)
+
+    ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert calls == ["extractions/Jarley_Trainor/2026-03-02/"]
 
 
 # ---------------------------------------------------------------------------

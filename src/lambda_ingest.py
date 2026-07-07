@@ -259,6 +259,9 @@ def ingest_report(date, user_folder, report_key):
         # and identity fixes + rerun would duplicate (Fable review C1/I1).
         chunks.delete_chunks_for_source(conn, report_key)
         topics.delete_topics_for_source(conn, report_key)
+        # Nightly report supersedes that day's session-sourced (live
+        # extraction) items — Phase 4b.
+        topics.delete_topics_for_source_prefix(conn, f"extractions/{user_folder}/{date}/")
 
         topic_seq_to_id = {}
         for t in report.get("topics", []):

@@ -71,3 +71,93 @@ def delete_topics_for_source(conn, source_s3_key) -> int:
         (source_s3_key,),
     )
     return cur.rowcount
+
+
+def delete_topics_for_source_prefix(conn, source_prefix) -> int:
+    """Delete topics rows whose source_s3_key starts with source_prefix.
+
+    Phase 4b nightly-report supersession of session-sourced items: once the
+    authoritative daily_report.json for a (date, user_folder) is ingested,
+    lambda_ingest calls this with f"extractions/{user_folder}/{date}/" to
+    remove that day's session-level (live) extraction topics, so the
+    dashboard shows the report version instead of duplicate/stale live
+    items. Children cascade-delete the same way as delete_topics_for_source.
+
+    NOTE — LIKE wildcard escaping: SQL LIKE treats both '%' (any run of
+    characters) and '_' (any single character) as wildcards. S3 user
+    folders are '_'-joined display names (e.g.
+    'extractions/Jarley_Trainor/2026-03-02/'), so the underscores in
+    source_prefix are literal data, not wildcards — they (and any literal
+    '%') must be escaped, or this DELETE would also match unrelated keys
+    (e.g. 'extractions/JarleyXTrainor/...'). ESCAPE '\\' designates '\\' as
+    the escape character, so '\\_'/'\\%' in the pattern are literal; only
+    the trailing '%' appended here (unescaped) is a real wildcard.
+    """
+    escaped = source_prefix.replace('%', '\\%').replace('_', '\\_')
+    cur = conn.execute(
+        "DELETE FROM topics WHERE source_s3_key LIKE %s ESCAPE '\\'",
+        (escaped + '%',),
+    )
+    return cur.rowcount
+
+
+_TOPIC_COLS_JOINED = (
+    "t.id, t.site_id, t.user_id, t.source_s3_key, t.report_date, t.occurred_at, "
+    "t.category, t.title, t.summary, t.created_at"
+)
+
+
+def list_topics_for_date(conn, site_ids, report_date) -> list[dict]:
+    """Dashboard multi-site read for one report_date: topics scoped to
+    site_ids (a caller-computed ACL list — ALL sites for an admin, or
+    memberships.accessible_site_ids for a scoped worker/PM), joined with
+    each topic's site_name and user_name, plus its action_items and
+    safety_observations children (two follow-up queries scoped to the
+    topic ids the first query returned, then grouped in Python — mirrors
+    get_topic_photos' per-topic-id pattern but batched instead of N+1).
+
+    is_live is computed in Python (source_s3_key LIKE 'extractions/%') --
+    True for session-sourced (not-yet-superseded) live extraction items,
+    False for nightly-report-sourced items.
+
+    Empty site_ids -> [] without a round-trip (mirrors sites.list_sites_by_ids)."""
+    if not site_ids:
+        return []
+
+    topic_rows = conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_TOPIC_COLS_JOINED}, "
+        f"s.name AS site_name, (u.first_name || ' ' || u.last_name) AS user_name "
+        f"FROM topics t "
+        f"LEFT JOIN sites s ON s.id = t.site_id "
+        f"LEFT JOIN users u ON u.id = t.user_id "
+        f"WHERE t.site_id = ANY(%s) AND t.report_date=%s "
+        f"ORDER BY t.occurred_at NULLS LAST, t.created_at",
+        (list(site_ids), report_date),
+    ).fetchall()
+
+    if not topic_rows:
+        return []
+
+    topic_ids = [t["id"] for t in topic_rows]
+    action_items_by_topic = {}
+    for a in conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, topic_id, text, responsible, deadline, priority, status, created_at "
+        "FROM action_items WHERE topic_id = ANY(%s) ORDER BY created_at",
+        (topic_ids,),
+    ).fetchall():
+        action_items_by_topic.setdefault(a["topic_id"], []).append(a)
+
+    safety_by_topic = {}
+    for s in conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, topic_id, observation, risk_level, location, status, created_at "
+        "FROM safety_observations WHERE topic_id = ANY(%s) ORDER BY created_at",
+        (topic_ids,),
+    ).fetchall():
+        safety_by_topic.setdefault(s["topic_id"], []).append(s)
+
+    for t in topic_rows:
+        t["action_items"] = action_items_by_topic.get(t["id"], [])
+        t["safety_observations"] = safety_by_topic.get(t["id"], [])
+        t["is_live"] = bool(t["source_s3_key"]) and t["source_s3_key"].startswith("extractions/")
+
+    return topic_rows
