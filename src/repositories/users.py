@@ -1,6 +1,6 @@
 from psycopg.rows import dict_row
 
-_COLS = "id, cognito_sub, company_id, email, first_name, last_name, avatar_s3_key, global_role, created_at, archived_at"
+_COLS = "id, cognito_sub, company_id, email, first_name, last_name, avatar_s3_key, global_role, created_at, archived_at, folder_name, kind"
 
 
 def upsert_user(conn, cognito_sub, email, company_id=None, first_name=None,
@@ -33,6 +33,47 @@ def get_user_by_sub(conn, cognito_sub) -> dict | None:
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_COLS} FROM users WHERE cognito_sub=%s", (cognito_sub,)
     ).fetchone()
+
+
+def get_by_folder_name(conn, company_id, folder_name) -> dict | None:
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM users WHERE company_id=%s AND folder_name=%s",
+        (company_id, folder_name),
+    ).fetchone()
+
+
+def upsert_field_only_user(conn, company_id, folder_name, first_name,
+                           last_name, global_role) -> dict:
+    """Enroll (or refresh) a non-login directory entry -- a field worker who
+    only ever appears as a device/report folder, never signs in via Cognito.
+    cognito_sub is NULL (NULL never collides in a UNIQUE index, so this
+    can't reuse upsert_user's ON CONFLICT (cognito_sub) path); conflicts are
+    keyed on (company_id, folder_name) instead. email has a NOT NULL
+    constraint -- field_only rows get ''."""
+    params = {
+        "company_id": company_id, "folder_name": folder_name,
+        "first": first_name, "last": last_name, "role": global_role,
+    }
+    return conn.cursor(row_factory=dict_row).execute(
+        f"INSERT INTO users (company_id, email, first_name, last_name, global_role, folder_name, kind, cognito_sub) "
+        f"VALUES (%(company_id)s, '', %(first)s, %(last)s, %(role)s, %(folder_name)s, 'field_only', NULL) "
+        f"ON CONFLICT (company_id, folder_name) DO UPDATE SET "
+        f"  first_name=EXCLUDED.first_name, "
+        f"  last_name=EXCLUDED.last_name, "
+        f"  global_role=EXCLUDED.global_role "
+        f"RETURNING {_COLS}",
+        params,
+    ).fetchone()
+
+
+def set_folder_name(conn, cognito_sub, folder_name) -> None:
+    """Backfill folder_name onto an existing login user (enrollment path for
+    the other 4 of the 8 directory people, who do have Cognito accounts)."""
+    conn.cursor().execute(
+        "UPDATE users SET folder_name=%s WHERE cognito_sub=%s",
+        (folder_name, cognito_sub),
+    )
+    return None
 
 
 def list_company_users(conn, company_id, include_archived=False) -> list[dict]:

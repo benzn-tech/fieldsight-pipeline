@@ -1,14 +1,14 @@
 from psycopg.rows import dict_row
 
-_COLS = "id, company_id, name, location, client, industry, icon_s3_key, created_at, archived_at"
+_COLS = "id, company_id, name, location, client, industry, icon_s3_key, created_at, archived_at, slug"
 
 
 def create_site(conn, company_id, name, location=None, client=None,
-                industry=None, icon_s3_key=None) -> dict:
+                industry=None, icon_s3_key=None, slug=None) -> dict:
     return conn.cursor(row_factory=dict_row).execute(
-        f"INSERT INTO sites (company_id, name, location, client, industry, icon_s3_key) "
-        f"VALUES (%s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
-        (company_id, name, location, client, industry, icon_s3_key),
+        f"INSERT INTO sites (company_id, name, location, client, industry, icon_s3_key, slug) "
+        f"VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
+        (company_id, name, location, client, industry, icon_s3_key, slug),
     ).fetchone()
 
 
@@ -38,6 +38,13 @@ def get_company_site_by_name(conn, company_id, name) -> dict | None:
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_COLS} FROM sites WHERE company_id=%s AND name=%s",
         (company_id, name),
+    ).fetchone()
+
+
+def get_company_site_by_slug(conn, company_id, slug) -> dict | None:
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM sites WHERE company_id=%s AND slug=%s",
+        (company_id, slug),
     ).fetchone()
 
 
