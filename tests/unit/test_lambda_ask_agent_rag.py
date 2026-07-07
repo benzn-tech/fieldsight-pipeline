@@ -144,12 +144,12 @@ def test_invokes_rag_search_with_sub_and_vector(monkeypatch):
     assert call["Payload"]["k"] == 3
 
 
-def test_default_k_is_8(monkeypatch):
+def test_default_k_is_5(monkeypatch):
     fake_client = wire(monkeypatch, chunks=[])
 
     invoke(make_event(k=None))
 
-    assert fake_client.calls[0]["Payload"]["k"] == 8
+    assert fake_client.calls[0]["Payload"]["k"] == 5
 
 
 def test_no_chunks_returns_not_found_empty_citations(monkeypatch):
