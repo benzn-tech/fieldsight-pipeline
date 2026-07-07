@@ -27,5 +27,5 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install --upgrade pip
-      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" pytest pytest-cov
+      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" boto3 pytest pytest-cov
       - run: python -m pytest -v
