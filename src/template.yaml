@@ -738,6 +738,19 @@ Resources:
                 - s3:PutObject
                 - s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/programmes/*
+            - Effect: Allow
+              # Without ListBucket, S3 returns AccessDenied/403 (not
+              # NoSuchKey/404) for a missing object under a prefix this
+              # role can't list — read_programme would then re-raise a
+              # fake 500 on every site that has never had a programme
+              # uploaded (Fable review High #1). Scoped to programmes/*
+              # only, mirrors ExtractSessionFunction's transcripts/* grant.
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${DataBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - programmes/*
       Events:
         OrgProxy:
           Type: Api
@@ -1116,7 +1129,7 @@ Resources:
       StageName: prod
       Cors:
         AllowOrigin: "'*'"
-        AllowMethods: "'GET,POST,PATCH,OPTIONS'"
+        AllowMethods: "'GET,POST,PUT,PATCH,OPTIONS'"
         AllowHeaders: "'Content-Type,Authorization'"
       Auth:
         DefaultAuthorizer: CognitoAuthorizer
