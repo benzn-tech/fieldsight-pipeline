@@ -25,6 +25,7 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/live-items?date=…        → live topics dashboard feed (ACL)
   GET   /api/org/programme?site=<site_id> → read site's Programme JSON (S3-backed, ACL)
   PUT   /api/org/programme?site=<site_id> → write site's Programme JSON (admin/gm/pm)
+  GET   /api/org/rollup/portfolio         → per-site open-count rollup + red/yellow/green (ACL)
 
 Credentials: PG* env vars injected at deploy time (BUG-36 — no runtime
 Secrets Manager call from a NAT-less VPC). Cognito calls need the
@@ -41,7 +42,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from db.connection import get_connection
-from repositories import memberships, observations, programme, sites, topics, users
+from repositories import memberships, observations, programme, rollup, sites, topics, users
 from repositories.acl import resolve_scope
 
 logger = logging.getLogger()
@@ -179,6 +180,9 @@ def dispatch(conn, event, method, route):
     if route == "/live-items":
         if method == "GET":
             return list_live_items(conn, caller, event)
+
+    if route == "/rollup/portfolio" and method == "GET":
+        return list_portfolio_rollup(conn, caller, event)
 
     if route == "/programme":
         if method == "GET":
@@ -618,6 +622,33 @@ def list_live_items(conn, caller, event):
             conn, caller["id"], caller["global_role"])
     rows = topics.list_topics_for_date(conn, site_ids, date)
     return ok({"topics": rows})
+
+
+# ----------------------------------------------------------
+# /rollup/portfolio (Phase 4c leg-1 — deterministic SQL aggregation; no LLM,
+# no narrative, no materialization. ACL mirrors list_live_items EXACTLY via
+# _allowed_site_ids, defined below in the /programme section — admin/gm see
+# every non-archived site in their company, everyone else only their
+# non-archived memberships. Status is a pure rule over the merged counts:
+# any open high-risk safety observation -> red; else any open safety
+# observation or open action item -> yellow; else green.)
+# ----------------------------------------------------------
+def _status(counts):
+    if counts.get("open_high_safety", 0) > 0:
+        return "red"
+    if counts.get("open_safety", 0) > 0 or counts.get("open_actions", 0) > 0:
+        return "yellow"
+    return "green"
+
+
+def list_portfolio_rollup(conn, caller, event):
+    site_ids = _allowed_site_ids(conn, caller)
+    counts = rollup.portfolio_counts(conn, site_ids)
+    sites_rollup = [
+        {"site_id": sid, **counts[sid], "status": _status(counts[sid])}
+        for sid in sorted(str(x) for x in site_ids)  # stable order (set → deterministic)
+    ]
+    return ok({"sites": sites_rollup})
 
 
 # ----------------------------------------------------------
