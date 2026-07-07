@@ -527,12 +527,39 @@ def claim_download(s3, bucket, s3_key):
         if status != 412 and error_code not in ("PreconditionFailed", "412"):
             raise
 
-        head = s3.head_object(Bucket=bucket, Key=claim_key)
+        try:
+            head = s3.head_object(Bucket=bucket, Key=claim_key)
+        except ClientError:
+            # M-1: the claim vanished between our failed conditional put and
+            # this HEAD -- the downloader that held it just released it.
+            # Refuse this attempt rather than propagate: a vanished claim
+            # means nothing is currently claimed, so the NEXT orchestrator
+            # sweep will see no marker and win a plain conditional put.
+            # Raising here would kill the whole sweep over one key that has
+            # already resolved itself.
+            logger.info(f"Claim vanished before HEAD (already released): {claim_key}")
+            return False
+
         age = datetime.now(timezone.utc) - head["LastModified"]
         if age > timedelta(minutes=STALE_MINUTES):
             logger.info(f"Stale claim takeover ({age} old): {claim_key}")
-            s3.put_object(Bucket=bucket, Key=claim_key, Body=b"")
-            return True
+            # M-2: takeover is itself conditioned (IfMatch on the ETag we
+            # just read) so two sweeps racing to take over the SAME stale
+            # claim can't both win -- the loser's put 412s and it backs off.
+            etag = head.get("ETag")
+            put_kwargs = {"Bucket": bucket, "Key": claim_key, "Body": b""}
+            if etag:
+                put_kwargs["IfMatch"] = etag
+            try:
+                s3.put_object(**put_kwargs)
+                return True
+            except ClientError as e2:
+                status2 = e2.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                code2 = e2.response.get("Error", {}).get("Code", "")
+                if status2 == 412 or code2 in ("PreconditionFailed", "412"):
+                    logger.info(f"Takeover lost race (another run won): {claim_key}")
+                    return False
+                raise
 
         logger.info(f"Claim contended, refusing (age {age}): {claim_key}")
         return False
@@ -543,6 +570,11 @@ def release_claim(s3, bucket, s3_key):
     Delete the claim marker for s3_key. Best-effort: any error is logged
     and swallowed so cleanup never fails a caller that already succeeded
     at its real work (upload, or handoff to Fargate).
+
+    M-3: unused by the pipeline itself (the downloader Lambda owns release
+    of the claims it creates via lambda_downloader.release_claim -- a
+    locally-defined duplicate, not a call back into this function); kept
+    here for ops/manual use (e.g. clearing a claim by hand from a shell).
     """
     claim_key = CLAIM_PREFIX + s3_key + ".claim"
     try:

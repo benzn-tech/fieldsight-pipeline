@@ -16,12 +16,33 @@ import pytest
 iw = pytest.importorskip("lambda_item_writer", reason="requires psycopg (installed in CI)")
 
 
+class _FakeCursor:
+    def __init__(self, row):
+        self._row = row
+
+    def fetchone(self):
+        return self._row
+
+
 class FakeConn:
+    """report_already_ingested governs what conn.execute(...).fetchone()
+    returns -- only the I-4 report-source-key query ever calls .fetchone()
+    in production code, so a single flag suffices even though every
+    conn.execute() call (including the I-3 advisory lock) shares it."""
+
+    def __init__(self, report_already_ingested=False):
+        self.executed = []
+        self.report_already_ingested = report_already_ingested
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        return _FakeCursor({"?column?": 1} if self.report_already_ingested else None)
 
 
 class FakeS3:
@@ -228,3 +249,58 @@ def test_user_bridge_miss_does_not_skip(wired):
 
     assert result["skipped"] is False
     assert seen == [None]
+
+
+# ---------------------------------------------------------------------------
+# I-3 regression test: the advisory lock is acquired (on this extraction's
+# key) before delete_topics_for_source/upsert_topic -- serializes concurrent
+# writers on the same key, since delete-then-insert isn't concurrency-safe
+# and upsert_topic is INSERT-only.
+# ---------------------------------------------------------------------------
+
+def test_advisory_lock_acquired_before_delete_and_insert(wired):
+    conn = FakeConn()
+    wired.setattr(iw, "get_connection", lambda *a, **k: conn)
+
+    order = []
+    wired.setattr(iw.topics, "delete_topics_for_source",
+                  lambda *a, **k: order.append("delete_topics"))
+    wired.setattr(iw.topics, "upsert_topic",
+                  lambda *a, **k: order.append("upsert_topic") or {"id": "topic-uuid-0"})
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert conn.executed[0] == ("SELECT pg_advisory_xact_lock(hashtext(%s))", (EXTRACTION_KEY,))
+    assert order == ["delete_topics", "upsert_topic"]
+
+
+# ---------------------------------------------------------------------------
+# I-4 regression test: when a row already exists for this (date, user_folder)
+# nightly report's source_s3_key, the extraction is superseded -- skip with
+# zero writes (no delete, no upsert).
+# ---------------------------------------------------------------------------
+
+def test_report_already_ingested_supersedes_late_extraction(wired):
+    conn = FakeConn(report_already_ingested=True)
+    wired.setattr(iw, "get_connection", lambda *a, **k: conn)
+
+    write_calls = []
+    wired.setattr(iw.topics, "delete_topics_for_source",
+                  lambda *a, **k: write_calls.append("delete_topics"))
+    wired.setattr(iw.topics, "upsert_topic",
+                  lambda *a, **k: write_calls.append("upsert_topic") or {"id": "x"})
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {
+        "skipped": True,
+        "reason": "nightly report already ingested — late session extraction superseded",
+    }
+    assert write_calls == []
+    # the report-source-key query used the nightly report's own contract key,
+    # not the (unrelated) session extraction key
+    report_query = [c for c in conn.executed if "topics" in c[0] and "advisory" not in c[0]]
+    assert report_query == [(
+        "SELECT 1 FROM topics WHERE source_s3_key=%s LIMIT 1",
+        ("reports/2026-07-06/Jarley_Trainor/daily_report.json",),
+    )]

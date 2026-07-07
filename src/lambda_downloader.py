@@ -207,6 +207,26 @@ def release_claim(bucket, s3_key):
         logger.warning(f"Failed to release claim {claim_key}: {e}")
 
 
+def refresh_claim(bucket, s3_key):
+    """
+    Heartbeat (Phase 4b): re-put the download-claim marker orchestrator.
+    claim_download() wrote for s3_key, so its LastModified advances.
+
+    Lambda's own hidden async-invoke retries (up to 2 by default, on
+    throttling/failure) can chain several download attempts for the same
+    key past STALE_MINUTES (30 min) even though any single attempt is
+    short -- without this heartbeat, a later orchestrator sweep could see
+    the claim from the FIRST attempt as "stale" and take it over while a
+    retry attempt is still in flight. Best-effort: swallow errors so a
+    heartbeat failure never kills the download itself.
+    """
+    claim_key = CLAIM_PREFIX + s3_key + ".claim"
+    try:
+        s3_client.put_object(Bucket=bucket, Key=claim_key, Body=b"")
+    except Exception as e:
+        logger.warning(f"Failed to refresh claim {claim_key}: {e}")
+
+
 def save_to_pending(bucket, s3_key, download_url, file_info, reason=""):
     """Save download job to pending_downloads/ for Fargate pickup"""
     pending_key = "pending_downloads/" + s3_key.replace("/", "_") + ".json"
@@ -267,7 +287,12 @@ def lambda_handler(event, context):
     logger.info(f"File type: {file_type}")
     logger.info(f"User: {display_name} (device: {device_account})")
     logger.info(f"S3 key: {s3_key}")
-    
+
+    # Phase 4b: heartbeat the download claim now, before any download work
+    # begins, so a stale-takeover sweep can never fire mid-attempt (see
+    # refresh_claim docstring).
+    refresh_claim(s3_bucket, s3_key)
+
     # Determine download URL based on file type
     if file_type == 'upload':
         raw_url = file_info.get('down_path', '')

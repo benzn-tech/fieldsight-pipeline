@@ -94,6 +94,29 @@ def write_extraction_items(date, user_folder, extraction_key):
     extraction = json.loads(raw.decode("utf-8"))
 
     with get_connection() as conn:
+        # I-3: serialize concurrent writers on this extraction key. Delete-
+        # then-insert is not concurrency-safe on its own (two overlapping
+        # invocations for the same key could interleave their delete/insert
+        # pairs), and upsert_topic is INSERT-only (no ON CONFLICT dedup) --
+        # an xact-scoped advisory lock keyed on the extraction key forces
+        # concurrent writers for the SAME key to run one at a time.
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (extraction_key,))
+
+        # I-4: Fargate next-evening catch-up downloads can produce a session
+        # extraction that lands AFTER that day's nightly report has already
+        # been ingested. Without this guard a late-landing extraction would
+        # re-insert topics with no future supersession ever coming --
+        # permanently-dangling live rows alongside the authoritative report.
+        report_source_key = f"reports/{date}/{user_folder}/daily_report.json"
+        report_already_ingested = conn.execute(
+            "SELECT 1 FROM topics WHERE source_s3_key=%s LIMIT 1",
+            (report_source_key,),
+        ).fetchone()
+        if report_already_ingested is not None:
+            reason = "nightly report already ingested — late session extraction superseded"
+            logger.info("%s: %s", extraction_key, reason)
+            return {"skipped": True, "reason": reason}
+
         company = companies.get_company_by_name(conn, COMPANY_NAME)
         if company is None:
             # Same guard + message as lambda_ingest.ingest_report (Fable

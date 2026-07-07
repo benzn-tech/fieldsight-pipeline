@@ -33,7 +33,7 @@ orch = pytest.importorskip("lambda_orchestrator", reason="requires boto3 (instal
 
 
 def precondition_failed_error():
-    """A ClientError shaped like S3's response to a failed IfNoneMatch put."""
+    """A ClientError shaped like S3's response to a failed IfNoneMatch/IfMatch put."""
     return ClientError(
         {
             "Error": {"Code": "PreconditionFailed", "Message": "At least one of the pre-conditions you specified did not hold."},
@@ -43,22 +43,40 @@ def precondition_failed_error():
     )
 
 
+def not_found_error():
+    """A ClientError shaped like S3's response to a HEAD on a missing key."""
+    return ClientError(
+        {
+            "Error": {"Code": "NoSuchKey", "Message": "The specified key does not exist."},
+            "ResponseMetadata": {"HTTPStatusCode": 404},
+        },
+        "HeadObject",
+    )
+
+
 class StubS3:
     """Minimal S3 client double: records every call it receives."""
 
-    def __init__(self, put_error=None, head_response=None):
+    def __init__(self, put_error=None, head_response=None, head_error=None,
+                 takeover_put_error=None):
         self.calls = []
         self._put_error = put_error
         self._head_response = head_response
+        self._head_error = head_error
+        self._takeover_put_error = takeover_put_error
 
     def put_object(self, **kwargs):
         self.calls.append(("put_object", kwargs))
+        if "IfMatch" in kwargs and self._takeover_put_error is not None:
+            raise self._takeover_put_error
         if self._put_error is not None and kwargs.get("IfNoneMatch") == "*":
             raise self._put_error
         return {}
 
     def head_object(self, **kwargs):
         self.calls.append(("head_object", kwargs))
+        if self._head_error is not None:
+            raise self._head_error
         return self._head_response
 
     def delete_object(self, **kwargs):
@@ -92,18 +110,50 @@ def test_claim_contended_fresh_refused():
 
 
 def test_claim_stale_takeover():
-    """412 + claim modified 31 min ago (stale) -> takeover: plain put, True."""
+    """412 + claim modified 31 min ago (stale) -> takeover: put conditioned
+    on the ETag read from the HEAD (M-2), True."""
     s3 = StubS3(
         put_error=precondition_failed_error(),
-        head_response={"LastModified": datetime.now(timezone.utc) - timedelta(minutes=31)},
+        head_response={
+            "LastModified": datetime.now(timezone.utc) - timedelta(minutes=31),
+            "ETag": '"abc123"',
+        },
     )
     assert orch.claim_download(s3, BUCKET, S3_KEY) is True
     kinds = [c[0] for c in s3.calls]
     assert kinds == ["put_object", "head_object", "put_object"]
-    # Second put_object is the unconditioned takeover write.
+    # Second put_object is the takeover write, conditioned on the HEAD'd ETag.
     second_put_kwargs = s3.calls[2][1]
     assert "IfNoneMatch" not in second_put_kwargs
     assert second_put_kwargs["Key"] == CLAIM_KEY
+    assert second_put_kwargs["IfMatch"] == '"abc123"'
+
+
+def test_claim_vanished_before_head_returns_false():
+    """M-1: 412 on the conditional put, then the claim is GONE by the time we
+    HEAD it (404) -- the downloader that held it just released it. Must
+    return False, never propagate (a raise here would kill the whole
+    orchestrator sweep over one key that already resolved itself)."""
+    s3 = StubS3(put_error=precondition_failed_error(), head_error=not_found_error())
+    assert orch.claim_download(s3, BUCKET, S3_KEY) is False
+    kinds = [c[0] for c in s3.calls]
+    assert kinds == ["put_object", "head_object"]  # no takeover put attempted
+
+
+def test_claim_takeover_loses_race_returns_false():
+    """M-2: claim is stale, but another sweep wins the conditioned takeover
+    put first (412 on our IfMatch put) -> we back off, return False."""
+    s3 = StubS3(
+        put_error=precondition_failed_error(),
+        head_response={
+            "LastModified": datetime.now(timezone.utc) - timedelta(minutes=31),
+            "ETag": '"abc123"',
+        },
+        takeover_put_error=precondition_failed_error(),
+    )
+    assert orch.claim_download(s3, BUCKET, S3_KEY) is False
+    kinds = [c[0] for c in s3.calls]
+    assert kinds == ["put_object", "head_object", "put_object"]
 
 
 def test_release_deletes_right_key():

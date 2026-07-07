@@ -15,6 +15,12 @@ import pytest
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 os.environ.setdefault("AWS_DEFAULT_REGION", "ap-southeast-2")
+# M-5 added an ANTHROPIC_API_KEY-configured guard at the top of
+# extract_session(); a dummy key here (read once at claude_utils import
+# time, same as ANTHROPIC_API_KEY itself) keeps every existing test -- which
+# monkeypatches claude_utils.call_claude directly and never hits a real
+# network call -- past that guard.
+os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-dummy-key")
 
 les = pytest.importorskip("lambda_extract_session", reason="requires boto3 (installed in CI)")
 import claude_utils  # noqa: E402  (import after importorskip, same module the handler calls)
@@ -329,3 +335,76 @@ def test_corrupt_transcript_skipped(monkeypatch):
     extraction = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
 
     assert extraction["source_transcripts"] == [os.path.basename(SEG1_KEY)]
+
+
+# ---------------------------------------------------------------------------
+# I-2 regression test: session grew (another segment landed) between the
+# gather used to build the prompt and the recheck immediately before the
+# S3 write -> raise, zero writes (S3 event retry picks up every segment).
+# ---------------------------------------------------------------------------
+
+def test_session_grown_during_extraction_raises_no_write(monkeypatch):
+    class GrowingFakeS3(FakeS3):
+        """Simulates a new segment landing mid-extraction: the SECOND
+        list_objects_v2 listing (the I-2 recheck) sees one more key than
+        the first (the initial gather used to build the prompt)."""
+
+        def get_paginator(self, op):
+            self.list_calls = getattr(self, "list_calls", 0) + 1
+            if self.list_calls == 2:
+                self.objects[SEG2_KEY] = json.dumps(
+                    make_transcribe_json("late arriving segment", start=30.0)
+                )
+            return super().get_paginator(op)
+
+    fake_s3 = GrowingFakeS3({SEG1_KEY: json.dumps(make_transcribe_json("hello world"))})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(
+        claude_utils, "call_claude",
+        _fake_call_claude_returning({"topics": [], "declared_site": None}),
+    )
+
+    with pytest.raises(RuntimeError, match="session grew"):
+        les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    assert fake_s3.put_calls == []
+    assert fake_s3.list_calls == 2  # both the initial gather AND the recheck ran
+
+
+# ---------------------------------------------------------------------------
+# M-5 — missing ANTHROPIC_API_KEY: skip quietly (no raise, no retry-storm),
+# and never even reach S3/Claude.
+# ---------------------------------------------------------------------------
+
+def test_missing_api_key_returns_none_without_raising(monkeypatch):
+    monkeypatch.setattr(claude_utils, "ANTHROPIC_API_KEY", "")
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("must not gather/call Claude when API key is missing")
+
+    monkeypatch.setattr(les, "s3", fail_if_called)
+    monkeypatch.setattr(claude_utils, "call_claude", fail_if_called)
+
+    result = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# M-6 — no usable speaker turns (e.g. every segment is corrupt/empty): skip
+# quietly, no Claude call, no write.
+# ---------------------------------------------------------------------------
+
+def test_no_turns_returns_none_without_claude_call(monkeypatch):
+    fake_s3 = FakeS3({SEG1_KEY: "{not valid json at all"})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("must not call Claude when there are no usable turns")
+
+    monkeypatch.setattr(claude_utils, "call_claude", fail_if_called)
+
+    result = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    assert result is None
+    assert fake_s3.put_calls == []

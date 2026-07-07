@@ -45,7 +45,12 @@ def call_claude(prompt, max_tokens=4096):
                 'x-api-key': ANTHROPIC_API_KEY,
                 'anthropic-version': '2023-06-01',
             },
-            timeout=180.0,
+            # 150s, not the Lambda function's 180s Timeout (template.yaml
+            # ExtractSessionFunction): the HTTP client must lose that race
+            # so we get a catchable urllib3 TimeoutError -- with both at
+            # 180s the Lambda runtime can hard-kill the invocation first,
+            # skipping our error handling/logging entirely.
+            timeout=150.0,
         )
         data = json.loads(resp.data.decode('utf-8'))
         if resp.status == 200:
