@@ -40,7 +40,8 @@ import hmac
 import logging
 import boto3
 import urllib3
-from datetime import datetime, timedelta
+from botocore.exceptions import ClientError
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs, unquote, urlencode, quote
 
 # Disable SSL warnings (REAL PTT uses self-signed certificate)
@@ -63,6 +64,11 @@ _user_mapping = None
 WEB_BASE = 'https://realptt.com'     # Must use realptt.com, NOT api.realptt.com
 UPLOAD_FILE_LIMIT = 20               # API max per page (higher = empty body)
 TIMEZONE_OFFSET = -780               # NZDT: -780 minutes from GMT
+
+# Download claim lock (Phase 4b): S3 conditional-put marker preventing two
+# orchestrator sweeps from triggering duplicate downloads for the same key.
+CLAIM_PREFIX = "download_claims/"
+STALE_MINUTES = 30
 
 
 # ============================================================
@@ -496,6 +502,55 @@ def invoke_downloader(function_name, file_info, s3_bucket):
     )
 
 
+def claim_download(s3, bucket, s3_key):
+    """
+    Try to claim s3_key for download via an S3 conditional put
+    (IfNoneMatch='*') on a marker object under CLAIM_PREFIX.
+
+    Returns True when the claim was acquired:
+      - no marker existed yet (plain conditional put succeeded), OR
+      - a marker existed but is stale (LastModified older than
+        STALE_MINUTES — the downloader that took it likely crashed or is
+        a long-running Fargate job that never released it) → we take it
+        over with an unconditioned put.
+    Returns False when a marker exists and is still fresh (another
+    in-flight download owns this key).
+    Any other S3 error is re-raised.
+    """
+    claim_key = CLAIM_PREFIX + s3_key + ".claim"
+    try:
+        s3.put_object(Bucket=bucket, Key=claim_key, Body=b"", IfNoneMatch="*")
+        return True
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if status != 412 and error_code not in ("PreconditionFailed", "412"):
+            raise
+
+        head = s3.head_object(Bucket=bucket, Key=claim_key)
+        age = datetime.now(timezone.utc) - head["LastModified"]
+        if age > timedelta(minutes=STALE_MINUTES):
+            logger.info(f"Stale claim takeover ({age} old): {claim_key}")
+            s3.put_object(Bucket=bucket, Key=claim_key, Body=b"")
+            return True
+
+        logger.info(f"Claim contended, refusing (age {age}): {claim_key}")
+        return False
+
+
+def release_claim(s3, bucket, s3_key):
+    """
+    Delete the claim marker for s3_key. Best-effort: any error is logged
+    and swallowed so cleanup never fails a caller that already succeeded
+    at its real work (upload, or handoff to Fargate).
+    """
+    claim_key = CLAIM_PREFIX + s3_key + ".claim"
+    try:
+        s3.delete_object(Bucket=bucket, Key=claim_key)
+    except Exception as e:
+        logger.warning(f"Failed to release claim {claim_key}: {e}")
+
+
 def safe_name(name):
     """Remove invalid characters from filename/folder name"""
     if not name:
@@ -626,6 +681,43 @@ def generate_s3_key(file_info, bucket):
     return f"other/unknown_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
 
 
+def process_file(file_info, stats, config):
+    """
+    Check S3 existence, claim the download (S3 conditional put — see
+    claim_download), and trigger the downloader Lambda if needed.
+
+    Module-level (not a lambda_handler closure) so it can be unit tested
+    directly; stats/config are passed in explicitly instead of being
+    captured from an enclosing scope.
+    """
+    stats['total_found'] += 1
+    ftype = file_info.get('type', 'upload')
+
+    s3_key = generate_s3_key(file_info, config['s3_bucket'])
+    device = (file_info.get('sender_account') or
+              file_info.get('user_name') or
+              file_info.get('src_account') or 'unknown')
+    display_name = get_display_name(device, config['s3_bucket'])
+
+    if check_s3_exists(config['s3_bucket'], s3_key):
+        stats['already_exists'] += 1
+        return
+
+    if not claim_download(s3_client, config['s3_bucket'], s3_key):
+        # Another sweep (or an in-flight download) already owns this key.
+        stats['in_progress'] = stats.get('in_progress', 0) + 1
+        return
+
+    file_info['s3_key'] = s3_key
+    file_info['display_name'] = display_name
+    file_info['device_account'] = device
+
+    invoke_downloader(config['downloader_function'], file_info, config['s3_bucket'])
+    stats['triggered'] += 1
+    stats['by_type'][ftype] = stats['by_type'].get(ftype, 0) + 1
+    stats['by_user'][display_name] = stats['by_user'].get(display_name, 0) + 1
+
+
 # ============================================================
 # MAIN HANDLER
 # ============================================================
@@ -673,33 +765,10 @@ def lambda_handler(event, context):
         'total_found': 0,
         'already_exists': 0,
         'triggered': 0,
+        'in_progress': 0,
         'by_type': {'video': 0, 'audio': 0, 'upload': 0},
         'by_user': {},
     }
-
-    def process_file(file_info):
-        """Check S3 existence and trigger download if needed"""
-        stats['total_found'] += 1
-        ftype = file_info.get('type', 'upload')
-
-        s3_key = generate_s3_key(file_info, config['s3_bucket'])
-        device = (file_info.get('sender_account') or
-                  file_info.get('user_name') or
-                  file_info.get('src_account') or 'unknown')
-        display_name = get_display_name(device, config['s3_bucket'])
-
-        if check_s3_exists(config['s3_bucket'], s3_key):
-            stats['already_exists'] += 1
-            return
-
-        file_info['s3_key'] = s3_key
-        file_info['display_name'] = display_name
-        file_info['device_account'] = device
-
-        invoke_downloader(config['downloader_function'], file_info, config['s3_bucket'])
-        stats['triggered'] += 1
-        stats['by_type'][ftype] = stats['by_type'].get(ftype, 0) + 1
-        stats['by_user'][display_name] = stats['by_user'].get(display_name, 0) + 1
 
     # --- 1. Videos ---
     if config['download_video']:
@@ -709,7 +778,7 @@ def lambda_handler(event, context):
         )
         for v in videos:
             if v.get('url'):
-                process_file(v)
+                process_file(v, stats, config)
 
     # --- 2. Audio ---
     if config['download_audio']:
@@ -719,7 +788,7 @@ def lambda_handler(event, context):
         )
         for a in audios:
             if a.get('download_url'):
-                process_file(a)
+                process_file(a, stats, config)
 
     # --- 3. Upload Files ---
     if config['download_files']:
@@ -734,7 +803,7 @@ def lambda_handler(event, context):
                 'upload_time': f.get('upload_time', ''),
             }
             if file_info['down_path']:
-                process_file(file_info)
+                process_file(file_info, stats, config)
 
     # --- Logout ---
     try:
@@ -748,6 +817,7 @@ def lambda_handler(event, context):
     logger.info(f"  Total found:     {stats['total_found']}")
     logger.info(f"  Already exists:  {stats['already_exists']}")
     logger.info(f"  Downloads fired: {stats['triggered']}")
+    logger.info(f"  In progress:     {stats['in_progress']}")
     logger.info(f"  By type: {stats['by_type']}")
     logger.info(f"  By user:")
     for user, count in stats['by_user'].items():

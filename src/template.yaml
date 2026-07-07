@@ -321,6 +321,12 @@ Resources:
             - Effect: Allow
               Action: s3:HeadObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/*
+            - Sid: DownloadClaimLock
+              Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/download_claims/*
       Events:
         ScheduleEvent:
           Type: Schedule
@@ -345,6 +351,12 @@ Resources:
       Policies:
         - S3WritePolicy:
             BucketName: !Ref DataBucketName
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: DownloadClaimRelease
+              Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/download_claims/*
 
   # ----------------------------------------------------------
   # Lambda 3: Transcribe Trigger

@@ -51,6 +51,11 @@ READ_TIMEOUT = 840  # 14 minutes for large files (Lambda max is 15min)
 # Files larger than this skip Lambda download entirely → Fargate
 SIZE_THRESHOLD_MB = 75
 
+# Download claim lock (Phase 4b): must match lambda_orchestrator.CLAIM_PREFIX.
+# Defined locally (not imported from lambda_orchestrator) — see release_claim()
+# docstring for the reasoning.
+CLAIM_PREFIX = "download_claims/"
+
 
 def create_http_client():
     """Create HTTP client with appropriate timeouts"""
@@ -176,6 +181,32 @@ def get_content_type(key):
     return content_types.get(ext, 'application/octet-stream')
 
 
+def release_claim(bucket, s3_key):
+    """
+    Delete the download-claim marker orchestrator.claim_download() wrote
+    for s3_key, once this Lambda no longer owns the download (either the
+    upload succeeded, or the job was handed off to Fargate). Best-effort:
+    swallow errors so a release failure never fails an otherwise-successful
+    response.
+
+    NOT imported from lambda_orchestrator: measured import cost there is
+    small (~20ms — it's just two extra boto3 client constructions, not a
+    heavy top-level load like a VAD model), but this Lambda's own handler
+    module is intentionally self-contained, matching every other Lambda in
+    this codebase (the one deliberate exception is transcript_utils.py, a
+    real shared utility module with no top-level AWS client side effects).
+    Importing another Lambda's *handler* module here would couple this
+    function's cold start to whatever lambda_orchestrator.py does at import
+    time in the future, for no benefit beyond avoiding a 4-line duplicate.
+    CLAIM_PREFIX is duplicated above for the same reason.
+    """
+    claim_key = CLAIM_PREFIX + s3_key + ".claim"
+    try:
+        s3_client.delete_object(Bucket=bucket, Key=claim_key)
+    except Exception as e:
+        logger.warning(f"Failed to release claim {claim_key}: {e}")
+
+
 def save_to_pending(bucket, s3_key, download_url, file_info, reason=""):
     """Save download job to pending_downloads/ for Fargate pickup"""
     pending_key = "pending_downloads/" + s3_key.replace("/", "_") + ".json"
@@ -276,6 +307,11 @@ def lambda_handler(event, context):
             s3_bucket, s3_key, download_url, file_info,
             reason=f"exceeds {SIZE_THRESHOLD_MB}MB threshold ({file_size_mb:.1f}MB)"
         )
+        # Handing off to Fargate: release the claim now. Fargate downloads
+        # can run well past STALE_MINUTES, and a claim left in place would
+        # otherwise get mistaken for an abandoned download and reclaimed by
+        # a later orchestrator sweep while Fargate is still working on it.
+        release_claim(s3_bucket, s3_key)
         return {
             'statusCode': 202,
             'body': json.dumps({
@@ -316,13 +352,17 @@ def lambda_handler(event, context):
             })
         }
     
+    # Success: release the claim so a stale-takeover sweep never re-fires
+    # a download that already landed.
+    release_claim(s3_bucket, s3_key)
+
     logger.info("=" * 50)
     logger.info("Download complete!")
     logger.info(f"  User: {display_name}")
     logger.info(f"  File: {s3_key}")
     logger.info(f"  Size: {len(data)} bytes")
     logger.info("=" * 50)
-    
+
     return {
         'statusCode': 200,
         'body': json.dumps({
