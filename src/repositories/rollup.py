@@ -54,7 +54,7 @@ def portfolio_counts(conn, site_ids) -> dict:
     safety_rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT site_id, "
         "count(*) FILTER (WHERE status='open') AS open_safety, "
-        "count(*) FILTER (WHERE status='open' AND risk_level='high') AS open_high_safety "
+        "count(*) FILTER (WHERE status='open' AND lower(risk_level)='high') AS open_high_safety "
         "FROM safety_observations WHERE site_id = ANY(%s) GROUP BY site_id",
         (ids,),
     ).fetchall()

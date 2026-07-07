@@ -646,7 +646,7 @@ def list_portfolio_rollup(conn, caller, event):
     counts = rollup.portfolio_counts(conn, site_ids)
     sites_rollup = [
         {"site_id": sid, **counts[sid], "status": _status(counts[sid])}
-        for sid in (str(x) for x in site_ids)
+        for sid in sorted(str(x) for x in site_ids)  # stable order (set → deterministic)
     ]
     return ok({"sites": sites_rollup})
 
