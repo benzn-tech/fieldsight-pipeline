@@ -258,9 +258,18 @@ def ingest_report(date, user_folder, report_key):
     raw = s3().get_object(Bucket=S3_BUCKET, Key=report_key)["Body"].read()
     report = json.loads(raw.decode("utf-8"))
 
-    with get_connection() as conn:
+    # A report with zero chunks (no topics AND no transcript turns) gets no
+    # sidecar from embed-report; the event path never fires ingest for it, but
+    # the backfill path (lists reports/) would. Treat a missing sidecar as a
+    # clean skip, not a failure (Fable review M3).
+    try:
         vectors = _load_vectors(S3_BUCKET, _sidecar_key(report_key))
+    except s3().exceptions.NoSuchKey:
+        reason = "no vector sidecar (zero-chunk report or embed-report not yet run)"
+        logger.info("%s: %s", report_key, reason)
+        return {"skipped": True, "reason": reason}
 
+    with get_connection() as conn:
         company = companies.get_company_by_name(conn, COMPANY_NAME)
         if company is None:
             # Unseeded org DB would otherwise surface as an opaque

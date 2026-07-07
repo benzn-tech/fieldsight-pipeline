@@ -837,6 +837,7 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/reports/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/embeddings/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
             - Effect: Allow
               Action: s3:ListBucket

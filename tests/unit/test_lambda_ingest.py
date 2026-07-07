@@ -31,8 +31,15 @@ class FakeConn:
         return False
 
 
+class _FakeS3Exceptions:
+    class NoSuchKey(Exception):
+        pass
+
+
 class FakeS3:
     """Minimal S3 client double: object store keyed by S3 key."""
+
+    exceptions = _FakeS3Exceptions
 
     def __init__(self, objects=None):
         self.objects = objects or {}
@@ -474,3 +481,14 @@ def test_null_user_reports_do_not_collide(wired, monkeypatch):
     assert keys_used == {key_a, key_b}
     assert deleted_keys.count(("chunks", key_a)) == 1
     assert deleted_keys.count(("chunks", key_b)) == 1
+
+
+def test_ingest_missing_sidecar_skips(wired):
+    """M3 (Fable): zero-chunk report has no sidecar -> backfill path's
+    _load_vectors 404s -> clean skip, not a failure."""
+    def _raise(bucket, key):
+        raise ing.s3().exceptions.NoSuchKey("no such key")
+    wired.setattr(ing, "_load_vectors", _raise)
+    res = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+    assert res.get("skipped") is True
+    assert "sidecar" in res.get("reason", "")

@@ -42,7 +42,7 @@ DASHSCOPE_EMBED_DIM = int(os.environ.get("DASHSCOPE_EMBED_DIM", "1024"))
 
 BATCH_SIZE = 10
 MAX_ATTEMPTS = 4
-RETRYABLE_STATUSES = {429, 500, 503}
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}  # 502/504 common on cross-border gateway (Fable M2)
 BACKOFF_BASE_SECONDS = 1.0
 
 
@@ -83,6 +83,13 @@ def _embed_batch(http, batch, dim):
         if resp.status == 200:
             data = json.loads(resp.data.decode("utf-8"))
             ranked = sorted(data["data"], key=lambda d: d["index"])
+            # Length guard (Fable review M1): a 200 that returns fewer vectors
+            # than inputs would misalign the caller's hash<->vector zip and
+            # insert WRONG vectors with no error — silent RAG corruption.
+            if len(ranked) != len(batch):
+                raise RuntimeError(
+                    f"DashScope returned {len(ranked)} embeddings for {len(batch)} inputs"
+                )
             return [d["embedding"] for d in ranked]
 
         if resp.status in RETRYABLE_STATUSES and attempt < MAX_ATTEMPTS - 1:
