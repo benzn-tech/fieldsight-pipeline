@@ -1,14 +1,14 @@
 from psycopg.rows import dict_row
 
-_COLS = "id, company_id, name, location, client, industry, icon_s3_key, created_at, archived_at"
+_COLS = "id, company_id, name, location, client, industry, icon_s3_key, created_at, archived_at, slug"
 
 
 def create_site(conn, company_id, name, location=None, client=None,
-                industry=None, icon_s3_key=None) -> dict:
+                industry=None, icon_s3_key=None, slug=None) -> dict:
     return conn.cursor(row_factory=dict_row).execute(
-        f"INSERT INTO sites (company_id, name, location, client, industry, icon_s3_key) "
-        f"VALUES (%s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
-        (company_id, name, location, client, industry, icon_s3_key),
+        f"INSERT INTO sites (company_id, name, location, client, industry, icon_s3_key, slug) "
+        f"VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
+        (company_id, name, location, client, industry, icon_s3_key, slug),
     ).fetchone()
 
 
@@ -38,6 +38,13 @@ def get_company_site_by_name(conn, company_id, name) -> dict | None:
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_COLS} FROM sites WHERE company_id=%s AND name=%s",
         (company_id, name),
+    ).fetchone()
+
+
+def get_company_site_by_slug(conn, company_id, slug) -> dict | None:
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM sites WHERE company_id=%s AND slug=%s",
+        (company_id, slug),
     ).fetchone()
 
 
@@ -72,6 +79,16 @@ def set_site_icon(conn, site_id, icon_s3_key) -> dict:
     return conn.cursor(row_factory=dict_row).execute(
         f"UPDATE sites SET icon_s3_key=%s WHERE id=%s RETURNING {_COLS}",
         (icon_s3_key, site_id),
+    ).fetchone()
+
+
+def set_slug(conn, site_id, slug) -> dict:
+    """Backfill slug onto an existing site row (seed re-run path — the site
+    already existed via get_company_site_by_name, so slug wasn't set at
+    INSERT time). UPDATE to the same value is idempotent."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE sites SET slug=%s WHERE id=%s RETURNING {_COLS}",
+        (slug, site_id),
     ).fetchone()
 
 

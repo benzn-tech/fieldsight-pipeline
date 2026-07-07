@@ -654,16 +654,19 @@ def list_portfolio_rollup(conn, caller, event):
 # ----------------------------------------------------------
 # /programme (S3-backed JSON blob per site; no SQL table)
 #
-# `site` is the org site's UUID (NOT a name/slug — a slug can drift from
-# the DB name on rename, which used to 403 every request; see Fable
-# review High #2). The ACL below mirrors list_live_items EXACTLY: admin/gm
+# `site` accepts EITHER the org site's UUID (original contract — NOT a
+# display name, which can drift from the DB name on rename and used to 403
+# every request; see Fable review High #2) OR its slug, resolved via
+# _resolve_site_param → sites.get_company_site_by_slug (a first-class,
+# company-scoped column — not name-derived, so it doesn't reintroduce that
+# drift risk). The ACL below mirrors list_live_items EXACTLY: admin/gm
 # (resolve_scope == "ALL") may touch any non-archived site in their own
 # company; everyone else is scoped to their own non-archived memberships.
 # Because the id must appear in one of those two company/membership-scoped
 # sets, this also blocks cross-company access and archived sites for free
-# — no separate lookup needed, and the S3 key (programmes/{site_id}/…) has
-# no name/slug in it, so there's no injection surface and no orphaned
-# object on a site rename.
+# — no separate lookup needed, and the S3 key (programmes/{site_id}/…)
+# always uses the resolved UUID, never the slug, so there's no injection
+# surface and no orphaned object on a site rename.
 # ----------------------------------------------------------
 def _allowed_site_ids(conn, caller):
     # str() both sides: psycopg returns site ids as uuid.UUID objects, but the
@@ -675,19 +678,43 @@ def _allowed_site_ids(conn, caller):
     return {str(x) for x in memberships.accessible_site_ids(conn, caller["id"], caller["global_role"])}
 
 
-def get_programme(conn, caller, event):
-    site_id = (event.get("queryStringParameters") or {}).get("site")
-    if not site_id:
-        return error("site required", 400)
+_SITE_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def _resolve_site_param(conn, caller, site_param):
+    """Resolve a `?site=` query param to (site_id_str, None) or (None,
+    error_response). Accepts EITHER the site's UUID (original contract,
+    unchanged) OR its slug (new — lets the report side's ?site=<slug> reach
+    org endpoints without a lookup of its own). Either way the resolved id
+    is ACL-checked against _allowed_site_ids, so a slug can't be used to
+    bypass company/membership scoping."""
+    if not site_param:
+        return None, error("site required", 400)
+    if _SITE_UUID_RE.match(site_param):
+        site_id = str(site_param)
+    else:
+        row = sites.get_company_site_by_slug(conn, caller["company_id"], site_param)
+        if row is None:
+            return None, error("site not found", 404)
+        site_id = str(row["id"])
     if site_id not in _allowed_site_ids(conn, caller):
-        return error("access denied to this site", 403)
+        return None, error("access denied to this site", 403)
+    return site_id, None
+
+
+def get_programme(conn, caller, event):
+    site_param = (event.get("queryStringParameters") or {}).get("site")
+    site_id, err = _resolve_site_param(conn, caller, site_param)
+    if err is not None:
+        return err
     doc = programme.read_programme(s3(), S3_BUCKET, site_id)
     return ok({"programme": doc})
 
 
 def put_programme(conn, caller, event, body):
-    site_id = (event.get("queryStringParameters") or {}).get("site")
-    if not site_id:
+    site_param = (event.get("queryStringParameters") or {}).get("site")
+    if not site_param:
         return error("site required", 400)
     if body is None:
         return error("malformed JSON body", 400)
@@ -695,8 +722,9 @@ def put_programme(conn, caller, event, body):
         return error("programme write requires manager role", 403)
     # Write requires BOTH the manager-role gate above AND site access below
     # — a pm can only write programmes for sites in their own memberships.
-    if site_id not in _allowed_site_ids(conn, caller):
-        return error("access denied to this site", 403)
+    site_id, err = _resolve_site_param(conn, caller, site_param)
+    if err is not None:
+        return err
     # NZ "today"/"now" — the codebase-wide UTC+13 display convention (BUG-19
     # / see create_org_observation's report_date default).
     updated_at = (datetime.utcnow() + timedelta(hours=13)).isoformat()

@@ -22,16 +22,18 @@ Entry points (event shapes):
     {"processed": N, "skipped": [{"key","reason"}], "failed": [{"key","error"}]}.
 
 Identity bridge (never invents a site -- real 2026-03-20 case: report['site']
-== 'BD Opportunity Brainstorm', not a real site):
+== 'BD Opportunity Brainstorm', not a real site). DB-driven since the Phase 1
+identity-directory consolidation (migration 0007 + org-seed enrollment) --
+no more folder/display-name-matching heuristics against user_mapping.json:
   1. report['site'] (display name) -> sites.get_company_site_by_name.
-  2. miss -> load config/user_mapping.json from S3 (cached for the module's
-     lifetime -- warm-container reuse): find the mapping entry whose 'name'
-     matches the user_folder (underscores -> spaces), take its
-     'primary_site' slug -> mapping['sites'][slug]['name'] -> retry
-     get_company_site_by_name.
+  2. miss -> resolve the REPORTING USER via users.get_by_folder_name(
+     company_id, user_folder) -> their first accessible site via
+     memberships.accessible_site_ids -> sites.get_site.
   3. still miss -> SKIP the whole report (zero writes), return a reason string.
-user_id bridge: match the display name (folder underscores -> spaces)
-  against list_company_users' first_name+last_name join; miss -> user_id
+user_id bridge: users.get_by_folder_name(company_id, user_folder) -- a direct
+  company+folder_name lookup (login users get folder_name backfilled onto
+  their existing row; field_only reporters -- device-only, no Cognito login
+  -- are enrolled with folder_name directly, org-seed Task 2). Miss -> user_id
   stays None (nullable column) -- this does NOT skip the report, unlike a
   site-bridge miss.
 
@@ -62,7 +64,7 @@ import boto3
 
 from chunking import chunk_report, chunk_transcripts
 from db.connection import get_connection
-from repositories import chunks, companies, sites, topics, users
+from repositories import chunks, companies, memberships, sites, topics, users
 from transcript_utils import normalize_transcript
 
 logger = logging.getLogger()
@@ -142,40 +144,36 @@ def embed_from_sidecar(text: str, vectors: dict) -> str:
 # ----------------------------------------------------------
 # Identity bridge
 # ----------------------------------------------------------
-def _display_name(user_folder: str) -> str:
-    return user_folder.replace("_", " ")
-
-
 def resolve_site(conn, company_id, report, user_folder):
-    """report['site'] direct match -> user_mapping.json primary_site slug
-    fallback -> None (caller skips; never creates a site)."""
+    """report['site'] direct match -> the reporting user's own site
+    membership (folder_name -> user row -> their first accessible site, all
+    DB lookups, no user_mapping.json name heuristic) -> None (caller skips;
+    never creates a site)."""
     name = (report.get("site") or "").strip()   # tolerate stray whitespace (Fable minor 7)
     if name:
         site = sites.get_company_site_by_name(conn, company_id, name)
         if site:
             return site
 
-    display_name = _display_name(user_folder)
-    mapping = load_mapping()
-    for info in mapping.get("mapping", {}).values():
-        if info.get("name") == display_name:
-            slug = info.get("primary_site")
-            site_name = mapping.get("sites", {}).get(slug, {}).get("name")
-            if site_name:
-                return sites.get_company_site_by_name(conn, company_id, site_name)
-            break
+    user = users.get_by_folder_name(conn, company_id, user_folder)
+    if user and memberships.resolve_scope(user["global_role"]) != "ALL":
+        # F4 (Fable review): only use this fallback for non-ALL scope
+        # (field_only/worker/site_manager) users. accessible_site_ids
+        # returns EVERY company site for ALL scope (admin/gm) with no
+        # ordering, so site_ids[0] would be an arbitrary site -- an
+        # admin/gm has no single "home" site to attribute a report to, so
+        # skip (None/caller-skips) rather than guess.
+        site_ids = memberships.accessible_site_ids(conn, user["id"], user["global_role"])
+        if site_ids:
+            return sites.get_site(conn, site_ids[0])
     return None
 
 
 def resolve_user(conn, company_id, user_folder):
-    """Match the folder's display name against company users' first+last
-    name join. Miss -> None (nullable column; does not skip the report)."""
-    display_name = _display_name(user_folder)
-    for u in users.list_company_users(conn, company_id):
-        full = " ".join(p for p in (u.get("first_name"), u.get("last_name")) if p)
-        if full == display_name:
-            return u["id"]
-    return None
+    """Direct company+folder_name lookup against the identity directory.
+    Miss -> None (nullable column; does not skip the report)."""
+    row = users.get_by_folder_name(conn, company_id, user_folder)
+    return row["id"] if row else None
 
 
 # ----------------------------------------------------------

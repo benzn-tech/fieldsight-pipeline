@@ -103,7 +103,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(ing.sites, "get_company_site_by_name",
                         lambda conn, cid, name: {"id": "site-1", "name": name}
                         if name == "Test Site" else None)
-    monkeypatch.setattr(ing.users, "list_company_users", lambda conn, cid: [])
+    monkeypatch.setattr(ing.users, "get_by_folder_name", lambda conn, cid, folder_name: None)
     monkeypatch.setattr(ing.chunks, "delete_chunks_for_source", lambda *a, **k: 0)
     monkeypatch.setattr(ing.topics, "delete_topics_for_source", lambda *a, **k: 0)
     monkeypatch.setattr(ing.topics, "delete_topics_for_source_prefix", lambda *a, **k: 0)
@@ -162,7 +162,7 @@ def test_handler_ignores_non_embeddings_key(monkeypatch):
 # Identity bridge — site resolution
 # ---------------------------------------------------------------------------
 
-def test_site_bridge_by_report_name(monkeypatch):
+def test_resolve_site_name_primary_path(monkeypatch):
     monkeypatch.setattr(
         ing.sites, "get_company_site_by_name",
         lambda conn, cid, name: {"id": "site-1", "name": name}
@@ -175,19 +175,27 @@ def test_site_bridge_by_report_name(monkeypatch):
     assert site == {"id": "site-1", "name": "SB1108 Ellesmere College"}
 
 
-def test_site_bridge_fallback_slug(monkeypatch):
-    mapping = {
-        "sites": {"sb1108-ellesmere": {"name": "SB1108 Ellesmere College"}},
-        "mapping": {"Benl1": {"name": "Jarley Trainor", "primary_site": "sb1108-ellesmere"}},
-    }
-    monkeypatch.setattr(ing, "load_mapping", lambda: mapping)
+def test_resolve_site_fallback_via_slug_or_membership(monkeypatch):
+    # report['site'] does not match anything directly -> resolve_site must
+    # fall through to a DB-driven lookup of the REPORTING USER's own site
+    # membership (folder_name -> user row -> accessible_site_ids -> site) --
+    # never a name-matching heuristic against user_mapping.json.
+    monkeypatch.setattr(ing.sites, "get_company_site_by_name",
+                        lambda conn, cid, name: None)
     monkeypatch.setattr(
-        ing.sites, "get_company_site_by_name",
-        lambda conn, cid, name: {"id": "site-9", "name": name}
-        if name == "SB1108 Ellesmere College" else None,
+        ing.users, "get_by_folder_name",
+        lambda conn, cid, folder_name: {"id": "u-9", "global_role": "worker"}
+        if folder_name == "Jarley_Trainor" else None,
     )
-    # report['site'] does not match anything directly -> must fall through
-    # to the user_mapping.json primary_site slug bridge.
+    monkeypatch.setattr(
+        ing.memberships, "accessible_site_ids",
+        lambda conn, user_id, global_role: ["site-9"] if user_id == "u-9" else [],
+    )
+    monkeypatch.setattr(
+        ing.sites, "get_site",
+        lambda conn, site_id: {"id": "site-9", "name": "SB1108 Ellesmere College"}
+        if site_id == "site-9" else None,
+    )
     report = {"site": "some transcription noise", "topics": []}
 
     site = ing.resolve_site(None, "co-1", report, "Jarley_Trainor")
@@ -195,13 +203,54 @@ def test_site_bridge_fallback_slug(monkeypatch):
     assert site == {"id": "site-9", "name": "SB1108 Ellesmere College"}
 
 
+def test_resolve_site_fallback_skips_for_all_scope(monkeypatch):
+    # F4 (Fable review): admin/gm have no single "home" site --
+    # accessible_site_ids returns EVERY company site for ALL scope with no
+    # ordering, so falling back to site_ids[0] would attribute the report to
+    # an arbitrary site. The membership fallback must be skipped (None) for
+    # ALL-scope (admin/gm) users -- never called at all.
+    monkeypatch.setattr(ing.sites, "get_company_site_by_name",
+                        lambda conn, cid, name: None)
+    monkeypatch.setattr(
+        ing.users, "get_by_folder_name",
+        lambda conn, cid, folder_name: {"id": "u-admin", "global_role": "admin"}
+        if folder_name == "Ben_Lin" else None,
+    )
+    called = []
+    monkeypatch.setattr(
+        ing.memberships, "accessible_site_ids",
+        lambda conn, user_id, global_role: called.append(user_id) or ["site-1", "site-2"],
+    )
+    report = {"site": "some transcription noise", "topics": []}
+
+    site = ing.resolve_site(None, "co-1", report, "Ben_Lin")
+
+    assert site is None
+    assert called == []  # ALL-scope skip happens before accessible_site_ids is ever called
+
+
+def test_resolve_site_double_miss_skips(monkeypatch):
+    # Real 2026-03-20 case: report['site'] is not a real site, and the
+    # reporting user has no resolvable site membership either -> None
+    # (caller skips, never invents a site).
+    monkeypatch.setattr(ing.sites, "get_company_site_by_name",
+                        lambda conn, cid, name: None)
+    monkeypatch.setattr(ing.users, "get_by_folder_name",
+                        lambda conn, cid, folder_name: None)
+    report = {"site": "BD Opportunity Brainstorm", "topics": []}
+
+    site = ing.resolve_site(None, "co-1", report, "Jarley_Trainor")
+
+    assert site is None
+
+
 def test_site_bridge_miss_skips(wired):
-    # Real 2026-03-20 case: report['site'] is not a real site, and the user
-    # isn't in user_mapping.json either -> skip, zero writes.
+    # Real 2026-03-20 case: report['site'] is not a real site, and the
+    # reporting user has no resolvable identity/membership either -> skip,
+    # zero writes (full ingest_report path, not just resolve_site).
     wired.setattr(ing, "_s3_client", FakeS3({REPORT_KEY: json.dumps(
         make_report(site="BD Opportunity Brainstorm"))}))
     wired.setattr(ing.sites, "get_company_site_by_name", lambda conn, cid, name: None)
-    wired.setattr(ing, "load_mapping", lambda: {"sites": {}, "mapping": {}})
 
     write_calls = []
     wired.setattr(ing.chunks, "delete_chunks_for_source",
@@ -410,12 +459,47 @@ def test_backfill_still_lists_reports(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# User bridge — null on miss
+# User bridge — direct folder_name lookup, null on miss
 # ---------------------------------------------------------------------------
 
+def test_resolve_user_by_folder_name(monkeypatch):
+    monkeypatch.setattr(
+        ing.users, "get_by_folder_name",
+        lambda conn, cid, folder_name: {"id": "u-42", "folder_name": folder_name}
+        if folder_name == "Jarley_Trainor" else None,
+    )
+
+    user_id = ing.resolve_user(None, "co-1", "Jarley_Trainor")
+
+    assert user_id == "u-42"
+
+
+def test_resolve_user_miss_none(monkeypatch):
+    monkeypatch.setattr(ing.users, "get_by_folder_name",
+                        lambda conn, cid, folder_name: None)
+
+    assert ing.resolve_user(None, "co-1", "Unknown_Person") is None
+
+
+def test_resolve_user_field_only_folder_hits(monkeypatch):
+    # Task 2 enrollment: field_only reporters (MPI1/MPI2/James_Lamb/
+    # Jack_Gibson) get a folder_name-keyed row with no Cognito login -- they
+    # must resolve exactly like a login user, straight off folder_name (no
+    # name-join heuristic).
+    monkeypatch.setattr(
+        ing.users, "get_by_folder_name",
+        lambda conn, cid, folder_name: {"id": "u-field-1", "kind": "field_only"}
+        if folder_name == "MPI1" else None,
+    )
+
+    user_id = ing.resolve_user(None, "co-1", "MPI1")
+
+    assert user_id == "u-field-1"
+
+
 def test_user_bridge_null_on_miss(wired):
-    wired.setattr(ing.users, "list_company_users",
-                  lambda conn, cid: [{"id": "u-1", "first_name": "Someone", "last_name": "Else"}])
+    wired.setattr(ing.users, "get_by_folder_name",
+                  lambda conn, cid, folder_name: None)
 
     user_id = ing.resolve_user(None, "co-1", "Jarley_Trainor")
     assert user_id is None
@@ -472,7 +556,7 @@ def test_null_user_reports_do_not_collide(wired, monkeypatch):
                   lambda conn, key: deleted_keys.append(("topics", key)) or 0)
     wired.setattr(ing.topics, "upsert_topic", lambda *a, **k: {"id": "t-uuid"})
     wired.setattr(ing.chunks, "insert_chunk", lambda *a, **k: {"id": "c-uuid"})
-    # user bridge misses for both (wired fixture's list_company_users is empty)
+    # user bridge misses for both (wired fixture's get_by_folder_name returns None)
 
     ing.ingest_report("2026-03-02", "MPI1", key_a)
     ing.ingest_report("2026-03-02", "MPI2", key_b)
