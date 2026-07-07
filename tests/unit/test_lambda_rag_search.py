@@ -1,3 +1,7 @@
+import datetime
+import json
+import uuid
+
 import pytest
 
 rag = pytest.importorskip("lambda_rag_search", reason="requires psycopg (installed in CI)")
@@ -90,19 +94,19 @@ def test_worker_uses_memberships(wired):
 
 
 def test_empty_site_ids_empty_chunks(wired):
-    # deny-by-default: a worker with no memberships still reaches
-    # search_chunks (with site_ids=[]) rather than short-circuiting —
-    # WHERE site_id = ANY('{}') simply matches no rows.
+    # deny-by-default: a worker with no memberships short-circuits to an
+    # empty result WITHOUT calling search_chunks (saves the DB round-trip —
+    # WHERE site_id = ANY('{}') would just match no rows anyway).
     wired.setattr(rag.users, "get_user_by_sub",
                   lambda conn, sub: {**CALLER, "global_role": "worker"})
     wired.setattr(rag.memberships, "accessible_site_ids", lambda conn, uid, role: [])
-    called = {}
-    wired.setattr(rag.chunks, "search_chunks",
-                  lambda conn, qv, site_ids, k=5: (called.update(site_ids=site_ids) or []))
+
+    def boom(*a, **k):
+        raise AssertionError("search_chunks must not be called when site_ids is empty")
+    wired.setattr(rag.chunks, "search_chunks", boom)
 
     res = rag.lambda_handler(make_event(), None)
 
-    assert called["site_ids"] == []
     assert res["chunks"] == []
     assert res["site_count"] == 0
 
@@ -138,3 +142,63 @@ def test_default_k_is_8(wired):
     rag.lambda_handler(make_event(), None)  # no "k" key in event
 
     assert captured["k"] == 8
+
+
+def test_k_is_clamped_to_1_32(wired):
+    wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
+    captured = {}
+
+    def fake_search(conn, qv, site_ids, k=5):
+        captured["k"] = k
+        return []
+
+    wired.setattr(rag.chunks, "search_chunks", fake_search)
+
+    rag.lambda_handler(make_event(k=999), None)
+    assert captured["k"] == 32
+
+    rag.lambda_handler(make_event(k=-5), None)
+    assert captured["k"] == 1
+
+
+def test_garbage_k_falls_back_to_default(wired):
+    wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
+    captured = {}
+
+    def fake_search(conn, qv, site_ids, k=5):
+        captured["k"] = k
+        return []
+
+    wired.setattr(rag.chunks, "search_chunks", fake_search)
+
+    rag.lambda_handler(make_event(k="not-a-number"), None)
+
+    assert captured["k"] == 8
+
+
+def test_json_safe_return_coerces_uuid_and_date(wired):
+    # C1: search_chunks returns raw psycopg rows containing uuid.UUID and
+    # datetime.date values. Lambda's JSON marshaller cannot serialize these
+    # (Runtime.MarshalError) — the handler MUST coerce them before returning
+    # or every real (non-empty) RAG hit silently fails in prod.
+    wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
+    row = {
+        "id": uuid.uuid4(),
+        "site_id": uuid.uuid4(),
+        "topic_id": uuid.uuid4(),
+        "report_date": datetime.date(2026, 2, 9),
+        "chunk_text": "hello",
+    }
+    wired.setattr(rag.chunks, "search_chunks", lambda conn, qv, site_ids, k=5: [row])
+
+    res = rag.lambda_handler(make_event(), None)
+
+    # This is exactly what the real Lambda JSON marshaller does to the
+    # handler's return value -- it must not raise.
+    json.dumps(res)
+
+    out_row = res["chunks"][0]
+    assert isinstance(out_row["id"], str)
+    assert isinstance(out_row["site_id"], str)
+    assert isinstance(out_row["topic_id"], str)
+    assert out_row["report_date"] == "2026-02-09"

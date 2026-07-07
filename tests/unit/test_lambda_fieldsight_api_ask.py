@@ -41,10 +41,11 @@ class FakeLambdaClient:
     """Stand-in for boto3.client('lambda') — records the invoke() call and
     returns a botocore-shaped {"Payload": <stream>} response."""
 
-    def __init__(self, response_payload=None):
+    def __init__(self, response_payload=None, function_error=None):
         self.response_payload = response_payload if response_payload is not None else {
             "answer": "stub", "citations": [], "model": "stub"
         }
+        self.function_error = function_error
         self.calls = []
 
     def invoke(self, FunctionName, InvocationType, Payload):
@@ -53,7 +54,10 @@ class FakeLambdaClient:
             "InvocationType": InvocationType,
             "Payload": json.loads(Payload),
         })
-        return {"Payload": io.BytesIO(json.dumps(self.response_payload).encode("utf-8"))}
+        resp = {"Payload": io.BytesIO(json.dumps(self.response_payload).encode("utf-8"))}
+        if self.function_error:
+            resp["FunctionError"] = self.function_error
+        return resp
 
 
 def wire(monkeypatch, **kwargs):
@@ -133,3 +137,24 @@ def test_worker_cannot_impersonate_other_user_via_ask(monkeypatch):
     fapi.ask_question({"question": "Q?", "user": "Someone_Else"}, WORKER_CALLER)
 
     assert fake_client.calls[0]["Payload"]["user"] == "Ben_Test"
+
+
+def test_function_error_returns_500_without_stack_trace_leak(monkeypatch):
+    """I1: if the Ask Agent lambda itself raised an unhandled exception,
+    boto3 reports it via resp['FunctionError'] with a Payload containing
+    {errorMessage, errorType, stackTrace}. ApiFunction must never pass that
+    payload straight through to the client -- it leaks internals."""
+    wire(monkeypatch,
+         response_payload={
+             "errorMessage": "RuntimeError: dashscope upstream 503",
+             "errorType": "RuntimeError",
+             "stackTrace": ["  File \"lambda_ask_agent.py\", line 525, in _rag_answer"],
+         },
+         function_error="Unhandled")
+
+    res = fapi.ask_question({"question": "What happened?", "date": "2026-02-09"}, ADMIN_CALLER)
+
+    assert res["statusCode"] == 500
+    body_text = res["body"]
+    assert "stackTrace" not in body_text
+    assert "lambda_ask_agent.py" not in body_text

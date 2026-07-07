@@ -882,6 +882,14 @@ def ask_question(body, caller):
             InvocationType='RequestResponse',
             Payload=json.dumps(payload)
         )
+        # An unhandled exception inside the Ask Agent lambda comes back as a
+        # 200 InvocationType response with FunctionError set and a Payload
+        # containing {errorMessage, errorType, stackTrace}. Never pass that
+        # straight through to the client -- it leaks internal stack traces.
+        if resp.get('FunctionError'):
+            logger.error(f"Ask agent returned FunctionError: {resp.get('FunctionError')}")
+            return error('Ask agent error', 500)
+
         result = json.loads(resp['Payload'].read().decode('utf-8'))
 
         # The Ask Agent returns API Gateway format {statusCode, body}

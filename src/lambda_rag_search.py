@@ -22,10 +22,13 @@ Result: {"chunks": [...], "site_count": N}
 ACL mirrors lambda_org_api.list_live_items EXACTLY: resolve_scope(caller's
 global_role) == "ALL" (admin/gm) sees every site in their company; anyone
 else is narrowed to memberships.accessible_site_ids. Deny-by-default: an
-empty site_ids list still reaches search_chunks (WHERE site_id = ANY('{}')
-matches no rows) rather than being special-cased — same behavior as the
+empty site_ids list short-circuits to an empty result BEFORE calling
+search_chunks (WHERE site_id = ANY('{}') would match no rows anyway — this
+just skips the DB round-trip and makes the deny-by-default case explicit)
+rather than being special-cased in the SQL — same net behavior as the
 org-api ACL branch it mirrors.
 """
+import json
 import logging
 
 from db.connection import get_connection
@@ -38,7 +41,11 @@ logger.setLevel(logging.INFO)
 
 def lambda_handler(event, context):
     sub = event.get("sub")
-    k = int(event.get("k", 8))
+    try:
+        k = int(event.get("k", 8))
+    except (TypeError, ValueError):
+        k = 8
+    k = max(1, min(k, 32))
     qv = event.get("query_embedding")
 
     if not sub or not qv:
@@ -57,5 +64,16 @@ def lambda_handler(event, context):
             site_ids = memberships.accessible_site_ids(
                 conn, caller["id"], caller["global_role"])
 
+        if not site_ids:
+            return {"chunks": [], "site_count": 0}
+
         rows = chunks.search_chunks(conn, qv, site_ids, k=k)
+        # search_chunks returns raw psycopg rows: id/site_id/topic_id are
+        # uuid.UUID and report_date is datetime.date. Lambda's JSON
+        # marshaller cannot serialize either — Runtime.MarshalError kills
+        # the invoke on any REAL (non-empty) hit, so RAG silently looks like
+        # "no results" in prod. Round-trip through json.dumps(default=str)
+        # to coerce them to plain strings before returning (mirrors
+        # lambda_org_api.py's `json.dumps(body, default=str)`).
+        rows = json.loads(json.dumps(rows, default=str))
         return {"chunks": rows, "site_count": len(site_ids)}

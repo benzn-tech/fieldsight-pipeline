@@ -25,6 +25,10 @@ os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 os.environ.setdefault("AWS_DEFAULT_REGION", "ap-southeast-2")
 os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-dummy-key")
+# C2: the RAG branch is only reachable when RAG_SEARCH_FUNCTION is set (mirrors
+# TEST, which always has it wired via template.yaml). Prod has no such env var
+# -- see test_caller_sub_without_rag_search_function_falls_back_to_legacy below.
+os.environ.setdefault("RAG_SEARCH_FUNCTION", "fieldsight-test-rag-search")
 
 laa = pytest.importorskip("lambda_ask_agent", reason="requires boto3/urllib3 (installed in CI)")
 import claude_utils  # noqa: E402  (import after importorskip, same module the handler calls)
@@ -237,3 +241,62 @@ def test_non_rag_event_uses_legacy_path(monkeypatch):
     assert result["date"] == "2026-02-09"
     assert result["user"] == "Jarley_Trainor"
     assert "citations" not in result  # legacy envelope shape, unchanged
+
+
+# ============================================================
+# C2 (Critical): prod-safe guard + lazy import
+# ============================================================
+
+def test_caller_sub_without_rag_search_function_falls_back_to_legacy(monkeypatch):
+    """This is exactly PROD's shape once ApiFunction forwards caller_sub
+    everywhere: no RAG_SEARCH_FUNCTION env var configured. The RAG branch
+    must NOT fire -- it must fall through to the legacy S3 path."""
+    monkeypatch.delenv("RAG_SEARCH_FUNCTION", raising=False)
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("RAG path must not run when RAG_SEARCH_FUNCTION is unset")
+
+    monkeypatch.setattr(dashscope_utils, "embed", fail_if_called)
+    monkeypatch.setattr(laa, "_get_lambda_client", fail_if_called)
+    monkeypatch.setattr(laa, "load_report",
+                         lambda bucket, date, user: ({"site": "TestSite", "executive_summary": "All good"}, "daily"))
+    monkeypatch.setattr(laa, "load_transcripts", lambda bucket, date, user, topic_time_range=None: [])
+    monkeypatch.setattr(laa, "call_claude", lambda prompt, max_tokens=2048: ("Legacy answer", None))
+
+    event = {
+        "date": "2026-02-09", "user": "Jarley_Trainor", "question": "What happened?",
+        "scope": "both", "caller_sub": "sub-1",
+    }
+    result = invoke(event)
+
+    assert result["answer"] == "Legacy answer"
+    assert result["grounded"] is True
+    assert "citations" not in result  # legacy envelope shape, not the RAG one
+
+
+def test_claude_and_dashscope_are_not_top_level_imports():
+    """C2: claude_utils/dashscope_utils must be imported lazily inside
+    _rag_answer, not at module top level. deploy-lambda-code.sh zips ONLY
+    lambda_ask_agent.py + transcript_utils.py for prod -- a top-level import
+    would ImportModuleError the whole module (killing the legacy path too)
+    the instant this file reaches prod."""
+    assert not hasattr(laa, "claude_utils")
+    assert not hasattr(laa, "dashscope_utils")
+
+
+# ============================================================
+# I1 (Important): graceful RAG errors, no unhandled-exception passthrough
+# ============================================================
+
+def test_embed_failure_returns_graceful_error_not_raise(monkeypatch):
+    def boom(texts, dim=None):
+        raise RuntimeError("dashscope upstream 503")
+
+    monkeypatch.setattr(dashscope_utils, "embed", boom)
+
+    result = invoke(make_event())
+
+    assert result["answer"] == ""
+    assert result["error"] == "dashscope upstream 503"
+    assert result["citations"] == []
+    assert result["model"] == claude_utils.CLAUDE_MODEL

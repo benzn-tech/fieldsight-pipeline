@@ -616,7 +616,13 @@ Resources:
           DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
           DASHSCOPE_EMBED_MODEL: text-embedding-v4
           DASHSCOPE_EMBED_DIM: '1024'
-          CLAUDE_MODEL: claude-sonnet-4-6
+          # I2: haiku, not sonnet. The user-facing ask round-trip is capped by
+          # APIGW's hard 29s integration timeout on ApiFunction (Timeout: 30
+          # above) -- and RAG synthesis adds two extra hops (embed call +
+          # rag-search invoke) on top of the Claude call itself. A 2048-token
+          # sonnet completion risks blowing that budget; haiku is fast and
+          # matches the legacy S3 path's HAIKU_MODEL.
+          CLAUDE_MODEL: claude-haiku-4-5-20251001
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName

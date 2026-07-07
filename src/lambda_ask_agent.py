@@ -36,8 +36,6 @@ import re
 import boto3
 import urllib3
 
-import claude_utils
-import dashscope_utils
 from datetime import datetime, timedelta
 
 # Import shared utilities — bundled in the same src/ directory
@@ -517,59 +515,91 @@ def _rag_answer(body):
     chunks (ACL-narrowed to caller_sub's accessible sites), then synthesize
     a cited markdown answer via claude_utils.call_claude. Returns a plain
     dict (never an HTTP-shaped response) -- lambda_handler wraps it with
-    ok() same as every other result."""
+    ok() same as every other result.
+
+    claude_utils / dashscope_utils are imported HERE (lazily), not at module
+    top level: scripts/deploy-lambda-code.sh zips ONLY lambda_ask_agent.py +
+    transcript_utils.py for prod. A top-level `import claude_utils` would
+    ImportModuleError the entire module on prod (killing the legacy S3-file
+    path too, not just RAG) the moment this file merges to main -- prod has
+    no RAG_SEARCH_FUNCTION env var and was never meant to take this branch
+    (see the caller_sub-and-RAG_SEARCH_FUNCTION guard in lambda_handler).
+
+    The whole body is wrapped in try/except so any failure (embed, the
+    rag-search invoke, Claude) degrades to the same success envelope shape
+    instead of raising -- an unhandled exception here would otherwise
+    propagate out of lambda_handler as a raw Lambda error (stack trace and
+    all) instead of a clean HTTP-shaped response.
+    """
+    import claude_utils
+    import dashscope_utils
+
     question = (body.get("question") or "").strip()
     caller_sub = body.get("caller_sub")
     k = int(body.get("k", 8))
 
-    query_vec = dashscope_utils.embed([question])[0]
+    try:
+        query_vec = dashscope_utils.embed([question])[0]
 
-    resp = _get_lambda_client().invoke(
-        FunctionName=RAG_SEARCH_FUNCTION,
-        InvocationType="RequestResponse",
-        Payload=json.dumps({"sub": caller_sub, "query_embedding": query_vec, "k": k}),
-    )
-    result = json.loads(resp["Payload"].read().decode("utf-8"))
-    chunks = result.get("chunks") or []
+        resp = _get_lambda_client().invoke(
+            FunctionName=RAG_SEARCH_FUNCTION,
+            InvocationType="RequestResponse",
+            Payload=json.dumps({"sub": caller_sub, "query_embedding": query_vec, "k": k}),
+        )
+        result = json.loads(resp["Payload"].read().decode("utf-8"))
+        chunks = result.get("chunks") or []
 
-    if not chunks:
+        if result.get("error"):
+            # Distinguish "caller not provisioned" / ACL misses from genuine
+            # no-results in the logs -- both currently surface as chunks=[].
+            logger.warning(f"  rag-search returned error: {result['error']}")
+
+        if not chunks:
+            return {
+                "answer": "未找到相关记录 / No relevant records found for this question.",
+                "citations": [],
+                "model": claude_utils.CLAUDE_MODEL,
+                "grounded": True,
+            }
+
+        prompt = build_rag_prompt(question, chunks)
+        answer, err = claude_utils.call_claude(prompt, max_tokens=2048)
+
+        if err:
+            logger.error(f"  RAG Claude error: {err}")
+            return {
+                "answer": "",
+                "error": err,
+                "citations": [],
+                "model": claude_utils.CLAUDE_MODEL,
+            }
+
+        citations = [
+            {
+                "source_s3_key": c.get("source_s3_key"),
+                "report_date": str(c.get("report_date", "") or ""),
+                "site_name": c.get("site_name"),
+                "topic_title": c.get("topic_title"),
+                "chunk_type": c.get("chunk_type"),
+                "snippet": (c.get("chunk_text") or "")[:200],
+            }
+            for c in chunks
+        ]
+
         return {
-            "answer": "未找到相关记录 / No relevant records found for this question.",
-            "citations": [],
+            "answer": answer,
+            "citations": citations,
             "model": claude_utils.CLAUDE_MODEL,
             "grounded": True,
         }
-
-    prompt = build_rag_prompt(question, chunks)
-    answer, err = claude_utils.call_claude(prompt, max_tokens=2048)
-
-    if err:
-        logger.error(f"  RAG Claude error: {err}")
+    except Exception as e:
+        logger.error(f"  RAG path failed: {e}")
         return {
             "answer": "",
-            "error": err,
+            "error": str(e),
             "citations": [],
             "model": claude_utils.CLAUDE_MODEL,
         }
-
-    citations = [
-        {
-            "source_s3_key": c.get("source_s3_key"),
-            "report_date": str(c.get("report_date", "") or ""),
-            "site_name": c.get("site_name"),
-            "topic_title": c.get("topic_title"),
-            "chunk_type": c.get("chunk_type"),
-            "snippet": (c.get("chunk_text") or "")[:200],
-        }
-        for c in chunks
-    ]
-
-    return {
-        "answer": answer,
-        "citations": citations,
-        "model": claude_utils.CLAUDE_MODEL,
-        "grounded": True,
-    }
 
 
 # ============================================================
@@ -636,8 +666,13 @@ def lambda_handler(event, context):
     if not question:
         return error('Missing question')
 
-    # --- RAG path (Phase 5): triggered when caller_sub is present ---
-    if body.get('caller_sub'):
+    # --- RAG path (Phase 5): triggered when caller_sub is present AND this
+    # deploy target actually has a rag-search function wired up. Prod has no
+    # RAG_SEARCH_FUNCTION env var (see template.yaml AskAgentFunction) and
+    # never runs SAM-provisioned VPC/DB/DashScope infra, so it must always
+    # fall through to the legacy S3 path even once ApiFunction starts
+    # forwarding caller_sub everywhere.
+    if body.get('caller_sub') and os.environ.get('RAG_SEARCH_FUNCTION'):
         return ok(_rag_answer(body))
 
     if not date:
