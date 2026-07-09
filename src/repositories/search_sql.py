@@ -16,8 +16,8 @@ def build_search_sql() -> str:
         "LEFT JOIN topics t ON t.id = c.topic_id "
         "LEFT JOIN sites s ON s.id = c.site_id "
         "WHERE c.site_id = ANY(%(site_ids)s) "
-        "AND (%(date_from)s IS NULL OR c.report_date >= %(date_from)s) "
-        "AND (%(date_to)s IS NULL OR c.report_date <= %(date_to)s) "
+        "AND (%(date_from)s::date IS NULL OR c.report_date >= %(date_from)s::date) "
+        "AND (%(date_to)s::date IS NULL OR c.report_date <= %(date_to)s::date) "
         "ORDER BY c.embedding <=> %(q)s::vector "
         "LIMIT %(k)s"
     )
