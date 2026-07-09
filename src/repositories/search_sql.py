@@ -3,9 +3,10 @@
 
 def build_search_sql() -> str:
     # Deny-by-default: ALWAYS filter by the caller's accessible site ids.
-    # small-to-big: return the parent topic's title/summary via LEFT JOIN.
-    # Citations (Phase 5 RAG ask) need report_date/site_id/site_name, so
-    # also LEFT JOIN sites for the human-readable site name.
+    # small-to-big: parent topic title/summary via LEFT JOIN. Citations need
+    # report_date/site_id/site_name. Optional inclusive report_date range
+    # (both NULL => no date filtering, so the Ask path stays byte-identical
+    # when it passes no dates).
     return (
         "SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_key, "
         "       c.metadata, c.report_date, c.site_id, s.name AS site_name, "
@@ -15,6 +16,8 @@ def build_search_sql() -> str:
         "LEFT JOIN topics t ON t.id = c.topic_id "
         "LEFT JOIN sites s ON s.id = c.site_id "
         "WHERE c.site_id = ANY(%(site_ids)s) "
+        "AND (%(date_from)s IS NULL OR c.report_date >= %(date_from)s) "
+        "AND (%(date_to)s IS NULL OR c.report_date <= %(date_to)s) "
         "ORDER BY c.embedding <=> %(q)s::vector "
         "LIMIT %(k)s"
     )

@@ -66,7 +66,8 @@ def test_admin_uses_company_sites(wired):
                   lambda conn, cid: (seen.update(cid=cid) or [{"id": "s-1"}, {"id": "s-2"}]))
     captured = {}
     wired.setattr(rag.chunks, "search_chunks",
-                  lambda conn, qv, site_ids, k=5: (captured.update(site_ids=site_ids) or []))
+                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None:
+                      (captured.update(site_ids=site_ids) or []))
 
     res = rag.lambda_handler(make_event(), None)
 
@@ -84,7 +85,8 @@ def test_worker_uses_memberships(wired):
                   lambda conn, uid, role: (seen.update(uid=uid, role=role) or ["s-3"]))
     captured = {}
     wired.setattr(rag.chunks, "search_chunks",
-                  lambda conn, qv, site_ids, k=5: (captured.update(site_ids=site_ids) or []))
+                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None:
+                      (captured.update(site_ids=site_ids) or []))
 
     res = rag.lambda_handler(make_event(), None)
 
@@ -115,7 +117,7 @@ def test_search_chunks_receives_vector_and_k(wired):
     wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
     captured = {}
 
-    def fake_search(conn, qv, site_ids, k=5):
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None):
         captured.update(qv=qv, site_ids=site_ids, k=k)
         return [{"chunk_text": "hello"}]
 
@@ -133,7 +135,7 @@ def test_default_k_is_8(wired):
     wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
     captured = {}
 
-    def fake_search(conn, qv, site_ids, k=5):
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None):
         captured["k"] = k
         return []
 
@@ -148,7 +150,7 @@ def test_k_is_clamped_to_1_32(wired):
     wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
     captured = {}
 
-    def fake_search(conn, qv, site_ids, k=5):
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None):
         captured["k"] = k
         return []
 
@@ -165,7 +167,7 @@ def test_garbage_k_falls_back_to_default(wired):
     wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
     captured = {}
 
-    def fake_search(conn, qv, site_ids, k=5):
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None):
         captured["k"] = k
         return []
 
@@ -189,7 +191,8 @@ def test_json_safe_return_coerces_uuid_and_date(wired):
         "report_date": datetime.date(2026, 2, 9),
         "chunk_text": "hello",
     }
-    wired.setattr(rag.chunks, "search_chunks", lambda conn, qv, site_ids, k=5: [row])
+    wired.setattr(rag.chunks, "search_chunks",
+                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None: [row])
 
     res = rag.lambda_handler(make_event(), None)
 
@@ -202,3 +205,38 @@ def test_json_safe_return_coerces_uuid_and_date(wired):
     assert isinstance(out_row["site_id"], str)
     assert isinstance(out_row["topic_id"], str)
     assert out_row["report_date"] == "2026-02-09"
+
+
+def test_date_bounds_forwarded_to_search_chunks(wired):
+    wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
+    captured = {}
+
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None):
+        captured.update(date_from=date_from, date_to=date_to)
+        return []
+
+    wired.setattr(rag.chunks, "search_chunks", fake_search)
+    ev = make_event()
+    ev["date_from"] = "2026-02-01"
+    ev["date_to"] = "2026-03-31"
+
+    rag.lambda_handler(ev, None)
+
+    assert captured["date_from"] == "2026-02-01"
+    assert captured["date_to"] == "2026-03-31"
+
+
+def test_date_bounds_default_none(wired):
+    wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
+    captured = {}
+
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None):
+        captured.update(date_from=date_from, date_to=date_to)
+        return []
+
+    wired.setattr(rag.chunks, "search_chunks", fake_search)
+
+    rag.lambda_handler(make_event(), None)  # no date keys
+
+    assert captured["date_from"] is None
+    assert captured["date_to"] is None

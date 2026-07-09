@@ -47,6 +47,8 @@ def lambda_handler(event, context):
         k = 8
     k = max(1, min(k, 32))
     qv = event.get("query_embedding")
+    date_from = event.get("date_from") or None
+    date_to = event.get("date_to") or None
 
     if not sub or not qv:
         return {"chunks": [], "error": "missing sub or query_embedding"}
@@ -67,7 +69,8 @@ def lambda_handler(event, context):
         if not site_ids:
             return {"chunks": [], "site_count": 0}
 
-        rows = chunks.search_chunks(conn, qv, site_ids, k=k)
+        rows = chunks.search_chunks(conn, qv, site_ids, k=k,
+                                    date_from=date_from, date_to=date_to)
         # search_chunks returns raw psycopg rows: id/site_id/topic_id are
         # uuid.UUID and report_date is datetime.date. Lambda's JSON
         # marshaller cannot serialize either — Runtime.MarshalError kills
