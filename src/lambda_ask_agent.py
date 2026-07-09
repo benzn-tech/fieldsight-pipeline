@@ -598,9 +598,16 @@ def _rag_search_list(body):
             InvocationType="RequestResponse",
             Payload=json.dumps(payload),
         )
+        # A crashed rag-search comes back as a 200 with FunctionError set and a
+        # {errorMessage,errorType,stackTrace} payload. Never treat that as
+        # "no results" — surface an error so the caller can tell empty from broken.
+        if resp.get("FunctionError"):
+            logger.error("  search rag-search FunctionError: %s", resp.get("FunctionError"))
+            return {"results": [], "error": "search backend failed", "count": 0}
         result = json.loads(resp["Payload"].read().decode("utf-8"))
         if result.get("error"):
             logger.warning(f"  search rag-search error: {result['error']}")
+            return {"results": [], "error": result["error"], "count": 0}
         rows = _aggregate_topics(result.get("chunks") or [])
         return {"results": rows, "count": len(rows), "grounded": True}
     except Exception as e:

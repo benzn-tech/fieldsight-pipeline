@@ -909,7 +909,7 @@ def search_topics(body, caller):
     Returns a ranked topic list (no LLM synthesis). ACL is enforced downstream
     in rag-search (org accessible sites via caller_sub), so no per-user gate is
     needed here. date_from/date_to are an optional inclusive range."""
-    question = body.get('question', '').strip()
+    question = (body.get('question') or '').strip()
     if len(question) < 2:
         return ok({'results': [], 'count': 0})
 
@@ -920,10 +920,16 @@ def search_topics(body, caller):
         'caller_sub': caller.get('sub', ''),
         'k': int(body.get('k', 30)) if str(body.get('k', 30)).isdigit() else 30,
     }
-    if body.get('date_from'):
-        payload['date_from'] = body['date_from']
-    if body.get('date_to'):
-        payload['date_to'] = body['date_to']
+    date_from = body.get('date_from')
+    date_to = body.get('date_to')
+    if date_from and not re.match(r'^\d{4}-\d{2}-\d{2}$', str(date_from)):
+        return error('Invalid date_from (expected YYYY-MM-DD)')
+    if date_to and not re.match(r'^\d{4}-\d{2}-\d{2}$', str(date_to)):
+        return error('Invalid date_to (expected YYYY-MM-DD)')
+    if date_from:
+        payload['date_from'] = date_from
+    if date_to:
+        payload['date_to'] = date_to
 
     try:
         resp = lambda_client.invoke(

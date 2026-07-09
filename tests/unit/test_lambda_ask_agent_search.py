@@ -34,13 +34,25 @@ def chunk(topic_id, date, dist, title, folder="Jarley_Trainor", site="Ellesmere"
 
 
 class FakeLambdaClient:
-    def __init__(self, chunks):
-        self.payload = {"chunks": chunks}
+    def __init__(self, chunks, function_error=None):
+        # Normal usage passes a list of chunks, wrapped as {"chunks": [...]}.
+        # The FunctionError-simulation test instead passes the raw error dict
+        # ({"errorMessage": ..., "errorType": ...}) as the Payload body itself
+        # (mirroring what a crashed Lambda actually returns) -- wrap whatever
+        # we're given so both usages work.
+        if isinstance(chunks, list):
+            self.payload = {"chunks": chunks}
+        else:
+            self.payload = chunks
+        self.function_error = function_error
         self.calls = []
 
     def invoke(self, FunctionName, InvocationType, Payload):
         self.calls.append({"FunctionName": FunctionName, "Payload": json.loads(Payload)})
-        return {"Payload": io.BytesIO(json.dumps(self.payload).encode("utf-8"))}
+        resp = {"Payload": io.BytesIO(json.dumps(self.payload).encode("utf-8"))}
+        if self.function_error:
+            resp["FunctionError"] = self.function_error
+        return resp
 
 
 def wire(monkeypatch, chunks):
@@ -127,13 +139,31 @@ def test_search_mode_default_k_is_30(monkeypatch):
 
 
 def test_ask_mode_unaffected_still_calls_claude(monkeypatch):
-    # mode absent => Ask path; call_claude IS used (no AssertionError wiring here)
+    # mode absent => Ask path; call_claude IS used and the Ask envelope (citations) is returned.
     monkeypatch.setattr(dashscope_utils, "embed", lambda texts, dim=None: [[0.1] * 1024])
     fc = FakeLambdaClient([chunk("t-1", "2026-02-09", 0.1, "Door")])
     monkeypatch.setattr(laa, "_get_lambda_client", lambda: fc)
     seen = {}
-    monkeypatch.setattr(claude_utils, "call_claude",
-                        lambda prompt, max_tokens=4096: (seen.setdefault("called", True), "ans [1]")[1] if False else ("ans [1]", None))
+
+    def rec(prompt, max_tokens=4096):
+        seen["called"] = True
+        return ("ans [1]", None)
+
+    monkeypatch.setattr(claude_utils, "call_claude", rec)
     resp = laa.lambda_handler({"question": "q", "caller_sub": "sub-1"}, None)
     body = json.loads(resp["body"])
-    assert "citations" in body  # Ask envelope, not the search {results} envelope
+    assert seen.get("called") is True   # Ask path DID synthesize via Claude
+    assert "citations" in body          # Ask envelope, not the search {results} envelope
+
+
+def test_search_mode_function_error_returns_error_not_silent_empty(monkeypatch):
+    monkeypatch.setattr(dashscope_utils, "embed", lambda texts, dim=None: [[0.1] * 1024])
+    fc = FakeLambdaClient({"errorMessage": "boom", "errorType": "RuntimeError"}, function_error="Unhandled")
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: fc)
+    monkeypatch.setattr(claude_utils, "call_claude",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no claude in search")))
+    out = run(ev())
+    assert out["count"] == 0
+    assert out["results"] == []
+    assert out.get("error")            # surfaced, NOT a silent grounded-empty
+    assert "grounded" not in out or out["grounded"] is not True

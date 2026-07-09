@@ -80,6 +80,21 @@ def test_function_error_returns_500_no_leak(monkeypatch):
     assert "lambda_ask_agent.py" not in res["body"]
 
 
+def test_invalid_date_from_returns_400_without_invoke(monkeypatch):
+    fc = wire(monkeypatch)
+    res = fapi.search_topics({"question": "door", "date_from": "last week"}, ADMIN_CALLER)
+    assert res["statusCode"] == 400
+    assert fc.calls == []
+
+
+def test_null_question_returns_empty_not_500(monkeypatch):
+    fc = wire(monkeypatch)
+    res = fapi.search_topics({"question": None}, ADMIN_CALLER)
+    assert res["statusCode"] == 200
+    assert body_of(res) == {"results": [], "count": 0}
+    assert fc.calls == []
+
+
 def test_router_dispatches_search(monkeypatch):
     wire(monkeypatch)
     event = {"httpMethod": "POST", "path": "/api/search",
