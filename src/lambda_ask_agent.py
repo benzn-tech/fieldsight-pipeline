@@ -35,6 +35,25 @@ import logging
 import re
 import boto3
 import urllib3
+import urllib.parse as _urlparse
+
+
+def _q(s):
+    return _urlparse.quote(str(s), safe="")
+
+
+def _folder_from_source(src):
+    """Report folder from the chunk's source_s3_key. Ingest stamps every chunk
+    with the report key `reports/<date>/<folder>/daily_report.json` (folder =
+    3rd segment). Tolerate the transcript key shape `transcripts/<folder>/
+    <date>/...` (folder = 2nd segment) too. Miss => '' (route omits &user)."""
+    parts = (src or "").split("/")
+    if len(parts) >= 4 and parts[0] == "reports":
+        return parts[2]
+    if len(parts) >= 3 and parts[0] == "transcripts":
+        return parts[1]
+    return ""
+
 
 from datetime import datetime, timedelta
 
@@ -510,6 +529,85 @@ def build_rag_prompt(question, chunks):
     return "\n\n".join(parts)
 
 
+def _aggregate_topics(chunks):
+    """Collapse retrieved chunks into distinct rows for the Search list.
+    Group key: (report_date, site_id, topic_id) when a topic is present,
+    else (report_date, site_id, "src:"+source_s3_key) for a topic-less
+    transcript window (shown as a report excerpt). Keep the smallest cosine
+    distance per group as the relevance score. Route mirrors the client's
+    existing topic deep-link EXACTLY (String(topic_id), encodeURIComponent);
+    &user omitted when folder is unknown, &topic omitted when no topic."""
+    groups = {}
+    for c in chunks:
+        topic_id = c.get("topic_id")
+        date = str(c.get("report_date", "") or "")
+        site_id = str(c.get("site_id", "") or "")
+        key = (date, site_id, topic_id) if topic_id \
+            else (date, site_id, "src:" + str(c.get("source_s3_key") or ""))
+        dist = c.get("distance")
+        dist = float(dist) if dist is not None else 1.0
+        cur = groups.get(key)
+        if cur is not None and dist >= cur["score"]:
+            continue
+        folder = _folder_from_source(c.get("source_s3_key"))
+        title = c.get("topic_title") or (c.get("chunk_text") or "")[:60]
+        route = "/timeline?date=" + _q(date)
+        if folder:
+            route += "&user=" + _q(folder)
+        if topic_id:
+            route += "&topic=" + _q(str(topic_id))
+        groups[key] = {
+            "report_date": date,
+            "site_name": c.get("site_name"),
+            "topic_id": str(topic_id) if topic_id else None,
+            "title": title,
+            "snippet": (c.get("chunk_text") or "")[:200],
+            "chunk_type": c.get("chunk_type"),
+            "route": route,
+            "score": dist,
+        }
+    rows = list(groups.values())
+    rows.sort(key=lambda r: r["report_date"], reverse=True)  # date desc tiebreak
+    rows.sort(key=lambda r: r["score"])                      # stable: distance asc primary
+    return rows
+
+
+def _rag_search_list(body):
+    """mode=search: embed question -> rag-search (ACL + optional date range)
+    -> aggregate to a ranked topic list. NO Claude synthesis."""
+    import dashscope_utils
+
+    question = (body.get("question") or "").strip()
+    caller_sub = body.get("caller_sub")
+    try:
+        k = int(body.get("k", 30))
+    except (TypeError, ValueError):
+        k = 30
+    date_from = body.get("date_from") or None
+    date_to = body.get("date_to") or None
+
+    try:
+        query_vec = dashscope_utils.embed([question])[0]
+        payload = {"sub": caller_sub, "query_embedding": query_vec, "k": k}
+        if date_from:
+            payload["date_from"] = date_from
+        if date_to:
+            payload["date_to"] = date_to
+        resp = _get_lambda_client().invoke(
+            FunctionName=RAG_SEARCH_FUNCTION,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload),
+        )
+        result = json.loads(resp["Payload"].read().decode("utf-8"))
+        if result.get("error"):
+            logger.warning(f"  search rag-search error: {result['error']}")
+        rows = _aggregate_topics(result.get("chunks") or [])
+        return {"results": rows, "count": len(rows), "grounded": True}
+    except Exception as e:
+        logger.error(f"  RAG search-list failed: {e}")
+        return {"results": [], "error": str(e), "count": 0}
+
+
 def _rag_answer(body):
     """RAG path: embed the question, invoke RAG_SEARCH_FUNCTION for grounded
     chunks (ACL-narrowed to caller_sub's accessible sites), then synthesize
@@ -681,6 +779,8 @@ def lambda_handler(event, context):
     # fall through to the legacy S3 path even once ApiFunction starts
     # forwarding caller_sub everywhere.
     if body.get('caller_sub') and os.environ.get('RAG_SEARCH_FUNCTION'):
+        if body.get('mode') == 'search':
+            return ok(_rag_search_list(body))
         return ok(_rag_answer(body))
 
     if not date:
