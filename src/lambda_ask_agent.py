@@ -396,7 +396,7 @@ Rules:
 - Keep answers concise and direct — 2-5 sentences for simple questions, longer for complex ones.
 - When quoting from transcripts, indicate the approximate time.
 - For action items and decisions, always mention who is responsible and any deadlines.
-- Answer in the same language the user asks in (English or 中文)."""
+- Answer in English (customer-facing responses are English-only for now)."""
 
 
 def build_prompt(question, report_text, transcript_text, scope, metadata):
@@ -499,7 +499,7 @@ Rules:
 - Format the answer as markdown.
 - Cite the excerpt(s) you used inline as [n] (matching the excerpt numbers below), placed at the point in the answer where each fact is used.
 - If the excerpts do not contain the answer, say so clearly instead of guessing.
-- Answer in the same language the question is asked in (English or 中文)."""
+- Answer in English (customer-facing responses are English-only for now)."""
 
 
 def build_rag_prompt(question, chunks):
@@ -664,7 +664,7 @@ def _rag_answer(body):
         if resp.get("FunctionError"):
             logger.error("  Ask rag-search FunctionError: %s", resp.get("FunctionError"))
             return {
-                "answer": "检索服务暂时不可用,请稍后再试 / Search service temporarily unavailable.",
+                "answer": "Search service temporarily unavailable. Please try again.",
                 "error": "rag-search unavailable",
                 "citations": [],
                 "model": claude_utils.CLAUDE_MODEL,
@@ -679,7 +679,7 @@ def _rag_answer(body):
 
         if not chunks:
             return {
-                "answer": "未找到相关记录 / No relevant records found for this question.",
+                "answer": "No relevant records found for this question.",
                 "citations": [],
                 "model": claude_utils.CLAUDE_MODEL,
                 "grounded": True,
