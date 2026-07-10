@@ -300,3 +300,31 @@ def test_embed_failure_returns_graceful_error_not_raise(monkeypatch):
     assert result["error"] == "dashscope upstream 503"
     assert result["citations"] == []
     assert result["model"] == claude_utils.CLAUDE_MODEL
+
+
+def test_ask_rag_search_function_error_is_service_error_not_no_records(monkeypatch):
+    # If rag-search crashes (FunctionError — e.g. DB down / rotated password),
+    # the Ask path must surface a clear service error, NOT the "未找到相关记录"
+    # no-results string (which masks an outage as "no data").
+    monkeypatch.setattr(dashscope_utils, "embed", lambda texts, dim=None: [[0.1] * 1024])
+
+    class CrashClient:
+        def invoke(self, FunctionName, InvocationType, Payload):
+            return {"FunctionError": "Unhandled",
+                    "Payload": io.BytesIO(json.dumps(
+                        {"errorMessage": "connection failed", "errorType": "OperationalError"}
+                    ).encode("utf-8"))}
+
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: CrashClient())
+
+    def no_claude(*a, **k):
+        raise AssertionError("call_claude must not run when rag-search crashed")
+
+    monkeypatch.setattr(claude_utils, "call_claude", no_claude)
+
+    result = invoke(make_event())
+
+    assert "未找到" not in result["answer"]
+    assert "No relevant records" not in result["answer"]
+    assert result.get("error")           # a service error is surfaced
+    assert result["citations"] == []

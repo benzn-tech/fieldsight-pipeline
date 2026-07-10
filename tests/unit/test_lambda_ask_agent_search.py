@@ -106,15 +106,26 @@ def test_search_mode_orders_by_distance(monkeypatch):
     assert [r["title"] for r in out["results"]] == ["Near", "Far"]
 
 
-def test_search_mode_topicless_chunk_grouped_no_topic_in_route(monkeypatch):
+def test_search_mode_drops_topicless_chunks(monkeypatch):
+    # user pref 2026-07-10: transcript-window chunks with no topic_id are NOT
+    # listed (they read as noisy raw-transcript lines in a "topics" list).
     wire(monkeypatch, [chunk(None, "2026-02-09", 0.2, "", chunk_type="transcript_window",
                              text="sliding door came off runner")])
     out = run(ev())
-    r = out["results"][0]
-    assert r["topic_id"] is None
-    assert "&topic=" not in r["route"]
-    assert r["route"].startswith("/timeline?date=2026-02-09&user=Jarley_Trainor")
-    assert r["title"] == "sliding door came off runner"[:60]
+    assert out["count"] == 0
+    assert out["results"] == []
+
+
+def test_search_mode_keeps_topic_drops_topicless_mixed(monkeypatch):
+    # a topic chunk + a topic-less chunk in the same result set -> only the
+    # topic survives.
+    wire(monkeypatch, [
+        chunk("t-1", "2026-02-09", 0.1, "Door Hardware Issues"),
+        chunk(None, "2026-02-09", 0.05, "", chunk_type="transcript_window", text="raw line"),
+    ])
+    out = run(ev())
+    assert out["count"] == 1
+    assert out["results"][0]["topic_id"] == "t-1"
 
 
 def test_search_mode_route_omits_user_when_folder_missing(monkeypatch):
