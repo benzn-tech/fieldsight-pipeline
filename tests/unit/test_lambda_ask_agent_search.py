@@ -178,3 +178,42 @@ def test_search_mode_function_error_returns_error_not_silent_empty(monkeypatch):
     assert out["results"] == []
     assert out.get("error")            # surfaced, NOT a silent grounded-empty
     assert "grounded" not in out or out["grounded"] is not True
+
+
+# ============================================================
+# Hybrid ranking (2026-07-11): lexical boost + relevance threshold
+# ============================================================
+
+def test_search_lexical_ranks_above_closer_semantic(monkeypatch):
+    # A word-match topic (title contains "door") ranks ABOVE a topic that is
+    # closer by cosine distance but has no query word — fixes "door damage's
+    # #1 result has no 'door'".
+    wire(monkeypatch, [
+        # closer by distance but NO query word (title + text avoid door/damage)
+        chunk("t-near", "2026-02-09", 0.10, "Ceiling Work Photo Documentation",
+              text="ceiling tiles installed today"),
+        # farther by distance but title has "door"
+        chunk("t-door", "2026-02-09", 0.50, "Door Hardware Issues", text="handle install"),
+    ])
+    out = run(ev())  # question = "door damage"
+    assert [r["title"] for r in out["results"]] == \
+        ["Door Hardware Issues", "Ceiling Work Photo Documentation"]
+    assert out["results"][0]["lexical"] is True
+
+
+def test_search_drops_nonlexical_beyond_threshold(monkeypatch):
+    # No query word + poor distance (> 0.6) => dropped, so a no-match query
+    # returns nothing (the always-on Ask row takes over) instead of noise.
+    wire(monkeypatch, [chunk("t-x", "2026-02-09", 0.70, "IP Ownership and Employment Considerations",
+                             text="ownership and employment terms")])
+    out = run(ev())  # "door damage" — no lexical match, 0.70 > 0.6
+    assert out["count"] == 0
+
+
+def test_search_keeps_nonlexical_within_threshold(monkeypatch):
+    # No query word but a strong semantic match (<= 0.6) is still kept.
+    wire(monkeypatch, [chunk("t-y", "2026-02-09", 0.30, "Access and Delineation Requirements",
+                             text="site access requirements")])
+    out = run(ev())
+    assert out["count"] == 1
+    assert out["results"][0]["lexical"] is False

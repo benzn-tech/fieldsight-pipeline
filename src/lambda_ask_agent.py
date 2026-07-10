@@ -529,14 +529,24 @@ def build_rag_prompt(question, chunks):
     return "\n\n".join(parts)
 
 
-def _aggregate_topics(chunks):
+_NO_LEX_MAX_DIST = 0.6  # non-lexical topics past this cosine distance are dropped as irrelevant
+
+
+def _aggregate_topics(chunks, question=""):
     """Collapse retrieved chunks into distinct topic rows for the Search list.
     Only chunks tied to a formal topic (topic_id present) are kept; raw
     transcript-window chunks with no topic are dropped (user pref 2026-07-10).
     Group key: (report_date, site_id, topic_id). Keep the smallest cosine
     distance per group as the relevance score. Route mirrors the client's
     existing topic deep-link EXACTLY (String(topic_id), encodeURIComponent);
-    &user is omitted only when the report folder can't be parsed."""
+    &user is omitted only when the report folder can't be parsed.
+
+    Hybrid ranking (2026-07-11): topics whose title/text literally contain a
+    query term rank ABOVE purely-semantic matches; non-lexical topics past
+    _NO_LEX_MAX_DIST cosine distance are dropped, so a query with no genuine
+    match returns nothing (the always-on Ask row takes over) instead of a list
+    of unrelated topics."""
+    terms = [t for t in re.split(r"[^a-z0-9]+", (question or "").lower()) if len(t) >= 3]
     groups = {}
     for c in chunks:
         topic_id = c.get("topic_id")
@@ -559,6 +569,7 @@ def _aggregate_topics(chunks):
         if folder:
             route += "&user=" + _q(folder)
         route += "&topic=" + _q(str(topic_id))
+        hay = ((c.get("topic_title") or "") + " " + (c.get("chunk_text") or "")).lower()
         groups[key] = {
             "report_date": date,
             "site_name": c.get("site_name"),
@@ -568,10 +579,15 @@ def _aggregate_topics(chunks):
             "chunk_type": c.get("chunk_type"),
             "route": route,
             "score": dist,
+            "lexical": any(t in hay for t in terms),
         }
     rows = list(groups.values())
-    rows.sort(key=lambda r: r["report_date"], reverse=True)  # date desc tiebreak
-    rows.sort(key=lambda r: r["score"])                      # stable: distance asc primary
+    # threshold: drop non-lexical topics whose semantic distance is poor, so a
+    # query with no genuine match returns nothing (-> the always-on Ask row)
+    # rather than a list of unrelated topics.
+    rows = [r for r in rows if r["lexical"] or r["score"] <= _NO_LEX_MAX_DIST]
+    rows.sort(key=lambda r: r["report_date"], reverse=True)           # stable date tiebreak
+    rows.sort(key=lambda r: (0 if r["lexical"] else 1, r["score"]))   # lexical first, then distance
     return rows
 
 
@@ -611,7 +627,7 @@ def _rag_search_list(body):
         if result.get("error"):
             logger.warning(f"  search rag-search error: {result['error']}")
             return {"results": [], "error": result["error"], "count": 0}
-        rows = _aggregate_topics(result.get("chunks") or [])
+        rows = _aggregate_topics(result.get("chunks") or [], question)
         return {"results": rows, "count": len(rows), "grounded": True}
     except Exception as e:
         logger.error(f"  RAG search-list failed: {e}")
