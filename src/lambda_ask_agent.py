@@ -529,7 +529,7 @@ def build_rag_prompt(question, chunks):
     return "\n\n".join(parts)
 
 
-_NO_LEX_MAX_DIST = 0.6  # non-lexical topics past this cosine distance are dropped as irrelevant
+_NO_LEX_MAX_DIST = 0.55  # non-lexical topics past this cosine distance are dropped as irrelevant
 
 
 def _aggregate_topics(chunks, question=""):
@@ -569,7 +569,12 @@ def _aggregate_topics(chunks, question=""):
         if folder:
             route += "&user=" + _q(folder)
         route += "&topic=" + _q(str(topic_id))
-        hay = ((c.get("topic_title") or "") + " " + (c.get("chunk_text") or "")).lower()
+        # Lexical match is checked against the TOPIC TITLE only, NOT the raw
+        # chunk_text: the retrieved chunks are semantically near the query so
+        # their text usually contains a term anyway (and common words like
+        # "safety" appear everywhere), which would make the lexical flag true
+        # for nearly everything. The concise title is the clean signal.
+        hay = (c.get("topic_title") or "").lower()
         groups[key] = {
             "report_date": date,
             "site_name": c.get("site_name"),
