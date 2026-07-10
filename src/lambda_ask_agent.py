@@ -530,20 +530,24 @@ def build_rag_prompt(question, chunks):
 
 
 def _aggregate_topics(chunks):
-    """Collapse retrieved chunks into distinct rows for the Search list.
-    Group key: (report_date, site_id, topic_id) when a topic is present,
-    else (report_date, site_id, "src:"+source_s3_key) for a topic-less
-    transcript window (shown as a report excerpt). Keep the smallest cosine
+    """Collapse retrieved chunks into distinct topic rows for the Search list.
+    Only chunks tied to a formal topic (topic_id present) are kept; raw
+    transcript-window chunks with no topic are dropped (user pref 2026-07-10).
+    Group key: (report_date, site_id, topic_id). Keep the smallest cosine
     distance per group as the relevance score. Route mirrors the client's
     existing topic deep-link EXACTLY (String(topic_id), encodeURIComponent);
-    &user omitted when folder is unknown, &topic omitted when no topic."""
+    &user is omitted only when the report folder can't be parsed."""
     groups = {}
     for c in chunks:
         topic_id = c.get("topic_id")
+        # user pref 2026-07-10: only formal topics in the Search list — drop
+        # raw transcript-window chunks that aren't tied to a topic (they read
+        # as noisy raw-transcript lines in a "topics" list).
+        if not topic_id:
+            continue
         date = str(c.get("report_date", "") or "")
         site_id = str(c.get("site_id", "") or "")
-        key = (date, site_id, topic_id) if topic_id \
-            else (date, site_id, "src:" + str(c.get("source_s3_key") or ""))
+        key = (date, site_id, topic_id)
         dist = c.get("distance")
         dist = float(dist) if dist is not None else 1.0
         cur = groups.get(key)
@@ -554,12 +558,11 @@ def _aggregate_topics(chunks):
         route = "/timeline?date=" + _q(date)
         if folder:
             route += "&user=" + _q(folder)
-        if topic_id:
-            route += "&topic=" + _q(str(topic_id))
+        route += "&topic=" + _q(str(topic_id))
         groups[key] = {
             "report_date": date,
             "site_name": c.get("site_name"),
-            "topic_id": str(topic_id) if topic_id else None,
+            "topic_id": str(topic_id),
             "title": title,
             "snippet": (c.get("chunk_text") or "")[:200],
             "chunk_type": c.get("chunk_type"),
@@ -655,6 +658,17 @@ def _rag_answer(body):
             InvocationType="RequestResponse",
             Payload=json.dumps({"sub": caller_sub, "query_embedding": query_vec, "k": k}),
         )
+        # A crashed rag-search (DB down — e.g. rotated password) comes back as a
+        # 200 with FunctionError set. Never let that masquerade as "no records"
+        # (mirrors _rag_search_list) -- surface a clear service error instead.
+        if resp.get("FunctionError"):
+            logger.error("  Ask rag-search FunctionError: %s", resp.get("FunctionError"))
+            return {
+                "answer": "检索服务暂时不可用,请稍后再试 / Search service temporarily unavailable.",
+                "error": "rag-search unavailable",
+                "citations": [],
+                "model": claude_utils.CLAUDE_MODEL,
+            }
         result = json.loads(resp["Payload"].read().decode("utf-8"))
         chunks = result.get("chunks") or []
 
