@@ -163,7 +163,7 @@ def test_no_chunks_returns_not_found_empty_citations(monkeypatch):
 
     assert result["citations"] == []
     assert result["grounded"] is True
-    assert "not found" in result["answer"].lower() or "未找到" in result["answer"]
+    assert "no relevant records" in result["answer"].lower()  # English-only user-facing string
     assert result["model"] == claude_utils.CLAUDE_MODEL
 
 
