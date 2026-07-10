@@ -902,6 +902,53 @@ def ask_question(body, caller):
         return error(f'Ask agent error: {e}', 500)
 
 
+# ── POST /api/search ─────────────────────────────────────────
+
+def search_topics(body, caller):
+    """Retrieve-only topic search: forward to the Ask Agent with mode=search.
+    Returns a ranked topic list (no LLM synthesis). ACL is enforced downstream
+    in rag-search (org accessible sites via caller_sub), so no per-user gate is
+    needed here. date_from/date_to are an optional inclusive range."""
+    question = (body.get('question') or '').strip()
+    if len(question) < 2:
+        return ok({'results': [], 'count': 0})
+
+    payload = {
+        'mode': 'search',
+        'question': question,
+        'user': resolve_user_display_name(caller),  # soft context only
+        'caller_sub': caller.get('sub', ''),
+        'k': int(body.get('k', 30)) if str(body.get('k', 30)).isdigit() else 30,
+    }
+    date_from = body.get('date_from')
+    date_to = body.get('date_to')
+    if date_from and not re.match(r'^\d{4}-\d{2}-\d{2}$', str(date_from)):
+        return error('Invalid date_from (expected YYYY-MM-DD)')
+    if date_to and not re.match(r'^\d{4}-\d{2}-\d{2}$', str(date_to)):
+        return error('Invalid date_to (expected YYYY-MM-DD)')
+    if date_from:
+        payload['date_from'] = date_from
+    if date_to:
+        payload['date_to'] = date_to
+
+    try:
+        resp = lambda_client.invoke(
+            FunctionName=ASK_AGENT_FUNCTION,
+            InvocationType='RequestResponse',
+            Payload=json.dumps(payload),
+        )
+        if resp.get('FunctionError'):
+            logger.error(f"Search agent returned FunctionError: {resp.get('FunctionError')}")
+            return error('Search error', 500)
+        result = json.loads(resp['Payload'].read().decode('utf-8'))
+        if 'body' in result:
+            return result
+        return ok(result)
+    except Exception as e:
+        logger.error(f"Search invocation failed: {e}")
+        return error(f'Search error: {e}', 500)
+
+
 def get_users(params):
     try:
         mapping = load_user_mapping()
@@ -988,6 +1035,7 @@ def lambda_handler(event, context):
         elif path == '/api/actions/toggle' and method == 'POST': return toggle_action(body, caller)
         elif path == '/api/actions': return get_actions(params, caller)
         elif path == '/api/ask' and method == 'POST': return ask_question(body, caller)
+        elif path == '/api/search' and method == 'POST': return search_topics(body, caller)
         else: return error(f'Not found: {method} {path}', 404)
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)

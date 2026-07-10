@@ -22,3 +22,13 @@ def test_search_sql_contains_citation_columns():
     assert "ORDER BY" in sql
     assert "<=>" in sql
     assert "LIMIT %(k)s" in sql
+
+
+def test_search_sql_has_date_filter():
+    sql = build_search_sql()
+    # optional inclusive date range (None => no filter)
+    assert "%(date_from)s::date IS NULL OR c.report_date >= %(date_from)s::date" in sql
+    assert "%(date_to)s::date IS NULL OR c.report_date <= %(date_to)s::date" in sql
+    # unchanged essentials still present
+    assert "site_id = ANY(%(site_ids)s)" in sql
+    assert "LIMIT %(k)s" in sql
