@@ -1014,6 +1014,45 @@ Resources:
                     - extractions/*
 
   # ----------------------------------------------------------
+  # Lambda 17: Suggestion Writer (Programme<->Item feedback, Task 2) —
+  # in-VPC, inserts `pending` rows into programme_progress_suggestions
+  # (migration 0008). Invoked directly (Lambda invoke, no S3 event) by the
+  # non-VPC MatcherFunction (Task 3) with a batch of suggestions — the
+  # matcher needs internet (DashScope/Claude) which in-VPC lambdas cannot
+  # reach (BUG-36: only an S3 gateway endpoint), so the match is split into
+  # this in-VPC write hop. Mirrors ItemWriterFunction's Layers/VpcConfig/PG
+  # env verbatim. Gated by HasDb. NO Events (manual/invoke only, like
+  # RagSearchFunction below).
+  # ----------------------------------------------------------
+  SuggestionWriterFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-suggestion-writer", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_suggestion_writer.lambda_handler
+      Timeout: 120
+      MemorySize: 512
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection — see MigrateFunction notes.
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !ImportValue
+            Fn::Sub: "${DbStackName}-DbName"
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+      Policies:
+        - VPCAccessPolicy: {}
+
+  # ----------------------------------------------------------
   # Lambda 16: RAG Search (Phase 5) — in-VPC ACL-scoped semantic
   # search over pgvector chunks (search_chunks). Consumed only by
   # AskAgentFunction via Lambda invoke (query_embedding computed
