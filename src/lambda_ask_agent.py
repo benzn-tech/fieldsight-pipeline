@@ -575,11 +575,12 @@ def _aggregate_topics(chunks, question=""):
         _ttl = c.get("topic_title") or ""
         if _ttl:
             route += "&topicTitle=" + _q(_ttl)
-        # &site carries the project so clicking a cross-project result syncs the
-        # top-bar project selector (联动 — the Timeline reads params.site).
-        _sid = c.get("site_id")
-        if _sid:
-            route += "&site=" + _q(str(_sid))
+        # &site carries the project SLUG (the top-bar selector's identifier, NOT
+        # the site UUID) so clicking a cross-project result syncs the selector
+        # (联动 — the Timeline reads params.site and calls siteContext.set).
+        _slug = c.get("site_slug")
+        if _slug:
+            route += "&site=" + _q(str(_slug))
         # Lexical match is checked against the TOPIC TITLE only, NOT the raw
         # chunk_text: the retrieved chunks are semantically near the query so
         # their text usually contains a term anyway (and common words like
@@ -741,7 +742,7 @@ def _rag_answer(body):
                 "source_s3_key": c.get("source_s3_key"),
                 "report_date": str(c.get("report_date", "") or ""),
                 "site_name": c.get("site_name"),
-                "site_id": str(c.get("site_id", "") or ""),  # for citation-click project sync (联动)
+                "site_slug": c.get("site_slug"),  # project slug for citation-click selector sync (联动)
                 "topic_title": c.get("topic_title"),
                 "chunk_type": c.get("chunk_type"),
                 "snippet": (c.get("chunk_text") or "")[:200],

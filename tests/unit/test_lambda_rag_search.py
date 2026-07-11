@@ -243,9 +243,12 @@ def test_date_bounds_default_none(wired):
 
 
 def test_site_filter_narrows_to_one_accessible_site(wired):
-    # project-scoped search: `site` narrows the ACL site_ids to that one site.
+    # project-scoped search: `site` (a slug) resolves to its id, then narrows
+    # the ACL site_ids to that one site.
     wired.setattr(rag.sites, "list_company_sites",
                   lambda conn, cid: [{"id": "s-1"}, {"id": "s-2"}])
+    wired.setattr(rag.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: {"id": slug})  # test: slug maps 1:1 to id
     captured = {}
     wired.setattr(rag.chunks, "search_chunks",
                   lambda conn, qv, site_ids, k=5, date_from=None, date_to=None:
@@ -264,6 +267,8 @@ def test_site_filter_inaccessible_denies(wired):
     # never touches search_chunks.
     wired.setattr(rag.sites, "list_company_sites",
                   lambda conn, cid: [{"id": "s-1"}, {"id": "s-2"}])
+    wired.setattr(rag.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: {"id": slug})  # resolves, but s-999 not accessible
 
     def boom(*a, **k):
         raise AssertionError("search_chunks must not run for an inaccessible site")
