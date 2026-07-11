@@ -1053,6 +1053,95 @@ Resources:
         - VPCAccessPolicy: {}
 
   # ----------------------------------------------------------
+  # Lambda 18: Programme Matcher (Programme<->Item feedback, Task 3) —
+  # S3 event on match_requests/ (wired by Task 4), reads the site's
+  # programme.json, hard-gates + DashScope-embed-ranks + one Claude call
+  # to pick at most one task per topic (fail-closed), then Lambda-invokes
+  # SuggestionWriterFunction above. NOT in VPC (needs public internet for
+  # DashScope/Claude; BUG-36 — an in-VPC lambda only has an S3 gateway
+  # endpoint) — mirrors ExtractSessionFunction/EmbedReportFunction's
+  # non-VPC shape (no VpcConfig). NO PsycopgLayer: unlike EmbedReportFunction
+  # (which transitively imports lambda_ingest -> psycopg at module load),
+  # this module only imports claude_utils/dashscope_utils/repositories.
+  # programme, none of which touch psycopg — so no PsycopgLayer is needed
+  # for import-time correctness. Condition: HasDb IS still required (unlike
+  # ExtractSessionFunction, which is unconditional) because this function's
+  # env/policy reference SuggestionWriterFunction, which only exists when
+  # HasDb is true — an unconditional Ref here would be a second W1001-style
+  # cross-condition reference with no existing lint suppression covering it.
+  # NO Events: S3 wired manually per BUG-33 — Task 4 adds a
+  # scripts/wire-s3-events.sh entry (fs-programme-match, match_requests/
+  # prefix, .json suffix).
+  # ----------------------------------------------------------
+  MatcherFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-programme-matcher", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_programme_matcher.lambda_handler
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          # match_requests/ artifact (Task 4 emits it) lands in the lake
+          # bucket that embed-report/extract-session/item-writer use.
+          S3_BUCKET: !Ref IngestBucketName
+          # programmes/{site_id}/programme.json is written by OrgApiFunction
+          # to DataBucketName — a DIFFERENT bucket than the lake on the TEST
+          # stack (org-api uses DataBucketName, lake fns use IngestBucketName)
+          # — so read_programme must target DataBucketName explicitly.
+          PROGRAMME_BUCKET: !Ref DataBucketName
+          # Ref (not Sub/GetAtt) on a Lambda resource returns its physical
+          # function name — same pattern as AskAgentFunction's
+          # RAG_SEARCH_FUNCTION: !Ref RagSearchFunction.
+          SUGGESTION_WRITER_FUNCTION: !Ref SuggestionWriterFunction
+          SIM_MAX_DIST: '0.55'
+          CONF_MIN: '0.70'
+          TOP_K: '5'
+          LEAD_DAYS: '7'
+          LAG_DAYS: '14'
+          # DashScope key — mirrors EmbedReportFunction's env block.
+          DASHSCOPE_API_KEY: !Ref DashScopeApiKey
+          DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+          DASHSCOPE_EMBED_MODEL: text-embedding-v4
+          DASHSCOPE_EMBED_DIM: '1024'
+          # Claude key — mirrors ExtractSessionFunction's env block.
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          CLAUDE_MODEL: claude-sonnet-4-6
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SuggestionWriterFunction
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/programmes/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/match_requests/*
+            - Effect: Allow
+              # Without ListBucket, S3 returns AccessDenied/403 (not
+              # NoSuchKey/404) for a missing object under a prefix this
+              # role can't list — read_programme would re-raise a fake 500
+              # for any site that has never had a programme uploaded
+              # (same reasoning as OrgApiFunction's programmes/* grant).
+              # programmes/ and match_requests/ live in DIFFERENT buckets,
+              # so ListBucket is granted per-bucket per-prefix.
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${DataBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - programmes/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - match_requests/*
+
+  # ----------------------------------------------------------
   # Lambda 16: RAG Search (Phase 5) — in-VPC ACL-scoped semantic
   # search over pgvector chunks (search_chunks). Consumed only by
   # AskAgentFunction via Lambda invoke (query_embedding computed
