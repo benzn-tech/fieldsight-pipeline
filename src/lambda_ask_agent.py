@@ -575,6 +575,12 @@ def _aggregate_topics(chunks, question=""):
         _ttl = c.get("topic_title") or ""
         if _ttl:
             route += "&topicTitle=" + _q(_ttl)
+        # &site carries the project SLUG (the top-bar selector's identifier, NOT
+        # the site UUID) so clicking a cross-project result syncs the selector
+        # (联动 — the Timeline reads params.site and calls siteContext.set).
+        _slug = c.get("site_slug")
+        if _slug:
+            route += "&site=" + _q(str(_slug))
         # Lexical match is checked against the TOPIC TITLE only, NOT the raw
         # chunk_text: the retrieved chunks are semantically near the query so
         # their text usually contains a term anyway (and common words like
@@ -615,6 +621,7 @@ def _rag_search_list(body):
         k = 30
     date_from = body.get("date_from") or None
     date_to = body.get("date_to") or None
+    site = body.get("site") or None  # project-scoped search (Search only; Ask omits)
 
     try:
         query_vec = dashscope_utils.embed([question])[0]
@@ -623,6 +630,8 @@ def _rag_search_list(body):
             payload["date_from"] = date_from
         if date_to:
             payload["date_to"] = date_to
+        if site:
+            payload["site"] = site
         resp = _get_lambda_client().invoke(
             FunctionName=RAG_SEARCH_FUNCTION,
             InvocationType="RequestResponse",
@@ -733,6 +742,7 @@ def _rag_answer(body):
                 "source_s3_key": c.get("source_s3_key"),
                 "report_date": str(c.get("report_date", "") or ""),
                 "site_name": c.get("site_name"),
+                "site_slug": c.get("site_slug"),  # project slug for citation-click selector sync (联动)
                 "topic_title": c.get("topic_title"),
                 "chunk_type": c.get("chunk_type"),
                 "snippet": (c.get("chunk_text") or "")[:200],

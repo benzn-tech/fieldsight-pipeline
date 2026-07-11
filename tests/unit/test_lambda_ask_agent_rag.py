@@ -47,6 +47,7 @@ CHUNK_A = {
     "report_date": "2026-02-09",
     "site_id": "s-1",
     "site_name": "Ellesmere",
+    "site_slug": "ellesmere",
     "distance": 0.1,
 }
 
@@ -62,6 +63,7 @@ CHUNK_B = {
     "report_date": "2026-02-09",
     "site_id": "s-2",
     "site_name": "Rolleston",
+    "site_slug": "rolleston",
     "distance": 0.2,
 }
 
@@ -205,6 +207,7 @@ def test_citations_shape_and_snippet_truncation(monkeypatch):
         "source_s3_key": "reports/2026-02-09/Ben/daily_report.json",
         "report_date": "2026-02-09",
         "site_name": "Ellesmere",
+        "site_slug": "ellesmere",
         "topic_title": "Door Inspection",
         "chunk_type": "report",
         "snippet": CHUNK_A["chunk_text"][:200],

@@ -49,6 +49,7 @@ def lambda_handler(event, context):
     qv = event.get("query_embedding")
     date_from = event.get("date_from") or None
     date_to = event.get("date_to") or None
+    site_filter = event.get("site") or None  # scope search to ONE project (within ACL)
 
     if not sub or not qv:
         return {"chunks": [], "error": "missing sub or query_embedding"}
@@ -68,6 +69,15 @@ def lambda_handler(event, context):
     else:
         site_ids = memberships.accessible_site_ids(
             conn, caller["id"], caller["global_role"])
+
+    # Project-scoped search: `site_filter` is the project SLUG (what the UI's
+    # top-bar selector uses), so resolve it to the site id first, then narrow
+    # within the caller's accessible sites (deny-by-default — an unknown or
+    # inaccessible slug yields []). Ask never passes site (stays cross-project).
+    if site_filter:
+        matched = sites.get_company_site_by_slug(conn, caller["company_id"], site_filter)
+        matched_id = matched["id"] if matched else None
+        site_ids = [s for s in site_ids if str(s) == str(matched_id)]
 
     if not site_ids:
         return {"chunks": [], "site_count": 0}

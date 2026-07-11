@@ -106,3 +106,9 @@ def test_router_dispatches_search(monkeypatch):
     res = fapi.lambda_handler(event, None)
     assert res["statusCode"] in (200, 500)  # routed (not 404); 200 with stub payload
     assert res["statusCode"] == 200
+
+
+def test_search_forwards_site(monkeypatch):
+    fc = wire(monkeypatch)
+    fapi.search_topics({"question": "door damage", "site": "s-xyz"}, ADMIN_CALLER)
+    assert fc.calls[0]["Payload"]["site"] == "s-xyz"

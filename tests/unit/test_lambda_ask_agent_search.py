@@ -30,6 +30,7 @@ def chunk(topic_id, date, dist, title, folder="Jarley_Trainor", site="Ellesmere"
     return {"id": "c-" + str(dist), "chunk_text": text, "chunk_type": chunk_type,
             "topic_id": topic_id, "source_s3_key": src, "metadata": {},
             "report_date": date, "site_id": "s-1", "site_name": site,
+            "site_slug": "s-slug-1",
             "topic_title": title, "topic_summary": "", "distance": dist}
 
 
@@ -84,7 +85,7 @@ def test_search_mode_returns_topics_no_claude(monkeypatch):
     r = out["results"][0]
     assert r["title"] == "Door Hardware Issues"
     assert r["report_date"] == "2026-02-09"
-    assert r["route"] == "/timeline?date=2026-02-09&user=Jarley_Trainor&topicTitle=Door%20Hardware%20Issues"
+    assert r["route"] == "/timeline?date=2026-02-09&user=Jarley_Trainor&topicTitle=Door%20Hardware%20Issues&site=s-slug-1"
 
 
 def test_search_mode_dedupes_topic_keeps_best_distance(monkeypatch):
@@ -131,7 +132,7 @@ def test_search_mode_keeps_topic_drops_topicless_mixed(monkeypatch):
 def test_search_mode_route_omits_user_when_folder_missing(monkeypatch):
     wire(monkeypatch, [chunk("t-9", "2026-02-09", 0.2, "T", folder=None)])
     out = run(ev())
-    assert out["results"][0]["route"] == "/timeline?date=2026-02-09&topicTitle=T"
+    assert out["results"][0]["route"] == "/timeline?date=2026-02-09&topicTitle=T&site=s-slug-1"
 
 
 def test_search_mode_forwards_date_range_and_k(monkeypatch):
@@ -217,3 +218,23 @@ def test_search_keeps_nonlexical_within_threshold(monkeypatch):
     out = run(ev())
     assert out["count"] == 1
     assert out["results"][0]["lexical"] is False
+
+
+def test_search_mode_forwards_site_to_rag_search(monkeypatch):
+    fc = wire(monkeypatch, [])
+    run(ev(site="s-abc"))
+    assert fc.calls[0]["Payload"]["site"] == "s-abc"
+
+
+def test_search_mode_no_site_key_when_absent(monkeypatch):
+    fc = wire(monkeypatch, [])
+    run(ev())  # no site
+    assert "site" not in fc.calls[0]["Payload"]
+
+
+def test_search_route_includes_site_for_project_sync(monkeypatch):
+    # chunk() stamps site_id "s-1"; the route carries &site so a cross-project
+    # result click can sync the top-bar project selector.
+    wire(monkeypatch, [chunk("t-1", "2026-02-09", 0.1, "Door Hardware Issues")])
+    out = run(ev())
+    assert "&site=s-slug-1" in out["results"][0]["route"]

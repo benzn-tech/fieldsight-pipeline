@@ -10,6 +10,7 @@ def build_search_sql() -> str:
     return (
         "SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_key, "
         "       c.metadata, c.report_date, c.site_id, s.name AS site_name, "
+        "       s.slug AS site_slug, "
         "       t.title AS topic_title, t.summary AS topic_summary, "
         "       c.embedding <=> %(q)s::vector AS distance "
         "FROM report_chunks c "
