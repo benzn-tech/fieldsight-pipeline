@@ -62,7 +62,7 @@ def list_for_site(conn, site_id, state='pending') -> list[dict]:
     Newest report_date first, then newest created_at within a date."""
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_COLS} FROM programme_progress_suggestions "
-        f"WHERE site_id=%s AND (%s IS NULL OR state=%s) "
+        f"WHERE site_id=%s AND (%s::text IS NULL OR state=%s) "
         f"ORDER BY report_date DESC, created_at DESC",
         (site_id, state, state),
     ).fetchall()
