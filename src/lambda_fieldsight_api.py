@@ -930,6 +930,8 @@ def search_topics(body, caller):
         payload['date_from'] = date_from
     if date_to:
         payload['date_to'] = date_to
+    if body.get('site'):
+        payload['site'] = body['site']  # project-scoped search (Ask omits site)
 
     try:
         resp = lambda_client.invoke(

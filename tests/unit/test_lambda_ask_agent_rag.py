@@ -205,6 +205,7 @@ def test_citations_shape_and_snippet_truncation(monkeypatch):
         "source_s3_key": "reports/2026-02-09/Ben/daily_report.json",
         "report_date": "2026-02-09",
         "site_name": "Ellesmere",
+        "site_id": "s-1",
         "topic_title": "Door Inspection",
         "chunk_type": "report",
         "snippet": CHUNK_A["chunk_text"][:200],

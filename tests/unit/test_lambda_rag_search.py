@@ -240,3 +240,37 @@ def test_date_bounds_default_none(wired):
 
     assert captured["date_from"] is None
     assert captured["date_to"] is None
+
+
+def test_site_filter_narrows_to_one_accessible_site(wired):
+    # project-scoped search: `site` narrows the ACL site_ids to that one site.
+    wired.setattr(rag.sites, "list_company_sites",
+                  lambda conn, cid: [{"id": "s-1"}, {"id": "s-2"}])
+    captured = {}
+    wired.setattr(rag.chunks, "search_chunks",
+                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None:
+                      (captured.update(site_ids=site_ids) or []))
+    ev = make_event()
+    ev["site"] = "s-2"
+
+    res = rag.lambda_handler(ev, None)
+
+    assert captured["site_ids"] == ["s-2"]
+    assert res["site_count"] == 1
+
+
+def test_site_filter_inaccessible_denies(wired):
+    # deny-by-default: a site the caller can't access yields no results and
+    # never touches search_chunks.
+    wired.setattr(rag.sites, "list_company_sites",
+                  lambda conn, cid: [{"id": "s-1"}, {"id": "s-2"}])
+
+    def boom(*a, **k):
+        raise AssertionError("search_chunks must not run for an inaccessible site")
+    wired.setattr(rag.chunks, "search_chunks", boom)
+    ev = make_event()
+    ev["site"] = "s-999"
+
+    res = rag.lambda_handler(ev, None)
+
+    assert res == {"chunks": [], "site_count": 0}
