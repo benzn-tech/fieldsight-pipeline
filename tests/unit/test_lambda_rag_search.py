@@ -25,7 +25,7 @@ CALLER = {
 @pytest.fixture
 def wired(monkeypatch):
     """Wire a FakeConn and a default admin caller; tests override as needed."""
-    monkeypatch.setattr(rag, "get_connection", lambda *a, **k: FakeConn())
+    monkeypatch.setattr(rag, "get_cached_connection", lambda *a, **k: FakeConn())
     monkeypatch.setattr(rag.users, "get_user_by_sub",
                         lambda conn, sub: dict(CALLER) if sub == "sub-1" else None)
     return monkeypatch
@@ -42,8 +42,8 @@ def make_event(sub="sub-1", query_embedding=None, k=None):
 def test_missing_sub_or_vector_returns_empty(monkeypatch):
     # Guard must fire BEFORE any DB connection is opened.
     def boom(*a, **k):
-        raise AssertionError("get_connection must not be called on a guard miss")
-    monkeypatch.setattr(rag, "get_connection", boom)
+        raise AssertionError("get_cached_connection must not be called on a guard miss")
+    monkeypatch.setattr(rag, "get_cached_connection", boom)
 
     res = rag.lambda_handler({"sub": None, "query_embedding": [0.1] * 1024}, None)
     assert res == {"chunks": [], "error": "missing sub or query_embedding"}

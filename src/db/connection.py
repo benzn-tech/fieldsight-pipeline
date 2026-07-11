@@ -65,3 +65,34 @@ def get_connection(dsn: str | None = None, autocommit: bool = False):
     if register_vector is not None:
         register_vector(conn)
     return conn
+
+
+# Module-level connection reused across warm Lambda invocations. Reconnecting
+# to Aurora costs ~1-2s per invoke (TLS handshake + auth) and dominated the
+# RAG-search latency; a warm container keeps this open so back-to-back searches
+# only pay the query time.
+_cached_conn = None
+
+
+def get_cached_connection():
+    """Persistent module-level connection for READ-ONLY, latency-sensitive
+    paths (rag-search). autocommit=True — there is no transaction to leave open
+    across invokes, and psycopg3's `with conn:` would CLOSE the connection
+    (defeating reuse). A cheap SELECT 1 liveness check transparently reconnects
+    if the cached connection has died. Do NOT use for writes/transactions —
+    use `with get_connection() as conn:` for those."""
+    global _cached_conn
+    if _cached_conn is not None:
+        try:
+            if not _cached_conn.closed:
+                with _cached_conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                return _cached_conn
+        except Exception:
+            try:
+                _cached_conn.close()
+            except Exception:
+                pass
+            _cached_conn = None
+    _cached_conn = get_connection(autocommit=True)
+    return _cached_conn
