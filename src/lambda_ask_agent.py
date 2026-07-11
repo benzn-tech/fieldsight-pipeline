@@ -568,7 +568,13 @@ def _aggregate_topics(chunks, question=""):
         route = "/timeline?date=" + _q(date)
         if folder:
             route += "&user=" + _q(folder)
-        route += "&topic=" + _q(str(topic_id))
+        # Deep-link by topic TITLE, not the Aurora topic UUID: the Timeline
+        # spotlight matches report topics by their per-report sequential id,
+        # which Aurora doesn't store. The report topic title is in both places,
+        # so the Timeline resolves title -> the report topic to open + flash it.
+        _ttl = c.get("topic_title") or ""
+        if _ttl:
+            route += "&topicTitle=" + _q(_ttl)
         # Lexical match is checked against the TOPIC TITLE only, NOT the raw
         # chunk_text: the retrieved chunks are semantically near the query so
         # their text usually contains a term anyway (and common words like
