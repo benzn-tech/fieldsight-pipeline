@@ -26,6 +26,9 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/programme?site=<site_id> → read site's Programme JSON (S3-backed, ACL)
   PUT   /api/org/programme?site=<site_id> → write site's Programme JSON (admin/gm/pm)
   GET   /api/org/rollup/portfolio         → per-site open-count rollup + red/yellow/green (ACL)
+  GET   /api/org/programme/suggestions            → list matcher suggestions for a site (admin/gm/pm)
+  POST  /api/org/programme/suggestions/{id}/confirm → apply + write back to programme.json (admin/gm/pm)
+  POST  /api/org/programme/suggestions/{id}/reject  → dismiss a suggestion (admin/gm/pm)
 
 Credentials: PG* env vars injected at deploy time (BUG-36 — no runtime
 Secrets Manager call from a NAT-less VPC). Cognito calls need the
@@ -36,13 +39,14 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import boto3
 from botocore.exceptions import ClientError
 
 from db.connection import get_connection
-from repositories import memberships, observations, programme, rollup, sites, topics, users
+from repositories import (memberships, observations, programme, programme_suggestions,
+                          rollup, sites, topics, users)
 from repositories.acl import resolve_scope
 
 logger = logging.getLogger()
@@ -189,6 +193,15 @@ def dispatch(conn, event, method, route):
             return get_programme(conn, caller, event)
         if method == "PUT":
             return put_programme(conn, caller, event, parse_body(event))
+
+    if route == "/programme/suggestions" and method == "GET":
+        return list_suggestions(conn, caller, event)
+    m_sc = re.match(r"^/programme/suggestions/([^/]+)/confirm$", route)
+    if m_sc and method == "POST":
+        return confirm_suggestion(conn, caller, m_sc.group(1), parse_body(event))
+    m_sr = re.match(r"^/programme/suggestions/([^/]+)/reject$", route)
+    if m_sr and method == "POST":
+        return reject_suggestion(conn, caller, m_sr.group(1))
 
     return error("not found", 404)
 
@@ -730,3 +743,91 @@ def put_programme(conn, caller, event, body):
     updated_at = (datetime.utcnow() + timedelta(hours=13)).isoformat()
     saved = programme.write_programme(s3(), S3_BUCKET, site_id, body, updated_at)
     return ok({"programme": saved})
+
+
+# ----------------------------------------------------------
+# /programme/suggestions (Task 5 — manager review queue for the programme
+# matcher's `pending` rows; see docs/superpowers/specs/
+# 2026-07-12-programme-item-feedback-design.md §6. Same manager-role gate as
+# put_programme, plus the same site ACL as get_programme/put_programme
+# (_resolve_site_param for list; _allowed_site_ids directly for confirm/
+# reject, since those are addressed by suggestion id, not `?site=`).
+# Confirm re-reads programme.json and rejects with 409 if its `updated_at`
+# has moved since the suggestion was matched (match_evidence carries the
+# doc's updated_at at match time) — optimistic locking, no last-write-wins.
+# ----------------------------------------------------------
+def list_suggestions(conn, caller, event):
+    if caller["global_role"] not in ("admin", "gm", "pm"):
+        return error("forbidden", 403)
+    params = event.get("queryStringParameters") or {}
+    site_id, err = _resolve_site_param(conn, caller, params.get("site"))
+    if err is not None:
+        return err
+    state = params.get("state") or "pending"
+    rows = programme_suggestions.list_for_site(
+        conn, site_id, state=None if state == "all" else state)
+    return ok({"suggestions": rows})
+
+
+def confirm_suggestion(conn, caller, suggestion_id, body):
+    if caller["global_role"] not in ("admin", "gm", "pm"):
+        return error("forbidden", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    row = programme_suggestions.get(conn, suggestion_id)
+    if row is None:
+        return error("not found", 404)
+    if row["state"] != "pending":
+        return error("already decided", 409)
+    if str(row["site_id"]) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+
+    doc = programme.read_programme(s3(), S3_BUCKET, row["site_id"])
+    if doc is None:
+        return error("programme not found", 409)
+    task = next((t for t in doc.get("leaves", []) if t.get("task_id") == row["task_id"]), None)
+    if task is None:
+        programme_suggestions.mark_stale(conn, suggestion_id)
+        return error("task no longer in programme", 409)
+
+    # Optimistic lock: the suggestion was matched against a specific version
+    # of the doc (match_evidence.programme_updated_at); if the doc has moved
+    # on since, refuse to write blind — the reviewer re-reads and re-decides.
+    evidence = row["match_evidence"] or {}
+    if (doc.get("updated_at") or None) != evidence.get("programme_updated_at"):
+        return error("programme changed since suggestion; re-review", 409)
+
+    new_status = body.get("status") if "status" in body else row["suggested_status"]
+    new_progress = body.get("progress_pct") if "progress_pct" in body else row["suggested_progress"]
+    # Never silently lower progress from the auto-suggested value — only an
+    # explicit reviewer-typed number ("progress_pct" present in body) may.
+    if (new_progress is not None and task.get("progress_pct") is not None
+            and new_progress < task["progress_pct"] and "progress_pct" not in body):
+        new_progress = task["progress_pct"]
+
+    if new_status is not None:
+        task["status"] = new_status
+    if new_progress is not None:
+        task["progress_pct"] = new_progress
+
+    new_ts = datetime.now(timezone.utc).isoformat()
+    programme.write_programme(s3(), S3_BUCKET, row["site_id"], doc, new_ts)
+    programme_suggestions.decide(
+        conn, suggestion_id, "confirmed", decided_by=caller["id"],
+        applied_status=new_status, applied_progress=new_progress)
+    return ok({"confirmed": True, "task_id": row["task_id"],
+              "applied_status": new_status, "applied_progress": new_progress})
+
+
+def reject_suggestion(conn, caller, suggestion_id):
+    if caller["global_role"] not in ("admin", "gm", "pm"):
+        return error("forbidden", 403)
+    row = programme_suggestions.get(conn, suggestion_id)
+    if row is None:
+        return error("not found", 404)
+    if row["state"] != "pending":
+        return error("already decided", 409)
+    if str(row["site_id"]) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    programme_suggestions.decide(conn, suggestion_id, "rejected", decided_by=caller["id"])
+    return ok({"rejected": True})
