@@ -31,7 +31,7 @@ org-api ACL branch it mirrors.
 import json
 import logging
 
-from db.connection import get_connection
+from db.connection import get_cached_connection
 from repositories import chunks, memberships, sites, users
 from repositories.acl import resolve_scope
 
@@ -53,30 +53,30 @@ def lambda_handler(event, context):
     if not sub or not qv:
         return {"chunks": [], "error": "missing sub or query_embedding"}
 
-    with get_connection() as conn:
-        caller = users.get_user_by_sub(conn, sub)
-        if caller is None:
-            logger.info("rag-search: caller not provisioned for sub=%s", sub)
-            return {"chunks": [], "error": "caller not provisioned"}
+    # Reuse a module-level connection across warm invokes — reconnecting to
+    # Aurora cost ~1-2s per call and dominated search latency. Read-only path,
+    # so no `with`/transaction (psycopg3's `with conn:` would close it).
+    conn = get_cached_connection()
+    caller = users.get_user_by_sub(conn, sub)
+    if caller is None:
+        logger.info("rag-search: caller not provisioned for sub=%s", sub)
+        return {"chunks": [], "error": "caller not provisioned"}
 
-        # ACL branch mirrors lambda_org_api.list_live_items exactly.
-        if resolve_scope(caller["global_role"]) == "ALL":
-            site_ids = [s["id"] for s in sites.list_company_sites(conn, caller["company_id"])]
-        else:
-            site_ids = memberships.accessible_site_ids(
-                conn, caller["id"], caller["global_role"])
+    # ACL branch mirrors lambda_org_api.list_live_items exactly.
+    if resolve_scope(caller["global_role"]) == "ALL":
+        site_ids = [s["id"] for s in sites.list_company_sites(conn, caller["company_id"])]
+    else:
+        site_ids = memberships.accessible_site_ids(
+            conn, caller["id"], caller["global_role"])
 
-        if not site_ids:
-            return {"chunks": [], "site_count": 0}
+    if not site_ids:
+        return {"chunks": [], "site_count": 0}
 
-        rows = chunks.search_chunks(conn, qv, site_ids, k=k,
-                                    date_from=date_from, date_to=date_to)
-        # search_chunks returns raw psycopg rows: id/site_id/topic_id are
-        # uuid.UUID and report_date is datetime.date. Lambda's JSON
-        # marshaller cannot serialize either — Runtime.MarshalError kills
-        # the invoke on any REAL (non-empty) hit, so RAG silently looks like
-        # "no results" in prod. Round-trip through json.dumps(default=str)
-        # to coerce them to plain strings before returning (mirrors
-        # lambda_org_api.py's `json.dumps(body, default=str)`).
-        rows = json.loads(json.dumps(rows, default=str))
-        return {"chunks": rows, "site_count": len(site_ids)}
+    rows = chunks.search_chunks(conn, qv, site_ids, k=k,
+                                date_from=date_from, date_to=date_to)
+    # search_chunks returns raw psycopg rows: id/site_id/topic_id are uuid.UUID
+    # and report_date is datetime.date — Lambda's JSON marshaller can't
+    # serialize either (Runtime.MarshalError kills the invoke on any non-empty
+    # hit). Coerce to plain strings before returning.
+    rows = json.loads(json.dumps(rows, default=str))
+    return {"chunks": rows, "site_count": len(site_ids)}
