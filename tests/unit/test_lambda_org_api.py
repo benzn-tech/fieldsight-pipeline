@@ -1262,3 +1262,274 @@ def test_portfolio_rollup_empty_site_ids_empty(wired):
     res = org.lambda_handler(make_event("GET", "/api/org/rollup/portfolio"), None)
     assert res["statusCode"] == 200
     assert body_of(res)["sites"] == []
+
+
+# ----------------------------------------------------------
+# /programme/suggestions (Task 5 — manager review queue for the matcher's
+# `pending` rows; ACL reuses _resolve_site_param / _allowed_site_ids exactly
+# like /programme above. `programme_wired` (defined above) wires FakeS3 +
+# sites/memberships to allow SITE_ID only.)
+# ----------------------------------------------------------
+def _suggestion_row(**over):
+    base = {
+        "id": "sugg-1", "site_id": SITE_ID, "task_id": "t-1", "topic_id": "topic-1",
+        "topic_title": "Poured slab", "topic_summary": "Crew finished the pour.",
+        "topic_user_id": "u-1", "report_date": "2026-07-10",
+        "source_s3_key": "reports/2026-07-10/foo/daily_report.json",
+        "task_name": "Foundations", "task_status_before": "in_progress",
+        "task_progress_before": 40, "suggested_status": "completed",
+        "suggested_progress": 100, "confidence": 0.9,
+        "match_evidence": {"programme_updated_at": "2026-07-01T00:00:00+00:00"},
+        "dedupe_key": "abc123", "state": "pending", "decided_by": None,
+        "decided_at": None, "applied_status": None, "applied_progress": None,
+        "created_at": "2026-07-10T00:00:00+00:00", "updated_at": "2026-07-10T00:00:00+00:00",
+    }
+    base.update(over)
+    return base
+
+
+def test_list_suggestions_admin_ok(programme_wired):
+    wired, fake = programme_wired
+    canned = [_suggestion_row()]
+    seen = {}
+    wired.setattr(org.programme_suggestions, "list_for_site",
+                  lambda conn, site_id, state: (seen.update(site_id=site_id, state=state) or canned))
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme/suggestions", params={"site": SITE_ID}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["suggestions"] == canned
+    assert seen == {"site_id": SITE_ID, "state": "pending"}
+
+
+def test_list_suggestions_state_all_passes_none(programme_wired):
+    wired, fake = programme_wired
+    seen = {}
+    wired.setattr(org.programme_suggestions, "list_for_site",
+                  lambda conn, site_id, state: (seen.update(state=state) or []))
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme/suggestions",
+        params={"site": SITE_ID, "state": "all"}), None)
+    assert res["statusCode"] == 200
+    assert seen["state"] is None
+
+
+def test_list_suggestions_inaccessible_site_403(programme_wired):
+    wired, fake = programme_wired
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme/suggestions", params={"site": OTHER_SITE_ID}), None)
+    assert res["statusCode"] == 403
+
+
+def test_list_suggestions_worker_403(programme_wired):
+    wired, fake = programme_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme/suggestions", params={"site": SITE_ID}), None)
+    assert res["statusCode"] == 403
+
+
+def test_confirm_applies_status_and_writes(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get",
+                  lambda conn, sid: row if sid == "sugg-1" else None)
+    doc = {"leaves": [{"task_id": "t-1", "parent_id": "p-1", "name": "Foundations",
+                       "start": "2026-07-01", "end": "2026-07-15",
+                       "status": "in_progress", "progress_pct": 40}],
+           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
+    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    written = {}
+
+    def fake_write(s3c, bucket, site_id, doc_, updated_at):
+        written.update(site_id=site_id, doc=doc_, updated_at=updated_at)
+        doc_["updated_at"] = updated_at
+        return doc_
+
+    wired.setattr(org.programme, "write_programme", fake_write)
+    decided = {}
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      (decided.update(sid=sid, state=state, decided_by=decided_by,
+                                      applied_status=applied_status,
+                                      applied_progress=applied_progress) or {**row, "state": state}))
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == {"confirmed": True, "task_id": "t-1",
+                            "applied_status": "completed", "applied_progress": 100}
+    assert written["site_id"] == SITE_ID
+    assert written["doc"]["leaves"][0]["status"] == "completed"
+    assert written["doc"]["leaves"][0]["progress_pct"] == 100
+    assert decided == {"sid": "sugg-1", "state": "confirmed", "decided_by": "u-uuid-1",
+                       "applied_status": "completed", "applied_progress": 100}
+
+
+def test_confirm_reviewer_override_status_and_progress(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
+           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
+    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    written = {}
+    wired.setattr(org.programme, "write_programme",
+                  lambda s3c, bucket, site_id, doc_, updated_at: (written.update(doc=doc_) or doc_))
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None: {**row})
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm",
+        body={"status": "in_progress", "progress_pct": 75}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["applied_status"] == "in_progress"
+    assert body_of(res)["applied_progress"] == 75
+    assert written["doc"]["leaves"][0]["status"] == "in_progress"
+    assert written["doc"]["leaves"][0]["progress_pct"] == 75
+
+
+def test_confirm_task_missing_marks_stale_409(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row(task_id="ghost-task")
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
+           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
+    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    staled = {}
+    wired.setattr(org.programme_suggestions, "mark_stale",
+                  lambda conn, sid: (staled.update(sid=sid) or {**row, "state": "stale"}))
+    write_calls = {"n": 0}
+    wired.setattr(org.programme, "write_programme",
+                  lambda *a, **k: write_calls.update(n=write_calls["n"] + 1))
+    decide_calls = {"n": 0}
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda *a, **k: decide_calls.update(n=decide_calls["n"] + 1))
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 409
+    assert staled == {"sid": "sugg-1"}
+    assert write_calls["n"] == 0
+    assert decide_calls["n"] == 0
+
+
+def test_confirm_optimistic_mismatch_409(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row(
+        match_evidence={"programme_updated_at": "2026-07-01T00:00:00+00:00"})
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
+           "parents": [], "updated_at": "2026-07-05T00:00:00+00:00"}  # changed since match
+    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    write_calls = {"n": 0}
+    wired.setattr(org.programme, "write_programme",
+                  lambda *a, **k: write_calls.update(n=write_calls["n"] + 1))
+    decide_calls = {"n": 0}
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda *a, **k: decide_calls.update(n=decide_calls["n"] + 1))
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 409
+    assert write_calls["n"] == 0
+    assert decide_calls["n"] == 0
+
+
+def test_confirm_already_decided_409(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row(state="confirmed")
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 409
+
+
+def test_confirm_unknown_id_404(programme_wired):
+    wired, fake = programme_wired
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: None)
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-ghost/confirm", body={}), None)
+    assert res["statusCode"] == 404
+
+
+def test_confirm_cross_company_site_403(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row(site_id=OTHER_SITE_ID)
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 403
+
+
+def test_confirm_worker_403(programme_wired):
+    wired, fake = programme_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 403
+
+
+def test_reject_marks_rejected(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    decided = {}
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      (decided.update(sid=sid, state=state, decided_by=decided_by) or
+                       {**row, "state": state}))
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/reject"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == {"rejected": True}
+    assert decided == {"sid": "sugg-1", "state": "rejected", "decided_by": "u-uuid-1"}
+
+
+def test_reject_already_decided_409(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row(state="rejected")
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/reject"), None)
+    assert res["statusCode"] == 409
+
+
+def test_confirm_never_lowers_progress_on_auto_value(programme_wired):
+    # suggested_progress (60) is below the task's current progress_pct (80)
+    # and the reviewer did NOT explicitly send progress_pct -> keep 80.
+    wired, fake = programme_wired
+    row = _suggestion_row(suggested_progress=60)
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 80}],
+           "parents": [], "updated_at": row["match_evidence"]["programme_updated_at"]}
+    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    written = {}
+    wired.setattr(org.programme, "write_programme",
+                  lambda s3c, bucket, site_id, doc_, updated_at: (written.update(doc=doc_) or doc_))
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None: {**row})
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 200
+    assert written["doc"]["leaves"][0]["progress_pct"] == 80  # not lowered to 60
+    assert body_of(res)["applied_progress"] == 80
+
+
+def test_confirm_explicit_lower_progress_allowed(programme_wired):
+    # An explicit reviewer-typed lower value IS allowed (only the
+    # auto-suggested value is protected from silently lowering progress).
+    wired, fake = programme_wired
+    row = _suggestion_row(suggested_progress=60)
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 80}],
+           "parents": [], "updated_at": row["match_evidence"]["programme_updated_at"]}
+    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    written = {}
+    wired.setattr(org.programme, "write_programme",
+                  lambda s3c, bucket, site_id, doc_, updated_at: (written.update(doc=doc_) or doc_))
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None: {**row})
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm",
+        body={"progress_pct": 50}), None)
+    assert res["statusCode"] == 200
+    assert written["doc"]["leaves"][0]["progress_pct"] == 50
+    assert body_of(res)["applied_progress"] == 50
