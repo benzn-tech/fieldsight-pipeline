@@ -64,7 +64,11 @@ below goes through `.get(...)` with an explicit fallback (missing status =
 not completed = still a candidate; missing end = ongoing/open-ended).
 
 Environment Variables:
-    S3_BUCKET                  - bucket holding programmes/ and match_requests/
+    S3_BUCKET                  - lake bucket holding match_requests/ (IngestBucketName;
+                                 item-writer/ingest emit here, in-VPC lake side)
+    PROGRAMME_BUCKET           - bucket holding programmes/ (DataBucketName; org-api
+                                 writes programme.json here — a DIFFERENT bucket than
+                                 the lake on the TEST stack, hence a separate env)
     SUGGESTION_WRITER_FUNCTION - name of the in-VPC writer Lambda to invoke
     SIM_MAX_DIST  (default 0.55) - cosine-distance floor for embedding rank
     CONF_MIN      (default 0.70) - minimum accepted LLM confidence
@@ -91,6 +95,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
+PROGRAMME_BUCKET = os.environ.get("PROGRAMME_BUCKET", "")
 SUGGESTION_WRITER_FUNCTION = os.environ.get("SUGGESTION_WRITER_FUNCTION", "")
 SIM_MAX_DIST = float(os.environ.get("SIM_MAX_DIST", "0.55"))
 CONF_MIN = float(os.environ.get("CONF_MIN", "0.70"))
@@ -276,7 +281,7 @@ def _process_topic(req, topic):
     report_date = req.get("report_date")
     topic_id = topic.get("topic_id")
 
-    programme_doc = programme.read_programme(s3(), S3_BUCKET, site_id)
+    programme_doc = programme.read_programme(s3(), PROGRAMME_BUCKET, site_id)
     if not programme_doc or not programme_doc.get("leaves"):
         logger.info("no programme/leaves for site=%s -- skipping topic=%s", site_id, topic_id)
         return None

@@ -1084,12 +1084,14 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
-          # Same bucket embed-report/extract-session/item-writer read/write
-          # (the real data lake — see IngestBucketName param notes); the
-          # match_requests/ artifact Task 4 emits lands here too, and
-          # programmes/{site_id}/programme.json must live in this SAME
-          # bucket for read_programme to find it.
+          # match_requests/ artifact (Task 4 emits it) lands in the lake
+          # bucket that embed-report/extract-session/item-writer use.
           S3_BUCKET: !Ref IngestBucketName
+          # programmes/{site_id}/programme.json is written by OrgApiFunction
+          # to DataBucketName — a DIFFERENT bucket than the lake on the TEST
+          # stack (org-api uses DataBucketName, lake fns use IngestBucketName)
+          # — so read_programme must target DataBucketName explicitly.
+          PROGRAMME_BUCKET: !Ref DataBucketName
           # Ref (not Sub/GetAtt) on a Lambda resource returns its physical
           # function name — same pattern as AskAgentFunction's
           # RAG_SEARCH_FUNCTION: !Ref RagSearchFunction.
@@ -1115,7 +1117,7 @@ Resources:
             - Effect: Allow
               Action: s3:GetObject
               Resource:
-                - !Sub arn:aws:s3:::${IngestBucketName}/programmes/*
+                - !Sub arn:aws:s3:::${DataBucketName}/programmes/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/match_requests/*
             - Effect: Allow
               # Without ListBucket, S3 returns AccessDenied/403 (not
@@ -1123,12 +1125,20 @@ Resources:
               # role can't list — read_programme would re-raise a fake 500
               # for any site that has never had a programme uploaded
               # (same reasoning as OrgApiFunction's programmes/* grant).
+              # programmes/ and match_requests/ live in DIFFERENT buckets,
+              # so ListBucket is granted per-bucket per-prefix.
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${DataBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - programmes/*
+            - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
                 StringLike:
                   s3:prefix:
-                    - programmes/*
                     - match_requests/*
 
   # ----------------------------------------------------------
