@@ -34,8 +34,9 @@ INGEST_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-ingest"
 EMBED_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-embed-report"
 EXTRACT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-extract-session"
 ITEM_WRITER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-item-writer"
+MATCHER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-programme-matcher"
 
-echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer"
+echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer ProgrammeMatcher=${PREFIX}-programme-matcher"
 
 # ---- desired LambdaFunctionConfigurations (our managed entries, Id prefix fs-) ----
 # Only wire functions that actually exist: VadFunction is conditional in the
@@ -118,6 +119,21 @@ if fn_exists "${PREFIX}-item-writer"; then
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-item-writer not deployed — skipping item-writer trigger"
+fi
+# NOTE(Programme<->Item feedback, Task 4): the non-VPC programme-matcher
+# (Task 3) triggers on match_requests/*.json, written by ItemWriterFunction
+# and IngestFunction (match_request.emit) after they commit a batch of
+# topics. Prefix "match_requests/" is disjoint from every other prefix
+# wired above (users/, audio_segments/, transcripts/, reports/, embeddings/,
+# extractions/) — no double-trigger.
+if fn_exists "${PREFIX}-programme-matcher"; then
+  WIRE_FNS+=("${PREFIX}-programme-matcher")
+  DESIRED=$(jq -c --arg arn "$MATCHER_ARN" '. + [
+    {"Id":"fs-programme-match","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"match_requests/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-programme-matcher not deployed — skipping programme-matcher trigger"
 fi
 
 CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --output json 2>/dev/null || echo '{}')

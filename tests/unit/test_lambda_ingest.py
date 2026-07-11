@@ -114,6 +114,11 @@ def wired(monkeypatch):
     monkeypatch.setattr(ing, "embed_from_sidecar",
                         lambda text, vectors: "[" + ",".join(["0.0"] * 1024) + "]")
     monkeypatch.setattr(ing, "_load_turns", lambda user_folder, date: [])
+    # match_request.emit does a real s3.put_object -- FakeS3 above only
+    # implements get_object/get_paginator, so stub emit to a no-op by
+    # default here (Task 4); tests that care about the emit call override
+    # this explicitly (mirrors test_lambda_item_writer.py's wired fixture).
+    monkeypatch.setattr(ing.match_request, "emit", lambda *a, **k: None)
     return monkeypatch
 
 
@@ -576,3 +581,62 @@ def test_ingest_missing_sidecar_skips(wired):
     res = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
     assert res.get("skipped") is True
     assert "sidecar" in res.get("reason", "")
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — match_request.emit is called with the freshly-written report
+# topics AFTER the connection block commits, and only when the report has
+# at least one topic (never on a zero-topic report or an identity-bridge skip).
+# ---------------------------------------------------------------------------
+
+def test_match_request_emitted_after_report_topic_write(wired):
+    calls = []
+    wired.setattr(
+        ing.match_request, "emit",
+        lambda s3_client, bucket, site_id, report_date, source_key, topics:
+            calls.append((bucket, site_id, report_date, source_key, topics))
+            or "match_requests/site-1/2026-03-02/abc123.json",
+    )
+
+    result = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert result["skipped"] is False
+    assert len(calls) == 1
+    bucket, site_id, report_date, source_key, topics = calls[0]
+    assert bucket == ing.S3_BUCKET
+    assert site_id == "site-1"
+    assert report_date == "2026-03-02"
+    assert source_key == REPORT_KEY
+    assert topics == [{
+        "topic_id": "topic-uuid-0",
+        "title": "Safety Briefing",
+        "summary": "Discussed PPE requirements.",
+        "user_id": None,
+        "action_items": [{"text": "Order more hard hats"}],
+    }]
+
+
+def test_match_request_not_emitted_on_zero_topic_report(wired, monkeypatch):
+    calls = []
+    wired.setattr(ing.match_request, "emit", lambda *a, **k: calls.append(a) or None)
+    monkeypatch.setattr(
+        ing, "_s3_client",
+        FakeS3({REPORT_KEY: json.dumps(make_report(topics=[]))}),
+    )
+
+    result = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert result["skipped"] is False
+    assert result["topics"] == 0
+    assert calls == []
+
+
+def test_match_request_not_emitted_on_identity_skip(wired):
+    calls = []
+    wired.setattr(ing.match_request, "emit", lambda *a, **k: calls.append(a) or None)
+    wired.setattr(ing.sites, "get_company_site_by_name", lambda conn, cid, name: None)
+
+    result = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert result["skipped"] is True
+    assert calls == []

@@ -895,6 +895,13 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/embeddings/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
             - Effect: Allow
+              # Task 4: after committing a report's topics, ingest emits a
+              # match_requests/ artifact (match_request.emit) for the non-VPC
+              # MatcherFunction's S3 trigger — mirrors EmbedReportFunction's
+              # embeddings/* PutObject grant below.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/match_requests/*
+            - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
@@ -1005,6 +1012,13 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
+            - Effect: Allow
+              # Task 4: after committing an extraction's topics, item-writer
+              # emits a match_requests/ artifact (match_request.emit) for the
+              # non-VPC MatcherFunction's S3 trigger — mirrors
+              # EmbedReportFunction's embeddings/* PutObject grant.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/match_requests/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
