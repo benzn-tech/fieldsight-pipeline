@@ -102,6 +102,10 @@ def wired(monkeypatch):
     monkeypatch.setattr(iw.lambda_ingest, "resolve_user", lambda conn, cid, user_folder: None)
     monkeypatch.setattr(iw.topics, "delete_topics_for_source", lambda *a, **k: 0)
     monkeypatch.setattr(iw.topics, "upsert_topic", lambda *a, **k: {"id": "topic-uuid-0"})
+    # match_request.emit does a real s3.put_object -- FakeS3 above only
+    # implements get_object, so stub emit to a no-op by default here;
+    # tests that care about the emit call override this explicitly.
+    monkeypatch.setattr(iw.match_request, "emit", lambda *a, **k: None)
     return monkeypatch
 
 
@@ -304,3 +308,64 @@ def test_report_already_ingested_supersedes_late_extraction(wired):
         "SELECT 1 FROM topics WHERE source_s3_key=%s LIMIT 1",
         ("reports/2026-07-06/Jarley_Trainor/daily_report.json",),
     )]
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — match_request.emit is called with the freshly-written topics
+# AFTER the connection block commits, and only on a successful non-empty
+# write (never on a skip or a zero-topic extraction).
+# ---------------------------------------------------------------------------
+
+def test_match_request_emitted_after_multi_topic_write(wired):
+    calls = []
+    wired.setattr(
+        iw.match_request, "emit",
+        lambda s3_client, bucket, site_id, report_date, source_key, topics:
+            calls.append((bucket, site_id, report_date, source_key, topics))
+            or "match_requests/site-1/2026-07-06/abc123.json",
+    )
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 1}
+    assert len(calls) == 1
+    bucket, site_id, report_date, source_key, topics = calls[0]
+    assert bucket == iw.S3_BUCKET
+    assert site_id == "site-1"
+    assert report_date == "2026-07-06"
+    assert source_key == EXTRACTION_KEY
+    assert topics == [{
+        "topic_id": "topic-uuid-0",
+        "title": "Safety Briefing",
+        "summary": "Discussed PPE requirements.",
+        "user_id": None,
+        "action_items": [{"text": "Order more hard hats"}],
+    }]
+
+
+def test_match_request_not_emitted_on_identity_skip(wired):
+    calls = []
+    wired.setattr(iw.match_request, "emit", lambda *a, **k: calls.append(a) or None)
+    wired.setattr(
+        iw.lambda_ingest, "resolve_site",
+        lambda conn, cid, report, user_folder: None,
+    )
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result["skipped"] is True
+    assert calls == []
+
+
+def test_match_request_not_emitted_on_zero_topics(wired):
+    calls = []
+    wired.setattr(iw.match_request, "emit", lambda *a, **k: calls.append(a) or None)
+    wired.setattr(
+        iw, "_s3_client",
+        FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(topics=[]))}),
+    )
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 0}
+    assert calls == []

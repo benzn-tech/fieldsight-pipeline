@@ -62,6 +62,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+import match_request
 from chunking import chunk_report, chunk_transcripts
 from db.connection import get_connection
 from repositories import chunks, companies, memberships, sites, topics, users
@@ -296,18 +297,30 @@ def ingest_report(date, user_folder, report_key):
         topics.delete_topics_for_source_prefix(conn, f"extractions/{user_folder}/{date}/")
 
         topic_seq_to_id = {}
+        collected_topics = []
         for t in report.get("topics", []):
+            mapped_action_items = _map_action_items(t.get("action_items"))
             row = topics.upsert_topic(
                 conn, site["id"], date, t.get("topic_title", ""),
                 user_id=user_id, source_s3_key=report_key,
                 category=t.get("category"), summary=t.get("summary"),
-                action_items=_map_action_items(t.get("action_items")),
+                action_items=mapped_action_items,
                 safety=_map_safety(t.get("safety_flags")),
             )
             # None keys stay out of the map: a literal "topic_id": null topic
             # must not adopt the unassigned transcript windows (Fable minor 1).
             if t.get("topic_id") is not None:
                 topic_seq_to_id[t.get("topic_id")] = row["id"]
+            # Snapshot for the match_requests/ artifact (Task 4) -- see
+            # lambda_item_writer's identical pattern; the non-VPC
+            # MatcherFunction reads this, never Aurora directly.
+            collected_topics.append({
+                "topic_id": str(row["id"]),
+                "title": t.get("topic_title", ""),
+                "summary": t.get("summary"),
+                "user_id": str(user_id) if user_id is not None else None,
+                "action_items": [{"text": a["text"]} for a in mapped_action_items],
+            })
 
         chunks_n = 0
         for c in chunk_report(report):
@@ -333,6 +346,13 @@ def ingest_report(date, user_folder, report_key):
 
     topics_n = len(topic_seq_to_id)
     logger.info("ingested report=%s topics=%d chunks=%d", report_key, topics_n, chunks_n)
+
+    # AFTER the connection block commits -- see lambda_item_writer's
+    # identical ordering rationale. Only emit when topics were actually
+    # written (a report can have zero topics but nonzero transcript chunks).
+    if collected_topics:
+        match_request.emit(s3(), S3_BUCKET, site["id"], date, report_key, collected_topics)
+
     return {"skipped": False, "topics": topics_n, "chunks": chunks_n}
 
 

@@ -52,6 +52,7 @@ from urllib.parse import unquote_plus
 import boto3
 
 import lambda_ingest
+import match_request
 from db.connection import get_connection
 from repositories import companies, topics
 
@@ -142,17 +143,39 @@ def write_extraction_items(date, user_folder, extraction_key):
         topics.delete_topics_for_source(conn, extraction_key)
 
         topics_n = 0
+        collected_topics = []
         for t in extraction.get("topics", []):
-            topics.upsert_topic(
+            mapped_action_items = lambda_ingest._map_action_items(t.get("action_items"))
+            row = topics.upsert_topic(
                 conn, site["id"], date, t.get("topic_title", ""),
                 user_id=user_id, source_s3_key=extraction_key,
                 category=t.get("category"), summary=t.get("summary"),
-                action_items=lambda_ingest._map_action_items(t.get("action_items")),
+                action_items=mapped_action_items,
                 safety=lambda_ingest._map_safety(t.get("safety_flags")),
             )
+            # Snapshot for the match_requests/ artifact (Task 4) -- the
+            # non-VPC MatcherFunction reads this, never Aurora directly, so
+            # every field it needs (the durable topic id + the same
+            # title/summary/action-item text just written) is captured here.
+            collected_topics.append({
+                "topic_id": str(row["id"]),
+                "title": t.get("topic_title", ""),
+                "summary": t.get("summary"),
+                "user_id": str(user_id) if user_id is not None else None,
+                "action_items": [{"text": a["text"]} for a in mapped_action_items],
+            })
             topics_n += 1
 
     logger.info("item-writer wrote extraction=%s topics=%d", extraction_key, topics_n)
+
+    # AFTER the connection block commits -- the topics referenced in the
+    # artifact must be durable before the matcher can act on them. Only
+    # emit when something was actually written (mirrors the zero-write
+    # skip above); an empty extraction's zero topics never reaches here
+    # anyway since collected_topics would be empty.
+    if collected_topics:
+        match_request.emit(s3(), S3_BUCKET, site["id"], date, extraction_key, collected_topics)
+
     return {"skipped": False, "topics": topics_n}
 
 
