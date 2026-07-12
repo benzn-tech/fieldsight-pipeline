@@ -151,8 +151,17 @@ def candidate_tasks(programme_doc, report_date, lead_days=7, lag_days=14):
     for task in leaves:
         if task.get("status") in _NOT_SCHEDULABLE_STATUSES:
             continue
-        start = _coerce_date(task.get("start"))
-        end = _coerce_date(task.get("end"))
+        try:
+            start = _coerce_date(task.get("start"))
+            end = _coerce_date(task.get("end"))
+        except ValueError:
+            # One malformed leaf (e.g. start/end="TBC") must not crash-loop
+            # the whole site -- every future artifact for this site would
+            # fail forever otherwise. Skip just this leaf; log for cleanup.
+            logger.warning(
+                "skipping leaf task_id=%s with unparseable start=%r end=%r",
+                task.get("task_id"), task.get("start"), task.get("end"))
+            continue
         window_start = (start - timedelta(days=lead_days)) if start else date.min
         window_end = (end + timedelta(days=lag_days)) if end else date.max
         if window_start <= report_date <= window_end:
@@ -199,13 +208,21 @@ def build_prompt(topic, candidates):
 
     candidate_lines = []
     for i, c in enumerate(candidates, start=1):
+        progress = c.get("progress_pct")
+        assignees = c.get("assignees") or []
         candidate_lines.append(
             "{n}. task_id={tid} | name=\"{name}\" | status={status} | "
+            "progress={progress} | assignees={assignees} | "
             "start={start} | end={end}".format(
                 n=i,
                 tid=c.get("task_id"),
                 name=c.get("name", ""),
                 status=c.get("status") or "not_started",
+                # progress_pct/assignees are OPTIONAL on a real programme
+                # leaf (module docstring) -- .get with an explicit fallback,
+                # never a bare index, so a bare-bones leaf still prompts fine.
+                progress=f"{progress}%" if progress is not None else "(unknown)",
+                assignees=", ".join(assignees) if assignees else "(none)",
                 start=c.get("start") or "(open)",
                 end=c.get("end") or "(ongoing)",
             )
@@ -263,10 +280,37 @@ def parse_verdict(raw, survivor_ids, conf_min=0.70):
         confidence = float(parsed.get("confidence"))
     except (TypeError, ValueError):
         return None
-    if confidence < conf_min:
+    # Reject anything not a genuine, in-range confidence. The old one-sided
+    # `confidence < conf_min` check let two bad values straight through:
+    # `float('nan') < conf_min` is False (every comparison with NaN is
+    # False), and there was no upper bound, so a >1.0 value also passed.
+    # A closed two-sided range rejects both (Fable review MINOR #6).
+    if not (isinstance(confidence, (int, float)) and conf_min <= confidence <= 1.0):
         return None
     parsed["confidence"] = confidence
+    parsed["suggested_progress"] = _coerce_suggested_progress(parsed.get("suggested_progress"))
     return parsed
+
+
+def _coerce_suggested_progress(p):
+    """Whitelist a raw suggested_progress verdict value the same way
+    suggested_status is whitelisted in _process_topic below: accept only a
+    genuine integer (or a float with no fractional part -- e.g. a JSON
+    number Claude may emit as 60.0) in [0, 100]; anything else (a string
+    like "about half", NaN/Infinity, a real fraction, out-of-range) coerces
+    to None. Never forward an unchecked value to the writer -- its single
+    transaction aborts the WHOLE batch of suggestions on the migration's
+    `suggested_progress BETWEEN 0 AND 100` CHECK violation (Fable review
+    IMPORTANT #3)."""
+    if isinstance(p, bool):
+        return None
+    if isinstance(p, int):
+        value = p
+    elif isinstance(p, float) and p.is_integer():
+        value = int(p)
+    else:
+        return None
+    return value if 0 <= value <= 100 else None
 
 
 # ============================================================
@@ -304,7 +348,11 @@ def _process_topic(req, topic):
         logger.info("no embedding survivors for topic=%s", topic_id)
         return None
 
-    prompt = build_prompt(topic, survivors)
+    # The match_requests/ artifact contract (module docstring) never puts a
+    # date on individual topics -- only the request as a whole carries
+    # report_date -- so build_prompt's Date line was always empty until
+    # this injects it per-topic (Fable review MINOR #8).
+    prompt = build_prompt({**topic, "report_date": report_date}, survivors)
     raw, error = claude_utils.call_claude(prompt, max_tokens=512)
     if raw is None:
         raise RuntimeError(f"Claude call failed for topic {topic_id}: {error}")

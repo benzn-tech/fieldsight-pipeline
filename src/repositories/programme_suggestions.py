@@ -89,8 +89,23 @@ def decide(conn, suggestion_id, state, decided_by, applied_status=None,
 
 
 def mark_stale(conn, suggestion_id) -> dict | None:
-    """Target task vanished from programme.json, or the source topic was
-    superseded before review. Guards WHERE state='pending' like decide()."""
+    """Marks a suggestion `stale`. Called ONLY from confirm_suggestion
+    (lambda_org_api.py), at confirm/review time, in two cases: (1) the
+    target task_id is no longer present in programme.json, or (2) the
+    row's topic_id is NULL — its source topic was deleted/superseded via
+    ON DELETE SET NULL (topics.delete_topics_for_source/_prefix) before
+    anyone reviewed it (Fable review #5).
+
+    NOT called proactively at supersession time, despite what an earlier
+    version of this docstring implied: marking a still-pending row stale
+    the moment its topic is superseded would race upsert_suggestion's
+    dedupe-key `ON CONFLICT ... WHERE state='pending'` re-link — a
+    reprocess landing after the stale-mark would silently no-op (the WHERE
+    guard excludes the now-stale row) instead of re-linking, permanently
+    losing a suggestion that should have re-matched. Catching it at confirm
+    time instead avoids that race entirely.
+
+    Guards WHERE state='pending' like decide()."""
     return conn.cursor(row_factory=dict_row).execute(
         f"UPDATE programme_progress_suggestions SET state='stale', updated_at=now() "
         f"WHERE id=%s AND state='pending' "

@@ -172,6 +172,28 @@ def test_candidate_report_date_as_string_is_coerced():
     assert [t["task_id"] for t in result] == ["T-7"]
 
 
+def test_candidate_skips_malformed_leaf_date_keeps_good_leaf():
+    # Fable review MINOR #7: one leaf with an unparseable start/end must
+    # not abort the whole loop (date.fromisoformat raising ValueError used
+    # to crash candidate_tasks entirely -- failing every future artifact
+    # for that site, not just the one bad leaf).
+    doc = {"leaves": [
+        _task(task_id="T-good", start="2026-04-01", end="2026-04-10"),
+        _task(task_id="T-bad", start="TBC", end="2026-04-10"),
+    ]}
+    result = lpm.candidate_tasks(doc, date(2026, 4, 5))
+    assert [t["task_id"] for t in result] == ["T-good"]
+
+
+def test_candidate_skips_malformed_end_date_too():
+    doc = {"leaves": [
+        _task(task_id="T-good", start="2026-04-01", end="2026-04-10"),
+        _task(task_id="T-bad", start="2026-04-01", end="unknown"),
+    ]}
+    result = lpm.candidate_tasks(doc, date(2026, 4, 5))
+    assert [t["task_id"] for t in result] == ["T-good"]
+
+
 # ---------------------------------------------------------------------------
 # rank_by_embedding — cosine distance floor + top_k trim
 # ---------------------------------------------------------------------------
@@ -239,6 +261,171 @@ def test_parse_verdict_none_when_task_id_null():
 def test_parse_verdict_none_when_unparseable():
     verdict = lpm.parse_verdict("not json at all {{{", {"T-1"}, conf_min=0.70)
     assert verdict is None
+
+
+# ---------------------------------------------------------------------------
+# parse_verdict — confidence gate must reject NaN/Infinity/out-of-range
+# (Fable review MINOR #6: `float('nan') < CONF_MIN` is False, so the old
+# one-sided `confidence < conf_min` check let NaN straight through, and let
+# any confidence > 1.0 through too since only the lower bound was checked.)
+# ---------------------------------------------------------------------------
+def test_parse_verdict_none_when_confidence_nan():
+    raw = ('{"task_id": "T-1", "confidence": NaN, "suggested_status": "completed", '
+           '"suggested_progress": null, "evidence": "e"}')
+    verdict = lpm.parse_verdict(raw, {"T-1"}, conf_min=0.70)
+    assert verdict is None
+
+
+def test_parse_verdict_none_when_confidence_above_one():
+    raw = json.dumps({"task_id": "T-1", "confidence": 5.0, "suggested_status": "completed",
+                       "suggested_progress": None, "evidence": "e"})
+    verdict = lpm.parse_verdict(raw, {"T-1"}, conf_min=0.70)
+    assert verdict is None
+
+
+def test_parse_verdict_none_when_confidence_non_numeric_string():
+    raw = json.dumps({"task_id": "T-1", "confidence": "high", "suggested_status": "completed",
+                       "suggested_progress": None, "evidence": "e"})
+    verdict = lpm.parse_verdict(raw, {"T-1"}, conf_min=0.70)
+    assert verdict is None
+
+
+def test_parse_verdict_accepts_in_range_confidence():
+    raw = json.dumps({"task_id": "T-1", "confidence": 0.8, "suggested_status": "completed",
+                       "suggested_progress": None, "evidence": "e"})
+    verdict = lpm.parse_verdict(raw, {"T-1"}, conf_min=0.70)
+    assert verdict is not None
+    assert verdict["confidence"] == 0.8
+
+
+# ---------------------------------------------------------------------------
+# _coerce_suggested_progress — same whitelist treatment as suggested_status
+# (Fable review IMPORTANT #3: an unchecked suggested_progress reaching the
+# writer's single-transaction batch insert would abort the WHOLE batch on
+# the migration's CHECK (suggested_progress BETWEEN 0 AND 100) constraint.)
+# ---------------------------------------------------------------------------
+def test_coerce_suggested_progress_out_of_range_to_none():
+    assert lpm._coerce_suggested_progress(105) is None
+    assert lpm._coerce_suggested_progress(-1) is None
+
+
+def test_coerce_suggested_progress_non_numeric_to_none():
+    assert lpm._coerce_suggested_progress("about half") is None
+
+
+def test_coerce_suggested_progress_valid_int_passthrough():
+    assert lpm._coerce_suggested_progress(60) == 60
+
+
+def test_coerce_suggested_progress_whole_float_coerced():
+    assert lpm._coerce_suggested_progress(60.0) == 60
+
+
+def test_coerce_suggested_progress_fractional_float_to_none():
+    assert lpm._coerce_suggested_progress(60.5) is None
+
+
+def test_coerce_suggested_progress_none_passthrough():
+    assert lpm._coerce_suggested_progress(None) is None
+
+
+def test_coerce_suggested_progress_bool_to_none():
+    # bool is a subclass of int in Python -- must not sneak through as 0/1.
+    assert lpm._coerce_suggested_progress(True) is None
+
+
+# ---------------------------------------------------------------------------
+# Handler — an invalid suggested_progress is coerced to None; if
+# suggested_status ends up None too, the existing "real change" gate still
+# drops the whole suggestion (verifies #3 composes correctly with the
+# pre-existing real-change logic, not just the pure coercion helper).
+# ---------------------------------------------------------------------------
+def test_handler_invalid_progress_coerced_and_no_status_drops_suggestion(monkeypatch):
+    req_key, fake_lambda = _clean_match_setup(monkeypatch)
+    monkeypatch.setattr(
+        claude_utils, "call_claude",
+        lambda prompt, max_tokens=512: (
+            json.dumps({
+                "task_id": "T-1", "confidence": 0.9,
+                "suggested_status": None, "suggested_progress": 105,
+                "evidence": "e",
+            }),
+            None,
+        ),
+    )
+    result = lpm.lambda_handler(_match_request_event(req_key), None)
+    assert result["suggestions"] == []
+    assert fake_lambda.invoke_calls == []
+
+
+def test_handler_invalid_progress_coerced_valid_status_still_suggests(monkeypatch):
+    # suggested_progress=105 is invalid -> coerced to None, but
+    # suggested_status="completed" differs from status_before -> still a
+    # real change, so a suggestion IS produced, just without a progress value.
+    req_key, fake_lambda = _clean_match_setup(monkeypatch)
+    monkeypatch.setattr(
+        claude_utils, "call_claude",
+        lambda prompt, max_tokens=512: (
+            json.dumps({
+                "task_id": "T-1", "confidence": 0.9,
+                "suggested_status": "completed", "suggested_progress": 105,
+                "evidence": "e",
+            }),
+            None,
+        ),
+    )
+    result = lpm.lambda_handler(_match_request_event(req_key), None)
+    assert len(result["suggestions"]) == 1
+    assert result["suggestions"][0]["suggested_status"] == "completed"
+    assert result["suggestions"][0]["suggested_progress"] is None
+
+
+# ---------------------------------------------------------------------------
+# build_prompt — Fable review MINOR #8: the Date line must reflect the
+# request's report_date (topics never carry their own date/report_date key
+# in the match_requests contract, so the old `topic.get('date') or
+# topic.get('report_date')` was always empty), and candidate lines should
+# surface progress_pct/assignees when present (defensive .get -- both are
+# frequently absent on a real programme leaf).
+# ---------------------------------------------------------------------------
+def test_build_prompt_includes_report_date():
+    topic = {"title": "t", "summary": "s", "action_items": [], "report_date": "2026-07-12"}
+    prompt = lpm.build_prompt(topic, [_task(task_id="T-1")])
+    assert "Date: 2026-07-12" in prompt
+
+
+def test_build_prompt_candidate_line_includes_progress_and_assignees():
+    candidate = _task(task_id="T-1", name="Steel frame", status="in_progress",
+                      progress_pct=40, assignees=["Ben", "Sam"])
+    prompt = lpm.build_prompt({"title": "t", "summary": "s"}, [candidate])
+    assert "40" in prompt
+    assert "Ben" in prompt and "Sam" in prompt
+
+
+def test_build_prompt_candidate_line_defensive_when_absent():
+    # progress_pct/assignees are OPTIONAL on a real programme leaf -- must
+    # not KeyError when absent.
+    candidate = _task(task_id="T-1", name="Steel frame")
+    assert "progress_pct" not in candidate and "assignees" not in candidate
+    prompt = lpm.build_prompt({"title": "t", "summary": "s"}, [candidate])
+    assert "T-1" in prompt
+
+
+def test_process_topic_injects_report_date_into_prompt(monkeypatch):
+    # Handler-level: _process_topic must pass the request's report_date
+    # through to build_prompt even though the topic dict itself never
+    # carries one.
+    req_key, fake_lambda = _clean_match_setup(monkeypatch)
+    captured = {}
+    real_build_prompt = lpm.build_prompt
+
+    def spying_build_prompt(topic, candidates):
+        captured["topic"] = topic
+        return real_build_prompt(topic, candidates)
+
+    monkeypatch.setattr(lpm, "build_prompt", spying_build_prompt)
+    lpm.lambda_handler(_match_request_event(req_key), None)
+    assert captured["topic"].get("report_date") == "2026-07-12"
 
 
 # ---------------------------------------------------------------------------

@@ -752,10 +752,34 @@ def put_programme(conn, caller, event, body):
 # put_programme, plus the same site ACL as get_programme/put_programme
 # (_resolve_site_param for list; _allowed_site_ids directly for confirm/
 # reject, since those are addressed by suggestion id, not `?site=`).
-# Confirm re-reads programme.json and rejects with 409 if its `updated_at`
-# has moved since the suggestion was matched (match_evidence carries the
-# doc's updated_at at match time) — optimistic locking, no last-write-wins.
+#
+# Confirm staleness (Fable review CRITICAL #1): re-reads programme.json and
+# compares the LIVE task's status/progress_pct against THIS suggestion's own
+# snapshot (task_status_before/task_progress_before, taken by the matcher at
+# match time) — 409 only when the ONE task this suggestion is about has
+# moved on. The original design (design doc §3 D3, §8 item 5) compared the
+# whole doc's `updated_at` against match_evidence.programme_updated_at
+# instead; that broke because confirm's OWN write re-stamps updated_at, so
+# confirming any one suggestion permanently 409'd every other still-pending
+# suggestion for the same site (upsert never refreshes match_evidence for a
+# pending row). match_evidence.programme_updated_at is still recorded by the
+# matcher for audit — it is simply no longer gated on here.
+#
+# Confirm CAS (Fable review IMPORTANT #2): programme_suggestions.decide()
+# (state='pending' -> 'confirmed', guarded by `WHERE state='pending'`) is
+# called BEFORE write_programme, and its return value is the authoritative
+# gate — None means another request already decided this suggestion (a
+# race lost), and the S3 write is skipped entirely. This runs inside
+# `with get_connection() as conn:` (see lambda_handler above) — a real
+# transaction that commits on clean return / rolls back on any exception —
+# so a write_programme failure AFTER a successful decide() rolls the decide
+# back too (no orphaned "confirmed" row with no matching S3 write). Were
+# this ever called under autocommit instead, that edge would NOT roll back:
+# the DB would show "confirmed" while programme.json was never updated.
 # ----------------------------------------------------------
+_ALLOWED_CONFIRM_STATUSES = ("in_progress", "completed", "blocked", "delayed")
+
+
 def list_suggestions(conn, caller, event):
     if caller["global_role"] not in ("admin", "gm", "pm"):
         return error("forbidden", 403)
@@ -781,6 +805,28 @@ def confirm_suggestion(conn, caller, suggestion_id, body):
         return error("already decided", 409)
     if str(row["site_id"]) not in _allowed_site_ids(conn, caller):
         return error("access denied to this site", 403)
+    if row["topic_id"] is None:
+        # Fable review IMPORTANT #5: the source topic was deleted/superseded
+        # (ON DELETE SET NULL — topics.py delete_topics_for_source[_prefix])
+        # before anyone reviewed this suggestion. Caught here, at confirm
+        # time, rather than proactively when the topic is superseded (see
+        # programme_suggestions.mark_stale docstring for why).
+        programme_suggestions.mark_stale(conn, suggestion_id)
+        return error("source topic was superseded; re-review", 409)
+
+    # Fable review MINOR #9: validate reviewer overrides BEFORE they can
+    # reach programme.json — a bad "status" or non-int/out-of-range
+    # "progress_pct" used to either write garbage or raise a TypeError deep
+    # in the never-lower-progress comparison below (str < int -> 500).
+    if "status" in body:
+        status_override = body.get("status")
+        if status_override not in _ALLOWED_CONFIRM_STATUSES:
+            return error(f"status must be one of {sorted(_ALLOWED_CONFIRM_STATUSES)}", 400)
+    if "progress_pct" in body:
+        progress_override = body.get("progress_pct")
+        if (isinstance(progress_override, bool) or not isinstance(progress_override, int)
+                or not (0 <= progress_override <= 100)):
+            return error("progress_pct must be an integer 0-100", 400)
 
     doc = programme.read_programme(s3(), S3_BUCKET, row["site_id"])
     if doc is None:
@@ -790,12 +836,13 @@ def confirm_suggestion(conn, caller, suggestion_id, body):
         programme_suggestions.mark_stale(conn, suggestion_id)
         return error("task no longer in programme", 409)
 
-    # Optimistic lock: the suggestion was matched against a specific version
-    # of the doc (match_evidence.programme_updated_at); if the doc has moved
-    # on since, refuse to write blind — the reviewer re-reads and re-decides.
-    evidence = row["match_evidence"] or {}
-    if (doc.get("updated_at") or None) != evidence.get("programme_updated_at"):
-        return error("programme changed since suggestion; re-review", 409)
+    # Fable review CRITICAL #1: per-task staleness — the live task must
+    # still be in the state the matcher saw when it made THIS suggestion.
+    # Scoped to the one task this suggestion is about (see module comment
+    # above list_suggestions for why the old whole-doc check was wrong).
+    if (task.get("status") != row["task_status_before"]
+            or task.get("progress_pct") != row["task_progress_before"]):
+        return error("task changed since this suggestion was made; re-review", 409)
 
     new_status = body.get("status") if "status" in body else row["suggested_status"]
     new_progress = body.get("progress_pct") if "progress_pct" in body else row["suggested_progress"]
@@ -810,11 +857,17 @@ def confirm_suggestion(conn, caller, suggestion_id, body):
     if new_progress is not None:
         task["progress_pct"] = new_progress
 
-    new_ts = datetime.now(timezone.utc).isoformat()
-    programme.write_programme(s3(), S3_BUCKET, row["site_id"], doc, new_ts)
-    programme_suggestions.decide(
+    # Fable review IMPORTANT #2: decide() is the compare-and-swap gate —
+    # called BEFORE the S3 write, and its return value decides whether we
+    # write at all (see module comment above list_suggestions).
+    decided = programme_suggestions.decide(
         conn, suggestion_id, "confirmed", decided_by=caller["id"],
         applied_status=new_status, applied_progress=new_progress)
+    if decided is None:
+        return error("already decided", 409)
+
+    new_ts = datetime.now(timezone.utc).isoformat()
+    programme.write_programme(s3(), S3_BUCKET, row["site_id"], doc, new_ts)
     return ok({"confirmed": True, "task_id": row["task_id"],
               "applied_status": new_status, "applied_progress": new_progress})
 
