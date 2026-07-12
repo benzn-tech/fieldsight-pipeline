@@ -211,9 +211,58 @@ def test_citations_shape_and_snippet_truncation(monkeypatch):
         "topic_title": "Door Inspection",
         "chunk_type": "report",
         "snippet": CHUNK_A["chunk_text"][:200],
+        "time_start": None,
     }
     assert c2["snippet"] == ("x" * 300)[:200]
     assert len(c2["snippet"]) == 200
+
+
+CHUNK_WINDOW = {
+    "id": "c-3",
+    "chunk_text": "Worker mentions door latch issue near the loading bay.",
+    "chunk_type": "transcript_window",
+    "topic_id": "t-1",
+    "source_s3_key": "transcripts/Ben/2026-02-09/seg1.json",
+    "metadata": {"window_span": "12:42:59–12:45:10"},  # EN DASH separator (chunking.py:134)
+    "topic_title": "Door Inspection",
+    "topic_summary": "",
+    "report_date": "2026-02-09",
+    "site_id": "s-1",
+    "site_name": "Ellesmere",
+    "site_slug": "ellesmere",
+    "distance": 0.15,
+}
+
+
+def test_citation_time_start_from_transcript_window(monkeypatch):
+    wire(monkeypatch, chunks=[CHUNK_WINDOW],
+         claude_answer=("Answer referencing [1].", None))
+
+    result = invoke(make_event())
+
+    assert result["citations"][0]["time_start"] == "12:42:59"
+
+
+def test_citation_time_start_none_for_topic(monkeypatch):
+    topic_chunk = dict(CHUNK_WINDOW, id="c-topic", chunk_type="topic", metadata={})
+    wire(monkeypatch, chunks=[topic_chunk],
+         claude_answer=("Answer referencing [1].", None))
+
+    result = invoke(make_event())
+
+    assert result["citations"][0]["time_start"] is None
+
+
+def test_citation_time_start_defensive(monkeypatch):
+    chunk_no_metadata = dict(CHUNK_WINDOW, id="c-4", metadata=None)
+    chunk_bad_span = dict(CHUNK_WINDOW, id="c-5", metadata={"window_span": "no-dash"})
+    wire(monkeypatch, chunks=[chunk_no_metadata, chunk_bad_span],
+         claude_answer=("Answer referencing [1] and [2].", None))
+
+    result = invoke(make_event())
+
+    assert result["citations"][0]["time_start"] is None
+    assert result["citations"][1]["time_start"] is None
 
 
 def test_claude_error_graceful(monkeypatch):
