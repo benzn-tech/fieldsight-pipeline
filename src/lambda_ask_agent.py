@@ -654,6 +654,21 @@ def _rag_search_list(body):
         return {"results": [], "error": str(e), "count": 0}
 
 
+def _citation_time_start(c):
+    """Exact-line anchor for a citation: the start time of a transcript_window
+    chunk's window_span (e.g. "12:42:59" from "12:42:59–12:45:10"). None for
+    topic chunks or any malformed/missing metadata -- never raises."""
+    if c.get("chunk_type") != "transcript_window":
+        return None
+    md = c.get("metadata")
+    if not isinstance(md, dict):
+        return None
+    span = md.get("window_span")
+    if not isinstance(span, str) or "–" not in span:
+        return None
+    return span.split("–", 1)[0].strip() or None
+
+
 def _rag_answer(body):
     """RAG path: embed the question, invoke RAG_SEARCH_FUNCTION for grounded
     chunks (ACL-narrowed to caller_sub's accessible sites), then synthesize
@@ -746,6 +761,7 @@ def _rag_answer(body):
                 "topic_title": c.get("topic_title"),
                 "chunk_type": c.get("chunk_type"),
                 "snippet": (c.get("chunk_text") or "")[:200],
+                "time_start": _citation_time_start(c),
             }
             for c in chunks
         ]
