@@ -1411,13 +1411,17 @@ def test_confirm_task_missing_marks_stale_409(programme_wired):
     assert decide_calls["n"] == 0
 
 
-def test_confirm_optimistic_mismatch_409(programme_wired):
+def test_confirm_task_changed_since_match_409(programme_wired):
+    # Fable #1 fix: staleness is now PER-TASK (task_status_before/
+    # task_progress_before snapshot vs the live task), not a whole-doc
+    # updated_at comparison. Here task t-1's live progress_pct (75) has
+    # moved on from what the matcher saw (task_progress_before=40) --
+    # someone else changed it since the suggestion was made.
     wired, fake = programme_wired
-    row = _suggestion_row(
-        match_evidence={"programme_updated_at": "2026-07-01T00:00:00+00:00"})
+    row = _suggestion_row(task_status_before="in_progress", task_progress_before=40)
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
-           "parents": [], "updated_at": "2026-07-05T00:00:00+00:00"}  # changed since match
+    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 75}],
+           "parents": [], "updated_at": "2026-07-05T00:00:00+00:00"}
     wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
     write_calls = {"n": 0}
     wired.setattr(org.programme, "write_programme",
@@ -1430,6 +1434,56 @@ def test_confirm_optimistic_mismatch_409(programme_wired):
     assert res["statusCode"] == 409
     assert write_calls["n"] == 0
     assert decide_calls["n"] == 0
+
+
+def test_confirm_second_pending_suggestion_for_other_task_not_blocked(programme_wired):
+    # Regression for the CRITICAL bug: confirming ANY suggestion used to
+    # re-stamp programme.json's whole-doc updated_at, and the old check
+    # compared THAT against match_evidence.programme_updated_at -- so
+    # confirming suggestion A for task t-1 permanently 409'd every OTHER
+    # pending suggestion (e.g. B for task t-2) on the SAME site, forever
+    # (upsert never refreshes match_evidence). The fix scopes staleness to
+    # the one task each suggestion is about, so confirming A must not
+    # affect B's confirmability at all.
+    wired, fake = programme_wired
+    rows = {
+        "sugg-A": _suggestion_row(
+            id="sugg-A", task_id="t-1", topic_id="topic-a",
+            task_status_before="in_progress", task_progress_before=40,
+            suggested_status="completed", suggested_progress=100),
+        "sugg-B": _suggestion_row(
+            id="sugg-B", task_id="t-2", topic_id="topic-b",
+            task_status_before="not_started", task_progress_before=0,
+            suggested_status="in_progress", suggested_progress=10),
+    }
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: rows.get(sid))
+    doc = {"leaves": [
+        {"task_id": "t-1", "status": "in_progress", "progress_pct": 40},
+        {"task_id": "t-2", "status": "not_started", "progress_pct": 0},
+    ], "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
+    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+
+    def fake_write(s3c, bucket, site_id, doc_, updated_at):
+        doc_["updated_at"] = updated_at  # mirrors the real write_programme
+        return doc_
+
+    wired.setattr(org.programme, "write_programme", fake_write)
+
+    def fake_decide(conn, sid, state, decided_by, applied_status=None, applied_progress=None):
+        rows[sid] = {**rows[sid], "state": state}
+        return rows[sid]
+
+    wired.setattr(org.programme_suggestions, "decide", fake_decide)
+
+    res_a = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-A/confirm", body={}), None)
+    assert res_a["statusCode"] == 200
+    # doc.updated_at has now moved on -- under the OLD whole-doc check this
+    # alone would 409 every other pending suggestion for this site.
+
+    res_b = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-B/confirm", body={}), None)
+    assert res_b["statusCode"] == 200  # THE key regression assertion -- not 409
 
 
 def test_confirm_already_decided_409(programme_wired):
@@ -1495,8 +1549,10 @@ def test_reject_already_decided_409(programme_wired):
 def test_confirm_never_lowers_progress_on_auto_value(programme_wired):
     # suggested_progress (60) is below the task's current progress_pct (80)
     # and the reviewer did NOT explicitly send progress_pct -> keep 80.
+    # task_progress_before=80 matches the live doc -- this is testing the
+    # never-lower-progress rule, not the (separate) per-task staleness gate.
     wired, fake = programme_wired
-    row = _suggestion_row(suggested_progress=60)
+    row = _suggestion_row(suggested_progress=60, task_progress_before=80)
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
     doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 80}],
            "parents": [], "updated_at": row["match_evidence"]["programme_updated_at"]}
@@ -1517,7 +1573,7 @@ def test_confirm_explicit_lower_progress_allowed(programme_wired):
     # An explicit reviewer-typed lower value IS allowed (only the
     # auto-suggested value is protected from silently lowering progress).
     wired, fake = programme_wired
-    row = _suggestion_row(suggested_progress=60)
+    row = _suggestion_row(suggested_progress=60, task_progress_before=80)
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
     doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 80}],
            "parents": [], "updated_at": row["match_evidence"]["programme_updated_at"]}
@@ -1533,3 +1589,119 @@ def test_confirm_explicit_lower_progress_allowed(programme_wired):
     assert res["statusCode"] == 200
     assert written["doc"]["leaves"][0]["progress_pct"] == 50
     assert body_of(res)["applied_progress"] == 50
+
+
+# ----------------------------------------------------------
+# Fable #2 — decide() is the compare-and-swap gate: it must be called BEFORE
+# write_programme, and a None return (another request already decided this
+# suggestion) must short-circuit with 409 WITHOUT writing to S3.
+# ----------------------------------------------------------
+def test_confirm_decide_cas_second_call_gets_409_no_write(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
+           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
+    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    write_calls = {"n": 0}
+    wired.setattr(org.programme, "write_programme",
+                  lambda *a, **k: (write_calls.update(n=write_calls["n"] + 1) or doc))
+    # 1st decide() call "wins" the race (returns the confirmed row); 2nd
+    # call simulates another request having already decided it (returns
+    # None, mirroring decide()'s real `WHERE state='pending'` guard).
+    decide_results = iter([{**row, "state": "confirmed"}, None])
+    wired.setattr(
+        org.programme_suggestions, "decide",
+        lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+            next(decide_results))
+
+    res1 = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res1["statusCode"] == 200
+    assert write_calls["n"] == 1
+
+    res2 = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res2["statusCode"] == 409
+    assert write_calls["n"] == 1  # NOT incremented -- the loser never writes S3
+
+
+# ----------------------------------------------------------
+# Fable #5 — a suggestion whose source topic was retracted (topic_id NULL
+# via ON DELETE SET NULL on topics deletion/supersession) must be caught at
+# confirm time: mark stale + 409, rather than staying silently confirmable.
+# ----------------------------------------------------------
+def test_confirm_retracted_topic_marks_stale_409(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row(topic_id=None)
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    staled = {}
+    wired.setattr(org.programme_suggestions, "mark_stale",
+                  lambda conn, sid: (staled.update(sid=sid) or {**row, "state": "stale"}))
+    write_calls = {"n": 0}
+    wired.setattr(org.programme, "write_programme",
+                  lambda *a, **k: write_calls.update(n=write_calls["n"] + 1))
+    decide_calls = {"n": 0}
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda *a, **k: decide_calls.update(n=decide_calls["n"] + 1))
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 409
+    assert staled == {"sid": "sugg-1"}
+    assert write_calls["n"] == 0
+    assert decide_calls["n"] == 0
+
+
+# ----------------------------------------------------------
+# Fable #9 — reviewer overrides in the confirm body must be validated
+# before they can reach programme.json (a bad status/progress used to
+# either 500 (TypeError comparing str < int) or write out-of-range data).
+# ----------------------------------------------------------
+def test_confirm_rejects_out_of_range_progress_400(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm",
+        body={"progress_pct": 150}), None)
+    assert res["statusCode"] == 400
+
+
+def test_confirm_rejects_non_integer_progress_400(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm",
+        body={"progress_pct": "50"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_confirm_rejects_invalid_status_400(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm",
+        body={"status": "bogus"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_confirm_valid_progress_override_applied(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
+           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
+    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    written = {}
+    wired.setattr(org.programme, "write_programme",
+                  lambda s3c, bucket, site_id, doc_, updated_at: (written.update(doc=doc_) or doc_))
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None: {**row})
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm",
+        body={"progress_pct": 60}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["applied_progress"] == 60
+    assert written["doc"]["leaves"][0]["progress_pct"] == 60
