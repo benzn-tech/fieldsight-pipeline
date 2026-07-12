@@ -211,7 +211,9 @@ def test_writes_extraction_contract(monkeypatch):
         os.path.basename(SEG1_KEY), os.path.basename(SEG2_KEY)
     ]
     assert extraction["extracted_at"].endswith("Z")
-    assert extraction["topics"] == [{"topic_title": "t"}]
+    # topic gains a derived (empty, since no findings were returned) safety_flags
+    # alongside whatever Claude returned -- the item-writer compatibility bridge.
+    assert extraction["topics"] == [{"topic_title": "t", "safety_flags": []}]
 
     written = json.loads(fake_s3.objects[OUT_KEY])
     assert written == extraction
@@ -408,3 +410,80 @@ def test_no_turns_returns_none_without_claude_call(monkeypatch):
 
     assert result is None
     assert fake_s3.put_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Unified-extraction Task 1 — rich schema (findings/decisions/questions/origin)
+# + derived legacy safety_flags (item-writer compatibility bridge)
+# ---------------------------------------------------------------------------
+
+def test_schema_has_new_fields():
+    for field in ("findings", "decisions", "questions", "origin"):
+        assert field in les.EXTRACTION_SCHEMA
+
+
+def test_derive_safety_flags_from_findings():
+    findings = [
+        {"observation": "x", "domain": "safety", "severity": "major", "recommended_action": "y"},
+        {"observation": "q", "domain": "quality", "severity": "minor"},
+    ]
+    assert les._derive_safety_flags(findings) == [
+        {"observation": "x", "risk_level": "high", "recommended_action": "y"},
+    ]
+
+
+def test_derive_safety_flags_empty():
+    assert les._derive_safety_flags(None) == []
+    assert les._derive_safety_flags([]) == []
+    assert les._derive_safety_flags(
+        [{"observation": "q", "domain": "quality", "severity": "minor"}]
+    ) == []
+
+
+def test_extraction_topic_gains_derived_safety_flags_and_findings(monkeypatch):
+    fake_s3 = FakeS3({SEG1_KEY: json.dumps(make_transcribe_json("hello world"))})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(
+        claude_utils, "call_claude",
+        _fake_call_claude_returning({
+            "topics": [{
+                "topic_title": "Block C Pour",
+                "category": "safety",
+                "origin": "inspection",
+                "action_items": [
+                    {"action": "Fix scaffold", "responsible": "Sam",
+                     "deadline": None, "priority": "high"},
+                ],
+                "findings": [
+                    {"observation": "Missing guardrail", "domain": "safety",
+                     "severity": "major", "entity": {"name": None, "trade": "scaffolder"},
+                     "recommended_action": "Install guardrail"},
+                    {"observation": "Slab finish uneven", "domain": "quality",
+                     "severity": "minor", "entity": {"name": None, "trade": None},
+                     "recommended_action": None},
+                ],
+                "decisions": [],
+                "questions": [],
+            }],
+            "declared_site": None,
+        }),
+    )
+
+    extraction = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    topic = extraction["topics"][0]
+    # action_items unchanged (item-writer contract)
+    assert topic["action_items"] == [
+        {"action": "Fix scaffold", "responsible": "Sam", "deadline": None, "priority": "high"},
+    ]
+    # new findings preserved verbatim
+    assert len(topic["findings"]) == 2
+    # legacy safety_flags derived from the safety-domain finding only
+    assert topic["safety_flags"] == [
+        {"observation": "Missing guardrail", "risk_level": "high",
+         "recommended_action": "Install guardrail"},
+    ]
+
+    written = json.loads(fake_s3.objects[OUT_KEY])
+    assert written["topics"][0]["safety_flags"] == topic["safety_flags"]
+    assert written["topics"][0]["action_items"] == topic["action_items"]
