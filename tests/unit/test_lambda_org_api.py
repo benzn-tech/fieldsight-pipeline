@@ -867,6 +867,38 @@ def test_live_items_response_passthrough_with_children(wired):
     assert body["topics"][0]["safety_observations"] == [{"id": "so-1", "observation": "loose rail"}]
 
 
+def test_live_items_payload_includes_findings_with_impact(wired):
+    """Task 5 of docs/superpowers/plans/2026-07-13-programme-impact-link.md:
+    /live-items needs ZERO route changes to expose findings -- it serializes
+    whatever topics.list_topics_for_date returns generically (no child
+    allowlist). This test pins that passthrough for the new `findings` key,
+    incl. the programme-impact columns (entity_name/programme_task_id/
+    impact_severity)."""
+    canned = [{
+        "id": "t-1", "site_id": "s-1", "site_name": "Alpha", "user_name": "Ada L",
+        "is_live": True, "source_s3_key": "extractions/Ada_L/2026-07-07/x.json",
+        "action_items": [], "safety_observations": [],
+        "findings": [{
+            "id": "f-1", "observation": "Missing edge protection",
+            "domain": "safety", "severity": "major",
+            "entity_name": "Acme Scaffolding", "entity_trade": "scaffolding",
+            "programme_task_id": "task-42", "impact_severity": "major",
+            "impact_task_name": "Level 3 Pour", "impact_note": "Blocks the pour",
+        }],
+    }]
+    wired.setattr(org.sites, "list_company_sites", lambda conn, cid, **kw: [{"id": "s-1"}])
+    wired.setattr(org.topics, "list_topics_for_date", lambda conn, site_ids, date: canned)
+    res = org.lambda_handler(make_event("GET", "/api/org/live-items",
+                                        params={"date": "2026-07-07"}), None)
+    assert res["statusCode"] == 200
+    body = body_of(res)
+    findings = body["topics"][0]["findings"]
+    assert findings == canned[0]["findings"]
+    assert findings[0]["entity_name"] == "Acme Scaffolding"
+    assert findings[0]["programme_task_id"] == "task-42"
+    assert findings[0]["impact_severity"] == "major"
+
+
 # ----------------------------------------------------------
 # /programme (S3-backed JSON blob; `site` is the org site's UUID, not a
 # slug — ACL mirrors list_live_items EXACTLY: admin/gm (ALL scope) via

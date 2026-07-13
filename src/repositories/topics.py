@@ -1,5 +1,7 @@
 from psycopg.rows import dict_row
 
+from repositories import findings
+
 _TOPIC_COLS = ("id, site_id, user_id, source_s3_key, report_date, occurred_at, "
                "category, title, summary, created_at")
 
@@ -120,6 +122,17 @@ def list_topics_for_date(conn, site_ids, report_date) -> list[dict]:
     True for session-sourced (not-yet-superseded) live extraction items,
     False for nightly-report-sourced items.
 
+    Also attaches `findings` (migration 0010, programme-impact-link plan
+    Task 5) via a THIRD batched child query -- same one-query-for-all-topics
+    shape as action_items/safety_observations above, using
+    repositories.findings.list_for_topics. Rows are exposed AS-IS (raw flat
+    columns: observation/domain/severity/entity_name/entity_trade/
+    programme_task_id/impact_severity/impact_note/impact_task_name/...).
+    NOTE: the design spec §4 sketches a nested `programme_impact: {task_id,
+    severity, note}` sub-object -- that reshape is a UI-phase mapping
+    concern, not a read-path one; consumers (e.g. /live-items) get the flat
+    columns straight off the `findings` table, same as every other child.
+
     Empty site_ids -> [] without a round-trip (mirrors sites.list_sites_by_ids)."""
     if not site_ids:
         return []
@@ -155,9 +168,14 @@ def list_topics_for_date(conn, site_ids, report_date) -> list[dict]:
     ).fetchall():
         safety_by_topic.setdefault(s["topic_id"], []).append(s)
 
+    findings_by_topic = {}
+    for f in findings.list_for_topics(conn, topic_ids):
+        findings_by_topic.setdefault(f["topic_id"], []).append(f)
+
     for t in topic_rows:
         t["action_items"] = action_items_by_topic.get(t["id"], [])
         t["safety_observations"] = safety_by_topic.get(t["id"], [])
+        t["findings"] = findings_by_topic.get(t["id"], [])
         t["is_live"] = bool(t["source_s3_key"]) and t["source_s3_key"].startswith("extractions/")
 
     return topic_rows
