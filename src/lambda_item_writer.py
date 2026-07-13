@@ -54,7 +54,7 @@ import boto3
 import lambda_ingest
 import match_request
 from db.connection import get_connection
-from repositories import companies, topics
+from repositories import companies, findings, topics
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -153,16 +153,37 @@ def write_extraction_items(date, user_folder, extraction_key):
                 action_items=mapped_action_items,
                 safety=lambda_ingest._map_safety(t.get("safety_flags")),
             )
+            # Task 2 (programme-impact-link plan) -- persist this topic's
+            # rich extraction findings in the SAME transaction as the topic
+            # upsert (inherits the I-3 advisory lock + I-4 supersession
+            # guard already established above). Legacy extraction JSON with
+            # no 'findings' key (pre-#46 extractions still in S3, and the
+            # report/ingest path which never has findings) -> t.get(...) or
+            # [] -> insert_findings returns [] -> zero rows, zero crash.
+            finding_rows = findings.insert_findings(
+                conn, row["id"], site["id"], t.get("findings") or [])
+
             # Snapshot for the match_requests/ artifact (Task 4) -- the
             # non-VPC MatcherFunction reads this, never Aurora directly, so
             # every field it needs (the durable topic id + the same
             # title/summary/action-item text just written) is captured here.
+            # The durable finding uuids are what the impact matcher (Task 4)
+            # will match against and the suggestion-writer (Task 3) will
+            # UPDATE by.
             collected_topics.append({
                 "topic_id": str(row["id"]),
                 "title": t.get("topic_title", ""),
                 "summary": t.get("summary"),
                 "user_id": str(user_id) if user_id is not None else None,
                 "action_items": [{"text": a["text"]} for a in mapped_action_items],
+                "findings": [{
+                    "finding_id": str(f["id"]),
+                    "observation": f["observation"],
+                    "domain": f["domain"],
+                    "severity": f["severity"],
+                    "entity_name": f["entity_name"],
+                    "entity_trade": f["entity_trade"],
+                } for f in finding_rows],
             })
             topics_n += 1
 
