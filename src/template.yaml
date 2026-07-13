@@ -1103,11 +1103,14 @@ Resources:
       FunctionName: !Sub ["${P}-programme-matcher", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_programme_matcher.lambda_handler
-      # 300s: above claude_utils' 150s HTTP timeout (call_claude), with
-      # headroom for multi-topic sequential work in one invocation (Fable
-      # review IMPORTANT #4 -- 120s left almost no room for more than one
-      # slow Claude call per invoke before the Lambda itself hard-kills it).
-      Timeout: 300
+      # 600s (bumped from 300 by the 2026-07-13 plan's Task 4): the impact
+      # phase adds a SECOND `claude_utils.call_claude` per topic (each up to
+      # claude_utils' 150s HTTP timeout), so a multi-topic artifact can now
+      # need up to ~2x the sequential Claude time it used to. 300s left
+      # headroom for one slow call per topic (Fable review IMPORTANT #4);
+      # doubling that per-topic cost while keeping room for several topics
+      # per invocation needs the doubled budget too.
+      Timeout: 600
       MemorySize: 256
       Environment:
         Variables:
