@@ -74,6 +74,22 @@ logger.setLevel(logging.INFO)
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 CONFIG_KEY = os.environ.get("CONFIG_KEY", "config/user_mapping.json")
 COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
+MULTI_TENANT = os.environ.get("MULTI_TENANT_RESOLUTION", "false") == "true"
+
+
+def resolve_company(conn, user_folder):
+    """Owning company for a lake object. MULTI_TENANT (prod stack): the
+    identity directory routes by globally-unique folder_name; unknown folders
+    fall back to the COMPANY_NAME pin (internal). Pinned (test stack):
+    develop-code runs can never write another company's rows."""
+    if MULTI_TENANT:
+        row = users.get_by_folder_name_global(conn, user_folder)
+        if row and row["company_id"]:
+            company = companies.get_company_by_id(conn, row["company_id"])
+            if company is not None:
+                return company
+    return companies.get_company_by_name(conn, COMPANY_NAME)
+
 
 REPORTS_PREFIX = "reports/"
 REPORT_KEY_RE = re.compile(r"^reports/([^/]+)/([^/]+)/daily_report\.json$")
@@ -269,7 +285,7 @@ def ingest_report(date, user_folder, report_key):
         return {"skipped": True, "reason": reason}
 
     with get_connection() as conn:
-        company = companies.get_company_by_name(conn, COMPANY_NAME)
+        company = resolve_company(conn, user_folder)
         if company is None:
             # Unseeded org DB would otherwise surface as an opaque
             # 'NoneType' subscript error on every report (Fable minor 6).
