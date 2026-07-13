@@ -302,7 +302,10 @@ Resources:
   # ----------------------------------------------------------
   StorageBucketPolicy:
     Type: AWS::S3::BucketPolicy
-    DeletionPolicy: Retain   # prod stack's DataBucketName is the LAKE — never strip its policy on stack delete
+    # prod stack's DataBucketName is the LAKE — never strip its hand-managed policy.
+    # Both policies required (cfn-lint W3011): Retain on delete AND on replace.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Condition: ShouldEnableTranscribe
     Properties:
       Bucket: !Ref DataBucketName
