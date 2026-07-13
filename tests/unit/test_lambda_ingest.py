@@ -640,3 +640,31 @@ def test_match_request_not_emitted_on_identity_skip(wired):
 
     assert result["skipped"] is True
     assert calls == []
+
+
+class TestResolveCompany:
+    """Task 2 (prod-isolation): resolve_company routes a lake object to its
+    owning company. Pinned (test stack) vs global-folder (prod stack)."""
+
+    def test_pinned_when_multi_tenant_off(self, monkeypatch):
+        monkeypatch.setattr(ing, "MULTI_TENANT", False)
+        monkeypatch.setattr(ing.users, "get_by_folder_name_global",
+                            lambda conn, f: (_ for _ in ()).throw(AssertionError("must not be called")))
+        monkeypatch.setattr(ing.companies, "get_company_by_name",
+                            lambda conn, name: {"id": "internal-co", "name": name})
+        assert ing.resolve_company(FakeConn(), "Cust_User")["id"] == "internal-co"
+
+    def test_global_folder_lookup_when_on(self, monkeypatch):
+        monkeypatch.setattr(ing, "MULTI_TENANT", True)
+        monkeypatch.setattr(ing.users, "get_by_folder_name_global",
+                            lambda conn, f: {"id": "u1", "company_id": "cust-co", "folder_name": f})
+        monkeypatch.setattr(ing.companies, "get_company_by_id",
+                            lambda conn, cid: {"id": cid, "name": "Pilot Co"})
+        assert ing.resolve_company(FakeConn(), "Cust_User")["id"] == "cust-co"
+
+    def test_falls_back_to_pin_on_unknown_folder(self, monkeypatch):
+        monkeypatch.setattr(ing, "MULTI_TENANT", True)
+        monkeypatch.setattr(ing.users, "get_by_folder_name_global", lambda conn, f: None)
+        monkeypatch.setattr(ing.companies, "get_company_by_name",
+                            lambda conn, name: {"id": "internal-co", "name": name})
+        assert ing.resolve_company(FakeConn(), "Legacy_Device")["id"] == "internal-co"

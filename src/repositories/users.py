@@ -42,6 +42,15 @@ def get_by_folder_name(conn, company_id, folder_name) -> dict | None:
     ).fetchone()
 
 
+def get_by_folder_name_global(conn, folder_name) -> dict | None:
+    """Cross-company folder lookup for the shared-lake pipeline (0012 makes
+    folder_name globally unique, so at most one row)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM users WHERE folder_name=%s",
+        (folder_name,),
+    ).fetchone()
+
+
 def upsert_field_only_user(conn, company_id, folder_name, first_name,
                            last_name, global_role) -> dict:
     """Enroll (or refresh) a non-login directory entry -- a field worker who

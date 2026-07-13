@@ -1,0 +1,125 @@
+name: Deploy FieldSight PROD (SAM)
+
+# ============================================================
+# main → fieldsight-prod stack (customer-facing) via full SAM deploy.
+# Approval-gated by the `production` GitHub environment.
+# Shares Aurora / RAG / the S3 lake with fieldsight-test — tenant
+# isolation is row-level (company_id/site). See
+# docs/superpowers/plans/2026-07-14-prod-isolation.md.
+# ============================================================
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'ui/**'
+      - 'frontend/**'
+      - 'tests/**'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-2
+
+jobs:
+  deploy-prod:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production       # required-reviewer approval gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/setup-sam@v2
+        with: { use-installer: true }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: PGPASSWORD-MATCH gate (rotation trap — do not deploy on mismatch)
+        run: |
+          set -e
+          DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
+          SECRET="$(aws secretsmanager get-secret-value --secret-id "$DB_SECRET_ARN" --query SecretString --output text | jq -r .password)"
+          LIVE="$(aws lambda get-function-configuration --function-name fieldsight-test-rag-search --query 'Environment.Variables.PGPASSWORD' --output text 2>/dev/null || echo NONE)"
+          if [ "$LIVE" != "NONE" ] && [ "$SECRET" != "$LIVE" ]; then
+            echo "::error::DB secret != live PGPASSWORD — the rotation trap is live. Resync before deploying (memory: fieldsight-db-password-rotation-trap)."; exit 1
+          fi
+          echo "MATCH"
+
+      - name: SAM validate
+        run: sam validate --template-file src/template.yaml --lint --region ${{ env.AWS_REGION }}
+
+      - name: SAM build
+        run: sam build --template-file src/template.yaml --base-dir .
+
+      # PREREQUISITE (Trap C / plan Task 5): this deploy creates StorageBucketPolicy,
+      # which does a WHOLESALE PutBucketPolicy on the lake (DataBucketName). The lake's
+      # live hand-managed policy MUST be reconciled into the template (Task 5) BEFORE the
+      # first promotion, or the deploy replaces it and drops statements. DeletionPolicy:
+      # Retain protects delete, not this update-time replace. Keep Task 5 merge-blocking.
+      - name: SAM deploy (PROD stack)
+        env:
+          REALPTT_ACCOUNT: ${{ secrets.REALPTT_ACCOUNT }}
+          REALPTT_PASSWORD: ${{ secrets.REALPTT_PASSWORD }}
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
+          FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
+        run: |
+          VPC="$(echo "$FARGATE_VPC_ID" | xargs)"
+          SUBNETS="$(echo "$FARGATE_SUBNET_IDS" | tr ',' ' ' | xargs | tr ' ' ',')"
+          DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
+          sam deploy --config-env prod \
+            --no-confirm-changeset --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              "Stage=prod" \
+              "DataBucketName=fieldsight-data-509194952652" \
+              "IngestBucketName=fieldsight-data-509194952652" \
+              "EnableSchedules=${{ vars.PROD_ENABLE_SCHEDULES || 'false' }}" \
+              "ItemsTableName=fieldsight-items" \
+              "ReportsTableName=fieldsight-reports" \
+              "AuditTableName=fieldsight-audit" \
+              "MultiTenantResolution=true" \
+              "VadLayerArn=${{ vars.PROD_VAD_LAYER_ARN }}" \
+              "DocxLayerArn=${{ vars.PROD_DOCX_LAYER_ARN }}" \
+              "RealPTTAccount=$REALPTT_ACCOUNT" \
+              "RealPTTPassword=$REALPTT_PASSWORD" \
+              "ClaudeApiKey=$CLAUDE_API_KEY" \
+              "DashScopeApiKey=$DASHSCOPE_API_KEY" \
+              "FargateSubnetIds=$SUBNETS" \
+              "FargateVpcId=$VPC" \
+              "DbStackName=fieldsight-db-test" \
+              "DbSubnetIds=subnet-082dd4480f7e20014,subnet-08b15b36113e542d4,subnet-05fb05613cf529121" \
+              "DbSecretArn=$DB_SECRET_ARN" \
+              "OrgUserPoolId=ap-southeast-2_q88pd6XXr"
+
+      - name: Apply DB migrations (fieldsight-prod-migrate — idempotent, shared schema_migrations)
+        run: |
+          set -e
+          RESP="$(aws lambda invoke --function-name fieldsight-prod-migrate \
+            --cli-binary-format raw-in-base64-out --payload '{}' \
+            /tmp/migrate-out.json --region ${{ env.AWS_REGION }})"
+          echo "invoke meta: $RESP"; cat /tmp/migrate-out.json; echo
+          if echo "$RESP" | grep -q '"FunctionError"'; then
+            echo "::error::MigrateFunction raised — see payload above"; exit 1
+          fi
+
+      - name: Wire LAKE S3 events (dry-run until PROD_WIRE_LAKE=true — Task 8 flips it)
+        env:
+          RETIRE_IDS: ${{ vars.PROD_RETIRE_IDS }}
+        run: |
+          if [ "${{ vars.PROD_WIRE_LAKE }}" = "true" ]; then
+            bash scripts/wire-s3-events.sh fieldsight-data-509194952652 prod ${{ env.AWS_REGION }} --apply
+          else
+            bash scripts/wire-s3-events.sh fieldsight-data-509194952652 prod ${{ env.AWS_REGION }}
+          fi
+
+      - name: Smoke test /api/health (PROD stack)
+        run: bash scripts/smoke-test.sh fieldsight-prod ${{ env.AWS_REGION }}

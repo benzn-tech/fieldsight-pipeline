@@ -14,3 +14,10 @@ def get_company_by_name(conn, name) -> dict | None:
         "SELECT id, name, industry, created_at FROM companies WHERE name=%s",
         (name,),
     ).fetchone()
+
+
+def get_company_by_id(conn, company_id) -> dict | None:
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, name, industry, created_at FROM companies WHERE id=%s",
+        (company_id,),
+    ).fetchone()

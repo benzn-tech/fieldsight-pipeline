@@ -118,7 +118,7 @@ def write_extraction_items(date, user_folder, extraction_key):
             logger.info("%s: %s", extraction_key, reason)
             return {"skipped": True, "reason": reason}
 
-        company = companies.get_company_by_name(conn, COMPANY_NAME)
+        company = lambda_ingest.resolve_company(conn, user_folder)
         if company is None:
             # Same guard + message as lambda_ingest.ingest_report (Fable
             # minor 6): an unseeded org DB would otherwise surface as an

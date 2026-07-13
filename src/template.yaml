@@ -19,11 +19,12 @@ Description: >
 # is a transform-generated resource we cannot attach a resource-level
 # ignore_checks Metadata to directly, so this is suppressed template-wide
 # instead (only 2 matches at time of writing, both from this pair).
-# Accepted because it is inert in practice: PROD is NOT deployed via SAM
-# (hand-assembled stack, see .github/workflows/deploy.yml header) and the
-# only real SAM deploy target (TEST, via CI) always passes DbStackName/
-# DbSecretArn/OrgUserPoolId together, so HasDb is always true wherever this
-# template is actually applied. AskAgentFunction is deliberately kept
+# Accepted because it is inert in practice: both real SAM deploy targets
+# (TEST via deploy.yml, and PROD=fieldsight-prod via deploy-prod.yml) always
+# pass DbStackName/DbSecretArn/OrgUserPoolId together, so HasDb is always
+# true wherever this template is actually applied. The legacy hand-built
+# fieldsight-* lambdas remain OUTSIDE CFN (never SAM-managed).
+# AskAgentFunction is deliberately kept
 # unconditional (not gated on HasDb) so its legacy S3-file Q&A mode keeps
 # working standalone if a future deploy target omits the DB.
 Metadata:
@@ -41,7 +42,7 @@ Parameters:
     Type: String
     Default: prod
     AllowedValues: [test, prod]
-    Description: Deployment stage. prod keeps legacy fieldsight-* names; test prefixes fieldsight-test-*.
+    Description: Deployment stage. prod deploys fieldsight-prod-*; test deploys fieldsight-test-*. Legacy hand-built fieldsight-* lambdas are NOT CFN-managed.
   EnableSchedules:
     Type: String
     Default: 'true'
@@ -250,13 +251,23 @@ Parameters:
       deploys are unaffected).
     Default: ''
 
+  MultiTenantResolution:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, ingest/item-writer resolve the owning company per user folder
+      via the identity directory (users.folder_name, globally unique). When
+      false, all pipeline writes are pinned to COMPANY_NAME's company — the
+      TEST stack keeps false so develop-code runs can never write customer rows.
+
 # ============================================================
 # Conditions
 # ============================================================
 Mappings:
   StageConfig:
     prod:
-      Prefix: fieldsight
+      Prefix: fieldsight-prod
     test:
       Prefix: fieldsight-test
 
@@ -291,6 +302,10 @@ Resources:
   # ----------------------------------------------------------
   StorageBucketPolicy:
     Type: AWS::S3::BucketPolicy
+    # prod stack's DataBucketName is the LAKE — never strip its hand-managed policy.
+    # Both policies required (cfn-lint W3011): Retain on delete AND on replace.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Condition: ShouldEnableTranscribe
     Properties:
       Bucket: !Ref DataBucketName
@@ -892,6 +907,7 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
+          MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
@@ -1012,6 +1028,7 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
+          MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
@@ -1264,7 +1281,7 @@ Resources:
   UserPoolDomain:
     Type: AWS::Cognito::UserPoolDomain
     Properties:
-      Domain: !Sub fieldsight-${AWS::AccountId}
+      Domain: !Sub ["${P}-${AWS::AccountId}", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       UserPoolId: !Ref UserPool
 
   # ==========================================================
@@ -1788,7 +1805,7 @@ Outputs:
 
   CognitoDomain:
     Description: Cognito hosted UI domain
-    Value: !Sub https://fieldsight-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com
+    Value: !Sub ["https://${P}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
 
   FargateClusterArn:
     Description: ECS Cluster for large file downloads

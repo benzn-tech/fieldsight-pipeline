@@ -27,7 +27,11 @@ REGION="${3:?missing region}"
 APPLY="${4:-}"
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-PREFIX="fieldsight"; [ "$STAGE" = "test" ] && PREFIX="fieldsight-test"
+case "$STAGE" in
+  test) PREFIX="fieldsight-test" ;;
+  prod) PREFIX="fieldsight-prod" ;;
+  *) echo "unknown stage '$STAGE' (test|prod)"; exit 1 ;;
+esac
 VAD_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-vad"
 TRANSCRIBE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-transcribe"
 INGEST_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-ingest"
@@ -141,9 +145,13 @@ CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --o
 [ -n "$CURRENT" ] || CURRENT='{}'
 
 # Keep every non-"fs-" lambda config + all SNS/SQS/EventBridge entries; replace our fs-* set.
-MERGED=$(jq -n --argjson cur "$CURRENT" --argjson des "$DESIRED" '
+# RETIRE_IDS: comma-separated non-"fs-" notification Ids to DROP in this same
+# atomic PUT (the legacy hand-named lake entries, e.g. vad-on-users). Default
+# empty = preserve all non-fs entries, exactly as before.
+RETIRE_JSON=$(jq -cn --arg s "${RETIRE_IDS:-}" '$s | split(",") | map(select(length > 0))')
+MERGED=$(jq -n --argjson cur "$CURRENT" --argjson des "$DESIRED" --argjson retire "$RETIRE_JSON" '
   ($cur.LambdaFunctionConfigurations // []) as $lam
-  | { LambdaFunctionConfigurations: (($lam | map(select(.Id | startswith("fs-") | not))) + $des) }
+  | { LambdaFunctionConfigurations: (($lam | map(select((.Id | startswith("fs-") | not) and (.Id as $i | $retire | index($i) | not)))) + $des) }
   + ( if $cur.TopicConfigurations    then {TopicConfigurations:    $cur.TopicConfigurations}    else {} end )
   + ( if $cur.QueueConfigurations    then {QueueConfigurations:    $cur.QueueConfigurations}    else {} end )
   + ( if $cur.EventBridgeConfiguration then {EventBridgeConfiguration: $cur.EventBridgeConfiguration} else {} end )

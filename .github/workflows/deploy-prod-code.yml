@@ -11,13 +11,12 @@ name: Deploy PROD Lambda code
 # ============================================================
 
 on:
-  workflow_dispatch:        # manual "Run workflow" button (Actions tab)
-  push:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'scripts/deploy-lambda-code.sh'
-      - '.github/workflows/deploy-prod-code.yml'
+  workflow_dispatch:        # legacy lambdas are FROZEN — manual escape hatch only.
+                            # Retired fully once the fieldsight-prod stack serves
+                            # customers (prod-isolation plan Task 14). The first
+                            # develop→main promotion carries this change, so GitHub
+                            # (which evaluates workflow files at the pushed commit)
+                            # will NOT trigger the old push-deploy on that merge.
 
 permissions:
   id-token: write
