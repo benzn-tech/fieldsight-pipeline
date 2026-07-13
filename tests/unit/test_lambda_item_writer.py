@@ -102,6 +102,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(iw.lambda_ingest, "resolve_user", lambda conn, cid, user_folder: None)
     monkeypatch.setattr(iw.topics, "delete_topics_for_source", lambda *a, **k: 0)
     monkeypatch.setattr(iw.topics, "upsert_topic", lambda *a, **k: {"id": "topic-uuid-0"})
+    monkeypatch.setattr(iw.findings, "insert_findings", lambda *a, **k: [])
     # match_request.emit does a real s3.put_object -- FakeS3 above only
     # implements get_object, so stub emit to a no-op by default here;
     # tests that care about the emit call override this explicitly.
@@ -340,6 +341,7 @@ def test_match_request_emitted_after_multi_topic_write(wired):
         "summary": "Discussed PPE requirements.",
         "user_id": None,
         "action_items": [{"text": "Order more hard hats"}],
+        "findings": [],
     }]
 
 
@@ -369,3 +371,120 @@ def test_match_request_not_emitted_on_zero_topics(wired):
 
     assert result == {"skipped": False, "topics": 0}
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Task 2 (programme-impact-link plan) — item-writer persists rich findings
+# to Aurora via repositories.findings.insert_findings, in the SAME
+# connection/transaction as the topic upsert, and carries the new finding
+# uuids in the match_requests/ artifact snapshot.
+# ---------------------------------------------------------------------------
+
+FINDINGS_PAYLOAD = [
+    {"observation": "Missing barrier tape at north stairwell", "domain": "safety",
+     "severity": "major", "entity": {"name": "ABC Scaffolding", "trade": "scaffolding"},
+     "recommended_action": "Install tape immediately"},
+    {"observation": "Slab pour running two days behind", "domain": "progress",
+     "severity": "minor", "entity": {"name": "ABC Concrete", "trade": "concrete"},
+     "recommended_action": None},
+]
+
+
+def test_writes_findings_rows_per_topic(wired):
+    conn_holder = {}
+    wired.setattr(iw, "get_connection",
+                  lambda *a, **k: conn_holder.setdefault("conn", FakeConn()))
+    wired.setattr(
+        iw, "_s3_client",
+        FakeS3({EXTRACTION_KEY: json.dumps(
+            make_extraction(topics=[{
+                **make_extraction()["topics"][0],
+                "findings": FINDINGS_PAYLOAD,
+            }]))}),
+    )
+    calls = []
+    wired.setattr(
+        iw.findings, "insert_findings",
+        lambda conn, topic_id, site_id, findings_list:
+            calls.append((conn, topic_id, site_id, findings_list)) or [],
+    )
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert len(calls) == 1
+    conn, topic_id, site_id, findings_list = calls[0]
+    # SAME connection as the topic upsert -- inherits the I-3 advisory lock
+    # and I-4 supersession-guard transaction.
+    assert conn is conn_holder["conn"]
+    assert topic_id == "topic-uuid-0"  # row["id"] from the stubbed upsert_topic
+    assert site_id == "site-1"         # site["id"] from the stubbed resolve_site
+    assert findings_list == FINDINGS_PAYLOAD
+
+
+def test_artifact_topics_carry_finding_ids(wired):
+    wired.setattr(
+        iw, "_s3_client",
+        FakeS3({EXTRACTION_KEY: json.dumps(
+            make_extraction(topics=[{
+                **make_extraction()["topics"][0],
+                "findings": FINDINGS_PAYLOAD,
+            }]))}),
+    )
+    wired.setattr(
+        iw.findings, "insert_findings",
+        lambda conn, topic_id, site_id, findings_list: [
+            {"id": "finding-uuid-1", "observation": "Missing barrier tape at north stairwell",
+             "domain": "safety", "severity": "major",
+             "entity_name": "ABC Scaffolding", "entity_trade": "scaffolding"},
+            {"id": "finding-uuid-2", "observation": "Slab pour running two days behind",
+             "domain": "progress", "severity": "minor",
+             "entity_name": "ABC Concrete", "entity_trade": "concrete"},
+        ],
+    )
+    emitted = []
+    wired.setattr(
+        iw.match_request, "emit",
+        lambda s3_client, bucket, site_id, report_date, source_key, topics:
+            emitted.append(topics) or "match_requests/site-1/2026-07-06/abc123.json",
+    )
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert len(emitted) == 1
+    topic_snapshot = emitted[0][0]
+    assert topic_snapshot["findings"] == [
+        {"finding_id": "finding-uuid-1", "observation": "Missing barrier tape at north stairwell",
+         "domain": "safety", "severity": "major",
+         "entity_name": "ABC Scaffolding", "entity_trade": "scaffolding"},
+        {"finding_id": "finding-uuid-2", "observation": "Slab pour running two days behind",
+         "domain": "progress", "severity": "minor",
+         "entity_name": "ABC Concrete", "entity_trade": "concrete"},
+    ]
+    # finding_id must be a str (the repo returns a uuid.UUID/asyncpg-style
+    # object in prod; the artifact is JSON so it must already be stringified).
+    assert all(isinstance(f["finding_id"], str) for f in topic_snapshot["findings"])
+
+
+def test_no_findings_key_still_works(wired):
+    # Legacy extraction JSON (pre-#46 extractions still in S3, and the
+    # report/ingest path which never carries findings) has no "findings"
+    # key on the topic at all -- must not crash, and insert_findings must
+    # be called with [] so the artifact still gets a "findings": [] key.
+    calls = []
+    wired.setattr(
+        iw.findings, "insert_findings",
+        lambda conn, topic_id, site_id, findings_list:
+            calls.append(findings_list) or [],
+    )
+    emitted = []
+    wired.setattr(
+        iw.match_request, "emit",
+        lambda s3_client, bucket, site_id, report_date, source_key, topics:
+            emitted.append(topics) or "match_requests/site-1/2026-07-06/abc123.json",
+    )
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 1}
+    assert calls == [[]]
+    assert emitted[0][0]["findings"] == []
