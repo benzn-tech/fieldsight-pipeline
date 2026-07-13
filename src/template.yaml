@@ -1802,7 +1802,7 @@ Outputs:
 
   CognitoDomain:
     Description: Cognito hosted UI domain
-    Value: !Sub https://fieldsight-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com
+    Value: !Sub ["https://${P}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
 
   FargateClusterArn:
     Description: ECS Cluster for large file downloads

@@ -17,6 +17,7 @@ on:
       - 'docs/**'
       - 'ui/**'
       - 'frontend/**'
+      - 'tests/**'
 
 permissions:
   id-token: write
@@ -58,6 +59,11 @@ jobs:
       - name: SAM build
         run: sam build --template-file src/template.yaml --base-dir .
 
+      # PREREQUISITE (Trap C / plan Task 5): this deploy creates StorageBucketPolicy,
+      # which does a WHOLESALE PutBucketPolicy on the lake (DataBucketName). The lake's
+      # live hand-managed policy MUST be reconciled into the template (Task 5) BEFORE the
+      # first promotion, or the deploy replaces it and drops statements. DeletionPolicy:
+      # Retain protects delete, not this update-time replace. Keep Task 5 merge-blocking.
       - name: SAM deploy (PROD stack)
         env:
           REALPTT_ACCOUNT: ${{ secrets.REALPTT_ACCOUNT }}

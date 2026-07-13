@@ -148,7 +148,7 @@ CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --o
 # RETIRE_IDS: comma-separated non-"fs-" notification Ids to DROP in this same
 # atomic PUT (the legacy hand-named lake entries, e.g. vad-on-users). Default
 # empty = preserve all non-fs entries, exactly as before.
-RETIRE_JSON=$(printf '%s' "${RETIRE_IDS:-}" | jq -R 'split(",") | map(select(length>0))')
+RETIRE_JSON=$(jq -cn --arg s "${RETIRE_IDS:-}" '$s | split(",") | map(select(length > 0))')
 MERGED=$(jq -n --argjson cur "$CURRENT" --argjson des "$DESIRED" --argjson retire "$RETIRE_JSON" '
   ($cur.LambdaFunctionConfigurations // []) as $lam
   | { LambdaFunctionConfigurations: (($lam | map(select((.Id | startswith("fs-") | not) and (.Id as $i | $retire | index($i) | not)))) + $des) }
