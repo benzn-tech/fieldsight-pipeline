@@ -74,20 +74,30 @@ def _match_request_event(key):
 
 
 def _clean_match_setup(monkeypatch, confidence=0.9, suggested_progress=100,
-                        progress_before=40, status_before="in_progress"):
+                        progress_before=40, status_before="in_progress",
+                        findings=None):
     """Wires a full clean-match handler scenario: one topic, one candidate
     task, embeddings that put them at cosine distance 0, and a Claude
     verdict picking that task. Returns (req_key, fake_lambda) so a test can
-    tweak `confidence`/etc. via the args and inspect the writer invoke."""
+    tweak `confidence`/etc. via the args and inspect the writer invoke.
+
+    `findings` (2026-07-13 plan, Task 4): when given, added as the topic's
+    "findings" list (mirrors the item-writer artifact contract); when None
+    (default), the topic has NO "findings" key at all, same as every
+    pre-Task-4 artifact and every report-path artifact -- exercises the
+    `.get(..., [])` backward-compat no-op."""
     req_key = "match_requests/site-1/2026-07-12/abc123.json"
+    topic = {
+        "topic_id": "topic-1", "title": "Steel frame progress",
+        "summary": "Crew finished the steel frame today.",
+        "user_id": "user-1", "action_items": [{"text": "close out steel frame"}],
+    }
+    if findings is not None:
+        topic["findings"] = findings
     req = {
         "site_id": "site-1", "report_date": "2026-07-12",
         "source_s3_key": "extractions/Benl1/2026-07-12/sess.json",
-        "topics": [{
-            "topic_id": "topic-1", "title": "Steel frame progress",
-            "summary": "Crew finished the steel frame today.",
-            "user_id": "user-1", "action_items": [{"text": "close out steel frame"}],
-        }],
+        "topics": [topic],
     }
     fake_s3 = FakeS3({req_key: json.dumps(req)})
     monkeypatch.setattr(lpm, "s3", lambda: fake_s3)
@@ -456,7 +466,7 @@ def test_handler_clean_match_produces_one_suggestion(monkeypatch):
 
     assert len(fake_lambda.invoke_calls) == 1
     sent = json.loads(fake_lambda.invoke_calls[0]["Payload"])
-    assert sent == {"suggestions": result["suggestions"]}
+    assert sent == {"suggestions": result["suggestions"], "impacts": result["impacts"]}
 
 
 def test_handler_below_threshold_produces_zero(monkeypatch):
@@ -573,4 +583,249 @@ def test_handler_progress_decrease_not_real_change(monkeypatch):
     result = lpm.lambda_handler(_match_request_event(req_key), None)
 
     assert result["suggestions"] == []
+    assert fake_lambda.invoke_calls == []
+
+
+# ---------------------------------------------------------------------------
+# build_impact_prompt / parse_impact_verdicts -- 2026-07-13 plan, Task 4
+# (programme-impact-link: finding -> task via a per-finding double-gate).
+# ---------------------------------------------------------------------------
+
+def test_impact_prompt_lists_findings_with_severity_prior():
+    topic = {"title": "Steel frame progress", "summary": "Crew finished the steel frame today."}
+    findings = [{
+        "finding_id": "F-1", "observation": "Delayed delivery of steel beams",
+        "domain": "progress", "severity": "major",
+        "entity_name": "SteelCo", "entity_trade": "Steel",
+    }]
+    candidates = [_task(task_id="T-1", name="Steel frame")]
+
+    prompt = lpm.build_impact_prompt(topic, findings, candidates)
+
+    assert "F-1" in prompt
+    assert "Delayed delivery of steel beams" in prompt
+    assert "major" in prompt
+    assert "your prior" in prompt  # severity labelled as extraction-stage prior
+    assert "SteelCo" in prompt
+    assert "Steel" in prompt
+    assert "T-1" in prompt
+
+
+def test_impact_verdict_rejects_nonsurvivor_for_that_finding():
+    # Finding A's own survivor set is {T-1}; finding B's is {T-2}. Claude
+    # picks T-2 for BOTH -- A's pick must be rejected (T-2 isn't in A's
+    # survivor set, even though it IS a valid pick for B).
+    raw = json.dumps({"impacts": [
+        {"finding_id": "F-A", "task_id": "T-2", "impact_severity": "major",
+         "note": "n", "confidence": 0.9},
+        {"finding_id": "F-B", "task_id": "T-2", "impact_severity": "minor",
+         "note": "n", "confidence": 0.9},
+    ]})
+    survivor_ids_by_finding = {"F-A": {"T-1"}, "F-B": {"T-2"}}
+    finding_severity_by_id = {"F-A": "minor", "F-B": "none"}
+
+    result = lpm.parse_impact_verdicts(raw, survivor_ids_by_finding, finding_severity_by_id, conf_min=0.70)
+
+    assert [r["finding_id"] for r in result] == ["F-B"]
+    assert result[0]["task_id"] == "T-2"
+
+
+def test_impact_verdict_bad_severity_falls_back_to_finding_severity():
+    raw = json.dumps({"impacts": [
+        {"finding_id": "F-1", "task_id": "T-1", "impact_severity": "catastrophic",
+         "note": "n", "confidence": 0.9},
+    ]})
+    result = lpm.parse_impact_verdicts(raw, {"F-1": {"T-1"}}, {"F-1": "minor"}, conf_min=0.70)
+    assert result[0]["impact_severity"] == "minor"
+
+    # Missing impact_severity entirely also falls back.
+    raw2 = json.dumps({"impacts": [
+        {"finding_id": "F-1", "task_id": "T-1", "note": "n", "confidence": 0.9},
+    ]})
+    result2 = lpm.parse_impact_verdicts(raw2, {"F-1": {"T-1"}}, {"F-1": "major"}, conf_min=0.70)
+    assert result2[0]["impact_severity"] == "major"
+
+
+def test_impact_verdict_confidence_gate_nan_and_range():
+    # NaN -- every comparison with NaN is False, so a one-sided
+    # `confidence < conf_min` check would let it through; the two-sided
+    # range guard (copied from parse_verdict) must not.
+    raw_nan = ('{"impacts": [{"finding_id": "F-1", "task_id": "T-1", '
+               '"impact_severity": "minor", "note": "n", "confidence": NaN}]}')
+    assert lpm.parse_impact_verdicts(raw_nan, {"F-1": {"T-1"}}, {"F-1": "minor"}, conf_min=0.70) == []
+
+    raw_high = json.dumps({"impacts": [
+        {"finding_id": "F-1", "task_id": "T-1", "impact_severity": "minor",
+         "note": "n", "confidence": 5.0},
+    ]})
+    assert lpm.parse_impact_verdicts(raw_high, {"F-1": {"T-1"}}, {"F-1": "minor"}, conf_min=0.70) == []
+
+    raw_low = json.dumps({"impacts": [
+        {"finding_id": "F-1", "task_id": "T-1", "impact_severity": "minor",
+         "note": "n", "confidence": 0.1},
+    ]})
+    assert lpm.parse_impact_verdicts(raw_low, {"F-1": {"T-1"}}, {"F-1": "minor"}, conf_min=0.70) == []
+
+    raw_ok = json.dumps({"impacts": [
+        {"finding_id": "F-1", "task_id": "T-1", "impact_severity": "minor",
+         "note": "n", "confidence": 0.85},
+    ]})
+    result = lpm.parse_impact_verdicts(raw_ok, {"F-1": {"T-1"}}, {"F-1": "minor"}, conf_min=0.70)
+    assert len(result) == 1
+    assert result[0]["confidence"] == 0.85
+
+
+def test_impact_verdict_unknown_finding_id_dropped():
+    # A finding_id Claude invented (or one that had zero embedding
+    # survivors and so was never in the prompt) drops just that element --
+    # the OTHER, valid element in the same batch must still be accepted.
+    raw = json.dumps({"impacts": [
+        {"finding_id": "F-UNKNOWN", "task_id": "T-1", "impact_severity": "minor",
+         "note": "n", "confidence": 0.9},
+        {"finding_id": "F-1", "task_id": "T-1", "impact_severity": "minor",
+         "note": "n", "confidence": 0.9},
+    ]})
+    result = lpm.parse_impact_verdicts(raw, {"F-1": {"T-1"}}, {"F-1": "minor"}, conf_min=0.70)
+    assert [r["finding_id"] for r in result] == ["F-1"]
+
+
+# ---------------------------------------------------------------------------
+# Handler -- impact phase adapter (2026-07-13 plan, Task 4).
+# ---------------------------------------------------------------------------
+
+def _dispatch_claude(impact_response):
+    """A call_claude stub that distinguishes the suggestion-phase prompt
+    from the impact-phase prompt by content: build_impact_prompt's finding
+    lines always contain "finding_id=", never present in build_prompt."""
+    def _dispatch(prompt, max_tokens=512):
+        if "finding_id=" in prompt:
+            return json.dumps(impact_response), None
+        return json.dumps({
+            "task_id": "T-1", "confidence": 0.9,
+            "suggested_status": "completed", "suggested_progress": 100,
+            "evidence": "finished the steel frame",
+        }), None
+    return _dispatch
+
+
+def test_handler_collects_impacts_and_invokes_writer_once(monkeypatch):
+    findings = [{
+        "finding_id": "F-1", "observation": "Steel delivery delayed",
+        "domain": "progress", "severity": "major",
+        "entity_name": "SteelCo", "entity_trade": "Steel",
+    }]
+    req_key, fake_lambda = _clean_match_setup(monkeypatch, findings=findings)
+    monkeypatch.setattr(claude_utils, "call_claude", _dispatch_claude({"impacts": [
+        {"finding_id": "F-1", "task_id": "T-1", "impact_severity": "major",
+         "note": "steel delayed", "confidence": 0.9},
+    ]}))
+
+    result = lpm.lambda_handler(_match_request_event(req_key), None)
+
+    assert len(result["suggestions"]) == 1
+    assert len(result["impacts"]) == 1
+    impact = result["impacts"][0]
+    assert impact["finding_id"] == "F-1"
+    assert impact["task_id"] == "T-1"
+    assert impact["impact_severity"] == "major"
+    assert impact["impact_note"] == "steel delayed"
+    assert impact["impact_task_name"] == "Steel frame"
+    assert impact["impact_evidence"]["finding_severity"] == "major"
+    assert impact["impact_evidence"]["llm_confidence"] == 0.9
+    assert impact["impact_evidence"]["programme_updated_at"] == "2026-07-10T00:00:00Z"
+
+    # ONE writer invoke carrying BOTH keys, after everything is processed.
+    assert len(fake_lambda.invoke_calls) == 1
+    sent = json.loads(fake_lambda.invoke_calls[0]["Payload"])
+    assert sent == {"suggestions": result["suggestions"], "impacts": result["impacts"]}
+
+
+def test_report_artifact_without_findings_skips_impact_phase(monkeypatch):
+    # No `findings` kwarg -> the topic has no "findings" key at all, same
+    # as a report-path artifact or a pre-Task-4 legacy artifact.
+    req_key, fake_lambda = _clean_match_setup(monkeypatch)
+    call_count = {"n": 0}
+
+    def counting_claude(prompt, max_tokens=512):
+        call_count["n"] += 1
+        return json.dumps({
+            "task_id": "T-1", "confidence": 0.9,
+            "suggested_status": "completed", "suggested_progress": 100,
+            "evidence": "finished the steel frame",
+        }), None
+
+    monkeypatch.setattr(claude_utils, "call_claude", counting_claude)
+
+    result = lpm.lambda_handler(_match_request_event(req_key), None)
+
+    assert result["impacts"] == []
+    assert len(result["suggestions"]) == 1
+    # Only the suggestion-phase call happened -- the impact phase no-op'd
+    # BEFORE ever calling Claude a second time.
+    assert call_count["n"] == 1
+
+
+def test_zero_survivor_finding_excluded_from_claude_call(monkeypatch):
+    findings = [
+        {"finding_id": "F-close", "observation": "close obs", "domain": "progress",
+         "severity": "minor", "entity_name": "A", "entity_trade": "B"},
+        {"finding_id": "F-far", "observation": "far obs", "domain": "progress",
+         "severity": "minor", "entity_name": "A", "entity_trade": "B"},
+    ]
+    req_key, fake_lambda = _clean_match_setup(monkeypatch, findings=findings)
+
+    # T-1's candidate name is "Steel frame"; give the far finding an
+    # orthogonal vector (cosine distance 1.0, > SIM_MAX_DIST=0.55) so it has
+    # ZERO survivors, while everything else (topic, candidate, close
+    # finding) stays at distance 0 via a shared vector.
+    def fake_embed(texts):
+        return [[0.0, 1.0] if t == "far obs" else [1.0, 0.0] for t in texts]
+
+    monkeypatch.setattr(lpm.dashscope_utils, "embed", fake_embed)
+
+    captured_prompts = []
+
+    def dispatch_and_capture(prompt, max_tokens=512):
+        captured_prompts.append(prompt)
+        if "finding_id=" in prompt:
+            return json.dumps({"impacts": [
+                {"finding_id": "F-close", "task_id": "T-1", "impact_severity": "minor",
+                 "note": "n", "confidence": 0.9},
+            ]}), None
+        return json.dumps({
+            "task_id": "T-1", "confidence": 0.9,
+            "suggested_status": "completed", "suggested_progress": 100,
+            "evidence": "finished the steel frame",
+        }), None
+
+    monkeypatch.setattr(claude_utils, "call_claude", dispatch_and_capture)
+
+    result = lpm.lambda_handler(_match_request_event(req_key), None)
+
+    impact_prompts = [p for p in captured_prompts if "finding_id=" in p]
+    assert len(impact_prompts) == 1
+    assert "F-close" in impact_prompts[0]
+    assert "F-far" not in impact_prompts[0]
+    assert [i["finding_id"] for i in result["impacts"]] == ["F-close"]
+
+
+def test_dry_run_returns_impacts_without_invoke(monkeypatch):
+    findings = [{
+        "finding_id": "F-1", "observation": "Steel delivery delayed",
+        "domain": "progress", "severity": "major",
+        "entity_name": "SteelCo", "entity_trade": "Steel",
+    }]
+    req_key, fake_lambda = _clean_match_setup(monkeypatch, findings=findings)
+    monkeypatch.setattr(claude_utils, "call_claude", _dispatch_claude({"impacts": [
+        {"finding_id": "F-1", "task_id": "T-1", "impact_severity": "major",
+         "note": "n", "confidence": 0.9},
+    ]}))
+
+    event = _match_request_event(req_key)
+    event["dry_run"] = True
+    result = lpm.lambda_handler(event, None)
+
+    assert result["dry_run"] is True
+    assert len(result["suggestions"]) == 1
+    assert len(result["impacts"]) == 1
     assert fake_lambda.invoke_calls == []
