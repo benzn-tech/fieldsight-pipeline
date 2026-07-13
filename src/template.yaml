@@ -268,8 +268,11 @@ Mappings:
   StageConfig:
     prod:
       Prefix: fieldsight-prod
+      Domain: fieldsight-prod       # hosted-UI domain (unused; SRP auth). Distinct from test to avoid the Trap-B collision.
     test:
       Prefix: fieldsight-test
+      Domain: fieldsight            # KEEP test's EXISTING domain (fieldsight-<acct>) — changing it forces a
+                                    # Cognito UserPoolDomain replacement, which fails (one domain per pool, InvalidRequest).
 
 Conditions:
   ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
@@ -1281,7 +1284,7 @@ Resources:
   UserPoolDomain:
     Type: AWS::Cognito::UserPoolDomain
     Properties:
-      Domain: !Sub ["${P}-${AWS::AccountId}", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      Domain: !Sub ["${D}-${AWS::AccountId}", {D: !FindInMap [StageConfig, !Ref Stage, Domain]}]
       UserPoolId: !Ref UserPool
 
   # ==========================================================
@@ -1805,7 +1808,7 @@ Outputs:
 
   CognitoDomain:
     Description: Cognito hosted UI domain
-    Value: !Sub ["https://${P}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+    Value: !Sub ["https://${D}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com", {D: !FindInMap [StageConfig, !Ref Stage, Domain]}]
 
   FargateClusterArn:
     Description: ECS Cluster for large file downloads
