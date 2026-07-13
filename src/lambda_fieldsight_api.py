@@ -1,5 +1,5 @@
 """
-Lambda: sitesync-api v2.0 — Backend API for SiteSync Frontend
+Lambda: sitesync-api v2.1 — Backend API for SiteSync Frontend
 
 Changes from v1.0:
 - ADD: Permission filtering — users only see their own data (admin sees all)
@@ -8,6 +8,16 @@ Changes from v1.0:
 - ADD: POST /api/actions/toggle — persist action item check/uncheck to DynamoDB
 - ADD: GET /api/actions — load persisted action states
 - CHANGE: /api/timeline auto-resolves user from JWT if not specified
+
+Changes from v2.0:
+- ADD: user-dimension audit key — optional `user_folder` (report OWNER's
+  folder, not caller) on POST /api/actions/toggle. Present → new SK
+  `USER#{user_folder}#TOPIC#{topic_id}#ACTION#{action_index}`; missing →
+  old SK `TOPIC#{topic_id}#ACTION#{action_index}` (old-frontend transition).
+- ADD: GET /api/actions now returns dual shape — `actions` (old collapsed
+  bare-key map, kept for old-frontend compat) AND `actions_v2` (composite
+  `{folder}|{topic_id}_{action_index}` keys for migrated records, bare
+  `{topic_id}_{action_index}` keys for not-yet-migrated legacy records).
 
 Routes:
   GET  /api/health                                    → health check (no auth)
@@ -19,8 +29,8 @@ Routes:
   GET  /api/users                                      → list all mapped users
   GET  /api/transcripts?date=YYYY-MM-DD&user=Name&start=HH:MM:SS&end=HH:MM:SS
   GET  /api/audio-segments?date=YYYY-MM-DD&user=Name&start=HH:MM:SS&end=HH:MM:SS
-  POST /api/actions/toggle                             → { date, topic_id, action_index, checked }
-  GET  /api/actions?date=YYYY-MM-DD                    → persisted action states
+  POST /api/actions/toggle                             → { date, topic_id, action_index, checked, user_folder? }
+  GET  /api/actions?date=YYYY-MM-DD                    → { date, actions, actions_v2 }
 
 Environment Variables:
     S3_BUCKET           fieldsight-data-509194952652
@@ -612,44 +622,62 @@ def toggle_action(body, caller):
     action_index = body.get('action_index', 0)
     is_checked = body.get('checked', True)
     action_text = body.get('action_text', '')
+    # user_folder = report OWNER's folder (not the caller — caller identity is
+    # already captured separately below as checked_by/unchecked_by). Optional:
+    # missing means an old-frontend write that hasn't been updated to send it
+    # yet, and falls back to the pre-migration SK so old clients keep working.
+    user_folder = body.get('user_folder')
     if not date:
         return error('Missing date')
+    if user_folder is not None and not (isinstance(user_folder, str) and re.fullmatch(r'[A-Za-z0-9_\-]{1,64}', user_folder)):
+        return error('Invalid user_folder')
     user_name = caller.get('display_name') or caller.get('name') or caller.get('email')
     now = datetime.utcnow().isoformat() + 'Z'
     table = dynamodb.Table(AUDIT_TABLE)
-    
+
     # Current state key
+    # user_folder present → USER#{folder}#TOPIC#{tid}#ACTION#{idx} (user-dimension
+    # audit key); user_folder missing → OLD TOPIC#{tid}#ACTION#{idx} (kept for
+    # old-frontend transition — see get_actions for the dual-shape read side).
     pk = f"ACTIONS#{date}"
-    sk = f"TOPIC#{topic_id}#ACTION#{action_index}"
-    
+    if user_folder:
+        sk = f"USER#{user_folder}#TOPIC#{topic_id}#ACTION#{action_index}"
+    else:
+        sk = f"TOPIC#{topic_id}#ACTION#{action_index}"
+
     # Audit log entry (append-only, never deleted)
     audit_pk = f"AUDIT#{date}"
     audit_sk = f"{now}#ACTION#{topic_id}#{action_index}"
-    
+
     try:
         # Write/update current state
         if is_checked:
             table.put_item(Item={'PK': pk, 'SK': sk, 'action_text': action_text,
-                                  'checked': True, 'checked_by': user_name, 'checked_at': now})
+                                  'checked': True, 'checked_by': user_name, 'checked_at': now,
+                                  'user_folder': user_folder or ''})
         else:
             table.put_item(Item={'PK': pk, 'SK': sk, 'action_text': action_text,
-                                  'checked': False, 'unchecked_by': user_name, 'unchecked_at': now})
-        
-        # Append audit log (immutable history)
+                                  'checked': False, 'unchecked_by': user_name, 'unchecked_at': now,
+                                  'user_folder': user_folder or ''})
+
+        # Append audit log (immutable history). SK unchanged — no reader consumes
+        # this log today; user_folder is carried for a future history endpoint.
         table.put_item(Item={
             'PK': audit_pk, 'SK': audit_sk,
             'action': 'check' if is_checked else 'uncheck',
             'topic_id': topic_id, 'action_index': action_index,
             'action_text': action_text,
             'user': user_name, 'timestamp': now,
+            'user_folder': user_folder or '',
         })
-        
+
         # Return the audit fields so the frontend can render "Checked by X ·
         # <time>" immediately on toggle, instead of waiting for a getActions
         # refetch (the bus emit reads res.checked_by / res.checked_at).
         return ok({'message': 'Updated', 'checked': is_checked,
                    'checked_by': user_name if is_checked else None,
-                   'checked_at': now if is_checked else None})
+                   'checked_at': now if is_checked else None,
+                   'user_folder': user_folder or None})
     except Exception as e:
         return error(f'Failed: {e}', 500)
 
@@ -661,15 +689,38 @@ def get_actions(params, caller):
     try:
         resp = table.query(KeyConditionExpression='PK = :pk', ExpressionAttributeValues={':pk': f"ACTIONS#{date}"})
         actions = {}
+        actions_v2 = {}
         for item in resp.get('Items', []):
             parts = item.get('SK', '').split('#')
-            if len(parts) >= 4:
-                actions[f"{parts[1]}_{parts[3]}"] = {
-                    'checked': item.get('checked', False),
-                    'checked_by': str(item.get('checked_by', '')),
-                    'checked_at': str(item.get('checked_at', '')),
-                }
-        return ok({'actions': actions, 'date': date})
+            audit = {
+                'checked': item.get('checked', False),
+                'checked_by': str(item.get('checked_by', '')),
+                'checked_at': str(item.get('checked_at', '')),
+            }
+            # idx can be numeric ('0'), 'flag_0'/'obs_0', or 'quality'; tid can be
+            # '-1' (observations). None of these contain '#', so the split above
+            # is safe — do not assume idx is numeric.
+            if parts[0] == 'USER' and len(parts) >= 6:
+                # New key: USER#{folder}#TOPIC#{tid}#ACTION#{idx}
+                folder, tid, idx = parts[1], parts[3], parts[5]
+                legacy_key = f"{tid}_{idx}"
+                v2_key = f"{folder}|{legacy_key}"
+            elif len(parts) >= 4:
+                # Old key: TOPIC#{tid}#ACTION#{idx} (pre-migration / old-frontend write)
+                tid, idx = parts[1], parts[3]
+                legacy_key = f"{tid}_{idx}"
+                v2_key = legacy_key
+            else:
+                continue
+            # Old collapsed shape — every record (old or new key) folds onto the
+            # bare key. Semantics == pre-migration behaviour, collisions included.
+            # Kept only for old-frontend compat during the transition window.
+            actions[legacy_key] = audit
+            # New per-owner shape — composite `{folder}|{tid}_{idx}` key for
+            # migrated/new records, bare `{tid}_{idx}` key (legacy fallback) for
+            # records not yet carrying a user_folder.
+            actions_v2[v2_key] = audit
+        return ok({'actions': actions, 'actions_v2': actions_v2, 'date': date})
     except Exception as e:
         return error(f'Failed: {e}', 500)
 
