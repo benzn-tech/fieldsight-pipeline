@@ -87,6 +87,21 @@ jobs:
               "DbSecretArn=$DB_SECRET_ARN" \
               "OrgUserPoolId=ap-southeast-2_q88pd6XXr"
 
+      - name: Apply DB migrations (invoke MigrateFunction, TEST)
+        # Idempotent: db/migrate.py only applies files not already recorded in
+        # the schema_migrations table, so re-running on every deploy is a no-op
+        # once caught up. Runs AFTER sam deploy so the function code is current.
+        run: |
+          set -e
+          RESP="$(aws lambda invoke --function-name fieldsight-test-migrate \
+            --cli-binary-format raw-in-base64-out --payload '{}' \
+            /tmp/migrate-out.json --region ${{ env.AWS_REGION }})"
+          echo "invoke meta: $RESP"
+          echo "payload:"; cat /tmp/migrate-out.json; echo
+          if echo "$RESP" | grep -q '"FunctionError"'; then
+            echo "::error::MigrateFunction raised — see payload above"; exit 1
+          fi
+
       - name: Wire S3 events (TEST bucket)
         run: bash scripts/wire-s3-events.sh fieldsight-data-test-509194952652 test ${{ env.AWS_REGION }} --apply
 

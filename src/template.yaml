@@ -739,6 +739,15 @@ Resources:
                 - s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/programmes/*
             - Effect: Allow
+              # Recordings upload: the org API issues presigned PUTs into
+              # users/{name}/{video|audio|pictures}/{date}/ for the mobile app
+              # (GrandTime). Presigning is offline, but the role must be able to
+              # PutObject there for the signed URL to be valid.
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/users/*
+            - Effect: Allow
               # Without ListBucket, S3 returns AccessDenied/403 (not
               # NoSuchKey/404) for a missing object under a prefix this
               # role can't list — read_programme would then re-raise a
