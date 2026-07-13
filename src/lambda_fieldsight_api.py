@@ -644,7 +644,12 @@ def toggle_action(body, caller):
             'user': user_name, 'timestamp': now,
         })
         
-        return ok({'message': 'Updated', 'checked': is_checked})
+        # Return the audit fields so the frontend can render "Checked by X ·
+        # <time>" immediately on toggle, instead of waiting for a getActions
+        # refetch (the bus emit reads res.checked_by / res.checked_at).
+        return ok({'message': 'Updated', 'checked': is_checked,
+                   'checked_by': user_name if is_checked else None,
+                   'checked_at': now if is_checked else None})
     except Exception as e:
         return error(f'Failed: {e}', 500)
 
