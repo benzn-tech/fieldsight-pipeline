@@ -126,11 +126,12 @@ def test_list_topics_for_date_joins_and_children_and_is_live():
         [topic_report, topic_live],   # main topics query
         [action_row],                 # action_items children
         [safety_row],                 # safety_observations children
+        [],                           # findings children
     ])
 
     rows = topics.list_topics_for_date(conn, ["site-1", "site-2"], "2026-07-06")
 
-    assert len(conn.calls) == 3
+    assert len(conn.calls) == 4
     main_sql, main_params = conn.calls[0]["sql"], conn.calls[0]["params"]
     assert "site_id = ANY(%s)" in main_sql
     assert "report_date=%s" in main_sql
@@ -138,20 +139,79 @@ def test_list_topics_for_date_joins_and_children_and_is_live():
     assert "LEFT JOIN users" in main_sql
     assert main_params == (["site-1", "site-2"], "2026-07-06")
 
-    # both children queries scoped to the topic ids the main query returned
+    # all three children queries scoped to the topic ids the main query returned
     assert conn.calls[1]["params"] == (["t-1", "t-2"],)
     assert conn.calls[2]["params"] == (["t-1", "t-2"],)
+    assert conn.calls[3]["params"] == (["t-1", "t-2"],)
     assert "action_items" in conn.calls[1]["sql"]
     assert "safety_observations" in conn.calls[2]["sql"]
+    assert "findings" in conn.calls[3]["sql"]
 
     by_id = {r["id"]: r for r in rows}
     assert by_id["t-2"]["action_items"] == [action_row]
     assert by_id["t-2"]["safety_observations"] == []
     assert by_id["t-1"]["safety_observations"] == [safety_row]
     assert by_id["t-1"]["action_items"] == []
+    assert by_id["t-1"]["findings"] == []
+    assert by_id["t-2"]["findings"] == []
 
     assert by_id["t-1"]["is_live"] is False
     assert by_id["t-2"]["is_live"] is True
+
+
+def test_list_topics_attaches_findings_batched():
+    """Task 5 of docs/superpowers/plans/2026-07-13-programme-impact-link.md:
+    findings (migration 0010, incl. programme-impact columns) are attached
+    to topics as a THIRD batched child query, mirroring action_items/safety.
+    ONE query for ALL topics regardless of how many topics are returned --
+    no N+1 (the FakeConn queue model makes this assertable: an N+1
+    implementation would issue an extra execute() per topic, desyncing the
+    results queue and the call count below)."""
+    topic_a = {
+        "id": "t-1", "site_id": "site-1", "user_id": "u-1",
+        "source_s3_key": "extractions/Jarley_Trainor/2026-07-06/x.json",
+        "report_date": "2026-07-06", "occurred_at": None, "category": "safety",
+        "title": "T1", "summary": "s", "created_at": "c0",
+        "site_name": "Test Site", "user_name": "Jarley Trainor",
+    }
+    topic_b = {**topic_a, "id": "t-2", "title": "T2"}
+    topic_c = {**topic_a, "id": "t-3", "title": "T3"}
+    finding_row = {
+        "id": "f-1", "topic_id": "t-1", "site_id": "site-1",
+        "observation": "Missing edge protection", "domain": "safety", "severity": "major",
+        "entity_name": "Acme Scaffolding", "entity_trade": "scaffolding",
+        "recommended_action": "Install edge protection",
+        "programme_task_id": "task-42", "impact_severity": "major",
+        "impact_note": "Blocks the Level 3 pour", "impact_task_name": "Level 3 Pour",
+        "impact_evidence": {}, "impact_matched_at": "c3",
+        "status": "open", "created_at": "c3",
+    }
+
+    conn = FakeConn(results=[
+        [topic_a, topic_b, topic_c],  # main topics query (THREE topics)
+        [],                           # action_items children
+        [],                           # safety_observations children
+        [finding_row],                # findings children -- ONE query, all topics
+    ])
+
+    rows = topics.list_topics_for_date(conn, ["site-1"], "2026-07-06")
+
+    # exactly 4 execute() calls total for 3 topics: main + 3 batched children.
+    # An N+1 findings implementation would need 3 extra calls (one per topic) -> 6.
+    assert len(conn.calls) == 4
+    findings_sql, findings_params = conn.calls[3]["sql"], conn.calls[3]["params"]
+    assert "FROM findings" in findings_sql
+    assert "topic_id = ANY(%s)" in findings_sql
+    assert findings_params == (["t-1", "t-2", "t-3"],)  # one batched call, all topic ids
+
+    by_id = {r["id"]: r for r in rows}
+    assert by_id["t-1"]["findings"] == [finding_row]
+    assert by_id["t-2"]["findings"] == []
+    assert by_id["t-3"]["findings"] == []
+    # raw flat columns, incl. programme-impact fields, exposed as-is
+    assert by_id["t-1"]["findings"][0]["entity_name"] == "Acme Scaffolding"
+    assert by_id["t-1"]["findings"][0]["programme_task_id"] == "task-42"
+    assert by_id["t-1"]["findings"][0]["impact_severity"] == "major"
 
 
 def test_list_topics_for_date_no_topics_skips_children_queries():

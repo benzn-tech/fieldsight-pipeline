@@ -570,3 +570,35 @@ Parameters:
 **日志零输出**(看起来像函数本身挂了)。**Fix**: 凭据在部署时经 CloudFormation 动态引用注入
 (`PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'`,ARN 走
 Parameter 而非 ImportValue);或为所需服务加 VPC interface endpoint。运行时零外呼是首选。
+
+---
+
+## Aurora item store — findings + programme-impact (2026-07-13/14)
+
+背景见 `docs/superpowers/specs/2026-07-13-unified-extraction-labeling-design.md` +
+`docs/superpowers/plans/2026-07-13-programme-impact-link.md`（Tasks 1-5，全部已上 TEST）。
+
+- **`findings` 表（migration 0010）**：每个 topic 的富提取项（`observation`/`domain`/
+  `severity`/`entity_name`/`entity_trade`/`recommended_action`），加上 programme-impact
+  列（`programme_task_id`/`impact_severity`/`impact_note`/`impact_task_name`/
+  `impact_evidence`/`impact_matched_at`）—— impact 是 finding 行上的列，不是第二张
+  link 表（spec §9 的约束）。
+- **`match_requests/` artifact v2**：item-writer 现在把每个 topic 的 `findings[]`
+  （含 durable uuid）一并塞进它本来就在发的 artifact 里；matcher 复用已有的候选门/
+  embedding 批次，多打一次 Claude 调用产出 finding→task 的 impact 判定；in-VPC
+  writer 用 `findings.apply_impact` 落库。matcher 本身仍是 non-VPC（BUG-36）。
+- **同日有效（same-day-only），直到 authority flip（spec §6 / plan Task 4，尚未实现）**：
+  findings + impact 链接挂在 PROVISIONAL 的 extraction topics 上，05:00 nightly cron
+  (`lambda_ingest.py` `delete_topics_for_source_prefix("extractions/…")`) 会把当天的
+  session-level topics 连同 findings/impacts 一起级联删除。report-path
+  （`daily_report.json` → item-writer）目前不产生 findings，所以过了当天，
+  impact 信号就消失，直到 authority flip 落地（停掉夜间覆盖）才会变成持久化。
+  验证 `/live-items` 的 findings 必须在当天 05:00 NZDT 之前做。
+- **D8 过渡期双写**：safety 域的 finding 现在同时落两个地方——旧的
+  `safety_observations`（PR #46 `_derive_safety_flags` 桥接，`rollup.py` 仍读这张表）
+  和新的 `findings`（0010）。这是刻意的过渡态，不去重；authority flip 落地后再退役
+  桥接（届时 `rollup.py` 要先切到读 `findings`，否则 rollup 计数会静默归零）。
+- **读路径**：`repositories/topics.py` `list_topics_for_date` 现在用第三个批量子查询
+  （`ANY(%s)`，一次查全部 topic，不是 N+1，镜像 action_items/safety_observations 的写法）
+  把 `findings` 挂到每个 topic 上；`/live-items`（`lambda_org_api.py`）零改动就能透传
+  ——它本来就是通用序列化，没有 child allowlist。
