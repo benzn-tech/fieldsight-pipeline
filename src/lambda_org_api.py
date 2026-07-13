@@ -43,6 +43,7 @@ from datetime import datetime, timedelta, timezone
 
 import boto3
 from botocore.exceptions import ClientError
+from psycopg.errors import UniqueViolation
 
 from db.connection import get_connection
 from repositories import (memberships, observations, programme, programme_suggestions,
@@ -260,14 +261,24 @@ def create_recording_upload_url(conn, caller, body):
         display_name = caller.get("folder_name") or \
             f"{caller.get('first_name', '')}_{caller.get('last_name', '')}"
         key = _recording_s3_key(display_name, kind, started_at, file_name)
-        row = recordings.insert_pending(
-            conn, company_id=caller["company_id"], user_id=caller["id"], site_id=site_id,
-            kind=kind, s3_key=key, client_uuid=client_uuid, started_at=started_at,
-            ended_at=body.get("endedAt"), duration_s=body.get("durationS"),
-            resolution=body.get("resolution"), codec=body.get("codec"),
-            size_bytes=body.get("sizeBytes"),
-        )
-        rec_id = row["id"]
+        try:
+            with conn.transaction():          # savepoint: on failure, roll back to here so conn stays usable
+                row = recordings.insert_pending(
+                    conn, company_id=caller["company_id"], user_id=caller["id"], site_id=site_id,
+                    kind=kind, s3_key=key, client_uuid=client_uuid, started_at=started_at,
+                    ended_at=body.get("endedAt"), duration_s=body.get("durationS"),
+                    resolution=body.get("resolution"), codec=body.get("codec"),
+                    size_bytes=body.get("sizeBytes"),
+                )
+            rec_id = row["id"]
+        except UniqueViolation:
+            # Either a concurrent request with the same clientUuid (idempotent → return the existing row),
+            # or a genuine s3_key collision (different recording, same key) → 409.
+            dup = recordings.get_by_client_uuid(conn, caller["id"], client_uuid)
+            if dup is not None:
+                rec_id, key = dup["id"], dup["s3_key"]
+            else:
+                return error("a recording with this s3 key already exists", 409)
 
     url = s3().generate_presigned_url(
         "put_object",

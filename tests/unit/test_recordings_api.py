@@ -1,8 +1,17 @@
 import json
 
 import pytest
+from psycopg.errors import UniqueViolation
 
 org = pytest.importorskip("lambda_org_api", reason="requires psycopg (installed in CI)")
+
+
+class _NoopCtx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
 
 
 class FakeConn:
@@ -11,6 +20,12 @@ class FakeConn:
 
     def __exit__(self, *a):
         return False
+
+    def transaction(self):
+        # Real psycopg conn.transaction() opens a savepoint; the fake just
+        # needs to be a no-op context manager so `with conn.transaction():`
+        # works in the code under test.
+        return _NoopCtx()
 
 
 class FakeS3:
@@ -98,6 +113,56 @@ def test_upload_url_idempotent_on_client_uuid(wired):
     b = body_of(res)
     assert b["recordingId"] == "rec-existing" and called["insert"] is False
     assert b["s3Key"] == "users/Ada_L/video/2026-07-13/old.mp4"
+
+
+def test_upload_url_duplicate_clientuuid_via_race_returns_existing(wired):
+    # First get_by_client_uuid call (pre-insert check) finds nothing, so the
+    # handler takes the insert path; insert_pending then hits a concurrent
+    # request's row and raises UniqueViolation; the handler re-queries
+    # (second get_by_client_uuid call) and must return the row that won the
+    # race, 200, idempotently — no 500.
+    mp, fake = wired
+    lookups = [None, {"id": "rec-won-race", "s3_key": "users/Ada_L/video/2026-07-13/race.mp4"}]
+
+    def fake_get_by_client_uuid(conn, user_id, client_uuid):
+        return lookups.pop(0)
+
+    def fake_insert_pending(conn, **kw):
+        raise UniqueViolation("duplicate key value violates unique constraint")
+
+    mp.setattr(org.recordings, "get_by_client_uuid", fake_get_by_client_uuid)
+    mp.setattr(org.recordings, "insert_pending", fake_insert_pending)
+
+    res = org.lambda_handler(make_event("POST", "/api/org/recordings/upload-url", body={
+        "kind": "video", "clientUuid": "cap-race", "siteId": None,
+        "fileName": "race.mp4", "contentType": "video/mp4",
+        "startedAt": "2026-07-13T16:01:58Z"}), None)
+
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["recordingId"] == "rec-won-race"
+    assert b["s3Key"] == "users/Ada_L/video/2026-07-13/race.mp4"
+    assert lookups == []  # both lookups consumed
+
+
+def test_upload_url_s3key_collision_returns_409(wired):
+    # insert_pending hits a genuine s3_key collision (different recording,
+    # same key) — the re-query for this caller's clientUuid finds nothing,
+    # so it's not a race with self; must return 409, not 500.
+    mp, fake = wired
+    mp.setattr(org.recordings, "get_by_client_uuid", lambda c, u, cu: None)
+
+    def fake_insert_pending(conn, **kw):
+        raise UniqueViolation("duplicate key value violates unique constraint")
+
+    mp.setattr(org.recordings, "insert_pending", fake_insert_pending)
+
+    res = org.lambda_handler(make_event("POST", "/api/org/recordings/upload-url", body={
+        "kind": "video", "clientUuid": "cap-collide", "siteId": None,
+        "fileName": "collide.mp4", "contentType": "video/mp4",
+        "startedAt": "2026-07-13T16:01:58Z"}), None)
+
+    assert res["statusCode"] == 409
 
 
 def test_site_from_other_company_rejected(wired):
