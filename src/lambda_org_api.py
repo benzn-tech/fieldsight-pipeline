@@ -46,7 +46,7 @@ from botocore.exceptions import ClientError
 
 from db.connection import get_connection
 from repositories import (memberships, observations, programme, programme_suggestions,
-                          rollup, sites, topics, users)
+                          recordings, rollup, sites, topics, users)
 from repositories.acl import resolve_scope
 
 logger = logging.getLogger()
@@ -62,6 +62,8 @@ ALLOWED_MEMBERSHIP_ROLES = {"pm", "site_manager", "worker"}
 ALLOWED_OBSERVATION_KINDS = {"safety", "quality"}
 ALLOWED_RISK_LEVELS = {"low", "medium", "high"}
 ALLOWED_OBSERVATION_STATUS = {"open", "closed"}
+RECORDING_KINDS = {"video", "audio", "photo"}
+_KIND_FOLDER = {"video": "video", "audio": "audio", "photo": "pictures"}
 
 _s3_client = None
 _cognito_client = None
@@ -203,7 +205,84 @@ def dispatch(conn, event, method, route):
     if m_sr and method == "POST":
         return reject_suggestion(conn, caller, m_sr.group(1))
 
+    if route == "/recordings/upload-url" and method == "POST":
+        return create_recording_upload_url(conn, caller, parse_body(event))
+    m_rc = re.match(r"^/recordings/([^/]+)/complete$", route)
+    if m_rc and method == "POST":
+        return complete_recording(conn, caller, m_rc.group(1), parse_body(event))
+
     return error("not found", 404)
+
+
+# ----------------------------------------------------------
+# /recordings — mobile app (GrandTime) media upload + metadata
+# ----------------------------------------------------------
+def _safe_seg(s):
+    # Conservative S3 path-segment cleanse: non [alnum . _ -] -> underscore
+    # (re is imported at module top).
+    return re.sub(r"[^A-Za-z0-9._-]", "_", (s or "").strip()) or "unknown"
+
+
+def _recording_s3_key(display_name, kind, started_at, file_name):
+    # Mirror the existing users/{name}/{video|audio|pictures}/{date}/{file}
+    # convention so the downstream transcribe/report pipeline consumes app
+    # uploads unchanged (site attribution lives in the recordings row, not the key).
+    date_str = str(started_at)[:10]  # ISO 'YYYY-MM-DD...' -> 'YYYY-MM-DD'
+    folder = _KIND_FOLDER[kind]
+    return f"users/{_safe_seg(display_name)}/{folder}/{date_str}/{_safe_seg(file_name)}"
+
+
+def create_recording_upload_url(conn, caller, body):
+    if body is None:
+        return error("malformed JSON body", 400)
+    kind = body.get("kind")
+    if kind not in RECORDING_KINDS:
+        return error(f"kind must be one of {sorted(RECORDING_KINDS)}", 400)
+    client_uuid = body.get("clientUuid")
+    file_name = body.get("fileName")
+    content_type = body.get("contentType")
+    started_at = body.get("startedAt")
+    if not (client_uuid and file_name and content_type and started_at):
+        return error("clientUuid, fileName, contentType, startedAt are required", 400)
+
+    site_id = body.get("siteId")
+    if site_id:
+        site = sites.get_site(conn, site_id)
+        if site is None or site["company_id"] != caller["company_id"]:
+            return error("site not accessible", 403)
+
+    # Idempotent on the device-side capture id: a resend (retry) reuses the
+    # existing row and just re-signs a fresh URL, never creating a duplicate.
+    existing = recordings.get_by_client_uuid(conn, caller["id"], client_uuid)
+    if existing is not None:
+        rec_id, key = existing["id"], existing["s3_key"]
+    else:
+        display_name = caller.get("folder_name") or \
+            f"{caller.get('first_name', '')}_{caller.get('last_name', '')}"
+        key = _recording_s3_key(display_name, kind, started_at, file_name)
+        row = recordings.insert_pending(
+            conn, company_id=caller["company_id"], user_id=caller["id"], site_id=site_id,
+            kind=kind, s3_key=key, client_uuid=client_uuid, started_at=started_at,
+            ended_at=body.get("endedAt"), duration_s=body.get("durationS"),
+            resolution=body.get("resolution"), codec=body.get("codec"),
+            size_bytes=body.get("sizeBytes"),
+        )
+        rec_id = row["id"]
+
+    url = s3().generate_presigned_url(
+        "put_object",
+        Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": content_type},
+        ExpiresIn=PRESIGNED_URL_EXPIRY,
+    )
+    return ok({"recordingId": rec_id, "uploadUrl": url, "s3Key": key})
+
+
+def complete_recording(conn, caller, rec_id, body):
+    size_bytes = (body or {}).get("sizeBytes")
+    row = recordings.mark_uploaded(conn, rec_id, caller["company_id"], size_bytes)
+    if row is None:
+        return error("recording not found", 404)
+    return ok({"ok": True})
 
 
 # ----------------------------------------------------------
