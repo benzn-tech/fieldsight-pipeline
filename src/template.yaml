@@ -261,6 +261,18 @@ Parameters:
       false, all pipeline writes are pinned to COMPANY_NAME's company — the
       TEST stack keeps false so develop-code runs can never write customer rows.
 
+  ManageDataBucketPolicy:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether this stack CREATES/owns the DataBucketName bucket policy. TEST
+      owns its own test bucket's policy (true). PROD points at the shared LAKE,
+      which already has a hand-managed policy (the 2 Transcribe statements) —
+      CFN's AWS::S3::BucketPolicy CREATE fails ("already exists") when adopting
+      an unmanaged policy, so PROD sets this false and relies on the lake's
+      existing policy.
+
 # ============================================================
 # Conditions
 # ============================================================
@@ -277,6 +289,7 @@ Mappings:
 Conditions:
   ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
   ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
+  ShouldManageBucketPolicy: !And [!Condition ShouldEnableTranscribe, !Equals [!Ref ManageDataBucketPolicy, 'true']]
   ShouldCreateAlerts: !Not [!Equals [!Ref AlertEmail, '']]
   HasVadLayer: !Not [!Equals [!Ref VadLayerArn, '']]
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
@@ -309,7 +322,7 @@ Resources:
     # Both policies required (cfn-lint W3011): Retain on delete AND on replace.
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
-    Condition: ShouldEnableTranscribe
+    Condition: ShouldManageBucketPolicy
     Properties:
       Bucket: !Ref DataBucketName
       PolicyDocument:
