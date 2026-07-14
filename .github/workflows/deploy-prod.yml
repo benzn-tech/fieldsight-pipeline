@@ -87,6 +87,7 @@ jobs:
               "ReportsTableName=fieldsight-reports" \
               "AuditTableName=fieldsight-audit" \
               "MultiTenantResolution=true" \
+              "ManageDataBucketPolicy=false" \
               "VadLayerArn=${{ vars.PROD_VAD_LAYER_ARN }}" \
               "DocxLayerArn=${{ vars.PROD_DOCX_LAYER_ARN }}" \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
