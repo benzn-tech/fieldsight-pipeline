@@ -72,6 +72,7 @@ jobs:
             --parameter-overrides \
               "Stage=test" \
               "DataBucketName=fieldsight-data-test-509194952652" \
+              "IngestBucketName=fieldsight-data-test-509194952652" \
               "EnableSchedules=false" \
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
