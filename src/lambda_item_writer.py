@@ -152,6 +152,7 @@ def write_extraction_items(date, user_folder, extraction_key):
                 category=t.get("category"), summary=t.get("summary"),
                 action_items=mapped_action_items,
                 safety=lambda_ingest._map_safety(t.get("safety_flags")),
+                time_range=t.get("time_range"), participants=t.get("participants"),
             )
             # Task 2 (programme-impact-link plan) -- persist this topic's
             # rich extraction findings in the SAME transaction as the topic

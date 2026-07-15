@@ -202,7 +202,10 @@ def _map_action_items(items):
     is free text ('EOD', 'Tomorrow 08:00', ...) per lambda_report_generator's
     schema, but the column is a SQL date -- only pass through values that
     already look like an ISO date, else drop to NULL rather than have a
-    real ingest 500 on a strptime-hostile string."""
+    real ingest 500 on a strptime-hostile string. 'deadline_text' (migration
+    0011, authority-flip) carries that SAME raw string verbatim -- including
+    non-ISO free text the 'deadline' column drops -- so the display layer
+    never loses "EOD"/"Tomorrow 08:00"/etc just because it isn't a SQL date."""
     out = []
     for a in items or []:
         deadline = a.get("deadline")
@@ -212,6 +215,7 @@ def _map_action_items(items):
             "text": a.get("action", ""),
             "responsible": a.get("responsible"),
             "deadline": deadline,
+            "deadline_text": a.get("deadline"),
             "priority": a.get("priority"),
         })
     return out
@@ -322,6 +326,7 @@ def ingest_report(date, user_folder, report_key):
                 category=t.get("category"), summary=t.get("summary"),
                 action_items=mapped_action_items,
                 safety=_map_safety(t.get("safety_flags")),
+                time_range=t.get("time_range"), participants=t.get("participants"),
             )
             # None keys stay out of the map: a literal "topic_id": null topic
             # must not adopt the unassigned transcript windows (Fable minor 1).
