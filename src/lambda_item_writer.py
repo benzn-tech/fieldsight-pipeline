@@ -55,6 +55,7 @@ import lambda_ingest
 import match_request
 from db.connection import get_connection
 from repositories import companies, findings, topics
+from transcript_utils import extract_base_time_from_filename
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -88,6 +89,104 @@ def _parse_extraction_key(key):
 
 
 # ----------------------------------------------------------
+# Task 3 (authority-flip plan) -- time-correlated photo attach.
+# Mirrors lambda_report_generator's photo correlation
+# (correlate_photos_with_transcripts, lambda_report_generator.py:386-402),
+# which reads photos from users/{user}/pictures/{date}/ -- but keyed on
+# each topic's own 'HH:MM – HH:MM' time_range display window instead of
+# nearest-transcript proximity.
+# ----------------------------------------------------------
+
+PHOTOS_PER_TOPIC_CAP = 5  # report-generator parity (related[:5], :402)
+
+# En-dash time_range, e.g. "10:00 – 10:05" (exactly what topics.upsert_topic
+# callers already write -- see make_extraction() fixtures in the test file
+# and lambda_ingest's own report topic fixtures).
+_TIME_RANGE_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*–\s*(\d{1,2}):(\d{2})$")
+
+
+def _hhmm_to_minutes(hhmm):
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def _parse_time_range(time_range):
+    """'HH:MM – HH:MM' -> (start_minutes, end_minutes), or None if
+    time_range is missing/unparseable (never raises -- callers treat 'no
+    range' as 'no photos', not an error)."""
+    if not time_range:
+        return None
+    m = _TIME_RANGE_RE.match(time_range.strip())
+    if not m:
+        return None
+    start_h, start_m, end_h, end_m = m.groups()
+    return int(start_h) * 60 + int(start_m), int(end_h) * 60 + int(end_m)
+
+
+def _photos_for_topics(photo_objects, topics):
+    """PURE. photo_objects: [{key, filename, hhmm}] -- hhmm ('HH:MM') is
+    already derived by the caller from the BUG-01-safe transcript_utils
+    filename extractor. topics: the extraction JSON's topic dicts (each may
+    carry 'time_range').
+
+    Returns {topic_index: [matched photo_objects entries]}. Only indices
+    whose topic has a parseable time_range appear in the result -- topics
+    with an unparseable/missing time_range get none (callers use
+    .get(i, [])). A photo attaches to AT MOST one topic: the first
+    (lowest-index) topic whose time_range window contains its HH:MM. Each
+    topic's list is capped at PHOTOS_PER_TOPIC_CAP.
+
+    NOTE: the `topics` parameter name intentionally shadows the
+    module-level `repositories.topics` import -- this function is pure and
+    never touches that module; the name is kept to match the design's
+    exact signature.
+    """
+    ranges = {}
+    for i, t in enumerate(topics):
+        parsed = _parse_time_range(t.get("time_range"))
+        if parsed is not None:
+            ranges[i] = parsed
+
+    result = {i: [] for i in ranges}
+    for p in photo_objects:
+        hhmm = p.get("hhmm")
+        if not hhmm:
+            continue
+        p_minutes = _hhmm_to_minutes(hhmm)
+        for i, (start, end) in ranges.items():  # insertion order == ascending topic index
+            if start <= p_minutes <= end:
+                result[i].append(p)
+                break  # first matching topic wins -- a photo attaches at most once
+
+    for i in result:
+        result[i] = result[i][:PHOTOS_PER_TOPIC_CAP]
+    return result
+
+
+def _list_pictures(prefix):
+    """List S3 pictures under prefix (paginated), deriving each photo's
+    clock time (BUG-01-safe) via transcript_utils.extract_base_time_from_
+    filename. A photo whose filename carries no parseable timestamp is
+    skipped -- it can never time-correlate to a topic anyway (mirrors
+    lambda_report_generator, which likewise only correlates photos with a
+    resolvable timestamp)."""
+    photo_objects = []
+    paginator = s3().get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            filename = key.rsplit("/", 1)[-1]
+            base_time = extract_base_time_from_filename(filename)
+            if base_time is None:
+                continue
+            photo_objects.append({
+                "key": key, "filename": filename,
+                "hhmm": base_time.strftime("%H:%M"),
+            })
+    return photo_objects
+
+
+# ----------------------------------------------------------
 # Per-extraction write (commit-per-extraction: one `with get_connection()` here)
 # ----------------------------------------------------------
 def write_extraction_items(date, user_folder, extraction_key):
@@ -108,6 +207,10 @@ def write_extraction_items(date, user_folder, extraction_key):
         # been ingested. Without this guard a late-landing extraction would
         # re-insert topics with no future supersession ever coming --
         # permanently-dangling live rows alongside the authoritative report.
+        # Post authority-flip (Task 7, spec §6): once AUTHORITY_FLIP defers
+        # for a day, lambda_ingest stops writing report topics for it, so
+        # report topics only exist for zero-extraction fallback days; this
+        # guard keeps that rare day duplicate-free.
         report_source_key = f"reports/{date}/{user_folder}/daily_report.json"
         report_already_ingested = conn.execute(
             "SELECT 1 FROM topics WHERE source_s3_key=%s LIMIT 1",
@@ -142,16 +245,27 @@ def write_extraction_items(date, user_folder, extraction_key):
         # prior rows before re-inserting.
         topics.delete_topics_for_source(conn, extraction_key)
 
+        # Task 3 (authority-flip plan) -- list the pictures prefix ONCE per
+        # invocation (paginator, outside the per-topic loop below), then
+        # pure-match photos to topics by time_range before the loop uses it.
+        pictures_prefix = f"users/{user_folder}/pictures/{date}/"
+        photo_objects = _list_pictures(pictures_prefix)
+        extraction_topics = extraction.get("topics", [])
+        photos_by_topic = _photos_for_topics(photo_objects, extraction_topics)
+
         topics_n = 0
         collected_topics = []
-        for t in extraction.get("topics", []):
+        for i, t in enumerate(extraction_topics):
             mapped_action_items = lambda_ingest._map_action_items(t.get("action_items"))
+            matched_photos = photos_by_topic.get(i, [])
             row = topics.upsert_topic(
                 conn, site["id"], date, t.get("topic_title", ""),
                 user_id=user_id, source_s3_key=extraction_key,
                 category=t.get("category"), summary=t.get("summary"),
                 action_items=mapped_action_items,
                 safety=lambda_ingest._map_safety(t.get("safety_flags")),
+                time_range=t.get("time_range"), participants=t.get("participants"),
+                photos=[{"s3_key": p["key"], "caption_text": None} for p in matched_photos],
             )
             # Task 2 (programme-impact-link plan) -- persist this topic's
             # rich extraction findings in the SAME transaction as the topic

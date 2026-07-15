@@ -14,7 +14,17 @@ A FakeConn/FakeCursor double records every execute() call's SQL text +
 params so behaviour can be asserted without a real Postgres (mirrors the
 FakeConn style of tests/unit/test_lambda_ingest.py, adapted here to capture
 SQL since these are repository-layer, not lambda-layer, tests).
+
+Authority-flip migration 0011 additions (docs/superpowers/plans/2026-07-14-
+authority-flip.md Task 1):
+  - upsert_topic gains time_range/participants kwargs (participants via
+    Jsonb) and action_items children carry deadline_text.
+  - has_topics_for_source_prefix / list_topics_for_source_prefix: new reads
+    keyed on source_s3_key prefix (org-api timeline shim), sharing the same
+    _escape_like() LIKE-wildcard escaping as delete_topics_for_source_prefix.
 """
+from psycopg.types.json import Jsonb
+
 from repositories import topics
 
 
@@ -221,3 +231,174 @@ def test_list_topics_for_date_no_topics_skips_children_queries():
 
     assert rows == []
     assert len(conn.calls) == 1  # children queries never fire for an empty result
+
+
+# ---------------------------------------------------------------------------
+# upsert_topic — time_range/participants/deadline_text (migration 0011)
+# ---------------------------------------------------------------------------
+
+def test_upsert_passes_time_range_participants_jsonb():
+    """time_range/participants are new display-field kwargs (migration 0011)
+    the extraction JSON already carries but the Aurora boundary dropped.
+    participants is bound via Jsonb (chunks.py/findings.py convention),
+    same as every other jsonb column in this codebase."""
+    inserted_topic = {
+        "id": "t-1", "site_id": "site-1", "user_id": None, "source_s3_key": None,
+        "report_date": "2026-07-06", "occurred_at": None, "category": None,
+        "title": "Morning briefing", "summary": None,
+        "time_range": "08:00-08:15", "participants": ["Ben", "Sam"], "source": "ai",
+        "created_at": "c0",
+    }
+    conn = FakeConn(results=[[inserted_topic]])
+
+    topic = topics.upsert_topic(
+        conn, "site-1", "2026-07-06", "Morning briefing",
+        time_range="08:00-08:15", participants=["Ben", "Sam"])
+
+    assert topic == inserted_topic
+    sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
+    assert "time_range" in sql
+    assert "participants" in sql
+    assert "08:00-08:15" in params
+    jsonb_params = [p for p in params if isinstance(p, Jsonb)]
+    assert len(jsonb_params) == 1
+    assert jsonb_params[0].obj == ["Ben", "Sam"]
+
+
+def test_upsert_action_items_carry_deadline_text():
+    """action_items[].deadline_text is the raw free-text deadline
+    ("Tomorrow 08:00") the date-typed `deadline` column can't hold
+    (lambda_ingest._map_action_items nulls it today)."""
+    inserted_topic = {
+        "id": "t-1", "site_id": "site-1", "user_id": None, "source_s3_key": None,
+        "report_date": "2026-07-06", "occurred_at": None, "category": None,
+        "title": "T", "summary": None, "time_range": None, "participants": None,
+        "source": "ai", "created_at": "c0",
+    }
+    conn = FakeConn(results=[[inserted_topic], 1])
+
+    topics.upsert_topic(
+        conn, "site-1", "2026-07-06", "T",
+        action_items=[{"text": "Order tape", "deadline_text": "Tomorrow 08:00"}])
+
+    assert len(conn.calls) == 2
+    action_sql, action_params = conn.calls[1]["sql"], conn.calls[1]["params"]
+    assert "deadline_text" in action_sql
+    assert "Tomorrow 08:00" in action_params
+
+
+# ---------------------------------------------------------------------------
+# has_topics_for_source_prefix / list_topics_for_source_prefix (0011,
+# org-api timeline shim reads)
+# ---------------------------------------------------------------------------
+
+def test_has_topics_for_source_prefix_escapes_like():
+    conn = FakeConn(results=[[{"?column?": 1}]])
+
+    result = topics.has_topics_for_source_prefix(
+        conn, "extractions/Jarley_Trainor/2026-07-06/")
+
+    assert result is True
+    sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
+    assert "LIKE %s" in sql
+    assert "ESCAPE '\\'" in sql
+    assert "LIMIT 1" in sql
+    # same underscore-escaping requirement as delete_topics_for_source_prefix
+    assert params == (r"extractions/Jarley\_Trainor/2026-07-06/%",)
+
+
+def test_list_for_source_prefix_orders_by_time_range_and_batches_four_children():
+    """Mirrors list_topics_for_date's JOIN + batched-children pattern, plus a
+    FOURTH batched child (photos, from topic_photos) and D3's stable
+    ORDER BY time_range NULLS LAST, created_at, id."""
+    topic_a = {
+        "id": "t-1", "site_id": "site-1", "user_id": "u-1",
+        "source_s3_key": "extractions/Jarley_Trainor/2026-07-06/a.json",
+        "report_date": "2026-07-06", "occurred_at": None, "category": "safety",
+        "title": "T1", "summary": "s", "time_range": "08:00-08:15",
+        "participants": ["Ben"], "source": "ai", "created_at": "c0",
+        "site_name": "Test Site", "user_name": "Jarley Trainor",
+    }
+    topic_b = {**topic_a, "id": "t-2", "title": "T2", "time_range": None}
+    action_row = {"id": "a-1", "topic_id": "t-1", "text": "Order tape",
+                  "responsible": None, "deadline": None, "deadline_text": "Tomorrow 08:00",
+                  "priority": None, "status": "open", "created_at": "c1"}
+    safety_row = {"id": "s-1", "topic_id": "t-2", "observation": "Missing tape",
+                  "risk_level": "medium", "location": None, "status": "open", "created_at": "c2"}
+    finding_row = {"id": "f-1", "topic_id": "t-1", "observation": "x"}
+    photo_row = {"id": "p-1", "topic_id": "t-2", "s3_key": "k.jpg", "caption_text": None}
+
+    conn = FakeConn(results=[
+        [topic_a, topic_b],   # main topics query
+        [action_row],         # action_items children
+        [safety_row],         # safety_observations children
+        [finding_row],        # findings children
+        [photo_row],          # photos children -- the fourth batched child
+    ])
+
+    rows = topics.list_topics_for_source_prefix(
+        conn, "extractions/Jarley_Trainor/2026-07-06/")
+
+    assert len(conn.calls) == 5  # main + 4 batched children, never N+1
+    main_sql, main_params = conn.calls[0]["sql"], conn.calls[0]["params"]
+    assert "source_s3_key LIKE %s" in main_sql
+    assert "ESCAPE '\\'" in main_sql
+    assert "ORDER BY t.time_range NULLS LAST, t.created_at, t.id" in main_sql
+    assert main_params == (r"extractions/Jarley\_Trainor/2026-07-06/%",)
+
+    for i in (1, 2, 3, 4):
+        assert conn.calls[i]["params"] == (["t-1", "t-2"],)
+    assert "action_items" in conn.calls[1]["sql"]
+    assert "deadline_text" in conn.calls[1]["sql"]
+    assert "safety_observations" in conn.calls[2]["sql"]
+    assert "findings" in conn.calls[3]["sql"]
+    assert "topic_photos" in conn.calls[4]["sql"]
+
+    by_id = {r["id"]: r for r in rows}
+    assert by_id["t-1"]["action_items"] == [action_row]
+    assert by_id["t-2"]["action_items"] == []
+    assert by_id["t-2"]["safety_observations"] == [safety_row]
+    assert by_id["t-1"]["safety_observations"] == []
+    assert by_id["t-1"]["findings"] == [finding_row]
+    assert by_id["t-2"]["findings"] == []
+    assert by_id["t-2"]["photos"] == [photo_row]
+    assert by_id["t-1"]["photos"] == []
+
+
+# ---------------------------------------------------------------------------
+# list_extraction_folder_names_for_date (authority-flip Task 4, admin
+# disambiguation multi-tenant guard)
+# ---------------------------------------------------------------------------
+
+def test_list_extraction_folder_names_for_date_scopes_by_company():
+    conn = FakeConn(results=[[{"folder_name": "Jarley_Trainor"}, {"folder_name": "Ada_L"}]])
+
+    folders = topics.list_extraction_folder_names_for_date(conn, "co-1", "2026-07-14")
+
+    assert folders == ["Jarley_Trainor", "Ada_L"]
+    assert len(conn.calls) == 1
+    sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
+    assert "u.company_id=%s" in sql
+    assert "JOIN users u ON u.id = t.user_id" in sql
+    assert "extractions/%%" in sql  # '%%' escapes the literal '%' for psycopg's %s paramstyle
+    assert params == ("2026-07-14", "co-1")
+
+
+def test_list_extraction_folder_names_for_date_empty():
+    conn = FakeConn(results=[[]])
+
+    assert topics.list_extraction_folder_names_for_date(conn, "co-1", "2026-07-14") == []
+
+
+def test_list_topics_for_date_selects_new_columns():
+    """_TOPIC_COLS_JOINED gains time_range/participants/source (additive) --
+    live-items consumers get these for free off the existing dashboard read,
+    no new query, no new children."""
+    conn = FakeConn(results=[[]])  # main query returns zero topics
+
+    topics.list_topics_for_date(conn, ["site-1"], "2026-07-06")
+
+    main_sql = conn.calls[0]["sql"]
+    assert "t.time_range" in main_sql
+    assert "t.participants" in main_sql
+    assert "t.source" in main_sql

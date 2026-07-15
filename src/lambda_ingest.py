@@ -75,6 +75,13 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "")
 CONFIG_KEY = os.environ.get("CONFIG_KEY", "config/user_mapping.json")
 COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 MULTI_TENANT = os.environ.get("MULTI_TENANT_RESOLUTION", "false") == "true"
+# Authority flip (spec §6, Task 7 of the authority-flip plan): when on AND
+# extraction topics already exist for (user_folder, date), nightly report
+# ingest defers to them instead of overwriting -- see ingest_report below.
+# Deployed OFF by default (AllowedValues true/false, template AuthorityFlip
+# param defaults 'false') -- this constant alone is a true no-op until a
+# later task flips the deploy param.
+AUTHORITY_FLIP = os.environ.get("AUTHORITY_FLIP", "false").lower() == "true"
 
 
 def resolve_company(conn, user_folder):
@@ -202,7 +209,10 @@ def _map_action_items(items):
     is free text ('EOD', 'Tomorrow 08:00', ...) per lambda_report_generator's
     schema, but the column is a SQL date -- only pass through values that
     already look like an ISO date, else drop to NULL rather than have a
-    real ingest 500 on a strptime-hostile string."""
+    real ingest 500 on a strptime-hostile string. 'deadline_text' (migration
+    0011, authority-flip) carries that SAME raw string verbatim -- including
+    non-ISO free text the 'deadline' column drops -- so the display layer
+    never loses "EOD"/"Tomorrow 08:00"/etc just because it isn't a SQL date."""
     out = []
     for a in items or []:
         deadline = a.get("deadline")
@@ -212,6 +222,7 @@ def _map_action_items(items):
             "text": a.get("action", ""),
             "responsible": a.get("responsible"),
             "deadline": deadline,
+            "deadline_text": a.get("deadline"),
             "priority": a.get("priority"),
         })
     return out
@@ -306,37 +317,52 @@ def ingest_report(date, user_folder, report_key):
         # user_id) — a NULL-user scope key let two same-site/same-date
         # reports (MPI1 + MPI2, both unresolved users) delete each other,
         # and identity fixes + rerun would duplicate (Fable review C1/I1).
+        extraction_prefix = f"extractions/{user_folder}/{date}/"
+        defer_to_extraction = AUTHORITY_FLIP and topics.has_topics_for_source_prefix(
+            conn, extraction_prefix)
+
         chunks.delete_chunks_for_source(conn, report_key)
-        topics.delete_topics_for_source(conn, report_key)
-        # Nightly report supersedes that day's session-sourced (live
-        # extraction) items — Phase 4b.
-        topics.delete_topics_for_source_prefix(conn, f"extractions/{user_folder}/{date}/")
+        topics.delete_topics_for_source(conn, report_key)  # always: clears stale pre-flip report rows
+        if defer_to_extraction:
+            # Authority flip (spec §6): the day's extraction topics ARE the
+            # item store; the report is a document artifact only. No
+            # extraction wipe, no report topics, no match_request. Chunks
+            # are still written below (RAG) with topic_id=None.
+            logger.info("%s: authority flip — deferring to extraction topics under %s",
+                        report_key, extraction_prefix)
+        else:
+            # Nightly report supersedes that day's session-sourced (live
+            # extraction) items — Phase 4b.
+            topics.delete_topics_for_source_prefix(conn, extraction_prefix)
 
         topic_seq_to_id = {}
         collected_topics = []
-        for t in report.get("topics", []):
-            mapped_action_items = _map_action_items(t.get("action_items"))
-            row = topics.upsert_topic(
-                conn, site["id"], date, t.get("topic_title", ""),
-                user_id=user_id, source_s3_key=report_key,
-                category=t.get("category"), summary=t.get("summary"),
-                action_items=mapped_action_items,
-                safety=_map_safety(t.get("safety_flags")),
-            )
-            # None keys stay out of the map: a literal "topic_id": null topic
-            # must not adopt the unassigned transcript windows (Fable minor 1).
-            if t.get("topic_id") is not None:
-                topic_seq_to_id[t.get("topic_id")] = row["id"]
-            # Snapshot for the match_requests/ artifact (Task 4) -- see
-            # lambda_item_writer's identical pattern; the non-VPC
-            # MatcherFunction reads this, never Aurora directly.
-            collected_topics.append({
-                "topic_id": str(row["id"]),
-                "title": t.get("topic_title", ""),
-                "summary": t.get("summary"),
-                "user_id": str(user_id) if user_id is not None else None,
-                "action_items": [{"text": a["text"]} for a in mapped_action_items],
-            })
+        if not defer_to_extraction:
+            for t in report.get("topics", []):
+                mapped_action_items = _map_action_items(t.get("action_items"))
+                row = topics.upsert_topic(
+                    conn, site["id"], date, t.get("topic_title", ""),
+                    user_id=user_id, source_s3_key=report_key,
+                    category=t.get("category"), summary=t.get("summary"),
+                    action_items=mapped_action_items,
+                    safety=_map_safety(t.get("safety_flags")),
+                    time_range=t.get("time_range"), participants=t.get("participants"),
+                )
+                # None keys stay out of the map: a literal "topic_id": null
+                # topic must not adopt the unassigned transcript windows
+                # (Fable minor 1).
+                if t.get("topic_id") is not None:
+                    topic_seq_to_id[t.get("topic_id")] = row["id"]
+                # Snapshot for the match_requests/ artifact (Task 4) -- see
+                # lambda_item_writer's identical pattern; the non-VPC
+                # MatcherFunction reads this, never Aurora directly.
+                collected_topics.append({
+                    "topic_id": str(row["id"]),
+                    "title": t.get("topic_title", ""),
+                    "summary": t.get("summary"),
+                    "user_id": str(user_id) if user_id is not None else None,
+                    "action_items": [{"text": a["text"]} for a in mapped_action_items],
+                })
 
         chunks_n = 0
         for c in chunk_report(report):

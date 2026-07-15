@@ -261,6 +261,17 @@ Parameters:
       false, all pipeline writes are pinned to COMPANY_NAME's company — the
       TEST stack keeps false so develop-code runs can never write customer rows.
 
+  AuthorityFlip:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, nightly report ingest defers to a day's extraction topics
+      instead of overwriting them (authority-flip spec §6) -- only when
+      extraction topics already exist for that (user_folder, date); a day
+      with none still falls back to writing report topics as before. False
+      (default) is the pre-flip legacy behavior, unchanged in every path.
+
   ManageDataBucketPolicy:
     Type: String
     Default: 'true'
@@ -752,6 +763,10 @@ Resources:
           COGNITO_USER_POOL_ID: !Ref OrgUserPoolId
           S3_BUCKET: !Ref DataBucketName
           ORG_ASSETS_PREFIX: org-assets/
+          # authority-flip Task 4 — /timeline reads the lake bucket's
+          # reports/ prefix (a DIFFERENT bucket than DataBucketName above;
+          # mirrors MatcherFunction's DataBucketName/IngestBucketName split).
+          LAKE_BUCKET: !Ref IngestBucketName
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
@@ -794,6 +809,27 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - programmes/*
+            - Effect: Allow
+              # authority-flip Task 4 — /timeline reads daily_report.json
+              # (and summary_report.json) verbatim from the lake bucket.
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/reports/*
+            - Effect: Allow
+              # Without ListBucket, S3 returns AccessDenied/403 (not
+              # NoSuchKey/404) for a missing object under a prefix this role
+              # can't list — the shim's _get_lake_json would then re-raise a
+              # fake 500 for every (user, date) with no report yet, and
+              # admin_disambiguation's folder listing would itself fail
+              # outright (same reasoning as this function's own programmes/*
+              # grant above, and MatcherFunction's programmes/* grant).
+              # Scoped to reports/* only, in the IngestBucketName bucket
+              # (the lake), not DataBucketName (org-assets/programmes).
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - reports/*
       Events:
         OrgProxy:
           Type: Api
@@ -927,6 +963,7 @@ Resources:
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
           MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
+          AUTHORITY_FLIP: !Ref AuthorityFlip
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
@@ -1071,6 +1108,11 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - extractions/*
+                    # Task 3 (authority-flip plan) -- list-only (no
+                    # GetObject) so write_extraction_items can list
+                    # users/{user_folder}/pictures/{date}/ to time-correlate
+                    # photos onto extraction topics (topic_photos).
+                    - users/*
 
   # ----------------------------------------------------------
   # Lambda 17: Suggestion Writer (Programme<->Item feedback, Task 2) —

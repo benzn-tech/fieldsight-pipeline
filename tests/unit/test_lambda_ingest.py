@@ -10,6 +10,7 @@ embeddings/{date}/{user}/vectors.json = {sha256(chunk_text[:8000]): [floats]});
 Bedrock is retired from this lambda entirely -- no test here may reference it.
 """
 import hashlib
+import importlib
 import io
 import json
 
@@ -297,6 +298,55 @@ def test_idempotent_source_delete_before_insert(wired):
 
 
 # ---------------------------------------------------------------------------
+# Task 2 (authority-flip plan) -- ingest passes time_range/participants
+# through to topics.upsert_topic (migration 0011 columns; report topics carry
+# both per DAILY_REPORT_SCHEMA). Task 1 already landed the repo-layer
+# plumbing, this is the writer actually calling it.
+# ---------------------------------------------------------------------------
+
+def test_ingest_passes_time_range_and_participants(wired):
+    captured = []
+    wired.setattr(
+        ing.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            captured.append(kw) or {"id": "topic-uuid-0"},
+    )
+
+    ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert len(captured) == 1
+    assert captured[0]["time_range"] == "09:00 – 09:05"
+    assert captured[0]["participants"] == ["Jarley Trainor"]
+
+
+# ---------------------------------------------------------------------------
+# _map_action_items -- 'deadline_text' carries the RAW free-text deadline
+# string alongside the existing ISO-only 'deadline' date filter (untouched).
+# ---------------------------------------------------------------------------
+
+def test_map_action_items_carries_raw_deadline_text_alongside_date_filter():
+    items = [
+        # non-ISO free text -> 'deadline' still drops to None, but
+        # 'deadline_text' keeps the raw string.
+        {"action": "Order more hard hats", "responsible": "Bob",
+         "deadline": "Friday", "priority": "high"},
+        # ISO date -> 'deadline' still passes through unfiltered, and
+        # 'deadline_text' carries the SAME raw string.
+        {"action": "Submit permit", "responsible": "Alice",
+         "deadline": "2026-07-06"},
+    ]
+
+    mapped = ing._map_action_items(items)
+
+    assert mapped == [
+        {"text": "Order more hard hats", "responsible": "Bob", "deadline": None,
+         "deadline_text": "Friday", "priority": "high"},
+        {"text": "Submit permit", "responsible": "Alice", "deadline": "2026-07-06",
+         "deadline_text": "2026-07-06", "priority": None},
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Topic uuid -> chunk topic_id
 # ---------------------------------------------------------------------------
 
@@ -538,6 +588,106 @@ def test_ingest_supersedes_session_items(wired):
     ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
 
     assert calls == ["extractions/Jarley_Trainor/2026-03-02/"]
+
+
+# ---------------------------------------------------------------------------
+# Task 7 (authority-flip plan) — AUTHORITY_FLIP defer (spec §6). When the
+# flag is on AND extraction topics already exist for (user_folder, date),
+# the nightly report ingest stops overwriting them: no extraction-prefix
+# wipe, no report topics written, no match_request emitted. Chunks still
+# flow (RAG) with topic_id=None. The report-key deletes (delete_chunks_for_
+# source / delete_topics_for_source) run ALWAYS regardless of the flag —
+# stale pre-flip report rows must still clear on re-ingest.
+# ---------------------------------------------------------------------------
+
+def test_flip_off_behavior_unchanged(wired):
+    wired.setattr(ing, "AUTHORITY_FLIP", False)
+    prefix_deletes = []
+    wired.setattr(ing.topics, "delete_topics_for_source_prefix",
+                  lambda conn, prefix: prefix_deletes.append(prefix) or 0)
+    upserts = []
+    wired.setattr(ing.topics, "upsert_topic",
+                  lambda *a, **k: upserts.append(1) or {"id": "topic-uuid-0"})
+    emits = []
+    wired.setattr(ing.match_request, "emit", lambda *a, **k: emits.append(1) or "key")
+
+    result = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert prefix_deletes == ["extractions/Jarley_Trainor/2026-03-02/"]
+    assert len(upserts) == 1
+    assert len(emits) == 1
+    assert result["topics"] == 1
+
+
+def test_flip_on_with_extractions_defers(wired):
+    wired.setattr(ing, "AUTHORITY_FLIP", True)
+    wired.setattr(ing.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+
+    report_deletes = []
+    wired.setattr(ing.chunks, "delete_chunks_for_source",
+                  lambda conn, key: report_deletes.append(("chunks", key)) or 0)
+    wired.setattr(ing.topics, "delete_topics_for_source",
+                  lambda conn, key: report_deletes.append(("topics", key)) or 0)
+    prefix_deletes = []
+    wired.setattr(ing.topics, "delete_topics_for_source_prefix",
+                  lambda conn, prefix: prefix_deletes.append(prefix) or 0)
+    upserts = []
+    wired.setattr(ing.topics, "upsert_topic",
+                  lambda *a, **k: upserts.append(1) or {"id": "topic-uuid-0"})
+    emits = []
+    wired.setattr(ing.match_request, "emit", lambda *a, **k: emits.append(1) or "key")
+    inserted = []
+    wired.setattr(
+        ing.chunks, "insert_chunk",
+        lambda conn, site_id, report_date, chunk_type, chunk_text, embedding, **kw:
+            inserted.append(kw) or {"id": "chunk-x"},
+    )
+
+    result = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    # Stale pre-flip report rows still clear, keyed on report_key -- ALWAYS.
+    assert ("chunks", REPORT_KEY) in report_deletes
+    assert ("topics", REPORT_KEY) in report_deletes
+    # But extraction topics are NOT wiped, and no report topics get written.
+    assert prefix_deletes == []
+    assert upserts == []
+    assert emits == []
+    assert result["topics"] == 0
+    # Chunks still flow (RAG), unlinked to any topic (topic_seq_to_id miss).
+    assert inserted
+    assert all(kw["topic_id"] is None for kw in inserted)
+
+
+def test_flip_on_without_extractions_falls_back_to_legacy(wired):
+    wired.setattr(ing, "AUTHORITY_FLIP", True)
+    wired.setattr(ing.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
+    prefix_deletes = []
+    wired.setattr(ing.topics, "delete_topics_for_source_prefix",
+                  lambda conn, prefix: prefix_deletes.append(prefix) or 0)
+    upserts = []
+    wired.setattr(ing.topics, "upsert_topic",
+                  lambda *a, **k: upserts.append(1) or {"id": "topic-uuid-0"})
+    emits = []
+    wired.setattr(ing.match_request, "emit", lambda *a, **k: emits.append(1) or "key")
+
+    result = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert prefix_deletes == ["extractions/Jarley_Trainor/2026-03-02/"]
+    assert len(upserts) == 1
+    assert len(emits) == 1
+    assert result["topics"] == 1
+
+
+def test_flip_env_parsing_defaults_false(monkeypatch):
+    # Exercises the real "os.environ.get(...).lower() == 'true'" module-top
+    # parse (not just the module attribute other tests monkeypatch directly)
+    # -- unset AUTHORITY_FLIP must parse to False.
+    monkeypatch.delenv("AUTHORITY_FLIP", raising=False)
+    importlib.reload(ing)
+    try:
+        assert ing.AUTHORITY_FLIP is False
+    finally:
+        importlib.reload(ing)  # restore a clean module for the rest of the suite
 
 
 # ---------------------------------------------------------------------------
