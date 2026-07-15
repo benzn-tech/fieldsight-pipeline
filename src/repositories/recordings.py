@@ -1,4 +1,5 @@
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 _COLS = ("id, company_id, user_id, site_id, kind, s3_key, client_uuid, started_at, "
          "ended_at, duration_s, resolution, codec, size_bytes, gps_track, uploaded_at, created_at")
@@ -29,9 +30,11 @@ def get_by_id(conn, rec_id) -> dict | None:
     ).fetchone()
 
 
-def mark_uploaded(conn, rec_id, company_id, size_bytes=None) -> dict | None:
+def mark_uploaded(conn, rec_id, company_id, size_bytes=None, gps_track=None) -> dict | None:
     return conn.cursor(row_factory=dict_row).execute(
-        f"UPDATE recordings SET uploaded_at=now(), size_bytes=COALESCE(%s, size_bytes) "
+        f"UPDATE recordings SET uploaded_at=now(), "
+        f"size_bytes=COALESCE(%s, size_bytes), "
+        f"gps_track=COALESCE(%s, gps_track) "
         f"WHERE id=%s AND company_id=%s RETURNING {_COLS}",
-        (size_bytes, rec_id, company_id),
+        (size_bytes, Jsonb(gps_track) if gps_track is not None else None, rec_id, company_id),
     ).fetchone()

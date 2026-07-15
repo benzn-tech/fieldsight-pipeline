@@ -48,3 +48,27 @@ def test_mark_uploaded_company_guarded(db):
     assert recordings.mark_uploaded(db, row["id"], other["id"], 999) is None, "wrong company must not update"
     done = recordings.mark_uploaded(db, row["id"], co["id"], 12345)
     assert done["uploaded_at"] is not None and done["size_bytes"] == 12345
+
+
+def test_mark_uploaded_persists_gps_track(db):
+    co, u, s = _seed(db)
+    row = recordings.insert_pending(
+        db, company_id=co["id"], user_id=u["id"], site_id=None, kind="video",
+        s3_key="users/r/video/2026-07-13/gps.mp4", client_uuid="cap-gps",
+        started_at="2026-07-13T16:07:00Z", ended_at=None, duration_s=None,
+        resolution=None, codec=None, size_bytes=None,
+    )
+    assert row["gps_track"] is None
+
+    track = [{"t": 1752421200000, "lat": -36.8485, "lon": 174.7633},
+             {"t": 1752421205000, "lat": -36.8486, "lon": 174.7634}]
+    done = recordings.mark_uploaded(db, row["id"], co["id"], 4096, track)
+    assert done["gps_track"] == track
+
+    fetched = recordings.get_by_id(db, row["id"])
+    assert fetched["gps_track"] == track
+
+    # A later call omitting gps_track (None) must not wipe the stored value —
+    # COALESCE(%s, gps_track) keeps the existing track, mirroring size_bytes.
+    kept = recordings.mark_uploaded(db, row["id"], co["id"], None, None)
+    assert kept["gps_track"] == track

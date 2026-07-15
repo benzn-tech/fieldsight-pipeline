@@ -289,8 +289,9 @@ def create_recording_upload_url(conn, caller, body):
 
 
 def complete_recording(conn, caller, rec_id, body):
-    size_bytes = (body or {}).get("sizeBytes")
-    row = recordings.mark_uploaded(conn, rec_id, caller["company_id"], size_bytes)
+    b = body or {}
+    row = recordings.mark_uploaded(conn, rec_id, caller["company_id"],
+                                    b.get("sizeBytes"), b.get("gpsTrack"))
     if row is None:
         return error("recording not found", 404)
     return ok({"ok": True})
