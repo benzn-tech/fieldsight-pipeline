@@ -207,6 +207,10 @@ def write_extraction_items(date, user_folder, extraction_key):
         # been ingested. Without this guard a late-landing extraction would
         # re-insert topics with no future supersession ever coming --
         # permanently-dangling live rows alongside the authoritative report.
+        # Post authority-flip (Task 7, spec §6): once AUTHORITY_FLIP defers
+        # for a day, lambda_ingest stops writing report topics for it, so
+        # report topics only exist for zero-extraction fallback days; this
+        # guard keeps that rare day duplicate-free.
         report_source_key = f"reports/{date}/{user_folder}/daily_report.json"
         report_already_ingested = conn.execute(
             "SELECT 1 FROM topics WHERE source_s3_key=%s LIMIT 1",
