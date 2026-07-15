@@ -461,6 +461,12 @@ class FakeS3:
         # instead of NoSuchKey when Key is missing (e.g. "AccessDenied" to
         # simulate a ListBucket-less IAM role — see read_programme).
         self.get_object_error_code = "NoSuchKey"
+        # /timeline admin_disambiguation's S3 folder listing (_list_report_folders)
+        # -- a list of {"Key": "..."} dicts, same shape as boto3's real response.
+        self.list_objects_response = {"Contents": []}
+
+    def list_objects_v2(self, Bucket=None, Prefix=None):
+        return self.list_objects_response
 
     def generate_presigned_url(self, op, Params=None, ExpiresIn=0):
         self.last = {"op": op, "params": Params, "expires": ExpiresIn}
@@ -1737,3 +1743,272 @@ def test_confirm_valid_progress_override_applied(programme_wired):
     assert res["statusCode"] == 200
     assert body_of(res)["applied_progress"] == 60
     assert written["doc"]["leaves"][0]["progress_pct"] == 60
+
+
+# ----------------------------------------------------------
+# /timeline (authority-flip Task 4 — org-api compatibility shim). D1
+# contract: byte-identical S3 verbatim for days without extraction topics,
+# Aurora-rendered daily_report.json shape for days that have them.
+# `presign_wired` (defined above) wires FakeS3 as org._s3_client — the same
+# module-level client the shim reads LAKE_BUCKET through (s3() is bucket-
+# agnostic; Bucket is a per-call param, no second client needed).
+# ----------------------------------------------------------
+def _topic_row(**over):
+    base = {
+        "id": "t-1", "site_id": SITE_ID, "site_name": "Alpha", "user_name": "Ada L",
+        "category": "safety", "title": "Morning walk", "summary": "Walked the site.",
+        "time_range": "08:00 – 08:15", "participants": ["Ada L"],
+        "action_items": [], "safety_observations": [], "findings": [], "photos": [],
+    }
+    base.update(over)
+    return base
+
+
+def test_timeline_requires_date(wired):
+    res = org.lambda_handler(make_event("GET", "/api/org/timeline"), None)
+    assert res["statusCode"] == 400
+    assert "date" in body_of(res)["error"]
+    res2 = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "14-07-2026"}), None)
+    assert res2["statusCode"] == 400
+
+
+def test_timeline_shim_serves_s3_verbatim_when_no_extraction_topics(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-2", "folder_name": folder})
+    verbatim_doc = {
+        "report_date": "2026-07-07", "site": "Alpha", "user_name": "Ada L",
+        "executive_summary": "All quiet.", "topics": [{"topic_id": 0, "topic_title": "Legacy"}],
+        "_report_metadata": {"source": "nightly_report", "version": "v3.5",
+                             "recordings_processed": 4, "total_words": 812},
+        "extra_legacy_field": "must survive unchanged",
+    }
+    fake.objects["reports/2026-07-07/Ada_L/daily_report.json"] = json.dumps(verbatim_doc).encode()
+    res = org.lambda_handler(make_event("GET", "/api/org/timeline",
+                                        params={"date": "2026-07-07", "user": "Ada_L"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == verbatim_doc  # EXACT passthrough -- nothing added/dropped/renamed
+
+
+def test_timeline_shim_renders_override_when_extraction_topics_exist(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    wired.setattr(org.topics, "list_topics_for_source_prefix", lambda conn, prefix: [_topic_row()])
+    wired.setattr(org.sites, "list_company_sites", lambda conn, cid, **kw: [{"id": SITE_ID}])
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-2", "folder_name": folder})
+    res = org.lambda_handler(make_event("GET", "/api/org/timeline",
+                                        params={"date": "2026-07-14", "user": "Ada_L"}), None)
+    assert res["statusCode"] == 200
+    body = body_of(res)
+    assert body["_report_metadata"] == {"source": "live_extraction", "version": "flip-v1"}
+    assert body["site"] == "Alpha"
+    assert body["user_name"] == "Ada L"
+    assert len(body["topics"]) == 1
+    assert body["topics"][0]["topic_title"] == "Morning walk"
+
+
+def test_render_shape_topic_ids_positional_and_ordered():
+    rows = [_topic_row(id="t-1", title="First"), _topic_row(id="t-2", title="Second"),
+            _topic_row(id="t-3", title="Third")]
+    shape = org.render_report_shape(rows, None, "2026-07-14", "Ada_L")
+    assert [t["topic_id"] for t in shape["topics"]] == [0, 1, 2]
+    assert [t["topic_title"] for t in shape["topics"]] == ["First", "Second", "Third"]
+
+
+def test_render_shape_safety_flags_from_findings_with_legacy_fallback():
+    with_findings = _topic_row(findings=[
+        {"observation": "Loose scaffold", "domain": "safety", "severity": "major",
+         "recommended_action": "Tag out"},
+        {"observation": "Wrong paint batch", "domain": "quality", "severity": "minor",
+         "recommended_action": "Reorder"},  # non-safety domain -- excluded from safety_flags
+    ])
+    legacy = _topic_row(findings=[], safety_observations=[
+        {"observation": "Missing handrail", "risk_level": "high"},
+    ])
+    shape = org.render_report_shape([with_findings, legacy], None, "2026-07-14", "Ada_L")
+    assert shape["topics"][0]["safety_flags"] == [
+        {"observation": "Loose scaffold", "risk_level": "high", "recommended_action": "Tag out"},
+    ]
+    assert shape["topics"][1]["safety_flags"] == [
+        {"observation": "Missing handrail", "risk_level": "high", "recommended_action": None},
+    ]
+
+
+def test_render_shape_deadline_prefers_deadline_text():
+    row = _topic_row(action_items=[
+        {"text": "Order tape", "responsible": "Ada", "priority": "high",
+         "deadline_text": "Tomorrow 8am", "deadline": "2026-07-15"},
+        {"text": "Fix rail", "responsible": "Sam", "priority": "medium",
+         "deadline_text": None, "deadline": "2026-07-16"},
+        {"text": "Sweep site", "responsible": None, "priority": "low",
+         "deadline_text": None, "deadline": None},
+    ])
+    shape = org.render_report_shape([row], None, "2026-07-14", "Ada_L")
+    items = shape["topics"][0]["action_items"]
+    assert items[0]["deadline"] == "Tomorrow 8am"   # deadline_text wins over deadline
+    assert items[1]["deadline"] == "2026-07-16"      # falls back to str(deadline)
+    assert items[2]["deadline"] is None              # neither present
+
+
+def test_render_shape_merges_doc_prose_fields():
+    row = _topic_row()
+    doc = {
+        "executive_summary": "Productive day.",
+        "safety_observations": [{"observation": "x", "risk_level": "low"}],
+        "quality_and_compliance": [{"item": "y"}],
+        "critical_dates_and_deadlines": [{"date": "2026-07-20", "item": "Pour"}],
+        "topics": [{"topic_title": "SHOULD NOT LEAK THROUGH"}],  # doc's own topics ignored
+    }
+    shape = org.render_report_shape([row], doc, "2026-07-14", "Ada_L")
+    assert shape["executive_summary"] == "Productive day."
+    assert shape["safety_observations"] == [{"observation": "x", "risk_level": "low"}]
+    assert shape["quality_and_compliance"] == [{"item": "y"}]
+    assert shape["critical_dates_and_deadlines"] == [{"date": "2026-07-20", "item": "Pour"}]
+    assert shape["topics"][0]["topic_title"] == "Morning walk"  # rendered from rows, not doc
+
+    # doc=None (no same-day S3 doc exists at all) -- prose fields degrade to
+    # defaults, not a KeyError/AttributeError.
+    shape_no_doc = org.render_report_shape([row], None, "2026-07-14", "Ada_L")
+    assert shape_no_doc["executive_summary"] is None
+    assert shape_no_doc["safety_observations"] == []
+    assert shape_no_doc["quality_and_compliance"] == []
+    assert shape_no_doc["critical_dates_and_deadlines"] == []
+
+
+def test_404_body_matches_prod_shape(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-2", "folder_name": folder})
+    res = org.lambda_handler(make_event("GET", "/api/org/timeline",
+                                        params={"date": "2026-07-14", "user": "Ghost_User"}), None)
+    assert res["statusCode"] == 404
+    assert body_of(res) == {"message": "No report for Ghost_User on 2026-07-14",
+                            "date": "2026-07-14"}
+
+
+def test_non_all_scope_forced_to_own_folder(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
+    seen = {}
+    wired.setattr(org.topics, "has_topics_for_source_prefix",
+                  lambda conn, prefix: (seen.update(prefix=prefix) or False))
+    # explicit ?user=Someone_Else must be IGNORED -- forced to caller's own folder (D10)
+    res = org.lambda_handler(make_event("GET", "/api/org/timeline",
+                                        params={"date": "2026-07-14", "user": "Someone_Else"}), None)
+    assert seen["prefix"] == "extractions/Ada_L/2026-07-14/"
+    assert res["statusCode"] == 404
+    assert body_of(res)["message"] == "No report for Ada_L on 2026-07-14"
+
+
+def test_non_all_scope_without_folder_name_403(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": None})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_admin_no_user_unions_extraction_folders(presign_wired):
+    wired, fake = presign_wired
+    fake.list_objects_response = {"Contents": [
+        {"Key": "reports/2026-07-14/Ada_L/daily_report.json"},
+        {"Key": "reports/2026-07-14/Ada_L_debug/daily_report.json"},   # _debug -- filtered out
+        {"Key": "reports/2026-07-14/Outsider_Co/daily_report.json"},  # not in this company
+    ]}
+
+    def fake_by_folder(conn, cid, folder):
+        return {"id": "u-2", "folder_name": folder} if folder == "Ada_L" else None
+
+    wired.setattr(org.users, "get_by_folder_name", fake_by_folder)
+    wired.setattr(org.topics, "list_extraction_folder_names_for_date",
+                  lambda conn, cid, date: ["Sam_Trainor"])
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == {"date": "2026-07-14", "available_users": ["Ada_L", "Sam_Trainor"]}
+
+
+def test_admin_summary_report_verbatim(presign_wired):
+    wired, fake = presign_wired
+    summary_doc = {"date": "2026-07-14", "company_summary": "All sites green.", "extra": 1}
+    fake.objects["reports/2026-07-14/summary_report.json"] = json.dumps(summary_doc).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == summary_doc
+
+
+def test_admin_no_candidates_404(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.topics, "list_extraction_folder_names_for_date",
+                  lambda conn, cid, date: [])
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
+    assert res["statusCode"] == 404
+    assert body_of(res) == {"message": "No reports for 2026-07-14", "date": "2026-07-14"}
+
+
+def test_admin_one_candidate_recurses_to_single_user(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.topics, "list_extraction_folder_names_for_date",
+                  lambda conn, cid, date: ["Ada_L"])
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
+    verbatim_doc = {"report_date": "2026-07-14", "topics": []}
+    fake.objects["reports/2026-07-14/Ada_L/daily_report.json"] = json.dumps(verbatim_doc).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == verbatim_doc
+
+
+def test_site_acl_filters_override_rows(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    allowed_row = _topic_row(id="t-1", site_id=SITE_ID, title="Allowed site topic")
+    denied_row = _topic_row(id="t-2", site_id=OTHER_SITE_ID, title="Denied site topic")
+    wired.setattr(org.topics, "list_topics_for_source_prefix",
+                  lambda conn, prefix: [allowed_row, denied_row])
+    wired.setattr(org.sites, "list_company_sites", lambda conn, cid, **kw: [{"id": SITE_ID}])
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-2", "folder_name": folder})
+    res = org.lambda_handler(make_event("GET", "/api/org/timeline",
+                                        params={"date": "2026-07-14", "user": "Ada_L"}), None)
+    assert res["statusCode"] == 200
+    body = body_of(res)
+    assert len(body["topics"]) == 1
+    assert body["topics"][0]["topic_title"] == "Allowed site topic"
+
+
+def test_site_acl_filters_all_rows_falls_back_to_s3(presign_wired):
+    # Every override row sits outside the caller's site ACL -- must fall
+    # through to the S3 verbatim/404 branch, never render an empty override.
+    wired, fake = presign_wired
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    wired.setattr(org.topics, "list_topics_for_source_prefix",
+                  lambda conn, prefix: [_topic_row(site_id=OTHER_SITE_ID)])
+    wired.setattr(org.sites, "list_company_sites", lambda conn, cid, **kw: [{"id": SITE_ID}])
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-2", "folder_name": folder})
+    res = org.lambda_handler(make_event("GET", "/api/org/timeline",
+                                        params={"date": "2026-07-14", "user": "Ada_L"}), None)
+    assert res["statusCode"] == 404
+
+
+def test_explicit_user_not_in_company_404(presign_wired):
+    # RETARGET override 5: an ALL-scope caller's explicit ?user= must resolve
+    # to a folder in THEIR OWN company before any Aurora/S3 read is attempted.
+    wired, fake = presign_wired
+    seen_has_topics = {"called": False}
+    wired.setattr(org.users, "get_by_folder_name", lambda conn, cid, folder: None)
+    wired.setattr(org.topics, "has_topics_for_source_prefix",
+                  lambda conn, prefix: seen_has_topics.update(called=True))
+    res = org.lambda_handler(make_event("GET", "/api/org/timeline",
+                                        params={"date": "2026-07-14", "user": "Outsider"}), None)
+    assert res["statusCode"] == 404
+    assert seen_has_topics["called"] is False  # no Aurora read attempted for an unverified folder

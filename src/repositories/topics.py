@@ -288,3 +288,23 @@ def list_topics_for_source_prefix(conn, source_prefix) -> list[dict]:
         t["photos"] = photos_by_topic.get(t["id"], [])
 
     return topic_rows
+
+
+def list_extraction_folder_names_for_date(conn, company_id, report_date) -> list[str]:
+    """Distinct extraction-sourced folder_name values for one company/date --
+    org-api timeline admin-disambiguation (authority-flip Task 4, RETARGET
+    override 5's multi-tenant guard). source_s3_key has no company scoping
+    of its own (S3 lake paths are folder_name-keyed only, not per-company);
+    the users JOIN + company_id filter is what makes this candidate list
+    tenant-safe. Read-only -- used only to build the admin
+    "available_users" list, never to gate a write. Same LIKE-wildcard
+    posture as has_topics_for_source_prefix, but the prefix here is a fixed
+    literal ('extractions/'), not caller input, so no _escape_like() call is
+    needed -- the '%%' is escaped inline for psycopg's %s paramstyle."""
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT DISTINCT u.folder_name FROM topics t JOIN users u ON u.id = t.user_id "
+        "WHERE t.report_date=%s AND u.company_id=%s "
+        "AND t.source_s3_key LIKE 'extractions/%%' AND u.folder_name IS NOT NULL",
+        (report_date, company_id),
+    ).fetchall()
+    return [r["folder_name"] for r in rows]
