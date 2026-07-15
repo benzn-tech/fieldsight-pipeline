@@ -7,6 +7,12 @@
 // writing/checking this in; the recorded evidence run happens after
 // promotion (docs/superpowers/plans/2026-07-14-authority-flip.md).
 //
+// "Byte-identical" above is shorthand for JSON-semantic equality, not a
+// literal byte comparison: both bodies are deep key-sorted before compare
+// (key order is insensitive) and JS has a single numeric type, so `1` and
+// `1.0` collapse to the same value. This is the deliberate contract, not
+// a gap — see stableStringify/firstDivergencePath below.
+//
 // RETARGET adjustment (baked in, differs from the brief's original values):
 //   PROD_BASE (customer site) =
 //     https://ys94qy2tk0.execute-api.ap-southeast-2.amazonaws.com/prod/api
@@ -91,8 +97,41 @@ function runSelfTest() {
   const c1 = { topics: [{ id: 1 }, { id: 2 }] }, c2 = { topics: [{ id: 2 }, { id: 1 }] };
   assert('array order preserved (reorder is a real diff)', stableStringify(c1) !== stableStringify(c2));
 
+  // classify() routing — OVERRIDE must be detected before status equality is
+  // even checked, since the flip-day case is prod=404 (no report yet) vs
+  // org=200 (live_extraction). This is the exact scenario FINDING 1 covers.
+  const flipProd = { status: 404, body: { message: 'No report for Ben_Lin on 2026-07-15', date: '2026-07-15' } };
+  const flipOrg = {
+    status: 200,
+    body: {
+      _report_metadata: { source: 'live_extraction' },
+      topics: [{ time_range: '08:00-09:00', action_items: [], safety_flags: [], related_photos: [] }],
+    },
+  };
+  const flipResult = classify(flipProd, flipOrg);
+  assert('classify: prod=404 + org=200 live_extraction → OVERRIDE', flipResult.kind === 'OVERRIDE');
+
+  const mismatchProd = { status: 200, body: { topics: [] } };
+  const mismatchOrg = { status: 404, body: { message: 'No report for Ben_Lin on 2026-07-15' } };
+  const mismatchResult = classify(mismatchProd, mismatchOrg);
+  assert(
+    'classify: status mismatch without override marker → DIFF mentioning both statuses',
+    mismatchResult.kind === 'DIFF' &&
+      mismatchResult.detail.reason === 'status' &&
+      mismatchResult.detail.prodStatus === 200 &&
+      mismatchResult.detail.orgStatus === 404
+  );
+
+  const eq1 = { status: 404, body: { message: 'No report for Ben_Lin on 2026-07-15', date: '2026-07-15' } };
+  const eq2 = { status: 404, body: { date: '2026-07-15', message: 'No report for Ben_Lin on 2026-07-15' } };
+  const eqResult = classify(eq1, eq2);
+  assert('classify: equal 404 bodies → IDENTICAL', eqResult.kind === 'IDENTICAL');
+
   if (failures.length) { console.log(`SELF-TEST FAIL: ${failures.join(', ')}`); return 1; }
-  console.log('SELF-TEST PASS: 4/4 assertions (key-order invariance, nested divergence path, 404-body equality, array order preserved)');
+  console.log(
+    'SELF-TEST PASS: 7/7 assertions (key-order invariance, nested divergence path, 404-body equality, ' +
+      'array order preserved, classify override-before-status, classify status-mismatch diff, classify identical)'
+  );
   return 0;
 }
 
@@ -176,6 +215,29 @@ function overrideSummary(body) {
   };
 }
 
+/* ------------------------------------- classify ------------------------------------- */
+
+// Pure per-pair decision. OVERRIDE is checked FIRST, before any status
+// comparison — the expected flip-day case is prod=404 (no report yet) vs
+// org=200 (live_extraction), and status equality must never gate it out.
+// A status mismatch that is NOT an override is a real DIFF (explicit detail
+// carries both statuses so the caller can print them). OVERRIDE never
+// affects the caller's exit code.
+function classify(prod, org) {
+  if (org.body && org.body._report_metadata && org.body._report_metadata.source === 'live_extraction') {
+    return { kind: 'OVERRIDE', detail: { status: org.status, summary: overrideSummary(org.body) } };
+  }
+  if (prod.status !== org.status) {
+    return { kind: 'DIFF', detail: { reason: 'status', prodStatus: prod.status, orgStatus: org.status } };
+  }
+  const prodStable = stableStringify(prod.body), orgStable = stableStringify(org.body);
+  if (prodStable === orgStable) {
+    return { kind: 'IDENTICAL', detail: { status: prod.status } };
+  }
+  const divergence = firstDivergencePath(sortKeysDeep(prod.body), sortKeysDeep(org.body));
+  return { kind: 'DIFF', detail: { reason: 'body', status: prod.status, divergence } };
+}
+
 /* -------------------------------------- main -------------------------------------- */
 
 async function main() {
@@ -188,6 +250,9 @@ async function main() {
   if (!IDTOKEN) usageError('env IDTOKEN is required');
 
   const { pairs: argPairs, datesFrom } = parseArgs(argv);
+  if (datesFrom && argPairs.length > 0) {
+    console.error(`Warning: both --dates-from and --date/--user pairs were given — the file (${datesFrom}) wins; the --date/--user pairs are ignored.`);
+  }
   const pairs = datesFrom ? await loadPairsFromFile(datesFrom) : argPairs;
   if (pairs.length === 0) usageError('no (date,user) pairs given — use --date/--user or --dates-from');
 
@@ -207,27 +272,24 @@ async function main() {
       console.log(`ERROR  ${label} — ${which} fetch failed after retry: ${(prod.error || org.error).message}`);
       continue;
     }
-    if (prod.status !== org.status) {
-      exitCode = 1;
-      console.log(`DIFF   ${label} — HTTP status mismatch: prod=${prod.status} org=${org.status}`);
-      continue;
-    }
-    if (org.body && org.body._report_metadata && org.body._report_metadata.source === 'live_extraction') {
-      const summary = overrideSummary(org.body);
-      console.log(`OVERRIDE ${label} — status=${org.status} topics=${summary.topics_count}`);
+
+    const result = classify(prod, org);
+    if (result.kind === 'OVERRIDE') {
+      const { status, summary } = result.detail;
+      console.log(`OVERRIDE ${label} — status=${status} topics=${summary.topics_count}`);
       summary.topics.forEach((t, i) => console.log(
         `  topic[${i}] time_range=${JSON.stringify(t.time_range)} n_action_items=${t.n_action_items} n_safety_flags=${t.n_safety_flags} n_photos=${t.n_photos}`
       ));
-      continue;
-    }
-
-    const prodStable = stableStringify(prod.body), orgStable = stableStringify(org.body);
-    if (prodStable === orgStable) {
-      console.log(`IDENTICAL ${label} — status=${prod.status}`);
-    } else {
+      // OVERRIDE never affects exit code.
+    } else if (result.kind === 'DIFF') {
       exitCode = 1;
-      const divergence = firstDivergencePath(sortKeysDeep(prod.body), sortKeysDeep(org.body));
-      console.log(`DIFF   ${label} — status=${prod.status} first divergence: ${divergence}`);
+      if (result.detail.reason === 'status') {
+        console.log(`DIFF   ${label} — HTTP status mismatch: prod=${result.detail.prodStatus} org=${result.detail.orgStatus}`);
+      } else {
+        console.log(`DIFF   ${label} — status=${result.detail.status} first divergence: ${result.detail.divergence}`);
+      }
+    } else {
+      console.log(`IDENTICAL ${label} — status=${result.detail.status}`);
     }
   }
 
