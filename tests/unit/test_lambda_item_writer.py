@@ -210,15 +210,67 @@ def test_topic_children_mapped(wired):
     assert kw["category"] == "safety"
     assert kw["summary"] == "Discussed PPE requirements."
     # _map_action_items: 'action' -> 'text'; 'deadline' "Friday" is not an
-    # ISO date -> dropped to None (same rule as lambda_ingest's reports).
+    # ISO date -> dropped to None (same rule as lambda_ingest's reports), but
+    # 'deadline_text' keeps the raw string (Task 2, authority-flip plan).
     assert kw["action_items"] == [{
         "text": "Order more hard hats", "responsible": "Bob",
-        "deadline": None, "priority": None,
+        "deadline": None, "deadline_text": "Friday", "priority": None,
     }]
     # _map_safety: no 'location' column source, 'recommended_action' dropped.
     assert kw["safety"] == [{
         "observation": "Missing barrier tape", "risk_level": "medium",
     }]
+
+
+# ---------------------------------------------------------------------------
+# Task 2 (authority-flip plan) -- item-writer passes time_range/participants
+# through to topics.upsert_topic (migration 0011 columns; Task 1 already
+# landed the repo-layer plumbing, this is the writer actually calling it).
+# ---------------------------------------------------------------------------
+
+def test_item_writer_passes_time_range_and_participants(wired):
+    captured = []
+    wired.setattr(
+        iw.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            captured.append(kw) or {"id": "topic-uuid-0"},
+    )
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert len(captured) == 1
+    assert captured[0]["time_range"] == "10:00 – 10:05"
+    assert captured[0]["participants"] == ["Jarley Trainor"]
+
+
+def test_legacy_extraction_without_time_range_writes_null(wired):
+    # Pre-authority-flip extraction JSON still in S3 has no time_range/
+    # participants keys on the topic at all -- t.get(...) -> None -> NULL,
+    # never a KeyError.
+    legacy_topic = {
+        "topic_title": "Safety Briefing",
+        "category": "safety",
+        "summary": "Discussed PPE requirements.",
+        "action_items": [],
+        "safety_flags": [],
+    }
+    wired.setattr(
+        iw, "_s3_client",
+        FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(topics=[legacy_topic]))}),
+    )
+    captured = []
+    wired.setattr(
+        iw.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            captured.append(kw) or {"id": "topic-uuid-0"},
+    )
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 1}
+    assert len(captured) == 1
+    assert captured[0]["time_range"] is None
+    assert captured[0]["participants"] is None
 
 
 # ---------------------------------------------------------------------------

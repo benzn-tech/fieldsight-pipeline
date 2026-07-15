@@ -297,6 +297,55 @@ def test_idempotent_source_delete_before_insert(wired):
 
 
 # ---------------------------------------------------------------------------
+# Task 2 (authority-flip plan) -- ingest passes time_range/participants
+# through to topics.upsert_topic (migration 0011 columns; report topics carry
+# both per DAILY_REPORT_SCHEMA). Task 1 already landed the repo-layer
+# plumbing, this is the writer actually calling it.
+# ---------------------------------------------------------------------------
+
+def test_ingest_passes_time_range_and_participants(wired):
+    captured = []
+    wired.setattr(
+        ing.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            captured.append(kw) or {"id": "topic-uuid-0"},
+    )
+
+    ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert len(captured) == 1
+    assert captured[0]["time_range"] == "09:00 – 09:05"
+    assert captured[0]["participants"] == ["Jarley Trainor"]
+
+
+# ---------------------------------------------------------------------------
+# _map_action_items -- 'deadline_text' carries the RAW free-text deadline
+# string alongside the existing ISO-only 'deadline' date filter (untouched).
+# ---------------------------------------------------------------------------
+
+def test_map_action_items_carries_raw_deadline_text_alongside_date_filter():
+    items = [
+        # non-ISO free text -> 'deadline' still drops to None, but
+        # 'deadline_text' keeps the raw string.
+        {"action": "Order more hard hats", "responsible": "Bob",
+         "deadline": "Friday", "priority": "high"},
+        # ISO date -> 'deadline' still passes through unfiltered, and
+        # 'deadline_text' carries the SAME raw string.
+        {"action": "Submit permit", "responsible": "Alice",
+         "deadline": "2026-07-06"},
+    ]
+
+    mapped = ing._map_action_items(items)
+
+    assert mapped == [
+        {"text": "Order more hard hats", "responsible": "Bob", "deadline": None,
+         "deadline_text": "Friday", "priority": "high"},
+        {"text": "Submit permit", "responsible": "Alice", "deadline": "2026-07-06",
+         "deadline_text": "2026-07-06", "priority": None},
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Topic uuid -> chunk topic_id
 # ---------------------------------------------------------------------------
 
