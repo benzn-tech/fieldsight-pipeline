@@ -238,3 +238,37 @@ def test_complete_without_gps_track_is_backward_compatible(wired):
                                         body={"sizeBytes": 10}), None)
     assert res["statusCode"] == 200
     assert captured["gps_track"] is None
+
+
+def test_complete_non_list_gps_track_dropped_not_rejected(wired):
+    # Malformed optional telemetry must never fail the complete: a non-list
+    # gpsTrack is dropped (mark_uploaded gets None) and the request still 200s.
+    mp, fake = wired
+    captured = {}
+
+    def fake_mark(conn, rid, cid, sz=None, gps_track=None):
+        captured["gps_track"] = gps_track
+        return {"id": rid}
+
+    mp.setattr(org.recordings, "mark_uploaded", fake_mark)
+    res = org.lambda_handler(make_event("POST", "/api/org/recordings/rid/complete",
+                                        body={"sizeBytes": 10, "gpsTrack": "not-a-list"}), None)
+    assert res["statusCode"] == 200
+    assert captured["gps_track"] is None
+
+
+def test_complete_empty_gps_track_list_passed_through(wired):
+    # Pin empty-list semantics: [] is a valid list and is passed through as-is
+    # (it overwrites via COALESCE since [] is not NULL — deliberate).
+    mp, fake = wired
+    captured = {}
+
+    def fake_mark(conn, rid, cid, sz=None, gps_track=None):
+        captured["gps_track"] = gps_track
+        return {"id": rid}
+
+    mp.setattr(org.recordings, "mark_uploaded", fake_mark)
+    res = org.lambda_handler(make_event("POST", "/api/org/recordings/rid/complete",
+                                        body={"sizeBytes": 10, "gpsTrack": []}), None)
+    assert res["statusCode"] == 200
+    assert captured["gps_track"] == []

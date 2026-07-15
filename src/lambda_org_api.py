@@ -290,8 +290,16 @@ def create_recording_upload_url(conn, caller, body):
 
 def complete_recording(conn, caller, rec_id, body):
     b = body or {}
+    gps_track = b.get("gpsTrack")
+    if gps_track is not None and not isinstance(gps_track, list):
+        # Lenient by design: complete must NOT 400 over a malformed optional
+        # telemetry field — a failing complete would strand the recording in
+        # un-uploaded state on mobile retry. Drop the bad track and log.
+        logger.warning("complete_recording %s: dropping non-list gpsTrack (%s)",
+                       rec_id, type(gps_track).__name__)
+        gps_track = None
     row = recordings.mark_uploaded(conn, rec_id, caller["company_id"],
-                                    b.get("sizeBytes"), b.get("gpsTrack"))
+                                    b.get("sizeBytes"), gps_track)
     if row is None:
         return error("recording not found", 404)
     return ok({"ok": True})
