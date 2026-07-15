@@ -135,19 +135,33 @@ def test_list_org_sites_includes_slug(wired):
     assert body_of(res)["sites"][0]["slug"] == "alpha"
 
 
+def test_list_org_sites_includes_address(wired):
+    # sites.py's _COLS already includes address — list_org_sites just
+    # forwards whatever the repository returns, so this proves the field
+    # isn't stripped anywhere between the query and the HTTP response.
+    wired.setattr(org.sites, "list_company_sites",
+                  lambda conn, cid, include_archived=False: [
+                      {"id": "s-1", "name": "Alpha", "address": "12 Queen St"}])
+    res = org.lambda_handler(make_event("GET", "/api/org/sites"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["sites"][0]["address"] == "12 Queen St"
+
+
 def test_create_site_admin_ok(wired):
     created = {}
 
     def fake_create(conn, company_id, name, location=None, client=None,
-                    industry=None, icon_s3_key=None):
-        created.update(company_id=company_id, name=name, location=location)
+                    industry=None, icon_s3_key=None, address=None):
+        created.update(company_id=company_id, name=name, location=location,
+                       address=address)
         return {"id": "s-new", "company_id": company_id, "name": name}
 
     wired.setattr(org.sites, "create_site", fake_create)
     res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
-        "name": "New Site", "location": "Chch"}), None)
+        "name": "New Site", "location": "Chch", "address": "12 Queen St"}), None)
     assert res["statusCode"] == 201
-    assert created == {"company_id": "c-uuid-1", "name": "New Site", "location": "Chch"}
+    assert created == {"company_id": "c-uuid-1", "name": "New Site",
+                       "location": "Chch", "address": "12 Queen St"}
 
 
 def test_create_site_worker_403(wired):
@@ -657,10 +671,12 @@ def test_patch_site_updates_fields(wired):
                                                 or {"id": sid, "name": kw.get("name") or "Old",
                                                     "icon_s3_key": None}))
     res = org.lambda_handler(make_event("PATCH", "/api/org/sites/s-1",
-                                        body={"name": "Renamed", "location": "Akl"}), None)
+                                        body={"name": "Renamed", "location": "Akl",
+                                              "address": "12 Queen St"}), None)
     assert res["statusCode"] == 200
     assert seen["sid"] == "s-1" and seen["cid"] == "c-uuid-1"
     assert seen["name"] == "Renamed" and seen["location"] == "Akl"
+    assert seen["address"] == "12 Queen St"
 
 
 def test_patch_site_worker_403_and_missing_404(wired):

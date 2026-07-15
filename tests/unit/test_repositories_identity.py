@@ -97,7 +97,7 @@ def test_set_slug_updates_by_id():
 def test_create_site_includes_slug_in_insert():
     site_row = {"id": "site-2", "company_id": "c-1", "name": "South Site",
                 "location": None, "client": None, "industry": None,
-                "icon_s3_key": None, "slug": "south-site",
+                "icon_s3_key": None, "slug": "south-site", "address": None,
                 "created_at": "2026-07-06", "archived_at": None}
     conn = FakeConn(results=[[site_row]])
 
@@ -106,7 +106,7 @@ def test_create_site_includes_slug_in_insert():
     assert row == site_row
     sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
     assert "slug" in sql.split("VALUES")[0]  # column list includes slug
-    assert params == ("c-1", "South Site", None, None, None, None, "south-site")
+    assert params == ("c-1", "South Site", None, None, None, None, "south-site", None)
 
 
 def test_create_site_slug_defaults_to_none():
@@ -115,7 +115,7 @@ def test_create_site_slug_defaults_to_none():
     sites.create_site(conn, "c-1", "No Slug Site")
 
     params = conn.calls[0]["params"]
-    assert params[-1] is None  # slug defaults to None, still passed positionally
+    assert params[-2] is None  # slug defaults to None, still passed positionally
 
 
 # ---------------------------------------------------------------------------
