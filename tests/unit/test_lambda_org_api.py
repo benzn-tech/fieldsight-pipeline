@@ -451,22 +451,39 @@ def test_create_member_archived_same_company_409(member_wired):
     assert res["statusCode"] == 409
 
 
+class _FakeS3Paginator:
+    def __init__(self, pages):
+        self.pages = pages
+
+    def paginate(self, Bucket=None, Prefix=None):
+        yield from self.pages
+
+
 class FakeS3:
     def __init__(self):
         self.copied = []
         self.deleted = []
         self.missing_source = False
         self.objects = {}  # programme.py get_object/put_object store
+        self.get_object_calls = []  # keys requested via get_object, in order
         # Override to make get_object raise ClientError with this code
         # instead of NoSuchKey when Key is missing (e.g. "AccessDenied" to
         # simulate a ListBucket-less IAM role — see read_programme).
         self.get_object_error_code = "NoSuchKey"
-        # /timeline admin_disambiguation's S3 folder listing (_list_report_folders)
-        # -- a list of {"Key": "..."} dicts, same shape as boto3's real response.
+        # /timeline admin_disambiguation's S3 folder listing
+        # (_list_report_folders, now paginated -- Fix wave 1 review finding
+        # 3). list_objects_pages, when set, is a list of {"Contents": [...]}
+        # page dicts yielded one-per-paginate-iteration (multi-page
+        # truncation regression coverage); list_objects_response is the
+        # single-page default most tests use.
         self.list_objects_response = {"Contents": []}
+        self.list_objects_pages = None
 
-    def list_objects_v2(self, Bucket=None, Prefix=None):
-        return self.list_objects_response
+    def get_paginator(self, op):
+        assert op == "list_objects_v2"
+        pages = self.list_objects_pages if self.list_objects_pages is not None \
+            else [self.list_objects_response]
+        return _FakeS3Paginator(pages)
 
     def generate_presigned_url(self, op, Params=None, ExpiresIn=0):
         self.last = {"op": op, "params": Params, "expires": ExpiresIn}
@@ -483,6 +500,7 @@ class FakeS3:
         self.deleted.append(Key)
 
     def get_object(self, Bucket=None, Key=None):
+        self.get_object_calls.append(Key)
         if Key not in self.objects:
             # Matches real boto3: NoSuchKey is itself a ClientError subclass.
             raise ClientError({"Error": {"Code": self.get_object_error_code}}, "GetObject")
@@ -496,6 +514,13 @@ class FakeS3:
 def presign_wired(wired):
     fake = FakeS3()
     wired.setattr(org, "_s3_client", fake)
+    # Fix wave 1 review finding 1: admin_disambiguation now resolves the
+    # lake-owner company before serving summary_report.json verbatim.
+    # Default it to the CALLER's own company (c-uuid-1) so every existing
+    # admin/gm test keeps its prior behavior unchanged; tests exercising the
+    # gate itself override this per-test.
+    wired.setattr(org.companies, "get_company_by_name",
+                  lambda conn, name: {"id": "c-uuid-1", "name": name})
     return wired, fake
 
 
@@ -1890,19 +1915,54 @@ def test_404_body_matches_prod_shape(presign_wired):
                             "date": "2026-07-14"}
 
 
-def test_non_all_scope_forced_to_own_folder(presign_wired):
+def test_non_all_scope_user_mismatch_403(presign_wired):
+    # Fix wave 1 review finding 2: an explicit ?user= for a DIFFERENT folder
+    # than the caller's own used to be silently overridden to self (D10),
+    # returning the caller's own report under the other user's URL -- a
+    # mislabeled-data bug. Must now be rejected with 403 before any read.
+    wired, fake = presign_wired
+    seen_has_topics = {"called": False}
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
+    wired.setattr(org.topics, "has_topics_for_source_prefix",
+                  lambda conn, prefix: seen_has_topics.update(called=True))
+    res = org.lambda_handler(make_event("GET", "/api/org/timeline",
+                                        params={"date": "2026-07-14", "user": "Someone_Else"}), None)
+    assert res["statusCode"] == 403
+    assert "own timeline" in body_of(res)["error"]
+    assert seen_has_topics["called"] is False  # no Aurora read attempted for the other folder
+    assert fake.get_object_calls == []          # no S3 read attempted either
+
+
+def test_non_all_scope_user_equals_own_folder_200(presign_wired):
+    # ?user= present but equal to the caller's own folder -- self-serve as before.
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
+    doc = {"report_date": "2026-07-14", "topics": []}
+    fake.objects["reports/2026-07-14/Ada_L/daily_report.json"] = json.dumps(doc).encode()
+    res = org.lambda_handler(make_event("GET", "/api/org/timeline",
+                                        params={"date": "2026-07-14", "user": "Ada_L"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == doc
+
+
+def test_non_all_scope_absent_user_self_serves_200(presign_wired):
+    # No ?user= at all -- forced to caller's own folder (D10), self-serve.
     wired, fake = presign_wired
     wired.setattr(org.users, "get_user_by_sub",
                   lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
     seen = {}
     wired.setattr(org.topics, "has_topics_for_source_prefix",
                   lambda conn, prefix: (seen.update(prefix=prefix) or False))
-    # explicit ?user=Someone_Else must be IGNORED -- forced to caller's own folder (D10)
-    res = org.lambda_handler(make_event("GET", "/api/org/timeline",
-                                        params={"date": "2026-07-14", "user": "Someone_Else"}), None)
+    doc = {"report_date": "2026-07-14", "topics": []}
+    fake.objects["reports/2026-07-14/Ada_L/daily_report.json"] = json.dumps(doc).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
     assert seen["prefix"] == "extractions/Ada_L/2026-07-14/"
-    assert res["statusCode"] == 404
-    assert body_of(res)["message"] == "No report for Ada_L on 2026-07-14"
+    assert res["statusCode"] == 200
+    assert body_of(res) == doc
 
 
 def test_non_all_scope_without_folder_name_403(presign_wired):
@@ -1935,6 +1995,9 @@ def test_admin_no_user_unions_extraction_folders(presign_wired):
 
 
 def test_admin_summary_report_verbatim(presign_wired):
+    # presign_wired's default companies.get_company_by_name pins the "internal"
+    # company to c-uuid-1 -- the same id as CALLER -- so this caller IS the
+    # lake owner and still gets the summary doc verbatim (Fix wave 1 finding 1).
     wired, fake = presign_wired
     summary_doc = {"date": "2026-07-14", "company_summary": "All sites green.", "extra": 1}
     fake.objects["reports/2026-07-14/summary_report.json"] = json.dumps(summary_doc).encode()
@@ -1942,6 +2005,66 @@ def test_admin_summary_report_verbatim(presign_wired):
         "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
     assert res["statusCode"] == 200
     assert body_of(res) == summary_doc
+
+
+def test_admin_summary_report_gated_for_non_owner_company(presign_wired):
+    # Fix wave 1 review finding 1 (CRITICAL cross-tenant leak): the summary
+    # doc is a lake-wide aggregate across EVERY company's folders. A caller
+    # whose company isn't the lake owner must never see it verbatim, even
+    # though the doc exists in S3 -- must fall through to the (company-
+    # scoped) disambiguation union instead, and must never even GetObject it.
+    wired, fake = presign_wired
+    wired.setattr(org.companies, "get_company_by_name",
+                  lambda conn, name: {"id": "OTHER-owner-co", "name": name})
+    summary_doc = {"date": "2026-07-14", "company_summary": "All sites green.", "extra": 1}
+    fake.objects["reports/2026-07-14/summary_report.json"] = json.dumps(summary_doc).encode()
+    # Two candidates -- forces the union envelope response (not the
+    # one-candidate recursion path) so this test isolates the gate itself.
+    wired.setattr(org.topics, "list_extraction_folder_names_for_date",
+                  lambda conn, cid, date: ["Sam_Trainor", "Ada_L"])
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == {"date": "2026-07-14", "available_users": ["Ada_L", "Sam_Trainor"]}
+    assert "reports/2026-07-14/summary_report.json" not in fake.get_object_calls
+
+
+def test_admin_summary_report_skipped_when_owner_unresolved(presign_wired):
+    # Fail-closed proof: if the lake-owner company can't be resolved at all
+    # (e.g. COMPANY_NAME points at a company row that doesn't exist), the
+    # summary branch is skipped for EVERYONE, not just non-owners -- it
+    # never falls back to "no gate" behavior.
+    wired, fake = presign_wired
+    wired.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
+    summary_doc = {"date": "2026-07-14", "company_summary": "All sites green.", "extra": 1}
+    fake.objects["reports/2026-07-14/summary_report.json"] = json.dumps(summary_doc).encode()
+    wired.setattr(org.topics, "list_extraction_folder_names_for_date",
+                  lambda conn, cid, date: [])
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
+    assert res["statusCode"] == 404  # no candidates either -- proves it never touched the summary doc
+    assert "reports/2026-07-14/summary_report.json" not in fake.get_object_calls
+
+
+def test_list_report_folders_paginates_across_pages(presign_wired):
+    # Fix wave 1 review finding 3: a single date prefix holds every
+    # company's folders in the multi-tenant lake, so an unpaginated
+    # list_objects_v2 silently truncates at 1000 keys. Simulate a
+    # truncated response spanning two pages and prove both contribute
+    # candidates to the union.
+    wired, fake = presign_wired
+    fake.list_objects_pages = [
+        {"Contents": [{"Key": "reports/2026-07-14/Ada_L/daily_report.json"}]},
+        {"Contents": [{"Key": "reports/2026-07-14/Sam_T/daily_report.json"}]},
+    ]
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-x", "folder_name": folder})
+    wired.setattr(org.topics, "list_extraction_folder_names_for_date",
+                  lambda conn, cid, date: [])
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == {"date": "2026-07-14", "available_users": ["Ada_L", "Sam_T"]}
 
 
 def test_admin_no_candidates_404(presign_wired):

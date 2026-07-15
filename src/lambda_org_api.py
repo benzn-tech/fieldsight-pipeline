@@ -48,7 +48,7 @@ from botocore.exceptions import ClientError
 from psycopg.errors import UniqueViolation
 
 from db.connection import get_connection
-from repositories import (memberships, observations, programme, programme_suggestions,
+from repositories import (companies, memberships, observations, programme, programme_suggestions,
                           recordings, rollup, sites, topics, users)
 from repositories.acl import resolve_scope
 
@@ -62,6 +62,14 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "")
 # module-level s3() client (boto3 clients aren't bucket-bound; Bucket is a
 # per-call param) — no second client needed.
 LAKE_BUCKET = os.environ.get("LAKE_BUCKET", "")
+# Fix wave 1 (review finding 1): the lake-owner/internal company name —
+# reuses the SAME marker lambda_ingest.py/lambda_item_writer.py already
+# introduced for MultiTenantResolution's company pin (resolve_company /
+# COMPANY_NAME), rather than inventing a second one. Resolved to a company
+# row via companies.get_company_by_name at call time (no template.yaml
+# wiring needed here either — those two functions don't wire it as an env
+# var, they rely on this same in-code default).
+COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 ORG_ASSETS_PREFIX = os.environ.get("ORG_ASSETS_PREFIX", "org-assets/")
 COGNITO_USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
 PRESIGNED_URL_EXPIRY = 900
@@ -1009,16 +1017,24 @@ def reject_suggestion(conn, caller, suggestion_id):
 # caller resolving another company's folder_name (deliberately or by
 # guessing) must never reach an S3 GetObject/Aurora read for it. Two
 # distinct cases:
-#   - non-ALL scope (worker/pm/site_manager): `user` is ALWAYS forced to
-#     the caller's OWN folder_name below — trivially safe, no lookup needed.
+#   - non-ALL scope (worker/pm/site_manager): `user` is forced to the
+#     caller's OWN folder_name below; an explicit ?user= that DIFFERS from
+#     it is rejected with 403 before any read (Fix wave 1 review finding 2 —
+#     previously it was silently overridden to self, returning the CALLER's
+#     own report under the URL the caller asked a different user for).
 #   - ALL scope (admin/gm) with an explicit ?user=: verified against
 #     users.get_by_folder_name(company_id, user) BEFORE any Aurora/S3 read
 #     (_render_timeline_for_user). admin_disambiguation's own candidate
 #     list is pre-filtered the same way (S3-listed folders) or scoped by
 #     construction (the Aurora union query filters u.company_id).
-# summary_report.json (admin_disambiguation's first branch) is a
-# day-level aggregate with no per-folder identity to check — same posture
-# prod's lambda_fieldsight_api.py already has for admin/gm.
+# summary_report.json (admin_disambiguation's first branch) is a day-level
+# aggregate built LAKE-WIDE across every company's folders by the report
+# generator — it has no per-folder identity to ACL-check, so instead the
+# whole branch is gated on the CALLER's company (Fix wave 1 review finding
+# 1): only the lake-owner/internal company (COMPANY_NAME, see above) may
+# see it verbatim; every other company's admin/gm skips straight to the
+# company-scoped disambiguation union below. Fail-closed: if the owner
+# company can't be resolved, the branch is skipped for everyone.
 # ----------------------------------------------------------
 _LAKE_NOT_FOUND_CODES = ("NoSuchKey", "404")
 
@@ -1045,17 +1061,24 @@ def _list_report_folders(date):
     reports/{date}/*/daily_report.json object and take the folder segment,
     skipping any *_debug* companion file. Returns [] (not an error) on any
     listing failure — admin_disambiguation still has the Aurora union to
-    fall back on, so a transient S3 issue here shouldn't 500 the request."""
+    fall back on, so a transient S3 issue here shouldn't 500 the request.
+    Paginated (Fix wave 1 review finding 3): in the multi-tenant lake a
+    single date prefix holds every company's folders, so a plain
+    list_objects_v2 call silently truncates at 1000 keys and drops users
+    from available_users — mirrors the paginator pattern used elsewhere in
+    this repo (lambda_ingest.py, lambda_item_writer.py, lambda_fieldsight_
+    api.py's get_dates)."""
     prefix = f"reports/{date}/"
     folders = []
     try:
-        resp = s3().list_objects_v2(Bucket=LAKE_BUCKET, Prefix=prefix)
-        for obj in resp.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith("/daily_report.json") and "_debug" not in key:
-                parts = key[len(prefix):].split("/")
-                if len(parts) >= 2:
-                    folders.append(parts[0])
+        paginator = s3().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=LAKE_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith("/daily_report.json") and "_debug" not in key:
+                    parts = key[len(prefix):].split("/")
+                    if len(parts) >= 2:
+                        folders.append(parts[0])
     except ClientError:
         pass
     return folders
@@ -1134,16 +1157,22 @@ def _render_timeline_for_user(conn, caller, date, user):
 
 def admin_disambiguation(conn, caller, date):
     """D1(iv): admin/gm asked for a date with no ?user=. Try the day's
-    aggregate summary_report.json verbatim first (prod parity — no
-    per-folder identity to ACL-check on an aggregate doc); otherwise union
-    S3-listed report folders (company-filtered via users.get_by_folder_name
-    — RETARGET override 5) with Aurora's extraction-sourced folder names
+    aggregate summary_report.json verbatim first — but ONLY for the
+    lake-owner/internal company (Fix wave 1 review finding 1): this doc is
+    built LAKE-WIDE across every company's folders by the report generator,
+    so serving it to a customer-company admin was a cross-tenant leak.
+    Fail-closed: if the owner company can't be resolved, the branch is
+    skipped for everyone, not just non-owners. Otherwise union S3-listed
+    report folders (company-filtered via users.get_by_folder_name —
+    RETARGET override 5) with Aurora's extraction-sourced folder names
     (already company-scoped by the repository query itself). One candidate
     recurses into the single-user path; several return the disambiguation
     envelope the UI's meeting-picker expects; none is a 404."""
-    doc = _get_lake_json(f"reports/{date}/summary_report.json")
-    if doc is not None:
-        return ok(doc)
+    owner = companies.get_company_by_name(conn, COMPANY_NAME)
+    if owner is not None and str(caller["company_id"]) == str(owner["id"]):
+        doc = _get_lake_json(f"reports/{date}/summary_report.json")
+        if doc is not None:
+            return ok(doc)
     candidates = set()
     for folder in _list_report_folders(date):
         if users.get_by_folder_name(conn, caller["company_id"], folder) is not None:
@@ -1166,6 +1195,14 @@ def get_timeline_compat(conn, caller, event):
         own = caller.get("folder_name")
         if not own:
             return error("no folder mapping for your account", 403)
+        if user and user != own:
+            # Fix wave 1 review finding 2: an explicit ?user= for a
+            # different folder used to be silently overridden to self
+            # (D10), returning the CALLER's own report under the URL the
+            # caller asked a different user for — a mislabeled-data bug,
+            # not a leak, but still wrong. Refines D10's forced-self
+            # posture: reject instead of silently substituting.
+            return error("you may only view your own timeline", 403)
         user = own                                  # D10: forced self, no ACL lookup needed
     if not user:                                    # admin/gm, no user
         return admin_disambiguation(conn, caller, date)
