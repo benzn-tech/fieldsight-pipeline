@@ -406,6 +406,7 @@ def create_org_site(conn, caller, body):
         conn, caller["company_id"], name,
         location=body.get("location"), client=body.get("client"),
         industry=body.get("industry"), icon_s3_key=None,
+        address=body.get("address"),
     )
     if icon is not None:
         fname = icon.rsplit("/", 1)[-1]
@@ -435,6 +436,7 @@ def patch_org_site(conn, caller, site_id, body):
         conn, site_id, caller["company_id"],
         name=name, location=body.get("location"),
         client=body.get("client"), industry=body.get("industry"),
+        address=body.get("address"),
     )
     if row is None:
         return error("site not found in your company", 404)

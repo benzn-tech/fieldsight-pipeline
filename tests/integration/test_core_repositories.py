@@ -42,9 +42,12 @@ def test_company_user_site_roundtrip(db):
     assert u1["id"] == u2["id"], "upsert by cognito_sub must not create a duplicate"
     assert users.get_user_by_sub(db, "sub-9")["first_name"] == "Ann"
 
-    s = sites.create_site(db, co["id"], "North Wharf", location="Auckland")
+    s = sites.create_site(db, co["id"], "North Wharf", location="Auckland",
+                          address="12 Queen St")
     assert sites.get_site(db, s["id"])["name"] == "North Wharf"
+    assert sites.get_site(db, s["id"])["address"] == "12 Queen St"
     assert [x["id"] for x in sites.list_company_sites(db, co["id"])] == [s["id"]]
+    assert [x["address"] for x in sites.list_company_sites(db, co["id"])] == ["12 Queen St"]
 
 
 def test_upsert_user_partial_update_preserves_role_and_company(db):
