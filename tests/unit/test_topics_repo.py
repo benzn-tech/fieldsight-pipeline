@@ -365,6 +365,31 @@ def test_list_for_source_prefix_orders_by_time_range_and_batches_four_children()
     assert by_id["t-1"]["photos"] == []
 
 
+# ---------------------------------------------------------------------------
+# list_extraction_folder_names_for_date (authority-flip Task 4, admin
+# disambiguation multi-tenant guard)
+# ---------------------------------------------------------------------------
+
+def test_list_extraction_folder_names_for_date_scopes_by_company():
+    conn = FakeConn(results=[[{"folder_name": "Jarley_Trainor"}, {"folder_name": "Ada_L"}]])
+
+    folders = topics.list_extraction_folder_names_for_date(conn, "co-1", "2026-07-14")
+
+    assert folders == ["Jarley_Trainor", "Ada_L"]
+    assert len(conn.calls) == 1
+    sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
+    assert "u.company_id=%s" in sql
+    assert "JOIN users u ON u.id = t.user_id" in sql
+    assert "extractions/%%" in sql  # '%%' escapes the literal '%' for psycopg's %s paramstyle
+    assert params == ("2026-07-14", "co-1")
+
+
+def test_list_extraction_folder_names_for_date_empty():
+    conn = FakeConn(results=[[]])
+
+    assert topics.list_extraction_folder_names_for_date(conn, "co-1", "2026-07-14") == []
+
+
 def test_list_topics_for_date_selects_new_columns():
     """_TOPIC_COLS_JOINED gains time_range/participants/source (additive) --
     live-items consumers get these for free off the existing dashboard read,
