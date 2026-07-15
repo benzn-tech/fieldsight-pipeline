@@ -261,6 +261,17 @@ Parameters:
       false, all pipeline writes are pinned to COMPANY_NAME's company — the
       TEST stack keeps false so develop-code runs can never write customer rows.
 
+  AuthorityFlip:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, nightly report ingest defers to a day's extraction topics
+      instead of overwriting them (authority-flip spec §6) -- only when
+      extraction topics already exist for that (user_folder, date); a day
+      with none still falls back to writing report topics as before. False
+      (default) is the pre-flip legacy behavior, unchanged in every path.
+
   ManageDataBucketPolicy:
     Type: String
     Default: 'true'
@@ -952,6 +963,7 @@ Resources:
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
           MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
+          AUTHORITY_FLIP: !Ref AuthorityFlip
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
