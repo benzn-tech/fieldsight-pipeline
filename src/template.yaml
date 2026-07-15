@@ -468,7 +468,8 @@ Resources:
       CodeUri: src/
       Handler: lambda_vad.lambda_handler
       Timeout: 900
-      MemorySize: 1024
+      MemorySize: 3008   # parity with the hand-tuned legacy fieldsight-vad (BUG-04: large-audio OOM headroom)
+      Runtime: python3.12  # fieldsight-vad-layer is built for cp312 (BUG-24 class) — do not fall back to the py3.11 global
       EphemeralStorage:
         Size: 2048
       Layers:
@@ -500,6 +501,7 @@ Resources:
       Handler: lambda_report_generator.lambda_handler
       Timeout: 300
       MemorySize: 512
+      Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24) — on 3.11 Word generation silently disables
       Layers: !If
         - HasDocxLayer
         - - !Ref DocxLayerArn
@@ -600,6 +602,7 @@ Resources:
       Handler: lambda_meeting_minutes.lambda_handler
       Timeout: 300
       MemorySize: 512
+      Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24) — on 3.11 Word generation silently disables
       Layers: !If
         - HasDocxLayer
         - - !Ref DocxLayerArn
