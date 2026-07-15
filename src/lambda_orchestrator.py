@@ -72,6 +72,22 @@ STALE_MINUTES = 30
 
 
 # ============================================================
+# Query range helpers
+# ============================================================
+
+def compute_query_range(now_utc, start_days_ago, time_difference_ms):
+    """RealPTT recordings are dated in NZ client time, so the query window must
+    be anchored to the NZ calendar day, not UTC. In Lambda datetime.now() is UTC,
+    which lagged the window by a day during NZ mornings and hid same-day
+    recordings until UTC caught up (~NZ noon). now_utc must be a tz-aware UTC
+    datetime; time_difference_ms is the UTC->NZ offset (config default 46800000)."""
+    nz_now = now_utc + timedelta(milliseconds=time_difference_ms)
+    end = nz_now
+    start = end - timedelta(days=start_days_ago)
+    return start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d')
+
+
+# ============================================================
 # Configuration
 # ============================================================
 
@@ -775,11 +791,11 @@ def lambda_handler(event, context):
         logger.error("Missing S3_BUCKET")
         return {'statusCode': 400, 'body': 'Missing S3_BUCKET'}
 
-    # Calculate date range
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=config['start_days_ago'])
-    start_date_str = start_date.strftime('%Y-%m-%d')
-    end_date_str = end_date.strftime('%Y-%m-%d')
+    # Anchor the window to the NZ calendar day (recordings are NZ-dated); see
+    # compute_query_range — datetime.now() is UTC in Lambda and used to hide
+    # same-day NZ-morning recordings until UTC rolled over.
+    start_date_str, end_date_str = compute_query_range(
+        datetime.now(timezone.utc), config['start_days_ago'], config['time_difference_ms'])
 
     logger.info(f"Query range: {start_date_str} to {end_date_str}")
     logger.info(f"S3 Bucket: {config['s3_bucket']}")
