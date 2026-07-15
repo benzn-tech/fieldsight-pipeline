@@ -189,17 +189,86 @@ def test_complete_marks_uploaded(wired):
     mp, fake = wired
     seen = {}
     mp.setattr(org.recordings, "mark_uploaded",
-               lambda c, rid, cid, sz: seen.update(rid=rid, cid=cid, sz=sz) or
+               lambda c, rid, cid, sz=None, gps_track=None: seen.update(
+                   rid=rid, cid=cid, sz=sz, gps_track=gps_track) or
                {"id": rid, "uploaded_at": "2026-07-13T16:10:00Z", "size_bytes": sz})
     res = org.lambda_handler(make_event("POST", "/api/org/recordings/rec-1/complete",
                                         body={"sizeBytes": 12345}), None)
     assert res["statusCode"] == 200 and body_of(res)["ok"] is True
-    assert seen == {"rid": "rec-1", "cid": "c-1", "sz": 12345}
+    assert seen == {"rid": "rec-1", "cid": "c-1", "sz": 12345, "gps_track": None}
 
 
 def test_complete_unknown_or_wrong_company_404(wired):
     mp, fake = wired
-    mp.setattr(org.recordings, "mark_uploaded", lambda c, rid, cid, sz: None)
+    mp.setattr(org.recordings, "mark_uploaded", lambda c, rid, cid, sz=None, gps_track=None: None)
     res = org.lambda_handler(make_event("POST", "/api/org/recordings/rec-x/complete",
                                         body={}), None)
     assert res["statusCode"] == 404
+
+
+def test_complete_persists_gps_track(wired):
+    # body carries a gpsTrack array -> complete_recording must pass it through
+    # to mark_uploaded unchanged (camelCase body key -> Python list).
+    mp, fake = wired
+    captured = {}
+
+    def fake_mark(conn, rid, cid, sz=None, gps_track=None):
+        captured["gps_track"] = gps_track
+        return {"id": rid}
+
+    mp.setattr(org.recordings, "mark_uploaded", fake_mark)
+    body = {"sizeBytes": 10, "gpsTrack": [{"t": 1, "lat": -36.85, "lon": 174.76}]}
+    res = org.lambda_handler(make_event("POST", "/api/org/recordings/rid/complete", body=body), None)
+    assert res["statusCode"] == 200
+    assert captured["gps_track"] == [{"t": 1, "lat": -36.85, "lon": 174.76}]
+
+
+def test_complete_without_gps_track_is_backward_compatible(wired):
+    # Old clients that omit gpsTrack entirely must behave exactly as today:
+    # mark_uploaded is called with gps_track=None (COALESCE keeps existing value).
+    mp, fake = wired
+    captured = {}
+
+    def fake_mark(conn, rid, cid, sz=None, gps_track=None):
+        captured["gps_track"] = gps_track
+        return {"id": rid}
+
+    mp.setattr(org.recordings, "mark_uploaded", fake_mark)
+    res = org.lambda_handler(make_event("POST", "/api/org/recordings/rid/complete",
+                                        body={"sizeBytes": 10}), None)
+    assert res["statusCode"] == 200
+    assert captured["gps_track"] is None
+
+
+def test_complete_non_list_gps_track_dropped_not_rejected(wired):
+    # Malformed optional telemetry must never fail the complete: a non-list
+    # gpsTrack is dropped (mark_uploaded gets None) and the request still 200s.
+    mp, fake = wired
+    captured = {}
+
+    def fake_mark(conn, rid, cid, sz=None, gps_track=None):
+        captured["gps_track"] = gps_track
+        return {"id": rid}
+
+    mp.setattr(org.recordings, "mark_uploaded", fake_mark)
+    res = org.lambda_handler(make_event("POST", "/api/org/recordings/rid/complete",
+                                        body={"sizeBytes": 10, "gpsTrack": "not-a-list"}), None)
+    assert res["statusCode"] == 200
+    assert captured["gps_track"] is None
+
+
+def test_complete_empty_gps_track_list_passed_through(wired):
+    # Pin empty-list semantics: [] is a valid list and is passed through as-is
+    # (it overwrites via COALESCE since [] is not NULL — deliberate).
+    mp, fake = wired
+    captured = {}
+
+    def fake_mark(conn, rid, cid, sz=None, gps_track=None):
+        captured["gps_track"] = gps_track
+        return {"id": rid}
+
+    mp.setattr(org.recordings, "mark_uploaded", fake_mark)
+    res = org.lambda_handler(make_event("POST", "/api/org/recordings/rid/complete",
+                                        body={"sizeBytes": 10, "gpsTrack": []}), None)
+    assert res["statusCode"] == 200
+    assert captured["gps_track"] == []
