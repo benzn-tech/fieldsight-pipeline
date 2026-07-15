@@ -56,6 +56,22 @@ class FakeS3:
         raw = body.encode("utf-8") if isinstance(body, str) else body
         return {"Body": io.BytesIO(raw)}
 
+    def get_paginator(self, op):
+        assert op == "list_objects_v2"
+        return _FakePaginator(self.objects)
+
+
+class _FakePaginator:
+    """Task 3 (authority-flip plan): the pictures-prefix listing paginator.
+    Mirrors tests/unit/test_lambda_ingest.py's _FakePaginator exactly."""
+
+    def __init__(self, objects):
+        self.objects = objects
+
+    def paginate(self, Bucket, Prefix):
+        contents = [{"Key": k} for k in self.objects if k.startswith(Prefix)]
+        yield {"Contents": contents}
+
 
 EXTRACTION_KEY = "extractions/Jarley_Trainor/2026-07-06/Benl1_2026-07-06_10-00-00.json"
 
@@ -540,3 +556,114 @@ def test_no_findings_key_still_works(wired):
     assert result == {"skipped": False, "topics": 1}
     assert calls == [[]]
     assert emitted[0][0]["findings"] == []
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (authority-flip plan) -- _photos_for_topics pure helper: time-
+# correlates S3 pictures (already resolved to {key, filename, hhmm} by the
+# BUG-01-safe transcript_utils filename extractor) against each topic's
+# 'HH:MM – HH:MM' time_range window. Mirrors lambda_report_generator's
+# correlate_photos_with_transcripts (lambda_report_generator.py:386-402),
+# but keyed on a topic's own display window instead of nearest-transcript
+# proximity.
+# ---------------------------------------------------------------------------
+
+def _photo(name, hhmm):
+    return {"key": f"users/Jarley_Trainor/pictures/2026-07-06/{name}",
+            "filename": name, "hhmm": hhmm}
+
+
+def test_photo_matches_inside_time_range_only():
+    topics_list = [{"time_range": "10:00 – 10:05"}]
+    inside = _photo("a.jpg", "10:02")
+    outside = _photo("b.jpg", "10:06")
+
+    result = iw._photos_for_topics([inside, outside], topics_list)
+
+    assert result == {0: [inside]}
+
+
+def test_photo_attaches_to_first_matching_topic_only():
+    # Two topics with overlapping time_range windows -- a photo that falls
+    # inside both must attach ONLY to the first (lowest-index) one.
+    topics_list = [
+        {"time_range": "09:00 – 10:00"},
+        {"time_range": "09:30 – 11:00"},
+    ]
+    photo = _photo("a.jpg", "09:45")
+
+    result = iw._photos_for_topics([photo], topics_list)
+
+    assert result == {0: [photo], 1: []}
+
+
+def test_cap_five_photos_per_topic():
+    topics_list = [{"time_range": "09:00 – 10:00"}]
+    photos = [_photo(f"p{i}.jpg", f"09:1{i}") for i in range(6)]
+
+    result = iw._photos_for_topics(photos, topics_list)
+
+    assert len(result[0]) == 5
+    assert result[0] == photos[:5]  # first 5, cap does not reorder
+
+
+def test_unparseable_time_range_gets_no_photos():
+    topics_list = [
+        {"time_range": None},          # missing
+        {"time_range": "not a range"},  # unparseable
+        {"time_range": "09:00 – 10:00"},  # valid, but doesn't overlap the others
+    ]
+    photo = _photo("a.jpg", "09:30")
+
+    result = iw._photos_for_topics([photo], topics_list)
+
+    assert result.get(0, []) == []
+    assert result.get(1, []) == []
+    assert result[2] == [photo]
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (authority-flip plan) -- adapter: write_extraction_items lists
+# users/{user_folder}/pictures/{date}/ ONCE per invocation (paginator,
+# outside the per-topic loop) and passes time-correlated matches into the
+# EXISTING topics.upsert_topic(photos=...) support (topics.py:38-42).
+# ---------------------------------------------------------------------------
+
+def test_item_writer_upserts_topic_photos(wired):
+    pictures_prefix = "users/Jarley_Trainor/pictures/2026-07-06/"
+    photo_key = pictures_prefix + "Benl1_2026-07-06_10-02-00.jpg"
+    wired.setattr(iw, "_s3_client", FakeS3({
+        EXTRACTION_KEY: json.dumps(make_extraction()),
+        photo_key: b"",
+    }))
+    captured = []
+    wired.setattr(
+        iw.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            captured.append(kw) or {"id": "topic-uuid-0"},
+    )
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 1}
+    assert len(captured) == 1
+    # make_extraction()'s one topic has time_range "10:00 – 10:05";
+    # the photo's filename encodes 10:02, inside that window.
+    assert captured[0]["photos"] == [{"s3_key": photo_key, "caption_text": None}]
+
+
+def test_missing_pictures_prefix_is_noop(wired):
+    # wired's default FakeS3 only has EXTRACTION_KEY -- the pictures prefix
+    # listing returns zero Contents (empty prefix -> no-op, not a crash).
+    captured = []
+    wired.setattr(
+        iw.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            captured.append(kw) or {"id": "topic-uuid-0"},
+    )
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 1}
+    assert len(captured) == 1
+    assert captured[0]["photos"] == []

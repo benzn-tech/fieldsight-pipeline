@@ -1071,6 +1071,11 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - extractions/*
+                    # Task 3 (authority-flip plan) -- list-only (no
+                    # GetObject) so write_extraction_items can list
+                    # users/{user_folder}/pictures/{date}/ to time-correlate
+                    # photos onto extraction topics (topic_photos).
+                    - users/*
 
   # ----------------------------------------------------------
   # Lambda 17: Suggestion Writer (Programme<->Item feedback, Task 2) —
