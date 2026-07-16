@@ -5,8 +5,6 @@ escaped, or the match would hit unrelated s3_keys. Real match/company/null
 semantics are covered by tests/integration/test_recordings_repo.py (real DB).
 FakeConn/FakeCursor record each execute() call; cursor() accepts row_factory.
 """
-import pytest
-
 from repositories import recordings
 
 

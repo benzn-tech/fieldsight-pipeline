@@ -91,7 +91,6 @@ def _insert_recording(db, cid, uid, sid, s3_key):
         (cid, uid, sid, s3_key, s3_key))  # client_uuid unique enough for the test
 
 
-@pytest.mark.integration
 def test_site_for_media_returns_in_company_tagged_site(db):
     cid, uid, sid = _seed_company_user_site(db, "A")
     _insert_recording(db, cid, uid, sid,
@@ -100,7 +99,6 @@ def test_site_for_media_returns_in_company_tagged_site(db):
     assert site is not None and site["id"] == sid
 
 
-@pytest.mark.integration
 def test_site_for_media_excludes_cross_company_and_null_and_nonmatch(db):
     cid, uid, sid = _seed_company_user_site(db, "A")
     # (a) a recording in company A but tagged with a site from company B → must be ignored
