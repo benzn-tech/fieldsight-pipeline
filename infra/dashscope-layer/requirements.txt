@@ -1,0 +1,8 @@
+dashscope==1.25.16
+# Pinned to a recent release confirmed on PyPI (July 2026) that includes the
+# dashscope.audio.qwen_tts_realtime module used by src/dashscope_utils.py's
+# tts(). Transitively pulls websocket-client (used by the realtime SDK for
+# the Qwen-TTS-Realtime WebSocket connection). If a build fails to resolve
+# this exact version, bump to whatever is current on PyPI at build time --
+# no known breaking changes to the qwen_tts_realtime API are expected across
+# patch/minor releases.

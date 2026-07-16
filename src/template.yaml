@@ -675,6 +675,11 @@ Resources:
           # sonnet completion risks blowing that budget; haiku is fast and
           # matches the legacy S3 path's HAIKU_MODEL.
           CLAUDE_MODEL: claude-haiku-4-5-20251001
+          # DASHSCOPE_TTS_* below default inside dashscope_utils.py (model
+          # qwen3-tts-flash-realtime, voice Cherry, intl WS url) — no env
+          # override needed here; DashScopeLayer (below) provides the SDK.
+      Layers:
+        - !Ref DashScopeLayer
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
@@ -682,6 +687,28 @@ Resources:
             FunctionName: !Ref RagSearchFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref VoiceAuditFunction
+
+  # ----------------------------------------------------------
+  # Lambda Layer: dashscope SDK (SP-Ask TTS)
+  # AskAgentFunction's tts() needs the Qwen-TTS-Realtime WebSocket client
+  # (dashscope.audio.qwen_tts_realtime), not available via a plain HTTP call
+  # like embed()/stt() -- hence a dedicated layer, same build pattern as
+  # PsycopgLayer just below. Condition: HasDb mirrors PsycopgLayer exactly;
+  # AskAgentFunction's !Ref to it is covered by the same W1001 suppression
+  # (top-of-file Metadata) as its RagSearchFunction/VoiceAuditFunction refs --
+  # inert in practice since both real deploy targets always set DbStackName.
+  # ----------------------------------------------------------
+  DashScopeLayer:
+    Type: AWS::Serverless::LayerVersion
+    Condition: HasDb
+    Properties:
+      LayerName: !Sub ["${P}-dashscope-layer", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      Description: dashscope SDK (Qwen-TTS-Realtime WebSocket client) for AskAgentFunction's tts()
+      ContentUri: infra/dashscope-layer/
+      CompatibleRuntimes:
+        - python3.11
+    Metadata:
+      BuildMethod: python3.11
 
   # ----------------------------------------------------------
   # Lambda Layer: psycopg[binary] + pgvector (Phase 2B)
