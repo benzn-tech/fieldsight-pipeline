@@ -83,6 +83,37 @@ def test_missing_content_returns_empty(monkeypatch):
     assert du.stt(b"x", "m4a") == ""
 
 
+def test_missing_content_logs_warning(monkeypatch, caplog):
+    """Structure-missing (as opposed to a genuinely silent clip) must leave a
+    WARNING in CloudWatch -- the only way to tell "broken integration" apart
+    from "user said nothing" while the DashScope response shape is still an
+    unverified guess. Return value must still be "" (fail-soft unchanged)."""
+    monkeypatch.setattr(du.urllib3.PoolManager, "request",
+                        lambda self, *a, **k: _FakeResponse(200, {"output": {}}))
+    with caplog.at_level("WARNING"):
+        result = du.stt(b"x", "m4a")
+    assert result == ""
+    assert any(
+        "DashScope ASR response missing expected structure" in r.message
+        for r in caplog.records
+    )
+
+
+def test_unexpected_content_type_logs_warning(monkeypatch, caplog):
+    """content present but neither str nor list (e.g. None) -- also a
+    structure mismatch, not a silent clip -- must warn and still return ""."""
+    payload = {"output": {"choices": [{"message": {"content": None}}]}}
+    monkeypatch.setattr(du.urllib3.PoolManager, "request",
+                        lambda self, *a, **k: _FakeResponse(200, payload))
+    with caplog.at_level("WARNING"):
+        result = du.stt(b"x", "m4a")
+    assert result == ""
+    assert any(
+        "DashScope ASR response missing expected structure" in r.message
+        for r in caplog.records
+    )
+
+
 def test_retries_on_503_then_succeeds(monkeypatch):
     calls = {"n": 0}
 

@@ -171,18 +171,46 @@ def _aigc_request(body):
     raise RuntimeError(f"DashScope aigc request failed after {MAX_ATTEMPTS} attempts: {last_error}")
 
 
+def _asr_response_preview(data):
+    """Best-effort short text preview of an ASR response body, for the
+    structure-missing warning below (never raises)."""
+    try:
+        return json.dumps(data)[:500]
+    except (TypeError, ValueError):
+        return str(data)[:500]
+
+
 def _extract_asr_text(data):
     """Pull the transcript out of a multimodal-generation ASR response.
     Expected: output.choices[0].message.content is a list of parts, each maybe
-    {"text": ...}; tolerant of a plain-string content too. "" if not present."""
+    {"text": ...}; tolerant of a plain-string content too. "" if not present.
+
+    Fail-soft by design (never raises -- a genuinely silent clip also yields
+    "" and must not fail the request). But the DashScope response shape here
+    is an UNVERIFIED guess (see stt()'s docstring); if the real shape differs,
+    every call would silently return "" and be indistinguishable from "user
+    said nothing". So when the structure itself doesn't match (not just an
+    empty transcript within an otherwise-well-formed structure), log a
+    WARNING -- this is the only CloudWatch signal that tells "broken
+    integration" apart from "silent clip" during device validation. The
+    return value is still "" either way; callers' fail-soft behavior is
+    unchanged."""
     try:
         content = data["output"]["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
+        logger.warning(
+            "DashScope ASR response missing expected structure: %s",
+            _asr_response_preview(data),
+        )
         return ""
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
         return "".join(p.get("text", "") for p in content if isinstance(p, dict)).strip()
+    logger.warning(
+        "DashScope ASR response missing expected structure: %s",
+        _asr_response_preview(data),
+    )
     return ""
 
 

@@ -694,11 +694,17 @@ def _rag_answer(body):
 
     claude_utils / dashscope_utils are imported HERE (lazily), not at module
     top level: scripts/deploy-lambda-code.sh zips ONLY lambda_ask_agent.py +
-    transcript_utils.py for prod. A top-level `import claude_utils` would
-    ImportModuleError the entire module on prod (killing the legacy S3-file
-    path too, not just RAG) the moment this file merges to main -- prod has
-    no RAG_SEARCH_FUNCTION env var and was never meant to take this branch
-    (see the caller_sub-and-RAG_SEARCH_FUNCTION guard in lambda_handler).
+    transcript_utils.py for the LEGACY hand-built prod (the fieldsight-*
+    lambdas outside CloudFormation/SAM entirely -- see CLAUDE.md / the
+    two-accounts note). A top-level `import claude_utils` would
+    ImportModuleError the entire module there (killing the legacy S3-file
+    path too, not just RAG) the moment this file merges to main -- that
+    legacy prod's zip genuinely has no claude_utils.py/dashscope_utils.py in
+    it and no RAG_SEARCH_FUNCTION env var (it's not SAM-managed, so
+    template.yaml doesn't apply to it at all). This is UNRELATED to whether
+    THIS SAM pipeline's own prod target (fieldsight-prod-*, template.yaml)
+    has RAG_SEARCH_FUNCTION -- it does, same as SAM test (see the
+    caller_sub-and-RAG_SEARCH_FUNCTION guard in lambda_handler for that).
 
     The whole body is wrapped in try/except so any failure (embed, the
     rag-search invoke, Claude) degrades to the same success envelope shape
@@ -921,9 +927,24 @@ def lambda_handler(event, context):
     if not body and ('question' in event or 'audio' in event):
         body = event
 
-    # --- Voice path (SP-Ask): body carries a base64 audio clip. Only when the
-    # RAG infra is wired (fieldsight-test); prod has no RAG_SEARCH_FUNCTION and
-    # must never take this branch.
+    # --- Voice path (SP-Ask): body carries a base64 audio clip. Gated on
+    # RAG_SEARCH_FUNCTION being set, i.e. this deploy target has RAG infra
+    # wired (Condition: HasDb in template.yaml). NOTE: within THIS SAM
+    # pipeline, RAG_SEARCH_FUNCTION is set UNCONDITIONALLY on AskAgentFunction
+    # whenever HasDb is true (template.yaml AskAgentFunction Environment --
+    # not wrapped in an !If), and template.yaml's own top-of-file Metadata
+    # states both real SAM deploy targets (TEST via deploy.yml AND
+    # PROD=fieldsight-prod via deploy-prod.yml) always pass DbStackName
+    # together, so HasDb -- and therefore RAG_SEARCH_FUNCTION -- is true on
+    # BOTH, including SAM prod. So this branch is NOT gated out of SAM prod;
+    # it activates there too whenever DASHSCOPE_API_KEY is also present
+    # (both deploy.yml and deploy-prod.yml pass it from the same GH secret).
+    # If DASHSCOPE_API_KEY is ever absent, this stays fail-safe: dashscope_
+    # utils.stt()/tts() raise, and _voice_answer() catches that and returns a
+    # graceful {"error": ...} instead of a hard failure -- it does not fall
+    # back out of this branch. (This is separate from the company's CDK-
+    # managed production account, which runs a different template entirely
+    # and never has RAG_SEARCH_FUNCTION -- see fieldsight-two-accounts.)
     if body.get('audio') and os.environ.get('RAG_SEARCH_FUNCTION'):
         return ok(_voice_answer(body))
 
@@ -937,11 +958,17 @@ def lambda_handler(event, context):
         return error('Missing question')
 
     # --- RAG path (Phase 5): triggered when caller_sub is present AND this
-    # deploy target actually has a rag-search function wired up. Prod has no
-    # RAG_SEARCH_FUNCTION env var (see template.yaml AskAgentFunction) and
-    # never runs SAM-provisioned VPC/DB/DashScope infra, so it must always
-    # fall through to the legacy S3 path even once ApiFunction starts
-    # forwarding caller_sub everywhere.
+    # deploy target actually has a rag-search function wired up, i.e.
+    # RAG_SEARCH_FUNCTION is set. Per template.yaml, AskAgentFunction sets
+    # RAG_SEARCH_FUNCTION unconditionally whenever Condition: HasDb is true,
+    # and template.yaml's own top-of-file Metadata says HasDb is true on
+    # BOTH real SAM deploy targets (TEST via deploy.yml and PROD=fieldsight-
+    # prod via deploy-prod.yml) -- so this branch is live on SAM prod too,
+    # not just test. (The LEGACY hand-built fieldsight-* lambdas -- deployed
+    # by scripts/deploy-lambda-code.sh, outside CloudFormation/SAM entirely
+    # -- are a different deploy target not governed by template.yaml at all;
+    # those never get RAG_SEARCH_FUNCTION and always fall through to the S3
+    # path. Don't conflate the two "prod"s.)
     if body.get('caller_sub') and os.environ.get('RAG_SEARCH_FUNCTION'):
         if body.get('mode') == 'search':
             return ok(_rag_search_list(body))
