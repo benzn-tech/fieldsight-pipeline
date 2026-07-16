@@ -902,6 +902,58 @@ def ask_question(body, caller):
         return error(f'Ask agent error: {e}', 500)
 
 
+# ── POST /api/ask/voice (SP-Ask) ─────────────────────────────
+
+# ~15s of 128kbps AAC ≈ 240KB ≈ 320K base64 chars; 1.5M chars (~1.1MB decoded)
+# is generous headroom while still rejecting absurd payloads early.
+MAX_VOICE_AUDIO_B64 = 1_500_000
+
+
+def ask_voice(body, caller):
+    """Hands-free voice ask (SP-Ask): forward the base64 clip to the Ask Agent,
+    which chains DashScope STT -> RAG (caller_sub ACL, voice prompt, Haiku) ->
+    DashScope TTS and returns {transcript, answerText, audioBase64, audioFormat}.
+
+    Routed here (ApiFunction, non-VPC) and NOT on lambda_org_api: the org API
+    is in-VPC with no NAT and no lambda VPC endpoint (BUG-36), so it can
+    neither reach DashScope nor invoke AskAgentFunction. This function already
+    holds LambdaInvokePolicy on AskAgentFunction and the /api/{proxy+} route.
+    caller identity comes from the Cognito authorizer claims -- never from the
+    client body (mirrors ask_question's caller_sub bridge)."""
+    if not caller.get('sub'):
+        return error('Unauthenticated', 401)
+    audio_b64 = body.get('audio')
+    if not audio_b64 or not isinstance(audio_b64, str):
+        return error('Missing audio (base64 clip required)')
+    if len(audio_b64) > MAX_VOICE_AUDIO_B64:
+        return error('Audio too large', 413)
+
+    payload = {
+        'mode': 'voice',
+        'audio': audio_b64,
+        'format': body.get('format') or 'm4a',
+        'caller_sub': caller['sub'],
+    }
+    try:
+        resp = lambda_client.invoke(
+            FunctionName=ASK_AGENT_FUNCTION,
+            InvocationType='RequestResponse',
+            Payload=json.dumps(payload)
+        )
+        # Same FunctionError posture as ask_question: never pass a crashed
+        # agent's {errorMessage, stackTrace} payload through to the client.
+        if resp.get('FunctionError'):
+            logger.error(f"Voice ask agent FunctionError: {resp.get('FunctionError')}")
+            return error('Ask agent error', 500)
+        result = json.loads(resp['Payload'].read().decode('utf-8'))
+        if 'body' in result:
+            return result
+        return ok(result)
+    except Exception as e:
+        logger.error(f"Voice ask invocation failed: {e}")
+        return error(f'Ask agent error: {e}', 500)
+
+
 # ── POST /api/search ─────────────────────────────────────────
 
 def search_topics(body, caller):
@@ -1037,6 +1089,7 @@ def lambda_handler(event, context):
         elif path == '/api/actions/toggle' and method == 'POST': return toggle_action(body, caller)
         elif path == '/api/actions': return get_actions(params, caller)
         elif path == '/api/ask' and method == 'POST': return ask_question(body, caller)
+        elif path == '/api/ask/voice' and method == 'POST': return ask_voice(body, caller)
         elif path == '/api/search' and method == 'POST': return search_topics(body, caller)
         else: return error(f'Not found: {method} {path}', 404)
     except Exception as e:
