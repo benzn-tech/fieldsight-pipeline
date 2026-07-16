@@ -155,3 +155,28 @@ def test_invalid_base64_returns_error(monkeypatch):
     wire(monkeypatch)
     body = run(voice_event(audio="!!!not base64!!!"))
     assert "error" in body
+
+
+def test_audit_invoke_failure_voice_turn_still_succeeds(monkeypatch):
+    class ExplodingLambdaClient:
+        def invoke(self, **kwargs):
+            raise RuntimeError("lambda invoke boom")
+
+    wire(monkeypatch)
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: ExplodingLambdaClient())
+    body = run(voice_event())
+    # Audit invoke blew up, but the voice turn itself must still succeed.
+    assert "error" not in body
+    assert body["transcript"] == "what happened at ellesmere"
+    assert body["answerText"] == "The slab pour finished."
+    assert body["audioFormat"] == "wav"
+
+
+def test_prod_guard_no_rag_search_function_voice_branch_not_taken(monkeypatch):
+    fake = wire(monkeypatch)
+    monkeypatch.delenv("RAG_SEARCH_FUNCTION", raising=False)
+    body = run(voice_event())
+    # Voice branch must not run (prod has no RAG/VPC infra); falls through to
+    # the legacy S3 path, which 400s since a voice event carries no 'question'.
+    assert body == {"error": "Missing question"}
+    assert fake.calls == []
