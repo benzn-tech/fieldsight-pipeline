@@ -803,6 +803,74 @@ def _rag_answer(body):
 # ============================================================
 
 
+# ============================================================
+# Voice path (SP-Ask): STT -> RAG(voice) -> TTS -> async audit
+# ============================================================
+
+def _invoke_voice_audit(caller_sub, transcript, answer):
+    """Fire-and-forget the audit-row write to the in-VPC VoiceAuditFunction.
+    This lambda is non-VPC and cannot reach Aurora (BUG-36); only a non-VPC ->
+    in-VPC invoke is allowed, so the write is split into that hop. Best-effort:
+    a failed/absent audit never fails the ask (InvocationType='Event')."""
+    fn = os.environ.get("VOICE_AUDIT_FUNCTION")
+    if not fn:
+        return
+    try:
+        _get_lambda_client().invoke(
+            FunctionName=fn,
+            InvocationType="Event",
+            Payload=json.dumps({"caller_sub": caller_sub,
+                                "transcript": transcript, "answer": answer}),
+        )
+    except Exception as e:
+        logger.warning("  voice audit invoke failed (non-fatal): %s", e)
+
+
+def _voice_answer(body):
+    """Chain one hands-free voice ask: base64-decode -> DashScope STT ->
+    existing RAG path (mode='voice', caller_sub ACL, Haiku) -> DashScope TTS ->
+    async audit. Returns the Contract voice shape, or {'error', 'transcript'?}
+    on any stage failure. Never raises (lambda_handler wraps with ok())."""
+    import base64 as _b64
+    import dashscope_utils
+
+    caller_sub = body.get("caller_sub")
+    fmt = body.get("format") or "m4a"
+    try:
+        audio_bytes = _b64.b64decode(body.get("audio") or "", validate=True)
+    except Exception:
+        return {"error": "Invalid audio encoding"}
+
+    try:
+        transcript = dashscope_utils.stt(audio_bytes, fmt)
+    except Exception as e:
+        logger.error("  voice STT failed: %s", e)
+        return {"error": "Speech recognition failed"}
+    if not transcript or not transcript.strip():
+        # STT heard nothing -> device plays its bundled error cue (spec §7).
+        return {"error": "Empty transcript", "transcript": ""}
+
+    rag = _rag_answer({"question": transcript, "caller_sub": caller_sub,
+                       "mode": "voice", "k": body.get("k", 5)})
+    answer_text = (rag.get("answer") or "").strip()
+    if rag.get("error") or not answer_text:
+        return {"error": rag.get("error") or "No answer", "transcript": transcript}
+
+    try:
+        audio_out = dashscope_utils.tts(answer_text)
+    except Exception as e:
+        logger.error("  voice TTS failed: %s", e)
+        return {"error": "Speech synthesis failed", "transcript": transcript}
+
+    _invoke_voice_audit(caller_sub, transcript, answer_text)
+    return {
+        "transcript": transcript,
+        "answerText": answer_text,
+        "audioBase64": _b64.b64encode(audio_out).decode("ascii"),
+        "audioFormat": "wav",
+    }
+
+
 def ok(body, status=200):
     return {
         'statusCode': status,
@@ -850,8 +918,14 @@ def lambda_handler(event, context):
             return error('Invalid JSON body')
 
     # Also support direct Lambda invocation (event IS the body)
-    if not body and 'question' in event:
+    if not body and ('question' in event or 'audio' in event):
         body = event
+
+    # --- Voice path (SP-Ask): body carries a base64 audio clip. Only when the
+    # RAG infra is wired (fieldsight-test); prod has no RAG_SEARCH_FUNCTION and
+    # must never take this branch.
+    if body.get('audio') and os.environ.get('RAG_SEARCH_FUNCTION'):
+        return ok(_voice_answer(body))
 
     date = body.get('date', '')
     user = body.get('user', '')
