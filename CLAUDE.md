@@ -571,6 +571,22 @@ Parameters:
 (`PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'`,ARN 走
 Parameter 而非 ImportValue);或为所需服务加 VPC interface endpoint。运行时零外呼是首选。
 
+### BUG-37: Lambda 里 `datetime.now()` 是 UTC —— 拿去和 NZ 日期比会偏一天
+Lambda 运行时时区是 UTC,`datetime.now()`(naive)= UTC。RealPTT 录音按 **NZ 客户端时间**记日期。
+orchestrator 用 `end_date = datetime.now()` 算查询窗口(`lambda_orchestrator.py`),NZ 上午
+(UTC 还是前一天)时窗口末端锚在 UTC 昨天,**漏掉今天 NZ 的录音**,要拖到 UTC 翻天(≈NZ 中午)才拉。
+2026-07-16 实证:NZ 10:49(UTC 07-15 22:49)查询窗口是 `[07-14,07-15]`,今早录音全在窗外。
+**Fix**(`compute_query_range`,已上线 PR #70):`datetime.now(timezone.utc) + timedelta(ms=time_difference_ms)`
+先转 NZ 再取日期。**通则:后端任何"今天"的日期计算都要显式转 NZ,别用裸 `datetime.now()`**
+(前端同类是 BUG-19)。同类可疑点:自研 app 的日期文件夹也偏了一天(见
+`docs/superpowers/specs/2026-07-16-grandtime-app-prod-integration.md` G3)。
+
+### 定时器交接(2026-07-15 schedules cutover 上线)
+录音下载 + 报告生成的 cron 已从遗留手管的 `sitesync` EventBridge 组切到 **fieldsight-prod SAM 栈**
+的 schedule(`PROD_ENABLE_SCHEDULES=true`):orchestrator 15 分钟 sweep(工作时段 05:00–19:59 NZ)
+让录音**盘中进湖**(不再一天一次 19:00)。5 个遗留 `sitesync` schedule 已 DISABLED(定义保留可回滚)。
+plan `docs/superpowers/plans/2026-07-15-schedules-cutover.md`。
+
 ---
 
 ## Aurora item store — findings + programme-impact (2026-07-13/14)
@@ -587,13 +603,15 @@ Parameter 而非 ImportValue);或为所需服务加 VPC interface endpoint。运
   （含 durable uuid）一并塞进它本来就在发的 artifact 里；matcher 复用已有的候选门/
   embedding 批次，多打一次 Claude 调用产出 finding→task 的 impact 判定；in-VPC
   writer 用 `findings.apply_impact` 落库。matcher 本身仍是 non-VPC（BUG-36）。
-- **同日有效（same-day-only），直到 authority flip（spec §6 / plan Task 4，尚未实现）**：
-  findings + impact 链接挂在 PROVISIONAL 的 extraction topics 上，05:00 nightly cron
-  (`lambda_ingest.py` `delete_topics_for_source_prefix("extractions/…")`) 会把当天的
-  session-level topics 连同 findings/impacts 一起级联删除。report-path
-  （`daily_report.json` → item-writer）目前不产生 findings，所以过了当天，
-  impact 信号就消失，直到 authority flip 落地（停掉夜间覆盖）才会变成持久化。
-  验证 `/live-items` 的 findings 必须在当天 05:00 NZDT 之前做。
+- **~~同日有效（same-day-only）~~ → 已持久化（authority flip 2026-07-16 上线）**：
+  authority flip 全线上线（Tasks 0-9，plan `docs/superpowers/plans/2026-07-14-authority-flip.md`）。
+  `fieldsight-prod-ingest` `AUTHORITY_FLIP=true`（由 repo 变量 `PROD_AUTHORITY_FLIP` 驱动，
+  deploy-prod.yml）：当某 `(user,date)` 有 extraction topics 时，夜间 ingest **defer**
+  （不再 `delete_topics_for_source_prefix("extractions/…")`、不写报告 topic），
+  findings + impact **跨天持久、手动打勾不回滚**。~~"验证必须在 05:00 NZDT 前"作废~~。
+  读路径：Today/Timeline 经 org-api `/timeline` shim（客户站 Amplify `FS_TIMELINE_SOURCE=aurora`）
+  服务持久 override + 报告文档 prose。回滚：`PROD_AUTHORITY_FLIP=false` 重部署 + 按 (date,user)
+  重跑 ingest 重新 supersede。零-extraction 天仍回落报告路径（I-4 门）。
 - **D8 过渡期双写**：safety 域的 finding 现在同时落两个地方——旧的
   `safety_observations`（PR #46 `_derive_safety_flags` 桥接，`rollup.py` 仍读这张表）
   和新的 `findings`（0010）。这是刻意的过渡态，不去重；authority flip 落地后再退役
