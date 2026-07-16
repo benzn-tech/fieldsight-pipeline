@@ -208,3 +208,35 @@ def stt(audio_bytes, fmt="m4a"):
         "parameters": {"asr_options": {"language": DASHSCOPE_ASR_LANG, "enable_lid": False}},
     })
     return _extract_asr_text(_aigc_request(body))
+
+
+def tts(text):
+    """DashScope TTS (qwen-tts): synthesize `text` to WAV bytes. Mirrors
+    embed()'s urllib3 + DASHSCOPE_API_KEY pattern via _aigc_request. Returns
+    raw WAV bytes (b"" for empty text). The model returns audio either inline
+    (base64) or as a short-lived URL -- handle both. Raises RuntimeError on a
+    missing key or a response carrying neither.
+
+    spec §11: verify the qwen-tts request nesting + output container (wav vs
+    mp3) against live DashScope in Task 3 Step 5."""
+    if not DASHSCOPE_API_KEY:
+        raise RuntimeError("DASHSCOPE_API_KEY not set")
+    if not text or not text.strip():
+        return b""
+    body = json.dumps({
+        "model": DASHSCOPE_TTS_MODEL,
+        "input": {"text": text, "voice": DASHSCOPE_TTS_VOICE},
+        "parameters": {"format": "wav"},
+    })
+    data = _aigc_request(body)
+    audio = (data.get("output") or {}).get("audio") or {}
+    inline = audio.get("data")
+    if inline:
+        return base64.b64decode(inline)
+    url = audio.get("url")
+    if url:
+        resp = urllib3.PoolManager().request("GET", url, timeout=60.0)
+        if resp.status != 200:
+            raise RuntimeError(f"DashScope TTS audio fetch failed: HTTP {resp.status}")
+        return resp.data
+    raise RuntimeError("DashScope TTS response missing audio data/url")
