@@ -116,6 +116,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(iw.lambda_ingest, "resolve_site",
                         lambda conn, cid, report, user_folder: {"id": "site-1", "name": "Test Site"})
     monkeypatch.setattr(iw.lambda_ingest, "resolve_user", lambda conn, cid, user_folder: None)
+    monkeypatch.setattr(iw.recordings, "site_for_media", lambda *a, **k: None)
     monkeypatch.setattr(iw.topics, "delete_topics_for_source", lambda *a, **k: 0)
     monkeypatch.setattr(iw.topics, "upsert_topic", lambda *a, **k: {"id": "topic-uuid-0"})
     monkeypatch.setattr(iw.findings, "insert_findings", lambda *a, **k: [])
@@ -667,3 +668,52 @@ def test_missing_pictures_prefix_is_noop(wired):
     assert result == {"skipped": False, "topics": 1}
     assert len(captured) == 1
     assert captured[0]["photos"] == []
+
+
+# ---------------------------------------------------------------------------
+# G5b -- recordings.site_for_media (app tag) overrides membership resolve_site
+# ---------------------------------------------------------------------------
+
+def _capture_topic_site(wired):
+    """Capture the site_id positional arg upsert_topic receives; returns the list."""
+    captured = []
+    wired.setattr(iw.topics, "upsert_topic",
+                  lambda conn, site_id, *a, **k: captured.append(site_id) or {"id": "topic-x"})
+    return captured
+
+
+def test_recording_tag_overrides_membership(wired):
+    wired.setattr(iw.recordings, "site_for_media", lambda *a, **k: {"id": "site-TAG"})
+    wired.setattr(iw.lambda_ingest, "resolve_site", lambda *a, **k: {"id": "site-MEMBER"})
+    seen = _capture_topic_site(wired)
+    iw.write_extraction_items("2026-07-16", "Ben_Lin", EXTRACTION_KEY)
+    assert seen and all(s == "site-TAG" for s in seen)
+
+
+def test_falls_back_to_membership_when_no_tag(wired):
+    wired.setattr(iw.recordings, "site_for_media", lambda *a, **k: None)
+    wired.setattr(iw.lambda_ingest, "resolve_site", lambda *a, **k: {"id": "site-MEMBER"})
+    seen = _capture_topic_site(wired)
+    iw.write_extraction_items("2026-07-16", "Ben_Lin", EXTRACTION_KEY)
+    assert seen and all(s == "site-MEMBER" for s in seen)
+
+
+def test_admin_recording_attributes_via_tag_not_skipped(wired):
+    # admin: membership resolver returns None (ALL scope), but the app tag exists
+    wired.setattr(iw.recordings, "site_for_media", lambda *a, **k: {"id": "site-TAG"})
+    wired.setattr(iw.lambda_ingest, "resolve_site", lambda *a, **k: None)
+    seen = _capture_topic_site(wired)
+    result = iw.write_extraction_items("2026-07-16", "Ben_Lin", EXTRACTION_KEY)
+    assert not result.get("skipped")
+    assert seen and all(s == "site-TAG" for s in seen)
+
+
+def test_no_tag_no_membership_still_skips(wired):
+    wired.setattr(iw.recordings, "site_for_media", lambda *a, **k: None)
+    wired.setattr(iw.lambda_ingest, "resolve_site", lambda *a, **k: None)
+    called = []
+    wired.setattr(iw.topics, "upsert_topic",
+                  lambda *a, **k: called.append("upsert") or {"id": "x"})
+    result = iw.write_extraction_items("2026-07-16", "Ben_Lin", EXTRACTION_KEY)
+    assert result.get("skipped") is True
+    assert called == []
