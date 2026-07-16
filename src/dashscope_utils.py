@@ -235,8 +235,37 @@ def tts(text):
         return base64.b64decode(inline)
     url = audio.get("url")
     if url:
-        resp = urllib3.PoolManager().request("GET", url, timeout=60.0)
-        if resp.status != 200:
-            raise RuntimeError(f"DashScope TTS audio fetch failed: HTTP {resp.status}")
-        return resp.data
+        return _get_with_retry(url)
     raise RuntimeError("DashScope TTS response missing audio data/url")
+
+
+def _get_with_retry(url):
+    """GET a short-lived audio URL, returning its raw bytes. Same retry posture
+    as _embed_batch / _aigc_request (transient RETRYABLE_STATUSES + request
+    exceptions backed off up to MAX_ATTEMPTS) -- qwen-tts's URL response is the
+    likely-dominant production path and the cross-border gateway commonly emits
+    502/504 (see RETRYABLE_STATUSES comment), so a bare single GET would fail an
+    otherwise-paid voice turn on a transient blip. Raises RuntimeError on a
+    permanent non-200 or exhausted retries."""
+    http = urllib3.PoolManager()
+    last_error = None
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            resp = http.request("GET", url, timeout=60.0)
+        except Exception as e:
+            last_error = str(e)
+            logger.warning("DashScope TTS audio fetch failed (attempt %d): %s", attempt + 1, last_error)
+            if attempt < MAX_ATTEMPTS - 1:
+                time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
+                continue
+            raise RuntimeError(
+                f"DashScope TTS audio fetch failed after {MAX_ATTEMPTS} attempts: {last_error}")
+        if resp.status == 200:
+            return resp.data
+        if resp.status in RETRYABLE_STATUSES and attempt < MAX_ATTEMPTS - 1:
+            logger.warning("DashScope TTS audio fetch HTTP %d, retrying (attempt %d/%d)",
+                           resp.status, attempt + 1, MAX_ATTEMPTS)
+            time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
+            continue
+        raise RuntimeError(f"DashScope TTS audio fetch failed: HTTP {resp.status}")
+    raise RuntimeError(f"DashScope TTS audio fetch failed after {MAX_ATTEMPTS} attempts: {last_error}")

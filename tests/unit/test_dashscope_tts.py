@@ -83,3 +83,33 @@ def test_missing_audio_raises(monkeypatch):
                         lambda self, *a, **k: _FakeResponse(200, {"output": {}}))
     with pytest.raises(RuntimeError, match="missing audio"):
         du.tts("hi")
+
+
+def test_url_fetch_retries_on_503_then_succeeds(monkeypatch):
+    wav = b"RIFFretried"
+    calls = {"get": 0}
+
+    def fake_request(self, method, url, body=None, headers=None, timeout=None):
+        if method == "POST":
+            return _FakeResponse(200, {"output": {"audio": {"url": "https://cdn/x.wav"}}})
+        calls["get"] += 1
+        if calls["get"] == 1:
+            return _FakeResponse(503, {"error": "gateway"})
+        return _FakeResponse(200, raw=wav)
+
+    monkeypatch.setattr(du.urllib3.PoolManager, "request", fake_request)
+
+    assert du.tts("hi") == wav
+    assert calls["get"] == 2  # retried once after the 503
+
+
+def test_url_fetch_permanent_404_raises(monkeypatch):
+    def fake_request(self, method, url, body=None, headers=None, timeout=None):
+        if method == "POST":
+            return _FakeResponse(200, {"output": {"audio": {"url": "https://cdn/x.wav"}}})
+        return _FakeResponse(404, {"error": "not found"})
+
+    monkeypatch.setattr(du.urllib3.PoolManager, "request", fake_request)
+
+    with pytest.raises(RuntimeError, match="HTTP 404"):
+        du.tts("hi")
