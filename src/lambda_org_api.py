@@ -583,6 +583,18 @@ def create_member(conn, caller, body):
         last_name=body.get("last_name"),
         global_role=global_role,
     )
+    # Auto-enroll the recording-folder identity (D4): link the login to its report
+    # folder from creation. Underscored safe_name (matches lambda_orchestrator.safe_name
+    # and patch_member_folder). Skip on collision — the global unique index (0012)
+    # would otherwise 500; folder can still be set later via PATCH /members/{sub}/folder.
+    if not user.get("folder_name"):
+        fn = re.sub(r'[<>:"/\\|?*\s]', '_', display_name.strip())
+        if fn:
+            clash = users.get_by_folder_name_global(conn, fn)
+            if clash is None or clash["cognito_sub"] == sub:
+                user = users.set_folder_name(conn, sub, fn) or user
+            else:
+                logger.info("create_member: folder_name %r taken, left unset for %s", fn, sub)
     created = [memberships.ensure_membership(conn, user["id"], mem["site_id"],
                                              mem["role"]) for mem in wanted]
     return ok({"user": user, "memberships": created}, 201)
