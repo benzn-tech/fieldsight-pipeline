@@ -90,6 +90,26 @@ but enrollment must become a first-class, always-applied step.
 
 ## 3. Design
 
+### 3.0 Multi-tenancy model (the core the whole model rests on) — DECIDED
+The company concept **already exists** in Aurora (migration `0002`): `companies`,
+`users.company_id`, `sites.company_id` (NOT NULL), `memberships`. The legacy
+DynamoDB store does **not** have this — another reason to consolidate on Aurora.
+
+- **Each customer is its own `company`** (SouthBase = one company, MOE = another,
+  …). A company's users see **only their own company's** sites/data. This is the
+  hard multi-tenant boundary — enforced under **every** role below, never relaxed.
+- **`platform_admin` (NEW tier)** = the FieldSight *vendor/ops* account that may
+  cross companies (this is the user's *"测试端 admin"* exception). It is the
+  **only** role that sees more than one company. Standard `admin`/`gm` are
+  company-scoped — a SouthBase admin sees only SouthBase.
+- **Every account carries a `company_id`.** The org-api already 403s a caller
+  with no company; `platform_admin` is the sole exception (company_id may be a
+  vendor/"FieldSight-platform" company or null-with-platform-flag — see D6).
+- **Setup migration (new):** today all test sites (SB1108, UC PK, MPI, …) live
+  under **one** company "FieldSight", so tenancy isn't actually exercised. To go
+  live multi-tenant we split customers into separate `companies` and reparent
+  their sites + users. Sequenced in §4.
+
 ### 3.1 One ACL primitive: `visible_scope(conn, caller)`
 A single function returns the caller's visibility envelope, used by **every**
 read path:
@@ -102,15 +122,18 @@ visible_scope(conn, caller) -> {
 }
 ```
 
-Resolution (replaces the binary `resolve_scope`):
+Resolution (replaces the binary `resolve_scope`). **All rows below `platform_admin`
+are additionally hard-scoped to the caller's `company_id`** (the multi-tenant
+invariant, §3.0):
 
-| global_role       | site_ids                                  | user_scope | meaning |
-|-------------------|-------------------------------------------|------------|---------|
-| `admin` / `gm`    | every non-archived company site           | `ALL`      | whole company |
-| `regional_manager`| union of assigned sites (memberships)     | `SITE`     | cross-project within their region |
-| `pm`              | sites where they hold a `pm` membership   | `SITE`     | all members at those projects |
-| `site_manager`    | sites where they are a member             | `SELF+WORKERS` | own + workers at their sites |
-| `worker`          | sites where they are a member             | `SELF`     | own only |
+| global_role            | company scope        | site_ids                                | user_scope     | meaning |
+|------------------------|----------------------|-----------------------------------------|----------------|---------|
+| `platform_admin` (NEW) | **all companies**    | every site in every company             | `ALL`          | FieldSight vendor/ops/test — cross-company |
+| `admin` / `gm`         | own company only     | every non-archived site in their company| `ALL`          | whole (their) company |
+| `regional_manager` (NEW)| own company only    | union of assigned sites (memberships)   | `SITE`         | cross-project within their company |
+| `pm`                   | own company only     | sites where they hold a `pm` **membership** | `SITE`     | all members at those projects |
+| `site_manager`         | own company only     | sites where they are a member           | `SELF+WORKERS` | own + workers at their sites |
+| `worker`               | own company only     | sites where they are a member           | `SELF`         | own only |
 
 - `user_scope` decides the **per-user** filter that read paths apply on top of
   `site_ids`:
@@ -120,9 +143,9 @@ Resolution (replaces the binary `resolve_scope`):
   - `SELF` → own folder only.
 - **`membership.role` is now read.** `pm` scope comes from holding a `pm`
   *membership* (per-site), independent of `global_role`; this lets one person be
-  a pm on Project A and a worker on Project B. `global_role` sets the ceiling;
-  `membership.role` sets per-site authority. (Open decision D1: whether pm is
-  driven by `global_role`, `membership.role`, or the max of the two.)
+  a pm on Project A and a worker on Project B. **(D1 DECIDED)** `global_role`
+  governs cross-project reach (regional/gm/admin/platform); per-site
+  `membership.role` governs within-project authority (pm/site_manager/worker).
 
 ### 3.2 Read-path unification
 Every read endpoint calls `visible_scope` and applies `(site_ids, user filter)`
@@ -172,22 +195,35 @@ identically. Specific fixes fall out automatically:
 3. **Graded roles**: introduce `visible_scope`, honor `membership.role`, add
    `regional_manager`. Migrate existing users (default mapping preserves current
    behavior: everyone non-admin stays site-scoped until explicitly promoted).
-4. Each step is independently shippable and reversible; the multi-tenant
+4. **Tenant split + platform_admin** (only when going truly multi-customer):
+   create per-customer `companies`, reparent their sites+users, add the
+   `platform_admin` role + platform company (D6). Until then the single
+   "FieldSight" company keeps working unchanged.
+5. Each step is independently shippable and reversible; the multi-tenant
    `company_id` guard is never relaxed.
 
 ---
 
-## 5. Open decisions (for your review)
-- **D1** — pm scope from `global_role` vs per-site `membership.role` vs max.
-- **D2** — `regional_manager`: new `global_role` value (cleanest) vs reuse `gm`
-  with a site-subset (less clean). Recommend **new value**.
-- **D3** — site_manager sees **self + workers** (legacy BUG-25 rule) vs **self
-  only** (stricter). Recommend **self + workers**, with the companion spec's
-  redaction protecting privacy.
-- **D4** — invite auto-derives `folder_name` (one-step onboarding, needs the
-  field_only-collision guard) vs explicit enroll step. Recommend **auto + guard**.
-- **D5** — legacy read-path retirement: hard cut vs keep as flagged fallback for
-  one release. Recommend **flagged fallback**, then remove.
+## 5. Decisions (RESOLVED 2026-07-17)
+- **Company structure — DECIDED:** true multi-tenancy — each customer is its own
+  `company`; add a `platform_admin` cross-company tier for the FieldSight
+  vendor/ops account. (§3.0)
+- **D1 — DECIDED:** `global_role` governs **cross-project** reach
+  (regional/gm/admin/platform); per-site **`membership.role`** governs
+  **within-project** authority (pm/site_manager/worker). So a `pm` membership at
+  UC PK lets Neil see James there, regardless of his global_role.
+- **D2 — DECIDED:** `regional_manager` is a **new `global_role` value** (added to
+  `ALLOWED_GLOBAL_ROLES`), sitting between pm and gm.
+- **D3 — DECIDED:** site_manager sees **self + workers** on their sites.
+- **D4 — DECIDED:** invite **auto-derives `folder_name`** (`safe_name("First
+  Last")`) with the unique-index collision guard (409/skip).
+- **D5 — DECIDED:** legacy read paths retired behind a **flagged fallback** for
+  one release, then removed.
+- **D6 — OPEN:** how `platform_admin` is represented — a dedicated
+  "FieldSight-platform" company row + a `platform_admin` global_role, vs a
+  `platform_admin` role with `company_id = NULL` + an explicit platform flag.
+  Recommend **dedicated platform company + `platform_admin` role** (keeps the
+  non-null `company_id` invariant intact everywhere else). One remaining call.
 
 ---
 
@@ -255,6 +291,14 @@ identically. Specific fixes fall out automatically:
 
 ## 3. 设计
 
+### 3.0 多租户模型(整个模型的内核)—— 已定
+公司概念在 Aurora 里**本就存在**(migration `0002`):`companies`、`users.company_id`、`sites.company_id`(NOT NULL)、`memberships`。遗留 DynamoDB **没有**这套——又一个该弃遗留、统一到 Aurora 的理由。
+
+- **每个客户是自己的 `company`**(SouthBase 一个公司、MOE 另一个…)。一个公司的用户**只看本公司**的站点/数据。这是硬多租户边界,下面**每个角色**都执行、绝不放松。
+- **`platform_admin`(新层)** = FieldSight *厂商/运维* 账户,可跨公司(即你说的*"测试端 admin"*例外)。它是**唯一**能看多个公司的角色。标准 `admin`/`gm` 按公司收窄——SouthBase admin 只看 SouthBase。
+- **每个账号都带 `company_id`。** org-api 现在就对无公司调用 403;`platform_admin` 是唯一例外(company_id 可为厂商/"FieldSight-platform" 公司,或 null+平台标记——见 D6)。
+- **配置迁移(新增):** 目前所有测试站点(SB1108、UC PK、MPI…)都在**一个**公司 "FieldSight" 下,租户没真正启用。要上线多租户,须把客户拆成独立 `companies`,把其站点+用户重新挂靠。步骤见 §4。
+
 ### 3.1 一个 ACL 原语:`visible_scope(conn, caller)`
 单一函数返回调用者的可见范围,供**每条**读路径使用:
 
@@ -266,18 +310,19 @@ visible_scope(conn, caller) -> {
 }
 ```
 
-解析(取代二值 `resolve_scope`):
+解析(取代二值 `resolve_scope`)。**`platform_admin` 以下所有行都额外硬绑到调用者的 `company_id`**(多租户不变量,§3.0):
 
-| global_role       | site_ids                              | user_scope        | 含义 |
-|-------------------|---------------------------------------|-------------------|------|
-| `admin` / `gm`    | 公司所有未归档站点                     | `ALL`             | 全公司 |
-| `regional_manager`| 分配站点并集(memberships)            | `SITE`            | 区域内跨项目 |
-| `pm`              | 持 `pm` membership 的站点             | `SITE`            | 这些项目的全员 |
-| `site_manager`    | 作为成员的站点                        | `SELF+WORKERS`    | 自己 + 本站 workers |
-| `worker`          | 作为成员的站点                        | `SELF`            | 只自己 |
+| global_role            | 公司范围        | site_ids                        | user_scope     | 含义 |
+|------------------------|-----------------|---------------------------------|----------------|------|
+| `platform_admin`(新)  | **所有公司**    | 每个公司的每个站点              | `ALL`          | FieldSight 厂商/运维/测试——跨公司 |
+| `admin` / `gm`         | 仅本公司        | 本公司所有未归档站点            | `ALL`          | (本)全公司 |
+| `regional_manager`(新)| 仅本公司        | 分配站点并集(memberships)      | `SITE`         | 本公司内跨项目 |
+| `pm`                   | 仅本公司        | 持 `pm` **membership** 的站点   | `SITE`         | 这些项目的全员 |
+| `site_manager`         | 仅本公司        | 作为成员的站点                  | `SELF+WORKERS` | 自己 + 本站 workers |
+| `worker`               | 仅本公司        | 作为成员的站点                  | `SELF`         | 只自己 |
 
 - `user_scope` 决定在 `site_ids` 之上的**逐用户**过滤:`ALL`=不过滤;`SITE`=作者文件夹归属于范围内站点;`SELF+WORKERS`=自己 + 本站 `worker` 角色成员;`SELF`=只自己。
-- **`membership.role` 现在被读取。** pm 范围来自持有 `pm` *membership*(每站),与 `global_role` 无关;于是一人可在 A 项目是 pm、B 项目是 worker。`global_role` 定上限,`membership.role` 定每站权限。(开放决策 D1:pm 由 `global_role`、`membership.role`,还是二者取大。)
+- **`membership.role` 现在被读取。** pm 范围来自持有 `pm` *membership*(每站),与 `global_role` 无关;于是一人可在 A 项目是 pm、B 项目是 worker。**(D1 已定)** `global_role` 管跨项目层级(regional/gm/admin/platform);每站 `membership.role` 管项目内权限(pm/site_manager/worker)。
 
 ### 3.2 读路径统一
 每个读端点都调 `visible_scope` 并统一施加 `(site_ids, 用户过滤)`。各修复自然落地:
@@ -303,16 +348,19 @@ visible_scope(conn, caller) -> {
 1. **入册** 所有现有登录的 `folder_name`(从 Aurora 成员/user_mapping 回填);邀请自动入册。*立即修好 Today 封禁与录音归属。*
 2. **改读** Today/Timeline/dates/site-users 到 Aurora;遗留读回落挂开关退役。*修好 dates + site-users 泄漏。*
 3. **分层角色**:引入 `visible_scope`,尊重 `membership.role`,加 `regional_manager`。迁移既有用户(默认映射保持现状:非 admin 一律站点范围,直到显式提升)。
-4. 每步独立可发、可逆;多租户 `company_id` 守卫从不放松。
+4. **租户拆分 + platform_admin**(仅当真正做多客户时):建每客户 `companies`,把其站点+用户重新挂靠,加 `platform_admin` 角色 + 平台公司(D6)。在此之前,单一 "FieldSight" 公司照常工作、不变。
+5. 每步独立可发、可逆;多租户 `company_id` 守卫从不放松。
 
 ---
 
-## 5. 开放决策(待你审)
-- **D1** —— pm 范围来自 `global_role` vs 每站 `membership.role` vs 取大。
-- **D2** —— `regional_manager`:新 `global_role` 值(最干净)vs 复用 `gm` 带站点子集(较不干净)。推荐**新值**。
-- **D3** —— site_manager 看**自己+workers**(遗留 BUG-25 规则)vs **只自己**(更严)。推荐**自己+workers**,隐私由配套 spec 的 redaction 兜。
-- **D4** —— 邀请自动派生 `folder_name`(一步 onboarding,需 field_only 冲突守卫)vs 显式入册步。推荐**自动+守卫**。
-- **D5** —— 遗留读路径退役:硬切 vs 留一版带开关回落。推荐**带开关回落**,再删。
+## 5. 决策(2026-07-17 已定)
+- **公司结构 —— 已定:** 真多租户——每个客户是自己的 `company`;加 `platform_admin` 跨公司层给 FieldSight 厂商/运维账户。(§3.0)
+- **D1 —— 已定:** `global_role` 管**跨项目**层级(regional/gm/admin/platform);每站 **`membership.role`** 管**项目内**权限(pm/site_manager/worker)。于是在 UC PK 给 Neil 一个 pm membership,他就能看到 James,与其 global_role 无关。
+- **D2 —— 已定:** `regional_manager` 是**新的 `global_role` 值**(加进 `ALLOWED_GLOBAL_ROLES`),位于 pm 与 gm 之间。
+- **D3 —— 已定:** site_manager 看**自己 + 本站 workers**。
+- **D4 —— 已定:** 邀请**自动派生 `folder_name`**(`safe_name("First Last")`),带唯一索引冲突守卫(409/跳过)。
+- **D5 —— 已定:** 遗留读路径挂**开关回落**一版,再删。
+- **D6 —— 待定:** `platform_admin` 怎么表示——专设一个 "FieldSight-platform" 公司行 + `platform_admin` 角色,vs `platform_admin` 角色 + `company_id = NULL` + 显式平台标记。推荐**专设平台公司 + `platform_admin` 角色**(别处 `company_id` 非空不变量不破)。剩这一个待拍。
 
 ---
 
