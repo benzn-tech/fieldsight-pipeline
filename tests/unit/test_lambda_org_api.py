@@ -234,6 +234,85 @@ def test_patch_role_unknown_target_404(wired):
     assert res["statusCode"] == 404
 
 
+def _by_sub_same_company(conn, sub):
+    if sub == "sub-1":
+        return dict(CALLER)
+    if sub == "sub-2":
+        return {**CALLER, "cognito_sub": "sub-2", "id": "u-2"}
+    return None
+
+
+def test_patch_member_folder_admin_ok(wired):
+    seen = {}
+
+    def fake_set_folder(conn, sub, folder_name):
+        seen.update(sub=sub, folder_name=folder_name)
+
+    wired.setattr(org.users, "get_user_by_sub", _by_sub_same_company)
+    wired.setattr(org.users, "get_by_folder_name_global", lambda conn, folder: None)
+    wired.setattr(org.users, "set_folder_name", fake_set_folder)
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/folder", body={"folder_name": "Neil Blunden"}), None)
+    assert res["statusCode"] == 200
+    assert seen == {"sub": "sub-2", "folder_name": "Neil_Blunden"}
+    assert body_of(res)["cognito_sub"] == "sub-2"
+
+
+def test_patch_member_folder_normalizes_spaces(wired):
+    seen = {}
+
+    def fake_set_folder(conn, sub, folder_name):
+        seen.update(sub=sub, folder_name=folder_name)
+
+    wired.setattr(org.users, "get_user_by_sub", _by_sub_same_company)
+    wired.setattr(org.users, "get_by_folder_name_global", lambda conn, folder: None)
+    wired.setattr(org.users, "set_folder_name", fake_set_folder)
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/folder", body={"folder_name": "  Amy Rose  "}), None)
+    assert res["statusCode"] == 200
+    assert seen["folder_name"] == "Amy_Rose"  # spaces -> underscore, leading/trailing stripped first
+
+
+def test_patch_member_folder_worker_403(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/folder", body={"folder_name": "Neil Blunden"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_patch_member_folder_missing_name_400(wired):
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/folder", body={"folder_name": "   "}), None)
+    assert res["statusCode"] == 400
+    res2 = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/folder", body={}), None)
+    assert res2["statusCode"] == 400
+
+
+def test_patch_member_folder_foreign_member_404(wired):
+    def by_sub(conn, sub):
+        if sub == "sub-1":
+            return dict(CALLER)
+        if sub == "sub-2":
+            return {**CALLER, "cognito_sub": "sub-2", "company_id": "OTHER-co"}
+        return None
+
+    wired.setattr(org.users, "get_user_by_sub", by_sub)
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/folder", body={"folder_name": "Neil Blunden"}), None)
+    assert res["statusCode"] == 404
+
+
+def test_patch_member_folder_collision_409(wired):
+    wired.setattr(org.users, "get_user_by_sub", _by_sub_same_company)
+    wired.setattr(org.users, "get_by_folder_name_global",
+                  lambda conn, folder: {**CALLER, "cognito_sub": "sub-other", "folder_name": folder})
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/folder", body={"folder_name": "Neil Blunden"}), None)
+    assert res["statusCode"] == 409
+
+
 class FakeCognito:
     def __init__(self, exists=False):
         self.exists = exists
