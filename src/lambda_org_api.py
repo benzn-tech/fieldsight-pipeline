@@ -14,6 +14,7 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   POST  /api/org/members                  → cognito admin-create + upsert + memberships (admin)
   PATCH /api/org/members/{sub}/role       → explicit global role set (admin)
   PATCH /api/org/members/{sub}/folder     → set recording-folder identity (admin)
+  POST  /api/org/members/enroll-backfill  → bulk-enroll folder_name for unenrolled company logins (admin)
   POST  /api/org/upload-url               → presigned PUT for avatar / site icon
   GET   /api/org/asset-url?key=…          → presigned GET for an org asset
   PATCH /api/org/sites/{id}               → update site fields / swap icon (admin/gm)
@@ -171,6 +172,8 @@ def dispatch(conn, event, method, route):
             return list_members(conn, caller, event)
         if method == "POST":
             return create_member(conn, caller, parse_body(event))
+    if route == "/members/enroll-backfill" and method == "POST":
+        return backfill_member_folders(conn, caller)
     m = re.match(r"^/members/([^/]+)/role$", route)
     if m and method == "PATCH":
         return patch_member_role(conn, caller, m.group(1), parse_body(event))
@@ -517,6 +520,34 @@ def patch_member_folder(conn, caller, target_sub, body):
     return ok(users.get_user_by_sub(conn, target_sub))
 
 
+def backfill_member_folders(conn, caller):
+    """Admin-only bulk enrollment: links folder_name for every existing
+    company login that never got one (e.g. seeded before create_member's
+    D4 auto-enroll shipped) — so an admin doesn't have to walk each old
+    user through PATCH /members/{sub}/folder by hand. Same normalization
+    + collision guard as patch_member_folder/create_member's auto-enroll;
+    a folder_name collision skips that one user (reason returned) rather
+    than 500ing the whole batch on the global unique index (0012)."""
+    if caller["global_role"] != "admin":
+        return error("admin role required", 403)
+    rows = users.list_company_logins_unenrolled(conn, caller["company_id"])
+    enrolled, skipped = [], []
+    for row in rows:
+        sub = row["cognito_sub"]
+        name = " ".join(p for p in (row.get("first_name"), row.get("last_name")) if p)
+        fn = re.sub(r'[<>:"/\\|?*\s]', '_', name.strip())
+        if not fn:
+            skipped.append({"sub": sub, "reason": "no name"})
+            continue
+        clash = users.get_by_folder_name_global(conn, fn)
+        if clash and clash["cognito_sub"] != sub:
+            skipped.append({"sub": sub, "reason": "folder taken by another user"})
+            continue
+        users.set_folder_name(conn, sub, fn)
+        enrolled.append({"sub": sub, "folder_name": fn})
+    return ok({"enrolled": enrolled, "skipped": skipped})
+
+
 def create_member(conn, caller, body):
     """Admin-only. Creates the Cognito login (email invite w/ temp password),
     the Aurora profile, and site memberships. Idempotent: an existing Cognito
@@ -583,6 +614,18 @@ def create_member(conn, caller, body):
         last_name=body.get("last_name"),
         global_role=global_role,
     )
+    # Auto-enroll the recording-folder identity (D4): link the login to its report
+    # folder from creation. Underscored safe_name (matches lambda_orchestrator.safe_name
+    # and patch_member_folder). Skip on collision — the global unique index (0012)
+    # would otherwise 500; folder can still be set later via PATCH /members/{sub}/folder.
+    if not user.get("folder_name"):
+        fn = re.sub(r'[<>:"/\\|?*\s]', '_', display_name.strip())
+        if fn:
+            clash = users.get_by_folder_name_global(conn, fn)
+            if clash is None or clash["cognito_sub"] == sub:
+                user = users.set_folder_name(conn, sub, fn) or user
+            else:
+                logger.info("create_member: folder_name %r taken, left unset for %s", fn, sub)
     created = [memberships.ensure_membership(conn, user["id"], mem["site_id"],
                                              mem["role"]) for mem in wanted]
     return ok({"user": user, "memberships": created}, 201)
