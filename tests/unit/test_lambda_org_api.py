@@ -350,6 +350,10 @@ def member_wired(wired):
     wired.setattr(org.memberships, "ensure_membership",
                   lambda conn, uid, sid, role: {
                       "user_id": uid, "site_id": sid, "role": role})
+    wired.setattr(org.users, "get_by_folder_name_global", lambda conn, folder: None)
+    wired.setattr(org.users, "set_folder_name",
+                  lambda conn, sub, folder: {
+                      "id": "u-new", "cognito_sub": sub, "folder_name": folder})
     return wired, fake
 
 
@@ -366,6 +370,44 @@ def test_create_member_creates_and_enrolls(member_wired):
                                  "role": "site_manager"}]
     assert fake.created[0]["Username"] == "new@x.nz"
     assert fake.created[0]["UserPoolId"] == org.COGNITO_USER_POOL_ID
+
+
+def test_create_member_auto_enrolls_folder_name(member_wired):
+    # admin invites "Neil Blunden" -> folder_name auto-set to "Neil_Blunden" (D4)
+    wired, fake = member_wired
+    seen = {}
+
+    def fake_set_folder(conn, sub, folder_name):
+        seen.update(sub=sub, folder_name=folder_name)
+
+    wired.setattr(org.users, "get_by_folder_name_global", lambda conn, folder: None)
+    wired.setattr(org.users, "set_folder_name", fake_set_folder)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "neil@x.com", "first_name": "Neil", "last_name": "Blunden",
+        "memberships": [],
+    }), None)
+    assert res["statusCode"] == 201
+    assert seen == {"sub": "sub-new", "folder_name": "Neil_Blunden"}
+
+
+def test_create_member_skips_autoenroll_on_folder_collision(member_wired):
+    # another user already owns "Neil_Blunden" -> invite still succeeds, folder
+    # left unset (no 500 from the global unique index)
+    wired, fake = member_wired
+    seen = {}
+
+    def fake_set_folder(conn, sub, folder_name):
+        seen.update(sub=sub, folder_name=folder_name)
+
+    wired.setattr(org.users, "get_by_folder_name_global",
+                  lambda conn, folder: {**CALLER, "cognito_sub": "other-sub", "folder_name": folder})
+    wired.setattr(org.users, "set_folder_name", fake_set_folder)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "neil2@x.com", "first_name": "Neil", "last_name": "Blunden",
+        "memberships": [],
+    }), None)
+    assert res["statusCode"] == 201
+    assert seen == {}  # collision -> set_folder_name never called, no 500
 
 
 def test_create_member_existing_cognito_user_is_idempotent(member_wired):
