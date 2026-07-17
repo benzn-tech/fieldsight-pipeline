@@ -350,6 +350,10 @@ def member_wired(wired):
     wired.setattr(org.memberships, "ensure_membership",
                   lambda conn, uid, sid, role: {
                       "user_id": uid, "site_id": sid, "role": role})
+    wired.setattr(org.users, "get_by_folder_name_global", lambda conn, folder: None)
+    wired.setattr(org.users, "set_folder_name",
+                  lambda conn, sub, folder: {
+                      "id": "u-new", "cognito_sub": sub, "folder_name": folder})
     return wired, fake
 
 
