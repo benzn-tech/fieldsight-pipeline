@@ -313,6 +313,49 @@ def test_patch_member_folder_collision_409(wired):
     assert res["statusCode"] == 409
 
 
+def test_backfill_enrolls_unenrolled_login(wired):
+    wired.setattr(org.users, "list_company_logins_unenrolled",
+                  lambda conn, cid: [
+                      {"id": "u-2", "cognito_sub": "sub-2", "first_name": "Neil", "last_name": "Blunden"}])
+    wired.setattr(org.users, "get_by_folder_name_global", lambda conn, folder: None)
+    seen = {}
+
+    def fake_set_folder(conn, sub, folder_name):
+        seen.update(sub=sub, folder_name=folder_name)
+
+    wired.setattr(org.users, "set_folder_name", fake_set_folder)
+    res = org.lambda_handler(make_event("POST", "/api/org/members/enroll-backfill"), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["enrolled"] == [{"sub": "sub-2", "folder_name": "Neil_Blunden"}]
+    assert b["skipped"] == []
+    assert seen == {"sub": "sub-2", "folder_name": "Neil_Blunden"}
+
+
+def test_backfill_skips_collision(wired):
+    wired.setattr(org.users, "list_company_logins_unenrolled",
+                  lambda conn, cid: [
+                      {"id": "u-2", "cognito_sub": "sub-2", "first_name": "Neil", "last_name": "Blunden"}])
+    wired.setattr(org.users, "get_by_folder_name_global",
+                  lambda conn, folder: {**CALLER, "cognito_sub": "sub-other", "folder_name": folder})
+    seen = {}
+    wired.setattr(org.users, "set_folder_name",
+                  lambda conn, sub, folder_name: seen.update(sub=sub, folder_name=folder_name))
+    res = org.lambda_handler(make_event("POST", "/api/org/members/enroll-backfill"), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["enrolled"] == []
+    assert b["skipped"] == [{"sub": "sub-2", "reason": "folder taken by another user"}]
+    assert seen == {}  # collision -> set_folder_name never called, no 500
+
+
+def test_backfill_non_admin_403(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "gm"})
+    res = org.lambda_handler(make_event("POST", "/api/org/members/enroll-backfill"), None)
+    assert res["statusCode"] == 403
+
+
 class FakeCognito:
     def __init__(self, exists=False):
         self.exists = exists
