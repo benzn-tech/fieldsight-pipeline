@@ -19,6 +19,8 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/asset-url?key=…          → presigned GET for an org asset
   PATCH /api/org/sites/{id}               → update site fields / swap icon (admin/gm)
   POST  /api/org/sites/{id}/(un)archive   → soft-delete / restore site (admin/gm)
+  GET   /api/org/sites/{id}/members       → site's members from memberships (ACL,
+                                             fixes legacy USERS ON SITE empty for Aurora-only sites)
   POST  /api/org/members/{sub}/(un)archive→ soft-delete / restore member (admin/gm, never self)
   POST  /api/org/observations             → create safety/quality observation (any member)
   GET   /api/org/observations             → list observations (company-scoped filters)
@@ -188,6 +190,9 @@ def dispatch(conn, event, method, route):
     m_sa = re.match(r"^/sites/([^/]+)/(archive|unarchive)$", route)
     if m_sa and method == "POST":
         return archive_site_endpoint(conn, caller, m_sa.group(1), m_sa.group(2))
+    m_sm = re.match(r"^/sites/([^/]+)/members$", route)
+    if m_sm and method == "GET":
+        return list_site_members(conn, caller, m_sm.group(1))
     m_ma = re.match(r"^/members/([^/]+)/(archive|unarchive)$", route)
     if m_ma and method == "POST":
         return archive_member_endpoint(conn, caller, m_ma.group(1), m_ma.group(2))
@@ -462,6 +467,17 @@ def patch_org_site(conn, caller, site_id, body):
         if old_icon and old_icon != final_icon:
             _delete_asset(old_icon)
     return ok(row)
+
+
+def list_site_members(conn, caller, site_id):
+    """Members of one site, from memberships (NOT user_mapping) -- the Aurora
+    replacement for legacy /site-users. ACL mirrors /live-items: the site id
+    must be in the caller's accessible set (admin/gm -> company sites,
+    else memberships), which also blocks cross-company and archived sites."""
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    rows = memberships.members_for_site(conn, caller["company_id"], site_id)
+    return ok({"members": rows, "site": str(site_id)})
 
 
 # ----------------------------------------------------------

@@ -91,3 +91,30 @@ def test_list_company_memberships_excludes_cross_company_user(db):
     ensure_membership(db, ub["id"], sa["id"], "worker")  # bad data simulation
     rows = list_company_memberships(db, ca["id"])
     assert [r["cognito_sub"] for r in rows] == ["sub-xt-a"]
+
+
+@pytest.mark.integration
+def test_members_for_site_returns_company_members_excludes_cross_company_and_archived(db):
+    c = companies.create_company(db, "MFS Co A")
+    s = sites.create_site(db, c["id"], "MFS Site")
+    u1 = users.upsert_user(db, "sub-mfs-a", "ada@mfs.nz", company_id=c["id"], first_name="Ada", last_name="X")
+    u2 = users.upsert_user(db, "sub-mfs-b", "bea@mfs.nz", company_id=c["id"], first_name="Bea", last_name="X")
+    ensure_membership(db, u1["id"], s["id"], "worker")
+    ensure_membership(db, u2["id"], s["id"], "site_manager")
+
+    # cross-company site+member must not appear
+    cb = companies.create_company(db, "MFS Co B")
+    sb = sites.create_site(db, cb["id"], "MFS Site B")
+    ub = users.upsert_user(db, "sub-mfs-c", "cy@mfs.nz", company_id=cb["id"], first_name="Cy", last_name="X")
+    ensure_membership(db, ub["id"], sb["id"], "worker")
+
+    # archived membership must not appear
+    db.execute("UPDATE memberships SET archived_at = now() WHERE user_id=%s AND site_id=%s", (u2["id"], s["id"]))
+
+    rows = memberships.members_for_site(db, c["id"], str(s["id"]))
+    names = [r["first_name"] for r in rows]
+    assert names == ["Ada"]                              # Bea archived; Cy cross-company; both excluded
+    assert rows[0]["site_role"] == "worker"
+
+    # cross-company caller company must never see this site's members
+    assert memberships.members_for_site(db, cb["id"], str(s["id"])) == []
