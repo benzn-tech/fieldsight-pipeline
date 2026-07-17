@@ -219,11 +219,12 @@ identically. Specific fixes fall out automatically:
   Last")`) with the unique-index collision guard (409/skip).
 - **D5 — DECIDED:** legacy read paths retired behind a **flagged fallback** for
   one release, then removed.
-- **D6 — OPEN:** how `platform_admin` is represented — a dedicated
-  "FieldSight-platform" company row + a `platform_admin` global_role, vs a
-  `platform_admin` role with `company_id = NULL` + an explicit platform flag.
-  Recommend **dedicated platform company + `platform_admin` role** (keeps the
-  non-null `company_id` invariant intact everywhere else). One remaining call.
+- **D6 — DECIDED:** `platform_admin` = a **dedicated "FieldSight-platform"
+  company row + a `platform_admin` global_role** (keeps `company_id` non-null
+  everywhere; cross-company lives in a single `visible_scope` branch). **Writes**
+  by a `platform_admin` (create site/member) must carry an explicit
+  `target_company_id` — read is cross-company, write is per-company. Only a
+  `platform_admin` may grant `platform_admin`.
 
 ---
 
@@ -360,7 +361,7 @@ visible_scope(conn, caller) -> {
 - **D3 —— 已定:** site_manager 看**自己 + 本站 workers**。
 - **D4 —— 已定:** 邀请**自动派生 `folder_name`**(`safe_name("First Last")`),带唯一索引冲突守卫(409/跳过)。
 - **D5 —— 已定:** 遗留读路径挂**开关回落**一版,再删。
-- **D6 —— 待定:** `platform_admin` 怎么表示——专设一个 "FieldSight-platform" 公司行 + `platform_admin` 角色,vs `platform_admin` 角色 + `company_id = NULL` + 显式平台标记。推荐**专设平台公司 + `platform_admin` 角色**(别处 `company_id` 非空不变量不破)。剩这一个待拍。
+- **D6 —— 已定:** `platform_admin` = **专设一个 "FieldSight-platform" 公司行 + `platform_admin` global_role**(别处 `company_id` 恒非空;跨公司只活在 `visible_scope` 一个分支)。platform_admin 的**写**(建站点/成员)必须带显式 `target_company_id`——读跨公司、写按公司。只有 platform_admin 能授予 platform_admin。
 
 ---
 
