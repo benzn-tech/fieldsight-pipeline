@@ -93,6 +93,19 @@ def list_company_users(conn, company_id, include_archived=False) -> list[dict]:
     ).fetchall()
 
 
+def list_company_logins_unenrolled(conn, company_id) -> list[dict]:
+    """Logins (cognito_sub IS NOT NULL) in this company that never got a
+    folder_name -- the bulk-backfill route's input set. Excludes field_only
+    directory rows (cognito_sub IS NULL; those are enrolled separately via
+    upsert_field_only_user) and archived accounts."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, cognito_sub, first_name, last_name FROM users "
+        "WHERE company_id=%s AND folder_name IS NULL AND cognito_sub IS NOT NULL "
+        "AND archived_at IS NULL",
+        (company_id,),
+    ).fetchall()
+
+
 def set_global_role(conn, cognito_sub, company_id, global_role) -> dict | None:
     """Explicit role SET (admin action). Company-guarded: refuses to touch a
     row outside the caller's company (cross-tenant write = returns None)."""
