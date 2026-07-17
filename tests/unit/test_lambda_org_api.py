@@ -2370,3 +2370,26 @@ def test_dates_with_accessible_site_scopes_to_it(wired):
     res = org.lambda_handler(make_event("GET", "/api/org/dates", params={"site": SITE_ID}), None)
     assert res["statusCode"] == 200
     assert seen["site_ids"] == [SITE_ID]                # scoped to the one accessible ?site
+
+
+def test_site_members_returns_members_for_accessible_site(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    seen = {}
+    wired.setattr(org.memberships, "members_for_site",
+                  lambda conn, cid, sid: (seen.update(cid=cid, sid=sid)
+                                          or [{"id": "u-1", "first_name": "Ada", "site_role": "worker"}]))
+    res = org.lambda_handler(make_event("GET", "/api/org/sites/" + SITE_ID + "/members"), None)
+    assert res["statusCode"] == 200
+    assert seen == {"cid": "c-uuid-1", "sid": SITE_ID}   # company from caller, site from the URL
+    body = body_of(res)
+    assert body["site"] == SITE_ID
+    assert body["members"][0]["first_name"] == "Ada"
+
+
+def test_site_members_denies_site_outside_accessible_set_403(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    called = []
+    wired.setattr(org.memberships, "members_for_site", lambda *a, **k: called.append(1) or [])
+    res = org.lambda_handler(make_event("GET", "/api/org/sites/" + OTHER_SITE_ID + "/members"), None)
+    assert res["statusCode"] == 403
+    assert called == []                                  # ACL rejects before the members read
