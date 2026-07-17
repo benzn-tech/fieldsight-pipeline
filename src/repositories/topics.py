@@ -220,6 +220,27 @@ def list_topics_for_date(conn, site_ids, report_date) -> list[dict]:
     return topic_rows
 
 
+def list_report_dates(conn, site_ids, since_date) -> list:
+    """Distinct report_date values (ascending) for a caller-computed ACL
+    site-id set, on or after since_date. Backs org-api GET /api/org/dates —
+    the membership-scoped replacement for legacy get_dates' S3 folder scan,
+    which had no ?site access check and leaked cross-user/cross-company
+    report-dates (visibility spec §1.1 dots leak). site_ids is the SAME
+    kind of caller-scoped list list_topics_for_date takes (ALL company
+    sites for admin/gm, else memberships.accessible_site_ids); the ::uuid[]
+    cast accepts the str ids _allowed_site_ids/_resolve_site_param hand back.
+    Empty site_ids -> [] without a round-trip (mirrors list_topics_for_date)."""
+    if not site_ids:
+        return []
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT DISTINCT report_date FROM topics "
+        "WHERE site_id = ANY(%s::uuid[]) AND report_date >= %s "
+        "ORDER BY report_date",
+        (list(site_ids), since_date),
+    ).fetchall()
+    return [r["report_date"] for r in rows]
+
+
 def list_topics_for_source_prefix(conn, source_prefix) -> list[dict]:
     """org-api timeline shim read (authority-flip Task 4): all topics whose
     source_s3_key starts with source_prefix (typically

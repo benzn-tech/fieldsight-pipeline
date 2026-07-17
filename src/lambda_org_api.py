@@ -25,6 +25,8 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   PATCH /api/org/observations/{id}        → update status (author or admin/gm)
   POST  /api/org/observations/{id}/archive→ soft-delete observation (admin/gm)
   GET   /api/org/live-items?date=…        → live topics dashboard feed (ACL)
+  GET   /api/org/dates?months=&site=      → Timeline dots: report-date index scoped to
+                                             caller's accessible sites (ACL, kills dots leak)
   GET   /api/org/timeline?date=…&user=…   → daily_report.json compat shim: S3 verbatim
                                              or Aurora extraction override (ACL, authority-flip)
   GET   /api/org/programme?site=<site_id> → read site's Programme JSON (S3-backed, ACL)
@@ -210,6 +212,9 @@ def dispatch(conn, event, method, route):
     if route == "/live-items":
         if method == "GET":
             return list_live_items(conn, caller, event)
+
+    if route == "/dates" and method == "GET":
+        return get_org_dates(conn, caller, event)
 
     if route == "/timeline" and method == "GET":
         return get_timeline_compat(conn, caller, event)
@@ -830,6 +835,48 @@ def list_live_items(conn, caller, event):
             conn, caller["id"], caller["global_role"])
     rows = topics.list_topics_for_date(conn, site_ids, date)
     return ok({"topics": rows})
+
+
+# ----------------------------------------------------------
+# /dates — Timeline "dots" (Phase 2 read consolidation). Replaces legacy
+# get_dates (S3 user_mapping-based scan) which had no ?site access check and,
+# on an empty accessible-user set, fell through to marking every report-date
+# across ALL users/companies (visibility spec §1.1 dots leak). ACL mirrors
+# list_live_items EXACTLY via _allowed_site_ids/_resolve_site_param (defined
+# below in the /programme section).
+# ----------------------------------------------------------
+def _dates_window_start(months) -> "datetime.date":
+    """First day of the dots window, in NZ (BUG-37/BUG-19: never derive a
+    'today' date from a bare UTC now). months defaults to 2 and is clamped
+    to 1..24 so a hostile ?months can't force a full-table scan."""
+    try:
+        m = int(months)
+    except (TypeError, ValueError):
+        m = 2
+    m = max(1, min(m, 24))
+    now_nz = datetime.now(timezone.utc) + timedelta(hours=13)
+    return (now_nz - timedelta(days=m * 30)).date()
+
+
+def get_org_dates(conn, caller, event):
+    """Membership-scoped report-date index for the Timeline dots — the Aurora
+    replacement for legacy /api/dates (get_dates), whose missing ?site check
+    leaked cross-user/cross-company report-dates (visibility spec §1.1). ACL
+    mirrors /live-items and /programme EXACTLY: admin/gm see every company
+    site, everyone else only their memberships; an explicit ?site outside
+    that set is 403'd here (via _resolve_site_param) before any read."""
+    p = event.get("queryStringParameters") or {}
+    since = _dates_window_start(p.get("months"))
+    site_param = p.get("site")
+    if site_param:
+        site_id, err = _resolve_site_param(conn, caller, site_param)
+        if err is not None:
+            return err                                  # 403 (out of scope) / 404 (unknown slug)
+        site_ids = [site_id]
+    else:
+        site_ids = list(_allowed_site_ids(conn, caller))
+    rows = topics.list_report_dates(conn, site_ids, since)
+    return ok({"dates": {str(d): {"hasReport": True} for d in rows}})
 
 
 # ----------------------------------------------------------
