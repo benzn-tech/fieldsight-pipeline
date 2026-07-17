@@ -23,6 +23,8 @@ authority-flip.md Task 1):
     keyed on source_s3_key prefix (org-api timeline shim), sharing the same
     _escape_like() LIKE-wildcard escaping as delete_topics_for_source_prefix.
 """
+import datetime as _dt
+
 from psycopg.types.json import Jsonb
 
 from repositories import topics
@@ -388,6 +390,25 @@ def test_list_extraction_folder_names_for_date_empty():
     conn = FakeConn(results=[[]])
 
     assert topics.list_extraction_folder_names_for_date(conn, "co-1", "2026-07-14") == []
+
+
+def test_list_report_dates_builds_distinct_since_query():
+    conn = FakeConn(results=[[{"report_date": _dt.date(2026, 7, 16)},
+                              {"report_date": _dt.date(2026, 7, 17)}]])
+    out = topics.list_report_dates(conn, ["s-1", "s-2"], _dt.date(2026, 5, 1))
+    assert out == [_dt.date(2026, 7, 16), _dt.date(2026, 7, 17)]
+    call = conn.calls[0]
+    assert "SELECT DISTINCT report_date FROM topics" in call["sql"]
+    assert "site_id = ANY(%s::uuid[])" in call["sql"]
+    assert "report_date >= %s" in call["sql"]
+    assert "ORDER BY report_date" in call["sql"]
+    assert call["params"] == (["s-1", "s-2"], _dt.date(2026, 5, 1))
+
+
+def test_list_report_dates_empty_site_ids_short_circuits():
+    conn = FakeConn(results=[])
+    assert topics.list_report_dates(conn, [], _dt.date(2026, 5, 1)) == []
+    assert conn.calls == []  # no round-trip on empty scope (mirrors list_topics_for_date)
 
 
 def test_list_topics_for_date_selects_new_columns():

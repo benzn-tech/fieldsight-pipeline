@@ -1,3 +1,4 @@
+import datetime as _dt
 import io
 import json
 import re
@@ -2315,3 +2316,57 @@ def test_explicit_user_not_in_company_404(presign_wired):
                                         params={"date": "2026-07-14", "user": "Outsider"}), None)
     assert res["statusCode"] == 404
     assert seen_has_topics["called"] is False  # no Aurora read attempted for an unverified folder
+
+
+# ----------------------------------------------------------
+# /dates (Phase 2 read consolidation) — Timeline dots, membership-scoped.
+# ACL mirrors /live-items and /programme EXACTLY via _allowed_site_ids /
+# _resolve_site_param; an out-of-scope ?site 403s before any date read,
+# which is the fix for the legacy get_dates dots leak (visibility spec §1.1).
+# ----------------------------------------------------------
+def test_dates_admin_scopes_to_allowed_ids(wired):
+    seen = {}
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-1", "s-2"})
+    wired.setattr(org.topics, "list_report_dates",
+                  lambda conn, site_ids, since: (seen.update(site_ids=set(site_ids), since=since)
+                                                 or [_dt.date(2026, 7, 16)]))
+    res = org.lambda_handler(make_event("GET", "/api/org/dates", params={"months": "2"}), None)
+    assert res["statusCode"] == 200
+    assert seen["site_ids"] == {"s-1", "s-2"}          # no ?site -> full accessible set
+    assert isinstance(seen["since"], _dt.date)          # NZ window is a date (BUG-37, not a bare str)
+    assert body_of(res)["dates"] == {"2026-07-16": {"hasReport": True}}
+
+
+def test_dates_worker_scope_via_allowed_ids(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    seen = {}
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-3"})
+    wired.setattr(org.topics, "list_report_dates",
+                  lambda conn, site_ids, since: (seen.update(site_ids=set(site_ids)) or []))
+    res = org.lambda_handler(make_event("GET", "/api/org/dates"), None)
+    assert res["statusCode"] == 200
+    assert seen["site_ids"] == {"s-3"}                  # membership scope, not all-company
+
+
+def test_dates_rejects_site_outside_accessible_set_403(wired):
+    # the dots-leak fix: an out-of-scope ?site must 403 BEFORE any date read,
+    # not fall through to a lake-wide scan (legacy get_dates bug).
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    called = []
+    wired.setattr(org.topics, "list_report_dates",
+                  lambda *a, **k: called.append(1) or [])
+    res = org.lambda_handler(make_event("GET", "/api/org/dates",
+                                        params={"site": OTHER_SITE_ID}), None)
+    assert res["statusCode"] == 403
+    assert called == []                                 # never reached the date query
+
+
+def test_dates_with_accessible_site_scopes_to_it(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID, OTHER_SITE_ID})
+    seen = {}
+    wired.setattr(org.topics, "list_report_dates",
+                  lambda conn, site_ids, since: (seen.update(site_ids=list(site_ids)) or []))
+    res = org.lambda_handler(make_event("GET", "/api/org/dates", params={"site": SITE_ID}), None)
+    assert res["statusCode"] == 200
+    assert seen["site_ids"] == [SITE_ID]                # scoped to the one accessible ?site
