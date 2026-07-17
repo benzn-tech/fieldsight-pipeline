@@ -13,6 +13,7 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/members                  → company members + memberships (admin/gm)
   POST  /api/org/members                  → cognito admin-create + upsert + memberships (admin)
   PATCH /api/org/members/{sub}/role       → explicit global role set (admin)
+  PATCH /api/org/members/{sub}/folder     → set recording-folder identity (admin)
   POST  /api/org/upload-url               → presigned PUT for avatar / site icon
   GET   /api/org/asset-url?key=…          → presigned GET for an org asset
   PATCH /api/org/sites/{id}               → update site fields / swap icon (admin/gm)
@@ -173,6 +174,9 @@ def dispatch(conn, event, method, route):
     m = re.match(r"^/members/([^/]+)/role$", route)
     if m and method == "PATCH":
         return patch_member_role(conn, caller, m.group(1), parse_body(event))
+    m_mf = re.match(r"^/members/([^/]+)/folder$", route)
+    if m_mf and method == "PATCH":
+        return patch_member_folder(conn, caller, m_mf.group(1), parse_body(event))
     m_sp = re.match(r"^/sites/([^/]+)$", route)
     if m_sp and method == "PATCH":
         return patch_org_site(conn, caller, m_sp.group(1), parse_body(event))
@@ -483,6 +487,34 @@ def patch_member_role(conn, caller, target_sub, body):
     if row is None:
         return error("member not found in your company", 404)
     return ok(row)
+
+
+def patch_member_folder(conn, caller, target_sub, body):
+    """Admin-only enrollment step: links a member's login (cognito_sub) to
+    the recording-folder identity (folder_name) the orchestrator/app write
+    S3 keys under (users/{folder_name}/...) — without this, POST /members
+    creates the login+membership but the member's own Today/Timeline (which
+    is self-keyed on folder_name) never shows their clips. Normalization
+    mirrors lambda_orchestrator.py's safe_name EXACTLY, so an admin typing
+    the display name they see in the app produces the identical S3 folder
+    segment. folder_name is globally unique (0012) — collision_guard below
+    avoids crashing that unique index with a raw IntegrityError."""
+    if caller["global_role"] != "admin":
+        return error("admin role required", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    raw = body.get("folder_name")
+    if not isinstance(raw, str) or not raw.strip():
+        return error("folder_name is required", 400)
+    folder = re.sub(r'[<>:"/\\|?*\s]', '_', raw.strip())
+    target = users.get_user_by_sub(conn, target_sub)
+    if target is None or target["company_id"] != caller["company_id"]:
+        return error("member not found in your company", 404)
+    clash = users.get_by_folder_name_global(conn, folder)
+    if clash and clash["cognito_sub"] != target_sub:
+        return error(f"folder_name '{folder}' is already used by another user", 409)
+    users.set_folder_name(conn, target_sub, folder)
+    return ok(users.get_user_by_sub(conn, target_sub))
 
 
 def create_member(conn, caller, body):
