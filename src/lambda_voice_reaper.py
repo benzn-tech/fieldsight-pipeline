@@ -30,6 +30,7 @@ def lambda_handler(event, context):
                 conn, now - timedelta(hours=STALE_HOURS))
             pruned = voice_messages.prune_older_than(
                 conn, now - timedelta(days=RETENTION_DAYS))
+            logger.info("voice-reaper sweep: swept %d stale connections, pruned %d messages", swept, pruned)
             return {"swept_connections": swept, "pruned_messages": pruned}
         ids = event.get("connectionIds") or []
         deleted = ws_connections.delete_connections(conn, ids)

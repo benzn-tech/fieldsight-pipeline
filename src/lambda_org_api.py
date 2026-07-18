@@ -397,7 +397,7 @@ def list_site_voice(conn, caller, site_id, event):
     # Serialize to camelCase (matches upload-url/asset-url + the app's parser);
     # never leak snake_case DB column names across the API boundary.
     items = [{"s3Key": r["s3_key"], "senderUserId": str(r["sender_user_id"]),
-              "durationS": r["duration_s"],
+              "durationS": float(r["duration_s"]) if r["duration_s"] is not None else None,
               "createdAt": r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else str(r["created_at"])}
              for r in rows]
     return ok({"items": items, "site": str(site_id)})
