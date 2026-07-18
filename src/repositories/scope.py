@@ -27,7 +27,18 @@ def visible_scope(conn, caller) -> dict:
       author_ids   : set|None  -- resolved per-author allow-set; None = no filter
       self_folder  : str|None  -- caller's recording folder (own-data key)
       self_user_id : str       -- caller.id; own items are always visible
-      company_id, cross_company."""
+      company_id, cross_company.
+
+    MEMOIZED (review MINOR-1): the envelope is cached on the `caller` dict
+    under `_visible_scope` and reused on repeat calls within the same request
+    (_allowed_site_ids + _author_filter + _can_view_folder each call this 2-3x
+    per request). `caller` is resolved once per request in dispatch, so the
+    cache is request-scoped -- no cross-request staleness. Single-query internal
+    behavior is unchanged: the FIRST call issues the membership query(ies);
+    every later call issues zero."""
+    cached = caller.get("_visible_scope")
+    if cached is not None:
+        return cached
     global_role = caller["global_role"]
     cross_company = acl.is_cross_company(global_role)
     self_user_id = str(caller["id"])
@@ -58,7 +69,7 @@ def visible_scope(conn, caller) -> dict:
     else:                                                  # SELF
         author_ids = {self_user_id}
 
-    return {
+    result = {
         "site_ids": site_ids,
         "user_scope": user_scope,
         "author_ids": author_ids,
@@ -67,3 +78,5 @@ def visible_scope(conn, caller) -> dict:
         "company_id": caller["company_id"],
         "cross_company": cross_company,
     }
+    caller["_visible_scope"] = result
+    return result
