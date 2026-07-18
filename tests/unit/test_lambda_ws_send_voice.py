@@ -84,3 +84,19 @@ def test_unprovisioned_caller_403(wired):
     res = sv.lambda_handler(_event({"action": "sendVoice", "siteId": "s-1",
                                     "s3Key": "voice/x.wav"}), None)
     assert res["statusCode"] == 403
+
+
+def test_malformed_json_body_400(wired):
+    mp, fake = wired
+    event = {"body": "{not json",
+             "requestContext": {"connectionId": "conn-1", "domainName": "ws.example.com",
+                                "stage": "prod", "authorizer": {"sub": "sub-1"}}}
+    res = sv.lambda_handler(event, None)
+    assert res["statusCode"] == 400 and fake.calls == []
+
+
+def test_missing_sub_400(wired):
+    mp, fake = wired
+    res = sv.lambda_handler(_event({"action": "sendVoice", "siteId": "s-1",
+                                    "s3Key": "voice/x.wav"}, sub=None), None)
+    assert res["statusCode"] == 400

@@ -63,7 +63,7 @@ def lambda_handler(event, context):
             {"messageId": str(msg["id"]), "recipients": len(recipients)})}
     except Exception:
         logger.exception("sendVoice failed")
-        return {"statusCode": 500}
+        return {"statusCode": 500, "body": "internal error"}
 
 
 def _dispatch_fanout(rc, recipients, msg, caller):
@@ -80,7 +80,7 @@ def _dispatch_fanout(rc, recipients, msg, caller):
         "s3Key": msg["s3_key"],
         "durationS": float(msg["duration_s"]) if msg.get("duration_s") is not None else None,
         "senderUserId": str(caller["id"]),
-        "createdAt": str(msg["created_at"]),
+        "createdAt": msg["created_at"].isoformat() if hasattr(msg["created_at"], "isoformat") else str(msg["created_at"]),
     }
     try:
         _lambda().invoke(
