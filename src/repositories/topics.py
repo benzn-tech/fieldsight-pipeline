@@ -148,7 +148,7 @@ _TOPIC_COLS_JOINED = (
 )
 
 
-def list_topics_for_date(conn, site_ids, report_date) -> list[dict]:
+def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None) -> list[dict]:
     """Dashboard multi-site read for one report_date: topics scoped to
     site_ids (a caller-computed ACL list — ALL sites for an admin, or
     memberships.accessible_site_ids for a scoped worker/PM), joined with
@@ -172,9 +172,22 @@ def list_topics_for_date(conn, site_ids, report_date) -> list[dict]:
     concern, not a read-path one; consumers (e.g. /live-items) get the flat
     columns straight off the `findings` table, same as every other child.
 
+    author_ids (visibility spec §3.1 user_scope, Phase 3 graded roles)
+    optionally restricts results to topics whose t.user_id is in the
+    caller's resolved allow-set; None (default) = no per-author filter,
+    today's behavior unchanged. A topic with a NULL user_id (unattributed
+    report row) is deliberately EXCLUDED when a filter is active --
+    fail-closed, no unattributed row leaks into a SELF/SELF+WORKERS feed.
+
     Empty site_ids -> [] without a round-trip (mirrors sites.list_sites_by_ids)."""
     if not site_ids:
         return []
+
+    where = "WHERE t.site_id = ANY(%s) AND t.report_date=%s"
+    params = [list(site_ids), report_date]
+    if author_ids is not None:
+        where += " AND t.user_id = ANY(%s::uuid[])"
+        params.append(list(author_ids))
 
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
@@ -182,9 +195,9 @@ def list_topics_for_date(conn, site_ids, report_date) -> list[dict]:
         f"FROM topics t "
         f"LEFT JOIN sites s ON s.id = t.site_id "
         f"LEFT JOIN users u ON u.id = t.user_id "
-        f"WHERE t.site_id = ANY(%s) AND t.report_date=%s "
+        f"{where} "
         f"ORDER BY t.occurred_at NULLS LAST, t.created_at",
-        (list(site_ids), report_date),
+        tuple(params),
     ).fetchall()
 
     if not topic_rows:
@@ -220,7 +233,7 @@ def list_topics_for_date(conn, site_ids, report_date) -> list[dict]:
     return topic_rows
 
 
-def list_report_dates(conn, site_ids, since_date) -> list:
+def list_report_dates(conn, site_ids, since_date, *, author_ids=None) -> list:
     """Distinct report_date values (ascending) for a caller-computed ACL
     site-id set, on or after since_date. Backs org-api GET /api/org/dates —
     the membership-scoped replacement for legacy get_dates' S3 folder scan,
@@ -229,14 +242,26 @@ def list_report_dates(conn, site_ids, since_date) -> list:
     kind of caller-scoped list list_topics_for_date takes (ALL company
     sites for admin/gm, else memberships.accessible_site_ids); the ::uuid[]
     cast accepts the str ids _allowed_site_ids/_resolve_site_param hand back.
+
+    author_ids (visibility spec §3.1, Phase 3 graded roles) optionally
+    restricts to dates carrying at least one topic authored by an id in the
+    caller's allow-set; None (default) = no per-author filter, today's
+    behavior unchanged. Same fail-closed NULL-user_id exclusion as
+    list_topics_for_date when a filter is active.
+
     Empty site_ids -> [] without a round-trip (mirrors list_topics_for_date)."""
     if not site_ids:
         return []
+    where = "WHERE site_id = ANY(%s::uuid[]) AND report_date >= %s"
+    params = [list(site_ids), since_date]
+    if author_ids is not None:
+        where += " AND user_id = ANY(%s::uuid[])"
+        params.append(list(author_ids))
     rows = conn.cursor(row_factory=dict_row).execute(
-        "SELECT DISTINCT report_date FROM topics "
-        "WHERE site_id = ANY(%s::uuid[]) AND report_date >= %s "
-        "ORDER BY report_date",
-        (list(site_ids), since_date),
+        f"SELECT DISTINCT report_date FROM topics "
+        f"{where} "
+        f"ORDER BY report_date",
+        tuple(params),
     ).fetchall()
     return [r["report_date"] for r in rows]
 

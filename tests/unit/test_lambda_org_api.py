@@ -923,9 +923,10 @@ def test_list_observations_filters(wired):
     seen = {}
 
     def fake_list(conn, company_id, kind=None, date_from=None, date_to=None,
-                  site_slug=None, include_archived=False):
+                  site_slug=None, allowed_site_slugs=None, include_archived=False):
         seen.update(company_id=company_id, kind=kind, date_from=date_from,
                     date_to=date_to, site_slug=site_slug,
+                    allowed_site_slugs=allowed_site_slugs,
                     include_archived=include_archived)
         return [{"id": "o-1"}]
 
@@ -938,7 +939,25 @@ def test_list_observations_filters(wired):
     assert body_of(res)["observations"] == [{"id": "o-1"}]
     assert seen == {"company_id": "c-uuid-1", "kind": "quality",
                      "date_from": "2026-07-01", "date_to": "2026-07-04",
-                     "site_slug": "site-b", "include_archived": True}
+                     "site_slug": "site-b", "allowed_site_slugs": None,
+                     "include_archived": True}
+
+
+def test_observations_graded_off_company_wide_unchanged(wired):
+    # Regression: with GRADED_ROLES at its default (off), /observations must
+    # stay company-wide -- allowed_site_slugs is never computed/passed.
+    seen = {}
+
+    def fake_list(conn, company_id, kind=None, date_from=None, date_to=None,
+                  site_slug=None, allowed_site_slugs=None, include_archived=False):
+        seen.update(allowed_site_slugs=allowed_site_slugs)
+        return []
+
+    wired.setattr(org.observations, "list_observations", fake_list)
+    res = org.lambda_handler(make_event("GET", "/api/org/observations"), None)
+    assert res["statusCode"] == 200
+    assert seen["allowed_site_slugs"] is None
+    assert org.GRADED_ROLES is False
 
 
 def test_patch_status_author_ok(wired):
@@ -1032,15 +1051,17 @@ def test_live_items_admin_uses_company_sites(wired):
                   lambda conn, cid, **kw: (seen.update(cid=cid)
                                            or [{"id": "s-1"}, {"id": "s-2"}]))
     wired.setattr(org.topics, "list_topics_for_date",
-                  lambda conn, site_ids, date: (seen.update(site_ids=site_ids, date=date)
-                                                or [{"id": "t-1", "is_live": True, "action_items": [],
-                                                     "safety_observations": []}]))
+                  lambda conn, site_ids, date, author_ids=None: (
+                      seen.update(site_ids=site_ids, date=date, author_ids=author_ids)
+                      or [{"id": "t-1", "is_live": True, "action_items": [],
+                           "safety_observations": []}]))
     res = org.lambda_handler(make_event("GET", "/api/org/live-items",
                                         params={"date": "2026-07-07"}), None)
     assert res["statusCode"] == 200
     assert seen["cid"] == "c-uuid-1"
-    assert seen["site_ids"] == ["s-1", "s-2"]
+    assert sorted(seen["site_ids"]) == ["s-1", "s-2"]   # _allowed_site_ids is a set -- order not guaranteed
     assert seen["date"] == "2026-07-07"
+    assert seen["author_ids"] is None                   # graded-off byte parity: no author filter
     assert body_of(res)["topics"] == [{"id": "t-1", "is_live": True, "action_items": [],
                                        "safety_observations": []}]
 
@@ -1052,13 +1073,30 @@ def test_live_items_worker_uses_accessible_site_ids(wired):
     wired.setattr(org.memberships, "accessible_site_ids",
                   lambda conn, uid, role: (seen.update(uid=uid, role=role) or ["s-3"]))
     wired.setattr(org.topics, "list_topics_for_date",
-                  lambda conn, site_ids, date: (seen.update(site_ids=site_ids) or []))
+                  lambda conn, site_ids, date, author_ids=None: (
+                      seen.update(site_ids=site_ids, author_ids=author_ids) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/live-items",
                                         params={"date": "2026-07-07"}), None)
     assert res["statusCode"] == 200
     assert seen["uid"] == "u-uuid-1" and seen["role"] == "worker"
     assert seen["site_ids"] == ["s-3"]
+    assert seen["author_ids"] is None                   # graded-off byte parity: no author filter
     assert body_of(res)["topics"] == []
+
+
+def test_live_items_graded_off_passes_no_author_filter(wired):
+    # Regression: with GRADED_ROLES at its default (off), _author_filter must
+    # return None regardless of caller role -- no author narrowing at all.
+    seen = {}
+    wired.setattr(org.sites, "list_company_sites", lambda conn, cid, **kw: [{"id": "s-1"}])
+    wired.setattr(org.topics, "list_topics_for_date",
+                  lambda conn, site_ids, date, author_ids=None: (
+                      seen.update(author_ids=author_ids) or []))
+    res = org.lambda_handler(make_event("GET", "/api/org/live-items",
+                                        params={"date": "2026-07-07"}), None)
+    assert res["statusCode"] == 200
+    assert seen["author_ids"] is None
+    assert org.GRADED_ROLES is False
 
 
 def test_live_items_response_passthrough_with_children(wired):
@@ -1069,7 +1107,8 @@ def test_live_items_response_passthrough_with_children(wired):
         "safety_observations": [{"id": "so-1", "observation": "loose rail"}],
     }]
     wired.setattr(org.sites, "list_company_sites", lambda conn, cid, **kw: [{"id": "s-1"}])
-    wired.setattr(org.topics, "list_topics_for_date", lambda conn, site_ids, date: canned)
+    wired.setattr(org.topics, "list_topics_for_date",
+                  lambda conn, site_ids, date, author_ids=None: canned)
     res = org.lambda_handler(make_event("GET", "/api/org/live-items",
                                         params={"date": "2026-07-07"}), None)
     assert res["statusCode"] == 200
@@ -1099,7 +1138,8 @@ def test_live_items_payload_includes_findings_with_impact(wired):
         }],
     }]
     wired.setattr(org.sites, "list_company_sites", lambda conn, cid, **kw: [{"id": "s-1"}])
-    wired.setattr(org.topics, "list_topics_for_date", lambda conn, site_ids, date: canned)
+    wired.setattr(org.topics, "list_topics_for_date",
+                  lambda conn, site_ids, date, author_ids=None: canned)
     res = org.lambda_handler(make_event("GET", "/api/org/live-items",
                                         params={"date": "2026-07-07"}), None)
     assert res["statusCode"] == 200
@@ -2328,13 +2368,29 @@ def test_dates_admin_scopes_to_allowed_ids(wired):
     seen = {}
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-1", "s-2"})
     wired.setattr(org.topics, "list_report_dates",
-                  lambda conn, site_ids, since: (seen.update(site_ids=set(site_ids), since=since)
-                                                 or [_dt.date(2026, 7, 16)]))
+                  lambda conn, site_ids, since, author_ids=None: (
+                      seen.update(site_ids=set(site_ids), since=since, author_ids=author_ids)
+                      or [_dt.date(2026, 7, 16)]))
     res = org.lambda_handler(make_event("GET", "/api/org/dates", params={"months": "2"}), None)
     assert res["statusCode"] == 200
     assert seen["site_ids"] == {"s-1", "s-2"}          # no ?site -> full accessible set
     assert isinstance(seen["since"], _dt.date)          # NZ window is a date (BUG-37, not a bare str)
+    assert seen["author_ids"] is None                   # graded-off byte parity: no author filter
     assert body_of(res)["dates"] == {"2026-07-16": {"hasReport": True}}
+
+
+def test_dates_graded_off_passes_no_author_filter(wired):
+    # Regression: with GRADED_ROLES at its default (off), /dates must not
+    # narrow by author regardless of caller role.
+    seen = {}
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-1"})
+    wired.setattr(org.topics, "list_report_dates",
+                  lambda conn, site_ids, since, author_ids=None: (
+                      seen.update(author_ids=author_ids) or []))
+    res = org.lambda_handler(make_event("GET", "/api/org/dates"), None)
+    assert res["statusCode"] == 200
+    assert seen["author_ids"] is None
+    assert org.GRADED_ROLES is False
 
 
 def test_dates_worker_scope_via_allowed_ids(wired):
@@ -2343,7 +2399,8 @@ def test_dates_worker_scope_via_allowed_ids(wired):
     seen = {}
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-3"})
     wired.setattr(org.topics, "list_report_dates",
-                  lambda conn, site_ids, since: (seen.update(site_ids=set(site_ids)) or []))
+                  lambda conn, site_ids, since, author_ids=None: (
+                      seen.update(site_ids=set(site_ids)) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/dates"), None)
     assert res["statusCode"] == 200
     assert seen["site_ids"] == {"s-3"}                  # membership scope, not all-company
@@ -2366,7 +2423,8 @@ def test_dates_with_accessible_site_scopes_to_it(wired):
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID, OTHER_SITE_ID})
     seen = {}
     wired.setattr(org.topics, "list_report_dates",
-                  lambda conn, site_ids, since: (seen.update(site_ids=list(site_ids)) or []))
+                  lambda conn, site_ids, since, author_ids=None: (
+                      seen.update(site_ids=list(site_ids)) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/dates", params={"site": SITE_ID}), None)
     assert res["statusCode"] == 200
     assert seen["site_ids"] == [SITE_ID]                # scoped to the one accessible ?site
@@ -2393,3 +2451,322 @@ def test_site_members_denies_site_outside_accessible_set_403(wired):
     res = org.lambda_handler(make_event("GET", "/api/org/sites/" + OTHER_SITE_ID + "/members"), None)
     assert res["statusCode"] == 403
     assert called == []                                  # ACL rejects before the members read
+
+
+# ----------------------------------------------------------
+# Phase 3 Task 2 -- per-path x per-role graded ACL tests (visibility spec
+# §3.1/§3.2). GRADED_ROLES=True is set explicitly per test via
+# wired.setattr(org, "GRADED_ROLES", True); org.scope.visible_scope is
+# stubbed to pin one role's exact envelope (no DB needed). The graded-off
+# regression tests for /live-items, /dates, /observations already live next
+# to their siblings above (test_live_items_graded_off_passes_no_author_filter,
+# test_dates_graded_off_passes_no_author_filter,
+# test_observations_graded_off_company_wide_unchanged); /timeline's graded-off
+# regression is test_timeline_graded_off_forces_self_403_on_other below.
+# ----------------------------------------------------------
+
+# ---- /live-items per-user filter (the R1/R4 gap) ----
+def test_live_items_worker_filters_to_own_author(wired):
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": {"u-self"},
+                                        "user_scope": "SELF", "self_folder": "W",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    seen = {}
+    wired.setattr(org.topics, "list_topics_for_date",
+                  lambda conn, sids, date, author_ids=None: (seen.update(author_ids=author_ids) or []))
+    res = org.lambda_handler(make_event("GET", "/api/org/live-items", params={"date": "2026-07-18"}), None)
+    assert res["statusCode"] == 200
+    assert seen["author_ids"] == {"u-self"}               # worker: own author only
+
+
+def test_live_items_site_manager_self_plus_workers(wired):
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": {"u-self", "u-w1", "u-w2"},
+                                        "user_scope": "SELF+WORKERS", "self_folder": "SM",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    seen = {}
+    wired.setattr(org.topics, "list_topics_for_date",
+                  lambda conn, sids, date, author_ids=None: (seen.update(author_ids=author_ids) or []))
+    res = org.lambda_handler(make_event("GET", "/api/org/live-items", params={"date": "2026-07-18"}), None)
+    assert res["statusCode"] == 200
+    assert seen["author_ids"] == {"u-self", "u-w1", "u-w2"}   # own + site workers, never other managers
+
+
+def test_live_items_pm_membership_no_author_filter(wired):
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": None,
+                                        "user_scope": "SITE", "self_folder": "PM",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    seen = {}
+    wired.setattr(org.topics, "list_topics_for_date",
+                  lambda conn, sids, date, author_ids=None: (seen.update(author_ids=author_ids) or []))
+    res = org.lambda_handler(make_event("GET", "/api/org/live-items", params={"date": "2026-07-18"}), None)
+    assert res["statusCode"] == 200
+    assert seen["author_ids"] is None                     # SITE scope: every author on in-scope sites
+
+
+def test_live_items_admin_unfiltered(wired):
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID, OTHER_SITE_ID})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID, OTHER_SITE_ID}, "author_ids": None,
+                                        "user_scope": "ALL", "self_folder": None,
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    seen = {}
+    wired.setattr(org.topics, "list_topics_for_date",
+                  lambda conn, sids, date, author_ids=None: (seen.update(author_ids=author_ids) or []))
+    res = org.lambda_handler(make_event("GET", "/api/org/live-items", params={"date": "2026-07-18"}), None)
+    assert res["statusCode"] == 200
+    assert seen["author_ids"] is None
+
+
+# ---- /dates author filter ----
+def test_dates_worker_author_filtered(wired):
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": {"u-self"},
+                                        "user_scope": "SELF", "self_folder": "W",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    seen = {}
+    wired.setattr(org.topics, "list_report_dates",
+                  lambda conn, site_ids, since, author_ids=None: (
+                      seen.update(author_ids=author_ids) or []))
+    res = org.lambda_handler(make_event("GET", "/api/org/dates"), None)
+    assert res["statusCode"] == 200
+    assert seen["author_ids"] == {"u-self"}
+
+
+def test_dates_admin_no_author_filter(wired):
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": None,
+                                        "user_scope": "ALL", "self_folder": None,
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    seen = {}
+    wired.setattr(org.topics, "list_report_dates",
+                  lambda conn, site_ids, since, author_ids=None: (
+                      seen.update(author_ids=author_ids) or []))
+    res = org.lambda_handler(make_event("GET", "/api/org/dates"), None)
+    assert res["statusCode"] == 200
+    assert seen["author_ids"] is None
+
+
+# ---- /timeline graded authority ----
+def test_timeline_worker_denied_other_user_403(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": {"u-self"},
+                                        "user_scope": "SELF", "self_folder": "Ada_L",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-other", "folder_name": folder})
+    seen_has_topics = {"called": False}
+    wired.setattr(org.topics, "has_topics_for_source_prefix",
+                  lambda conn, prefix: seen_has_topics.update(called=True))
+    res = org.lambda_handler(make_event("GET", "/api/org/timeline",
+                                        params={"date": "2026-07-14", "user": "Someone_Else"}), None)
+    assert res["statusCode"] == 403
+    assert seen_has_topics["called"] is False   # denied before any Aurora/S3 read
+
+
+def test_timeline_worker_defaults_to_self(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": {"u-self"},
+                                        "user_scope": "SELF", "self_folder": "Ada_L",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
+    doc = {"report_date": "2026-07-14", "topics": []}
+    fake.objects["reports/2026-07-14/Ada_L/daily_report.json"] = json.dumps(doc).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == doc
+
+
+def test_timeline_site_manager_may_view_worker_on_site(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "SM_Folder"})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": {"u-self", "u-w1"},
+                                        "user_scope": "SELF+WORKERS", "self_folder": "SM_Folder",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-w1", "folder_name": folder})
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
+    doc = {"report_date": "2026-07-14", "topics": []}
+    fake.objects["reports/2026-07-14/Worker1_Folder/daily_report.json"] = json.dumps(doc).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "Worker1_Folder"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == doc
+
+
+def test_timeline_site_manager_denied_other_site_manager_403(presign_wired):
+    # BUG-25 class: a site_manager must never see another site_manager's
+    # timeline, only own + workers (D3).
+    wired, fake = presign_wired
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "SM_Folder"})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": {"u-self", "u-w1"},
+                                        "user_scope": "SELF+WORKERS", "self_folder": "SM_Folder",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-sm2", "folder_name": folder})
+    seen_has_topics = {"called": False}
+    wired.setattr(org.topics, "has_topics_for_source_prefix",
+                  lambda conn, prefix: seen_has_topics.update(called=True))
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "Other_SM_Folder"}), None)
+    assert res["statusCode"] == 403
+    assert seen_has_topics["called"] is False
+
+
+def test_timeline_pm_may_view_any_in_scope_user(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "PM_Folder"})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": None,
+                                        "user_scope": "SITE", "self_folder": "PM_Folder",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-x", "folder_name": folder})
+    wired.setattr(org.memberships, "caller_site_roles",
+                  lambda conn, uid: {SITE_ID: "worker"})    # target's site IS in the pm's site_ids
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
+    doc = {"report_date": "2026-07-14", "topics": []}
+    fake.objects["reports/2026-07-14/Other_User/daily_report.json"] = json.dumps(doc).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "Other_User"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == doc
+
+
+def test_timeline_pm_denied_out_of_scope_user_403(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "PM_Folder"})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": None,
+                                        "user_scope": "SITE", "self_folder": "PM_Folder",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-y", "folder_name": folder})
+    wired.setattr(org.memberships, "caller_site_roles",
+                  lambda conn, uid: {OTHER_SITE_ID: "worker"})   # target's site is NOT in pm's site_ids
+    seen_has_topics = {"called": False}
+    wired.setattr(org.topics, "has_topics_for_source_prefix",
+                  lambda conn, prefix: seen_has_topics.update(called=True))
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "Out_Of_Scope_User"}), None)
+    assert res["statusCode"] == 403
+    assert seen_has_topics["called"] is False
+
+
+def test_timeline_admin_unchanged_disambiguation(presign_wired):
+    # ALL-scope callers still hit admin_disambiguation for a bare (no ?user)
+    # request when graded -- unchanged from the legacy behavior.
+    wired, fake = presign_wired
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": None,
+                                        "user_scope": "ALL", "self_folder": None,
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    wired.setattr(org.topics, "list_extraction_folder_names_for_date",
+                  lambda conn, cid, date: [])
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
+    assert res["statusCode"] == 404
+    assert body_of(res) == {"message": "No reports for 2026-07-14", "date": "2026-07-14"}
+
+
+def test_timeline_graded_off_forces_self_403_on_other(presign_wired):
+    # Regression: with GRADED_ROLES at its default (off), the legacy
+    # hard-force-self branch runs verbatim and never touches scope.visible_
+    # scope at all.
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
+
+    def _boom(conn, caller):
+        raise AssertionError("visible_scope must not be called when GRADED_ROLES is off")
+
+    wired.setattr(org.scope, "visible_scope", _boom)
+    res = org.lambda_handler(make_event("GET", "/api/org/timeline",
+                                        params={"date": "2026-07-14", "user": "Someone_Else"}), None)
+    assert res["statusCode"] == 403
+    assert "own timeline" in body_of(res)["error"]
+    assert org.GRADED_ROLES is False
+
+
+# ---- /observations site scoping ----
+def test_observations_worker_scoped_to_member_site_slugs(wired):
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": {"u-self"},
+                                        "user_scope": "SELF", "self_folder": "W",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    wired.setattr(org.sites, "list_sites_by_ids",
+                  lambda conn, ids: [{"id": SITE_ID, "slug": "site-a"}])
+    seen = {}
+    wired.setattr(org.observations, "list_observations",
+                  lambda conn, company_id, kind=None, date_from=None, date_to=None,
+                         site_slug=None, allowed_site_slugs=None, include_archived=False: (
+                      seen.update(allowed_site_slugs=allowed_site_slugs) or []))
+    res = org.lambda_handler(make_event("GET", "/api/org/observations"), None)
+    assert res["statusCode"] == 200
+    assert seen["allowed_site_slugs"] == {"site-a"}
+
+
+def test_observations_admin_company_wide(wired):
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID, OTHER_SITE_ID}, "author_ids": None,
+                                        "user_scope": "ALL", "self_folder": None,
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    seen = {}
+    wired.setattr(org.observations, "list_observations",
+                  lambda conn, company_id, kind=None, date_from=None, date_to=None,
+                         site_slug=None, allowed_site_slugs=None, include_archived=False: (
+                      seen.update(allowed_site_slugs=allowed_site_slugs) or []))
+    res = org.lambda_handler(make_event("GET", "/api/org/observations"), None)
+    assert res["statusCode"] == 200
+    assert seen["allowed_site_slugs"] is None
