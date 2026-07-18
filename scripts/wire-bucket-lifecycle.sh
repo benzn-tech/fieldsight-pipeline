@@ -12,7 +12,7 @@ BUCKET="${1:?usage: wire-bucket-lifecycle.sh BUCKET [REGION]}"
 REGION="${2:-ap-southeast-2}"
 
 EXISTING="$(aws s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" \
-  --region "$REGION" --query 'Rules[?ID!=`org-assets-pending-expiry` && ID!=`download-claims-expiry`].ID' \
+  --region "$REGION" --query 'Rules[?ID!=`org-assets-pending-expiry` && ID!=`download-claims-expiry` && ID!=`voice-clips-expiry`].ID' \
   --output text 2>/dev/null || true)"
 if [ -n "$EXISTING" ]; then
   echo "ERROR: bucket $BUCKET has other lifecycle rules ($EXISTING); refusing to replace. Merge manually." >&2
@@ -33,6 +33,12 @@ aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" --region "$REGIO
         "Status": "Enabled",
         "Filter": { "Prefix": "download_claims/" },
         "Expiration": { "Days": 1 }
+      }
+      ,{
+        "ID": "voice-clips-expiry",
+        "Status": "Enabled",
+        "Filter": { "Prefix": "voice/" },
+        "Expiration": { "Days": 30 }
       }
     ]
   }'
