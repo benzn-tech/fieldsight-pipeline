@@ -274,6 +274,17 @@ Parameters:
       with none still falls back to writing report topics as before. False
       (default) is the pre-flip legacy behavior, unchanged in every path.
 
+  GradedRoles:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, org-api read paths route through visible_scope for graded
+      visibility (regional_manager/platform_admin, per-site membership
+      authority, the /live-items per-user filter -- Phase 3 graded-roles
+      spec §3). False (default) is the pre-Phase-3 binary resolve_scope
+      behavior, unchanged in every path, mirroring AuthorityFlip's rollout.
+
   ManageDataBucketPolicy:
     Type: String
     Default: 'true'
@@ -803,6 +814,10 @@ Resources:
           # reports/ prefix (a DIFFERENT bucket than DataBucketName above;
           # mirrors MatcherFunction's DataBucketName/IngestBucketName split).
           LAKE_BUCKET: !Ref IngestBucketName
+          # Phase 3 Task 4 — graded-roles cutover flag, wired the same way as
+          # AUTHORITY_FLIP (IngestFunction, above): Parameter default 'false',
+          # driven per-environment by a repo variable in the deploy workflows.
+          GRADED_ROLES: !Ref GradedRoles
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
