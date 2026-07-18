@@ -1568,6 +1568,134 @@ Resources:
           # own UserPool later; today just the org pool.
           WS_USER_POOL_IDS: !Ref OrgUserPoolId
 
+  # ----------------------------------------------------------
+  # Site Voice WebSocket API (raw ApiGatewayV2 — SAM has no WS type).
+  # ----------------------------------------------------------
+  VoiceWebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Condition: HasSiteVoice
+    Properties:
+      Name: !Sub ["${P}-voice-ws", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  VoiceWsAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Condition: HasSiteVoice
+    Properties:
+      ApiId: !Ref VoiceWebSocketApi
+      Name: !Sub ["${P}-voice-ws-authorizer", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AuthorizerType: REQUEST
+      IdentitySource:
+        - route.request.header.Authorization
+      AuthorizerUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${VoiceWsAuthorizerFunction.Arn}/invocations
+
+  VoiceWsConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: HasSiteVoice
+    Properties:
+      ApiId: !Ref VoiceWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsConnectFunction.Arn}/invocations
+
+  VoiceWsDisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: HasSiteVoice
+    Properties:
+      ApiId: !Ref VoiceWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsDisconnectFunction.Arn}/invocations
+
+  VoiceWsSendVoiceIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: HasSiteVoice
+    Properties:
+      ApiId: !Ref VoiceWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsSendVoiceFunction.Arn}/invocations
+
+  VoiceWsConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasSiteVoice
+    Properties:
+      ApiId: !Ref VoiceWebSocketApi
+      RouteKey: $connect
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref VoiceWsAuthorizer
+      Target: !Sub integrations/${VoiceWsConnectIntegration}
+
+  VoiceWsDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasSiteVoice
+    Properties:
+      ApiId: !Ref VoiceWebSocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      Target: !Sub integrations/${VoiceWsDisconnectIntegration}
+
+  VoiceWsSendVoiceRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasSiteVoice
+    Properties:
+      ApiId: !Ref VoiceWebSocketApi
+      RouteKey: sendVoice
+      AuthorizationType: NONE
+      Target: !Sub integrations/${VoiceWsSendVoiceIntegration}
+
+  VoiceWsDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    Condition: HasSiteVoice
+    DependsOn:
+      - VoiceWsConnectRoute
+      - VoiceWsDisconnectRoute
+      - VoiceWsSendVoiceRoute
+    Properties:
+      ApiId: !Ref VoiceWebSocketApi
+
+  VoiceWsStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Condition: HasSiteVoice
+    Properties:
+      ApiId: !Ref VoiceWebSocketApi
+      StageName: prod
+      DeploymentId: !Ref VoiceWsDeployment
+
+  VoiceWsAuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasSiteVoice
+    Properties:
+      FunctionName: !Ref VoiceWsAuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${VoiceWebSocketApi}/*
+
+  WsConnectPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasSiteVoice
+    Properties:
+      FunctionName: !Ref WsConnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${VoiceWebSocketApi}/*
+
+  WsDisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasSiteVoice
+    Properties:
+      FunctionName: !Ref WsDisconnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${VoiceWebSocketApi}/*
+
+  WsSendVoicePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasSiteVoice
+    Properties:
+      FunctionName: !Ref WsSendVoiceFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${VoiceWebSocketApi}/*
+
   # ==========================================================
   # COGNITO - User Authentication
   # ==========================================================
@@ -2178,6 +2306,11 @@ Outputs:
   ApiEndpoint:
     Description: API Gateway endpoint URL
     Value: !Sub https://${FieldSightApi}.execute-api.${AWS::Region}.amazonaws.com/prod/api
+
+  VoiceWsEndpoint:
+    Description: Site Voice WebSocket endpoint (wss)
+    Condition: HasSiteVoice
+    Value: !Sub wss://${VoiceWebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod
 
   CognitoUserPoolId:
     Description: Cognito User Pool ID
