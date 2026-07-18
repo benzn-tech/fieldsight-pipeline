@@ -286,6 +286,16 @@ Parameters:
       an unmanaged policy, so PROD sets this false and relies on the lake's
       existing policy.
 
+  EnableSiteVoice:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true (and HasOrgApi), deploys the Site Voice WebSocket API + its
+      Lambdas. Default false; test sets true (deploy.yml), prod is dark-launched
+      false until the app is device-accepted (repo var PROD_ENABLE_SITE_VOICE,
+      deploy-prod.yml) — mirrors PROD_ENABLE_SCHEDULES / PROD_AUTHORITY_FLIP.
+
 # ============================================================
 # Conditions
 # ============================================================
@@ -309,6 +319,7 @@ Conditions:
   HasDb: !Not [!Equals [!Ref DbStackName, '']]
   HasOrgPool: !Not [!Equals [!Ref OrgUserPoolId, '']]
   HasOrgApi: !And [!Condition HasDb, !Condition HasOrgPool]
+  HasSiteVoice: !And [!Condition HasOrgApi, !Equals [!Ref EnableSiteVoice, 'true']]
 
 # ============================================================
 # Global Settings
@@ -711,6 +722,22 @@ Resources:
       BuildMethod: python3.11
 
   # ----------------------------------------------------------
+  # Lambda Layer: PyJWT[crypto] for the Site Voice WS authorizer.
+  # Same sam-build pattern as PsycopgLayer/DashScopeLayer. Gated HasSiteVoice.
+  # ----------------------------------------------------------
+  JwtLayer:
+    Type: AWS::Serverless::LayerVersion
+    Condition: HasSiteVoice
+    Properties:
+      LayerName: !Sub ["${P}-jwt-layer", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      Description: PyJWT[crypto] (JWKS RS256) for the Site Voice WebSocket authorizer
+      ContentUri: infra/jwt-layer/
+      CompatibleRuntimes:
+        - python3.11
+    Metadata:
+      BuildMethod: python3.11
+
+  # ----------------------------------------------------------
   # Lambda Layer: psycopg[binary] + pgvector (Phase 2B)
   # `sam build` runs pip on the CI runner (Metadata BuildMethod) to produce
   # manylinux wheels compatible with the Lambda python3.11 runtime.
@@ -803,6 +830,8 @@ Resources:
           # reports/ prefix (a DIFFERENT bucket than DataBucketName above;
           # mirrors MatcherFunction's DataBucketName/IngestBucketName split).
           LAKE_BUCKET: !Ref IngestBucketName
+          # Site voice: dedicated off-the-record prefix (matches no S3 trigger).
+          VOICE_PREFIX: voice/
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
@@ -832,6 +861,15 @@ Resources:
                 - s3:PutObject
                 - s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/users/*
+            - Effect: Allow
+              # Site voice clips: presigned PUT/GET under a DEDICATED voice/
+              # prefix (never users/ or recordings) — the data-isolation
+              # invariant. Same bucket as recordings (DataBucketName); voice/
+              # matches no wire-s3-events.sh trigger, so it never ingests.
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/voice/*
             - Effect: Allow
               # Without ListBucket, S3 returns AccessDenied/403 (not
               # NoSuchKey/404) for a missing object under a prefix this
@@ -1358,6 +1396,179 @@ Resources:
         - VPCAccessPolicy: {}
 
   # ==========================================================
+  # SITE VOICE (WebSocket) — Lambdas. WS API wiring is in the
+  # ApiGatewayV2 block below. All gated by HasSiteVoice.
+  # ==========================================================
+
+  # In-VPC reaper: targeted delete (fanout GoneException) + scheduled sweep.
+  VoiceReaperFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasSiteVoice
+    Properties:
+      FunctionName: !Sub ["${P}-voice-reaper", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_voice_reaper.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !ImportValue
+            Fn::Sub: "${DbStackName}-DbName"
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+      Policies:
+        - VPCAccessPolicy: {}
+      Events:
+        SweepEvent:
+          Type: Schedule
+          Properties:
+            Schedule: rate(6 hours)
+            Description: Reap stale ws_connections + prune voice_messages > 30d
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+            Input: '{"sweep": true}'
+
+  # Non-VPC fanout: POST payload over @connections; GoneException -> reaper.
+  VoiceFanoutFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasSiteVoice
+    Properties:
+      FunctionName: !Sub ["${P}-voice-fanout", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_voice_fanout.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          VOICE_REAPER_FUNCTION: !Ref VoiceReaperFunction
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref VoiceReaperFunction
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              # @connections management POST. Scoped to POST/@connections; the
+              # concrete WS api id (VoiceWebSocketApi, below) is created in the
+              # ApiGatewayV2 block — wildcard api keeps this fn's role
+              # self-contained and is least-privilege on action+path.
+              Action: execute-api:ManageConnections
+              Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*/*/POST/@connections/*
+
+  # In-VPC $connect: resolve sub -> upsert ws_connections.
+  WsConnectFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasSiteVoice
+    Properties:
+      FunctionName: !Sub ["${P}-ws-connect", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_ws_connect.lambda_handler
+      Timeout: 15
+      MemorySize: 256
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !ImportValue
+            Fn::Sub: "${DbStackName}-DbName"
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+      Policies:
+        - VPCAccessPolicy: {}
+
+  # In-VPC $disconnect: delete the connection row.
+  WsDisconnectFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasSiteVoice
+    Properties:
+      FunctionName: !Sub ["${P}-ws-disconnect", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_ws_disconnect.lambda_handler
+      Timeout: 15
+      MemorySize: 256
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !ImportValue
+            Fn::Sub: "${DbStackName}-DbName"
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+      Policies:
+        - VPCAccessPolicy: {}
+
+  # In-VPC sendVoice: ACL + insert pointer + resolve recipients + async fanout.
+  WsSendVoiceFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasSiteVoice
+    Properties:
+      FunctionName: !Sub ["${P}-send-voice", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_ws_send_voice.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !ImportValue
+            Fn::Sub: "${DbStackName}-DbName"
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          VOICE_FANOUT_FUNCTION: !Ref VoiceFanoutFunction
+      Policies:
+        - VPCAccessPolicy: {}
+        - LambdaInvokePolicy:
+            FunctionName: !Ref VoiceFanoutFunction
+
+  # Non-VPC REQUEST authorizer: verify Cognito idToken via JWKS (RS256).
+  VoiceWsAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasSiteVoice
+    Properties:
+      FunctionName: !Sub ["${P}-voice-ws-authorizer", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_ws_authorizer.lambda_handler
+      Timeout: 10
+      MemorySize: 256
+      Layers:
+        - !Ref JwtLayer
+      Environment:
+        Variables:
+          # Trust the same pool(s) the REST CognitoAuthorizer trusts (the pool
+          # the app logs into). Comma-separated to allow adding this stack's
+          # own UserPool later; today just the org pool.
+          WS_USER_POOL_IDS: !Ref OrgUserPoolId
+
+  # ==========================================================
   # COGNITO - User Authentication
   # ==========================================================
 
@@ -1789,6 +2000,48 @@ Resources:
     Condition: HasOrgApi
     Properties:
       LogGroupName: !Sub /aws/lambda/${OrgSeedFunction}
+      RetentionInDays: 14
+
+  VoiceWsAuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasSiteVoice
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${VoiceWsAuthorizerFunction}
+      RetentionInDays: 14
+
+  WsConnectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasSiteVoice
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${WsConnectFunction}
+      RetentionInDays: 14
+
+  WsDisconnectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasSiteVoice
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${WsDisconnectFunction}
+      RetentionInDays: 14
+
+  WsSendVoiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasSiteVoice
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${WsSendVoiceFunction}
+      RetentionInDays: 14
+
+  VoiceFanoutLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasSiteVoice
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${VoiceFanoutFunction}
+      RetentionInDays: 14
+
+  VoiceReaperLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasSiteVoice
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${VoiceReaperFunction}
       RetentionInDays: 14
 
   FargateLogGroup:
