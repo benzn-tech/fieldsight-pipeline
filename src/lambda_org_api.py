@@ -55,7 +55,7 @@ from psycopg.errors import UniqueViolation
 
 from db.connection import get_connection
 from repositories import (companies, memberships, observations, programme, programme_suggestions,
-                          recordings, rollup, sites, topics, users)
+                          recordings, rollup, scope, sites, topics, users)
 from repositories.acl import resolve_scope
 
 logger = logging.getLogger()
@@ -79,6 +79,11 @@ COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 ORG_ASSETS_PREFIX = os.environ.get("ORG_ASSETS_PREFIX", "org-assets/")
 COGNITO_USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
 PRESIGNED_URL_EXPIRY = 900
+# Phase 3 graded roles (visibility spec §3.1). Default OFF: _allowed_site_ids
+# and every read path below behave EXACTLY as today until an environment is
+# cut over (repo var PROD_GRADED_ROLES/TEST_GRADED_ROLES -> env, deploy-*.yml,
+# same pattern as AUTHORITY_FLIP). No user silently gains visibility.
+GRADED_ROLES = os.environ.get("GRADED_ROLES", "").lower() == "true"
 
 ALLOWED_GLOBAL_ROLES = {"admin", "gm", "regional_manager", "pm", "site_manager", "worker", "platform_admin"}
 ALLOWED_MEMBERSHIP_ROLES = {"pm", "site_manager", "worker"}
@@ -768,10 +773,16 @@ def list_org_observations(conn, caller, event):
     kind = params.get("kind")
     if kind is not None and kind not in ALLOWED_OBSERVATION_KINDS:
         return error(f"kind must be one of {sorted(ALLOWED_OBSERVATION_KINDS)}", 400)
+    allowed_slugs = None
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)
+        if sc["user_scope"] != "ALL":                         # admin/gm stay company-wide
+            allowed_slugs = {s["slug"] for s in sites.list_sites_by_ids(conn, sc["site_ids"])
+                             if s.get("slug")}
     rows = observations.list_observations(
         conn, caller["company_id"], kind=kind,
         date_from=params.get("from"), date_to=params.get("to"),
-        site_slug=params.get("site_slug"),
+        site_slug=params.get("site_slug"), allowed_site_slugs=allowed_slugs,
         include_archived=params.get("include_archived") == "1",
     )
     return ok({"observations": rows})
@@ -844,12 +855,9 @@ def list_live_items(conn, caller, event):
     date = (event.get("queryStringParameters") or {}).get("date")
     if not date or not REPORT_DATE_RE.match(date):
         return error("date required (YYYY-MM-DD)", 400)
-    if resolve_scope(caller["global_role"]) == "ALL":
-        site_ids = [s["id"] for s in sites.list_company_sites(conn, caller["company_id"])]
-    else:
-        site_ids = memberships.accessible_site_ids(
-            conn, caller["id"], caller["global_role"])
-    rows = topics.list_topics_for_date(conn, site_ids, date)
+    site_ids = list(_allowed_site_ids(conn, caller))          # graded-aware reach
+    rows = topics.list_topics_for_date(conn, site_ids, date,
+                                       author_ids=_author_filter(conn, caller))
     return ok({"topics": rows})
 
 
@@ -891,7 +899,8 @@ def get_org_dates(conn, caller, event):
         site_ids = [site_id]
     else:
         site_ids = list(_allowed_site_ids(conn, caller))
-    rows = topics.list_report_dates(conn, site_ids, since)
+    rows = topics.list_report_dates(conn, site_ids, since,
+                                    author_ids=_author_filter(conn, caller))
     return ok({"dates": {str(d): {"hasReport": True} for d in rows}})
 
 
@@ -939,7 +948,17 @@ def list_portfolio_rollup(conn, caller, event):
 # always uses the resolved UUID, never the slug, so there's no injection
 # surface and no orphaned object on a site rename.
 # ----------------------------------------------------------
+def _author_filter(conn, caller):
+    """Per-author id allow-set (visibility spec §3.1 user_scope) when graded
+    roles are on, else None = today's site-only scoping. None => unrestricted."""
+    if not GRADED_ROLES:
+        return None
+    return scope.visible_scope(conn, caller)["author_ids"]
+
+
 def _allowed_site_ids(conn, caller):
+    if GRADED_ROLES:
+        return scope.visible_scope(conn, caller)["site_ids"]   # graded reach (incl. platform_admin)
     # str() both sides: psycopg returns site ids as uuid.UUID objects, but the
     # ?site= query param arrives as a string — a UUID-vs-str `in` check is
     # always False (every request 403'd, incl. admins). Unit mocks used string
@@ -1325,11 +1344,53 @@ def admin_disambiguation(conn, caller, date):
     return ok({"date": date, "available_users": sorted(candidates)})
 
 
+def _can_view_folder(conn, caller, target_folder):
+    """GRADED /timeline authority (spec §3.2): may caller read target_folder's
+    (folder, date) timeline? Own folder always; SITE (pm/regional) any user on
+    an in-scope site; SELF+WORKERS (site_manager) own + workers on in-scope
+    sites; SELF (worker) own only. Company-pinned: the target is resolved
+    within caller.company_id first (unless caller is cross-company)."""
+    sc = scope.visible_scope(conn, caller)
+    if target_folder and target_folder == sc["self_folder"]:
+        return True
+    if sc["cross_company"]:
+        target = users.get_by_folder_name_global(conn, target_folder)
+    else:
+        target = users.get_by_folder_name(conn, caller["company_id"], target_folder)
+    if target is None:
+        return False                                          # not in caller's company / unknown
+    if sc["user_scope"] == "ALL":
+        return True
+    if sc["user_scope"] == "SITE":
+        target_sites = memberships.caller_site_roles(conn, target["id"])
+        return any(sid in sc["site_ids"] for sid in target_sites)   # target is on an in-scope site
+    return str(target["id"]) in (sc["author_ids"] or set())   # SELF / SELF+WORKERS
+
+
 def get_timeline_compat(conn, caller, event):
     p = event.get("queryStringParameters") or {}
     date, user = p.get("date"), (p.get("user") or "").strip()
     if not date or not REPORT_DATE_RE.match(date):
         return error("date required (YYYY-MM-DD)", 400)
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)
+        if sc["user_scope"] == "ALL":                         # admin/gm/platform_admin
+            if not user:
+                return admin_disambiguation(conn, caller, date)
+            if not sc["cross_company"] and \
+                    users.get_by_folder_name(conn, caller["company_id"], user) is None:
+                return error("user not found in your company", 404)
+            return _render_timeline_for_user(conn, caller, date, user)
+        # graded non-ALL: default self, but pm/regional/site_manager may view
+        # in-scope users (spec §3.2 -- no longer hard-forced to self).
+        if not user:
+            user = sc["self_folder"]
+            if not user:
+                return error("no folder mapping for your account", 403)
+        if not _can_view_folder(conn, caller, user):
+            return error("not permitted to view this timeline", 403)
+        return _render_timeline_for_user(conn, caller, date, user)
+    # ---- GRADED_ROLES off: today's behavior, verbatim ----
     is_all = resolve_scope(caller["global_role"]) == "ALL"
     if not is_all:
         own = caller.get("folder_name")

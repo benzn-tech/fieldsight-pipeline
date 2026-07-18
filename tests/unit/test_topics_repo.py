@@ -411,6 +411,41 @@ def test_list_report_dates_empty_site_ids_short_circuits():
     assert conn.calls == []  # no round-trip on empty scope (mirrors list_topics_for_date)
 
 
+def test_list_topics_for_date_author_ids_adds_user_filter():
+    """Phase 3 Task 2 (visibility spec §3.1): author_ids narrows the
+    dashboard read to topics authored by one of the caller's resolved
+    allow-set ids -- the graded per-author filter /live-items and /dates
+    apply on top of site-scoping."""
+    conn = FakeConn(results=[[]])   # empty topic result short-circuits before children queries
+    topics.list_topics_for_date(conn, ["s-1"], "2026-07-18", author_ids={"u-1", "u-2"})
+    call = conn.calls[0]
+    assert "t.user_id = ANY(%s::uuid[])" in call["sql"]
+    author_param = call["params"][2]
+    assert set(author_param) == {"u-1", "u-2"}
+
+
+def test_list_topics_for_date_author_ids_none_no_filter():
+    conn = FakeConn(results=[[]])
+    topics.list_topics_for_date(conn, ["s-1"], "2026-07-18")
+    assert "t.user_id = ANY" not in conn.calls[0]["sql"]
+    assert conn.calls[0]["params"] == (["s-1"], "2026-07-18")   # graded-off byte parity
+
+
+def test_list_report_dates_author_ids_adds_user_filter():
+    conn = FakeConn(results=[[]])
+    topics.list_report_dates(conn, ["s-1"], _dt.date(2026, 5, 1), author_ids={"u-1"})
+    call = conn.calls[0]
+    assert "user_id = ANY(%s::uuid[])" in call["sql"]
+    assert call["params"][2] == ["u-1"]
+
+
+def test_list_report_dates_author_ids_none_no_filter():
+    conn = FakeConn(results=[[]])
+    topics.list_report_dates(conn, ["s-1"], _dt.date(2026, 5, 1))
+    assert "user_id = ANY" not in conn.calls[0]["sql"]
+    assert conn.calls[0]["params"] == (["s-1"], _dt.date(2026, 5, 1))   # graded-off byte parity
+
+
 def test_list_topics_for_date_selects_new_columns():
     """_TOPIC_COLS_JOINED gains time_range/participants/source (additive) --
     live-items consumers get these for free off the existing dashboard read,
