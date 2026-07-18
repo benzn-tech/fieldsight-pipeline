@@ -49,7 +49,7 @@ from psycopg.errors import UniqueViolation
 
 from db.connection import get_connection
 from repositories import (companies, memberships, observations, programme, programme_suggestions,
-                          recordings, rollup, sites, topics, users)
+                          recordings, rollup, sites, topics, users, voice_messages)
 from repositories.acl import resolve_scope
 
 logger = logging.getLogger()
@@ -81,6 +81,13 @@ ALLOWED_RISK_LEVELS = {"low", "medium", "high"}
 ALLOWED_OBSERVATION_STATUS = {"open", "closed"}
 RECORDING_KINDS = {"video", "audio", "photo"}
 _KIND_FOLDER = {"video": "video", "audio": "audio", "photo": "pictures"}
+
+# Site voice (off-the-record): a DEDICATED voice/ prefix that matches NO S3
+# event trigger (BUG-13), and the voice_messages table — never recordings /
+# create_recording_upload_url (data-isolation invariant).
+VOICE_PREFIX = os.environ.get("VOICE_PREFIX", "voice/")
+ALLOWED_VOICE_TYPES = {"audio/wav": "wav", "audio/x-wav": "wav",
+                       "audio/mpeg": "mp3", "audio/mp4": "m4a", "audio/aac": "aac"}
 
 _s3_client = None
 _cognito_client = None
@@ -231,6 +238,14 @@ def dispatch(conn, event, method, route):
     if m_rc and method == "POST":
         return complete_recording(conn, caller, m_rc.group(1), parse_body(event))
 
+    if route == "/voice/upload-url" and method == "POST":
+        return create_voice_upload_url(conn, caller, parse_body(event))
+    if route == "/voice/asset-url" and method == "GET":
+        return get_voice_asset_url(event, caller)
+    m_sv = re.match(r"^/sites/([^/]+)/voice$", route)
+    if m_sv and method == "GET":
+        return list_site_voice(conn, caller, m_sv.group(1), event)
+
     return error("not found", 404)
 
 
@@ -322,6 +337,70 @@ def complete_recording(conn, caller, rec_id, body):
     if row is None:
         return error("recording not found", 404)
     return ok({"ok": True})
+
+
+# ----------------------------------------------------------
+# /voice — Site voice (off-the-record; dedicated voice/ prefix + voice_messages)
+# ----------------------------------------------------------
+def _voice_s3_key(company_id, site_id, sender_id, file_ext):
+    # Dedicated voice/ prefix — matches NO S3 event trigger (BUG-13 / data
+    # isolation). Scoped by company/site so a listing (and the asset-url ACL)
+    # stays tenant-bounded. sender_id keeps sibling clips distinct in audit.
+    return (f"{VOICE_PREFIX}{_safe_seg(str(company_id))}/{_safe_seg(str(site_id))}/"
+            f"{_safe_seg(str(sender_id))}_{uuid.uuid4().hex}.{file_ext}")
+
+
+def create_voice_upload_url(conn, caller, body):
+    if body is None:
+        return error("malformed JSON body", 400)
+    content_type = body.get("contentType")
+    ext = ALLOWED_VOICE_TYPES.get(content_type) if isinstance(content_type, str) else None
+    if ext is None:
+        return error(f"contentType must be one of {sorted(ALLOWED_VOICE_TYPES)}", 400)
+    site_id = body.get("siteId")
+    if not site_id:
+        return error("siteId is required", 400)
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("site not accessible", 403)
+    key = _voice_s3_key(caller["company_id"], site_id, caller["id"], ext)
+    # NOTE: no voice_messages insert here — sendVoice (Task 6) is the sole writer
+    # of the row (created when the clip is actually sent). An abandoned recording
+    # thus leaves at most an orphan S3 object, reaped by the 30-day voice/ lifecycle.
+    url = s3().generate_presigned_url(
+        "put_object",
+        Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": content_type},
+        ExpiresIn=PRESIGNED_URL_EXPIRY)
+    return ok({"uploadUrl": url, "s3Key": key})
+
+
+def get_voice_asset_url(event, caller):
+    """Presigned GET for a voice clip. Tenant-isolated: the key must live under
+    the caller's own company prefix (voice/{company}/...), so a caller can only
+    fetch their company's clips."""
+    key = (event.get("queryStringParameters") or {}).get("key", "")
+    prefix = f"{VOICE_PREFIX}{_safe_seg(str(caller['company_id']))}/"
+    if not key.startswith(prefix):
+        return error("key must be one of your company's voice clips", 400)
+    url = s3().generate_presigned_url(
+        "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=PRESIGNED_URL_EXPIRY)
+    return ok({"url": url, "expiresIn": PRESIGNED_URL_EXPIRY})
+
+
+def list_site_voice(conn, caller, site_id, event):
+    """Reconnect backfill: recent voice messages on a site the caller can see.
+    ACL mirrors list_site_members / list_live_items (_allowed_site_ids)."""
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    since = (event.get("queryStringParameters") or {}).get("since") or "1970-01-01T00:00:00Z"
+    rows = voice_messages.list_since(conn, caller["company_id"], site_id, since)
+    # Serialize to camelCase (matches upload-url/asset-url + the app's parser);
+    # never leak snake_case DB column names across the API boundary.
+    items = [{"s3Key": r["s3_key"], "senderUserId": str(r["sender_user_id"]),
+              "durationS": r["duration_s"],
+              "createdAt": r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else str(r["created_at"])}
+             for r in rows]
+    return ok({"items": items, "site": str(site_id)})
 
 
 # ----------------------------------------------------------
