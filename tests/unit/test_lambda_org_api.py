@@ -2929,6 +2929,134 @@ def test_timeline_admin_all_scope_sees_full_target_content(presign_wired):
     assert body_of(res) == full_doc                      # admin (ALL scope) still sees everything
 
 
+# ----------------------------------------------------------
+# /transcripts (Aurora-identity read — fixes the legacy /transcripts
+# gateway's DynamoDB-identity 403 for Aurora-only accounts, e.g.
+# site_manager Ben_UCPK). ACL mirrors /timeline's GRADED_ROLES-off path
+# verbatim; `presign_wired` wires FakeS3 as org._s3_client (same client
+# _read_org_transcripts reads S3_BUCKET through).
+# ----------------------------------------------------------
+
+def _transcript_doc():
+    return {
+        "results": {
+            "transcripts": [{"transcript": "Hello there. All good on site."}],
+            "audio_segments": [
+                {"speaker_label": "spk_0", "transcript": "Hello there.",
+                 "start_time": "0.0", "end_time": "2.0"},
+                {"speaker_label": "spk_1", "transcript": "All good on site.",
+                 "start_time": "2.5", "end_time": "5.0"},
+            ],
+            "items": [
+                {"type": "pronunciation", "start_time": "0.0", "end_time": "0.5",
+                 "alternatives": [{"content": "Hello"}]},
+                {"type": "pronunciation", "start_time": "0.6", "end_time": "1.0",
+                 "alternatives": [{"content": "there"}]},
+            ],
+        }
+    }
+
+
+def _wire_one_transcript_file(fake, folder, date, filename="_2026-07-18_08-00-00.json"):
+    key = f"transcripts/{folder}/{date}/{folder}{filename}"
+    fake.list_objects_response = {"Contents": [{"Key": key}]}
+    fake.objects[key] = json.dumps(_transcript_doc()).encode()
+    return key
+
+
+def test_transcripts_requires_date(wired):
+    res = org.lambda_handler(make_event("GET", "/api/org/transcripts"), None)
+    assert res["statusCode"] == 400
+    assert "date" in body_of(res)["error"]
+    res2 = org.lambda_handler(make_event(
+        "GET", "/api/org/transcripts", params={"date": "18-07-2026"}), None)
+    assert res2["statusCode"] == 400
+
+
+def test_transcripts_non_all_caller_reads_own_folder(presign_wired):
+    # site_manager Ben_UCPK's actual bug: an Aurora-provisioned, non-ALL
+    # caller reading their OWN transcripts must get the transcript shape,
+    # not a 403 -- this is the regression the Aurora route exists to fix.
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "site_manager", "folder_name": "Ben_UCPK"})
+    _wire_one_transcript_file(fake, "Ben_UCPK", "2026-07-18")
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/transcripts", params={"date": "2026-07-18"}), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["count"] == 1
+    assert b["speaker_count"] == 2
+    assert b["total_speaker_segments"] == 2
+    assert b["speakers"] == ["spk_0", "spk_1"]
+    assert b["speaker_segments"][0] == {
+        "speaker": "spk_0", "text": "Hello there.",
+        "start": 28800.0, "end": 28802.0, "time_label": "08:00:00", "duration": 2.0,
+    }
+    assert b["speaker_segments"][1]["time_label"] == "08:00:02"
+    assert b["segments"][0]["filename"] == "Ben_UCPK_2026-07-18_08-00-00.json"
+
+
+def test_transcripts_non_all_caller_explicit_own_folder_ok(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
+    _wire_one_transcript_file(fake, "Ada_L", "2026-07-18")
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/transcripts", params={"date": "2026-07-18", "user": "Ada_L"}), None)
+    assert res["statusCode"] == 200
+
+
+def test_transcripts_non_all_caller_other_user_403(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/transcripts", params={"date": "2026-07-18", "user": "Someone_Else"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_transcripts_non_all_caller_without_folder_name_403(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": None})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/transcripts", params={"date": "2026-07-18"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_transcripts_admin_with_user_ok(presign_wired):
+    wired, fake = presign_wired  # CALLER default global_role is "admin"
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-2", "folder_name": folder})
+    _wire_one_transcript_file(fake, "Ada_L", "2026-07-18")
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/transcripts", params={"date": "2026-07-18", "user": "Ada_L"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["count"] == 1
+
+
+def test_transcripts_admin_user_not_in_company_404(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_by_folder_name", lambda conn, cid, folder: None)
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/transcripts", params={"date": "2026-07-18", "user": "Ghost_User"}), None)
+    assert res["statusCode"] == 404
+
+
+def test_transcripts_no_files_returns_no_transcripts_message(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
+    fake.list_objects_response = {"Contents": []}
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/transcripts", params={"date": "2026-07-18"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == {
+        "text": "", "segments": [], "speaker_segments": [], "message": "No transcripts found",
+    }
+
+
 # ---- /observations site scoping ----
 def test_observations_worker_scoped_to_member_site_slugs(wired):
     wired.setattr(org, "GRADED_ROLES", True)
