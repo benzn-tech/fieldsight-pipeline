@@ -27,8 +27,15 @@ def create_observation(conn, company_id, kind, site_slug, author_sub, author_nam
 
 
 def list_observations(conn, company_id, kind=None, date_from=None, date_to=None,
-                      site_slug=None, include_archived=False) -> list[dict]:
-    """Company-scoped list with optional filters, newest report_date first."""
+                      site_slug=None, allowed_site_slugs=None,
+                      include_archived=False) -> list[dict]:
+    """Company-scoped list with optional filters, newest report_date first.
+
+    allowed_site_slugs (visibility spec §3.1, Phase 3 graded roles):
+    optionally narrows to observations whose site_slug is in the caller's
+    resolved in-scope set; None (default) = company-wide, today's behavior
+    unchanged. An empty set is a real "no in-scope sites" filter (not
+    treated as None) -- it still applies and yields zero rows."""
     conditions = ["company_id = %s"]
     params = [company_id]
     if kind is not None:
@@ -37,6 +44,9 @@ def list_observations(conn, company_id, kind=None, date_from=None, date_to=None,
     if site_slug is not None:
         conditions.append("site_slug = %s")
         params.append(site_slug)
+    if allowed_site_slugs is not None:
+        conditions.append("site_slug = ANY(%s)")
+        params.append(list(allowed_site_slugs))
     if date_from is not None:
         conditions.append("report_date >= %s")
         params.append(date_from)

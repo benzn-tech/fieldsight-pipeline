@@ -19,12 +19,16 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/asset-url?key=…          → presigned GET for an org asset
   PATCH /api/org/sites/{id}               → update site fields / swap icon (admin/gm)
   POST  /api/org/sites/{id}/(un)archive   → soft-delete / restore site (admin/gm)
+  GET   /api/org/sites/{id}/members       → site's members from memberships (ACL,
+                                             fixes legacy USERS ON SITE empty for Aurora-only sites)
   POST  /api/org/members/{sub}/(un)archive→ soft-delete / restore member (admin/gm, never self)
   POST  /api/org/observations             → create safety/quality observation (any member)
   GET   /api/org/observations             → list observations (company-scoped filters)
   PATCH /api/org/observations/{id}        → update status (author or admin/gm)
   POST  /api/org/observations/{id}/archive→ soft-delete observation (admin/gm)
   GET   /api/org/live-items?date=…        → live topics dashboard feed (ACL)
+  GET   /api/org/dates?months=&site=      → Timeline dots: report-date index scoped to
+                                             caller's accessible sites (ACL, kills dots leak)
   GET   /api/org/timeline?date=…&user=…   → daily_report.json compat shim: S3 verbatim
                                              or Aurora extraction override (ACL, authority-flip)
   GET   /api/org/programme?site=<site_id> → read site's Programme JSON (S3-backed, ACL)
@@ -51,8 +55,8 @@ from psycopg.errors import UniqueViolation
 
 from db.connection import get_connection
 from repositories import (companies, memberships, observations, programme, programme_suggestions,
-                          recordings, rollup, sites, topics, users)
-from repositories.acl import resolve_scope
+                          recordings, rollup, scope, sites, topics, users)
+from repositories.acl import is_cross_company, resolve_scope
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -75,8 +79,13 @@ COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 ORG_ASSETS_PREFIX = os.environ.get("ORG_ASSETS_PREFIX", "org-assets/")
 COGNITO_USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
 PRESIGNED_URL_EXPIRY = 900
+# Phase 3 graded roles (visibility spec §3.1). Default OFF: _allowed_site_ids
+# and every read path below behave EXACTLY as today until an environment is
+# cut over (repo var PROD_GRADED_ROLES/TEST_GRADED_ROLES -> env, deploy-*.yml,
+# same pattern as AUTHORITY_FLIP). No user silently gains visibility.
+GRADED_ROLES = os.environ.get("GRADED_ROLES", "").lower() == "true"
 
-ALLOWED_GLOBAL_ROLES = {"admin", "gm", "pm", "site_manager", "worker"}
+ALLOWED_GLOBAL_ROLES = {"admin", "gm", "regional_manager", "pm", "site_manager", "worker", "platform_admin"}
 ALLOWED_MEMBERSHIP_ROLES = {"pm", "site_manager", "worker"}
 ALLOWED_OBSERVATION_KINDS = {"safety", "quality"}
 ALLOWED_RISK_LEVELS = {"low", "medium", "high"}
@@ -186,6 +195,9 @@ def dispatch(conn, event, method, route):
     m_sa = re.match(r"^/sites/([^/]+)/(archive|unarchive)$", route)
     if m_sa and method == "POST":
         return archive_site_endpoint(conn, caller, m_sa.group(1), m_sa.group(2))
+    m_sm = re.match(r"^/sites/([^/]+)/members$", route)
+    if m_sm and method == "GET":
+        return list_site_members(conn, caller, m_sm.group(1))
     m_ma = re.match(r"^/members/([^/]+)/(archive|unarchive)$", route)
     if m_ma and method == "POST":
         return archive_member_endpoint(conn, caller, m_ma.group(1), m_ma.group(2))
@@ -210,6 +222,9 @@ def dispatch(conn, event, method, route):
     if route == "/live-items":
         if method == "GET":
             return list_live_items(conn, caller, event)
+
+    if route == "/dates" and method == "GET":
+        return get_org_dates(conn, caller, event)
 
     if route == "/timeline" and method == "GET":
         return get_timeline_compat(conn, caller, event)
@@ -335,9 +350,19 @@ def complete_recording(conn, caller, rec_id, body):
 # /me
 # ----------------------------------------------------------
 def get_me(conn, caller):
-    site_ids = memberships.accessible_site_ids(
-        conn, caller["id"], caller["global_role"])
-    return ok({**caller, "site_ids": site_ids,
+    if GRADED_ROLES:
+        # MINOR-2: source /me's site_ids from the graded reach (visible_scope
+        # via _allowed_site_ids) so the site-selector matches /live-items -- a
+        # regional_manager/platform_admin no longer under-returns here vs the
+        # dashboard. Non-graded path below is byte-identical to before.
+        site_ids = sorted(_allowed_site_ids(conn, caller))
+    else:
+        site_ids = memberships.accessible_site_ids(
+            conn, caller["id"], caller["global_role"])
+    # Strip the request-scoped visible_scope memo (MINOR-1) before echoing the
+    # caller profile -- it's an internal cache, not part of the /me contract.
+    profile = {k: v for k, v in caller.items() if k != "_visible_scope"}
+    return ok({**profile, "site_ids": site_ids,
                "scope": resolve_scope(caller["global_role"])})
 
 
@@ -382,7 +407,14 @@ def patch_me(conn, caller, body):
 def list_org_sites(conn, caller, event):
     include_archived = ((event.get("queryStringParameters") or {})
                         .get("include_archived") == "1")
-    if resolve_scope(caller["global_role"]) == "ALL":
+    if GRADED_ROLES:
+        # MINOR-2: graded reach (visible_scope) so the selector matches
+        # /live-items exactly -- a regional_manager/platform_admin no longer
+        # sees fewer sites here than the dashboard. visible_scope and
+        # list_sites_by_ids both exclude archived sites, so include_archived
+        # has no effect under graded roles (same as every graded read path).
+        rows = sites.list_sites_by_ids(conn, _allowed_site_ids(conn, caller))
+    elif resolve_scope(caller["global_role"]) == "ALL":
         rows = sites.list_company_sites(conn, caller["company_id"],
                                         include_archived=include_archived)
     else:
@@ -394,8 +426,8 @@ def list_org_sites(conn, caller, event):
 
 
 def create_org_site(conn, caller, body):
-    if caller["global_role"] not in ("admin", "gm"):
-        return error("admin or gm role required", 403)
+    if caller["global_role"] not in ("admin", "gm", "platform_admin"):
+        return error("admin, gm, or platform_admin role required", 403)
     if body is None:
         return error("malformed JSON body", 400)
     name_raw = body.get("name")
@@ -409,8 +441,19 @@ def create_org_site(conn, caller, body):
         pending_prefix = f"{ORG_ASSETS_PREFIX}pending/{caller['cognito_sub']}/"
         if not isinstance(icon, str) or not icon.startswith(pending_prefix):
             return error(f"icon_s3_key must be your pending upload ({pending_prefix}…)", 400)
+    # D6: target_company_id lets ONLY a platform_admin write a site into
+    # another company; absent (or equal to caller's own) -> today's behavior,
+    # unchanged, for every other role.
+    target_company_id = caller["company_id"]
+    req_company_id = body.get("target_company_id")
+    if req_company_id and str(req_company_id) != str(caller["company_id"]):
+        if not is_cross_company(caller["global_role"]):
+            return error("only platform_admin may create sites in another company", 403)
+        if companies.get_company_by_id(conn, req_company_id) is None:
+            return error("target company not found", 404)
+        target_company_id = req_company_id
     row = sites.create_site(
-        conn, caller["company_id"], name,
+        conn, target_company_id, name,
         location=body.get("location"), client=body.get("client"),
         industry=body.get("industry"), icon_s3_key=None,
         address=body.get("address"),
@@ -459,6 +502,17 @@ def patch_org_site(conn, caller, site_id, body):
     return ok(row)
 
 
+def list_site_members(conn, caller, site_id):
+    """Members of one site, from memberships (NOT user_mapping) -- the Aurora
+    replacement for legacy /site-users. ACL mirrors /live-items: the site id
+    must be in the caller's accessible set (admin/gm -> company sites,
+    else memberships), which also blocks cross-company and archived sites."""
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    rows = memberships.members_for_site(conn, caller["company_id"], site_id)
+    return ok({"members": rows, "site": str(site_id)})
+
+
 # ----------------------------------------------------------
 # /members
 # ----------------------------------------------------------
@@ -479,13 +533,19 @@ def list_members(conn, caller, event):
 
 
 def patch_member_role(conn, caller, target_sub, body):
-    if caller["global_role"] != "admin":
+    # widened to admit platform_admin (D6) alongside admin -- required so a
+    # platform_admin can reach the grant guard below and patch a role at all;
+    # a plain "admin" caller's path is unchanged.
+    if caller["global_role"] not in ("admin", "platform_admin"):
         return error("admin role required", 403)
     if body is None:
         return error("malformed JSON body", 400)
     role = body.get("global_role")
     if not isinstance(role, str) or role not in ALLOWED_GLOBAL_ROLES:
         return error(f"global_role must be one of {sorted(ALLOWED_GLOBAL_ROLES)}", 400)
+    # D6: only a platform_admin may grant platform_admin.
+    if role == "platform_admin" and not is_cross_company(caller["global_role"]):
+        return error("only platform_admin may grant platform_admin", 403)
     row = users.set_global_role(conn, target_sub, caller["company_id"], role)
     if row is None:
         return error("member not found in your company", 404)
@@ -556,8 +616,12 @@ def create_member(conn, caller, body):
     An existing user keeps their current global_role unless global_role is
     explicitly sent in the body (no silent reset to "worker" on re-invite).
     If the resolved Cognito user already belongs to another company, the
-    request is rejected with 409 rather than re-parenting them."""
-    if caller["global_role"] != "admin":
+    request is rejected with 409 rather than re-parenting them.
+    D6: an optional target_company_id lets ONLY a platform_admin create a
+    member in another company (default = caller's own company, unchanged for
+    everyone else); granting global_role="platform_admin" itself requires the
+    caller to already be a platform_admin."""
+    if caller["global_role"] not in ("admin", "platform_admin"):
         return error("admin role required", 403)
     if body is None:
         return error("malformed JSON body", 400)
@@ -568,6 +632,20 @@ def create_member(conn, caller, body):
     if global_role is not None and (
             not isinstance(global_role, str) or global_role not in ALLOWED_GLOBAL_ROLES):
         return error(f"global_role must be one of {sorted(ALLOWED_GLOBAL_ROLES)}", 400)
+    # D6: only a platform_admin may grant platform_admin.
+    if global_role == "platform_admin" and not is_cross_company(caller["global_role"]):
+        return error("only platform_admin may grant platform_admin", 403)
+    # D6: target_company_id lets ONLY a platform_admin create a member in
+    # another company; absent (or equal to caller's own) -> today's behavior,
+    # unchanged, for every other role.
+    target_company_id = caller["company_id"]
+    req_company_id = body.get("target_company_id")
+    if req_company_id and str(req_company_id) != str(caller["company_id"]):
+        if not is_cross_company(caller["global_role"]):
+            return error("only platform_admin may create members in another company", 403)
+        if companies.get_company_by_id(conn, req_company_id) is None:
+            return error("target company not found", 404)
+        target_company_id = req_company_id
     wanted = body.get("memberships") or []
     for mem in wanted:
         if not isinstance(mem, dict) or not mem.get("site_id"):
@@ -576,7 +654,7 @@ def create_member(conn, caller, body):
             return error(
                 f"membership role must be one of {sorted(ALLOWED_MEMBERSHIP_ROLES)}", 400)
         site = sites.get_site(conn, mem["site_id"])
-        if site is None or site["company_id"] != caller["company_id"]:
+        if site is None or site["company_id"] != target_company_id:
             return error("site not found in your company", 403)
         if site.get("archived_at"):
             return error("site is archived — unarchive it first", 409)
@@ -602,14 +680,14 @@ def create_member(conn, caller, body):
     sub = next(a["Value"] for a in attrs if a["Name"] == "sub")
 
     existing = users.get_user_by_sub(conn, sub)
-    if existing and existing["company_id"] and existing["company_id"] != caller["company_id"]:
+    if existing and existing["company_id"] and existing["company_id"] != target_company_id:
         return error("user already belongs to another company", 409)
-    if existing and existing["company_id"] == caller["company_id"] and existing.get("archived_at"):
+    if existing and existing["company_id"] == target_company_id and existing.get("archived_at"):
         return error("user is archived — unarchive them instead", 409)
 
     user = users.upsert_user(
         conn, sub, email,
-        company_id=caller["company_id"],
+        company_id=target_company_id,
         first_name=body.get("first_name"),
         last_name=body.get("last_name"),
         global_role=global_role,
@@ -747,10 +825,16 @@ def list_org_observations(conn, caller, event):
     kind = params.get("kind")
     if kind is not None and kind not in ALLOWED_OBSERVATION_KINDS:
         return error(f"kind must be one of {sorted(ALLOWED_OBSERVATION_KINDS)}", 400)
+    allowed_slugs = None
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)
+        if sc["user_scope"] != "ALL":                         # admin/gm stay company-wide
+            allowed_slugs = {s["slug"] for s in sites.list_sites_by_ids(conn, sc["site_ids"])
+                             if s.get("slug")}
     rows = observations.list_observations(
         conn, caller["company_id"], kind=kind,
         date_from=params.get("from"), date_to=params.get("to"),
-        site_slug=params.get("site_slug"),
+        site_slug=params.get("site_slug"), allowed_site_slugs=allowed_slugs,
         include_archived=params.get("include_archived") == "1",
     )
     return ok({"observations": rows})
@@ -823,13 +907,53 @@ def list_live_items(conn, caller, event):
     date = (event.get("queryStringParameters") or {}).get("date")
     if not date or not REPORT_DATE_RE.match(date):
         return error("date required (YYYY-MM-DD)", 400)
-    if resolve_scope(caller["global_role"]) == "ALL":
-        site_ids = [s["id"] for s in sites.list_company_sites(conn, caller["company_id"])]
-    else:
-        site_ids = memberships.accessible_site_ids(
-            conn, caller["id"], caller["global_role"])
-    rows = topics.list_topics_for_date(conn, site_ids, date)
+    site_ids = list(_allowed_site_ids(conn, caller))          # graded-aware reach
+    rows = topics.list_topics_for_date(conn, site_ids, date,
+                                       author_ids=_author_filter(conn, caller))
     return ok({"topics": rows})
+
+
+# ----------------------------------------------------------
+# /dates — Timeline "dots" (Phase 2 read consolidation). Replaces legacy
+# get_dates (S3 user_mapping-based scan) which had no ?site access check and,
+# on an empty accessible-user set, fell through to marking every report-date
+# across ALL users/companies (visibility spec §1.1 dots leak). ACL mirrors
+# list_live_items EXACTLY via _allowed_site_ids/_resolve_site_param (defined
+# below in the /programme section).
+# ----------------------------------------------------------
+def _dates_window_start(months) -> "datetime.date":
+    """First day of the dots window, in NZ (BUG-37/BUG-19: never derive a
+    'today' date from a bare UTC now). months defaults to 2 and is clamped
+    to 1..24 so a hostile ?months can't force a full-table scan."""
+    try:
+        m = int(months)
+    except (TypeError, ValueError):
+        m = 2
+    m = max(1, min(m, 24))
+    now_nz = datetime.now(timezone.utc) + timedelta(hours=13)
+    return (now_nz - timedelta(days=m * 30)).date()
+
+
+def get_org_dates(conn, caller, event):
+    """Membership-scoped report-date index for the Timeline dots — the Aurora
+    replacement for legacy /api/dates (get_dates), whose missing ?site check
+    leaked cross-user/cross-company report-dates (visibility spec §1.1). ACL
+    mirrors /live-items and /programme EXACTLY: admin/gm see every company
+    site, everyone else only their memberships; an explicit ?site outside
+    that set is 403'd here (via _resolve_site_param) before any read."""
+    p = event.get("queryStringParameters") or {}
+    since = _dates_window_start(p.get("months"))
+    site_param = p.get("site")
+    if site_param:
+        site_id, err = _resolve_site_param(conn, caller, site_param)
+        if err is not None:
+            return err                                  # 403 (out of scope) / 404 (unknown slug)
+        site_ids = [site_id]
+    else:
+        site_ids = list(_allowed_site_ids(conn, caller))
+    rows = topics.list_report_dates(conn, site_ids, since,
+                                    author_ids=_author_filter(conn, caller))
+    return ok({"dates": {str(d): {"hasReport": True} for d in rows}})
 
 
 # ----------------------------------------------------------
@@ -876,7 +1000,17 @@ def list_portfolio_rollup(conn, caller, event):
 # always uses the resolved UUID, never the slug, so there's no injection
 # surface and no orphaned object on a site rename.
 # ----------------------------------------------------------
+def _author_filter(conn, caller):
+    """Per-author id allow-set (visibility spec §3.1 user_scope) when graded
+    roles are on, else None = today's site-only scoping. None => unrestricted."""
+    if not GRADED_ROLES:
+        return None
+    return scope.visible_scope(conn, caller)["author_ids"]
+
+
 def _allowed_site_ids(conn, caller):
+    if GRADED_ROLES:
+        return scope.visible_scope(conn, caller)["site_ids"]   # graded reach (incl. platform_admin)
     # str() both sides: psycopg returns site ids as uuid.UUID objects, but the
     # ?site= query param arrives as a string — a UUID-vs-str `in` check is
     # always False (every request 403'd, incl. admins). Unit mocks used string
@@ -1210,22 +1344,43 @@ def render_report_shape(rows, doc, date, folder):
     }
 
 
-def _render_timeline_for_user(conn, caller, date, user):
+def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     """The single-(user, date) D1 read: Aurora override when extraction
     topics exist AND at least one survives the site ACL filter, else S3
     verbatim, else the 404 body. Callers (get_timeline_compat's explicit-
     user path, admin_disambiguation's one-candidate recursion) are each
     responsible for verifying `user`'s folder belongs to the caller's
     company BEFORE calling this — see the multi-tenant note on the /timeline
-    section header above."""
+    section header above.
+
+    cross_user_clip (review CRITICAL-1): set by get_timeline_compat's graded
+    non-ALL path when a pm/regional_manager/site_manager views SOMEONE ELSE's
+    timeline (user != own folder). The target may be a multi-site member whose
+    day spans sites OUTSIDE the caller's scope, so the served doc must be built
+    ONLY from the caller's site-clipped Aurora rows: the target's whole-day
+    free-text prose (executive_summary/safety_observations/quality_and_
+    compliance/critical_dates_and_deadlines in the S3 daily_report.json) is NOT
+    site-scoped and would leak that out-of-scope content, so it is never merged
+    (doc forced to None) and the verbatim S3 fallback is never served -- when no
+    in-scope Aurora topics exist there is nothing safe to show (404). Own-
+    timeline and ALL-scope (admin/gm/platform_admin) callers pass
+    cross_user_clip=False and are UNCHANGED."""
     prefix = f"extractions/{user}/{date}/"
     if topics.has_topics_for_source_prefix(conn, prefix):
         rows = topics.list_topics_for_source_prefix(conn, prefix)
         allowed = _allowed_site_ids(conn, caller)
         rows = [r for r in rows if str(r["site_id"]) in allowed]
         if rows:
-            doc = _get_lake_json(f"reports/{date}/{user}/daily_report.json")
+            # CRITICAL-1: for a cross-user graded view never merge the target's
+            # whole-day prose (not site-clipped -> cross-site leak). Topic rows
+            # are already site-clipped just above.
+            doc = None if cross_user_clip else _get_lake_json(f"reports/{date}/{user}/daily_report.json")
             return ok(render_report_shape(rows, doc, date, user))
+    if cross_user_clip:
+        # CRITICAL-1: no in-scope Aurora topics for this (target, date). The
+        # verbatim S3 daily_report.json is NOT site-clipped, so serving it would
+        # leak the target's out-of-scope content. Nothing safe to show -> 404.
+        return ok({"message": f"No in-scope report for {user} on {date}", "date": date}, 404)
     doc = _get_lake_json(f"reports/{date}/{user}/daily_report.json")
     if doc is not None:
         return ok(doc)                              # VERBATIM (byte-identical history)
@@ -1262,11 +1417,59 @@ def admin_disambiguation(conn, caller, date):
     return ok({"date": date, "available_users": sorted(candidates)})
 
 
+def _can_view_folder(conn, caller, target_folder):
+    """GRADED /timeline authority (spec §3.2): may caller read target_folder's
+    (folder, date) timeline? Own folder always; SITE (pm/regional) any user on
+    an in-scope site; SELF+WORKERS (site_manager) own + workers on in-scope
+    sites; SELF (worker) own only. Company-pinned: the target is resolved
+    within caller.company_id first (unless caller is cross-company)."""
+    sc = scope.visible_scope(conn, caller)
+    if target_folder and target_folder == sc["self_folder"]:
+        return True
+    if sc["cross_company"]:
+        target = users.get_by_folder_name_global(conn, target_folder)
+    else:
+        target = users.get_by_folder_name(conn, caller["company_id"], target_folder)
+    if target is None:
+        return False                                          # not in caller's company / unknown
+    if sc["user_scope"] == "ALL":
+        return True
+    if sc["user_scope"] == "SITE":
+        target_sites = memberships.caller_site_roles(conn, target["id"])
+        return any(sid in sc["site_ids"] for sid in target_sites)   # target is on an in-scope site
+    return str(target["id"]) in (sc["author_ids"] or set())   # SELF / SELF+WORKERS
+
+
 def get_timeline_compat(conn, caller, event):
     p = event.get("queryStringParameters") or {}
     date, user = p.get("date"), (p.get("user") or "").strip()
     if not date or not REPORT_DATE_RE.match(date):
         return error("date required (YYYY-MM-DD)", 400)
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)
+        if sc["user_scope"] == "ALL":                         # admin/gm/platform_admin
+            if not user:
+                return admin_disambiguation(conn, caller, date)
+            if not sc["cross_company"] and \
+                    users.get_by_folder_name(conn, caller["company_id"], user) is None:
+                return error("user not found in your company", 404)
+            return _render_timeline_for_user(conn, caller, date, user)
+        # graded non-ALL: default self, but pm/regional/site_manager may view
+        # in-scope users (spec §3.2 -- no longer hard-forced to self).
+        if not user:
+            user = sc["self_folder"]
+            if not user:
+                return error("no folder mapping for your account", 403)
+        if not _can_view_folder(conn, caller, user):
+            return error("not permitted to view this timeline", 403)
+        # CRITICAL-1: viewing SOMEONE ELSE (user != own folder) must return a
+        # site-clipped view built only from in-scope Aurora rows -- never the
+        # target's un-clipped whole-day prose or verbatim daily_report.json,
+        # which can span the target's other, out-of-scope sites. Own timeline
+        # (user == self_folder) is unchanged (full verbatim/prose).
+        cross_user = user != sc["self_folder"]
+        return _render_timeline_for_user(conn, caller, date, user, cross_user_clip=cross_user)
+    # ---- GRADED_ROLES off: today's behavior, verbatim ----
     is_all = resolve_scope(caller["global_role"]) == "ALL"
     if not is_all:
         own = caller.get("folder_name")
