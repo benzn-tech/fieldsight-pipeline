@@ -80,7 +80,7 @@ ORG_ASSETS_PREFIX = os.environ.get("ORG_ASSETS_PREFIX", "org-assets/")
 COGNITO_USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
 PRESIGNED_URL_EXPIRY = 900
 
-ALLOWED_GLOBAL_ROLES = {"admin", "gm", "pm", "site_manager", "worker"}
+ALLOWED_GLOBAL_ROLES = {"admin", "gm", "regional_manager", "pm", "site_manager", "worker", "platform_admin"}
 ALLOWED_MEMBERSHIP_ROLES = {"pm", "site_manager", "worker"}
 ALLOWED_OBSERVATION_KINDS = {"safety", "quality"}
 ALLOWED_RISK_LEVELS = {"low", "medium", "high"}
