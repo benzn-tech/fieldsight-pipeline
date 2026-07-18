@@ -180,3 +180,32 @@ def test_site_manager_visible_scope_issues_exactly_two_membership_queries(stub, 
                         lambda conn, sids: calls.append("worker_user_ids_for_sites") or set())
     scope_mod.visible_scope(None, _caller("site_manager"))
     assert calls == ["caller_site_roles", "worker_user_ids_for_sites"]   # exactly two
+
+
+# ---------------------------------------------------------------------------
+# Review MINOR-1: request-scoped memoization. visible_scope is recomputed 2-3x
+# per request (_allowed_site_ids + _author_filter + _can_view_folder each call
+# it); the result is cached on the caller dict so repeat calls within the same
+# request issue ZERO additional DB queries.
+# ---------------------------------------------------------------------------
+
+def test_visible_scope_memoized_second_call_issues_zero_queries(stub, monkeypatch):
+    calls = []
+    monkeypatch.setattr(scope_mod.memberships, "caller_site_roles",
+                        lambda conn, uid: calls.append("caller_site_roles") or {"s-9": "worker"})
+    caller = _caller("worker")
+    first = scope_mod.visible_scope(None, caller)
+    second = scope_mod.visible_scope(None, caller)
+    assert second is first                              # same cached object reused
+    assert calls == ["caller_site_roles"]               # zero additional queries on the 2nd call
+
+
+def test_visible_scope_memo_is_per_caller_not_global(stub, monkeypatch):
+    # A DIFFERENT caller dict recomputes (the cache lives on the caller, so it
+    # can't stale across requests -- caller is resolved once per request).
+    calls = []
+    monkeypatch.setattr(scope_mod.memberships, "caller_site_roles",
+                        lambda conn, uid: calls.append(uid) or {"s-9": "worker"})
+    scope_mod.visible_scope(None, _caller("worker", uid="u-a"))
+    scope_mod.visible_scope(None, _caller("worker", uid="u-b"))
+    assert calls == ["u-a", "u-b"]                      # each fresh caller computes once

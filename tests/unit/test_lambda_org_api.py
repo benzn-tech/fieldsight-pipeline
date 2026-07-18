@@ -71,6 +71,29 @@ def test_get_me_returns_profile_and_sites(wired):
     assert res["headers"]["Access-Control-Allow-Origin"] == "*"
 
 
+def test_get_me_graded_sources_site_ids_from_visible_scope(wired):
+    # MINOR-2: /me's site_ids come from the graded reach (visible_scope via
+    # _allowed_site_ids), not the legacy binary accessible_site_ids. The
+    # request-scoped visible_scope memo (MINOR-1) must NOT leak into the body.
+    wired.setattr(org, "GRADED_ROLES", True)
+    # caller already carries a request-scoped memo -> the strip must remove it.
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "regional_manager",
+                                     "_visible_scope": {"should": "be stripped"}})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID, OTHER_SITE_ID}, "author_ids": None,
+                                        "user_scope": "SITE", "self_folder": "RM",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    wired.setattr(org.memberships, "accessible_site_ids",
+                  lambda *a, **k: (_ for _ in ()).throw(AssertionError("legacy scope used")))
+    res = org.lambda_handler(make_event("GET", "/api/org/me"), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert set(b["site_ids"]) == {SITE_ID, OTHER_SITE_ID}
+    assert "_visible_scope" not in b                     # internal memo not exposed
+
+
 def test_patch_me_updates_profile_fields_only(wired):
     seen = {}
 
@@ -122,6 +145,31 @@ def test_list_sites_worker_gets_membership_sites(wired):
                   lambda conn, ids: [{"id": i, "name": "Beta"} for i in ids])
     res = org.lambda_handler(make_event("GET", "/api/org/sites"), None)
     assert body_of(res)["sites"] == [{"id": "s-2", "name": "Beta"}]
+
+
+def test_list_sites_graded_regional_manager_full_membership_set(wired):
+    # MINOR-2: under graded roles the site-selector must source its site set
+    # from visible_scope (via _allowed_site_ids), matching /live-items -- a
+    # regional_manager no longer under-returns vs the dashboard. Real
+    # _allowed_site_ids runs; only visible_scope is stubbed.
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "regional_manager"})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID, OTHER_SITE_ID}, "author_ids": None,
+                                        "user_scope": "SITE", "self_folder": "RM",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    # legacy binary accessible_site_ids must NOT be consulted under graded roles
+    wired.setattr(org.memberships, "accessible_site_ids",
+                  lambda *a, **k: (_ for _ in ()).throw(AssertionError("legacy scope used")))
+    captured = {}
+    wired.setattr(org.sites, "list_sites_by_ids",
+                  lambda conn, ids: captured.update(ids=set(ids)) or [{"id": i} for i in sorted(ids)])
+    res = org.lambda_handler(make_event("GET", "/api/org/sites"), None)
+    assert res["statusCode"] == 200
+    assert captured["ids"] == {SITE_ID, OTHER_SITE_ID}   # full graded reach via visible_scope
+    assert {s["id"] for s in body_of(res)["sites"]} == {SITE_ID, OTHER_SITE_ID}
 
 
 def test_list_org_sites_includes_slug(wired):
@@ -2618,13 +2666,22 @@ def test_timeline_site_manager_may_view_worker_on_site(presign_wired):
                                         "cross_company": False})
     wired.setattr(org.users, "get_by_folder_name",
                   lambda conn, cid, folder: {"id": "u-w1", "folder_name": folder})
-    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
-    doc = {"report_date": "2026-07-14", "topics": []}
-    fake.objects["reports/2026-07-14/Worker1_Folder/daily_report.json"] = json.dumps(doc).encode()
+    # CRITICAL-1: an authorized cross-user view is served from the worker's
+    # in-scope Aurora topics (site-clipped), never the verbatim daily_report.json
+    # and never the target's whole-day prose.
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    wired.setattr(org.topics, "list_topics_for_source_prefix",
+                  lambda conn, prefix: [_topic_row(site_id=SITE_ID, title="Worker in-scope walk")])
+    leak_doc = {"report_date": "2026-07-14", "executive_summary": "WHOLE-DAY PROSE",
+                "topics": [{"topic_title": "SHOULD NOT APPEAR"}]}
+    fake.objects["reports/2026-07-14/Worker1_Folder/daily_report.json"] = json.dumps(leak_doc).encode()
     res = org.lambda_handler(make_event(
         "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "Worker1_Folder"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == doc
+    body = body_of(res)
+    assert [t["topic_title"] for t in body["topics"]] == ["Worker in-scope walk"]
+    assert body["executive_summary"] is None                 # target's whole-day prose not merged
+    assert "reports/2026-07-14/Worker1_Folder/daily_report.json" not in fake.get_object_calls
 
 
 def test_timeline_site_manager_denied_other_site_manager_403(presign_wired):
@@ -2664,13 +2721,20 @@ def test_timeline_pm_may_view_any_in_scope_user(presign_wired):
                   lambda conn, cid, folder: {"id": "u-x", "folder_name": folder})
     wired.setattr(org.memberships, "caller_site_roles",
                   lambda conn, uid: {SITE_ID: "worker"})    # target's site IS in the pm's site_ids
-    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
-    doc = {"report_date": "2026-07-14", "topics": []}
-    fake.objects["reports/2026-07-14/Other_User/daily_report.json"] = json.dumps(doc).encode()
+    # CRITICAL-1: authorized cross-user view -> site-clipped Aurora topics only,
+    # never the verbatim daily_report.json / whole-day prose.
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    wired.setattr(org.topics, "list_topics_for_source_prefix",
+                  lambda conn, prefix: [_topic_row(site_id=SITE_ID, title="In-scope walk")])
+    leak_doc = {"report_date": "2026-07-14", "executive_summary": "WHOLE-DAY PROSE",
+                "topics": [{"topic_title": "SHOULD NOT APPEAR"}]}
+    fake.objects["reports/2026-07-14/Other_User/daily_report.json"] = json.dumps(leak_doc).encode()
     res = org.lambda_handler(make_event(
         "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "Other_User"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == doc
+    body = body_of(res)
+    assert [t["topic_title"] for t in body["topics"]] == ["In-scope walk"]
+    assert body["executive_summary"] is None                 # whole-day prose not merged (clipped)
 
 
 def test_timeline_pm_denied_out_of_scope_user_403(presign_wired):
@@ -2731,6 +2795,138 @@ def test_timeline_graded_off_forces_self_403_on_other(presign_wired):
     assert res["statusCode"] == 403
     assert "own timeline" in body_of(res)["error"]
     assert org.GRADED_ROLES is False
+
+
+# ---- /timeline CRITICAL-1: cross-user views must be site-clipped ----
+# Leak scenario: worker W is a member of Site A (pm P's) and Site B (NOT P's).
+# On a date W worked only at Site B, P requests W's timeline: _can_view_folder
+# is True (they share Site A) but the CONTENT served must contain none of W's
+# out-of-scope Site-B content -- no prose, no out-of-scope topics.
+def test_timeline_pm_cross_user_out_of_scope_site_no_leak(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "PM_Folder"})
+    # pm P: SITE scope, reach = Site A (SITE_ID) only.
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": None,
+                                        "user_scope": "SITE", "self_folder": "PM_Folder",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-w", "folder_name": folder})
+    # W is a member of BOTH Site A (shared -> _can_view_folder True) and Site B.
+    wired.setattr(org.memberships, "caller_site_roles",
+                  lambda conn, uid: {SITE_ID: "worker", OTHER_SITE_ID: "worker"})
+    # ...but on THIS date W only worked at Site B (OTHER_SITE_ID), out of P's scope.
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    wired.setattr(org.topics, "list_topics_for_source_prefix",
+                  lambda conn, prefix: [_topic_row(site_id=OTHER_SITE_ID, title="SITE-B walk")])
+    leak_doc = {"report_date": "2026-07-14", "site": "Site B", "user_name": "W",
+                "executive_summary": "SECRET SITE-B SUMMARY",
+                "safety_observations": [{"observation": "SITE-B HAZARD"}],
+                "quality_and_compliance": [{"item": "SITE-B QA"}],
+                "critical_dates_and_deadlines": [{"item": "SITE-B POUR"}],
+                "topics": [{"topic_title": "SITE-B TOPIC"}]}
+    fake.objects["reports/2026-07-14/W_Folder/daily_report.json"] = json.dumps(leak_doc).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "W_Folder"}), None)
+    assert res["statusCode"] == 404                     # no in-scope content -> NOT the verbatim doc
+    blob = res["body"]
+    for secret in ("SECRET SITE-B SUMMARY", "SITE-B HAZARD", "SITE-B QA",
+                   "SITE-B POUR", "SITE-B TOPIC", "SITE-B walk"):
+        assert secret not in blob                        # no prose, no out-of-scope topic leaked
+    # the un-clipped daily_report.json is never even fetched for a cross-user view
+    assert "reports/2026-07-14/W_Folder/daily_report.json" not in fake.get_object_calls
+
+
+def test_timeline_pm_cross_user_in_scope_returns_clipped_content(presign_wired):
+    # Same multi-site target, but on THIS date W worked BOTH sites. Only the
+    # in-scope topic (Site A) may surface; the out-of-scope topic (Site B) and
+    # the whole-day prose must be clipped out.
+    wired, fake = presign_wired
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "PM_Folder"})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": None,
+                                        "user_scope": "SITE", "self_folder": "PM_Folder",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-w", "folder_name": folder})
+    wired.setattr(org.memberships, "caller_site_roles",
+                  lambda conn, uid: {SITE_ID: "worker", OTHER_SITE_ID: "worker"})
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    wired.setattr(org.topics, "list_topics_for_source_prefix",
+                  lambda conn, prefix: [
+                      _topic_row(site_id=SITE_ID, title="In-scope walk"),
+                      _topic_row(site_id=OTHER_SITE_ID, title="SITE-B walk"),
+                  ])
+    leak_doc = {"executive_summary": "SECRET SITE-B SUMMARY",
+                "safety_observations": [{"observation": "SITE-B HAZARD"}],
+                "quality_and_compliance": [{"item": "SITE-B QA"}],
+                "critical_dates_and_deadlines": [{"item": "SITE-B POUR"}],
+                "topics": [{"topic_title": "SITE-B TOPIC"}]}
+    fake.objects["reports/2026-07-14/W_Folder/daily_report.json"] = json.dumps(leak_doc).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "W_Folder"}), None)
+    assert res["statusCode"] == 200
+    body = body_of(res)
+    assert [t["topic_title"] for t in body["topics"]] == ["In-scope walk"]   # out-of-scope topic clipped
+    assert body["executive_summary"] is None                 # whole-day prose omitted
+    assert body["safety_observations"] == []
+    assert body["quality_and_compliance"] == []
+    assert body["critical_dates_and_deadlines"] == []
+    blob = res["body"]
+    for secret in ("SECRET SITE-B SUMMARY", "SITE-B HAZARD", "SITE-B QA",
+                   "SITE-B POUR", "SITE-B TOPIC", "SITE-B walk"):
+        assert secret not in blob
+    assert "reports/2026-07-14/W_Folder/daily_report.json" not in fake.get_object_calls
+
+
+def test_timeline_pm_own_timeline_unaffected_by_clip(presign_wired):
+    # Own timeline (user == self_folder): full verbatim/prose served, UNCHANGED.
+    wired, fake = presign_wired
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "PM_Folder"})
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID}, "author_ids": None,
+                                        "user_scope": "SITE", "self_folder": "PM_Folder",
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
+    own_doc = {"report_date": "2026-07-14", "executive_summary": "MY OWN SUMMARY", "topics": []}
+    fake.objects["reports/2026-07-14/PM_Folder/daily_report.json"] = json.dumps(own_doc).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "PM_Folder"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == own_doc                       # own timeline served verbatim, prose intact
+
+
+def test_timeline_admin_all_scope_sees_full_target_content(presign_wired):
+    # user_scope == ALL (admin/gm/platform_admin): still sees the target's
+    # whole-day verbatim report, UNCHANGED -- the clip only applies to graded
+    # non-ALL callers viewing someone else.
+    wired, fake = presign_wired
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {SITE_ID, OTHER_SITE_ID}, "author_ids": None,
+                                        "user_scope": "ALL", "self_folder": None,
+                                        "self_user_id": "u-self", "company_id": "c-uuid-1",
+                                        "cross_company": False})
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-w", "folder_name": folder})
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
+    full_doc = {"report_date": "2026-07-14", "executive_summary": "FULL SUMMARY",
+                "safety_observations": [{"observation": "HAZARD"}],
+                "topics": [{"topic_title": "X"}]}
+    fake.objects["reports/2026-07-14/W_Folder/daily_report.json"] = json.dumps(full_doc).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "W_Folder"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == full_doc                      # admin (ALL scope) still sees everything
 
 
 # ---- /observations site scoping ----

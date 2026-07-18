@@ -350,9 +350,19 @@ def complete_recording(conn, caller, rec_id, body):
 # /me
 # ----------------------------------------------------------
 def get_me(conn, caller):
-    site_ids = memberships.accessible_site_ids(
-        conn, caller["id"], caller["global_role"])
-    return ok({**caller, "site_ids": site_ids,
+    if GRADED_ROLES:
+        # MINOR-2: source /me's site_ids from the graded reach (visible_scope
+        # via _allowed_site_ids) so the site-selector matches /live-items -- a
+        # regional_manager/platform_admin no longer under-returns here vs the
+        # dashboard. Non-graded path below is byte-identical to before.
+        site_ids = sorted(_allowed_site_ids(conn, caller))
+    else:
+        site_ids = memberships.accessible_site_ids(
+            conn, caller["id"], caller["global_role"])
+    # Strip the request-scoped visible_scope memo (MINOR-1) before echoing the
+    # caller profile -- it's an internal cache, not part of the /me contract.
+    profile = {k: v for k, v in caller.items() if k != "_visible_scope"}
+    return ok({**profile, "site_ids": site_ids,
                "scope": resolve_scope(caller["global_role"])})
 
 
@@ -397,7 +407,14 @@ def patch_me(conn, caller, body):
 def list_org_sites(conn, caller, event):
     include_archived = ((event.get("queryStringParameters") or {})
                         .get("include_archived") == "1")
-    if resolve_scope(caller["global_role"]) == "ALL":
+    if GRADED_ROLES:
+        # MINOR-2: graded reach (visible_scope) so the selector matches
+        # /live-items exactly -- a regional_manager/platform_admin no longer
+        # sees fewer sites here than the dashboard. visible_scope and
+        # list_sites_by_ids both exclude archived sites, so include_archived
+        # has no effect under graded roles (same as every graded read path).
+        rows = sites.list_sites_by_ids(conn, _allowed_site_ids(conn, caller))
+    elif resolve_scope(caller["global_role"]) == "ALL":
         rows = sites.list_company_sites(conn, caller["company_id"],
                                         include_archived=include_archived)
     else:
@@ -410,7 +427,7 @@ def list_org_sites(conn, caller, event):
 
 def create_org_site(conn, caller, body):
     if caller["global_role"] not in ("admin", "gm", "platform_admin"):
-        return error("admin or gm role required", 403)
+        return error("admin, gm, or platform_admin role required", 403)
     if body is None:
         return error("malformed JSON body", 400)
     name_raw = body.get("name")
@@ -1327,22 +1344,43 @@ def render_report_shape(rows, doc, date, folder):
     }
 
 
-def _render_timeline_for_user(conn, caller, date, user):
+def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     """The single-(user, date) D1 read: Aurora override when extraction
     topics exist AND at least one survives the site ACL filter, else S3
     verbatim, else the 404 body. Callers (get_timeline_compat's explicit-
     user path, admin_disambiguation's one-candidate recursion) are each
     responsible for verifying `user`'s folder belongs to the caller's
     company BEFORE calling this — see the multi-tenant note on the /timeline
-    section header above."""
+    section header above.
+
+    cross_user_clip (review CRITICAL-1): set by get_timeline_compat's graded
+    non-ALL path when a pm/regional_manager/site_manager views SOMEONE ELSE's
+    timeline (user != own folder). The target may be a multi-site member whose
+    day spans sites OUTSIDE the caller's scope, so the served doc must be built
+    ONLY from the caller's site-clipped Aurora rows: the target's whole-day
+    free-text prose (executive_summary/safety_observations/quality_and_
+    compliance/critical_dates_and_deadlines in the S3 daily_report.json) is NOT
+    site-scoped and would leak that out-of-scope content, so it is never merged
+    (doc forced to None) and the verbatim S3 fallback is never served -- when no
+    in-scope Aurora topics exist there is nothing safe to show (404). Own-
+    timeline and ALL-scope (admin/gm/platform_admin) callers pass
+    cross_user_clip=False and are UNCHANGED."""
     prefix = f"extractions/{user}/{date}/"
     if topics.has_topics_for_source_prefix(conn, prefix):
         rows = topics.list_topics_for_source_prefix(conn, prefix)
         allowed = _allowed_site_ids(conn, caller)
         rows = [r for r in rows if str(r["site_id"]) in allowed]
         if rows:
-            doc = _get_lake_json(f"reports/{date}/{user}/daily_report.json")
+            # CRITICAL-1: for a cross-user graded view never merge the target's
+            # whole-day prose (not site-clipped -> cross-site leak). Topic rows
+            # are already site-clipped just above.
+            doc = None if cross_user_clip else _get_lake_json(f"reports/{date}/{user}/daily_report.json")
             return ok(render_report_shape(rows, doc, date, user))
+    if cross_user_clip:
+        # CRITICAL-1: no in-scope Aurora topics for this (target, date). The
+        # verbatim S3 daily_report.json is NOT site-clipped, so serving it would
+        # leak the target's out-of-scope content. Nothing safe to show -> 404.
+        return ok({"message": f"No in-scope report for {user} on {date}", "date": date}, 404)
     doc = _get_lake_json(f"reports/{date}/{user}/daily_report.json")
     if doc is not None:
         return ok(doc)                              # VERBATIM (byte-identical history)
@@ -1424,7 +1462,13 @@ def get_timeline_compat(conn, caller, event):
                 return error("no folder mapping for your account", 403)
         if not _can_view_folder(conn, caller, user):
             return error("not permitted to view this timeline", 403)
-        return _render_timeline_for_user(conn, caller, date, user)
+        # CRITICAL-1: viewing SOMEONE ELSE (user != own folder) must return a
+        # site-clipped view built only from in-scope Aurora rows -- never the
+        # target's un-clipped whole-day prose or verbatim daily_report.json,
+        # which can span the target's other, out-of-scope sites. Own timeline
+        # (user == self_folder) is unchanged (full verbatim/prose).
+        cross_user = user != sc["self_folder"]
+        return _render_timeline_for_user(conn, caller, date, user, cross_user_clip=cross_user)
     # ---- GRADED_ROLES off: today's behavior, verbatim ----
     is_all = resolve_scope(caller["global_role"]) == "ALL"
     if not is_all:
