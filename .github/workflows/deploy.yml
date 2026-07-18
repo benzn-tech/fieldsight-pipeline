@@ -74,6 +74,7 @@ jobs:
               "DataBucketName=fieldsight-data-test-509194952652" \
               "IngestBucketName=fieldsight-data-test-509194952652" \
               "EnableSchedules=false" \
+              "EnableSiteVoice=true" \
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \
@@ -115,3 +116,12 @@ jobs:
 
       - name: Smoke test /api/health (TEST)
         run: bash scripts/smoke-test.sh fieldsight-test ${{ env.AWS_REGION }}
+
+      - name: Site Voice WS smoke (TEST, best-effort)
+        # Runs only if a member idToken + site are provisioned as repo secrets;
+        # skips cleanly (exit 0) otherwise so the deploy never fails on absence.
+        env:
+          VOICE_SMOKE_TOKEN: ${{ secrets.VOICE_SMOKE_TOKEN }}
+          VOICE_SMOKE_SITE: ${{ secrets.VOICE_SMOKE_SITE }}
+          VOICE_SMOKE_TOKEN2: ${{ secrets.VOICE_SMOKE_TOKEN2 }}
+        run: bash scripts/voice-ws-smoke.sh fieldsight-test ${{ env.AWS_REGION }}
