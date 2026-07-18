@@ -62,6 +62,7 @@ parameter_overrides = [
     "Stage=test",
     "DataBucketName=fieldsight-data-test-509194952652",
     "EnableSchedules=false",
+    "EnableSiteVoice=true",
     "ItemsTableName=fieldsight-test-items",
     "ReportsTableName=fieldsight-test-reports",
     "AuditTableName=fieldsight-test-audit",

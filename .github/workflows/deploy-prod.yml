@@ -83,6 +83,7 @@ jobs:
               "DataBucketName=fieldsight-data-509194952652" \
               "IngestBucketName=fieldsight-data-509194952652" \
               "EnableSchedules=${{ vars.PROD_ENABLE_SCHEDULES || 'false' }}" \
+              "EnableSiteVoice=${{ vars.PROD_ENABLE_SITE_VOICE || 'false' }}" \
               "ItemsTableName=fieldsight-items" \
               "ReportsTableName=fieldsight-reports" \
               "AuditTableName=fieldsight-audit" \
