@@ -848,18 +848,30 @@ Resources:
                 - s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/users/*
             - Effect: Allow
+              # GET /api/org/transcripts (Aurora-identity /transcripts fix) —
+              # read-only, same transcripts/* objects the legacy fieldsight-api
+              # role and ExtractSessionFunction already read (different bucket
+              # for the latter — see ExtractSessionFunction's IngestBucketName
+              # grant — but same DataBucketName prefix the Transcribe service
+              # itself writes into, see StorageBucketPolicy's AllowTranscribeWrite
+              # above).
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/transcripts/*
+            - Effect: Allow
               # Without ListBucket, S3 returns AccessDenied/403 (not
               # NoSuchKey/404) for a missing object under a prefix this
               # role can't list — read_programme would then re-raise a
               # fake 500 on every site that has never had a programme
               # uploaded (Fable review High #1). Scoped to programmes/*
-              # only, mirrors ExtractSessionFunction's transcripts/* grant.
+              # and transcripts/* only, mirrors ExtractSessionFunction's
+              # transcripts/* grant (in the other bucket).
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${DataBucketName}
               Condition:
                 StringLike:
                   s3:prefix:
                     - programmes/*
+                    - transcripts/*
             - Effect: Allow
               # authority-flip Task 4 — /timeline reads daily_report.json
               # (and summary_report.json) verbatim from the lake bucket.

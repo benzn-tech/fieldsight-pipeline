@@ -31,6 +31,11 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
                                              caller's accessible sites (ACL, kills dots leak)
   GET   /api/org/timeline?date=…&user=…   → daily_report.json compat shim: S3 verbatim
                                              or Aurora extraction override (ACL, authority-flip)
+  GET   /api/org/transcripts?date=&user=&start=&end= → transcript speaker segments for a
+                                             (user,date) window, Aurora-identity ACL (mirrors
+                                             /timeline's graded-off shape; fixes the legacy
+                                             /transcripts gateway's DynamoDB-identity 403 for
+                                             Aurora-only accounts)
   GET   /api/org/programme?site=<site_id> → read site's Programme JSON (S3-backed, ACL)
   PUT   /api/org/programme?site=<site_id> → write site's Programme JSON (admin/gm/pm)
   GET   /api/org/rollup/portfolio         → per-site open-count rollup + red/yellow/green (ACL)
@@ -228,6 +233,9 @@ def dispatch(conn, event, method, route):
 
     if route == "/timeline" and method == "GET":
         return get_timeline_compat(conn, caller, event)
+
+    if route == "/transcripts" and method == "GET":
+        return get_org_transcripts(conn, caller, event)
 
     if route == "/rollup/portfolio" and method == "GET":
         return list_portfolio_rollup(conn, caller, event)
@@ -1491,3 +1499,209 @@ def get_timeline_compat(conn, caller, event):
         # must resolve to a folder in THIS company before any lake read.
         return error("user not found in your company", 404)
     return _render_timeline_for_user(conn, caller, date, user)
+
+
+# ----------------------------------------------------------
+# /transcripts — Aurora-identity read of transcript S3 objects
+# ----------------------------------------------------------
+
+def _org_parse_time_to_seconds(time_str):
+    """Mirror lambda_fieldsight_api.parse_time_to_seconds verbatim. Kept as
+    a local copy rather than a cross-lambda import (the pattern lambda_
+    item_writer.py/lambda_embed_report.py use for `import lambda_ingest`):
+    lambda_fieldsight_api.py constructs LIVE boto3 clients (s3/lambda/
+    dynamodb) at MODULE level, so importing it here would run that
+    construction on every lambda_org_api import -- including test
+    collection, where no AWS region/credentials are guaranteed to be
+    configured (confirmed locally: boto3.client('s3') raises without a
+    region unless AWS_DEFAULT_REGION is already set by some other test
+    module's import order -- fragile to depend on)."""
+    parts = time_str.replace(" ", "").split(":")
+    try:
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
+        s = int(parts[2]) if len(parts) > 2 else 0
+        return h * 3600 + m * 60 + s
+    except (ValueError, IndexError):
+        return 0
+
+
+def _org_extract_time_seconds_from_filename(filename):
+    """Mirror lambda_fieldsight_api.extract_time_seconds_from_filename
+    verbatim -- see _org_parse_time_to_seconds for why this is a local
+    copy, not an import. BUG-01/BUG-11: always anchor on the full
+    YYYY-MM-DD_ prefix before capturing HH-MM-SS, never a bare
+    (\\d{2})-(\\d{2})-(\\d{2}) (matches the date, not the time)."""
+    off_match = re.search(r"_off([\d.]+)_to", filename)
+    base_match = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})", filename)
+    if off_match and base_match:
+        h, m, s = int(base_match.group(1)), int(base_match.group(2)), int(base_match.group(3))
+        return h * 3600 + m * 60 + s + int(float(off_match.group(1)))
+    if base_match:
+        return int(base_match.group(1)) * 3600 + int(base_match.group(2)) * 60 + int(base_match.group(3))
+    return None
+
+
+def _read_org_transcripts(date, folder, start_time, end_time):
+    """S3 read + normalize for one (folder, date) window -- mirrors
+    lambda_fieldsight_api.get_transcripts's locate/parse/response-shape
+    verbatim (same per-file `segments[]` and speaker-turn `speaker_
+    segments[]` fields) so scripts/composites/transcript-list.js needs no
+    reshape. Unlike the legacy endpoint's 4-prefix fallback hunt (flat-
+    folder / spaced-display-name variants kept for pre-BUG-12 data), this
+    route only serves the current transcripts/{folder}/{date}/ convention:
+    BUG-12 already normalized every write path onto it, and Aurora only
+    ever hands this route a `folder_name` (never a spaced display name),
+    so those extra legacy variants don't apply here."""
+    start_sec = _org_parse_time_to_seconds(start_time) - 60 if start_time else 0
+    end_sec = _org_parse_time_to_seconds(end_time) + 60 if end_time else 86400
+    if start_sec < 0:
+        start_sec = 0
+
+    prefix = f"transcripts/{folder}/{date}/"
+    transcript_files = []
+    try:
+        paginator = s3().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith(".json"):
+                    transcript_files.append(key)
+    except ClientError:
+        # Same posture as _list_report_folders: a listing failure (e.g. an
+        # IAM edge case) degrades to "no transcripts" rather than a 500.
+        pass
+
+    if not transcript_files:
+        return {"text": "", "segments": [], "speaker_segments": [], "message": "No transcripts found"}
+
+    all_speaker_segs = []
+    segments = []
+    for key in sorted(transcript_files):
+        filename = key.split("/")[-1]
+        file_time_sec = _org_extract_time_seconds_from_filename(filename)
+        if file_time_sec is None:
+            continue
+        file_end_sec = file_time_sec + 600
+        if file_end_sec < start_sec or file_time_sec > end_sec:
+            continue
+        try:
+            obj = s3().get_object(Bucket=S3_BUCKET, Key=key)
+            data = json.loads(obj["Body"].read().decode("utf-8"))
+            results = data.get("results", {})
+            full_text = results.get("transcripts", [{}])[0].get("transcript", "")
+
+            # Speaker-segmented audio_segments from Transcribe
+            audio_segs = results.get("audio_segments", [])
+            for aseg in audio_segs:
+                seg_start = float(aseg.get("start_time", 0))
+                seg_end = float(aseg.get("end_time", 0))
+                abs_start = file_time_sec + seg_start
+                abs_end = file_time_sec + seg_end
+
+                # Filter to topic time range
+                if abs_end < start_sec or abs_start > end_sec:
+                    continue
+
+                speaker = aseg.get("speaker_label", "spk_0")
+                text = aseg.get("transcript", "")
+                if not text.strip():
+                    continue
+
+                ah, am, asec_v = int(abs_start) // 3600, (int(abs_start) % 3600) // 60, int(abs_start) % 60
+                all_speaker_segs.append({
+                    "speaker": speaker,
+                    "text": text,
+                    "start": round(abs_start, 1),
+                    "end": round(abs_end, 1),
+                    "time_label": f"{ah:02d}:{am:02d}:{asec_v:02d}",
+                    "duration": round(seg_end - seg_start, 1),
+                })
+
+            # Word-level filtered text
+            items = results.get("items", [])
+            in_range_words = []
+            total_words = 0
+            for item in items:
+                if item.get("type") != "pronunciation":
+                    continue
+                total_words += 1
+                word_start = float(item.get("start_time", 0))
+                abs_ws = file_time_sec + word_start
+                if start_sec <= abs_ws <= end_sec:
+                    in_range_words.append(item.get("alternatives", [{}])[0].get("content", ""))
+
+            h, m, s = file_time_sec // 3600, (file_time_sec % 3600) // 60, file_time_sec % 60
+            segments.append({
+                "time": f"{h:02d}:{m:02d}:{s:02d}",
+                "time_seconds": file_time_sec,
+                "text": full_text,
+                "filtered_text": " ".join(in_range_words),
+                "filename": filename,
+                "word_count": total_words,
+                "in_range_count": len(in_range_words),
+                "speaker_segment_count": len(
+                    [sg for sg in all_speaker_segs if sg.get("start", 0) >= file_time_sec]),
+            })
+        except Exception as e:
+            logger.warning("transcripts: failed to load %s: %s", key, e)
+
+    all_speaker_segs.sort(key=lambda sg: sg["start"])
+    filtered_full = " ".join(sg["text"] for sg in all_speaker_segs)
+    speakers = sorted({sg["speaker"] for sg in all_speaker_segs})
+
+    return {
+        "text": filtered_full,
+        "filtered_text": filtered_full,
+        "segments": segments,
+        "speaker_segments": all_speaker_segs,
+        "speakers": speakers,
+        "count": len(segments),
+        "speaker_count": len(speakers),
+        "total_speaker_segments": len(all_speaker_segs),
+    }
+
+
+def get_org_transcripts(conn, caller, event):
+    """GET /api/org/transcripts?date=&user=&start=&end= -- Aurora-identity
+    transcript read (Timeline "Transcript" tab bug fix). scripts/api/
+    transcripts.js unconditionally called the LEGACY /transcripts gateway
+    (lambda_fieldsight_api.get_transcripts), whose get_caller_identity
+    resolves role/display_name from the OLD DynamoDB fieldsight-users
+    table / config/user_mapping.json -- a DIFFERENT identity store than
+    the Aurora `users` table. An Aurora-only account (e.g. site_manager
+    Ben_UCPK) resolves there to role='viewer', display_name='', so
+    can_access_user_data 403s even though the transcript S3 object
+    exists. This route resolves the caller from Aurora instead (dispatch's
+    `caller`, same as every other /api/org/* route) and applies get_
+    timeline_compat's GRADED_ROLES-off ACL verbatim: a non-ALL caller may
+    only read their own folder (?user= for anyone else is 403, silently
+    forcing to self the way D10 used to is exactly the mislabeled-data bug
+    fix wave 1 closed for /timeline -- reject, don't substitute); admin/gm
+    may pass ?user=, defaulting to their own folder when omitted, and an
+    explicit ?user= must resolve to a folder in their company (RETARGET
+    override 5, same as /timeline). Phase 3 GRADED_ROLES still defaults
+    off and this route doesn't add a graded branch -- when that flag
+    flips, /timeline's graded path is the template to extend this with.
+    The S3 read/normalize is delegated to _read_org_transcripts (mirrors
+    the legacy endpoint's shape so transcript-list.js needs no reshape)."""
+    p = event.get("queryStringParameters") or {}
+    date = p.get("date")
+    user = (p.get("user") or "").strip()
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    is_all = resolve_scope(caller["global_role"]) == "ALL"
+    if not is_all:
+        own = caller.get("folder_name")
+        if not own:
+            return error("no folder mapping for your account", 403)
+        if user and user != own:
+            return error("you may only view your own transcripts", 403)
+        user = own
+    elif not user:
+        user = caller.get("folder_name") or ""
+    if not user:
+        return error("user required", 400)
+    if is_all and users.get_by_folder_name(conn, caller["company_id"], user) is None:
+        return error("user not found in your company", 404)
+    return ok(_read_org_transcripts(date, user, p.get("start") or "", p.get("end") or ""))
