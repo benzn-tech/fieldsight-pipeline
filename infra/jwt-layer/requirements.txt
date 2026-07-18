@@ -1,0 +1,6 @@
+# PyJWT + cryptography (RS256) for the Site Voice WebSocket authorizer.
+# jwt.PyJWKClient fetches the Cognito pool JWKS; cryptography verifies RS256.
+# Built by `sam build` (Metadata BuildMethod python3.11) into manylinux
+# wheels compatible with the Lambda python3.11 x86_64 runtime — same pattern
+# as infra/psycopg-layer and infra/dashscope-layer.
+PyJWT[crypto]>=2.8
