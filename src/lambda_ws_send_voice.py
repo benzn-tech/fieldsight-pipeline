@@ -1,12 +1,11 @@
 """
-In-VPC Lambda: WebSocket `sendVoice` route for Site Voice.
-
-Body {siteId, s3Key, durationS}. Verifies the sender is a member of siteId
-(same ACL floor as org-api: memberships.accessible_site_ids), records the
-delivery pointer (voice_messages), resolves online recipients (connected
-members of the site minus the sender) and async-invokes the NON-VPC
-voice-fanout Lambda to POST over @connections. BUG-36: an in-VPC fn cannot
-reach the execute-api endpoint, so the broadcast is split into that hop.
+Non-VPC WS `sendVoice` orchestrator. It cannot touch Aurora (it is NON-VPC), so
+it sync-invokes the IN-VPC voice-resolve leaf (ACL + insert voice_messages +
+resolve recipients), then async-invokes the NON-VPC voice-fanout to POST the
+payload over @connections. Non-VPC so BOTH lambda:Invoke calls have egress — an
+in-VPC fn cannot reach the Lambda API (no NAT / no lambda VPC endpoint, BUG-36),
+which is exactly why the DB work is delegated to the in-VPC leaf and the invokes
++ the @connections fanout run out here where egress exists.
 """
 import json
 import logging
@@ -14,12 +13,10 @@ import os
 
 import boto3
 
-from db.connection import get_connection
-from repositories import memberships, users, voice_messages, ws_connections
-
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+RESOLVE_FUNCTION = os.environ.get("VOICE_RESOLVE_FUNCTION", "")
 FANOUT_FUNCTION = os.environ.get("VOICE_FANOUT_FUNCTION", "")
 
 _lambda_client = None
@@ -44,44 +41,34 @@ def lambda_handler(event, context):
     duration_s = body.get("durationS")
     if not (sub and site_id and s3_key):
         return {"statusCode": 400, "body": "siteId and s3Key required"}
+    if not RESOLVE_FUNCTION:
+        logger.error("VOICE_RESOLVE_FUNCTION not set")
+        return {"statusCode": 500}
     try:
-        with get_connection() as conn:
-            caller = users.get_user_by_sub(conn, sub)
-            if caller is None or not caller["company_id"]:
-                return {"statusCode": 403, "body": "not provisioned"}
-            allowed = {str(x) for x in memberships.accessible_site_ids(
-                conn, caller["id"], caller["global_role"])}
-            if str(site_id) not in allowed:
-                return {"statusCode": 403, "body": "not a member of site"}
-            msg = voice_messages.insert_message(
-                conn, caller["company_id"], site_id, caller["id"], s3_key,
-                duration_s=duration_s)
-            recipients = ws_connections.recipients_for_site(
-                conn, caller["company_id"], site_id, caller["id"])
-        _dispatch_fanout(rc, recipients, msg, caller)
-        return {"statusCode": 200, "body": json.dumps(
-            {"messageId": str(msg["id"]), "recipients": len(recipients)})}
+        resp = _lambda().invoke(
+            FunctionName=RESOLVE_FUNCTION, InvocationType="RequestResponse",
+            Payload=json.dumps({"sub": sub, "siteId": site_id,
+                                "s3Key": s3_key, "durationS": duration_s}))
+        resolved = json.loads(resp["Payload"].read())
     except Exception:
-        logger.exception("sendVoice failed")
-        return {"statusCode": 500, "body": "internal error"}
+        logger.exception("voice-resolve invoke failed")
+        return {"statusCode": 500}
+    status = resolved.get("statusCode", 500)
+    if status != 200:
+        return {"statusCode": status, "body": "not authorized for site"}
+    recipients = resolved.get("connectionIds") or []
+    payload = resolved.get("payload") or {}
+    _dispatch_fanout(rc, recipients, payload)
+    return {"statusCode": 200, "body": json.dumps(
+        {"messageId": resolved.get("messageId"), "recipients": len(recipients)})}
 
 
-def _dispatch_fanout(rc, recipients, msg, caller):
+def _dispatch_fanout(rc, recipients, payload):
     """Async-invoke the non-VPC fanout with the connection list + payload.
-    Best-effort: never fail the send if the async hop can't be queued (and
-    skip entirely when nobody else is online)."""
+    Best-effort; skip when nobody else is online or the env is unset."""
     if not recipients or not FANOUT_FUNCTION:
         return
     endpoint = f"https://{rc.get('domainName')}/{rc.get('stage')}"
-    payload = {
-        "type": "voice",
-        "messageId": str(msg["id"]),
-        "siteId": str(msg["site_id"]),
-        "s3Key": msg["s3_key"],
-        "durationS": float(msg["duration_s"]) if msg.get("duration_s") is not None else None,
-        "senderUserId": str(caller["id"]),
-        "createdAt": msg["created_at"].isoformat() if hasattr(msg["created_at"], "isoformat") else str(msg["created_at"]),
-    }
     try:
         _lambda().invoke(
             FunctionName=FANOUT_FUNCTION, InvocationType="Event",

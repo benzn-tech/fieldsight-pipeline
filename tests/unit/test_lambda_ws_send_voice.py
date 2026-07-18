@@ -2,18 +2,24 @@ import json
 
 import pytest
 
-sv = pytest.importorskip("lambda_ws_send_voice", reason="requires psycopg import path")
+sv = pytest.importorskip("lambda_ws_send_voice", reason="requires boto3 import path")
 
 
-class _FakeConn:
-    def __enter__(self): return self
-    def __exit__(self, *a): return False
+class _Body:
+    def __init__(self, s): self._s = s.encode("utf-8")
+    def read(self): return self._s
 
 
 class _FakeLambda:
-    def __init__(self): self.calls = []
+    """Fakes the resolve (RequestResponse) + fanout (Event) invokes."""
+    def __init__(self, resolve_result):
+        self.resolve_result = resolve_result
+        self.calls = []
+
     def invoke(self, **kw):
         self.calls.append({**kw, "payload": json.loads(kw["Payload"])})
+        if kw.get("InvocationType") == "RequestResponse":
+            return {"Payload": _Body(json.dumps(self.resolve_result))}
         return {"StatusCode": 202}
 
 
@@ -23,80 +29,75 @@ def _event(body, sub="sub-1"):
                                "stage": "prod", "authorizer": {"sub": sub} if sub else {}}}
 
 
-@pytest.fixture
-def wired(monkeypatch):
-    monkeypatch.setattr(sv, "get_connection", lambda *a, **k: _FakeConn())
+def _wire(monkeypatch, resolve_result):
+    monkeypatch.setattr(sv, "RESOLVE_FUNCTION", "fieldsight-test-voice-resolve")
     monkeypatch.setattr(sv, "FANOUT_FUNCTION", "fieldsight-test-voice-fanout")
-    monkeypatch.setattr(sv.users, "get_user_by_sub",
-                        lambda c, sub: {"id": "u-1", "company_id": "c-1", "global_role": "worker"})
-    monkeypatch.setattr(sv.memberships, "accessible_site_ids", lambda c, uid, role: ["s-1"])
-    monkeypatch.setattr(sv.voice_messages, "insert_message",
-                        lambda c, coid, sid, uid, key, duration_s=None: {
-                            "id": "m-1", "site_id": sid, "s3_key": key,
-                            "duration_s": duration_s, "created_at": "2026-07-18T00:00:00Z"})
-    monkeypatch.setattr(sv.ws_connections, "recipients_for_site",
-                        lambda c, coid, sid, uid: ["conn-b", "conn-c"])
-    fake = _FakeLambda()
+    fake = _FakeLambda(resolve_result)
     monkeypatch.setattr(sv, "_lambda", lambda: fake)
-    return monkeypatch, fake
+    return fake
 
 
-def test_send_inserts_and_dispatches_fanout(wired):
-    mp, fake = wired
+_OK_RESOLVE = {"statusCode": 200, "messageId": "m-1",
+               "connectionIds": ["conn-b", "conn-c"],
+               "payload": {"type": "voice", "messageId": "m-1", "siteId": "s-1",
+                           "s3Key": "voice/c-1/s-1/x.wav", "durationS": 1.2,
+                           "senderUserId": "u-1", "createdAt": "2026-07-18T00:00:00Z"}}
+
+
+def test_send_resolves_then_dispatches_fanout(monkeypatch):
+    fake = _wire(monkeypatch, _OK_RESOLVE)
     res = sv.lambda_handler(_event({"action": "sendVoice", "siteId": "s-1",
                                     "s3Key": "voice/c-1/s-1/x.wav", "durationS": 1.2}), None)
     assert res["statusCode"] == 200
     assert json.loads(res["body"]) == {"messageId": "m-1", "recipients": 2}
-    inv = fake.calls[0]
-    assert inv["FunctionName"] == "fieldsight-test-voice-fanout"
-    assert inv["InvocationType"] == "Event"
-    p = inv["payload"]
-    assert p["endpoint"] == "https://ws.example.com/prod"
-    assert p["connectionIds"] == ["conn-b", "conn-c"]
-    assert p["payload"]["s3Key"] == "voice/c-1/s-1/x.wav" and p["payload"]["messageId"] == "m-1"
+    assert fake.calls[0]["FunctionName"] == "fieldsight-test-voice-resolve"
+    assert fake.calls[0]["InvocationType"] == "RequestResponse"
+    assert fake.calls[0]["payload"] == {"sub": "sub-1", "siteId": "s-1",
+                                        "s3Key": "voice/c-1/s-1/x.wav", "durationS": 1.2}
+    assert fake.calls[1]["FunctionName"] == "fieldsight-test-voice-fanout"
+    assert fake.calls[1]["InvocationType"] == "Event"
+    fp = fake.calls[1]["payload"]
+    assert fp["endpoint"] == "https://ws.example.com/prod"
+    assert fp["connectionIds"] == ["conn-b", "conn-c"]
+    assert fp["payload"]["s3Key"] == "voice/c-1/s-1/x.wav"
 
 
-def test_non_member_site_403(wired):
-    mp, fake = wired
-    mp.setattr(sv.memberships, "accessible_site_ids", lambda c, uid, role: ["other-site"])
-    res = sv.lambda_handler(_event({"action": "sendVoice", "siteId": "s-1",
-                                    "s3Key": "voice/x.wav"}), None)
-    assert res["statusCode"] == 403 and fake.calls == []
-
-
-def test_missing_fields_400(wired):
-    mp, fake = wired
-    res = sv.lambda_handler(_event({"action": "sendVoice", "siteId": "s-1"}), None)
-    assert res["statusCode"] == 400
-
-
-def test_no_recipients_skips_fanout(wired):
-    mp, fake = wired
-    mp.setattr(sv.ws_connections, "recipients_for_site", lambda c, coid, sid, uid: [])
-    res = sv.lambda_handler(_event({"action": "sendVoice", "siteId": "s-1",
-                                    "s3Key": "voice/x.wav"}), None)
-    assert res["statusCode"] == 200 and fake.calls == []   # inserted, but nobody online
-
-
-def test_unprovisioned_caller_403(wired):
-    mp, fake = wired
-    mp.setattr(sv.users, "get_user_by_sub", lambda c, sub: None)
+def test_resolve_403_returns_403_no_fanout(monkeypatch):
+    fake = _wire(monkeypatch, {"statusCode": 403})
     res = sv.lambda_handler(_event({"action": "sendVoice", "siteId": "s-1",
                                     "s3Key": "voice/x.wav"}), None)
     assert res["statusCode"] == 403
+    assert len(fake.calls) == 1 and fake.calls[0]["InvocationType"] == "RequestResponse"
 
 
-def test_malformed_json_body_400(wired):
-    mp, fake = wired
+def test_no_recipients_skips_fanout(monkeypatch):
+    fake = _wire(monkeypatch, {"statusCode": 200, "messageId": "m-1",
+                               "connectionIds": [], "payload": {}})
+    res = sv.lambda_handler(_event({"action": "sendVoice", "siteId": "s-1",
+                                    "s3Key": "voice/x.wav"}), None)
+    assert res["statusCode"] == 200
+    assert len(fake.calls) == 1
+
+
+def test_missing_fields_400(monkeypatch):
+    fake = _wire(monkeypatch, _OK_RESOLVE)
+    res = sv.lambda_handler(_event({"action": "sendVoice", "siteId": "s-1"}), None)
+    assert res["statusCode"] == 400
+    assert fake.calls == []
+
+
+def test_missing_sub_400(monkeypatch):
+    fake = _wire(monkeypatch, _OK_RESOLVE)
+    res = sv.lambda_handler(_event({"action": "sendVoice", "siteId": "s-1",
+                                    "s3Key": "voice/x.wav"}, sub=None), None)
+    assert res["statusCode"] == 400
+
+
+def test_malformed_json_body_400(monkeypatch):
+    fake = _wire(monkeypatch, _OK_RESOLVE)
     event = {"body": "{not json",
              "requestContext": {"connectionId": "conn-1", "domainName": "ws.example.com",
                                 "stage": "prod", "authorizer": {"sub": "sub-1"}}}
     res = sv.lambda_handler(event, None)
-    assert res["statusCode"] == 400 and fake.calls == []
-
-
-def test_missing_sub_400(wired):
-    mp, fake = wired
-    res = sv.lambda_handler(_event({"action": "sendVoice", "siteId": "s-1",
-                                    "s3Key": "voice/x.wav"}, sub=None), None)
     assert res["statusCode"] == 400
+    assert fake.calls == []
