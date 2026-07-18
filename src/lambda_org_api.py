@@ -56,7 +56,7 @@ from psycopg.errors import UniqueViolation
 from db.connection import get_connection
 from repositories import (companies, memberships, observations, programme, programme_suggestions,
                           recordings, rollup, scope, sites, topics, users)
-from repositories.acl import resolve_scope
+from repositories.acl import is_cross_company, resolve_scope
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -409,7 +409,7 @@ def list_org_sites(conn, caller, event):
 
 
 def create_org_site(conn, caller, body):
-    if caller["global_role"] not in ("admin", "gm"):
+    if caller["global_role"] not in ("admin", "gm", "platform_admin"):
         return error("admin or gm role required", 403)
     if body is None:
         return error("malformed JSON body", 400)
@@ -424,8 +424,19 @@ def create_org_site(conn, caller, body):
         pending_prefix = f"{ORG_ASSETS_PREFIX}pending/{caller['cognito_sub']}/"
         if not isinstance(icon, str) or not icon.startswith(pending_prefix):
             return error(f"icon_s3_key must be your pending upload ({pending_prefix}…)", 400)
+    # D6: target_company_id lets ONLY a platform_admin write a site into
+    # another company; absent (or equal to caller's own) -> today's behavior,
+    # unchanged, for every other role.
+    target_company_id = caller["company_id"]
+    req_company_id = body.get("target_company_id")
+    if req_company_id and str(req_company_id) != str(caller["company_id"]):
+        if not is_cross_company(caller["global_role"]):
+            return error("only platform_admin may create sites in another company", 403)
+        if companies.get_company_by_id(conn, req_company_id) is None:
+            return error("target company not found", 404)
+        target_company_id = req_company_id
     row = sites.create_site(
-        conn, caller["company_id"], name,
+        conn, target_company_id, name,
         location=body.get("location"), client=body.get("client"),
         industry=body.get("industry"), icon_s3_key=None,
         address=body.get("address"),
@@ -505,13 +516,19 @@ def list_members(conn, caller, event):
 
 
 def patch_member_role(conn, caller, target_sub, body):
-    if caller["global_role"] != "admin":
+    # widened to admit platform_admin (D6) alongside admin -- required so a
+    # platform_admin can reach the grant guard below and patch a role at all;
+    # a plain "admin" caller's path is unchanged.
+    if caller["global_role"] not in ("admin", "platform_admin"):
         return error("admin role required", 403)
     if body is None:
         return error("malformed JSON body", 400)
     role = body.get("global_role")
     if not isinstance(role, str) or role not in ALLOWED_GLOBAL_ROLES:
         return error(f"global_role must be one of {sorted(ALLOWED_GLOBAL_ROLES)}", 400)
+    # D6: only a platform_admin may grant platform_admin.
+    if role == "platform_admin" and not is_cross_company(caller["global_role"]):
+        return error("only platform_admin may grant platform_admin", 403)
     row = users.set_global_role(conn, target_sub, caller["company_id"], role)
     if row is None:
         return error("member not found in your company", 404)
@@ -582,8 +599,12 @@ def create_member(conn, caller, body):
     An existing user keeps their current global_role unless global_role is
     explicitly sent in the body (no silent reset to "worker" on re-invite).
     If the resolved Cognito user already belongs to another company, the
-    request is rejected with 409 rather than re-parenting them."""
-    if caller["global_role"] != "admin":
+    request is rejected with 409 rather than re-parenting them.
+    D6: an optional target_company_id lets ONLY a platform_admin create a
+    member in another company (default = caller's own company, unchanged for
+    everyone else); granting global_role="platform_admin" itself requires the
+    caller to already be a platform_admin."""
+    if caller["global_role"] not in ("admin", "platform_admin"):
         return error("admin role required", 403)
     if body is None:
         return error("malformed JSON body", 400)
@@ -594,6 +615,20 @@ def create_member(conn, caller, body):
     if global_role is not None and (
             not isinstance(global_role, str) or global_role not in ALLOWED_GLOBAL_ROLES):
         return error(f"global_role must be one of {sorted(ALLOWED_GLOBAL_ROLES)}", 400)
+    # D6: only a platform_admin may grant platform_admin.
+    if global_role == "platform_admin" and not is_cross_company(caller["global_role"]):
+        return error("only platform_admin may grant platform_admin", 403)
+    # D6: target_company_id lets ONLY a platform_admin create a member in
+    # another company; absent (or equal to caller's own) -> today's behavior,
+    # unchanged, for every other role.
+    target_company_id = caller["company_id"]
+    req_company_id = body.get("target_company_id")
+    if req_company_id and str(req_company_id) != str(caller["company_id"]):
+        if not is_cross_company(caller["global_role"]):
+            return error("only platform_admin may create members in another company", 403)
+        if companies.get_company_by_id(conn, req_company_id) is None:
+            return error("target company not found", 404)
+        target_company_id = req_company_id
     wanted = body.get("memberships") or []
     for mem in wanted:
         if not isinstance(mem, dict) or not mem.get("site_id"):
@@ -602,7 +637,7 @@ def create_member(conn, caller, body):
             return error(
                 f"membership role must be one of {sorted(ALLOWED_MEMBERSHIP_ROLES)}", 400)
         site = sites.get_site(conn, mem["site_id"])
-        if site is None or site["company_id"] != caller["company_id"]:
+        if site is None or site["company_id"] != target_company_id:
             return error("site not found in your company", 403)
         if site.get("archived_at"):
             return error("site is archived — unarchive it first", 409)
@@ -628,14 +663,14 @@ def create_member(conn, caller, body):
     sub = next(a["Value"] for a in attrs if a["Name"] == "sub")
 
     existing = users.get_user_by_sub(conn, sub)
-    if existing and existing["company_id"] and existing["company_id"] != caller["company_id"]:
+    if existing and existing["company_id"] and existing["company_id"] != target_company_id:
         return error("user already belongs to another company", 409)
-    if existing and existing["company_id"] == caller["company_id"] and existing.get("archived_at"):
+    if existing and existing["company_id"] == target_company_id and existing.get("archived_at"):
         return error("user is archived — unarchive them instead", 409)
 
     user = users.upsert_user(
         conn, sub, email,
-        company_id=caller["company_id"],
+        company_id=target_company_id,
         first_name=body.get("first_name"),
         last_name=body.get("last_name"),
         global_role=global_role,

@@ -2770,3 +2770,212 @@ def test_observations_admin_company_wide(wired):
     res = org.lambda_handler(make_event("GET", "/api/org/observations"), None)
     assert res["statusCode"] == 200
     assert seen["allowed_site_slugs"] is None
+
+
+# ---- Phase 3 Task 3: platform_admin cross-company writes (D6) ----
+
+def test_create_site_platform_admin_targets_other_company(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "platform_admin"})
+    wired.setattr(org.companies, "get_company_by_id",
+                  lambda conn, cid: {"id": cid, "name": "Other Co"})
+    created = {}
+
+    def fake_create(conn, company_id, name, location=None, client=None,
+                    industry=None, icon_s3_key=None, address=None):
+        created.update(company_id=company_id, name=name)
+        return {"id": "s-new", "company_id": company_id, "name": name}
+
+    wired.setattr(org.sites, "create_site", fake_create)
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "Cross Co Site", "target_company_id": "c-uuid-B"}), None)
+    assert res["statusCode"] == 201
+    assert created["company_id"] == "c-uuid-B"          # pinned to target, not caller's company
+    assert body_of(res)["company_id"] == "c-uuid-B"
+
+
+def test_create_site_non_platform_cannot_target_other_company_403(wired):
+    # caller stays the default admin (CALLER) -- not platform_admin
+    called = []
+    wired.setattr(org.sites, "create_site",
+                  lambda *a, **k: called.append(1) or {"id": "s-new"})
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "X", "target_company_id": "c-uuid-B"}), None)
+    assert res["statusCode"] == 403
+    assert called == []                                  # create_site never reached
+
+
+def test_create_site_admin_own_company_unaffected(wired):
+    # no target_company_id -> caller.company_id, unchanged
+    created = {}
+
+    def fake_create(conn, company_id, name, location=None, client=None,
+                    industry=None, icon_s3_key=None, address=None):
+        created.update(company_id=company_id, name=name)
+        return {"id": "s-new", "company_id": company_id, "name": name}
+
+    wired.setattr(org.sites, "create_site", fake_create)
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "New Site"}), None)
+    assert res["statusCode"] == 201
+    assert created["company_id"] == "c-uuid-1"
+
+
+def test_create_site_platform_admin_unknown_target_company_404(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "platform_admin"})
+    wired.setattr(org.companies, "get_company_by_id", lambda conn, cid: None)
+    called = []
+    wired.setattr(org.sites, "create_site",
+                  lambda *a, **k: called.append(1) or {"id": "s-new"})
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "X", "target_company_id": "c-ghost"}), None)
+    assert res["statusCode"] == 404
+    assert called == []
+
+
+def test_create_site_default_path_unchanged_regardless_of_graded_roles_flag(wired):
+    # Task 3's write-path guards are independent of the Task 2 GRADED_ROLES
+    # read flag: on or off, a caller with no target_company_id creates in
+    # their own company, byte-for-byte identical to pre-Task-3 behavior
+    # (mirrors test_create_site_admin_ok exactly, flag toggled on).
+    wired.setattr(org, "GRADED_ROLES", True)
+    created = {}
+
+    def fake_create(conn, company_id, name, location=None, client=None,
+                    industry=None, icon_s3_key=None, address=None):
+        created.update(company_id=company_id, name=name, location=location,
+                       address=address)
+        return {"id": "s-new", "company_id": company_id, "name": name}
+
+    wired.setattr(org.sites, "create_site", fake_create)
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "New Site", "location": "Chch", "address": "12 Queen St"}), None)
+    assert res["statusCode"] == 201
+    assert created == {"company_id": "c-uuid-1", "name": "New Site",
+                       "location": "Chch", "address": "12 Queen St"}
+
+
+def test_create_member_platform_admin_targets_other_company(member_wired):
+    # upsert_user company_id == target; membership site checks use target company
+    wired, fake = member_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: ({**CALLER, "global_role": "platform_admin"}
+                                     if sub == "sub-1" else None))
+    wired.setattr(org.companies, "get_company_by_id",
+                  lambda conn, cid: {"id": cid, "name": "Other Co"})
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": "c-uuid-B"})
+    seen = {}
+
+    def fake_upsert(conn, sub, email, **kw):
+        seen.update(kw)
+        return {"id": "u-new", "cognito_sub": sub, "email": email, **kw}
+
+    wired.setattr(org.users, "upsert_user", fake_upsert)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@x.nz", "target_company_id": "c-uuid-B",
+        "memberships": [{"site_id": "s-1", "role": "worker"}],
+    }), None)
+    assert res["statusCode"] == 201
+    assert seen["company_id"] == "c-uuid-B"
+
+
+def test_create_member_non_platform_cannot_target_other_company_403(member_wired):
+    wired, fake = member_wired
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz", "target_company_id": "c-uuid-B"}), None)
+    assert res["statusCode"] == 403
+    assert fake.created == []                            # Cognito never reached
+
+
+def test_create_member_target_company_id_absent_unaffected(member_wired):
+    wired, fake = member_wired
+    seen = {}
+
+    def fake_upsert(conn, sub, email, **kw):
+        seen.update(kw)
+        return {"id": "u-new", "cognito_sub": sub, "email": email, **kw}
+
+    wired.setattr(org.users, "upsert_user", fake_upsert)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@x.nz"}), None)
+    assert res["statusCode"] == 201
+    assert seen["company_id"] == "c-uuid-1"               # caller's own company, unchanged
+
+
+def test_create_member_only_platform_admin_may_grant_platform_admin_403(member_wired):
+    # caller admin, body global_role='platform_admin' -> 403
+    wired, fake = member_wired
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz", "global_role": "platform_admin"}), None)
+    assert res["statusCode"] == 403
+    assert fake.created == []
+
+
+def test_create_member_platform_admin_may_grant_platform_admin(member_wired):
+    wired, fake = member_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: ({**CALLER, "global_role": "platform_admin"}
+                                     if sub == "sub-1" else None))
+    seen = {}
+
+    def fake_upsert(conn, sub, email, **kw):
+        seen.update(kw)
+        return {"id": "u-new", "cognito_sub": sub, "email": email, **kw}
+
+    wired.setattr(org.users, "upsert_user", fake_upsert)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new-admin@x.nz", "global_role": "platform_admin"}), None)
+    assert res["statusCode"] == 201
+    assert seen["global_role"] == "platform_admin"
+
+
+def test_create_member_platform_admin_unknown_target_company_404(member_wired):
+    wired, fake = member_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: ({**CALLER, "global_role": "platform_admin"}
+                                     if sub == "sub-1" else None))
+    wired.setattr(org.companies, "get_company_by_id", lambda conn, cid: None)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz", "target_company_id": "c-ghost"}), None)
+    assert res["statusCode"] == 404
+    assert fake.created == []
+
+
+def test_create_member_default_path_unchanged_regardless_of_graded_roles_flag(member_wired):
+    # mirrors test_create_member_creates_and_enrolls exactly, flag toggled on
+    wired, fake = member_wired
+    wired.setattr(org, "GRADED_ROLES", True)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@x.nz", "first_name": "New", "global_role": "site_manager",
+        "memberships": [{"site_id": "s-1", "role": "site_manager"}],
+    }), None)
+    assert res["statusCode"] == 201
+    b = body_of(res)
+    assert b["user"]["cognito_sub"] == "sub-new"
+    assert b["memberships"] == [{"user_id": "u-new", "site_id": "s-1",
+                                 "role": "site_manager"}]
+
+
+def test_patch_member_role_only_platform_admin_may_grant_platform_admin_403(wired):
+    # caller stays the default admin (CALLER) -- not platform_admin
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/role", body={"global_role": "platform_admin"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_patch_member_role_platform_admin_may_grant_platform_admin(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "platform_admin"})
+    seen = {}
+
+    def fake_set(conn, sub, company_id, role):
+        seen.update(sub=sub, company_id=company_id, role=role)
+        return {**CALLER, "cognito_sub": sub, "global_role": role}
+
+    wired.setattr(org.users, "set_global_role", fake_set)
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/members/sub-2/role", body={"global_role": "platform_admin"}), None)
+    assert res["statusCode"] == 200
+    assert seen["role"] == "platform_admin"
