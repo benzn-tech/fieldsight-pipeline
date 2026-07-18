@@ -89,6 +89,7 @@ jobs:
               "AuditTableName=fieldsight-audit" \
               "MultiTenantResolution=true" \
               "AuthorityFlip=${{ vars.PROD_AUTHORITY_FLIP || 'false' }}" \
+              "GradedRoles=${{ vars.PROD_GRADED_ROLES || 'false' }}" \
               "ManageDataBucketPolicy=false" \
               "VadLayerArn=${{ vars.PROD_VAD_LAYER_ARN }}" \
               "DocxLayerArn=${{ vars.PROD_DOCX_LAYER_ARN }}" \

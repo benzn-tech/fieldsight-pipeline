@@ -25,6 +25,16 @@ def list_company_sites(conn, company_id, include_archived=False) -> list[dict]:
     ).fetchall()
 
 
+def list_all_sites(conn, include_archived=False) -> list[dict]:
+    """EVERY company's sites -- the ONE deliberately company-agnostic query,
+    reachable ONLY through visible_scope's platform_admin branch (D6). Never
+    call this from a company-pinned path."""
+    guard = "" if include_archived else "WHERE archived_at IS NULL "
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM sites {guard}ORDER BY company_id, created_at"
+    ).fetchall()
+
+
 def list_sites_by_ids(conn, site_ids) -> list[dict]:
     if not site_ids:
         return []  # ANY('{}') is valid SQL but skip the round-trip

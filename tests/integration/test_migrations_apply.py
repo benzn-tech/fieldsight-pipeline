@@ -40,3 +40,38 @@ def test_extensions_installed():
         assert "pgcrypto" in names
     finally:
         conn.close()
+
+
+def test_platform_company_seeded():
+    # Phase 3 T3 / D6: 0015 seeds the dedicated FieldSight-platform company row
+    # so a platform_admin's company_id stays NOT NULL.
+    conn = _fresh_conn()
+    try:
+        apply_migrations(conn, MIGRATIONS_DIR)
+        rows = conn.execute(
+            "SELECT name, industry FROM companies WHERE name='FieldSight-platform'"
+        ).fetchall()
+        assert rows == [("FieldSight-platform", "platform")]
+    finally:
+        conn.close()
+
+
+def test_platform_company_seed_sql_is_idempotent_on_direct_rerun():
+    # Belt-and-suspenders on top of the schema_migrations gate (which already
+    # prevents a file from re-running via apply_migrations): even a manual
+    # re-run of 0015's raw SQL (e.g. a recovery script) must not double-insert
+    # the platform company row -- the file's own WHERE NOT EXISTS guard.
+    conn = _fresh_conn()
+    try:
+        apply_migrations(conn, MIGRATIONS_DIR)
+        path = os.path.join(MIGRATIONS_DIR, "0015_platform_company.sql")
+        with open(path, "r", encoding="utf-8") as fh:
+            sql = fh.read()
+        conn.execute(sql)
+        conn.execute(sql)
+        count = conn.execute(
+            "SELECT count(*) FROM companies WHERE name='FieldSight-platform'"
+        ).fetchone()[0]
+        assert count == 1
+    finally:
+        conn.close()

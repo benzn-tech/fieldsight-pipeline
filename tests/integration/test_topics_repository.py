@@ -1,3 +1,5 @@
+import datetime as _dt
+
 import pytest
 
 pytestmark = pytest.mark.integration
@@ -42,3 +44,19 @@ def test_upsert_topic_with_children(db):
     assert ai == [("Order rebar",)]
     assert sf == [("Edge unprotected",)]
     assert ph[0]["s3_key"].endswith("p1.jpg")
+
+
+def test_list_report_dates_distinct_scoped_and_windowed(db):
+    co = companies.create_company(db, "A")
+    s1 = sites.create_site(db, co["id"], "S1")
+    s2 = sites.create_site(db, co["id"], "S2")
+    other = sites.create_site(db, co["id"], "S3")
+
+    topics.upsert_topic(db, s1["id"], _dt.date(2026, 7, 16), "t")
+    topics.upsert_topic(db, s1["id"], _dt.date(2026, 7, 16), "t-dup")  # dup same day -> DISTINCT collapses
+    topics.upsert_topic(db, s2["id"], _dt.date(2026, 7, 17), "t3")
+    topics.upsert_topic(db, other["id"], _dt.date(2026, 7, 18), "t4")  # NOT in the scoped set
+    topics.upsert_topic(db, s1["id"], _dt.date(2026, 1, 1), "t5")      # before the window
+
+    out = topics.list_report_dates(db, [str(s1["id"]), str(s2["id"])], _dt.date(2026, 6, 1))
+    assert out == [_dt.date(2026, 7, 16), _dt.date(2026, 7, 17)]      # distinct, ordered, other/old excluded

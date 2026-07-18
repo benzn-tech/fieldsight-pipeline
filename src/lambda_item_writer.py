@@ -17,12 +17,16 @@ guard are REUSED from lambda_ingest by import -- never copied:
 Site resolution note: the extraction JSON has no 'site' field (unlike a
 daily_report.json, which may carry report['site']) -- declared_site is only
 ever stored for record in the extraction JSON, it is NOT consumed for site
-attribution here (that consumption waits on the identity system's
-recording_sessions, Phase 4b Global Constraints). So resolve_site is always
-called with an empty report dict, which falls straight through to the
-user_mapping.json primary_site slug bridge. A double miss (report has no
-site AND the mapping bridge also misses) skips the extraction, zero writes
--- exactly like lambda_ingest's report-level site-bridge miss.
+attribution here. resolve_site is always called with an empty report dict,
+which falls straight through to the user_mapping.json primary_site slug
+bridge. A double miss (report has no site AND the mapping bridge also
+misses) skips the extraction, zero writes -- exactly like lambda_ingest's
+report-level site-bridge miss.
+
+G5b: recordings.site_for_media (the app-tagged site, keyed on the
+recording's own session_base) is now consulted FIRST and, when present,
+overrides the membership resolver above -- resolve_site is only the
+fallback when there is no matching tag.
 
 Idempotency: keyed on source_s3_key = the extraction's own S3 key (delete
 then re-insert) -- same source-key idempotency Phase 4a topics/chunks use,
@@ -54,7 +58,7 @@ import boto3
 import lambda_ingest
 import match_request
 from db.connection import get_connection
-from repositories import companies, findings, topics
+from repositories import companies, findings, recordings, topics
 from transcript_utils import extract_base_time_from_filename
 
 logger = logging.getLogger()
@@ -230,9 +234,14 @@ def write_extraction_items(date, user_folder, extraction_key):
                 f"org company {COMPANY_NAME!r} not found — run the org seed "
                 "(fieldsight-*-org-seed) before ingesting")
 
-        # Extraction JSON has no 'site' field -- {} makes resolve_site fall
-        # straight to the user_mapping.json primary_site bridge.
-        site = lambda_ingest.resolve_site(conn, company["id"], {}, user_folder)
+        # G5b: the app stamps the in-app project pick onto recordings.site_id.
+        # That explicit tag is authoritative over the recorder's membership
+        # (and is the ONLY way an admin-account recording -- resolve_site returns
+        # None for ALL scope -- attributes to a site). Fall through to the legacy
+        # membership resolver only when there is no matching, company-valid tag.
+        session_base = _parse_extraction_key(extraction_key)[2]
+        site = recordings.site_for_media(conn, company["id"], user_folder, date, session_base) \
+            or lambda_ingest.resolve_site(conn, company["id"], {}, user_folder)
         if site is None:
             reason = (f"identity bridge miss: user_folder={user_folder!r} -- "
                       f"skipping extraction, zero writes")
