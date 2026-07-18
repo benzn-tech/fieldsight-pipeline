@@ -25,6 +25,8 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   POST  /api/org/observations             → create safety/quality observation (any member)
   GET   /api/org/observations             → list observations (company-scoped filters)
   PATCH /api/org/observations/{id}        → update status (author or admin/gm)
+  PATCH /api/org/action-items/{id}        → update priority/status/deadline/responsible
+                                             (site-authority ACL + member-validated reassignment)
   POST  /api/org/observations/{id}/archive→ soft-delete observation (admin/gm)
   GET   /api/org/live-items?date=…        → live topics dashboard feed (ACL)
   GET   /api/org/dates?months=&site=      → Timeline dots: report-date index scoped to
@@ -59,8 +61,9 @@ from botocore.exceptions import ClientError
 from psycopg.errors import UniqueViolation
 
 from db.connection import get_connection
-from repositories import (companies, memberships, observations, programme, programme_suggestions,
-                          recordings, rollup, scope, sites, topics, users, voice_messages)
+from repositories import (action_items, companies, memberships, observations, programme,
+                          programme_suggestions, recordings, rollup, scope, sites, topics,
+                          users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
 
 logger = logging.getLogger()
@@ -95,6 +98,8 @@ ALLOWED_MEMBERSHIP_ROLES = {"pm", "site_manager", "worker"}
 ALLOWED_OBSERVATION_KINDS = {"safety", "quality"}
 ALLOWED_RISK_LEVELS = {"low", "medium", "high"}
 ALLOWED_OBSERVATION_STATUS = {"open", "closed"}
+ALLOWED_ACTION_STATUS = {"open", "in_progress", "blocked", "done"}
+ALLOWED_ACTION_PRIORITY = {"low", "medium", "high"}
 RECORDING_KINDS = {"video", "audio", "photo"}
 _KIND_FOLDER = {"video": "video", "audio": "audio", "photo": "pictures"}
 
@@ -230,6 +235,9 @@ def dispatch(conn, event, method, route):
     m_oa = re.match(r"^/observations/([^/]+)/archive$", route)
     if m_oa and method == "POST":
         return archive_observation_endpoint(conn, caller, m_oa.group(1))
+    m_ai = re.match(r"^/action-items/([^/]+)$", route)
+    if m_ai and method == "PATCH":
+        return patch_action_item(conn, caller, m_ai.group(1), parse_body(event))
 
     if route == "/live-items":
         if method == "GET":
@@ -978,6 +986,65 @@ def patch_observation_status(conn, caller, obs_id, body):
     return ok(updated)
 
 
+def _display_name(caller):
+    return " ".join(p for p in (caller.get("first_name"), caller.get("last_name")) if p).strip()
+
+
+def patch_action_item(conn, caller, action_item_id, body):
+    """Edit priority/status/deadline/responsible on one action item (spec §3).
+    ACL mirrors patch_observation_status widened to site authority: the task's
+    site must be in the caller's reach, and the caller must be admin/gm, a
+    pm/site_manager of THAT site, or the current assignee. Reassignment target
+    must be a member of the task's site. Addressed by durable action_items.id."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    row = action_items.get_action_item(conn, action_item_id)
+    if row is None or str(row["company_id"]) != str(caller["company_id"]):
+        return error("action item not found", 404)            # incl. cross-company
+    site_id = str(row["site_id"])
+    if site_id not in _allowed_site_ids(conn, caller):
+        return error("access denied to this task's site", 403)  # reach gate
+    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
+    is_admin = resolve_scope(caller["global_role"]) == "ALL"
+    is_site_authority = site_role in ("pm", "site_manager")
+    is_assignee = bool(row["responsible"]) and row["responsible"] == _display_name(caller)
+    if not (is_admin or is_site_authority or is_assignee):
+        return error("admin/gm, this site's pm/site_manager, or the assignee only", 403)
+
+    fields = {}
+    if "priority" in body:
+        if body["priority"] not in ALLOWED_ACTION_PRIORITY:
+            return error(f"priority must be one of {sorted(ALLOWED_ACTION_PRIORITY)}", 400)
+        fields["priority"] = body["priority"]
+    if "status" in body:
+        if body["status"] not in ALLOWED_ACTION_STATUS:
+            return error(f"status must be one of {sorted(ALLOWED_ACTION_STATUS)}", 400)
+        fields["status"] = body["status"]
+    if "deadline" in body:
+        dl = body["deadline"]
+        if dl is not None and not (isinstance(dl, str) and REPORT_DATE_RE.match(dl)):
+            return error("deadline must be YYYY-MM-DD or null", 400)
+        fields["deadline"] = dl                               # write both so the
+        fields["deadline_text"] = dl                          # date + free-text mirror agree (§3.5)
+    if "responsible" in body:
+        target = body["responsible"]
+        if not isinstance(target, str) or not target.strip():
+            return error("responsible must be a non-empty display name", 400)
+        target = target.strip()
+        member_names = {" ".join(p for p in (m.get("first_name"), m.get("last_name")) if p).strip()
+                        for m in memberships.members_for_site(conn, caller["company_id"], site_id)}
+        if target not in member_names:
+            return error("assignee must be a member of this site", 400)
+        fields["responsible"] = target
+    if not fields:
+        return error("no editable fields provided", 400)
+
+    updated = action_items.update_action_item_fields(conn, action_item_id, fields, caller["cognito_sub"])
+    if updated is None:
+        return error("action item not found", 404)
+    return ok(updated)
+
+
 def archive_observation_endpoint(conn, caller, obs_id):
     if resolve_scope(caller["global_role"]) != "ALL":
         return error("admin or gm role required", 403)
@@ -1411,9 +1478,9 @@ def render_report_shape(rows, doc, date, folder):
             "participants": t["participants"] or [],
             "summary": t["summary"],
             "key_decisions": [],                    # D3: v1, decisions table deferred
-            "action_items": [{"action": a["text"], "responsible": a["responsible"],
+            "action_items": [{"id": str(a["id"]), "action": a["text"], "responsible": a["responsible"],
                               "deadline": a["deadline_text"] or (str(a["deadline"]) if a["deadline"] else None),
-                              "priority": a["priority"]} for a in t["action_items"]],
+                              "priority": a["priority"], "status": a["status"]} for a in t["action_items"]],
             "safety_flags": flags,
             "related_photos": [ph["s3_key"].rsplit("/", 1)[-1] for ph in t["photos"]],
             "findings": t["findings"],              # additive passthrough (D3)
