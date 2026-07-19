@@ -1050,13 +1050,16 @@ def patch_action_item(conn, caller, action_item_id, body):
     if body is None:
         return error("malformed JSON body", 400)
     row = action_items.get_action_item(conn, action_item_id)
-    if row is None or str(row["company_id"]) != str(caller["company_id"]):
+    # platform_admin (is_cross_company) edits across every tenant; company roles
+    # stay pinned to their own company (mirrors the Team/sites fix in #96).
+    cross = is_cross_company(caller["global_role"])
+    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
         return error("action item not found", 404)            # incl. cross-company
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
         return error("access denied to this task's site", 403)  # reach gate
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL"
+    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
     is_site_authority = site_role in ("pm", "site_manager")
     is_assignee = bool(row["responsible"]) and row["responsible"] == _display_name(caller)
     if not (is_admin or is_site_authority or is_assignee):
@@ -1083,7 +1086,7 @@ def patch_action_item(conn, caller, action_item_id, body):
             return error("responsible must be a non-empty display name", 400)
         target = target.strip()
         member_names = {" ".join(p for p in (m.get("first_name"), m.get("last_name")) if p).strip()
-                        for m in memberships.members_for_site(conn, caller["company_id"], site_id)}
+                        for m in memberships.members_for_site(conn, row["company_id"], site_id)}
         if target not in member_names:
             return error("assignee must be a member of this site", 400)
         fields["responsible"] = target

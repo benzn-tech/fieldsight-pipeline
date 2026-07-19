@@ -3511,6 +3511,20 @@ def test_patch_action_item_cross_company_row_404(wired):
     assert res["statusCode"] == 404
 
 
+def test_patch_action_item_platform_admin_edits_cross_company(wired):
+    """platform_admin (is_cross_company) edits a task in ANOTHER company: both
+    the company-pin 404 and the resolve_scope==ALL authority gate yield to
+    is_cross_company (mirrors the Team/sites fix in #96). A company admin/gm
+    stays pinned — see test_patch_action_item_cross_company_row_404 above."""
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "company_id": "c-platform",
+                                     "global_role": "platform_admin"})
+    seen = _wire_item(wired, item={**AITEM, "company_id": "c-south"})  # task in another company
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"priority": "high"}), None)
+    assert res["statusCode"] == 200 and seen["fields"] == {"priority": "high"}
+
+
 def test_patch_action_item_reassign_to_site_member_ok(wired):
     seen = _wire_item(wired, members=[{"first_name": "Neo", "last_name": "Tan"}])
     res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
