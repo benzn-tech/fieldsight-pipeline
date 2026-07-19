@@ -106,7 +106,7 @@ def test_create_site_includes_slug_in_insert():
     assert row == site_row
     sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
     assert "slug" in sql.split("VALUES")[0]  # column list includes slug
-    assert params == ("c-1", "South Site", None, None, None, None, "south-site", None)
+    assert params == ("c-1", "South Site", None, None, None, None, "south-site", None, None, None)
 
 
 def test_create_site_slug_defaults_to_none():
@@ -115,7 +115,7 @@ def test_create_site_slug_defaults_to_none():
     sites.create_site(conn, "c-1", "No Slug Site")
 
     params = conn.calls[0]["params"]
-    assert params[-2] is None  # slug defaults to None, still passed positionally
+    assert params[6] is None  # slug defaults to None, still passed positionally
 
 
 # ---------------------------------------------------------------------------
