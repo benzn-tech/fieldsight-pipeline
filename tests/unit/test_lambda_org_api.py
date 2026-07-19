@@ -200,7 +200,8 @@ def test_create_site_admin_ok(wired):
     created = {}
 
     def fake_create(conn, company_id, name, location=None, client=None,
-                    industry=None, icon_s3_key=None, address=None):
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None):
         created.update(company_id=company_id, name=name, location=location,
                        address=address)
         return {"id": "s-new", "company_id": company_id, "name": name}
@@ -211,6 +212,59 @@ def test_create_site_admin_ok(wired):
     assert res["statusCode"] == 201
     assert created == {"company_id": "c-uuid-1", "name": "New Site",
                        "location": "Chch", "address": "12 Queen St"}
+
+
+def test_create_site_persists_coordinates(wired):
+    created = {}
+
+    def fake_create(conn, company_id, name, location=None, client=None,
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None):
+        created.update(latitude=latitude, longitude=longitude, address=address)
+        return {"id": "s-geo", "company_id": company_id, "name": name,
+                "latitude": latitude, "longitude": longitude}
+
+    wired.setattr(org.sites, "create_site", fake_create)
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "Geo Site", "address": "1 Colombo St",
+        "latitude": -43.5321, "longitude": 172.6362}), None)
+    assert res["statusCode"] == 201
+    assert created == {"latitude": -43.5321, "longitude": 172.6362,
+                       "address": "1 Colombo St"}
+    assert body_of(res)["latitude"] == -43.5321
+
+
+def test_create_site_rejects_non_numeric_latitude(wired):
+    called = []
+    wired.setattr(org.sites, "create_site",
+                  lambda *a, **k: called.append(1) or {"id": "x"})
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "Bad", "latitude": "not-a-number", "longitude": 10}), None)
+    assert res["statusCode"] == 400
+    assert called == []  # never reached the repo
+
+
+def test_create_site_rejects_out_of_range_longitude(wired):
+    wired.setattr(org.sites, "create_site", lambda *a, **k: {"id": "x"})
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "Bad", "latitude": -43.5, "longitude": 999}), None)
+    assert res["statusCode"] == 400
+
+
+def test_patch_site_persists_coordinates(wired):
+    seen = {}
+
+    def fake_update(conn, site_id, company_id, name=None, location=None,
+                    client=None, industry=None, address=None,
+                    latitude=None, longitude=None):
+        seen.update(latitude=latitude, longitude=longitude)
+        return {"id": site_id, "latitude": latitude, "longitude": longitude}
+
+    wired.setattr(org.sites, "update_site", fake_update)
+    res = org.lambda_handler(make_event("PATCH", "/api/org/sites/s-1", body={
+        "latitude": -41.2865, "longitude": 174.7762}), None)
+    assert res["statusCode"] == 200
+    assert seen == {"latitude": -41.2865, "longitude": 174.7762}
 
 
 def test_create_site_worker_403(wired):
@@ -3119,7 +3173,8 @@ def test_create_site_platform_admin_targets_other_company(wired):
     created = {}
 
     def fake_create(conn, company_id, name, location=None, client=None,
-                    industry=None, icon_s3_key=None, address=None):
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None):
         created.update(company_id=company_id, name=name)
         return {"id": "s-new", "company_id": company_id, "name": name}
 
@@ -3147,7 +3202,8 @@ def test_create_site_admin_own_company_unaffected(wired):
     created = {}
 
     def fake_create(conn, company_id, name, location=None, client=None,
-                    industry=None, icon_s3_key=None, address=None):
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None):
         created.update(company_id=company_id, name=name)
         return {"id": "s-new", "company_id": company_id, "name": name}
 
@@ -3180,7 +3236,8 @@ def test_create_site_default_path_unchanged_regardless_of_graded_roles_flag(wire
     created = {}
 
     def fake_create(conn, company_id, name, location=None, client=None,
-                    industry=None, icon_s3_key=None, address=None):
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None):
         created.update(company_id=company_id, name=name, location=location,
                        address=address)
         return {"id": "s-new", "company_id": company_id, "name": name}

@@ -520,6 +520,19 @@ def list_org_sites(conn, caller, event):
     return ok({"sites": rows})
 
 
+def _coerce_coord(value, lo, hi, label):
+    """Validate an optional coordinate from a request body. Returns
+    (coord_or_None, error_response_or_None). org-api is in-VPC — this only
+    validates; it never geocodes (BUG-36)."""
+    if value is None:
+        return None, None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, error(f"{label} must be a number", 400)
+    if not (lo <= value <= hi):
+        return None, error(f"{label} must be between {lo} and {hi}", 400)
+    return float(value), None
+
+
 def create_org_site(conn, caller, body):
     if caller["global_role"] not in ("admin", "gm", "platform_admin"):
         return error("admin, gm, or platform_admin role required", 403)
@@ -547,11 +560,17 @@ def create_org_site(conn, caller, body):
         if companies.get_company_by_id(conn, req_company_id) is None:
             return error("target company not found", 404)
         target_company_id = req_company_id
+    lat, lat_err = _coerce_coord(body.get("latitude"), -90.0, 90.0, "latitude")
+    if lat_err:
+        return lat_err
+    lng, lng_err = _coerce_coord(body.get("longitude"), -180.0, 180.0, "longitude")
+    if lng_err:
+        return lng_err
     row = sites.create_site(
         conn, target_company_id, name,
         location=body.get("location"), client=body.get("client"),
         industry=body.get("industry"), icon_s3_key=None,
-        address=body.get("address"),
+        address=body.get("address"), latitude=lat, longitude=lng,
     )
     if icon is not None:
         fname = icon.rsplit("/", 1)[-1]
@@ -577,11 +596,17 @@ def patch_org_site(conn, caller, site_id, body):
         pending_prefix = f"{ORG_ASSETS_PREFIX}pending/{caller['cognito_sub']}/"
         if not isinstance(icon, str) or not icon.startswith(pending_prefix):
             return error(f"icon_s3_key must be your pending upload ({pending_prefix}…)", 400)
+    lat, lat_err = _coerce_coord(body.get("latitude"), -90.0, 90.0, "latitude")
+    if lat_err:
+        return lat_err
+    lng, lng_err = _coerce_coord(body.get("longitude"), -180.0, 180.0, "longitude")
+    if lng_err:
+        return lng_err
     row = sites.update_site(
         conn, site_id, caller["company_id"],
         name=name, location=body.get("location"),
         client=body.get("client"), industry=body.get("industry"),
-        address=body.get("address"),
+        address=body.get("address"), latitude=lat, longitude=lng,
     )
     if row is None:
         return error("site not found in your company", 404)
