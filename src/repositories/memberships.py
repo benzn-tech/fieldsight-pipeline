@@ -54,6 +54,26 @@ def list_company_memberships(conn, company_id) -> list[dict]:
     ).fetchall()
 
 
+def count_by_site(conn, site_ids) -> dict:
+    """Active-member count per site, for the Sites-page card KPIs. Returns
+    {site_id(str): count}; sites with no members are absent (caller defaults
+    to 0). In-company invariant enforced via the users<->sites join, so it is
+    correct for every caller including the cross-company platform_admin."""
+    if not site_ids:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT m.site_id, COUNT(*) AS n "
+        "FROM memberships m "
+        "JOIN users u ON u.id = m.user_id "
+        "JOIN sites s ON s.id = m.site_id "
+        "WHERE m.site_id = ANY(%s) AND u.company_id = s.company_id "
+        "AND m.archived_at IS NULL AND u.archived_at IS NULL "
+        "GROUP BY m.site_id",
+        (list(site_ids),),
+    ).fetchall()
+    return {str(r["site_id"]): r["n"] for r in rows}
+
+
 def list_all_memberships(conn) -> list[dict]:
     """Cross-company membership list -- platform_admin only. Mirrors
     list_company_memberships without the company pin; the in-company invariant

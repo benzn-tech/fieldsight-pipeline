@@ -434,6 +434,15 @@ def list_org_sites(conn, caller, event):
         ids = memberships.accessible_site_ids(
             conn, caller["id"], caller["global_role"])
         rows = sites.list_sites_by_ids(conn, ids)
+    # Card KPIs / labels: member count per site + owning company name. Both are
+    # additive and scoped to the sites already returned, so they never widen
+    # visibility -- a platform_admin sees every company here, a company role
+    # only its own. (#2 company tag on sites, #8 Users count.)
+    counts = memberships.count_by_site(conn, [r["id"] for r in rows])
+    co_name = {str(c["id"]): c["name"] for c in companies.list_companies(conn)}
+    for r in rows:
+        r["user_count"] = counts.get(str(r["id"]), 0)
+        r["company_name"] = co_name.get(str(r.get("company_id")))
     return ok({"sites": rows})
 
 
