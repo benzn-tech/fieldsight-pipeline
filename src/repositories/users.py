@@ -93,6 +93,17 @@ def list_company_users(conn, company_id, include_archived=False) -> list[dict]:
     ).fetchall()
 
 
+def list_all_users(conn, include_archived=False) -> list[dict]:
+    """Cross-company user directory -- platform_admin (is_cross_company) only.
+    Mirrors list_company_users WITHOUT the company_id filter so the platform
+    operator's Team directory spans every tenant. Each row still carries
+    company_id (in _COLS) so callers can group / label by company."""
+    guard = "" if include_archived else "WHERE archived_at IS NULL "
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM users {guard}ORDER BY company_id, created_at",
+    ).fetchall()
+
+
 def list_company_logins_unenrolled(conn, company_id) -> list[dict]:
     """Logins (cognito_sub IS NOT NULL) in this company that never got a
     folder_name -- the bulk-backfill route's input set. Excludes field_only

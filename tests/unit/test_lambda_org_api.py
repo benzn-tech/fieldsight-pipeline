@@ -40,6 +40,14 @@ def wired(monkeypatch):
     monkeypatch.setattr(org, "get_connection", lambda *a, **k: FakeConn())
     monkeypatch.setattr(org.users, "get_user_by_sub",
                         lambda conn, sub: dict(CALLER) if sub == "sub-1" else None)
+    # get_me hydrates company_name via get_company_by_id; FakeConn has no
+    # real cursor, so stub it (tests override the name where they assert it).
+    monkeypatch.setattr(org.companies, "get_company_by_id",
+                        lambda conn, cid: {"id": cid, "name": "Acme Co"})
+    # list_org_sites now attaches per-site user_count + company_name; default
+    # these to empty so existing site-list tests don't hit FakeConn's cursor.
+    monkeypatch.setattr(org.memberships, "count_by_site", lambda conn, ids: {})
+    monkeypatch.setattr(org.companies, "list_companies", lambda conn: [])
     return monkeypatch
 
 
@@ -133,7 +141,10 @@ def test_list_sites_admin_gets_company_sites(wired):
                   lambda conn, cid, include_archived=False: [{"id": "s-1", "name": "Alpha"}])
     res = org.lambda_handler(make_event("GET", "/api/org/sites"), None)
     assert res["statusCode"] == 200
-    assert body_of(res)["sites"] == [{"id": "s-1", "name": "Alpha"}]
+    # list_org_sites now decorates every row with user_count + company_name
+    # (defaults 0 / None from the wired fixture's empty stubs).
+    assert body_of(res)["sites"] == [
+        {"id": "s-1", "name": "Alpha", "user_count": 0, "company_name": None}]
 
 
 def test_list_sites_worker_gets_membership_sites(wired):
@@ -144,7 +155,26 @@ def test_list_sites_worker_gets_membership_sites(wired):
     wired.setattr(org.sites, "list_sites_by_ids",
                   lambda conn, ids: [{"id": i, "name": "Beta"} for i in ids])
     res = org.lambda_handler(make_event("GET", "/api/org/sites"), None)
-    assert body_of(res)["sites"] == [{"id": "s-2", "name": "Beta"}]
+    assert body_of(res)["sites"] == [
+        {"id": "s-2", "name": "Beta", "user_count": 0, "company_name": None}]
+
+
+def test_list_sites_decorates_user_count_and_company_name(wired):
+    """Every site row carries member count (#8 Users) + owning company name
+    (#2 company tag), scoped to the sites already returned."""
+    wired.setattr(org.sites, "list_company_sites",
+                  lambda conn, cid, include_archived=False: [
+                      {"id": "s-1", "name": "Alpha", "company_id": "c-south"},
+                      {"id": "s-2", "name": "Beta", "company_id": "c-briv"}])
+    wired.setattr(org.memberships, "count_by_site",
+                  lambda conn, ids: {"s-1": 4})
+    wired.setattr(org.companies, "list_companies", lambda conn: [
+        {"id": "c-south", "name": "Southbase"},
+        {"id": "c-briv", "name": "Briv Construction"}])
+    res = org.lambda_handler(make_event("GET", "/api/org/sites"), None)
+    sites = body_of(res)["sites"]
+    assert sites[0]["user_count"] == 4 and sites[0]["company_name"] == "Southbase"
+    assert sites[1]["user_count"] == 0 and sites[1]["company_name"] == "Briv Construction"
 
 
 def test_list_sites_graded_regional_manager_full_membership_set(wired):
@@ -300,6 +330,35 @@ def test_list_members_worker_403(wired):
                   lambda conn, sub: {**CALLER, "global_role": "worker"})
     res = org.lambda_handler(make_event("GET", "/api/org/members"), None)
     assert res["statusCode"] == 403
+
+
+def test_list_members_platform_admin_spans_all_companies(wired):
+    """platform_admin sits in an empty operator company; its Team directory
+    must span every tenant (list_all_*) and carry a company_name label,
+    NOT company-pin to the caller's own (empty) company."""
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "company_id": "c-platform",
+                                     "global_role": "platform_admin"})
+    # company-pinned reads would be wired to blow up if hit
+    wired.setattr(org.users, "list_company_users",
+                  lambda *a, **k: pytest.fail("must not company-pin"))
+    wired.setattr(org.users, "list_all_users", lambda conn, include_archived=False: [
+        {"id": "u-1", "cognito_sub": "sub-1", "company_id": "c-south"},
+        {"id": "u-2", "cognito_sub": "sub-2", "company_id": "c-briv"},
+    ])
+    wired.setattr(org.memberships, "list_all_memberships", lambda conn: [
+        {"user_id": "u-1", "cognito_sub": "sub-1", "site_id": "s-1", "role": "pm"},
+    ])
+    wired.setattr(org.companies, "list_companies", lambda conn: [
+        {"id": "c-south", "name": "Southbase"},
+        {"id": "c-briv", "name": "Briv Construction"},
+    ])
+    res = org.lambda_handler(make_event("GET", "/api/org/members"), None)
+    assert res["statusCode"] == 200
+    members = body_of(res)["members"]
+    assert members[0]["company_name"] == "Southbase"
+    assert members[0]["memberships"] == [{"site_id": "s-1", "role": "pm"}]
+    assert members[1]["company_name"] == "Briv Construction"
 
 
 def test_patch_role_admin_ok(wired):
@@ -3450,6 +3509,20 @@ def test_patch_action_item_cross_company_row_404(wired):
     res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
                                         body={"priority": "low"}), None)
     assert res["statusCode"] == 404
+
+
+def test_patch_action_item_platform_admin_edits_cross_company(wired):
+    """platform_admin (is_cross_company) edits a task in ANOTHER company: both
+    the company-pin 404 and the resolve_scope==ALL authority gate yield to
+    is_cross_company (mirrors the Team/sites fix in #96). A company admin/gm
+    stays pinned — see test_patch_action_item_cross_company_row_404 above."""
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "company_id": "c-platform",
+                                     "global_role": "platform_admin"})
+    seen = _wire_item(wired, item={**AITEM, "company_id": "c-south"})  # task in another company
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"priority": "high"}), None)
+    assert res["statusCode"] == 200 and seen["fields"] == {"priority": "high"}
 
 
 def test_patch_action_item_reassign_to_site_member_ok(wired):

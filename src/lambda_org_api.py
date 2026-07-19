@@ -457,8 +457,12 @@ def get_me(conn, caller):
     # Strip the request-scoped visible_scope memo (MINOR-1) before echoing the
     # caller profile -- it's an internal cache, not part of the /me contract.
     profile = {k: v for k, v in caller.items() if k != "_visible_scope"}
+    # Company name for the profile UI (the caller carries company_id; surface
+    # the human name too — tenant-split shows each user their company/Corp).
+    company = companies.get_company_by_id(conn, caller["company_id"]) if caller.get("company_id") else None
     return ok({**profile, "site_ids": site_ids,
-               "scope": resolve_scope(caller["global_role"])})
+               "scope": resolve_scope(caller["global_role"]),
+               "company_name": (company or {}).get("name")})
 
 
 def patch_me(conn, caller, body):
@@ -517,6 +521,15 @@ def list_org_sites(conn, caller, event):
         ids = memberships.accessible_site_ids(
             conn, caller["id"], caller["global_role"])
         rows = sites.list_sites_by_ids(conn, ids)
+    # Card KPIs / labels: member count per site + owning company name. Both are
+    # additive and scoped to the sites already returned, so they never widen
+    # visibility -- a platform_admin sees every company here, a company role
+    # only its own. (#2 company tag on sites, #8 Users count.)
+    counts = memberships.count_by_site(conn, [r["id"] for r in rows])
+    co_name = {str(c["id"]): c["name"] for c in companies.list_companies(conn)}
+    for r in rows:
+        r["user_count"] = counts.get(str(r["id"]), 0)
+        r["company_name"] = co_name.get(str(r.get("company_id")))
     return ok({"sites": rows})
 
 
@@ -637,18 +650,31 @@ def list_site_members(conn, caller, site_id):
 # /members
 # ----------------------------------------------------------
 def list_members(conn, caller, event):
-    if resolve_scope(caller["global_role"]) != "ALL":
+    # platform_admin (is_cross_company) sits in its own operator company, so
+    # the legacy resolve_scope==ALL company-pin would return an empty directory
+    # -- span every tenant instead and tag each row with its company name.
+    cross = is_cross_company(caller["global_role"])
+    if not cross and resolve_scope(caller["global_role"]) != "ALL":
         return error("admin or gm role required", 403)
     include_archived = ((event.get("queryStringParameters") or {})
                         .get("include_archived") == "1")
-    rows = users.list_company_users(conn, caller["company_id"],
-                                    include_archived=include_archived)
+    if cross:
+        rows = users.list_all_users(conn, include_archived=include_archived)
+        mem_rows = memberships.list_all_memberships(conn)
+        co_name = {str(c["id"]): c["name"] for c in companies.list_companies(conn)}
+    else:
+        rows = users.list_company_users(conn, caller["company_id"],
+                                        include_archived=include_archived)
+        mem_rows = memberships.list_company_memberships(conn, caller["company_id"])
+        co_name = None
     per_user = {}
-    for mem in memberships.list_company_memberships(conn, caller["company_id"]):
+    for mem in mem_rows:
         per_user.setdefault(mem["user_id"], []).append(
             {"site_id": mem["site_id"], "role": mem["role"]})
     for row in rows:
         row["memberships"] = per_user.get(row["id"], [])
+        if co_name is not None:
+            row["company_name"] = co_name.get(str(row.get("company_id")))
     return ok({"members": rows})
 
 
@@ -1024,13 +1050,16 @@ def patch_action_item(conn, caller, action_item_id, body):
     if body is None:
         return error("malformed JSON body", 400)
     row = action_items.get_action_item(conn, action_item_id)
-    if row is None or str(row["company_id"]) != str(caller["company_id"]):
+    # platform_admin (is_cross_company) edits across every tenant; company roles
+    # stay pinned to their own company (mirrors the Team/sites fix in #96).
+    cross = is_cross_company(caller["global_role"])
+    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
         return error("action item not found", 404)            # incl. cross-company
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
         return error("access denied to this task's site", 403)  # reach gate
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL"
+    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
     is_site_authority = site_role in ("pm", "site_manager")
     is_assignee = bool(row["responsible"]) and row["responsible"] == _display_name(caller)
     if not (is_admin or is_site_authority or is_assignee):
@@ -1057,7 +1086,7 @@ def patch_action_item(conn, caller, action_item_id, body):
             return error("responsible must be a non-empty display name", 400)
         target = target.strip()
         member_names = {" ".join(p for p in (m.get("first_name"), m.get("last_name")) if p).strip()
-                        for m in memberships.members_for_site(conn, caller["company_id"], site_id)}
+                        for m in memberships.members_for_site(conn, row["company_id"], site_id)}
         if target not in member_names:
             return error("assignee must be a member of this site", 400)
         fields["responsible"] = target
