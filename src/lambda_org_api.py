@@ -370,8 +370,12 @@ def get_me(conn, caller):
     # Strip the request-scoped visible_scope memo (MINOR-1) before echoing the
     # caller profile -- it's an internal cache, not part of the /me contract.
     profile = {k: v for k, v in caller.items() if k != "_visible_scope"}
+    # Company name for the profile UI (the caller carries company_id; surface
+    # the human name too — tenant-split shows each user their company/Corp).
+    company = companies.get_company_by_id(conn, caller["company_id"]) if caller.get("company_id") else None
     return ok({**profile, "site_ids": site_ids,
-               "scope": resolve_scope(caller["global_role"])})
+               "scope": resolve_scope(caller["global_role"]),
+               "company_name": (company or {}).get("name")})
 
 
 def patch_me(conn, caller, body):
