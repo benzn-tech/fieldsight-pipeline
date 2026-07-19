@@ -434,6 +434,15 @@ def list_org_sites(conn, caller, event):
         ids = memberships.accessible_site_ids(
             conn, caller["id"], caller["global_role"])
         rows = sites.list_sites_by_ids(conn, ids)
+    # Card KPIs / labels: member count per site + owning company name. Both are
+    # additive and scoped to the sites already returned, so they never widen
+    # visibility -- a platform_admin sees every company here, a company role
+    # only its own. (#2 company tag on sites, #8 Users count.)
+    counts = memberships.count_by_site(conn, [r["id"] for r in rows])
+    co_name = {str(c["id"]): c["name"] for c in companies.list_companies(conn)}
+    for r in rows:
+        r["user_count"] = counts.get(str(r["id"]), 0)
+        r["company_name"] = co_name.get(str(r.get("company_id")))
     return ok({"sites": rows})
 
 
@@ -529,18 +538,31 @@ def list_site_members(conn, caller, site_id):
 # /members
 # ----------------------------------------------------------
 def list_members(conn, caller, event):
-    if resolve_scope(caller["global_role"]) != "ALL":
+    # platform_admin (is_cross_company) sits in its own operator company, so
+    # the legacy resolve_scope==ALL company-pin would return an empty directory
+    # -- span every tenant instead and tag each row with its company name.
+    cross = is_cross_company(caller["global_role"])
+    if not cross and resolve_scope(caller["global_role"]) != "ALL":
         return error("admin or gm role required", 403)
     include_archived = ((event.get("queryStringParameters") or {})
                         .get("include_archived") == "1")
-    rows = users.list_company_users(conn, caller["company_id"],
-                                    include_archived=include_archived)
+    if cross:
+        rows = users.list_all_users(conn, include_archived=include_archived)
+        mem_rows = memberships.list_all_memberships(conn)
+        co_name = {str(c["id"]): c["name"] for c in companies.list_companies(conn)}
+    else:
+        rows = users.list_company_users(conn, caller["company_id"],
+                                        include_archived=include_archived)
+        mem_rows = memberships.list_company_memberships(conn, caller["company_id"])
+        co_name = None
     per_user = {}
-    for mem in memberships.list_company_memberships(conn, caller["company_id"]):
+    for mem in mem_rows:
         per_user.setdefault(mem["user_id"], []).append(
             {"site_id": mem["site_id"], "role": mem["role"]})
     for row in rows:
         row["memberships"] = per_user.get(row["id"], [])
+        if co_name is not None:
+            row["company_name"] = co_name.get(str(row.get("company_id")))
     return ok({"members": rows})
 
 

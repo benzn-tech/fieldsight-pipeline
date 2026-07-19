@@ -21,3 +21,11 @@ def get_company_by_id(conn, company_id) -> dict | None:
         "SELECT id, name, industry, created_at FROM companies WHERE id=%s",
         (company_id,),
     ).fetchone()
+
+
+def list_companies(conn) -> list[dict]:
+    """Every tenant company -- platform_admin cross-company views (Team,
+    Sites) use this to label each user/site with its company name."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, name, industry, created_at FROM companies ORDER BY name",
+    ).fetchall()
