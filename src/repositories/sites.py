@@ -1,14 +1,15 @@
 from psycopg.rows import dict_row
 
-_COLS = "id, company_id, name, location, client, industry, icon_s3_key, created_at, archived_at, slug, address"
+_COLS = "id, company_id, name, location, client, industry, icon_s3_key, created_at, archived_at, slug, address, latitude, longitude"
 
 
 def create_site(conn, company_id, name, location=None, client=None,
-                industry=None, icon_s3_key=None, slug=None, address=None) -> dict:
+                industry=None, icon_s3_key=None, slug=None, address=None,
+                latitude=None, longitude=None) -> dict:
     return conn.cursor(row_factory=dict_row).execute(
-        f"INSERT INTO sites (company_id, name, location, client, industry, icon_s3_key, slug, address) "
-        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
-        (company_id, name, location, client, industry, icon_s3_key, slug, address),
+        f"INSERT INTO sites (company_id, name, location, client, industry, icon_s3_key, slug, address, latitude, longitude) "
+        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
+        (company_id, name, location, client, industry, icon_s3_key, slug, address, latitude, longitude),
     ).fetchone()
 
 
@@ -103,7 +104,8 @@ def set_slug(conn, site_id, slug) -> dict:
 
 
 def update_site(conn, site_id, company_id, name=None, location=None,
-                client=None, industry=None, address=None) -> dict | None:
+                client=None, industry=None, address=None,
+                latitude=None, longitude=None) -> dict | None:
     """None = leave unchanged (same semantics as users.update_profile).
     Company-guarded; archived sites are not editable."""
     return conn.cursor(row_factory=dict_row).execute(
@@ -112,9 +114,12 @@ def update_site(conn, site_id, company_id, name=None, location=None,
         f"  location=COALESCE(%(loc)s, location), "
         f"  client=COALESCE(%(client)s, client), "
         f"  industry=COALESCE(%(ind)s, industry), "
-        f"  address=COALESCE(%(addr)s, address) "
+        f"  address=COALESCE(%(addr)s, address), "
+        f"  latitude=COALESCE(%(lat)s, latitude), "
+        f"  longitude=COALESCE(%(lng)s, longitude) "
         f"WHERE id=%(sid)s AND company_id=%(cid)s AND archived_at IS NULL "
         f"RETURNING {_COLS}",
         {"sid": site_id, "cid": company_id, "name": name, "loc": location,
-         "client": client, "ind": industry, "addr": address},
+         "client": client, "ind": industry, "addr": address,
+         "lat": latitude, "lng": longitude},
     ).fetchone()
