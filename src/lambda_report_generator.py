@@ -63,6 +63,7 @@ import logging
 import re
 import boto3
 import urllib3
+import weather
 from datetime import datetime, timedelta
 from io import BytesIO
 from transcript_utils import (
@@ -500,6 +501,23 @@ def save_debug_record(bucket, target_date, user_name, prompt, raw_response,
 # ============================================================
 # Prompt Builders
 # ============================================================
+
+def build_weather_block_for_site(site_info, target_date, today_iso,
+                                 fetch=weather.fetch_weather):
+    """Fetch the normalized (site, date) weather block, or None when the site
+    has no coordinate (un-backfilled) or the fetch fails. Non-VPC: this runs in
+    ReportGeneratorFunction, which has egress. Coordinate comes from the
+    config/user_mapping.json `sites` block (D-COORD option a)."""
+    lat = site_info.get("latitude")
+    lng = site_info.get("longitude")
+    if lat is None or lng is None:
+        return None
+    try:
+        return fetch(lat, lng, target_date, today_iso)
+    except Exception as e:
+        logger.warning(f"weather fetch failed for {target_date}: {e}")
+        return None
+
 
 def build_daily_prompt(transcripts_with_photos, user_name, site_name, target_date,
                        role=None, total_duration=0.0, num_photos=0, name_mapping=None):
@@ -1273,11 +1291,17 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         user_site_info = sites_info.get(user_site_id, {})
         user_site_name = user_site_info.get('name', site_name)
 
+        weather_block = build_weather_block_for_site(
+            user_site_info, target_date, get_nzdt_now().strftime('%Y-%m-%d'))
+
         prompt = build_daily_prompt(
             correlated, user_name, user_site_name, target_date,
             role=user_role, total_duration=user_data['total_duration'],
             num_photos=len(user_data['photos']), name_mapping=user_mapping,
         )
+        if weather_block:
+            prompt += ("\n\n## Site Weather (for AI correlation)\n"
+                       + weather.weather_prompt_block(weather_block))
 
         max_tokens = min(4096 + n_transcripts * 350, 16000)
         logger.info(f"  {user_name}: {n_transcripts} transcripts \u2192 max_tokens={max_tokens}")
@@ -1358,6 +1382,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
                 'photos': len(user_data['photos']),
                 'per_recording': recording_durations,
             },
+            'weather': weather_block,
             'executive_summary': claude_output.get('executive_summary', ''),
             'quality_and_compliance': claude_output.get('quality_and_compliance', []),
             'safety_observations': claude_output.get('safety_observations', []),
