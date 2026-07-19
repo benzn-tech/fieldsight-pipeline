@@ -529,18 +529,31 @@ def list_site_members(conn, caller, site_id):
 # /members
 # ----------------------------------------------------------
 def list_members(conn, caller, event):
-    if resolve_scope(caller["global_role"]) != "ALL":
+    # platform_admin (is_cross_company) sits in its own operator company, so
+    # the legacy resolve_scope==ALL company-pin would return an empty directory
+    # -- span every tenant instead and tag each row with its company name.
+    cross = is_cross_company(caller["global_role"])
+    if not cross and resolve_scope(caller["global_role"]) != "ALL":
         return error("admin or gm role required", 403)
     include_archived = ((event.get("queryStringParameters") or {})
                         .get("include_archived") == "1")
-    rows = users.list_company_users(conn, caller["company_id"],
-                                    include_archived=include_archived)
+    if cross:
+        rows = users.list_all_users(conn, include_archived=include_archived)
+        mem_rows = memberships.list_all_memberships(conn)
+        co_name = {str(c["id"]): c["name"] for c in companies.list_companies(conn)}
+    else:
+        rows = users.list_company_users(conn, caller["company_id"],
+                                        include_archived=include_archived)
+        mem_rows = memberships.list_company_memberships(conn, caller["company_id"])
+        co_name = None
     per_user = {}
-    for mem in memberships.list_company_memberships(conn, caller["company_id"]):
+    for mem in mem_rows:
         per_user.setdefault(mem["user_id"], []).append(
             {"site_id": mem["site_id"], "role": mem["role"]})
     for row in rows:
         row["memberships"] = per_user.get(row["id"], [])
+        if co_name is not None:
+            row["company_name"] = co_name.get(str(row.get("company_id")))
     return ok({"members": rows})
 
 

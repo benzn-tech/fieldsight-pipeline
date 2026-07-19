@@ -40,6 +40,10 @@ def wired(monkeypatch):
     monkeypatch.setattr(org, "get_connection", lambda *a, **k: FakeConn())
     monkeypatch.setattr(org.users, "get_user_by_sub",
                         lambda conn, sub: dict(CALLER) if sub == "sub-1" else None)
+    # get_me hydrates company_name via get_company_by_id; FakeConn has no
+    # real cursor, so stub it (tests override the name where they assert it).
+    monkeypatch.setattr(org.companies, "get_company_by_id",
+                        lambda conn, cid: {"id": cid, "name": "Acme Co"})
     return monkeypatch
 
 
@@ -246,6 +250,35 @@ def test_list_members_worker_403(wired):
                   lambda conn, sub: {**CALLER, "global_role": "worker"})
     res = org.lambda_handler(make_event("GET", "/api/org/members"), None)
     assert res["statusCode"] == 403
+
+
+def test_list_members_platform_admin_spans_all_companies(wired):
+    """platform_admin sits in an empty operator company; its Team directory
+    must span every tenant (list_all_*) and carry a company_name label,
+    NOT company-pin to the caller's own (empty) company."""
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "company_id": "c-platform",
+                                     "global_role": "platform_admin"})
+    # company-pinned reads would be wired to blow up if hit
+    wired.setattr(org.users, "list_company_users",
+                  lambda *a, **k: pytest.fail("must not company-pin"))
+    wired.setattr(org.users, "list_all_users", lambda conn, include_archived=False: [
+        {"id": "u-1", "cognito_sub": "sub-1", "company_id": "c-south"},
+        {"id": "u-2", "cognito_sub": "sub-2", "company_id": "c-briv"},
+    ])
+    wired.setattr(org.memberships, "list_all_memberships", lambda conn: [
+        {"user_id": "u-1", "cognito_sub": "sub-1", "site_id": "s-1", "role": "pm"},
+    ])
+    wired.setattr(org.companies, "list_companies", lambda conn: [
+        {"id": "c-south", "name": "Southbase"},
+        {"id": "c-briv", "name": "Briv Construction"},
+    ])
+    res = org.lambda_handler(make_event("GET", "/api/org/members"), None)
+    assert res["statusCode"] == 200
+    members = body_of(res)["members"]
+    assert members[0]["company_name"] == "Southbase"
+    assert members[0]["memberships"] == [{"site_id": "s-1", "role": "pm"}]
+    assert members[1]["company_name"] == "Briv Construction"
 
 
 def test_patch_role_admin_ok(wired):
