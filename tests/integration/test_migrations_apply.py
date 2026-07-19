@@ -56,6 +56,23 @@ def test_platform_company_seeded():
         conn.close()
 
 
+def test_sites_has_coordinate_columns():
+    # 0018: nullable lat/lng for weather + map features.
+    conn = _fresh_conn()
+    try:
+        apply_migrations(conn, MIGRATIONS_DIR)
+        cols = {
+            r[0]
+            for r in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='sites'"
+            ).fetchall()
+        }
+        assert {"latitude", "longitude"} <= cols
+    finally:
+        conn.close()
+
+
 def test_platform_company_seed_sql_is_idempotent_on_direct_rerun():
     # Belt-and-suspenders on top of the schema_migrations gate (which already
     # prevents a file from re-running via apply_migrations): even a manual

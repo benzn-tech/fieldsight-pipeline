@@ -25,6 +25,8 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   POST  /api/org/observations             → create safety/quality observation (any member)
   GET   /api/org/observations             → list observations (company-scoped filters)
   PATCH /api/org/observations/{id}        → update status (author or admin/gm)
+  PATCH /api/org/action-items/{id}        → update priority/status/deadline/responsible
+                                             (site-authority ACL + member-validated reassignment)
   POST  /api/org/observations/{id}/archive→ soft-delete observation (admin/gm)
   GET   /api/org/live-items?date=…        → live topics dashboard feed (ACL)
   GET   /api/org/dates?months=&site=      → Timeline dots: report-date index scoped to
@@ -59,8 +61,9 @@ from botocore.exceptions import ClientError
 from psycopg.errors import UniqueViolation
 
 from db.connection import get_connection
-from repositories import (companies, memberships, observations, programme, programme_suggestions,
-                          recordings, rollup, scope, sites, topics, users)
+from repositories import (action_items, companies, memberships, observations, programme,
+                          programme_suggestions, recordings, rollup, scope, sites, topics,
+                          users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
 
 logger = logging.getLogger()
@@ -95,8 +98,17 @@ ALLOWED_MEMBERSHIP_ROLES = {"pm", "site_manager", "worker"}
 ALLOWED_OBSERVATION_KINDS = {"safety", "quality"}
 ALLOWED_RISK_LEVELS = {"low", "medium", "high"}
 ALLOWED_OBSERVATION_STATUS = {"open", "closed"}
+ALLOWED_ACTION_STATUS = {"open", "in_progress", "blocked", "done"}
+ALLOWED_ACTION_PRIORITY = {"low", "medium", "high"}
 RECORDING_KINDS = {"video", "audio", "photo"}
 _KIND_FOLDER = {"video": "video", "audio": "audio", "photo": "pictures"}
+
+# Site voice (off-the-record): a DEDICATED voice/ prefix that matches NO S3
+# event trigger (BUG-13), and the voice_messages table — never recordings /
+# create_recording_upload_url (data-isolation invariant).
+VOICE_PREFIX = os.environ.get("VOICE_PREFIX", "voice/")
+ALLOWED_VOICE_TYPES = {"audio/wav": "wav", "audio/x-wav": "wav",
+                       "audio/mpeg": "mp3", "audio/mp4": "m4a", "audio/aac": "aac"}
 
 _s3_client = None
 _cognito_client = None
@@ -223,6 +235,9 @@ def dispatch(conn, event, method, route):
     m_oa = re.match(r"^/observations/([^/]+)/archive$", route)
     if m_oa and method == "POST":
         return archive_observation_endpoint(conn, caller, m_oa.group(1))
+    m_ai = re.match(r"^/action-items/([^/]+)$", route)
+    if m_ai and method == "PATCH":
+        return patch_action_item(conn, caller, m_ai.group(1), parse_body(event))
 
     if route == "/live-items":
         if method == "GET":
@@ -260,6 +275,14 @@ def dispatch(conn, event, method, route):
     m_rc = re.match(r"^/recordings/([^/]+)/complete$", route)
     if m_rc and method == "POST":
         return complete_recording(conn, caller, m_rc.group(1), parse_body(event))
+
+    if route == "/voice/upload-url" and method == "POST":
+        return create_voice_upload_url(conn, caller, parse_body(event))
+    if route == "/voice/asset-url" and method == "GET":
+        return get_voice_asset_url(event, caller)
+    m_sv = re.match(r"^/sites/([^/]+)/voice$", route)
+    if m_sv and method == "GET":
+        return list_site_voice(conn, caller, m_sv.group(1), event)
 
     return error("not found", 404)
 
@@ -355,6 +378,70 @@ def complete_recording(conn, caller, rec_id, body):
 
 
 # ----------------------------------------------------------
+# /voice — Site voice (off-the-record; dedicated voice/ prefix + voice_messages)
+# ----------------------------------------------------------
+def _voice_s3_key(company_id, site_id, sender_id, file_ext):
+    # Dedicated voice/ prefix — matches NO S3 event trigger (BUG-13 / data
+    # isolation). Scoped by company/site so a listing (and the asset-url ACL)
+    # stays tenant-bounded. sender_id keeps sibling clips distinct in audit.
+    return (f"{VOICE_PREFIX}{_safe_seg(str(company_id))}/{_safe_seg(str(site_id))}/"
+            f"{_safe_seg(str(sender_id))}_{uuid.uuid4().hex}.{file_ext}")
+
+
+def create_voice_upload_url(conn, caller, body):
+    if body is None:
+        return error("malformed JSON body", 400)
+    content_type = body.get("contentType")
+    ext = ALLOWED_VOICE_TYPES.get(content_type) if isinstance(content_type, str) else None
+    if ext is None:
+        return error(f"contentType must be one of {sorted(ALLOWED_VOICE_TYPES)}", 400)
+    site_id = body.get("siteId")
+    if not site_id:
+        return error("siteId is required", 400)
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("site not accessible", 403)
+    key = _voice_s3_key(caller["company_id"], site_id, caller["id"], ext)
+    # NOTE: no voice_messages insert here — sendVoice (Task 6) is the sole writer
+    # of the row (created when the clip is actually sent). An abandoned recording
+    # thus leaves at most an orphan S3 object, reaped by the 30-day voice/ lifecycle.
+    url = s3().generate_presigned_url(
+        "put_object",
+        Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": content_type},
+        ExpiresIn=PRESIGNED_URL_EXPIRY)
+    return ok({"uploadUrl": url, "s3Key": key})
+
+
+def get_voice_asset_url(event, caller):
+    """Presigned GET for a voice clip. Tenant-isolated: the key must live under
+    the caller's own company prefix (voice/{company}/...), so a caller can only
+    fetch their company's clips."""
+    key = (event.get("queryStringParameters") or {}).get("key", "")
+    prefix = f"{VOICE_PREFIX}{_safe_seg(str(caller['company_id']))}/"
+    if not key.startswith(prefix):
+        return error("key must be one of your company's voice clips", 400)
+    url = s3().generate_presigned_url(
+        "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=PRESIGNED_URL_EXPIRY)
+    return ok({"url": url, "expiresIn": PRESIGNED_URL_EXPIRY})
+
+
+def list_site_voice(conn, caller, site_id, event):
+    """Reconnect backfill: recent voice messages on a site the caller can see.
+    ACL mirrors list_site_members / list_live_items (_allowed_site_ids)."""
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    since = (event.get("queryStringParameters") or {}).get("since") or "1970-01-01T00:00:00Z"
+    rows = voice_messages.list_since(conn, caller["company_id"], site_id, since)
+    # Serialize to camelCase (matches upload-url/asset-url + the app's parser);
+    # never leak snake_case DB column names across the API boundary.
+    items = [{"s3Key": r["s3_key"], "senderUserId": str(r["sender_user_id"]),
+              "durationS": float(r["duration_s"]) if r["duration_s"] is not None else None,
+              "createdAt": r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else str(r["created_at"])}
+             for r in rows]
+    return ok({"items": items, "site": str(site_id)})
+
+
+# ----------------------------------------------------------
 # /me
 # ----------------------------------------------------------
 def get_me(conn, caller):
@@ -446,6 +533,19 @@ def list_org_sites(conn, caller, event):
     return ok({"sites": rows})
 
 
+def _coerce_coord(value, lo, hi, label):
+    """Validate an optional coordinate from a request body. Returns
+    (coord_or_None, error_response_or_None). org-api is in-VPC — this only
+    validates; it never geocodes (BUG-36)."""
+    if value is None:
+        return None, None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, error(f"{label} must be a number", 400)
+    if not (lo <= value <= hi):
+        return None, error(f"{label} must be between {lo} and {hi}", 400)
+    return float(value), None
+
+
 def create_org_site(conn, caller, body):
     if caller["global_role"] not in ("admin", "gm", "platform_admin"):
         return error("admin, gm, or platform_admin role required", 403)
@@ -473,11 +573,17 @@ def create_org_site(conn, caller, body):
         if companies.get_company_by_id(conn, req_company_id) is None:
             return error("target company not found", 404)
         target_company_id = req_company_id
+    lat, lat_err = _coerce_coord(body.get("latitude"), -90.0, 90.0, "latitude")
+    if lat_err:
+        return lat_err
+    lng, lng_err = _coerce_coord(body.get("longitude"), -180.0, 180.0, "longitude")
+    if lng_err:
+        return lng_err
     row = sites.create_site(
         conn, target_company_id, name,
         location=body.get("location"), client=body.get("client"),
         industry=body.get("industry"), icon_s3_key=None,
-        address=body.get("address"),
+        address=body.get("address"), latitude=lat, longitude=lng,
     )
     if icon is not None:
         fname = icon.rsplit("/", 1)[-1]
@@ -503,11 +609,17 @@ def patch_org_site(conn, caller, site_id, body):
         pending_prefix = f"{ORG_ASSETS_PREFIX}pending/{caller['cognito_sub']}/"
         if not isinstance(icon, str) or not icon.startswith(pending_prefix):
             return error(f"icon_s3_key must be your pending upload ({pending_prefix}…)", 400)
+    lat, lat_err = _coerce_coord(body.get("latitude"), -90.0, 90.0, "latitude")
+    if lat_err:
+        return lat_err
+    lng, lng_err = _coerce_coord(body.get("longitude"), -180.0, 180.0, "longitude")
+    if lng_err:
+        return lng_err
     row = sites.update_site(
         conn, site_id, caller["company_id"],
         name=name, location=body.get("location"),
         client=body.get("client"), industry=body.get("industry"),
-        address=body.get("address"),
+        address=body.get("address"), latitude=lat, longitude=lng,
     )
     if row is None:
         return error("site not found in your company", 404)
@@ -922,6 +1034,65 @@ def patch_observation_status(conn, caller, obs_id, body):
     if row["author_sub"] != caller["cognito_sub"] and resolve_scope(caller["global_role"]) != "ALL":
         return error("author or admin/gm role required", 403)
     updated = observations.set_status(conn, caller["company_id"], obs_id, status)
+    return ok(updated)
+
+
+def _display_name(caller):
+    return " ".join(p for p in (caller.get("first_name"), caller.get("last_name")) if p).strip()
+
+
+def patch_action_item(conn, caller, action_item_id, body):
+    """Edit priority/status/deadline/responsible on one action item (spec §3).
+    ACL mirrors patch_observation_status widened to site authority: the task's
+    site must be in the caller's reach, and the caller must be admin/gm, a
+    pm/site_manager of THAT site, or the current assignee. Reassignment target
+    must be a member of the task's site. Addressed by durable action_items.id."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    row = action_items.get_action_item(conn, action_item_id)
+    if row is None or str(row["company_id"]) != str(caller["company_id"]):
+        return error("action item not found", 404)            # incl. cross-company
+    site_id = str(row["site_id"])
+    if site_id not in _allowed_site_ids(conn, caller):
+        return error("access denied to this task's site", 403)  # reach gate
+    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
+    is_admin = resolve_scope(caller["global_role"]) == "ALL"
+    is_site_authority = site_role in ("pm", "site_manager")
+    is_assignee = bool(row["responsible"]) and row["responsible"] == _display_name(caller)
+    if not (is_admin or is_site_authority or is_assignee):
+        return error("admin/gm, this site's pm/site_manager, or the assignee only", 403)
+
+    fields = {}
+    if "priority" in body:
+        if body["priority"] not in ALLOWED_ACTION_PRIORITY:
+            return error(f"priority must be one of {sorted(ALLOWED_ACTION_PRIORITY)}", 400)
+        fields["priority"] = body["priority"]
+    if "status" in body:
+        if body["status"] not in ALLOWED_ACTION_STATUS:
+            return error(f"status must be one of {sorted(ALLOWED_ACTION_STATUS)}", 400)
+        fields["status"] = body["status"]
+    if "deadline" in body:
+        dl = body["deadline"]
+        if dl is not None and not (isinstance(dl, str) and REPORT_DATE_RE.match(dl)):
+            return error("deadline must be YYYY-MM-DD or null", 400)
+        fields["deadline"] = dl                               # write both so the
+        fields["deadline_text"] = dl                          # date + free-text mirror agree (§3.5)
+    if "responsible" in body:
+        target = body["responsible"]
+        if not isinstance(target, str) or not target.strip():
+            return error("responsible must be a non-empty display name", 400)
+        target = target.strip()
+        member_names = {" ".join(p for p in (m.get("first_name"), m.get("last_name")) if p).strip()
+                        for m in memberships.members_for_site(conn, caller["company_id"], site_id)}
+        if target not in member_names:
+            return error("assignee must be a member of this site", 400)
+        fields["responsible"] = target
+    if not fields:
+        return error("no editable fields provided", 400)
+
+    updated = action_items.update_action_item_fields(conn, action_item_id, fields, caller["cognito_sub"])
+    if updated is None:
+        return error("action item not found", 404)
     return ok(updated)
 
 
@@ -1358,9 +1529,9 @@ def render_report_shape(rows, doc, date, folder):
             "participants": t["participants"] or [],
             "summary": t["summary"],
             "key_decisions": [],                    # D3: v1, decisions table deferred
-            "action_items": [{"action": a["text"], "responsible": a["responsible"],
+            "action_items": [{"id": str(a["id"]), "action": a["text"], "responsible": a["responsible"],
                               "deadline": a["deadline_text"] or (str(a["deadline"]) if a["deadline"] else None),
-                              "priority": a["priority"]} for a in t["action_items"]],
+                              "priority": a["priority"], "status": a["status"]} for a in t["action_items"]],
             "safety_flags": flags,
             "related_photos": [ph["s3_key"].rsplit("/", 1)[-1] for ph in t["photos"]],
             "findings": t["findings"],              # additive passthrough (D3)

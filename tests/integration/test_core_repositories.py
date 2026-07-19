@@ -50,6 +50,20 @@ def test_company_user_site_roundtrip(db):
     assert [x["address"] for x in sites.list_company_sites(db, co["id"])] == ["12 Queen St"]
 
 
+def test_site_coordinates_create_and_update(db):
+    co = companies.create_company(db, "GeoCo")
+    s = sites.create_site(db, co["id"], "Depot", address="1 Colombo St",
+                          latitude=-43.5321, longitude=172.6362)
+    assert s["latitude"] == -43.5321 and s["longitude"] == 172.6362
+    got = sites.get_site(db, s["id"])
+    assert got["latitude"] == -43.5321 and got["longitude"] == 172.6362
+
+    # update_site: None leaves a column unchanged (COALESCE), a value overwrites
+    upd = sites.update_site(db, s["id"], co["id"], latitude=-41.2865, longitude=174.7762)
+    assert upd["latitude"] == -41.2865 and upd["longitude"] == 174.7762
+    assert upd["address"] == "1 Colombo St"  # untouched column preserved
+
+
 def test_upsert_user_partial_update_preserves_role_and_company(db):
     co = companies.create_company(db, "Acme")
     u1 = users.upsert_user(db, "sub-pm", "pm@acme.com", company_id=co["id"], global_role="pm")

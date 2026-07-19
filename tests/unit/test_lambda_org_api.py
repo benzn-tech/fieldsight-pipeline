@@ -230,7 +230,8 @@ def test_create_site_admin_ok(wired):
     created = {}
 
     def fake_create(conn, company_id, name, location=None, client=None,
-                    industry=None, icon_s3_key=None, address=None):
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None):
         created.update(company_id=company_id, name=name, location=location,
                        address=address)
         return {"id": "s-new", "company_id": company_id, "name": name}
@@ -241,6 +242,59 @@ def test_create_site_admin_ok(wired):
     assert res["statusCode"] == 201
     assert created == {"company_id": "c-uuid-1", "name": "New Site",
                        "location": "Chch", "address": "12 Queen St"}
+
+
+def test_create_site_persists_coordinates(wired):
+    created = {}
+
+    def fake_create(conn, company_id, name, location=None, client=None,
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None):
+        created.update(latitude=latitude, longitude=longitude, address=address)
+        return {"id": "s-geo", "company_id": company_id, "name": name,
+                "latitude": latitude, "longitude": longitude}
+
+    wired.setattr(org.sites, "create_site", fake_create)
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "Geo Site", "address": "1 Colombo St",
+        "latitude": -43.5321, "longitude": 172.6362}), None)
+    assert res["statusCode"] == 201
+    assert created == {"latitude": -43.5321, "longitude": 172.6362,
+                       "address": "1 Colombo St"}
+    assert body_of(res)["latitude"] == -43.5321
+
+
+def test_create_site_rejects_non_numeric_latitude(wired):
+    called = []
+    wired.setattr(org.sites, "create_site",
+                  lambda *a, **k: called.append(1) or {"id": "x"})
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "Bad", "latitude": "not-a-number", "longitude": 10}), None)
+    assert res["statusCode"] == 400
+    assert called == []  # never reached the repo
+
+
+def test_create_site_rejects_out_of_range_longitude(wired):
+    wired.setattr(org.sites, "create_site", lambda *a, **k: {"id": "x"})
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "Bad", "latitude": -43.5, "longitude": 999}), None)
+    assert res["statusCode"] == 400
+
+
+def test_patch_site_persists_coordinates(wired):
+    seen = {}
+
+    def fake_update(conn, site_id, company_id, name=None, location=None,
+                    client=None, industry=None, address=None,
+                    latitude=None, longitude=None):
+        seen.update(latitude=latitude, longitude=longitude)
+        return {"id": site_id, "latitude": latitude, "longitude": longitude}
+
+    wired.setattr(org.sites, "update_site", fake_update)
+    res = org.lambda_handler(make_event("PATCH", "/api/org/sites/s-1", body={
+        "latitude": -41.2865, "longitude": 174.7762}), None)
+    assert res["statusCode"] == 200
+    assert seen == {"latitude": -41.2865, "longitude": 174.7762}
 
 
 def test_create_site_worker_403(wired):
@@ -2192,18 +2246,31 @@ def test_render_shape_safety_flags_from_findings_with_legacy_fallback():
 
 def test_render_shape_deadline_prefers_deadline_text():
     row = _topic_row(action_items=[
-        {"text": "Order tape", "responsible": "Ada", "priority": "high",
-         "deadline_text": "Tomorrow 8am", "deadline": "2026-07-15"},
-        {"text": "Fix rail", "responsible": "Sam", "priority": "medium",
-         "deadline_text": None, "deadline": "2026-07-16"},
-        {"text": "Sweep site", "responsible": None, "priority": "low",
-         "deadline_text": None, "deadline": None},
+        {"id": "a-1", "text": "Order tape", "responsible": "Ada", "priority": "high",
+         "deadline_text": "Tomorrow 8am", "deadline": "2026-07-15", "status": "open"},
+        {"id": "a-2", "text": "Fix rail", "responsible": "Sam", "priority": "medium",
+         "deadline_text": None, "deadline": "2026-07-16", "status": "open"},
+        {"id": "a-3", "text": "Sweep site", "responsible": None, "priority": "low",
+         "deadline_text": None, "deadline": None, "status": "open"},
     ])
     shape = org.render_report_shape([row], None, "2026-07-14", "Ada_L")
     items = shape["topics"][0]["action_items"]
     assert items[0]["deadline"] == "Tomorrow 8am"   # deadline_text wins over deadline
     assert items[1]["deadline"] == "2026-07-16"      # falls back to str(deadline)
     assert items[2]["deadline"] is None              # neither present
+
+
+def test_render_report_shape_exposes_action_item_id_and_status():
+    # editable-tasks-reassignment Task 1: the durable id + authoritative
+    # status must be on each rendered action item so the card can PATCH it.
+    row = _topic_row(action_items=[
+        {"id": "a-1", "text": "do X", "responsible": "Neo Tan",
+         "deadline": None, "deadline_text": "Tomorrow", "priority": "high", "status": "done"},
+    ])
+    shape = org.render_report_shape([row], None, "2026-07-18", "Neo_Tan")
+    item = shape["topics"][0]["action_items"][0]
+    assert item["id"] == "a-1" and item["status"] == "done"
+    assert item["action"] == "do X" and item["responsible"] == "Neo Tan"
 
 
 def test_render_shape_merges_doc_prose_fields():
@@ -3165,7 +3232,8 @@ def test_create_site_platform_admin_targets_other_company(wired):
     created = {}
 
     def fake_create(conn, company_id, name, location=None, client=None,
-                    industry=None, icon_s3_key=None, address=None):
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None):
         created.update(company_id=company_id, name=name)
         return {"id": "s-new", "company_id": company_id, "name": name}
 
@@ -3193,7 +3261,8 @@ def test_create_site_admin_own_company_unaffected(wired):
     created = {}
 
     def fake_create(conn, company_id, name, location=None, client=None,
-                    industry=None, icon_s3_key=None, address=None):
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None):
         created.update(company_id=company_id, name=name)
         return {"id": "s-new", "company_id": company_id, "name": name}
 
@@ -3226,7 +3295,8 @@ def test_create_site_default_path_unchanged_regardless_of_graded_roles_flag(wire
     created = {}
 
     def fake_create(conn, company_id, name, location=None, client=None,
-                    industry=None, icon_s3_key=None, address=None):
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None):
         created.update(company_id=company_id, name=name, location=location,
                        address=address)
         return {"id": "s-new", "company_id": company_id, "name": name}
@@ -3362,3 +3432,107 @@ def test_patch_member_role_platform_admin_may_grant_platform_admin(wired):
         "PATCH", "/api/org/members/sub-2/role", body={"global_role": "platform_admin"}), None)
     assert res["statusCode"] == 200
     assert seen["role"] == "platform_admin"
+
+
+# ----------------------------------------------------------
+# PATCH /api/org/action-items/{id} (editable-tasks-reassignment spec Task 1)
+# ACL: admin/gm (resolve_scope ALL), this site's pm/site_manager (membership
+# authority via memberships.caller_site_roles), or the current assignee
+# (responsible == caller's display name) may edit; the task's site must
+# also be in the caller's reach (_allowed_site_ids). Reassignment target
+# must be a member of the task's site (memberships.members_for_site).
+# ----------------------------------------------------------
+AITEM = {"id": "a-1", "site_id": SITE_ID, "company_id": "c-uuid-1",
+         "responsible": "Ada Owner", "status": "open", "priority": "low"}
+
+
+def _wire_item(wired, item=AITEM, roles=None, members=None):
+    wired.setattr(org.action_items, "get_action_item", lambda conn, i: dict(item))
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {item["site_id"]})
+    wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: roles or {})
+    wired.setattr(org.memberships, "members_for_site",
+                  lambda conn, cid, sid: members or [{"first_name": "Neo", "last_name": "Tan"}])
+    seen = {}
+    wired.setattr(org.action_items, "update_action_item_fields",
+                  lambda conn, i, fields, by: (seen.update(fields=fields, by=by) or {**item, **fields}))
+    return seen
+
+
+def test_patch_action_item_admin_updates_priority(wired):
+    seen = _wire_item(wired)                                   # CALLER is admin (resolve_scope ALL)
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"priority": "medium"}), None)
+    assert res["statusCode"] == 200
+    assert seen["fields"] == {"priority": "medium"} and seen["by"] == CALLER["cognito_sub"]
+
+
+def test_patch_action_item_site_manager_of_site_may_edit(wired):
+    wired.setattr(org.users, "get_user_by_sub", lambda conn, sub: {**CALLER, "global_role": "worker"})
+    seen = _wire_item(wired, roles={SITE_ID: "site_manager"})  # membership authority, not admin
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"status": "blocked"}), None)
+    assert res["statusCode"] == 200 and seen["fields"] == {"status": "blocked"}
+
+
+def test_patch_action_item_current_assignee_may_edit_own(wired):
+    caller = {**CALLER, "global_role": "worker", "first_name": "Ada", "last_name": "Owner"}
+    wired.setattr(org.users, "get_user_by_sub", lambda conn, sub: caller)
+    seen = _wire_item(wired, roles={})                         # no site role, but IS the assignee
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"status": "done"}), None)
+    assert res["statusCode"] == 200 and seen["fields"] == {"status": "done"}
+
+
+def test_patch_action_item_outsider_worker_denied_403(wired):
+    wired.setattr(org.users, "get_user_by_sub", lambda conn, sub: {**CALLER, "global_role": "worker",
+                                                                   "first_name": "X", "last_name": "Y"})
+    _wire_item(wired, roles={SITE_ID: "worker"})               # worker on the site, not the assignee
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"status": "done"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_patch_action_item_site_out_of_reach_403(wired):
+    wired.setattr(org.action_items, "get_action_item",
+                  lambda conn, i: {**AITEM, "site_id": OTHER_SITE_ID})
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})   # not OTHER_SITE_ID
+    called = []
+    wired.setattr(org.action_items, "update_action_item_fields", lambda *a, **k: called.append(1))
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"priority": "low"}), None)
+    assert res["statusCode"] == 403 and called == []          # never written
+
+
+def test_patch_action_item_cross_company_row_404(wired):
+    wired.setattr(org.action_items, "get_action_item",
+                  lambda conn, i: {**AITEM, "company_id": "OTHER-CO"})
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"priority": "low"}), None)
+    assert res["statusCode"] == 404
+
+
+def test_patch_action_item_reassign_to_site_member_ok(wired):
+    seen = _wire_item(wired, members=[{"first_name": "Neo", "last_name": "Tan"}])
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"responsible": "Neo Tan"}), None)
+    assert res["statusCode"] == 200 and seen["fields"] == {"responsible": "Neo Tan"}
+
+
+def test_patch_action_item_reassign_to_non_member_400(wired):
+    _wire_item(wired, members=[{"first_name": "Neo", "last_name": "Tan"}])
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"responsible": "Someone Else"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_patch_action_item_bad_status_400(wired):
+    _wire_item(wired)
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"status": "finished"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_patch_action_item_empty_body_400(wired):
+    _wire_item(wired)
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1", body={}), None)
+    assert res["statusCode"] == 400
