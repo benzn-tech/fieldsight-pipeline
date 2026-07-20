@@ -2660,16 +2660,35 @@ def test_dates_with_accessible_site_scopes_to_it(wired):
 
 def test_site_members_returns_members_for_accessible_site(wired):
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.sites, "get_site", lambda conn, sid: {"id": sid, "company_id": "c-site-co"})
     seen = {}
     wired.setattr(org.memberships, "members_for_site",
                   lambda conn, cid, sid: (seen.update(cid=cid, sid=sid)
                                           or [{"id": "u-1", "first_name": "Ada", "site_role": "worker"}]))
     res = org.lambda_handler(make_event("GET", "/api/org/sites/" + SITE_ID + "/members"), None)
     assert res["statusCode"] == 200
-    assert seen == {"cid": "c-uuid-1", "sid": SITE_ID}   # company from caller, site from the URL
+    assert seen == {"cid": "c-site-co", "sid": SITE_ID}   # company from the SITE, not the caller
     body = body_of(res)
     assert body["site"] == SITE_ID
     assert body["members"][0]["first_name"] == "Ada"
+
+
+def test_site_members_platform_admin_cross_company_uses_site_company(wired):
+    """platform_admin reaches a site in ANOTHER company; the roster query must
+    pin to the SITE's company (else members_for_site returns [] for the empty
+    operator company). Fixes the empty assignee-roster gap (same class as #96)."""
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "company_id": "c-platform",
+                                     "global_role": "platform_admin"})
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.sites, "get_site", lambda conn, sid: {"id": sid, "company_id": "c-south"})
+    seen = {}
+    wired.setattr(org.memberships, "members_for_site",
+                  lambda conn, cid, sid: (seen.update(cid=cid)
+                                          or [{"id": "u-1", "first_name": "Neo"}]))
+    res = org.lambda_handler(make_event("GET", "/api/org/sites/" + SITE_ID + "/members"), None)
+    assert res["statusCode"] == 200 and seen["cid"] == "c-south"
+    assert body_of(res)["members"][0]["first_name"] == "Neo"
 
 
 def test_site_members_denies_site_outside_accessible_set_403(wired):
