@@ -354,3 +354,37 @@ def list_extraction_folder_names_for_date(conn, company_id, report_date) -> list
         (report_date, company_id),
     ).fetchall()
     return [r["folder_name"] for r in rows]
+
+
+def get_topic_full(conn, topic_id) -> dict | None:
+    """One topic row (joined site_name/user_name) plus its action_items /
+    safety_observations / findings / photos children, shaped EXACTLY like a
+    list_topics_for_source_prefix element so render_report_shape can consume
+    [row]. Used by the per-topic reindex builder (reindex.enqueue_topic_
+    reindex). Returns None if the id is missing/malformed."""
+    rows = conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_TOPIC_COLS_JOINED}, "
+        f"s.name AS site_name, (u.first_name || ' ' || u.last_name) AS user_name "
+        f"FROM topics t "
+        f"LEFT JOIN sites s ON s.id = t.site_id "
+        f"LEFT JOIN users u ON u.id = t.user_id "
+        f"WHERE t.id=%s",
+        (topic_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    t = rows[0]
+    tids = [t["id"]]
+    t["action_items"] = conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, topic_id, text, responsible, deadline, deadline_text, "
+        "priority, status, created_at FROM action_items WHERE topic_id = ANY(%s) "
+        "ORDER BY created_at", (tids,)).fetchall()
+    t["safety_observations"] = conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, topic_id, observation, risk_level, location, status, "
+        "created_at FROM safety_observations WHERE topic_id = ANY(%s) "
+        "ORDER BY created_at", (tids,)).fetchall()
+    t["findings"] = findings.list_for_topics(conn, tids)
+    t["photos"] = conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, topic_id, s3_key, caption_text FROM topic_photos "
+        "WHERE topic_id = ANY(%s) ORDER BY created_at", (tids,)).fetchall()
+    return t
