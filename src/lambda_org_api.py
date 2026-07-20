@@ -651,11 +651,20 @@ def patch_org_site(conn, caller, site_id, body):
 def list_site_members(conn, caller, site_id):
     """Members of one site, from memberships (NOT user_mapping) -- the Aurora
     replacement for legacy /site-users. ACL mirrors /live-items: the site id
-    must be in the caller's accessible set (admin/gm -> company sites,
-    else memberships), which also blocks cross-company and archived sites."""
+    must be in the caller's accessible set (graded reach -> platform_admin
+    spans companies), which also blocks archived sites."""
     if str(site_id) not in _allowed_site_ids(conn, caller):
         return error("access denied to this site", 403)
-    rows = memberships.members_for_site(conn, caller["company_id"], site_id)
+    # Query members with the SITE's company, not the caller's. members_for_site
+    # is company-pinned on both joins; pinning to caller["company_id"] returns
+    # [] for a cross-company site the platform_admin operator can legitimately
+    # reach (its own operator company is empty). The reach gate above already
+    # authorized the site, and its company is the correct tenant. For every
+    # non-cross caller the site's company == caller's, so behavior is unchanged.
+    site = sites.get_site(conn, site_id)
+    if site is None:
+        return error("site not found", 404)
+    rows = memberships.members_for_site(conn, site["company_id"], site_id)
     return ok({"members": rows, "site": str(site_id)})
 
 
