@@ -3,7 +3,17 @@
 PATCH /api/org/content/{table}/{id}. Excludes categorical/enum fields
 (domain/severity/category/status/priority/deadline) -- those are extraction
 judgments or task metadata, not transcription errors (spec §3). Generalizes
-action_items.get_action_item / update_action_item_fields."""
+action_items.get_action_item / update_action_item_fields.
+
+Phase F Task 24 (D8 retirement, spec §8): safety_observations was removed
+from EDITABLE (and its _SELECT entry dropped) -- findings is now the single
+editable source for safety/quality content. A correction to a safety/quality
+finding's `observation` (etc.) already lands on the findings row via the
+`findings` entry below, and Tasks 21/22 make that the row SAFETY/QUALITY
+reads FROM -- so the correction propagates automatically. Editing
+safety_observations directly would target the unlinked legacy table and
+never be seen again. The safety_observations TABLE itself is untouched
+(still exists, unread here, for rollback)."""
 import psycopg
 from psycopg.rows import dict_row
 
@@ -12,7 +22,6 @@ EDITABLE = {
     "topics": {"title", "summary"},
     "action_items": {"text", "responsible"},
     "findings": {"observation", "recommended_action", "entity_name", "entity_trade"},
-    "safety_observations": {"observation"},
 }
 
 # Per-table SELECT that returns id, site_id, company_id, author_user_id, plus
@@ -34,11 +43,6 @@ _SELECT = {
         "SELECT x.id, x.site_id, s.company_id, tp.user_id AS author_user_id, "
         "x.observation, x.recommended_action, x.entity_name, x.entity_trade "
         "FROM findings x JOIN sites s ON s.id = x.site_id "
-        "JOIN topics tp ON tp.id = x.topic_id WHERE x.id=%s"),
-    "safety_observations": (
-        "SELECT x.id, x.site_id, s.company_id, tp.user_id AS author_user_id, "
-        "x.observation "
-        "FROM safety_observations x JOIN sites s ON s.id = x.site_id "
         "JOIN topics tp ON tp.id = x.topic_id WHERE x.id=%s"),
 }
 

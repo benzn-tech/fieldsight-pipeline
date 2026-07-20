@@ -6,6 +6,30 @@ from repositories import findings
 _TOPIC_COLS = ("id, site_id, user_id, source_s3_key, report_date, occurred_at, "
                "category, title, summary, time_range, participants, source, created_at")
 
+# Phase F (D8 retirement, spec §8): severity -> risk_level, for reshaping
+# safety-domain findings into the legacy safety_observations row shape.
+# Mirrors lambda_org_api._SEV_TO_RISK / lambda_extract_session._SEV_TO_RISK
+# (kept as a small local copy -- importing from lambda_org_api would be
+# circular, since it imports this module).
+_SEV_TO_RISK = {"major": "high", "minor": "medium", "none": "low"}
+
+
+def _findings_as_safety_rows(topic_findings):
+    """Reshape one topic's safety-domain findings into the legacy
+    safety_observations row shape ({id, topic_id, observation, risk_level,
+    location, status, created_at}) so existing consumers of the
+    safety_observations child slot keep working unchanged while the
+    underlying source of truth becomes `findings` (Phase F / D8 retirement,
+    spec §8: a corrected finding.observation must reach this slot
+    immediately, not the unlinked legacy dual-write copy). location has no
+    findings equivalent -- always None (findings has no location column).
+    All access is defensive .get() -- findings dicts vary by call site."""
+    return [{
+        "id": f.get("id"), "topic_id": f.get("topic_id"), "observation": f.get("observation"),
+        "risk_level": _SEV_TO_RISK.get(f.get("severity"), "medium"),
+        "location": None, "status": f.get("status"), "created_at": f.get("created_at"),
+    } for f in topic_findings if f.get("domain") == "safety"]
+
 
 def _escape_like(prefix) -> str:
     """Escapes SQL LIKE wildcards ('%' and '_') in a literal prefix so it can
@@ -172,6 +196,18 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None) -> lis
     concern, not a read-path one; consumers (e.g. /live-items) get the flat
     columns straight off the `findings` table, same as every other child.
 
+    Phase F (D8 retirement, spec §8): the `safety_observations` child slot
+    itself is now SOURCED from safety-domain findings first (via
+    _findings_as_safety_rows, reusing the already-fetched findings -- no
+    extra query), falling back to the raw safety_observations rows for a
+    topic ONLY when it has zero safety-domain findings (pre-#46 legacy
+    extractions that predate the findings table). This makes the /live-items
+    dashboard feed -- which the frontend reads `topic.safety_observations`
+    off of directly, with no findings-aware merge of its own -- reflect a
+    finding.observation correction immediately instead of the unlinked
+    dual-write copy. The safety_observations query itself is kept (not
+    removed) precisely to preserve that legacy-topic fallback.
+
     author_ids (visibility spec §3.1 user_scope, Phase 3 graded roles)
     optionally restricts results to topics whose t.user_id is in the
     caller's resolved allow-set; None (default) = no per-author filter,
@@ -226,8 +262,11 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None) -> lis
 
     for t in topic_rows:
         t["action_items"] = action_items_by_topic.get(t["id"], [])
-        t["safety_observations"] = safety_by_topic.get(t["id"], [])
-        t["findings"] = findings_by_topic.get(t["id"], [])
+        t_findings = findings_by_topic.get(t["id"], [])
+        # Phase F / D8 retirement (spec §8): findings-first, legacy-fallback.
+        t["safety_observations"] = (_findings_as_safety_rows(t_findings)
+                                    or safety_by_topic.get(t["id"], []))
+        t["findings"] = t_findings
         t["is_live"] = bool(t["source_s3_key"]) and t["source_s3_key"].startswith("extractions/")
 
     return topic_rows
@@ -282,7 +321,17 @@ def list_topics_for_source_prefix(conn, source_prefix) -> list[dict]:
     ORDER BY time_range NULLS LAST, created_at, id gives D3 stable ordering
     (time_range is a free-text display field, not sortable as a real range,
     but groups topics that share one, with created_at/id as tiebreakers for
-    topics with no time_range)."""
+    topics with no time_range).
+
+    Phase F (D8 retirement, spec §8): the safety_observations child slot
+    itself is findings-first with a per-topic legacy fallback, same
+    _findings_as_safety_rows rule as list_topics_for_date -- see that
+    docstring. render_report_shape (the shim's own consumer) already layers
+    a findings-vs-safety_observations preference of its own on top of this;
+    this fix makes that layering redundant-but-harmless rather than
+    load-bearing (NOTE: get_topic_full, below, is a separate single-topic
+    read used only by the reindex builder and is intentionally NOT changed
+    here -- out of this task's scoped call sites)."""
     escaped = _escape_like(source_prefix)
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
@@ -329,8 +378,11 @@ def list_topics_for_source_prefix(conn, source_prefix) -> list[dict]:
 
     for t in topic_rows:
         t["action_items"] = action_items_by_topic.get(t["id"], [])
-        t["safety_observations"] = safety_by_topic.get(t["id"], [])
-        t["findings"] = findings_by_topic.get(t["id"], [])
+        t_findings = findings_by_topic.get(t["id"], [])
+        # Phase F / D8 retirement (spec §8): findings-first, legacy-fallback.
+        t["safety_observations"] = (_findings_as_safety_rows(t_findings)
+                                    or safety_by_topic.get(t["id"], []))
+        t["findings"] = t_findings
         t["photos"] = photos_by_topic.get(t["id"], [])
 
     return topic_rows
