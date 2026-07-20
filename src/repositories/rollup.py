@@ -2,11 +2,13 @@
 no LLM / no narrative / no materialization — see Global Constraints in
 docs/superpowers/plans/2026-07-08-dashboard-4b-live-4c-rollup.md).
 
-portfolio_counts(conn, site_ids) runs three GROUP BY queries — one each
-against safety_observations, action_items, and topics — scoped to
+portfolio_counts(conn, site_ids) runs four GROUP BY queries — one each
+against safety_observations and action_items, and two against topics
+(a 30-day windowed count/participants query plus an all-time
+MAX(report_date) for last_activity_at) — scoped to
 site_ids via `WHERE site_id = ANY(%s)` (uses the idx_*_site_status /
 idx_topics_site_date indexes from 0003_dashboard_readmodel.sql), then
-merges the three result sets into one dict per site.
+merges the result sets into one dict per site.
 
 v1 deliberately aggregates only the report-extracted tables (topics /
 action_items / safety_observations, all keyed by site_id uuid). Manual
@@ -22,12 +24,15 @@ _ZERO_FIELDS = ("open_safety", "open_high_safety", "open_actions", "total_action
 
 
 def _zero() -> dict:
-    return {f: 0 for f in _ZERO_FIELDS}
+    d = {f: 0 for f in _ZERO_FIELDS}
+    d["last_activity_at"] = None    # ISO 'YYYY-MM-DD' once the site has any topic
+    return d
 
 
 def portfolio_counts(conn, site_ids) -> dict:
     """Return `{str(site_id): {open_safety, open_high_safety, open_actions,
-    total_actions, overdue_actions, topics_count, participants}}` for every
+    total_actions, overdue_actions, topics_count, participants,
+    last_activity_at}}` for every
     id in site_ids (a caller-computed ACL list/set — mirrors
     lambda_org_api._allowed_site_ids / list_live_items's site_ids param).
 
@@ -90,5 +95,26 @@ def portfolio_counts(conn, site_ids) -> dict:
         b = merged.setdefault(str(r["site_id"]), _zero())
         b["topics_count"] = r["topics_count"]
         b["participants"] = r["participants"]
+
+    # Last activity = ALL-TIME MAX(report_date) — the Sites cards' "Last
+    # activity" KPI. Deliberately NOT folded into the 30-day topics query
+    # above: its WHERE would clamp the max to the window and any site idle
+    # for >30 days would show no date at all. Separate index-friendly
+    # aggregate instead (idx_topics_site_date).
+    activity_rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT site_id, MAX(report_date) AS last_activity_at "
+        "FROM topics WHERE site_id = ANY(%s) GROUP BY site_id",
+        (ids,),
+    ).fetchall()
+    for r in activity_rows:
+        b = merged.setdefault(str(r["site_id"]), _zero())
+        la = r["last_activity_at"]
+        if la is not None:
+            # psycopg returns datetime.date for a date column; normalise to
+            # ISO here so JSON never sees a date object (ok()'s
+            # json.dumps(default=str) would str() it anyway, but the repo
+            # contract stays explicit and unit-testable). hasattr-guard
+            # mirrors lambda_org_api's created_at serialisation.
+            b["last_activity_at"] = la.isoformat() if hasattr(la, "isoformat") else str(la)
 
     return merged
