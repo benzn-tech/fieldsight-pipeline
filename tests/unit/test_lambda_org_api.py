@@ -2277,20 +2277,22 @@ def test_render_shape_topic_ids_positional_and_ordered():
 
 def test_render_shape_safety_flags_from_findings_with_legacy_fallback():
     with_findings = _topic_row(findings=[
-        {"observation": "Loose scaffold", "domain": "safety", "severity": "major",
+        {"id": "f-1", "observation": "Loose scaffold", "domain": "safety", "severity": "major",
          "recommended_action": "Tag out"},
-        {"observation": "Wrong paint batch", "domain": "quality", "severity": "minor",
+        {"id": "f-2", "observation": "Wrong paint batch", "domain": "quality", "severity": "minor",
          "recommended_action": "Reorder"},  # non-safety domain -- excluded from safety_flags
     ])
     legacy = _topic_row(findings=[], safety_observations=[
-        {"observation": "Missing handrail", "risk_level": "high"},
+        {"id": "so-1", "observation": "Missing handrail", "risk_level": "high"},
     ])
     shape = org.render_report_shape([with_findings, legacy], None, "2026-07-14", "Ada_L")
     assert shape["topics"][0]["safety_flags"] == [
-        {"observation": "Loose scaffold", "risk_level": "high", "recommended_action": "Tag out"},
+        {"observation": "Loose scaffold", "risk_level": "high", "recommended_action": "Tag out",
+         "id": "f-1", "source_table": "findings"},
     ]
     assert shape["topics"][1]["safety_flags"] == [
-        {"observation": "Missing handrail", "risk_level": "high", "recommended_action": None},
+        {"observation": "Missing handrail", "risk_level": "high", "recommended_action": None,
+         "id": "so-1", "source_table": "safety_observations"},
     ]
 
 
@@ -2398,14 +2400,16 @@ def test_non_all_scope_absent_user_self_serves_200(presign_wired):
     wired, fake = presign_wired
     wired.setattr(org.users, "get_user_by_sub",
                   lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
-    seen = {}
+    seen = []
     wired.setattr(org.topics, "has_topics_for_source_prefix",
-                  lambda conn, prefix: (seen.update(prefix=prefix) or False))
+                  lambda conn, prefix: (seen.append(prefix) or False))
     doc = {"report_date": "2026-07-14", "topics": []}
     fake.objects["reports/2026-07-14/Ada_L/daily_report.json"] = json.dumps(doc).encode()
     res = org.lambda_handler(make_event(
         "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
-    assert seen["prefix"] == "extractions/Ada_L/2026-07-14/"
+    # D fix: both the extraction and report prefixes are probed (in that
+    # order) before falling back to verbatim S3.
+    assert seen == ["extractions/Ada_L/2026-07-14/", "reports/2026-07-14/Ada_L/"]
     assert res["statusCode"] == 200
     assert body_of(res) == doc
 
@@ -3600,3 +3604,59 @@ def test_patch_action_item_empty_body_400(wired):
     _wire_item(wired)
     res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1", body={}), None)
     assert res["statusCode"] == 400
+
+
+def test_render_report_shape_exposes_durable_topic_and_safety_ids():
+    rows = [{
+        "id": "topic-uuid-1", "site_id": "s-1", "site_name": "Alpha",
+        "user_name": "Ada L", "time_range": "09:00 - 09:30", "title": "Slab",
+        "category": "progress", "participants": [], "summary": "poured slab",
+        "action_items": [{"id": "ai-1", "text": "cure 7d", "responsible": "Sam",
+                          "deadline": None, "deadline_text": None,
+                          "priority": "medium", "status": "open"}],
+        "safety_observations": [{"id": "so-1", "observation": "edge protection",
+                                 "risk_level": "high"}],
+        "findings": [], "photos": [],
+    }]
+    out = org.render_report_shape(rows, None, "2026-07-16", "Ada_L")
+    t = out["topics"][0]
+    assert t["topic_row_id"] == "topic-uuid-1"          # NEW durable id
+    assert t["action_items"][0]["id"] == "ai-1"          # already present
+    assert t["safety_flags"][0]["id"] == "so-1"          # NEW
+    assert t["safety_flags"][0]["source_table"] == "safety_observations"
+
+
+def test_timeline_report_sourced_day_renders_with_ids(wired, monkeypatch):
+    # No extraction topics, but report-sourced Aurora topics DO exist -> must
+    # render the id-carrying shape, not S3-verbatim (the SB1108 2026-07-16 case).
+    def has_prefix(conn, prefix):
+        return prefix.startswith("reports/")            # extraction miss, report hit
+
+    report_rows = [{
+        "id": "topic-uuid-9", "site_id": "s-1", "site_name": "Alpha",
+        "user_name": "Ada L", "time_range": None, "title": "From report",
+        "category": None, "participants": [], "summary": "s",
+        "action_items": [], "safety_observations": [], "findings": [], "photos": [],
+    }]
+    monkeypatch.setattr(org.topics, "has_topics_for_source_prefix", has_prefix)
+    monkeypatch.setattr(org.topics, "list_topics_for_source_prefix",
+                        lambda conn, prefix: report_rows)
+    monkeypatch.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-1"})
+    monkeypatch.setattr(org, "_get_lake_json", lambda key: {"executive_summary": ["ok"]})
+    res = org._render_timeline_for_user(FakeConn(), CALLER, "2026-07-16", "Ada_L")
+    body = body_of(res)
+    assert res["statusCode"] == 200
+    assert body["topics"][0]["topic_row_id"] == "topic-uuid-9"
+    assert body["executive_summary"] == ["ok"]           # prose preserved
+
+
+def test_timeline_no_aurora_topics_stays_verbatim(wired, monkeypatch):
+    monkeypatch.setattr(org.topics, "has_topics_for_source_prefix",
+                        lambda conn, prefix: False)       # neither prefix has topics
+    monkeypatch.setattr(org, "_get_lake_json",
+                        lambda key: {"_report_metadata": {"source": "nightly"},
+                                     "topics": [{"topic_title": "verbatim"}]})
+    res = org._render_timeline_for_user(FakeConn(), CALLER, "2026-07-10", "Ada_L")
+    body = body_of(res)
+    assert body["_report_metadata"]["source"] == "nightly"   # byte-verbatim
+    assert body["topics"][0]["topic_title"] == "verbatim"

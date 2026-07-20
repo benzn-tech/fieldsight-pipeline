@@ -1522,13 +1522,17 @@ def render_report_shape(rows, doc, date, folder):
     for i, t in enumerate(rows):
         flags = [{"observation": f["observation"],
                   "risk_level": _SEV_TO_RISK.get(f["severity"], "medium"),
-                  "recommended_action": f["recommended_action"]}
+                  "recommended_action": f["recommended_action"],
+                  "id": str(f["id"]), "source_table": "findings"}
                  for f in t["findings"] if f["domain"] == "safety"]
         if not flags:                               # pre-#46 legacy extractions
             flags = [{"observation": s["observation"], "risk_level": s["risk_level"],
-                      "recommended_action": None} for s in t["safety_observations"]]
+                      "recommended_action": None,
+                      "id": str(s["id"]), "source_table": "safety_observations"}
+                     for s in t["safety_observations"]]
         topics_out.append({
             "topic_id": i,
+            "topic_row_id": str(t["id"]),           # durable topics.id (D fix — editable anchor)
             "time_range": t["time_range"],
             "topic_title": t["title"],
             "category": t["category"],
@@ -1576,17 +1580,30 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     in-scope Aurora topics exist there is nothing safe to show (404). Own-
     timeline and ALL-scope (admin/gm/platform_admin) callers pass
     cross_user_clip=False and are UNCHANGED."""
-    prefix = f"extractions/{user}/{date}/"
-    if topics.has_topics_for_source_prefix(conn, prefix):
-        rows = topics.list_topics_for_source_prefix(conn, prefix)
+    def _aurora_shape(prefix):
+        """Return the id-carrying rendered shape for `prefix` if it has
+        Aurora topics inside the caller's site ACL, else None."""
+        if not topics.has_topics_for_source_prefix(conn, prefix):
+            return None
         allowed = _allowed_site_ids(conn, caller)
-        rows = [r for r in rows if str(r["site_id"]) in allowed]
-        if rows:
-            # CRITICAL-1: for a cross-user graded view never merge the target's
-            # whole-day prose (not site-clipped -> cross-site leak). Topic rows
-            # are already site-clipped just above.
-            doc = None if cross_user_clip else _get_lake_json(f"reports/{date}/{user}/daily_report.json")
-            return ok(render_report_shape(rows, doc, date, user))
+        rows = [r for r in topics.list_topics_for_source_prefix(conn, prefix)
+                if str(r["site_id"]) in allowed]
+        if not rows:
+            return None
+        # CRITICAL-1: cross-user graded view never merges the target's whole-day
+        # prose (not site-clipped). Topic rows are already site-clipped above.
+        doc = None if cross_user_clip else \
+            _get_lake_json(f"reports/{date}/{user}/daily_report.json")
+        return render_report_shape(rows, doc, date, user)
+
+    # D fix (spec §5.1): prefer the Aurora-rendered shape whenever Aurora topics
+    # exist for this (user, date) -- extraction-sourced OR report-sourced -- so
+    # report-sourced content is editable exactly like extraction-sourced. Only
+    # a day with NO Aurora topics at all keeps the byte-verbatim S3 contract.
+    for prefix in (f"extractions/{user}/{date}/", f"reports/{date}/{user}/"):
+        shape = _aurora_shape(prefix)
+        if shape is not None:
+            return ok(shape)
     if cross_user_clip:
         # CRITICAL-1: no in-scope Aurora topics for this (target, date). The
         # verbatim S3 daily_report.json is NOT site-clipped, so serving it would
