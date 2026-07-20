@@ -1608,7 +1608,11 @@ def test_portfolio_counts_merges_four_queries():
     ])
     counts = org.rollup.portfolio_counts(conn, ["s-1"])
     assert len(conn.calls) == 4
-    assert "safety_observations" in conn.calls[0]["sql"]
+    # Phase F (D8 retirement): safety counts read findings-by-domain, not the
+    # legacy safety_observations dual-write copy (spec §8).
+    assert "FROM findings" in conn.calls[0]["sql"]
+    assert "domain='safety'" in conn.calls[0]["sql"]
+    assert "severity='major'" in conn.calls[0]["sql"]
     assert "action_items" in conn.calls[1]["sql"]
     assert "topics" in conn.calls[2]["sql"]
     assert "MAX(report_date)" in conn.calls[3]["sql"]

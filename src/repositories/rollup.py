@@ -3,12 +3,23 @@ no LLM / no narrative / no materialization — see Global Constraints in
 docs/superpowers/plans/2026-07-08-dashboard-4b-live-4c-rollup.md).
 
 portfolio_counts(conn, site_ids) runs four GROUP BY queries — one each
-against safety_observations and action_items, and two against topics
+against findings (safety-domain, Phase F / D8 retirement, spec §8 — see
+below) and action_items, and two against topics
 (a 30-day windowed count/participants query plus an all-time
 MAX(report_date) for last_activity_at) — scoped to
 site_ids via `WHERE site_id = ANY(%s)` (uses the idx_*_site_status /
-idx_topics_site_date indexes from 0003_dashboard_readmodel.sql), then
+idx_topics_site_date / idx_findings_site_domain indexes), then
 merges the result sets into one dict per site.
+
+Phase F (D8 retirement, spec §8): the safety count used to read the legacy
+`safety_observations` dual-write copy, which is NOT linked to `findings`
+(no finding_id column) — a content correction to a finding's text/severity
+never reached this count. It now reads `findings WHERE domain='safety'`
+directly (severity vocab is none/minor/major, NOT the legacy risk_level
+high/medium/low — open_high_safety filters on severity='major').
+safety_observations stays in place, unread here, for rollback (see
+lambda_item_writer.py / _derive_safety_flags for the corresponding
+dual-write-stop).
 
 v1 deliberately aggregates only the report-extracted tables (topics /
 action_items / safety_observations, all keyed by site_id uuid). Manual
@@ -59,8 +70,8 @@ def portfolio_counts(conn, site_ids) -> dict:
     safety_rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT site_id, "
         "count(*) FILTER (WHERE status='open') AS open_safety, "
-        "count(*) FILTER (WHERE status='open' AND lower(risk_level)='high') AS open_high_safety "
-        "FROM safety_observations WHERE site_id = ANY(%s) GROUP BY site_id",
+        "count(*) FILTER (WHERE status='open' AND severity='major') AS open_high_safety "
+        "FROM findings WHERE site_id = ANY(%s) AND domain='safety' GROUP BY site_id",
         (ids,),
     ).fetchall()
     for r in safety_rows:
