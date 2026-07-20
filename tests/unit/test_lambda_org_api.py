@@ -3725,3 +3725,31 @@ def test_patch_content_cross_company_platform_admin_allowed(wired, monkeypatch):
                                   body={"title": "x"}),
                        "PATCH", "/content/topics/t-1")
     assert res["statusCode"] == 200
+
+
+def test_create_alias_requires_site_manager_plus(wired, monkeypatch):
+    worker = dict(CALLER, global_role="worker")
+    monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: dict(worker))
+    res = org.dispatch(FakeConn(),
+                       make_event("POST", "/api/org/aliases",
+                                  body={"wrong_term": "Mackon", "right_term": "McCahon"}),
+                       "POST", "/aliases")
+    assert res["statusCode"] == 403
+
+
+def test_create_alias_company_wide_by_site_manager(wired, monkeypatch):
+    sm = dict(CALLER, global_role="site_manager")
+    monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: dict(sm))
+    monkeypatch.setattr(org.aliases, "create_alias",
+                        lambda conn, cid, sid, w, r, kind, by, source="correction":
+                        {"id": "a-1", "wrong_term": w, "right_term": r,
+                         "site_id": sid, "kind": kind})
+    res = org.dispatch(FakeConn(),
+                       make_event("POST", "/api/org/aliases",
+                                  body={"wrong_term": "Mackon", "right_term": "McCahon",
+                                        "kind": "company"}),
+                       "POST", "/aliases")
+    body = body_of(res)
+    assert res["statusCode"] == 200
+    assert body["right_term"] == "McCahon"
+    assert body["site_id"] is None                       # no ?site -> company-wide

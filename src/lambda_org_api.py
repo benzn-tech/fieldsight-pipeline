@@ -63,7 +63,7 @@ from psycopg.errors import UniqueViolation
 import reindex
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
-from repositories import (action_items, companies, content, content_edits, memberships,
+from repositories import (action_items, aliases, companies, content, content_edits, memberships,
                           observations, programme, programme_suggestions, recordings, rollup,
                           scope, sites, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
@@ -248,6 +248,9 @@ def dispatch(conn, event, method, route):
     m_ch = re.match(r"^/content/([^/]+)/([^/]+)/history$", route)
     if m_ch and method == "GET":
         return get_content_history(conn, caller, m_ch.group(1), m_ch.group(2))
+
+    if route == "/aliases" and method == "POST":
+        return create_alias_endpoint(conn, caller, parse_body(event), event)
 
     if route == "/live-items":
         if method == "GET":
@@ -1186,6 +1189,35 @@ def _enqueue_content_reindex(conn, table, row_id):
     # chain lives on the lake, so enqueue writes there (see Task 20 IAM grant).
     reindex.enqueue_topic_reindex(s3(), LAKE_BUCKET, conn, tid,
                                   meta["folder_name"], str(meta["report_date"]))
+
+
+_ALIAS_KINDS = ("person", "product", "company", "other")
+
+
+def create_alias_endpoint(conn, caller, body, event):
+    """Confirm a diff candidate into a scoped name_aliases row (spec §5.4, D5,
+    D2 glossary confirm). D7 alias tier: site_manager+ only. Optional ?site=
+    scopes it to one site; absent => company-wide (site_id NULL)."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    if caller["global_role"] not in ("site_manager", "pm", "gm", "admin", "platform_admin"):
+        return error("site_manager or above required to add a glossary alias", 403)
+    wrong = (body.get("wrong_term") or "").strip()
+    right = (body.get("right_term") or "").strip()
+    if not wrong or not right:
+        return error("wrong_term and right_term are required", 400)
+    kind = body.get("kind") or "other"
+    if kind not in _ALIAS_KINDS:
+        return error(f"kind must be one of {sorted(_ALIAS_KINDS)}", 400)
+    site_id = None
+    site_param = (event.get("queryStringParameters") or {}).get("site")
+    if site_param:
+        site_id, err = _resolve_site_param(conn, caller, site_param)
+        if err is not None:
+            return err
+    row = aliases.create_alias(conn, caller["company_id"], site_id, wrong, right,
+                               kind, caller["id"], source="correction")
+    return ok(row)
 
 
 def get_content_history(conn, caller, table, row_id):
