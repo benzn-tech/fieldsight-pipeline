@@ -1738,6 +1738,27 @@ def test_portfolio_rollup_empty_site_ids_empty(wired):
     assert body_of(res)["sites"] == []
 
 
+def test_portfolio_rollup_last_activity_passthrough_json(wired):
+    # list_portfolio_rollup spreads **counts[sid] with no field allow-list
+    # and ok() serialises via json.dumps(default=str) — last_activity_at
+    # must reach the JSON body unchanged as an ISO string (and must not
+    # perturb _status, which only reads the open_* counters).
+    wired.setattr(org.sites, "list_company_sites",
+                  lambda conn, cid, **kw: [{"id": "s-1"}])
+    wired.setattr(org.rollup, "portfolio_counts",
+                  lambda conn, site_ids: {
+                      "s-1": {"open_safety": 0, "open_high_safety": 0, "open_actions": 4,
+                              "total_actions": 6, "overdue_actions": 1, "topics_count": 2,
+                              "participants": 1, "last_activity_at": "2026-07-18"},
+                  })
+    res = org.lambda_handler(make_event("GET", "/api/org/rollup/portfolio"), None)
+    assert res["statusCode"] == 200
+    row = body_of(res)["sites"][0]
+    assert row["last_activity_at"] == "2026-07-18"
+    assert row["open_actions"] == 4
+    assert row["status"] == "yellow"
+
+
 # ----------------------------------------------------------
 # /programme/suggestions (Task 5 — manager review queue for the matcher's
 # `pending` rows; ACL reuses _resolve_site_param / _allowed_site_ids exactly

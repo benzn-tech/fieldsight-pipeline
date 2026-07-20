@@ -40,7 +40,7 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
                                              Aurora-only accounts)
   GET   /api/org/programme?site=<site_id> → read site's Programme JSON (S3-backed, ACL)
   PUT   /api/org/programme?site=<site_id> → write site's Programme JSON (admin/gm/pm)
-  GET   /api/org/rollup/portfolio         → per-site open-count rollup + red/yellow/green (ACL)
+  GET   /api/org/rollup/portfolio         → per-site open-count rollup + last_activity_at + red/yellow/green (ACL)
   GET   /api/org/programme/suggestions            → list matcher suggestions for a site (admin/gm/pm)
   POST  /api/org/programme/suggestions/{id}/confirm → apply + write back to programme.json (admin/gm/pm)
   POST  /api/org/programme/suggestions/{id}/reject  → dismiss a suggestion (admin/gm/pm)
@@ -1171,7 +1171,10 @@ def get_org_dates(conn, caller, event):
 # every non-archived site in their company, everyone else only their
 # non-archived memberships. Status is a pure rule over the merged counts:
 # any open high-risk safety observation -> red; else any open safety
-# observation or open action item -> yellow; else green.)
+# observation or open action item -> yellow; else green. Each row also
+# carries last_activity_at — the ALL-TIME max topics.report_date as an ISO
+# string or None (rollup.portfolio_counts) — consumed by the Sites cards'
+# "Last activity" KPI; _status deliberately ignores it.)
 # ----------------------------------------------------------
 def _status(counts):
     if counts.get("open_high_safety", 0) > 0:
