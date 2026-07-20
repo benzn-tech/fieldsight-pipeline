@@ -581,6 +581,23 @@ orchestrator 用 `end_date = datetime.now()` 算查询窗口(`lambda_orchestrato
 (前端同类是 BUG-19)。同类可疑点:自研 app 的日期文件夹也偏了一天(见
 `docs/superpowers/specs/2026-07-16-grandtime-app-prod-integration.md` G3)。
 
+### BUG-38: test 与 prod org-api 共享 Aurora,只差 S3 桶 + GRADED_ROLES
+`deploy.yml`(fieldsight-test)与 `deploy-prod.yml`(fieldsight-prod)给 `OrgApiFunction` 传的
+`DbStackName=fieldsight-db-test`、`DbSecretArn`、`OrgUserPoolId` **两边完全相同** —— test/prod org-api
+读写的是**同一个 Aurora + 同一个 Cognito 池**,只有 S3 桶(`fieldsight-data-test` vs prod 湖 `fieldsight-data`)
+和 `GRADED_ROLES` 不同。两个含义:
+1. **无数据隔离**:test org-api 的写会落到 prod 库行。dev 因 `FS_WRITEMOCKS=true` 写全 mock 才安全;
+   想在 dev 测真实写必须另起一套 Aurora(大工程),不能靠"指向 test org-api"隔离。
+2. **`GRADED_ROLES` 由 repo 变量驱动**:prod 有 `PROD_GRADED_ROLES=true`,**test 原本没有 `TEST_GRADED_ROLES`
+   → `${{ vars.TEST_GRADED_ROLES || 'false' }}` = false**(2026-07-21 已补 `TEST_GRADED_ROLES=true`)。
+   **graded-off 不对称坑**:platform_admin 的 `list_members`(直接走 `is_cross_company`)正常返回全公司成员,
+   但 `list_org_sites`(走 `_allowed_site_ids`,跨公司仅 graded 开时生效)返回 `[]` → 站点列表/选择器空。
+   member 通、site 空 = 一定是 GRADED_ROLES,不是代码/数据(develop==main 时更要先怀疑环境变量)。
+
+dev 可把 Amplify `FS_ORG_BASEURL` 指向 test 网关(`wdsgobb7b0…/prod/api`,prod 是 `ys94qy2tk0`)在 dev 上验
+新端点、免先上 prod —— test 网关的 CognitoAuthorizer 已信任 prod 池 token。`update-branch --environment-variables`
+是**整包替换**(须带全部 6 个 FS_* 变量),改完 `start-job RELEASE` 重建。
+
 ### 定时器交接(2026-07-15 schedules cutover 上线)
 录音下载 + 报告生成的 cron 已从遗留手管的 `sitesync` EventBridge 组切到 **fieldsight-prod SAM 栈**
 的 schedule(`PROD_ENABLE_SCHEDULES=true`):orchestrator 15 分钟 sweep(工作时段 05:00–19:59 NZ)
