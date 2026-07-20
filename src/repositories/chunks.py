@@ -2,7 +2,8 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from repositories.search_sql import build_search_sql  # re-export
 
-__all__ = ["build_search_sql", "insert_chunk", "search_chunks", "delete_chunks_for_scope"]
+__all__ = ["build_search_sql", "insert_chunk", "search_chunks",
+           "delete_chunks_for_source", "delete_chunks_for_topic"]
 
 
 def insert_chunk(conn, site_id, report_date, chunk_type, chunk_text, embedding, *,
@@ -43,5 +44,18 @@ def delete_chunks_for_source(conn, source_s3_key) -> int:
     cur = conn.execute(
         "DELETE FROM report_chunks WHERE source_s3_key=%s",
         (source_s3_key,),
+    )
+    return cur.rowcount
+
+
+def delete_chunks_for_topic(conn, topic_id) -> int:
+    """Delete report_chunks rows for one topic (spec §5.3, D6 per-topic
+    re-index). Sibling of delete_chunks_for_source, keyed on the durable
+    topic_id that lambda_ingest stamps onto each chunk (topic_seq_to_id).
+    Used by the reindex apply step: delete this topic's chunks, then
+    re-insert the freshly-embedded corrected chunks."""
+    cur = conn.execute(
+        "DELETE FROM report_chunks WHERE topic_id=%s",
+        (topic_id,),
     )
     return cur.rowcount

@@ -60,11 +60,14 @@ import boto3
 from botocore.exceptions import ClientError
 from psycopg.errors import UniqueViolation
 
+import reindex
 from db.connection import get_connection
-from repositories import (action_items, companies, memberships, observations, programme,
-                          programme_suggestions, recordings, rollup, scope, sites, topics,
-                          users, voice_messages)
+from psycopg.rows import dict_row as RealDictRow
+from repositories import (action_items, aliases, companies, content, content_edits, memberships,
+                          observations, programme, programme_suggestions, recordings, rollup,
+                          scope, sites, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
+from text_normalize import diff_candidates
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -238,6 +241,16 @@ def dispatch(conn, event, method, route):
     m_ai = re.match(r"^/action-items/([^/]+)$", route)
     if m_ai and method == "PATCH":
         return patch_action_item(conn, caller, m_ai.group(1), parse_body(event))
+
+    m_ce = re.match(r"^/content/([^/]+)/([^/]+)$", route)
+    if m_ce and method == "PATCH":
+        return patch_content(conn, caller, m_ce.group(1), m_ce.group(2), parse_body(event))
+    m_ch = re.match(r"^/content/([^/]+)/([^/]+)/history$", route)
+    if m_ch and method == "GET":
+        return get_content_history(conn, caller, m_ch.group(1), m_ch.group(2))
+
+    if route == "/aliases" and method == "POST":
+        return create_alias_endpoint(conn, caller, parse_body(event), event)
 
     if route == "/live-items":
         if method == "GET":
@@ -1099,6 +1112,127 @@ def patch_action_item(conn, caller, action_item_id, body):
     return ok(updated)
 
 
+def patch_content(conn, caller, table, row_id, body):
+    """Edit one free-text content field (spec §3/§5.2, D1). ACL is the D7
+    per-item tier -- mirrors patch_action_item exactly: platform_admin
+    (cross-company) edits any tenant; company roles stay pinned; the row's
+    site must be in the caller's reach; and the caller must be admin/gm, THIS
+    site's pm/site_manager, or the item's author (the owning topic's user).
+    Writes the corrected text + a content_edits audit row atomically, then
+    enqueues a best-effort per-topic re-index (never rolls back the edit)."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    if table not in content.EDITABLE:
+        return error(f"table must be one of {sorted(content.EDITABLE)}", 400)
+    # Exactly one whitelisted field per request (D1 whole-field edit).
+    fields = {k: v for k, v in body.items() if content.is_editable(table, k)}
+    if len(fields) != 1:
+        return error("exactly one editable field required", 400)
+    field, value = next(iter(fields.items()))
+    if not isinstance(value, str):
+        return error("value must be a string", 400)
+
+    row = content.get_content_row(conn, table, row_id)
+    cross = is_cross_company(caller["global_role"])
+    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+        return error("content row not found", 404)      # incl. cross-company
+    site_id = str(row["site_id"])
+    if site_id not in _allowed_site_ids(conn, caller):
+        return error("access denied to this content's site", 403)
+    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
+    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_site_authority = site_role in ("pm", "site_manager")
+    is_author = row.get("author_user_id") is not None and \
+        str(row["author_user_id"]) == str(caller["id"])
+    if not (is_admin or is_site_authority or is_author):
+        return error("admin/gm, this site's pm/site_manager, or the author only", 403)
+
+    before = row.get(field)
+    updated = content.update_content_field(conn, table, row_id, field, value)
+    if updated is None:
+        return error("content row not found", 404)
+    content_edits.append_content_edit(
+        conn, row["company_id"], table, row_id, field, before, value,
+        caller["id"], caller["global_role"])
+
+    # Best-effort per-topic re-index (spec §6: async, never blocks/rolls back
+    # the edit). Topic id + folder/date come from the row's owning topic.
+    try:
+        _enqueue_content_reindex(conn, table, row_id)
+    except Exception:
+        logger.exception("content edit %s/%s: reindex enqueue failed (edit kept)",
+                          table, row_id)
+
+    candidates = diff_candidates(before or "", value)
+    return ok({"row": updated, "candidates": candidates})
+
+
+def _enqueue_content_reindex(conn, table, row_id):
+    """Resolve the edited row's owning topic + its (folder, date), then write
+    the reindex request artifact. topic_id = the row itself for `topics`, else
+    the child's topic_id."""
+    if table == "topics":
+        tid = row_id
+    else:
+        r = conn.cursor(row_factory=RealDictRow).execute(
+            f"SELECT topic_id FROM {table} WHERE id=%s", (row_id,)).fetchone()
+        if not r:
+            return
+        tid = r["topic_id"]
+    meta = conn.cursor(row_factory=RealDictRow).execute(
+        "SELECT t.report_date, u.folder_name FROM topics t "
+        "LEFT JOIN users u ON u.id = t.user_id WHERE t.id=%s", (tid,)).fetchone()
+    if not meta or not meta.get("folder_name"):
+        return                                          # unattributed -> skip re-index
+    # LAKE_BUCKET (IngestBucketName) is the lake the embed/ingest lambdas read;
+    # org-api's S3_BUCKET is DataBucketName, a DIFFERENT bucket. The reindex
+    # chain lives on the lake, so enqueue writes there (see Task 20 IAM grant).
+    reindex.enqueue_topic_reindex(s3(), LAKE_BUCKET, conn, tid,
+                                  meta["folder_name"], str(meta["report_date"]))
+
+
+_ALIAS_KINDS = ("person", "product", "company", "other")
+
+
+def create_alias_endpoint(conn, caller, body, event):
+    """Confirm a diff candidate into a scoped name_aliases row (spec §5.4, D5,
+    D2 glossary confirm). D7 alias tier: site_manager+ only. Optional ?site=
+    scopes it to one site; absent => company-wide (site_id NULL)."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    if caller["global_role"] not in ("site_manager", "pm", "gm", "admin", "platform_admin"):
+        return error("site_manager or above required to add a glossary alias", 403)
+    wrong = (body.get("wrong_term") or "").strip()
+    right = (body.get("right_term") or "").strip()
+    if not wrong or not right:
+        return error("wrong_term and right_term are required", 400)
+    kind = body.get("kind") or "other"
+    if kind not in _ALIAS_KINDS:
+        return error(f"kind must be one of {sorted(_ALIAS_KINDS)}", 400)
+    site_id = None
+    site_param = (event.get("queryStringParameters") or {}).get("site")
+    if site_param:
+        site_id, err = _resolve_site_param(conn, caller, site_param)
+        if err is not None:
+            return err
+    row = aliases.create_alias(conn, caller["company_id"], site_id, wrong, right,
+                               kind, caller["id"], source="correction")
+    return ok(row)
+
+
+def get_content_history(conn, caller, table, row_id):
+    """content_edits trail for one row (spec §5.5 History view). Company-guarded
+    via get_content_row (which also resolves cross-company for platform_admin)."""
+    if table not in content.EDITABLE:
+        return error(f"table must be one of {sorted(content.EDITABLE)}", 400)
+    row = content.get_content_row(conn, table, row_id)
+    cross = is_cross_company(caller["global_role"])
+    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+        return error("content row not found", 404)
+    edits = content_edits.list_content_edits(conn, row["company_id"], table, row_id)
+    return ok({"edits": edits})
+
+
 def archive_observation_endpoint(conn, caller, obs_id):
     if resolve_scope(caller["global_role"]) != "ALL":
         return error("admin or gm role required", 403)
@@ -1522,13 +1656,17 @@ def render_report_shape(rows, doc, date, folder):
     for i, t in enumerate(rows):
         flags = [{"observation": f["observation"],
                   "risk_level": _SEV_TO_RISK.get(f["severity"], "medium"),
-                  "recommended_action": f["recommended_action"]}
+                  "recommended_action": f["recommended_action"],
+                  "id": str(f["id"]), "source_table": "findings"}
                  for f in t["findings"] if f["domain"] == "safety"]
         if not flags:                               # pre-#46 legacy extractions
             flags = [{"observation": s["observation"], "risk_level": s["risk_level"],
-                      "recommended_action": None} for s in t["safety_observations"]]
+                      "recommended_action": None,
+                      "id": str(s["id"]), "source_table": "safety_observations"}
+                     for s in t["safety_observations"]]
         topics_out.append({
             "topic_id": i,
+            "topic_row_id": str(t["id"]),           # durable topics.id (D fix — editable anchor)
             "time_range": t["time_range"],
             "topic_title": t["title"],
             "category": t["category"],
@@ -1576,17 +1714,30 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     in-scope Aurora topics exist there is nothing safe to show (404). Own-
     timeline and ALL-scope (admin/gm/platform_admin) callers pass
     cross_user_clip=False and are UNCHANGED."""
-    prefix = f"extractions/{user}/{date}/"
-    if topics.has_topics_for_source_prefix(conn, prefix):
-        rows = topics.list_topics_for_source_prefix(conn, prefix)
+    def _aurora_shape(prefix):
+        """Return the id-carrying rendered shape for `prefix` if it has
+        Aurora topics inside the caller's site ACL, else None."""
+        if not topics.has_topics_for_source_prefix(conn, prefix):
+            return None
         allowed = _allowed_site_ids(conn, caller)
-        rows = [r for r in rows if str(r["site_id"]) in allowed]
-        if rows:
-            # CRITICAL-1: for a cross-user graded view never merge the target's
-            # whole-day prose (not site-clipped -> cross-site leak). Topic rows
-            # are already site-clipped just above.
-            doc = None if cross_user_clip else _get_lake_json(f"reports/{date}/{user}/daily_report.json")
-            return ok(render_report_shape(rows, doc, date, user))
+        rows = [r for r in topics.list_topics_for_source_prefix(conn, prefix)
+                if str(r["site_id"]) in allowed]
+        if not rows:
+            return None
+        # CRITICAL-1: cross-user graded view never merges the target's whole-day
+        # prose (not site-clipped). Topic rows are already site-clipped above.
+        doc = None if cross_user_clip else \
+            _get_lake_json(f"reports/{date}/{user}/daily_report.json")
+        return render_report_shape(rows, doc, date, user)
+
+    # D fix (spec §5.1): prefer the Aurora-rendered shape whenever Aurora topics
+    # exist for this (user, date) -- extraction-sourced OR report-sourced -- so
+    # report-sourced content is editable exactly like extraction-sourced. Only
+    # a day with NO Aurora topics at all keeps the byte-verbatim S3 contract.
+    for prefix in (f"extractions/{user}/{date}/", f"reports/{date}/{user}/"):
+        shape = _aurora_shape(prefix)
+        if shape is not None:
+            return ok(shape)
     if cross_user_clip:
         # CRITICAL-1: no in-scope Aurora topics for this (target, date). The
         # verbatim S3 daily_report.json is NOT site-clipped, so serving it would
