@@ -32,8 +32,9 @@ import json
 import logging
 
 from db.connection import get_cached_connection
-from repositories import chunks, memberships, sites, users
+from repositories import aliases, chunks, memberships, sites, users
 from repositories.acl import resolve_scope
+import text_normalize
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -84,9 +85,19 @@ def lambda_handler(event, context):
 
     rows = chunks.search_chunks(conn, qv, site_ids, k=k,
                                 date_from=date_from, date_to=date_to)
+    # Synthesis-time safety net (spec §4): normalize retrieved chunk text with
+    # the company's active aliases, so a chunk not yet re-embedded still reads
+    # corrected before the LLM. site_ids here are the caller's accessible sites.
+    active = aliases.list_active(conn, caller["company_id"], site_ids=[str(s) for s in site_ids])
+    alias_pairs = [{"wrong_term": a["wrong_term"], "right_term": a["right_term"]}
+                   for a in active]
+    if alias_pairs:
+        for r in rows:
+            if r.get("chunk_text"):
+                r["chunk_text"] = text_normalize.normalize(r["chunk_text"], alias_pairs)
+
     # search_chunks returns raw psycopg rows: id/site_id/topic_id are uuid.UUID
-    # and report_date is datetime.date — Lambda's JSON marshaller can't
-    # serialize either (Runtime.MarshalError kills the invoke on any non-empty
-    # hit). Coerce to plain strings before returning.
+    # and report_date is datetime.date -- Lambda's JSON marshaller can't
+    # serialize either. Coerce to plain strings before returning.
     rows = json.loads(json.dumps(rows, default=str))
     return {"chunks": rows, "site_count": len(site_ids)}
