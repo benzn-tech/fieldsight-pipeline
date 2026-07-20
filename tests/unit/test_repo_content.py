@@ -32,7 +32,11 @@ def test_editable_allow_list_matches_spec():
     assert content.EDITABLE["action_items"] == {"text", "responsible"}
     assert content.EDITABLE["findings"] == {
         "observation", "recommended_action", "entity_name", "entity_trade"}
-    assert content.EDITABLE["safety_observations"] == {"observation"}
+    # Phase F Task 24 (D8 retirement, spec §8): safety_observations is no
+    # longer editable -- findings is the single source of truth for
+    # safety/quality content, so a correction must target the findings row
+    # (Tasks 21/22 make that row the one SAFETY/QUALITY reads).
+    assert "safety_observations" not in content.EDITABLE
 
 
 def test_is_editable_rejects_enum_and_unknown_tables():
@@ -40,6 +44,16 @@ def test_is_editable_rejects_enum_and_unknown_tables():
     assert not content.is_editable("topics", "category")     # enum, excluded (§3)
     assert not content.is_editable("action_items", "status")  # task metadata
     assert not content.is_editable("recordings", "title")     # not an item-store table
+
+
+def test_safety_observations_no_longer_editable():
+    # Phase F Task 24: safety/quality corrections target findings, not the
+    # legacy safety_observations table (removed from both EDITABLE and
+    # _SELECT -- get_content_row must 404, same posture as any other
+    # unknown table).
+    assert not content.is_editable("safety_observations", "observation")
+    conn = FakeConn({"id": "so-1", "observation": "x"})
+    assert content.get_content_row(conn, "safety_observations", "so-1") is None
 
 
 def test_get_content_row_joins_company_and_author():
