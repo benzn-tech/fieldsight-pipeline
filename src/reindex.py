@@ -20,6 +20,14 @@ from repositories import aliases, chunks, topics
 from chunking import chunk_report
 
 REQUEST_PREFIX = "reindex_requests/"
+# Vectors go under a SEPARATE top-level prefix (not reindex_requests/*.vectors
+# .json): S3 rejects two bucket-notification rules that share a prefix with
+# overlapping suffixes ("Configuration is ambiguously defined") — a
+# .vectors.json object matches both the embed rule (reindex_requests/ + .json)
+# and the ingest rule. Distinct prefixes keep the embed (request) and ingest
+# (vectors) triggers unambiguous, and the embed's own output never re-triggers
+# it.
+VECTORS_PREFIX = "reindex_vectors/"
 
 
 def request_key(date, folder, topic_id):
@@ -27,7 +35,7 @@ def request_key(date, folder, topic_id):
 
 
 def vectors_key(date, folder, topic_id):
-    return f"{REQUEST_PREFIX}{date}/{folder}/{topic_id}.vectors.json"
+    return f"{VECTORS_PREFIX}{date}/{folder}/{topic_id}.json"
 
 
 def _company_id_for_site(conn, site_id):

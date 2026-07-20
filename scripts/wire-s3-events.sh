@@ -80,14 +80,12 @@ fi
 # with ingest below (reports/ vs embeddings/), so no double-trigger loop.
 # NOTE(Task 20, content-correction reindex chain): embed-report ALSO triggers
 # on reindex_requests/*.json — the per-topic reindex REQUEST artifact org-api
-# (in-VPC) writes after a content edit commits. S3 suffix filters cannot
-# express "ends with .json but NOT .vectors.json", so this same rule also
-# matches the VECTORS artifact embed-report itself writes back into
-# reindex_requests/ (see fs-ingest-reindex below) — that is NOT a BUG-13
-# infinite loop: embed_reindex_request() in lambda_embed_report.py explicitly
-# `continue`s on any key already ending ".vectors.json" before doing any
-# DashScope call or S3 write, so the re-trigger is a single harmless no-op
-# invocation, never a second write.
+# (in-VPC) writes after a content edit commits. embed-report's VECTORS output
+# goes to a SEPARATE prefix (reindex_vectors/, see fs-ingest-reindex below),
+# NOT back under reindex_requests/, so it never re-triggers embed-report (no
+# BUG-13 loop) and the two rules don't share a prefix — S3 rejects two rules
+# with overlapping suffixes on a shared prefix ("Configuration is ambiguously
+# defined").
 if fn_exists "${PREFIX}-embed-report"; then
   WIRE_FNS+=("${PREFIX}-embed-report")
   DESIRED=$(jq -c --arg arn "$EMBED_ARN" '. + [
@@ -108,19 +106,17 @@ fi
 # (fieldsight-data-509194952652) and is managed MANUALLY there (that
 # bucket has hand-managed notifications; see IngestBucketName param).
 # NOTE(Task 20, content-correction reindex chain): ingest ALSO triggers on
-# reindex_requests/*.vectors.json — the VECTORS result fs-embed-reindex above
-# writes. This suffix IS precise (embed-report's plain REQUEST artifacts end
-# in ".json" but never ".vectors.json"), so ingest never fires on its own
-# input; lambda_ingest.lambda_handler routes it to apply_reindex_vectors
-# (delete_chunks_for_topic + insert_chunk), which writes to Aurora only, not
-# back to S3 — no BUG-13 loop on this side either.
+# reindex_vectors/*.json — the VECTORS result fs-embed-reindex above writes to
+# that separate prefix. lambda_ingest.lambda_handler routes it to
+# apply_reindex_vectors (delete_chunks_for_topic + insert_chunk), which writes
+# to Aurora only, not back to S3 — no BUG-13 loop.
 if fn_exists "${PREFIX}-ingest"; then
   WIRE_FNS+=("${PREFIX}-ingest")
   DESIRED=$(jq -c --arg arn "$INGEST_ARN" '. + [
     {"Id":"fs-ingest-report","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
      "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"embeddings/"},{"Name":"suffix","Value":"vectors.json"}]}}},
     {"Id":"fs-ingest-reindex","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
-     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reindex_requests/"},{"Name":"suffix","Value":".vectors.json"}]}}}
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reindex_vectors/"},{"Name":"suffix","Value":".json"}]}}}
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-ingest not deployed — skipping ingest trigger"
