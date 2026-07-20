@@ -272,7 +272,17 @@ def write_extraction_items(date, user_folder, extraction_key):
                 user_id=user_id, source_s3_key=extraction_key,
                 category=t.get("category"), summary=t.get("summary"),
                 action_items=mapped_action_items,
-                safety=lambda_ingest._map_safety(t.get("safety_flags")),
+                # Phase F Task 23 (D8 retirement, spec §8): no `safety=` kwarg
+                # here anymore -- findings.insert_findings below is now the
+                # ONLY Aurora write for this topic's safety data, so
+                # upsert_topic's own safety_observations INSERT loop never
+                # fires. t['safety_flags'] (still derived by lambda_extract_
+                # session._derive_safety_flags) is intentionally left
+                # untouched in the extraction JSON -- chunking.py and
+                # lambda_ask_agent.py still read it for RAG embedding text;
+                # only this Aurora dual-write is stopped. safety_observations
+                # the TABLE stays in place, unread by this writer, for
+                # rollback.
                 time_range=t.get("time_range"), participants=t.get("participants"),
                 photos=[{"s3_key": p["key"], "caption_text": None} for p in matched_photos],
             )

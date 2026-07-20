@@ -236,6 +236,75 @@ def test_list_topics_for_date_no_topics_skips_children_queries():
 
 
 # ---------------------------------------------------------------------------
+# Phase F (D8 retirement, spec §8) -- the safety_observations child slot is
+# sourced from safety-domain findings FIRST (single source of truth: a
+# corrected finding.observation shows up here immediately), falling back to
+# the legacy safety_observations row ONLY for a topic with zero safety-domain
+# findings (pre-#46 extractions that predate the findings table -- same
+# per-topic fallback posture as lambda_org_api.render_report_shape). Quality-
+# domain findings need no new slot: they are already exposed, unfiltered,
+# via the existing `findings` child.
+# ---------------------------------------------------------------------------
+
+def test_list_topics_for_date_safety_slot_prefers_findings_over_legacy():
+    topic_a = {  # has BOTH a safety finding and a legacy row -- finding wins
+        "id": "t-1", "site_id": "site-1", "user_id": "u-1",
+        "source_s3_key": "extractions/Jarley_Trainor/2026-07-06/x.json",
+        "report_date": "2026-07-06", "occurred_at": None, "category": "safety",
+        "title": "T1", "summary": "s", "created_at": "c0",
+        "site_name": "Test Site", "user_name": "Jarley Trainor",
+    }
+    topic_b = {**topic_a, "id": "t-2", "title": "T2"}  # legacy row only, no findings
+    topic_c = {**topic_a, "id": "t-3", "title": "T3"}  # quality finding only
+
+    legacy_row_t1 = {"id": "so-1", "topic_id": "t-1", "observation": "STALE pre-edit text",
+                      "risk_level": "medium", "location": None, "status": "open", "created_at": "c1"}
+    legacy_row_t2 = {"id": "so-2", "topic_id": "t-2", "observation": "Legacy only, no finding",
+                      "risk_level": "low", "location": "Level 2", "status": "open", "created_at": "c1"}
+    safety_finding_t1 = {
+        "id": "f-1", "topic_id": "t-1", "site_id": "site-1",
+        "observation": "Corrected barrier tape text", "domain": "safety", "severity": "major",
+        "entity_name": None, "entity_trade": None, "recommended_action": "Install tape",
+        "status": "open", "created_at": "c2",
+    }
+    quality_finding_t3 = {
+        "id": "f-2", "topic_id": "t-3", "site_id": "site-1",
+        "observation": "Slab finish below spec", "domain": "quality", "severity": "minor",
+        "entity_name": None, "entity_trade": None, "recommended_action": None,
+        "status": "open", "created_at": "c2",
+    }
+
+    conn = FakeConn(results=[
+        [topic_a, topic_b, topic_c],               # main topics query
+        [],                                         # action_items children
+        [legacy_row_t1, legacy_row_t2],             # safety_observations children (legacy net)
+        [safety_finding_t1, quality_finding_t3],    # findings children
+    ])
+
+    rows = topics.list_topics_for_date(conn, ["site-1"], "2026-07-06")
+    by_id = {r["id"]: r for r in rows}
+
+    # t-1: a safety-domain finding exists -> findings win, legacy row is NOT
+    # used (no dependency on safety_observations once a finding is present --
+    # this is the actual D8 fix: editing the finding now reaches this slot).
+    assert len(by_id["t-1"]["safety_observations"]) == 1
+    safety_slot = by_id["t-1"]["safety_observations"][0]
+    assert safety_slot["observation"] == "Corrected barrier tape text"
+    assert safety_slot["id"] == "f-1"
+    assert safety_slot["risk_level"] == "high"  # severity 'major' -> risk_level 'high'
+
+    # t-2: zero safety-domain findings -> legacy fallback still shown (no
+    # regression for topics extracted before the findings table existed).
+    assert by_id["t-2"]["safety_observations"] == [legacy_row_t2]
+
+    # t-3: a quality-domain finding is NOT a safety row -- the safety slot
+    # stays empty (no cross-domain leak), and the finding is still reachable,
+    # unfiltered, via the existing `findings` child.
+    assert by_id["t-3"]["safety_observations"] == []
+    assert [f for f in by_id["t-3"]["findings"] if f["domain"] == "quality"] == [quality_finding_t3]
+
+
+# ---------------------------------------------------------------------------
 # upsert_topic — time_range/participants/deadline_text (migration 0011)
 # ---------------------------------------------------------------------------
 
@@ -365,6 +434,49 @@ def test_list_for_source_prefix_orders_by_time_range_and_batches_four_children()
     assert by_id["t-2"]["findings"] == []
     assert by_id["t-2"]["photos"] == [photo_row]
     assert by_id["t-1"]["photos"] == []
+
+
+def test_list_for_source_prefix_safety_slot_prefers_findings_over_legacy():
+    """Same Phase F (D8 retirement) fix as list_topics_for_date, applied to
+    the /timeline shim's read (the plan names both ~218 and ~313 call
+    sites). render_report_shape's own findings-first fallback is unaffected
+    either way -- this just makes the shared safety_observations slot
+    correct BEFORE render_report_shape ever sees it."""
+    topic_a = {
+        "id": "t-1", "site_id": "site-1", "user_id": "u-1",
+        "source_s3_key": "extractions/Jarley_Trainor/2026-07-06/a.json",
+        "report_date": "2026-07-06", "occurred_at": None, "category": "safety",
+        "title": "T1", "summary": "s", "time_range": "08:00-08:15",
+        "participants": ["Ben"], "source": "ai", "created_at": "c0",
+        "site_name": "Test Site", "user_name": "Jarley Trainor",
+    }
+    topic_b = {**topic_a, "id": "t-2", "title": "T2", "time_range": None}
+    legacy_row_t2 = {"id": "so-1", "topic_id": "t-2", "observation": "Legacy only",
+                      "risk_level": "medium", "location": None, "status": "open", "created_at": "c2"}
+    safety_finding_t1 = {
+        "id": "f-1", "topic_id": "t-1", "observation": "Corrected text",
+        "domain": "safety", "severity": "minor", "status": "open", "created_at": "c3",
+    }
+
+    conn = FakeConn(results=[
+        [topic_a, topic_b],           # main topics query
+        [],                           # action_items children
+        [legacy_row_t2],              # safety_observations children (legacy net)
+        [safety_finding_t1],          # findings children
+        [],                           # photos children
+    ])
+
+    rows = topics.list_topics_for_source_prefix(
+        conn, "extractions/Jarley_Trainor/2026-07-06/")
+    by_id = {r["id"]: r for r in rows}
+
+    # t-1 has a safety finding -> findings win over any (absent here) legacy row.
+    assert len(by_id["t-1"]["safety_observations"]) == 1
+    assert by_id["t-1"]["safety_observations"][0]["observation"] == "Corrected text"
+    assert by_id["t-1"]["safety_observations"][0]["risk_level"] == "medium"  # 'minor' -> 'medium'
+
+    # t-2 has zero safety findings -> legacy fallback preserved.
+    assert by_id["t-2"]["safety_observations"] == [legacy_row_t2]
 
 
 # ---------------------------------------------------------------------------

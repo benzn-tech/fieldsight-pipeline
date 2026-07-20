@@ -1608,12 +1608,19 @@ def test_portfolio_counts_merges_four_queries():
     ])
     counts = org.rollup.portfolio_counts(conn, ["s-1"])
     assert len(conn.calls) == 4
-    assert "safety_observations" in conn.calls[0]["sql"]
+    # Phase F (D8 retirement): safety counts read findings-by-domain FIRST, with
+    # a legacy safety_observations fallback for report-only topics that have no
+    # safety finding (so mixed-source sites are not under-counted). spec §8.
+    assert "findings" in conn.calls[0]["sql"]
+    assert "domain='safety'" in conn.calls[0]["sql"]
+    assert "severity='major'" in conn.calls[0]["sql"]
+    assert "safety_observations" in conn.calls[0]["sql"]   # legacy fallback
+    assert "NOT EXISTS" in conn.calls[0]["sql"]            # only topics w/o a safety finding
     assert "action_items" in conn.calls[1]["sql"]
     assert "topics" in conn.calls[2]["sql"]
     assert "MAX(report_date)" in conn.calls[3]["sql"]
     assert "report_date >=" not in conn.calls[3]["sql"]   # all-time, NOT the 30-day window
-    assert conn.calls[0]["params"] == (["s-1"],)
+    assert conn.calls[0]["params"] == (["s-1"], ["s-1"])  # findings + fallback both scoped
     # psycopg returns datetime.date for MAX(report_date) — the repo must
     # normalise it to an ISO string so the JSON layer never sees a date object.
     assert counts == {"s-1": {

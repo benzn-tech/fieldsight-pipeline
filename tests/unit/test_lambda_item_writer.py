@@ -233,10 +233,14 @@ def test_topic_children_mapped(wired):
         "text": "Order more hard hats", "responsible": "Bob",
         "deadline": None, "deadline_text": "Friday", "priority": None,
     }]
-    # _map_safety: no 'location' column source, 'recommended_action' dropped.
-    assert kw["safety"] == [{
-        "observation": "Missing barrier tape", "risk_level": "medium",
-    }]
+    # Phase F Task 23 (D8 retirement, spec §8): the item-writer no longer
+    # passes safety= to upsert_topic at all -- findings (inserted separately,
+    # below) are the single source of truth for safety, and the
+    # safety_observations dual-write INSERT this kwarg used to trigger is
+    # gone. safety_flags stays in the extraction JSON itself (chunking.py /
+    # lambda_ask_agent.py still read topic['safety_flags'] for RAG embedding
+    # text) -- only the Aurora write is stopped.
+    assert "safety" not in kw
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +492,51 @@ def test_writes_findings_rows_per_topic(wired):
     assert topic_id == "topic-uuid-0"  # row["id"] from the stubbed upsert_topic
     assert site_id == "site-1"         # site["id"] from the stubbed resolve_site
     assert findings_list == FINDINGS_PAYLOAD
+
+
+# ---------------------------------------------------------------------------
+# Phase F Task 23 (D8 retirement, spec §8) -- stop the _derive_safety_flags
+# dual-write INSERT into safety_observations. findings.insert_findings (Task
+# 2 above) is the ONLY Aurora write for a topic's safety data now; the
+# extraction JSON's topic['safety_flags'] (populated by lambda_extract_
+# session._derive_safety_flags, still consumed by chunking.py's RAG
+# embedding text -- untouched by this task) is no longer mapped into
+# topics.upsert_topic's `safety=` kwarg, so upsert_topic's own
+# `INSERT INTO safety_observations` loop never fires.
+# ---------------------------------------------------------------------------
+
+def test_findings_written_and_safety_observations_no_longer_inserted(wired):
+    upsert_calls = []
+    wired.setattr(
+        iw.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            upsert_calls.append(kw) or {"id": "topic-uuid-0"},
+    )
+    finding_calls = []
+    wired.setattr(
+        iw.findings, "insert_findings",
+        lambda conn, topic_id, site_id, findings_list:
+            finding_calls.append(findings_list) or [],
+    )
+    wired.setattr(
+        iw, "_s3_client",
+        FakeS3({EXTRACTION_KEY: json.dumps(
+            make_extraction(topics=[{
+                **make_extraction()["topics"][0],
+                "findings": FINDINGS_PAYLOAD,
+            }]))}),
+    )
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 1}
+    # findings remain the source of truth -- still written.
+    assert finding_calls == [FINDINGS_PAYLOAD]
+    # the dual-write is gone: upsert_topic never receives a `safety` kwarg,
+    # so its own safety_observations INSERT loop (`for o in (safety or []):`)
+    # has nothing to iterate and never executes.
+    assert len(upsert_calls) == 1
+    assert "safety" not in upsert_calls[0]
 
 
 def test_artifact_topics_carry_finding_ids(wired):

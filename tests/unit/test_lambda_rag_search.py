@@ -28,6 +28,10 @@ def wired(monkeypatch):
     monkeypatch.setattr(rag, "get_cached_connection", lambda *a, **k: FakeConn())
     monkeypatch.setattr(rag.users, "get_user_by_sub",
                         lambda conn, sub: dict(CALLER) if sub == "sub-1" else None)
+    # Default: no active aliases, so the Task 14 normalize() safety net is a
+    # no-op for these pre-existing tests (they don't exercise alias behavior).
+    monkeypatch.setattr(rag.aliases, "list_active",
+                        lambda conn, cid, site_ids=None: [])
     return monkeypatch
 
 

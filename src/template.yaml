@@ -931,6 +931,16 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - reports/*
+            - Effect: Allow
+              # Task 20 (content correction reindex chain): after a content
+              # edit commits, org-api (in-VPC) writes the per-topic reindex
+              # REQUEST artifact to the lake bucket's reindex_requests/
+              # prefix — it never calls DashScope itself (BUG-36). The
+              # non-VPC EmbedReportFunction picks this up via a manually
+              # wired S3 trigger (scripts/wire-s3-events.sh, BUG-33) and
+              # writes the VECTORS artifact back into the same prefix.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/reindex_requests/*
       Events:
         OrgProxy:
           Type: Api
@@ -1084,6 +1094,16 @@ Resources:
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/match_requests/*
             - Effect: Allow
+              # Task 20 (content correction reindex chain): apply_reindex_vectors
+              # reads the VECTORS artifact the non-VPC EmbedReportFunction wrote
+              # under reindex_vectors/ (separate prefix from the request — S3
+              # forbids overlapping-suffix rules on a shared prefix; S3-event
+              # triggered, BUG-33 wiring in scripts/wire-s3-events.sh) before
+              # replacing the topic's chunks in Aurora (delete_chunks_for_topic
+              # + insert_chunk).
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/reindex_vectors/*
+            - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
@@ -1140,6 +1160,18 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/embeddings/*
+            - Effect: Allow
+              # Task 20 (content correction reindex chain): reads the REQUEST
+              # artifact org-api enqueued under reindex_requests/ and writes the
+              # VECTORS result to a SEPARATE prefix reindex_vectors/ for the
+              # in-VPC IngestFunction to apply. Distinct prefixes — S3 forbids
+              # overlapping-suffix rules on a shared prefix, and the vectors
+              # output never re-triggers embed (no BUG-13 loop).
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/reindex_requests/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/reindex_vectors/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}

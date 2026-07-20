@@ -9,6 +9,8 @@
 #   Transcribe  ← audio_segments/**.wav         (VAD output)
 #   EmbedReport ← reports/**daily_report.json   (report generator output, non-VPC DashScope embed)
 #   Ingest      ← embeddings/**vectors.json     (embed-report output, in-VPC Aurora insert)
+#   EmbedReport ← reindex_requests/**.json      (content-edit reindex REQUEST, org-api output, non-VPC DashScope embed)
+#   Ingest      ← reindex_requests/**.vectors.json (embed-report reindex VECTORS output, in-VPC Aurora apply)
 #
 # SAFETY:
 #   * MERGE, not clobber: we read the existing notification config and
@@ -76,11 +78,21 @@ fi
 # internet, chunks the report + transcripts, and writes the
 # {sha256(chunk_text): vector} sidecar to embeddings/. Zero prefix overlap
 # with ingest below (reports/ vs embeddings/), so no double-trigger loop.
+# NOTE(Task 20, content-correction reindex chain): embed-report ALSO triggers
+# on reindex_requests/*.json — the per-topic reindex REQUEST artifact org-api
+# (in-VPC) writes after a content edit commits. embed-report's VECTORS output
+# goes to a SEPARATE prefix (reindex_vectors/, see fs-ingest-reindex below),
+# NOT back under reindex_requests/, so it never re-triggers embed-report (no
+# BUG-13 loop) and the two rules don't share a prefix — S3 rejects two rules
+# with overlapping suffixes on a shared prefix ("Configuration is ambiguously
+# defined").
 if fn_exists "${PREFIX}-embed-report"; then
   WIRE_FNS+=("${PREFIX}-embed-report")
   DESIRED=$(jq -c --arg arn "$EMBED_ARN" '. + [
     {"Id":"fs-embed-report","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
-     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reports/"},{"Name":"suffix","Value":"daily_report.json"}]}}}
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reports/"},{"Name":"suffix","Value":"daily_report.json"}]}}},
+    {"Id":"fs-embed-reindex","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reindex_requests/"},{"Name":"suffix","Value":".json"}]}}}
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-embed-report not deployed — skipping embed-report trigger"
@@ -93,11 +105,18 @@ fi
 # harmless. The REAL lake trigger lives on the prod bucket
 # (fieldsight-data-509194952652) and is managed MANUALLY there (that
 # bucket has hand-managed notifications; see IngestBucketName param).
+# NOTE(Task 20, content-correction reindex chain): ingest ALSO triggers on
+# reindex_vectors/*.json — the VECTORS result fs-embed-reindex above writes to
+# that separate prefix. lambda_ingest.lambda_handler routes it to
+# apply_reindex_vectors (delete_chunks_for_topic + insert_chunk), which writes
+# to Aurora only, not back to S3 — no BUG-13 loop.
 if fn_exists "${PREFIX}-ingest"; then
   WIRE_FNS+=("${PREFIX}-ingest")
   DESIRED=$(jq -c --arg arn "$INGEST_ARN" '. + [
     {"Id":"fs-ingest-report","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
-     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"embeddings/"},{"Name":"suffix","Value":"vectors.json"}]}}}
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"embeddings/"},{"Name":"suffix","Value":"vectors.json"}]}}},
+    {"Id":"fs-ingest-reindex","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reindex_vectors/"},{"Name":"suffix","Value":".json"}]}}}
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-ingest not deployed — skipping ingest trigger"

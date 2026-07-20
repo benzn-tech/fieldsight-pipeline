@@ -56,6 +56,8 @@ import boto3
 
 import dashscope_utils
 import lambda_ingest
+import reindex
+import text_normalize
 from chunking import chunk_report, chunk_transcripts
 
 logger = logging.getLogger()
@@ -128,11 +130,65 @@ def embed_report(date, user_folder, report_key):
     return {"report": report_key, "chunks": len(chunks), "vectors": len(vectors)}
 
 
+REINDEX_REQUEST_RE = re.compile(
+    r"^reindex_requests/[^/]+/[^/]+/[^/]+\.json$")
+
+
+def embed_reindex_request(key):
+    """Non-VPC reindex worker (spec §5.3). Embeds the corrected topic chunks +
+    this topic's alias-normalized transcript windows, writes the vectors
+    result artifact for the in-VPC apply step. Transcript S3 is read, never
+    written (D4)."""
+    req = json.loads(s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8"))
+    chunks_out = [dict(c) for c in req.get("topic_chunks", [])]
+
+    # Rebuild THIS topic's transcript windows from the immutable report doc.
+    if req.get("report_key") and req.get("topic_seq") is not None:
+        try:
+            raw = s3().get_object(Bucket=S3_BUCKET, Key=req["report_key"])["Body"].read()
+            report = json.loads(raw.decode("utf-8"))
+            one = [t for t in report.get("topics", [])
+                   if t.get("topic_id") == req["topic_seq"]]
+            if one:
+                turns = lambda_ingest._load_turns(req["folder"], req["date"])
+                for c in chunk_transcripts({"topics": one, **{k: report.get(k)
+                                            for k in ("user_name", "site", "report_date")}}, turns):
+                    text = text_normalize.normalize(c["chunk_text"], req.get("aliases") or [])
+                    chunks_out.append({"chunk_type": c["chunk_type"], "chunk_text": text,
+                                       "metadata": c["metadata"]})
+        except Exception:
+            logger.exception("reindex %s: transcript window rebuild failed (topic chunks only)", key)
+
+    if not chunks_out:
+        logger.info("reindex %s: no chunks -- skipping", key)
+        return {"reindex": key, "chunks": 0}
+
+    embeddings = dashscope_utils.embed([c["chunk_text"] for c in chunks_out])
+    for c, e in zip(chunks_out, embeddings):
+        c["embedding"] = e
+
+    result = {
+        "topic_id": req["topic_id"], "site_id": req["site_id"],
+        "user_id": req.get("user_id"), "report_date": req["report_date"],
+        "source_s3_key": req.get("source_s3_key"), "chunks": chunks_out,
+    }
+    vkey = reindex.vectors_key(req["date"], req["folder"], req["topic_id"])
+    s3().put_object(Bucket=S3_BUCKET, Key=vkey,
+                    Body=json.dumps(result), ContentType="application/json")
+    logger.info("reindex embedded %s chunks=%d", key, len(chunks_out))
+    return {"reindex": key, "chunks": len(chunks_out)}
+
+
 def lambda_handler(event, context):
     event = event or {}
     results = []
     for record in event.get("Records", []):
         key = unquote_plus(record["s3"]["object"]["key"])
+        if key.endswith(".vectors.json"):
+            continue                                    # apply-side input, not ours
+        if REINDEX_REQUEST_RE.match(key):
+            results.append(embed_reindex_request(key))
+            continue
         m = REPORT_KEY_RE.match(key)
         if not m:
             logger.warning("skipping non-report S3 key: %s", key)
