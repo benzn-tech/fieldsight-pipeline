@@ -1599,31 +1599,38 @@ class _RollupFakeConn:
         return _RollupFakeCursor(self)
 
 
-def test_portfolio_counts_merges_three_queries():
+def test_portfolio_counts_merges_four_queries():
     conn = _RollupFakeConn(results=[
         [{"site_id": "s-1", "open_safety": 2, "open_high_safety": 1}],
         [{"site_id": "s-1", "open_actions": 3, "total_actions": 5, "overdue_actions": 1}],
         [{"site_id": "s-1", "topics_count": 7, "participants": 4}],
+        [{"site_id": "s-1", "last_activity_at": _dt.date(2026, 7, 18)}],
     ])
     counts = org.rollup.portfolio_counts(conn, ["s-1"])
-    assert len(conn.calls) == 3
+    assert len(conn.calls) == 4
     assert "safety_observations" in conn.calls[0]["sql"]
     assert "action_items" in conn.calls[1]["sql"]
     assert "topics" in conn.calls[2]["sql"]
+    assert "MAX(report_date)" in conn.calls[3]["sql"]
+    assert "report_date >=" not in conn.calls[3]["sql"]   # all-time, NOT the 30-day window
     assert conn.calls[0]["params"] == (["s-1"],)
+    # psycopg returns datetime.date for MAX(report_date) — the repo must
+    # normalise it to an ISO string so the JSON layer never sees a date object.
     assert counts == {"s-1": {
         "open_safety": 2, "open_high_safety": 1,
         "open_actions": 3, "total_actions": 5, "overdue_actions": 1,
         "topics_count": 7, "participants": 4,
+        "last_activity_at": "2026-07-18",
     }}
 
 
 def test_zero_count_site_included():
-    # no rows come back from any of the 3 GROUP BY queries for either site
-    conn = _RollupFakeConn(results=[[], [], []])
+    # no rows come back from any of the 4 GROUP BY queries for either site
+    conn = _RollupFakeConn(results=[[], [], [], []])
     counts = org.rollup.portfolio_counts(conn, ["s-1", "s-2"])
     zero = {"open_safety": 0, "open_high_safety": 0, "open_actions": 0,
-            "total_actions": 0, "overdue_actions": 0, "topics_count": 0, "participants": 0}
+            "total_actions": 0, "overdue_actions": 0, "topics_count": 0,
+            "participants": 0, "last_activity_at": None}
     assert counts == {"s-1": zero, "s-2": dict(zero)}
 
 
@@ -1635,11 +1642,33 @@ def test_site_id_keys_are_strings():
     sid = _uuid.uuid4()
     conn = _RollupFakeConn(results=[
         [{"site_id": sid, "open_safety": 1, "open_high_safety": 0}],
-        [], [],
+        [], [], [],
     ])
     counts = org.rollup.portfolio_counts(conn, [sid])
     assert str(sid) in counts
     assert all(isinstance(k, str) for k in counts)
+
+
+def test_portfolio_counts_last_activity_is_all_time_not_windowed():
+    # A site whose only topics are OLDER than 30 days still gets a
+    # last_activity_at (all-time MAX), even though the 30-day topics query
+    # returned no row for it — the exact reason the MAX lives in its own
+    # query instead of the windowed one.
+    conn = _RollupFakeConn(results=[
+        [],                                                  # safety
+        [],                                                  # actions
+        [],                                                  # 30-day topics: nothing
+        [{"site_id": "s-1", "last_activity_at": _dt.date(2026, 1, 3)}],
+    ])
+    counts = org.rollup.portfolio_counts(conn, ["s-1"])
+    assert counts["s-1"]["topics_count"] == 0
+    assert counts["s-1"]["last_activity_at"] == "2026-01-03"
+
+
+def test_portfolio_counts_last_activity_none_without_topics():
+    conn = _RollupFakeConn(results=[[], [], [], []])
+    counts = org.rollup.portfolio_counts(conn, ["s-1"])
+    assert counts["s-1"]["last_activity_at"] is None
 
 
 def test_status_red_on_high_safety():
