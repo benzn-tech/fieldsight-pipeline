@@ -210,10 +210,45 @@ name_aliases(
   re-embed inserts the corrected/normalized chunks (mock DashScope).
 - **Frontend** — `node --check`; editor renders per ACL; history shows edits.
 
-## 8. Scope boundary (what this spec delivers)
+## 8. SAFETY & QUALITY must stay consistent with edits (D8 single-source)
+
+**Requirement (raised in review):** SAFETY and QUALITY are not separate content —
+they are the daily-extracted findings **grouped by `domain`** (`safety`/`quality`).
+So when a user corrects a finding's text, the SAFETY/QUALITY views MUST reflect
+it automatically. Any path that shows a stale copy is a bug.
+
+**Current obstacle — the D8 transitional dual-write.** Safety findings are
+written to BOTH the new `findings` table (0010: has `domain`, `severity`, and
+`status DEFAULT 'open'`) AND the legacy `safety_observations` table (0003), via
+the extractor's `_derive_safety_flags` bridge. The two rows are **not linked**
+(no `finding_id` on `safety_observations`). Today's SAFETY reads come from
+`safety_observations`, in two places:
+- `rollup.portfolio_counts` safety subquery (`FROM safety_observations …`);
+- `topics.list_topics_for_date` attaches `safety_observations` as a topic child
+  (the Timeline / live-items / SAFETY-page read path).
+
+If the content endpoint edits a `findings` row, `safety_observations` stays
+stale → SAFETY shows the old text. Editing `safety_observations` directly (it is
+in the v1 allow-list) has the mirror problem.
+
+**Decision — retire D8; make `findings`-by-`domain` the single source.** SAFETY/
+QUALITY become pure views over `findings`:
+- `rollup.portfolio_counts` safety count → `findings WHERE domain='safety' AND status='open'` (open-high = `severity='major'`).
+- `topics.list_topics_for_date` (both shapes) → attach `findings WHERE domain IN ('safety','quality')` in the child slot the SAFETY/QUALITY UI reads, instead of `safety_observations`.
+- Stop the `_derive_safety_flags` dual-write into `safety_observations` (leave the table in place, unread, for rollback; drop later).
+- Content **allow-list**: safety/quality corrections edit the `findings` row
+  (`observation`, `entity_name`, …); **remove `safety_observations` from the
+  editable set** so there is only one editable source.
+
+**Sequencing:** this retirement must land **before** the Phase D frontend
+content editors, so the first real content edit already propagates to SAFETY/
+QUALITY. It is added as **Phase F** of the plan, scheduled before Phase D.
+
+## 9. Scope boundary (what this spec delivers)
 **Delivers:** editable structured content (free-text, materialized) + audit
 history + the D id-surfacing fix + per-topic delete-and-re-embed re-index +
-`name_aliases` store + `normalize()` + the diff-candidate glossary confirm.
+`name_aliases` store + `normalize()` + the diff-candidate glossary confirm +
+the D8 single-source retirement (§8) so edits propagate to SAFETY/QUALITY.
 
 **Not here:** B's AWS Transcribe Custom Vocabulary integration (uses the store
 built here); C's content-filter / privacy (masking, non-work removal,
