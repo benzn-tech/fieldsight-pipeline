@@ -19,6 +19,9 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/asset-url?key=…          → presigned GET for an org asset
   PATCH /api/org/sites/{id}               → update site fields / swap icon (admin/gm)
   POST  /api/org/sites/{id}/(un)archive   → soft-delete / restore site (admin/gm)
+  GET   /api/org/sites/{id}/contributors  → folders with topics attributed to
+                                            (site,date); members∪this = the
+                                            aggregated-timeline fan-out set
   GET   /api/org/sites/{id}/members       → site's members from memberships (ACL,
                                              fixes legacy USERS ON SITE empty for Aurora-only sites)
   POST  /api/org/members/{sub}/(un)archive→ soft-delete / restore member (admin/gm, never self)
@@ -218,6 +221,9 @@ def dispatch(conn, event, method, route):
     m_sm = re.match(r"^/sites/([^/]+)/members$", route)
     if m_sm and method == "GET":
         return list_site_members(conn, caller, m_sm.group(1))
+    m_sc = re.match(r"^/sites/([^/]+)/contributors$", route)
+    if m_sc and method == "GET":
+        return list_site_contributors(conn, caller, m_sc.group(1), event)
     m_ma = re.match(r"^/members/([^/]+)/(archive|unarchive)$", route)
     if m_ma and method == "POST":
         return archive_member_endpoint(conn, caller, m_ma.group(1), m_ma.group(2))
@@ -666,6 +672,23 @@ def list_site_members(conn, caller, site_id):
         return error("site not found", 404)
     rows = memberships.members_for_site(conn, site["company_id"], site_id)
     return ok({"members": rows, "site": str(site_id)})
+
+
+def list_site_contributors(conn, caller, site_id, event):
+    """Recording folders whose topics are attributed to this (site, date) but
+    who may NOT be site members -- the read-side complement to G5b write-side
+    attribution (recordings.site_id). The site-aggregated timeline fans out over
+    members UNION these folders, so a non-member recorder's site-tagged topics
+    stop vanishing from the site view (the aggregation-attribution quirk). Same
+    ACL as list_site_members (_allowed_site_ids -> graded / cross-company)."""
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    p = event.get("queryStringParameters") or {}
+    date = (p.get("date") or "").strip()
+    if not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    folders = topics.list_contributor_folders_for_site_date(conn, site_id, date)
+    return ok({"folders": folders, "site": str(site_id), "date": date})
 
 
 # ----------------------------------------------------------
