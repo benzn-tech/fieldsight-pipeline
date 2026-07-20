@@ -2707,6 +2707,45 @@ def test_site_members_denies_site_outside_accessible_set_403(wired):
     assert called == []                                  # ACL rejects before the members read
 
 
+# ---- /sites/{id}/contributors (aggregation-attribution fix) ----
+def test_site_contributors_returns_folders_for_accessible_site(wired):
+    """The read-side complement to G5b: folders with topics attributed to
+    (site,date) even when not members -- the aggregated timeline unions these."""
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    seen = {}
+    wired.setattr(org.topics, "list_contributor_folders_for_site_date",
+                  lambda conn, sid, date: (seen.update(sid=sid, date=date)
+                                           or ["Ben_Lin", "David_Poole"]))
+    res = org.lambda_handler(make_event("GET", "/api/org/sites/" + SITE_ID + "/contributors",
+                                        params={"date": "2026-07-17"}), None)
+    assert res["statusCode"] == 200
+    assert seen == {"sid": SITE_ID, "date": "2026-07-17"}
+    body = body_of(res)
+    assert body["folders"] == ["Ben_Lin", "David_Poole"]
+    assert body["site"] == SITE_ID and body["date"] == "2026-07-17"
+
+
+def test_site_contributors_denies_site_outside_accessible_set_403(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    called = []
+    wired.setattr(org.topics, "list_contributor_folders_for_site_date",
+                  lambda *a, **k: called.append(1) or [])
+    res = org.lambda_handler(make_event("GET", "/api/org/sites/" + OTHER_SITE_ID + "/contributors",
+                                        params={"date": "2026-07-17"}), None)
+    assert res["statusCode"] == 403
+    assert called == []                                  # ACL rejects before the topics read
+
+
+def test_site_contributors_requires_valid_date_400(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    called = []
+    wired.setattr(org.topics, "list_contributor_folders_for_site_date",
+                  lambda *a, **k: called.append(1) or [])
+    res = org.lambda_handler(make_event("GET", "/api/org/sites/" + SITE_ID + "/contributors"), None)
+    assert res["statusCode"] == 400
+    assert called == []                                  # bad/missing date never reaches the query
+
+
 # ----------------------------------------------------------
 # Phase 3 Task 2 -- per-path x per-role graded ACL tests (visibility spec
 # §3.1/§3.2). GRADED_ROLES=True is set explicitly per test via

@@ -100,6 +100,32 @@ def list_site_topics(conn, site_id, report_date) -> list[dict]:
     ).fetchall()
 
 
+def list_contributor_folders_for_site_date(conn, site_id, report_date) -> list[str]:
+    """Distinct S3 recording-folder names whose topics are attributed to this
+    (site_id, report_date) -- the UNION source for the site-aggregated timeline
+    fan-out.
+
+    A topic's folder is the recorder folder encoded in source_s3_key
+    ('extractions/{folder}/{date}/...' or 'reports/{date}/{folder}/...'), NOT
+    user_id: G5b attribution resolves the AUTHOR/site, but the /timeline read is
+    served per S3 FOLDER. A non-member recorder (e.g. an admin whose recording
+    was site-tagged via recordings.site_id) has topics attributed here yet is
+    absent from memberships, so a members-only fan-out drops them -- exactly the
+    aggregation gap this closes. Members ∪ these folders = the correct fan-out.
+
+    Literal '%' in the LIKE patterns is doubled ('%%') because the query carries
+    positional params (psycopg %-style)."""
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT DISTINCT CASE "
+        "  WHEN source_s3_key LIKE 'extractions/%%' THEN split_part(source_s3_key, '/', 2) "
+        "  WHEN source_s3_key LIKE 'reports/%%'     THEN split_part(source_s3_key, '/', 3) "
+        "END AS folder "
+        "FROM topics WHERE site_id=%s AND report_date=%s",
+        (site_id, report_date),
+    ).fetchall()
+    return sorted({r["folder"] for r in rows if r["folder"]})
+
+
 def get_topic_photos(conn, topic_id) -> list[dict]:
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, s3_key, caption_text, created_at FROM topic_photos "
