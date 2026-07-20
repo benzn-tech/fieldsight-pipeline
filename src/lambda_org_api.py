@@ -60,11 +60,14 @@ import boto3
 from botocore.exceptions import ClientError
 from psycopg.errors import UniqueViolation
 
+import reindex
 from db.connection import get_connection
-from repositories import (action_items, companies, memberships, observations, programme,
-                          programme_suggestions, recordings, rollup, scope, sites, topics,
-                          users, voice_messages)
+from psycopg.rows import dict_row as RealDictRow
+from repositories import (action_items, companies, content, content_edits, memberships,
+                          observations, programme, programme_suggestions, recordings, rollup,
+                          scope, sites, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
+from text_normalize import diff_candidates
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -238,6 +241,13 @@ def dispatch(conn, event, method, route):
     m_ai = re.match(r"^/action-items/([^/]+)$", route)
     if m_ai and method == "PATCH":
         return patch_action_item(conn, caller, m_ai.group(1), parse_body(event))
+
+    m_ce = re.match(r"^/content/([^/]+)/([^/]+)$", route)
+    if m_ce and method == "PATCH":
+        return patch_content(conn, caller, m_ce.group(1), m_ce.group(2), parse_body(event))
+    m_ch = re.match(r"^/content/([^/]+)/([^/]+)/history$", route)
+    if m_ch and method == "GET":
+        return get_content_history(conn, caller, m_ch.group(1), m_ch.group(2))
 
     if route == "/live-items":
         if method == "GET":
@@ -1097,6 +1107,98 @@ def patch_action_item(conn, caller, action_item_id, body):
     if updated is None:
         return error("action item not found", 404)
     return ok(updated)
+
+
+def patch_content(conn, caller, table, row_id, body):
+    """Edit one free-text content field (spec §3/§5.2, D1). ACL is the D7
+    per-item tier -- mirrors patch_action_item exactly: platform_admin
+    (cross-company) edits any tenant; company roles stay pinned; the row's
+    site must be in the caller's reach; and the caller must be admin/gm, THIS
+    site's pm/site_manager, or the item's author (the owning topic's user).
+    Writes the corrected text + a content_edits audit row atomically, then
+    enqueues a best-effort per-topic re-index (never rolls back the edit)."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    if table not in content.EDITABLE:
+        return error(f"table must be one of {sorted(content.EDITABLE)}", 400)
+    # Exactly one whitelisted field per request (D1 whole-field edit).
+    fields = {k: v for k, v in body.items() if content.is_editable(table, k)}
+    if len(fields) != 1:
+        return error("exactly one editable field required", 400)
+    field, value = next(iter(fields.items()))
+    if not isinstance(value, str):
+        return error("value must be a string", 400)
+
+    row = content.get_content_row(conn, table, row_id)
+    cross = is_cross_company(caller["global_role"])
+    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+        return error("content row not found", 404)      # incl. cross-company
+    site_id = str(row["site_id"])
+    if site_id not in _allowed_site_ids(conn, caller):
+        return error("access denied to this content's site", 403)
+    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
+    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_site_authority = site_role in ("pm", "site_manager")
+    is_author = row.get("author_user_id") is not None and \
+        str(row["author_user_id"]) == str(caller["id"])
+    if not (is_admin or is_site_authority or is_author):
+        return error("admin/gm, this site's pm/site_manager, or the author only", 403)
+
+    before = row.get(field)
+    updated = content.update_content_field(conn, table, row_id, field, value)
+    if updated is None:
+        return error("content row not found", 404)
+    content_edits.append_content_edit(
+        conn, row["company_id"], table, row_id, field, before, value,
+        caller["id"], caller["global_role"])
+
+    # Best-effort per-topic re-index (spec §6: async, never blocks/rolls back
+    # the edit). Topic id + folder/date come from the row's owning topic.
+    try:
+        _enqueue_content_reindex(conn, table, row_id)
+    except Exception:
+        logger.exception("content edit %s/%s: reindex enqueue failed (edit kept)",
+                          table, row_id)
+
+    candidates = diff_candidates(before or "", value)
+    return ok({"row": updated, "candidates": candidates})
+
+
+def _enqueue_content_reindex(conn, table, row_id):
+    """Resolve the edited row's owning topic + its (folder, date), then write
+    the reindex request artifact. topic_id = the row itself for `topics`, else
+    the child's topic_id."""
+    if table == "topics":
+        tid = row_id
+    else:
+        r = conn.cursor(row_factory=RealDictRow).execute(
+            f"SELECT topic_id FROM {table} WHERE id=%s", (row_id,)).fetchone()
+        if not r:
+            return
+        tid = r["topic_id"]
+    meta = conn.cursor(row_factory=RealDictRow).execute(
+        "SELECT t.report_date, u.folder_name FROM topics t "
+        "LEFT JOIN users u ON u.id = t.user_id WHERE t.id=%s", (tid,)).fetchone()
+    if not meta or not meta.get("folder_name"):
+        return                                          # unattributed -> skip re-index
+    # LAKE_BUCKET (IngestBucketName) is the lake the embed/ingest lambdas read;
+    # org-api's S3_BUCKET is DataBucketName, a DIFFERENT bucket. The reindex
+    # chain lives on the lake, so enqueue writes there (see Task 20 IAM grant).
+    reindex.enqueue_topic_reindex(s3(), LAKE_BUCKET, conn, tid,
+                                  meta["folder_name"], str(meta["report_date"]))
+
+
+def get_content_history(conn, caller, table, row_id):
+    """content_edits trail for one row (spec §5.5 History view). Company-guarded
+    via get_content_row (which also resolves cross-company for platform_admin)."""
+    if table not in content.EDITABLE:
+        return error(f"table must be one of {sorted(content.EDITABLE)}", 400)
+    row = content.get_content_row(conn, table, row_id)
+    cross = is_cross_company(caller["global_role"])
+    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+        return error("content row not found", 404)
+    edits = content_edits.list_content_edits(conn, row["company_id"], table, row_id)
+    return ok({"edits": edits})
 
 
 def archive_observation_endpoint(conn, caller, obs_id):

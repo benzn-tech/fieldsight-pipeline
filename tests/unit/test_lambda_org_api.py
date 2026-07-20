@@ -3660,3 +3660,68 @@ def test_timeline_no_aurora_topics_stays_verbatim(wired, monkeypatch):
     body = body_of(res)
     assert body["_report_metadata"]["source"] == "nightly"   # byte-verbatim
     assert body["topics"][0]["topic_title"] == "verbatim"
+
+
+def _wire_content(monkeypatch, row, *, cross=False):
+    monkeypatch.setattr(org.content, "get_content_row", lambda conn, tbl, rid: dict(row))
+    monkeypatch.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-1"})
+    monkeypatch.setattr(org.memberships, "caller_site_roles",
+                        lambda conn, uid: {"s-1": "site_manager"})
+    monkeypatch.setattr(org, "is_cross_company", lambda role: cross)
+    updated = {}
+    monkeypatch.setattr(org.content, "update_content_field",
+                        lambda conn, tbl, rid, f, v: updated.update({f: v}) or {"id": rid, f: v})
+    audit = {}
+    monkeypatch.setattr(org.content_edits, "append_content_edit",
+                        lambda conn, *a, **k: audit.update({"args": a}) or {"id": "e-1"})
+    monkeypatch.setattr(org.reindex, "enqueue_topic_reindex",
+                        lambda *a, **k: "reindex_requests/x.json")
+    return updated, audit
+
+
+CONTENT_ROW = {"id": "t-1", "site_id": "s-1", "company_id": "c-uuid-1",
+               "author_user_id": "u-9", "title": "Mackon slab", "summary": "s"}
+
+
+def test_patch_content_writes_audit_and_returns_candidates(wired, monkeypatch):
+    updated, audit = _wire_content(monkeypatch, CONTENT_ROW)
+    res = org.dispatch(FakeConn(),
+                       make_event("PATCH", "/api/org/content/topics/t-1",
+                                  body={"title": "McCahon slab"}),
+                       "PATCH", "/content/topics/t-1")
+    body = body_of(res)
+    assert res["statusCode"] == 200
+    assert updated["title"] == "McCahon slab"
+    # audit: (company_id, table, row_id, field, before, after, actor_user, actor_role)
+    assert audit["args"][4] == "Mackon slab"
+    assert audit["args"][5] == "McCahon slab"
+    assert "McCahon" in body["candidates"]               # D2 diff candidate
+
+
+def test_patch_content_rejects_non_whitelisted_field(wired, monkeypatch):
+    _wire_content(monkeypatch, CONTENT_ROW)
+    res = org.dispatch(FakeConn(),
+                       make_event("PATCH", "/api/org/content/topics/t-1",
+                                  body={"category": "safety"}),
+                       "PATCH", "/content/topics/t-1")
+    assert res["statusCode"] == 400
+
+
+def test_patch_content_outsider_denied(wired, monkeypatch):
+    _wire_content(monkeypatch, CONTENT_ROW)
+    monkeypatch.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-OTHER"})
+    res = org.dispatch(FakeConn(),
+                       make_event("PATCH", "/api/org/content/topics/t-1",
+                                  body={"title": "x"}),
+                       "PATCH", "/content/topics/t-1")
+    assert res["statusCode"] == 403
+
+
+def test_patch_content_cross_company_platform_admin_allowed(wired, monkeypatch):
+    other = dict(CONTENT_ROW, company_id="c-OTHER")
+    _wire_content(monkeypatch, other, cross=True)
+    res = org.dispatch(FakeConn(),
+                       make_event("PATCH", "/api/org/content/topics/t-1",
+                                  body={"title": "x"}),
+                       "PATCH", "/content/topics/t-1")
+    assert res["statusCode"] == 200
