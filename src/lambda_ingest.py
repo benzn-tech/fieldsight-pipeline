@@ -63,6 +63,7 @@ from urllib.parse import unquote_plus
 import boto3
 
 import match_request
+import reindex
 from chunking import chunk_report, chunk_transcripts
 from db.connection import get_connection
 from repositories import chunks, companies, memberships, sites, topics, users
@@ -454,6 +455,20 @@ def run_backfill():
     return {"processed": processed, "skipped": skipped, "failed": failed}
 
 
+REINDEX_VECTORS_RE = re.compile(
+    r"^reindex_requests/[^/]+/[^/]+/[^/]+\.vectors\.json$")
+
+
+def apply_reindex_vectors(key):
+    """In-VPC reindex apply (spec §5.3): read the embedded result artifact and
+    replace the topic's chunks (delete_chunks_for_topic + insert_chunk)."""
+    result = json.loads(s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8"))
+    with get_connection() as conn:
+        n = reindex.apply_vectors(conn, result)
+    logger.info("reindex applied %s chunks=%d", key, n)
+    return {"reindex_applied": key, "chunks": n}
+
+
 # ----------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------
@@ -466,6 +481,9 @@ def lambda_handler(event, context):
         results = []
         for record in event["Records"]:
             key = unquote_plus(record["s3"]["object"]["key"])
+            if REINDEX_VECTORS_RE.match(key):
+                results.append(apply_reindex_vectors(key))
+                continue
             parsed = _parse_embeddings_key(key)
             if parsed is None:
                 logger.warning("skipping non-embeddings S3 key: %s", key)
