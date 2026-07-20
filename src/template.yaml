@@ -1096,11 +1096,13 @@ Resources:
             - Effect: Allow
               # Task 20 (content correction reindex chain): apply_reindex_vectors
               # reads the VECTORS artifact the non-VPC EmbedReportFunction wrote
-              # under reindex_requests/ (S3-event triggered, BUG-33 wiring in
-              # scripts/wire-s3-events.sh) before replacing the topic's chunks
-              # in Aurora (delete_chunks_for_topic + insert_chunk).
+              # under reindex_vectors/ (separate prefix from the request — S3
+              # forbids overlapping-suffix rules on a shared prefix; S3-event
+              # triggered, BUG-33 wiring in scripts/wire-s3-events.sh) before
+              # replacing the topic's chunks in Aurora (delete_chunks_for_topic
+              # + insert_chunk).
               Action: s3:GetObject
-              Resource: !Sub arn:aws:s3:::${IngestBucketName}/reindex_requests/*
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/reindex_vectors/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
@@ -1160,16 +1162,16 @@ Resources:
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/embeddings/*
             - Effect: Allow
               # Task 20 (content correction reindex chain): reads the REQUEST
-              # artifact org-api enqueued and writes the VECTORS result back
-              # into the same prefix for the in-VPC IngestFunction to apply.
-              # Distinct suffix (.json request vs .vectors.json result) —
-              # embed_reindex_request explicitly skips keys already ending in
-              # .vectors.json (its own output), so re-triggering on that
-              # output is a no-op, not a BUG-13 loop.
-              Action:
-                - s3:GetObject
-                - s3:PutObject
+              # artifact org-api enqueued under reindex_requests/ and writes the
+              # VECTORS result to a SEPARATE prefix reindex_vectors/ for the
+              # in-VPC IngestFunction to apply. Distinct prefixes — S3 forbids
+              # overlapping-suffix rules on a shared prefix, and the vectors
+              # output never re-triggers embed (no BUG-13 loop).
+              Action: s3:GetObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/reindex_requests/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/reindex_vectors/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}

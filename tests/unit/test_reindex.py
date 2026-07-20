@@ -18,7 +18,7 @@ def test_keys():
     assert reindex.request_key("2026-07-16", "Ada_L", "t-1") == \
         "reindex_requests/2026-07-16/Ada_L/t-1.json"
     assert reindex.vectors_key("2026-07-16", "Ada_L", "t-1") == \
-        "reindex_requests/2026-07-16/Ada_L/t-1.vectors.json"
+        "reindex_vectors/2026-07-16/Ada_L/t-1.json"
 
 
 def test_enqueue_writes_request_with_topic_chunks_and_aliases(monkeypatch):

@@ -34,7 +34,7 @@ def test_reindex_event_embeds_topic_chunks_and_writes_vectors(monkeypatch):
     monkeypatch.setattr(mod.dashscope_utils, "embed", lambda texts: [[0.5] * 1024 for _ in texts])
 
     out = mod.lambda_handler({"Records": [{"s3": {"object": {"key": key}}}]}, None)
-    vkey = "reindex_requests/2026-07-16/Ada_L/t-1.vectors.json"
+    vkey = "reindex_vectors/2026-07-16/Ada_L/t-1.json"
     assert vkey in s3.puts
     result = s3.puts[vkey]
     assert result["topic_id"] == "t-1"
