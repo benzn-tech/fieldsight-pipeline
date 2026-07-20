@@ -67,12 +67,29 @@ def portfolio_counts(conn, site_ids) -> dict:
     ids = list(site_ids)
     merged = {str(sid): _zero() for sid in ids}
 
+    # Safety count = safety-domain findings (source of truth) PLUS a legacy
+    # fallback: safety_observations rows for report-only topics that have NO
+    # safety finding (zero-extraction days never emit findings). This mirrors
+    # the per-topic findings-first fallback in topics.list_topics_for_date, so
+    # the rollup count matches what the SAFETY view shows and mixed-source
+    # sites are never under-counted after the D8 dual-write is retired.
+    # findings severity='major' and safety_observations risk_level='high' both
+    # map to the "high" tier.
     safety_rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT site_id, "
         "count(*) FILTER (WHERE status='open') AS open_safety, "
-        "count(*) FILTER (WHERE status='open' AND severity='major') AS open_high_safety "
-        "FROM findings WHERE site_id = ANY(%s) AND domain='safety' GROUP BY site_id",
-        (ids,),
+        "count(*) FILTER (WHERE status='open' AND is_high) AS open_high_safety "
+        "FROM ("
+        "  SELECT site_id, status, (severity='major') AS is_high "
+        "  FROM findings WHERE site_id = ANY(%s) AND domain='safety' "
+        "  UNION ALL "
+        "  SELECT so.site_id, so.status, (lower(so.risk_level)='high') AS is_high "
+        "  FROM safety_observations so "
+        "  WHERE so.site_id = ANY(%s) "
+        "    AND NOT EXISTS (SELECT 1 FROM findings f "
+        "                    WHERE f.topic_id = so.topic_id AND f.domain='safety')"
+        ") u GROUP BY site_id",
+        (ids, ids),
     ).fetchall()
     for r in safety_rows:
         b = merged.setdefault(str(r["site_id"]), _zero())
