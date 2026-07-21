@@ -3853,3 +3853,90 @@ def test_render_report_shape_carries_work_class_and_redacted(wired):
     by = {t["topic_row_id"]: t for t in shape["topics"]}
     assert by["t-red"]["redacted"] is True and by["t-lunch"]["redacted"] is False
     assert by["t-lunch"]["work_class"] == "non_work" and by["t-lunch"]["work_confidence"] == 0.9
+
+
+# ----------------------------------------------------------
+# Task 9: /redactions + /classification-feedback (life-conversation separation)
+# ----------------------------------------------------------
+
+def test_create_redaction_ok_and_enqueues_reindex(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: {SITE_ID: "site_manager"})
+    seen = {}
+    wired.setattr(org.redactions, "create_redaction",
+                  lambda conn, cid, tid, reason, auid, arole, **k: seen.update(
+                      cid=cid, tid=tid, reason=reason, scope=k.get("scope")) or {"id": "r-1"})
+    enq = []
+    wired.setattr(org, "_enqueue_content_reindex", lambda conn, table, rid: enq.append((table, rid)))
+    res = org.lambda_handler(make_event("POST", "/api/org/redactions",
+                                        body={"target_id": "t-9", "reason": "non_work"}), None)
+    assert res["statusCode"] == 201
+    assert seen == {"cid": "c-uuid-1", "tid": "t-9", "reason": "non_work", "scope": "analysis"}
+    assert enq == [("topics", "t-9")]                       # RAG removal enqueued
+
+
+def test_create_redaction_denies_site_outside_reach_403(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": OTHER_SITE_ID,
+                                            "author_user_id": None})
+    called = []
+    wired.setattr(org.redactions, "create_redaction", lambda *a, **k: called.append(1))
+    res = org.lambda_handler(make_event("POST", "/api/org/redactions",
+                                        body={"target_id": "t-9", "reason": "non_work"}), None)
+    assert res["statusCode"] == 403 and called == []
+
+
+def test_classification_feedback_ok(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: {SITE_ID: "site_manager"})
+    seen = {}
+    wired.setattr(org.classification_feedback, "append_feedback",
+                  lambda conn, cid, tid, verdict, **k: seen.update(
+                      cid=cid, tid=tid, verdict=verdict) or {"id": "f-1"})
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback",
+                                        body={"topic_id": "t-9", "human_verdict": "confirm_non_work"}), None)
+    assert res["statusCode"] == 201 and seen["verdict"] == "confirm_non_work"
+
+
+def test_classification_feedback_reject_is_work_flips_work_class_and_reindexes(wired):
+    """Critical-3 fix: a 'reject_is_work' verdict (classifier false positive)
+    must flip topics.work_class -> 'work' AND enqueue a re-index so the topic
+    returns to the company tier + RAG, or it would stay excluded forever."""
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: {SITE_ID: "site_manager"})
+    wired.setattr(org.classification_feedback, "append_feedback",
+                  lambda conn, cid, tid, verdict, **k: {"id": "f-1"})
+    flipped = []
+    wired.setattr(org.topics, "set_work_class",
+                  lambda conn, tid, wc: flipped.append((tid, wc)) or {"id": tid, "work_class": wc})
+    enq = []
+    wired.setattr(org, "_enqueue_content_reindex", lambda conn, table, rid: enq.append((table, rid)))
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback",
+                                        body={"topic_id": "t-9", "human_verdict": "reject_is_work"}), None)
+    assert res["statusCode"] == 201
+    assert flipped == [("t-9", "work")]
+    assert enq == [("topics", "t-9")]
+
+
+def test_classification_feedback_bad_classifier_verdict_400(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    called = []
+    wired.setattr(org.classification_feedback, "append_feedback",
+                  lambda *a, **k: called.append(1))
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback",
+                                        body={"topic_id": "t-9", "human_verdict": "confirm_non_work",
+                                              "classifier_verdict": "maybe"}), None)
+    assert res["statusCode"] == 400 and called == []

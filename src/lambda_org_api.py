@@ -66,9 +66,10 @@ from psycopg.errors import UniqueViolation
 import reindex
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
-from repositories import (action_items, aliases, companies, content, content_edits, memberships,
-                          observations, programme, programme_suggestions, recordings, redactions,
-                          rollup, scope, sites, topics, users, voice_messages)
+from repositories import (action_items, aliases, classification_feedback, companies, content,
+                          content_edits, memberships, observations, programme,
+                          programme_suggestions, recordings, redactions, rollup,
+                          scope, sites, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates
 
@@ -257,6 +258,14 @@ def dispatch(conn, event, method, route):
 
     if route == "/aliases" and method == "POST":
         return create_alias_endpoint(conn, caller, parse_body(event), event)
+
+    if route == "/redactions" and method == "POST":
+        return create_redaction_endpoint(conn, caller, parse_body(event))
+    m_rr = re.match(r"^/redactions/([^/]+)/revert$", route)
+    if m_rr and method == "POST":
+        return revert_redaction_endpoint(conn, caller, m_rr.group(1))
+    if route == "/classification-feedback" and method == "POST":
+        return create_classification_feedback_endpoint(conn, caller, parse_body(event))
 
     if route == "/live-items":
         if method == "GET":
@@ -1221,6 +1230,108 @@ def _enqueue_content_reindex(conn, table, row_id):
     # chain lives on the lake, so enqueue writes there (see Task 20 IAM grant).
     reindex.enqueue_topic_reindex(s3(), LAKE_BUCKET, conn, tid,
                                   meta["folder_name"], str(meta["report_date"]))
+
+
+def _topic_authority(conn, caller, topic_id):
+    """Shared ACL for topic-scoped redaction/feedback writes -- IDENTICAL to
+    patch_content's per-item tier. Returns (row, None) if allowed, else
+    (None, error_response)."""
+    row = content.get_content_row(conn, "topics", topic_id)
+    cross = is_cross_company(caller["global_role"])
+    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+        return None, error("topic not found", 404)
+    site_id = str(row["site_id"])
+    if site_id not in _allowed_site_ids(conn, caller):
+        return None, error("access denied to this topic's site", 403)
+    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
+    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_site_authority = site_role in ("pm", "site_manager")
+    is_author = row.get("author_user_id") is not None and \
+        str(row["author_user_id"]) == str(caller["id"])
+    if not (is_admin or is_site_authority or is_author):
+        return None, error("admin/gm, this site's pm/site_manager, or the author only", 403)
+    return row, None
+
+
+def create_redaction_endpoint(conn, caller, body):
+    """Soft-remove one topic (spec §4/§5): write a tombstone + enqueue a
+    delete-only re-index so it leaves RAG. Never hard-deletes."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    target_id = body.get("target_id")
+    if not target_id:
+        return error("target_id required", 400)
+    reason = body.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return error("reason required", 400)
+    scope_val = body.get("scope", "analysis")
+    if scope_val not in ("analysis", "all"):
+        return error("scope must be one of ['all', 'analysis']", 400)
+    row, err = _topic_authority(conn, caller, target_id)
+    if err is not None:
+        return err
+    red = redactions.create_redaction(conn, row["company_id"], target_id, reason.strip(),
+                                      caller["id"], caller["global_role"], scope=scope_val)
+    try:
+        _enqueue_content_reindex(conn, "topics", target_id)
+    except Exception:
+        logger.exception("redaction %s: reindex enqueue failed (redaction kept)", target_id)
+    return ok({"redaction": red}, 201)
+
+
+def revert_redaction_endpoint(conn, caller, redaction_id):
+    """Un-tombstone (spec §4) + re-index so the topic returns to RAG."""
+    red = redactions.get_redaction(conn, redaction_id)
+    cross = is_cross_company(caller["global_role"])
+    if red is None or (not cross and str(red["company_id"]) != str(caller["company_id"])):
+        return error("redaction not found", 404)
+    _, err = _topic_authority(conn, caller, red["target_id"])
+    if err is not None:
+        return err
+    reverted = redactions.revert_redaction(conn, redaction_id, red["company_id"])
+    if reverted is None:
+        return error("redaction already reverted", 409)
+    try:
+        _enqueue_content_reindex(conn, "topics", red["target_id"])
+    except Exception:
+        logger.exception("revert %s: reindex enqueue failed (revert kept)", redaction_id)
+    return ok({"redaction": reverted})
+
+
+def create_classification_feedback_endpoint(conn, caller, body):
+    """Record a human verdict on the classifier (spec §7, metadata only). On
+    'reject_is_work' (false positive) ALSO flip topics.work_class -> 'work' and
+    re-index, releasing the topic to the company tier (spec §5/§6) -- otherwise a
+    mis-flagged topic would stay excluded forever (Fable review C3)."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    topic_id = body.get("topic_id")
+    if not topic_id:
+        return error("topic_id required", 400)
+    verdict = body.get("human_verdict")
+    if verdict not in ("confirm_non_work", "reject_is_work", "missed_personal"):
+        return error("human_verdict must be one of "
+                     "['confirm_non_work', 'missed_personal', 'reject_is_work']", 400)
+    cv = body.get("classifier_verdict")                       # Fable review #10: validate
+    if cv is not None and cv not in ("work", "non_work"):
+        return error("classifier_verdict must be one of ['non_work', 'work']", 400)
+    conf = body.get("classifier_confidence")
+    if conf is not None and not isinstance(conf, (int, float)):
+        return error("classifier_confidence must be a number", 400)
+    row, err = _topic_authority(conn, caller, topic_id)
+    if err is not None:
+        return err
+    fb = classification_feedback.append_feedback(
+        conn, row["company_id"], topic_id, verdict,
+        classifier_verdict=cv, classifier_confidence=conf,
+        topic_category=body.get("topic_category"), actor_user_id=caller["id"])
+    if verdict == "reject_is_work":                           # Fable review C3
+        topics.set_work_class(conn, topic_id, "work")
+        try:
+            _enqueue_content_reindex(conn, "topics", topic_id)   # re-embed into RAG
+        except Exception:
+            logger.exception("feedback %s: reindex enqueue failed (verdict kept)", topic_id)
+    return ok({"feedback": fb}, 201)
 
 
 _ALIAS_KINDS = ("person", "product", "company", "other")
