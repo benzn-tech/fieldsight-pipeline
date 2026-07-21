@@ -1,6 +1,6 @@
 """Tests for lambda_ask_agent mode=search (retrieve-only topic list).
 Mirrors test_lambda_ask_agent_rag.py's wiring (FakeLambdaClient stand-in for
-rag-search; dashscope_utils.embed / claude_utils.call_claude monkeypatched as
+rag-search; dashscope_utils.embed / llm_utils.call_llm monkeypatched as
 shared-module attributes)."""
 import io
 import json
@@ -15,7 +15,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-dummy-key")
 os.environ.setdefault("RAG_SEARCH_FUNCTION", "fieldsight-test-rag-search")
 
 laa = pytest.importorskip("lambda_ask_agent", reason="requires boto3/urllib3")
-import claude_utils  # noqa: E402
+import llm_utils  # noqa: E402
 import dashscope_utils  # noqa: E402
 
 
@@ -62,8 +62,8 @@ def wire(monkeypatch, chunks):
     monkeypatch.setattr(laa, "_get_lambda_client", lambda: fc)
 
     def no_claude(*a, **k):
-        raise AssertionError("call_claude must not run in search mode")
-    monkeypatch.setattr(claude_utils, "call_claude", no_claude)
+        raise AssertionError("call_llm must not run in search mode")
+    monkeypatch.setattr(llm_utils, "call_llm", no_claude)
     return fc
 
 
@@ -157,11 +157,11 @@ def test_ask_mode_unaffected_still_calls_claude(monkeypatch):
     monkeypatch.setattr(laa, "_get_lambda_client", lambda: fc)
     seen = {}
 
-    def rec(prompt, max_tokens=4096):
+    def rec(prompt, max_tokens=4096, force_json=False):
         seen["called"] = True
         return ("ans [1]", None)
 
-    monkeypatch.setattr(claude_utils, "call_claude", rec)
+    monkeypatch.setattr(llm_utils, "call_llm", rec)
     resp = laa.lambda_handler({"question": "q", "caller_sub": "sub-1"}, None)
     body = json.loads(resp["body"])
     assert seen.get("called") is True   # Ask path DID synthesize via Claude
@@ -172,7 +172,7 @@ def test_search_mode_function_error_returns_error_not_silent_empty(monkeypatch):
     monkeypatch.setattr(dashscope_utils, "embed", lambda texts, dim=None: [[0.1] * 1024])
     fc = FakeLambdaClient({"errorMessage": "boom", "errorType": "RuntimeError"}, function_error="Unhandled")
     monkeypatch.setattr(laa, "_get_lambda_client", lambda: fc)
-    monkeypatch.setattr(claude_utils, "call_claude",
+    monkeypatch.setattr(llm_utils, "call_llm",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("no claude in search")))
     out = run(ev())
     assert out["count"] == 0

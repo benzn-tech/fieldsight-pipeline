@@ -19,7 +19,7 @@ set -euo pipefail
 
 PREFIX="${1:?usage: deploy-lambda-code.sh <prefix> <region>}"
 REGION="${2:?missing region}"
-SHARED="src/transcript_utils.py"   # bundled in every zip (CLAUDE.md rule)
+SHARED=("src/transcript_utils.py" "src/llm_utils.py")   # bundled in every zip (CLAUDE.md rule)
 
 # function-name suffix → handler source file (the 9 real-logic lambdas).
 # fieldsight-fargate-trigger is intentionally omitted: it is an inline-code
@@ -36,7 +36,7 @@ declare -A MAP=(
   [api]=lambda_fieldsight_api
 )
 
-[ -f "$SHARED" ] || { echo "❌ $SHARED not found (run from repo root)"; exit 1; }
+for f in "${SHARED[@]}"; do [ -f "$f" ] || { echo "❌ $f not found (run from repo root)"; exit 1; }; done
 WORK="$(mktemp -d)"; FAIL=0
 
 for suffix in "${!MAP[@]}"; do
@@ -44,8 +44,8 @@ for suffix in "${!MAP[@]}"; do
   HANDLER="src/${MAP[$suffix]}.py"
   if [ ! -f "$HANDLER" ]; then echo "⚠️  skip $FN — $HANDLER missing"; continue; fi
   ZIP="${WORK}/${FN}.zip"
-  zip -j -q "$ZIP" "$HANDLER" "$SHARED"
-  echo "→ update-function-code $FN  ($(basename "$HANDLER") + transcript_utils.py)"
+  zip -j -q "$ZIP" "$HANDLER" "${SHARED[@]}"
+  echo "→ update-function-code $FN  ($(basename "$HANDLER") + transcript_utils.py + llm_utils.py)"
   if aws lambda update-function-code --function-name "$FN" \
         --zip-file "fileb://${ZIP}" --publish --region "$REGION" \
         --query '{Fn:FunctionName,Ver:Version,Size:CodeSize,Mod:LastModified}' --output table; then

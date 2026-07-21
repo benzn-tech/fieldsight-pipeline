@@ -16,7 +16,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-dummy-key")
 os.environ.setdefault("RAG_SEARCH_FUNCTION", "fieldsight-test-rag-search")
 
 laa = pytest.importorskip("lambda_ask_agent", reason="requires boto3/urllib3 (installed in CI)")
-import claude_utils  # noqa: E402
+import llm_utils  # noqa: E402
 import dashscope_utils  # noqa: E402
 
 
@@ -60,7 +60,7 @@ def test_unknown_mode_falls_back_to_screen():
 def test_rag_answer_threads_mode_voice(monkeypatch):
     captured = {}
 
-    def fake_call_claude(prompt, max_tokens=4096):
+    def fake_call_llm(prompt, max_tokens=4096, force_json=False):
         captured["prompt"] = prompt
         return "Spoken answer.", None
 
@@ -71,7 +71,7 @@ def test_rag_answer_threads_mode_voice(monkeypatch):
             return {"Payload": io.BytesIO(json.dumps({"chunks": CHUNKS}).encode("utf-8"))}
 
     monkeypatch.setattr(laa, "_get_lambda_client", lambda: FakeClient())
-    monkeypatch.setattr(claude_utils, "call_claude", fake_call_claude)
+    monkeypatch.setattr(llm_utils, "call_llm", fake_call_llm)
 
     result = laa._rag_answer({"question": "q?", "caller_sub": "sub-1", "mode": "voice"})
 
