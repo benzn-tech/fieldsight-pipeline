@@ -3940,3 +3940,46 @@ def test_classification_feedback_bad_classifier_verdict_400(wired):
                                         body={"topic_id": "t-9", "human_verdict": "confirm_non_work",
                                               "classifier_verdict": "maybe"}), None)
     assert res["statusCode"] == 400 and called == []
+
+
+# ---- Task 9 review follow-up: revert endpoint + feedback deny coverage ----
+def test_revert_redaction_ok(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.redactions, "get_redaction",
+                  lambda conn, rid: {"id": rid, "company_id": "c-uuid-1", "target_id": "t-9"})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: {SITE_ID: "site_manager"})
+    seen = {}
+    wired.setattr(org.redactions, "revert_redaction",
+                  lambda conn, rid, cid: seen.update(rid=rid, cid=cid) or {"id": rid, "reverted_at": "t"})
+    enq = []
+    wired.setattr(org, "_enqueue_content_reindex", lambda conn, table, rid: enq.append((table, rid)))
+    res = org.lambda_handler(make_event("POST", "/api/org/redactions/r-1/revert"), None)
+    assert res["statusCode"] == 200
+    assert seen == {"rid": "r-1", "cid": "c-uuid-1"}
+    assert enq == [("topics", "t-9")]                      # re-embed after revert
+
+
+def test_revert_redaction_wrong_company_404(wired):
+    # admin caller (not cross-company) -> a redaction in another company is 404,
+    # and revert_redaction must never be called.
+    wired.setattr(org.redactions, "get_redaction",
+                  lambda conn, rid: {"id": rid, "company_id": "c-OTHER", "target_id": "t-9"})
+    called = []
+    wired.setattr(org.redactions, "revert_redaction", lambda *a, **k: called.append(1))
+    res = org.lambda_handler(make_event("POST", "/api/org/redactions/r-1/revert"), None)
+    assert res["statusCode"] == 404 and called == []
+
+
+def test_classification_feedback_denies_site_outside_reach_403(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": OTHER_SITE_ID,
+                                            "author_user_id": None})
+    called = []
+    wired.setattr(org.classification_feedback, "append_feedback", lambda *a, **k: called.append(1))
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback",
+                                        body={"topic_id": "t-9", "human_verdict": "confirm_non_work"}), None)
+    assert res["statusCode"] == 403 and called == []
