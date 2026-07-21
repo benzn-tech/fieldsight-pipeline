@@ -1417,6 +1417,10 @@ Resources:
             Fn::Sub: "${DbStackName}-DbName"
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          # Graded roles: search must scope through scope.visible_scope (site +
+          # per-author) like org-api's read paths, not the legacy site-only
+          # binary. Driven by the SAME GradedRoles param as OrgApiFunction.
+          GRADED_ROLES: !Ref GradedRoles
       Policies:
         - VPCAccessPolicy: {}
 

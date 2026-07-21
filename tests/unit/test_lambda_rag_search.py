@@ -70,7 +70,7 @@ def test_admin_uses_company_sites(wired):
                   lambda conn, cid: (seen.update(cid=cid) or [{"id": "s-1"}, {"id": "s-2"}]))
     captured = {}
     wired.setattr(rag.chunks, "search_chunks",
-                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None:
+                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None:
                       (captured.update(site_ids=site_ids) or []))
 
     res = rag.lambda_handler(make_event(), None)
@@ -89,7 +89,7 @@ def test_worker_uses_memberships(wired):
                   lambda conn, uid, role: (seen.update(uid=uid, role=role) or ["s-3"]))
     captured = {}
     wired.setattr(rag.chunks, "search_chunks",
-                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None:
+                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None:
                       (captured.update(site_ids=site_ids) or []))
 
     res = rag.lambda_handler(make_event(), None)
@@ -121,7 +121,7 @@ def test_search_chunks_receives_vector_and_k(wired):
     wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
     captured = {}
 
-    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None):
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None):
         captured.update(qv=qv, site_ids=site_ids, k=k)
         return [{"chunk_text": "hello"}]
 
@@ -139,7 +139,7 @@ def test_default_k_is_8(wired):
     wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
     captured = {}
 
-    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None):
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None):
         captured["k"] = k
         return []
 
@@ -154,7 +154,7 @@ def test_k_is_clamped_to_1_32(wired):
     wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
     captured = {}
 
-    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None):
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None):
         captured["k"] = k
         return []
 
@@ -171,7 +171,7 @@ def test_garbage_k_falls_back_to_default(wired):
     wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
     captured = {}
 
-    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None):
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None):
         captured["k"] = k
         return []
 
@@ -196,7 +196,7 @@ def test_json_safe_return_coerces_uuid_and_date(wired):
         "chunk_text": "hello",
     }
     wired.setattr(rag.chunks, "search_chunks",
-                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None: [row])
+                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None: [row])
 
     res = rag.lambda_handler(make_event(), None)
 
@@ -215,7 +215,7 @@ def test_date_bounds_forwarded_to_search_chunks(wired):
     wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
     captured = {}
 
-    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None):
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None):
         captured.update(date_from=date_from, date_to=date_to)
         return []
 
@@ -234,7 +234,7 @@ def test_date_bounds_default_none(wired):
     wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
     captured = {}
 
-    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None):
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None):
         captured.update(date_from=date_from, date_to=date_to)
         return []
 
@@ -255,7 +255,7 @@ def test_site_filter_narrows_to_one_accessible_site(wired):
                   lambda conn, cid, slug: {"id": slug})  # test: slug maps 1:1 to id
     captured = {}
     wired.setattr(rag.chunks, "search_chunks",
-                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None:
+                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None:
                       (captured.update(site_ids=site_ids) or []))
     ev = make_event()
     ev["site"] = "s-2"
@@ -283,3 +283,73 @@ def test_site_filter_inaccessible_denies(wired):
     res = rag.lambda_handler(ev, None)
 
     assert res == {"chunks": [], "site_count": 0}
+
+
+# ----------------------------------------------------------
+# Graded roles (visibility spec §3.1): search must scope through
+# scope.visible_scope -- site reach AND per-author allow-set -- exactly like
+# org-api's list_live_items. Regression for the "prod search returns nothing /
+# leaks every author" incident.
+# ----------------------------------------------------------
+def test_graded_worker_filters_by_author(wired):
+    """GRADED_ROLES on: a worker's search is narrowed to their OWN authored
+    chunks (author_ids = {self}), not every author on their sites."""
+    wired.setattr(rag, "GRADED_ROLES", True)
+    wired.setattr(rag.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    wired.setattr(rag.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {"s-3"}, "user_scope": "SELF",
+                                        "author_ids": {"u-uuid-1"}})
+    captured = {}
+    wired.setattr(rag.chunks, "search_chunks",
+                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None,
+                  author_ids=None: (captured.update(site_ids=site_ids,
+                                                    author_ids=author_ids) or []))
+
+    res = rag.lambda_handler(make_event(), None)
+
+    assert captured["site_ids"] == ["s-3"]
+    assert captured["author_ids"] == {"u-uuid-1"}   # own-only, not all site authors
+    assert res["site_count"] == 1
+
+
+def test_graded_platform_admin_all_sites_no_author_filter(wired):
+    """GRADED_ROLES on: a platform_admin sees EVERY site (cross-company) with
+    NO per-author filter (author_ids None). Regression for Ben's 0-results."""
+    wired.setattr(rag, "GRADED_ROLES", True)
+    wired.setattr(rag.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "company_id": "c-platform",
+                                     "global_role": "platform_admin"})
+    wired.setattr(rag.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {"s-1", "s-2"}, "user_scope": "ALL",
+                                        "author_ids": None})
+    captured = {}
+    wired.setattr(rag.chunks, "search_chunks",
+                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None,
+                  author_ids=None: (captured.update(site_ids=sorted(site_ids),
+                                                    author_ids=author_ids) or [{"chunk_text": "x"}]))
+
+    res = rag.lambda_handler(make_event(), None)
+
+    assert captured["site_ids"] == ["s-1", "s-2"]
+    assert captured["author_ids"] is None          # no per-author filter for ALL
+    assert res["chunks"] == [{"chunk_text": "x"}]
+
+
+def test_graded_off_keeps_legacy_site_only(wired):
+    """GRADED_ROLES off (default): unchanged legacy binary branch, author_ids
+    stays None (no per-author filter) -- back-compat guard."""
+    wired.setattr(rag, "GRADED_ROLES", False)
+    wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
+
+    def boom(*a, **k):
+        raise AssertionError("visible_scope must not be called when GRADED_ROLES is off")
+    wired.setattr(rag.scope, "visible_scope", boom)
+    captured = {}
+    wired.setattr(rag.chunks, "search_chunks",
+                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None,
+                  author_ids=None: (captured.update(author_ids=author_ids) or []))
+
+    rag.lambda_handler(make_event(), None)   # default CALLER = admin
+
+    assert captured["author_ids"] is None

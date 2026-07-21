@@ -32,3 +32,11 @@ def test_search_sql_has_date_filter():
     # unchanged essentials still present
     assert "site_id = ANY(%(site_ids)s)" in sql
     assert "LIMIT %(k)s" in sql
+
+
+def test_search_sql_has_author_filter():
+    # graded roles per-author allow-set (visibility spec §3.1): NULL => no
+    # filter (ALL/SITE), else restrict chunks to c.user_id in the set (SELF /
+    # SELF+WORKERS). Same ::uuid[] IS-NULL guard idiom as the date range.
+    sql = build_search_sql()
+    assert "%(author_ids)s::uuid[] IS NULL OR c.user_id = ANY(%(author_ids)s::uuid[])" in sql

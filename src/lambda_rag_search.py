@@ -30,14 +30,21 @@ org-api ACL branch it mirrors.
 """
 import json
 import logging
+import os
 
 from db.connection import get_cached_connection
-from repositories import aliases, chunks, memberships, sites, users
+from repositories import aliases, chunks, memberships, scope, sites, users
 from repositories.acl import resolve_scope
 import text_normalize
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# Graded roles (visibility spec §3.1). When on, search scopes through the SAME
+# scope.visible_scope primitive as org-api's list_live_items/timeline -- both
+# site reach AND per-author filter -- instead of the legacy site-only binary.
+# Defaults off so a stack without the env behaves exactly as before.
+GRADED_ROLES = os.environ.get("GRADED_ROLES", "").lower() == "true"
 
 
 def lambda_handler(event, context):
@@ -64,12 +71,22 @@ def lambda_handler(event, context):
         logger.info("rag-search: caller not provisioned for sub=%s", sub)
         return {"chunks": [], "error": "caller not provisioned"}
 
-    # ACL branch mirrors lambda_org_api.list_live_items exactly.
-    if resolve_scope(caller["global_role"]) == "ALL":
+    # ACL branch mirrors lambda_org_api.list_live_items exactly: when graded
+    # roles are on, BOTH the site reach and the per-author allow-set come from
+    # scope.visible_scope (worker->SELF, site_manager->SELF+WORKERS, regional/
+    # pm->SITE, admin/gm/platform_admin->ALL). Otherwise the legacy site-only
+    # binary branch (author_ids stays None = no per-author filter).
+    if GRADED_ROLES:
+        env = scope.visible_scope(conn, caller)
+        site_ids = list(env["site_ids"])
+        author_ids = env["author_ids"]
+    elif resolve_scope(caller["global_role"]) == "ALL":
         site_ids = [s["id"] for s in sites.list_company_sites(conn, caller["company_id"])]
+        author_ids = None
     else:
         site_ids = memberships.accessible_site_ids(
             conn, caller["id"], caller["global_role"])
+        author_ids = None
 
     # Project-scoped search: `site_filter` is the project SLUG (what the UI's
     # top-bar selector uses), so resolve it to the site id first, then narrow
@@ -84,7 +101,8 @@ def lambda_handler(event, context):
         return {"chunks": [], "site_count": 0}
 
     rows = chunks.search_chunks(conn, qv, site_ids, k=k,
-                                date_from=date_from, date_to=date_to)
+                                date_from=date_from, date_to=date_to,
+                                author_ids=author_ids)
     # Synthesis-time safety net (spec §4): normalize retrieved chunk text with
     # the company's active aliases, so a chunk not yet re-embedded still reads
     # corrected before the LLM. site_ids here are the caller's accessible sites.
