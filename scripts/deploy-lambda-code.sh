@@ -19,7 +19,7 @@ set -euo pipefail
 
 PREFIX="${1:?usage: deploy-lambda-code.sh <prefix> <region>}"
 REGION="${2:?missing region}"
-SHARED=("src/transcript_utils.py" "src/llm_utils.py")   # bundled in every zip (CLAUDE.md rule)
+SHARED=("src/transcript_utils.py" "src/llm_utils.py" "src/elevenlabs_utils.py")   # bundled in every zip (CLAUDE.md rule)
 
 # function-name suffix → handler source file (the 9 real-logic lambdas).
 # fieldsight-fargate-trigger is intentionally omitted: it is an inline-code
