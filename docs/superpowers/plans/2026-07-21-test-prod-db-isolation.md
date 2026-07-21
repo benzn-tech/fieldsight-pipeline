@@ -1,5 +1,7 @@
 # Test/Prod DB Isolation Implementation Plan
 
+> ✅ **DONE — executed & live 2026-07-21.** Phase 1 (Tasks 1–3) merged via PR #114; Phase 2 (Tasks 4–9) executed by the operator: `fieldsight_test` created + `pg_dump`/`pg_restore`-populated from a throwaway EC2 (row-count parity verified), test SAM deploy repointed all 12 in-VPC functions to `fieldsight_test`, prod stays on `fieldsight`, boundary write test confirmed isolation both directions, EC2 + temp IAM torn down. Rollback: remove `PgDatabase=fieldsight_test` from `deploy.yml` + redeploy, then `DROP DATABASE fieldsight_test`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 > **PHASE GATE:** Phase 1 (Tasks 1–3) is git-only, behavior-neutral, and subagent-safe. Phase 2 (Tasks 4–9) performs LIVE AWS operations on the shared prod cluster and MUST be run by the human operator with an authenticated AWS session — subagents MUST NOT execute Phase 2.
 
