@@ -3973,6 +3973,32 @@ def test_revert_redaction_wrong_company_404(wired):
     assert res["statusCode"] == 404 and called == []
 
 
+# ---- Task 12: /classification-feedback/summary ----
+def test_feedback_summary_admin_only(wired):
+    wired.setattr(org.classification_feedback, "summary",
+                  lambda conn, cid: {"confirm_non_work": 3, "reject_is_work": 1,
+                                     "missed_personal": 0, "precision": 0.75})
+    res = org.lambda_handler(make_event("GET", "/api/org/classification-feedback/summary"), None)
+    assert res["statusCode"] == 200 and body_of(res)["precision"] == 0.75
+    # a worker is denied
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res2 = org.lambda_handler(make_event("GET", "/api/org/classification-feedback/summary"), None)
+    assert res2["statusCode"] == 403
+
+
+def test_feedback_summary_platform_admin_200(wired):
+    # platform_admin is cross-company (resolve_scope != ALL for it) -- the
+    # endpoint must include it explicitly (Fable review #5), not 403 it.
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "platform_admin"})
+    wired.setattr(org.classification_feedback, "summary",
+                  lambda conn, cid: {"confirm_non_work": 0, "reject_is_work": 0,
+                                     "missed_personal": 0, "precision": None})
+    res = org.lambda_handler(make_event("GET", "/api/org/classification-feedback/summary"), None)
+    assert res["statusCode"] == 200 and body_of(res)["precision"] is None
+
+
 def test_classification_feedback_denies_site_outside_reach_403(wired):
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
     wired.setattr(org.content, "get_content_row",

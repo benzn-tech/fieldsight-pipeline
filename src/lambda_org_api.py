@@ -264,6 +264,8 @@ def dispatch(conn, event, method, route):
     m_rr = re.match(r"^/redactions/([^/]+)/revert$", route)
     if m_rr and method == "POST":
         return revert_redaction_endpoint(conn, caller, m_rr.group(1))
+    if route == "/classification-feedback/summary" and method == "GET":
+        return classification_feedback_summary_endpoint(conn, caller)
     if route == "/classification-feedback" and method == "POST":
         return create_classification_feedback_endpoint(conn, caller, parse_body(event))
 
@@ -1332,6 +1334,16 @@ def create_classification_feedback_endpoint(conn, caller, body):
         except Exception:
             logger.exception("feedback %s: reindex enqueue failed (verdict kept)", topic_id)
     return ok({"feedback": fb}, 201)
+
+
+def classification_feedback_summary_endpoint(conn, caller):
+    """Classifier accuracy roll-up (spec §7). Admin/gm/platform_admin only —
+    metadata, no PII, but company-wide so gate to ALL-scope roles. platform_admin
+    is cross-company (resolve_scope != ALL for it) so include it explicitly
+    (Fable review #5 — the recurring 'teach each endpoint about platform_admin')."""
+    if resolve_scope(caller["global_role"]) != "ALL" and not is_cross_company(caller["global_role"]):
+        return error("admin or gm role required", 403)
+    return ok(classification_feedback.summary(conn, caller["company_id"]))
 
 
 _ALIAS_KINDS = ("person", "product", "company", "other")
