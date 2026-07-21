@@ -88,7 +88,8 @@ jobs:
               "DbStackName=fieldsight-db-test" \
               "DbSubnetIds=subnet-082dd4480f7e20014,subnet-08b15b36113e542d4,subnet-05fb05613cf529121" \
               "DbSecretArn=$DB_SECRET_ARN" \
-              "OrgUserPoolId=ap-southeast-2_q88pd6XXr"
+              "OrgUserPoolId=ap-southeast-2_q88pd6XXr" \
+              "PgDatabase=fieldsight_test"
 
       - name: Apply DB migrations (invoke MigrateFunction, TEST)
         # Idempotent: db/migrate.py only applies files not already recorded in
