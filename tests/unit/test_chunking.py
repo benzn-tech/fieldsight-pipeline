@@ -155,6 +155,18 @@ def test_chunk_report_splits_oversize_topic_into_two_overlapping_parts():
     assert f"Decision: D6{filler}" not in chunks[0]["chunk_text"]
 
 
+def test_chunk_report_skips_non_work_topics():
+    import chunking
+    report = {"user_name": "U", "site": "S", "report_date": "2026-07-21", "topics": [
+        {"topic_id": 0, "topic_title": "Pour", "summary": "work", "work_class": "work"},
+        {"topic_id": 1, "topic_title": "Lunch", "summary": "personal", "work_class": "non_work"},
+        {"topic_id": 2, "topic_title": "Legacy", "summary": "no class"},  # work_class absent -> kept
+    ]}
+    chunks = chunking.chunk_report(report)
+    seqs = {c["topic_seq"] for c in chunks}
+    assert 0 in seqs and 2 in seqs and 1 not in seqs
+
+
 # ---------------------------------------------------------------------------
 # chunk_transcripts — transcript windows
 # ---------------------------------------------------------------------------

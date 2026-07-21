@@ -100,6 +100,8 @@ def chunk_report(report):
     """Build one (or more, if oversize) 'topic' chunk per report topic."""
     chunks = []
     for t in report.get("topics", []):
+        if t.get("work_class") == "non_work":
+            continue                       # spec §6: personal talk never embedded
         text = _topic_text(t)
         if len(text) <= TOPIC_SPLIT_CHARS:
             chunks.append({

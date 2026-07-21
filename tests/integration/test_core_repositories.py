@@ -109,3 +109,39 @@ def test_update_profile_none_preserving(db):
     assert row["last_name"] == "Name"  # None = unchanged
     assert row["avatar_s3_key"] == "org-assets/avatars/sub-pf-1/a.jpg"
     assert users.update_profile(db, "sub-does-not-exist", first_name="X") is None
+
+
+def test_topic_work_class_roundtrip(db):
+    import repositories.topics as topics
+    from repositories import companies, sites
+    co = companies.create_company(db, "WC-Co")
+    s = sites.create_site(db, co["id"], "WC-Site")
+    row = topics.upsert_topic(
+        db, s["id"], "2026-07-21", "Lunch chat",
+        work_class="non_work", work_confidence=0.91, is_mixed=True)
+    assert row["work_class"] == "non_work"
+    assert abs(row["work_confidence"] - 0.91) < 1e-6
+    assert row["is_mixed"] is True
+    got = topics.list_site_topics(db, s["id"], "2026-07-21")[0]
+    assert got["work_class"] == "non_work" and got["is_mixed"] is True
+
+
+def test_portfolio_counts_excludes_non_work_and_redacted(db):
+    import datetime as _dt
+    import repositories.topics as topics
+    from repositories import companies, sites, rollup, redactions
+    today = _dt.date.today().isoformat()   # topics_count is report_date >= CURRENT_DATE-30
+    co = companies.create_company(db, "RU-Co")
+    s = sites.create_site(db, co["id"], "RU-Site")
+    work = topics.upsert_topic(db, s["id"], today, "Pour", work_class="work",
+                               action_items=[{"text": "fix rebar"}])
+    topics.upsert_topic(db, s["id"], today, "Lunch", work_class="non_work",
+                        action_items=[{"text": "personal errand"}])
+    redacted = topics.upsert_topic(db, s["id"], today, "Call", work_class="work",
+                                   action_items=[{"text": "call spouse"}])
+    redactions.create_redaction(db, co["id"], redacted["id"], "privacy", None, "admin")
+
+    counts = rollup.portfolio_counts(db, [s["id"]])[str(s["id"])]
+    # only the one 'work', non-redacted topic + its action item are counted
+    assert counts["topics_count"] == 1
+    assert counts["open_actions"] == 1 and counts["total_actions"] == 1

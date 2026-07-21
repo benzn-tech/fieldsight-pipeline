@@ -66,8 +66,9 @@ from psycopg.errors import UniqueViolation
 import reindex
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
-from repositories import (action_items, aliases, companies, content, content_edits, memberships,
-                          observations, programme, programme_suggestions, recordings, rollup,
+from repositories import (action_items, aliases, classification_feedback, companies, content,
+                          content_edits, memberships, observations, programme,
+                          programme_suggestions, recordings, redactions, rollup,
                           scope, sites, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates
@@ -257,6 +258,16 @@ def dispatch(conn, event, method, route):
 
     if route == "/aliases" and method == "POST":
         return create_alias_endpoint(conn, caller, parse_body(event), event)
+
+    if route == "/redactions" and method == "POST":
+        return create_redaction_endpoint(conn, caller, parse_body(event))
+    m_rr = re.match(r"^/redactions/([^/]+)/revert$", route)
+    if m_rr and method == "POST":
+        return revert_redaction_endpoint(conn, caller, m_rr.group(1))
+    if route == "/classification-feedback/summary" and method == "GET":
+        return classification_feedback_summary_endpoint(conn, caller)
+    if route == "/classification-feedback" and method == "POST":
+        return create_classification_feedback_endpoint(conn, caller, parse_body(event))
 
     if route == "/live-items":
         if method == "GET":
@@ -1246,6 +1257,121 @@ def _enqueue_content_reindex(conn, table, row_id):
                                   meta["folder_name"], str(meta["report_date"]))
 
 
+def _topic_authority(conn, caller, topic_id):
+    """Shared ACL for topic-scoped redaction/feedback writes -- IDENTICAL to
+    patch_content's per-item tier. Returns (row, None) if allowed, else
+    (None, error_response)."""
+    row = content.get_content_row(conn, "topics", topic_id)
+    cross = is_cross_company(caller["global_role"])
+    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+        return None, error("topic not found", 404)
+    site_id = str(row["site_id"])
+    if site_id not in _allowed_site_ids(conn, caller):
+        return None, error("access denied to this topic's site", 403)
+    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
+    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_site_authority = site_role in ("pm", "site_manager")
+    is_author = row.get("author_user_id") is not None and \
+        str(row["author_user_id"]) == str(caller["id"])
+    if not (is_admin or is_site_authority or is_author):
+        return None, error("admin/gm, this site's pm/site_manager, or the author only", 403)
+    return row, None
+
+
+def create_redaction_endpoint(conn, caller, body):
+    """Soft-remove one topic (spec §4/§5): write a tombstone + enqueue a
+    delete-only re-index so it leaves RAG. Never hard-deletes."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    target_id = body.get("target_id")
+    if not target_id:
+        return error("target_id required", 400)
+    reason = body.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return error("reason required", 400)
+    scope_val = body.get("scope", "analysis")
+    if scope_val not in ("analysis", "all"):
+        return error("scope must be one of ['all', 'analysis']", 400)
+    row, err = _topic_authority(conn, caller, target_id)
+    if err is not None:
+        return err
+    red = redactions.create_redaction(conn, row["company_id"], target_id, reason.strip(),
+                                      caller["id"], caller["global_role"], scope=scope_val)
+    try:
+        _enqueue_content_reindex(conn, "topics", target_id)
+    except Exception:
+        logger.exception("redaction %s: reindex enqueue failed (redaction kept)", target_id)
+    return ok({"redaction": red}, 201)
+
+
+def revert_redaction_endpoint(conn, caller, redaction_id):
+    """Un-tombstone (spec §4) + re-index so the topic returns to RAG."""
+    red = redactions.get_redaction(conn, redaction_id)
+    cross = is_cross_company(caller["global_role"])
+    if red is None or (not cross and str(red["company_id"]) != str(caller["company_id"])):
+        return error("redaction not found", 404)
+    _, err = _topic_authority(conn, caller, red["target_id"])
+    if err is not None:
+        return err
+    reverted = redactions.revert_redaction(conn, redaction_id, red["company_id"])
+    if reverted is None:
+        return error("redaction already reverted", 409)
+    try:
+        _enqueue_content_reindex(conn, "topics", red["target_id"])
+    except Exception:
+        logger.exception("revert %s: reindex enqueue failed (revert kept)", redaction_id)
+    return ok({"redaction": reverted})
+
+
+def create_classification_feedback_endpoint(conn, caller, body):
+    """Record a human verdict on the classifier (spec §7, metadata only). On
+    'reject_is_work' (false positive) ALSO flip topics.work_class -> 'work' and
+    re-index, releasing the topic to the company tier (spec §5/§6) -- otherwise a
+    mis-flagged topic would stay excluded forever (Fable review C3)."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    topic_id = body.get("topic_id")
+    if not topic_id:
+        return error("topic_id required", 400)
+    verdict = body.get("human_verdict")
+    if verdict not in ("confirm_non_work", "reject_is_work", "missed_personal"):
+        return error("human_verdict must be one of "
+                     "['confirm_non_work', 'missed_personal', 'reject_is_work']", 400)
+    cv = body.get("classifier_verdict")                       # Fable review #10: validate
+    if cv is not None and cv not in ("work", "non_work"):
+        return error("classifier_verdict must be one of ['non_work', 'work']", 400)
+    conf = body.get("classifier_confidence")
+    if conf is not None and not isinstance(conf, (int, float)):
+        return error("classifier_confidence must be a number", 400)
+    tc = body.get("topic_category")            # final-review #2: keep the table metadata-only
+    if tc is not None and tc not in ("safety", "progress", "quality"):   # no arbitrary free text
+        return error("topic_category must be one of ['progress', 'quality', 'safety']", 400)
+    row, err = _topic_authority(conn, caller, topic_id)
+    if err is not None:
+        return err
+    fb = classification_feedback.append_feedback(
+        conn, row["company_id"], topic_id, verdict,
+        classifier_verdict=cv, classifier_confidence=conf,
+        topic_category=tc, actor_user_id=caller["id"])
+    if verdict == "reject_is_work":                           # Fable review C3
+        topics.set_work_class(conn, topic_id, "work")
+        try:
+            _enqueue_content_reindex(conn, "topics", topic_id)   # re-embed into RAG
+        except Exception:
+            logger.exception("feedback %s: reindex enqueue failed (verdict kept)", topic_id)
+    return ok({"feedback": fb}, 201)
+
+
+def classification_feedback_summary_endpoint(conn, caller):
+    """Classifier accuracy roll-up (spec §7). Admin/gm/platform_admin only —
+    metadata, no PII, but company-wide so gate to ALL-scope roles. platform_admin
+    is cross-company (resolve_scope != ALL for it) so include it explicitly
+    (Fable review #5 — the recurring 'teach each endpoint about platform_admin')."""
+    if resolve_scope(caller["global_role"]) != "ALL" and not is_cross_company(caller["global_role"]):
+        return error("admin or gm role required", 403)
+    return ok(classification_feedback.summary(conn, caller["company_id"]))
+
+
 _ALIAS_KINDS = ("person", "product", "company", "other")
 
 
@@ -1698,16 +1824,22 @@ def _list_report_folders(date):
 _SEV_TO_RISK = {"major": "high", "minor": "medium", "none": "low"}
 
 
-def render_report_shape(rows, doc, date, folder):
+def render_report_shape(rows, doc, date, folder, conn=None):
     """Pure function: render Aurora extraction topics INTO the
     daily_report.json shape, optionally merging the doc's own prose fields
     (executive_summary etc.) when a same-day S3 doc also exists (e.g. an
     earlier extraction pass already wrote one before the nightly report
     ran). `rows` must already be D3-ordered (list_topics_for_source_prefix's
     ORDER BY time_range NULLS LAST, created_at, id) — topic_id here is
-    purely positional (index into that order), not any DB id."""
+    purely positional (index into that order), not any DB id.
+
+    `conn` (optional, trailing kwarg — Task 1b) enables the redaction-status
+    lookup below; callers that don't pass it (or pass None) simply get
+    `redacted: False` for every topic, unchanged from before this field
+    existed."""
     doc = doc or {}
     topics_out = []
+    _redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if conn is not None else {}
     for i, t in enumerate(rows):
         flags = [{"observation": f["observation"],
                   "risk_level": _SEV_TO_RISK.get(f["severity"], "medium"),
@@ -1734,6 +1866,11 @@ def render_report_shape(rows, doc, date, folder):
             "safety_flags": flags,
             "related_photos": [ph["s3_key"].rsplit("/", 1)[-1] for ph in t["photos"]],
             "findings": t["findings"],              # additive passthrough (D3)
+            "work_class": t.get("work_class"),
+            "work_confidence": t.get("work_confidence"),
+            "is_mixed": t.get("is_mixed"),
+            "redacted": t["id"] in _redacted,
+            "redaction_id": (_redacted.get(t["id"]) or {}).get("id"),
         })
     return {
         "report_date": date,
@@ -1783,7 +1920,7 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # prose (not site-clipped). Topic rows are already site-clipped above.
         doc = None if cross_user_clip else \
             _get_lake_json(f"reports/{date}/{user}/daily_report.json")
-        return render_report_shape(rows, doc, date, user)
+        return render_report_shape(rows, doc, date, user, conn=conn)
 
     # D fix (spec §5.1): prefer the Aurora-rendered shape whenever Aurora topics
     # exist for this (user, date) -- extraction-sourced OR report-sourced -- so
