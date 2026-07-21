@@ -62,7 +62,7 @@ def enqueue_topic_reindex(s3_client, bucket, conn, topic_id, folder, date):
     alias_pairs = [{"wrong_term": a["wrong_term"], "right_term": a["right_term"]}
                    for a in active]
 
-    shaped = render_report_shape([t], None, date, folder)
+    shaped = render_report_shape([t], None, date, folder, conn=conn)
     topic_chunks = chunk_report(shaped)             # chunk_type='topic' only
 
     request = {

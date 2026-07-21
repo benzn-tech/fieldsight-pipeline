@@ -67,8 +67,8 @@ import reindex
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 from repositories import (action_items, aliases, companies, content, content_edits, memberships,
-                          observations, programme, programme_suggestions, recordings, rollup,
-                          scope, sites, topics, users, voice_messages)
+                          observations, programme, programme_suggestions, recordings, redactions,
+                          rollup, scope, sites, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates
 
@@ -1675,16 +1675,22 @@ def _list_report_folders(date):
 _SEV_TO_RISK = {"major": "high", "minor": "medium", "none": "low"}
 
 
-def render_report_shape(rows, doc, date, folder):
+def render_report_shape(rows, doc, date, folder, conn=None):
     """Pure function: render Aurora extraction topics INTO the
     daily_report.json shape, optionally merging the doc's own prose fields
     (executive_summary etc.) when a same-day S3 doc also exists (e.g. an
     earlier extraction pass already wrote one before the nightly report
     ran). `rows` must already be D3-ordered (list_topics_for_source_prefix's
     ORDER BY time_range NULLS LAST, created_at, id) — topic_id here is
-    purely positional (index into that order), not any DB id."""
+    purely positional (index into that order), not any DB id.
+
+    `conn` (optional, trailing kwarg — Task 1b) enables the redaction-status
+    lookup below; callers that don't pass it (or pass None) simply get
+    `redacted: False` for every topic, unchanged from before this field
+    existed."""
     doc = doc or {}
     topics_out = []
+    _redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if conn is not None else {}
     for i, t in enumerate(rows):
         flags = [{"observation": f["observation"],
                   "risk_level": _SEV_TO_RISK.get(f["severity"], "medium"),
@@ -1711,6 +1717,11 @@ def render_report_shape(rows, doc, date, folder):
             "safety_flags": flags,
             "related_photos": [ph["s3_key"].rsplit("/", 1)[-1] for ph in t["photos"]],
             "findings": t["findings"],              # additive passthrough (D3)
+            "work_class": t.get("work_class"),
+            "work_confidence": t.get("work_confidence"),
+            "is_mixed": t.get("is_mixed"),
+            "redacted": t["id"] in _redacted,
+            "redaction_id": (_redacted.get(t["id"]) or {}).get("id"),
         })
     return {
         "report_date": date,
@@ -1760,7 +1771,7 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # prose (not site-clipped). Topic rows are already site-clipped above.
         doc = None if cross_user_clip else \
             _get_lake_json(f"reports/{date}/{user}/daily_report.json")
-        return render_report_shape(rows, doc, date, user)
+        return render_report_shape(rows, doc, date, user, conn=conn)
 
     # D fix (spec §5.1): prefer the Aurora-rendered shape whenever Aurora topics
     # exist for this (user, date) -- extraction-sourced OR report-sourced -- so

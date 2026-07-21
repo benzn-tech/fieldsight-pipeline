@@ -48,6 +48,11 @@ def wired(monkeypatch):
     # these to empty so existing site-list tests don't hit FakeConn's cursor.
     monkeypatch.setattr(org.memberships, "count_by_site", lambda conn, ids: {})
     monkeypatch.setattr(org.companies, "list_companies", lambda conn: [])
+    # Task 1b: render_report_shape (called from _render_timeline_for_user with
+    # a real conn) now unconditionally looks up redaction status; default to
+    # "nothing redacted" so FakeConn (no real .cursor()) doesn't crash tests
+    # that don't care about redactions. Tests exercising it override this.
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {})
     return monkeypatch
 
 
@@ -3818,3 +3823,26 @@ def test_create_alias_company_wide_by_site_manager(wired, monkeypatch):
     assert res["statusCode"] == 200
     assert body["right_term"] == "McCahon"
     assert body["site_id"] is None                       # no ?site -> company-wide
+
+
+def test_render_report_shape_carries_work_class_and_redacted(wired):
+    wired.setattr(org.redactions, "list_active_for_topics",
+                  lambda conn, ids: {"t-red": {"id": "r-1"}})
+    rows = [
+        {"id": "t-red", "site_id": "s", "user_id": None, "source_s3_key": "extractions/U/2026-07-21/x.json",
+         "report_date": "2026-07-21", "occurred_at": None, "category": "progress", "title": "Call",
+         "summary": "", "time_range": None, "participants": None, "source": "ai", "created_at": "t",
+         "work_class": "work", "work_confidence": 0.2, "is_mixed": False,
+         "action_items": [], "safety_observations": [], "findings": [], "photos": [],
+         "site_name": "S", "user_name": "U"},
+        {"id": "t-lunch", "site_id": "s", "user_id": None, "source_s3_key": "extractions/U/2026-07-21/x.json",
+         "report_date": "2026-07-21", "occurred_at": None, "category": "progress", "title": "Lunch",
+         "summary": "", "time_range": None, "participants": None, "source": "ai", "created_at": "t",
+         "work_class": "non_work", "work_confidence": 0.9, "is_mixed": False,
+         "action_items": [], "safety_observations": [], "findings": [], "photos": [],
+         "site_name": "S", "user_name": "U"},
+    ]
+    shape = org.render_report_shape(rows, None, "2026-07-21", "U", conn=object())
+    by = {t["topic_row_id"]: t for t in shape["topics"]}
+    assert by["t-red"]["redacted"] is True and by["t-lunch"]["redacted"] is False
+    assert by["t-lunch"]["work_class"] == "non_work" and by["t-lunch"]["work_confidence"] == 0.9

@@ -35,6 +35,12 @@ def test_enqueue_writes_request_with_topic_chunks_and_aliases(monkeypatch):
                         lambda conn, cid, site_ids=None: [
                             {"wrong_term": "Mackon", "right_term": "McCahon"}])
     monkeypatch.setattr(reindex, "_company_id_for_site", lambda conn, sid: "co-1")
+    # Task 1b: render_report_shape (invoked here via the lazy lambda_org_api
+    # import) now looks up redaction status whenever a real conn is passed;
+    # this test's conn is a bare object() with no .cursor(), so stub it.
+    import lambda_org_api
+    monkeypatch.setattr(lambda_org_api.redactions, "list_active_for_topics",
+                        lambda conn, ids: {})
 
     s3 = FakeS3()
     key = reindex.enqueue_topic_reindex(s3, "bkt", object(), "t-1", "Ada_L", "2026-07-16")

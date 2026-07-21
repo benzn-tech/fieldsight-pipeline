@@ -471,3 +471,12 @@ def get_topic_full(conn, topic_id) -> dict | None:
         "SELECT id, topic_id, s3_key, caption_text FROM topic_photos "
         "WHERE topic_id = ANY(%s) ORDER BY created_at", (tids,)).fetchall()
     return t
+
+
+def set_work_class(conn, topic_id, work_class):
+    """Human override of the machine work/non_work call (spec §5: '其实是工作'
+    flips it to 'work', releasing the topic to the company tier). Returns the
+    updated row, or None if the id is missing."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE topics SET work_class=%s WHERE id=%s RETURNING {_TOPIC_COLS}",
+        (work_class, topic_id)).fetchone()
