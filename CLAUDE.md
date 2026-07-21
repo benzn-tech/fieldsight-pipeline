@@ -598,6 +598,10 @@ dev 可把 Amplify `FS_ORG_BASEURL` 指向 test 网关(`wdsgobb7b0…/prod/api`,
 新端点、免先上 prod —— test 网关的 CognitoAuthorizer 已信任 prod 池 token。`update-branch --environment-variables`
 是**整包替换**(须带全部 6 个 FS_* 变量),改完 `start-job RELEASE` 重建。
 
+截至 db-isolation cutover(plan `docs/superpowers/plans/2026-07-21-test-prod-db-isolation.md`)之后,
+test 栈通过 `PgDatabase` 参数指向同一集群上**另一个独立数据库** `fieldsight_test`,prod 仍留在
+`fieldsight`——这个拆分是**故意的**,不要再当成 bug 去"修"。
+
 ### 定时器交接(2026-07-15 schedules cutover 上线)
 录音下载 + 报告生成的 cron 已从遗留手管的 `sitesync` EventBridge 组切到 **fieldsight-prod SAM 栈**
 的 schedule(`PROD_ENABLE_SCHEDULES=true`):orchestrator 15 分钟 sweep(工作时段 05:00–19:59 NZ)
