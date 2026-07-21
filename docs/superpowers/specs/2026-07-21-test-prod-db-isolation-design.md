@@ -45,7 +45,13 @@ cost and effort.
    (company/role/membership) lives in the DB, which IS separated, so a shared
    `sub` is inert in prod without a prod `users` row. Revisit only if test needs
    to exercise auth-flow/pool-policy changes, or heavy invite testing pollutes
-   the pool (mitigation: use `+test`/fake-domain emails when invite-testing).
+   the pool. **Hard rule (Fable m-4), not optional:** inviting a NEW email from
+   test runs `admin_create_user` with `DesiredDeliveryMediums=["EMAIL"]`
+   (`src/lambda_org_api.py:880-894`) — it really emails a real invite and creates
+   a real pool user, and a later prod invite of that email reuses test's account
+   and temp password. **Always use `+test`/fake-domain emails when invite-testing
+   on test.** (Re-inviting an *existing* email is read-only —
+   `UsernameExistsException → admin_get_user` — so it never disturbs prod users.)
 3. **Test data: one-time `pg_dump` copy** of the current `fieldsight` database
    into the new `fieldsight_test`. Test begins as a snapshot of today's data,
    then diverges. Accepted tradeoff: real customer data is copied into test
@@ -58,86 +64,145 @@ cost and effort.
 |---|---|
 | Aurora cluster | Unchanged. A second database `fieldsight_test` is created inside it. |
 | prod `fieldsight` DB | **Nothing.** Never moved, never touched — zero prod risk. |
-| test lambdas `PGDATABASE` | `fieldsight` → `fieldsight_test`, driven by a new template param set only for the test stage. |
+| test lambdas `PGDATABASE` | `fieldsight` → `fieldsight_test`, via a new `PgDatabase` template param passed only in `deploy.yml`'s `--parameter-overrides` (see §A). |
 | Cognito | Shared `q88pd6XXr`. The `users` table copied by `pg_dump` means testers resolve in the test DB with the same login. |
 | S3 buckets | Already separate — no change. |
 | Master secret / password | Same cluster = same secret. No new credential; the rotation trap surface is unchanged. |
 
 ## Components
 
-### A. `PGDATABASE` override parameter (`src/template.yaml` + `samconfig.toml`)
+### A. `PGDATABASE` override parameter (`src/template.yaml` + `deploy.yml`)
 
-Today every in-VPC function sets `PGDATABASE: !ImportValue "${DbStackName}-DbName"`
-(= `fieldsight`) uniformly. Add:
+Exactly **12** in-VPC functions set `PGDATABASE: !ImportValue "${DbStackName}-DbName"`
+(= `fieldsight`), all byte-identical (`src/template.yaml:800, 833, 977, 1070,
+1214, 1282, 1416, 1450, 1483, 1545, 1573, 1603` = Migrate / OrgApi / OrgSeed /
+Ingest / ItemWriter / SuggestionWriter / RagSearch / VoiceAudit / VoiceReaper /
+WsConnect / WsDisconnect / VoiceResolve). Verified these are the only DB clients:
+the same 12 lambda entries import `db.connection`, and no function uses a
+`DATABASE_URL` / `DB_SECRET_ARN` env path. **`EmbedReportFunction` and the
+matcher are non-VPC and do NOT connect to the DB** — they are not in scope.
 
-- A parameter `PgDatabase` (default `""`).
-- A condition `HasPgDatabaseOverride: !Not [!Equals [!Ref PgDatabase, ""]]`.
-- Replace each `PGDATABASE` value with
+Change:
+
+- Add a parameter `PgDatabase` (default `""`).
+- Add condition `HasPgDatabaseOverride: !Not [!Equals [!Ref PgDatabase, ""]]`.
+- Replace each of the 12 `PGDATABASE` values with
   `!If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue "${DbStackName}-DbName"]`.
-- In `samconfig.toml` `[test.deploy.parameters]`, add
-  `PgDatabase=fieldsight_test`; leave it unset for `[prod.deploy.parameters]`
-  (prod keeps the imported `fieldsight`).
 
-One parameter repoints **every** test in-VPC function uniformly (org-api,
-rag-search, ingest, embed-report, migrate, org-seed, item-writer/matcher, voice
-audit, etc.), because they all read the same env source.
+**CRITICAL — delivery channel (Fable B-1):** the value MUST be added to the
+**`--parameter-overrides` list in `.github/workflows/deploy.yml`**
+(`deploy.yml:72-81`, append `"PgDatabase=fieldsight_test"`), NOT to
+`samconfig.toml`. The CI runs `sam deploy --config-env test --parameter-overrides
+"Stage=test" ...`, and CLI `--parameter-overrides` **replaces** (does not merge)
+the samconfig parameter list (`samconfig.toml:4-6` documents this; its test list
+is already stale). Putting `PgDatabase` only in samconfig would leave the param
+at default `""` → the `!If` falls back to the imported `fieldsight` → **test
+silently keeps writing prod's database while everyone believes it is isolated.**
+`deploy-prod.yml` gets nothing (prod keeps the default `fieldsight`). samconfig
+may be updated too for doc parity, but the workflow is the only effective channel.
 
-**Durability (binding):** this override MUST live in the template + samconfig, not
-a manual `update-function-configuration`, or the next test SAM deploy silently
-reverts test to the shared `fieldsight` DB (same class as this session's
-hot-patch reverts).
+**Durability (binding):** the override lives in the template + workflow, never a
+manual `update-function-configuration`, or the next test SAM deploy reverts test
+to the shared DB.
 
-### B. Bootstrap the test database (one-time, in-VPC)
+`src/db/connection.py:32` has a `DB_NAME` default `"fieldsight"` fallback used
+only if a function ever connects via `DB_SECRET_ARN` (none do today); any future
+such function would NOT be covered by `PgDatabase` and must be handled then.
 
-Aurora is VPC-private and the copy needs the PostgreSQL client binaries, which
-the Lambda runtime does NOT ship. Two shortcuts are ruled out:
+### B. Bootstrap the test database (one-time) — MUST run before A
 
-- `CREATE DATABASE fieldsight_test TEMPLATE fieldsight` — a pure-SQL clone, but
-  Postgres requires **zero active connections** to the template database. The
-  live prod lambdas hold connections, so this cannot run without downtime.
-  Rejected.
-- Running `pg_dump`/`psql` from a Lambda — no `pg_dump` binary in the runtime;
-  bundling one is possible but heavier than the alternative below.
+**Ordering (Fable M-2, hard prerequisite):** the database must exist and be
+populated **before** the `PgDatabase=fieldsight_test` override is deployed. If A
+ships first, all 12 in-VPC functions fail with `FATAL: database "fieldsight_test"
+does not exist`, and `deploy.yml:93-106` runs migrate post-deploy and `exit 1`s
+on the error — the test pipeline stays red until the DB is created. The
+implementation plan encodes B-before-A as a task dependency.
 
-**Chosen mechanism: an ephemeral Fargate task in the VPC** (the repo already runs
-Fargate — `fargate_downloader.py`, `FARGATE_SUBNET_IDS`/`FARGATE_VPC_ID`
-secrets, `deploy-prod.yml`), using a `postgres`-client image, running:
+Aurora is VPC-private and dump/restore needs the PostgreSQL **16** client
+(cluster is Aurora PostgreSQL **16.4**, `infra/db-template.yaml:168`; a client
+below 16 refuses with a server-version mismatch). Two shortcuts are ruled out:
 
-```
-psql "$CLUSTER/postgres" -c 'CREATE DATABASE fieldsight_test;'
-pg_dump "$CLUSTER/fieldsight" | psql "$CLUSTER/fieldsight_test"
-```
+- `CREATE DATABASE fieldsight_test TEMPLATE fieldsight` — pure-SQL clone, but
+  Postgres requires **zero active connections** to the template DB; live prod
+  lambdas hold connections, so this needs downtime. Rejected for the copy.
+- `pg_dump`/`psql` from a Lambda — no client binary in the runtime.
 
-- `pg_dump` of the live `fieldsight` takes a consistent transactional snapshot —
-  no prod downtime.
-- Same master credentials for both databases (same cluster), so no new secret;
-  the task reads the existing DB secret from Secrets Manager.
-- Result: `fieldsight_test` is a full snapshot of `fieldsight` at copy time —
-  schema, rows, and the `users` table (so testers keep their logins).
-- Documented as **repeatable**: to refresh test from prod later, drop/recreate
-  `fieldsight_test` and re-run the task (destructive to test only).
+**The two `CREATE DATABASE` / (rollback) `DROP DATABASE` DDL statements need NO
+VPC host** — the cluster has the Data API enabled (`EnableHttpEndpoint: true`,
+`infra/db-template.yaml:179`; `ClusterArn` exported `:214`), so run them from the
+operator machine via `aws rds-data execute-statement` (verify Data API's
+transaction handling for `CREATE DATABASE`; fall back to `psql` if it wraps it in
+a txn, which `CREATE DATABASE` forbids).
 
-An acceptable alternative if Fargate proves fiddly: a temporary EC2 (or an
-existing bastion) in the DB subnets with `postgresql-client` installed, running
-the same three commands, then terminated. The plan picks one during
-implementation; the design requires only "a pg-client host inside the VPC".
+**The dump/restore body runs in a one-off ECS/Fargate task (Fable M-1 — a NEW
+task definition, not the existing downloader):**
+
+- The existing `FargateDownloaderTask` (`src/template.yaml:2013-2043`,
+  `python:3.11-slim` + S3 script) and its `FargateSecurityGroup`
+  (`:2001-2008`, egress-only) and `FargateTaskRole` (`:1968-1996`, S3-only) are
+  **not reusable**: Aurora's `DbSG` allows 5432 only from the exported
+  `fieldsight-db-test-LambdaSG` (`infra/db-template.yaml:78-83, 232-236`), and
+  the copy needs `secretsmanager:GetSecretValue`.
+- Create a **new one-off task def**: a `postgres:16` (or newer) image, attached to
+  the **`fieldsight-db-test-LambdaSG`** security group, running in the **DB VPC**
+  subnets (`vpc-0791974a474386d1c` per `samconfig.toml:91`; the `FARGATE_VPC_ID`
+  secret must be confirmed to equal this VPC before use), with a task role
+  granting `secretsmanager:GetSecretValue` on the DB secret. Only the ECS cluster
+  and the run-one-off-task pattern are reused.
+- Command:
+  ```
+  # credentials via PGHOST/PGPASSWORD env (NOT a URI DSN — the RDS-managed
+  # password contains URI-reserved chars; see src/db/connection.py:36-40)
+  pg_dump  "$fieldsight"     -Fc -f /tmp/dump.pgc          # or | psql
+  pg_restore --dbname="$fieldsight_test" --no-owner /tmp/dump.pgc   # ON_ERROR_STOP semantics
+  ```
+  Use `-Fc` + `pg_restore` (or `psql -v ON_ERROR_STOP=1`) so a partial failure
+  does not pass silently.
+- `pg_dump` of live `fieldsight` is a consistent transactional snapshot — no prod
+  downtime. Same cluster = same master secret (read from Secrets Manager); no new
+  credential. `pg_restore` recreates the `report_chunks` HNSW index
+  (`src/migrations/0004_report_chunks.sql:15-16`) and emits `CREATE EXTENSION`
+  for pgvector (master can install) — no manual step.
+- Result: `fieldsight_test` = full snapshot of `fieldsight` (schema, rows, the
+  `users` table so testers keep their logins, and the `schema_migrations` state).
+- **Repeatable**: to refresh test later, `DROP DATABASE fieldsight_test`
+  (Data API) + re-run the task (destructive to test only).
 
 ### C. Migration workflow (the payoff)
 
-Once separated, migrations are **independent**:
+Migration **state** is per-database: `schema_migrations` lives in the DB
+(`src/db/migrate.py:14-20`) and is copied by `pg_dump`, so `fieldsight_test`
+starts "all applied" and the two databases advance independently thereafter.
 
-- The **"additive-only" constraint is retired** — test may drop/rename/retype
-  freely.
+The precise claim (Fable M-3 — do NOT overstate "freely"):
+
+- Test may **experiment** with destructive migrations (drop/rename/retype)
+  against `fieldsight_test` with zero effect on prod. The "additive-only
+  discipline" no longer constrains *experimentation*.
+- **BUT `deploy-prod.yml:107-116` auto-runs `src/migrations/` from `main` on the
+  prod DB after every prod deploy.** So any migration file **merged to `main`**
+  still executes on `fieldsight`. Isolation protects prod from *test deploys*,
+  not from *merged migration files*. Rule: **experimental / throwaway migrations
+  must never be merged to `main`; a migration that reaches `main` is a
+  deliberate, reviewed prod change.**
 - Each stack's migrate lambda (`lambda_migrate.py`) connects to its own
-  `PGDATABASE`: test → `fieldsight_test`, prod → `fieldsight`.
-- No ongoing sync between the two databases (that is the isolation). Divergence
-  is expected and fine.
+  `PGDATABASE`: test → `fieldsight_test`, prod → `fieldsight`. No ongoing sync
+  (that is the isolation).
+
+**Documentation to correct on cutover (prevents a future session from "fixing"
+the split back):** `deploy-prod.yml:6-8` ("Shares Aurora … with fieldsight-test")
+and `:107` ("shared schema_migrations"), `CLAUDE.md` BUG-38, and the
+`fieldsight-test-prod-org-api-topology` memory all describe the shared-DB state
+and become misleading once test moves to `fieldsight_test`.
 
 ### D. Rollback
 
-- Point `[test.deploy.parameters]` `PgDatabase` back to empty (or `fieldsight`)
-  and redeploy the test stack → test instantly returns to the shared database.
-- `DROP DATABASE fieldsight_test` once the separation is confirmed unwanted.
+- Remove `PgDatabase=fieldsight_test` from `deploy.yml`'s `--parameter-overrides`
+  (per B-1, the workflow — not samconfig — is the effective channel) and redeploy
+  the test stack → the `!If` falls back to the imported `fieldsight` → test
+  instantly returns to the shared database.
+- `DROP DATABASE fieldsight_test` (via Data API) once the separation is confirmed
+  unwanted.
 
 ## Risks / caveats
 
