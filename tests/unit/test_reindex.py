@@ -41,6 +41,9 @@ def test_enqueue_writes_request_with_topic_chunks_and_aliases(monkeypatch):
     import lambda_org_api
     monkeypatch.setattr(lambda_org_api.redactions, "list_active_for_topics",
                         lambda conn, ids: {})
+    # Task 5: enqueue_topic_reindex's delete-only guard also checks redaction
+    # status directly; stub it too (this test's conn has no .cursor()).
+    monkeypatch.setattr(reindex.redactions, "is_topic_redacted", lambda conn, tid: False)
 
     s3 = FakeS3()
     key = reindex.enqueue_topic_reindex(s3, "bkt", object(), "t-1", "Ada_L", "2026-07-16")

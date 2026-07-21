@@ -160,6 +160,19 @@ def embed_reindex_request(key):
             logger.exception("reindex %s: transcript window rebuild failed (topic chunks only)", key)
 
     if not chunks_out:
+        if req.get("delete_only"):
+            # Redacted/non_work topic (spec §6): write an empty vectors result so
+            # ingest's apply_vectors runs delete_chunks_for_topic and removes it.
+            result = {
+                "topic_id": req["topic_id"], "site_id": req["site_id"],
+                "user_id": req.get("user_id"), "report_date": req["report_date"],
+                "source_s3_key": req.get("source_s3_key"), "chunks": [],
+            }
+            vkey = reindex.vectors_key(req["date"], req["folder"], req["topic_id"])
+            s3().put_object(Bucket=S3_BUCKET, Key=vkey,
+                            Body=json.dumps(result), ContentType="application/json")
+            logger.info("reindex %s: delete-only -- wrote empty vectors artifact", key)
+            return {"reindex": key, "chunks": 0, "deleted": True}
         logger.info("reindex %s: no chunks -- skipping", key)
         return {"reindex": key, "chunks": 0}
 
