@@ -146,6 +146,49 @@ Parameters:
     NoEcho: true
     Default: ''
 
+  LlmProvider:
+    Type: String
+    Description: LLM provider for all Claude call sites (anthropic|qwen)
+    AllowedValues: [anthropic, qwen]
+    Default: anthropic
+
+  QwenBaseUrl:
+    Type: String
+    Description: DashScope OpenAI-compatible base URL for Qwen chat completions
+    Default: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+
+  QwenModelPlus:
+    Type: String
+    Description: Qwen model for structured-JSON tasks (report/meeting/extract/matcher)
+    Default: qwen3.7-plus
+
+  QwenModelFast:
+    Type: String
+    Description: Qwen model for the latency-bound ask path
+    Default: qwen-flash
+
+  AsrProvider:
+    Type: String
+    Description: Speech-to-text provider (transcribe|elevenlabs)
+    AllowedValues: [transcribe, elevenlabs]
+    Default: transcribe
+
+  ElevenLabsApiKey:
+    Type: String
+    Description: ElevenLabs xi-api-key for scribe_v2 STT
+    NoEcho: true
+    Default: ''
+
+  ElevenLabsSttModel:
+    Type: String
+    Description: ElevenLabs STT model id
+    Default: scribe_v2
+
+  ElevenLabsLanguage:
+    Type: String
+    Description: ISO 639-3 language to pin (empty = auto-detect)
+    Default: ''
+
   ScheduleExpression:
     Type: String
     Description: Download schedule (Cron in UTC)
@@ -464,7 +507,7 @@ Resources:
       FunctionName: !Sub ["${P}-transcribe", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_transcribe.lambda_handler
-      Timeout: 60
+      Timeout: 300
       MemorySize: 128
       Environment:
         Variables:
@@ -473,6 +516,11 @@ Resources:
           MAX_SPEAKERS: !Ref MaxSpeakers
           TRANSCRIPT_TABLE: !Ref TranscriptTableName
           VOCABULARY_NAME: !Ref CustomVocabularyName
+          ASR_PROVIDER: !Ref AsrProvider
+          ELEVENLABS_API_KEY: !Ref ElevenLabsApiKey
+          ELEVENLABS_STT_MODEL: !Ref ElevenLabsSttModel
+          ELEVENLABS_LANGUAGE: !Ref ElevenLabsLanguage
+          KEYTERMS_PATH: config/custom_vocabulary_construction_nz.txt
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
@@ -546,6 +594,10 @@ Resources:
           S3_BUCKET: !Ref DataBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
+          LLM_PROVIDER: !Ref LlmProvider
+          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelPlus
           REPORT_PREFIX: reports/
           SITE_NAME: !Ref SiteName
           ITEMS_TABLE: !Ref ItemsTableName
@@ -647,6 +699,10 @@ Resources:
           S3_BUCKET: !Ref DataBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
+          LLM_PROVIDER: !Ref LlmProvider
+          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelPlus
           MINUTES_PREFIX: meeting_minutes/
           REPORT_PREFIX: reports/
       Policies:
@@ -697,6 +753,10 @@ Resources:
           # sonnet completion risks blowing that budget; haiku is fast and
           # matches the legacy S3 path's HAIKU_MODEL.
           CLAUDE_MODEL: claude-haiku-4-5-20251001
+          LLM_PROVIDER: !Ref LlmProvider
+          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelFast
           # DASHSCOPE_TTS_* below default inside dashscope_utils.py (model
           # qwen3-tts-flash-realtime, voice Cherry, intl WS url) — no env
           # override needed here; DashScopeLayer (below) provides the SDK.
@@ -1016,6 +1076,10 @@ Resources:
           CONFIG_KEY: config/user_mapping.json
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
+          LLM_PROVIDER: !Ref LlmProvider
+          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelPlus
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -1350,6 +1414,10 @@ Resources:
           # Claude key — mirrors ExtractSessionFunction's env block.
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
+          LLM_PROVIDER: !Ref LlmProvider
+          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelPlus
       Policies:
         - LambdaInvokePolicy:
             FunctionName: !Ref SuggestionWriterFunction
