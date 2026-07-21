@@ -199,64 +199,95 @@ On the chosen copy host (Fargate image `postgres:16` or EC2 with `postgresql-16-
 
 Run the same check `deploy-prod.yml:45-54` uses: the DB secret's `password` must equal a live lambda's `PGPASSWORD`. If mismatched, resync before proceeding (memory: `fieldsight-db-password-rotation-trap`).
 
-### Task 5: Create the `fieldsight_test` database (Data API — no VPC host)
+### Task 5: Provision the throwaway copy EC2 (IAM role + instance)
 
-- [ ] **Step 1: Get the cluster ARN + secret ARN**
+Verified resource IDs (from pre-flight): PGHOST `fieldsight-db-test-dbcluster-hywiixu8ihi9.cluster-ctugu28wme3y.ap-southeast-2.rds.amazonaws.com`; SecretArn `arn:aws:secretsmanager:ap-southeast-2:509194952652:secret:rds!cluster-1757a281-ee31-460d-b56e-950817921010-Ansbey`; SG `sg-0749d42a6d5696729` (LambdaSG, all-egress, trusted by DbSG on 5432); DB subnet `subnet-08b15b36113e542d4` (public, IGW route).
 
-Run:
+- [ ] **Step 1: Create the instance role + profile with SSM + secret read**
+
 ```bash
-CLUSTER_ARN=$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-ClusterArn'].Value" --output text)
-SECRET_ARN=$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)
+SECRET_ARN='arn:aws:secretsmanager:ap-southeast-2:509194952652:secret:rds!cluster-1757a281-ee31-460d-b56e-950817921010-Ansbey'
+aws iam create-role --role-name fs-db-copy-tmp \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam attach-role-policy --role-name fs-db-copy-tmp \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam put-role-policy --role-name fs-db-copy-tmp --policy-name secret-read \
+  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"secretsmanager:GetSecretValue\",\"Resource\":\"$SECRET_ARN\"}]}"
+aws iam create-instance-profile --instance-profile-name fs-db-copy-tmp
+aws iam add-role-to-instance-profile --instance-profile-name fs-db-copy-tmp --role-name fs-db-copy-tmp
+sleep 10   # allow the instance profile to propagate
 ```
 
-- [ ] **Step 2: Create the database**
-
-`CREATE DATABASE` cannot run inside a transaction; Data API auto-commits single statements (no explicit transaction id), so:
-```bash
-aws rds-data execute-statement --resource-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" \
-  --database postgres --sql 'CREATE DATABASE fieldsight_test;'
-```
-Expected: `{"numberOfRecordsUpdated": 0}` (no error). If it errors with "cannot run inside a transaction block", fall back to `psql` from the copy host (Task 6) for this one statement.
-
-- [ ] **Step 3: Verify it exists**
+- [ ] **Step 2: Launch the instance**
 
 ```bash
-aws rds-data execute-statement --resource-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" \
-  --database postgres --sql "SELECT datname FROM pg_database WHERE datname='fieldsight_test';"
-```
-Expected: one row `fieldsight_test`.
-
-### Task 6: Copy `fieldsight` → `fieldsight_test` (in-VPC pg-16 client)
-
-- [ ] **Step 1: Launch the copy host**
-
-Register a one-off ECS/Fargate task (image `postgres:16`; SG `fieldsight-db-test-LambdaSG`; DB VPC subnets; task role with `secretsmanager:GetSecretValue` on `$SECRET_ARN`), OR a temporary EC2 in the DB subnets with `postgresql-16-client`. Export on that host:
-```bash
-export PGHOST=fieldsight-db-test-dbcluster-hywiixu8ihi9.cluster-ctugu28wme3y.ap-southeast-2.rds.amazonaws.com
-export PGUSER=postgres
-export PGPASSWORD='<from Secrets Manager — do NOT build a URI DSN; reserved chars, see src/db/connection.py:36-40>'
+AMI=$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text)
+IID=$(aws ec2 run-instances --image-id "$AMI" --instance-type t3.small \
+  --subnet-id subnet-08b15b36113e542d4 --associate-public-ip-address \
+  --security-group-ids sg-0749d42a6d5696729 \
+  --iam-instance-profile Name=fs-db-copy-tmp \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=fs-db-copy-tmp}]' \
+  --query 'Instances[0].InstanceId' --output text)
+echo "$IID"
+aws ec2 wait instance-running --instance-ids "$IID"
 ```
 
-- [ ] **Step 2: Dump prod (consistent snapshot, no downtime) + restore into test**
+- [ ] **Step 3: Wait for SSM registration**
 
 ```bash
-pg_dump -d fieldsight -Fc -f /tmp/fieldsight.pgc
-pg_restore --dbname=fieldsight_test --no-owner --exit-on-error /tmp/fieldsight.pgc
+until aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$IID" \
+  --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null | grep -q Online; do sleep 10; done
+echo "SSM Online"
 ```
-`--exit-on-error` (pg_restore) / `ON_ERROR_STOP=1` semantics so a partial failure is loud. pgvector `CREATE EXTENSION` + the `report_chunks` HNSW index rebuild happen automatically.
+Expected: prints `SSM Online` within ~1-2 min.
 
-- [ ] **Step 3: Verify the copy — row counts match on key tables**
+### Task 6: Run the copy over SSM, verify, then destroy the host
 
-For `users`, `topics`, `action_items`, `report_chunks`, `sites`, compare counts between the two databases (via Data API against each `--database`):
+- [ ] **Step 1: Send the copy commands over SSM**
+
 ```bash
+PGHOST=fieldsight-db-test-dbcluster-hywiixu8ihi9.cluster-ctugu28wme3y.ap-southeast-2.rds.amazonaws.com
+CMD=$(aws ssm send-command --instance-ids "$IID" --document-name AWS-RunShellScript \
+  --comment "fieldsight_test bootstrap copy" --timeout-seconds 3600 \
+  --parameters commands="[\"set -euo pipefail\",\"dnf install -y postgresql16 jq >/dev/null\",\"export PGHOST=$PGHOST PGUSER=postgres\",\"export PGPASSWORD=\$(aws secretsmanager get-secret-value --secret-id '$SECRET_ARN' --region ap-southeast-2 --query SecretString --output text | jq -r .password)\",\"createdb fieldsight_test\",\"pg_dump -d fieldsight -Fc -f /tmp/f.pgc\",\"pg_restore --dbname=fieldsight_test --no-owner --exit-on-error /tmp/f.pgc\",\"echo COPY_DONE\"]" \
+  --query 'Command.CommandId' --output text)
+echo "$CMD"
+```
+
+- [ ] **Step 2: Poll for completion and read output**
+
+```bash
+until aws ssm get-command-invocation --command-id "$CMD" --instance-id "$IID" \
+  --query Status --output text 2>/dev/null | grep -qE 'Success|Failed'; do sleep 15; done
+aws ssm get-command-invocation --command-id "$CMD" --instance-id "$IID" \
+  --query '{status:Status,out:StandardOutputContent,err:StandardErrorContent}' --output json
+```
+Expected: `status: Success`, output ends with `COPY_DONE`. If `Failed`, read `err` — most common: pg16 not yet installed (rerun), or a restore constraint error (surfaced by `--exit-on-error`).
+
+- [ ] **Step 3: Verify row-count parity (Data API, host-free)**
+
+```bash
+CLUSTER_ARN='arn:aws:rds:ap-southeast-2:509194952652:cluster:fieldsight-db-test-dbcluster-hywiixu8ihi9'
 for t in users topics action_items report_chunks sites; do
-  for db in fieldsight fieldsight_test; do
-    aws rds-data execute-statement --resource-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" \
-      --database "$db" --sql "SELECT count(*) FROM $t;" --query 'records[0][0].longValue' --output text
-  done
+  a=$(aws rds-data execute-statement --resource-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" --database fieldsight      --sql "SELECT count(*) FROM $t;" --query 'records[0][0].longValue' --output text)
+  b=$(aws rds-data execute-statement --resource-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" --database fieldsight_test --sql "SELECT count(*) FROM $t;" --query 'records[0][0].longValue' --output text)
+  echo "$t: prod=$a test=$b $( [ "$a" = "$b" ] && echo OK || echo MISMATCH )"
 done
 ```
-Expected: each table's two counts equal. Tear down the copy host afterward.
+Expected: every row prints `OK`.
+
+- [ ] **Step 4: Destroy the throwaway host + role (leave NOTHING running)**
+
+```bash
+aws ec2 terminate-instances --instance-ids "$IID" >/dev/null
+aws ec2 wait instance-terminated --instance-ids "$IID"
+aws iam remove-role-from-instance-profile --instance-profile-name fs-db-copy-tmp --role-name fs-db-copy-tmp
+aws iam delete-instance-profile --instance-profile-name fs-db-copy-tmp
+aws iam delete-role-policy --role-name fs-db-copy-tmp --policy-name secret-read
+aws iam detach-role-policy --role-name fs-db-copy-tmp --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam delete-role --role-name fs-db-copy-tmp
+```
+Expected: instance terminated; role/profile gone. Cost of the whole task ≈ 1 cent.
 
 ### Task 7: Deploy the switch (test only)
 

@@ -127,46 +127,53 @@ below 16 refuses with a server-version mismatch). Two shortcuts are ruled out:
   lambdas hold connections, so this needs downtime. Rejected for the copy.
 - `pg_dump`/`psql` from a Lambda — no client binary in the runtime.
 
-**The two `CREATE DATABASE` / (rollback) `DROP DATABASE` DDL statements need NO
-VPC host** — the cluster has the Data API enabled (`EnableHttpEndpoint: true`,
-`infra/db-template.yaml:179`; `ClusterArn` exported `:214`), so run them from the
-operator machine via `aws rds-data execute-statement` (verify Data API's
-transaction handling for `CREATE DATABASE`; fall back to `psql` if it wraps it in
-a txn, which `CREATE DATABASE` forbids).
+**Mechanism: a temporary EC2 host in the DB VPC, driven over SSM, then
+terminated** (chosen over Fargate for interactive debuggability on a one-off; both
+cost ~1 cent and neither touches prod's `fieldsight`). Verified live-topology
+facts that make one host + one SG sufficient:
 
-**The dump/restore body runs in a one-off ECS/Fargate task (Fable M-1 — a NEW
-task definition, not the existing downloader):**
+- **Networking (verified):** the 3 DB subnets (`subnet-08b15b36113e542d4`,
+  `-05fb05613cf529121`, `-082dd4480f7e20014`) use the VPC main route table
+  `rtb-0f167c1fa3469bafd`, which has `0.0.0.0/0 → igw-0f12e5a0ff97b4479`. So an
+  instance there with a **public IP** egresses to the internet (for `dnf` + SSM +
+  Secrets Manager). Lambda ENIs never get public IPs (that is BUG-36's no-egress),
+  but an EC2/Fargate host does.
+- **One security group covers both directions:** attach
+  `fieldsight-db-test-LambdaSG` (`sg-0749d42a6d5696729`). Aurora's `DbSG`
+  (`sg-0845ec1fea44de4ad`) trusts exactly that SG on 5432 (so the host is allowed
+  into the DB), and that SG's egress is all-protocols `0.0.0.0/0` (so `dnf`/SSM/
+  Secrets Manager outbound works). No second SG needed.
+- **AMI:** Amazon Linux 2023 (`/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`
+  = `ami-059a26205fdaa13ea` at design time) — ships the SSM agent and provides
+  `postgresql16` via `dnf` (the pg-16 client that matches the 16.4 server).
 
-- The existing `FargateDownloaderTask` (`src/template.yaml:2013-2043`,
-  `python:3.11-slim` + S3 script) and its `FargateSecurityGroup`
-  (`:2001-2008`, egress-only) and `FargateTaskRole` (`:1968-1996`, S3-only) are
-  **not reusable**: Aurora's `DbSG` allows 5432 only from the exported
-  `fieldsight-db-test-LambdaSG` (`infra/db-template.yaml:78-83, 232-236`), and
-  the copy needs `secretsmanager:GetSecretValue`.
-- Create a **new one-off task def**: a `postgres:16` (or newer) image, attached to
-  the **`fieldsight-db-test-LambdaSG`** security group, running in the **DB VPC**
-  subnets (`vpc-0791974a474386d1c` per `samconfig.toml:91`; the `FARGATE_VPC_ID`
-  secret must be confirmed to equal this VPC before use), with a task role
-  granting `secretsmanager:GetSecretValue` on the DB secret. Only the ECS cluster
-  and the run-one-off-task pattern are reused.
-- Command:
-  ```
-  # credentials via PGHOST/PGPASSWORD env (NOT a URI DSN — the RDS-managed
-  # password contains URI-reserved chars; see src/db/connection.py:36-40)
-  pg_dump  "$fieldsight"     -Fc -f /tmp/dump.pgc          # or | psql
-  pg_restore --dbname="$fieldsight_test" --no-owner /tmp/dump.pgc   # ON_ERROR_STOP semantics
-  ```
-  Use `-Fc` + `pg_restore` (or `psql -v ON_ERROR_STOP=1`) so a partial failure
-  does not pass silently.
+Procedure (full detail + exact commands in the plan Task 6 and the runbook):
+
+1. Create a throwaway IAM role + instance profile: trust `ec2.amazonaws.com`,
+   attach `AmazonSSMManagedInstanceCore`, plus an inline
+   `secretsmanager:GetSecretValue` on the DB secret ARN.
+2. Launch a `t3.small` AL2023 instance in a DB subnet with `--associate-public-ip-address`,
+   security group `sg-0749d42a6d5696729`, the instance profile above; wait for it
+   to register in SSM.
+3. Over SSM (`send-command`), run: `dnf install -y postgresql16 jq`; read
+   `PGPASSWORD` from Secrets Manager; `createdb fieldsight_test`; `pg_dump -d
+   fieldsight -Fc -f /tmp/fieldsight.pgc`; `pg_restore --dbname=fieldsight_test
+   --no-owner --exit-on-error /tmp/fieldsight.pgc`; then row-count parity checks.
+   Credentials go through `PGHOST`/`PGUSER`/`PGPASSWORD` env — NOT a URI DSN (the
+   RDS-managed password has URI-reserved chars; `src/db/connection.py:36-40`).
+4. **Terminate the instance and delete the throwaway role/instance profile.**
+
 - `pg_dump` of live `fieldsight` is a consistent transactional snapshot — no prod
-  downtime. Same cluster = same master secret (read from Secrets Manager); no new
-  credential. `pg_restore` recreates the `report_chunks` HNSW index
-  (`src/migrations/0004_report_chunks.sql:15-16`) and emits `CREATE EXTENSION`
-  for pgvector (master can install) — no manual step.
+  downtime. Same cluster = same master secret; no new credential. `pg_restore`
+  rebuilds the `report_chunks` HNSW index (`src/migrations/0004_report_chunks.sql:15-16`)
+  and emits `CREATE EXTENSION` for pgvector (master installs it) — no manual step.
+- `-Fc` + `pg_restore --exit-on-error` so a partial failure is loud, not silent.
 - Result: `fieldsight_test` = full snapshot of `fieldsight` (schema, rows, the
-  `users` table so testers keep their logins, and the `schema_migrations` state).
-- **Repeatable**: to refresh test later, `DROP DATABASE fieldsight_test`
-  (Data API) + re-run the task (destructive to test only).
+  `users` table so testers keep their logins, and `schema_migrations` state).
+- **Repeatable**: to refresh test later, `DROP DATABASE fieldsight_test` + re-run.
+  `CREATE`/`DROP DATABASE` can also be issued host-free via the cluster's Data API
+  (`EnableHttpEndpoint: true`, `infra/db-template.yaml:179`), but since the EC2
+  host exists for the copy, it runs `createdb` directly (one fewer moving part).
 
 ### C. Migration workflow (the payoff)
 
