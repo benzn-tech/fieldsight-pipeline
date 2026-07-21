@@ -625,8 +625,8 @@ def create_org_site(conn, caller, body):
 
 
 def patch_org_site(conn, caller, site_id, body):
-    if caller["global_role"] not in ("admin", "gm"):
-        return error("admin or gm role required", 403)
+    if caller["global_role"] not in ("admin", "gm", "platform_admin"):
+        return error("admin, gm, or platform_admin role required", 403)
     if body is None:
         return error("malformed JSON body", 400)
     name = body.get("name")
@@ -645,8 +645,20 @@ def patch_org_site(conn, caller, site_id, body):
     lng, lng_err = _coerce_coord(body.get("longitude"), -180.0, 180.0, "longitude")
     if lng_err:
         return lng_err
+    # platform_admin (is_cross_company) edits sites across every tenant; company
+    # roles stay pinned to their own company. Resolve the scoping company from
+    # the site itself for a cross-company caller so update_site's company guard
+    # matches -- otherwise a platform_admin (in an empty operator company) always
+    # hits 0 rows -> 404 (mirrors the Team/sites cross-company fix in #96 and
+    # patch_action_item).
+    scope_company_id = caller["company_id"]
+    if is_cross_company(caller["global_role"]):
+        target = sites.get_site(conn, site_id)
+        if target is None:
+            return error("site not found", 404)
+        scope_company_id = target["company_id"]
     row = sites.update_site(
-        conn, site_id, caller["company_id"],
+        conn, site_id, scope_company_id,
         name=name, location=body.get("location"),
         client=body.get("client"), industry=body.get("industry"),
         address=body.get("address"), latitude=lat, longitude=lng,
@@ -849,6 +861,17 @@ def create_member(conn, caller, body):
             return error("target company not found", 404)
         target_company_id = req_company_id
     wanted = body.get("memberships") or []
+    # A platform_admin operates from an empty operator company; when it invites
+    # onto a customer site WITHOUT an explicit target_company_id, adopt that
+    # site's company so the per-site company guard below matches instead of
+    # 403-ing every real invite (mirrors create_org_site + the #96 fix). Company
+    # roles keep target_company_id = their own company, unchanged.
+    if (is_cross_company(caller["global_role"]) and not req_company_id and wanted
+            and isinstance(wanted[0], dict) and wanted[0].get("site_id")):
+        anchor = sites.get_site(conn, wanted[0]["site_id"])
+        if anchor is None:
+            return error("site not found in your company", 403)
+        target_company_id = anchor["company_id"]
     for mem in wanted:
         if not isinstance(mem, dict) or not mem.get("site_id"):
             return error("each membership needs a site_id", 400)
