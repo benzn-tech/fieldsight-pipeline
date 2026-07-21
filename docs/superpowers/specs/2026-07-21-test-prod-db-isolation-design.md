@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-21
 **Repo:** `fieldsight-pipeline` (account 509194952652, the user's own SAM pipeline — NOT the company CDK prod 164088480050)
-**Status:** Approved design, pending spec review → implementation plan
+**Status:** ✅ IMPLEMENTED & LIVE — 2026-07-21 (PR #114 → `develop` → test SAM deploy). `fieldsight_test` created + populated (row-count parity verified), all 12 in-VPC test functions repointed (`PGDATABASE=fieldsight_test`), prod untouched (`fieldsight`), boundary write test confirmed both ways. Temporary EC2 copy host + IAM torn down. See `docs/superpowers/plans/2026-07-21-test-prod-db-isolation.md` for the executed plan and `scripts/db-isolation-bootstrap.md` for the operator runbook.
 
 ## Problem
 
