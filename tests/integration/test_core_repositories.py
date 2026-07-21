@@ -124,3 +124,24 @@ def test_topic_work_class_roundtrip(db):
     assert row["is_mixed"] is True
     got = topics.list_site_topics(db, s["id"], "2026-07-21")[0]
     assert got["work_class"] == "non_work" and got["is_mixed"] is True
+
+
+def test_portfolio_counts_excludes_non_work_and_redacted(db):
+    import datetime as _dt
+    import repositories.topics as topics
+    from repositories import companies, sites, rollup, redactions
+    today = _dt.date.today().isoformat()   # topics_count is report_date >= CURRENT_DATE-30
+    co = companies.create_company(db, "RU-Co")
+    s = sites.create_site(db, co["id"], "RU-Site")
+    work = topics.upsert_topic(db, s["id"], today, "Pour", work_class="work",
+                               action_items=[{"text": "fix rebar"}])
+    topics.upsert_topic(db, s["id"], today, "Lunch", work_class="non_work",
+                        action_items=[{"text": "personal errand"}])
+    redacted = topics.upsert_topic(db, s["id"], today, "Call", work_class="work",
+                                   action_items=[{"text": "call spouse"}])
+    redactions.create_redaction(db, co["id"], redacted["id"], "privacy", None, "admin")
+
+    counts = rollup.portfolio_counts(db, [s["id"]])[str(s["id"])]
+    # only the one 'work', non-redacted topic + its action item are counted
+    assert counts["topics_count"] == 1
+    assert counts["open_actions"] == 1 and counts["total_actions"] == 1

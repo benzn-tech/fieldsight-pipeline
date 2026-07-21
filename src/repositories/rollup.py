@@ -30,6 +30,8 @@ manual+live merging separately.
 """
 from psycopg.rows import dict_row
 
+from repositories import redactions
+
 _ZERO_FIELDS = ("open_safety", "open_high_safety", "open_actions", "total_actions",
                  "overdue_actions", "topics_count", "participants")
 
@@ -66,6 +68,7 @@ def portfolio_counts(conn, site_ids) -> dict:
 
     ids = list(site_ids)
     merged = {str(sid): _zero() for sid in ids}
+    excluded = list(redactions.company_excluded_topic_ids(conn, ids))
 
     # Safety count = safety-domain findings (source of truth) PLUS a legacy
     # fallback: safety_observations rows for report-only topics that have NO
@@ -82,14 +85,15 @@ def portfolio_counts(conn, site_ids) -> dict:
         "FROM ("
         "  SELECT site_id, status, (severity='major') AS is_high "
         "  FROM findings WHERE site_id = ANY(%s) AND domain='safety' "
+        "    AND topic_id != ALL(%s::uuid[]) "
         "  UNION ALL "
         "  SELECT so.site_id, so.status, (lower(so.risk_level)='high') AS is_high "
         "  FROM safety_observations so "
-        "  WHERE so.site_id = ANY(%s) "
+        "  WHERE so.site_id = ANY(%s) AND so.topic_id != ALL(%s::uuid[]) "
         "    AND NOT EXISTS (SELECT 1 FROM findings f "
         "                    WHERE f.topic_id = so.topic_id AND f.domain='safety')"
         ") u GROUP BY site_id",
-        (ids, ids),
+        (ids, excluded, ids, excluded),
     ).fetchall()
     for r in safety_rows:
         b = merged.setdefault(str(r["site_id"]), _zero())
@@ -102,8 +106,8 @@ def portfolio_counts(conn, site_ids) -> dict:
         "count(*) AS total_actions, "
         "count(*) FILTER (WHERE status='open' AND deadline IS NOT NULL "
         "AND deadline < CURRENT_DATE) AS overdue_actions "
-        "FROM action_items WHERE site_id = ANY(%s) GROUP BY site_id",
-        (ids,),
+        "FROM action_items WHERE site_id = ANY(%s) AND topic_id != ALL(%s::uuid[]) GROUP BY site_id",
+        (ids, excluded),
     ).fetchall()
     for r in action_rows:
         b = merged.setdefault(str(r["site_id"]), _zero())
@@ -116,8 +120,9 @@ def portfolio_counts(conn, site_ids) -> dict:
         "count(*) AS topics_count, "
         "count(DISTINCT user_id) AS participants "
         "FROM topics WHERE site_id = ANY(%s) AND report_date >= CURRENT_DATE - 30 "
+        "AND id != ALL(%s::uuid[]) "
         "GROUP BY site_id",
-        (ids,),
+        (ids, excluded),
     ).fetchall()
     for r in topic_rows:
         b = merged.setdefault(str(r["site_id"]), _zero())
@@ -131,8 +136,8 @@ def portfolio_counts(conn, site_ids) -> dict:
     # aggregate instead (idx_topics_site_date).
     activity_rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT site_id, MAX(report_date) AS last_activity_at "
-        "FROM topics WHERE site_id = ANY(%s) GROUP BY site_id",
-        (ids,),
+        "FROM topics WHERE site_id = ANY(%s) AND id != ALL(%s::uuid[]) GROUP BY site_id",
+        (ids, excluded),
     ).fetchall()
     for r in activity_rows:
         b = merged.setdefault(str(r["site_id"]), _zero())
