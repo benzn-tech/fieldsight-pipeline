@@ -295,6 +295,59 @@ def test_legacy_extraction_without_time_range_writes_null(wired):
 
 
 # ---------------------------------------------------------------------------
+# Task 8 (life-conversation-separation plan) -- item-writer passes
+# work_class/work_confidence/is_mixed through to topics.upsert_topic
+# (migration 0011-follow-on columns; Task 1 landed the repo-layer plumbing,
+# Task 7 landed the classifier populating these keys on the topic dict).
+# ---------------------------------------------------------------------------
+
+def test_item_writer_passes_work_class_fields(wired):
+    captured = {}
+
+    def fake_upsert(conn, site_id, report_date, title, **kw):
+        captured.update(kw)
+        return {"id": "topic-uuid-0"}
+
+    topic = make_extraction()["topics"][0]
+    topic.update(work_class="non_work", work_confidence=0.9, is_mixed=True)
+    wired.setattr(
+        iw, "_s3_client",
+        FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(topics=[topic]))}),
+    )
+    wired.setattr(iw.topics, "upsert_topic", fake_upsert)
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert captured["work_class"] == "non_work"
+    assert captured["work_confidence"] == 0.9 and captured["is_mixed"] is True
+
+
+def test_item_writer_sanitizes_garbage_work_class_fields(wired):
+    # A raw bad LLM value (e.g. "personal", or a non-numeric confidence)
+    # would otherwise raise inside the CHECK-constrained INSERT and abort
+    # the whole session's topics/findings write (Fable review #7) -- the
+    # writer must sanitize invalid values to NULL instead of raising.
+    captured = {}
+
+    def fake_upsert(conn, site_id, report_date, title, **kw):
+        captured.update(kw)
+        return {"id": "topic-uuid-0"}
+
+    topic = make_extraction()["topics"][0]
+    topic.update(work_class="personal", work_confidence="high", is_mixed=True)
+    wired.setattr(
+        iw, "_s3_client",
+        FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(topics=[topic]))}),
+    )
+    wired.setattr(iw.topics, "upsert_topic", fake_upsert)
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert captured["work_class"] is None
+    assert captured["work_confidence"] is None
+
+
+# ---------------------------------------------------------------------------
 # Result shape
 # ---------------------------------------------------------------------------
 

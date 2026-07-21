@@ -267,6 +267,19 @@ def write_extraction_items(date, user_folder, extraction_key):
         for i, t in enumerate(extraction_topics):
             mapped_action_items = lambda_ingest._map_action_items(t.get("action_items"))
             matched_photos = photos_by_topic.get(i, [])
+            # Sanitize work_class/work_confidence before the upsert (Fable
+            # review #7): the columns carry CHECK constraints (work_class IN
+            # ('work','non_work'); work_confidence is real) so a raw bad LLM
+            # value (e.g. "personal", or a non-numeric confidence) would
+            # raise inside this transaction and abort the whole session's
+            # topics/findings write. Invalid -> NULL (legacy/unclassified,
+            # which enforcement treats as work).
+            _wc = t.get("work_class")
+            _wc = _wc if _wc in ("work", "non_work") else None
+            try:
+                _wconf = float(t["work_confidence"]) if t.get("work_confidence") is not None else None
+            except (TypeError, ValueError):
+                _wconf = None
             row = topics.upsert_topic(
                 conn, site["id"], date, t.get("topic_title", ""),
                 user_id=user_id, source_s3_key=extraction_key,
@@ -284,6 +297,7 @@ def write_extraction_items(date, user_folder, extraction_key):
                 # the TABLE stays in place, unread by this writer, for
                 # rollback.
                 time_range=t.get("time_range"), participants=t.get("participants"),
+                work_class=_wc, work_confidence=_wconf, is_mixed=bool(t.get("is_mixed")),
                 photos=[{"s3_key": p["key"], "caption_text": None} for p in matched_photos],
             )
             # Task 2 (programme-impact-link plan) -- persist this topic's
