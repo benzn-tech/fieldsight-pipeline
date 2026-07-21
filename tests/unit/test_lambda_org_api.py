@@ -4009,3 +4009,14 @@ def test_classification_feedback_denies_site_outside_reach_403(wired):
     res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback",
                                         body={"topic_id": "t-9", "human_verdict": "confirm_non_work"}), None)
     assert res["statusCode"] == 403 and called == []
+
+
+def test_classification_feedback_rejects_freetext_topic_category_400(wired):
+    # final-review #2: the feedback table is metadata-only; an arbitrary
+    # topic_category string must be rejected before any write.
+    called = []
+    wired.setattr(org.classification_feedback, "append_feedback", lambda *a, **k: called.append(1))
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback", body={
+        "topic_id": "t-9", "human_verdict": "confirm_non_work",
+        "topic_category": "he mentioned his wife's surgery"}), None)
+    assert res["statusCode"] == 400 and called == []

@@ -297,7 +297,7 @@ def write_extraction_items(date, user_folder, extraction_key):
                 # the TABLE stays in place, unread by this writer, for
                 # rollback.
                 time_range=t.get("time_range"), participants=t.get("participants"),
-                work_class=_wc, work_confidence=_wconf, is_mixed=bool(t.get("is_mixed")),
+                work_class=_wc, work_confidence=_wconf, is_mixed=(t.get("is_mixed") is True),
                 photos=[{"s3_key": p["key"], "caption_text": None} for p in matched_photos],
             )
             # Task 2 (programme-impact-link plan) -- persist this topic's

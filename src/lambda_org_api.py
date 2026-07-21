@@ -1320,13 +1320,16 @@ def create_classification_feedback_endpoint(conn, caller, body):
     conf = body.get("classifier_confidence")
     if conf is not None and not isinstance(conf, (int, float)):
         return error("classifier_confidence must be a number", 400)
+    tc = body.get("topic_category")            # final-review #2: keep the table metadata-only
+    if tc is not None and tc not in ("safety", "progress", "quality"):   # no arbitrary free text
+        return error("topic_category must be one of ['progress', 'quality', 'safety']", 400)
     row, err = _topic_authority(conn, caller, topic_id)
     if err is not None:
         return err
     fb = classification_feedback.append_feedback(
         conn, row["company_id"], topic_id, verdict,
         classifier_verdict=cv, classifier_confidence=conf,
-        topic_category=body.get("topic_category"), actor_user_id=caller["id"])
+        topic_category=tc, actor_user_id=caller["id"])
     if verdict == "reject_is_work":                           # Fable review C3
         topics.set_work_class(conn, topic_id, "work")
         try:
