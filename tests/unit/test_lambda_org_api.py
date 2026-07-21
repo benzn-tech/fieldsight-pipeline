@@ -640,6 +640,35 @@ def test_create_member_rejects_foreign_site(member_wired):
     assert res["statusCode"] == 403
 
 
+def test_create_member_platform_admin_infers_company_from_site(member_wired):
+    """A platform_admin (empty operator company) inviting onto a customer site
+    without an explicit target_company_id must adopt the site's company so the
+    per-site guard passes -- else every real cross-company invite 403s before
+    Cognito ever emails. Regression for the 'invite does nothing, no email' half
+    of the incident."""
+    wired, fake = member_wired
+
+    def by_sub(conn, sub):
+        if sub == "sub-1":
+            return {**CALLER, "company_id": "c-platform", "global_role": "platform_admin"}
+        return None  # the freshly-created "sub-new" is not yet provisioned
+
+    wired.setattr(org.users, "get_user_by_sub", by_sub)
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": "c-customer"})
+    seen = {}
+    wired.setattr(org.users, "upsert_user",
+                  lambda conn, sub, email, **kw: (seen.update(kw)
+                                                  or {"id": "u-new", "cognito_sub": sub,
+                                                      "email": email, **kw}))
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@x.nz", "memberships": [{"site_id": "s-7", "role": "worker"}],
+    }), None)
+    assert res["statusCode"] == 201
+    assert seen["company_id"] == "c-customer"  # adopted the site's company
+    assert fake.created  # Cognito invite email actually sent
+
+
 def test_create_member_rejects_bad_membership_role(member_wired):
     res = org.lambda_handler(make_event("POST", "/api/org/members", body={
         "email": "x@x.nz", "memberships": [{"site_id": "s-1", "role": "admin"}],
@@ -1014,6 +1043,26 @@ def test_patch_site_worker_403_and_missing_404(wired):
     wired.setattr(org.sites, "update_site", lambda conn, sid, cid, **kw: None)
     assert org.lambda_handler(make_event("PATCH", "/api/org/sites/s-9",
                                          body={"name": "X"}), None)["statusCode"] == 404
+
+
+def test_patch_site_platform_admin_edits_cross_company(wired):
+    """A platform_admin sits in an empty operator company; editing a customer
+    site must scope update_site by the SITE's company, not the caller's, else it
+    hits 0 rows -> 404. Regression for the silent 'save does nothing' incident."""
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "company_id": "c-platform",
+                                     "global_role": "platform_admin"})
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": "c-customer"})
+    seen = {}
+    wired.setattr(org.sites, "update_site",
+                  lambda conn, sid, cid, **kw: (seen.update(sid=sid, cid=cid, **kw)
+                                                or {"id": sid, "name": kw.get("name"),
+                                                    "icon_s3_key": None}))
+    res = org.lambda_handler(make_event("PATCH", "/api/org/sites/s-1",
+                                        body={"name": "Renamed"}), None)
+    assert res["statusCode"] == 200
+    assert seen["cid"] == "c-customer"  # scoped by site's company, not caller's
 
 
 def test_patch_site_swaps_icon_and_deletes_old(presign_wired):
