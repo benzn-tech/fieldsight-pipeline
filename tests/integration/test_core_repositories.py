@@ -109,3 +109,18 @@ def test_update_profile_none_preserving(db):
     assert row["last_name"] == "Name"  # None = unchanged
     assert row["avatar_s3_key"] == "org-assets/avatars/sub-pf-1/a.jpg"
     assert users.update_profile(db, "sub-does-not-exist", first_name="X") is None
+
+
+def test_topic_work_class_roundtrip(db):
+    import repositories.topics as topics
+    from repositories import companies, sites
+    co = companies.create_company(db, "WC-Co")
+    s = sites.create_site(db, co["id"], "WC-Site")
+    row = topics.upsert_topic(
+        db, s["id"], "2026-07-21", "Lunch chat",
+        work_class="non_work", work_confidence=0.91, is_mixed=True)
+    assert row["work_class"] == "non_work"
+    assert abs(row["work_confidence"] - 0.91) < 1e-6
+    assert row["is_mixed"] is True
+    got = topics.list_site_topics(db, s["id"], "2026-07-21")[0]
+    assert got["work_class"] == "non_work" and got["is_mixed"] is True
