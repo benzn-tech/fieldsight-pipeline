@@ -56,6 +56,7 @@ jobs:
           REALPTT_PASSWORD: ${{ secrets.REALPTT_PASSWORD }}
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
           FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
         run: |
@@ -88,7 +89,10 @@ jobs:
               "DbStackName=fieldsight-db-test" \
               "DbSubnetIds=subnet-082dd4480f7e20014,subnet-08b15b36113e542d4,subnet-05fb05613cf529121" \
               "DbSecretArn=$DB_SECRET_ARN" \
-              "OrgUserPoolId=ap-southeast-2_q88pd6XXr"
+              "OrgUserPoolId=ap-southeast-2_q88pd6XXr" \
+              "LlmProvider=${{ vars.TEST_LLM_PROVIDER || 'qwen' }}" \
+              "AsrProvider=${{ vars.TEST_ASR_PROVIDER || 'elevenlabs' }}" \
+              "ElevenLabsApiKey=$ELEVENLABS_API_KEY"
 
       - name: Apply DB migrations (invoke MigrateFunction, TEST)
         # Idempotent: db/migrate.py only applies files not already recorded in
