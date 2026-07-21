@@ -1604,7 +1604,10 @@ class _RollupFakeConn:
         return _RollupFakeCursor(self)
 
 
-def test_portfolio_counts_merges_four_queries():
+def test_portfolio_counts_merges_four_queries(monkeypatch):
+    # Task 4: portfolio_counts now computes company_excluded_topic_ids first;
+    # stub it so this test still exercises exactly the 4 aggregate queries.
+    monkeypatch.setattr(org.rollup.redactions, "company_excluded_topic_ids", lambda conn, ids: set())
     conn = _RollupFakeConn(results=[
         [{"site_id": "s-1", "open_safety": 2, "open_high_safety": 1}],
         [{"site_id": "s-1", "open_actions": 3, "total_actions": 5, "overdue_actions": 1}],
@@ -1625,7 +1628,9 @@ def test_portfolio_counts_merges_four_queries():
     assert "topics" in conn.calls[2]["sql"]
     assert "MAX(report_date)" in conn.calls[3]["sql"]
     assert "report_date >=" not in conn.calls[3]["sql"]   # all-time, NOT the 30-day window
-    assert conn.calls[0]["params"] == (["s-1"], ["s-1"])  # findings + fallback both scoped
+    # Task 4: safety UNION now also excludes company-excluded topics in BOTH
+    # arms -> params are (ids, excluded, ids, excluded); excluded is [] here.
+    assert conn.calls[0]["params"] == (["s-1"], [], ["s-1"], [])
     # psycopg returns datetime.date for MAX(report_date) — the repo must
     # normalise it to an ISO string so the JSON layer never sees a date object.
     assert counts == {"s-1": {
@@ -1646,10 +1651,11 @@ def test_zero_count_site_included():
     assert counts == {"s-1": zero, "s-2": dict(zero)}
 
 
-def test_site_id_keys_are_strings():
+def test_site_id_keys_are_strings(monkeypatch):
     """Regression: DB returns uuid.UUID site ids from the GROUP BY queries —
     every merged dict key must be str() (the exact bug that once 403'd
     /programme; see _allowed_site_ids above)."""
+    monkeypatch.setattr(org.rollup.redactions, "company_excluded_topic_ids", lambda conn, ids: set())
     import uuid as _uuid
     sid = _uuid.uuid4()
     conn = _RollupFakeConn(results=[
@@ -1661,7 +1667,8 @@ def test_site_id_keys_are_strings():
     assert all(isinstance(k, str) for k in counts)
 
 
-def test_portfolio_counts_last_activity_is_all_time_not_windowed():
+def test_portfolio_counts_last_activity_is_all_time_not_windowed(monkeypatch):
+    monkeypatch.setattr(org.rollup.redactions, "company_excluded_topic_ids", lambda conn, ids: set())
     # A site whose only topics are OLDER than 30 days still gets a
     # last_activity_at (all-time MAX), even though the 30-day topics query
     # returned no row for it — the exact reason the MAX lives in its own
