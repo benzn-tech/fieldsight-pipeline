@@ -43,9 +43,12 @@ a goal, but existing zh capability **must not regress**.
 
 ## 3. Guiding Principles
 
-- **Default-safe merge.** Every new code path is gated by an env-var toggle whose
-  default selects the *current* provider. Merging to `develop`/`main` and
-  deploying does not change behaviour until a toggle is explicitly set.
+- **Prod-safe merge, test dogfoods new.** Every new code path is gated by an
+  env-var toggle. **Prod defaults to the current provider** (Claude / Transcribe)
+  — merging and deploying to prod changes nothing until a prod toggle is
+  explicitly flipped. **Test defaults to the new provider** (Qwen / ElevenLabs)
+  — so every push to `develop` validates the new path automatically. The two
+  stacks are configured independently.
 - **Preserve public interfaces.** LLM callers keep their existing call signature
   and JSON-extraction fallback ladder; ASR downstream keeps the exact Transcribe
   JSON contract. No consumer code changes.
@@ -254,13 +257,20 @@ New env vars (CFN parameters, defaults select AWS Transcribe):
   secret → workflow `env:` → `sam deploy --parameter-overrides` → CFN `NoEcho`
   String parameter → Lambda plaintext env var. **Action required from user:** add
   the `ELEVENLABS_API_KEY` secret to the GitHub repo (shared across test/prod).
-- Provider-toggle CFN parameters default to the current provider on both stacks.
-  Real prod cutover is gated behind GitHub Actions **repo variables** (mirroring
-  the existing `PROD_WIRE_LAKE` / `PROD_AUTHORITY_FLIP` pattern), e.g.
-  `PROD_LLM_PROVIDER`, `PROD_ASR_PROVIDER`, defaulting to the old provider.
-- Test stack (`fieldsight-test`, `ap-southeast-2`) is the validation ground; prod
-  (`fieldsight-prod`, shared Aurora/lake) is actively transcribing daily, so it
-  stays on old providers until explicitly cut over.
+- Provider selection is driven by GitHub Actions **repo variables** injected into
+  `sam deploy --parameter-overrides` (mirroring the existing `PROD_WIRE_LAKE` /
+  `PROD_AUTHORITY_FLIP` / `TEST_GRADED_ROLES` pattern), which bake into each
+  Lambda's env var:
+  - Test: `TEST_LLM_PROVIDER` / `TEST_ASR_PROVIDER` default to **`qwen` /
+    `elevenlabs`** (new) — test dogfoods the new path on every `develop` deploy.
+  - Prod: `PROD_LLM_PROVIDER` / `PROD_ASR_PROVIDER` default to **`anthropic` /
+    `transcribe`** (old) — prod is untouched until explicitly cut over.
+- **Operating the toggle:** change the repo variable, then trigger a deploy (push
+  to the branch or manually run the workflow). **Emergency rollback:** edit the
+  Lambda env var directly in the AWS console for seconds-level effect (note: the
+  repo variable remains the source of truth and re-asserts on the next deploy).
+- Prod (`fieldsight-prod`, shared Aurora/lake) is actively transcribing daily, so
+  it stays on old providers until the prod variable is deliberately flipped.
 
 ## 7. Modules & Files Changed
 
@@ -285,17 +295,18 @@ downstream consumers: **no change**.
 
 ## 8. Rollout Phases (risk isolation)
 
-1. **Implement behind toggles (defaults = old providers).** Unit-test both
-   providers. Safe to merge to `develop` — no behavioural change until a toggle
-   flips.
-2. **Test-stack LLM validation.** Set `LLM_PROVIDER=qwen` on `fieldsight-test`.
-   Validate structured-JSON parity (report/extraction/matcher output shape) and
-   **measure ask-path latency** against the 29 s budget.
-3. **Test-stack ASR validation.** Set `ASR_PROVIDER=elevenlabs` on test. Run the
-   same audio through both providers and diff the normalized transcripts
-   (speaker turns, text, absolute times) for parity.
-4. **Gated prod cutover.** Flip prod repo variables per provider. Rollback = flip
-   the env var back (seconds).
+1. **Implement behind toggles.** Prod defaults old, test defaults new. Unit-test
+   both providers. Safe to merge to `develop` — prod behaviour unchanged; test
+   begins running the new path on deploy.
+2. **Test-stack LLM validation.** With test already on `qwen`, validate
+   structured-JSON parity (report/extraction/matcher output shape) and **measure
+   ask-path latency** against the 29 s budget.
+3. **Test-stack ASR validation.** With test already on `elevenlabs`, run the same
+   audio through both providers and diff the normalized transcripts (speaker
+   turns, text, absolute times) for parity.
+4. **Gated prod cutover.** Flip `PROD_LLM_PROVIDER` / `PROD_ASR_PROVIDER` when
+   validated. Rollback = flip back (repo variable + deploy, or env var in console
+   for instant effect).
 
 ## 9. Open Items (resolve during implementation)
 
