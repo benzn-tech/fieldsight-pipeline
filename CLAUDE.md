@@ -598,6 +598,16 @@ dev 可把 Amplify `FS_ORG_BASEURL` 指向 test 网关(`wdsgobb7b0…/prod/api`,
 新端点、免先上 prod —— test 网关的 CognitoAuthorizer 已信任 prod 池 token。`update-branch --environment-variables`
 是**整包替换**(须带全部 6 个 FS_* 变量),改完 `start-job RELEASE` 重建。
 
+**DB 隔离已上线(2026-07-21,PR #114)**:test 栈通过 `PgDatabase` 参数指向同一集群上**另一个独立数据库**
+`fieldsight_test`,prod 仍留在 `fieldsight`——这个拆分是**故意的**,不要再当成 bug 去"修"。机制:template
+的 12 处 `PGDATABASE` 走 `!If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue …]`;
+`PgDatabase=fieldsight_test` 只加在 **`deploy.yml` 的 `--parameter-overrides`**(不是 samconfig——CLI 覆盖会
+整体取代 samconfig),`deploy-prod.yml` 不加故 prod 留默认。**含义**:test 与 prod **数据/schema 物理隔离**
+(test 随便改/删/破坏性 migration 都碰不到 prod 客户数据);Cognito 仍共享。**但合进 `main` 的 migration 仍会
+自动跑 prod**(deploy-prod.yml 夜跑),所以试验性 migration 别进 main。回滚:去掉 deploy.yml 那行重部署→
+`!If` 回落 import→test 复用 `fieldsight`;再 `DROP DATABASE fieldsight_test`。详见
+`docs/superpowers/specs/2026-07-21-test-prod-db-isolation-design.md` + runbook `scripts/db-isolation-bootstrap.md`。
+
 ### 定时器交接(2026-07-15 schedules cutover 上线)
 录音下载 + 报告生成的 cron 已从遗留手管的 `sitesync` EventBridge 组切到 **fieldsight-prod SAM 栈**
 的 schedule(`PROD_ENABLE_SCHEDULES=true`):orchestrator 15 分钟 sweep(工作时段 05:00–19:59 NZ)

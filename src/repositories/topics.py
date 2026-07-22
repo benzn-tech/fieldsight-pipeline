@@ -4,7 +4,8 @@ from psycopg.types.json import Jsonb
 from repositories import findings
 
 _TOPIC_COLS = ("id, site_id, user_id, source_s3_key, report_date, occurred_at, "
-               "category, title, summary, time_range, participants, source, created_at")
+               "category, title, summary, time_range, participants, source, created_at, "
+               "work_class, work_confidence, is_mixed")
 
 # Phase F (D8 retirement, spec §8): severity -> risk_level, for reshaping
 # safety-domain findings into the legacy safety_observations row shape.
@@ -46,7 +47,8 @@ def _escape_like(prefix) -> str:
 def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_key=None,
                  occurred_at=None, category=None, summary=None,
                  action_items=None, safety=None, photos=None,
-                 time_range=None, participants=None) -> dict:
+                 time_range=None, participants=None,
+                 work_class=None, work_confidence=None, is_mixed=False) -> dict:
     """Insert a topic with its children. NOTE: currently insert-only —
     no ON CONFLICT dedup. Dedup is instead handled by callers running
     delete_topics_for_scope() first to clear the (site_id, report_date, user_id)
@@ -64,10 +66,12 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
     cur = conn.cursor(row_factory=dict_row)
     topic = cur.execute(
         f"INSERT INTO topics (site_id, user_id, source_s3_key, report_date, occurred_at, "
-        f"category, title, summary, time_range, participants) "
-        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_TOPIC_COLS}",
+        f"category, title, summary, time_range, participants, "
+        f"work_class, work_confidence, is_mixed) "
+        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_TOPIC_COLS}",
         (site_id, user_id, source_s3_key, report_date, occurred_at, category, title, summary,
-         time_range, Jsonb(participants) if participants is not None else None),
+         time_range, Jsonb(participants) if participants is not None else None,
+         work_class, work_confidence, is_mixed),
     ).fetchone()
     tid = topic["id"]
     for a in (action_items or []):
@@ -194,7 +198,8 @@ def has_topics_for_source_prefix(conn, source_prefix) -> bool:
 
 _TOPIC_COLS_JOINED = (
     "t.id, t.site_id, t.user_id, t.source_s3_key, t.report_date, t.occurred_at, "
-    "t.category, t.title, t.summary, t.time_range, t.participants, t.source, t.created_at"
+    "t.category, t.title, t.summary, t.time_range, t.participants, t.source, t.created_at, "
+    "t.work_class, t.work_confidence, t.is_mixed"
 )
 
 
@@ -466,3 +471,12 @@ def get_topic_full(conn, topic_id) -> dict | None:
         "SELECT id, topic_id, s3_key, caption_text FROM topic_photos "
         "WHERE topic_id = ANY(%s) ORDER BY created_at", (tids,)).fetchall()
     return t
+
+
+def set_work_class(conn, topic_id, work_class):
+    """Human override of the machine work/non_work call (spec §5: '其实是工作'
+    flips it to 'work', releasing the topic to the company tier). Returns the
+    updated row, or None if the id is missing."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE topics SET work_class=%s WHERE id=%s RETURNING {_TOPIC_COLS}",
+        (work_class, topic_id)).fetchone()

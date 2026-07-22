@@ -16,7 +16,7 @@ import json
 
 from psycopg.rows import dict_row
 
-from repositories import aliases, chunks, topics
+from repositories import aliases, chunks, redactions, topics
 from chunking import chunk_report
 
 REQUEST_PREFIX = "reindex_requests/"
@@ -56,13 +56,30 @@ def enqueue_topic_reindex(s3_client, bucket, conn, topic_id, folder, date):
     t = topics.get_topic_full(conn, topic_id)
     if t is None:
         return None
+
+    # Life-conversation separation (spec §6): a redacted or non_work topic is
+    # removed from RAG. Write a DELETE-ONLY request (no topic_chunks) so
+    # apply_vectors deletes its existing vectors and inserts nothing.
+    if t.get("work_class") == "non_work" or redactions.is_topic_redacted(conn, topic_id):
+        key = request_key(date, folder, topic_id)
+        s3_client.put_object(Bucket=bucket, Key=key, ContentType="application/json",
+            Body=json.dumps({
+                "topic_id": str(topic_id), "site_id": str(t["site_id"]),
+                "user_id": str(t["user_id"]) if t.get("user_id") is not None else None,
+                "report_date": str(t["report_date"]),
+                "source_s3_key": t["source_s3_key"], "report_key": None, "topic_seq": None,
+                "folder": folder, "date": date, "aliases": [], "topic_chunks": [],
+                "delete_only": True,
+            }))
+        return key
+
     site_id = str(t["site_id"])
     company_id = _company_id_for_site(conn, t["site_id"])
     active = aliases.list_active(conn, company_id, site_ids=[site_id]) if company_id else []
     alias_pairs = [{"wrong_term": a["wrong_term"], "right_term": a["right_term"]}
                    for a in active]
 
-    shaped = render_report_shape([t], None, date, folder)
+    shaped = render_report_shape([t], None, date, folder, conn=conn)
     topic_chunks = chunk_report(shaped)             # chunk_type='topic' only
 
     request = {

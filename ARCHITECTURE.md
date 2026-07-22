@@ -194,6 +194,49 @@ If a device is not in the mapping, its account name is used as-is.
 
 ---
 
+## Test/Prod Environment Isolation (live 2026-07-21, PR #114)
+
+The `fieldsight-test-*` and `fieldsight-prod-*` SAM stacks share **one Aurora
+cluster** (`fieldsight-db-test-dbcluster-hywiixu8ihi9`) and **one Cognito pool**
+(`ap-southeast-2_q88pd6XXr`), but each stack now uses its **own database** inside
+that cluster:
+
+| | Database | S3 lake bucket | Cognito |
+|---|---|---|---|
+| **prod** (`fieldsight-prod-*`) | `fieldsight` | `fieldsight-data-509194952652` | shared `q88pd6XXr` |
+| **test** (`fieldsight-test-*`) | `fieldsight_test` | `fieldsight-data-test-509194952652` | shared `q88pd6XXr` |
+
+**Result:** test and prod are **physically isolated at the data + schema layer** —
+a test data change or destructive migration cannot touch prod's customer data.
+They still share the cluster (so cluster-level events are not isolated) and the
+Cognito pool (authorization is resolved from each database's `users` row by
+`cognito_sub`, so a shared sub is inert in an environment without a row there).
+
+**Mechanism.** All 12 in-VPC DB functions render `PGDATABASE` as
+`!If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue "${DbStackName}-DbName"]`
+(default falls back to the imported `fieldsight`, so the template is
+behavior-neutral without an override). The override is passed **only** in
+`.github/workflows/deploy.yml`'s `--parameter-overrides`
+(`PgDatabase=fieldsight_test`) — NOT in `samconfig.toml`, because the CI's CLI
+`--parameter-overrides` **replaces** (does not merge) the samconfig list.
+`deploy-prod.yml` passes no override, so prod keeps `fieldsight`.
+
+**Migrations** are per-database (`schema_migrations` lives in each DB). Test may
+experiment with destructive migrations freely, **but any migration file merged to
+`main` still auto-runs on prod** (`deploy-prod.yml` invokes `fieldsight-prod-migrate`
+after each prod deploy) — so throwaway/experimental migrations must never reach
+`main`.
+
+**Bootstrap / rollback.** `fieldsight_test` was created + `pg_dump`/`pg_restore`
+-populated from `fieldsight` via a throwaway EC2 in the DB VPC (over SSM), then
+destroyed. To roll back: remove the `PgDatabase=fieldsight_test` line from
+`deploy.yml` and redeploy (the `!If` falls back to `fieldsight`), then
+`DROP DATABASE fieldsight_test`. Full procedure:
+`scripts/db-isolation-bootstrap.md`; design:
+`docs/superpowers/specs/2026-07-21-test-prod-db-isolation-design.md`.
+
+---
+
 ## Download Strategy: Lambda + Fargate
 
 Small/medium files are downloaded by **Lambda 2** (up to 15 min timeout). When downloads would exceed Lambda's time limit (e.g. 150–300 MB body cam videos), the orchestrator writes a **pending download job** to `pending_downloads/{uuid}.json`.

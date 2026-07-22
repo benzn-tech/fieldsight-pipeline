@@ -48,6 +48,11 @@ def wired(monkeypatch):
     # these to empty so existing site-list tests don't hit FakeConn's cursor.
     monkeypatch.setattr(org.memberships, "count_by_site", lambda conn, ids: {})
     monkeypatch.setattr(org.companies, "list_companies", lambda conn: [])
+    # Task 1b: render_report_shape (called from _render_timeline_for_user with
+    # a real conn) now unconditionally looks up redaction status; default to
+    # "nothing redacted" so FakeConn (no real .cursor()) doesn't crash tests
+    # that don't care about redactions. Tests exercising it override this.
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {})
     return monkeypatch
 
 
@@ -1648,7 +1653,10 @@ class _RollupFakeConn:
         return _RollupFakeCursor(self)
 
 
-def test_portfolio_counts_merges_four_queries():
+def test_portfolio_counts_merges_four_queries(monkeypatch):
+    # Task 4: portfolio_counts now computes company_excluded_topic_ids first;
+    # stub it so this test still exercises exactly the 4 aggregate queries.
+    monkeypatch.setattr(org.rollup.redactions, "company_excluded_topic_ids", lambda conn, ids: set())
     conn = _RollupFakeConn(results=[
         [{"site_id": "s-1", "open_safety": 2, "open_high_safety": 1}],
         [{"site_id": "s-1", "open_actions": 3, "total_actions": 5, "overdue_actions": 1}],
@@ -1669,7 +1677,9 @@ def test_portfolio_counts_merges_four_queries():
     assert "topics" in conn.calls[2]["sql"]
     assert "MAX(report_date)" in conn.calls[3]["sql"]
     assert "report_date >=" not in conn.calls[3]["sql"]   # all-time, NOT the 30-day window
-    assert conn.calls[0]["params"] == (["s-1"], ["s-1"])  # findings + fallback both scoped
+    # Task 4: safety UNION now also excludes company-excluded topics in BOTH
+    # arms -> params are (ids, excluded, ids, excluded); excluded is [] here.
+    assert conn.calls[0]["params"] == (["s-1"], [], ["s-1"], [])
     # psycopg returns datetime.date for MAX(report_date) — the repo must
     # normalise it to an ISO string so the JSON layer never sees a date object.
     assert counts == {"s-1": {
@@ -1690,10 +1700,11 @@ def test_zero_count_site_included():
     assert counts == {"s-1": zero, "s-2": dict(zero)}
 
 
-def test_site_id_keys_are_strings():
+def test_site_id_keys_are_strings(monkeypatch):
     """Regression: DB returns uuid.UUID site ids from the GROUP BY queries —
     every merged dict key must be str() (the exact bug that once 403'd
     /programme; see _allowed_site_ids above)."""
+    monkeypatch.setattr(org.rollup.redactions, "company_excluded_topic_ids", lambda conn, ids: set())
     import uuid as _uuid
     sid = _uuid.uuid4()
     conn = _RollupFakeConn(results=[
@@ -1705,7 +1716,8 @@ def test_site_id_keys_are_strings():
     assert all(isinstance(k, str) for k in counts)
 
 
-def test_portfolio_counts_last_activity_is_all_time_not_windowed():
+def test_portfolio_counts_last_activity_is_all_time_not_windowed(monkeypatch):
+    monkeypatch.setattr(org.rollup.redactions, "company_excluded_topic_ids", lambda conn, ids: set())
     # A site whose only topics are OLDER than 30 days still gets a
     # last_activity_at (all-time MAX), even though the 30-day topics query
     # returned no row for it — the exact reason the MAX lives in its own
@@ -3867,3 +3879,193 @@ def test_create_alias_company_wide_by_site_manager(wired, monkeypatch):
     assert res["statusCode"] == 200
     assert body["right_term"] == "McCahon"
     assert body["site_id"] is None                       # no ?site -> company-wide
+
+
+def test_render_report_shape_carries_work_class_and_redacted(wired):
+    wired.setattr(org.redactions, "list_active_for_topics",
+                  lambda conn, ids: {"t-red": {"id": "r-1"}})
+    rows = [
+        {"id": "t-red", "site_id": "s", "user_id": None, "source_s3_key": "extractions/U/2026-07-21/x.json",
+         "report_date": "2026-07-21", "occurred_at": None, "category": "progress", "title": "Call",
+         "summary": "", "time_range": None, "participants": None, "source": "ai", "created_at": "t",
+         "work_class": "work", "work_confidence": 0.2, "is_mixed": False,
+         "action_items": [], "safety_observations": [], "findings": [], "photos": [],
+         "site_name": "S", "user_name": "U"},
+        {"id": "t-lunch", "site_id": "s", "user_id": None, "source_s3_key": "extractions/U/2026-07-21/x.json",
+         "report_date": "2026-07-21", "occurred_at": None, "category": "progress", "title": "Lunch",
+         "summary": "", "time_range": None, "participants": None, "source": "ai", "created_at": "t",
+         "work_class": "non_work", "work_confidence": 0.9, "is_mixed": False,
+         "action_items": [], "safety_observations": [], "findings": [], "photos": [],
+         "site_name": "S", "user_name": "U"},
+    ]
+    shape = org.render_report_shape(rows, None, "2026-07-21", "U", conn=object())
+    by = {t["topic_row_id"]: t for t in shape["topics"]}
+    assert by["t-red"]["redacted"] is True and by["t-lunch"]["redacted"] is False
+    assert by["t-lunch"]["work_class"] == "non_work" and by["t-lunch"]["work_confidence"] == 0.9
+
+
+# ----------------------------------------------------------
+# Task 9: /redactions + /classification-feedback (life-conversation separation)
+# ----------------------------------------------------------
+
+def test_create_redaction_ok_and_enqueues_reindex(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: {SITE_ID: "site_manager"})
+    seen = {}
+    wired.setattr(org.redactions, "create_redaction",
+                  lambda conn, cid, tid, reason, auid, arole, **k: seen.update(
+                      cid=cid, tid=tid, reason=reason, scope=k.get("scope")) or {"id": "r-1"})
+    enq = []
+    wired.setattr(org, "_enqueue_content_reindex", lambda conn, table, rid: enq.append((table, rid)))
+    res = org.lambda_handler(make_event("POST", "/api/org/redactions",
+                                        body={"target_id": "t-9", "reason": "non_work"}), None)
+    assert res["statusCode"] == 201
+    assert seen == {"cid": "c-uuid-1", "tid": "t-9", "reason": "non_work", "scope": "analysis"}
+    assert enq == [("topics", "t-9")]                       # RAG removal enqueued
+
+
+def test_create_redaction_denies_site_outside_reach_403(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": OTHER_SITE_ID,
+                                            "author_user_id": None})
+    called = []
+    wired.setattr(org.redactions, "create_redaction", lambda *a, **k: called.append(1))
+    res = org.lambda_handler(make_event("POST", "/api/org/redactions",
+                                        body={"target_id": "t-9", "reason": "non_work"}), None)
+    assert res["statusCode"] == 403 and called == []
+
+
+def test_classification_feedback_ok(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: {SITE_ID: "site_manager"})
+    seen = {}
+    wired.setattr(org.classification_feedback, "append_feedback",
+                  lambda conn, cid, tid, verdict, **k: seen.update(
+                      cid=cid, tid=tid, verdict=verdict) or {"id": "f-1"})
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback",
+                                        body={"topic_id": "t-9", "human_verdict": "confirm_non_work"}), None)
+    assert res["statusCode"] == 201 and seen["verdict"] == "confirm_non_work"
+
+
+def test_classification_feedback_reject_is_work_flips_work_class_and_reindexes(wired):
+    """Critical-3 fix: a 'reject_is_work' verdict (classifier false positive)
+    must flip topics.work_class -> 'work' AND enqueue a re-index so the topic
+    returns to the company tier + RAG, or it would stay excluded forever."""
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: {SITE_ID: "site_manager"})
+    wired.setattr(org.classification_feedback, "append_feedback",
+                  lambda conn, cid, tid, verdict, **k: {"id": "f-1"})
+    flipped = []
+    wired.setattr(org.topics, "set_work_class",
+                  lambda conn, tid, wc: flipped.append((tid, wc)) or {"id": tid, "work_class": wc})
+    enq = []
+    wired.setattr(org, "_enqueue_content_reindex", lambda conn, table, rid: enq.append((table, rid)))
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback",
+                                        body={"topic_id": "t-9", "human_verdict": "reject_is_work"}), None)
+    assert res["statusCode"] == 201
+    assert flipped == [("t-9", "work")]
+    assert enq == [("topics", "t-9")]
+
+
+def test_classification_feedback_bad_classifier_verdict_400(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    called = []
+    wired.setattr(org.classification_feedback, "append_feedback",
+                  lambda *a, **k: called.append(1))
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback",
+                                        body={"topic_id": "t-9", "human_verdict": "confirm_non_work",
+                                              "classifier_verdict": "maybe"}), None)
+    assert res["statusCode"] == 400 and called == []
+
+
+# ---- Task 9 review follow-up: revert endpoint + feedback deny coverage ----
+def test_revert_redaction_ok(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.redactions, "get_redaction",
+                  lambda conn, rid: {"id": rid, "company_id": "c-uuid-1", "target_id": "t-9"})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: {SITE_ID: "site_manager"})
+    seen = {}
+    wired.setattr(org.redactions, "revert_redaction",
+                  lambda conn, rid, cid: seen.update(rid=rid, cid=cid) or {"id": rid, "reverted_at": "t"})
+    enq = []
+    wired.setattr(org, "_enqueue_content_reindex", lambda conn, table, rid: enq.append((table, rid)))
+    res = org.lambda_handler(make_event("POST", "/api/org/redactions/r-1/revert"), None)
+    assert res["statusCode"] == 200
+    assert seen == {"rid": "r-1", "cid": "c-uuid-1"}
+    assert enq == [("topics", "t-9")]                      # re-embed after revert
+
+
+def test_revert_redaction_wrong_company_404(wired):
+    # admin caller (not cross-company) -> a redaction in another company is 404,
+    # and revert_redaction must never be called.
+    wired.setattr(org.redactions, "get_redaction",
+                  lambda conn, rid: {"id": rid, "company_id": "c-OTHER", "target_id": "t-9"})
+    called = []
+    wired.setattr(org.redactions, "revert_redaction", lambda *a, **k: called.append(1))
+    res = org.lambda_handler(make_event("POST", "/api/org/redactions/r-1/revert"), None)
+    assert res["statusCode"] == 404 and called == []
+
+
+# ---- Task 12: /classification-feedback/summary ----
+def test_feedback_summary_admin_only(wired):
+    wired.setattr(org.classification_feedback, "summary",
+                  lambda conn, cid: {"confirm_non_work": 3, "reject_is_work": 1,
+                                     "missed_personal": 0, "precision": 0.75})
+    res = org.lambda_handler(make_event("GET", "/api/org/classification-feedback/summary"), None)
+    assert res["statusCode"] == 200 and body_of(res)["precision"] == 0.75
+    # a worker is denied
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker"})
+    res2 = org.lambda_handler(make_event("GET", "/api/org/classification-feedback/summary"), None)
+    assert res2["statusCode"] == 403
+
+
+def test_feedback_summary_platform_admin_200(wired):
+    # platform_admin is cross-company (resolve_scope != ALL for it) -- the
+    # endpoint must include it explicitly (Fable review #5), not 403 it.
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "platform_admin"})
+    wired.setattr(org.classification_feedback, "summary",
+                  lambda conn, cid: {"confirm_non_work": 0, "reject_is_work": 0,
+                                     "missed_personal": 0, "precision": None})
+    res = org.lambda_handler(make_event("GET", "/api/org/classification-feedback/summary"), None)
+    assert res["statusCode"] == 200 and body_of(res)["precision"] is None
+
+
+def test_classification_feedback_denies_site_outside_reach_403(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": OTHER_SITE_ID,
+                                            "author_user_id": None})
+    called = []
+    wired.setattr(org.classification_feedback, "append_feedback", lambda *a, **k: called.append(1))
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback",
+                                        body={"topic_id": "t-9", "human_verdict": "confirm_non_work"}), None)
+    assert res["statusCode"] == 403 and called == []
+
+
+def test_classification_feedback_rejects_freetext_topic_category_400(wired):
+    # final-review #2: the feedback table is metadata-only; an arbitrary
+    # topic_category string must be rejected before any write.
+    called = []
+    wired.setattr(org.classification_feedback, "append_feedback", lambda *a, **k: called.append(1))
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback", body={
+        "topic_id": "t-9", "human_verdict": "confirm_non_work",
+        "topic_category": "he mentioned his wife's surgery"}), None)
+    assert res["statusCode"] == 400 and called == []

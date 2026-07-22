@@ -487,3 +487,15 @@ def test_extraction_topic_gains_derived_safety_flags_and_findings(monkeypatch):
     written = json.loads(fake_s3.objects[OUT_KEY])
     assert written["topics"][0]["safety_flags"] == topic["safety_flags"]
     assert written["topics"][0]["action_items"] == topic["action_items"]
+
+
+# ---------------------------------------------------------------------------
+# Life-conversation-separation Task 7 — schema + prompt request work_class
+# ---------------------------------------------------------------------------
+
+def test_prompt_and_schema_request_work_class():
+    assert '"work_class"' in les.EXTRACTION_SCHEMA
+    assert '"work_confidence"' in les.EXTRACTION_SCHEMA
+    assert '"is_mixed"' in les.EXTRACTION_SCHEMA
+    prompt = les.build_extraction_prompt("U", "2026-07-21", "sess", [], 0)
+    assert "work_class" in prompt and "non_work" in prompt

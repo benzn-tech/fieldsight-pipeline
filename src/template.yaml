@@ -253,6 +253,15 @@ Parameters:
       deploys are unaffected).
     Default: ''
 
+  PgDatabase:
+    Type: String
+    Default: ""
+    Description: >
+      Overrides the Aurora database name for THIS stack's in-VPC functions.
+      Empty (default) => use the imported DbStackName-DbName (fieldsight),
+      i.e. today's shared-DB behavior. Set to fieldsight_test (via deploy.yml
+      --parameter-overrides, NOT samconfig) to isolate the test stack.
+
   MultiTenantResolution:
     Type: String
     Default: 'false'
@@ -329,6 +338,7 @@ Conditions:
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
   HasDb: !Not [!Equals [!Ref DbStackName, '']]
   HasOrgPool: !Not [!Equals [!Ref OrgUserPoolId, '']]
+  HasPgDatabaseOverride: !Not [!Equals [!Ref PgDatabase, ""]]
   HasOrgApi: !And [!Condition HasDb, !Condition HasOrgPool]
   HasSiteVoice: !And [!Condition HasOrgApi, !Equals [!Ref EnableSiteVoice, 'true']]
 
@@ -797,8 +807,7 @@ Resources:
           # the export and passes it through).
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          PGDATABASE: !ImportValue
-            Fn::Sub: "${DbStackName}-DbName"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
       Policies:
@@ -830,8 +839,7 @@ Resources:
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          PGDATABASE: !ImportValue
-            Fn::Sub: "${DbStackName}-DbName"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           COGNITO_USER_POOL_ID: !Ref OrgUserPoolId
@@ -974,8 +982,7 @@ Resources:
         Variables:
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          PGDATABASE: !ImportValue
-            Fn::Sub: "${DbStackName}-DbName"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           COGNITO_USER_POOL_ID: !Ref OrgUserPoolId
@@ -1067,8 +1074,7 @@ Resources:
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          PGDATABASE: !ImportValue
-            Fn::Sub: "${DbStackName}-DbName"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
@@ -1211,8 +1217,7 @@ Resources:
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          PGDATABASE: !ImportValue
-            Fn::Sub: "${DbStackName}-DbName"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
@@ -1279,8 +1284,7 @@ Resources:
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          PGDATABASE: !ImportValue
-            Fn::Sub: "${DbStackName}-DbName"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
       Policies:
@@ -1413,8 +1417,7 @@ Resources:
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          PGDATABASE: !ImportValue
-            Fn::Sub: "${DbStackName}-DbName"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
       Policies:
@@ -1447,8 +1450,7 @@ Resources:
         Variables:
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          PGDATABASE: !ImportValue
-            Fn::Sub: "${DbStackName}-DbName"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
       Policies:
@@ -1480,8 +1482,7 @@ Resources:
         Variables:
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          PGDATABASE: !ImportValue
-            Fn::Sub: "${DbStackName}-DbName"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
       Policies:
@@ -1542,8 +1543,7 @@ Resources:
         Variables:
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          PGDATABASE: !ImportValue
-            Fn::Sub: "${DbStackName}-DbName"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
       Policies:
@@ -1570,8 +1570,7 @@ Resources:
         Variables:
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          PGDATABASE: !ImportValue
-            Fn::Sub: "${DbStackName}-DbName"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
       Policies:
@@ -1600,8 +1599,7 @@ Resources:
         Variables:
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          PGDATABASE: !ImportValue
-            Fn::Sub: "${DbStackName}-DbName"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
       Policies:
