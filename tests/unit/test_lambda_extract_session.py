@@ -178,6 +178,26 @@ def test_prompt_contains_all_segment_turns(monkeypatch):
     assert captured["max_tokens"] == 4096 + 2 * 350
 
 
+def test_extract_session_requests_force_json(monkeypatch):
+    """extract_session must ask llm_utils.call_llm for structured (JSON) output --
+    the extraction contract is parsed as JSON downstream, so a plain-text
+    completion would break parsing. Minor-T2: close the force_json polarity gap."""
+    fake_s3 = FakeS3({SEG1_KEY: json.dumps(make_transcribe_json("hello world"))})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+
+    captured = {}
+
+    def _cap(prompt, max_tokens=4096, force_json=False):
+        captured["force_json"] = force_json
+        return json.dumps({"topics": [], "declared_site": None}), None
+
+    monkeypatch.setattr(llm_utils, "call_llm", _cap)
+
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    assert captured["force_json"] is True
+
+
 # ---------------------------------------------------------------------------
 # Extraction contract — every key present, source_transcripts sorted
 # ---------------------------------------------------------------------------

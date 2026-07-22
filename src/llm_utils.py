@@ -43,7 +43,10 @@ RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 BACKOFF_BASE_SECONDS = 1.0
 # 150s so the HTTP client loses the race against the Lambda's own Timeout and
 # we get a catchable urllib3 error instead of a runtime hard-kill.
-HTTP_TIMEOUT = 150.0
+# ReportGeneratorFunction and MeetingMinutesFunction override this to 180 via
+# LLM_HTTP_TIMEOUT (see template.yaml) because their Lambda Timeout is 300s,
+# not 180s like extract_session/matcher/ask-agent.
+HTTP_TIMEOUT = float(os.environ.get("LLM_HTTP_TIMEOUT", "150"))
 
 
 def api_key_configured():

@@ -598,6 +598,7 @@ Resources:
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_HTTP_TIMEOUT: '180'
           REPORT_PREFIX: reports/
           SITE_NAME: !Ref SiteName
           ITEMS_TABLE: !Ref ItemsTableName
@@ -703,6 +704,7 @@ Resources:
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_HTTP_TIMEOUT: '180'
           MINUTES_PREFIX: meeting_minutes/
           REPORT_PREFIX: reports/
       Policies:
