@@ -15,6 +15,7 @@ Environment Variables:
     LLM_PROVIDER   - 'anthropic' (default) | 'qwen'
     ANTHROPIC_API_KEY / CLAUDE_MODEL - anthropic path
     QWEN_API_KEY (falls back to DASHSCOPE_API_KEY) / QWEN_BASE_URL / QWEN_MODEL - qwen path
+    QWEN_ENABLE_THINKING - 'true' runs qwen in thinking mode (skips response_format) - qwen path
 """
 import json
 import logging
@@ -36,7 +37,13 @@ QWEN_API_KEY = os.environ.get("QWEN_API_KEY", os.environ.get("DASHSCOPE_API_KEY"
 QWEN_BASE_URL = os.environ.get(
     "QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 )
-QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen3.7-plus")
+QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen3.7-max")
+# When true, the qwen path runs in thinking mode (enable_thinking) for higher
+# answer quality on batch tasks, and does NOT force response_format — DashScope
+# guidance is that thinking + json_object can yield non-strict JSON, so we let
+# the model output freely and rely on extract_json(). Default false keeps the
+# fast/cheap non-thinking path for latency-bound callers (ask-agent).
+QWEN_ENABLE_THINKING = os.environ.get("QWEN_ENABLE_THINKING", "false").lower() == "true"
 
 MAX_ATTEMPTS = 4
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
@@ -121,7 +128,14 @@ def _call_qwen(prompt, max_tokens, force_json):
         logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
         return None, "QWEN_API_KEY not configured"
     payload = {"model": QWEN_MODEL, "messages": [{"role": "user", "content": prompt}]}
-    if force_json:
+    if QWEN_ENABLE_THINKING:
+        # Thinking mode: highest quality for batch tasks. Do NOT force
+        # response_format even when force_json (thinking + json_object risks
+        # non-strict JSON); the prompt already instructs JSON and extract_json()
+        # parses it. No max_tokens cap so the answer isn't truncated after the
+        # (separate reasoning_content) chain of thought.
+        payload["enable_thinking"] = True
+    elif force_json:
         # DashScope: do NOT send max_tokens with response_format (truncation risk).
         payload["response_format"] = {"type": "json_object"}
     else:

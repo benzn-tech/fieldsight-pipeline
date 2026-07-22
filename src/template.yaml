@@ -160,12 +160,12 @@ Parameters:
   QwenModelPlus:
     Type: String
     Description: Qwen model for structured-JSON tasks (report/meeting/extract/matcher)
-    Default: qwen3.7-plus
+    Default: qwen3.7-max
 
   QwenModelFast:
     Type: String
     Description: Qwen model for the latency-bound ask path
-    Default: qwen-flash
+    Default: qwen3.6-flash
 
   AsrProvider:
     Type: String
@@ -598,6 +598,7 @@ Resources:
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          QWEN_ENABLE_THINKING: 'true'
           LLM_HTTP_TIMEOUT: '180'
           REPORT_PREFIX: reports/
           SITE_NAME: !Ref SiteName
@@ -704,6 +705,7 @@ Resources:
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          QWEN_ENABLE_THINKING: 'true'
           LLM_HTTP_TIMEOUT: '180'
           MINUTES_PREFIX: meeting_minutes/
           REPORT_PREFIX: reports/
@@ -1082,6 +1084,7 @@ Resources:
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          QWEN_ENABLE_THINKING: 'true'
       Policies:
         - Version: '2012-10-17'
           Statement:

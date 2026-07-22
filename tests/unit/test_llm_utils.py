@@ -91,6 +91,23 @@ def test_qwen_force_json_omits_max_tokens(monkeypatch):
     assert "max_tokens" not in body
 
 
+def test_qwen_thinking_sets_flag_and_skips_response_format(monkeypatch):
+    monkeypatch.setattr(lu, "LLM_PROVIDER", "qwen")
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "sk-w")
+    monkeypatch.setattr(lu, "QWEN_ENABLE_THINKING", True)
+    calls = _patch_request(monkeypatch, [
+        _FakeResponse(200, {"choices": [{"message": {"content": "{}"}}]}),
+    ])
+    # Even with force_json=True, thinking mode must NOT force response_format
+    # (DashScope: thinking + json_object risks non-strict JSON) and must not cap
+    # max_tokens; it relies on the prompt's JSON instruction + extract_json().
+    lu.call_llm("give JSON", max_tokens=999, force_json=True)
+    body = json.loads(calls["bodies"][0])
+    assert body["enable_thinking"] is True
+    assert "response_format" not in body
+    assert "max_tokens" not in body
+
+
 def test_qwen_retries_on_503_then_succeeds(monkeypatch):
     monkeypatch.setattr(lu, "LLM_PROVIDER", "qwen")
     monkeypatch.setattr(lu, "QWEN_API_KEY", "sk-w")
