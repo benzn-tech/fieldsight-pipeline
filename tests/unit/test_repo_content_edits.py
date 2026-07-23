@@ -43,4 +43,6 @@ def test_list_is_company_guarded_newest_first():
     rows = ce.list_content_edits(conn, "co-1", "topics", "t-1")
     assert len(rows) == 2
     assert "company_id=%s" in conn.cur.sql or "company_id = %s" in conn.cur.sql
-    assert "order by created_at desc" in conn.cur.sql.lower()
+    # PR #117 aliased content_edits as `ce` to JOIN users for actor_name, so the
+    # ORDER BY became qualified. Assert on the qualified column, not the bare one.
+    assert "order by ce.created_at desc" in conn.cur.sql.lower()
