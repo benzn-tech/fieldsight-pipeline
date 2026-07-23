@@ -124,6 +124,11 @@ def wired(monkeypatch):
     # implements get_object, so stub emit to a no-op by default here;
     # tests that care about the emit call override this explicitly.
     monkeypatch.setattr(iw.match_request, "emit", lambda *a, **k: None)
+    # video-keyframe plan: same reasoning for the keyframe_requests/ emit, and
+    # keep emission OFF by default (module constant is env-gated at import) so
+    # the pre-existing tests never trip it.
+    monkeypatch.setattr(iw.keyframe_request, "emit", lambda *a, **k: None)
+    monkeypatch.setattr(iw, "EMIT_KEYFRAME_REQUESTS", False)
     return monkeypatch
 
 
@@ -659,6 +664,95 @@ def test_no_findings_key_still_works(wired):
     assert result == {"skipped": False, "topics": 1}
     assert calls == [[]]
     assert emitted[0][0]["findings"] == []
+
+
+# ---------------------------------------------------------------------------
+# video-keyframe plan, Task 2 -- item-writer emits a keyframe_requests/
+# artifact post-commit, gated by EMIT_KEYFRAME_REQUESTS, carrying ONLY the
+# topics whose time_range passes the >=2-minute gate (keyframe_seconds
+# non-empty), with their durable topic ids + time_ranges.
+# ---------------------------------------------------------------------------
+
+def _two_topic_extraction():
+    """One gate-passing topic (5 min) + one gated-out topic (same-minute)."""
+    passing = {
+        "topic_title": "Long talk-to-camera", "category": "progress",
+        "summary": "Walkthrough.", "time_range": "10:00 – 10:05",
+        "action_items": [], "safety_flags": [],
+    }
+    gated = {
+        "topic_title": "Quick note", "category": "general",
+        "summary": "Brief.", "time_range": "12:14 – 12:14",
+        "action_items": [], "safety_flags": [],
+    }
+    return make_extraction(topics=[passing, gated])
+
+
+def _upsert_incrementing(wired):
+    """Give each upserted topic a distinct id so emit payloads are checkable."""
+    counter = {"n": 0}
+
+    def fake_upsert(conn, site_id, report_date, title, **kw):
+        counter["n"] += 1
+        return {"id": f"topic-{counter['n']}"}
+
+    wired.setattr(iw.topics, "upsert_topic", fake_upsert)
+
+
+def test_keyframe_request_emitted_only_for_gated_topics_when_enabled(wired):
+    wired.setattr(iw, "EMIT_KEYFRAME_REQUESTS", True)
+    wired.setattr(iw, "_s3_client", FakeS3({EXTRACTION_KEY: json.dumps(_two_topic_extraction())}))
+    _upsert_incrementing(wired)
+    calls = []
+    wired.setattr(
+        iw.keyframe_request, "emit",
+        lambda s3_client, bucket, user_folder, date, session_base, extraction_key, topics:
+            calls.append((bucket, user_folder, date, session_base, extraction_key, topics))
+            or "keyframe_requests/Jarley_Trainor/2026-07-06/abc.json",
+    )
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 2}
+    assert len(calls) == 1
+    bucket, user_folder, date, session_base, extraction_key, topics = calls[0]
+    assert bucket == iw.S3_BUCKET
+    assert user_folder == "Jarley_Trainor"
+    assert date == "2026-07-06"
+    assert session_base == "Benl1_2026-07-06_10-00-00"
+    assert extraction_key == EXTRACTION_KEY
+    # ONLY the 5-min topic (topic-1); the same-minute topic is gated out.
+    assert topics == [{"topic_id": "topic-1", "time_range": "10:00 – 10:05"}]
+
+
+def test_keyframe_request_not_emitted_when_no_gated_topic(wired):
+    wired.setattr(iw, "EMIT_KEYFRAME_REQUESTS", True)
+    gated_only = {
+        "topic_title": "Quick note", "category": "general", "summary": "Brief.",
+        "time_range": "12:12 – 12:13", "action_items": [], "safety_flags": [],
+    }
+    wired.setattr(iw, "_s3_client",
+                  FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(topics=[gated_only]))}))
+    calls = []
+    wired.setattr(iw.keyframe_request, "emit", lambda *a, **k: calls.append(a) or None)
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 1}
+    assert calls == []
+
+
+def test_keyframe_request_not_emitted_when_flag_disabled(wired):
+    wired.setattr(iw, "EMIT_KEYFRAME_REQUESTS", False)
+    wired.setattr(iw, "_s3_client", FakeS3({EXTRACTION_KEY: json.dumps(_two_topic_extraction())}))
+    _upsert_incrementing(wired)
+    calls = []
+    wired.setattr(iw.keyframe_request, "emit", lambda *a, **k: calls.append(a) or None)
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 2}
+    assert calls == []  # gated topic present, but emission is off
 
 
 # ---------------------------------------------------------------------------

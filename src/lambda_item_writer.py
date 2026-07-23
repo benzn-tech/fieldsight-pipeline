@@ -56,8 +56,10 @@ from urllib.parse import unquote_plus
 import boto3
 
 import lambda_ingest
+import keyframe_request
 import match_request
 from db.connection import get_connection
+from keyframe_selection import keyframe_seconds
 from photo_binding import PHOTOS_PER_TOPIC_CAP  # noqa: F401  (re-export)
 from photo_binding import list_pictures as _pb_list_pictures
 from photo_binding import photos_for_topics as _photos_for_topics
@@ -69,6 +71,10 @@ logger.setLevel(logging.INFO)
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 CONFIG_KEY = os.environ.get("CONFIG_KEY", "config/user_mapping.json")
 COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
+
+# video-keyframe plan: ship the pipeline change inert -- only when
+# EnableKeyframes flips this env true does item-writer emit keyframe_requests/.
+EMIT_KEYFRAME_REQUESTS = os.environ.get("EMIT_KEYFRAME_REQUESTS", "false").lower() == "true"
 
 EXTRACTIONS_PREFIX = "extractions/"
 # Depth-exact: extractions/{user_folder}/{date}/{name}.json -- a key nested
@@ -191,6 +197,7 @@ def write_extraction_items(date, user_folder, extraction_key):
 
         topics_n = 0
         collected_topics = []
+        keyframe_topics = []  # video-keyframe plan: {topic_id, time_range} of gate-passers
         for i, t in enumerate(extraction_topics):
             mapped_action_items = lambda_ingest._map_action_items(t.get("action_items"))
             matched_photos = photos_by_topic.get(i, [])
@@ -259,6 +266,13 @@ def write_extraction_items(date, user_folder, extraction_key):
                     "entity_trade": f["entity_trade"],
                 } for f in finding_rows],
             })
+            # video-keyframe plan (Task 2): collect the durable id + time_range
+            # of every topic whose window passes the >=2-minute gate (i.e.
+            # keyframe_seconds yields at least one frame). The KeyframeFunction
+            # recomputes the exact frame instants itself from time_range.
+            if keyframe_seconds(t.get("time_range")):
+                keyframe_topics.append({"topic_id": str(row["id"]),
+                                        "time_range": t.get("time_range")})
             topics_n += 1
 
     logger.info("item-writer wrote extraction=%s topics=%d", extraction_key, topics_n)
@@ -270,6 +284,14 @@ def write_extraction_items(date, user_folder, extraction_key):
     # anyway since collected_topics would be empty.
     if collected_topics:
         match_request.emit(s3(), S3_BUCKET, site["id"], date, extraction_key, collected_topics)
+
+    # video-keyframe plan (Task 2): post-commit, like match_request above --
+    # the KeyframeFunction reads these durable topic ids. Env-gated so the
+    # pipeline change ships inert. Video availability is resolved by the
+    # keyframe fn itself (vad-metadata coverage) -- audio-only days no-op there.
+    if EMIT_KEYFRAME_REQUESTS and keyframe_topics:
+        keyframe_request.emit(s3(), S3_BUCKET, user_folder, date, session_base,
+                              extraction_key, keyframe_topics)
 
     return {"skipped": False, "topics": topics_n}
 
