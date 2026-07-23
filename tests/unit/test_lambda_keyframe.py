@@ -44,6 +44,7 @@ class FakeS3:
         self.downloads = []                # (key, local)
         self.uploads = []                  # (local, key, extra)
         self.deletes = []
+        self.head_calls = []               # every key head_object was asked about
 
     def get_object(self, Bucket, Key):
         body = self.objects[Key]
@@ -55,6 +56,7 @@ class FakeS3:
         return _Paginator(self.objects)
 
     def head_object(self, Bucket, Key):
+        self.head_calls.append(Key)
         if Key in self.heads:
             return {}
         raise Exception("404 Not Found")
@@ -313,6 +315,110 @@ def test_stale_keyframe_cleanup(patched):
 
 
 # --------------------------------------------------------------------------
+# Behavior 6b (M-2) -- stale cleanup also deletes the dangling topic_photos
+#   rows, in the SAME connection/transaction as the S3 object deletes
+# --------------------------------------------------------------------------
+
+def test_stale_cleanup_also_deletes_topic_photos_rows(patched):
+    stale = PICS + "Benl1_2026-07-23_10-30-00_kf_s101534.jpg"   # this session, not expected
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:15 – 10:17"}]),
+                 SIDECAR_KEY: _sidecar(),
+                 stale: b"x"})
+    patched.setattr(lk, "_s3_client", s3)
+    conn = FakeConn()
+    patched.setattr(lk, "get_connection", lambda *a, **k: conn)
+    patched.setattr(lk.subprocess, "run", FakeRun())
+
+    lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    # S3 object deleted AND its topic_photos row deleted by the same conn
+    assert s3.deletes == [stale]
+    row_deletes = [(sql, params) for sql, params in conn.executed
+                   if "DELETE FROM topic_photos" in sql]
+    assert len(row_deletes) == 1
+    assert stale in row_deletes[0][1][0]     # deleted key passed to WHERE s3_key = ANY(...)
+
+
+def test_no_stale_files_means_no_topic_photos_delete(patched):
+    # Nothing stale -> the DELETE FROM topic_photos is not issued at all.
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:15 – 10:17"}]),
+                 SIDECAR_KEY: _sidecar()})
+    patched.setattr(lk, "_s3_client", s3)
+    conn = FakeConn()
+    patched.setattr(lk, "get_connection", lambda *a, **k: conn)
+    patched.setattr(lk.subprocess, "run", FakeRun())
+
+    lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    assert s3.deletes == []
+    assert not [1 for sql, _ in conn.executed if "DELETE FROM topic_photos" in sql]
+
+
+# --------------------------------------------------------------------------
+# M-3 -- one corrupt _vad_metadata.json sidecar among good ones is skipped
+#   (warn-and-continue), never raised: the good recording still loads
+# --------------------------------------------------------------------------
+
+def test_corrupt_sidecar_is_skipped_not_fatal():
+    good_video = "users/Ben_UCPK/video/2026-07-23/Benl1_2026-07-23_10-15-34.mp4"
+    good = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_10-15-34_vad_metadata.json"
+    corrupt = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_11-00-00_vad_metadata.json"
+    s3 = FakeS3({good: _sidecar(source_key=good_video, dur=600),
+                 corrupt: '{"source_type": "video", "sou'})   # truncated JSON
+
+    recs = lk.load_video_recordings(s3, "bkt", "Ben_UCPK", "2026-07-23")
+
+    assert len(recs) == 1
+    assert recs[0]["source_key"] == good_video
+
+
+def test_sidecar_missing_source_key_is_skipped_not_fatal():
+    good_video = "users/Ben_UCPK/video/2026-07-23/Benl1_2026-07-23_10-15-34.mp4"
+    good = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_10-15-34_vad_metadata.json"
+    # valid JSON, source_type video, but no source_key -> KeyError, must skip
+    bad = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_11-00-00_vad_metadata.json"
+    s3 = FakeS3({good: _sidecar(source_key=good_video, dur=600),
+                 bad: json.dumps({"source_type": "video", "total_duration_sec": 120})})
+
+    recs = lk.load_video_recordings(s3, "bkt", "Ben_UCPK", "2026-07-23")
+
+    assert [r["source_key"] for r in recs] == [good_video]
+
+
+# --------------------------------------------------------------------------
+# M-1 -- the HeadObject existence fast-path is actually exercised (its key
+#   needs s3:GetObject on users/*/pictures/*_kf_s*.jpg, else it 403s silently)
+# --------------------------------------------------------------------------
+
+def test_head_object_fast_path_is_exercised(patched):
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:15 – 10:17"}]),
+                 SIDECAR_KEY: _sidecar()})
+    patched.setattr(lk, "_s3_client", s3)
+    patched.setattr(lk.subprocess, "run", FakeRun())
+
+    lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    expected_key = PICS + "Benl1_2026-07-23_10-16-00_kf_s101534.jpg"
+    assert expected_key in s3.head_calls
+
+
+def test_original_downloaded_once_per_source_key(patched):
+    # M-4: a 3-frame topic seeks one downloaded original, not three downloads.
+    sidecar = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_10-00-00_vad_metadata.json"
+    video = "users/Ben_UCPK/video/2026-07-23/Benl1_2026-07-23_10-00-00.mp4"
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:00 – 10:06"}]),
+                 sidecar: _sidecar(source_key=video, dur=600)})
+    patched.setattr(lk, "_s3_client", s3)
+    run = FakeRun()
+    patched.setattr(lk.subprocess, "run", run)
+
+    lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    assert len(run.calls) == 3                       # 3 frames decoded
+    assert [k for k, _ in s3.downloads] == [video]   # but the original pulled ONCE
+
+
+# --------------------------------------------------------------------------
 # Behavior 7 -- duration source: recordings from *_vad_metadata.json sidecars,
 #               source_type=='video' only, base_s via transcript_utils
 # --------------------------------------------------------------------------
@@ -345,9 +451,16 @@ def test_load_video_recordings_filters_to_video_sidecars():
 def test_add_topic_photo_if_absent_inserts_once_then_dedupes():
     from repositories.topics import add_topic_photo_if_absent
 
+    import contextlib
+
     class PhotoConn:
         def __init__(self):
             self.rows = set()
+
+        def transaction(self):
+            # L-1: add_topic_photo_if_absent now wraps the insert in a SAVEPOINT
+            # (conn.transaction()); a no-op CM is enough for the happy path.
+            return contextlib.nullcontext()
 
         def execute(self, sql, params):
             pair = (params["tid"], params["key"])
@@ -362,6 +475,24 @@ def test_add_topic_photo_if_absent_inserts_once_then_dedupes():
     assert add_topic_photo_if_absent(conn, "t1", "users/k.jpg", "cap") is False
     # a different key for the same topic inserts
     assert add_topic_photo_if_absent(conn, "t1", "users/other.jpg", "cap") is True
+
+
+def test_add_topic_photo_if_absent_skips_fk_violation_without_raising():
+    # L-1: the topic cascaded away between the caller's SELECT 1 and this
+    # insert -> the FK violation is caught inside the SAVEPOINT and the row is
+    # skipped (return False), never re-raised to abort the whole request.
+    import contextlib
+    import psycopg
+
+    class FKConn:
+        def transaction(self):
+            return contextlib.nullcontext()
+
+        def execute(self, sql, params):
+            raise psycopg.errors.ForeignKeyViolation("topic gone")
+
+    from repositories.topics import add_topic_photo_if_absent
+    assert add_topic_photo_if_absent(FKConn(), "t-gone", "users/k.jpg", "cap") is False
 
 
 # --------------------------------------------------------------------------

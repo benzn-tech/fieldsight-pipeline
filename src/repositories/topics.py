@@ -1,7 +1,12 @@
+import logging
+
+import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from repositories import findings
+
+logger = logging.getLogger(__name__)
 
 _TOPIC_COLS = ("id, site_id, user_id, source_s3_key, report_date, occurred_at, "
                "category, title, summary, time_range, participants, source, created_at, "
@@ -476,21 +481,35 @@ def get_topic_full(conn, topic_id) -> dict | None:
 def add_topic_photo_if_absent(conn, topic_id, s3_key, caption_text):
     """Idempotent keyframe bind (video-keyframe plan): inserts only when no
     (topic_id, s3_key) row exists -- safe under S3-event retries and after
-    item-writer re-runs have already re-bound the file. Returns True iff a
-    row was inserted. The table has no unique constraint on (topic_id,
-    s3_key), so the WHERE NOT EXISTS guard is what enforces idempotency."""
-    row = conn.execute(
-        """
-        INSERT INTO topic_photos (topic_id, s3_key, caption_text)
-        SELECT %(tid)s, %(key)s, %(cap)s
-        WHERE NOT EXISTS (
-            SELECT 1 FROM topic_photos WHERE topic_id = %(tid)s AND s3_key = %(key)s
-        )
-        RETURNING id
-        """,
-        {"tid": topic_id, "key": s3_key, "cap": caption_text},
-    ).fetchone()
-    return row is not None
+    item-writer re-runs have already re-bound the file. The table has no unique
+    constraint on (topic_id, s3_key), so the WHERE NOT EXISTS guard is what
+    enforces idempotency.
+
+    Returns True iff a row was inserted; False when the row already existed OR
+    (L-1) the topic was cascaded away between the caller's SELECT 1 pre-check
+    and this insert (a concurrent re-extraction) -- that FK violation is caught
+    per-row inside a SAVEPOINT (conn.transaction()) so the aborted statement
+    rolls back to the savepoint and the caller's outer transaction stays usable:
+    one racing topic is skipped, the whole keyframe request is NOT lost. Does
+    not raise for that race."""
+    try:
+        with conn.transaction():
+            row = conn.execute(
+                """
+                INSERT INTO topic_photos (topic_id, s3_key, caption_text)
+                SELECT %(tid)s, %(key)s, %(cap)s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM topic_photos WHERE topic_id = %(tid)s AND s3_key = %(key)s
+                )
+                RETURNING id
+                """,
+                {"tid": topic_id, "key": s3_key, "cap": caption_text},
+            ).fetchone()
+        return row is not None
+    except psycopg.errors.ForeignKeyViolation:
+        logger.warning("topic %s vanished before keyframe bind (%s) -- skipping row",
+                       topic_id, s3_key)
+        return False
 
 
 def set_work_class(conn, topic_id, work_class):

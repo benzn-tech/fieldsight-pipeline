@@ -3,7 +3,10 @@
 In-VPC (PsycopgLayer + PG env, S3 via the gateway endpoint -- zero non-S3 AWS
 calls, BUG-36-clean). The VAD layer is attached ONLY for the static
 /opt/bin/ffmpeg binary; onnxruntime/numpy in that layer are cp312 and are
-NEVER imported here (runtime is the global python3.11).
+NEVER imported here. The function Runtime is pinned to python3.12 (H-2): the
+VAD layer's CompatibleRuntimes is python3.12-only, so a python3.11 function +
+this layer is rejected by CreateFunction (stack rollback). The keyframe code
+itself is stdlib subprocess/json + photo_binding -- 3.12-clean either way.
 
 Trigger: S3 ObjectCreated on keyframe_requests/*.json (wire-s3-events.sh,
 BUG-33), written post-commit by lambda_item_writer. For each gated topic in
@@ -24,6 +27,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import uuid
 from urllib.parse import unquote_plus
 
 import boto3
@@ -63,18 +67,27 @@ def load_video_recordings(s3c, bucket, user_folder, date):
         for obj in page.get("Contents", []):
             if not obj["Key"].endswith("_vad_metadata.json"):
                 continue
-            meta = json.loads(s3c.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read())
-            if meta.get("source_type") != "video":
+            # M-3: guard EACH sidecar. A single truncated/corrupt
+            # _vad_metadata.json (bad JSON, or missing source_key) must not
+            # raise out to the handler -- that would fail the whole request,
+            # trigger S3's retries, and permanently drop it (no DLQ). Warn and
+            # skip just that sidecar; the module's "never raises" contract holds.
+            try:
+                meta = json.loads(s3c.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read())
+                if meta.get("source_type") != "video":
+                    continue
+                basename = meta["source_key"].rsplit("/", 1)[-1]
+                base = extract_base_time_from_filename(basename)
+                if base is None:
+                    continue
+                recs.append({
+                    "source_key": meta["source_key"],
+                    "base_s": base.hour * 3600 + base.minute * 60 + base.second,
+                    "duration_s": float(meta.get("total_duration_sec", 0)),
+                })
+            except Exception as e:
+                logger.warning("skipping unreadable VAD sidecar %s: %s", obj["Key"], e)
                 continue
-            basename = meta["source_key"].rsplit("/", 1)[-1]
-            base = extract_base_time_from_filename(basename)
-            if base is None:
-                continue
-            recs.append({
-                "source_key": meta["source_key"],
-                "base_s": base.hour * 3600 + base.minute * 60 + base.second,
-                "duration_s": float(meta.get("total_duration_sec", 0)),
-            })
     return recs
 
 
@@ -105,30 +118,52 @@ def process_request(req):
             expected.add(key)
             plans.append((t["topic_id"], mid_s, pick, key))
 
-    # Stale cleanup: this session's previous keyframes no longer expected
-    # (window shifted on a re-extraction). Scoped to *_kf_s{session}.jpg so
-    # other sessions' keyframes and real user photos are never touched.
     sess_marker = f"_kf_s{session_base.rsplit('_', 1)[-1].replace('-', '')}.jpg"
-    for page in s3().get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix=pics_prefix):
-        for obj in page.get("Contents", []):
-            if obj["Key"].endswith(sess_marker) and obj["Key"] not in expected:
-                logger.info("deleting stale keyframe %s", obj["Key"])
-                s3().delete_object(Bucket=S3_BUCKET, Key=obj["Key"])
 
     written = 0
-    with get_connection() as conn:
-        for topic_id, mid_s, (source_key, seek), key in plans:
-            # Stale request (topic cascaded away between emit and processing):
-            # skip instead of raising an FK error on insert.
-            if conn.execute("SELECT 1 FROM topics WHERE id=%s", (topic_id,)).fetchone() is None:
-                logger.info("topic %s superseded -- skipping keyframe", topic_id)
-                continue
-            if not _object_exists(key):
-                if not _extract_and_upload(source_key, seek, key):
-                    continue                       # ffmpeg failed: log-and-skip, never raise
-            caption = f"Auto keyframe @ {mid_s // 3600:02d}:{(mid_s % 3600) // 60:02d}"
-            if add_topic_photo_if_absent(conn, topic_id, key, caption):
-                written += 1
+    # M-4: download each original ONCE per invocation (keyed by source_key) and
+    # seek to every requested frame off the local file. A topic can ask for up
+    # to KEYFRAME_MAX_FRAMES grabs off one source_key; the old per-frame
+    # re-download blew the (now 600s) timeout budget and, on a mid-run timeout,
+    # left S3 uploads with zero committed DB bindings.
+    downloaded = {}
+    tmp_dir = tempfile.mkdtemp(prefix="kf_")
+    try:
+        with get_connection() as conn:
+            # Stale cleanup: this session's previous keyframes no longer
+            # expected (window shifted on a re-extraction). Scoped to
+            # *_kf_s{session}.jpg so other sessions' keyframes and real user
+            # photos are never touched. M-2: run this INSIDE the connection
+            # block and, in the SAME transaction as the S3 object deletes,
+            # remove the dangling topic_photos rows -- otherwise item-writer's
+            # re-bind of the old file to a new topic leaves a topic_photos row
+            # pointing at a just-deleted key (dead "Preview unavailable" link,
+            # no self-heal).
+            deleted_keys = []
+            for page in s3().get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix=pics_prefix):
+                for obj in page.get("Contents", []):
+                    if obj["Key"].endswith(sess_marker) and obj["Key"] not in expected:
+                        logger.info("deleting stale keyframe %s", obj["Key"])
+                        s3().delete_object(Bucket=S3_BUCKET, Key=obj["Key"])
+                        deleted_keys.append(obj["Key"])
+            if deleted_keys:
+                conn.execute("DELETE FROM topic_photos WHERE s3_key = ANY(%s)", (deleted_keys,))
+
+            for topic_id, mid_s, (source_key, seek), key in plans:
+                # Stale request (topic cascaded away between emit and
+                # processing): skip instead of raising an FK error on insert.
+                if conn.execute("SELECT 1 FROM topics WHERE id=%s", (topic_id,)).fetchone() is None:
+                    logger.info("topic %s superseded -- skipping keyframe", topic_id)
+                    continue
+                if not _object_exists(key):
+                    local = _download_original(downloaded, tmp_dir, source_key)
+                    if not _extract_and_upload(local, seek, key):
+                        continue                   # ffmpeg failed: log-and-skip, never raise
+                caption = f"Auto keyframe @ {mid_s // 3600:02d}:{(mid_s % 3600) // 60:02d}"
+                if add_topic_photo_if_absent(conn, topic_id, key, caption):
+                    written += 1
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     return {"skipped": False, "keyframes": written}
 
 
@@ -140,24 +175,36 @@ def _object_exists(key):
         return False
 
 
-def _extract_and_upload(source_key, seek, dest_key):
-    tmp_dir = tempfile.mkdtemp(prefix="kf_")
-    try:
-        local = os.path.join(tmp_dir, "in" + os.path.splitext(source_key)[1])
-        out = os.path.join(tmp_dir, "frame.jpg")
+def _download_original(cache, tmp_dir, source_key):
+    """Download the original video ONCE per invocation (M-4). Cached by
+    source_key so a topic's N frames all seek into the same local file instead
+    of re-pulling a ~200 MB original per frame. The whole tmp_dir is removed by
+    process_request's finally, so there is no per-file cleanup here."""
+    local = cache.get(source_key)
+    if local is None:
+        local = os.path.join(tmp_dir, f"in{len(cache)}" + os.path.splitext(source_key)[1])
         s3().download_file(S3_BUCKET, source_key, local)
-        r = subprocess.run(ffmpeg_frame_cmd(FFMPEG_PATH, local, seek, out),
+        cache[source_key] = local
+    return local
+
+
+def _extract_and_upload(local_input, seek, dest_key):
+    """Grab ONE frame from an already-downloaded original and upload it. Never
+    raises: an ffmpeg non-zero exit / missing output warns and returns False so
+    the caller skips just this frame. The output name is unique per call (the
+    same original is seeked to many frames within one invocation)."""
+    out = os.path.join(os.path.dirname(local_input), uuid.uuid4().hex + ".jpg")
+    try:
+        r = subprocess.run(ffmpeg_frame_cmd(FFMPEG_PATH, local_input, seek, out),
                            capture_output=True, text=True, timeout=90)
         if r.returncode != 0 or not os.path.exists(out):
-            logger.warning("ffmpeg frame grab failed for %s: %s", source_key, (r.stderr or "")[:300])
+            logger.warning("ffmpeg frame grab failed for %s: %s", local_input, (r.stderr or "")[:300])
             return False
         s3().upload_file(out, S3_BUCKET, dest_key, ExtraArgs={"ContentType": "image/jpeg"})
         return True
     except Exception as e:
-        logger.warning("keyframe extract error for %s: %s", source_key, e)
+        logger.warning("keyframe extract error for %s: %s", local_input, e)
         return False
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def lambda_handler(event, context):

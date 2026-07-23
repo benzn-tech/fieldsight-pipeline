@@ -1305,8 +1305,10 @@ Resources:
   # S3 event on keyframe_requests/ (wired manually per BUG-33 —
   # scripts/wire-s3-events.sh). VAD layer is attached ONLY for the static
   # /opt/bin/ffmpeg binary; its cp312 Python packages are never imported
-  # (runtime stays the global python3.11; psycopg comes from PsycopgLayer).
-  # Zero non-S3 AWS calls at runtime (BUG-36: S3 gateway endpoint only).
+  # (psycopg comes from PsycopgLayer). Runtime is pinned python3.12 (H-2):
+  # the VAD layer's CompatibleRuntimes is python3.12-only, so a python3.11
+  # function + this layer is rejected at CreateFunction and rolls back the
+  # whole stack. Zero non-S3 AWS calls at runtime (BUG-36: S3 gateway only).
   # ----------------------------------------------------------
   KeyframeFunction:
     Type: AWS::Serverless::Function
@@ -1315,8 +1317,14 @@ Resources:
       FunctionName: !Sub ["${P}-keyframe", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_keyframe.lambda_handler
-      Timeout: 120
+      # M-4: one topic can request up to KEYFRAME_MAX_FRAMES (10) single-GOP
+      # grabs; even with the per-invocation download cache (download once, seek
+      # N times) the decode+upload work won't fit 120s, and a mid-run timeout
+      # commits zero DB bindings while leaving S3 uploads. Give generous
+      # headroom (still well under the 900s Lambda ceiling).
+      Timeout: 600
       MemorySize: 1024
+      Runtime: python3.12  # fieldsight-vad-layer is built for cp312 (BUG-24 class) — do not fall back to the py3.11 global
       EphemeralStorage:
         Size: 2048     # original H265 videos observed up to ~200 MB (VadFunction parity)
       Layers:
@@ -1346,11 +1354,23 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/keyframe_requests/*   # its own trigger payload
                 - !Sub arn:aws:s3:::${IngestBucketName}/users/*/video/*        # originals to decode
                 - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*       # vad metadata sidecars
+                # M-1: HeadObject is authorized by s3:GetObject. The
+                # _object_exists fast-path HEADs the keyframe it is about to
+                # (re)create; without this grant the HEAD 403s, the bare except
+                # swallows it as "missing", and every S3-retry re-downloads the
+                # original + re-decodes. Scoped to the *_kf_s*.jpg marker only.
+                - !Sub arn:aws:s3:::${IngestBucketName}/users/*/pictures/*_kf_s*.jpg
             - Effect: Allow
-              Action:
-                - s3:PutObject
-                - s3:DeleteObject      # stale-keyframe cleanup (only ever *_kf_s*.jpg keys)
+              Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/users/*/pictures/*
+            - Effect: Allow
+              # L-2 (defense-in-depth on the crown-jewel grant): narrowed from
+              # users/*/pictures/* to the *_kf_s*.jpg keyframe marker so IAM
+              # physically CANNOT delete a real user photo even if the app-layer
+              # marker match ever regresses. The mid-string wildcard form
+              # (*_kf_s*.jpg) is a valid S3 resource ARN pattern.
+              Action: s3:DeleteObject      # stale-keyframe cleanup (only ever *_kf_s*.jpg keys)
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/users/*/pictures/*_kf_s*.jpg
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}

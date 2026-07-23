@@ -67,6 +67,16 @@ jobs:
           # parameter because {{resolve:secretsmanager:...}} can't compose
           # with Fn::ImportValue (only with Parameters).
           DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
+          # KEYFRAME FEATURE (H-1) — activating it on TEST needs BOTH repo vars set:
+          #   * TEST_VAD_LAYER_ARN  -> the VAD layer ARN (VadLayerArn below). Layers are
+          #     account+region scoped, so the SAME fieldsight-vad-layer:N ARN prod uses
+          #     (PROD_VAD_LAYER_ARN, deploy-prod.yml) is valid here. This flips HasVadLayer
+          #     -> HasKeyframeStack true so KeyframeFunction is actually CREATED on TEST and
+          #     the feature can be verified BEFORE prod. Unset => empty => keyframe stack
+          #     stays uncreated (today's behavior, merge-safe).
+          #   * TEST_ENABLE_KEYFRAMES -> gates item-writer's keyframe_requests/ EMISSION.
+          #     Left default false so merging does NOT auto-enable emission; flip it
+          #     deliberately only after the created stack + its IAM are verified on TEST.
           sam deploy --config-env test \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -75,6 +85,7 @@ jobs:
               "IngestBucketName=fieldsight-data-test-509194952652" \
               "EnableSchedules=false" \
               "EnableSiteVoice=true" \
+              "VadLayerArn=${{ vars.TEST_VAD_LAYER_ARN }}" \
               "EnableKeyframes=${{ vars.TEST_ENABLE_KEYFRAMES || 'false' }}" \
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
