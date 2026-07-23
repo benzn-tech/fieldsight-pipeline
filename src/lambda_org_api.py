@@ -282,6 +282,14 @@ def dispatch(conn, event, method, route):
     if route == "/transcripts" and method == "GET":
         return get_org_transcripts(conn, caller, event)
 
+    if route == "/audio-segments" and method == "GET":
+        return get_org_audio_segments(conn, caller, event)
+
+    if route == "/video-segments" and method == "GET":
+        return get_org_video_segments(conn, caller, event)
+
+    if route == "/media/presigned-url" and method == "GET":
+        return get_org_media_presigned_url(conn, caller, event)
     if route == "/reports/history" and method == "GET":
         return get_org_report_history(conn, caller, event)
 
@@ -2093,6 +2101,38 @@ def _org_extract_time_seconds_from_filename(filename):
     return None
 
 
+def _list_media_objects(prefix, what):
+    """Paginated list_objects_v2 over one media prefix in S3_BUCKET.
+
+    SECURITY/OPS (adversarial review BLOCKER 1). The media readers used to
+    wrap this in `except ClientError: pass`, which collapsed EVERY listing
+    failure into an empty result and a 200. The dominant such failure is
+    AccessDenied from a missing s3:ListBucket prefix grant -- and its
+    rendered output ("No audio segments in this window.") is byte-identical
+    to the legitimate empty day, i.e. exactly the invisible failure these
+    routes were written to eliminate. An overloaded sentinel that cannot
+    distinguish "nothing here" from "I was not allowed to look" is not an
+    acceptable degrade.
+
+    A missing prefix is NOT an error to S3: list_objects_v2 returns an empty
+    Contents. So there is no not-found class to tolerate here at all -- any
+    ClientError is a genuine fault (IAM, bucket, throttle) and is re-raised
+    for lambda_handler to turn into a 500 {"error": "internal error"}. Same
+    posture as _get_lake_json / programme.read_programme in this codebase.
+    (_list_report_folders keeps its tolerant catch on purpose: it has an
+    Aurora union to fall back on, and admin_disambiguation's answer is still
+    complete without it.)"""
+    try:
+        paginator = s3().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                yield obj
+    except ClientError:
+        logger.exception("%s: S3 listing failed for prefix %s (bucket %s)",
+                         what, prefix, S3_BUCKET)
+        raise
+
+
 def _read_org_transcripts(date, folder, start_time, end_time):
     """S3 read + normalize for one (folder, date) window -- mirrors
     lambda_fieldsight_api.get_transcripts's locate/parse/response-shape
@@ -2110,18 +2150,8 @@ def _read_org_transcripts(date, folder, start_time, end_time):
         start_sec = 0
 
     prefix = f"transcripts/{folder}/{date}/"
-    transcript_files = []
-    try:
-        paginator = s3().get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith(".json"):
-                    transcript_files.append(key)
-    except ClientError:
-        # Same posture as _list_report_folders: a listing failure (e.g. an
-        # IAM edge case) degrades to "no transcripts" rather than a 500.
-        pass
+    transcript_files = [obj["Key"] for obj in _list_media_objects(prefix, "transcripts")
+                        if obj["Key"].endswith(".json")]
 
     if not transcript_files:
         return {"text": "", "segments": [], "speaker_segments": [], "message": "No transcripts found"}
@@ -2213,6 +2243,113 @@ def _read_org_transcripts(date, folder, start_time, end_time):
     }
 
 
+def _resolve_org_media_folder(conn, caller, user, what="media"):
+    """Shared Aurora-identity ACL for the media routes (/transcripts,
+    /audio-segments, /video-segments, /media/presigned-url) -- P1,
+    2026-07-23 prod-media-binding plan (graded adoption decided by the
+    user). Returns (folder, None) on success or (None, error_response).
+
+    GRADED_ROLES on (prod): /timeline's graded authority verbatim
+    (get_timeline_compat above) -- ALL-scope callers may target any
+    in-company folder (unknown -> 404, RETARGET override 5); everyone else
+    defaults to self and passes explicit targets through _can_view_folder:
+    SITE (pm/regional) reads any member of an in-scope site, SELF+WORKERS
+    (site_manager) reads self + role='worker' members on their sites (never
+    pms or fellow site_managers -- BUG-25's graded restatement), SELF
+    (worker) reads self only. _can_view_folder conflates unknown-user with
+    out-of-scope (returns False) -> both surface as 403, same as /timeline
+    (no user-existence oracle for non-ALL callers).
+
+    GRADED_ROLES off: the original binary rule -- non-ALL callers read
+    their OWN folder only (reject, never silently substitute -- D10
+    lesson); ALL callers company-pinned via users.get_by_folder_name.
+
+    NOTE the deliberate behaviour change on /transcripts: pre-plan it ran
+    the binary rule even with the flag on; site/self-scoped callers now
+    reach exactly the folders /timeline already shows them.
+
+    EXCEPTION (review BLOCKER 2): /media/presigned-url does NOT route
+    reports/{date}/{folder}/... through here -- that object is the one
+    /timeline withholds from graded non-ALL cross-user callers. See
+    _authorize_report_object_presign."""
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)
+        if sc["user_scope"] == "ALL":                     # admin/gm/platform_admin
+            if not user:
+                user = sc["self_folder"] or ""
+            if not user:
+                return None, error("user required", 400)
+            if not sc["cross_company"] and \
+                    users.get_by_folder_name(conn, caller["company_id"], user) is None:
+                return None, error("user not found in your company", 404)
+            return user, None
+        if not user:
+            user = sc["self_folder"]
+            if not user:
+                return None, error("no folder mapping for your account", 403)
+        if not _can_view_folder(conn, caller, user):
+            return None, error(f"not permitted to view this user's {what}", 403)
+        return user, None
+    # ---- GRADED_ROLES off: binary fallback (original /transcripts rule) ----
+    is_all = resolve_scope(caller["global_role"]) == "ALL"
+    if not is_all:
+        own = caller.get("folder_name")
+        if not own:
+            return None, error("no folder mapping for your account", 403)
+        if user and user != own:
+            return None, error(f"you may only view your own {what}", 403)
+        return own, None
+    if not user:
+        user = caller.get("folder_name") or ""
+    if not user:
+        return None, error("user required", 400)
+    if users.get_by_folder_name(conn, caller["company_id"], user) is None:
+        return None, error("user not found in your company", 404)
+    return user, None
+
+
+def _org_caller_may_read_ownerless(conn, caller):
+    """May this caller presign an artifact whose OWNER cannot be derived
+    (reports/{date}/summary_report.json, reports/{date}/sites/...)?
+
+    SECURITY (S-4, 2026-07-23 security-acl-sentinel plan). The previous
+    gate (_org_caller_has_all_scope) tested the scope TIER only and applied
+    NO company scoping, so a company-A admin could presign a company-B
+    site/summary rollup. Latent rather than live -- every site currently
+    sits in the single FieldSight company (dc2eafa9) -- which is exactly
+    why it must be closed BEFORE tenant separation turns it into a
+    cross-tenant leak with no code change to blame.
+
+    Company scoping is not achievable by derivation for either shape:
+    summary_report.json is a whole-lake rollup with no site and no company
+    even in principle; sites/{site_id}/ carries a LEGACY user_mapping slug
+    (lambda_report_generator.py:1548/:1710), not an Aurora sites.id, so
+    resolving it needs either a company_id we do not have
+    (sites.get_company_site_by_slug is circular for this purpose) or an
+    O(all-sites) scan whose cross-company slug collisions are unguarded.
+    So we fail closed on the honest alternative: only platform_admin -- the
+    SOLE role for which the absence of company scoping is correct rather
+    than an omission (repositories/scope.py: cross_company is true only via
+    acl.is_cross_company, which is platform_admin-only) -- may read an
+    artifact whose company cannot be established.
+
+    Company admins/gms lose the ability to download site/company rollups
+    through this route. That capability should be restored properly by a
+    site-rollup route taking an explicit site_id authorized through the
+    company-scoped site ACL, not by loosening this gate."""
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)
+        return sc["user_scope"] == "ALL" and sc["cross_company"]
+    # Binary branch (review FOLLOW-UP 3). This used to `return False`
+    # unconditionally, which made GRADED_ROLES -- an operational kill switch
+    # -- also strip platform_admin of the ownerless presign it holds on the
+    # graded branch, precisely during the incident someone would flip it to
+    # investigate. The graded branch's real predicate is cross_company, and
+    # acl.is_cross_company is a pure function of global_role
+    # (platform_admin-only), so asking the role directly reaches the SAME
+    # conclusion with no company dimension required -- no loosening, just
+    # the flag-independent restatement. Everyone else stays fail-closed.
+    return caller["global_role"] == "platform_admin"
 # ----------------------------------------------------------
 # /reports/history -- Aurora-identity report index.
 #
@@ -2389,35 +2526,258 @@ def get_org_transcripts(conn, caller, event):
     Ben_UCPK) resolves there to role='viewer', display_name='', so
     can_access_user_data 403s even though the transcript S3 object
     exists. This route resolves the caller from Aurora instead (dispatch's
-    `caller`, same as every other /api/org/* route) and applies get_
-    timeline_compat's GRADED_ROLES-off ACL verbatim: a non-ALL caller may
-    only read their own folder (?user= for anyone else is 403, silently
-    forcing to self the way D10 used to is exactly the mislabeled-data bug
-    fix wave 1 closed for /timeline -- reject, don't substitute); admin/gm
-    may pass ?user=, defaulting to their own folder when omitted, and an
-    explicit ?user= must resolve to a folder in their company (RETARGET
-    override 5, same as /timeline). Phase 3 GRADED_ROLES still defaults
-    off and this route doesn't add a graded branch -- when that flag
-    flips, /timeline's graded path is the template to extend this with.
-    The S3 read/normalize is delegated to _read_org_transcripts (mirrors
-    the legacy endpoint's shape so transcript-list.js needs no reshape)."""
+    `caller`, same as every other /api/org/* route) and authorizes through
+    _resolve_org_media_folder: graded when GRADED_ROLES is on, binary
+    fallback when off (2026-07-23 prod-media-binding plan; behaviour
+    change: site/self-scoped callers now reach exactly the folders
+    /timeline shows them). The S3 read/normalize is delegated to
+    _read_org_transcripts (mirrors the legacy endpoint's shape so
+    transcript-list.js needs no reshape)."""
     p = event.get("queryStringParameters") or {}
     date = p.get("date")
     user = (p.get("user") or "").strip()
     if not date or not REPORT_DATE_RE.match(date):
         return error("date required (YYYY-MM-DD)", 400)
-    is_all = resolve_scope(caller["global_role"]) == "ALL"
-    if not is_all:
-        own = caller.get("folder_name")
-        if not own:
-            return error("no folder mapping for your account", 403)
-        if user and user != own:
-            return error("you may only view your own transcripts", 403)
-        user = own
-    elif not user:
-        user = caller.get("folder_name") or ""
-    if not user:
-        return error("user required", 400)
-    if is_all and users.get_by_folder_name(conn, caller["company_id"], user) is None:
-        return error("user not found in your company", 404)
-    return ok(_read_org_transcripts(date, user, p.get("start") or "", p.get("end") or ""))
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="transcripts")
+    if err is not None:
+        return err
+    return ok(_read_org_transcripts(date, folder, p.get("start") or "", p.get("end") or ""))
+
+
+# ----------------------------------------------------------
+# /audio-segments + /video-segments + /media/presigned-url — Aurora-identity
+# media reads (P1, 2026-07-23 prod-media-binding plan)
+# ----------------------------------------------------------
+
+def _read_org_audio_segments(date, folder, start_time, end_time):
+    """S3 list + presign for one (folder, date) window -- mirrors
+    lambda_fieldsight_api.get_audio_segments verbatim: same BUG-01-anchored
+    regexes, same window filter (no +/-60s buffer -- the legacy audio
+    endpoint never had one), same response fields. Only the folder_name
+    spelling of the prefix is searched (same posture as
+    _read_org_transcripts: the modern frontend never hands a spaced name)."""
+    start_sec = _org_parse_time_to_seconds(start_time) if start_time else 0
+    end_sec = _org_parse_time_to_seconds(end_time) if end_time else 86400
+    prefix = f"audio_segments/{folder}/{date}/"
+    segments = []
+    for obj in _list_media_objects(prefix, "audio-segments"):
+        key = obj["Key"]
+        if not key.endswith(".wav"):
+            continue
+        filename = key.split("/")[-1]
+        base_match = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})_off", filename)
+        off_match = re.search(r"_off([\d.]+)_to([\d.]+)", filename)
+        if not base_match or not off_match:
+            continue
+        h, m, sec = (int(base_match.group(1)), int(base_match.group(2)),
+                     int(base_match.group(3)))
+        base_sec = h * 3600 + m * 60 + sec
+        abs_start = base_sec + float(off_match.group(1))
+        abs_end = base_sec + float(off_match.group(2))
+        if abs_end < start_sec or abs_start > end_sec:
+            continue
+        url = s3().generate_presigned_url(
+            "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
+            ExpiresIn=PRESIGNED_URL_EXPIRY)
+        ah, am, asec = (int(abs_start) // 3600, (int(abs_start) % 3600) // 60,
+                        int(abs_start) % 60)
+        segments.append({
+            "url": url, "filename": filename,
+            "absolute_start": abs_start, "absolute_end": abs_end,
+            "duration": round(abs_end - abs_start, 1),
+            "time_label": f"{ah:02d}:{am:02d}:{asec:02d}",
+        })
+    segments.sort(key=lambda seg: seg["absolute_start"])
+    return {"segments": segments, "count": len(segments)}
+
+
+def get_org_audio_segments(conn, caller, event):
+    """GET /api/org/audio-segments?date=&user=&start=&end= -- Aurora-identity
+    audio read (P1, 2026-07-23 prod-media-binding plan). Same bug family as
+    get_org_transcripts (see its docstring): audio.js called the legacy
+    gateway whose DynamoDB identity store 403s every Aurora-only account."""
+    p = event.get("queryStringParameters") or {}
+    date = p.get("date")
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, (p.get("user") or "").strip(),
+                                            what="audio")
+    if err is not None:
+        return err
+    return ok(_read_org_audio_segments(date, folder, p.get("start") or "", p.get("end") or ""))
+
+
+def _read_org_video_segments(date, folder, start_time, end_time):
+    """Mirrors lambda_fieldsight_api.get_video_segments: web_video/ H264
+    previews first, users/{folder}/video/ originals second, an original
+    suppressed when a preview shares its base_name, ~10-min assumed file
+    span, offset_sec = seek hint into the file. The legacy [user_folder,
+    user] name-variant loop is collapsed to folder_name only (see
+    _read_org_transcripts' identical stance)."""
+    start_sec = _org_parse_time_to_seconds(start_time) if start_time else 0
+    end_sec = _org_parse_time_to_seconds(end_time) if end_time else 86400
+    videos = []
+    for prefix, is_preview in ((f"web_video/{folder}/{date}/", True),
+                               (f"users/{folder}/video/{date}/", False)):
+        for obj in _list_media_objects(prefix, "video-segments"):
+            key = obj["Key"]
+            if not any(key.lower().endswith(e) for e in (".mp4", ".webm", ".mov")):
+                continue
+            filename = key.split("/")[-1]
+            time_match = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})", filename)
+            if not time_match:
+                continue
+            h, m, sec = (int(time_match.group(1)), int(time_match.group(2)),
+                         int(time_match.group(3)))
+            vid_start = h * 3600 + m * 60 + sec
+            if vid_start + 600 < start_sec or vid_start > end_sec:
+                continue
+            base_name = re.sub(r"\.\w+$", "", filename)
+            if not is_preview and any(v.get("base_name") == base_name for v in videos):
+                continue
+            url = s3().generate_presigned_url(
+                "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
+                ExpiresIn=PRESIGNED_URL_EXPIRY)
+            vh, vm, vs = vid_start // 3600, (vid_start % 3600) // 60, vid_start % 60
+            videos.append({
+                "url": url, "key": key, "filename": filename,
+                "base_name": base_name,
+                "video_start_sec": vid_start,
+                "time_label": f"{vh:02d}:{vm:02d}:{vs:02d}",
+                "offset_sec": round(max(0, start_sec - vid_start), 1),
+                "size_mb": round(obj["Size"] / (1024 * 1024), 1),
+                "is_preview": is_preview,
+                "codec": "h264" if is_preview else "unknown",
+            })
+    videos.sort(key=lambda v: v["video_start_sec"])
+    return {"videos": videos, "count": len(videos)}
+
+
+def get_org_video_segments(conn, caller, event):
+    """GET /api/org/video-segments -- Aurora-identity video read (P1)."""
+    p = event.get("queryStringParameters") or {}
+    date = p.get("date")
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, (p.get("user") or "").strip(),
+                                            what="video")
+    if err is not None:
+        return err
+    return ok(_read_org_video_segments(date, folder, p.get("start") or "", p.get("end") or ""))
+
+
+_ORG_MEDIA_PRESIGN_PREFIXES = ("users/", "audio_segments/", "transcripts/",
+                               "reports/", "web_video/")
+
+
+def _authorize_report_object_presign(conn, caller, folder):
+    """May this caller presign reports/{date}/{folder}/... ?
+    Returns None when allowed, else an error response.
+
+    SECURITY (adversarial review BLOCKER 2). reports/ is the ONE presignable
+    shape whose object /timeline deliberately WITHHOLDS from part of the
+    population that _can_view_folder admits: _render_timeline_for_user sets
+    doc=None and serves 404 (cross_user_clip) when a graded non-ALL caller
+    views someone else, because the target's whole-day free-text prose
+    (executive_summary / safety_observations / quality_and_compliance /
+    critical_dates_and_deadlines) is NOT site-scoped and can span sites
+    outside the caller's reach. Routing reports/ through
+    _resolve_org_media_folder like the other prefixes handed exactly those
+    callers a bearer URL to exactly that object -- /timeline 404s pm
+    Neil_Blunden on Ben_UCPK's day while the presigner returned 200 for
+    reports/{date}/Ben_UCPK/daily_report.json. It also sat outside the
+    widening the user approved, whose residual-risk paragraph scopes its
+    exemption to audio/video/transcript objects keyed by (folder, date) and
+    never mentions reports/.
+
+    The rule restores exact parity rather than blanket-denying:
+      * ALL tier  -> allowed. /timeline serves these callers the verbatim
+        doc (cross_user_clip=False), so allowing the presign IS parity.
+        Still company-pinned, via _resolve_org_media_folder's own
+        users.get_by_folder_name check (RETARGET override 5).
+      * everyone else -> own folder only. /timeline gives them nothing else
+        from this object, so denying IS parity. Dropping reports/ from the
+        allowlist entirely would break the legitimate own-report presigns
+        (meetings.js:40, reports.js:61).
+    GRADED_ROLES off is coherent by construction: /timeline's binary branch
+    already forces non-ALL callers to self, so the same two-case rule -- read
+    off resolve_scope/caller.folder_name instead of the graded envelope --
+    is parity there too."""
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)
+        is_all, self_folder = sc["user_scope"] == "ALL", sc["self_folder"]
+    else:
+        is_all = resolve_scope(caller["global_role"]) == "ALL"
+        self_folder = caller.get("folder_name")
+    if is_all:
+        # Delegate ONLY the ALL-tier case, so the company pin and its 404
+        # shape stay in one place.
+        _, err = _resolve_org_media_folder(conn, caller, folder, what="reports")
+        return err
+    if not self_folder or folder != self_folder:
+        return error("you may only access your own reports", 403)
+    return None
+
+
+def get_org_media_presigned_url(conn, caller, event):
+    """GET /api/org/media/presigned-url?key= -- Aurora-identity presigner
+    (P1, prod-media-binding plan). The legacy /media/presigned-url
+    (lambda_fieldsight_api.get_presigned_url) folder-checks through the
+    DynamoDB identity store, 403ing every Aurora-only account -- which
+    would leave P2's topic_photos bindings rendering as 'Preview
+    unavailable'. Same prefix allowlist and owner-folder extraction as the
+    legacy endpoint; authorization via _resolve_org_media_folder -- i.e. the
+    SAME graded-or-binary rule as the list routes, so a caller who can list
+    a member's photos/audio can also presign them (no half-working state
+    where the list step passes and every thumbnail 403s). Keys with no
+    derivable owner (e.g. reports/{date}/summary_report.json) are allowed
+    for platform_admin only (S-4: neither ownerless shape carries a
+    derivable company, so tier alone is not a sufficient authorization) --
+    deliberately NARROWER than both the legacy handler (which let any
+    caller presign an ownerless key) and this route's own pre-S-4 gate
+    (which allowed any ALL-tier caller, including a company admin/gm).
+    reports/{date}/{folder}/... is the ONE owner-derivable shape that does
+    NOT use the shared list-route rule -- see _authorize_report_object_presign
+    for why (/timeline withholds that exact object from graded non-ALL
+    cross-user callers, review BLOCKER 2).
+    No unquote_plus here: API Gateway already URL-decodes query params
+    once; the legacy endpoint's extra decode would corrupt a literal '+'.
+    That omission is load-bearing, not an oversight: it keeps the bytes this
+    function PARSES for the ACL identical to the bytes botocore SIGNS, which
+    is what structurally prevents the classic presign bypass. Do not add a
+    decode here."""
+    key = (event.get("queryStringParameters") or {}).get("key", "")
+    if not key:
+        return error("key required", 400)
+    if not any(key.startswith(p) for p in _ORG_MEDIA_PRESIGN_PREFIXES):
+        return error("access denied", 403)
+    parts = key.split("/")
+    # Defensive canonicalization (review FOLLOW-UP 4). 31 crafted keys failed
+    # to produce a leak -- dot-segments fail closed at S3/SigV4 in both
+    # directions -- but that safety rests on a botocore implementation detail,
+    # and "users/Ada_L/../Someone_Else/..." would otherwise pass an
+    # own-folder check while naming a different owner. Reject non-canonical
+    # keys outright instead of reasoning about the signer's behaviour.
+    if "//" in key or key.startswith("/") or any(p in (".", "..") for p in parts):
+        return error("access denied", 403)
+    target = None
+    if len(parts) >= 2 and parts[0] in ("users", "audio_segments", "transcripts", "web_video"):
+        target = parts[1]
+    elif parts[0] == "reports" and len(parts) > 3 and \
+            parts[2] not in ("summary_report.json", "sites"):
+        target = parts[2]
+    if not target:
+        if not _org_caller_may_read_ownerless(conn, caller):
+            return error("access denied", 403)
+    elif parts[0] == "reports":
+        err = _authorize_report_object_presign(conn, caller, target)
+        if err is not None:
+            return err
+    else:
+        _, err = _resolve_org_media_folder(conn, caller, target, what="media")
+        if err is not None:
+            return err
+    url = s3().generate_presigned_url(
+        "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=PRESIGNED_URL_EXPIRY)
+    return ok({"url": url, "expires_in": PRESIGNED_URL_EXPIRY})
