@@ -665,10 +665,17 @@ def test_no_findings_key_still_works(wired):
 # Task 3 (authority-flip plan) -- _photos_for_topics pure helper: time-
 # correlates S3 pictures (already resolved to {key, filename, hhmm} by the
 # BUG-01-safe transcript_utils filename extractor) against each topic's
-# 'HH:MM – HH:MM' time_range window. Mirrors lambda_report_generator's
-# correlate_photos_with_transcripts (lambda_report_generator.py:386-402),
-# but keyed on a topic's own display window instead of nearest-transcript
-# proximity.
+# 'HH:MM – HH:MM' time_range window.
+#
+# P2 (2026-07-23 prod-media-binding plan): the helper now DELEGATES to
+# photo_binding (shared with lambda_ingest's report path) and the rule
+# changed -- strict containment stranded every prod photo by 1-2 minutes
+# (topic_photos held 0 rows across all of prod history). New rule: nearest
+# window wins (distance 0 inside it, so the +/-5 min tolerance is subsumed),
+# ties -> lowest topic index, never orphan a photo when the day has topics,
+# cap raised 5 -> 10 with cascade. The exhaustive rule table lives in
+# tests/unit/test_photo_binding.py; the cases below stay here to pin the
+# delegation and the module-level aliases.
 # ---------------------------------------------------------------------------
 
 def _photo(name, hhmm):
@@ -676,19 +683,23 @@ def _photo(name, hhmm):
             "filename": name, "hhmm": hhmm}
 
 
-def test_photo_matches_inside_time_range_only():
+def test_photo_near_window_binds_via_tolerance():
+    # Was test_photo_matches_inside_time_range_only (strict containment): the
+    # 10:06 photo, 1 minute outside the window, used to bind to nothing --
+    # exactly the prod defect. Under the nearest-window rule it binds too.
     topics_list = [{"time_range": "10:00 – 10:05"}]
     inside = _photo("a.jpg", "10:02")
     outside = _photo("b.jpg", "10:06")
 
     result = iw._photos_for_topics([inside, outside], topics_list)
 
-    assert result == {0: [inside]}
+    assert result == {0: [inside, outside]}
 
 
 def test_photo_attaches_to_first_matching_topic_only():
-    # Two topics with overlapping time_range windows -- a photo that falls
-    # inside both must attach ONLY to the first (lowest-index) one.
+    # Two topics with overlapping time_range windows -- a photo inside both
+    # is equidistant (distance 0 from each), so the tie-break sends it to
+    # the lowest-index topic ONLY. Unchanged by the P2 rule change.
     topics_list = [
         {"time_range": "09:00 – 10:00"},
         {"time_range": "09:30 – 11:00"},
@@ -700,17 +711,24 @@ def test_photo_attaches_to_first_matching_topic_only():
     assert result == {0: [photo], 1: []}
 
 
-def test_cap_five_photos_per_topic():
+def test_cap_ten_photos_per_topic():
+    # Was test_cap_five_photos_per_topic: the cap is PHOTOS_PER_TOPIC_CAP=10
+    # (raised from the report-generator's 5). This day has a single topic, so
+    # the 11th photo has nowhere to cascade to and is dropped with a warning.
     topics_list = [{"time_range": "09:00 – 10:00"}]
-    photos = [_photo(f"p{i}.jpg", f"09:1{i}") for i in range(6)]
+    photos = [_photo(f"p{i:02d}.jpg", f"09:{i:02d}") for i in range(11)]
 
     result = iw._photos_for_topics(photos, topics_list)
 
-    assert len(result[0]) == 5
-    assert result[0] == photos[:5]  # first 5, cap does not reorder
+    assert iw.PHOTOS_PER_TOPIC_CAP == 10
+    assert len(result[0]) == 10
+    assert result[0] == photos[:10]  # first 10, cap does not reorder
 
 
 def test_unparseable_time_range_gets_no_photos():
+    # Survives the P2 rule change verbatim: a topic with no parseable window
+    # never joins the candidate set while another topic has one, and the
+    # all-indices result contract is tolerated by .get(i, []).
     topics_list = [
         {"time_range": None},          # missing
         {"time_range": "not a range"},  # unparseable
