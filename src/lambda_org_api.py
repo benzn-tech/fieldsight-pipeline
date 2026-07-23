@@ -282,6 +282,9 @@ def dispatch(conn, event, method, route):
     if route == "/transcripts" and method == "GET":
         return get_org_transcripts(conn, caller, event)
 
+    if route == "/reports/history" and method == "GET":
+        return get_org_report_history(conn, caller, event)
+
     if route == "/rollup/portfolio" and method == "GET":
         return list_portfolio_rollup(conn, caller, event)
 
@@ -1043,6 +1046,8 @@ def get_asset_url(event):
 # are already blocked by the dispatch guard above)
 # ----------------------------------------------------------
 REPORT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# The same date, matched ANYWHERE in an S3 key (report-history rows).
+REPORT_DATE_IN_KEY_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 
 def list_org_observations(conn, caller, event):
@@ -2206,6 +2211,171 @@ def _read_org_transcripts(date, folder, start_time, end_time):
         "speaker_count": len(speakers),
         "total_speaker_segments": len(all_speaker_segs),
     }
+
+
+# ----------------------------------------------------------
+# /reports/history -- Aurora-identity report index.
+#
+# WHY THIS ROUTE EXISTS (S-1 companion, 2026-07-23 security-acl-and-error-
+# sentinel plan). The legacy /api/reports/history
+# (lambda_fieldsight_api.get_report_history) used an empty LIST to mean
+# BOTH "admin/gm -- no filter" AND "this caller can access nothing", and
+# `if allowed_folders:` is falsy for both -- so an Aurora-only account
+# (absent from the legacy DynamoDB fieldsight-users store -> role='viewer',
+# display_name='' -> no accessible users) received EVERY report key in the
+# lake. Proven live on prod: 88 keys spanning every user folder, across
+# unrelated customers. Fixing that correctly leaves those same accounts
+# with an EMPTY Reports page, because the legacy lambda cannot resolve
+# them at all. This route restores the page from Aurora identity -- the
+# same routing-around-the-legacy-identity-store pattern as
+# get_org_transcripts / get_org_dates.
+# ----------------------------------------------------------
+
+REPORT_LAKE_PREFIX = "reports/"
+_MAX_REPORT_HISTORY = 500
+
+
+def _report_key_owner_folder(key):
+    """Owner folder for a lake report key, or None when it has no owner.
+
+    reports/{date}/{folder}/{type}_report.json  -> {folder}
+    reports/{date}/summary_report.json          -> None (whole-lake rollup)
+    reports/{date}/sites/{site}/...             -> None (site rollup)
+
+    Deliberately the SAME derivation the legacy presigner uses after S-2,
+    and it fails the same way: a key whose owner cannot be derived is not
+    authorizable by ownership, so scoped callers never see it. Neither
+    ownerless shape carries a company even in principle (the site segment
+    is a legacy config/user_mapping slug from lambda_report_generator.py,
+    not an Aurora sites.id), which is why deriving one is not attempted."""
+    parts = key.split("/")
+    if len(parts) < 4 or parts[0] != "reports":
+        return None
+    folder = parts[2]
+    if not folder or folder in ("sites", "summary_report.json"):
+        return None
+    return folder
+
+
+def _org_report_folder_scope(conn, caller):
+    """Folder-name scope for the report index, as a THREE-STATE value.
+
+        None      -> unrestricted. Apply no filter.
+        set()     -> DENY ALL. The caller can see nothing.
+        {"A","B"} -> exactly these folders.
+
+    SECURITY (the governing principle of the 2026-07-23 plan): "unrestricted"
+    and "nothing accessible" must never be the same value, and no caller may
+    branch on a bare truthiness test. `None` and `set()` are different values
+    and neither is a list.
+
+    UNRESTRICTED IS NARROWER HERE THAN ON THE LEGACY ENDPOINT. Only a
+    cross-company caller (platform_admin -- acl.is_cross_company, D6) gets
+    None. An ALL-tier *company* admin/gm gets the explicit set of their own
+    company's folders instead, because the lake is multi-tenant and a report
+    key carries no company: "no filter" would hand company A every company-B
+    folder. This is the same reasoning as S-4 on the ownerless presign gate --
+    platform_admin is the sole role for which the absence of company scoping
+    is correct rather than an omission.
+
+    GRADED_ROLES on: the folder set is derived from /timeline's own envelope
+    (scope.visible_scope) so this route can never show more than /timeline --
+    SITE (pm/regional_manager) resolves every author on an in-scope site;
+    SELF+WORKERS (site_manager) and SELF (worker) resolve the envelope's
+    author_ids, which is BUG-25's graded restatement (self + role='worker'
+    members, never fellow site_managers or pms).
+
+    GRADED_ROLES off: the binary rule -- ALL tier (admin/gm) gets the company
+    folder set, everyone else their OWN folder only, deny-all when they have
+    no folder mapping."""
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)
+        if sc["cross_company"]:
+            return None
+        if sc["user_scope"] == "ALL":
+            return _company_folder_names(conn, caller["company_id"])
+        if sc["user_scope"] == "SITE":
+            # author_ids is None for this tier (no per-author filter within
+            # the reach) -- resolve the reach itself into folders rather
+            # than treating "no per-author filter" as "no filter at all".
+            user_ids = memberships.user_ids_for_sites(conn, sc["site_ids"])
+            user_ids = set(user_ids) | {sc["self_user_id"]}
+            return users.folder_names_for_user_ids(conn, user_ids,
+                                                   company_id=caller["company_id"])
+        return users.folder_names_for_user_ids(conn, sc["author_ids"] or set(),
+                                               company_id=caller["company_id"])
+    # ---- GRADED_ROLES off: binary fallback ----
+    if is_cross_company(caller["global_role"]):
+        return None
+    if resolve_scope(caller["global_role"]) == "ALL":
+        return _company_folder_names(conn, caller["company_id"])
+    own = caller.get("folder_name")
+    return {own} if own else set()
+
+
+def _company_folder_names(conn, company_id):
+    return {u["folder_name"] for u in users.list_company_users(conn, company_id)
+            if u.get("folder_name")}
+
+
+def _read_org_report_history(folder_scope, limit):
+    """List the lake's report index, filtered by an ALREADY-RESOLVED folder
+    scope. `folder_scope is None` means unrestricted; callers MUST have
+    short-circuited the deny-all (empty set) case before getting here.
+
+    Row shape is byte-compatible with the legacy endpoint's
+    ({key, type, date, generated_at, size}) so pages/reports.js needs no
+    reshape. A listing failure degrades to an empty list -- never to an
+    unfiltered one."""
+    reports = []
+    try:
+        paginator = s3().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=LAKE_BUCKET, Prefix=REPORT_LAKE_PREFIX):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith("_report.json") or "_debug" in key:
+                    continue
+                if folder_scope is not None:
+                    owner = _report_key_owner_folder(key)
+                    if owner is None or owner not in folder_scope:
+                        continue
+                rtype = ("weekly" if "weekly" in key
+                         else "monthly" if "monthly" in key else "daily")
+                dm = REPORT_DATE_IN_KEY_RE.search(key)
+                reports.append({
+                    "key": key, "type": rtype,
+                    "date": dm.group(1) if dm else "",
+                    "generated_at": obj["LastModified"].isoformat(),
+                    "size": obj["Size"],
+                })
+    except ClientError:
+        # Same degrade-to-empty posture as _list_report_folders: a transient
+        # S3 problem must not 500 the Reports page, and must not fall back
+        # to anything unfiltered either.
+        logger.exception("report history listing failed")
+    reports.sort(key=lambda r: r["date"], reverse=True)
+    return {"reports": reports[:limit]}
+
+
+def get_org_report_history(conn, caller, event):
+    """GET /api/org/reports/history?limit=20 -- Aurora-identity replacement
+    for the legacy /api/reports/history (S-1's leak; see the block comment
+    above). Scoped through _org_report_folder_scope, whose deny-all state is
+    an explicit early return rather than a falsy container."""
+    p = event.get("queryStringParameters") or {}
+    raw_limit = (p.get("limit") or "20").strip()
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        return error("limit must be an integer", 400)
+    if limit < 1 or limit > _MAX_REPORT_HISTORY:
+        return error(f"limit must be between 1 and {_MAX_REPORT_HISTORY}", 400)
+    folder_scope = _org_report_folder_scope(conn, caller)
+    if folder_scope is not None and not folder_scope:
+        # DENY ALL -- return early rather than fall into a filter loop whose
+        # predicate an empty container would silently satisfy.
+        return ok({"reports": []})
+    return ok(_read_org_report_history(folder_scope, limit))
 
 
 def get_org_transcripts(conn, caller, event):
