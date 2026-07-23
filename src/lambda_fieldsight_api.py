@@ -300,6 +300,34 @@ def find_any_report(date, caller=None):
     # with unrestricted, and unlike get_report_history this function can
     # return a full report BODY when exactly one key survives the filter.
     folder_scope = accessible_folder_scope(caller) if caller else None
+    if caller and folder_scope is None:
+        # NO SILENT WIDENING. accessible_folder_scope returns None
+        # ("unrestricted") for admin/gm, but the code this replaced ran
+        # `accessible = get_accessible_users(caller)` for EVERY role --
+        # and for an admin that returns the whole config/user_mapping.json
+        # roster, a NON-empty list, so `if accessible:` was true and the
+        # filter DID run: a folder absent from the mapping (e.g. an
+        # Aurora-provisioned Ben_UCPK) was dropped and the caller got the
+        # 404 envelope. Handing admin/gm a bare None here would widen that
+        # to a 200 carrying the full report BODY -- unacceptable in a PR
+        # whose entire purpose is to narrow. Admin/gm therefore keep the
+        # mapping-derived allowlist, exactly as before.
+        #
+        # Deliberately LOCAL to find_any_report: get_report_history and
+        # get_presigned_url already treated admin/gm as unrestricted
+        # before this branch and must stay byte-identical.
+        mapped = {u['folder_name'] for u in get_accessible_users(caller)}
+        # Empty-mapping edge: load_user_mapping falls back to
+        # {'mapping': {}} whenever the S3 read of config/user_mapping.json
+        # fails, so an admin's derived set can be empty for reasons that
+        # have nothing to do with authorisation. Failing that closed would
+        # be a brand-new availability regression triggered by an unrelated
+        # S3 hiccup, and it is not what the old code did either (an empty
+        # list is falsy -> no filter ran). Fall back to None: identical to
+        # the pre-branch behaviour, and not a fail-open, because admin/gm
+        # are unrestricted in every sibling reader here anyway. Scoped
+        # callers are untouched -- for them an empty set stays deny-all.
+        folder_scope = mapped or None
     if folder_scope is not None and not folder_scope:
         return ok({'message': f'No reports for {date}', 'date': date}, 404)
     try:
@@ -452,7 +480,14 @@ def get_presigned_url(params, caller=None):
     # reports/{date}/sites/... ('sites' explicitly excluded) both took that
     # path: 36 real objects on prod, each a full report body. An
     # undeterminable owner is now a DENY for every non-admin/gm caller.
-    if caller and caller.get('role') not in ('admin', 'gm'):
+    #
+    # The `not caller` leg closes the second half of the same shape: the
+    # guard used to read `if caller and ...`, so an ABSENT identity skipped
+    # the whole block and was served a signed URL unchecked -- "no identity
+    # == unrestricted", precisely what this branch exists to abolish.
+    # Unreachable from lambda_handler today (it always passes a dict), but
+    # the default `caller=None` in the signature keeps the door ajar.
+    if not caller or caller.get('role') not in ('admin', 'gm'):
         # Extract user folder name from common path patterns:
         #   users/{name}/...  audio_segments/{name}/...  transcripts/{name}/...
         #   reports/{date}/{name}/...  web_video/{name}/...
@@ -479,9 +514,12 @@ def get_presigned_url(params, caller=None):
             # same DynamoDB table that does not contain these users at all).
             # That belongs on org-api.
             logger.info("presign denied: no derivable owner for key=%s role=%s",
-                        s3_key, caller.get('role'))
+                        s3_key, caller.get('role') if caller else None)
             return error('Access denied to this media', 403)
-        if not can_access_user_data(caller, target_user):
+        # `not caller` first: with no identity there is nothing to
+        # authorise against, and can_access_user_data would dereference
+        # caller['role'] and raise.
+        if not caller or not can_access_user_data(caller, target_user):
             return error('Access denied to this user\'s media', 403)
     try:
         url = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': s3_key}, ExpiresIn=PRESIGNED_URL_EXPIRY)

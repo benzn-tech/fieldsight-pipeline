@@ -111,7 +111,7 @@ class FakeS3:
     def __init__(self, keys=None):
         self.keys = keys if keys is not None else list(ALL_KEYS)
         self.presigned = []
-        self.got = []
+        self.got = []          # every get_object ATTEMPT, recorded before raising
 
     def get_paginator(self, _op):
         return FakePaginator(self.keys)
@@ -121,7 +121,28 @@ class FakeS3:
         return {"Contents": [{"Key": k, "LastModified": _TS, "Size": 100}
                              for k in self.keys if k.startswith(Prefix)]}
 
+    def head_object(self, Bucket=None, Key=None):
+        """get_dates probes one HEAD per (date, folder) pair inside a bare
+        `except:`. Without this method every probe raised AttributeError,
+        `dates` came back {} for EVERY scoped caller, and
+        test_dates_worker_sees_only_own_dates passed vacuously (a `<=`
+        subset assertion that the empty set satisfies) -- leaving the
+        positive path, 'a scoped caller can still RECEIVE dates',
+        completely unproven."""
+        if Key not in self.keys:
+            raise KeyError(Key)
+        return {"ContentLength": 100, "LastModified": _TS}
+
     def get_object(self, Bucket=None, Key=None):
+        """Body reads are RECORDED in self.got, then rejected.
+
+        The recording is the load-bearing half. find_any_report wraps its
+        body read in `except Exception: pass` and AssertionError IS an
+        Exception, so the raise alone is swallowed there -- the buggy
+        pre-fix code run against this fake still returned 200. Tests that
+        must prove no content escaped therefore assert `fake.got == []`,
+        which works through a bare except. The raise only fails loudly in
+        callers that do not swallow."""
         self.got.append(Key)
         raise AssertionError(f"unexpected report body read: {Key}")
 
@@ -221,12 +242,15 @@ def test_find_any_report_denies_caller_with_empty_scope(monkeypatch):
     one can return a full report BODY when exactly one key survives
     (:285-290). Deny-all must yield the 404 envelope, not a report.
 
-    FakeS3.get_object raises AssertionError, so a regression that reaches
-    the body read fails loudly rather than silently returning content."""
-    wire(monkeypatch, keys=["reports/2026-07-20/Otto_Other/daily_report.json"])
+    The 404 envelope alone is what catches a regression here: the body
+    read sits under `except Exception: pass`, so FakeS3.get_object's
+    AssertionError would be swallowed. `fake.got == []` is the assertion
+    that actually proves no content was even fetched."""
+    fake = wire(monkeypatch, keys=["reports/2026-07-20/Otto_Other/daily_report.json"])
     res = fapi.find_any_report("2026-07-20", VIEWER_CALLER)
     assert res["statusCode"] == 404
     assert "available_users" not in body_of(res)
+    assert fake.got == []
 
 
 def test_find_any_report_admin_unaffected(monkeypatch):
@@ -237,13 +261,51 @@ def test_find_any_report_admin_unaffected(monkeypatch):
     assert sorted(body_of(res)["available_users"]) == ["Ben_Test", "Otto_Other"]
 
 
+def test_find_any_report_admin_does_not_widen_to_unmapped_folders(monkeypatch):
+    """NO SILENT WIDENING (the delta test_find_any_report_admin_unaffected
+    cannot see, because both of its fixtures ARE in MAPPING).
+
+    Before this branch admin/gm went through `get_accessible_users` too,
+    which returns the config/user_mapping.json roster -- a NON-empty list
+    for an admin, so the filter DID run and a folder absent from the
+    mapping was dropped. If admin/gm get the bare `None` scope instead,
+    this lake of exactly one unmapped folder collapses to len(reports)==1
+    and find_any_report returns the full report BODY. A narrowing PR must
+    not widen the one function that can serve content."""
+    fake = wire(monkeypatch, keys=["reports/2026-07-20/Ben_UCPK/daily_report.json"])
+    res = fapi.find_any_report("2026-07-20", ADMIN_CALLER)
+    assert res["statusCode"] == 404
+    assert "available_users" not in body_of(res)
+    assert fake.got == []          # no body read attempted, let alone served
+
+
+def test_find_any_report_admin_with_unreadable_mapping_stays_unrestricted(monkeypatch):
+    """The empty-mapping edge of the parity fix, pinned deliberately.
+
+    load_user_mapping falls back to {'mapping': {}} whenever the S3 read
+    of config/user_mapping.json fails, so an admin's mapping-derived set
+    can be empty for reasons that have nothing to do with authorisation.
+    Turning that into deny-all would be a NEW availability regression
+    caused by an unrelated S3 hiccup, and it is not what the old code did
+    either (an empty list was falsy -> no filter). Admin/gm therefore fall
+    back to unrestricted, exactly as before. Non-admins are unaffected:
+    for them an empty set stays deny-all (see the VIEWER test above)."""
+    wire(monkeypatch, keys=["reports/2026-07-20/Ben_UCPK/daily_report.json",
+                            "reports/2026-07-20/Otto_Other/daily_report.json"])
+    monkeypatch.setattr(fapi, "load_user_mapping", lambda: {"mapping": {}, "sites": {}})
+    res = fapi.find_any_report("2026-07-20", ADMIN_CALLER)
+    assert res["statusCode"] == 200
+    assert sorted(body_of(res)["available_users"]) == ["Ben_UCPK", "Otto_Other"]
+
+
 def test_find_any_report_worker_sees_only_own_folder(monkeypatch):
     """A scoped caller with a NON-empty scope still filters correctly --
     the fix must not turn 'restricted' into 'unrestricted' either."""
-    wire(monkeypatch, keys=["reports/2026-07-20/Otto_Other/daily_report.json",
-                            "reports/2026-07-20/Ada_Worker/daily_report.json"])
+    fake = wire(monkeypatch, keys=["reports/2026-07-20/Otto_Other/daily_report.json",
+                                   "reports/2026-07-20/Ada_Worker/daily_report.json"])
     res = fapi.find_any_report("2026-07-20", WORKER_CALLER)
     assert res["statusCode"] == 404
+    assert fake.got == []
 
 
 # ---------------------------------------------------------------
@@ -328,6 +390,30 @@ def test_presign_ownerless_allowed_for_admin(monkeypatch):
     assert res["statusCode"] == 200
 
 
+def test_presign_absent_caller_denied_for_ownerless_key(monkeypatch):
+    """ABSENT IDENTITY == UNRESTRICTED, the very shape this branch set out
+    to abolish, still living in the function it just hardened: the guard
+    read `if caller and caller.get('role') not in ('admin','gm')`, so
+    caller=None skipped the ENTIRE permission block and got a signed URL
+    for a whole-company rollup. Unreachable from lambda_handler today
+    (it always passes a dict), which is exactly why it needs a test."""
+    fake = wire(monkeypatch)
+    res = fapi.get_presigned_url({"key": "reports/2026-07-20/summary_report.json"}, None)
+    assert res["statusCode"] == 403
+    assert fake.presigned == []
+
+
+def test_presign_absent_caller_denied_for_owned_key(monkeypatch):
+    """The same rule for a key whose owner IS derivable: with no identity
+    there is nothing to authorise against, so deny (and never reach
+    can_access_user_data, which would dereference caller['role'])."""
+    fake = wire(monkeypatch)
+    res = fapi.get_presigned_url(
+        {"key": "users/Ben_Test/pictures/2026-07-20/a.jpg"}, None)
+    assert res["statusCode"] == 403
+    assert fake.presigned == []
+
+
 def test_presign_disallowed_prefix_still_403(monkeypatch):
     wire(monkeypatch)
     assert fapi.get_presigned_url(
@@ -366,6 +452,32 @@ def test_dates_viewer_with_no_mapping_returns_empty(monkeypatch):
 
 
 def test_dates_worker_sees_only_own_dates(monkeypatch):
+    """THE POSITIVE PATH (previously unproven anywhere in the suite).
+
+    FakeS3 used to define no head_object, so every scoped lookup
+    AttributeError'd inside get_dates' bare `except:`, `dates` was always
+    {}, and `set(dates.keys()) <= {"2026-07-20"}` was satisfied by the
+    empty set -- the test could not tell 'correctly scoped' from
+    'totally broken'. Equality, so a scoped caller must actually RECEIVE
+    its own date."""
     wire(monkeypatch)
     dates = body_of(fapi.get_dates({"months": "2"}, WORKER_CALLER))["dates"]
-    assert set(dates.keys()) <= {"2026-07-20"}
+    assert set(dates.keys()) == {"2026-07-20"}
+    assert dates["2026-07-20"]["hasReport"] is True
+
+
+def test_dates_admin_site_filter_with_no_mapped_users_returns_empty(monkeypatch):
+    """LIVE BEHAVIOUR CHANGE, pinned deliberately (correct, keep it).
+
+    `elif site:` is evaluated BEFORE `elif role in ('admin','gm')`, so an
+    admin passing ?site= takes the scoped branch. get_accessible_users
+    filters against config/user_mapping.json's legacy-only site ids, so an
+    Aurora-provisioned site yields [] -> the new deny-all early return ->
+    {} , where before it fell through the falsy-empty-list hole and
+    returned EVERY date enriched from the unscoped summary rollup. An
+    admin asking about a site the legacy mapping has never heard of gets
+    nothing rather than everything."""
+    wire(monkeypatch)
+    res = fapi.get_dates({"months": "2", "site": "s-aurora-99"}, ADMIN_CALLER)
+    assert res["statusCode"] == 200
+    assert body_of(res)["dates"] == {}
