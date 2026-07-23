@@ -232,7 +232,13 @@ def write_extraction_items(date, user_folder, extraction_key):
                 # rollback.
                 time_range=t.get("time_range"), participants=t.get("participants"),
                 work_class=_wc, work_confidence=_wconf, is_mixed=(t.get("is_mixed") is True),
-                photos=[{"s3_key": p["key"], "caption_text": None} for p in matched_photos],
+                # video-keyframe plan (Task 4): re-bound synthetic keyframes
+                # (filename carries the '_kf_' marker) keep an "Auto keyframe"
+                # caption so the UI can still distinguish them after an
+                # item-writer re-run; real photos stay caption-less (None).
+                photos=[{"s3_key": p["key"],
+                         "caption_text": "Auto keyframe" if "_kf_" in p["filename"] else None}
+                        for p in matched_photos],
             )
             # Task 2 (programme-impact-link plan) -- persist this topic's
             # rich extraction findings in the SAME transaction as the topic

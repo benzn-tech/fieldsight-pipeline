@@ -871,6 +871,32 @@ def test_item_writer_upserts_topic_photos(wired):
     assert captured[0]["photos"] == [{"s3_key": photo_key, "caption_text": None}]
 
 
+def test_item_writer_captions_kf_files_on_rebind(wired):
+    # video-keyframe plan, Task 4: when item-writer re-lists the pictures
+    # prefix and re-binds a synthetic keyframe (its filename parses to a
+    # mid-topic time inside the window), the photo mapping must carry
+    # caption_text "Auto keyframe" for _kf_ files and None for real photos.
+    prefix = "users/Jarley_Trainor/pictures/2026-07-06/"
+    kf_key = prefix + "Benl1_2026-07-06_10-03-00_kf_s100000.jpg"   # parses to 10:03, in window
+    normal_key = prefix + "Benl1_2026-07-06_10-02-00.jpg"           # real photo at 10:02
+    wired.setattr(iw, "_s3_client", FakeS3({
+        EXTRACTION_KEY: json.dumps(make_extraction()),   # one topic, 10:00 – 10:05
+        kf_key: b"", normal_key: b"",
+    }))
+    captured = []
+    wired.setattr(
+        iw.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            captured.append(kw) or {"id": "topic-uuid-0"},
+    )
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert len(captured) == 1
+    photos = {p["s3_key"]: p["caption_text"] for p in captured[0]["photos"]}
+    assert photos == {kf_key: "Auto keyframe", normal_key: None}
+
+
 def test_missing_pictures_prefix_is_noop(wired):
     # wired's default FakeS3 only has EXTRACTION_KEY -- the pictures prefix
     # listing returns zero Contents (empty prefix -> no-op, not a crash).
