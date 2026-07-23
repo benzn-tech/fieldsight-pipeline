@@ -4791,3 +4791,297 @@ def test_classification_feedback_rejects_freetext_topic_category_400(wired):
         "topic_id": "t-9", "human_verdict": "confirm_non_work",
         "topic_category": "he mentioned his wife's surgery"}), None)
     assert res["statusCode"] == 400 and called == []
+
+
+# ----------------------------------------------------------
+# /reports/history -- Aurora-identity report index (S-1 companion route,
+# 2026-07-23 security-acl-and-error-sentinel plan).
+#
+# WHY THIS ROUTE EXISTS. S-1 closed a live prod leak in the LEGACY
+# /api/reports/history (lambda_fieldsight_api.get_report_history): an empty
+# list meant BOTH "admin/gm, no filter" and "this caller can access
+# nothing", and `if allowed_folders:` is falsy for both, so an Aurora-only
+# account received every report key in the lake (88 keys, every user
+# folder). Closing it correctly leaves those accounts with an EMPTY
+# Reports page, because the legacy lambda resolves identity from a
+# DynamoDB table they are not in. This route restores the page from
+# Aurora identity, scoped to what the caller may actually see.
+#
+# SENTINEL DISCIPLINE (the plan's governing principle): the folder scope
+# is THREE-STATE -- None = unrestricted, set() = deny-all with an explicit
+# early return, {folders} = an allowlist. "Unrestricted" and "nothing
+# accessible" must never again be the same value.
+#
+# COMPANY SCOPING: unlike the legacy endpoint, an ALL-tier *company*
+# admin/gm does NOT get None. The lake is multi-tenant and a report key
+# carries no company, so an ALL-tier caller is given the explicit set of
+# their own company's folders. None is reserved for cross-company
+# (platform_admin) -- the sole role for which the absence of company
+# scoping is correct rather than an omission (repositories/scope.py
+# :43-46, D6). Same reasoning as S-4 on the ownerless presign gate.
+# ----------------------------------------------------------
+
+ORG_REPORT_KEYS = [
+    "reports/2026-07-20/Ben_UCPK/daily_report.json",
+    "reports/2026-07-19/Site_Worker/daily_report.json",
+    "reports/2026-07-18/Other_Co_Person/daily_report.json",
+    "reports/2026-07-17/Ben_UCPK/weekly_report.json",
+    "reports/2026-07-20/summary_report.json",                     # ownerless
+    "reports/2026-07-20/sites/uc-pk/weekly_report.json",          # ownerless
+    "reports/2026-07-20/Ben_UCPK/daily_report_debug.json",        # debug companion
+    "reports/2026-07-20/Ben_UCPK/notes.txt",                      # not a report
+]
+
+
+def _wire_report_lake(fake, keys=None):
+    ts = _dt.datetime(2026, 7, 20, 12, 0, 0)
+    fake.list_objects_response = {
+        "Contents": [{"Key": k, "LastModified": ts, "Size": 100}
+                     for k in (ORG_REPORT_KEYS if keys is None else keys)]}
+
+
+def _report_keys(res):
+    return [r["key"] for r in body_of(res)["reports"]]
+
+
+def _history_caller(wired, **over):
+    wired.setattr(org.users, "get_user_by_sub", lambda conn, sub: {**CALLER, **over})
+
+
+def _history_graded(wired, folder, user_scope, author_ids=None, site_ids=None,
+                    cross_company=False, global_role="site_manager"):
+    """Seed the visible_scope envelope directly on the stubbed caller dict.
+    visible_scope memoizes on caller['_visible_scope'] (scope.py:39-41), so
+    no memberships/sites stubbing is needed for the envelope itself."""
+    wired.setattr(org, "GRADED_ROLES", True)
+    envelope = {
+        "site_ids": set(site_ids or ()), "user_scope": user_scope,
+        "author_ids": set(author_ids) if author_ids is not None else None,
+        "self_folder": folder, "self_user_id": "u-self",
+        "company_id": CALLER["company_id"], "cross_company": cross_company,
+    }
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "id": "u-self",
+                                     "global_role": global_role,
+                                     "folder_name": folder,
+                                     "_visible_scope": envelope})
+
+
+def test_org_report_history_deny_all_is_not_the_same_value_as_unrestricted(wired):
+    """The sentinel itself, asserted directly on the org helper -- deny-all
+    and unrestricted must never be equal. `[] == []` was the whole S-1 bug
+    and this route must not reintroduce it in a new file."""
+    conn = FakeConn()
+    unrestricted = org._org_report_folder_scope(
+        conn, {**CALLER, "global_role": "platform_admin", "folder_name": None})
+    deny_all = org._org_report_folder_scope(
+        conn, {**CALLER, "global_role": "worker", "folder_name": None})
+    assert unrestricted is None
+    assert deny_all == set()
+    assert unrestricted != deny_all
+
+
+def test_org_report_history_caller_without_folder_gets_zero_reports(presign_wired):
+    """The exact shape of the live prod leak, on the new route: a caller
+    whose folder scope is EMPTY must get ZERO reports, never the lake."""
+    wired, fake = presign_wired
+    _history_caller(wired, global_role="worker", folder_name=None)
+    _wire_report_lake(fake)
+    res = org.lambda_handler(make_event("GET", "/api/org/reports/history"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["reports"] == []
+
+
+def test_org_report_history_non_all_caller_sees_only_own_folder(presign_wired):
+    wired, fake = presign_wired
+    _history_caller(wired, global_role="worker", folder_name="Ben_UCPK")
+    _wire_report_lake(fake)
+    res = org.lambda_handler(make_event("GET", "/api/org/reports/history"), None)
+    assert res["statusCode"] == 200
+    assert _report_keys(res) == ["reports/2026-07-20/Ben_UCPK/daily_report.json",
+                                 "reports/2026-07-17/Ben_UCPK/weekly_report.json"]
+
+
+def test_org_report_history_excludes_ownerless_and_debug_and_non_reports(presign_wired):
+    """Ownerless rollups (summary_report.json, sites/...) have no owner
+    folder to authorize against -- excluded for every scoped caller, same
+    fail-closed rule as S-2's presigner. _debug companions and non-report
+    objects are excluded too (legacy parity)."""
+    wired, fake = presign_wired
+    _history_caller(wired, global_role="worker", folder_name="Ben_UCPK")
+    _wire_report_lake(fake)
+    got = _report_keys(org.lambda_handler(
+        make_event("GET", "/api/org/reports/history"), None))
+    assert not any("summary_report" in k or "/sites/" in k for k in got)
+    assert not any("_debug" in k or k.endswith(".txt") for k in got)
+
+
+def test_org_report_history_row_shape_matches_legacy(presign_wired):
+    """pages/reports.js consumes {key, type, date, generated_at, size} --
+    the org route must be a drop-in for the legacy body."""
+    wired, fake = presign_wired
+    _history_caller(wired, global_role="worker", folder_name="Ben_UCPK")
+    _wire_report_lake(fake)
+    row = body_of(org.lambda_handler(
+        make_event("GET", "/api/org/reports/history"), None))["reports"][0]
+    assert set(row) == {"key", "type", "date", "generated_at", "size"}
+    assert row["type"] == "daily" and row["date"] == "2026-07-20"
+    assert row["size"] == 100 and row["generated_at"].startswith("2026-07-20T")
+
+
+def test_org_report_history_weekly_type_and_newest_first_and_limit(presign_wired):
+    wired, fake = presign_wired
+    _history_caller(wired, global_role="worker", folder_name="Ben_UCPK")
+    _wire_report_lake(fake)
+    b = body_of(org.lambda_handler(
+        make_event("GET", "/api/org/reports/history", params={"limit": "1"}), None))
+    assert len(b["reports"]) == 1
+    assert b["reports"][0]["date"] == "2026-07-20"          # newest first
+    b2 = body_of(org.lambda_handler(
+        make_event("GET", "/api/org/reports/history"), None))
+    assert b2["reports"][1]["type"] == "weekly"
+
+
+def test_org_report_history_rejects_bad_limit(presign_wired):
+    wired, fake = presign_wired
+    _history_caller(wired, global_role="worker", folder_name="Ben_UCPK")
+    _wire_report_lake(fake)
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/reports/history", params={"limit": "nope"}), None)
+    assert res["statusCode"] == 400
+
+
+def test_org_report_history_company_admin_is_company_scoped_not_unrestricted(presign_wired):
+    """An ALL-tier COMPANY admin gets an explicit folder allowlist built
+    from their own company's users -- NOT None. A report key carries no
+    company, so 'no filter' on a multi-tenant lake would hand company A
+    every company-B folder. Other_Co_Person is not in the company."""
+    wired, fake = presign_wired
+    _history_caller(wired, global_role="admin", folder_name="Ada_Admin")
+    wired.setattr(org.users, "list_company_users",
+                  lambda conn, cid: [{"folder_name": "Ben_UCPK"},
+                                     {"folder_name": "Site_Worker"},
+                                     {"folder_name": None}])
+    _wire_report_lake(fake)
+    got = _report_keys(org.lambda_handler(
+        make_event("GET", "/api/org/reports/history"), None))
+    assert "reports/2026-07-20/Ben_UCPK/daily_report.json" in got
+    assert "reports/2026-07-19/Site_Worker/daily_report.json" in got
+    assert "reports/2026-07-18/Other_Co_Person/daily_report.json" not in got
+    assert not any("summary_report" in k for k in got)
+
+
+def test_org_report_history_platform_admin_is_unrestricted(presign_wired):
+    """cross_company (platform_admin) is the SOLE unrestricted caller --
+    the only role for which absent company scoping is correct (D6)."""
+    wired, fake = presign_wired
+    _history_caller(wired, global_role="platform_admin", folder_name="Plat_Admin")
+    _wire_report_lake(fake)
+    got = _report_keys(org.lambda_handler(
+        make_event("GET", "/api/org/reports/history"), None))
+    assert "reports/2026-07-18/Other_Co_Person/daily_report.json" in got
+    assert "reports/2026-07-20/summary_report.json" in got
+    assert not any("_debug" in k for k in got)
+
+
+def test_org_report_history_graded_site_manager_sees_self_plus_workers(presign_wired):
+    """SELF+WORKERS (site_manager): own folder + role='worker' members on
+    the caller's sites -- BUG-25's graded restatement, resolved through the
+    SAME author_ids envelope /timeline uses."""
+    wired, fake = presign_wired
+    _history_graded(wired, "Ben_UCPK", "SELF+WORKERS",
+                    author_ids={"u-self", "u-worker"}, site_ids={"site-1"})
+    wired.setattr(org.users, "folder_names_for_user_ids",
+                  lambda conn, ids, company_id=None: {"Ben_UCPK", "Site_Worker"})
+    _wire_report_lake(fake)
+    got = _report_keys(org.lambda_handler(
+        make_event("GET", "/api/org/reports/history"), None))
+    assert "reports/2026-07-20/Ben_UCPK/daily_report.json" in got
+    assert "reports/2026-07-19/Site_Worker/daily_report.json" in got
+    assert "reports/2026-07-18/Other_Co_Person/daily_report.json" not in got
+
+
+def test_org_report_history_graded_pm_sees_members_of_in_scope_sites(presign_wired):
+    """SITE (pm/regional_manager): every author on an in-scope site.
+    author_ids is None for this tier, so the folder set comes from the
+    site membership roster -- never from 'no filter'."""
+    wired, fake = presign_wired
+    _history_graded(wired, "Neil_Blunden", "SITE", author_ids=None,
+                    site_ids={"site-1"}, global_role="pm")
+    wired.setattr(org.memberships, "user_ids_for_sites",
+                  lambda conn, site_ids: {"u-ben", "u-worker"})
+    wired.setattr(org.users, "folder_names_for_user_ids",
+                  lambda conn, ids, company_id=None: {"Ben_UCPK", "Site_Worker"})
+    _wire_report_lake(fake)
+    got = _report_keys(org.lambda_handler(
+        make_event("GET", "/api/org/reports/history"), None))
+    assert "reports/2026-07-20/Ben_UCPK/daily_report.json" in got
+    assert "reports/2026-07-18/Other_Co_Person/daily_report.json" not in got
+
+
+def test_org_report_history_graded_worker_sees_self_only(presign_wired):
+    wired, fake = presign_wired
+    _history_graded(wired, "Site_Worker", "SELF", author_ids={"u-self"},
+                    global_role="worker")
+    wired.setattr(org.users, "folder_names_for_user_ids",
+                  lambda conn, ids, company_id=None: {"Site_Worker"})
+    _wire_report_lake(fake)
+    got = _report_keys(org.lambda_handler(
+        make_event("GET", "/api/org/reports/history"), None))
+    assert got == ["reports/2026-07-19/Site_Worker/daily_report.json"]
+
+
+def test_org_report_history_graded_cross_company_is_unrestricted(presign_wired):
+    wired, fake = presign_wired
+    _history_graded(wired, "Plat_Admin", "ALL", author_ids=None,
+                    cross_company=True, global_role="platform_admin")
+    _wire_report_lake(fake)
+    got = _report_keys(org.lambda_handler(
+        make_event("GET", "/api/org/reports/history"), None))
+    assert "reports/2026-07-18/Other_Co_Person/daily_report.json" in got
+
+
+def test_org_report_history_graded_all_scope_company_admin_still_company_scoped(presign_wired):
+    """GRADED on, ALL tier, NOT cross-company: still an explicit company
+    allowlist. The graded envelope must not become a back door to the
+    unrestricted branch."""
+    wired, fake = presign_wired
+    _history_graded(wired, "Ada_Admin", "ALL", author_ids=None,
+                    cross_company=False, global_role="admin")
+    wired.setattr(org.users, "list_company_users",
+                  lambda conn, cid: [{"folder_name": "Ben_UCPK"}])
+    _wire_report_lake(fake)
+    got = _report_keys(org.lambda_handler(
+        make_event("GET", "/api/org/reports/history"), None))
+    assert got == ["reports/2026-07-20/Ben_UCPK/daily_report.json",
+                   "reports/2026-07-17/Ben_UCPK/weekly_report.json"]
+
+
+def test_org_report_history_graded_off_binary_fallback_own_folder_only(presign_wired):
+    """GRADED_ROLES=False (module default in unit tests): the binary rule
+    -- non-ALL callers read their OWN folder only."""
+    wired, fake = presign_wired
+    _history_caller(wired, global_role="site_manager", folder_name="Ben_UCPK")
+    wired.setattr(org.scope, "visible_scope",
+                  lambda conn, caller: (_ for _ in ()).throw(
+                      AssertionError("graded scope used with GRADED_ROLES off")))
+    _wire_report_lake(fake)
+    got = _report_keys(org.lambda_handler(
+        make_event("GET", "/api/org/reports/history"), None))
+    assert got == ["reports/2026-07-20/Ben_UCPK/daily_report.json",
+                   "reports/2026-07-17/Ben_UCPK/weekly_report.json"]
+
+
+def test_org_report_history_s3_failure_degrades_to_empty(presign_wired):
+    """A lake listing failure must not 500 the Reports page -- and must
+    not fall back to anything unfiltered either."""
+    wired, fake = presign_wired
+    _history_caller(wired, global_role="worker", folder_name="Ben_UCPK")
+
+    def boom(_op):
+        raise ClientError({"Error": {"Code": "AccessDenied"}}, "ListObjectsV2")
+
+    wired.setattr(fake, "get_paginator", boom)
+    res = org.lambda_handler(make_event("GET", "/api/org/reports/history"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["reports"] == []
