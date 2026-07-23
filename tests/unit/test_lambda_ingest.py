@@ -818,3 +818,68 @@ class TestResolveCompany:
         monkeypatch.setattr(ing.companies, "get_company_by_name",
                             lambda conn, name: {"id": "internal-co", "name": name})
         assert ing.resolve_company(FakeConn(), "Legacy_Device")["id"] == "internal-co"
+
+
+# ---------------------------------------------------------------------------
+# P4 (2026-07-23 prod-media-binding plan) -- the report-ingest path binds
+# photos too. ingest_report called topics.upsert_topic without photos=, so
+# report-sourced Aurora topics (the zero-extraction fallback day, the only
+# day this branch still runs post authority-flip) could never carry photos.
+# Binding delegates to the SAME shared matcher the item-writer uses
+# (photo_binding), so both write paths share one rule.
+# ---------------------------------------------------------------------------
+
+PICTURES_PREFIX = "users/Jarley_Trainor/pictures/2026-03-02/"
+PHOTO_KEY = PICTURES_PREFIX + "Benl1_2026-03-02_09-02-00.jpg"
+
+
+def test_ingest_binds_photos_to_report_topics(wired):
+    # make_report()'s one topic has time_range "09:00 - 09:05"; the photo's
+    # filename encodes 09:02 (BUG-01-safe extraction), inside that window.
+    wired.setattr(ing, "_s3_client", FakeS3({
+        REPORT_KEY: json.dumps(make_report()),
+        PHOTO_KEY: b"",
+    }))
+    captured = []
+    wired.setattr(
+        ing.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            captured.append(kw) or {"id": "topic-uuid-0"},
+    )
+
+    result = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert result["topics"] == 1
+    assert len(captured) == 1
+    assert captured[0]["photos"] == [{"s3_key": PHOTO_KEY, "caption_text": None}]
+
+
+def test_ingest_missing_pictures_prefix_is_noop(wired):
+    # wired's default FakeS3 only has REPORT_KEY -- the pictures listing
+    # returns zero Contents (empty prefix -> photos=[], not a crash).
+    captured = []
+    wired.setattr(
+        ing.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            captured.append(kw) or {"id": "topic-uuid-0"},
+    )
+
+    ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert len(captured) == 1
+    assert captured[0]["photos"] == []
+
+
+def test_ingest_defer_day_lists_no_pictures(wired):
+    # AUTHORITY_FLIP defer branch writes no report topics -> it must not
+    # spend an S3 LIST on the pictures prefix either.
+    wired.setattr(ing, "AUTHORITY_FLIP", True)
+    wired.setattr(ing.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    calls = []
+    wired.setattr(ing, "_list_report_pictures",
+                  lambda *a, **k: calls.append(a) or [])
+
+    result = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert result["topics"] == 0
+    assert calls == []
