@@ -1,17 +1,19 @@
 """
-Tests for src/photo_binding.py — P2, 2026-07-23 prod-media-binding plan (TDD).
+Tests for src/photo_binding.py.
 
 Style mirrors tests/unit/test_lambda_item_writer.py: plain functions plus a
 `_photo` fixture builder; the matcher is pure so no FakeConn/FakeS3 is needed
 except for the S3 lister at the bottom of the file.
 
-The decided rule (user-approved): ±5 min tolerance around each topic window
-PLUS a nearest-topic fallback for otherwise-orphaned photos — a photo must
-never end up orphaned when the day has at least one topic. Both clauses
-collapse into one deterministic rule: the nearest window wins (distance 0
-when inside the window), ties -> lowest topic index; no parseable window on
-any topic -> topic 0; per-topic cap PHOTOS_PER_TOPIC_CAP with a deterministic
-cascade to the next-nearest topic that still has headroom.
+The current rule (2026-07-24 correction, user-approved -- supersedes the
+2026-07-23 P2 "nearest-wins, never orphan" rule): a photo binds to a topic
+only if it is inside the topic's time_range window, or overreaches either
+edge by at most PHOTO_TOLERANCE_MIN (2) minutes. Beyond that it binds to
+NOTHING -- there is no never-orphan fallback anymore. Among qualifying
+topics, nearest wins; ties -> lowest topic index. A topic with no parseable
+window never competes and always resolves to an empty list. Per-topic cap
+PHOTOS_PER_TOPIC_CAP with a deterministic cascade to the next-nearest
+QUALIFYING topic that still has headroom.
 """
 import photo_binding as pb
 
@@ -38,18 +40,38 @@ def test_photo_within_tolerance_binds():
     assert pb.photos_for_topics([p], topics) == {0: [p]}
 
 
-def test_photo_beyond_tolerance_still_binds_to_nearest():
-    # Orphan fallback: 10:40 photo vs a 10:39-10:39 window 1 min away and a
-    # 12:12-12:13 window ~92 min away -> nearest wins.
+def test_photo_at_tolerance_edge_binds():
+    # Exactly PHOTO_TOLERANCE_MIN (2) minutes past the edge still qualifies.
+    topics = [{"time_range": "10:00 – 10:05"}]
+    p = _photo("a.jpg", "10:07")            # distance == 2
+    assert pb.photos_for_topics([p], topics) == {0: [p]}
+
+
+def test_photo_past_tolerance_edge_binds_to_nothing():
+    # One minute beyond the 2-min cap: no longer qualifies for this topic.
+    topics = [{"time_range": "10:00 – 10:05"}]
+    p = _photo("a.jpg", "10:08")            # distance == 3
+    assert pb.photos_for_topics([p], topics) == {0: []}
+
+
+def test_photo_beyond_tolerance_binds_to_nothing():
+    # Was test_photo_beyond_tolerance_still_binds_to_nearest (unbounded
+    # nearest-wins). Under the 2026-07-24 rule a photo further than
+    # PHOTO_TOLERANCE_MIN from every window binds to nothing, even though
+    # one topic is still "nearest": 10:45 is 6 min from topic 0's window and
+    # ~87 min from topic 1's -- neither qualifies.
     topics = [{"time_range": "10:39 – 10:39"}, {"time_range": "12:12 – 12:13"}]
-    p = _photo("a.jpg", "10:40")
-    assert pb.photos_for_topics([p], topics) == {0: [p], 1: []}
+    p = _photo("a.jpg", "10:45")
+    assert pb.photos_for_topics([p], topics) == {0: [], 1: []}
 
 
-def test_far_orphan_binds_to_nearest_topic():
+def test_far_photo_binds_to_nothing():
+    # Was test_far_orphan_binds_to_nearest_topic (unbounded nearest-wins).
+    # Now: both windows are far beyond the 2-min cap -> no binding at all,
+    # not "bind to the less-far one".
     topics = [{"time_range": "08:00 – 08:10"}, {"time_range": "15:00 – 15:10"}]
     p = _photo("a.jpg", "13:00")            # 290 min from t0's end, 120 from t1's start
-    assert pb.photos_for_topics([p], topics) == {0: [], 1: [p]}
+    assert pb.photos_for_topics([p], topics) == {0: [], 1: []}
 
 
 def test_tie_breaks_to_lowest_index():
@@ -59,10 +81,13 @@ def test_tie_breaks_to_lowest_index():
     assert pb.photos_for_topics([p], topics) == {0: [p], 1: []}
 
 
-def test_no_parseable_windows_binds_to_first_topic():
+def test_no_parseable_windows_binds_to_nothing():
+    # Was test_no_parseable_windows_binds_to_first_topic (never-orphan
+    # fallback). Now: no topic has a window within 2 min of anything (there
+    # is no window at all), so the photo binds to nothing -- not topic 0.
     topics = [{"time_range": None}, {"time_range": "not a range"}]
     p = _photo("a.jpg", "09:30")
-    assert pb.photos_for_topics([p], topics) == {0: [p], 1: []}
+    assert pb.photos_for_topics([p], topics) == {0: [], 1: []}
 
 
 def test_unparseable_window_topic_never_competes():
@@ -96,8 +121,14 @@ def test_photo_without_hhmm_is_skipped():
 
 
 def test_cap_overflow_cascades_to_next_nearest():
+    # The two windows touch at 10:00 (09:00-10:00 / 10:00-11:00), so a photo
+    # at exactly 10:00 is inside BOTH (distance 0 for each) and both qualify
+    # -- unlike a photo merely near the boundary, which would only qualify
+    # under the 2-min tolerance for one side. Tie-break sends the first 10
+    # (input order) to topic 0; the cap sends the overflow to topic 1, which
+    # still qualifies, rather than dropping them.
     topics = [{"time_range": "09:00 – 10:00"}, {"time_range": "10:00 – 11:00"}]
-    photos = [_photo(f"p{i:02d}.jpg", f"09:{i:02d}") for i in range(12)]
+    photos = [_photo(f"p{i:02d}.jpg", "10:00") for i in range(12)]
     result = pb.photos_for_topics(photos, topics)
     assert len(result[0]) == pb.PHOTOS_PER_TOPIC_CAP        # first 10 in input order
     assert result[0] == photos[:10]

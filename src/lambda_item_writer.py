@@ -103,10 +103,12 @@ def _parse_extraction_key(key):
 # circular, since this module imports lambda_ingest for the identity
 # bridge. The rule also changed there: strict containment against the
 # topic's time_range stranded every prod photo by 1-2 minutes
-# (topic_photos: 0 rows across all of prod history), so binding is now
-# nearest-window with a never-orphan fallback -- see photo_binding's
-# docstring. The aliases below keep the historical private names
-# importable for existing callers and tests.
+# (topic_photos: 0 rows across all of prod history). 2026-07-24 correction:
+# binding is bounded-tolerance (inside the window, or within
+# PHOTO_TOLERANCE_MIN=2 min of an edge; beyond that, no binding at all --
+# the never-orphan fallback was removed) -- see photo_binding's docstring.
+# The aliases below keep the historical private names importable for
+# existing callers and tests.
 # ----------------------------------------------------------
 
 def _list_pictures(prefix):

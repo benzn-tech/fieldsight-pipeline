@@ -670,12 +670,15 @@ def test_no_findings_key_still_works(wired):
 # P2 (2026-07-23 prod-media-binding plan): the helper now DELEGATES to
 # photo_binding (shared with lambda_ingest's report path) and the rule
 # changed -- strict containment stranded every prod photo by 1-2 minutes
-# (topic_photos held 0 rows across all of prod history). New rule: nearest
-# window wins (distance 0 inside it, so the +/-5 min tolerance is subsumed),
-# ties -> lowest topic index, never orphan a photo when the day has topics,
-# cap raised 5 -> 10 with cascade. The exhaustive rule table lives in
-# tests/unit/test_photo_binding.py; the cases below stay here to pin the
-# delegation and the module-level aliases.
+# (topic_photos held 0 rows across all of prod history).
+#
+# 2026-07-24 correction (supersedes P2's unbounded nearest-wins): a photo
+# binds to a topic only if inside its window or within PHOTO_TOLERANCE_MIN
+# (2) minutes of an edge; ties -> lowest topic index; beyond that it binds
+# to nothing (the never-orphan fallback is gone). Cap raised 5 -> 10 with
+# cascade to the next-nearest QUALIFYING topic. The exhaustive rule table
+# lives in tests/unit/test_photo_binding.py; the cases below stay here to
+# pin the delegation and the module-level aliases.
 # ---------------------------------------------------------------------------
 
 def _photo(name, hhmm):
@@ -686,7 +689,8 @@ def _photo(name, hhmm):
 def test_photo_near_window_binds_via_tolerance():
     # Was test_photo_matches_inside_time_range_only (strict containment): the
     # 10:06 photo, 1 minute outside the window, used to bind to nothing --
-    # exactly the prod defect. Under the nearest-window rule it binds too.
+    # exactly the prod defect. It's within PHOTO_TOLERANCE_MIN (2 min), so it
+    # still qualifies and binds under the current bounded-tolerance rule.
     topics_list = [{"time_range": "10:00 – 10:05"}]
     inside = _photo("a.jpg", "10:02")
     outside = _photo("b.jpg", "10:06")
