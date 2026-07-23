@@ -473,6 +473,26 @@ def get_topic_full(conn, topic_id) -> dict | None:
     return t
 
 
+def add_topic_photo_if_absent(conn, topic_id, s3_key, caption_text):
+    """Idempotent keyframe bind (video-keyframe plan): inserts only when no
+    (topic_id, s3_key) row exists -- safe under S3-event retries and after
+    item-writer re-runs have already re-bound the file. Returns True iff a
+    row was inserted. The table has no unique constraint on (topic_id,
+    s3_key), so the WHERE NOT EXISTS guard is what enforces idempotency."""
+    row = conn.execute(
+        """
+        INSERT INTO topic_photos (topic_id, s3_key, caption_text)
+        SELECT %(tid)s, %(key)s, %(cap)s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM topic_photos WHERE topic_id = %(tid)s AND s3_key = %(key)s
+        )
+        RETURNING id
+        """,
+        {"tid": topic_id, "key": s3_key, "cap": caption_text},
+    ).fetchone()
+    return row is not None
+
+
 def set_work_class(conn, topic_id, work_class):
     """Human override of the machine work/non_work call (spec §5: '其实是工作'
     flips it to 'work', releasing the topic to the company tier). Returns the
