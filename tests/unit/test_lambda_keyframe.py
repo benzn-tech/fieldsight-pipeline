@@ -7,6 +7,7 @@ FakeConn/FakeS3 conventions.
 """
 import io
 import json
+import re
 import shutil
 import subprocess
 import types
@@ -38,13 +39,16 @@ class _Paginator:
 
 
 class FakeS3:
-    def __init__(self, objects=None):
+    def __init__(self, objects=None, missing=None, download_error=None):
         self.objects = dict(objects or {})
         self.heads = set(self.objects)     # keys head_object finds (200)
-        self.downloads = []                # (key, local)
+        self.downloads = []                # (key, local) -- successful pulls only
+        self.download_attempts = []        # every download_file(key) call (incl. failures)
         self.uploads = []                  # (local, key, extra)
         self.deletes = []
         self.head_calls = []               # every key head_object was asked about
+        self.missing = set(missing or [])  # keys whose download_file 404s
+        self.download_error = download_error  # exception to raise for a missing key
 
     def get_object(self, Bucket, Key):
         body = self.objects[Key]
@@ -62,6 +66,9 @@ class FakeS3:
         raise Exception("404 Not Found")
 
     def download_file(self, Bucket, Key, local):
+        self.download_attempts.append(Key)
+        if Key in self.missing:
+            raise (self.download_error or Exception("404 Not Found (video deleted)"))
         self.downloads.append((Key, local))
         with open(local, "wb") as f:
             f.write(b"fake-video-bytes")
@@ -115,6 +122,59 @@ class FakeConn:
             tid = params[0]
             alive = self.existing is None or tid in self.existing
             return _Cur({"?column?": 1} if alive else None)
+        return _Cur(None)
+
+
+def _like_match(key, pattern):
+    """Minimal SQL `LIKE ... ESCAPE '\\'` evaluator so a test can prove the M-2
+    row-cleanup predicate matches (or spares) a given s3_key the same way
+    Postgres would."""
+    out, i = [], 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\":
+            out.append(re.escape(pattern[i + 1])); i += 2
+        elif c == "%":
+            out.append(".*"); i += 1
+        elif c == "_":
+            out.append("."); i += 1
+        else:
+            out.append(re.escape(c)); i += 1
+    return re.fullmatch("".join(out), key) is not None
+
+
+class StatefulConn:
+    """Context-manager conn that actually stores topic_photos s3_keys and applies
+    the M-2 DELETE predicate (prefix LIKE + marker LIKE + <> ALL(expected)), so a
+    test can prove the row cleanup self-heals from the DB side -- independent of
+    what the S3 listing returned this run."""
+
+    def __init__(self, rows=(), existing=None):
+        self.rows = set(rows)
+        self.existing = set(existing) if existing is not None else None
+        self.executed = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        if "SELECT 1 FROM topics" in sql:
+            tid = params[0]
+            alive = self.existing is None or tid in self.existing
+            return _Cur({"?column?": 1} if alive else None)
+        if "DELETE FROM topic_photos" in sql:
+            prefix_like, marker_like, expected = params
+            self.rows = {
+                k for k in self.rows
+                if not (_like_match(k, prefix_like)
+                        and _like_match(k, marker_like)
+                        and k not in expected)
+            }
+            return _Cur(None)
         return _Cur(None)
 
 
@@ -320,38 +380,68 @@ def test_stale_keyframe_cleanup(patched):
 # --------------------------------------------------------------------------
 
 def test_stale_cleanup_also_deletes_topic_photos_rows(patched):
-    stale = PICS + "Benl1_2026-07-23_10-30-00_kf_s101534.jpg"   # this session, not expected
+    stale = PICS + "Benl1_2026-07-23_10-30-00_kf_s101534.jpg"       # this session, not expected
+    expected_key = PICS + "Benl1_2026-07-23_10-16-00_kf_s101534.jpg"  # this run's frame
     s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:15 – 10:17"}]),
                  SIDECAR_KEY: _sidecar(),
                  stale: b"x"})
     patched.setattr(lk, "_s3_client", s3)
-    conn = FakeConn()
+    conn = StatefulConn(rows={stale, expected_key})
     patched.setattr(lk, "get_connection", lambda *a, **k: conn)
     patched.setattr(lk.subprocess, "run", FakeRun())
 
     lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
 
-    # S3 object deleted AND its topic_photos row deleted by the same conn
+    # S3 object deleted AND its dangling topic_photos row removed by the DB
+    # predicate; the row for THIS run's expected keyframe survives.
     assert s3.deletes == [stale]
-    row_deletes = [(sql, params) for sql, params in conn.executed
-                   if "DELETE FROM topic_photos" in sql]
+    assert stale not in conn.rows
+    assert expected_key in conn.rows
+    row_deletes = [(sql, p) for sql, p in conn.executed if "DELETE FROM topic_photos" in sql]
     assert len(row_deletes) == 1
-    assert stale in row_deletes[0][1][0]     # deleted key passed to WHERE s3_key = ANY(...)
+    # M-2: the predicate is derived from (prefix, marker, expected) -- NOT from
+    # the keys the S3 listing returned this run.
+    prefix_like, marker_like, expected = row_deletes[0][1]
+    assert "%" in prefix_like and marker_like.startswith("%")
+    assert expected_key in expected and stale not in expected
 
 
-def test_no_stale_files_means_no_topic_photos_delete(patched):
-    # Nothing stale -> the DELETE FROM topic_photos is not issued at all.
+def test_row_cleanup_preserves_expected_row_when_nothing_stale(patched):
+    # New M-2 shape: the topic_photos DELETE runs unconditionally (self-heal),
+    # but its `<> ALL(expected)` guard means THIS run's expected keyframe row is
+    # never removed when there is nothing stale.
+    expected_key = PICS + "Benl1_2026-07-23_10-16-00_kf_s101534.jpg"
     s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:15 – 10:17"}]),
                  SIDECAR_KEY: _sidecar()})
     patched.setattr(lk, "_s3_client", s3)
-    conn = FakeConn()
+    conn = StatefulConn(rows={expected_key})
     patched.setattr(lk, "get_connection", lambda *a, **k: conn)
     patched.setattr(lk.subprocess, "run", FakeRun())
 
     lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
 
     assert s3.deletes == []
-    assert not [1 for sql, _ in conn.executed if "DELETE FROM topic_photos" in sql]
+    assert expected_key in conn.rows            # expected row survived
+    assert any("DELETE FROM topic_photos" in sql for sql, _ in conn.executed)  # still issued
+
+
+def test_m2_retry_self_heals_dangling_row_after_s3_already_deleted(patched):
+    # Simulated crash: a PRIOR run deleted the stale keyframe's S3 object but
+    # died before COMMIT, so the topic_photos row survived while the S3 key is
+    # gone. On retry the S3 listing can't rediscover the key (nothing to delete),
+    # yet the DB-side predicate still removes the dangling row -- self-heal.
+    dangling = PICS + "Benl1_2026-07-23_10-30-00_kf_s101534.jpg"   # S3 object already gone
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:15 – 10:17"}]),
+                 SIDECAR_KEY: _sidecar()})                          # note: no `dangling` object
+    patched.setattr(lk, "_s3_client", s3)
+    conn = StatefulConn(rows={dangling})
+    patched.setattr(lk, "get_connection", lambda *a, **k: conn)
+    patched.setattr(lk.subprocess, "run", FakeRun())
+
+    lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    assert s3.deletes == []            # S3 listing found nothing (object already gone)
+    assert dangling not in conn.rows   # ...but the dangling row was still removed
 
 
 # --------------------------------------------------------------------------
@@ -416,6 +506,95 @@ def test_original_downloaded_once_per_source_key(patched):
 
     assert len(run.calls) == 3                       # 3 frames decoded
     assert [k for k, _ in s3.downloads] == [video]   # but the original pulled ONCE
+
+
+# --------------------------------------------------------------------------
+# NEW-2 -- a dead/deleted original (download 404) must skip only THAT frame|
+#   topic; other topics in the same request still bind, handler never raises
+# --------------------------------------------------------------------------
+
+def test_missing_original_skips_its_topic_but_others_proceed(patched):
+    video1 = "users/Ben_UCPK/video/2026-07-23/Benl1_2026-07-23_10-15-34.mp4"   # DELETED
+    sidecar1 = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_10-15-34_vad_metadata.json"
+    video2 = "users/Ben_UCPK/video/2026-07-23/Benl1_2026-07-23_11-00-00.mp4"   # healthy
+    sidecar2 = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_11-00-00_vad_metadata.json"
+    topics = [
+        {"topic_id": "topic-1", "time_range": "10:15 – 10:17"},   # covered by video1 (gone)
+        {"topic_id": "topic-2", "time_range": "11:00 – 11:02"},   # covered by video2 (ok)
+    ]
+    s3 = FakeS3({REQUEST_KEY: _request(topics),
+                 sidecar1: _sidecar(source_key=video1, dur=600),
+                 sidecar2: _sidecar(source_key=video2, dur=600)},
+                missing={video1})
+    patched.setattr(lk, "_s3_client", s3)
+    patched.setattr(lk.subprocess, "run", FakeRun())
+
+    result = lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    # dead video1 was attempted and skipped; healthy video2 still bound -- no raise
+    assert video1 in s3.download_attempts
+    assert [k for k, _ in s3.downloads] == [video2]     # only the healthy pull succeeded
+    ok_key = PICS + "Benl1_2026-07-23_11-01-00_kf_s101534.jpg"
+    assert patched._kf_inserts == [("topic-2", ok_key, "Auto keyframe @ 11:01")]
+    assert result == {"results": [{"skipped": False, "keyframes": 1}]}
+
+
+def test_missing_original_sibling_frames_do_not_retry_download(patched):
+    # NEW-2: all frames of one dead video share a source_key -> the download is
+    # attempted ONCE; the cached failure short-circuits the siblings. No raise.
+    video = "users/Ben_UCPK/video/2026-07-23/Benl1_2026-07-23_10-00-00.mp4"
+    sidecar = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_10-00-00_vad_metadata.json"
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:00 – 10:06"}]),
+                 sidecar: _sidecar(source_key=video, dur=600)},
+                missing={video})
+    patched.setattr(lk, "_s3_client", s3)
+    patched.setattr(lk.subprocess, "run", FakeRun())
+
+    result = lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    assert s3.download_attempts == [video]   # 3 planned frames, ONE download attempt
+    assert s3.downloads == []
+    assert patched._kf_inserts == []
+    assert result == {"results": [{"skipped": False, "keyframes": 0}]}   # no raise
+
+
+# --------------------------------------------------------------------------
+# NEW-3 -- a full ephemeral disk (download OSError) travels the same skip+warn
+#   path, never crashing the request
+# --------------------------------------------------------------------------
+
+def test_disk_full_oserror_skips_frame_without_raising(patched):
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:15 – 10:17"}]),
+                 SIDECAR_KEY: _sidecar()},
+                missing={VIDEO_KEY},
+                download_error=OSError(28, "No space left on device"))
+    patched.setattr(lk, "_s3_client", s3)
+    patched.setattr(lk.subprocess, "run", FakeRun())
+
+    result = lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    assert s3.downloads == [] and patched._kf_inserts == []
+    assert result == {"results": [{"skipped": False, "keyframes": 0}]}   # no raise
+
+
+def test_downloaded_original_is_evicted_after_its_last_frame(patched):
+    # NEW-3: the local original is os.remove'd once its last planned frame is
+    # processed, so many source_keys (~200 MB each) don't pile up on the 2048 MB
+    # ephemeral disk before the tmp_dir finally sweeps.
+    video = "users/Ben_UCPK/video/2026-07-23/Benl1_2026-07-23_10-00-00.mp4"
+    sidecar = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_10-00-00_vad_metadata.json"
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:00 – 10:06"}]),
+                 sidecar: _sidecar(source_key=video, dur=600)})
+    patched.setattr(lk, "_s3_client", s3)
+    patched.setattr(lk.subprocess, "run", FakeRun())
+    removed = []
+    real_remove = lk.os.remove
+    patched.setattr(lk.os, "remove", lambda p: removed.append(p) or real_remove(p))
+
+    lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    assert [k for k, _ in s3.downloads] == [video]   # pulled once
+    assert len(removed) == 1                          # ...and evicted once, after 3 frames
 
 
 # --------------------------------------------------------------------------

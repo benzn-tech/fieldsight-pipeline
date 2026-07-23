@@ -68,12 +68,17 @@ jobs:
           # with Fn::ImportValue (only with Parameters).
           DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
           # KEYFRAME FEATURE (H-1) — activating it on TEST needs BOTH repo vars set:
-          #   * TEST_VAD_LAYER_ARN  -> the VAD layer ARN (VadLayerArn below). Layers are
-          #     account+region scoped, so the SAME fieldsight-vad-layer:N ARN prod uses
-          #     (PROD_VAD_LAYER_ARN, deploy-prod.yml) is valid here. This flips HasVadLayer
-          #     -> HasKeyframeStack true so KeyframeFunction is actually CREATED on TEST and
+          #   * TEST_KEYFRAME_FFMPEG_LAYER_ARN -> the ffmpeg layer ARN
+          #     (KeyframeFfmpegLayerArn below). Intended value:
+          #     arn:aws:lambda:ap-southeast-2:509194952652:layer:sitesync-vad-layer:2
+          #     — a runtime-agnostic layer (CompatibleRuntimes [python3.11, python3.12])
+          #     bundling /opt/bin/ffmpeg, so it loads on the 3.11 KeyframeFunction next to
+          #     the cp311-only PsycopgLayer. This flips HasKeyframeFfmpegLayer ->
+          #     HasKeyframeStack true so KeyframeFunction is actually CREATED on TEST and
           #     the feature can be verified BEFORE prod. Unset => empty => keyframe stack
-          #     stays uncreated (today's behavior, merge-safe).
+          #     stays uncreated (today's behavior, merge-safe). NOTE: distinct from
+          #     TEST_VAD_LAYER_ARN (the cp312-only fieldsight-vad-layer that feeds
+          #     VadFunction) — do not conflate the two.
           #   * TEST_ENABLE_KEYFRAMES -> gates item-writer's keyframe_requests/ EMISSION.
           #     Left default false so merging does NOT auto-enable emission; flip it
           #     deliberately only after the created stack + its IAM are verified on TEST.
@@ -86,6 +91,7 @@ jobs:
               "EnableSchedules=false" \
               "EnableSiteVoice=true" \
               "VadLayerArn=${{ vars.TEST_VAD_LAYER_ARN }}" \
+              "KeyframeFfmpegLayerArn=${{ vars.TEST_KEYFRAME_FFMPEG_LAYER_ARN }}" \
               "EnableKeyframes=${{ vars.TEST_ENABLE_KEYFRAMES || 'false' }}" \
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \

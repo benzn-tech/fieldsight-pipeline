@@ -173,6 +173,18 @@ Parameters:
       Leave empty to skip VAD function deployment.
     Default: ''
 
+  KeyframeFfmpegLayerArn:
+    Type: String
+    Description: >
+      ARN of a runtime-agnostic ffmpeg layer for KeyframeFunction. Intended value:
+      arn:aws:lambda:ap-southeast-2:509194952652:layer:sitesync-vad-layer:2 — whose
+      CompatibleRuntimes is [python3.11, python3.12] and which bundles /opt/bin/ffmpeg.
+      KeyframeFunction only shells out to that binary (never imports the layer's Python
+      packages), so it stays on the python3.11 Global runtime alongside the cp311-only
+      PsycopgLayer. Do NOT point this at VadLayerArn (fieldsight-vad-layer is cp312-only
+      and would reject a 3.11 function). Leave empty to skip KeyframeFunction deployment.
+    Default: ''
+
   DocxLayerArn:
     Type: String
     Description: >
@@ -344,6 +356,7 @@ Conditions:
   ShouldManageBucketPolicy: !And [!Condition ShouldEnableTranscribe, !Equals [!Ref ManageDataBucketPolicy, 'true']]
   ShouldCreateAlerts: !Not [!Equals [!Ref AlertEmail, '']]
   HasVadLayer: !Not [!Equals [!Ref VadLayerArn, '']]
+  HasKeyframeFfmpegLayer: !Not [!Equals [!Ref KeyframeFfmpegLayerArn, '']]
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
   HasDb: !Not [!Equals [!Ref DbStackName, '']]
   HasOrgPool: !Not [!Equals [!Ref OrgUserPoolId, '']]
@@ -351,9 +364,12 @@ Conditions:
   HasOrgApi: !And [!Condition HasDb, !Condition HasOrgPool]
   HasSiteVoice: !And [!Condition HasOrgApi, !Equals [!Ref EnableSiteVoice, 'true']]
   # video-keyframe plan: the KeyframeFunction needs Aurora (HasDb) for the
-  # topic_photos bind AND the VAD layer (HasVadLayer) for the static
-  # /opt/bin/ffmpeg binary — so it deploys only when both are present.
-  HasKeyframeStack: !And [!Condition HasDb, !Condition HasVadLayer]
+  # topic_photos bind AND a runtime-agnostic ffmpeg layer (HasKeyframeFfmpegLayer,
+  # the sitesync-vad-layer with CompatibleRuntimes [3.11, 3.12]) for the static
+  # /opt/bin/ffmpeg binary — so it deploys only when both are present. It does
+  # NOT depend on HasVadLayer: that layer (fieldsight-vad-layer) is cp312-only
+  # and feeds VadFunction, not KeyframeFunction.
+  HasKeyframeStack: !And [!Condition HasDb, !Condition HasKeyframeFfmpegLayer]
 
 # ============================================================
 # Global Settings
@@ -1303,12 +1319,15 @@ Resources:
   # ----------------------------------------------------------
   # Lambda: Keyframe extractor (video-keyframe-to-photo plan) — in-VPC,
   # S3 event on keyframe_requests/ (wired manually per BUG-33 —
-  # scripts/wire-s3-events.sh). VAD layer is attached ONLY for the static
-  # /opt/bin/ffmpeg binary; its cp312 Python packages are never imported
-  # (psycopg comes from PsycopgLayer). Runtime is pinned python3.12 (H-2):
-  # the VAD layer's CompatibleRuntimes is python3.12-only, so a python3.11
-  # function + this layer is rejected at CreateFunction and rolls back the
-  # whole stack. Zero non-S3 AWS calls at runtime (BUG-36: S3 gateway only).
+  # scripts/wire-s3-events.sh). The ffmpeg layer (KeyframeFfmpegLayerArn ->
+  # sitesync-vad-layer, CompatibleRuntimes [3.11, 3.12]) is attached ONLY for
+  # the static /opt/bin/ffmpeg binary; its Python packages are never imported
+  # (psycopg comes from PsycopgLayer). Runtime stays on the python3.11 Global:
+  # PsycopgLayer is cp311-only and the ffmpeg layer is 3.11-compatible, so both
+  # layers load on one 3.11 function. (Do NOT reuse the cp312-only VadLayerArn
+  # here — a 3.11 function + that layer is rejected at CreateFunction and rolls
+  # back the whole stack.) Zero non-S3 AWS calls at runtime (BUG-36: S3 gateway
+  # only).
   # ----------------------------------------------------------
   KeyframeFunction:
     Type: AWS::Serverless::Function
@@ -1324,11 +1343,12 @@ Resources:
       # headroom (still well under the 900s Lambda ceiling).
       Timeout: 600
       MemorySize: 1024
-      Runtime: python3.12  # fieldsight-vad-layer is built for cp312 (BUG-24 class) — do not fall back to the py3.11 global
+      # No Runtime override: inherits the python3.11 Global. The ffmpeg layer is
+      # 3.11-compatible and PsycopgLayer is cp311-only, so both load on 3.11.
       EphemeralStorage:
         Size: 2048     # original H265 videos observed up to ~200 MB (VadFunction parity)
       Layers:
-        - !Ref VadLayerArn
+        - !Ref KeyframeFfmpegLayerArn   # runtime-agnostic ffmpeg (sitesync-vad-layer); /opt/bin/ffmpeg only
         - !Ref PsycopgLayer
       VpcConfig:
         SubnetIds: !Ref DbSubnetIds
