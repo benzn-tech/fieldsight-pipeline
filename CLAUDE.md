@@ -49,6 +49,18 @@ Frontend (CloudFront → S3)
 
 ---
 
+## Architecture Direction — Dashboard-first inversion (in-flight)
+
+We are inverting the current **report-first** model into **dashboard-content-first**. Today `reports/{date}/{user}/daily_report.json` IS the dashboard payload (`get_timeline` returns it verbatim) and the DynamoDB item store is dead code (`ENABLE_DYNAMODB=false`). Target:
+
+- The **item store** (`ITEM#` / `TODAY#` / `DEADLINE#` rows) becomes the **source of truth**, written first.
+- The **report** (`daily_report.json` / `.docx`) becomes a **secondary, on-demand, frozen projection** for storage & accountability (追责).
+- **Keep `daily_report.json` byte-compatible during migration** so the API contract and the UI `today-adapter` keep working — read paths cut over to the item store in phases.
+
+Full phased plan + risks: **ROADMAP.md** and **DASHBOARD-FIRST-INVERSION.md**. Verified blocking defects: **BUG-35..BUG-41** below.
+
+---
+
 ## Key Files
 
 | File | Purpose |
@@ -390,6 +402,54 @@ result = [u for u in all_users
 
 ---
 
+### Report→Dashboard Inversion (verified 2026-06, in-flight)
+
+Found while verifying `feature/p2-dashboard-digest-qaqc-realtime` for the dashboard-first inversion (see **ROADMAP.md** + **DASHBOARD-FIRST-INVERSION.md**). These are real and must be fixed before the AUTO_REPORT / fast-path work is trusted.
+
+#### BUG-35: AUTO_REPORT payload key mismatch (whole-account rebuild)
+**Bug**: `lambda_transcribe_callback` sends `{"users_filter": [...]}`, but the report-generator handler reads `event.get("user")` — it never reads `users_filter`.
+**Impact**: `users_filter` is ignored → the event-driven path rebuilds the report for **every user** on that date, not just the one with a new transcript.
+**Fix**: Send `"user"` in the payload (or make the handler read both `user` and `users_filter`).
+**Files affected**: `lambda_report_generator.py:1802`, `lambda_transcribe_callback.py` (AUTO_REPORT block).
+
+#### BUG-36: AUTO_REPORT username form mismatch (nothing generated)
+**Bug**: The callback sends a space-form name (`user.replace("_", " ")`, e.g. `"Ben Lin"`), but the handler builds its user set from S3 transcript **folder names** (underscore form, e.g. `"Ben_Lin"`) and intersects: `users = users & set(users_filter)`.
+**Impact**: The intersection is **empty** → "No matching users found" → the new transcript produces **no report at all**. With BUG-35 this makes the "only the new user re-runs" story doubly broken.
+**Fix**: Normalize the filter to the underscore folder form (don't `replace("_"," ")`), or match case/underscore-insensitively.
+**Files affected**: `lambda_report_generator.py:1212-1218`.
+
+#### BUG-37: Multi-segment transcripts trigger redundant full-day Claude rebuilds
+**Bug**: The freshness gate only skips when `recordings_processed == current_transcript_count`. VAD splits one recording into many segments that COMPLETE at different times, so the count keeps changing and the gate **never matches**.
+**Impact**: Every COMPLETED event triggers a **full-day Claude regenerate** → N redundant expensive calls per meeting per user during ingestion.
+**Fix**: Debounce/coalesce COMPLETED events (short SQS delay, or a "last-COMPLETED + N seconds" window) into one rebuild; move to the incremental materialize path (Inversion Phase 4).
+**Files affected**: `lambda_report_generator.py:1168`.
+
+#### BUG-38: AUTO_REPORT races the meeting manifest (re-opens BUG-18)
+**Bug**: The fast-path fires on **every** COMPLETED with no coordination. Per BUG-18 the meeting-minutes Lambda must run first and write `.meeting_manifest.json` so the report generator excludes those keys — but meeting-minutes has **no auto-trigger**, so the manifest may not exist yet.
+**Impact**: Meeting transcripts get swallowed into the daily report / duplicated.
+**Fix**: Fast-path must skip meeting-candidate transcripts or gate on manifest presence/debounce.
+**Files affected**: `lambda_report_generator.py:1230-1241` (manifest read), see BUG-18.
+
+#### BUG-39: write_items_to_dynamodb writes only ITEM#, never DEADLINE#/TODAY#
+**Bug**: `write_items_to_dynamodb` writes only `ITEM#` rows, but p2's `get_site_dashboard` queries `SK begins_with("DEADLINE#")` (and the Today header wants a `TODAY#` aggregate).
+**Impact**: After enabling DynamoDB the dashboard **deadline panel is silently empty**, and the Today header has to re-count topics.
+**Fix**: Also write `DEADLINE#` rows (from `critical_dates_and_deadlines`) and a `TODAY#` aggregate row (executive_summary[], counts, generated_at). Add `materialized_at` + `source_transcript_keys` + `site_name` per `ITEM#` row.
+**Files affected**: `lambda_report_generator.py:765-792`.
+
+#### BUG-40: Transcript ledger `'reported'` terminal state has no writer
+**Bug**: The callback only writes `'pending'`; no code writes `'reported'`. The ledger transition `transcribing → pending → reported` is incomplete.
+**Impact**: Any optimistic `GET /api/today` state machine (processing cards) would **never clear** — cards stick forever.
+**Fix**: Write `'reported'` after the report generator successfully puts the report/items.
+**Files affected**: `lambda_transcribe_callback.py:130`, report-generator success path.
+
+#### BUG-41: Per-user AUTO_REPORT skips the combined summary refresh
+**Bug**: The combined/summary block is guarded by `if combined_transcripts and not users_filter:` — a single-user event-driven run skips it.
+**Impact**: After per-user fast-path updates, the admin/gm `summary_report.json` stays **stale**.
+**Fix**: Refresh the summary (or a per-site `TODAY#` rollup) after AUTO_REPORT, or have admin roles read item rows directly.
+**Files affected**: `lambda_report_generator.py:1412`.
+
+---
+
 ## Lambda Deployment
 
 **CRITICAL: Always bundle transcript_utils.py in every Lambda zip.**
@@ -429,7 +489,7 @@ aws s3 cp s3://BUCKET/KEY s3://BUCKET/KEY --metadata-directive REPLACE --region 
 - **Model default:** `claude-sonnet-4-6` (update if newer model available)
 - **Timezone:** All internal times are UTC. Display times are NZDT (UTC+13). Use `get_nzdt_now()`.
 - **S3 paths:** `reports/{date}/{user}/daily_report.json`, `meeting_minutes/{date}/{title}.json`
-- **DynamoDB:** Controlled by `ENABLE_DYNAMODB` env var. Currently OFF in production.
+- **DynamoDB:** Controlled by `ENABLE_DYNAMODB` env var. Currently OFF in production. **Inversion direction:** turn this ON to make the item store the source of truth — must also write `DEADLINE#` + `TODAY#` rows, not just `ITEM#` (see BUG-39, ROADMAP.md, DASHBOARD-FIRST-INVERSION.md).
 - **Prompt templates:** Hot-swappable from S3 (`config/prompt_templates.json`). Lambda falls back to inline defaults if S3 template missing.
 - **Debug records:** Every Claude API call saves prompt + response to `*_debug.json` alongside the report. Use these for prompt tuning.
 - **Version strings:** Update in docstring header, `_report_metadata.version`, and logger startup message.
