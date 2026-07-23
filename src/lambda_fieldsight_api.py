@@ -342,7 +342,16 @@ def get_dates(params, caller):
     
     role = caller['role']
     user_param = params.get('user', '')
-    # Determine which user folders to check
+    # SECURITY: three-state scope, same discipline as
+    # get_report_history/find_any_report/accessible_folder_scope. None =
+    # unrestricted (admin/gm with no ?site and no ?user); a list is an
+    # allowlist. Previously the admin/gm "no filter" case used
+    # `user_folders = []`, and `?site=` with no accessible users on that
+    # site ALSO produced `[]` -- `if user_folders:` (below) is falsy for
+    # both, so a scoped caller with nobody accessible on ?site= took the
+    # "no filter" branch: every date was marked hasReport=True and
+    # enriched from the UNSCOPED summary_report.json, leaking
+    # company-wide topic/safety counts per day.
     if user_param and can_access_user_data(caller, user_param):
         # Explicit ?user= wins: the timeline date-picker asks for one user's
         # dates so its dots match the per-user report fetch. Without this the
@@ -356,9 +365,18 @@ def get_dates(params, caller):
         users = get_accessible_users(caller, site_filter=site)
         user_folders = [u['folder_name'] for u in users]
     elif role in ('admin', 'gm'):
-        user_folders = []  # Check all (no filter)
+        user_folders = None  # unrestricted -- no filter
     else:
         user_folders = [resolve_user_display_name(caller)]
+
+    # Deny-all: an empty list, OR a list of only-blank folder names (the
+    # unmapped-caller shape -- resolve_user_display_name returns '' when
+    # display_name is blank, and [''] is TRUTHY, which is why the old code
+    # failed closed here only by accident rather than by design). Made
+    # explicit so a future edit can't silently turn this back into a leak.
+    if user_folders is not None and not any(user_folders):
+        return ok({'dates': {}})
+
     dates = {}
     try:
         paginator = s3_client.get_paginator('list_objects_v2')
@@ -369,7 +387,7 @@ def get_dates(params, caller):
                     try:
                         d = datetime.strptime(ds, '%Y-%m-%d')
                         if d >= start_date:
-                            if user_folders:
+                            if user_folders is not None:
                                 # Check if any accessible user has a report
                                 for uf in user_folders:
                                     try:
@@ -388,7 +406,7 @@ def get_dates(params, caller):
     for ds in list(dates.keys()):
         try:
             loaded = False
-            if user_folders:
+            if user_folders is not None:
                 for uf in user_folders:
                     try:
                         obj = s3_client.get_object(Bucket=S3_BUCKET, Key=f"{REPORT_PREFIX}{ds}/{uf}/daily_report.json")

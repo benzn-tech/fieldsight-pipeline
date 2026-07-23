@@ -332,3 +332,40 @@ def test_presign_disallowed_prefix_still_403(monkeypatch):
     wire(monkeypatch)
     assert fapi.get_presigned_url(
         {"key": "config/user_mapping.json"}, ADMIN_CALLER)["statusCode"] == 403
+
+
+# ---------------------------------------------------------------
+# S-3: get_dates -- same falsy-empty-list idiom at :331 and :350.
+# ---------------------------------------------------------------
+
+def test_dates_site_filter_with_no_accessible_users_returns_empty(monkeypatch):
+    """`elif site:` yields [] when the caller can reach nobody on that
+    site; `if user_folders:` was then falsy and EVERY date got marked
+    hasReport=True, then enriched from the unscoped summary_report.json --
+    leaking company-wide topic and safety counts per day."""
+    wire(monkeypatch)
+    res = fapi.get_dates({"months": "2", "site": "s-2"}, SITE_MANAGER_CALLER)
+    assert res["statusCode"] == 200
+    assert body_of(res)["dates"] == {}
+
+
+def test_dates_admin_unfiltered_unchanged(monkeypatch):
+    """Blast radius: admin/gm keep the union-across-all-users behaviour."""
+    wire(monkeypatch)
+    dates = body_of(fapi.get_dates({"months": "2"}, ADMIN_CALLER))["dates"]
+    assert "2026-07-20" in dates
+    assert dates["2026-07-20"]["hasReport"] is True
+
+
+def test_dates_viewer_with_no_mapping_returns_empty(monkeypatch):
+    """The final `else` branch currently yields [''] -- truthy, so it
+    fails closed by ACCIDENT. Pin the intent so a future 'clean up the
+    empty string' commit can't turn luck into a leak."""
+    wire(monkeypatch)
+    assert body_of(fapi.get_dates({"months": "2"}, VIEWER_CALLER))["dates"] == {}
+
+
+def test_dates_worker_sees_only_own_dates(monkeypatch):
+    wire(monkeypatch)
+    dates = body_of(fapi.get_dates({"months": "2"}, WORKER_CALLER))["dates"]
+    assert set(dates.keys()) <= {"2026-07-20"}
