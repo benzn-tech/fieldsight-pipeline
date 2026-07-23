@@ -3395,17 +3395,18 @@ def test_transcripts_no_files_returns_no_transcripts_message(presign_wired):
 # target lookup.
 # ----------------------------------------------------------
 
-def _graded_caller(wired, folder, user_scope, author_ids=None, site_ids=None):
+def _graded_caller(wired, folder, user_scope, author_ids=None, site_ids=None,
+                    cross_company=False, global_role="site_manager"):
     wired.setattr(org, "GRADED_ROLES", True)
     envelope = {
         "site_ids": set(site_ids or ()), "user_scope": user_scope,
         "author_ids": set(author_ids) if author_ids is not None else None,
         "self_folder": folder, "self_user_id": "u-self",
-        "company_id": CALLER["company_id"], "cross_company": False,
+        "company_id": CALLER["company_id"], "cross_company": cross_company,
     }
     wired.setattr(org.users, "get_user_by_sub",
                   lambda conn, sub: {**CALLER, "id": "u-self",
-                                     "global_role": "site_manager",
+                                     "global_role": global_role,
                                      "folder_name": folder,
                                      "_visible_scope": envelope})
 
@@ -3753,9 +3754,26 @@ def test_media_presign_underivable_owner_non_all_403(presign_wired):
 
 
 def test_media_presign_underivable_owner_all_scope_ok(presign_wired):
-    # ALL scope (admin/gm; platform_admin via the graded envelope) keeps the
-    # legacy permission to presign ownerless lake artifacts.
+    # S-4 (2026-07-23 security-acl-sentinel plan): ALL tier alone is no
+    # longer sufficient for an ownerless key -- neither shape carries a
+    # derivable company (summary_report.json has no site at all; sites/{id}
+    # is a legacy user_mapping slug, not an Aurora sites.id), so a company
+    # admin/gm (ALL tier, NOT cross-company) is now DENIED. This is a
+    # deliberate tightening from the pre-S-4 behaviour this test used to pin.
     wired, fake = presign_wired          # CALLER default global_role is "admin"
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "reports/2026-07-18/summary_report.json"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_media_presign_ownerless_allowed_for_platform_admin(presign_wired):
+    # S-4: platform_admin is the ONE tier for which "no company scoping" is
+    # the correct answer rather than an omission (scope.py: cross_company is
+    # true only via acl.is_cross_company, which is platform_admin-only).
+    wired, fake = presign_wired
+    _graded_caller(wired, "Platform_Admin", "ALL", cross_company=True,
+                   global_role="platform_admin")
     res = org.lambda_handler(make_event(
         "GET", "/api/org/media/presigned-url",
         params={"key": "reports/2026-07-18/summary_report.json"}), None)
@@ -3792,6 +3810,19 @@ def test_media_presign_graded_underivable_owner_403(presign_wired):
     # SELF+WORKERS caller never reaches summary_report.json.
     wired, fake = presign_wired
     _graded_caller(wired, "Ben_UCPK", "SELF+WORKERS", author_ids={"u-self"})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "reports/2026-07-18/summary_report.json"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_media_presign_ownerless_denied_for_graded_company_admin(presign_wired):
+    # S-4: ALL tier under the graded envelope but NOT cross-company (an
+    # ordinary company admin/gm) is still denied an ownerless key -- ALL
+    # tier alone is not sufficient; cross_company must also be true.
+    wired, fake = presign_wired
+    _graded_caller(wired, "Ada_Admin", "ALL", cross_company=False,
+                   global_role="admin")
     res = org.lambda_handler(make_event(
         "GET", "/api/org/media/presigned-url",
         params={"key": "reports/2026-07-18/summary_report.json"}), None)

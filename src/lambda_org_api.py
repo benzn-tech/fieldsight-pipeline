@@ -2277,14 +2277,42 @@ def _resolve_org_media_folder(conn, caller, user, what="media"):
     return user, None
 
 
-def _org_caller_has_all_scope(conn, caller):
-    """ALL-scope test that honours whichever ACL branch is live -- the graded
-    envelope (which lifts platform_admin to ALL) when GRADED_ROLES is on, the
-    binary admin/gm primitive when it is off. Used only where there is no
-    target folder to authorize (the presigner's ownerless keys)."""
+def _org_caller_may_read_ownerless(conn, caller):
+    """May this caller presign an artifact whose OWNER cannot be derived
+    (reports/{date}/summary_report.json, reports/{date}/sites/...)?
+
+    SECURITY (S-4, 2026-07-23 security-acl-sentinel plan). The previous
+    gate (_org_caller_has_all_scope) tested the scope TIER only and applied
+    NO company scoping, so a company-A admin could presign a company-B
+    site/summary rollup. Latent rather than live -- every site currently
+    sits in the single FieldSight company (dc2eafa9) -- which is exactly
+    why it must be closed BEFORE tenant separation turns it into a
+    cross-tenant leak with no code change to blame.
+
+    Company scoping is not achievable by derivation for either shape:
+    summary_report.json is a whole-lake rollup with no site and no company
+    even in principle; sites/{site_id}/ carries a LEGACY user_mapping slug
+    (lambda_report_generator.py:1548/:1710), not an Aurora sites.id, so
+    resolving it needs either a company_id we do not have
+    (sites.get_company_site_by_slug is circular for this purpose) or an
+    O(all-sites) scan whose cross-company slug collisions are unguarded.
+    So we fail closed on the honest alternative: only platform_admin -- the
+    SOLE role for which the absence of company scoping is correct rather
+    than an omission (repositories/scope.py: cross_company is true only via
+    acl.is_cross_company, which is platform_admin-only) -- may read an
+    artifact whose company cannot be established.
+
+    Company admins/gms lose the ability to download site/company rollups
+    through this route. That capability should be restored properly by a
+    site-rollup route taking an explicit site_id authorized through the
+    company-scoped site ACL, not by loosening this gate."""
     if GRADED_ROLES:
-        return scope.visible_scope(conn, caller)["user_scope"] == "ALL"
-    return resolve_scope(caller["global_role"]) == "ALL"
+        sc = scope.visible_scope(conn, caller)
+        return sc["user_scope"] == "ALL" and sc["cross_company"]
+    # Binary branch: resolve_scope reads only global_role and carries no
+    # company dimension whatsoever, so there is no signal to consult.
+    # Deny outright rather than authorize on tier alone.
+    return False
 
 
 def get_org_transcripts(conn, caller, event):
@@ -2464,13 +2492,14 @@ def get_org_media_presigned_url(conn, caller, event):
     SAME graded-or-binary rule as the list routes, so a caller who can list
     a member's photos/audio can also presign them (no half-working state
     where the list step passes and every thumbnail 403s). Keys with no
-    derivable owner (e.g. reports/{date}/summary_report.json) are
-    fail-closed for every non-ALL-scope caller, graded or not, and allowed
-    for ALL scope (legacy admin/gm parity; platform_admin qualifies via the
-    graded envelope) -- deliberately NARROWER than the legacy handler, which
-    let any caller presign an ownerless key. No unquote_plus here: API
-    Gateway already URL-decodes query params once; the legacy endpoint's
-    extra decode would corrupt a literal '+'."""
+    derivable owner (e.g. reports/{date}/summary_report.json) are allowed
+    for platform_admin only (S-4: neither ownerless shape carries a
+    derivable company, so tier alone is not a sufficient authorization) --
+    deliberately NARROWER than both the legacy handler (which let any
+    caller presign an ownerless key) and this route's own pre-S-4 gate
+    (which allowed any ALL-tier caller, including a company admin/gm).
+    No unquote_plus here: API Gateway already URL-decodes query params
+    once; the legacy endpoint's extra decode would corrupt a literal '+'."""
     key = (event.get("queryStringParameters") or {}).get("key", "")
     if not key:
         return error("key required", 400)
@@ -2484,7 +2513,7 @@ def get_org_media_presigned_url(conn, caller, event):
             parts[2] not in ("summary_report.json", "sites"):
         target = parts[2]
     if not target:
-        if not _org_caller_has_all_scope(conn, caller):
+        if not _org_caller_may_read_ownerless(conn, caller):
             return error("access denied", 403)
     else:
         _, err = _resolve_org_media_folder(conn, caller, target, what="media")
