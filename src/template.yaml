@@ -904,6 +904,20 @@ Resources:
               Action: s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/transcripts/*
             - Effect: Allow
+              # GET /api/org/audio-segments and GET /api/org/video-segments
+              # (Aurora-identity media routes, P1 prod-media-binding) —
+              # read-only, and read-only is enough: both routes only list
+              # these prefixes and mint presigned GETs over them, which the
+              # role must be able to GetObject for the signature to be valid
+              # (same reasoning as the users/* recordings grant above).
+              # Same DataBucketName objects the legacy fieldsight-api role
+              # already reads; audio_segments/* is written by the extractor,
+              # web_video/* by the H264 preview transcoder.
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/audio_segments/*
+                - !Sub arn:aws:s3:::${DataBucketName}/web_video/*
+            - Effect: Allow
               # Without ListBucket, S3 returns AccessDenied/403 (not
               # NoSuchKey/404) for a missing object under a prefix this
               # role can't list — read_programme would then re-raise a
@@ -911,6 +925,14 @@ Resources:
               # uploaded (Fable review High #1). Scoped to programmes/*
               # and transcripts/* only, mirrors ExtractSessionFunction's
               # transcripts/* grant (in the other bucket).
+              # P1 (prod-media-binding) adds the three prefixes the media
+              # routes PAGINATE over, not merely GetObject: audio_segments/*
+              # (GET /api/org/audio-segments) and web_video/* + users/*
+              # (GET /api/org/video-segments lists web_video/{folder}/{date}/
+              # for H264 previews AND falls back to users/{folder}/video/
+              # for originals). Without these three, list_objects_v2 raises
+              # AccessDenied and the route degrades to an empty 200 —
+              # byte-identical to the bug these routes exist to fix.
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${DataBucketName}
               Condition:
@@ -918,6 +940,9 @@ Resources:
                   s3:prefix:
                     - programmes/*
                     - transcripts/*
+                    - audio_segments/*
+                    - web_video/*
+                    - users/*
             - Effect: Allow
               # authority-flip Task 4 — /timeline reads daily_report.json
               # (and summary_report.json) verbatim from the lake bucket.

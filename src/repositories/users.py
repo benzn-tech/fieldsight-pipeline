@@ -93,6 +93,33 @@ def list_company_users(conn, company_id, include_archived=False) -> list[dict]:
     ).fetchall()
 
 
+def folder_names_for_user_ids(conn, user_ids, company_id=None) -> set:
+    """Recording folder names for a set of user ids -- the org report-history
+    route's scope resolver (S-1 companion, 2026-07-23 security plan).
+
+    Returns a SET of non-empty folder_name strings; users with no folder
+    mapping simply contribute nothing (they own no reports/{date}/{folder}/
+    objects either). Empty in -> empty out, no round-trip.
+
+    company_id, when given, pins the lookup to that company -- belt and
+    braces on top of the already company-scoped id sets visible_scope
+    hands us, so a mis-tenanted membership row can never widen the
+    result. Pass None only for the cross-company (platform_admin) path."""
+    if not user_ids:
+        return set()
+    guard = "AND company_id = %s " if company_id else ""
+    params = [list(str(u) for u in user_ids)]
+    if company_id:
+        params.append(company_id)
+    rows = conn.execute(
+        "SELECT folder_name FROM users WHERE id = ANY(%s::uuid[]) "
+        f"AND archived_at IS NULL {guard}"
+        "AND folder_name IS NOT NULL AND folder_name <> ''",
+        tuple(params),
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
 def list_all_users(conn, include_archived=False) -> list[dict]:
     """Cross-company user directory -- platform_admin (is_cross_company) only.
     Mirrors list_company_users WITHOUT the company_id filter so the platform

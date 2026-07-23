@@ -192,6 +192,35 @@ def can_access_user_data(caller, target_user_name):
     target_clean = target_user_name.replace('_', ' ')
     return any(u['name'] == target_clean or u['folder_name'] == target_user_name for u in accessible)
 
+
+def accessible_folder_scope(caller):
+    """Folder-name scope for a caller, as a THREE-STATE value.
+
+        None      -> unrestricted (admin/gm only). Apply no filter.
+        set()     -> DENY ALL. The caller can see nothing.
+        {"A","B"} -> exactly these folders.
+
+    SECURITY (2026-07-23, live prod leak): the previous idiom used an
+    empty LIST for both "unrestricted" and "nothing accessible", and every
+    consumer tested it with `if allowed_folders:` -- falsy for both, so a
+    caller with NO access took the "no filter" branch and received the
+    whole bucket. Proven live: a UC PK site_manager (Aurora-provisioned,
+    therefore absent from the DynamoDB users table -> role='viewer',
+    display_name='' -> get_accessible_users -> []) pulled 88 report keys
+    spanning every user folder in the lake.
+
+    `None` and `set()` are different values and neither is a list, so a
+    bare truthiness test on the result is an obviously wrong construct
+    that review will catch. Callers MUST branch with `is None` and handle
+    the empty set explicitly.
+
+    Note get_accessible_users' own posture is unchanged -- this is a
+    thin, honest wrapper around it, not a new policy."""
+    if caller.get('role') in ('admin', 'gm'):
+        return None
+    return {u['folder_name'] for u in get_accessible_users(caller)}
+
+
 def parse_time_to_seconds(time_str):
     parts = time_str.replace(' ', '').split(':')
     try:
@@ -264,7 +293,43 @@ def get_timeline(params, caller):
 def find_any_report(date, caller=None):
     prefix = f"{REPORT_PREFIX}{date}/"
     reports = []
-    accessible = get_accessible_users(caller) if caller else None
+    # SECURITY: same three-state scope as get_report_history. `None` here
+    # means BOTH "no caller supplied" (dead today -- both call sites in
+    # get_timeline pass one) and "admin/gm"; an empty set is deny-all and
+    # short-circuits below. Previously `if accessible:` conflated deny-all
+    # with unrestricted, and unlike get_report_history this function can
+    # return a full report BODY when exactly one key survives the filter.
+    folder_scope = accessible_folder_scope(caller) if caller else None
+    if caller and folder_scope is None:
+        # NO SILENT WIDENING. accessible_folder_scope returns None
+        # ("unrestricted") for admin/gm, but the code this replaced ran
+        # `accessible = get_accessible_users(caller)` for EVERY role --
+        # and for an admin that returns the whole config/user_mapping.json
+        # roster, a NON-empty list, so `if accessible:` was true and the
+        # filter DID run: a folder absent from the mapping (e.g. an
+        # Aurora-provisioned Ben_UCPK) was dropped and the caller got the
+        # 404 envelope. Handing admin/gm a bare None here would widen that
+        # to a 200 carrying the full report BODY -- unacceptable in a PR
+        # whose entire purpose is to narrow. Admin/gm therefore keep the
+        # mapping-derived allowlist, exactly as before.
+        #
+        # Deliberately LOCAL to find_any_report: get_report_history and
+        # get_presigned_url already treated admin/gm as unrestricted
+        # before this branch and must stay byte-identical.
+        mapped = {u['folder_name'] for u in get_accessible_users(caller)}
+        # Empty-mapping edge: load_user_mapping falls back to
+        # {'mapping': {}} whenever the S3 read of config/user_mapping.json
+        # fails, so an admin's derived set can be empty for reasons that
+        # have nothing to do with authorisation. Failing that closed would
+        # be a brand-new availability regression triggered by an unrelated
+        # S3 hiccup, and it is not what the old code did either (an empty
+        # list is falsy -> no filter ran). Fall back to None: identical to
+        # the pre-branch behaviour, and not a fail-open, because admin/gm
+        # are unrestricted in every sibling reader here anyway. Scoped
+        # callers are untouched -- for them an empty set stays deny-all.
+        folder_scope = mapped or None
+    if folder_scope is not None and not folder_scope:
+        return ok({'message': f'No reports for {date}', 'date': date}, 404)
     try:
         resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
         for obj in resp.get('Contents', []):
@@ -273,10 +338,14 @@ def find_any_report(date, caller=None):
                 parts = key.replace(prefix, '').split('/')
                 if len(parts) >= 2:
                     user_name = parts[0]
-                    # Filter by permission
-                    if accessible:
-                        if not any(u['folder_name'] == user_name or u['name'] == user_name for u in accessible):
-                            continue
+                    # Filter by permission. Deliberate narrowing: the old
+                    # predicate also matched the SPACED display name
+                    # (u['name']) against what is always an S3 path
+                    # segment, i.e. the folder form -- that could only
+                    # ever match for a single-word name, where both forms
+                    # are identical. No real caller loses access.
+                    if folder_scope is not None and user_name not in folder_scope:
+                        continue
                     reports.append({'user': user_name, 'key': key})
     except Exception:
         pass
@@ -301,7 +370,16 @@ def get_dates(params, caller):
     
     role = caller['role']
     user_param = params.get('user', '')
-    # Determine which user folders to check
+    # SECURITY: three-state scope, same discipline as
+    # get_report_history/find_any_report/accessible_folder_scope. None =
+    # unrestricted (admin/gm with no ?site and no ?user); a list is an
+    # allowlist. Previously the admin/gm "no filter" case used
+    # `user_folders = []`, and `?site=` with no accessible users on that
+    # site ALSO produced `[]` -- `if user_folders:` (below) is falsy for
+    # both, so a scoped caller with nobody accessible on ?site= took the
+    # "no filter" branch: every date was marked hasReport=True and
+    # enriched from the UNSCOPED summary_report.json, leaking
+    # company-wide topic/safety counts per day.
     if user_param and can_access_user_data(caller, user_param):
         # Explicit ?user= wins: the timeline date-picker asks for one user's
         # dates so its dots match the per-user report fetch. Without this the
@@ -315,9 +393,18 @@ def get_dates(params, caller):
         users = get_accessible_users(caller, site_filter=site)
         user_folders = [u['folder_name'] for u in users]
     elif role in ('admin', 'gm'):
-        user_folders = []  # Check all (no filter)
+        user_folders = None  # unrestricted -- no filter
     else:
         user_folders = [resolve_user_display_name(caller)]
+
+    # Deny-all: an empty list, OR a list of only-blank folder names (the
+    # unmapped-caller shape -- resolve_user_display_name returns '' when
+    # display_name is blank, and [''] is TRUTHY, which is why the old code
+    # failed closed here only by accident rather than by design). Made
+    # explicit so a future edit can't silently turn this back into a leak.
+    if user_folders is not None and not any(user_folders):
+        return ok({'dates': {}})
+
     dates = {}
     try:
         paginator = s3_client.get_paginator('list_objects_v2')
@@ -328,7 +415,7 @@ def get_dates(params, caller):
                     try:
                         d = datetime.strptime(ds, '%Y-%m-%d')
                         if d >= start_date:
-                            if user_folders:
+                            if user_folders is not None:
                                 # Check if any accessible user has a report
                                 for uf in user_folders:
                                     try:
@@ -347,7 +434,7 @@ def get_dates(params, caller):
     for ds in list(dates.keys()):
         try:
             loaded = False
-            if user_folders:
+            if user_folders is not None:
                 for uf in user_folders:
                     try:
                         obj = s3_client.get_object(Bucket=S3_BUCKET, Key=f"{REPORT_PREFIX}{ds}/{uf}/daily_report.json")
@@ -382,22 +469,57 @@ def get_presigned_url(params, caller=None):
     if not any(s3_key.startswith(p) for p in allowed):
         return error('Access denied', 403)
 
-    # Permission check: extract user folder from key and verify caller can access
-    if caller and caller.get('role') not in ('admin', 'gm'):
+    # Permission check: derive the owning user folder from the key and
+    # verify the caller can reach it.
+    #
+    # SECURITY (2026-07-23): this block used to leave target_user = None
+    # for any key shape it could not parse -- and `if target_user and not
+    # can_access_user_data(...)` then short-circuited, issuing a presigned
+    # URL with NO check at all. reports/{date}/summary_report.json (length
+    # 3, so the old `len(key_parts) > 3` guard was False) and
+    # reports/{date}/sites/... ('sites' explicitly excluded) both took that
+    # path: 36 real objects on prod, each a full report body. An
+    # undeterminable owner is now a DENY for every non-admin/gm caller.
+    #
+    # The `not caller` leg closes the second half of the same shape: the
+    # guard used to read `if caller and ...`, so an ABSENT identity skipped
+    # the whole block and was served a signed URL unchecked -- "no identity
+    # == unrestricted", precisely what this branch exists to abolish.
+    # Unreachable from lambda_handler today (it always passes a dict), but
+    # the default `caller=None` in the signature keeps the door ajar.
+    if not caller or caller.get('role') not in ('admin', 'gm'):
         # Extract user folder name from common path patterns:
         #   users/{name}/...  audio_segments/{name}/...  transcripts/{name}/...
         #   reports/{date}/{name}/...  web_video/{name}/...
         key_parts = s3_key.split('/')
         target_user = None
         if len(key_parts) >= 2 and key_parts[0] in ('users', 'audio_segments', 'transcripts', 'web_video'):
-            target_user = key_parts[1]
-        elif len(key_parts) >= 3 and key_parts[0] == 'reports':
-            # reports/{date}/{user}/...  — but skip summary_report.json at date level
-            candidate = key_parts[2] if len(key_parts) > 3 else None
+            target_user = key_parts[1] or None
+        elif key_parts[0] == 'reports' and len(key_parts) > 3:
+            # reports/{date}/{user}/... — 'sites' is a rollup namespace,
+            # not a user folder; 'summary_report.json' can't appear at this
+            # position today (it lives at length 3) but is kept in the
+            # guard so a future reports/{date}/summary_report.json/... shape
+            # can't sneak through as an owner name.
+            candidate = key_parts[2]
             if candidate and candidate not in ('summary_report.json', 'sites'):
                 target_user = candidate
 
-        if target_user and not can_access_user_data(caller, target_user):
+        if target_user is None:
+            # FAIL CLOSED. Company/site-level rollups have no owner folder
+            # to check, so a scoped caller cannot be authorised for them by
+            # this endpoint. Serving them to genuine site/company members is
+            # desirable but needs a real membership check this legacy lambda
+            # cannot perform (no Aurora connection; its identity store is the
+            # same DynamoDB table that does not contain these users at all).
+            # That belongs on org-api.
+            logger.info("presign denied: no derivable owner for key=%s role=%s",
+                        s3_key, caller.get('role') if caller else None)
+            return error('Access denied to this media', 403)
+        # `not caller` first: with no identity there is nothing to
+        # authorise against, and can_access_user_data would dereference
+        # caller['role'] and raise.
+        if not caller or not can_access_user_data(caller, target_user):
             return error('Access denied to this user\'s media', 403)
     try:
         url = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': s3_key}, ExpiresIn=PRESIGNED_URL_EXPIRY)
@@ -781,15 +903,19 @@ def get_recording_stats(params, caller):
 
 def get_report_history(params, caller):
     limit = int(params.get('limit', '20'))
-    role = caller['role']
-    # Get accessible user folders
-    if role == 'worker':
-        allowed_folders = [resolve_user_display_name(caller)]
-    elif role in ('admin', 'gm'):
-        allowed_folders = []  # no filter
-    else:
-        accessible = get_accessible_users(caller)
-        allowed_folders = [u['folder_name'] for u in accessible]
+    # SECURITY: three-state scope -- None = unrestricted (admin/gm), an
+    # empty set = deny-all (explicit early return below), otherwise an
+    # allowlist. See accessible_folder_scope for the leak this replaces.
+    # The old dedicated `worker` branch is gone: accessible_folder_scope
+    # routes a worker through get_accessible_users' self-only arm, which
+    # yields the SAME folder_name string resolve_user_display_name did
+    # (display_name with spaces -> underscores). Behaviour equivalence,
+    # not a widening -- pinned by test_history_worker_sees_only_own_folder.
+    folder_scope = accessible_folder_scope(caller)
+    if folder_scope is not None and not folder_scope:
+        # DENY ALL -- return early rather than fall into a filter loop
+        # whose predicate an empty container would silently satisfy.
+        return ok({'reports': []})
     
     reports = []
     try:
@@ -799,8 +925,8 @@ def get_report_history(params, caller):
                 key = obj['Key']
                 if not key.endswith('_report.json') or '_debug' in key:
                     continue
-                if allowed_folders:
-                    if not any(f'/{uf}/' in key for uf in allowed_folders):
+                if folder_scope is not None:
+                    if not any(f'/{uf}/' in key for uf in folder_scope):
                         continue
                 rtype = 'weekly' if 'weekly' in key else 'monthly' if 'monthly' in key else 'daily'
                 dm = re.search(r'(\d{4}-\d{2}-\d{2})', key)
