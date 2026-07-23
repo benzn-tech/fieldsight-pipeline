@@ -82,6 +82,13 @@ jobs:
           #   * TEST_ENABLE_KEYFRAMES -> gates item-writer's keyframe_requests/ EMISSION.
           #     Left default false so merging does NOT auto-enable emission; flip it
           #     deliberately only after the created stack + its IAM are verified on TEST.
+          # SAM's --parameter-overrides REJECTS a bare "Key=" with an empty value, so the
+          # ffmpeg-layer override is only appended when the var is actually set; unset =>
+          # the token is omitted and the template Default ('') keeps the stack uncreated.
+          KF_LAYER_PARAM=""
+          if [ -n "${{ vars.TEST_KEYFRAME_FFMPEG_LAYER_ARN }}" ]; then
+            KF_LAYER_PARAM="KeyframeFfmpegLayerArn=${{ vars.TEST_KEYFRAME_FFMPEG_LAYER_ARN }}"
+          fi
           sam deploy --config-env test \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -90,9 +97,8 @@ jobs:
               "IngestBucketName=fieldsight-data-test-509194952652" \
               "EnableSchedules=false" \
               "EnableSiteVoice=true" \
-              "VadLayerArn=${{ vars.TEST_VAD_LAYER_ARN }}" \
-              "KeyframeFfmpegLayerArn=${{ vars.TEST_KEYFRAME_FFMPEG_LAYER_ARN }}" \
               "EnableKeyframes=${{ vars.TEST_ENABLE_KEYFRAMES || 'false' }}" \
+              $KF_LAYER_PARAM \
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \
