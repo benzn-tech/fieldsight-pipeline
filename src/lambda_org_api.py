@@ -2097,6 +2097,38 @@ def _org_extract_time_seconds_from_filename(filename):
     return None
 
 
+def _list_media_objects(prefix, what):
+    """Paginated list_objects_v2 over one media prefix in S3_BUCKET.
+
+    SECURITY/OPS (adversarial review BLOCKER 1). The media readers used to
+    wrap this in `except ClientError: pass`, which collapsed EVERY listing
+    failure into an empty result and a 200. The dominant such failure is
+    AccessDenied from a missing s3:ListBucket prefix grant -- and its
+    rendered output ("No audio segments in this window.") is byte-identical
+    to the legitimate empty day, i.e. exactly the invisible failure these
+    routes were written to eliminate. An overloaded sentinel that cannot
+    distinguish "nothing here" from "I was not allowed to look" is not an
+    acceptable degrade.
+
+    A missing prefix is NOT an error to S3: list_objects_v2 returns an empty
+    Contents. So there is no not-found class to tolerate here at all -- any
+    ClientError is a genuine fault (IAM, bucket, throttle) and is re-raised
+    for lambda_handler to turn into a 500 {"error": "internal error"}. Same
+    posture as _get_lake_json / programme.read_programme in this codebase.
+    (_list_report_folders keeps its tolerant catch on purpose: it has an
+    Aurora union to fall back on, and admin_disambiguation's answer is still
+    complete without it.)"""
+    try:
+        paginator = s3().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                yield obj
+    except ClientError:
+        logger.exception("%s: S3 listing failed for prefix %s (bucket %s)",
+                         what, prefix, S3_BUCKET)
+        raise
+
+
 def _read_org_transcripts(date, folder, start_time, end_time):
     """S3 read + normalize for one (folder, date) window -- mirrors
     lambda_fieldsight_api.get_transcripts's locate/parse/response-shape
@@ -2114,18 +2146,8 @@ def _read_org_transcripts(date, folder, start_time, end_time):
         start_sec = 0
 
     prefix = f"transcripts/{folder}/{date}/"
-    transcript_files = []
-    try:
-        paginator = s3().get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith(".json"):
-                    transcript_files.append(key)
-    except ClientError:
-        # Same posture as _list_report_folders: a listing failure (e.g. an
-        # IAM edge case) degrades to "no transcripts" rather than a 500.
-        pass
+    transcript_files = [obj["Key"] for obj in _list_media_objects(prefix, "transcripts")
+                        if obj["Key"].endswith(".json")]
 
     if not transcript_files:
         return {"text": "", "segments": [], "speaker_segments": [], "message": "No transcripts found"}
@@ -2240,7 +2262,12 @@ def _resolve_org_media_folder(conn, caller, user, what="media"):
 
     NOTE the deliberate behaviour change on /transcripts: pre-plan it ran
     the binary rule even with the flag on; site/self-scoped callers now
-    reach exactly the folders /timeline already shows them."""
+    reach exactly the folders /timeline already shows them.
+
+    EXCEPTION (review BLOCKER 2): /media/presigned-url does NOT route
+    reports/{date}/{folder}/... through here -- that object is the one
+    /timeline withholds from graded non-ALL cross-user callers. See
+    _authorize_report_object_presign."""
     if GRADED_ROLES:
         sc = scope.visible_scope(conn, caller)
         if sc["user_scope"] == "ALL":                     # admin/gm/platform_admin
@@ -2309,10 +2336,16 @@ def _org_caller_may_read_ownerless(conn, caller):
     if GRADED_ROLES:
         sc = scope.visible_scope(conn, caller)
         return sc["user_scope"] == "ALL" and sc["cross_company"]
-    # Binary branch: resolve_scope reads only global_role and carries no
-    # company dimension whatsoever, so there is no signal to consult.
-    # Deny outright rather than authorize on tier alone.
-    return False
+    # Binary branch (review FOLLOW-UP 3). This used to `return False`
+    # unconditionally, which made GRADED_ROLES -- an operational kill switch
+    # -- also strip platform_admin of the ownerless presign it holds on the
+    # graded branch, precisely during the incident someone would flip it to
+    # investigate. The graded branch's real predicate is cross_company, and
+    # acl.is_cross_company is a pure function of global_role
+    # (platform_admin-only), so asking the role directly reaches the SAME
+    # conclusion with no company dimension required -- no loosening, just
+    # the flag-independent restatement. Everyone else stays fail-closed.
+    return caller["global_role"] == "platform_admin"
 
 
 def get_org_transcripts(conn, caller, event):
@@ -2360,39 +2393,33 @@ def _read_org_audio_segments(date, folder, start_time, end_time):
     end_sec = _org_parse_time_to_seconds(end_time) if end_time else 86400
     prefix = f"audio_segments/{folder}/{date}/"
     segments = []
-    try:
-        paginator = s3().get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if not key.endswith(".wav"):
-                    continue
-                filename = key.split("/")[-1]
-                base_match = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})_off", filename)
-                off_match = re.search(r"_off([\d.]+)_to([\d.]+)", filename)
-                if not base_match or not off_match:
-                    continue
-                h, m, sec = (int(base_match.group(1)), int(base_match.group(2)),
-                             int(base_match.group(3)))
-                base_sec = h * 3600 + m * 60 + sec
-                abs_start = base_sec + float(off_match.group(1))
-                abs_end = base_sec + float(off_match.group(2))
-                if abs_end < start_sec or abs_start > end_sec:
-                    continue
-                url = s3().generate_presigned_url(
-                    "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
-                    ExpiresIn=PRESIGNED_URL_EXPIRY)
-                ah, am, asec = (int(abs_start) // 3600, (int(abs_start) % 3600) // 60,
-                                int(abs_start) % 60)
-                segments.append({
-                    "url": url, "filename": filename,
-                    "absolute_start": abs_start, "absolute_end": abs_end,
-                    "duration": round(abs_end - abs_start, 1),
-                    "time_label": f"{ah:02d}:{am:02d}:{asec:02d}",
-                })
-    except ClientError:
-        # Same degrade-to-empty posture as _read_org_transcripts.
-        pass
+    for obj in _list_media_objects(prefix, "audio-segments"):
+        key = obj["Key"]
+        if not key.endswith(".wav"):
+            continue
+        filename = key.split("/")[-1]
+        base_match = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})_off", filename)
+        off_match = re.search(r"_off([\d.]+)_to([\d.]+)", filename)
+        if not base_match or not off_match:
+            continue
+        h, m, sec = (int(base_match.group(1)), int(base_match.group(2)),
+                     int(base_match.group(3)))
+        base_sec = h * 3600 + m * 60 + sec
+        abs_start = base_sec + float(off_match.group(1))
+        abs_end = base_sec + float(off_match.group(2))
+        if abs_end < start_sec or abs_start > end_sec:
+            continue
+        url = s3().generate_presigned_url(
+            "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
+            ExpiresIn=PRESIGNED_URL_EXPIRY)
+        ah, am, asec = (int(abs_start) // 3600, (int(abs_start) % 3600) // 60,
+                        int(abs_start) % 60)
+        segments.append({
+            "url": url, "filename": filename,
+            "absolute_start": abs_start, "absolute_end": abs_end,
+            "duration": round(abs_end - abs_start, 1),
+            "time_label": f"{ah:02d}:{am:02d}:{asec:02d}",
+        })
     segments.sort(key=lambda seg: seg["absolute_start"])
     return {"segments": segments, "count": len(segments)}
 
@@ -2425,41 +2452,36 @@ def _read_org_video_segments(date, folder, start_time, end_time):
     videos = []
     for prefix, is_preview in ((f"web_video/{folder}/{date}/", True),
                                (f"users/{folder}/video/{date}/", False)):
-        try:
-            paginator = s3().get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
-                for obj in page.get("Contents", []):
-                    key = obj["Key"]
-                    if not any(key.lower().endswith(e) for e in (".mp4", ".webm", ".mov")):
-                        continue
-                    filename = key.split("/")[-1]
-                    time_match = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})", filename)
-                    if not time_match:
-                        continue
-                    h, m, sec = (int(time_match.group(1)), int(time_match.group(2)),
-                                 int(time_match.group(3)))
-                    vid_start = h * 3600 + m * 60 + sec
-                    if vid_start + 600 < start_sec or vid_start > end_sec:
-                        continue
-                    base_name = re.sub(r"\.\w+$", "", filename)
-                    if not is_preview and any(v.get("base_name") == base_name for v in videos):
-                        continue
-                    url = s3().generate_presigned_url(
-                        "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
-                        ExpiresIn=PRESIGNED_URL_EXPIRY)
-                    vh, vm, vs = vid_start // 3600, (vid_start % 3600) // 60, vid_start % 60
-                    videos.append({
-                        "url": url, "key": key, "filename": filename,
-                        "base_name": base_name,
-                        "video_start_sec": vid_start,
-                        "time_label": f"{vh:02d}:{vm:02d}:{vs:02d}",
-                        "offset_sec": round(max(0, start_sec - vid_start), 1),
-                        "size_mb": round(obj["Size"] / (1024 * 1024), 1),
-                        "is_preview": is_preview,
-                        "codec": "h264" if is_preview else "unknown",
-                    })
-        except ClientError:
-            pass
+        for obj in _list_media_objects(prefix, "video-segments"):
+            key = obj["Key"]
+            if not any(key.lower().endswith(e) for e in (".mp4", ".webm", ".mov")):
+                continue
+            filename = key.split("/")[-1]
+            time_match = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})", filename)
+            if not time_match:
+                continue
+            h, m, sec = (int(time_match.group(1)), int(time_match.group(2)),
+                         int(time_match.group(3)))
+            vid_start = h * 3600 + m * 60 + sec
+            if vid_start + 600 < start_sec or vid_start > end_sec:
+                continue
+            base_name = re.sub(r"\.\w+$", "", filename)
+            if not is_preview and any(v.get("base_name") == base_name for v in videos):
+                continue
+            url = s3().generate_presigned_url(
+                "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
+                ExpiresIn=PRESIGNED_URL_EXPIRY)
+            vh, vm, vs = vid_start // 3600, (vid_start % 3600) // 60, vid_start % 60
+            videos.append({
+                "url": url, "key": key, "filename": filename,
+                "base_name": base_name,
+                "video_start_sec": vid_start,
+                "time_label": f"{vh:02d}:{vm:02d}:{vs:02d}",
+                "offset_sec": round(max(0, start_sec - vid_start), 1),
+                "size_mb": round(obj["Size"] / (1024 * 1024), 1),
+                "is_preview": is_preview,
+                "codec": "h264" if is_preview else "unknown",
+            })
     videos.sort(key=lambda v: v["video_start_sec"])
     return {"videos": videos, "count": len(videos)}
 
@@ -2481,6 +2503,55 @@ _ORG_MEDIA_PRESIGN_PREFIXES = ("users/", "audio_segments/", "transcripts/",
                                "reports/", "web_video/")
 
 
+def _authorize_report_object_presign(conn, caller, folder):
+    """May this caller presign reports/{date}/{folder}/... ?
+    Returns None when allowed, else an error response.
+
+    SECURITY (adversarial review BLOCKER 2). reports/ is the ONE presignable
+    shape whose object /timeline deliberately WITHHOLDS from part of the
+    population that _can_view_folder admits: _render_timeline_for_user sets
+    doc=None and serves 404 (cross_user_clip) when a graded non-ALL caller
+    views someone else, because the target's whole-day free-text prose
+    (executive_summary / safety_observations / quality_and_compliance /
+    critical_dates_and_deadlines) is NOT site-scoped and can span sites
+    outside the caller's reach. Routing reports/ through
+    _resolve_org_media_folder like the other prefixes handed exactly those
+    callers a bearer URL to exactly that object -- /timeline 404s pm
+    Neil_Blunden on Ben_UCPK's day while the presigner returned 200 for
+    reports/{date}/Ben_UCPK/daily_report.json. It also sat outside the
+    widening the user approved, whose residual-risk paragraph scopes its
+    exemption to audio/video/transcript objects keyed by (folder, date) and
+    never mentions reports/.
+
+    The rule restores exact parity rather than blanket-denying:
+      * ALL tier  -> allowed. /timeline serves these callers the verbatim
+        doc (cross_user_clip=False), so allowing the presign IS parity.
+        Still company-pinned, via _resolve_org_media_folder's own
+        users.get_by_folder_name check (RETARGET override 5).
+      * everyone else -> own folder only. /timeline gives them nothing else
+        from this object, so denying IS parity. Dropping reports/ from the
+        allowlist entirely would break the legitimate own-report presigns
+        (meetings.js:40, reports.js:61).
+    GRADED_ROLES off is coherent by construction: /timeline's binary branch
+    already forces non-ALL callers to self, so the same two-case rule -- read
+    off resolve_scope/caller.folder_name instead of the graded envelope --
+    is parity there too."""
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)
+        is_all, self_folder = sc["user_scope"] == "ALL", sc["self_folder"]
+    else:
+        is_all = resolve_scope(caller["global_role"]) == "ALL"
+        self_folder = caller.get("folder_name")
+    if is_all:
+        # Delegate ONLY the ALL-tier case, so the company pin and its 404
+        # shape stay in one place.
+        _, err = _resolve_org_media_folder(conn, caller, folder, what="reports")
+        return err
+    if not self_folder or folder != self_folder:
+        return error("you may only access your own reports", 403)
+    return None
+
+
 def get_org_media_presigned_url(conn, caller, event):
     """GET /api/org/media/presigned-url?key= -- Aurora-identity presigner
     (P1, prod-media-binding plan). The legacy /media/presigned-url
@@ -2498,14 +2569,30 @@ def get_org_media_presigned_url(conn, caller, event):
     deliberately NARROWER than both the legacy handler (which let any
     caller presign an ownerless key) and this route's own pre-S-4 gate
     (which allowed any ALL-tier caller, including a company admin/gm).
+    reports/{date}/{folder}/... is the ONE owner-derivable shape that does
+    NOT use the shared list-route rule -- see _authorize_report_object_presign
+    for why (/timeline withholds that exact object from graded non-ALL
+    cross-user callers, review BLOCKER 2).
     No unquote_plus here: API Gateway already URL-decodes query params
-    once; the legacy endpoint's extra decode would corrupt a literal '+'."""
+    once; the legacy endpoint's extra decode would corrupt a literal '+'.
+    That omission is load-bearing, not an oversight: it keeps the bytes this
+    function PARSES for the ACL identical to the bytes botocore SIGNS, which
+    is what structurally prevents the classic presign bypass. Do not add a
+    decode here."""
     key = (event.get("queryStringParameters") or {}).get("key", "")
     if not key:
         return error("key required", 400)
     if not any(key.startswith(p) for p in _ORG_MEDIA_PRESIGN_PREFIXES):
         return error("access denied", 403)
     parts = key.split("/")
+    # Defensive canonicalization (review FOLLOW-UP 4). 31 crafted keys failed
+    # to produce a leak -- dot-segments fail closed at S3/SigV4 in both
+    # directions -- but that safety rests on a botocore implementation detail,
+    # and "users/Ada_L/../Someone_Else/..." would otherwise pass an
+    # own-folder check while naming a different owner. Reject non-canonical
+    # keys outright instead of reasoning about the signer's behaviour.
+    if "//" in key or key.startswith("/") or any(p in (".", "..") for p in parts):
+        return error("access denied", 403)
     target = None
     if len(parts) >= 2 and parts[0] in ("users", "audio_segments", "transcripts", "web_video"):
         target = parts[1]
@@ -2515,6 +2602,10 @@ def get_org_media_presigned_url(conn, caller, event):
     if not target:
         if not _org_caller_may_read_ownerless(conn, caller):
             return error("access denied", 403)
+    elif parts[0] == "reports":
+        err = _authorize_report_object_presign(conn, caller, target)
+        if err is not None:
+            return err
     else:
         _, err = _resolve_org_media_folder(conn, caller, target, what="media")
         if err is not None:

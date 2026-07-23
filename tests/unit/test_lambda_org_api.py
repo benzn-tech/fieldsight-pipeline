@@ -826,10 +826,17 @@ def test_create_member_archived_same_company_409(member_wired):
 
 
 class _FakeS3Paginator:
-    def __init__(self, pages):
+    def __init__(self, pages, error_code=None):
         self.pages = pages
+        self.error_code = error_code
 
     def paginate(self, Bucket=None, Prefix=None):
+        # Adversarial review BLOCKER 1: a listing failure (AccessDenied when
+        # the execution role lacks s3:ListBucket on the prefix) must NOT be
+        # swallowed into an empty 200. Raised from inside the generator, the
+        # way botocore surfaces it on the first page fetch.
+        if self.error_code:
+            raise ClientError({"Error": {"Code": self.error_code}}, "ListObjectsV2")
         # Filter by Prefix the way real S3 does. Required by the media routes
         # (P1, prod-media-binding plan): /video-segments lists TWO prefixes
         # (web_video/ preview then users/{folder}/video/ original) in one
@@ -865,12 +872,16 @@ class FakeS3:
         # single-page default most tests use.
         self.list_objects_response = {"Contents": []}
         self.list_objects_pages = None
+        # When set (e.g. "AccessDenied"), paginate() raises ClientError with
+        # this code instead of yielding pages — the IAM-misconfiguration
+        # failure mode the media routes must not swallow (review BLOCKER 1).
+        self.list_objects_error_code = None
 
     def get_paginator(self, op):
         assert op == "list_objects_v2"
         pages = self.list_objects_pages if self.list_objects_pages is not None \
             else [self.list_objects_response]
-        return _FakeS3Paginator(pages)
+        return _FakeS3Paginator(pages, self.list_objects_error_code)
 
     def generate_presigned_url(self, op, Params=None, ExpiresIn=0):
         self.last = {"op": op, "params": Params, "expires": ExpiresIn}
@@ -3562,6 +3573,18 @@ def test_audio_segments_graded_site_manager_cannot_read_pm_403(presign_wired):
     assert res["statusCode"] == 403
 
 
+def _site_roles_by_uid(wired, roles):
+    """Stub memberships.caller_site_roles so it HONOURS its user_id argument.
+
+    Review FOLLOW-UP 5(a): the previous stub returned the same in-scope map
+    for every user_id, so _can_view_folder's SITE branch
+    (`any(sid in sc["site_ids"] for sid in caller_site_roles(target.id))`)
+    could never evaluate False and the whole branch was untested on its deny
+    side. Keyed by user id, an out-of-scope target genuinely fails it."""
+    wired.setattr(org.memberships, "caller_site_roles",
+                  lambda conn, uid: dict(roles.get(str(uid), {})))
+
+
 def test_audio_segments_graded_pm_reads_site_member(presign_wired):
     # SITE scope (pm/regional_manager): any member of an in-scope site.
     # The cohort's real unlock: pm Neil_Blunden / James_Alcock reading
@@ -3570,13 +3593,71 @@ def test_audio_segments_graded_pm_reads_site_member(presign_wired):
     _graded_caller(wired, "Neil_Blunden", "SITE", author_ids=None, site_ids={"site-1"})
     wired.setattr(org.users, "get_by_folder_name",
                   lambda conn, cid, folder: {"id": "u-ben", "folder_name": folder})
-    wired.setattr(org.memberships, "caller_site_roles",
-                  lambda conn, uid: {"site-1": "site_manager"})
+    # Honours user_id (see _site_roles_by_uid): u-ben really is on site-1.
+    _site_roles_by_uid(wired, {"u-ben": {"site-1": "site_manager"},
+                               "u-stranger": {"site-9": "worker"}})
     _wire_one_audio_segment(fake, "Ben_UCPK", "2026-07-18")
     res = org.lambda_handler(make_event(
         "GET", "/api/org/audio-segments",
         params={"date": "2026-07-18", "user": "Ben_UCPK"}), None)
     assert res["statusCode"] == 200
+
+
+def test_audio_segments_graded_pm_denied_out_of_scope_site_403(presign_wired):
+    # Review FOLLOW-UP 5(a): the repo's FIRST negative SITE-scope test. The
+    # target exists in the caller's company but every one of their sites is
+    # outside the pm's reach, so _can_view_folder's SITE branch must return
+    # False. With the old user_id-ignoring stub this test could not fail.
+    wired, fake = presign_wired
+    _graded_caller(wired, "Neil_Blunden", "SITE", author_ids=None, site_ids={"site-1"})
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-stranger", "folder_name": folder})
+    _site_roles_by_uid(wired, {"u-ben": {"site-1": "site_manager"},
+                               "u-stranger": {"site-9": "worker"}})
+    _wire_one_audio_segment(fake, "Other_Site_Person", "2026-07-18")
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/audio-segments",
+        params={"date": "2026-07-18", "user": "Other_Site_Person"}), None)
+    assert res["statusCode"] == 403
+
+
+# ---- listing failures must never degrade to an empty 200 (BLOCKER 1) ----
+
+def test_audio_segments_list_access_denied_surfaces_500(presign_wired):
+    # Adversarial review BLOCKER 1: `except ClientError: pass` turned a
+    # missing s3:ListBucket grant on audio_segments/* into {"segments": [],
+    # "count": 0} with HTTP 200 — indistinguishable from "no audio in this
+    # window", i.e. byte-identical to the bug this route exists to fix.
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
+    fake.list_objects_error_code = "AccessDenied"
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/audio-segments", params={"date": "2026-07-18"}), None)
+    assert res["statusCode"] == 500
+    assert body_of(res) == {"error": "internal error"}
+
+
+def test_video_segments_list_access_denied_surfaces_500(presign_wired):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
+    fake.list_objects_error_code = "AccessDenied"
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/video-segments", params={"date": "2026-07-18"}), None)
+    assert res["statusCode"] == 500
+
+
+def test_transcripts_list_access_denied_surfaces_500(presign_wired):
+    # Same overloaded sentinel on the third media route: an empty listing is
+    # "no transcripts", a failed listing is a failure.
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
+    fake.list_objects_error_code = "AccessDenied"
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/transcripts", params={"date": "2026-07-18"}), None)
+    assert res["statusCode"] == 500
 
 
 def test_audio_segments_graded_off_binary_fallback(presign_wired):
@@ -3838,6 +3919,170 @@ def test_media_presign_graded_off_binary_fallback(presign_wired):
         "GET", "/api/org/media/presigned-url",
         params={"key": "users/Site_Worker/pictures/2026-07-23/x.jpg"}), None)
     assert res["statusCode"] == 403
+
+
+def test_media_presign_company_pinned_other_company_folder_404(presign_wired):
+    # Review FOLLOW-UP 5(b): an ALL-tier COMPANY admin (not cross-company)
+    # presigning another company's users/{folder}/... must not succeed. The
+    # pin is users.get_by_folder_name(company_id, folder) -> None -> 404,
+    # the same RETARGET-override-5 shape /timeline uses.
+    wired, fake = presign_wired
+    _graded_caller(wired, "Ada_Admin", "ALL", cross_company=False, global_role="admin")
+    wired.setattr(org.users, "get_by_folder_name", lambda conn, cid, folder: None)
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "users/Other_Co_User/pictures/2026-07-23/x.jpg"}), None)
+    assert res["statusCode"] == 404
+
+
+# ---- reports/ parity with /timeline's CRITICAL-1 clip (BLOCKER 2) ----
+# /timeline forces doc=None and 404s rather than serve the verbatim S3 report
+# when a graded non-ALL caller views SOMEONE ELSE (the target's whole-day
+# free-text prose is not site-scoped). The presigner authorizes the identical
+# caller/target pair, so without a dedicated rule it minted a bearer URL to
+# the exact object /timeline had just withheld. reports/ stays in the
+# allowlist: meetings.js/reports.js legitimately presign the CALLER'S OWN
+# reports through it.
+
+def test_media_presign_reports_graded_pm_denied_other_folder_403(presign_wired):
+    # The reviewer's repro: pm Neil_Blunden (SITE scope) vs target Ben_UCPK.
+    # /timeline 404s him; the presigner must not hand him the same bytes.
+    wired, fake = presign_wired
+    _graded_caller(wired, "Neil_Blunden", "SITE", author_ids=None, site_ids={"site-1"},
+                   global_role="pm")
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-ben", "folder_name": folder})
+    _site_roles_by_uid(wired, {"u-ben": {"site-1": "site_manager"}})
+    for name in ("daily_report.json", "meeting_minutes.json", "daily_report.docx"):
+        res = org.lambda_handler(make_event(
+            "GET", "/api/org/media/presigned-url",
+            params={"key": f"reports/2026-07-18/Ben_UCPK/{name}"}), None)
+        assert res["statusCode"] == 403, name
+
+
+def test_media_presign_reports_graded_own_folder_ok(presign_wired):
+    # meetings.js:40 / reports.js:61 presign the caller's OWN reports — the
+    # reason reports/ must stay in the allowlist rather than be dropped.
+    wired, fake = presign_wired
+    _graded_caller(wired, "Neil_Blunden", "SITE", author_ids=None, site_ids={"site-1"},
+                   global_role="pm")
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "reports/2026-07-18/Neil_Blunden/meeting_minutes.json"}), None)
+    assert res["statusCode"] == 200
+
+
+def test_media_presign_reports_graded_all_tier_other_folder_ok(presign_wired):
+    # Parity, not an exception: an ALL-tier caller gets the verbatim doc from
+    # /timeline (cross_user_clip=False), so allowing the presign IS parity.
+    wired, fake = presign_wired
+    _graded_caller(wired, "Ada_Admin", "ALL", cross_company=False, global_role="admin")
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-ben", "folder_name": folder})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "reports/2026-07-18/Ben_UCPK/daily_report.json"}), None)
+    assert res["statusCode"] == 200
+
+
+def test_media_presign_reports_all_tier_other_company_folder_404(presign_wired):
+    # The ALL-tier allowance keeps /timeline's company pin.
+    wired, fake = presign_wired
+    _graded_caller(wired, "Ada_Admin", "ALL", cross_company=False, global_role="admin")
+    wired.setattr(org.users, "get_by_folder_name", lambda conn, cid, folder: None)
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "reports/2026-07-18/Other_Co_User/daily_report.json"}), None)
+    assert res["statusCode"] == 404
+
+
+def test_media_presign_reports_graded_site_manager_denied_worker_403(presign_wired):
+    # SELF+WORKERS reaches a worker's AUDIO/VIDEO/TRANSCRIPTS (approved
+    # widening) but never their report prose — /timeline clips it too.
+    wired, fake = presign_wired
+    _graded_caller(wired, "Ben_UCPK", "SELF+WORKERS", author_ids={"u-self", "u-worker"})
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-worker", "folder_name": folder})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "reports/2026-07-18/Site_Worker/daily_report.json"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_media_presign_reports_graded_off_non_all_other_folder_403(presign_wired):
+    # GRADED_ROLES off: /timeline's binary rule already forces self, so the
+    # presigner denying a non-ALL caller another folder's report is parity
+    # there too (this is the module default in unit tests).
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "site_manager",
+                                     "folder_name": "Ben_UCPK"})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "reports/2026-07-18/Site_Worker/daily_report.json"}), None)
+    assert res["statusCode"] == 403
+
+
+def test_media_presign_reports_graded_off_all_tier_other_folder_ok(presign_wired):
+    # GRADED_ROLES off + ALL tier: /timeline serves the verbatim doc, so does
+    # the presigner — still company-pinned.
+    wired, fake = presign_wired          # CALLER default global_role is "admin"
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-ben", "folder_name": folder})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "reports/2026-07-18/Ben_UCPK/daily_report.json"}), None)
+    assert res["statusCode"] == 200
+
+
+# ---- ownerless keys with GRADED_ROLES off (FOLLOW-UP 3) ----
+
+def test_media_presign_ownerless_graded_off_platform_admin_ok(presign_wired):
+    # FOLLOW-UP 3: the binary branch used to `return False` unconditionally,
+    # so flipping the GRADED_ROLES kill switch during an incident stripped
+    # platform_admin of the ownerless presign it has when the flag is on.
+    # global_role is the whole input — no company dimension needed.
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "platform_admin",
+                                     "folder_name": "Platform_Admin"})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "reports/2026-07-18/summary_report.json"}), None)
+    assert res["statusCode"] == 200
+
+
+def test_media_presign_ownerless_graded_off_company_admin_denied(presign_wired):
+    # Fail-closed posture preserved for everyone else on the binary branch.
+    wired, fake = presign_wired          # CALLER default global_role is "admin"
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "reports/2026-07-18/sites/uc-pk/site_report.json"}), None)
+    assert res["statusCode"] == 403
+
+
+# ---- defensive key canonicalization (FOLLOW-UP 4) ----
+
+def test_media_presign_rejects_non_canonical_keys_403(presign_wired):
+    # The reviewer could not produce a leak (dot-segments fail closed at
+    # S3/SigV4 in both directions, and the deliberate absence of
+    # unquote_plus keeps the ACL-parsed bytes identical to the signed
+    # bytes), but that argument rested on a botocore implementation detail.
+    # This is the cheap explicit guard. Note the LAST key would otherwise
+    # parse its owner segment as ".." and sail through the own-folder check.
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ada_L"})
+    for key in (
+        "users//pictures/2026-07-23/x.jpg",
+        "users/Ada_L/../Someone_Else/pictures/x.jpg",
+        "users/Ada_L/./pictures/x.jpg",
+        "users/../users/Someone_Else/pictures/x.jpg",
+        "users/..",
+    ):
+        res = org.lambda_handler(make_event(
+            "GET", "/api/org/media/presigned-url", params={"key": key}), None)
+        assert res["statusCode"] == 403, key
 
 
 # ---- /observations site scoping ----
