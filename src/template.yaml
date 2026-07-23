@@ -50,6 +50,15 @@ Parameters:
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: Disable in test to avoid polling RealPTT / generating reports on cron.
+  EnableKeyframes:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Emit keyframe_requests/ from item-writer (video-keyframe plan). The
+      KeyframeFunction itself deploys whenever HasKeyframeStack (HasDb &&
+      HasVadLayer); this flag only gates the item-writer emission so the
+      pipeline change ships inert until flipped per stage.
   RealPTTAccount:
     Type: String
     Description: RealPTT platform account (external service)
@@ -341,6 +350,10 @@ Conditions:
   HasPgDatabaseOverride: !Not [!Equals [!Ref PgDatabase, ""]]
   HasOrgApi: !And [!Condition HasDb, !Condition HasOrgPool]
   HasSiteVoice: !And [!Condition HasOrgApi, !Equals [!Ref EnableSiteVoice, 'true']]
+  # video-keyframe plan: the KeyframeFunction needs Aurora (HasDb) for the
+  # topic_photos bind AND the VAD layer (HasVadLayer) for the static
+  # /opt/bin/ffmpeg binary — so it deploys only when both are present.
+  HasKeyframeStack: !And [!Condition HasDb, !Condition HasVadLayer]
 
 # ============================================================
 # Global Settings
@@ -1248,6 +1261,9 @@ Resources:
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
           MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
+          # video-keyframe plan: emit keyframe_requests/ post-commit only when
+          # this stage flag is on (ships inert otherwise).
+          EMIT_KEYFRAME_REQUESTS: !Ref EnableKeyframes
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
@@ -1265,6 +1281,13 @@ Resources:
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/match_requests/*
             - Effect: Allow
+              # video-keyframe plan: post-commit request artifact for the
+              # S3-triggered KeyframeFunction (item-writer is in-VPC, BUG-36 —
+              # no lambda:Invoke possible; mirrors the match_requests/ grant
+              # above). Its own PutObject grant, gated to the disjoint prefix.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/keyframe_requests/*
+            - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
@@ -1275,6 +1298,66 @@ Resources:
                     # GetObject) so write_extraction_items can list
                     # users/{user_folder}/pictures/{date}/ to time-correlate
                     # photos onto extraction topics (topic_photos).
+                    - users/*
+
+  # ----------------------------------------------------------
+  # Lambda: Keyframe extractor (video-keyframe-to-photo plan) — in-VPC,
+  # S3 event on keyframe_requests/ (wired manually per BUG-33 —
+  # scripts/wire-s3-events.sh). VAD layer is attached ONLY for the static
+  # /opt/bin/ffmpeg binary; its cp312 Python packages are never imported
+  # (runtime stays the global python3.11; psycopg comes from PsycopgLayer).
+  # Zero non-S3 AWS calls at runtime (BUG-36: S3 gateway endpoint only).
+  # ----------------------------------------------------------
+  KeyframeFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasKeyframeStack
+    Properties:
+      FunctionName: !Sub ["${P}-keyframe", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_keyframe.lambda_handler
+      Timeout: 120
+      MemorySize: 1024
+      EphemeralStorage:
+        Size: 2048     # original H265 videos observed up to ~200 MB (VadFunction parity)
+      Layers:
+        - !Ref VadLayerArn
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection — see MigrateFunction notes.
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          S3_BUCKET: !Ref IngestBucketName
+      Policies:
+        - VPCAccessPolicy: {}
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/keyframe_requests/*   # its own trigger payload
+                - !Sub arn:aws:s3:::${IngestBucketName}/users/*/video/*        # originals to decode
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*       # vad metadata sidecars
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:DeleteObject      # stale-keyframe cleanup (only ever *_kf_s*.jpg keys)
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/users/*/pictures/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - audio_segments/*
                     - users/*
 
   # ----------------------------------------------------------

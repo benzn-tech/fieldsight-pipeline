@@ -23,5 +23,7 @@ def test_all_pgdatabase_values_are_guarded_by_the_condition():
     # bare !ImportValue (that would be an un-switched function).
     guarded = len(re.findall(r"PGDATABASE:\s*!If \[HasPgDatabaseOverride", t))
     bare = len(re.findall(r"PGDATABASE:\s*!ImportValue", t))
-    assert guarded == 12, f"expected 12 guarded PGDATABASE, found {guarded}"
+    # 13 since the video-keyframe plan added the in-VPC KeyframeFunction
+    # (12 before). Its PGDATABASE is correctly !If-guarded like the rest.
+    assert guarded == 13, f"expected 13 guarded PGDATABASE, found {guarded}"
     assert bare == 0, f"found {bare} un-switched bare PGDATABASE !ImportValue"

@@ -75,6 +75,7 @@ jobs:
               "IngestBucketName=fieldsight-data-test-509194952652" \
               "EnableSchedules=false" \
               "EnableSiteVoice=true" \
+              "EnableKeyframes=${{ vars.TEST_ENABLE_KEYFRAMES || 'false' }}" \
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \
