@@ -5,6 +5,7 @@ real-ffmpeg coverage is the opt-in integration smoke at the bottom (skipif no
 local ffmpeg). Doubles mirror tests/unit/test_lambda_item_writer.py's
 FakeConn/FakeS3 conventions.
 """
+import contextlib
 import io
 import json
 import re
@@ -16,6 +17,7 @@ import pytest
 
 lk = pytest.importorskip("lambda_keyframe", reason="requires psycopg (installed in CI)")
 import keyframe_selection as ks
+import psycopg      # lambda_keyframe imported cleanly, so psycopg is present
 
 
 # --------------------------------------------------------------------------
@@ -144,11 +146,83 @@ class FakeConn:
     def __exit__(self, *a):
         return False
 
+    def transaction(self):
+        # Telemetry writes are savepoint-wrapped (Q7); a no-op CM is enough for
+        # the paths that don't model abort semantics -- see TxAbortConn for those.
+        return contextlib.nullcontext()
+
     def cursor(self, *a, **k):
         return _TopicCursor(self)
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
+        return _Cur(None)
+
+
+class _Savepoint:
+    """psycopg3 `conn.transaction()` semantics, faithfully: entering issues a
+    SAVEPOINT, which FAILS on an already-aborted transaction; leaving via an
+    exception rolls back to the savepoint, which CLEARS the aborted state (that
+    is precisely what keeps the connection usable)."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        if self.conn.failed:
+            raise psycopg.errors.InFailedSqlTransaction(
+                "current transaction is aborted, commands ignored until "
+                "end of transaction block")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            self.conn.failed = False        # ROLLBACK TO SAVEPOINT un-poisons it
+        return False                        # never suppress
+
+
+class TxAbortConn:
+    """Models a real aborted transaction: once a statement fails, `failed` is set
+    and EVERY later statement (or a bare SAVEPOINT) raises
+    InFailedSqlTransaction until something rolls back. Uses the REAL
+    add_topic_photo_if_absent so its `with conn.transaction():` is genuinely
+    exercised against this state machine."""
+
+    def __init__(self, existing=None, topic_meta=None):
+        self.existing = set(existing) if existing is not None else None
+        self.topic_meta = topic_meta or DEFAULT_TOPIC_META
+        self.failed = False
+        self.executed = []
+        self.rows = set()          # committed (topic_id, s3_key) binds
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def transaction(self):
+        return _Savepoint(self)
+
+    def _guard(self):
+        if self.failed:
+            raise psycopg.errors.InFailedSqlTransaction(
+                "current transaction is aborted, commands ignored until "
+                "end of transaction block")
+
+    def cursor(self, *a, **k):
+        self._guard()
+        return _TopicCursor(self)
+
+    def execute(self, sql, params=None):
+        self._guard()
+        self.executed.append((sql, params))
+        if "INSERT INTO topic_photos" in sql:
+            pair = (params["tid"], params["key"])
+            if pair in self.rows:
+                return _Cur(None)
+            self.rows.add(pair)
+            return _Cur({"id": "new-photo-id"})
         return _Cur(None)
 
 
@@ -187,6 +261,9 @@ class StatefulConn:
 
     def __exit__(self, *a):
         return False
+
+    def transaction(self):
+        return contextlib.nullcontext()
 
     def cursor(self, *a, **k):
         return _TopicCursor(self)
@@ -796,23 +873,83 @@ def test_generated_event_written_only_on_real_upload(patched):
         assert kw["company_id"] == "co-1" and kw["site_id"] == "s-1"
 
 
-def test_telemetry_failure_does_not_drop_frames(patched):
-    # record_event raising must NOT cost the frame: the upload + DB bind stand.
-    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:15 – 10:17"}]),
-                 SIDECAR_KEY: _sidecar()})
-    patched.setattr(lk, "_s3_client", s3)
+def test_telemetry_db_failure_does_not_abort_tx_or_drop_bindings(patched):
+    """The real failure mode: a DB-level telemetry failure (e.g. keyframe_events
+    not migrated in this environment) ABORTS the transaction. Without a SAVEPOINT
+    around record_event, the next statement -- add_topic_photo_if_absent's own
+    `with conn.transaction():` -- raises InFailedSqlTransaction, which its
+    `except ForeignKeyViolation` does not catch; that escapes the per-plan
+    try/finally and rolls back EVERY bind of the request (S3 objects uploaded,
+    zero rows committed, request permanently dropped after S3's retries).
 
-    def boom(conn, event, **kw):
-        raise RuntimeError("telemetry down")
-    patched.setattr(lk.keyframes, "record_event", boom)
+    Uses the REAL add_topic_photo_if_absent against a connection that models
+    psycopg3 abort semantics, so the savepoint is genuinely exercised."""
+    from repositories.topics import add_topic_photo_if_absent
+
+    # 3-frame topic: proves the blast radius is the WHOLE request, not one frame.
+    sidecar = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_10-00-00_vad_metadata.json"
+    video = "users/Ben_UCPK/video/2026-07-23/Benl1_2026-07-23_10-00-00.mp4"
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:00 – 10:06"}]),
+                 sidecar: _sidecar(source_key=video, dur=600)})
+    patched.setattr(lk, "_s3_client", s3)
+    conn = TxAbortConn()
+    patched.setattr(lk, "get_connection", lambda *a, **k: conn)
+    patched.setattr(lk, "add_topic_photo_if_absent", add_topic_photo_if_absent)
+
+    def failing_record_event(conn_, event, **kw):
+        conn_.failed = True                       # the INSERT poisoned the tx
+        raise psycopg.errors.UndefinedTable(
+            'relation "keyframe_events" does not exist')
+    patched.setattr(lk.keyframes, "record_event", failing_record_event)
     patched.setattr(lk.subprocess, "run", FakeRun())
 
     result = lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
 
-    expected_key = PICS + "Benl1_2026-07-23_10-16-00_kf_s101534.jpg"
-    assert s3.uploads and s3.uploads[0][1] == expected_key      # frame still uploaded
-    assert patched._kf_inserts == [("topic-1", expected_key, "Auto keyframe @ 10:16")]
-    assert result == {"results": [{"skipped": False, "keyframes": 1}]}   # never raised
+    # never raised, and EVERY frame still bound despite telemetry failing on each
+    assert result == {"results": [{"skipped": False, "keyframes": 3}]}
+    assert len(s3.uploads) == 3
+    assert conn.rows == {
+        ("topic-1", PICS + "Benl1_2026-07-23_10-01-00_kf_s101534.jpg"),
+        ("topic-1", PICS + "Benl1_2026-07-23_10-03-00_kf_s101534.jpg"),
+        ("topic-1", PICS + "Benl1_2026-07-23_10-05-00_kf_s101534.jpg"),
+    }
+    assert conn.failed is False       # savepoint rollback left the conn usable
+
+
+def test_telemetry_write_is_wrapped_in_a_savepoint(patched):
+    """Belt-and-braces on the same defect: assert the record_event call site is
+    lexically inside a `with conn.transaction():`, by failing the test if
+    record_event is ever reached without an open savepoint."""
+    depth = {"n": 0}
+
+    class _CountingSavepoint(_Savepoint):
+        def __enter__(self):
+            r = super().__enter__()
+            depth["n"] += 1
+            return r
+
+        def __exit__(self, *a):
+            depth["n"] -= 1
+            return super().__exit__(*a)
+
+    class CountingConn(TxAbortConn):
+        def transaction(self):
+            return _CountingSavepoint(self)
+
+    seen = []
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:15 – 10:17"}]),
+                 SIDECAR_KEY: _sidecar()})
+    patched.setattr(lk, "_s3_client", s3)
+    patched.setattr(lk, "get_connection", lambda *a, **k: CountingConn())
+    patched.setattr(lk.keyframes, "record_event",
+                    lambda conn_, event, **kw: seen.append(depth["n"]) or {"id": "e"})
+    patched.setattr(lk.subprocess, "run", FakeRun())
+
+    lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    assert seen, "record_event was never called"
+    assert all(d >= 1 for d in seen), \
+        "record_event ran OUTSIDE conn.transaction() -- a DB failure would abort the tx"
 
 
 # --------------------------------------------------------------------------

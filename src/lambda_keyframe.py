@@ -238,14 +238,26 @@ def _record_generated_event(conn, trow, duration_min, frame_index, n_frames):
     """Append one 'generated' telemetry row for a frame just produced (Q7).
     Never-raise contract (module docstring): telemetry must NEVER cost a frame or
     trip S3's retry-then-drop behaviour, so a failed write warns and is swallowed
-    -- the upload + DB bind already happened and must stand."""
+    -- the upload + DB bind already happened and must stand.
+
+    The SAVEPOINT is what makes that contract real. Catching the Python exception
+    is NOT enough: a DB-level failure of this INSERT (e.g. keyframe_events not yet
+    migrated in this environment) leaves the psycopg3 transaction ABORTED, and the
+    very next statement -- add_topic_photo_if_absent's own `with conn.transaction()`
+    -- would then raise InFailedSqlTransaction, which its `except ForeignKeyViolation`
+    does not catch. That escapes the per-plan try/finally, rolls back EVERY
+    topic_photos bind of the request, and (no DLQ) permanently drops it after S3's
+    retries. Rolling back to this savepoint keeps conn usable so the remaining
+    frames still bind. Same pattern as repositories/topics.py:496 and
+    lambda_org_api.py:385."""
     try:
-        keyframes.record_event(
-            conn, "generated",
-            company_id=trow.get("company_id"), site_id=trow.get("site_id"),
-            topic_category=trow.get("category"), work_class=trow.get("work_class"),
-            duration_min=duration_min, n_frames_generated=n_frames,
-            frame_index=frame_index)
+        with conn.transaction():      # savepoint: on failure, roll back to here so conn stays usable
+            keyframes.record_event(
+                conn, "generated",
+                company_id=trow.get("company_id"), site_id=trow.get("site_id"),
+                topic_category=trow.get("category"), work_class=trow.get("work_class"),
+                duration_min=duration_min, n_frames_generated=n_frames,
+                frame_index=frame_index)
     except Exception as e:
         logger.warning("keyframe 'generated' telemetry write failed: %s", e)
 

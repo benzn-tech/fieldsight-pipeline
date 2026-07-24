@@ -103,7 +103,9 @@ def wired(monkeypatch):
     def add_tombstone(conn, s3_key, company_id, topic_id, deleted_by):
         order.append("tombstone")
         bag["tombstones"].append((s3_key, company_id, topic_id, deleted_by))
-        return True
+        # True = a NEW tombstone row; False = ON CONFLICT DO NOTHING (already
+        # tombstoned, e.g. the row was resurrected by a re-extraction).
+        return bag.get("tombstone_is_new", True)
 
     def record_event(conn, event, **kw):
         order.append("event")
@@ -146,6 +148,9 @@ def _call(conn, body):
     "users/x/pictures/d/evil.jpg",                                       # crafted non-kf
     "org-assets/logo.png",                                               # wrong prefix
     "users/x/video/d/Benl1_2026-07-23_10-16-00_kf_s101534.jpg",          # not /pictures/
+    # regex anchor: `$` would also match before a trailing newline, letting a
+    # key ending "...jpg\n" through the guard. \Z anchors at the true end.
+    "users/Ben_UCPK/pictures/2026-07-23/Benl1_2026-07-23_10-16-00_kf_s101534.jpg\n",
 ])
 def test_delete_refuses_non_keyframe_key(wired, bad_key):
     conn = KFConn(order=wired["order"])
@@ -223,6 +228,25 @@ def test_deleted_event_degrades_to_nulls_on_unparseable_range(wired):
     _, kw = wired["events"][0]
     assert kw["duration_min"] is None and kw["frame_index"] is None
     assert kw["n_frames_generated"] is None
+
+
+def test_second_delete_of_resurrected_row_records_no_duplicate_event(wired):
+    """Ratio integrity: in the s3_deleted:false window an item-writer
+    re-extraction can re-bind the still-present object (photo_binding has no
+    tombstone check), resurrecting the topic_photos row. A second user delete
+    must NOT record a second 'deleted' event for ONE keyframe -- that would
+    inflate the deleted/generated ratio this table exists to measure."""
+    wired["tombstone_is_new"] = False          # ON CONFLICT DO NOTHING
+    conn = KFConn(photo_rows=[{"id": "p-2", "topic_id": "t-1"}],
+                  topic_row={"time_range": "10:15 – 10:17", "category": "safety",
+                             "work_class": "work", "site_id": "s-1"},
+                  order=wired["order"])
+    res = _call(conn, {"s3_key": KF_KEY})
+    assert res["statusCode"] == 200
+    # the resurrected row is still removed and the object still deleted...
+    assert wired["order"] == ["tombstone", "delete_row", "commit", "s3_delete"]
+    # ...but NO second 'deleted' event
+    assert wired["events"] == []
 
 
 # --------------------------------------------------------------------------

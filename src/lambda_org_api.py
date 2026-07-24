@@ -1395,7 +1395,9 @@ def classification_feedback_summary_endpoint(conn, caller):
 # Keyframe Q7: the durable auto-keyframe basename marker (keyframe_selection
 # .keyframe_filename). Digits-only session id -> can never collide with a real
 # user photo. The delete route refuses ANY key whose basename fails this.
-_KF_BASENAME_RE = re.compile(r"_kf_s\d{6}\.jpg$")
+# \Z (not $): `$` also matches just before a trailing newline, so a key ending
+# "..._kf_s101534.jpg\n" would pass the guard. \Z anchors at the true end.
+_KF_BASENAME_RE = re.compile(r"_kf_s\d{6}\.jpg\Z")
 
 
 def _delete_keyframe_object(s3_key):
@@ -1413,10 +1415,16 @@ def _delete_keyframe_object(s3_key):
 
 def _keyframe_deleted_event_fields(conn, topic_id, s3_key):
     """Structural-signal-only telemetry fields for a 'deleted' event, derived
-    from the still-live topic row + the key's own mid-time. Every field is
-    nullable-safe: an unparseable/shifted time_range degrades to NULLs, NEVER to
-    a failed delete (the derivation is wrapped; the record_event INSERT itself
-    stays inside the delete transaction for atomicity)."""
+    from the still-live topic row + the key's own mid-time. Parse-level failures
+    (missing/unparseable/shifted time_range, unnamed category) degrade to NULLs
+    rather than failing the delete.
+
+    NB a DB-level failure of the SELECT below is different: it aborts the
+    transaction, so the subsequent record_event raises and the request 500s with
+    a full rollback. That is deliberate fail-CLOSED behaviour -- no tombstone, no
+    row delete, no S3 delete, no partial state -- and the client simply retries.
+    Unlike the generator's telemetry (which must never cost an already-uploaded
+    frame) there is nothing here worth salvaging, so no savepoint is used."""
     fields = {"site_id": None, "topic_category": None, "work_class": None,
               "duration_min": None, "n_frames_generated": None, "frame_index": None}
     try:
@@ -1505,9 +1513,17 @@ def delete_keyframe_endpoint(conn, caller, body):
     primary_topic_id = topic_ids[0]
 
     # ONE transaction (Section 4.3c): tombstone -> 'deleted' event -> row delete.
-    keyframes.add_tombstone(conn, s3_key, company_id, primary_topic_id, caller["id"])
-    fields = _keyframe_deleted_event_fields(conn, primary_topic_id, s3_key)
-    keyframes.record_event(conn, "deleted", company_id=company_id, **fields)
+    # The event is gated on the tombstone being NEW: in the s3_deleted:false
+    # window an item-writer re-extraction can re-bind the still-present object
+    # (photo_binding has no tombstone check), resurrecting the topic_photos row,
+    # and a second user delete would otherwise record a SECOND 'deleted' event
+    # for ONE keyframe -- corrupting the deleted/generated ratio this table
+    # exists to measure. One human decision, one event.
+    first_tombstone = keyframes.add_tombstone(
+        conn, s3_key, company_id, primary_topic_id, caller["id"])
+    if first_tombstone:
+        fields = _keyframe_deleted_event_fields(conn, primary_topic_id, s3_key)
+        keyframes.record_event(conn, "deleted", company_id=company_id, **fields)
     rows_removed = conn.execute(
         "DELETE FROM topic_photos WHERE s3_key=%s", (s3_key,)).rowcount
 
