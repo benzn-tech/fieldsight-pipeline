@@ -30,6 +30,33 @@ class _Cur:
         return self._row
 
 
+# The structural signal the widened topic pre-check now fetches (Q7). The
+# generator reads category/work_class/site_id/company_id from here; duration_min/
+# frame_index/n_frames come from the plan tuple, not this row.
+DEFAULT_TOPIC_META = {"time_range": "10:15 – 10:17", "category": "safety",
+                      "work_class": "work", "site_id": "s-1", "company_id": "co-1"}
+
+
+class _TopicCursor:
+    """Serves the widened `SELECT ... FROM topics t LEFT JOIN sites ...` pre-check
+    that now runs through conn.cursor(row_factory=dict_row). Honours the conn's
+    `existing` set (None -> alive) so superseded topics still return None."""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self._row = None
+
+    def execute(self, sql, params=None):
+        self.conn.executed.append((sql, params))
+        tid = params[0]
+        alive = self.conn.existing is None or tid in self.conn.existing
+        self._row = dict(self.conn.topic_meta) if alive else None
+        return self
+
+    def fetchone(self):
+        return self._row
+
+
 class _Paginator:
     def __init__(self, objects):
         self.objects = objects
@@ -103,11 +130,12 @@ class FakeRun:
 
 
 class FakeConn:
-    """SELECT 1 FROM topics -> existing governs which topic ids are 'alive'
-    (None = all alive). Context-manager like the real get_connection()."""
+    """The topic pre-check (via cursor) -> `existing` governs which topic ids are
+    'alive' (None = all alive). Context-manager like the real get_connection()."""
 
-    def __init__(self, existing=None):
+    def __init__(self, existing=None, topic_meta=None):
         self.existing = set(existing) if existing is not None else None
+        self.topic_meta = topic_meta or DEFAULT_TOPIC_META
         self.executed = []
 
     def __enter__(self):
@@ -116,12 +144,11 @@ class FakeConn:
     def __exit__(self, *a):
         return False
 
+    def cursor(self, *a, **k):
+        return _TopicCursor(self)
+
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
-        if "SELECT 1 FROM topics" in sql:
-            tid = params[0]
-            alive = self.existing is None or tid in self.existing
-            return _Cur({"?column?": 1} if alive else None)
         return _Cur(None)
 
 
@@ -149,9 +176,10 @@ class StatefulConn:
     test can prove the row cleanup self-heals from the DB side -- independent of
     what the S3 listing returned this run."""
 
-    def __init__(self, rows=(), existing=None):
+    def __init__(self, rows=(), existing=None, topic_meta=None):
         self.rows = set(rows)
         self.existing = set(existing) if existing is not None else None
+        self.topic_meta = topic_meta or DEFAULT_TOPIC_META
         self.executed = []
 
     def __enter__(self):
@@ -160,12 +188,11 @@ class StatefulConn:
     def __exit__(self, *a):
         return False
 
+    def cursor(self, *a, **k):
+        return _TopicCursor(self)
+
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
-        if "SELECT 1 FROM topics" in sql:
-            tid = params[0]
-            alive = self.existing is None or tid in self.existing
-            return _Cur({"?column?": 1} if alive else None)
         if "DELETE FROM topic_photos" in sql:
             prefix_like, marker_like, expected = params
             self.rows = {
@@ -212,6 +239,14 @@ def patched(monkeypatch):
     monkeypatch.setattr(lk, "add_topic_photo_if_absent",
                         lambda conn, tid, key, cap: inserts.append((tid, key, cap)) or True)
     monkeypatch._kf_inserts = inserts
+    # Q7: default the tombstone check to a no-op (nothing tombstoned) and record
+    # 'generated' events so existing behavior tests stay green and new ones can
+    # assert on them. Tests override tombstoned_subset to exercise the skip.
+    events = []
+    monkeypatch.setattr(lk.keyframes, "tombstoned_subset", lambda conn, keys: set())
+    monkeypatch.setattr(lk.keyframes, "record_event",
+                        lambda conn, event, **kw: events.append((event, kw)) or {"id": "e"})
+    monkeypatch._kf_events = events
     return monkeypatch
 
 
@@ -672,6 +707,112 @@ def test_add_topic_photo_if_absent_skips_fk_violation_without_raising():
 
     from repositories.topics import add_topic_photo_if_absent
     assert add_topic_photo_if_absent(FKConn(), "t-gone", "users/k.jpg", "cap") is False
+
+
+# --------------------------------------------------------------------------
+# Q7 -- tombstoned key is skipped ENTIRELY (never head/download/ffmpeg/insert)
+#   and, being excluded from `expected`, is garbage-collected by the stale S3
+#   sweep + the M-2 DB row cleanup.
+# --------------------------------------------------------------------------
+
+def test_tombstoned_frame_is_skipped_entirely(patched):
+    kf_key = PICS + "Benl1_2026-07-23_10-16-00_kf_s101534.jpg"
+    # a lingering S3 object AND a dangling topic_photos row for the tombstoned key
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:15 – 10:17"}]),
+                 SIDECAR_KEY: _sidecar(),
+                 kf_key: b"stale-tombstoned-jpg"})
+    patched.setattr(lk, "_s3_client", s3)
+    conn = StatefulConn(rows={kf_key})
+    patched.setattr(lk, "get_connection", lambda *a, **k: conn)
+    patched.setattr(lk.keyframes, "tombstoned_subset", lambda conn, keys: {kf_key})
+    run = FakeRun()
+    patched.setattr(lk.subprocess, "run", run)
+
+    result = lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    # never planned: no head, no download, no ffmpeg, no DB bind, no 'generated' event
+    assert kf_key not in s3.head_calls
+    assert s3.downloads == [] and run.calls == []
+    assert patched._kf_inserts == [] and patched._kf_events == []
+    # excluded from `expected` -> stale sweep deletes the S3 object AND the M-2
+    # predicate removes the dangling row (tombstone's garbage collector)
+    assert s3.deletes == [kf_key]
+    assert kf_key not in conn.rows
+    assert result == {"results": [{"skipped": False, "keyframes": 0}]}
+
+
+def test_one_tombstoned_frame_among_live_ones_only_skips_that_frame(patched):
+    # 10:00-10:06 -> 3 frames; tombstone only the middle one (10:03:00).
+    sidecar = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_10-00-00_vad_metadata.json"
+    video = "users/Ben_UCPK/video/2026-07-23/Benl1_2026-07-23_10-00-00.mp4"
+    tombstoned = PICS + "Benl1_2026-07-23_10-03-00_kf_s101534.jpg"
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:00 – 10:06"}]),
+                 sidecar: _sidecar(source_key=video, dur=600)})
+    patched.setattr(lk, "_s3_client", s3)
+    patched.setattr(lk.keyframes, "tombstoned_subset", lambda conn, keys: {tombstoned})
+    run = FakeRun()
+    patched.setattr(lk.subprocess, "run", run)
+
+    result = lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    keys = sorted(k for _, k, _ in s3.uploads)
+    assert keys == [
+        PICS + "Benl1_2026-07-23_10-01-00_kf_s101534.jpg",
+        PICS + "Benl1_2026-07-23_10-05-00_kf_s101534.jpg",
+    ]                                        # the tombstoned middle frame never produced
+    assert result == {"results": [{"skipped": False, "keyframes": 2}]}
+
+
+# --------------------------------------------------------------------------
+# Q7 -- 'generated' telemetry: one row per frame ACTUALLY produced (real upload
+#   only), with the right frame_index / n_frames_generated / duration_min; the
+#   head-exists fast path writes NOTHING (S3-retry dedup).
+# --------------------------------------------------------------------------
+
+def test_generated_event_written_only_on_real_upload(patched):
+    # 10:00-10:06 -> 3 frames; the middle one already exists in S3 (head hit),
+    # so only the two freshly-decoded frames emit a 'generated' event.
+    sidecar = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_10-00-00_vad_metadata.json"
+    video = "users/Ben_UCPK/video/2026-07-23/Benl1_2026-07-23_10-00-00.mp4"
+    existing = PICS + "Benl1_2026-07-23_10-03-00_kf_s101534.jpg"   # frame_index 1, head hit
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:00 – 10:06"}]),
+                 sidecar: _sidecar(source_key=video, dur=600),
+                 existing: b"already-here"})
+    patched.setattr(lk, "_s3_client", s3)
+    run = FakeRun()
+    patched.setattr(lk.subprocess, "run", run)
+
+    lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    # exactly two 'generated' events -- the head-hit middle frame emitted none
+    assert [e for e, _ in patched._kf_events] == ["generated", "generated"]
+    by_index = {kw["frame_index"]: kw for _, kw in patched._kf_events}
+    assert set(by_index) == {0, 2}                     # NOT frame_index 1 (head hit)
+    for kw in by_index.values():
+        assert kw["n_frames_generated"] == 3
+        assert kw["duration_min"] == 6
+        assert kw["topic_category"] == "safety"        # from the widened topic row
+        assert kw["work_class"] == "work"
+        assert kw["company_id"] == "co-1" and kw["site_id"] == "s-1"
+
+
+def test_telemetry_failure_does_not_drop_frames(patched):
+    # record_event raising must NOT cost the frame: the upload + DB bind stand.
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:15 – 10:17"}]),
+                 SIDECAR_KEY: _sidecar()})
+    patched.setattr(lk, "_s3_client", s3)
+
+    def boom(conn, event, **kw):
+        raise RuntimeError("telemetry down")
+    patched.setattr(lk.keyframes, "record_event", boom)
+    patched.setattr(lk.subprocess, "run", FakeRun())
+
+    result = lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    expected_key = PICS + "Benl1_2026-07-23_10-16-00_kf_s101534.jpg"
+    assert s3.uploads and s3.uploads[0][1] == expected_key      # frame still uploaded
+    assert patched._kf_inserts == [("topic-1", expected_key, "Auto keyframe @ 10:16")]
+    assert result == {"results": [{"skipped": False, "keyframes": 1}]}   # never raised
 
 
 # --------------------------------------------------------------------------
