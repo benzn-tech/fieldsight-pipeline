@@ -224,12 +224,29 @@ def test_all_photos_already_bound_is_a_noop():
 
 def test_fetch_bound_photo_keys_parses_and_shortcircuits():
     execute = Mock()
-    # No topic ids -> no round-trip.
-    assert bf.fetch_bound_photo_keys(execute, []) == set()
+    # Missing folder/date -> no round-trip.
+    assert bf.fetch_bound_photo_keys(execute, "", "2026-07-23") == set()
+    assert bf.fetch_bound_photo_keys(execute, "Ben_UCPK", "") == set()
     execute.assert_not_called()
 
     execute.return_value = {"formattedRecords": '[{"s3_key": "k1"}, {"s3_key": "k2"}]'}
-    assert bf.fetch_bound_photo_keys(execute, ["tA", "tB"]) == {"k1", "k2"}
-    # array param passed for the ANY(:ids::uuid[]) exclusion query.
+    assert bf.fetch_bound_photo_keys(execute, "Ben_UCPK", "2026-07-23") == {"k1", "k2"}
     params = execute.call_args.kwargs["params"]
-    assert params[0]["value"]["arrayValue"]["stringValues"] == ["tA", "tB"]
+    names = {p["name"]: p["value"]["stringValue"] for p in params}
+    assert names == {"date": "2026-07-23", "folder": "Ben_UCPK"}
+
+
+def test_bound_keys_query_uses_no_array_param():
+    # Regression: the AWS RDS Data API rejects array-typed params
+    # ("ValidationException: Array parameters are not supported"), which mocked
+    # tests previously hid. The bound-keys query MUST scope by scalar
+    # folder+date -- no ANY(...) / ::uuid[] in the SQL and no list-valued param.
+    sql = bf.BOUND_PHOTO_KEYS_SQL.upper()
+    assert "ANY(" not in sql
+    assert "[]" not in bf.BOUND_PHOTO_KEYS_SQL
+    execute = Mock()
+    execute.return_value = {"formattedRecords": "[]"}
+    bf.fetch_bound_photo_keys(execute, "Ben_UCPK", "2026-07-23")
+    for p in execute.call_args.kwargs["params"]:
+        assert "arrayValue" not in p["value"]
+        assert not any(isinstance(v, list) for v in p["value"].values())

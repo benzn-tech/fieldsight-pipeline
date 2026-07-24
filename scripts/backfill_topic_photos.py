@@ -117,12 +117,28 @@ DISCOVER_TOPICS_SQL_HEAD = (
 )
 DISCOVER_TOPICS_SQL_TAIL = " ORDER BY t.report_date, t.time_range NULLS LAST, t.created_at, t.id"
 
-# READ-ONLY. The photo s3_keys already bound to any of a day's topics -- fed
-# to the matcher as an exclusion set so already-bound photos are never
-# re-matched (photo-level idempotency). No write.
+# READ-ONLY. The photo s3_keys already bound to any topic of one (folder,
+# date) -- fed to the matcher as an exclusion set so already-bound photos are
+# never re-matched (photo-level idempotency). No write.
+#
+# The (folder, date) selection MIRRORS plan_candidates' grouping EXACTLY: the
+# report_date column plus the SAME source_s3_key folder derivation as
+# derive_folder / list_contributor_folders_for_site_date (extractions/ -> path
+# part 2, reports/ -> path part 3, via split_part). That keeps the excluded-
+# topic set identical to the discovery-grouped topic set. A per-topic-id scope
+# would be equivalent, but the AWS RDS Data API does NOT support array-typed
+# parameters (ValidationException: Array parameters are not supported), so
+# day-scoped SCALAR params (:date, :folder) are used instead. The literal '%'
+# needs no doubling: the Data API uses named params, not psycopg %-paramstyle.
 BOUND_PHOTO_KEYS_SQL = (
-    "SELECT DISTINCT tp.s3_key AS s3_key FROM topic_photos tp "
-    "WHERE tp.topic_id = ANY(:ids::uuid[])"
+    "SELECT DISTINCT tp.s3_key AS s3_key "
+    "FROM topic_photos tp JOIN topics t ON t.id = tp.topic_id "
+    "WHERE t.report_date = :date::date AND "
+    "  CASE WHEN t.source_s3_key LIKE 'extractions/%' "
+    "         THEN split_part(t.source_s3_key, '/', 2) "
+    "       WHEN t.source_s3_key LIKE 'reports/%' "
+    "         THEN split_part(t.source_s3_key, '/', 3) "
+    "  END = :folder"
 )
 
 
@@ -256,14 +272,21 @@ def fetch_topic_rows(execute, date=None, date_from=None, date_to=None):
     return json.loads(formatted)
 
 
-def fetch_bound_photo_keys(execute, topic_ids):
-    """READ-ONLY. Return the set of photo s3_keys already bound to any of these
-    topic ids -- the photo-level idempotency exclusion set. No topic_ids -> no
+def fetch_bound_photo_keys(execute, folder, date):
+    """READ-ONLY. Return the set of photo s3_keys already bound to any topic of
+    this (folder, date) -- the photo-level idempotency exclusion set.
+
+    The (folder, date) is selected by BOUND_PHOTO_KEYS_SQL using the report_date
+    column + the same source_s3_key folder derivation plan_candidates groups by,
+    so the excluded-topic set == the candidate's grouped-topic set. SCALAR
+    params only (the Data API rejects array params). Missing folder/date -> no
     round-trip, empty set."""
-    ids = [str(t) for t in (topic_ids or []) if t]
-    if not ids:
+    if not folder or not date:
         return set()
-    params = [{"name": "ids", "value": {"arrayValue": {"stringValues": ids}}}]
+    params = [
+        {"name": "date", "value": {"stringValue": date}},
+        {"name": "folder", "value": {"stringValue": folder}},
+    ]
     resp = execute(BOUND_PHOTO_KEYS_SQL, params=params, json_records=True)
     rows = json.loads(resp.get("formattedRecords") or "[]")
     return {r["s3_key"] for r in rows if r.get("s3_key")}
@@ -376,7 +399,7 @@ def main(argv=None):
     total_already_bound = 0
     days_with_photos = 0
     for cand in candidates:
-        bound_keys = fetch_bound_photo_keys(execute, [t["id"] for t in cand["topics"]])
+        bound_keys = fetch_bound_photo_keys(execute, cand["folder"], cand["date"])
         result = process_candidate(cand, s3_client, args.bucket, execute, args.apply,
                                    bound_keys=bound_keys)
         total_already_bound += result["already_bound"]
