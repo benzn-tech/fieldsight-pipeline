@@ -17,12 +17,22 @@ never be seen again. The safety_observations TABLE itself is untouched
 import psycopg
 from psycopg.rows import dict_row
 
-# table_name -> editable free-text columns (spec §3)
-EDITABLE = {
-    "topics": {"title", "summary"},
-    "action_items": {"text", "responsible"},
-    "findings": {"observation", "recommended_action", "entity_name", "entity_trade"},
+# table_name -> editable free-text columns, in a STABLE order (spec §3). The
+# ordered tuples are the single source of truth; EDITABLE below is the set view
+# every existing caller already uses. Order matters only for the intra-topic
+# propagation preview, which lists proposed changes field by field.
+_EDITABLE_ORDERED = {
+    "topics": ("title", "summary"),
+    "action_items": ("text", "responsible"),
+    "findings": ("observation", "recommended_action", "entity_name", "entity_trade"),
 }
+EDITABLE = {t: set(f) for t, f in _EDITABLE_ORDERED.items()}
+
+# Which column ties a row to its topic: `topics` IS the topic, children carry
+# topic_id. Used only by list_topic_content_fields (intra-topic propagation);
+# both table and column names come from these constants, never from request
+# input, so the interpolation is injection-safe.
+_TOPIC_KEY = {"topics": "id", "action_items": "topic_id", "findings": "topic_id"}
 
 # Per-table SELECT that returns id, site_id, company_id, author_user_id, plus
 # every editable field's current value. Every table reaches company_id via
@@ -63,6 +73,39 @@ def get_content_row(conn, table, row_id):
     except psycopg.Error:
         conn.rollback()
         return None
+
+
+def list_topic_content_fields(conn, topic_id):
+    """Every editable free-text CELL belonging to ONE topic, as
+    [{table, row_id, field, value}] -- the complete blast radius of an
+    intra-topic correction (the topic row itself + its action_items +
+    its findings). Ordered topics -> action_items -> findings, and within a
+    table by _EDITABLE_ORDERED, so a preview is stable across calls.
+
+    Only columns listed in EDITABLE are selected, so nothing outside the
+    allow-list can be previewed and therefore nothing outside it can be
+    rewritten. NULL cells are skipped (they can never contain the wrong
+    term). Returns [] on a missing/malformed topic id -- same 404-friendly
+    posture as get_content_row."""
+    out = []
+    for table, fields in _EDITABLE_ORDERED.items():
+        cols = ", ".join(fields)
+        try:
+            rows = conn.cursor(row_factory=dict_row).execute(
+                f"SELECT id, {cols} FROM {table} WHERE {_TOPIC_KEY[table]}=%s "
+                f"ORDER BY id",
+                (topic_id,),
+            ).fetchall()
+        except psycopg.Error:
+            conn.rollback()
+            return []
+        for row in rows:
+            for field in fields:
+                if row[field] is None:
+                    continue
+                out.append({"table": table, "row_id": row["id"],
+                            "field": field, "value": row[field]})
+    return out
 
 
 def update_content_field(conn, table, row_id, field, value):
