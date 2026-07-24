@@ -263,7 +263,8 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None) -> lis
 
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
-        f"s.name AS site_name, (u.first_name || ' ' || u.last_name) AS user_name "
+        f"s.name AS site_name, "
+        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name "
         f"FROM topics t "
         f"LEFT JOIN sites s ON s.id = t.site_id "
         f"LEFT JOIN users u ON u.id = t.user_id "
@@ -371,7 +372,8 @@ def list_topics_for_source_prefix(conn, source_prefix) -> list[dict]:
     escaped = _escape_like(source_prefix)
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
-        f"s.name AS site_name, (u.first_name || ' ' || u.last_name) AS user_name "
+        f"s.name AS site_name, "
+        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name "
         f"FROM topics t "
         f"LEFT JOIN sites s ON s.id = t.site_id "
         f"LEFT JOIN users u ON u.id = t.user_id "
@@ -452,7 +454,8 @@ def get_topic_full(conn, topic_id) -> dict | None:
     reindex). Returns None if the id is missing/malformed."""
     rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
-        f"s.name AS site_name, (u.first_name || ' ' || u.last_name) AS user_name "
+        f"s.name AS site_name, "
+        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name "
         f"FROM topics t "
         f"LEFT JOIN sites s ON s.id = t.site_id "
         f"LEFT JOIN users u ON u.id = t.user_id "

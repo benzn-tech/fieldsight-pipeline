@@ -52,3 +52,28 @@ def test_org_api_role_lists_every_prefix_the_media_routes_paginate():
     for needed in ("programmes/*", "transcripts/*", "audio_segments/*",
                    "web_video/*", "users/*"):
         assert needed in prefixes, f"{needed} missing from the ListBucket s3:prefix condition"
+
+
+def test_org_api_role_may_delete_only_keyframe_objects():
+    # Keyframe Q7: DELETE /api/org/media/keyframe needs s3:DeleteObject, but the
+    # grant MUST be narrowed to the *_kf_s*.jpg marker so the role can never
+    # delete a real user photo (L-2 defense-in-depth, mirrors KeyframeFunction).
+    block = _org_api_block()
+    assert "arn:aws:s3:::${DataBucketName}/users/*/pictures/*_kf_s*.jpg" in block, \
+        "OrgApiFunction has no narrowed s3:DeleteObject grant on the keyframe marker"
+    # ...and NO broader users/* (or users/*/pictures/*) DeleteObject appears.
+    m = re.findall(r"Action:\s*s3:DeleteObject\s*\n\s*Resource: !Sub (\S+)", block)
+    for res in m:
+        assert res == "arn:aws:s3:::${DataBucketName}/users/*/pictures/*_kf_s*.jpg" \
+            or "users/" not in res, \
+            f"over-broad DeleteObject on users/ prefix: {res}"
+
+
+def test_api_cors_allows_delete():
+    # The API-level CORS preflight string must advertise DELETE, or the browser
+    # blocks the request before it reaches the Lambda (Section 4.1).
+    text = TEMPLATE.read_text(encoding="utf-8")
+    m = re.search(r"AllowMethods:\s*\"'([A-Z,]+)'\"", text)
+    assert m, "no Cors.AllowMethods found in template"
+    assert "DELETE" in m.group(1).split(","), \
+        f"DELETE missing from API Cors.AllowMethods: {m.group(1)}"

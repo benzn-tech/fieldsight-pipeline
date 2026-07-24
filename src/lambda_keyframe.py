@@ -35,10 +35,13 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+from psycopg.rows import dict_row
+
 from db.connection import get_connection
 from keyframe_selection import (ffmpeg_frame_cmd, keyframe_filename,
                                 keyframe_seconds, select_covering_recording)
 from photo_binding import parse_time_range
+from repositories import keyframes
 from repositories.topics import add_topic_photo_if_absent
 from transcript_utils import (extract_base_time_from_filename,
                               extract_device_from_filename)
@@ -111,15 +114,20 @@ def process_request(req):
         if parsed is None:
             continue
         start_min, end_min = parsed
+        duration_min = end_min - start_min
         # Multiple frames per topic (2026-07-24 rule): keyframe_seconds is a
-        # list; the emitter already gated, this double-check is free.
-        for mid_s in keyframe_seconds(t.get("time_range")):
+        # list; the emitter already gated, this double-check is free. frame_index
+        # + n_frames + duration_min ride the plan tuple into the 'generated'
+        # telemetry (Q7) at zero extra cost -- all three are already in hand.
+        mids = keyframe_seconds(t.get("time_range"))
+        n_frames = len(mids)
+        for frame_index, mid_s in enumerate(mids):
             pick = select_covering_recording(recordings, start_min * 60, end_min * 60, mid_s)
             if pick is None:
                 continue
             key = pics_prefix + keyframe_filename(device, date, mid_s, session_base)
             expected.add(key)
-            plans.append((t["topic_id"], mid_s, pick, key))
+            plans.append((t["topic_id"], mid_s, pick, key, frame_index, n_frames, duration_min))
 
     sess_marker = f"_kf_s{session_base.rsplit('_', 1)[-1].replace('-', '')}.jpg"
 
@@ -130,13 +138,27 @@ def process_request(req):
     # re-download blew the (now 600s) timeout budget and, on a mid-run timeout,
     # left S3 uploads with zero committed DB bindings.
     downloaded = {}
-    # NEW-3: how many still-to-process frames need each original. The local file
-    # is evicted the instant its count hits 0, so many source_keys (~200 MB each)
-    # in one request cannot pile up past the 2048 MB ephemeral disk.
-    remaining = Counter(source_key for _, _, (source_key, _seek), _ in plans)
     tmp_dir = tempfile.mkdtemp(prefix="kf_")
     try:
         with get_connection() as conn:
+            # Q7 tombstone skip -- BEFORE head_object, ffmpeg, insert, and BEFORE
+            # the cleanup below. A reviewer-deleted keyframe must never
+            # regenerate: drop tombstoned keys from the plan (never plan the
+            # frame at all) AND from the expected set. Removing them from
+            # `expected` is what turns the existing stale S3 sweep and the M-2
+            # row cleanup into the tombstone's garbage collector -- any lingering
+            # object/row for a tombstoned key is then actively deleted below.
+            tombstoned = keyframes.tombstoned_subset(conn, list(expected))
+            if tombstoned:
+                logger.info("skipping %d tombstoned keyframe(s)", len(tombstoned))
+                plans = [p for p in plans if p[3] not in tombstoned]
+                expected -= tombstoned
+            # NEW-3: how many still-to-process frames need each original. The
+            # local file is evicted the instant its count hits 0, so many
+            # source_keys (~200 MB each) in one request cannot pile up past the
+            # 2048 MB ephemeral disk. Computed AFTER the tombstone filter so a
+            # shared original's count reflects only frames actually processed.
+            remaining = Counter(pick[0] for _, _, pick, _, _, _, _ in plans)
             # Stale cleanup: this session's previous keyframes no longer
             # expected (window shifted on a re-extraction). Scoped to
             # *_kf_s{session}.jpg so other sessions' keyframes and real user
@@ -166,11 +188,18 @@ def process_request(req):
                  list(expected)),
             )
 
-            for topic_id, mid_s, (source_key, seek), key in plans:
+            for topic_id, mid_s, (source_key, seek), key, frame_index, n_frames, duration_min in plans:
                 try:
                     # Stale request (topic cascaded away between emit and
                     # processing): skip instead of raising an FK error on insert.
-                    if conn.execute("SELECT 1 FROM topics WHERE id=%s", (topic_id,)).fetchone() is None:
+                    # Widened from `SELECT 1` to also fetch the structural signal
+                    # the 'generated' telemetry needs, in ONE round trip. dict_row
+                    # -> attribute-free dict access; None still means superseded.
+                    trow = conn.cursor(row_factory=dict_row).execute(
+                        "SELECT t.time_range, t.category, t.work_class, t.site_id, "
+                        "s.company_id FROM topics t LEFT JOIN sites s ON s.id = t.site_id "
+                        "WHERE t.id=%s", (topic_id,)).fetchone()
+                    if trow is None:
                         logger.info("topic %s superseded -- skipping keyframe", topic_id)
                         continue
                     if not _object_exists(key):
@@ -189,6 +218,10 @@ def process_request(req):
                             continue
                         if not _extract_and_upload(local, seek, key):
                             continue               # ffmpeg failed: log-and-skip, never raise
+                        # A NEW JPEG was produced THIS run -> append-only
+                        # 'generated' event. NOT on the _object_exists fast path
+                        # (S3-event retries / unchanged re-runs must add nothing).
+                        _record_generated_event(conn, trow, duration_min, frame_index, n_frames)
                     caption = f"Auto keyframe @ {mid_s // 3600:02d}:{(mid_s % 3600) // 60:02d}"
                     if add_topic_photo_if_absent(conn, topic_id, key, caption):
                         written += 1
@@ -199,6 +232,34 @@ def process_request(req):
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
     return {"skipped": False, "keyframes": written}
+
+
+def _record_generated_event(conn, trow, duration_min, frame_index, n_frames):
+    """Append one 'generated' telemetry row for a frame just produced (Q7).
+    Never-raise contract (module docstring): telemetry must NEVER cost a frame or
+    trip S3's retry-then-drop behaviour, so a failed write warns and is swallowed
+    -- the upload + DB bind already happened and must stand.
+
+    The SAVEPOINT is what makes that contract real. Catching the Python exception
+    is NOT enough: a DB-level failure of this INSERT (e.g. keyframe_events not yet
+    migrated in this environment) leaves the psycopg3 transaction ABORTED, and the
+    very next statement -- add_topic_photo_if_absent's own `with conn.transaction()`
+    -- would then raise InFailedSqlTransaction, which its `except ForeignKeyViolation`
+    does not catch. That escapes the per-plan try/finally, rolls back EVERY
+    topic_photos bind of the request, and (no DLQ) permanently drops it after S3's
+    retries. Rolling back to this savepoint keeps conn usable so the remaining
+    frames still bind. Same pattern as repositories/topics.py:496 and
+    lambda_org_api.py:385."""
+    try:
+        with conn.transaction():      # savepoint: on failure, roll back to here so conn stays usable
+            keyframes.record_event(
+                conn, "generated",
+                company_id=trow.get("company_id"), site_id=trow.get("site_id"),
+                topic_category=trow.get("category"), work_class=trow.get("work_class"),
+                duration_min=duration_min, n_frames_generated=n_frames,
+                frame_index=frame_index)
+    except Exception as e:
+        logger.warning("keyframe 'generated' telemetry write failed: %s", e)
 
 
 def _object_exists(key):

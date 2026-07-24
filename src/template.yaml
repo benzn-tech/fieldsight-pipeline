@@ -914,6 +914,16 @@ Resources:
                 - s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/users/*
             - Effect: Allow
+              # Keyframe Q7: DELETE /api/org/media/keyframe removes the S3 object
+              # of an auto-generated keyframe (tombstone is the source of truth;
+              # this is the non-transactional cleanup). Scoped PAST users/*/
+              # pictures/* to the *_kf_s*.jpg keyframe marker (mid-string
+              # wildcard, same shape as KeyframeFunction's own narrowed delete
+              # grant) so this role can NEVER delete a real user photo even if the
+              # handler's marker validation ever regresses.
+              Action: s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/users/*/pictures/*_kf_s*.jpg
+            - Effect: Allow
               # Site voice clips: presigned PUT/GET under a DEDICATED voice/
               # prefix (never users/ or recordings) — the data-isolation
               # invariant. Same bucket as recordings (DataBucketName); voice/
@@ -2034,7 +2044,7 @@ Resources:
           "latency":"$context.responseLatency","len":"$context.responseLength"}
       Cors:
         AllowOrigin: "'*'"
-        AllowMethods: "'GET,POST,PUT,PATCH,OPTIONS'"
+        AllowMethods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
         AllowHeaders: "'Content-Type,Authorization'"
       Auth:
         DefaultAuthorizer: CognitoAuthorizer
