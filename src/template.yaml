@@ -1984,6 +1984,18 @@ Resources:
   # API GATEWAY + API Lambda
   # ==========================================================
 
+  # Access-log destination for FieldSightApi. Name is stack-scoped because the
+  # test and prod stacks share this template and would otherwise collide on a
+  # single log group. 90-day retention: long enough to answer an access
+  # question, short enough not to become its own data-retention liability
+  # (the Lambda's own group is 14 days, which was too short to investigate
+  # the 2026-07-23 leak).
+  FieldSightApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}-access"
+      RetentionInDays: 90
+
   FieldSightApi:
     Type: AWS::Serverless::Api
     Metadata:
@@ -1998,6 +2010,28 @@ Resources:
             - W1028
     Properties:
       StageName: prod
+      # Access logging (2026-07-23). Until now this stage had
+      # accessLogSettings=null and the Lambda logged only "METHOD /path"
+      # (lambda_fieldsight_api.py:1063) with no caller, so an ACL incident
+      # could not be attributed after the fact — exactly the gap hit when
+      # investigating the get_report_history leak. The format below records
+      # the Cognito subject, the resource path and the query string so a
+      # future "who read what" question is answerable.
+      # PREREQUISITE: API Gateway needs an ACCOUNT-level CloudWatch role
+      # (`aws apigateway get-account` → cloudwatchRoleArn). It is a REGIONAL
+      # SINGLETON, so it is deliberately NOT declared here — the test and
+      # prod stacks share this template and would fight over it. Set it once,
+      # out of band; see docs/superpowers/plans/2026-07-23-security-acl-and-
+      # error-sentinel-fixes.md. Deploying this stage change while the
+      # account role is unset makes the stack update FAIL.
+      AccessLogSetting:
+        DestinationArn: !GetAtt FieldSightApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "caller":"$context.authorizer.claims.sub","time":"$context.requestTime",
+          "method":"$context.httpMethod","path":"$context.resourcePath",
+          "query":"$context.path","status":"$context.status",
+          "latency":"$context.responseLatency","len":"$context.responseLength"}
       Cors:
         AllowOrigin: "'*'"
         AllowMethods: "'GET,POST,PUT,PATCH,OPTIONS'"
