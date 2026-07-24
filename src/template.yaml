@@ -50,6 +50,15 @@ Parameters:
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: Disable in test to avoid polling RealPTT / generating reports on cron.
+  EnableKeyframes:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Emit keyframe_requests/ from item-writer (video-keyframe plan). The
+      KeyframeFunction itself deploys whenever HasKeyframeStack (HasDb &&
+      HasVadLayer); this flag only gates the item-writer emission so the
+      pipeline change ships inert until flipped per stage.
   RealPTTAccount:
     Type: String
     Description: RealPTT platform account (external service)
@@ -162,6 +171,18 @@ Parameters:
     Description: >
       ARN of the VAD Lambda Layer (ffmpeg + onnxruntime + silero model + numpy + soundfile).
       Leave empty to skip VAD function deployment.
+    Default: ''
+
+  KeyframeFfmpegLayerArn:
+    Type: String
+    Description: >
+      ARN of a runtime-agnostic ffmpeg layer for KeyframeFunction. Intended value:
+      arn:aws:lambda:ap-southeast-2:509194952652:layer:sitesync-vad-layer:2 — whose
+      CompatibleRuntimes is [python3.11, python3.12] and which bundles /opt/bin/ffmpeg.
+      KeyframeFunction only shells out to that binary (never imports the layer's Python
+      packages), so it stays on the python3.11 Global runtime alongside the cp311-only
+      PsycopgLayer. Do NOT point this at VadLayerArn (fieldsight-vad-layer is cp312-only
+      and would reject a 3.11 function). Leave empty to skip KeyframeFunction deployment.
     Default: ''
 
   DocxLayerArn:
@@ -335,12 +356,20 @@ Conditions:
   ShouldManageBucketPolicy: !And [!Condition ShouldEnableTranscribe, !Equals [!Ref ManageDataBucketPolicy, 'true']]
   ShouldCreateAlerts: !Not [!Equals [!Ref AlertEmail, '']]
   HasVadLayer: !Not [!Equals [!Ref VadLayerArn, '']]
+  HasKeyframeFfmpegLayer: !Not [!Equals [!Ref KeyframeFfmpegLayerArn, '']]
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
   HasDb: !Not [!Equals [!Ref DbStackName, '']]
   HasOrgPool: !Not [!Equals [!Ref OrgUserPoolId, '']]
   HasPgDatabaseOverride: !Not [!Equals [!Ref PgDatabase, ""]]
   HasOrgApi: !And [!Condition HasDb, !Condition HasOrgPool]
   HasSiteVoice: !And [!Condition HasOrgApi, !Equals [!Ref EnableSiteVoice, 'true']]
+  # video-keyframe plan: the KeyframeFunction needs Aurora (HasDb) for the
+  # topic_photos bind AND a runtime-agnostic ffmpeg layer (HasKeyframeFfmpegLayer,
+  # the sitesync-vad-layer with CompatibleRuntimes [3.11, 3.12]) for the static
+  # /opt/bin/ffmpeg binary — so it deploys only when both are present. It does
+  # NOT depend on HasVadLayer: that layer (fieldsight-vad-layer) is cp312-only
+  # and feeds VadFunction, not KeyframeFunction.
+  HasKeyframeStack: !And [!Condition HasDb, !Condition HasKeyframeFfmpegLayer]
 
 # ============================================================
 # Global Settings
@@ -1248,6 +1277,9 @@ Resources:
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
           MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
+          # video-keyframe plan: emit keyframe_requests/ post-commit only when
+          # this stage flag is on (ships inert otherwise).
+          EMIT_KEYFRAME_REQUESTS: !Ref EnableKeyframes
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
@@ -1265,6 +1297,13 @@ Resources:
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/match_requests/*
             - Effect: Allow
+              # video-keyframe plan: post-commit request artifact for the
+              # S3-triggered KeyframeFunction (item-writer is in-VPC, BUG-36 —
+              # no lambda:Invoke possible; mirrors the match_requests/ grant
+              # above). Its own PutObject grant, gated to the disjoint prefix.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/keyframe_requests/*
+            - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
@@ -1275,6 +1314,90 @@ Resources:
                     # GetObject) so write_extraction_items can list
                     # users/{user_folder}/pictures/{date}/ to time-correlate
                     # photos onto extraction topics (topic_photos).
+                    - users/*
+
+  # ----------------------------------------------------------
+  # Lambda: Keyframe extractor (video-keyframe-to-photo plan) — in-VPC,
+  # S3 event on keyframe_requests/ (wired manually per BUG-33 —
+  # scripts/wire-s3-events.sh). The ffmpeg layer (KeyframeFfmpegLayerArn ->
+  # sitesync-vad-layer, CompatibleRuntimes [3.11, 3.12]) is attached ONLY for
+  # the static /opt/bin/ffmpeg binary; its Python packages are never imported
+  # (psycopg comes from PsycopgLayer). Runtime stays on the python3.11 Global:
+  # PsycopgLayer is cp311-only and the ffmpeg layer is 3.11-compatible, so both
+  # layers load on one 3.11 function. (Do NOT reuse the cp312-only VadLayerArn
+  # here — a 3.11 function + that layer is rejected at CreateFunction and rolls
+  # back the whole stack.) Zero non-S3 AWS calls at runtime (BUG-36: S3 gateway
+  # only).
+  # ----------------------------------------------------------
+  KeyframeFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasKeyframeStack
+    Properties:
+      FunctionName: !Sub ["${P}-keyframe", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_keyframe.lambda_handler
+      # M-4: one topic can request up to KEYFRAME_MAX_FRAMES (10) single-GOP
+      # grabs; even with the per-invocation download cache (download once, seek
+      # N times) the decode+upload work won't fit 120s, and a mid-run timeout
+      # commits zero DB bindings while leaving S3 uploads. Give generous
+      # headroom (still well under the 900s Lambda ceiling).
+      Timeout: 600
+      MemorySize: 1024
+      # No Runtime override: inherits the python3.11 Global. The ffmpeg layer is
+      # 3.11-compatible and PsycopgLayer is cp311-only, so both load on 3.11.
+      EphemeralStorage:
+        Size: 2048     # original H265 videos observed up to ~200 MB (VadFunction parity)
+      Layers:
+        - !Ref KeyframeFfmpegLayerArn   # runtime-agnostic ffmpeg (sitesync-vad-layer); /opt/bin/ffmpeg only
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection — see MigrateFunction notes.
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          S3_BUCKET: !Ref IngestBucketName
+      Policies:
+        - VPCAccessPolicy: {}
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/keyframe_requests/*   # its own trigger payload
+                - !Sub arn:aws:s3:::${IngestBucketName}/users/*/video/*        # originals to decode
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*       # vad metadata sidecars
+                # M-1: HeadObject is authorized by s3:GetObject. The
+                # _object_exists fast-path HEADs the keyframe it is about to
+                # (re)create; without this grant the HEAD 403s, the bare except
+                # swallows it as "missing", and every S3-retry re-downloads the
+                # original + re-decodes. Scoped to the *_kf_s*.jpg marker only.
+                - !Sub arn:aws:s3:::${IngestBucketName}/users/*/pictures/*_kf_s*.jpg
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/users/*/pictures/*
+            - Effect: Allow
+              # L-2 (defense-in-depth on the crown-jewel grant): narrowed from
+              # users/*/pictures/* to the *_kf_s*.jpg keyframe marker so IAM
+              # physically CANNOT delete a real user photo even if the app-layer
+              # marker match ever regresses. The mid-string wildcard form
+              # (*_kf_s*.jpg) is a valid S3 resource ARN pattern.
+              Action: s3:DeleteObject      # stale-keyframe cleanup (only ever *_kf_s*.jpg keys)
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/users/*/pictures/*_kf_s*.jpg
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - audio_segments/*
                     - users/*
 
   # ----------------------------------------------------------

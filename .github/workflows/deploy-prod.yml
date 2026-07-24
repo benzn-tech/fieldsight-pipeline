@@ -113,6 +113,26 @@ jobs:
           VPC="$(echo "$FARGATE_VPC_ID" | xargs)"
           SUBNETS="$(echo "$FARGATE_SUBNET_IDS" | tr ',' ' ' | xargs | tr ' ' ',')"
           DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
+          # KEYFRAME FEATURE — activating it on PROD needs BOTH repo vars set:
+          #   * PROD_KEYFRAME_FFMPEG_LAYER_ARN -> the ffmpeg layer ARN
+          #     (KeyframeFfmpegLayerArn below). Intended value:
+          #     arn:aws:lambda:ap-southeast-2:509194952652:layer:sitesync-vad-layer:2
+          #     — runtime-agnostic (CompatibleRuntimes [python3.11, python3.12]),
+          #     bundles /opt/bin/ffmpeg, loads on the 3.11 KeyframeFunction next to the
+          #     cp311-only PsycopgLayer. Flips HasKeyframeFfmpegLayer -> HasKeyframeStack
+          #     so KeyframeFunction is CREATED. Unset => empty => stack stays uncreated.
+          #     Distinct from PROD_VAD_LAYER_ARN (cp312-only fieldsight-vad-layer for
+          #     VadFunction) — do not conflate.
+          #   * PROD_ENABLE_KEYFRAMES -> gates item-writer's keyframe_requests/ EMISSION.
+          #     Default false so a deploy ships inert; flip only after the created stack
+          #     + its IAM are verified.
+          # SAM rejects a bare "Key=" empty value, so the ffmpeg-layer override is appended
+          # only when PROD_KEYFRAME_FFMPEG_LAYER_ARN is set. Until it is, the keyframe stack
+          # is not created and unrelated prod deploys are unaffected (merge-safe).
+          KF_LAYER_PARAM=""
+          if [ -n "${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}" ]; then
+            KF_LAYER_PARAM="KeyframeFfmpegLayerArn=${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}"
+          fi
           sam deploy --config-env prod \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -130,6 +150,8 @@ jobs:
               "ManageDataBucketPolicy=false" \
               "VadLayerArn=${{ vars.PROD_VAD_LAYER_ARN }}" \
               "DocxLayerArn=${{ vars.PROD_DOCX_LAYER_ARN }}" \
+              "EnableKeyframes=${{ vars.PROD_ENABLE_KEYFRAMES || 'false' }}" \
+              $KF_LAYER_PARAM \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \

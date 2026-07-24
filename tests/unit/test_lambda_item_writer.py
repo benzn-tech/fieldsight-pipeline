@@ -124,6 +124,11 @@ def wired(monkeypatch):
     # implements get_object, so stub emit to a no-op by default here;
     # tests that care about the emit call override this explicitly.
     monkeypatch.setattr(iw.match_request, "emit", lambda *a, **k: None)
+    # video-keyframe plan: same reasoning for the keyframe_requests/ emit, and
+    # keep emission OFF by default (module constant is env-gated at import) so
+    # the pre-existing tests never trip it.
+    monkeypatch.setattr(iw.keyframe_request, "emit", lambda *a, **k: None)
+    monkeypatch.setattr(iw, "EMIT_KEYFRAME_REQUESTS", False)
     return monkeypatch
 
 
@@ -662,6 +667,95 @@ def test_no_findings_key_still_works(wired):
 
 
 # ---------------------------------------------------------------------------
+# video-keyframe plan, Task 2 -- item-writer emits a keyframe_requests/
+# artifact post-commit, gated by EMIT_KEYFRAME_REQUESTS, carrying ONLY the
+# topics whose time_range passes the >=2-minute gate (keyframe_seconds
+# non-empty), with their durable topic ids + time_ranges.
+# ---------------------------------------------------------------------------
+
+def _two_topic_extraction():
+    """One gate-passing topic (5 min) + one gated-out topic (same-minute)."""
+    passing = {
+        "topic_title": "Long talk-to-camera", "category": "progress",
+        "summary": "Walkthrough.", "time_range": "10:00 – 10:05",
+        "action_items": [], "safety_flags": [],
+    }
+    gated = {
+        "topic_title": "Quick note", "category": "general",
+        "summary": "Brief.", "time_range": "12:14 – 12:14",
+        "action_items": [], "safety_flags": [],
+    }
+    return make_extraction(topics=[passing, gated])
+
+
+def _upsert_incrementing(wired):
+    """Give each upserted topic a distinct id so emit payloads are checkable."""
+    counter = {"n": 0}
+
+    def fake_upsert(conn, site_id, report_date, title, **kw):
+        counter["n"] += 1
+        return {"id": f"topic-{counter['n']}"}
+
+    wired.setattr(iw.topics, "upsert_topic", fake_upsert)
+
+
+def test_keyframe_request_emitted_only_for_gated_topics_when_enabled(wired):
+    wired.setattr(iw, "EMIT_KEYFRAME_REQUESTS", True)
+    wired.setattr(iw, "_s3_client", FakeS3({EXTRACTION_KEY: json.dumps(_two_topic_extraction())}))
+    _upsert_incrementing(wired)
+    calls = []
+    wired.setattr(
+        iw.keyframe_request, "emit",
+        lambda s3_client, bucket, user_folder, date, session_base, extraction_key, topics:
+            calls.append((bucket, user_folder, date, session_base, extraction_key, topics))
+            or "keyframe_requests/Jarley_Trainor/2026-07-06/abc.json",
+    )
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 2}
+    assert len(calls) == 1
+    bucket, user_folder, date, session_base, extraction_key, topics = calls[0]
+    assert bucket == iw.S3_BUCKET
+    assert user_folder == "Jarley_Trainor"
+    assert date == "2026-07-06"
+    assert session_base == "Benl1_2026-07-06_10-00-00"
+    assert extraction_key == EXTRACTION_KEY
+    # ONLY the 5-min topic (topic-1); the same-minute topic is gated out.
+    assert topics == [{"topic_id": "topic-1", "time_range": "10:00 – 10:05"}]
+
+
+def test_keyframe_request_not_emitted_when_no_gated_topic(wired):
+    wired.setattr(iw, "EMIT_KEYFRAME_REQUESTS", True)
+    gated_only = {
+        "topic_title": "Quick note", "category": "general", "summary": "Brief.",
+        "time_range": "12:12 – 12:13", "action_items": [], "safety_flags": [],
+    }
+    wired.setattr(iw, "_s3_client",
+                  FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(topics=[gated_only]))}))
+    calls = []
+    wired.setattr(iw.keyframe_request, "emit", lambda *a, **k: calls.append(a) or None)
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 1}
+    assert calls == []
+
+
+def test_keyframe_request_not_emitted_when_flag_disabled(wired):
+    wired.setattr(iw, "EMIT_KEYFRAME_REQUESTS", False)
+    wired.setattr(iw, "_s3_client", FakeS3({EXTRACTION_KEY: json.dumps(_two_topic_extraction())}))
+    _upsert_incrementing(wired)
+    calls = []
+    wired.setattr(iw.keyframe_request, "emit", lambda *a, **k: calls.append(a) or None)
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 2}
+    assert calls == []  # gated topic present, but emission is off
+
+
+# ---------------------------------------------------------------------------
 # Task 3 (authority-flip plan) -- _photos_for_topics pure helper: time-
 # correlates S3 pictures (already resolved to {key, filename, hhmm} by the
 # BUG-01-safe transcript_utils filename extractor) against each topic's
@@ -775,6 +869,32 @@ def test_item_writer_upserts_topic_photos(wired):
     # make_extraction()'s one topic has time_range "10:00 – 10:05";
     # the photo's filename encodes 10:02, inside that window.
     assert captured[0]["photos"] == [{"s3_key": photo_key, "caption_text": None}]
+
+
+def test_item_writer_captions_kf_files_on_rebind(wired):
+    # video-keyframe plan, Task 4: when item-writer re-lists the pictures
+    # prefix and re-binds a synthetic keyframe (its filename parses to a
+    # mid-topic time inside the window), the photo mapping must carry
+    # caption_text "Auto keyframe" for _kf_ files and None for real photos.
+    prefix = "users/Jarley_Trainor/pictures/2026-07-06/"
+    kf_key = prefix + "Benl1_2026-07-06_10-03-00_kf_s100000.jpg"   # parses to 10:03, in window
+    normal_key = prefix + "Benl1_2026-07-06_10-02-00.jpg"           # real photo at 10:02
+    wired.setattr(iw, "_s3_client", FakeS3({
+        EXTRACTION_KEY: json.dumps(make_extraction()),   # one topic, 10:00 – 10:05
+        kf_key: b"", normal_key: b"",
+    }))
+    captured = []
+    wired.setattr(
+        iw.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            captured.append(kw) or {"id": "topic-uuid-0"},
+    )
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert len(captured) == 1
+    photos = {p["s3_key"]: p["caption_text"] for p in captured[0]["photos"]}
+    assert photos == {kf_key: "Auto keyframe", normal_key: None}
 
 
 def test_missing_pictures_prefix_is_noop(wired):

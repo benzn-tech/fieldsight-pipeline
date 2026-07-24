@@ -67,6 +67,28 @@ jobs:
           # parameter because {{resolve:secretsmanager:...}} can't compose
           # with Fn::ImportValue (only with Parameters).
           DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
+          # KEYFRAME FEATURE (H-1) — activating it on TEST needs BOTH repo vars set:
+          #   * TEST_KEYFRAME_FFMPEG_LAYER_ARN -> the ffmpeg layer ARN
+          #     (KeyframeFfmpegLayerArn below). Intended value:
+          #     arn:aws:lambda:ap-southeast-2:509194952652:layer:sitesync-vad-layer:2
+          #     — a runtime-agnostic layer (CompatibleRuntimes [python3.11, python3.12])
+          #     bundling /opt/bin/ffmpeg, so it loads on the 3.11 KeyframeFunction next to
+          #     the cp311-only PsycopgLayer. This flips HasKeyframeFfmpegLayer ->
+          #     HasKeyframeStack true so KeyframeFunction is actually CREATED on TEST and
+          #     the feature can be verified BEFORE prod. Unset => empty => keyframe stack
+          #     stays uncreated (today's behavior, merge-safe). NOTE: distinct from
+          #     TEST_VAD_LAYER_ARN (the cp312-only fieldsight-vad-layer that feeds
+          #     VadFunction) — do not conflate the two.
+          #   * TEST_ENABLE_KEYFRAMES -> gates item-writer's keyframe_requests/ EMISSION.
+          #     Left default false so merging does NOT auto-enable emission; flip it
+          #     deliberately only after the created stack + its IAM are verified on TEST.
+          # SAM's --parameter-overrides REJECTS a bare "Key=" with an empty value, so the
+          # ffmpeg-layer override is only appended when the var is actually set; unset =>
+          # the token is omitted and the template Default ('') keeps the stack uncreated.
+          KF_LAYER_PARAM=""
+          if [ -n "${{ vars.TEST_KEYFRAME_FFMPEG_LAYER_ARN }}" ]; then
+            KF_LAYER_PARAM="KeyframeFfmpegLayerArn=${{ vars.TEST_KEYFRAME_FFMPEG_LAYER_ARN }}"
+          fi
           sam deploy --config-env test \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -75,6 +97,8 @@ jobs:
               "IngestBucketName=fieldsight-data-test-509194952652" \
               "EnableSchedules=false" \
               "EnableSiteVoice=true" \
+              "EnableKeyframes=${{ vars.TEST_ENABLE_KEYFRAMES || 'false' }}" \
+              $KF_LAYER_PARAM \
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \
