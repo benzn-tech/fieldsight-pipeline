@@ -13,13 +13,20 @@ def get_action_item(conn, action_item_id) -> dict | None:
     """One action item joined to its site's company_id (the tenant guard the
     handler checks against caller.company_id). Returns None if not found or
     action_item_id is not a valid UUID -- malformed id == missing (404
-    semantics), same posture as observations.get_observation."""
+    semantics), same posture as observations.get_observation.
+
+    Also carries topic_user_id: who RECORDED the topic this task came from.
+    _is_assignee needs it to decide whether an UNASSIGNED task is the caller's
+    own work. LEFT JOIN, because the topic row is not guaranteed to outlive the
+    action item -- a missing topic yields NULL, which that predicate treats as
+    "not mine" (fail-closed)."""
     try:
         return conn.cursor(row_factory=dict_row).execute(
             "SELECT a.id, a.topic_id, a.site_id, a.text, a.responsible, a.deadline, "
             "a.deadline_text, a.priority, a.status, a.created_at, a.updated_at, "
-            "a.updated_by, s.company_id "
-            "FROM action_items a JOIN sites s ON s.id = a.site_id WHERE a.id=%s",
+            "a.updated_by, s.company_id, t.user_id AS topic_user_id "
+            "FROM action_items a JOIN sites s ON s.id = a.site_id "
+            "LEFT JOIN topics t ON t.id = a.topic_id WHERE a.id=%s",
             (action_item_id,),
         ).fetchone()
     except psycopg.Error:
