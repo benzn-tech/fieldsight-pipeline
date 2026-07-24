@@ -5667,3 +5667,126 @@ def test_org_report_history_s3_failure_degrades_to_empty(presign_wired):
     res = org.lambda_handler(make_event("GET", "/api/org/reports/history"), None)
     assert res["statusCode"] == 200
     assert body_of(res)["reports"] == []
+
+
+# ----------------------------------------------------------
+# GET /api/org/action-items/closures?from=&to= (fix/week-kpi)
+# The Today weekly tile's single aggregate call. Metric = action items CLOSED
+# in the window (a flow, no denominator) + the same-length window before it,
+# read from the content_edits status->done trail. ACL is the reach+tenant pair
+# patch_action_item / get_content_history use.
+# ----------------------------------------------------------
+OTHER_SITE_ID = "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2"
+
+
+def _wire_closures(wired, counts=None, reach=None):
+    """`seen["args"]` = the (site_ids, start, end, company_id) the handler hands
+    the repo; absent means the aggregate was never queried at all."""
+    seen = {}
+    allowed = {SITE_ID} if reach is None else set(reach)
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: allowed)
+
+    def _agg(conn, site_ids, start, end, company_id=None, **kw):
+        seen["args"] = (set(site_ids), start.isoformat(), end.isoformat(), company_id)
+        # Emulate the repo's empty-reach short circuit so an ACL test that
+        # empties the reach still sees a zero, not the canned counts.
+        if not site_ids:
+            return {}
+        return dict(counts or {})
+
+    wired.setattr(org.content_edits, "count_action_closures_by_day", _agg)
+    return seen
+
+
+def _closures_event(frm="2026-07-20", to="2026-07-25"):
+    return make_event("GET", "/api/org/action-items/closures",
+                      params={"from": frm, "to": to})
+
+
+def test_action_closures_totals_the_window_and_zero_fills_the_day_series(wired):
+    seen = _wire_closures(wired, counts={"2026-07-20": 2, "2026-07-23": 5})
+    res = org.lambda_handler(_closures_event(), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["closed"] == 7
+    assert [d["date"] for d in b["by_day"]] == [
+        "2026-07-20", "2026-07-21", "2026-07-22", "2026-07-23", "2026-07-24", "2026-07-25"]
+    assert [d["closed"] for d in b["by_day"]] == [2, 0, 0, 5, 0, 0]
+    assert b["from"] == "2026-07-20" and b["to"] == "2026-07-25"
+    assert b["timezone"] == "Pacific/Auckland"
+    # ONE repo call covering BOTH windows -- no per-day fan-out.
+    assert seen["args"][1:3] == ("2026-07-14", "2026-07-25")
+
+
+def test_action_closures_previous_window_is_the_same_length_immediately_before(wired):
+    seen = _wire_closures(wired, counts={"2026-07-15": 3, "2026-07-19": 1,
+                                         "2026-07-21": 4})
+    b = body_of(org.lambda_handler(_closures_event(), None))
+    assert b["previous"] == {"from": "2026-07-14", "to": "2026-07-19", "closed": 4}
+    assert b["closed"] == 4                       # the current window is disjoint
+    assert seen["args"][1] == "2026-07-14"
+
+
+def test_action_closures_empty_window_is_a_well_formed_zero(wired):
+    _wire_closures(wired, counts={})
+    b = body_of(org.lambda_handler(_closures_event(), None))
+    assert b["closed"] == 0
+    assert b["previous"]["closed"] == 0
+    assert len(b["by_day"]) == 6
+    assert all(d["closed"] == 0 for d in b["by_day"])
+
+
+def test_action_closures_is_company_scoped_for_a_company_role(wired):
+    seen = _wire_closures(wired)
+    org.lambda_handler(_closures_event(), None)
+    assert seen["args"][3] == CALLER["company_id"]        # tenant pin, always
+
+
+def test_action_closures_platform_admin_spans_tenants_but_keeps_the_reach_gate(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "platform_admin"})
+    seen = _wire_closures(wired, reach={SITE_ID, OTHER_SITE_ID})
+    res = org.lambda_handler(_closures_event(), None)
+    assert res["statusCode"] == 200
+    assert seen["args"][3] is None                        # no company pin
+    assert seen["args"][0] == {SITE_ID, OTHER_SITE_ID}    # reach still applied
+
+
+def test_action_closures_counts_only_sites_inside_the_callers_reach(wired):
+    """The KPI must not total up sites the caller cannot open: the reach set is
+    what the aggregate is scoped to, not the company's whole site list."""
+    seen = _wire_closures(wired, reach={SITE_ID})
+    org.lambda_handler(_closures_event(), None)
+    assert seen["args"][0] == {SITE_ID}
+    assert OTHER_SITE_ID not in seen["args"][0]
+
+
+def test_action_closures_empty_reach_returns_zero_not_an_unscoped_count(wired):
+    seen = _wire_closures(wired, counts={"2026-07-20": 99}, reach=set())
+    b = body_of(org.lambda_handler(_closures_event(), None))
+    assert seen["args"][0] == set()
+    assert b["closed"] == 0 and b["previous"]["closed"] == 0
+
+
+def test_action_closures_requires_both_dates(wired):
+    _wire_closures(wired)
+    assert org.lambda_handler(make_event(
+        "GET", "/api/org/action-items/closures", params={"from": "2026-07-20"}),
+        None)["statusCode"] == 400
+    assert org.lambda_handler(make_event(
+        "GET", "/api/org/action-items/closures", params=None), None)["statusCode"] == 400
+
+
+def test_action_closures_rejects_a_malformed_or_impossible_date(wired):
+    _wire_closures(wired)
+    assert org.lambda_handler(_closures_event(frm="20/07/2026"), None)["statusCode"] == 400
+    assert org.lambda_handler(_closures_event(frm="2026-02-31"), None)["statusCode"] == 400
+
+
+def test_action_closures_rejects_a_reversed_or_oversized_window(wired):
+    seen = _wire_closures(wired)
+    assert org.lambda_handler(
+        _closures_event(frm="2026-07-25", to="2026-07-20"), None)["statusCode"] == 400
+    assert org.lambda_handler(
+        _closures_event(frm="2026-01-01", to="2026-06-01"), None)["statusCode"] == 400
+    assert "args" not in seen                       # rejected before any query
