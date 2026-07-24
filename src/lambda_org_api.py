@@ -1153,6 +1153,49 @@ def _display_name(caller):
     return " ".join(p for p in (caller.get("first_name"), caller.get("last_name")) if p).strip()
 
 
+def _name_key(value):
+    """Normalize a person name for comparison: trim, collapse inner runs of
+    whitespace, casefold. `responsible` is free text the extraction model wrote
+    from speech, so "ben lin", "Ben  Lin" and "Ben Lin" all denote one person
+    and must compare equal."""
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _folder_key(value):
+    """Folder form of a name: whitespace -> underscore, matching how the client
+    and the S3 layout derive a folder. Lets "Ben_Lin" match "Ben Lin"."""
+    return "_".join(str(value or "").split()).casefold()
+
+
+def _is_assignee(row, caller):
+    """Is this task the caller's own to resolve?
+
+    Deliberately kept in step with the client's isMineTask predicate
+    (fieldsight-ui scripts/api/mine-team.js). When the server is stricter than
+    the client, the UI shows a task as yours with a live checkbox and the write
+    then 403s -- the interface lies. Same three rules as the client:
+
+      1. normalized name match (trim / collapse / case-insensitive)
+      2. folder-form match, so "Ben_Lin" == "Ben Lin"
+      3. UNASSIGNED and the caller recorded the topic it came from
+
+    Rule 3 grants authority strict equality never did, so keep its scope exact:
+    it requires the topic's own user_id to be the caller, which is the caller's
+    own recorded work and cannot reach anyone else's task. Site authority and
+    admin are checked separately by the caller."""
+    responsible = row.get("responsible")
+    if responsible and str(responsible).strip():
+        name = _display_name(caller)
+        return bool(name) and (
+            _name_key(responsible) == _name_key(name)
+            or _folder_key(responsible) == _folder_key(name)
+            or (bool(caller.get("folder_name"))
+                and _folder_key(responsible) == _folder_key(caller.get("folder_name")))
+        )
+    owner = row.get("topic_user_id")
+    return bool(owner) and bool(caller.get("id")) and str(owner) == str(caller.get("id"))
+
+
 def patch_action_item(conn, caller, action_item_id, body):
     """Edit priority/status/deadline/responsible on one action item (spec §3).
     ACL mirrors patch_observation_status widened to site authority: the task's
@@ -1173,7 +1216,7 @@ def patch_action_item(conn, caller, action_item_id, body):
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
     is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
     is_site_authority = site_role in ("pm", "site_manager")
-    is_assignee = bool(row["responsible"]) and row["responsible"] == _display_name(caller)
+    is_assignee = _is_assignee(row, caller)
     if not (is_admin or is_site_authority or is_assignee):
         return error("admin/gm, this site's pm/site_manager, or the assignee only", 403)
 
