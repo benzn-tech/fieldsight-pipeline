@@ -43,6 +43,38 @@ def mark_uploaded(conn, rec_id, company_id, size_bytes=None, gps_track=None) -> 
     ).fetchone()
 
 
+def duration_for_media(conn, company_id, user_folder, date, session_base) -> float | None:
+    """Recorded DURATION in seconds for the media file an extraction session
+    came from, or None when there is no matching recordings row. Same
+    session_base LIKE match + company scoping as site_for_media below (kept as
+    its own query so the two callers stay independent).
+
+    Deliberately returns a duration, NOT an absolute end instant:
+    recordings.started_at/ended_at are timestamptz (UTC), while a session's
+    start is the NZ device wall clock encoded in session_base. Mixing the two
+    would label a 13:05 meeting as ending at 01:22 (BUG-37's family). The
+    caller adds this duration to the session_base start, so everything stays
+    on ONE clock. Prefers the explicitly reported duration_s; falls back to
+    the ended_at - started_at delta (a difference of two timestamptz values is
+    timezone-safe). Non-positive/degenerate values are treated as absent."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT duration_s, started_at, ended_at FROM recordings "
+        "WHERE company_id = %s AND s3_key LIKE %s ESCAPE '\\' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (company_id, f"users/{_escape_like(user_folder)}/%/{date}/{_escape_like(session_base)}.%"),
+    ).fetchone()
+    if row is None:
+        return None
+    if row.get("duration_s") is not None and float(row["duration_s"]) > 0:
+        return float(row["duration_s"])
+    started, ended = row.get("started_at"), row.get("ended_at")
+    if started is not None and ended is not None:
+        delta = (ended - started).total_seconds()
+        if delta > 0:
+            return delta
+    return None
+
+
 def site_for_media(conn, company_id, user_folder, date, session_base) -> dict | None:
     """The app-tagged site (recordings.site_id) for the recording whose media
     file this extraction session came from, or None. Matches recordings.s3_key
