@@ -30,6 +30,11 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   PATCH /api/org/observations/{id}        → update status (author or admin/gm)
   PATCH /api/org/action-items/{id}        → update priority/status/deadline/responsible
                                              (site-authority ACL + member-validated reassignment)
+  GET   /api/org/action-items/closures?from=&to= → action items CLOSED per NZ
+                                             calendar day in the window + the same-length
+                                             window before it, from the content_edits
+                                             status→done audit trail (ONE call, reach+tenant
+                                             scoped; backs the Today weekly KPI)
   POST  /api/org/observations/{id}/archive→ soft-delete observation (admin/gm)
   POST  /api/org/topics/{id}/propagate/preview → dry-run: which cells of THIS
                                              topic still carry the wrong term
@@ -62,6 +67,9 @@ import logging
 import os
 import re
 import uuid
+# `date` is aliased: several handlers below bind a LOCAL `date` from
+# queryStringParameters, so an unaliased import would be shadowed there.
+from datetime import date as _date
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -255,6 +263,11 @@ def dispatch(conn, event, method, route):
     m_oa = re.match(r"^/observations/([^/]+)/archive$", route)
     if m_oa and method == "POST":
         return archive_observation_endpoint(conn, caller, m_oa.group(1))
+    # Literal first: /action-items/closures is a collection-level aggregate,
+    # not an item id (the regex below only serves PATCH, but keeping the
+    # literal ahead of it stops a future PATCH-shaped route from shadowing it).
+    if route == "/action-items/closures" and method == "GET":
+        return get_action_closures(conn, caller, event)
     m_ai = re.match(r"^/action-items/([^/]+)$", route)
     if m_ai and method == "PATCH":
         return patch_action_item(conn, caller, m_ai.group(1), parse_body(event))
@@ -1303,6 +1316,89 @@ def patch_action_item(conn, caller, action_item_id, body):
     except _ActionItemVanished:
         return error("action item not found", 404)
     return ok(updated)
+
+
+# ----------------------------------------------------------
+# GET /action-items/closures?from=&to= — the Today page's weekly KPI.
+#
+# METRIC (deliberately a pure FLOW, no denominator): "action items closed
+# between `from` 00:00 and the end of `to`, NZ local". The tile used to claim
+# "N / M actions resolved this week" over the legacy DynamoDB overlay, where M
+# was "rows that ever had an overlay write" and the date axis was the task's
+# REPORT date -- so ticking a box moved neither number. Every denominator
+# actually available here is either a STOCK (open items: an all-time backlog
+# reaching back to February plus ~119 rows the legacy overlay closed without
+# ever clearing Aurora's status='open', i.e. a near-constant that still would
+# not move when you tick something) or an unrelated flow (items CREATED this
+# week, which nightly ingest drives, not the team). Counting closures and
+# comparing them with the SAME window one period earlier keeps flow against
+# flow, and every number is backed by a real timestamped audit row.
+#
+# The comparison window is served in the SAME response (`previous`): the point
+# of the endpoint is that the client asks once, instead of the per-day fan-out
+# getActionsRange did.
+# ----------------------------------------------------------
+_CLOSURES_MAX_DAYS = 31          # bounds the scan; the caller is a week tile
+
+
+def _parse_iso_date(value):
+    if not value or not REPORT_DATE_RE.match(value):
+        return None
+    try:
+        return _date.fromisoformat(value)     # regex above already pinned the shape
+    except ValueError:            # e.g. 2026-02-31
+        return None
+
+
+def _day_series(counts, start, end):
+    """Dense [{date, closed}] for every day in [start, end] -- zero-filled, so
+    the sparkline always spans the whole window instead of collapsing to the
+    days that happened to have activity."""
+    out, d = [], start
+    while d <= end:
+        iso = d.isoformat()
+        out.append({"date": iso, "closed": int(counts.get(iso, 0))})
+        d += timedelta(days=1)
+    return out
+
+
+def get_action_closures(conn, caller, event):
+    """Closure counts for [from, to] plus the equally long window immediately
+    before it, in one round-trip.
+
+    ACL: exactly the pair patch_action_item / get_content_history enforce --
+    the caller's site reach (_allowed_site_ids, graded-aware) AND the tenant.
+    platform_admin (is_cross_company) drops the tenant pin only, keeping the
+    reach gate, so a KPI can never total up sites the caller cannot open. An
+    empty reach is a well-formed zero, never an unscoped count."""
+    params = event.get("queryStringParameters") or {}
+    start = _parse_iso_date(params.get("from"))
+    end = _parse_iso_date(params.get("to"))
+    if start is None or end is None:
+        return error("from and to required (YYYY-MM-DD)", 400)
+    if end < start:
+        return error("to must not precede from", 400)
+    span = (end - start).days + 1
+    if span > _CLOSURES_MAX_DAYS:
+        return error(f"window must be {_CLOSURES_MAX_DAYS} days or fewer", 400)
+    prev_end = start - timedelta(days=1)
+    prev_start = prev_end - timedelta(days=span - 1)
+
+    cross = is_cross_company(caller["global_role"])
+    counts = content_edits.count_action_closures_by_day(
+        conn, _allowed_site_ids(conn, caller), prev_start, end,
+        company_id=None if cross else caller["company_id"])
+
+    days = _day_series(counts, start, end)
+    prev_days = _day_series(counts, prev_start, prev_end)
+    return ok({
+        "from": start.isoformat(), "to": end.isoformat(),
+        "timezone": content_edits.CLOSURE_TZ,
+        "closed": sum(d["closed"] for d in days),
+        "by_day": days,
+        "previous": {"from": prev_start.isoformat(), "to": prev_end.isoformat(),
+                     "closed": sum(d["closed"] for d in prev_days)},
+    })
 
 
 def patch_content(conn, caller, table, row_id, body):
