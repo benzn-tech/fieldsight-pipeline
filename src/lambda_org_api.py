@@ -1835,14 +1835,41 @@ def create_alias_endpoint(conn, caller, body, event):
 
 
 def get_content_history(conn, caller, table, row_id):
-    """content_edits trail for one row (spec §5.5 History view). Company-guarded
-    via get_content_row (which also resolves cross-company for platform_admin)."""
+    """content_edits trail for one row (spec §5.5 History view).
+
+    ACL is the READ half of patch_content's D7 tier: platform_admin
+    (is_cross_company) reads any tenant; company roles stay pinned; and the
+    row's site must be in the caller's reach (_allowed_site_ids). The
+    per-item AUTHOR/site-authority tier is deliberately NOT applied -- this
+    is a read, and anyone who can see the row can see how it got that way --
+    but reach is, because the trail is not a subset of the row: it names the
+    people who edited it, and (since check-off audit) who closed or
+    reassigned a task and when. Company-only guarding let any authenticated
+    user in the company read that for sites they cannot otherwise see.
+
+    `row["site_id"]` is the row's OWN site for all three EDITABLE tables --
+    content._SELECT selects x.site_id and reaches company_id through it, so
+    action_items/findings are gated on the same site their write path gates
+    on (patch_action_item / patch_content), not the owning topic's.
+
+    Refusal posture matches the siblings exactly: cross-company (and missing)
+    is 404 so existence never leaks; in-company but out-of-reach is 403, the
+    same status and shape patch_action_item returns for that case.
+
+    No-op for the live History tab: ContentHistoryPanel is only ever mounted
+    with the durable topic_row_id of a topic the user is already viewing, and
+    that id only reaches the client through render_report_shape, which
+    _render_timeline_for_user feeds with rows ALREADY filtered by this same
+    _allowed_site_ids. An out-of-reach topic has no id in the UI to ask about."""
     if table not in content.EDITABLE:
         return error(f"table must be one of {sorted(content.EDITABLE)}", 400)
     row = content.get_content_row(conn, table, row_id)
     cross = is_cross_company(caller["global_role"])
     if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
         return error("content row not found", 404)
+    site_id = str(row["site_id"])
+    if not cross and site_id not in _allowed_site_ids(conn, caller):
+        return error("access denied to this content's site", 403)
     edits = content_edits.list_content_edits(conn, row["company_id"], table, row_id)
     return ok({"edits": edits})
 

@@ -4626,13 +4626,35 @@ AI_CONTENT_ROW = {"id": "a-1", "site_id": SITE_ID, "company_id": "c-uuid-1",
                   "responsible": "Ada Owner"}
 
 
-def _wire_history(wired, row=AI_CONTENT_ROW, edits=None):
+def _wire_history(wired, row=AI_CONTENT_ROW, edits=None, reach=None):
+    """`seen["args"]` = the list_content_edits call (absent = never read);
+    `seen["reach"]` = the _allowed_site_ids calls, so a test can assert the
+    route consults the reach predicate at all. `reach` defaults to the row's
+    own site (in-reach); pass a set to put the row out of reach."""
     wired.setattr(org.content, "get_content_row", lambda conn, tbl, rid: dict(row))
-    seen = {}
+    seen = {"reach": []}
+    allowed = {str(row["site_id"])} if reach is None else set(reach)
+    wired.setattr(org, "_allowed_site_ids",
+                  lambda conn, caller: (seen["reach"].append(caller["id"]) or allowed))
     wired.setattr(org.content_edits, "list_content_edits",
                   lambda conn, cid, tbl, rid: (seen.update(args=(cid, tbl, rid))
                                                or (edits if edits is not None else [])))
     return seen
+
+
+# One representative row per content.EDITABLE table. content._SELECT gives all
+# three the SAME shape (id/site_id/company_id/author_user_id + editable cols) and
+# site_id is always the row's OWN site -- action_items/findings INNER JOIN topics
+# only to resolve author_user_id -- so the gate reads the same field for each.
+_HISTORY_ROWS = {
+    "topics": {"id": "t-1", "site_id": SITE_ID, "company_id": "c-uuid-1",
+               "author_user_id": "u-9", "title": "Slab", "summary": "poured"},
+    "action_items": AI_CONTENT_ROW,
+    "findings": {"id": "f-1", "site_id": SITE_ID, "company_id": "c-uuid-1",
+                 "author_user_id": "u-9", "observation": "edge protection",
+                 "recommended_action": "install", "entity_name": "Acme",
+                 "entity_trade": "steel"},
+}
 
 
 def test_content_history_returns_action_item_edits(wired):
@@ -4684,6 +4706,84 @@ def test_content_history_rejects_table_outside_the_whitelist(wired):
     res = org.lambda_handler(
         make_event("GET", "/api/org/content/users/u-1/history"), None)
     assert res["statusCode"] == 400 and called == []
+
+
+# ---- site-reach gate (the read half of patch_content's D7 tier) ----
+# The trail is not a subset of the row: it names who edited what, and since the
+# check-off audit above it also names who CLOSED or REASSIGNED a task and when.
+# Company-only guarding let any authenticated user in the company read that for
+# sites outside their reach. Refusal posture mirrors the write siblings exactly:
+# cross-company 404 (existence never leaks), in-company/out-of-reach 403.
+
+@pytest.mark.parametrize("table", sorted(_HISTORY_ROWS))
+def test_content_history_in_reach_returns_edits_for_every_editable_table(wired, table):
+    """In-company AND the row's site in reach -> 200 with the trail, for all
+    three content.EDITABLE tables."""
+    edits = [{"id": "e-1", "field": "status", "before_text": "open",
+              "after_text": "done"}]
+    seen = _wire_history(wired, row=_HISTORY_ROWS[table], edits=edits)
+    res = org.lambda_handler(
+        make_event("GET", f"/api/org/content/{table}/x-1/history"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["edits"] == edits
+    assert seen["args"] == ("c-uuid-1", table, "x-1")
+
+
+@pytest.mark.parametrize("table", sorted(_HISTORY_ROWS))
+def test_content_history_site_out_of_reach_403_and_returns_no_edits(wired, table):
+    """In-company but the row sits on a site the caller cannot reach: 403 --
+    the same status patch_action_item returns for exactly this case -- and the
+    body carries no edit rows because list_content_edits is never called."""
+    seen = _wire_history(wired, row={**_HISTORY_ROWS[table], "site_id": OTHER_SITE_ID},
+                         edits=[{"id": "e-leak"}], reach={SITE_ID})
+    res = org.lambda_handler(
+        make_event("GET", f"/api/org/content/{table}/x-1/history"), None)
+    assert res["statusCode"] == 403
+    assert "args" not in seen                       # trail never read
+    assert "edits" not in body_of(res)              # and never rendered
+
+
+def test_content_history_out_of_reach_403_is_not_the_cross_company_404(wired):
+    """Posture parity check, both directions at once: an in-company row on an
+    unreachable site is 403 (sibling's status), while another tenant's row stays
+    404 so the gate can never be used to probe existence across companies."""
+    _wire_history(wired, row={**AI_CONTENT_ROW, "site_id": OTHER_SITE_ID},
+                  reach={SITE_ID})
+    in_company = org.lambda_handler(
+        make_event("GET", "/api/org/content/action_items/a-1/history"), None)
+    _wire_history(wired, row={**AI_CONTENT_ROW, "company_id": "c-OTHER",
+                              "site_id": OTHER_SITE_ID}, reach={SITE_ID})
+    cross_company = org.lambda_handler(
+        make_event("GET", "/api/org/content/action_items/a-1/history"), None)
+    assert in_company["statusCode"] == 403
+    assert cross_company["statusCode"] == 404
+
+
+def test_content_history_platform_admin_reads_site_outside_its_own_reach(wired):
+    """is_cross_company exempts the reach gate exactly as it exempts the company
+    pin (the file-wide platform_admin posture, #96): with GRADED_ROLES off a
+    platform_admin's _allowed_site_ids is only its own (empty operator company)
+    memberships, so without the exemption cross-tenant reads would 403."""
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "platform_admin"})
+    seen = _wire_history(wired, row={**AI_CONTENT_ROW, "company_id": "c-south",
+                                     "site_id": OTHER_SITE_ID},
+                         edits=[{"id": "e-1"}], reach=set())      # reaches NO site
+    res = org.lambda_handler(
+        make_event("GET", "/api/org/content/action_items/a-1/history"), None)
+    assert res["statusCode"] == 200
+    assert seen["args"][0] == "c-south"
+
+
+def test_content_history_consults_the_site_reach_predicate(wired):
+    """Regression guard: the route must actually call _allowed_site_ids, so it
+    cannot silently fall back to a company-only gate again. Asserted on the
+    ALLOWED path -- a 200 that never consulted reach is the exact bug."""
+    seen = _wire_history(wired, edits=[{"id": "e-1"}])
+    res = org.lambda_handler(
+        make_event("GET", "/api/org/content/action_items/a-1/history"), None)
+    assert res["statusCode"] == 200
+    assert seen["reach"] == [CALLER["id"]]          # called once, with the caller
 
 
 def test_render_report_shape_exposes_durable_topic_and_safety_ids():
