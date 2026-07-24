@@ -31,6 +31,11 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   PATCH /api/org/action-items/{id}        → update priority/status/deadline/responsible
                                              (site-authority ACL + member-validated reassignment)
   POST  /api/org/observations/{id}/archive→ soft-delete observation (admin/gm)
+  POST  /api/org/topics/{id}/propagate/preview → dry-run: which cells of THIS
+                                             topic still carry the wrong term
+                                             (read-only, no writes)
+  POST  /api/org/topics/{id}/propagate    → rewrite exactly those cells
+                                             (one transaction + one re-index)
   GET   /api/org/live-items?date=…        → live topics dashboard feed (ACL)
   GET   /api/org/dates?months=&site=      → Timeline dots: report-date index scoped to
                                              caller's accessible sites (ACL, kills dots leak)
@@ -71,7 +76,7 @@ from repositories import (action_items, aliases, classification_feedback, compan
                           programme_suggestions, recordings, redactions, rollup,
                           scope, sites, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
-from text_normalize import diff_candidates
+from text_normalize import diff_candidates, first_match_span, normalize, occurrences
 # Keyframe Q7 telemetry derivation (all AWS-free, pure helpers): the deleted
 # frame's structural signal is reconstructed from the still-live topic row.
 from keyframe_selection import keyframe_seconds
@@ -260,6 +265,14 @@ def dispatch(conn, event, method, route):
     m_ch = re.match(r"^/content/([^/]+)/([^/]+)/history$", route)
     if m_ch and method == "GET":
         return get_content_history(conn, caller, m_ch.group(1), m_ch.group(2))
+
+    # Intra-topic correction propagation (item #3) -- preview BEFORE apply.
+    m_pp = re.match(r"^/topics/([^/]+)/propagate/preview$", route)
+    if m_pp and method == "POST":
+        return preview_topic_correction(conn, caller, m_pp.group(1), parse_body(event))
+    m_pa = re.match(r"^/topics/([^/]+)/propagate$", route)
+    if m_pa and method == "POST":
+        return apply_topic_correction(conn, caller, m_pa.group(1), parse_body(event))
 
     if route == "/aliases" and method == "POST":
         return create_alias_endpoint(conn, caller, parse_body(event), event)
@@ -1140,6 +1153,49 @@ def _display_name(caller):
     return " ".join(p for p in (caller.get("first_name"), caller.get("last_name")) if p).strip()
 
 
+def _name_key(value):
+    """Normalize a person name for comparison: trim, collapse inner runs of
+    whitespace, casefold. `responsible` is free text the extraction model wrote
+    from speech, so "ben lin", "Ben  Lin" and "Ben Lin" all denote one person
+    and must compare equal."""
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _folder_key(value):
+    """Folder form of a name: whitespace -> underscore, matching how the client
+    and the S3 layout derive a folder. Lets "Ben_Lin" match "Ben Lin"."""
+    return "_".join(str(value or "").split()).casefold()
+
+
+def _is_assignee(row, caller):
+    """Is this task the caller's own to resolve?
+
+    Deliberately kept in step with the client's isMineTask predicate
+    (fieldsight-ui scripts/api/mine-team.js). When the server is stricter than
+    the client, the UI shows a task as yours with a live checkbox and the write
+    then 403s -- the interface lies. Same three rules as the client:
+
+      1. normalized name match (trim / collapse / case-insensitive)
+      2. folder-form match, so "Ben_Lin" == "Ben Lin"
+      3. UNASSIGNED and the caller recorded the topic it came from
+
+    Rule 3 grants authority strict equality never did, so keep its scope exact:
+    it requires the topic's own user_id to be the caller, which is the caller's
+    own recorded work and cannot reach anyone else's task. Site authority and
+    admin are checked separately by the caller."""
+    responsible = row.get("responsible")
+    if responsible and str(responsible).strip():
+        name = _display_name(caller)
+        return bool(name) and (
+            _name_key(responsible) == _name_key(name)
+            or _folder_key(responsible) == _folder_key(name)
+            or (bool(caller.get("folder_name"))
+                and _folder_key(responsible) == _folder_key(caller.get("folder_name")))
+        )
+    owner = row.get("topic_user_id")
+    return bool(owner) and bool(caller.get("id")) and str(owner) == str(caller.get("id"))
+
+
 def patch_action_item(conn, caller, action_item_id, body):
     """Edit priority/status/deadline/responsible on one action item (spec §3).
     ACL mirrors patch_observation_status widened to site authority: the task's
@@ -1160,7 +1216,7 @@ def patch_action_item(conn, caller, action_item_id, body):
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
     is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
     is_site_authority = site_role in ("pm", "site_manager")
-    is_assignee = bool(row["responsible"]) and row["responsible"] == _display_name(caller)
+    is_assignee = _is_assignee(row, caller)
     if not (is_admin or is_site_authority or is_assignee):
         return error("admin/gm, this site's pm/site_manager, or the assignee only", 403)
 
@@ -1296,6 +1352,167 @@ def _topic_authority(conn, caller, topic_id):
     if not (is_admin or is_site_authority or is_author):
         return None, error("admin/gm, this site's pm/site_manager, or the author only", 403)
     return row, None
+
+
+# ----------------------------------------------------------
+# Intra-topic correction propagation (item #3)
+#
+# Correcting one field today fixes exactly one column of one row, so the SAME
+# mis-transcribed name survives in that topic's other cells (action_items.text,
+# findings.observation, ...). These two endpoints fix the rest of the term's
+# own topic -- and ONLY its own topic: never the day, the site or the company,
+# because a substring match at that blast radius can silently corrupt unrelated
+# sentences. Preview is read-only and must be shown to the user first; apply
+# rewrites exactly the cells the preview listed.
+# ----------------------------------------------------------
+_SNIPPET_PAD = 60
+
+
+class _PropagationAborted(Exception):
+    """A planned row vanished/failed mid-apply -- abort the whole transaction
+    rather than commit half a correction."""
+
+
+def _snippet(text, span):
+    """~_SNIPPET_PAD characters either side of `span`, ellipsized -- enough
+    context for the user to recognise the sentence being rewritten."""
+    if not span:
+        return text
+    start, end = span
+    lo, hi = max(0, start - _SNIPPET_PAD), min(len(text), end + _SNIPPET_PAD)
+    return ("…" if lo > 0 else "") + text[lo:hi] + ("…" if hi < len(text) else "")
+
+
+def _parse_correction_terms(body):
+    """Shared validation for preview/apply. Returns (before, after, None) or
+    (None, None, error_response)."""
+    if body is None:
+        return None, None, error("malformed JSON body", 400)
+    before = body.get("before")
+    after = body.get("after")
+    if not isinstance(before, str) or not before.strip():
+        return None, None, error("before must be a non-empty string", 400)
+    if not isinstance(after, str) or not after.strip():
+        return None, None, error("after must be a non-empty string", 400)
+    before, after = before.strip(), after.strip()
+    # Convergence guard: `after` must be a fixpoint of its own alias, or a
+    # re-run would keep rewriting (before='Mackon', after='Mackon Ltd' ->
+    # 'Mackon Ltd Ltd'). This is what makes apply idempotent-safe. A pure
+    # case fix (before='mackon', after='Mackon') IS a fixpoint -- normalize
+    # adopts the surface casing -- so it stays allowed.
+    if normalize(after, [{"wrong_term": before, "right_term": after}]) != after:
+        return None, None, error(
+            "after must not itself contain before (the correction would not be stable)", 400)
+    return before, after, None
+
+
+def _plan_topic_propagation(conn, topic_id, before, after):
+    """Read-only: every editable cell in THIS topic whose text actually
+    changes when before -> after is applied. Matching is text_normalize.
+    normalize (whole-word, case-aware) -- the same function the embed and RAG
+    paths use -- never a raw str.replace, so 'Mackon' never rewrites inside
+    'Mackonsson'. A cell that comes back unchanged is dropped here and is
+    therefore never written and never audited."""
+    alias = [{"wrong_term": before, "right_term": after}]
+    plan = []
+    for cell in content.list_topic_content_fields(conn, topic_id):
+        # Belt-and-braces: the scan already selects only EDITABLE columns, but
+        # re-assert it here so nothing outside the allow-list (e.g. findings'
+        # impact_note/impact_task_name/impact_evidence) can ever be planned.
+        if not content.is_editable(cell["table"], cell["field"]):
+            continue
+        value = cell["value"]
+        rewritten = normalize(value, alias)
+        if rewritten == value:
+            continue
+        plan.append({
+            "table": cell["table"], "row_id": str(cell["row_id"]),
+            "field": cell["field"], "occurrences": occurrences(value, before),
+            "before_text": value, "after_text": rewritten,
+        })
+    return plan
+
+
+def _match_view(p, before, after):
+    """Wire shape for one planned change (snippets, not whole documents) --
+    each window is centred on the FIRST occurrence of the term."""
+    return {
+        "table": p["table"], "row_id": p["row_id"], "field": p["field"],
+        "occurrences": p["occurrences"],
+        "before_snippet": _snippet(p["before_text"],
+                                   first_match_span(p["before_text"], before)),
+        "after_snippet": _snippet(p["after_text"],
+                                  first_match_span(p["after_text"], after)),
+    }
+
+
+def preview_topic_correction(conn, caller, topic_id, body):
+    """POST /topics/{id}/propagate/preview -- what an intra-topic correction
+    WOULD change. Strictly read-only: no UPDATE, no audit row, no re-index.
+    The frontend must show this before offering apply."""
+    before, after, err = _parse_correction_terms(body)
+    if err is not None:
+        return err
+    _, err = _topic_authority(conn, caller, topic_id)
+    if err is not None:
+        return err
+    plan = _plan_topic_propagation(conn, topic_id, before, after)
+    matches = [_match_view(p, before, after) for p in plan]
+    return ok({
+        "topic_id": str(topic_id), "before": before, "after": after,
+        "field_count": len(matches),
+        "occurrence_count": sum(m["occurrences"] for m in matches),
+        "matches": matches,
+    })
+
+
+def apply_topic_correction(conn, caller, topic_id, body):
+    """POST /topics/{id}/propagate -- rewrite exactly the cells the preview
+    listed. All UPDATEs plus their content_edits audit rows run inside ONE
+    transaction, so the correction is all-or-nothing; the per-topic re-index is
+    enqueued ONCE afterwards (reindex re-renders the whole topic, children
+    included, so one enqueue covers every rewritten cell) and is best-effort --
+    it never rolls the correction back. Re-running with the same terms finds
+    nothing left to change and writes nothing."""
+    before, after, err = _parse_correction_terms(body)
+    if err is not None:
+        return err
+    row, err = _topic_authority(conn, caller, topic_id)
+    if err is not None:
+        return err
+    plan = _plan_topic_propagation(conn, topic_id, before, after)
+    if not plan:                                     # incl. the re-apply no-op
+        return ok({"topic_id": str(topic_id), "before": before, "after": after,
+                   "changed_count": 0, "changed": [], "reindex_enqueued": False})
+
+    try:
+        with conn.transaction():
+            for p in plan:
+                updated = content.update_content_field(
+                    conn, p["table"], p["row_id"], p["field"], p["after_text"])
+                if updated is None:                  # row vanished mid-flight
+                    raise _PropagationAborted(f"{p['table']}/{p['row_id']}")
+                content_edits.append_content_edit(
+                    conn, row["company_id"], p["table"], p["row_id"], p["field"],
+                    p["before_text"], p["after_text"], caller["id"], caller["global_role"])
+    except _PropagationAborted as e:
+        logger.warning("propagate %s: %s changed under us -- nothing written", topic_id, e)
+        return error("content changed during propagation, nothing was written", 409)
+
+    reindexed = True
+    try:
+        _enqueue_content_reindex(conn, "topics", topic_id)     # ONCE for the topic
+    except Exception:
+        logger.exception("propagate %s: reindex enqueue failed (edits kept)", topic_id)
+        reindexed = False
+
+    return ok({
+        "topic_id": str(topic_id), "before": before, "after": after,
+        "changed_count": len(plan),
+        "changed": [{"table": p["table"], "row_id": p["row_id"], "field": p["field"],
+                     "occurrences": p["occurrences"]} for p in plan],
+        "reindex_enqueued": reindexed,
+    })
 
 
 def create_redaction_endpoint(conn, caller, body):
@@ -1989,6 +2206,42 @@ def _list_report_folders(date):
 _SEV_TO_RISK = {"major": "high", "minor": "medium", "none": "low"}
 
 
+def _prose_alias_pairs(conn, site_id):
+    """Active alias pairs for the site's company, loaded ONCE per render --
+    same source (and same site-before-company precedence) the re-index builder
+    feeds text_normalize with (reindex.enqueue_topic_reindex). Best-effort:
+    prose normalization is cosmetic, so a lookup failure degrades to 'no
+    aliases' instead of failing the whole read."""
+    if conn is None or not site_id:
+        return []
+    try:
+        site = sites.get_site(conn, site_id)
+        if not site or not site.get("company_id"):
+            return []
+        return [{"wrong_term": a["wrong_term"], "right_term": a["right_term"]}
+                for a in aliases.list_active(conn, site["company_id"],
+                                             site_ids=[str(site_id)])]
+    except Exception:
+        logger.warning("prose alias lookup failed for site %s -- rendering raw", site_id)
+        return []
+
+
+def _normalize_prose(value, alias_pairs):
+    """Apply aliases to every string inside one prose field, whatever shape it
+    has: a bare string (v1 executive_summary), a list of strings (the current
+    bullet form), or a list of dicts (safety_observations /
+    quality_and_compliance / critical_dates_and_deadlines rows). Non-string
+    leaves pass through untouched. READ-TIME ONLY -- the S3 daily_report.json
+    stays immutable and auditable (D4); nothing here is ever written back."""
+    if isinstance(value, str):
+        return normalize(value, alias_pairs)
+    if isinstance(value, list):
+        return [_normalize_prose(v, alias_pairs) for v in value]
+    if isinstance(value, dict):
+        return {k: _normalize_prose(v, alias_pairs) for k, v in value.items()}
+    return value
+
+
 def render_report_shape(rows, doc, date, folder, conn=None):
     """Pure function: render Aurora extraction topics INTO the
     daily_report.json shape, optionally merging the doc's own prose fields
@@ -2001,7 +2254,13 @@ def render_report_shape(rows, doc, date, folder, conn=None):
     `conn` (optional, trailing kwarg — Task 1b) enables the redaction-status
     lookup below; callers that don't pass it (or pass None) simply get
     `redacted: False` for every topic, unchanged from before this field
-    existed."""
+    existed.
+
+    The four prose fields merged out of the S3 doc have no Aurora row and no
+    edit surface, so a name the user already corrected in the item store would
+    keep showing here (Today's morning brief, the Timeline exec-summary card,
+    the whole Quality page). They are therefore alias-normalized at READ time
+    (item #3 part B) — the document itself is never rewritten."""
     doc = doc or {}
     topics_out = []
     _redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if conn is not None else {}
@@ -2037,14 +2296,24 @@ def render_report_shape(rows, doc, date, folder, conn=None):
             "redacted": t["id"] in _redacted,
             "redaction_id": (_redacted.get(t["id"]) or {}).get("id"),
         })
-    return {
-        "report_date": date,
-        "site": rows[0]["site_name"],
-        "user_name": rows[0]["user_name"] or folder.replace("_", " "),
+    prose = {
         "executive_summary": doc.get("executive_summary"),
         "safety_observations": doc.get("safety_observations", []),
         "quality_and_compliance": doc.get("quality_and_compliance", []),
         "critical_dates_and_deadlines": doc.get("critical_dates_and_deadlines", []),
+    }
+    # One alias load for all four fields, and none at all when there is no
+    # prose to rewrite (the reindex builder renders with doc=None, so this
+    # costs it nothing).
+    if any(prose.values()):
+        alias_pairs = _prose_alias_pairs(conn, rows[0].get("site_id"))
+        if alias_pairs:
+            prose = {k: _normalize_prose(v, alias_pairs) for k, v in prose.items()}
+    return {
+        "report_date": date,
+        "site": rows[0]["site_name"],
+        "user_name": rows[0]["user_name"] or folder.replace("_", " "),
+        **prose,
         "_report_metadata": {"source": "live_extraction", "version": "flip-v1"},
         "topics": topics_out,
     }

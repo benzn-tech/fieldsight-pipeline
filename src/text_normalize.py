@@ -21,6 +21,13 @@ def _match_case(surface: str, replacement: str) -> str:
     return replacement
 
 
+def term_pattern(wrong):
+    """The ONE whole-word, case-insensitive pattern used to both find and
+    rewrite a term. Shared so a preview count can never disagree with what a
+    later rewrite actually changes."""
+    return re.compile(r"\b" + re.escape(wrong) + r"\b", re.IGNORECASE)
+
+
 def normalize(text, aliases):
     if not text or not aliases:
         return text
@@ -30,9 +37,29 @@ def normalize(text, aliases):
         right = a.get("right_term") or ""
         if not wrong:
             continue
-        pattern = re.compile(r"\b" + re.escape(wrong) + r"\b", re.IGNORECASE)
+        pattern = term_pattern(wrong)
         out = pattern.sub(lambda m: _match_case(m.group(0), right), out)
     return out
+
+
+def occurrences(text, wrong):
+    """How many whole-word matches of `wrong` normalize() would rewrite in
+    `text` (0 for empty text/term). Same pattern as normalize -- counts and
+    rewrites stay in lockstep."""
+    wrong = (wrong or "").strip()
+    if not text or not wrong:
+        return 0
+    return len(term_pattern(wrong).findall(text))
+
+
+def first_match_span(text, wrong):
+    """(start, end) of the first whole-word match, or None -- lets a caller
+    build a preview snippet around the exact text normalize() would touch."""
+    wrong = (wrong or "").strip()
+    if not text or not wrong:
+        return None
+    m = term_pattern(wrong).search(text)
+    return m.span() if m else None
 
 
 def _proper_nounish(tok: str) -> bool:
