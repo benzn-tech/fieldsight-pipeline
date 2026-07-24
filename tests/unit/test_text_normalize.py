@@ -1,4 +1,4 @@
-from text_normalize import normalize, diff_candidates
+from text_normalize import diff_candidates, first_match_span, normalize, occurrences
 
 
 def _a(wrong, right):
@@ -26,6 +26,23 @@ def test_multiple_aliases_applied_in_order():
 
 def test_no_aliases_is_identity():
     assert normalize("unchanged text", []) == "unchanged text"
+
+
+def test_occurrences_counts_only_whole_words():
+    # Same pattern normalize() rewrites with -- a preview count can never
+    # promise a change normalize wouldn't make.
+    text = "Mackonsson met Mackon, then MACKON left"
+    assert occurrences(text, "Mackon") == 2                   # not Mackonsson
+    assert occurrences(text, "mackon") == 2                   # case-insensitive
+    assert occurrences(text, "Fyfe") == 0
+    assert occurrences("", "Mackon") == 0 and occurrences(text, "") == 0
+
+
+def test_first_match_span_points_at_the_first_whole_word_hit():
+    text = "Mackonsson met Mackon today"
+    span = first_match_span(text, "Mackon")
+    assert text[span[0]:span[1]] == "Mackon" and span[0] == 15  # not index 0
+    assert first_match_span(text, "Fyfe") is None
 
 
 def test_diff_candidates_surfaces_new_proper_nouns_only():

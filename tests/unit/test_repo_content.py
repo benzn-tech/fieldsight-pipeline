@@ -27,6 +27,31 @@ class FakeConn:
         return self.cur
 
 
+class ScanCursor:
+    """Returns a canned row list per table, keyed off the SQL's FROM clause."""
+
+    def __init__(self, by_table):
+        self.by_table = by_table
+        self.sql_log = []
+
+    def execute(self, sql, params=None):
+        self.sql_log.append(sql)
+        table = sql.split(" FROM ")[1].split(" ")[0]
+        self._rows = self.by_table.get(table, [])
+        return self
+
+    def fetchall(self):
+        return self._rows
+
+
+class ScanConn:
+    def __init__(self, by_table):
+        self.cur = ScanCursor(by_table)
+
+    def cursor(self, *a, **k):
+        return self.cur
+
+
 def test_editable_allow_list_matches_spec():
     assert content.EDITABLE["topics"] == {"title", "summary"}
     assert content.EDITABLE["action_items"] == {"text", "responsible"}
@@ -76,3 +101,51 @@ def test_update_content_field_only_writes_whitelisted_column():
 def test_update_content_field_rejects_non_whitelisted_field():
     conn = FakeConn(None)
     assert content.update_content_field(conn, "topics", "t-1", "category", "x") is None
+
+
+# ----------------------------------------------------------
+# list_topic_content_fields — the intra-topic propagation blast radius
+# ----------------------------------------------------------
+_SCAN = {
+    "topics": [{"id": "t-1", "title": "Mackon slab", "summary": "Mackon poured it"}],
+    "action_items": [{"id": "a-1", "text": "call Mackon", "responsible": "Mackon"}],
+    "findings": [{"id": "f-1", "observation": "Mackon left the edge open",
+                  "recommended_action": None, "entity_name": "Mackon",
+                  "entity_trade": None}],
+}
+
+
+def test_list_topic_content_fields_covers_all_three_tables():
+    cells = content.list_topic_content_fields(ScanConn(_SCAN), "t-1")
+    assert {(c["table"], c["field"]) for c in cells} == {
+        ("topics", "title"), ("topics", "summary"),
+        ("action_items", "text"), ("action_items", "responsible"),
+        ("findings", "observation"), ("findings", "entity_name"),
+    }
+    assert [c["table"] for c in cells][:2] == ["topics", "topics"]   # stable order
+
+
+def test_list_topic_content_fields_skips_null_cells():
+    cells = content.list_topic_content_fields(ScanConn(_SCAN), "t-1")
+    # recommended_action / entity_trade are NULL -> never previewed, so they
+    # can never be rewritten either.
+    assert all(c["field"] not in ("recommended_action", "entity_trade") for c in cells)
+    assert all(c["value"] is not None for c in cells)
+
+
+def test_list_topic_content_fields_selects_only_editable_columns():
+    conn = ScanConn(_SCAN)
+    content.list_topic_content_fields(conn, "t-1")
+    joined = " ".join(conn.cur.sql_log)
+    for banned in ("impact_note", "impact_task_name", "impact_evidence",
+                   "severity", "domain", "status", "priority", "category"):
+        assert banned not in joined
+
+
+def test_list_topic_content_fields_scopes_children_by_topic_id():
+    conn = ScanConn(_SCAN)
+    content.list_topic_content_fields(conn, "t-1")
+    sqls = {s.split(" FROM ")[1].split(" ")[0]: s for s in conn.cur.sql_log}
+    assert "WHERE id=%s" in sqls["topics"]                   # the topic row itself
+    assert "WHERE topic_id=%s" in sqls["action_items"]       # never the whole day
+    assert "WHERE topic_id=%s" in sqls["findings"]
