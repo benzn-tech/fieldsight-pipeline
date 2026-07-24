@@ -26,6 +26,11 @@ class FakeConn:
     def __exit__(self, exc_type, exc, tb):
         return False
 
+    def transaction(self):
+        # psycopg3's `with conn.transaction():` — the fake is its own context
+        # manager, so the block either runs whole or propagates, like the real one.
+        return self
+
 
 CALLER = {
     "id": "u-uuid-1", "cognito_sub": "sub-1", "company_id": "c-uuid-1",
@@ -4573,6 +4578,188 @@ def test_patch_content_cross_company_platform_admin_allowed(wired, monkeypatch):
                                   body={"title": "x"}),
                        "PATCH", "/content/topics/t-1")
     assert res["statusCode"] == 200
+
+
+# ----------------------------------------------------------
+# Item #3 — intra-topic correction propagation
+# ----------------------------------------------------------
+PROP_TOPIC_ROW = {"id": "t-9", "site_id": SITE_ID, "company_id": "c-uuid-1",
+                  "author_user_id": "u-9", "title": "Mackon slab", "summary": "s"}
+
+# One topic's editable cells: two carry the term with different casing, one
+# carries it inside a LONGER word (must survive), two are unrelated.
+PROP_CELLS = [
+    {"table": "topics", "row_id": "t-1", "field": "title", "value": "Mackon slab"},
+    {"table": "topics", "row_id": "t-1", "field": "summary",
+     "value": "Mackonsson watched Mackon pour the slab"},
+    {"table": "action_items", "row_id": "a-1", "field": "text", "value": "call Mackon"},
+    {"table": "action_items", "row_id": "a-1", "field": "responsible", "value": "Sam Fyfe"},
+    {"table": "findings", "row_id": "f-1", "field": "observation",
+     "value": "MACKON left the edge open"},
+    {"table": "findings", "row_id": "f-1", "field": "entity_name", "value": "Fyfe"},
+]
+
+PROP_BODY = {"before": "Mackon", "after": "McCahon"}
+PREVIEW_ROUTE = "/topics/t-9/propagate/preview"
+APPLY_ROUTE = "/topics/t-9/propagate"
+
+
+def _wire_propagate(monkeypatch, cells=None, *, topic_row=None):
+    monkeypatch.setattr(org.content, "get_content_row",
+                        lambda conn, tbl, rid: dict(topic_row or PROP_TOPIC_ROW))
+    monkeypatch.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    monkeypatch.setattr(org.memberships, "caller_site_roles",
+                        lambda conn, uid: {SITE_ID: "site_manager"})
+    seen_topics = []
+    monkeypatch.setattr(
+        org.content, "list_topic_content_fields",
+        lambda conn, tid: seen_topics.append(str(tid)) or
+        [dict(c) for c in (PROP_CELLS if cells is None else cells)])
+    writes, audits, enq = [], [], []
+    monkeypatch.setattr(org.content, "update_content_field",
+                        lambda conn, tbl, rid, f, v:
+                        writes.append((tbl, rid, f, v)) or {"id": rid, f: v})
+    monkeypatch.setattr(org.content_edits, "append_content_edit",
+                        lambda conn, *a, **k: audits.append(a) or {"id": "e-1"})
+    monkeypatch.setattr(org, "_enqueue_content_reindex",
+                        lambda conn, table, rid: enq.append((table, rid)))
+    return {"writes": writes, "audits": audits, "enq": enq, "topics": seen_topics}
+
+
+def _propagate(route, body=PROP_BODY):
+    return org.dispatch(FakeConn(), make_event("POST", "/api/org" + route, body=body),
+                        "POST", route)
+
+
+def test_propagate_preview_finds_matches_across_all_three_tables(wired, monkeypatch):
+    _wire_propagate(monkeypatch)
+    res = _propagate(PREVIEW_ROUTE)
+    body = body_of(res)
+    assert res["statusCode"] == 200
+    assert body["field_count"] == 4 and body["occurrence_count"] == 4
+    assert {(m["table"], m["field"]) for m in body["matches"]} == {
+        ("topics", "title"), ("topics", "summary"),
+        ("action_items", "text"), ("findings", "observation")}
+    summary = next(m for m in body["matches"] if m["field"] == "summary")
+    assert summary["occurrences"] == 1                    # Mackonsson is NOT a match
+    assert "Mackon pour" in summary["before_snippet"]
+    assert "McCahon pour" in summary["after_snippet"]
+    assert "Mackonsson" in summary["after_snippet"]       # untouched inside a longer word
+
+
+def test_propagate_preview_writes_nothing(wired, monkeypatch):
+    spy = _wire_propagate(monkeypatch)
+    assert _propagate(PREVIEW_ROUTE)["statusCode"] == 200
+    assert spy["writes"] == [] and spy["audits"] == [] and spy["enq"] == []
+
+
+def test_propagate_apply_rewrites_only_matching_fields(wired, monkeypatch):
+    spy = _wire_propagate(monkeypatch)
+    res = _propagate(APPLY_ROUTE)
+    body = body_of(res)
+    assert res["statusCode"] == 200 and body["changed_count"] == 4
+    written = {(t, f): v for t, _rid, f, v in spy["writes"]}
+    assert written[("topics", "title")] == "McCahon slab"
+    assert written[("topics", "summary")] == "Mackonsson watched McCahon pour the slab"
+    assert written[("action_items", "text")] == "call McCahon"
+    assert written[("findings", "observation")] == "MCCAHON left the edge open"  # case-aware
+    # Cells without the term are never written (no audit noise, no churn).
+    assert ("action_items", "responsible") not in written
+    assert ("findings", "entity_name") not in written
+
+
+def test_propagate_apply_writes_one_audit_row_per_changed_field(wired, monkeypatch):
+    spy = _wire_propagate(monkeypatch)
+    assert _propagate(APPLY_ROUTE)["statusCode"] == 200
+    assert len(spy["audits"]) == len(spy["writes"]) == 4
+    # (company_id, table, row_id, field, before, after, actor_user, actor_role)
+    a = next(x for x in spy["audits"] if x[3] == "title")
+    assert a[0] == "c-uuid-1" and a[1] == "topics" and a[2] == "t-1"
+    assert a[4] == "Mackon slab" and a[5] == "McCahon slab"
+    assert a[6] == CALLER["id"] and a[7] == "admin"
+
+
+def test_propagate_apply_enqueues_exactly_one_reindex(wired, monkeypatch):
+    spy = _wire_propagate(monkeypatch)
+    body = body_of(_propagate(APPLY_ROUTE))
+    # 4 rewritten cells, ONE enqueue: reindex re-renders the whole topic.
+    assert spy["enq"] == [("topics", "t-9")]
+    assert body["reindex_enqueued"] is True
+
+
+def test_propagate_apply_never_writes_a_field_outside_editable(wired, monkeypatch):
+    # A cell for a non-EDITABLE column (findings.impact_note) must be dropped
+    # even if it somehow reaches the planner.
+    hostile = PROP_CELLS + [{"table": "findings", "row_id": "f-1",
+                             "field": "impact_note", "value": "Mackon delayed us"}]
+    spy = _wire_propagate(monkeypatch, cells=hostile)
+    assert _propagate(APPLY_ROUTE)["statusCode"] == 200
+    assert all(f != "impact_note" for _t, _r, f, _v in spy["writes"])
+    assert all(f in org.content.EDITABLE[t] for t, _r, f, _v in spy["writes"])
+
+
+def test_propagate_apply_touches_no_row_from_another_topic(wired, monkeypatch):
+    """Blast radius: the CURRENT TOPIC ONLY. The scan is asked for exactly one
+    topic id, and nothing outside the rows it returned is ever written."""
+    spy = _wire_propagate(monkeypatch)
+    assert _propagate(APPLY_ROUTE)["statusCode"] == 200
+    assert spy["topics"] == ["t-9"]                        # one topic scanned, once
+    assert {rid for _t, rid, _f, _v in spy["writes"]} == {"t-1", "a-1", "f-1"}
+
+
+def test_propagate_apply_is_a_noop_on_reapply(wired, monkeypatch):
+    corrected = [{"table": "topics", "row_id": "t-1", "field": "title",
+                  "value": "McCahon slab"}]
+    spy = _wire_propagate(monkeypatch, cells=corrected)
+    body = body_of(_propagate(APPLY_ROUTE))
+    assert body["changed_count"] == 0 and body["changed"] == []
+    assert spy["writes"] == [] and spy["audits"] == [] and spy["enq"] == []
+    assert body["reindex_enqueued"] is False
+
+
+@pytest.mark.parametrize("route", [PREVIEW_ROUTE, APPLY_ROUTE])
+def test_propagate_denied_when_site_outside_reach_403(wired, monkeypatch, route):
+    spy = _wire_propagate(monkeypatch)
+    monkeypatch.setattr(org, "_allowed_site_ids", lambda conn, caller: {OTHER_SITE_ID})
+    res = _propagate(route)
+    assert res["statusCode"] == 403
+    assert spy["writes"] == [] and spy["audits"] == []
+
+
+@pytest.mark.parametrize("route", [PREVIEW_ROUTE, APPLY_ROUTE])
+def test_propagate_cross_company_topic_404(wired, monkeypatch, route):
+    spy = _wire_propagate(monkeypatch,
+                          topic_row={**PROP_TOPIC_ROW, "company_id": "c-OTHER"})
+    res = _propagate(route)
+    assert res["statusCode"] == 404
+    assert spy["writes"] == []
+
+
+@pytest.mark.parametrize("route", [PREVIEW_ROUTE, APPLY_ROUTE])
+def test_propagate_rejects_unstable_after_400(wired, monkeypatch, route):
+    # after CONTAINS before -> re-running would keep growing the text, so the
+    # correction is refused rather than made non-idempotent.
+    spy = _wire_propagate(monkeypatch)
+    res = _propagate(route, {"before": "Mackon", "after": "Mackon Ltd"})
+    assert res["statusCode"] == 400 and spy["writes"] == []
+
+
+@pytest.mark.parametrize("body", [{}, {"before": "Mackon"}, {"before": "  ", "after": "x"},
+                                  {"before": "Mackon", "after": ""}])
+def test_propagate_rejects_missing_terms_400(wired, monkeypatch, body):
+    spy = _wire_propagate(monkeypatch)
+    assert _propagate(APPLY_ROUTE, body)["statusCode"] == 400
+    assert spy["writes"] == []
+
+
+def test_propagate_allows_case_only_correction(wired, monkeypatch):
+    # before='mackon' / after='Mackon' IS a fixpoint (normalize adopts surface
+    # casing), so the stability guard must not reject it.
+    cells = [{"table": "topics", "row_id": "t-1", "field": "title", "value": "mackon slab"}]
+    spy = _wire_propagate(monkeypatch, cells=cells)
+    res = _propagate(APPLY_ROUTE, {"before": "mackon", "after": "Mackon"})
+    assert res["statusCode"] == 200
+    assert spy["writes"] == [("topics", "t-1", "title", "Mackon slab")]
 
 
 def test_create_alias_requires_site_manager_plus(wired, monkeypatch):
