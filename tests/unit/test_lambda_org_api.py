@@ -4790,6 +4790,74 @@ def test_create_alias_company_wide_by_site_manager(wired, monkeypatch):
     assert body["site_id"] is None                       # no ?site -> company-wide
 
 
+PROSE_ROWS = [{
+    "id": "t-1", "site_id": "s-1", "site_name": "Alpha", "user_name": "Ada L",
+    "time_range": None, "title": "Slab", "category": "progress", "participants": [],
+    "summary": "s", "action_items": [], "safety_observations": [], "findings": [],
+    "photos": [],
+}]
+
+PROSE_DOC = {
+    "executive_summary": ["Mackon poured the slab", "Mackonsson checked levels"],
+    "safety_observations": [{"observation": "MACKON near the edge", "risk_level": "high",
+                             "who_raised": "Mackon"}],
+    "quality_and_compliance": [{"item": "Mackon test cubes", "follow_up_needed": True}],
+    "critical_dates_and_deadlines": [{"context": "Mackon inspection", "urgency": "high"}],
+}
+
+
+def _wire_prose_aliases(monkeypatch, pairs):
+    monkeypatch.setattr(org.sites, "get_site",
+                        lambda conn, sid: {"id": sid, "company_id": "c-uuid-1"})
+    monkeypatch.setattr(org.aliases, "list_active",
+                        lambda conn, cid, site_ids=None: list(pairs))
+
+
+def test_report_prose_normalized_with_active_aliases(wired, monkeypatch):
+    """Item #3 part B: the four S3-sourced prose fields have no Aurora row and
+    no edit surface, so they are alias-normalized at READ time. The S3 doc
+    itself is never rewritten."""
+    _wire_prose_aliases(monkeypatch, [{"wrong_term": "Mackon", "right_term": "McCahon"}])
+    doc = json.loads(json.dumps(PROSE_DOC))            # deep copy — must stay untouched
+    shape = org.render_report_shape(PROSE_ROWS, doc, "2026-07-23", "Ada_L", conn=FakeConn())
+    assert shape["executive_summary"][0] == "McCahon poured the slab"
+    assert shape["executive_summary"][1] == "Mackonsson checked levels"   # whole-word only
+    assert shape["safety_observations"][0]["observation"] == "MCCAHON near the edge"
+    assert shape["safety_observations"][0]["who_raised"] == "McCahon"
+    assert shape["safety_observations"][0]["risk_level"] == "high"        # non-prose leaf kept
+    assert shape["quality_and_compliance"][0]["item"] == "McCahon test cubes"
+    assert shape["quality_and_compliance"][0]["follow_up_needed"] is True  # bool untouched
+    assert shape["critical_dates_and_deadlines"][0]["context"] == "McCahon inspection"
+    assert doc == PROSE_DOC                            # read-time only, no write-back
+
+
+def test_report_prose_unchanged_without_aliases(wired, monkeypatch):
+    _wire_prose_aliases(monkeypatch, [])
+    shape = org.render_report_shape(PROSE_ROWS, json.loads(json.dumps(PROSE_DOC)),
+                                    "2026-07-23", "Ada_L", conn=FakeConn())
+    assert shape["executive_summary"] == PROSE_DOC["executive_summary"]
+    assert shape["safety_observations"] == PROSE_DOC["safety_observations"]
+
+
+def test_report_prose_alias_load_is_skipped_when_there_is_no_prose(wired, monkeypatch):
+    # The reindex builder renders with doc=None — it must not pay for an alias
+    # query it can't use.
+    monkeypatch.setattr(org.sites, "get_site",
+                        lambda conn, sid: pytest.fail("alias load with no prose"))
+    shape = org.render_report_shape(PROSE_ROWS, None, "2026-07-23", "Ada_L", conn=FakeConn())
+    assert shape["executive_summary"] is None and shape["quality_and_compliance"] == []
+
+
+def test_report_prose_alias_failure_degrades_to_raw_text(wired, monkeypatch):
+    def boom(conn, sid):
+        raise RuntimeError("aurora hiccup")
+
+    monkeypatch.setattr(org.sites, "get_site", boom)
+    shape = org.render_report_shape(PROSE_ROWS, json.loads(json.dumps(PROSE_DOC)),
+                                    "2026-07-23", "Ada_L", conn=FakeConn())
+    assert shape["executive_summary"] == PROSE_DOC["executive_summary"]   # never 500s
+
+
 def test_render_report_shape_carries_work_class_and_redacted(wired):
     wired.setattr(org.redactions, "list_active_for_topics",
                   lambda conn, ids: {"t-red": {"id": "r-1"}})

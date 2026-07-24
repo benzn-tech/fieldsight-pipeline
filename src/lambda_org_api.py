@@ -2163,6 +2163,42 @@ def _list_report_folders(date):
 _SEV_TO_RISK = {"major": "high", "minor": "medium", "none": "low"}
 
 
+def _prose_alias_pairs(conn, site_id):
+    """Active alias pairs for the site's company, loaded ONCE per render --
+    same source (and same site-before-company precedence) the re-index builder
+    feeds text_normalize with (reindex.enqueue_topic_reindex). Best-effort:
+    prose normalization is cosmetic, so a lookup failure degrades to 'no
+    aliases' instead of failing the whole read."""
+    if conn is None or not site_id:
+        return []
+    try:
+        site = sites.get_site(conn, site_id)
+        if not site or not site.get("company_id"):
+            return []
+        return [{"wrong_term": a["wrong_term"], "right_term": a["right_term"]}
+                for a in aliases.list_active(conn, site["company_id"],
+                                             site_ids=[str(site_id)])]
+    except Exception:
+        logger.warning("prose alias lookup failed for site %s -- rendering raw", site_id)
+        return []
+
+
+def _normalize_prose(value, alias_pairs):
+    """Apply aliases to every string inside one prose field, whatever shape it
+    has: a bare string (v1 executive_summary), a list of strings (the current
+    bullet form), or a list of dicts (safety_observations /
+    quality_and_compliance / critical_dates_and_deadlines rows). Non-string
+    leaves pass through untouched. READ-TIME ONLY -- the S3 daily_report.json
+    stays immutable and auditable (D4); nothing here is ever written back."""
+    if isinstance(value, str):
+        return normalize(value, alias_pairs)
+    if isinstance(value, list):
+        return [_normalize_prose(v, alias_pairs) for v in value]
+    if isinstance(value, dict):
+        return {k: _normalize_prose(v, alias_pairs) for k, v in value.items()}
+    return value
+
+
 def render_report_shape(rows, doc, date, folder, conn=None):
     """Pure function: render Aurora extraction topics INTO the
     daily_report.json shape, optionally merging the doc's own prose fields
@@ -2175,7 +2211,13 @@ def render_report_shape(rows, doc, date, folder, conn=None):
     `conn` (optional, trailing kwarg — Task 1b) enables the redaction-status
     lookup below; callers that don't pass it (or pass None) simply get
     `redacted: False` for every topic, unchanged from before this field
-    existed."""
+    existed.
+
+    The four prose fields merged out of the S3 doc have no Aurora row and no
+    edit surface, so a name the user already corrected in the item store would
+    keep showing here (Today's morning brief, the Timeline exec-summary card,
+    the whole Quality page). They are therefore alias-normalized at READ time
+    (item #3 part B) — the document itself is never rewritten."""
     doc = doc or {}
     topics_out = []
     _redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if conn is not None else {}
@@ -2211,14 +2253,24 @@ def render_report_shape(rows, doc, date, folder, conn=None):
             "redacted": t["id"] in _redacted,
             "redaction_id": (_redacted.get(t["id"]) or {}).get("id"),
         })
-    return {
-        "report_date": date,
-        "site": rows[0]["site_name"],
-        "user_name": rows[0]["user_name"] or folder.replace("_", " "),
+    prose = {
         "executive_summary": doc.get("executive_summary"),
         "safety_observations": doc.get("safety_observations", []),
         "quality_and_compliance": doc.get("quality_and_compliance", []),
         "critical_dates_and_deadlines": doc.get("critical_dates_and_deadlines", []),
+    }
+    # One alias load for all four fields, and none at all when there is no
+    # prose to rewrite (the reindex builder renders with doc=None, so this
+    # costs it nothing).
+    if any(prose.values()):
+        alias_pairs = _prose_alias_pairs(conn, rows[0].get("site_id"))
+        if alias_pairs:
+            prose = {k: _normalize_prose(v, alias_pairs) for k, v in prose.items()}
+    return {
+        "report_date": date,
+        "site": rows[0]["site_name"],
+        "user_name": rows[0]["user_name"] or folder.replace("_", " "),
+        **prose,
         "_report_metadata": {"source": "live_extraction", "version": "flip-v1"},
         "topics": topics_out,
     }
