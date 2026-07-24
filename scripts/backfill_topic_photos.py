@@ -21,11 +21,18 @@ Phase 6 / Backfill):
     reverts `content_edits` (those audit tables have no FK). This script
     touches topics / redactions / content_edits / action_items NOT AT ALL.
 
-  * Idempotent. Each insert is NOT-EXISTS-guarded on (topic_id, s3_key)
-    (the Data-API restatement of repositories.topics.add_topic_photo_if_absent);
-    re-running is a no-op. Additionally, any (folder, date) whose topics
-    ALREADY hold >=1 topic_photos row is skipped whole -- the live writer
-    already bound that day; we do not second-guess it.
+  * Idempotent, PHOTO-LEVEL (NOT day-level). For each (folder, date) the set
+    of photo s3_keys ALREADY bound that day is queried and EXCLUDED from the
+    photos fed to the matcher. An already-bound photo is therefore never
+    re-matched (it can never be double-bound to a different topic), while an
+    unbound photo on a PARTIALLY-bound day still gets its chance -- the exact
+    Ben_UCPK / 2026-07-23 case (12:15 + 12:16 already bound inside their
+    windows, 10:40 left unbound 1 min outside "10:39 - 10:39") that the
+    ±2 min rule exists to rescue. A whole-day skip would strand that 10:40
+    photo forever, defeating the backfill's purpose. Each insert is ALSO
+    NOT-EXISTS-guarded on (topic_id, s3_key) (the Data-API restatement of
+    repositories.topics.add_topic_photo_if_absent) as belt-and-suspenders;
+    re-running is a no-op.
 
   * Dry-run by DEFAULT. Without --apply the script only PRINTS what it WOULD
     insert and a summary; it performs no writes. --apply performs the inserts.
@@ -98,18 +105,25 @@ INSERT_TOPIC_PHOTO_SQL = (
     ") RETURNING id"
 )
 
-# All topics + whether that topic already carries any photo. Folder is derived
-# in Python (below); ordering is the shim's deterministic D3 order so grouping
-# preserves per-day topic order for photos_for_topics' index semantics.
+# All topics (id + time_range). Folder is derived in Python (below); ordering
+# is the shim's deterministic D3 order so grouping preserves per-day topic
+# order for photos_for_topics' index semantics.
 DISCOVER_TOPICS_SQL_HEAD = (
     "SELECT t.id::text AS id, "
     "       t.source_s3_key AS source_s3_key, "
     "       t.report_date::text AS report_date, "
-    "       t.time_range AS time_range, "
-    "       EXISTS (SELECT 1 FROM topic_photos tp WHERE tp.topic_id = t.id) AS has_photos "
+    "       t.time_range AS time_range "
     "FROM topics t "
 )
 DISCOVER_TOPICS_SQL_TAIL = " ORDER BY t.report_date, t.time_range NULLS LAST, t.created_at, t.id"
+
+# READ-ONLY. The photo s3_keys already bound to any of a day's topics -- fed
+# to the matcher as an exclusion set so already-bound photos are never
+# re-matched (photo-level idempotency). No write.
+BOUND_PHOTO_KEYS_SQL = (
+    "SELECT DISTINCT tp.s3_key AS s3_key FROM topic_photos tp "
+    "WHERE tp.topic_id = ANY(:ids::uuid[])"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -134,19 +148,19 @@ def derive_folder(source_s3_key):
 def plan_candidates(topic_rows, folder=None):
     """Group topic rows into per-(folder, date) candidates for backfill.
 
-    A (folder, date) is SKIPPED whole when ANY of its topics already holds a
-    topic_photos row (idempotency gate -- the live writer bound that day). The
-    input order is preserved, so each surviving candidate's `topics` list stays
-    in the deterministic order the discovery query imposed
-    (time_range NULLS LAST, created_at, id) -- which is exactly the index order
-    photos_for_topics relies on for stable tie-breaking.
+    EVERY (folder, date) with topics is a candidate -- there is deliberately NO
+    day-level skip. Idempotency is enforced per-PHOTO downstream (already-bound
+    s3_keys are excluded from the matcher), so a partially-bound day still has
+    its unbound photos rescued. The input order is preserved, so each
+    candidate's `topics` list stays in the deterministic order the discovery
+    query imposed (time_range NULLS LAST, created_at, id) -- exactly the index
+    order photos_for_topics relies on for stable tie-breaking.
 
     Returns (candidates, stats):
       candidates: [{folder, date, topics: [{id, time_range}, ...]}, ...]
-      stats: {"days_total", "days_skipped_had_rows"}
+      stats: {"days_total"}
     """
     groups = {}          # (folder, date) -> list[{id, time_range}]
-    had_rows = {}        # (folder, date) -> bool
     for row in topic_rows:
         f = derive_folder(row.get("source_s3_key"))
         if f is None:
@@ -157,24 +171,10 @@ def plan_candidates(topic_rows, folder=None):
         groups.setdefault(key, []).append(
             {"id": row.get("id"), "time_range": row.get("time_range")}
         )
-        if _truthy(row.get("has_photos")):
-            had_rows[key] = True
 
-    candidates = []
-    skipped = 0
-    for key, topics in groups.items():
-        if had_rows.get(key):
-            skipped += 1
-            continue
-        candidates.append({"folder": key[0], "date": key[1], "topics": topics})
-    return candidates, {"days_total": len(groups), "days_skipped_had_rows": skipped}
-
-
-def _truthy(v):
-    """Data API / JSON booleans can arrive as bool, 1/0, or 't'/'f' strings."""
-    if isinstance(v, str):
-        return v.strip().lower() in ("t", "true", "1")
-    return bool(v)
+    candidates = [{"folder": k[0], "date": k[1], "topics": t}
+                  for k, t in groups.items()]
+    return candidates, {"days_total": len(groups)}
 
 
 def plan_bindings(topics_list, photo_objects):
@@ -256,6 +256,19 @@ def fetch_topic_rows(execute, date=None, date_from=None, date_to=None):
     return json.loads(formatted)
 
 
+def fetch_bound_photo_keys(execute, topic_ids):
+    """READ-ONLY. Return the set of photo s3_keys already bound to any of these
+    topic ids -- the photo-level idempotency exclusion set. No topic_ids -> no
+    round-trip, empty set."""
+    ids = [str(t) for t in (topic_ids or []) if t]
+    if not ids:
+        return set()
+    params = [{"name": "ids", "value": {"arrayValue": {"stringValues": ids}}}]
+    resp = execute(BOUND_PHOTO_KEYS_SQL, params=params, json_records=True)
+    rows = json.loads(resp.get("formattedRecords") or "[]")
+    return {r["s3_key"] for r in rows if r.get("s3_key")}
+
+
 def insert_topic_photo_if_absent(execute, topic_id, s3_key, caption_text):
     """INSERT-ONLY, idempotent. Executes INSERT_TOPIC_PHOTO_SQL via the Data
     API. Returns True iff a row was actually inserted (RETURNING id present).
@@ -272,12 +285,18 @@ def insert_topic_photo_if_absent(execute, topic_id, s3_key, caption_text):
     return bool(records)
 
 
-def process_candidate(candidate, s3_client, bucket, execute, apply):
-    """List a day's pictures, compute bindings, and (only when apply=True)
-    insert them. In dry-run mode `execute` is NEVER called -- no write of any
-    kind reaches the database."""
+def process_candidate(candidate, s3_client, bucket, execute, apply, bound_keys=frozenset()):
+    """List a day's pictures, EXCLUDE photos already bound (`bound_keys`),
+    compute bindings on the remainder, and (only when apply=True) insert them.
+
+    `bound_keys` is the photo-level idempotency set (see fetch_bound_photo_keys):
+    an already-bound photo is dropped BEFORE the matcher runs, so it is never
+    re-matched or double-bound. In dry-run mode `execute` is NEVER called -- no
+    write of any kind reaches the database."""
     prefix = f"users/{candidate['folder']}/pictures/{candidate['date']}/"
-    photo_objects = list_pictures(s3_client, bucket, prefix)
+    all_photos = list_pictures(s3_client, bucket, prefix)
+    photo_objects = [p for p in all_photos if p["key"] not in bound_keys]
+    already_bound = len(all_photos) - len(photo_objects)
     bindings = plan_bindings(candidate["topics"], photo_objects)
 
     inserted = 0
@@ -289,7 +308,8 @@ def process_candidate(candidate, s3_client, bucket, execute, apply):
     return {
         "folder": candidate["folder"],
         "date": candidate["date"],
-        "photos_listed": len(photo_objects),
+        "photos_listed": len(all_photos),
+        "already_bound": already_bound,
         "topics": len(candidate["topics"]),
         "bindings": bindings,
         "inserted": inserted,
@@ -353,20 +373,26 @@ def main(argv=None):
 
     total_would = 0
     total_inserted = 0
+    total_already_bound = 0
     days_with_photos = 0
     for cand in candidates:
-        result = process_candidate(cand, s3_client, args.bucket, execute, args.apply)
+        bound_keys = fetch_bound_photo_keys(execute, [t["id"] for t in cand["topics"]])
+        result = process_candidate(cand, s3_client, args.bucket, execute, args.apply,
+                                   bound_keys=bound_keys)
+        total_already_bound += result["already_bound"]
         if result["photos_listed"] == 0:
             continue
         if not result["bindings"]:
             print(f"[{cand['folder']} {cand['date']}] "
-                  f"{result['photos_listed']} photo(s), {result['topics']} topic(s) "
-                  f"-> 0 bindings (no topic window within tolerance)")
+                  f"{result['photos_listed']} photo(s) "
+                  f"({result['already_bound']} already bound), {result['topics']} topic(s) "
+                  f"-> 0 new bindings (no unbound photo within tolerance)")
             continue
         days_with_photos += 1
         print(f"[{cand['folder']} {cand['date']}] "
-              f"{result['photos_listed']} photo(s), {result['topics']} topic(s) "
-              f"-> {len(result['bindings'])} binding(s):")
+              f"{result['photos_listed']} photo(s) "
+              f"({result['already_bound']} already bound), {result['topics']} topic(s) "
+              f"-> {len(result['bindings'])} new binding(s):")
         for b in result["bindings"]:
             dist = "inside" if b["distance_min"] == 0 else (
                 f"{b['distance_min']}min" if b["distance_min"] is not None else "n/a")
@@ -378,8 +404,8 @@ def main(argv=None):
 
     print("-" * 72)
     print(f"Summary: {stats['days_total']} day(s) scanned, "
-          f"{days_with_photos} day(s) with bindable photos, "
-          f"{stats['days_skipped_had_rows']} day(s) skipped (already had topic_photos rows).")
+          f"{days_with_photos} day(s) with new bindable photos, "
+          f"{total_already_bound} photo(s) already bound (skipped).")
     if args.apply:
         print(f"         {total_inserted} row(s) inserted "
               f"(of {total_would} binding(s); NOT-EXISTS guard absorbed the rest).")
