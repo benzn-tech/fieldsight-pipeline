@@ -4353,15 +4353,21 @@ AITEM = {"id": "a-1", "site_id": SITE_ID, "company_id": "c-uuid-1",
          "responsible": "Ada Owner", "status": "open", "priority": "low"}
 
 
-def _wire_item(wired, item=AITEM, roles=None, members=None):
+def _wire_item(wired, item=AITEM, roles=None, members=None, updated=None):
+    """`seen` collects the write side: seen["fields"]/["by"] from the UPDATE and
+    seen["audits"] as the ordered list of content_edits.append_content_edit
+    positional args (checkoff-audit: check-off must leave an audit trail)."""
     wired.setattr(org.action_items, "get_action_item", lambda conn, i: dict(item))
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {item["site_id"]})
     wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: roles or {})
     wired.setattr(org.memberships, "members_for_site",
                   lambda conn, cid, sid: members or [{"first_name": "Neo", "last_name": "Tan"}])
-    seen = {}
+    seen = {"audits": []}
     wired.setattr(org.action_items, "update_action_item_fields",
-                  lambda conn, i, fields, by: (seen.update(fields=fields, by=by) or {**item, **fields}))
+                  lambda conn, i, fields, by: (seen.update(fields=fields, by=by)
+                                               or {**item, **fields, **(updated or {})}))
+    wired.setattr(org.content_edits, "append_content_edit",
+                  lambda conn, *a: seen["audits"].append(a) or {"id": "e-1"})
     return seen
 
 
@@ -4457,6 +4463,227 @@ def test_patch_action_item_empty_body_400(wired):
     _wire_item(wired)
     res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1", body={}), None)
     assert res["statusCode"] == 400
+
+
+# ----------------------------------------------------------
+# Check-off audit trail (regression: when check-off moved from DynamoDB to
+# org-api, "who closed this and when" stopped being recorded anywhere the UI
+# could read). PATCH now appends a content_edits row per CHANGED field, in the
+# same transaction as the UPDATE, and returns a resolved updated_by_name.
+# Audit tuple positions: (company_id, table, row_id, field, before, after,
+#                         actor_user_id, actor_role)
+# ----------------------------------------------------------
+class TxnConn(FakeConn):
+    """FakeConn whose transaction() records how each block ENDED, so a test can
+    prove the UPDATE + audit rows are all-or-nothing."""
+
+    def __init__(self):
+        self.txn_log = []
+
+    def transaction(self):
+        conn = self
+
+        class _Txn:
+            def __enter__(inner):
+                conn.txn_log.append("enter")
+                return inner
+
+            def __exit__(inner, exc_type, exc, tb):
+                conn.txn_log.append("rollback" if exc_type else "commit")
+                return False
+
+        return _Txn()
+
+
+def test_patch_action_item_checkoff_appends_one_content_edit_row(wired):
+    seen = _wire_item(wired)                      # AITEM.status == "open"
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"status": "done"}), None)
+    assert res["statusCode"] == 200
+    assert len(seen["audits"]) == 1
+    company_id, table, row_id, field, before, after, actor, actor_role = seen["audits"][0]
+    assert (table, row_id, field) == ("action_items", "a-1", "status")
+    assert (before, after) == ("open", "done")
+    assert company_id == "c-uuid-1"
+    assert actor == CALLER["id"] and actor_role == CALLER["global_role"]
+
+
+def test_patch_action_item_two_changed_fields_append_two_audit_rows(wired):
+    seen = _wire_item(wired)                      # status open, priority low
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/action-items/a-1",
+        body={"status": "done", "priority": "high"}), None)
+    assert res["statusCode"] == 200
+    assert [a[3] for a in seen["audits"]] == ["status", "priority"]
+    assert [(a[4], a[5]) for a in seen["audits"]] == [("open", "done"), ("low", "high")]
+
+
+def test_patch_action_item_unchanged_field_appends_no_audit_row(wired):
+    """Re-sending the value a task already has must not litter the History
+    panel -- the UPDATE still runs (updated_at/updated_by bump), the audit
+    doesn't."""
+    seen = _wire_item(wired)                      # already status=open, priority=low
+    res = org.lambda_handler(make_event(
+        "PATCH", "/api/org/action-items/a-1",
+        body={"status": "open", "priority": "high"}), None)
+    assert res["statusCode"] == 200
+    assert seen["fields"] == {"status": "open", "priority": "high"}   # both written
+    assert [a[3] for a in seen["audits"]] == ["priority"]             # only one audited
+
+
+def test_patch_action_item_deadline_audits_once_not_the_deadline_text_mirror(wired):
+    """§3.5 writes deadline AND deadline_text from the same request key; the
+    audit records the canonical `deadline` only, so one date change is one
+    History row, not two."""
+    seen = _wire_item(wired, item={**AITEM, "deadline": None, "deadline_text": None})
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"deadline": "2026-07-30"}), None)
+    assert res["statusCode"] == 200
+    assert seen["fields"] == {"deadline": "2026-07-30", "deadline_text": "2026-07-30"}
+    assert [a[3] for a in seen["audits"]] == ["deadline"]
+    assert (seen["audits"][0][4], seen["audits"][0][5]) == (None, "2026-07-30")
+
+
+def test_patch_action_item_deadline_date_object_matching_request_is_no_change(wired):
+    """The stored deadline is a `date`, the request carries 'YYYY-MM-DD'.
+    Comparing them raw would call every re-save a change; _audit_text
+    normalises both sides first."""
+    seen = _wire_item(wired, item={**AITEM, "deadline": _dt.date(2026, 7, 30),
+                                   "deadline_text": "2026-07-30"})
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"deadline": "2026-07-30"}), None)
+    assert res["statusCode"] == 200 and seen["audits"] == []
+
+
+def test_patch_action_item_returns_resolved_updated_by_name(wired):
+    """The caption needs a person, not the cognito sub in updated_by."""
+    _wire_item(wired, updated={"updated_by": "sub-1", "updated_by_name": "Ada L",
+                               "updated_at": "2026-07-23T04:05:06Z"})
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"status": "done"}), None)
+    b = body_of(res)
+    assert res["statusCode"] == 200
+    assert b["updated_by_name"] == "Ada L"
+    assert b["updated_by"] == "sub-1" and b["updated_at"] == "2026-07-23T04:05:06Z"
+    assert b["status"] == "done"                 # response shape otherwise unchanged
+
+
+def test_patch_action_item_updated_by_name_null_safe_for_missing_surname(wired):
+    """5 prod accounts have an empty/NULL last_name. The repo's
+    NULLIF(TRIM(CONCAT_WS(...))) yields the bare first name (never 'Ada '), and
+    NULL when there is no name at all -- the handler must pass both through
+    untouched rather than 500 or invent a placeholder."""
+    _wire_item(wired, updated={"updated_by_name": "Ada"})
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"status": "done"}), None)
+    assert res["statusCode"] == 200 and body_of(res)["updated_by_name"] == "Ada"
+
+    _wire_item(wired, updated={"updated_by_name": None})
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"status": "blocked"}), None)
+    assert res["statusCode"] == 200 and body_of(res)["updated_by_name"] is None
+
+
+def test_patch_action_item_audit_failure_rolls_back_the_update(wired):
+    """One transaction: if the audit insert blows up, the status change must go
+    with it -- never a silently unaudited check-off."""
+    conn = TxnConn()
+    wired.setattr(org, "get_connection", lambda *a, **k: conn)
+    _wire_item(wired)
+
+    def boom(*a, **k):
+        raise RuntimeError("content_edits insert failed")
+
+    wired.setattr(org.content_edits, "append_content_edit", boom)
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"status": "done"}), None)
+    assert res["statusCode"] == 500                 # surfaced, not swallowed
+    assert conn.txn_log == ["enter", "rollback"]    # UPDATE rolled back with it
+
+
+def test_patch_action_item_vanished_row_rolls_back_and_writes_no_audit(wired):
+    """The row disappeared between the ACL read and the UPDATE: 404, and the
+    transaction unwinds so no orphan audit row survives."""
+    conn = TxnConn()
+    wired.setattr(org, "get_connection", lambda *a, **k: conn)
+    seen = _wire_item(wired)
+    wired.setattr(org.action_items, "update_action_item_fields",
+                  lambda *a, **k: None)
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"status": "done"}), None)
+    assert res["statusCode"] == 404
+    assert seen["audits"] == []
+    assert conn.txn_log == ["enter", "rollback"]
+
+
+# ----------------------------------------------------------
+# GET /content/{table}/{id}/history -- the route the History tab reads. Generic
+# over content.EDITABLE, which already includes action_items, so the check-off
+# audit rows above are readable without a whitelist change.
+# ----------------------------------------------------------
+AI_CONTENT_ROW = {"id": "a-1", "site_id": SITE_ID, "company_id": "c-uuid-1",
+                  "author_user_id": "u-9", "text": "cure slab",
+                  "responsible": "Ada Owner"}
+
+
+def _wire_history(wired, row=AI_CONTENT_ROW, edits=None):
+    wired.setattr(org.content, "get_content_row", lambda conn, tbl, rid: dict(row))
+    seen = {}
+    wired.setattr(org.content_edits, "list_content_edits",
+                  lambda conn, cid, tbl, rid: (seen.update(args=(cid, tbl, rid))
+                                               or (edits if edits is not None else [])))
+    return seen
+
+
+def test_content_history_returns_action_item_edits(wired):
+    edits = [{"id": "e-2", "field": "status", "before_text": "open",
+              "after_text": "done", "actor_name": "Ada L",
+              "created_at": "2026-07-23T04:05:06Z"}]
+    seen = _wire_history(wired, edits=edits)
+    res = org.lambda_handler(
+        make_event("GET", "/api/org/content/action_items/a-1/history"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["edits"] == edits
+    # company-scoped read of exactly this table/row -- action_items needs no
+    # whitelist change, it is already in content.EDITABLE.
+    assert seen["args"] == ("c-uuid-1", "action_items", "a-1")
+    assert "action_items" in org.content.EDITABLE
+
+
+def test_content_history_cross_company_action_item_404(wired):
+    """A company admin stays pinned to their own tenant."""
+    _wire_history(wired, row={**AI_CONTENT_ROW, "company_id": "c-OTHER"},
+                  edits=[{"id": "e-1"}])
+    res = org.lambda_handler(
+        make_event("GET", "/api/org/content/action_items/a-1/history"), None)
+    assert res["statusCode"] == 404
+
+
+def test_content_history_platform_admin_reads_cross_company_action_item(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "platform_admin"})
+    seen = _wire_history(wired, row={**AI_CONTENT_ROW, "company_id": "c-south"},
+                         edits=[{"id": "e-1"}])
+    res = org.lambda_handler(
+        make_event("GET", "/api/org/content/action_items/a-1/history"), None)
+    assert res["statusCode"] == 200
+    assert seen["args"][0] == "c-south"           # the ROW's company, not the caller's
+
+
+def test_content_history_missing_row_404(wired):
+    wired.setattr(org.content, "get_content_row", lambda conn, tbl, rid: None)
+    res = org.lambda_handler(
+        make_event("GET", "/api/org/content/action_items/ghost/history"), None)
+    assert res["statusCode"] == 404
+
+
+def test_content_history_rejects_table_outside_the_whitelist(wired):
+    called = []
+    wired.setattr(org.content_edits, "list_content_edits",
+                  lambda *a, **k: called.append(1) or [])
+    res = org.lambda_handler(
+        make_event("GET", "/api/org/content/users/u-1/history"), None)
+    assert res["statusCode"] == 400 and called == []
 
 
 def test_render_report_shape_exposes_durable_topic_and_safety_ids():

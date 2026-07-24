@@ -1196,12 +1196,43 @@ def _is_assignee(row, caller):
     return bool(owner) and bool(caller.get("id")) and str(owner) == str(caller.get("id"))
 
 
+class _ActionItemVanished(Exception):
+    """The row disappeared between the ACL read and the UPDATE -- abort the
+    whole transaction rather than commit audit rows for a task that isn't
+    there any more."""
+
+
+# Which action-item columns get a content_edits audit row on PATCH.
+# `deadline_text` is deliberately ABSENT: the handler writes it as a pure
+# MIRROR of `deadline`, from the same request key (§3.5), so auditing both
+# would double every date change in the History panel. `text` is not PATCHable
+# through this endpoint at all (it goes through /content, which already audits).
+_AUDITED_ACTION_FIELDS = ("status", "priority", "deadline", "responsible")
+
+
+def _audit_text(value):
+    """content_edits.before_text/after_text are text, but action-item values
+    are a mix of str / date / None. Normalising here serves BOTH the
+    changed-or-not comparison and the stored value, so a `date(2026, 7, 30)`
+    read back from the row compares equal to the '2026-07-30' string coming in
+    from the request body (which must NOT be recorded as a change)."""
+    return None if value is None else str(value)
+
+
 def patch_action_item(conn, caller, action_item_id, body):
     """Edit priority/status/deadline/responsible on one action item (spec §3).
     ACL mirrors patch_observation_status widened to site authority: the task's
     site must be in the caller's reach, and the caller must be admin/gm, a
     pm/site_manager of THAT site, or the current assignee. Reassignment target
-    must be a member of the task's site. Addressed by durable action_items.id."""
+    must be a member of the task's site. Addressed by durable action_items.id.
+
+    Every field whose value actually CHANGES also appends a content_edits row
+    (table_name 'action_items'), the same audit trail patch_content writes and
+    GET /content/action_items/{id}/history already renders. Before check-off
+    moved to org-api it wrote DynamoDB checked_by/checked_at, which the UI read;
+    this restores "who closed this and when" on the relational path. The UPDATE
+    and its audit rows share ONE transaction -- all of it lands or none of it
+    does (same posture as apply_topic_correction)."""
     if body is None:
         return error("malformed JSON body", 400)
     row = action_items.get_action_item(conn, action_item_id)
@@ -1248,8 +1279,28 @@ def patch_action_item(conn, caller, action_item_id, body):
     if not fields:
         return error("no editable fields provided", 400)
 
-    updated = action_items.update_action_item_fields(conn, action_item_id, fields, caller["cognito_sub"])
-    if updated is None:
+    # Before/after come from the PRE-update row read above, one audit row per
+    # field that ACTUALLY changes -- re-ticking an already-done task, or
+    # re-sending an unchanged priority, must not litter the History panel.
+    audits = []
+    for col in _AUDITED_ACTION_FIELDS:
+        if col not in fields:
+            continue
+        before, after = _audit_text(row.get(col)), _audit_text(fields[col])
+        if before != after:
+            audits.append((col, before, after))
+
+    try:
+        with conn.transaction():          # UPDATE + audit rows commit together
+            updated = action_items.update_action_item_fields(
+                conn, action_item_id, fields, caller["cognito_sub"])
+            if updated is None:
+                raise _ActionItemVanished(action_item_id)
+            for col, before, after in audits:
+                content_edits.append_content_edit(
+                    conn, row["company_id"], "action_items", action_item_id,
+                    col, before, after, caller["id"], caller["global_role"])
+    except _ActionItemVanished:
         return error("action item not found", 404)
     return ok(updated)
 
