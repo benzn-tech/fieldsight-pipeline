@@ -1196,12 +1196,43 @@ def _is_assignee(row, caller):
     return bool(owner) and bool(caller.get("id")) and str(owner) == str(caller.get("id"))
 
 
+class _ActionItemVanished(Exception):
+    """The row disappeared between the ACL read and the UPDATE -- abort the
+    whole transaction rather than commit audit rows for a task that isn't
+    there any more."""
+
+
+# Which action-item columns get a content_edits audit row on PATCH.
+# `deadline_text` is deliberately ABSENT: the handler writes it as a pure
+# MIRROR of `deadline`, from the same request key (§3.5), so auditing both
+# would double every date change in the History panel. `text` is not PATCHable
+# through this endpoint at all (it goes through /content, which already audits).
+_AUDITED_ACTION_FIELDS = ("status", "priority", "deadline", "responsible")
+
+
+def _audit_text(value):
+    """content_edits.before_text/after_text are text, but action-item values
+    are a mix of str / date / None. Normalising here serves BOTH the
+    changed-or-not comparison and the stored value, so a `date(2026, 7, 30)`
+    read back from the row compares equal to the '2026-07-30' string coming in
+    from the request body (which must NOT be recorded as a change)."""
+    return None if value is None else str(value)
+
+
 def patch_action_item(conn, caller, action_item_id, body):
     """Edit priority/status/deadline/responsible on one action item (spec §3).
     ACL mirrors patch_observation_status widened to site authority: the task's
     site must be in the caller's reach, and the caller must be admin/gm, a
     pm/site_manager of THAT site, or the current assignee. Reassignment target
-    must be a member of the task's site. Addressed by durable action_items.id."""
+    must be a member of the task's site. Addressed by durable action_items.id.
+
+    Every field whose value actually CHANGES also appends a content_edits row
+    (table_name 'action_items'), the same audit trail patch_content writes and
+    GET /content/action_items/{id}/history already renders. Before check-off
+    moved to org-api it wrote DynamoDB checked_by/checked_at, which the UI read;
+    this restores "who closed this and when" on the relational path. The UPDATE
+    and its audit rows share ONE transaction -- all of it lands or none of it
+    does (same posture as apply_topic_correction)."""
     if body is None:
         return error("malformed JSON body", 400)
     row = action_items.get_action_item(conn, action_item_id)
@@ -1248,8 +1279,28 @@ def patch_action_item(conn, caller, action_item_id, body):
     if not fields:
         return error("no editable fields provided", 400)
 
-    updated = action_items.update_action_item_fields(conn, action_item_id, fields, caller["cognito_sub"])
-    if updated is None:
+    # Before/after come from the PRE-update row read above, one audit row per
+    # field that ACTUALLY changes -- re-ticking an already-done task, or
+    # re-sending an unchanged priority, must not litter the History panel.
+    audits = []
+    for col in _AUDITED_ACTION_FIELDS:
+        if col not in fields:
+            continue
+        before, after = _audit_text(row.get(col)), _audit_text(fields[col])
+        if before != after:
+            audits.append((col, before, after))
+
+    try:
+        with conn.transaction():          # UPDATE + audit rows commit together
+            updated = action_items.update_action_item_fields(
+                conn, action_item_id, fields, caller["cognito_sub"])
+            if updated is None:
+                raise _ActionItemVanished(action_item_id)
+            for col, before, after in audits:
+                content_edits.append_content_edit(
+                    conn, row["company_id"], "action_items", action_item_id,
+                    col, before, after, caller["id"], caller["global_role"])
+    except _ActionItemVanished:
         return error("action item not found", 404)
     return ok(updated)
 
@@ -1784,14 +1835,41 @@ def create_alias_endpoint(conn, caller, body, event):
 
 
 def get_content_history(conn, caller, table, row_id):
-    """content_edits trail for one row (spec §5.5 History view). Company-guarded
-    via get_content_row (which also resolves cross-company for platform_admin)."""
+    """content_edits trail for one row (spec §5.5 History view).
+
+    ACL is the READ half of patch_content's D7 tier: platform_admin
+    (is_cross_company) reads any tenant; company roles stay pinned; and the
+    row's site must be in the caller's reach (_allowed_site_ids). The
+    per-item AUTHOR/site-authority tier is deliberately NOT applied -- this
+    is a read, and anyone who can see the row can see how it got that way --
+    but reach is, because the trail is not a subset of the row: it names the
+    people who edited it, and (since check-off audit) who closed or
+    reassigned a task and when. Company-only guarding let any authenticated
+    user in the company read that for sites they cannot otherwise see.
+
+    `row["site_id"]` is the row's OWN site for all three EDITABLE tables --
+    content._SELECT selects x.site_id and reaches company_id through it, so
+    action_items/findings are gated on the same site their write path gates
+    on (patch_action_item / patch_content), not the owning topic's.
+
+    Refusal posture matches the siblings exactly: cross-company (and missing)
+    is 404 so existence never leaks; in-company but out-of-reach is 403, the
+    same status and shape patch_action_item returns for that case.
+
+    No-op for the live History tab: ContentHistoryPanel is only ever mounted
+    with the durable topic_row_id of a topic the user is already viewing, and
+    that id only reaches the client through render_report_shape, which
+    _render_timeline_for_user feeds with rows ALREADY filtered by this same
+    _allowed_site_ids. An out-of-reach topic has no id in the UI to ask about."""
     if table not in content.EDITABLE:
         return error(f"table must be one of {sorted(content.EDITABLE)}", 400)
     row = content.get_content_row(conn, table, row_id)
     cross = is_cross_company(caller["global_role"])
     if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
         return error("content row not found", 404)
+    site_id = str(row["site_id"])
+    if not cross and site_id not in _allowed_site_ids(conn, caller):
+        return error("access denied to this content's site", 403)
     edits = content_edits.list_content_edits(conn, row["company_id"], table, row_id)
     return ok({"edits": edits})
 
