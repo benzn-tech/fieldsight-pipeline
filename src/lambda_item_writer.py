@@ -50,7 +50,6 @@ Environment Variables:
 import json
 import logging
 import os
-import re
 from urllib.parse import unquote_plus
 
 import boto3
@@ -64,6 +63,13 @@ from photo_binding import PHOTOS_PER_TOPIC_CAP  # noqa: F401  (re-export)
 from photo_binding import list_pictures as _pb_list_pictures
 from photo_binding import photos_for_topics as _photos_for_topics
 from repositories import companies, findings, recordings, topics
+# The extraction-key shape lives in session_scope now (the read side needs the
+# SAME parse to derive session_id from topics.source_s3_key -- see that
+# module). Re-exported under the historical private names so existing callers
+# and tests keep working; same extraction pattern photo_binding/
+# keyframe_selection already followed.
+from session_scope import EXTRACTION_KEY_RE  # noqa: F401  (re-export)
+from session_scope import parse_extraction_key as _parse_extraction_key
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -77,10 +83,6 @@ COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 EMIT_KEYFRAME_REQUESTS = os.environ.get("EMIT_KEYFRAME_REQUESTS", "false").lower() == "true"
 
 EXTRACTIONS_PREFIX = "extractions/"
-# Depth-exact: extractions/{user_folder}/{date}/{name}.json -- a key nested
-# any deeper (or shallower, or not ending in .json) is not this contract's
-# shape and must be skipped rather than guessed at.
-EXTRACTION_KEY_RE = re.compile(r"^extractions/([^/]+)/([^/]+)/([^/]+)\.json$")
 
 _s3_client = None
 
@@ -90,14 +92,6 @@ def s3():
     if _s3_client is None:
         _s3_client = boto3.client("s3")
     return _s3_client
-
-
-def _parse_extraction_key(key):
-    m = EXTRACTION_KEY_RE.match(key)
-    if not m:
-        return None
-    user_folder, date, session_base = m.group(1), m.group(2), m.group(3)
-    return user_folder, date, session_base
 
 
 # ----------------------------------------------------------

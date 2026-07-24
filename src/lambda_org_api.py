@@ -46,6 +46,11 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
                                              caller's accessible sites (ACL, kills dots leak)
   GET   /api/org/timeline?date=…&user=…   → daily_report.json compat shim: S3 verbatim
                                              or Aurora extraction override (ACL, authority-flip)
+  GET   /api/org/sessions?date=&user= → the day's recording sessions (one per
+                                             press-record→stop == one extraction key)
+                                             for the meeting-scoped export picker: id,
+                                             deterministic start, best-effort end/label,
+                                             counts, participants (ACL = /timeline's)
   GET   /api/org/transcripts?date=&user=&start=&end= → transcript speaker segments for a
                                              (user,date) window, Aurora-identity ACL (mirrors
                                              /timeline's graded-off shape; fixes the legacy
@@ -77,6 +82,7 @@ from botocore.exceptions import ClientError
 from psycopg.errors import UniqueViolation
 
 import reindex
+import session_scope
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 from repositories import (action_items, aliases, classification_feedback, companies, content,
@@ -309,6 +315,9 @@ def dispatch(conn, event, method, route):
 
     if route == "/timeline" and method == "GET":
         return get_timeline_compat(conn, caller, event)
+
+    if route == "/sessions" and method == "GET":
+        return get_org_sessions(conn, caller, event)
 
     if route == "/transcripts" and method == "GET":
         return get_org_transcripts(conn, caller, event)
@@ -2449,9 +2458,19 @@ def render_report_shape(rows, doc, date, folder, conn=None):
                       "recommended_action": None,
                       "id": str(s["id"]), "source_table": "safety_observations"}
                      for s in t["safety_observations"]]
+        # Session identity (#11, meeting-scoped-export design §3.2) — ADDITIVE.
+        # Derived from the topic's own extraction key by the shared parse, the
+        # same one lambda_item_writer stamps that key with. The raw
+        # source_s3_key is deliberately NOT exposed; only the basename
+        # (session_base) is. session_kind lets the UI tell "report-sourced, no
+        # session granularity exists" (kind='report', the 'Whole day' row)
+        # from "we could not tell" (kind='unknown') — both carry a null id.
+        session_id, session_kind = session_scope.session_ref(t.get("source_s3_key"))
         topics_out.append({
             "topic_id": i,
             "topic_row_id": str(t["id"]),           # durable topics.id (D fix — editable anchor)
+            "session_id": session_id,
+            "session_kind": session_kind,
             "time_range": t["time_range"],
             "topic_title": t["title"],
             "category": t["category"],
@@ -2653,6 +2672,199 @@ def get_timeline_compat(conn, caller, event):
         # must resolve to a folder in THIS company before any lake read.
         return error("user not found in your company", 404)
     return _render_timeline_for_user(conn, caller, date, user)
+
+
+# ----------------------------------------------------------
+# /sessions — the day's recording sessions, for the meeting-scoped export
+# picker (#11; design docs/superpowers/specs/2026-07-25-meeting-scoped-
+# action-export.md §3.2). A site manager who just finished a 13:00-14:30
+# meeting picks THAT session instead of exporting all of rolling Today.
+#
+# WHAT IS AUTHORITATIVE HERE (the design's load-bearing rule — see
+# session_scope.py):
+#   * session_id / membership  — from topics.source_s3_key. Deterministic.
+#   * started_at               — parsed out of session_base itself.
+#                                Deterministic, LLM-independent.
+#   * topic_count / open_action_count / participants / topic_row_ids —
+#                                counted off the Aurora rows themselves.
+# WHAT IS COSMETIC (display only, may be null, never decides membership):
+#   * ended_at, label          — best-effort: recorded duration when a
+#                                recordings row exists, else the LLM's own
+#                                free-text time_range.
+#   * block                    — the gap-merge display grouping (§3.3).
+# A malformed/absent time_range degrades a LABEL to null. It can never move
+# a topic into the wrong session.
+# ----------------------------------------------------------
+
+def _session_participants(rows):
+    """Union of the rows' LLM-heard participant names, deduped
+    case-insensitively, first-seen order preserved (design §3.2). These are
+    unverified suggestions, not identities — see design §2.4."""
+    seen, out = set(), []
+    for r in rows:
+        for p in (r.get("participants") or []):
+            if not isinstance(p, str):
+                continue
+            name = p.strip()
+            if name and name.lower() not in seen:
+                seen.add(name.lower())
+                out.append(name)
+    return out
+
+
+def _time_range_end_dt(rows, start_dt):
+    """COSMETIC end label, tier (2) of the design's §3.2 resolution order:
+    the latest parseable end half of the session's topics' `time_range`.
+
+    `time_range` is LLM free text (session_scope's module docstring); this is
+    the ONLY thing it is allowed to influence. Parsed with the shared,
+    dash-tolerant photo_binding.parse_time_range — anything unparseable is
+    skipped, and an end that lands BEFORE the deterministic start (garbage, or
+    a range that crossed midnight) is declined rather than guessed at, so the
+    worst case is `ended_at: null` ("13:05 – ?"), never a wrong span."""
+    if start_dt is None:
+        return None
+    midnight = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    best = None
+    for r in rows:
+        parsed = parse_time_range(r.get("time_range"))
+        if parsed is None:
+            continue
+        end_dt = midnight + timedelta(minutes=parsed[1])
+        if end_dt < start_dt:
+            continue
+        if best is None or end_dt > best:
+            best = end_dt
+    return best
+
+
+def _session_end_dt(conn, caller, folder, date, session_id, rows, start_dt):
+    """ended_at resolution order (design §3.2): (1) the recordings row's own
+    duration added to the deterministic start — the closest thing to an
+    authoritative end, and timezone-safe because it is a DURATION, not a UTC
+    instant (see recordings.duration_for_media); (2) the LLM time_range end
+    label; (3) null. RealPTT / worker-device uploads have no recordings row
+    (the G5b fallback path), so (2)/(3) are the common case today."""
+    if start_dt is not None:
+        duration_s = recordings.duration_for_media(
+            conn, caller["company_id"], folder, date, session_id)
+        if duration_s:
+            return start_dt + timedelta(seconds=duration_s)
+    return _time_range_end_dt(rows, start_dt)
+
+
+def _hhmm(dt):
+    return dt.strftime("%H:%M") if dt is not None else None
+
+
+def build_day_sessions(conn, caller, folder, date, rows):
+    """Group one (folder, date)'s extraction topic rows into sessions.
+
+    EXCLUSIONS (design §5 / life-conversation separation Q1 rule) — applied
+    to every count, participant list and topic_row_ids handle, so a caller
+    cannot act on what it must not act on. Exactly the rule the shipped code
+    already uses (redactions.company_excluded_topic_ids, reindex.py:63,
+    chunking.py:103): an ACTIVE redaction, OR `work_class == 'non_work'` —
+    same comparison direction, NULL/absent work_class counts as work. Both
+    signals are read the same way /timeline's render_report_shape reads them
+    (one batched redactions.list_active_for_topics + the row's own
+    work_class), not via a second rule.
+
+    A session all of whose topics are excluded is dropped entirely rather
+    than listed empty — an unactionable row in the picker that advertises
+    "a personal conversation happened at 12:40" is worse than no row. The
+    envelope's `excluded` counts keep it honest.
+    """
+    excluded = {"non_work": 0, "redacted": 0}
+    redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if rows else {}
+    by_session = {}
+    for r in rows:
+        session_id, kind = session_scope.session_ref(r.get("source_s3_key"))
+        if kind != session_scope.KIND_EXTRACTION:
+            # Only extraction keys carry session granularity. Report-sourced
+            # rows are a whole-day key (design §2.7) and never a session.
+            continue
+        if r["id"] in redacted:
+            excluded["redacted"] += 1
+            continue
+        if r.get("work_class") == "non_work":
+            excluded["non_work"] += 1
+            continue
+        by_session.setdefault(session_id, []).append(r)
+
+    sessions = []
+    for session_id, srows in by_session.items():
+        start_dt = session_scope.session_start(session_id)
+        end_dt = _session_end_dt(conn, caller, folder, date, session_id, srows, start_dt)
+        sessions.append({
+            "session_id": session_id,
+            "started_at": start_dt.isoformat() if start_dt else None,   # authoritative
+            "ended_at": end_dt.isoformat() if end_dt else None,         # cosmetic
+            "site_name": next((r.get("site_name") for r in srows if r.get("site_name")), None),
+            "topic_count": len(srows),
+            "open_action_count": sum(1 for r in srows for a in r["action_items"]
+                                     if a["status"] == "open"),
+            "participants": _session_participants(srows),
+            "topic_row_ids": [str(r["id"]) for r in srows],   # the export's scope handle
+            "label": f"{_hhmm(start_dt) or '?'} – {_hhmm(end_dt) or '?'}",   # cosmetic
+            "_start_dt": start_dt,
+            "_end_dt": end_dt,
+        })
+    # Chronological. A session whose session_base carries no parseable base
+    # time sorts last (and, per assign_blocks, never auto-merges).
+    # Sorted on the ISO start STRING: a fixed-width ISO timestamp sorts
+    # lexicographically exactly as it sorts chronologically, and it is
+    # None-safe without inventing a sentinel datetime.
+    sessions.sort(key=lambda s: (s["started_at"] is None, s["started_at"] or "", s["session_id"]))
+    session_scope.assign_blocks(sessions)
+    for s in sessions:
+        s.pop("_start_dt", None)
+        s.pop("_end_dt", None)
+    return sessions, excluded
+
+
+def get_org_sessions(conn, caller, event):
+    """GET /api/org/sessions?date=YYYY-MM-DD[&user={folder}]
+
+    ACL: `_resolve_org_media_folder` — the shared wrapper that applies
+    /timeline's graded authority (`_can_view_folder`) verbatim AND carries
+    the GRADED_ROLES-off self/ALL branch, exactly as /transcripts,
+    /audio-segments, /video-segments already do. Using the wrapper rather
+    than calling `_can_view_folder` directly is the same gate plus the
+    flag-off path and the default-to-self rule, so this route can never show
+    sessions for a folder the caller cannot view on /timeline.
+
+    Second gate, deliberately kept: the rows are also clipped to
+    `_allowed_site_ids` before grouping — the identical clip
+    `_render_timeline_for_user._aurora_shape` applies. A target folder may be
+    a multi-site member whose day spans sites outside the caller's reach; the
+    folder gate alone would not clip those.
+
+    A day with no in-scope extraction sessions returns 200 with an EMPTY
+    sessions list — a report-only (pre-flip / zero-extraction) day is a
+    legitimate "no session granularity exists here" answer, and the UI's
+    "Whole day" row is the right rendering. It must stay distinguishable
+    from an error, which is why it is not a 404.
+    """
+    p = event.get("queryStringParameters") or {}
+    date, user = p.get("date"), (p.get("user") or "").strip()
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="sessions")
+    if err is not None:
+        return err
+
+    allowed = _allowed_site_ids(conn, caller)
+    rows = [r for r in topics.list_topics_for_source_prefix(conn, f"extractions/{folder}/{date}/")
+            if str(r["site_id"]) in allowed]
+    sessions, excluded = build_day_sessions(conn, caller, folder, date, rows)
+    return ok({
+        "date": date,
+        "user": folder,
+        "gap_minutes": session_scope.SESSION_GAP_MINUTES,
+        "sessions": sessions,
+        "excluded": excluded,
+    })
 
 
 # ----------------------------------------------------------
