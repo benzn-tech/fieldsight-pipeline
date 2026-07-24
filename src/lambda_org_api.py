@@ -67,11 +67,16 @@ import reindex
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 from repositories import (action_items, aliases, classification_feedback, companies, content,
-                          content_edits, memberships, observations, programme,
+                          content_edits, keyframes, memberships, observations, programme,
                           programme_suggestions, recordings, redactions, rollup,
                           scope, sites, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates
+# Keyframe Q7 telemetry derivation (all AWS-free, pure helpers): the deleted
+# frame's structural signal is reconstructed from the still-live topic row.
+from keyframe_selection import keyframe_seconds
+from photo_binding import parse_time_range
+from transcript_utils import extract_base_time_from_filename
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -142,7 +147,7 @@ def ok(body, status=200):
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": "Content-Type,Authorization",
-            "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,OPTIONS",
+            "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
         },
         "body": json.dumps(body, default=str),
     }
@@ -290,6 +295,8 @@ def dispatch(conn, event, method, route):
 
     if route == "/media/presigned-url" and method == "GET":
         return get_org_media_presigned_url(conn, caller, event)
+    if route == "/media/keyframe" and method == "DELETE":
+        return delete_keyframe_endpoint(conn, caller, parse_body(event))
     if route == "/reports/history" and method == "GET":
         return get_org_report_history(conn, caller, event)
 
@@ -1383,6 +1390,151 @@ def classification_feedback_summary_endpoint(conn, caller):
     if resolve_scope(caller["global_role"]) != "ALL" and not is_cross_company(caller["global_role"]):
         return error("admin or gm role required", 403)
     return ok(classification_feedback.summary(conn, caller["company_id"]))
+
+
+# Keyframe Q7: the durable auto-keyframe basename marker (keyframe_selection
+# .keyframe_filename). Digits-only session id -> can never collide with a real
+# user photo. The delete route refuses ANY key whose basename fails this.
+# \Z (not $): `$` also matches just before a trailing newline, so a key ending
+# "..._kf_s101534.jpg\n" would pass the guard. \Z anchors at the true end.
+_KF_BASENAME_RE = re.compile(r"_kf_s\d{6}\.jpg\Z")
+
+
+def _delete_keyframe_object(s3_key):
+    """Non-transactional S3 delete (Section 4.4): the tombstone is the source of
+    truth, so a failure here is logged and reported (s3_deleted:false) but never
+    5xxs -- the delete is already durable and the generator's stale/M-2 cleanup
+    garbage-collects any lingering object. Idempotent-safe if already gone."""
+    try:
+        s3().delete_object(Bucket=S3_BUCKET, Key=s3_key)
+        return True
+    except Exception:
+        logger.warning("keyframe S3 delete failed for %s (tombstone is source of truth)", s3_key)
+        return False
+
+
+def _keyframe_deleted_event_fields(conn, topic_id, s3_key):
+    """Structural-signal-only telemetry fields for a 'deleted' event, derived
+    from the still-live topic row + the key's own mid-time. Parse-level failures
+    (missing/unparseable/shifted time_range, unnamed category) degrade to NULLs
+    rather than failing the delete.
+
+    NB a DB-level failure of the SELECT below is different: it aborts the
+    transaction, so the subsequent record_event raises and the request 500s with
+    a full rollback. That is deliberate fail-CLOSED behaviour -- no tombstone, no
+    row delete, no S3 delete, no partial state -- and the client simply retries.
+    Unlike the generator's telemetry (which must never cost an already-uploaded
+    frame) there is nothing here worth salvaging, so no savepoint is used."""
+    fields = {"site_id": None, "topic_category": None, "work_class": None,
+              "duration_min": None, "n_frames_generated": None, "frame_index": None}
+    try:
+        trow = conn.cursor(row_factory=RealDictRow).execute(
+            "SELECT time_range, category, work_class, site_id "
+            "FROM topics WHERE id=%s", (topic_id,)).fetchone()
+        if trow is None:
+            return fields
+        fields["topic_category"] = trow.get("category")
+        fields["work_class"] = trow.get("work_class")
+        fields["site_id"] = trow.get("site_id")
+        time_range = trow.get("time_range")
+        parsed = parse_time_range(time_range)
+        if parsed is not None:
+            start_min, end_min = parsed
+            fields["duration_min"] = end_min - start_min
+        mids = keyframe_seconds(time_range)
+        if mids:
+            fields["n_frames_generated"] = len(mids)
+            base = extract_base_time_from_filename(s3_key.rsplit("/", 1)[-1])
+            if base is not None:
+                mid_s = base.hour * 3600 + base.minute * 60 + base.second
+                if mid_s in mids:
+                    fields["frame_index"] = mids.index(mid_s)
+    except Exception:
+        logger.warning("keyframe delete telemetry derivation failed for %s", s3_key)
+    return fields
+
+
+def delete_keyframe_endpoint(conn, caller, body):
+    """DELETE /api/org/media/keyframe -- reviewer removes ONE auto-generated
+    keyframe (tombstone + telemetry + row + object). Keyed on the durable
+    s3_key; the owning topic is resolved server-side and gated by the SAME
+    _topic_authority predicate patch_content/redactions use."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    s3_key = body.get("s3_key")
+    if not s3_key or not isinstance(s3_key, str):
+        return error("s3_key required", 400)
+    # Canonicalization guard (identical posture to get_org_media_presigned_url):
+    # reject '//', a leading '/', or any '.'/'..' path segment before anything.
+    parts = s3_key.split("/")
+    if "//" in s3_key or s3_key.startswith("/") or any(p in (".", "..") for p in parts):
+        return error("access denied", 403)
+    # THE keyframe guard -- refuse anything that is not an auto-generated
+    # keyframe BEFORE any lookup, so a real user photo is structurally
+    # unreachable through this route even if everything downstream regressed.
+    if not (s3_key.startswith("users/") and "/pictures/" in s3_key
+            and _KF_BASENAME_RE.search(parts[-1])):
+        return error("not an auto-generated keyframe", 400)
+
+    # Resolve owning topic(s). Normally exactly one row; an item-writer re-bind
+    # can in principle attach the key to a replacement topic -> handle them all.
+    rows = conn.cursor(row_factory=RealDictRow).execute(
+        "SELECT id, topic_id FROM topic_photos WHERE s3_key=%s", (s3_key,)).fetchall()
+
+    if not rows:
+        # Idempotent re-delete: the row is already gone. Re-attempt ONLY the S3
+        # delete; do NOT write a second tombstone/event.
+        t = keyframes.get_tombstone(conn, s3_key)
+        if t is None:
+            return error("keyframe not found", 404)
+        if not is_cross_company(caller["global_role"]) and \
+                str(t["company_id"]) != str(caller["company_id"]):
+            return error("keyframe not found", 404)     # cross-company shape parity
+        s3_deleted = _delete_keyframe_object(s3_key)
+        return ok({"deleted": True, "already_deleted": True, "s3_deleted": s3_deleted})
+
+    # Authorize EVERY distinct owning topic via the shared gate; first failure
+    # wins (its 403/404 is returned verbatim -- site-less topics 404 here, same
+    # posture as patch_content, because get_content_row INNER JOINs sites).
+    topic_ids, seen = [], set()
+    for r in rows:
+        tid = r["topic_id"]
+        if tid not in seen:
+            seen.add(tid)
+            topic_ids.append(tid)
+    authorized_row = None
+    for tid in topic_ids:
+        arow, err = _topic_authority(conn, caller, tid)
+        if err is not None:
+            return err
+        if authorized_row is None:
+            authorized_row = arow
+    company_id = authorized_row["company_id"]
+    primary_topic_id = topic_ids[0]
+
+    # ONE transaction (Section 4.3c): tombstone -> 'deleted' event -> row delete.
+    # The event is gated on the tombstone being NEW: in the s3_deleted:false
+    # window an item-writer re-extraction can re-bind the still-present object
+    # (photo_binding has no tombstone check), resurrecting the topic_photos row,
+    # and a second user delete would otherwise record a SECOND 'deleted' event
+    # for ONE keyframe -- corrupting the deleted/generated ratio this table
+    # exists to measure. One human decision, one event.
+    first_tombstone = keyframes.add_tombstone(
+        conn, s3_key, company_id, primary_topic_id, caller["id"])
+    if first_tombstone:
+        fields = _keyframe_deleted_event_fields(conn, primary_topic_id, s3_key)
+        keyframes.record_event(conn, "deleted", company_id=company_id, **fields)
+    rows_removed = conn.execute(
+        "DELETE FROM topic_photos WHERE s3_key=%s", (s3_key,)).rowcount
+
+    # Commit BEFORE the (non-transactional) S3 delete: the tombstone must be
+    # durable before the object can vanish (Section 4.4), so the generator can
+    # never observe "object missing + no tombstone" for a user-deleted frame.
+    conn.commit()
+
+    s3_deleted = _delete_keyframe_object(s3_key)
+    return ok({"deleted": True, "s3_key": s3_key,
+               "rows_removed": rows_removed, "s3_deleted": s3_deleted})
 
 
 _ALIAS_KINDS = ("person", "product", "company", "other")

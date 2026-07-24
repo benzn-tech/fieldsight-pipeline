@@ -5,6 +5,7 @@ real-ffmpeg coverage is the opt-in integration smoke at the bottom (skipif no
 local ffmpeg). Doubles mirror tests/unit/test_lambda_item_writer.py's
 FakeConn/FakeS3 conventions.
 """
+import contextlib
 import io
 import json
 import re
@@ -16,6 +17,7 @@ import pytest
 
 lk = pytest.importorskip("lambda_keyframe", reason="requires psycopg (installed in CI)")
 import keyframe_selection as ks
+import psycopg      # lambda_keyframe imported cleanly, so psycopg is present
 
 
 # --------------------------------------------------------------------------
@@ -25,6 +27,33 @@ import keyframe_selection as ks
 class _Cur:
     def __init__(self, row):
         self._row = row
+
+    def fetchone(self):
+        return self._row
+
+
+# The structural signal the widened topic pre-check now fetches (Q7). The
+# generator reads category/work_class/site_id/company_id from here; duration_min/
+# frame_index/n_frames come from the plan tuple, not this row.
+DEFAULT_TOPIC_META = {"time_range": "10:15 – 10:17", "category": "safety",
+                      "work_class": "work", "site_id": "s-1", "company_id": "co-1"}
+
+
+class _TopicCursor:
+    """Serves the widened `SELECT ... FROM topics t LEFT JOIN sites ...` pre-check
+    that now runs through conn.cursor(row_factory=dict_row). Honours the conn's
+    `existing` set (None -> alive) so superseded topics still return None."""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self._row = None
+
+    def execute(self, sql, params=None):
+        self.conn.executed.append((sql, params))
+        tid = params[0]
+        alive = self.conn.existing is None or tid in self.conn.existing
+        self._row = dict(self.conn.topic_meta) if alive else None
+        return self
 
     def fetchone(self):
         return self._row
@@ -103,11 +132,12 @@ class FakeRun:
 
 
 class FakeConn:
-    """SELECT 1 FROM topics -> existing governs which topic ids are 'alive'
-    (None = all alive). Context-manager like the real get_connection()."""
+    """The topic pre-check (via cursor) -> `existing` governs which topic ids are
+    'alive' (None = all alive). Context-manager like the real get_connection()."""
 
-    def __init__(self, existing=None):
+    def __init__(self, existing=None, topic_meta=None):
         self.existing = set(existing) if existing is not None else None
+        self.topic_meta = topic_meta or DEFAULT_TOPIC_META
         self.executed = []
 
     def __enter__(self):
@@ -116,12 +146,83 @@ class FakeConn:
     def __exit__(self, *a):
         return False
 
+    def transaction(self):
+        # Telemetry writes are savepoint-wrapped (Q7); a no-op CM is enough for
+        # the paths that don't model abort semantics -- see TxAbortConn for those.
+        return contextlib.nullcontext()
+
+    def cursor(self, *a, **k):
+        return _TopicCursor(self)
+
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
-        if "SELECT 1 FROM topics" in sql:
-            tid = params[0]
-            alive = self.existing is None or tid in self.existing
-            return _Cur({"?column?": 1} if alive else None)
+        return _Cur(None)
+
+
+class _Savepoint:
+    """psycopg3 `conn.transaction()` semantics, faithfully: entering issues a
+    SAVEPOINT, which FAILS on an already-aborted transaction; leaving via an
+    exception rolls back to the savepoint, which CLEARS the aborted state (that
+    is precisely what keeps the connection usable)."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        if self.conn.failed:
+            raise psycopg.errors.InFailedSqlTransaction(
+                "current transaction is aborted, commands ignored until "
+                "end of transaction block")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            self.conn.failed = False        # ROLLBACK TO SAVEPOINT un-poisons it
+        return False                        # never suppress
+
+
+class TxAbortConn:
+    """Models a real aborted transaction: once a statement fails, `failed` is set
+    and EVERY later statement (or a bare SAVEPOINT) raises
+    InFailedSqlTransaction until something rolls back. Uses the REAL
+    add_topic_photo_if_absent so its `with conn.transaction():` is genuinely
+    exercised against this state machine."""
+
+    def __init__(self, existing=None, topic_meta=None):
+        self.existing = set(existing) if existing is not None else None
+        self.topic_meta = topic_meta or DEFAULT_TOPIC_META
+        self.failed = False
+        self.executed = []
+        self.rows = set()          # committed (topic_id, s3_key) binds
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def transaction(self):
+        return _Savepoint(self)
+
+    def _guard(self):
+        if self.failed:
+            raise psycopg.errors.InFailedSqlTransaction(
+                "current transaction is aborted, commands ignored until "
+                "end of transaction block")
+
+    def cursor(self, *a, **k):
+        self._guard()
+        return _TopicCursor(self)
+
+    def execute(self, sql, params=None):
+        self._guard()
+        self.executed.append((sql, params))
+        if "INSERT INTO topic_photos" in sql:
+            pair = (params["tid"], params["key"])
+            if pair in self.rows:
+                return _Cur(None)
+            self.rows.add(pair)
+            return _Cur({"id": "new-photo-id"})
         return _Cur(None)
 
 
@@ -149,9 +250,10 @@ class StatefulConn:
     test can prove the row cleanup self-heals from the DB side -- independent of
     what the S3 listing returned this run."""
 
-    def __init__(self, rows=(), existing=None):
+    def __init__(self, rows=(), existing=None, topic_meta=None):
         self.rows = set(rows)
         self.existing = set(existing) if existing is not None else None
+        self.topic_meta = topic_meta or DEFAULT_TOPIC_META
         self.executed = []
 
     def __enter__(self):
@@ -160,12 +262,14 @@ class StatefulConn:
     def __exit__(self, *a):
         return False
 
+    def transaction(self):
+        return contextlib.nullcontext()
+
+    def cursor(self, *a, **k):
+        return _TopicCursor(self)
+
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
-        if "SELECT 1 FROM topics" in sql:
-            tid = params[0]
-            alive = self.existing is None or tid in self.existing
-            return _Cur({"?column?": 1} if alive else None)
         if "DELETE FROM topic_photos" in sql:
             prefix_like, marker_like, expected = params
             self.rows = {
@@ -212,6 +316,14 @@ def patched(monkeypatch):
     monkeypatch.setattr(lk, "add_topic_photo_if_absent",
                         lambda conn, tid, key, cap: inserts.append((tid, key, cap)) or True)
     monkeypatch._kf_inserts = inserts
+    # Q7: default the tombstone check to a no-op (nothing tombstoned) and record
+    # 'generated' events so existing behavior tests stay green and new ones can
+    # assert on them. Tests override tombstoned_subset to exercise the skip.
+    events = []
+    monkeypatch.setattr(lk.keyframes, "tombstoned_subset", lambda conn, keys: set())
+    monkeypatch.setattr(lk.keyframes, "record_event",
+                        lambda conn, event, **kw: events.append((event, kw)) or {"id": "e"})
+    monkeypatch._kf_events = events
     return monkeypatch
 
 
@@ -672,6 +784,172 @@ def test_add_topic_photo_if_absent_skips_fk_violation_without_raising():
 
     from repositories.topics import add_topic_photo_if_absent
     assert add_topic_photo_if_absent(FKConn(), "t-gone", "users/k.jpg", "cap") is False
+
+
+# --------------------------------------------------------------------------
+# Q7 -- tombstoned key is skipped ENTIRELY (never head/download/ffmpeg/insert)
+#   and, being excluded from `expected`, is garbage-collected by the stale S3
+#   sweep + the M-2 DB row cleanup.
+# --------------------------------------------------------------------------
+
+def test_tombstoned_frame_is_skipped_entirely(patched):
+    kf_key = PICS + "Benl1_2026-07-23_10-16-00_kf_s101534.jpg"
+    # a lingering S3 object AND a dangling topic_photos row for the tombstoned key
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:15 – 10:17"}]),
+                 SIDECAR_KEY: _sidecar(),
+                 kf_key: b"stale-tombstoned-jpg"})
+    patched.setattr(lk, "_s3_client", s3)
+    conn = StatefulConn(rows={kf_key})
+    patched.setattr(lk, "get_connection", lambda *a, **k: conn)
+    patched.setattr(lk.keyframes, "tombstoned_subset", lambda conn, keys: {kf_key})
+    run = FakeRun()
+    patched.setattr(lk.subprocess, "run", run)
+
+    result = lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    # never planned: no head, no download, no ffmpeg, no DB bind, no 'generated' event
+    assert kf_key not in s3.head_calls
+    assert s3.downloads == [] and run.calls == []
+    assert patched._kf_inserts == [] and patched._kf_events == []
+    # excluded from `expected` -> stale sweep deletes the S3 object AND the M-2
+    # predicate removes the dangling row (tombstone's garbage collector)
+    assert s3.deletes == [kf_key]
+    assert kf_key not in conn.rows
+    assert result == {"results": [{"skipped": False, "keyframes": 0}]}
+
+
+def test_one_tombstoned_frame_among_live_ones_only_skips_that_frame(patched):
+    # 10:00-10:06 -> 3 frames; tombstone only the middle one (10:03:00).
+    sidecar = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_10-00-00_vad_metadata.json"
+    video = "users/Ben_UCPK/video/2026-07-23/Benl1_2026-07-23_10-00-00.mp4"
+    tombstoned = PICS + "Benl1_2026-07-23_10-03-00_kf_s101534.jpg"
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:00 – 10:06"}]),
+                 sidecar: _sidecar(source_key=video, dur=600)})
+    patched.setattr(lk, "_s3_client", s3)
+    patched.setattr(lk.keyframes, "tombstoned_subset", lambda conn, keys: {tombstoned})
+    run = FakeRun()
+    patched.setattr(lk.subprocess, "run", run)
+
+    result = lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    keys = sorted(k for _, k, _ in s3.uploads)
+    assert keys == [
+        PICS + "Benl1_2026-07-23_10-01-00_kf_s101534.jpg",
+        PICS + "Benl1_2026-07-23_10-05-00_kf_s101534.jpg",
+    ]                                        # the tombstoned middle frame never produced
+    assert result == {"results": [{"skipped": False, "keyframes": 2}]}
+
+
+# --------------------------------------------------------------------------
+# Q7 -- 'generated' telemetry: one row per frame ACTUALLY produced (real upload
+#   only), with the right frame_index / n_frames_generated / duration_min; the
+#   head-exists fast path writes NOTHING (S3-retry dedup).
+# --------------------------------------------------------------------------
+
+def test_generated_event_written_only_on_real_upload(patched):
+    # 10:00-10:06 -> 3 frames; the middle one already exists in S3 (head hit),
+    # so only the two freshly-decoded frames emit a 'generated' event.
+    sidecar = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_10-00-00_vad_metadata.json"
+    video = "users/Ben_UCPK/video/2026-07-23/Benl1_2026-07-23_10-00-00.mp4"
+    existing = PICS + "Benl1_2026-07-23_10-03-00_kf_s101534.jpg"   # frame_index 1, head hit
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:00 – 10:06"}]),
+                 sidecar: _sidecar(source_key=video, dur=600),
+                 existing: b"already-here"})
+    patched.setattr(lk, "_s3_client", s3)
+    run = FakeRun()
+    patched.setattr(lk.subprocess, "run", run)
+
+    lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    # exactly two 'generated' events -- the head-hit middle frame emitted none
+    assert [e for e, _ in patched._kf_events] == ["generated", "generated"]
+    by_index = {kw["frame_index"]: kw for _, kw in patched._kf_events}
+    assert set(by_index) == {0, 2}                     # NOT frame_index 1 (head hit)
+    for kw in by_index.values():
+        assert kw["n_frames_generated"] == 3
+        assert kw["duration_min"] == 6
+        assert kw["topic_category"] == "safety"        # from the widened topic row
+        assert kw["work_class"] == "work"
+        assert kw["company_id"] == "co-1" and kw["site_id"] == "s-1"
+
+
+def test_telemetry_db_failure_does_not_abort_tx_or_drop_bindings(patched):
+    """The real failure mode: a DB-level telemetry failure (e.g. keyframe_events
+    not migrated in this environment) ABORTS the transaction. Without a SAVEPOINT
+    around record_event, the next statement -- add_topic_photo_if_absent's own
+    `with conn.transaction():` -- raises InFailedSqlTransaction, which its
+    `except ForeignKeyViolation` does not catch; that escapes the per-plan
+    try/finally and rolls back EVERY bind of the request (S3 objects uploaded,
+    zero rows committed, request permanently dropped after S3's retries).
+
+    Uses the REAL add_topic_photo_if_absent against a connection that models
+    psycopg3 abort semantics, so the savepoint is genuinely exercised."""
+    from repositories.topics import add_topic_photo_if_absent
+
+    # 3-frame topic: proves the blast radius is the WHOLE request, not one frame.
+    sidecar = "audio_segments/Ben_UCPK/2026-07-23/Benl1_2026-07-23_10-00-00_vad_metadata.json"
+    video = "users/Ben_UCPK/video/2026-07-23/Benl1_2026-07-23_10-00-00.mp4"
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:00 – 10:06"}]),
+                 sidecar: _sidecar(source_key=video, dur=600)})
+    patched.setattr(lk, "_s3_client", s3)
+    conn = TxAbortConn()
+    patched.setattr(lk, "get_connection", lambda *a, **k: conn)
+    patched.setattr(lk, "add_topic_photo_if_absent", add_topic_photo_if_absent)
+
+    def failing_record_event(conn_, event, **kw):
+        conn_.failed = True                       # the INSERT poisoned the tx
+        raise psycopg.errors.UndefinedTable(
+            'relation "keyframe_events" does not exist')
+    patched.setattr(lk.keyframes, "record_event", failing_record_event)
+    patched.setattr(lk.subprocess, "run", FakeRun())
+
+    result = lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    # never raised, and EVERY frame still bound despite telemetry failing on each
+    assert result == {"results": [{"skipped": False, "keyframes": 3}]}
+    assert len(s3.uploads) == 3
+    assert conn.rows == {
+        ("topic-1", PICS + "Benl1_2026-07-23_10-01-00_kf_s101534.jpg"),
+        ("topic-1", PICS + "Benl1_2026-07-23_10-03-00_kf_s101534.jpg"),
+        ("topic-1", PICS + "Benl1_2026-07-23_10-05-00_kf_s101534.jpg"),
+    }
+    assert conn.failed is False       # savepoint rollback left the conn usable
+
+
+def test_telemetry_write_is_wrapped_in_a_savepoint(patched):
+    """Belt-and-braces on the same defect: assert the record_event call site is
+    lexically inside a `with conn.transaction():`, by failing the test if
+    record_event is ever reached without an open savepoint."""
+    depth = {"n": 0}
+
+    class _CountingSavepoint(_Savepoint):
+        def __enter__(self):
+            r = super().__enter__()
+            depth["n"] += 1
+            return r
+
+        def __exit__(self, *a):
+            depth["n"] -= 1
+            return super().__exit__(*a)
+
+    class CountingConn(TxAbortConn):
+        def transaction(self):
+            return _CountingSavepoint(self)
+
+    seen = []
+    s3 = FakeS3({REQUEST_KEY: _request([{"topic_id": "topic-1", "time_range": "10:15 – 10:17"}]),
+                 SIDECAR_KEY: _sidecar()})
+    patched.setattr(lk, "_s3_client", s3)
+    patched.setattr(lk, "get_connection", lambda *a, **k: CountingConn())
+    patched.setattr(lk.keyframes, "record_event",
+                    lambda conn_, event, **kw: seen.append(depth["n"]) or {"id": "e"})
+    patched.setattr(lk.subprocess, "run", FakeRun())
+
+    lk.lambda_handler({"Records": [{"s3": {"object": {"key": REQUEST_KEY}}}]}, None)
+
+    assert seen, "record_event was never called"
+    assert all(d >= 1 for d in seen), \
+        "record_event ran OUTSIDE conn.transaction() -- a DB failure would abort the tx"
 
 
 # --------------------------------------------------------------------------
