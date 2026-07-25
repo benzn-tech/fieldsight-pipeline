@@ -1755,19 +1755,24 @@ def _parse_correction_terms(body):
 
 
 def _plan_topic_propagation(conn, topic_id, before, after):
-    """Read-only: every editable cell in THIS topic whose text actually
-    changes when before -> after is applied. Matching is text_normalize.
-    normalize (whole-word, case-aware) -- the same function the embed and RAG
-    paths use -- never a raw str.replace, so 'Mackon' never rewrites inside
-    'Mackonsson'. A cell that comes back unchanged is dropped here and is
-    therefore never written and never audited."""
+    """Read-only: every propagatable cell in THIS topic whose text actually
+    changes when before -> after is applied. "Propagatable" (content.
+    is_propagatable) is EDITABLE plus the propagation-only extras
+    (_PROPAGATE_EXTRA, e.g. findings.impact_note) -- prose that may carry a
+    corrected name but is deliberately not individually PATCH-editable.
+    Matching is text_normalize.normalize (whole-word, case-aware) -- the same
+    function the embed and RAG paths use -- never a raw str.replace, so
+    'Mackon' never rewrites inside 'Mackonsson'. A cell that comes back
+    unchanged is dropped here and is therefore never written and never
+    audited."""
     alias = [{"wrong_term": before, "right_term": after}]
     plan = []
     for cell in content.list_topic_content_fields(conn, topic_id):
-        # Belt-and-braces: the scan already selects only EDITABLE columns, but
-        # re-assert it here so nothing outside the allow-list (e.g. findings'
-        # impact_note/impact_task_name/impact_evidence) can ever be planned.
-        if not content.is_editable(cell["table"], cell["field"]):
+        # Belt-and-braces: the scan already selects only propagatable columns,
+        # but re-assert it here so nothing outside that allow-list (e.g.
+        # findings' impact_task_name/impact_severity/impact_evidence/
+        # impact_matched_at) can ever be planned.
+        if not content.is_propagatable(cell["table"], cell["field"]):
             continue
         value = cell["value"]
         rewritten = normalize(value, alias)
