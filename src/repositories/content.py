@@ -28,6 +28,16 @@ _EDITABLE_ORDERED = {
 }
 EDITABLE = {t: set(f) for t, f in _EDITABLE_ORDERED.items()}
 
+# Fields that intra-topic propagation may REWRITE but that are NOT individually
+# editable (not in EDITABLE, so patch_content/history don't expose them).
+# impact_note is model prose that can carry a corrected name; it is not rendered
+# in the UI and not embedded in RAG, so this is data-hygiene / wire-consistency,
+# not a visible fix. impact_task_name is deliberately EXCLUDED -- it mirrors a
+# programme task's name in another store; rewriting the mirror would desync it.
+# The enum/jsonb/timestamp impact_* fields are never text and must never be
+# text-replaced.
+_PROPAGATE_EXTRA = {"findings": ("impact_note",)}
+
 # Which column ties a row to its topic: `topics` IS the topic, children carry
 # topic_id. Used only by list_topic_content_fields (intra-topic propagation);
 # both table and column names come from these constants, never from request
@@ -61,6 +71,15 @@ def is_editable(table, field):
     return table in EDITABLE and field in EDITABLE[table]
 
 
+def is_propagatable(table, field):
+    """True for anything intra-topic propagation may rewrite: every
+    individually-editable field, PLUS the propagation-only extras
+    (_PROPAGATE_EXTRA, e.g. findings.impact_note). Distinct from is_editable
+    on purpose -- a field can be propagatable without being individually
+    PATCH-editable."""
+    return is_editable(table, field) or field in _PROPAGATE_EXTRA.get(table, ())
+
+
 def get_content_row(conn, table, row_id):
     """id/site_id/company_id/author_user_id + current editable values for one
     row. None on unknown table, missing row, or malformed uuid (404 semantics,
@@ -82,14 +101,16 @@ def list_topic_content_fields(conn, topic_id):
     its findings). Ordered topics -> action_items -> findings, and within a
     table by _EDITABLE_ORDERED, so a preview is stable across calls.
 
-    Only columns listed in EDITABLE are selected, so nothing outside the
-    allow-list can be previewed and therefore nothing outside it can be
-    rewritten. NULL cells are skipped (they can never contain the wrong
-    term). Returns [] on a missing/malformed topic id -- same 404-friendly
-    posture as get_content_row."""
+    Columns come from EDITABLE plus _PROPAGATE_EXTRA (propagation-only fields,
+    e.g. findings.impact_note) -- the union is exactly is_propagatable's
+    allow-list, so nothing outside it can be previewed and therefore nothing
+    outside it can be rewritten. NULL cells are skipped (they can never
+    contain the wrong term). Returns [] on a missing/malformed topic id --
+    same 404-friendly posture as get_content_row."""
     out = []
     for table, fields in _EDITABLE_ORDERED.items():
-        cols = ", ".join(fields)
+        all_fields = fields + _PROPAGATE_EXTRA.get(table, ())
+        cols = ", ".join(all_fields)
         try:
             rows = conn.cursor(row_factory=dict_row).execute(
                 f"SELECT id, {cols} FROM {table} WHERE {_TOPIC_KEY[table]}=%s "
@@ -100,7 +121,7 @@ def list_topic_content_fields(conn, topic_id):
             conn.rollback()
             return []
         for row in rows:
-            for field in fields:
+            for field in all_fields:
                 if row[field] is None:
                     continue
                 out.append({"table": table, "row_id": row["id"],
@@ -109,10 +130,16 @@ def list_topic_content_fields(conn, topic_id):
 
 
 def update_content_field(conn, table, row_id, field, value):
-    """Whitelisted single-field UPDATE (D3 materialize-in-place). Returns the
-    updated row (id + the field), or None on non-whitelisted table/field or
-    malformed uuid. No updated_at bump -- content_edits IS the audit trail."""
-    if not is_editable(table, field):
+    """Whitelisted single-field UPDATE (D3 materialize-in-place), shared by
+    patch_content (individual edits) and apply_topic_correction (propagation).
+    Gated on is_propagatable, not is_editable, so propagation-only fields
+    (_PROPAGATE_EXTRA) can be written here too -- this does NOT widen
+    patch_content's individual-edit surface because patch_content already
+    filters its body to is_editable fields before ever reaching this call.
+    Returns the updated row (id + the field), or None on non-whitelisted
+    table/field or malformed uuid. No updated_at bump -- content_edits IS the
+    audit trail."""
+    if not is_propagatable(table, field):
         return None
     try:
         return conn.cursor(row_factory=dict_row).execute(
