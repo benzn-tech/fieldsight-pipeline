@@ -35,6 +35,14 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
                                              window before it, from the content_edits
                                              status→done audit trail (ONE call, reach+tenant
                                              scoped; backs the Today weekly KPI)
+  PATCH /api/org/compliance/resolution    → set/flip durable safety/quality
+                                             resolved-state on one row (natural-key
+                                             upsert; site-authority ACL; server-side
+                                             content_hash) — retires the DynamoDB
+                                             POST /api/actions/toggle overlay
+  GET   /api/org/compliance/resolutions?from=&to=&site=&domain= → one aggregate
+                                             range read for the union aggregator
+                                             (reach-gated; ?site/?domain optional)
   POST  /api/org/observations/{id}/archive→ soft-delete observation (admin/gm)
   POST  /api/org/topics/{id}/propagate/preview → dry-run: which cells of THIS
                                              topic still carry the wrong term
@@ -81,14 +89,16 @@ import boto3
 from botocore.exceptions import ClientError
 from psycopg.errors import UniqueViolation
 
+import content_hash
 import reindex
 import session_scope
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
-from repositories import (action_items, aliases, classification_feedback, companies, content,
-                          content_edits, keyframes, memberships, observations, programme,
-                          programme_suggestions, recordings, redactions, rollup,
-                          scope, sites, topics, users, voice_messages)
+from repositories import (action_items, aliases, classification_feedback, companies,
+                          compliance_resolutions, content, content_edits, keyframes,
+                          memberships, observations, programme, programme_suggestions,
+                          recordings, redactions, rollup, scope, sites, topics, users,
+                          voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates, first_match_span, normalize, occurrences
 # Keyframe Q7 telemetry derivation (all AWS-free, pure helpers): the deleted
@@ -277,6 +287,15 @@ def dispatch(conn, event, method, route):
     m_ai = re.match(r"^/action-items/([^/]+)$", route)
     if m_ai and method == "PATCH":
         return patch_action_item(conn, caller, m_ai.group(1), parse_body(event))
+
+    # Durable safety/quality resolved-state (spec 2026-07-26). Literal routes,
+    # no id in the path (the row is addressed by its natural key in the body /
+    # query), so no greedy regex can shadow them. Singular PATCH = set/flip one;
+    # plural GET = the union aggregator's one range read.
+    if route == "/compliance/resolution" and method == "PATCH":
+        return patch_compliance_resolution(conn, caller, parse_body(event))
+    if route == "/compliance/resolutions" and method == "GET":
+        return get_compliance_resolutions(conn, caller, event)
 
     m_ce = re.match(r"^/content/([^/]+)/([^/]+)$", route)
     if m_ce and method == "PATCH":
@@ -1410,6 +1429,112 @@ def get_action_closures(conn, caller, event):
     })
 
 
+# ----------------------------------------------------------
+# Durable safety/quality "resolved" state (spec 2026-07-26). Retires the
+# unauthenticated DynamoDB POST /api/actions/toggle overlay for compliance
+# rows. Keyed on the re-extraction-stable natural identity
+# (company_id, site_id, report_date, domain, user_folder, content_hash);
+# content_hash is computed SERVER-SIDE from the row's displayed text -- the
+# client never sends it (§2/§3). company_id is resolved from the SITE (not the
+# caller), so a cross-company platform_admin marks under the row's own tenant,
+# where the owner's read will find it.
+# ----------------------------------------------------------
+def patch_compliance_resolution(conn, caller, body):
+    """PATCH /api/org/compliance/resolution -- set or flip one row's resolved
+    state. Body: {domain, site, report_date, user_folder, text, resolved}.
+
+    ACL = _resolve_site_param reach gate + patch_action_item's site-authority/
+    admin tier, MINUS the assignee branch: a compliance resolution is a
+    site-authority act (these rows have no assignee). admin/gm (ALL scope or
+    cross-company) OR this site's pm/site_manager only."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    domain = body.get("domain")
+    if domain not in ALLOWED_OBSERVATION_KINDS:                 # {"safety","quality"}
+        return error("domain must be 'safety' or 'quality'", 400)
+    report_date = body.get("report_date")
+    if not isinstance(report_date, str) or not REPORT_DATE_RE.match(report_date):
+        return error("report_date must be YYYY-MM-DD", 400)
+    user_folder = body.get("user_folder")
+    if not isinstance(user_folder, str) or not user_folder.strip():
+        return error("user_folder required", 400)
+    user_folder = user_folder.strip()
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return error("text required", 400)
+    resolved = body.get("resolved")
+    if not isinstance(resolved, bool):
+        return error("resolved must be a boolean", 400)
+
+    # Reach gate (slug or uuid; company/membership-scoped). A resolver who
+    # cannot open the site gets the standard 403 here.
+    site_id, err = _resolve_site_param(conn, caller, body.get("site"))
+    if err is not None:
+        return err
+    # Site-authority tier (no assignee branch, unlike patch_action_item).
+    cross = is_cross_company(caller["global_role"])
+    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
+    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_site_authority = site_role in ("pm", "site_manager")
+    if not (is_admin or is_site_authority):
+        return error("admin/gm or this site's pm/site_manager only", 403)
+
+    # company_id from the SITE, not the caller (correct for cross-company
+    # platform_admin; still never from the body). The reach gate above already
+    # proved the caller may act on this site.
+    site = sites.get_site(conn, site_id)
+    if site is None:
+        return error("site not found", 404)
+    company_id = str(site["company_id"])
+
+    chash = content_hash.content_hash(text)
+    sample = content_hash.normalize(text)
+    row = compliance_resolutions.upsert_resolution(
+        conn, company_id, site_id, report_date, domain, user_folder,
+        chash, sample, resolved, caller["id"])
+    return ok({
+        "resolved": row["resolved"],
+        "resolved_by": row["resolved_by_name"],       # null-safe display name
+        "resolved_at": row["resolved_at"],
+        "content_hash": row["content_hash"],
+        "content_sample": row["content_sample"],
+    })
+
+
+def get_compliance_resolutions(conn, caller, event):
+    """GET /api/org/compliance/resolutions?from=&to=&site=&domain= -- one
+    aggregate range read for the union aggregator (§4). Site-reach gated
+    (_allowed_site_ids); ?site optional (omitted => every reachable site, the
+    global Insights view); ?domain optional. platform_admin (is_cross_company)
+    drops the tenant pin only, keeping the reach gate. An EMPTY reach is a
+    well-formed empty list, never an unscoped read (the []-means-no-filter
+    trap)."""
+    params = event.get("queryStringParameters") or {}
+    start = _parse_iso_date(params.get("from"))
+    end = _parse_iso_date(params.get("to"))
+    if start is None or end is None:
+        return error("from and to required (YYYY-MM-DD)", 400)
+    if end < start:
+        return error("to must not precede from", 400)
+    domain = params.get("domain")
+    if domain is not None and domain not in ALLOWED_OBSERVATION_KINDS:
+        return error("domain must be 'safety' or 'quality'", 400)
+
+    site_param = params.get("site")
+    if site_param:
+        site_id, err = _resolve_site_param(conn, caller, site_param)
+        if err is not None:
+            return err
+        site_ids = {site_id}
+    else:
+        site_ids = _allowed_site_ids(conn, caller)
+
+    cross = is_cross_company(caller["global_role"])
+    rows = compliance_resolutions.list_resolutions(
+        conn, None if cross else caller["company_id"], site_ids, start, end, domain)
+    return ok({"resolutions": rows})
+
+
 def patch_content(conn, caller, table, row_id, body):
     """Edit one free-text content field (spec §3/§5.2, D1). ACL is the D7
     per-item tier -- mirrors patch_action_item exactly: platform_admin
@@ -1453,6 +1578,10 @@ def patch_content(conn, caller, table, row_id, body):
         conn, row["company_id"], table, row_id, field, before, value,
         caller["id"], caller["global_role"])
 
+    # Best-effort re-key of any compliance_resolutions mark keyed on this text
+    # (spec §3.1, item 1b) -- self-guarded, never fails the edit.
+    _rekey_compliance_mark(conn, table, field, row_id, before, value)
+
     # Best-effort per-topic re-index (spec §6: async, never blocks/rolls back
     # the edit). Topic id + folder/date come from the row's owning topic.
     try:
@@ -1487,6 +1616,69 @@ def _enqueue_content_reindex(conn, table, row_id):
     # chain lives on the lake, so enqueue writes there (see Task 20 IAM grant).
     reindex.enqueue_topic_reindex(s3(), LAKE_BUCKET, conn, tid,
                                   meta["folder_name"], str(meta["report_date"]))
+
+
+# item 1b (spec §3.1): the (table, field) pairs whose text feeds a
+# compliance_resolutions key, mapped to the domain the mark lives under.
+# ONLY these two re-key -- finding.observation is the safety topic_flag source
+# (#1) and topics.title is the quality topic_quality source (#3). Every other
+# editable field (recommended_action/entity_*/action_items.text/topics.summary/
+# responsible) is not part of any compliance key. Source #2 (prose obs_) has no
+# editable Aurora row, so it can never appear here.
+_COMPLIANCE_REKEY_DOMAIN = {("findings", "observation"): "safety",
+                            ("topics", "title"): "quality"}
+
+
+def _compliance_key_context(conn, table, row_id):
+    """Resolve (company_id, site_id, report_date, user_folder) for a compliance
+    re-key from the edited row's owning topic -- company_id via the SITE (so it
+    matches how the write endpoint keyed the mark). Only 'findings'/'topics' can
+    trigger a re-key; anything else returns None. A row with no attributed
+    recorder (folder_name NULL) yields user_folder None, which the caller
+    treats as 'no key to move'."""
+    if table == "findings":
+        sql = ("SELECT s.company_id, f.site_id, t.report_date, "
+               "       u.folder_name AS user_folder "
+               "FROM findings f JOIN topics t ON t.id = f.topic_id "
+               "JOIN sites s ON s.id = f.site_id "
+               "LEFT JOIN users u ON u.id = t.user_id WHERE f.id=%s")
+    elif table == "topics":
+        sql = ("SELECT s.company_id, t.site_id, t.report_date, "
+               "       u.folder_name AS user_folder "
+               "FROM topics t JOIN sites s ON s.id = t.site_id "
+               "LEFT JOIN users u ON u.id = t.user_id WHERE t.id=%s")
+    else:
+        return None
+    return conn.cursor(row_factory=RealDictRow).execute(sql, (row_id,)).fetchone()
+
+
+def _rekey_compliance_mark(conn, table, field, row_id, before_text, after_text):
+    """Best-effort (spec §3.1, item 1b): when a content edit changes the text a
+    compliance_resolutions mark is keyed on, migrate the mark to the new hash so
+    the resolved state follows the corrected text. NEVER fails or rolls back the
+    content edit -- any error is logged and swallowed, same posture as the
+    reindex enqueue. Only the two trigger fields re-key; only a row that HAS a
+    mark actually moves (rekey_resolution is an UPDATE no-op otherwise)."""
+    domain = _COMPLIANCE_REKEY_DOMAIN.get((table, field))
+    if domain is None:
+        return
+    old_hash = content_hash.content_hash(before_text or "")
+    new_hash = content_hash.content_hash(after_text or "")
+    if old_hash == new_hash:
+        return                                   # no textual change -> nothing to move
+    try:
+        ctx = _compliance_key_context(conn, table, row_id)
+        if ctx is None or not ctx.get("user_folder"):
+            return                               # unattributed -> no folder to key on
+        old_key = {
+            "company_id": str(ctx["company_id"]), "site_id": str(ctx["site_id"]),
+            "report_date": str(ctx["report_date"]), "domain": domain,
+            "user_folder": ctx["user_folder"], "content_hash": old_hash,
+        }
+        compliance_resolutions.rekey_resolution(
+            conn, old_key, new_hash, content_hash.normalize(after_text or ""))
+    except Exception:
+        logger.exception("compliance re-key failed for %s/%s (edit kept)", table, row_id)
 
 
 def _topic_authority(conn, caller, topic_id):
@@ -1654,6 +1846,12 @@ def apply_topic_correction(conn, caller, topic_id, body):
     except _PropagationAborted as e:
         logger.warning("propagate %s: %s changed under us -- nothing written", topic_id, e)
         return error("content changed during propagation, nothing was written", 409)
+
+    # Best-effort re-key of any compliance_resolutions mark on each rewritten
+    # cell (spec §3.1, item 1b) -- self-guarded per cell, never fails the edit.
+    for p in plan:
+        _rekey_compliance_mark(conn, p["table"], p["field"], p["row_id"],
+                               p["before_text"], p["after_text"])
 
     reindexed = True
     try:
