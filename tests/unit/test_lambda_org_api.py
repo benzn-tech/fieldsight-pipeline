@@ -4804,6 +4804,21 @@ def test_render_report_shape_exposes_durable_topic_and_safety_ids():
     assert t["action_items"][0]["id"] == "ai-1"          # already present
     assert t["safety_flags"][0]["id"] == "so-1"          # NEW
     assert t["safety_flags"][0]["source_table"] == "safety_observations"
+    # site_id (org UUID) alongside the display name, so the client can rebuild the
+    # compliance-resolution key; site_name alone can't (would 404 / never match).
+    assert out["site_id"] == "s-1"
+    assert out["site"] == "Alpha"
+
+
+def test_render_report_shape_site_id_is_none_when_absent():
+    rows = [{
+        "id": "t-1", "site_id": None, "site_name": "Alpha", "user_name": "Ada L",
+        "time_range": None, "title": "x", "category": None, "participants": [],
+        "summary": "s", "action_items": [], "safety_observations": [],
+        "findings": [], "photos": [],
+    }]
+    out = org.render_report_shape(rows, None, "2026-07-16", "Ada_L")
+    assert out["site_id"] is None            # null-safe, never the string "None"
 
 
 def test_timeline_report_sourced_day_renders_with_ids(wired, monkeypatch):

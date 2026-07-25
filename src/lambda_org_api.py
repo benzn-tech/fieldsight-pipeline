@@ -2703,6 +2703,13 @@ def render_report_shape(rows, doc, date, folder, conn=None):
     return {
         "report_date": date,
         "site": rows[0]["site_name"],
+        # site_id (org UUID) alongside the display name: the compliance-resolution
+        # durable key is (company_id, site_id, report_date, domain, user_folder,
+        # content_hash), and the client can only rebuild it with a real site_id.
+        # The name alone would 404 on write and never match on read (site_name is
+        # not the slug _resolve_site_param accepts), silently orphaning every mark.
+        # rows[0]["site_id"] is already in hand here (used for the alias lookup).
+        "site_id": str(rows[0]["site_id"]) if rows[0].get("site_id") else None,
         "user_name": rows[0]["user_name"] or folder.replace("_", " "),
         **prose,
         "_report_metadata": {"source": "live_extraction", "version": "flip-v1"},
