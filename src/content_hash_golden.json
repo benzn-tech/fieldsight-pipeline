@@ -1,0 +1,14 @@
+{
+  "_note": "Parity guard for content_hash.normalize + content_hash (spec 2026-07-26 §2). hash = sha256_hex(utf8(normalize(input))). BOTH src/content_hash.py (Python) AND the future JS twin in the aggregator MUST reproduce every pair below byte-for-byte, else resolved marks silently orphan across the write/read boundary. Inputs are ASCII/Latin so Python casefold() and JS toLowerCase() agree. When you change normalize(), regenerate this file and update the JS twin in the SAME change.",
+  "algorithm": "sha256_hex(utf8(casefold(collapse_ws(nfc(text)))))",
+  "cases": [
+    { "input": "Loose handrail on level 3", "hash": "534afd6876dd21809a0d70ef705abb0d141be9c081f12c2acb04b3f6210fa2d8" },
+    { "input": "  Loose   handrail on level 3  ", "hash": "534afd6876dd21809a0d70ef705abb0d141be9c081f12c2acb04b3f6210fa2d8" },
+    { "input": "LOOSE HANDRAIL ON LEVEL 3", "hash": "534afd6876dd21809a0d70ef705abb0d141be9c081f12c2acb04b3f6210fa2d8" },
+    { "input": "Missing guardrail\tnear\nthe edge", "hash": "493ca055c23548da3b90225e2dae97495d9d456f82b912202bfc42ed275033cd" },
+    { "input": "Rebar @ 200mm c/c -- check spacing", "hash": "28771386fc4b31e66a7376cb9dc829d912786f5d74e4c3b0693532b6f2174994" },
+    { "input": "Cafe rebar spacing area", "hash": "68562aef50c24a52e0a748d2374275735fc2e7272aed993b300d871c44aea0b9" },
+    { "input": "", "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+    { "input": "Concrete pour delayed; formwork not signed off.", "hash": "3d4564e6efb88f3e06db65817aef2a31c9d9eb17322f3e5b217dfcf953eeec9f" }
+  ]
+}
