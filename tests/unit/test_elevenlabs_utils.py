@@ -80,6 +80,14 @@ def test_transcribe_segment_missing_key_raises(monkeypatch):
         eu.transcribe_segment(b"\x00", "seg.wav")
 
 
+def _fields_dict(fields):
+    """Collapse a list of (name, value) multipart tuples into name -> [values]."""
+    out = {}
+    for name, value in fields:
+        out.setdefault(name, []).append(value)
+    return out
+
+
 def test_transcribe_segment_success(monkeypatch):
     monkeypatch.setattr(eu, "ELEVENLABS_API_KEY", "xi-key")
     captured = {}
@@ -94,8 +102,94 @@ def test_transcribe_segment_success(monkeypatch):
     out = eu.transcribe_segment(b"\x00\x01", "seg.wav", num_speakers=3, keyterms=["GIB"])
     assert out["results"]["transcripts"][0]["transcript"] == "pour the slab today"
     assert captured["headers"]["xi-api-key"] == "xi-key"
-    assert captured["fields"]["model_id"] == eu.ELEVENLABS_STT_MODEL
-    assert captured["fields"]["num_speakers"] == "3"
+    fd = _fields_dict(captured["fields"])
+    assert fd["model_id"] == [eu.ELEVENLABS_STT_MODEL]
+    assert fd["num_speakers"] == ["3"]
+
+
+def test_transcribe_segment_sends_keyterms_as_repeated_fields(monkeypatch):
+    """Each keyterm is a separate repeated `keyterms` multipart entry (the
+    scribe_v2 keyword-list contract), not one JSON-array string value."""
+    monkeypatch.setattr(eu, "ELEVENLABS_API_KEY", "xi-key")
+    captured = {}
+
+    def fake_request(self, method, url, fields=None, headers=None, timeout=None):
+        captured["fields"] = fields
+        return _FakeResponse(200, SCRIBE_RESPONSE)
+
+    monkeypatch.setattr(eu.urllib3.PoolManager, "request", fake_request)
+    eu.transcribe_segment(b"\x00", "seg.wav", keyterms=["GIB", "dwang", "BRANZ"])
+    # one repeated tuple per term, carrying the raw term (no JSON serialization)
+    keyterm_vals = [v for (n, v) in captured["fields"] if n == "keyterms"]
+    assert keyterm_vals == ["GIB", "dwang", "BRANZ"]
+
+
+def test_transcribe_segment_caps_keyterm_length_below_50(monkeypatch):
+    monkeypatch.setattr(eu, "ELEVENLABS_API_KEY", "xi-key")
+    captured = {}
+
+    def fake_request(self, method, url, fields=None, headers=None, timeout=None):
+        captured["fields"] = fields
+        return _FakeResponse(200, SCRIBE_RESPONSE)
+
+    monkeypatch.setattr(eu.urllib3.PoolManager, "request", fake_request)
+    long_term = "x" * 60
+    eu.transcribe_segment(b"\x00", "seg.wav", keyterms=[long_term])
+    keyterm_vals = [v for (n, v) in captured["fields"] if n == "keyterms"]
+    assert len(keyterm_vals[0]) <= 49 and len(keyterm_vals[0]) < 50
+
+
+KEYTERMS_400_BODY = {
+    "detail": {
+        "type": "validation_error",
+        "code": "invalid_parameters",
+        "message": "All keywords must be less than 50 characters.",
+        "status": "invalid_keyword_length",
+        "param": "keywords",
+    }
+}
+
+
+def test_transcribe_segment_keyterms_400_retries_once_without_keyterms(monkeypatch):
+    monkeypatch.setattr(eu, "ELEVENLABS_API_KEY", "xi-key")
+    seq = [_FakeResponse(400, KEYTERMS_400_BODY), _FakeResponse(200, SCRIBE_RESPONSE)]
+    calls = []
+
+    def fake_request(self, method, url, fields=None, headers=None, timeout=None):
+        calls.append(fields)
+        return seq.pop(0)
+
+    monkeypatch.setattr(eu.urllib3.PoolManager, "request", fake_request)
+    out = eu.transcribe_segment(b"\x00", "seg.wav", keyterms=["GIB", "dwang"])
+    assert out["results"]["transcripts"][0]["transcript"] == "pour the slab today"
+    assert seq == []  # exactly two requests: original + one retry
+    assert len(calls) == 2
+    # first attempt carried keyterms; the retry carried none
+    assert any(n == "keyterms" for (n, v) in calls[0])
+    assert not any(n == "keyterms" for (n, v) in calls[1])
+
+
+def test_transcribe_segment_non_keyterms_400_does_not_retry(monkeypatch):
+    monkeypatch.setattr(eu, "ELEVENLABS_API_KEY", "xi-key")
+    bad_model_body = {
+        "detail": {
+            "type": "validation_error",
+            "code": "invalid_parameters",
+            "message": "Invalid model_id.",
+            "status": "invalid_model",
+            "param": "model_id",
+        }
+    }
+    calls = []
+
+    def fake_request(self, method, url, fields=None, headers=None, timeout=None):
+        calls.append(fields)
+        return _FakeResponse(400, bad_model_body)
+
+    monkeypatch.setattr(eu.urllib3.PoolManager, "request", fake_request)
+    with pytest.raises(RuntimeError, match="HTTP 400"):
+        eu.transcribe_segment(b"\x00", "seg.wav", keyterms=["GIB"])
+    assert len(calls) == 1  # surfaced immediately, no retry
 
 
 def test_transcribe_segment_retries_then_succeeds(monkeypatch):
