@@ -50,16 +50,26 @@ Environment Variables:
 import json
 import logging
 import os
-import re
 from urllib.parse import unquote_plus
 
 import boto3
 
 import lambda_ingest
+import keyframe_request
 import match_request
 from db.connection import get_connection
+from keyframe_selection import keyframe_seconds
+from photo_binding import PHOTOS_PER_TOPIC_CAP  # noqa: F401  (re-export)
+from photo_binding import list_pictures as _pb_list_pictures
+from photo_binding import photos_for_topics as _photos_for_topics
 from repositories import companies, findings, recordings, topics
-from transcript_utils import extract_base_time_from_filename
+# The extraction-key shape lives in session_scope now (the read side needs the
+# SAME parse to derive session_id from topics.source_s3_key -- see that
+# module). Re-exported under the historical private names so existing callers
+# and tests keep working; same extraction pattern photo_binding/
+# keyframe_selection already followed.
+from session_scope import EXTRACTION_KEY_RE  # noqa: F401  (re-export)
+from session_scope import parse_extraction_key as _parse_extraction_key
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -68,11 +78,11 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "")
 CONFIG_KEY = os.environ.get("CONFIG_KEY", "config/user_mapping.json")
 COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 
+# video-keyframe plan: ship the pipeline change inert -- only when
+# EnableKeyframes flips this env true does item-writer emit keyframe_requests/.
+EMIT_KEYFRAME_REQUESTS = os.environ.get("EMIT_KEYFRAME_REQUESTS", "false").lower() == "true"
+
 EXTRACTIONS_PREFIX = "extractions/"
-# Depth-exact: extractions/{user_folder}/{date}/{name}.json -- a key nested
-# any deeper (or shallower, or not ending in .json) is not this contract's
-# shape and must be skipped rather than guessed at.
-EXTRACTION_KEY_RE = re.compile(r"^extractions/([^/]+)/([^/]+)/([^/]+)\.json$")
 
 _s3_client = None
 
@@ -84,110 +94,27 @@ def s3():
     return _s3_client
 
 
-def _parse_extraction_key(key):
-    m = EXTRACTION_KEY_RE.match(key)
-    if not m:
-        return None
-    user_folder, date, session_base = m.group(1), m.group(2), m.group(3)
-    return user_folder, date, session_base
-
-
 # ----------------------------------------------------------
 # Task 3 (authority-flip plan) -- time-correlated photo attach.
-# Mirrors lambda_report_generator's photo correlation
-# (correlate_photos_with_transcripts, lambda_report_generator.py:386-402),
-# which reads photos from users/{user}/pictures/{date}/ -- but keyed on
-# each topic's own 'HH:MM – HH:MM' time_range display window instead of
-# nearest-transcript proximity.
+#
+# P2 (2026-07-23 prod-media-binding plan): the matcher and the pictures
+# lister now live in photo_binding, shared with lambda_ingest's report path
+# (P4) -- a direct import of THIS module from lambda_ingest would be
+# circular, since this module imports lambda_ingest for the identity
+# bridge. The rule also changed there: strict containment against the
+# topic's time_range stranded every prod photo by 1-2 minutes
+# (topic_photos: 0 rows across all of prod history). 2026-07-24 correction:
+# binding is bounded-tolerance (inside the window, or within
+# PHOTO_TOLERANCE_MIN=2 min of an edge; beyond that, no binding at all --
+# the never-orphan fallback was removed) -- see photo_binding's docstring.
+# The aliases below keep the historical private names importable for
+# existing callers and tests.
 # ----------------------------------------------------------
 
-PHOTOS_PER_TOPIC_CAP = 5  # report-generator parity (related[:5], :402)
-
-# En-dash time_range, e.g. "10:00 – 10:05" (exactly what topics.upsert_topic
-# callers already write -- see make_extraction() fixtures in the test file
-# and lambda_ingest's own report topic fixtures).
-_TIME_RANGE_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*–\s*(\d{1,2}):(\d{2})$")
-
-
-def _hhmm_to_minutes(hhmm):
-    h, m = hhmm.split(":")
-    return int(h) * 60 + int(m)
-
-
-def _parse_time_range(time_range):
-    """'HH:MM – HH:MM' -> (start_minutes, end_minutes), or None if
-    time_range is missing/unparseable (never raises -- callers treat 'no
-    range' as 'no photos', not an error)."""
-    if not time_range:
-        return None
-    m = _TIME_RANGE_RE.match(time_range.strip())
-    if not m:
-        return None
-    start_h, start_m, end_h, end_m = m.groups()
-    return int(start_h) * 60 + int(start_m), int(end_h) * 60 + int(end_m)
-
-
-def _photos_for_topics(photo_objects, topics):
-    """PURE. photo_objects: [{key, filename, hhmm}] -- hhmm ('HH:MM') is
-    already derived by the caller from the BUG-01-safe transcript_utils
-    filename extractor. topics: the extraction JSON's topic dicts (each may
-    carry 'time_range').
-
-    Returns {topic_index: [matched photo_objects entries]}. Only indices
-    whose topic has a parseable time_range appear in the result -- topics
-    with an unparseable/missing time_range get none (callers use
-    .get(i, [])). A photo attaches to AT MOST one topic: the first
-    (lowest-index) topic whose time_range window contains its HH:MM. Each
-    topic's list is capped at PHOTOS_PER_TOPIC_CAP.
-
-    NOTE: the `topics` parameter name intentionally shadows the
-    module-level `repositories.topics` import -- this function is pure and
-    never touches that module; the name is kept to match the design's
-    exact signature.
-    """
-    ranges = {}
-    for i, t in enumerate(topics):
-        parsed = _parse_time_range(t.get("time_range"))
-        if parsed is not None:
-            ranges[i] = parsed
-
-    result = {i: [] for i in ranges}
-    for p in photo_objects:
-        hhmm = p.get("hhmm")
-        if not hhmm:
-            continue
-        p_minutes = _hhmm_to_minutes(hhmm)
-        for i, (start, end) in ranges.items():  # insertion order == ascending topic index
-            if start <= p_minutes <= end:
-                result[i].append(p)
-                break  # first matching topic wins -- a photo attaches at most once
-
-    for i in result:
-        result[i] = result[i][:PHOTOS_PER_TOPIC_CAP]
-    return result
-
-
 def _list_pictures(prefix):
-    """List S3 pictures under prefix (paginated), deriving each photo's
-    clock time (BUG-01-safe) via transcript_utils.extract_base_time_from_
-    filename. A photo whose filename carries no parseable timestamp is
-    skipped -- it can never time-correlate to a topic anyway (mirrors
-    lambda_report_generator, which likewise only correlates photos with a
-    resolvable timestamp)."""
-    photo_objects = []
-    paginator = s3().get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            filename = key.rsplit("/", 1)[-1]
-            base_time = extract_base_time_from_filename(filename)
-            if base_time is None:
-                continue
-            photo_objects.append({
-                "key": key, "filename": filename,
-                "hhmm": base_time.strftime("%H:%M"),
-            })
-    return photo_objects
+    """Pictures listing bound to THIS module's S3 client + bucket (the
+    shared lister is client-parameterized so lambda_ingest can reuse it)."""
+    return _pb_list_pictures(s3(), S3_BUCKET, prefix)
 
 
 # ----------------------------------------------------------
@@ -264,6 +191,7 @@ def write_extraction_items(date, user_folder, extraction_key):
 
         topics_n = 0
         collected_topics = []
+        keyframe_topics = []  # video-keyframe plan: {topic_id, time_range} of gate-passers
         for i, t in enumerate(extraction_topics):
             mapped_action_items = lambda_ingest._map_action_items(t.get("action_items"))
             matched_photos = photos_by_topic.get(i, [])
@@ -298,7 +226,13 @@ def write_extraction_items(date, user_folder, extraction_key):
                 # rollback.
                 time_range=t.get("time_range"), participants=t.get("participants"),
                 work_class=_wc, work_confidence=_wconf, is_mixed=(t.get("is_mixed") is True),
-                photos=[{"s3_key": p["key"], "caption_text": None} for p in matched_photos],
+                # video-keyframe plan (Task 4): re-bound synthetic keyframes
+                # (filename carries the '_kf_' marker) keep an "Auto keyframe"
+                # caption so the UI can still distinguish them after an
+                # item-writer re-run; real photos stay caption-less (None).
+                photos=[{"s3_key": p["key"],
+                         "caption_text": "Auto keyframe" if "_kf_" in p["filename"] else None}
+                        for p in matched_photos],
             )
             # Task 2 (programme-impact-link plan) -- persist this topic's
             # rich extraction findings in the SAME transaction as the topic
@@ -332,6 +266,13 @@ def write_extraction_items(date, user_folder, extraction_key):
                     "entity_trade": f["entity_trade"],
                 } for f in finding_rows],
             })
+            # video-keyframe plan (Task 2): collect the durable id + time_range
+            # of every topic whose window passes the >=2-minute gate (i.e.
+            # keyframe_seconds yields at least one frame). The KeyframeFunction
+            # recomputes the exact frame instants itself from time_range.
+            if keyframe_seconds(t.get("time_range")):
+                keyframe_topics.append({"topic_id": str(row["id"]),
+                                        "time_range": t.get("time_range")})
             topics_n += 1
 
     logger.info("item-writer wrote extraction=%s topics=%d", extraction_key, topics_n)
@@ -343,6 +284,14 @@ def write_extraction_items(date, user_folder, extraction_key):
     # anyway since collected_topics would be empty.
     if collected_topics:
         match_request.emit(s3(), S3_BUCKET, site["id"], date, extraction_key, collected_topics)
+
+    # video-keyframe plan (Task 2): post-commit, like match_request above --
+    # the KeyframeFunction reads these durable topic ids. Env-gated so the
+    # pipeline change ships inert. Video availability is resolved by the
+    # keyframe fn itself (vad-metadata coverage) -- audio-only days no-op there.
+    if EMIT_KEYFRAME_REQUESTS and keyframe_topics:
+        keyframe_request.emit(s3(), S3_BUCKET, user_folder, date, session_base,
+                              extraction_key, keyframe_topics)
 
     return {"skipped": False, "topics": topics_n}
 

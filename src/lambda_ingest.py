@@ -63,6 +63,7 @@ from urllib.parse import unquote_plus
 import boto3
 
 import match_request
+import photo_binding
 import reindex
 from chunking import chunk_report, chunk_transcripts
 from db.connection import get_connection
@@ -113,6 +114,15 @@ def s3():
     if _s3_client is None:
         _s3_client = boto3.client("s3")
     return _s3_client
+
+
+def _list_report_pictures(user_folder, date):
+    """Photo listing for the report-ingest path (P4, 2026-07-23
+    prod-media-binding plan) -- the SAME lister the item-writer uses, bound to
+    this module's S3 client (photo_binding.list_pictures is
+    client-parameterized precisely so both paths can share it)."""
+    return photo_binding.list_pictures(s3(), S3_BUCKET,
+                                       f"users/{user_folder}/pictures/{date}/")
 
 
 def load_mapping() -> dict:
@@ -339,7 +349,16 @@ def ingest_report(date, user_folder, report_key):
         topic_seq_to_id = {}
         collected_topics = []
         if not defer_to_extraction:
-            for t in report.get("topics", []):
+            # P4 (2026-07-23 prod-media-binding plan): list the pictures
+            # prefix ONCE (paginator, outside the loop) and time-correlate it
+            # against this report's topics with the shared matcher, so
+            # report-sourced topics carry photos exactly like extraction ones.
+            # Only this branch lists -- a defer day writes no report topics
+            # and must not spend the S3 LIST.
+            report_topics = report.get("topics", [])
+            photos_by_topic = photo_binding.photos_for_topics(
+                _list_report_pictures(user_folder, date), report_topics)
+            for i, t in enumerate(report_topics):
                 mapped_action_items = _map_action_items(t.get("action_items"))
                 row = topics.upsert_topic(
                     conn, site["id"], date, t.get("topic_title", ""),
@@ -348,6 +367,8 @@ def ingest_report(date, user_folder, report_key):
                     action_items=mapped_action_items,
                     safety=_map_safety(t.get("safety_flags")),
                     time_range=t.get("time_range"), participants=t.get("participants"),
+                    photos=[{"s3_key": p["key"], "caption_text": None}
+                            for p in photos_by_topic.get(i, [])],
                 )
                 # None keys stay out of the map: a literal "topic_id": null
                 # topic must not adopt the unassigned transcript windows

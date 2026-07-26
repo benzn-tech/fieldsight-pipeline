@@ -124,6 +124,11 @@ def wired(monkeypatch):
     # implements get_object, so stub emit to a no-op by default here;
     # tests that care about the emit call override this explicitly.
     monkeypatch.setattr(iw.match_request, "emit", lambda *a, **k: None)
+    # video-keyframe plan: same reasoning for the keyframe_requests/ emit, and
+    # keep emission OFF by default (module constant is env-gated at import) so
+    # the pre-existing tests never trip it.
+    monkeypatch.setattr(iw.keyframe_request, "emit", lambda *a, **k: None)
+    monkeypatch.setattr(iw, "EMIT_KEYFRAME_REQUESTS", False)
     return monkeypatch
 
 
@@ -662,13 +667,112 @@ def test_no_findings_key_still_works(wired):
 
 
 # ---------------------------------------------------------------------------
+# video-keyframe plan, Task 2 -- item-writer emits a keyframe_requests/
+# artifact post-commit, gated by EMIT_KEYFRAME_REQUESTS, carrying ONLY the
+# topics whose time_range passes the >=2-minute gate (keyframe_seconds
+# non-empty), with their durable topic ids + time_ranges.
+# ---------------------------------------------------------------------------
+
+def _two_topic_extraction():
+    """One gate-passing topic (5 min) + one gated-out topic (same-minute)."""
+    passing = {
+        "topic_title": "Long talk-to-camera", "category": "progress",
+        "summary": "Walkthrough.", "time_range": "10:00 – 10:05",
+        "action_items": [], "safety_flags": [],
+    }
+    gated = {
+        "topic_title": "Quick note", "category": "general",
+        "summary": "Brief.", "time_range": "12:14 – 12:14",
+        "action_items": [], "safety_flags": [],
+    }
+    return make_extraction(topics=[passing, gated])
+
+
+def _upsert_incrementing(wired):
+    """Give each upserted topic a distinct id so emit payloads are checkable."""
+    counter = {"n": 0}
+
+    def fake_upsert(conn, site_id, report_date, title, **kw):
+        counter["n"] += 1
+        return {"id": f"topic-{counter['n']}"}
+
+    wired.setattr(iw.topics, "upsert_topic", fake_upsert)
+
+
+def test_keyframe_request_emitted_only_for_gated_topics_when_enabled(wired):
+    wired.setattr(iw, "EMIT_KEYFRAME_REQUESTS", True)
+    wired.setattr(iw, "_s3_client", FakeS3({EXTRACTION_KEY: json.dumps(_two_topic_extraction())}))
+    _upsert_incrementing(wired)
+    calls = []
+    wired.setattr(
+        iw.keyframe_request, "emit",
+        lambda s3_client, bucket, user_folder, date, session_base, extraction_key, topics:
+            calls.append((bucket, user_folder, date, session_base, extraction_key, topics))
+            or "keyframe_requests/Jarley_Trainor/2026-07-06/abc.json",
+    )
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 2}
+    assert len(calls) == 1
+    bucket, user_folder, date, session_base, extraction_key, topics = calls[0]
+    assert bucket == iw.S3_BUCKET
+    assert user_folder == "Jarley_Trainor"
+    assert date == "2026-07-06"
+    assert session_base == "Benl1_2026-07-06_10-00-00"
+    assert extraction_key == EXTRACTION_KEY
+    # ONLY the 5-min topic (topic-1); the same-minute topic is gated out.
+    assert topics == [{"topic_id": "topic-1", "time_range": "10:00 – 10:05"}]
+
+
+def test_keyframe_request_not_emitted_when_no_gated_topic(wired):
+    wired.setattr(iw, "EMIT_KEYFRAME_REQUESTS", True)
+    gated_only = {
+        "topic_title": "Quick note", "category": "general", "summary": "Brief.",
+        "time_range": "12:12 – 12:13", "action_items": [], "safety_flags": [],
+    }
+    wired.setattr(iw, "_s3_client",
+                  FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(topics=[gated_only]))}))
+    calls = []
+    wired.setattr(iw.keyframe_request, "emit", lambda *a, **k: calls.append(a) or None)
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 1}
+    assert calls == []
+
+
+def test_keyframe_request_not_emitted_when_flag_disabled(wired):
+    wired.setattr(iw, "EMIT_KEYFRAME_REQUESTS", False)
+    wired.setattr(iw, "_s3_client", FakeS3({EXTRACTION_KEY: json.dumps(_two_topic_extraction())}))
+    _upsert_incrementing(wired)
+    calls = []
+    wired.setattr(iw.keyframe_request, "emit", lambda *a, **k: calls.append(a) or None)
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 2}
+    assert calls == []  # gated topic present, but emission is off
+
+
+# ---------------------------------------------------------------------------
 # Task 3 (authority-flip plan) -- _photos_for_topics pure helper: time-
 # correlates S3 pictures (already resolved to {key, filename, hhmm} by the
 # BUG-01-safe transcript_utils filename extractor) against each topic's
-# 'HH:MM – HH:MM' time_range window. Mirrors lambda_report_generator's
-# correlate_photos_with_transcripts (lambda_report_generator.py:386-402),
-# but keyed on a topic's own display window instead of nearest-transcript
-# proximity.
+# 'HH:MM – HH:MM' time_range window.
+#
+# P2 (2026-07-23 prod-media-binding plan): the helper now DELEGATES to
+# photo_binding (shared with lambda_ingest's report path) and the rule
+# changed -- strict containment stranded every prod photo by 1-2 minutes
+# (topic_photos held 0 rows across all of prod history).
+#
+# 2026-07-24 correction (supersedes P2's unbounded nearest-wins): a photo
+# binds to a topic only if inside its window or within PHOTO_TOLERANCE_MIN
+# (2) minutes of an edge; ties -> lowest topic index; beyond that it binds
+# to nothing (the never-orphan fallback is gone). Cap raised 5 -> 10 with
+# cascade to the next-nearest QUALIFYING topic. The exhaustive rule table
+# lives in tests/unit/test_photo_binding.py; the cases below stay here to
+# pin the delegation and the module-level aliases.
 # ---------------------------------------------------------------------------
 
 def _photo(name, hhmm):
@@ -676,19 +780,24 @@ def _photo(name, hhmm):
             "filename": name, "hhmm": hhmm}
 
 
-def test_photo_matches_inside_time_range_only():
+def test_photo_near_window_binds_via_tolerance():
+    # Was test_photo_matches_inside_time_range_only (strict containment): the
+    # 10:06 photo, 1 minute outside the window, used to bind to nothing --
+    # exactly the prod defect. It's within PHOTO_TOLERANCE_MIN (2 min), so it
+    # still qualifies and binds under the current bounded-tolerance rule.
     topics_list = [{"time_range": "10:00 – 10:05"}]
     inside = _photo("a.jpg", "10:02")
     outside = _photo("b.jpg", "10:06")
 
     result = iw._photos_for_topics([inside, outside], topics_list)
 
-    assert result == {0: [inside]}
+    assert result == {0: [inside, outside]}
 
 
 def test_photo_attaches_to_first_matching_topic_only():
-    # Two topics with overlapping time_range windows -- a photo that falls
-    # inside both must attach ONLY to the first (lowest-index) one.
+    # Two topics with overlapping time_range windows -- a photo inside both
+    # is equidistant (distance 0 from each), so the tie-break sends it to
+    # the lowest-index topic ONLY. Unchanged by the P2 rule change.
     topics_list = [
         {"time_range": "09:00 – 10:00"},
         {"time_range": "09:30 – 11:00"},
@@ -700,17 +809,24 @@ def test_photo_attaches_to_first_matching_topic_only():
     assert result == {0: [photo], 1: []}
 
 
-def test_cap_five_photos_per_topic():
+def test_cap_ten_photos_per_topic():
+    # Was test_cap_five_photos_per_topic: the cap is PHOTOS_PER_TOPIC_CAP=10
+    # (raised from the report-generator's 5). This day has a single topic, so
+    # the 11th photo has nowhere to cascade to and is dropped with a warning.
     topics_list = [{"time_range": "09:00 – 10:00"}]
-    photos = [_photo(f"p{i}.jpg", f"09:1{i}") for i in range(6)]
+    photos = [_photo(f"p{i:02d}.jpg", f"09:{i:02d}") for i in range(11)]
 
     result = iw._photos_for_topics(photos, topics_list)
 
-    assert len(result[0]) == 5
-    assert result[0] == photos[:5]  # first 5, cap does not reorder
+    assert iw.PHOTOS_PER_TOPIC_CAP == 10
+    assert len(result[0]) == 10
+    assert result[0] == photos[:10]  # first 10, cap does not reorder
 
 
 def test_unparseable_time_range_gets_no_photos():
+    # Survives the P2 rule change verbatim: a topic with no parseable window
+    # never joins the candidate set while another topic has one, and the
+    # all-indices result contract is tolerated by .get(i, []).
     topics_list = [
         {"time_range": None},          # missing
         {"time_range": "not a range"},  # unparseable
@@ -753,6 +869,32 @@ def test_item_writer_upserts_topic_photos(wired):
     # make_extraction()'s one topic has time_range "10:00 – 10:05";
     # the photo's filename encodes 10:02, inside that window.
     assert captured[0]["photos"] == [{"s3_key": photo_key, "caption_text": None}]
+
+
+def test_item_writer_captions_kf_files_on_rebind(wired):
+    # video-keyframe plan, Task 4: when item-writer re-lists the pictures
+    # prefix and re-binds a synthetic keyframe (its filename parses to a
+    # mid-topic time inside the window), the photo mapping must carry
+    # caption_text "Auto keyframe" for _kf_ files and None for real photos.
+    prefix = "users/Jarley_Trainor/pictures/2026-07-06/"
+    kf_key = prefix + "Benl1_2026-07-06_10-03-00_kf_s100000.jpg"   # parses to 10:03, in window
+    normal_key = prefix + "Benl1_2026-07-06_10-02-00.jpg"           # real photo at 10:02
+    wired.setattr(iw, "_s3_client", FakeS3({
+        EXTRACTION_KEY: json.dumps(make_extraction()),   # one topic, 10:00 – 10:05
+        kf_key: b"", normal_key: b"",
+    }))
+    captured = []
+    wired.setattr(
+        iw.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            captured.append(kw) or {"id": "topic-uuid-0"},
+    )
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert len(captured) == 1
+    photos = {p["s3_key"]: p["caption_text"] for p in captured[0]["photos"]}
+    assert photos == {kf_key: "Auto keyframe", normal_key: None}
 
 
 def test_missing_pictures_prefix_is_noop(wired):

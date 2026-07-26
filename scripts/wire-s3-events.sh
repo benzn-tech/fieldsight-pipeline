@@ -41,8 +41,9 @@ EMBED_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-embed-repor
 EXTRACT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-extract-session"
 ITEM_WRITER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-item-writer"
 MATCHER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-programme-matcher"
+KEYFRAME_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-keyframe"
 
-echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer ProgrammeMatcher=${PREFIX}-programme-matcher"
+echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer ProgrammeMatcher=${PREFIX}-programme-matcher Keyframe=${PREFIX}-keyframe"
 
 # ---- desired LambdaFunctionConfigurations (our managed entries, Id prefix fs-) ----
 # Only wire functions that actually exist: VadFunction is conditional in the
@@ -157,6 +158,23 @@ if fn_exists "${PREFIX}-programme-matcher"; then
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-programme-matcher not deployed — skipping programme-matcher trigger"
+fi
+# NOTE(video-keyframe plan): the in-VPC keyframe extractor triggers on
+# keyframe_requests/*.json, written post-commit by item-writer. Prefix is
+# disjoint from every other wired prefix (users/, audio_segments/,
+# transcripts/, reports/, embeddings/, extractions/, match_requests/,
+# reindex_requests/, reindex_vectors/) — no double-trigger. Its own OUTPUT
+# (.jpg under users/*/pictures/) matches no rule here (the users/ rules are
+# suffix .wav/.mp4) — no BUG-13 loop. Same fn_exists guard as the others: a
+# stack deployed without the VAD layer has no keyframe fn.
+if fn_exists "${PREFIX}-keyframe"; then
+  WIRE_FNS+=("${PREFIX}-keyframe")
+  DESIRED=$(jq -c --arg arn "$KEYFRAME_ARN" '. + [
+    {"Id":"fs-keyframe-requests","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"keyframe_requests/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-keyframe not deployed — skipping keyframe trigger"
 fi
 
 CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --output json 2>/dev/null || echo '{}')

@@ -27,6 +27,31 @@ class FakeConn:
         return self.cur
 
 
+class ScanCursor:
+    """Returns a canned row list per table, keyed off the SQL's FROM clause."""
+
+    def __init__(self, by_table):
+        self.by_table = by_table
+        self.sql_log = []
+
+    def execute(self, sql, params=None):
+        self.sql_log.append(sql)
+        table = sql.split(" FROM ")[1].split(" ")[0]
+        self._rows = self.by_table.get(table, [])
+        return self
+
+    def fetchall(self):
+        return self._rows
+
+
+class ScanConn:
+    def __init__(self, by_table):
+        self.cur = ScanCursor(by_table)
+
+    def cursor(self, *a, **k):
+        return self.cur
+
+
 def test_editable_allow_list_matches_spec():
     assert content.EDITABLE["topics"] == {"title", "summary"}
     assert content.EDITABLE["action_items"] == {"text", "responsible"}
@@ -76,3 +101,93 @@ def test_update_content_field_only_writes_whitelisted_column():
 def test_update_content_field_rejects_non_whitelisted_field():
     conn = FakeConn(None)
     assert content.update_content_field(conn, "topics", "t-1", "category", "x") is None
+
+
+# ----------------------------------------------------------
+# is_propagatable / _PROPAGATE_EXTRA — propagation-only fields (findings.
+# impact_note): rewritable by intra-topic propagation, but NOT individually
+# editable (not in EDITABLE).
+# ----------------------------------------------------------
+def test_is_propagatable_true_for_editable_and_propagate_extra():
+    assert content.is_propagatable("findings", "observation")   # EDITABLE
+    assert content.is_propagatable("findings", "impact_note")   # _PROPAGATE_EXTRA
+
+
+def test_is_propagatable_false_for_hard_excluded_impact_fields():
+    for field in ("impact_severity", "impact_evidence", "impact_task_name",
+                  "impact_matched_at"):
+        assert not content.is_propagatable("findings", field)
+    assert not content.is_propagatable("unknown_table", "impact_note")
+
+
+def test_impact_note_is_not_individually_editable():
+    # The whole point: propagatable != editable. impact_note must stay out of
+    # EDITABLE/is_editable so patch_content and history never expose it as a
+    # directly-editable field.
+    assert not content.is_editable("findings", "impact_note")
+    assert "impact_note" not in content.EDITABLE["findings"]
+
+
+def test_update_content_field_writes_propagate_only_field():
+    # apply_topic_correction writes through update_content_field too, so it
+    # must accept the propagation-only extra even though is_editable rejects it.
+    conn = FakeConn({"id": "f-1", "impact_note": "McCahon delayed the pour"})
+    row = content.update_content_field(
+        conn, "findings", "f-1", "impact_note", "McCahon delayed the pour")
+    assert row["impact_note"] == "McCahon delayed the pour"
+    assert "update findings set impact_note" in conn.cur.sql.lower()
+
+
+# ----------------------------------------------------------
+# list_topic_content_fields — the intra-topic propagation blast radius
+# ----------------------------------------------------------
+_SCAN = {
+    "topics": [{"id": "t-1", "title": "Mackon slab", "summary": "Mackon poured it"}],
+    "action_items": [{"id": "a-1", "text": "call Mackon", "responsible": "Mackon"}],
+    "findings": [{"id": "f-1", "observation": "Mackon left the edge open",
+                  "recommended_action": None, "entity_name": "Mackon",
+                  "entity_trade": None,
+                  "impact_note": "Mackon's delay pushed the pour back two days"}],
+}
+
+
+def test_list_topic_content_fields_covers_all_three_tables():
+    cells = content.list_topic_content_fields(ScanConn(_SCAN), "t-1")
+    assert {(c["table"], c["field"]) for c in cells} == {
+        ("topics", "title"), ("topics", "summary"),
+        ("action_items", "text"), ("action_items", "responsible"),
+        ("findings", "observation"), ("findings", "entity_name"),
+        # impact_note is propagation-only (_PROPAGATE_EXTRA): scanned/rewritten
+        # here, but NOT in EDITABLE, so it stays out of patch_content/history.
+        ("findings", "impact_note"),
+    }
+    assert [c["table"] for c in cells][:2] == ["topics", "topics"]   # stable order
+
+
+def test_list_topic_content_fields_skips_null_cells():
+    cells = content.list_topic_content_fields(ScanConn(_SCAN), "t-1")
+    # recommended_action / entity_trade are NULL -> never previewed, so they
+    # can never be rewritten either.
+    assert all(c["field"] not in ("recommended_action", "entity_trade") for c in cells)
+    assert all(c["value"] is not None for c in cells)
+
+
+def test_list_topic_content_fields_selects_propagatable_columns_only():
+    # impact_note IS now selected (propagation-only, _PROPAGATE_EXTRA), but the
+    # hard-excluded impact_* fields (mirror/enum/jsonb/timestamp) never are.
+    conn = ScanConn(_SCAN)
+    content.list_topic_content_fields(conn, "t-1")
+    joined = " ".join(conn.cur.sql_log)
+    assert "impact_note" in joined
+    for banned in ("impact_task_name", "impact_evidence", "impact_matched_at",
+                   "severity", "domain", "status", "priority", "category"):
+        assert banned not in joined
+
+
+def test_list_topic_content_fields_scopes_children_by_topic_id():
+    conn = ScanConn(_SCAN)
+    content.list_topic_content_fields(conn, "t-1")
+    sqls = {s.split(" FROM ")[1].split(" ")[0]: s for s in conn.cur.sql_log}
+    assert "WHERE id=%s" in sqls["topics"]                   # the topic row itself
+    assert "WHERE topic_id=%s" in sqls["action_items"]       # never the whole day
+    assert "WHERE topic_id=%s" in sqls["findings"]

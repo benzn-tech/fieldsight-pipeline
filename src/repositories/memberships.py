@@ -2,7 +2,8 @@ from psycopg.rows import dict_row
 from repositories.acl import resolve_scope  # re-export
 
 __all__ = ["resolve_scope", "add_membership", "accessible_site_ids", "ensure_membership", "list_company_memberships",
-          "members_for_site", "caller_site_roles", "worker_user_ids_for_sites"]
+          "members_for_site", "caller_site_roles", "worker_user_ids_for_sites",
+          "user_ids_for_sites"]
 
 
 def add_membership(conn, user_id, site_id, role) -> dict:
@@ -119,6 +120,23 @@ def caller_site_roles(conn, user_id) -> dict:
         (user_id,),
     ).fetchall()
     return {str(r[0]): r[1] for r in rows}
+
+
+def user_ids_for_sites(conn, site_ids) -> set:
+    """Distinct user_ids holding ANY non-archived membership on any of
+    site_ids -- the SITE tier's author set (pm / regional_manager see every
+    author on an in-scope site, visibility spec 3.1). Mirrors
+    worker_user_ids_for_sites exactly, minus the role filter; kept as a
+    separate function rather than a role= kwarg so neither call site can
+    accidentally widen the other. Empty in -> empty out, no round-trip."""
+    if not site_ids:
+        return set()
+    rows = conn.execute(
+        "SELECT DISTINCT user_id FROM memberships "
+        "WHERE site_id = ANY(%s::uuid[]) AND archived_at IS NULL",
+        (list(site_ids),),
+    ).fetchall()
+    return {str(r[0]) for r in rows}
 
 
 def worker_user_ids_for_sites(conn, site_ids) -> set:

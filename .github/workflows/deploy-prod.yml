@@ -6,6 +6,8 @@ name: Deploy FieldSight PROD (SAM)
 # Shares Aurora / RAG / the S3 lake with fieldsight-test — tenant
 # isolation is row-level (company_id/site). See
 # docs/superpowers/plans/2026-07-14-prod-isolation.md.
+# NOTE: as of db-isolation cutover, ONLY prod uses `fieldsight`; test uses
+# `fieldsight_test`. schema_migrations is per-database.
 # ============================================================
 
 on:
@@ -27,7 +29,42 @@ env:
   AWS_REGION: ap-southeast-2
 
 jobs:
+  # ------------------------------------------------------------------
+  # Test gate. Until 2026-07-23 the `Tests` workflow and this deploy ran
+  # independently, so a red suite did not stop a production release —
+  # PR #117 left test_repo_content_edits failing on feature, develop AND
+  # main, and PR #118 still deployed to prod. `needs:` cannot reference a
+  # job in another workflow file, so the suite is mirrored here (same
+  # setup as .github/workflows/test.yml) and deploy-prod depends on it.
+  # Keep the two in sync: if test.yml's setup changes, change this too.
+  # ------------------------------------------------------------------
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: fieldsight
+          POSTGRES_PASSWORD: fieldsight
+          POSTGRES_DB: fieldsight_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U fieldsight"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://fieldsight:fieldsight@localhost:5432/fieldsight_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip
+      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 pytest pytest-cov
+      - run: python -m pytest -v
+
   deploy-prod:
+    needs: tests                  # red suite ⇒ no production deploy
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production       # required-reviewer approval gate
@@ -77,6 +114,26 @@ jobs:
           VPC="$(echo "$FARGATE_VPC_ID" | xargs)"
           SUBNETS="$(echo "$FARGATE_SUBNET_IDS" | tr ',' ' ' | xargs | tr ' ' ',')"
           DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
+          # KEYFRAME FEATURE — activating it on PROD needs BOTH repo vars set:
+          #   * PROD_KEYFRAME_FFMPEG_LAYER_ARN -> the ffmpeg layer ARN
+          #     (KeyframeFfmpegLayerArn below). Intended value:
+          #     arn:aws:lambda:ap-southeast-2:509194952652:layer:sitesync-vad-layer:2
+          #     — runtime-agnostic (CompatibleRuntimes [python3.11, python3.12]),
+          #     bundles /opt/bin/ffmpeg, loads on the 3.11 KeyframeFunction next to the
+          #     cp311-only PsycopgLayer. Flips HasKeyframeFfmpegLayer -> HasKeyframeStack
+          #     so KeyframeFunction is CREATED. Unset => empty => stack stays uncreated.
+          #     Distinct from PROD_VAD_LAYER_ARN (cp312-only fieldsight-vad-layer for
+          #     VadFunction) — do not conflate.
+          #   * PROD_ENABLE_KEYFRAMES -> gates item-writer's keyframe_requests/ EMISSION.
+          #     Default false so a deploy ships inert; flip only after the created stack
+          #     + its IAM are verified.
+          # SAM rejects a bare "Key=" empty value, so the ffmpeg-layer override is appended
+          # only when PROD_KEYFRAME_FFMPEG_LAYER_ARN is set. Until it is, the keyframe stack
+          # is not created and unrelated prod deploys are unaffected (merge-safe).
+          KF_LAYER_PARAM=""
+          if [ -n "${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}" ]; then
+            KF_LAYER_PARAM="KeyframeFfmpegLayerArn=${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}"
+          fi
           sam deploy --config-env prod \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -94,6 +151,8 @@ jobs:
               "ManageDataBucketPolicy=false" \
               "VadLayerArn=${{ vars.PROD_VAD_LAYER_ARN }}" \
               "DocxLayerArn=${{ vars.PROD_DOCX_LAYER_ARN }}" \
+              "EnableKeyframes=${{ vars.PROD_ENABLE_KEYFRAMES || 'false' }}" \
+              $KF_LAYER_PARAM \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \
@@ -109,6 +168,8 @@ jobs:
               "ElevenLabsApiKey=$ELEVENLABS_API_KEY"
 
       - name: Apply DB migrations (fieldsight-prod-migrate — idempotent, shared schema_migrations)
+        # NOTE: as of db-isolation cutover, ONLY prod uses `fieldsight`; test uses
+        # `fieldsight_test`. schema_migrations is per-database.
         run: |
           set -e
           RESP="$(aws lambda invoke --function-name fieldsight-prod-migrate \

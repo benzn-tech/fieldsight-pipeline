@@ -30,12 +30,35 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   PATCH /api/org/observations/{id}        → update status (author or admin/gm)
   PATCH /api/org/action-items/{id}        → update priority/status/deadline/responsible
                                              (site-authority ACL + member-validated reassignment)
+  GET   /api/org/action-items/closures?from=&to= → action items CLOSED per NZ
+                                             calendar day in the window + the same-length
+                                             window before it, from the content_edits
+                                             status→done audit trail (ONE call, reach+tenant
+                                             scoped; backs the Today weekly KPI)
+  PATCH /api/org/compliance/resolution    → set/flip durable safety/quality
+                                             resolved-state on one row (natural-key
+                                             upsert; site-authority ACL; server-side
+                                             content_hash) — retires the DynamoDB
+                                             POST /api/actions/toggle overlay
+  GET   /api/org/compliance/resolutions?from=&to=&site=&domain= → one aggregate
+                                             range read for the union aggregator
+                                             (reach-gated; ?site/?domain optional)
   POST  /api/org/observations/{id}/archive→ soft-delete observation (admin/gm)
+  POST  /api/org/topics/{id}/propagate/preview → dry-run: which cells of THIS
+                                             topic still carry the wrong term
+                                             (read-only, no writes)
+  POST  /api/org/topics/{id}/propagate    → rewrite exactly those cells
+                                             (one transaction + one re-index)
   GET   /api/org/live-items?date=…        → live topics dashboard feed (ACL)
   GET   /api/org/dates?months=&site=      → Timeline dots: report-date index scoped to
                                              caller's accessible sites (ACL, kills dots leak)
   GET   /api/org/timeline?date=…&user=…   → daily_report.json compat shim: S3 verbatim
                                              or Aurora extraction override (ACL, authority-flip)
+  GET   /api/org/sessions?date=&user= → the day's recording sessions (one per
+                                             press-record→stop == one extraction key)
+                                             for the meeting-scoped export picker: id,
+                                             deterministic start, best-effort end/label,
+                                             counts, participants (ACL = /timeline's)
   GET   /api/org/transcripts?date=&user=&start=&end= → transcript speaker segments for a
                                              (user,date) window, Aurora-identity ACL (mirrors
                                              /timeline's graded-off shape; fixes the legacy
@@ -57,21 +80,32 @@ import logging
 import os
 import re
 import uuid
+# `date` is aliased: several handlers below bind a LOCAL `date` from
+# queryStringParameters, so an unaliased import would be shadowed there.
+from datetime import date as _date
 from datetime import datetime, timedelta, timezone
 
 import boto3
 from botocore.exceptions import ClientError
 from psycopg.errors import UniqueViolation
 
+import content_hash
 import reindex
+import session_scope
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
-from repositories import (action_items, aliases, classification_feedback, companies, content,
-                          content_edits, memberships, observations, programme,
-                          programme_suggestions, recordings, redactions, rollup,
-                          scope, sites, topics, users, voice_messages)
+from repositories import (action_items, aliases, classification_feedback, companies,
+                          compliance_resolutions, content, content_edits, keyframes,
+                          memberships, observations, programme, programme_suggestions,
+                          recordings, redactions, rollup, scope, sites, topics, users,
+                          voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
-from text_normalize import diff_candidates
+from text_normalize import diff_candidates, first_match_span, normalize, occurrences
+# Keyframe Q7 telemetry derivation (all AWS-free, pure helpers): the deleted
+# frame's structural signal is reconstructed from the still-live topic row.
+from keyframe_selection import keyframe_seconds
+from photo_binding import parse_time_range
+from transcript_utils import extract_base_time_from_filename
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -142,7 +176,7 @@ def ok(body, status=200):
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": "Content-Type,Authorization",
-            "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,OPTIONS",
+            "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
         },
         "body": json.dumps(body, default=str),
     }
@@ -245,9 +279,23 @@ def dispatch(conn, event, method, route):
     m_oa = re.match(r"^/observations/([^/]+)/archive$", route)
     if m_oa and method == "POST":
         return archive_observation_endpoint(conn, caller, m_oa.group(1))
+    # Literal first: /action-items/closures is a collection-level aggregate,
+    # not an item id (the regex below only serves PATCH, but keeping the
+    # literal ahead of it stops a future PATCH-shaped route from shadowing it).
+    if route == "/action-items/closures" and method == "GET":
+        return get_action_closures(conn, caller, event)
     m_ai = re.match(r"^/action-items/([^/]+)$", route)
     if m_ai and method == "PATCH":
         return patch_action_item(conn, caller, m_ai.group(1), parse_body(event))
+
+    # Durable safety/quality resolved-state (spec 2026-07-26). Literal routes,
+    # no id in the path (the row is addressed by its natural key in the body /
+    # query), so no greedy regex can shadow them. Singular PATCH = set/flip one;
+    # plural GET = the union aggregator's one range read.
+    if route == "/compliance/resolution" and method == "PATCH":
+        return patch_compliance_resolution(conn, caller, parse_body(event))
+    if route == "/compliance/resolutions" and method == "GET":
+        return get_compliance_resolutions(conn, caller, event)
 
     m_ce = re.match(r"^/content/([^/]+)/([^/]+)$", route)
     if m_ce and method == "PATCH":
@@ -255,6 +303,14 @@ def dispatch(conn, event, method, route):
     m_ch = re.match(r"^/content/([^/]+)/([^/]+)/history$", route)
     if m_ch and method == "GET":
         return get_content_history(conn, caller, m_ch.group(1), m_ch.group(2))
+
+    # Intra-topic correction propagation (item #3) -- preview BEFORE apply.
+    m_pp = re.match(r"^/topics/([^/]+)/propagate/preview$", route)
+    if m_pp and method == "POST":
+        return preview_topic_correction(conn, caller, m_pp.group(1), parse_body(event))
+    m_pa = re.match(r"^/topics/([^/]+)/propagate$", route)
+    if m_pa and method == "POST":
+        return apply_topic_correction(conn, caller, m_pa.group(1), parse_body(event))
 
     if route == "/aliases" and method == "POST":
         return create_alias_endpoint(conn, caller, parse_body(event), event)
@@ -279,8 +335,24 @@ def dispatch(conn, event, method, route):
     if route == "/timeline" and method == "GET":
         return get_timeline_compat(conn, caller, event)
 
+    if route == "/sessions" and method == "GET":
+        return get_org_sessions(conn, caller, event)
+
     if route == "/transcripts" and method == "GET":
         return get_org_transcripts(conn, caller, event)
+
+    if route == "/audio-segments" and method == "GET":
+        return get_org_audio_segments(conn, caller, event)
+
+    if route == "/video-segments" and method == "GET":
+        return get_org_video_segments(conn, caller, event)
+
+    if route == "/media/presigned-url" and method == "GET":
+        return get_org_media_presigned_url(conn, caller, event)
+    if route == "/media/keyframe" and method == "DELETE":
+        return delete_keyframe_endpoint(conn, caller, parse_body(event))
+    if route == "/reports/history" and method == "GET":
+        return get_org_report_history(conn, caller, event)
 
     if route == "/rollup/portfolio" and method == "GET":
         return list_portfolio_rollup(conn, caller, event)
@@ -1043,6 +1115,8 @@ def get_asset_url(event):
 # are already blocked by the dispatch guard above)
 # ----------------------------------------------------------
 REPORT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# The same date, matched ANYWHERE in an S3 key (report-history rows).
+REPORT_DATE_IN_KEY_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 
 def list_org_observations(conn, caller, event):
@@ -1120,12 +1194,86 @@ def _display_name(caller):
     return " ".join(p for p in (caller.get("first_name"), caller.get("last_name")) if p).strip()
 
 
+def _name_key(value):
+    """Normalize a person name for comparison: trim, collapse inner runs of
+    whitespace, casefold. `responsible` is free text the extraction model wrote
+    from speech, so "ben lin", "Ben  Lin" and "Ben Lin" all denote one person
+    and must compare equal."""
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _folder_key(value):
+    """Folder form of a name: whitespace -> underscore, matching how the client
+    and the S3 layout derive a folder. Lets "Ben_Lin" match "Ben Lin"."""
+    return "_".join(str(value or "").split()).casefold()
+
+
+def _is_assignee(row, caller):
+    """Is this task the caller's own to resolve?
+
+    Deliberately kept in step with the client's isMineTask predicate
+    (fieldsight-ui scripts/api/mine-team.js). When the server is stricter than
+    the client, the UI shows a task as yours with a live checkbox and the write
+    then 403s -- the interface lies. Same three rules as the client:
+
+      1. normalized name match (trim / collapse / case-insensitive)
+      2. folder-form match, so "Ben_Lin" == "Ben Lin"
+      3. UNASSIGNED and the caller recorded the topic it came from
+
+    Rule 3 grants authority strict equality never did, so keep its scope exact:
+    it requires the topic's own user_id to be the caller, which is the caller's
+    own recorded work and cannot reach anyone else's task. Site authority and
+    admin are checked separately by the caller."""
+    responsible = row.get("responsible")
+    if responsible and str(responsible).strip():
+        name = _display_name(caller)
+        return bool(name) and (
+            _name_key(responsible) == _name_key(name)
+            or _folder_key(responsible) == _folder_key(name)
+            or (bool(caller.get("folder_name"))
+                and _folder_key(responsible) == _folder_key(caller.get("folder_name")))
+        )
+    owner = row.get("topic_user_id")
+    return bool(owner) and bool(caller.get("id")) and str(owner) == str(caller.get("id"))
+
+
+class _ActionItemVanished(Exception):
+    """The row disappeared between the ACL read and the UPDATE -- abort the
+    whole transaction rather than commit audit rows for a task that isn't
+    there any more."""
+
+
+# Which action-item columns get a content_edits audit row on PATCH.
+# `deadline_text` is deliberately ABSENT: the handler writes it as a pure
+# MIRROR of `deadline`, from the same request key (§3.5), so auditing both
+# would double every date change in the History panel. `text` is not PATCHable
+# through this endpoint at all (it goes through /content, which already audits).
+_AUDITED_ACTION_FIELDS = ("status", "priority", "deadline", "responsible")
+
+
+def _audit_text(value):
+    """content_edits.before_text/after_text are text, but action-item values
+    are a mix of str / date / None. Normalising here serves BOTH the
+    changed-or-not comparison and the stored value, so a `date(2026, 7, 30)`
+    read back from the row compares equal to the '2026-07-30' string coming in
+    from the request body (which must NOT be recorded as a change)."""
+    return None if value is None else str(value)
+
+
 def patch_action_item(conn, caller, action_item_id, body):
     """Edit priority/status/deadline/responsible on one action item (spec §3).
     ACL mirrors patch_observation_status widened to site authority: the task's
     site must be in the caller's reach, and the caller must be admin/gm, a
     pm/site_manager of THAT site, or the current assignee. Reassignment target
-    must be a member of the task's site. Addressed by durable action_items.id."""
+    must be a member of the task's site. Addressed by durable action_items.id.
+
+    Every field whose value actually CHANGES also appends a content_edits row
+    (table_name 'action_items'), the same audit trail patch_content writes and
+    GET /content/action_items/{id}/history already renders. Before check-off
+    moved to org-api it wrote DynamoDB checked_by/checked_at, which the UI read;
+    this restores "who closed this and when" on the relational path. The UPDATE
+    and its audit rows share ONE transaction -- all of it lands or none of it
+    does (same posture as apply_topic_correction)."""
     if body is None:
         return error("malformed JSON body", 400)
     row = action_items.get_action_item(conn, action_item_id)
@@ -1140,7 +1288,7 @@ def patch_action_item(conn, caller, action_item_id, body):
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
     is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
     is_site_authority = site_role in ("pm", "site_manager")
-    is_assignee = bool(row["responsible"]) and row["responsible"] == _display_name(caller)
+    is_assignee = _is_assignee(row, caller)
     if not (is_admin or is_site_authority or is_assignee):
         return error("admin/gm, this site's pm/site_manager, or the assignee only", 403)
 
@@ -1172,10 +1320,219 @@ def patch_action_item(conn, caller, action_item_id, body):
     if not fields:
         return error("no editable fields provided", 400)
 
-    updated = action_items.update_action_item_fields(conn, action_item_id, fields, caller["cognito_sub"])
-    if updated is None:
+    # Before/after come from the PRE-update row read above, one audit row per
+    # field that ACTUALLY changes -- re-ticking an already-done task, or
+    # re-sending an unchanged priority, must not litter the History panel.
+    audits = []
+    for col in _AUDITED_ACTION_FIELDS:
+        if col not in fields:
+            continue
+        before, after = _audit_text(row.get(col)), _audit_text(fields[col])
+        if before != after:
+            audits.append((col, before, after))
+
+    try:
+        with conn.transaction():          # UPDATE + audit rows commit together
+            updated = action_items.update_action_item_fields(
+                conn, action_item_id, fields, caller["cognito_sub"])
+            if updated is None:
+                raise _ActionItemVanished(action_item_id)
+            for col, before, after in audits:
+                content_edits.append_content_edit(
+                    conn, row["company_id"], "action_items", action_item_id,
+                    col, before, after, caller["id"], caller["global_role"])
+    except _ActionItemVanished:
         return error("action item not found", 404)
     return ok(updated)
+
+
+# ----------------------------------------------------------
+# GET /action-items/closures?from=&to= — the Today page's weekly KPI.
+#
+# METRIC (deliberately a pure FLOW, no denominator): "action items closed
+# between `from` 00:00 and the end of `to`, NZ local". The tile used to claim
+# "N / M actions resolved this week" over the legacy DynamoDB overlay, where M
+# was "rows that ever had an overlay write" and the date axis was the task's
+# REPORT date -- so ticking a box moved neither number. Every denominator
+# actually available here is either a STOCK (open items: an all-time backlog
+# reaching back to February plus ~119 rows the legacy overlay closed without
+# ever clearing Aurora's status='open', i.e. a near-constant that still would
+# not move when you tick something) or an unrelated flow (items CREATED this
+# week, which nightly ingest drives, not the team). Counting closures and
+# comparing them with the SAME window one period earlier keeps flow against
+# flow, and every number is backed by a real timestamped audit row.
+#
+# The comparison window is served in the SAME response (`previous`): the point
+# of the endpoint is that the client asks once, instead of the per-day fan-out
+# getActionsRange did.
+# ----------------------------------------------------------
+_CLOSURES_MAX_DAYS = 31          # bounds the scan; the caller is a week tile
+
+
+def _parse_iso_date(value):
+    if not value or not REPORT_DATE_RE.match(value):
+        return None
+    try:
+        return _date.fromisoformat(value)     # regex above already pinned the shape
+    except ValueError:            # e.g. 2026-02-31
+        return None
+
+
+def _day_series(counts, start, end):
+    """Dense [{date, closed}] for every day in [start, end] -- zero-filled, so
+    the sparkline always spans the whole window instead of collapsing to the
+    days that happened to have activity."""
+    out, d = [], start
+    while d <= end:
+        iso = d.isoformat()
+        out.append({"date": iso, "closed": int(counts.get(iso, 0))})
+        d += timedelta(days=1)
+    return out
+
+
+def get_action_closures(conn, caller, event):
+    """Closure counts for [from, to] plus the equally long window immediately
+    before it, in one round-trip.
+
+    ACL: exactly the pair patch_action_item / get_content_history enforce --
+    the caller's site reach (_allowed_site_ids, graded-aware) AND the tenant.
+    platform_admin (is_cross_company) drops the tenant pin only, keeping the
+    reach gate, so a KPI can never total up sites the caller cannot open. An
+    empty reach is a well-formed zero, never an unscoped count."""
+    params = event.get("queryStringParameters") or {}
+    start = _parse_iso_date(params.get("from"))
+    end = _parse_iso_date(params.get("to"))
+    if start is None or end is None:
+        return error("from and to required (YYYY-MM-DD)", 400)
+    if end < start:
+        return error("to must not precede from", 400)
+    span = (end - start).days + 1
+    if span > _CLOSURES_MAX_DAYS:
+        return error(f"window must be {_CLOSURES_MAX_DAYS} days or fewer", 400)
+    prev_end = start - timedelta(days=1)
+    prev_start = prev_end - timedelta(days=span - 1)
+
+    cross = is_cross_company(caller["global_role"])
+    counts = content_edits.count_action_closures_by_day(
+        conn, _allowed_site_ids(conn, caller), prev_start, end,
+        company_id=None if cross else caller["company_id"])
+
+    days = _day_series(counts, start, end)
+    prev_days = _day_series(counts, prev_start, prev_end)
+    return ok({
+        "from": start.isoformat(), "to": end.isoformat(),
+        "timezone": content_edits.CLOSURE_TZ,
+        "closed": sum(d["closed"] for d in days),
+        "by_day": days,
+        "previous": {"from": prev_start.isoformat(), "to": prev_end.isoformat(),
+                     "closed": sum(d["closed"] for d in prev_days)},
+    })
+
+
+# ----------------------------------------------------------
+# Durable safety/quality "resolved" state (spec 2026-07-26). Retires the
+# unauthenticated DynamoDB POST /api/actions/toggle overlay for compliance
+# rows. Keyed on the re-extraction-stable natural identity
+# (company_id, site_id, report_date, domain, user_folder, content_hash);
+# content_hash is computed SERVER-SIDE from the row's displayed text -- the
+# client never sends it (§2/§3). company_id is resolved from the SITE (not the
+# caller), so a cross-company platform_admin marks under the row's own tenant,
+# where the owner's read will find it.
+# ----------------------------------------------------------
+def patch_compliance_resolution(conn, caller, body):
+    """PATCH /api/org/compliance/resolution -- set or flip one row's resolved
+    state. Body: {domain, site, report_date, user_folder, text, resolved}.
+
+    ACL = _resolve_site_param reach gate + patch_action_item's site-authority/
+    admin tier, MINUS the assignee branch: a compliance resolution is a
+    site-authority act (these rows have no assignee). admin/gm (ALL scope or
+    cross-company) OR this site's pm/site_manager only."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    domain = body.get("domain")
+    if domain not in ALLOWED_OBSERVATION_KINDS:                 # {"safety","quality"}
+        return error("domain must be 'safety' or 'quality'", 400)
+    report_date = body.get("report_date")
+    if not isinstance(report_date, str) or not REPORT_DATE_RE.match(report_date):
+        return error("report_date must be YYYY-MM-DD", 400)
+    user_folder = body.get("user_folder")
+    if not isinstance(user_folder, str) or not user_folder.strip():
+        return error("user_folder required", 400)
+    user_folder = user_folder.strip()
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return error("text required", 400)
+    resolved = body.get("resolved")
+    if not isinstance(resolved, bool):
+        return error("resolved must be a boolean", 400)
+
+    # Reach gate (slug or uuid; company/membership-scoped). A resolver who
+    # cannot open the site gets the standard 403 here.
+    site_id, err = _resolve_site_param(conn, caller, body.get("site"))
+    if err is not None:
+        return err
+    # Site-authority tier (no assignee branch, unlike patch_action_item).
+    cross = is_cross_company(caller["global_role"])
+    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
+    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_site_authority = site_role in ("pm", "site_manager")
+    if not (is_admin or is_site_authority):
+        return error("admin/gm or this site's pm/site_manager only", 403)
+
+    # company_id from the SITE, not the caller (correct for cross-company
+    # platform_admin; still never from the body). The reach gate above already
+    # proved the caller may act on this site.
+    site = sites.get_site(conn, site_id)
+    if site is None:
+        return error("site not found", 404)
+    company_id = str(site["company_id"])
+
+    chash = content_hash.content_hash(text)
+    sample = content_hash.normalize(text)
+    row = compliance_resolutions.upsert_resolution(
+        conn, company_id, site_id, report_date, domain, user_folder,
+        chash, sample, resolved, caller["id"])
+    return ok({
+        "resolved": row["resolved"],
+        "resolved_by": row["resolved_by_name"],       # null-safe display name
+        "resolved_at": row["resolved_at"],
+        "content_hash": row["content_hash"],
+        "content_sample": row["content_sample"],
+    })
+
+
+def get_compliance_resolutions(conn, caller, event):
+    """GET /api/org/compliance/resolutions?from=&to=&site=&domain= -- one
+    aggregate range read for the union aggregator (§4). Site-reach gated
+    (_allowed_site_ids); ?site optional (omitted => every reachable site, the
+    global Insights view); ?domain optional. platform_admin (is_cross_company)
+    drops the tenant pin only, keeping the reach gate. An EMPTY reach is a
+    well-formed empty list, never an unscoped read (the []-means-no-filter
+    trap)."""
+    params = event.get("queryStringParameters") or {}
+    start = _parse_iso_date(params.get("from"))
+    end = _parse_iso_date(params.get("to"))
+    if start is None or end is None:
+        return error("from and to required (YYYY-MM-DD)", 400)
+    if end < start:
+        return error("to must not precede from", 400)
+    domain = params.get("domain")
+    if domain is not None and domain not in ALLOWED_OBSERVATION_KINDS:
+        return error("domain must be 'safety' or 'quality'", 400)
+
+    site_param = params.get("site")
+    if site_param:
+        site_id, err = _resolve_site_param(conn, caller, site_param)
+        if err is not None:
+            return err
+        site_ids = {site_id}
+    else:
+        site_ids = _allowed_site_ids(conn, caller)
+
+    cross = is_cross_company(caller["global_role"])
+    rows = compliance_resolutions.list_resolutions(
+        conn, None if cross else caller["company_id"], site_ids, start, end, domain)
+    return ok({"resolutions": rows})
 
 
 def patch_content(conn, caller, table, row_id, body):
@@ -1221,6 +1578,10 @@ def patch_content(conn, caller, table, row_id, body):
         conn, row["company_id"], table, row_id, field, before, value,
         caller["id"], caller["global_role"])
 
+    # Best-effort re-key of any compliance_resolutions mark keyed on this text
+    # (spec §3.1, item 1b) -- self-guarded, never fails the edit.
+    _rekey_compliance_mark(conn, table, field, row_id, before, value)
+
     # Best-effort per-topic re-index (spec §6: async, never blocks/rolls back
     # the edit). Topic id + folder/date come from the row's owning topic.
     try:
@@ -1257,6 +1618,69 @@ def _enqueue_content_reindex(conn, table, row_id):
                                   meta["folder_name"], str(meta["report_date"]))
 
 
+# item 1b (spec §3.1): the (table, field) pairs whose text feeds a
+# compliance_resolutions key, mapped to the domain the mark lives under.
+# ONLY these two re-key -- finding.observation is the safety topic_flag source
+# (#1) and topics.title is the quality topic_quality source (#3). Every other
+# editable field (recommended_action/entity_*/action_items.text/topics.summary/
+# responsible) is not part of any compliance key. Source #2 (prose obs_) has no
+# editable Aurora row, so it can never appear here.
+_COMPLIANCE_REKEY_DOMAIN = {("findings", "observation"): "safety",
+                            ("topics", "title"): "quality"}
+
+
+def _compliance_key_context(conn, table, row_id):
+    """Resolve (company_id, site_id, report_date, user_folder) for a compliance
+    re-key from the edited row's owning topic -- company_id via the SITE (so it
+    matches how the write endpoint keyed the mark). Only 'findings'/'topics' can
+    trigger a re-key; anything else returns None. A row with no attributed
+    recorder (folder_name NULL) yields user_folder None, which the caller
+    treats as 'no key to move'."""
+    if table == "findings":
+        sql = ("SELECT s.company_id, f.site_id, t.report_date, "
+               "       u.folder_name AS user_folder "
+               "FROM findings f JOIN topics t ON t.id = f.topic_id "
+               "JOIN sites s ON s.id = f.site_id "
+               "LEFT JOIN users u ON u.id = t.user_id WHERE f.id=%s")
+    elif table == "topics":
+        sql = ("SELECT s.company_id, t.site_id, t.report_date, "
+               "       u.folder_name AS user_folder "
+               "FROM topics t JOIN sites s ON s.id = t.site_id "
+               "LEFT JOIN users u ON u.id = t.user_id WHERE t.id=%s")
+    else:
+        return None
+    return conn.cursor(row_factory=RealDictRow).execute(sql, (row_id,)).fetchone()
+
+
+def _rekey_compliance_mark(conn, table, field, row_id, before_text, after_text):
+    """Best-effort (spec §3.1, item 1b): when a content edit changes the text a
+    compliance_resolutions mark is keyed on, migrate the mark to the new hash so
+    the resolved state follows the corrected text. NEVER fails or rolls back the
+    content edit -- any error is logged and swallowed, same posture as the
+    reindex enqueue. Only the two trigger fields re-key; only a row that HAS a
+    mark actually moves (rekey_resolution is an UPDATE no-op otherwise)."""
+    domain = _COMPLIANCE_REKEY_DOMAIN.get((table, field))
+    if domain is None:
+        return
+    old_hash = content_hash.content_hash(before_text or "")
+    new_hash = content_hash.content_hash(after_text or "")
+    if old_hash == new_hash:
+        return                                   # no textual change -> nothing to move
+    try:
+        ctx = _compliance_key_context(conn, table, row_id)
+        if ctx is None or not ctx.get("user_folder"):
+            return                               # unattributed -> no folder to key on
+        old_key = {
+            "company_id": str(ctx["company_id"]), "site_id": str(ctx["site_id"]),
+            "report_date": str(ctx["report_date"]), "domain": domain,
+            "user_folder": ctx["user_folder"], "content_hash": old_hash,
+        }
+        compliance_resolutions.rekey_resolution(
+            conn, old_key, new_hash, content_hash.normalize(after_text or ""))
+    except Exception:
+        logger.exception("compliance re-key failed for %s/%s (edit kept)", table, row_id)
+
+
 def _topic_authority(conn, caller, topic_id):
     """Shared ACL for topic-scoped redaction/feedback writes -- IDENTICAL to
     patch_content's per-item tier. Returns (row, None) if allowed, else
@@ -1276,6 +1700,178 @@ def _topic_authority(conn, caller, topic_id):
     if not (is_admin or is_site_authority or is_author):
         return None, error("admin/gm, this site's pm/site_manager, or the author only", 403)
     return row, None
+
+
+# ----------------------------------------------------------
+# Intra-topic correction propagation (item #3)
+#
+# Correcting one field today fixes exactly one column of one row, so the SAME
+# mis-transcribed name survives in that topic's other cells (action_items.text,
+# findings.observation, ...). These two endpoints fix the rest of the term's
+# own topic -- and ONLY its own topic: never the day, the site or the company,
+# because a substring match at that blast radius can silently corrupt unrelated
+# sentences. Preview is read-only and must be shown to the user first; apply
+# rewrites exactly the cells the preview listed.
+# ----------------------------------------------------------
+_SNIPPET_PAD = 60
+
+
+class _PropagationAborted(Exception):
+    """A planned row vanished/failed mid-apply -- abort the whole transaction
+    rather than commit half a correction."""
+
+
+def _snippet(text, span):
+    """~_SNIPPET_PAD characters either side of `span`, ellipsized -- enough
+    context for the user to recognise the sentence being rewritten."""
+    if not span:
+        return text
+    start, end = span
+    lo, hi = max(0, start - _SNIPPET_PAD), min(len(text), end + _SNIPPET_PAD)
+    return ("…" if lo > 0 else "") + text[lo:hi] + ("…" if hi < len(text) else "")
+
+
+def _parse_correction_terms(body):
+    """Shared validation for preview/apply. Returns (before, after, None) or
+    (None, None, error_response)."""
+    if body is None:
+        return None, None, error("malformed JSON body", 400)
+    before = body.get("before")
+    after = body.get("after")
+    if not isinstance(before, str) or not before.strip():
+        return None, None, error("before must be a non-empty string", 400)
+    if not isinstance(after, str) or not after.strip():
+        return None, None, error("after must be a non-empty string", 400)
+    before, after = before.strip(), after.strip()
+    # Convergence guard: `after` must be a fixpoint of its own alias, or a
+    # re-run would keep rewriting (before='Mackon', after='Mackon Ltd' ->
+    # 'Mackon Ltd Ltd'). This is what makes apply idempotent-safe. A pure
+    # case fix (before='mackon', after='Mackon') IS a fixpoint -- normalize
+    # adopts the surface casing -- so it stays allowed.
+    if normalize(after, [{"wrong_term": before, "right_term": after}]) != after:
+        return None, None, error(
+            "after must not itself contain before (the correction would not be stable)", 400)
+    return before, after, None
+
+
+def _plan_topic_propagation(conn, topic_id, before, after):
+    """Read-only: every propagatable cell in THIS topic whose text actually
+    changes when before -> after is applied. "Propagatable" (content.
+    is_propagatable) is EDITABLE plus the propagation-only extras
+    (_PROPAGATE_EXTRA, e.g. findings.impact_note) -- prose that may carry a
+    corrected name but is deliberately not individually PATCH-editable.
+    Matching is text_normalize.normalize (whole-word, case-aware) -- the same
+    function the embed and RAG paths use -- never a raw str.replace, so
+    'Mackon' never rewrites inside 'Mackonsson'. A cell that comes back
+    unchanged is dropped here and is therefore never written and never
+    audited."""
+    alias = [{"wrong_term": before, "right_term": after}]
+    plan = []
+    for cell in content.list_topic_content_fields(conn, topic_id):
+        # Belt-and-braces: the scan already selects only propagatable columns,
+        # but re-assert it here so nothing outside that allow-list (e.g.
+        # findings' impact_task_name/impact_severity/impact_evidence/
+        # impact_matched_at) can ever be planned.
+        if not content.is_propagatable(cell["table"], cell["field"]):
+            continue
+        value = cell["value"]
+        rewritten = normalize(value, alias)
+        if rewritten == value:
+            continue
+        plan.append({
+            "table": cell["table"], "row_id": str(cell["row_id"]),
+            "field": cell["field"], "occurrences": occurrences(value, before),
+            "before_text": value, "after_text": rewritten,
+        })
+    return plan
+
+
+def _match_view(p, before, after):
+    """Wire shape for one planned change (snippets, not whole documents) --
+    each window is centred on the FIRST occurrence of the term."""
+    return {
+        "table": p["table"], "row_id": p["row_id"], "field": p["field"],
+        "occurrences": p["occurrences"],
+        "before_snippet": _snippet(p["before_text"],
+                                   first_match_span(p["before_text"], before)),
+        "after_snippet": _snippet(p["after_text"],
+                                  first_match_span(p["after_text"], after)),
+    }
+
+
+def preview_topic_correction(conn, caller, topic_id, body):
+    """POST /topics/{id}/propagate/preview -- what an intra-topic correction
+    WOULD change. Strictly read-only: no UPDATE, no audit row, no re-index.
+    The frontend must show this before offering apply."""
+    before, after, err = _parse_correction_terms(body)
+    if err is not None:
+        return err
+    _, err = _topic_authority(conn, caller, topic_id)
+    if err is not None:
+        return err
+    plan = _plan_topic_propagation(conn, topic_id, before, after)
+    matches = [_match_view(p, before, after) for p in plan]
+    return ok({
+        "topic_id": str(topic_id), "before": before, "after": after,
+        "field_count": len(matches),
+        "occurrence_count": sum(m["occurrences"] for m in matches),
+        "matches": matches,
+    })
+
+
+def apply_topic_correction(conn, caller, topic_id, body):
+    """POST /topics/{id}/propagate -- rewrite exactly the cells the preview
+    listed. All UPDATEs plus their content_edits audit rows run inside ONE
+    transaction, so the correction is all-or-nothing; the per-topic re-index is
+    enqueued ONCE afterwards (reindex re-renders the whole topic, children
+    included, so one enqueue covers every rewritten cell) and is best-effort --
+    it never rolls the correction back. Re-running with the same terms finds
+    nothing left to change and writes nothing."""
+    before, after, err = _parse_correction_terms(body)
+    if err is not None:
+        return err
+    row, err = _topic_authority(conn, caller, topic_id)
+    if err is not None:
+        return err
+    plan = _plan_topic_propagation(conn, topic_id, before, after)
+    if not plan:                                     # incl. the re-apply no-op
+        return ok({"topic_id": str(topic_id), "before": before, "after": after,
+                   "changed_count": 0, "changed": [], "reindex_enqueued": False})
+
+    try:
+        with conn.transaction():
+            for p in plan:
+                updated = content.update_content_field(
+                    conn, p["table"], p["row_id"], p["field"], p["after_text"])
+                if updated is None:                  # row vanished mid-flight
+                    raise _PropagationAborted(f"{p['table']}/{p['row_id']}")
+                content_edits.append_content_edit(
+                    conn, row["company_id"], p["table"], p["row_id"], p["field"],
+                    p["before_text"], p["after_text"], caller["id"], caller["global_role"])
+    except _PropagationAborted as e:
+        logger.warning("propagate %s: %s changed under us -- nothing written", topic_id, e)
+        return error("content changed during propagation, nothing was written", 409)
+
+    # Best-effort re-key of any compliance_resolutions mark on each rewritten
+    # cell (spec §3.1, item 1b) -- self-guarded per cell, never fails the edit.
+    for p in plan:
+        _rekey_compliance_mark(conn, p["table"], p["field"], p["row_id"],
+                               p["before_text"], p["after_text"])
+
+    reindexed = True
+    try:
+        _enqueue_content_reindex(conn, "topics", topic_id)     # ONCE for the topic
+    except Exception:
+        logger.exception("propagate %s: reindex enqueue failed (edits kept)", topic_id)
+        reindexed = False
+
+    return ok({
+        "topic_id": str(topic_id), "before": before, "after": after,
+        "changed_count": len(plan),
+        "changed": [{"table": p["table"], "row_id": p["row_id"], "field": p["field"],
+                     "occurrences": p["occurrences"]} for p in plan],
+        "reindex_enqueued": reindexed,
+    })
 
 
 def create_redaction_endpoint(conn, caller, body):
@@ -1372,6 +1968,151 @@ def classification_feedback_summary_endpoint(conn, caller):
     return ok(classification_feedback.summary(conn, caller["company_id"]))
 
 
+# Keyframe Q7: the durable auto-keyframe basename marker (keyframe_selection
+# .keyframe_filename). Digits-only session id -> can never collide with a real
+# user photo. The delete route refuses ANY key whose basename fails this.
+# \Z (not $): `$` also matches just before a trailing newline, so a key ending
+# "..._kf_s101534.jpg\n" would pass the guard. \Z anchors at the true end.
+_KF_BASENAME_RE = re.compile(r"_kf_s\d{6}\.jpg\Z")
+
+
+def _delete_keyframe_object(s3_key):
+    """Non-transactional S3 delete (Section 4.4): the tombstone is the source of
+    truth, so a failure here is logged and reported (s3_deleted:false) but never
+    5xxs -- the delete is already durable and the generator's stale/M-2 cleanup
+    garbage-collects any lingering object. Idempotent-safe if already gone."""
+    try:
+        s3().delete_object(Bucket=S3_BUCKET, Key=s3_key)
+        return True
+    except Exception:
+        logger.warning("keyframe S3 delete failed for %s (tombstone is source of truth)", s3_key)
+        return False
+
+
+def _keyframe_deleted_event_fields(conn, topic_id, s3_key):
+    """Structural-signal-only telemetry fields for a 'deleted' event, derived
+    from the still-live topic row + the key's own mid-time. Parse-level failures
+    (missing/unparseable/shifted time_range, unnamed category) degrade to NULLs
+    rather than failing the delete.
+
+    NB a DB-level failure of the SELECT below is different: it aborts the
+    transaction, so the subsequent record_event raises and the request 500s with
+    a full rollback. That is deliberate fail-CLOSED behaviour -- no tombstone, no
+    row delete, no S3 delete, no partial state -- and the client simply retries.
+    Unlike the generator's telemetry (which must never cost an already-uploaded
+    frame) there is nothing here worth salvaging, so no savepoint is used."""
+    fields = {"site_id": None, "topic_category": None, "work_class": None,
+              "duration_min": None, "n_frames_generated": None, "frame_index": None}
+    try:
+        trow = conn.cursor(row_factory=RealDictRow).execute(
+            "SELECT time_range, category, work_class, site_id "
+            "FROM topics WHERE id=%s", (topic_id,)).fetchone()
+        if trow is None:
+            return fields
+        fields["topic_category"] = trow.get("category")
+        fields["work_class"] = trow.get("work_class")
+        fields["site_id"] = trow.get("site_id")
+        time_range = trow.get("time_range")
+        parsed = parse_time_range(time_range)
+        if parsed is not None:
+            start_min, end_min = parsed
+            fields["duration_min"] = end_min - start_min
+        mids = keyframe_seconds(time_range)
+        if mids:
+            fields["n_frames_generated"] = len(mids)
+            base = extract_base_time_from_filename(s3_key.rsplit("/", 1)[-1])
+            if base is not None:
+                mid_s = base.hour * 3600 + base.minute * 60 + base.second
+                if mid_s in mids:
+                    fields["frame_index"] = mids.index(mid_s)
+    except Exception:
+        logger.warning("keyframe delete telemetry derivation failed for %s", s3_key)
+    return fields
+
+
+def delete_keyframe_endpoint(conn, caller, body):
+    """DELETE /api/org/media/keyframe -- reviewer removes ONE auto-generated
+    keyframe (tombstone + telemetry + row + object). Keyed on the durable
+    s3_key; the owning topic is resolved server-side and gated by the SAME
+    _topic_authority predicate patch_content/redactions use."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    s3_key = body.get("s3_key")
+    if not s3_key or not isinstance(s3_key, str):
+        return error("s3_key required", 400)
+    # Canonicalization guard (identical posture to get_org_media_presigned_url):
+    # reject '//', a leading '/', or any '.'/'..' path segment before anything.
+    parts = s3_key.split("/")
+    if "//" in s3_key or s3_key.startswith("/") or any(p in (".", "..") for p in parts):
+        return error("access denied", 403)
+    # THE keyframe guard -- refuse anything that is not an auto-generated
+    # keyframe BEFORE any lookup, so a real user photo is structurally
+    # unreachable through this route even if everything downstream regressed.
+    if not (s3_key.startswith("users/") and "/pictures/" in s3_key
+            and _KF_BASENAME_RE.search(parts[-1])):
+        return error("not an auto-generated keyframe", 400)
+
+    # Resolve owning topic(s). Normally exactly one row; an item-writer re-bind
+    # can in principle attach the key to a replacement topic -> handle them all.
+    rows = conn.cursor(row_factory=RealDictRow).execute(
+        "SELECT id, topic_id FROM topic_photos WHERE s3_key=%s", (s3_key,)).fetchall()
+
+    if not rows:
+        # Idempotent re-delete: the row is already gone. Re-attempt ONLY the S3
+        # delete; do NOT write a second tombstone/event.
+        t = keyframes.get_tombstone(conn, s3_key)
+        if t is None:
+            return error("keyframe not found", 404)
+        if not is_cross_company(caller["global_role"]) and \
+                str(t["company_id"]) != str(caller["company_id"]):
+            return error("keyframe not found", 404)     # cross-company shape parity
+        s3_deleted = _delete_keyframe_object(s3_key)
+        return ok({"deleted": True, "already_deleted": True, "s3_deleted": s3_deleted})
+
+    # Authorize EVERY distinct owning topic via the shared gate; first failure
+    # wins (its 403/404 is returned verbatim -- site-less topics 404 here, same
+    # posture as patch_content, because get_content_row INNER JOINs sites).
+    topic_ids, seen = [], set()
+    for r in rows:
+        tid = r["topic_id"]
+        if tid not in seen:
+            seen.add(tid)
+            topic_ids.append(tid)
+    authorized_row = None
+    for tid in topic_ids:
+        arow, err = _topic_authority(conn, caller, tid)
+        if err is not None:
+            return err
+        if authorized_row is None:
+            authorized_row = arow
+    company_id = authorized_row["company_id"]
+    primary_topic_id = topic_ids[0]
+
+    # ONE transaction (Section 4.3c): tombstone -> 'deleted' event -> row delete.
+    # The event is gated on the tombstone being NEW: in the s3_deleted:false
+    # window an item-writer re-extraction can re-bind the still-present object
+    # (photo_binding has no tombstone check), resurrecting the topic_photos row,
+    # and a second user delete would otherwise record a SECOND 'deleted' event
+    # for ONE keyframe -- corrupting the deleted/generated ratio this table
+    # exists to measure. One human decision, one event.
+    first_tombstone = keyframes.add_tombstone(
+        conn, s3_key, company_id, primary_topic_id, caller["id"])
+    if first_tombstone:
+        fields = _keyframe_deleted_event_fields(conn, primary_topic_id, s3_key)
+        keyframes.record_event(conn, "deleted", company_id=company_id, **fields)
+    rows_removed = conn.execute(
+        "DELETE FROM topic_photos WHERE s3_key=%s", (s3_key,)).rowcount
+
+    # Commit BEFORE the (non-transactional) S3 delete: the tombstone must be
+    # durable before the object can vanish (Section 4.4), so the generator can
+    # never observe "object missing + no tombstone" for a user-deleted frame.
+    conn.commit()
+
+    s3_deleted = _delete_keyframe_object(s3_key)
+    return ok({"deleted": True, "s3_key": s3_key,
+               "rows_removed": rows_removed, "s3_deleted": s3_deleted})
+
+
 _ALIAS_KINDS = ("person", "product", "company", "other")
 
 
@@ -1402,14 +2143,41 @@ def create_alias_endpoint(conn, caller, body, event):
 
 
 def get_content_history(conn, caller, table, row_id):
-    """content_edits trail for one row (spec §5.5 History view). Company-guarded
-    via get_content_row (which also resolves cross-company for platform_admin)."""
+    """content_edits trail for one row (spec §5.5 History view).
+
+    ACL is the READ half of patch_content's D7 tier: platform_admin
+    (is_cross_company) reads any tenant; company roles stay pinned; and the
+    row's site must be in the caller's reach (_allowed_site_ids). The
+    per-item AUTHOR/site-authority tier is deliberately NOT applied -- this
+    is a read, and anyone who can see the row can see how it got that way --
+    but reach is, because the trail is not a subset of the row: it names the
+    people who edited it, and (since check-off audit) who closed or
+    reassigned a task and when. Company-only guarding let any authenticated
+    user in the company read that for sites they cannot otherwise see.
+
+    `row["site_id"]` is the row's OWN site for all three EDITABLE tables --
+    content._SELECT selects x.site_id and reaches company_id through it, so
+    action_items/findings are gated on the same site their write path gates
+    on (patch_action_item / patch_content), not the owning topic's.
+
+    Refusal posture matches the siblings exactly: cross-company (and missing)
+    is 404 so existence never leaks; in-company but out-of-reach is 403, the
+    same status and shape patch_action_item returns for that case.
+
+    No-op for the live History tab: ContentHistoryPanel is only ever mounted
+    with the durable topic_row_id of a topic the user is already viewing, and
+    that id only reaches the client through render_report_shape, which
+    _render_timeline_for_user feeds with rows ALREADY filtered by this same
+    _allowed_site_ids. An out-of-reach topic has no id in the UI to ask about."""
     if table not in content.EDITABLE:
         return error(f"table must be one of {sorted(content.EDITABLE)}", 400)
     row = content.get_content_row(conn, table, row_id)
     cross = is_cross_company(caller["global_role"])
     if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
         return error("content row not found", 404)
+    site_id = str(row["site_id"])
+    if not cross and site_id not in _allowed_site_ids(conn, caller):
+        return error("access denied to this content's site", 403)
     edits = content_edits.list_content_edits(conn, row["company_id"], table, row_id)
     return ok({"edits": edits})
 
@@ -1824,6 +2592,42 @@ def _list_report_folders(date):
 _SEV_TO_RISK = {"major": "high", "minor": "medium", "none": "low"}
 
 
+def _prose_alias_pairs(conn, site_id):
+    """Active alias pairs for the site's company, loaded ONCE per render --
+    same source (and same site-before-company precedence) the re-index builder
+    feeds text_normalize with (reindex.enqueue_topic_reindex). Best-effort:
+    prose normalization is cosmetic, so a lookup failure degrades to 'no
+    aliases' instead of failing the whole read."""
+    if conn is None or not site_id:
+        return []
+    try:
+        site = sites.get_site(conn, site_id)
+        if not site or not site.get("company_id"):
+            return []
+        return [{"wrong_term": a["wrong_term"], "right_term": a["right_term"]}
+                for a in aliases.list_active(conn, site["company_id"],
+                                             site_ids=[str(site_id)])]
+    except Exception:
+        logger.warning("prose alias lookup failed for site %s -- rendering raw", site_id)
+        return []
+
+
+def _normalize_prose(value, alias_pairs):
+    """Apply aliases to every string inside one prose field, whatever shape it
+    has: a bare string (v1 executive_summary), a list of strings (the current
+    bullet form), or a list of dicts (safety_observations /
+    quality_and_compliance / critical_dates_and_deadlines rows). Non-string
+    leaves pass through untouched. READ-TIME ONLY -- the S3 daily_report.json
+    stays immutable and auditable (D4); nothing here is ever written back."""
+    if isinstance(value, str):
+        return normalize(value, alias_pairs)
+    if isinstance(value, list):
+        return [_normalize_prose(v, alias_pairs) for v in value]
+    if isinstance(value, dict):
+        return {k: _normalize_prose(v, alias_pairs) for k, v in value.items()}
+    return value
+
+
 def render_report_shape(rows, doc, date, folder, conn=None):
     """Pure function: render Aurora extraction topics INTO the
     daily_report.json shape, optionally merging the doc's own prose fields
@@ -1836,7 +2640,13 @@ def render_report_shape(rows, doc, date, folder, conn=None):
     `conn` (optional, trailing kwarg — Task 1b) enables the redaction-status
     lookup below; callers that don't pass it (or pass None) simply get
     `redacted: False` for every topic, unchanged from before this field
-    existed."""
+    existed.
+
+    The four prose fields merged out of the S3 doc have no Aurora row and no
+    edit surface, so a name the user already corrected in the item store would
+    keep showing here (Today's morning brief, the Timeline exec-summary card,
+    the whole Quality page). They are therefore alias-normalized at READ time
+    (item #3 part B) — the document itself is never rewritten."""
     doc = doc or {}
     topics_out = []
     _redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if conn is not None else {}
@@ -1851,9 +2661,19 @@ def render_report_shape(rows, doc, date, folder, conn=None):
                       "recommended_action": None,
                       "id": str(s["id"]), "source_table": "safety_observations"}
                      for s in t["safety_observations"]]
+        # Session identity (#11, meeting-scoped-export design §3.2) — ADDITIVE.
+        # Derived from the topic's own extraction key by the shared parse, the
+        # same one lambda_item_writer stamps that key with. The raw
+        # source_s3_key is deliberately NOT exposed; only the basename
+        # (session_base) is. session_kind lets the UI tell "report-sourced, no
+        # session granularity exists" (kind='report', the 'Whole day' row)
+        # from "we could not tell" (kind='unknown') — both carry a null id.
+        session_id, session_kind = session_scope.session_ref(t.get("source_s3_key"))
         topics_out.append({
             "topic_id": i,
             "topic_row_id": str(t["id"]),           # durable topics.id (D fix — editable anchor)
+            "session_id": session_id,
+            "session_kind": session_kind,
             "time_range": t["time_range"],
             "topic_title": t["title"],
             "category": t["category"],
@@ -1872,14 +2692,31 @@ def render_report_shape(rows, doc, date, folder, conn=None):
             "redacted": t["id"] in _redacted,
             "redaction_id": (_redacted.get(t["id"]) or {}).get("id"),
         })
-    return {
-        "report_date": date,
-        "site": rows[0]["site_name"],
-        "user_name": rows[0]["user_name"] or folder.replace("_", " "),
+    prose = {
         "executive_summary": doc.get("executive_summary"),
         "safety_observations": doc.get("safety_observations", []),
         "quality_and_compliance": doc.get("quality_and_compliance", []),
         "critical_dates_and_deadlines": doc.get("critical_dates_and_deadlines", []),
+    }
+    # One alias load for all four fields, and none at all when there is no
+    # prose to rewrite (the reindex builder renders with doc=None, so this
+    # costs it nothing).
+    if any(prose.values()):
+        alias_pairs = _prose_alias_pairs(conn, rows[0].get("site_id"))
+        if alias_pairs:
+            prose = {k: _normalize_prose(v, alias_pairs) for k, v in prose.items()}
+    return {
+        "report_date": date,
+        "site": rows[0]["site_name"],
+        # site_id (org UUID) alongside the display name: the compliance-resolution
+        # durable key is (company_id, site_id, report_date, domain, user_folder,
+        # content_hash), and the client can only rebuild it with a real site_id.
+        # The name alone would 404 on write and never match on read (site_name is
+        # not the slug _resolve_site_param accepts), silently orphaning every mark.
+        # rows[0]["site_id"] is already in hand here (used for the alias lookup).
+        "site_id": str(rows[0]["site_id"]) if rows[0].get("site_id") else None,
+        "user_name": rows[0]["user_name"] or folder.replace("_", " "),
+        **prose,
         "_report_metadata": {"source": "live_extraction", "version": "flip-v1"},
         "topics": topics_out,
     }
@@ -2048,6 +2885,199 @@ def get_timeline_compat(conn, caller, event):
 
 
 # ----------------------------------------------------------
+# /sessions — the day's recording sessions, for the meeting-scoped export
+# picker (#11; design docs/superpowers/specs/2026-07-25-meeting-scoped-
+# action-export.md §3.2). A site manager who just finished a 13:00-14:30
+# meeting picks THAT session instead of exporting all of rolling Today.
+#
+# WHAT IS AUTHORITATIVE HERE (the design's load-bearing rule — see
+# session_scope.py):
+#   * session_id / membership  — from topics.source_s3_key. Deterministic.
+#   * started_at               — parsed out of session_base itself.
+#                                Deterministic, LLM-independent.
+#   * topic_count / open_action_count / participants / topic_row_ids —
+#                                counted off the Aurora rows themselves.
+# WHAT IS COSMETIC (display only, may be null, never decides membership):
+#   * ended_at, label          — best-effort: recorded duration when a
+#                                recordings row exists, else the LLM's own
+#                                free-text time_range.
+#   * block                    — the gap-merge display grouping (§3.3).
+# A malformed/absent time_range degrades a LABEL to null. It can never move
+# a topic into the wrong session.
+# ----------------------------------------------------------
+
+def _session_participants(rows):
+    """Union of the rows' LLM-heard participant names, deduped
+    case-insensitively, first-seen order preserved (design §3.2). These are
+    unverified suggestions, not identities — see design §2.4."""
+    seen, out = set(), []
+    for r in rows:
+        for p in (r.get("participants") or []):
+            if not isinstance(p, str):
+                continue
+            name = p.strip()
+            if name and name.lower() not in seen:
+                seen.add(name.lower())
+                out.append(name)
+    return out
+
+
+def _time_range_end_dt(rows, start_dt):
+    """COSMETIC end label, tier (2) of the design's §3.2 resolution order:
+    the latest parseable end half of the session's topics' `time_range`.
+
+    `time_range` is LLM free text (session_scope's module docstring); this is
+    the ONLY thing it is allowed to influence. Parsed with the shared,
+    dash-tolerant photo_binding.parse_time_range — anything unparseable is
+    skipped, and an end that lands BEFORE the deterministic start (garbage, or
+    a range that crossed midnight) is declined rather than guessed at, so the
+    worst case is `ended_at: null` ("13:05 – ?"), never a wrong span."""
+    if start_dt is None:
+        return None
+    midnight = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    best = None
+    for r in rows:
+        parsed = parse_time_range(r.get("time_range"))
+        if parsed is None:
+            continue
+        end_dt = midnight + timedelta(minutes=parsed[1])
+        if end_dt < start_dt:
+            continue
+        if best is None or end_dt > best:
+            best = end_dt
+    return best
+
+
+def _session_end_dt(conn, caller, folder, date, session_id, rows, start_dt):
+    """ended_at resolution order (design §3.2): (1) the recordings row's own
+    duration added to the deterministic start — the closest thing to an
+    authoritative end, and timezone-safe because it is a DURATION, not a UTC
+    instant (see recordings.duration_for_media); (2) the LLM time_range end
+    label; (3) null. RealPTT / worker-device uploads have no recordings row
+    (the G5b fallback path), so (2)/(3) are the common case today."""
+    if start_dt is not None:
+        duration_s = recordings.duration_for_media(
+            conn, caller["company_id"], folder, date, session_id)
+        if duration_s:
+            return start_dt + timedelta(seconds=duration_s)
+    return _time_range_end_dt(rows, start_dt)
+
+
+def _hhmm(dt):
+    return dt.strftime("%H:%M") if dt is not None else None
+
+
+def build_day_sessions(conn, caller, folder, date, rows):
+    """Group one (folder, date)'s extraction topic rows into sessions.
+
+    EXCLUSIONS (design §5 / life-conversation separation Q1 rule) — applied
+    to every count, participant list and topic_row_ids handle, so a caller
+    cannot act on what it must not act on. Exactly the rule the shipped code
+    already uses (redactions.company_excluded_topic_ids, reindex.py:63,
+    chunking.py:103): an ACTIVE redaction, OR `work_class == 'non_work'` —
+    same comparison direction, NULL/absent work_class counts as work. Both
+    signals are read the same way /timeline's render_report_shape reads them
+    (one batched redactions.list_active_for_topics + the row's own
+    work_class), not via a second rule.
+
+    A session all of whose topics are excluded is dropped entirely rather
+    than listed empty — an unactionable row in the picker that advertises
+    "a personal conversation happened at 12:40" is worse than no row. The
+    envelope's `excluded` counts keep it honest.
+    """
+    excluded = {"non_work": 0, "redacted": 0}
+    redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if rows else {}
+    by_session = {}
+    for r in rows:
+        session_id, kind = session_scope.session_ref(r.get("source_s3_key"))
+        if kind != session_scope.KIND_EXTRACTION:
+            # Only extraction keys carry session granularity. Report-sourced
+            # rows are a whole-day key (design §2.7) and never a session.
+            continue
+        if r["id"] in redacted:
+            excluded["redacted"] += 1
+            continue
+        if r.get("work_class") == "non_work":
+            excluded["non_work"] += 1
+            continue
+        by_session.setdefault(session_id, []).append(r)
+
+    sessions = []
+    for session_id, srows in by_session.items():
+        start_dt = session_scope.session_start(session_id)
+        end_dt = _session_end_dt(conn, caller, folder, date, session_id, srows, start_dt)
+        sessions.append({
+            "session_id": session_id,
+            "started_at": start_dt.isoformat() if start_dt else None,   # authoritative
+            "ended_at": end_dt.isoformat() if end_dt else None,         # cosmetic
+            "site_name": next((r.get("site_name") for r in srows if r.get("site_name")), None),
+            "topic_count": len(srows),
+            "open_action_count": sum(1 for r in srows for a in r["action_items"]
+                                     if a["status"] == "open"),
+            "participants": _session_participants(srows),
+            "topic_row_ids": [str(r["id"]) for r in srows],   # the export's scope handle
+            "label": f"{_hhmm(start_dt) or '?'} – {_hhmm(end_dt) or '?'}",   # cosmetic
+            "_start_dt": start_dt,
+            "_end_dt": end_dt,
+        })
+    # Chronological. A session whose session_base carries no parseable base
+    # time sorts last (and, per assign_blocks, never auto-merges).
+    # Sorted on the ISO start STRING: a fixed-width ISO timestamp sorts
+    # lexicographically exactly as it sorts chronologically, and it is
+    # None-safe without inventing a sentinel datetime.
+    sessions.sort(key=lambda s: (s["started_at"] is None, s["started_at"] or "", s["session_id"]))
+    session_scope.assign_blocks(sessions)
+    for s in sessions:
+        s.pop("_start_dt", None)
+        s.pop("_end_dt", None)
+    return sessions, excluded
+
+
+def get_org_sessions(conn, caller, event):
+    """GET /api/org/sessions?date=YYYY-MM-DD[&user={folder}]
+
+    ACL: `_resolve_org_media_folder` — the shared wrapper that applies
+    /timeline's graded authority (`_can_view_folder`) verbatim AND carries
+    the GRADED_ROLES-off self/ALL branch, exactly as /transcripts,
+    /audio-segments, /video-segments already do. Using the wrapper rather
+    than calling `_can_view_folder` directly is the same gate plus the
+    flag-off path and the default-to-self rule, so this route can never show
+    sessions for a folder the caller cannot view on /timeline.
+
+    Second gate, deliberately kept: the rows are also clipped to
+    `_allowed_site_ids` before grouping — the identical clip
+    `_render_timeline_for_user._aurora_shape` applies. A target folder may be
+    a multi-site member whose day spans sites outside the caller's reach; the
+    folder gate alone would not clip those.
+
+    A day with no in-scope extraction sessions returns 200 with an EMPTY
+    sessions list — a report-only (pre-flip / zero-extraction) day is a
+    legitimate "no session granularity exists here" answer, and the UI's
+    "Whole day" row is the right rendering. It must stay distinguishable
+    from an error, which is why it is not a 404.
+    """
+    p = event.get("queryStringParameters") or {}
+    date, user = p.get("date"), (p.get("user") or "").strip()
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="sessions")
+    if err is not None:
+        return err
+
+    allowed = _allowed_site_ids(conn, caller)
+    rows = [r for r in topics.list_topics_for_source_prefix(conn, f"extractions/{folder}/{date}/")
+            if str(r["site_id"]) in allowed]
+    sessions, excluded = build_day_sessions(conn, caller, folder, date, rows)
+    return ok({
+        "date": date,
+        "user": folder,
+        "gap_minutes": session_scope.SESSION_GAP_MINUTES,
+        "sessions": sessions,
+        "excluded": excluded,
+    })
+
+
+# ----------------------------------------------------------
 # /transcripts — Aurora-identity read of transcript S3 objects
 # ----------------------------------------------------------
 
@@ -2088,6 +3118,38 @@ def _org_extract_time_seconds_from_filename(filename):
     return None
 
 
+def _list_media_objects(prefix, what):
+    """Paginated list_objects_v2 over one media prefix in S3_BUCKET.
+
+    SECURITY/OPS (adversarial review BLOCKER 1). The media readers used to
+    wrap this in `except ClientError: pass`, which collapsed EVERY listing
+    failure into an empty result and a 200. The dominant such failure is
+    AccessDenied from a missing s3:ListBucket prefix grant -- and its
+    rendered output ("No audio segments in this window.") is byte-identical
+    to the legitimate empty day, i.e. exactly the invisible failure these
+    routes were written to eliminate. An overloaded sentinel that cannot
+    distinguish "nothing here" from "I was not allowed to look" is not an
+    acceptable degrade.
+
+    A missing prefix is NOT an error to S3: list_objects_v2 returns an empty
+    Contents. So there is no not-found class to tolerate here at all -- any
+    ClientError is a genuine fault (IAM, bucket, throttle) and is re-raised
+    for lambda_handler to turn into a 500 {"error": "internal error"}. Same
+    posture as _get_lake_json / programme.read_programme in this codebase.
+    (_list_report_folders keeps its tolerant catch on purpose: it has an
+    Aurora union to fall back on, and admin_disambiguation's answer is still
+    complete without it.)"""
+    try:
+        paginator = s3().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                yield obj
+    except ClientError:
+        logger.exception("%s: S3 listing failed for prefix %s (bucket %s)",
+                         what, prefix, S3_BUCKET)
+        raise
+
+
 def _read_org_transcripts(date, folder, start_time, end_time):
     """S3 read + normalize for one (folder, date) window -- mirrors
     lambda_fieldsight_api.get_transcripts's locate/parse/response-shape
@@ -2105,18 +3167,8 @@ def _read_org_transcripts(date, folder, start_time, end_time):
         start_sec = 0
 
     prefix = f"transcripts/{folder}/{date}/"
-    transcript_files = []
-    try:
-        paginator = s3().get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith(".json"):
-                    transcript_files.append(key)
-    except ClientError:
-        # Same posture as _list_report_folders: a listing failure (e.g. an
-        # IAM edge case) degrades to "no transcripts" rather than a 500.
-        pass
+    transcript_files = [obj["Key"] for obj in _list_media_objects(prefix, "transcripts")
+                        if obj["Key"].endswith(".json")]
 
     if not transcript_files:
         return {"text": "", "segments": [], "speaker_segments": [], "message": "No transcripts found"}
@@ -2208,6 +3260,278 @@ def _read_org_transcripts(date, folder, start_time, end_time):
     }
 
 
+def _resolve_org_media_folder(conn, caller, user, what="media"):
+    """Shared Aurora-identity ACL for the media routes (/transcripts,
+    /audio-segments, /video-segments, /media/presigned-url) -- P1,
+    2026-07-23 prod-media-binding plan (graded adoption decided by the
+    user). Returns (folder, None) on success or (None, error_response).
+
+    GRADED_ROLES on (prod): /timeline's graded authority verbatim
+    (get_timeline_compat above) -- ALL-scope callers may target any
+    in-company folder (unknown -> 404, RETARGET override 5); everyone else
+    defaults to self and passes explicit targets through _can_view_folder:
+    SITE (pm/regional) reads any member of an in-scope site, SELF+WORKERS
+    (site_manager) reads self + role='worker' members on their sites (never
+    pms or fellow site_managers -- BUG-25's graded restatement), SELF
+    (worker) reads self only. _can_view_folder conflates unknown-user with
+    out-of-scope (returns False) -> both surface as 403, same as /timeline
+    (no user-existence oracle for non-ALL callers).
+
+    GRADED_ROLES off: the original binary rule -- non-ALL callers read
+    their OWN folder only (reject, never silently substitute -- D10
+    lesson); ALL callers company-pinned via users.get_by_folder_name.
+
+    NOTE the deliberate behaviour change on /transcripts: pre-plan it ran
+    the binary rule even with the flag on; site/self-scoped callers now
+    reach exactly the folders /timeline already shows them.
+
+    EXCEPTION (review BLOCKER 2): /media/presigned-url does NOT route
+    reports/{date}/{folder}/... through here -- that object is the one
+    /timeline withholds from graded non-ALL cross-user callers. See
+    _authorize_report_object_presign."""
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)
+        if sc["user_scope"] == "ALL":                     # admin/gm/platform_admin
+            if not user:
+                user = sc["self_folder"] or ""
+            if not user:
+                return None, error("user required", 400)
+            if not sc["cross_company"] and \
+                    users.get_by_folder_name(conn, caller["company_id"], user) is None:
+                return None, error("user not found in your company", 404)
+            return user, None
+        if not user:
+            user = sc["self_folder"]
+            if not user:
+                return None, error("no folder mapping for your account", 403)
+        if not _can_view_folder(conn, caller, user):
+            return None, error(f"not permitted to view this user's {what}", 403)
+        return user, None
+    # ---- GRADED_ROLES off: binary fallback (original /transcripts rule) ----
+    is_all = resolve_scope(caller["global_role"]) == "ALL"
+    if not is_all:
+        own = caller.get("folder_name")
+        if not own:
+            return None, error("no folder mapping for your account", 403)
+        if user and user != own:
+            return None, error(f"you may only view your own {what}", 403)
+        return own, None
+    if not user:
+        user = caller.get("folder_name") or ""
+    if not user:
+        return None, error("user required", 400)
+    if users.get_by_folder_name(conn, caller["company_id"], user) is None:
+        return None, error("user not found in your company", 404)
+    return user, None
+
+
+def _org_caller_may_read_ownerless(conn, caller):
+    """May this caller presign an artifact whose OWNER cannot be derived
+    (reports/{date}/summary_report.json, reports/{date}/sites/...)?
+
+    SECURITY (S-4, 2026-07-23 security-acl-sentinel plan). The previous
+    gate (_org_caller_has_all_scope) tested the scope TIER only and applied
+    NO company scoping, so a company-A admin could presign a company-B
+    site/summary rollup. Latent rather than live -- every site currently
+    sits in the single FieldSight company (dc2eafa9) -- which is exactly
+    why it must be closed BEFORE tenant separation turns it into a
+    cross-tenant leak with no code change to blame.
+
+    Company scoping is not achievable by derivation for either shape:
+    summary_report.json is a whole-lake rollup with no site and no company
+    even in principle; sites/{site_id}/ carries a LEGACY user_mapping slug
+    (lambda_report_generator.py:1548/:1710), not an Aurora sites.id, so
+    resolving it needs either a company_id we do not have
+    (sites.get_company_site_by_slug is circular for this purpose) or an
+    O(all-sites) scan whose cross-company slug collisions are unguarded.
+    So we fail closed on the honest alternative: only platform_admin -- the
+    SOLE role for which the absence of company scoping is correct rather
+    than an omission (repositories/scope.py: cross_company is true only via
+    acl.is_cross_company, which is platform_admin-only) -- may read an
+    artifact whose company cannot be established.
+
+    Company admins/gms lose the ability to download site/company rollups
+    through this route. That capability should be restored properly by a
+    site-rollup route taking an explicit site_id authorized through the
+    company-scoped site ACL, not by loosening this gate."""
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)
+        return sc["user_scope"] == "ALL" and sc["cross_company"]
+    # Binary branch (review FOLLOW-UP 3). This used to `return False`
+    # unconditionally, which made GRADED_ROLES -- an operational kill switch
+    # -- also strip platform_admin of the ownerless presign it holds on the
+    # graded branch, precisely during the incident someone would flip it to
+    # investigate. The graded branch's real predicate is cross_company, and
+    # acl.is_cross_company is a pure function of global_role
+    # (platform_admin-only), so asking the role directly reaches the SAME
+    # conclusion with no company dimension required -- no loosening, just
+    # the flag-independent restatement. Everyone else stays fail-closed.
+    return caller["global_role"] == "platform_admin"
+# ----------------------------------------------------------
+# /reports/history -- Aurora-identity report index.
+#
+# WHY THIS ROUTE EXISTS (S-1 companion, 2026-07-23 security-acl-and-error-
+# sentinel plan). The legacy /api/reports/history
+# (lambda_fieldsight_api.get_report_history) used an empty LIST to mean
+# BOTH "admin/gm -- no filter" AND "this caller can access nothing", and
+# `if allowed_folders:` is falsy for both -- so an Aurora-only account
+# (absent from the legacy DynamoDB fieldsight-users store -> role='viewer',
+# display_name='' -> no accessible users) received EVERY report key in the
+# lake. Proven live on prod: 88 keys spanning every user folder, across
+# unrelated customers. Fixing that correctly leaves those same accounts
+# with an EMPTY Reports page, because the legacy lambda cannot resolve
+# them at all. This route restores the page from Aurora identity -- the
+# same routing-around-the-legacy-identity-store pattern as
+# get_org_transcripts / get_org_dates.
+# ----------------------------------------------------------
+
+REPORT_LAKE_PREFIX = "reports/"
+_MAX_REPORT_HISTORY = 500
+
+
+def _report_key_owner_folder(key):
+    """Owner folder for a lake report key, or None when it has no owner.
+
+    reports/{date}/{folder}/{type}_report.json  -> {folder}
+    reports/{date}/summary_report.json          -> None (whole-lake rollup)
+    reports/{date}/sites/{site}/...             -> None (site rollup)
+
+    Deliberately the SAME derivation the legacy presigner uses after S-2,
+    and it fails the same way: a key whose owner cannot be derived is not
+    authorizable by ownership, so scoped callers never see it. Neither
+    ownerless shape carries a company even in principle (the site segment
+    is a legacy config/user_mapping slug from lambda_report_generator.py,
+    not an Aurora sites.id), which is why deriving one is not attempted."""
+    parts = key.split("/")
+    if len(parts) < 4 or parts[0] != "reports":
+        return None
+    folder = parts[2]
+    if not folder or folder in ("sites", "summary_report.json"):
+        return None
+    return folder
+
+
+def _org_report_folder_scope(conn, caller):
+    """Folder-name scope for the report index, as a THREE-STATE value.
+
+        None      -> unrestricted. Apply no filter.
+        set()     -> DENY ALL. The caller can see nothing.
+        {"A","B"} -> exactly these folders.
+
+    SECURITY (the governing principle of the 2026-07-23 plan): "unrestricted"
+    and "nothing accessible" must never be the same value, and no caller may
+    branch on a bare truthiness test. `None` and `set()` are different values
+    and neither is a list.
+
+    UNRESTRICTED IS NARROWER HERE THAN ON THE LEGACY ENDPOINT. Only a
+    cross-company caller (platform_admin -- acl.is_cross_company, D6) gets
+    None. An ALL-tier *company* admin/gm gets the explicit set of their own
+    company's folders instead, because the lake is multi-tenant and a report
+    key carries no company: "no filter" would hand company A every company-B
+    folder. This is the same reasoning as S-4 on the ownerless presign gate --
+    platform_admin is the sole role for which the absence of company scoping
+    is correct rather than an omission.
+
+    GRADED_ROLES on: the folder set is derived from /timeline's own envelope
+    (scope.visible_scope) so this route can never show more than /timeline --
+    SITE (pm/regional_manager) resolves every author on an in-scope site;
+    SELF+WORKERS (site_manager) and SELF (worker) resolve the envelope's
+    author_ids, which is BUG-25's graded restatement (self + role='worker'
+    members, never fellow site_managers or pms).
+
+    GRADED_ROLES off: the binary rule -- ALL tier (admin/gm) gets the company
+    folder set, everyone else their OWN folder only, deny-all when they have
+    no folder mapping."""
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)
+        if sc["cross_company"]:
+            return None
+        if sc["user_scope"] == "ALL":
+            return _company_folder_names(conn, caller["company_id"])
+        if sc["user_scope"] == "SITE":
+            # author_ids is None for this tier (no per-author filter within
+            # the reach) -- resolve the reach itself into folders rather
+            # than treating "no per-author filter" as "no filter at all".
+            user_ids = memberships.user_ids_for_sites(conn, sc["site_ids"])
+            user_ids = set(user_ids) | {sc["self_user_id"]}
+            return users.folder_names_for_user_ids(conn, user_ids,
+                                                   company_id=caller["company_id"])
+        return users.folder_names_for_user_ids(conn, sc["author_ids"] or set(),
+                                               company_id=caller["company_id"])
+    # ---- GRADED_ROLES off: binary fallback ----
+    if is_cross_company(caller["global_role"]):
+        return None
+    if resolve_scope(caller["global_role"]) == "ALL":
+        return _company_folder_names(conn, caller["company_id"])
+    own = caller.get("folder_name")
+    return {own} if own else set()
+
+
+def _company_folder_names(conn, company_id):
+    return {u["folder_name"] for u in users.list_company_users(conn, company_id)
+            if u.get("folder_name")}
+
+
+def _read_org_report_history(folder_scope, limit):
+    """List the lake's report index, filtered by an ALREADY-RESOLVED folder
+    scope. `folder_scope is None` means unrestricted; callers MUST have
+    short-circuited the deny-all (empty set) case before getting here.
+
+    Row shape is byte-compatible with the legacy endpoint's
+    ({key, type, date, generated_at, size}) so pages/reports.js needs no
+    reshape. A listing failure degrades to an empty list -- never to an
+    unfiltered one."""
+    reports = []
+    try:
+        paginator = s3().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=LAKE_BUCKET, Prefix=REPORT_LAKE_PREFIX):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith("_report.json") or "_debug" in key:
+                    continue
+                if folder_scope is not None:
+                    owner = _report_key_owner_folder(key)
+                    if owner is None or owner not in folder_scope:
+                        continue
+                rtype = ("weekly" if "weekly" in key
+                         else "monthly" if "monthly" in key else "daily")
+                dm = REPORT_DATE_IN_KEY_RE.search(key)
+                reports.append({
+                    "key": key, "type": rtype,
+                    "date": dm.group(1) if dm else "",
+                    "generated_at": obj["LastModified"].isoformat(),
+                    "size": obj["Size"],
+                })
+    except ClientError:
+        # Same degrade-to-empty posture as _list_report_folders: a transient
+        # S3 problem must not 500 the Reports page, and must not fall back
+        # to anything unfiltered either.
+        logger.exception("report history listing failed")
+    reports.sort(key=lambda r: r["date"], reverse=True)
+    return {"reports": reports[:limit]}
+
+
+def get_org_report_history(conn, caller, event):
+    """GET /api/org/reports/history?limit=20 -- Aurora-identity replacement
+    for the legacy /api/reports/history (S-1's leak; see the block comment
+    above). Scoped through _org_report_folder_scope, whose deny-all state is
+    an explicit early return rather than a falsy container."""
+    p = event.get("queryStringParameters") or {}
+    raw_limit = (p.get("limit") or "20").strip()
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        return error("limit must be an integer", 400)
+    if limit < 1 or limit > _MAX_REPORT_HISTORY:
+        return error(f"limit must be between 1 and {_MAX_REPORT_HISTORY}", 400)
+    folder_scope = _org_report_folder_scope(conn, caller)
+    if folder_scope is not None and not folder_scope:
+        # DENY ALL -- return early rather than fall into a filter loop whose
+        # predicate an empty container would silently satisfy.
+        return ok({"reports": []})
+    return ok(_read_org_report_history(folder_scope, limit))
+
+
 def get_org_transcripts(conn, caller, event):
     """GET /api/org/transcripts?date=&user=&start=&end= -- Aurora-identity
     transcript read (Timeline "Transcript" tab bug fix). scripts/api/
@@ -2219,35 +3543,258 @@ def get_org_transcripts(conn, caller, event):
     Ben_UCPK) resolves there to role='viewer', display_name='', so
     can_access_user_data 403s even though the transcript S3 object
     exists. This route resolves the caller from Aurora instead (dispatch's
-    `caller`, same as every other /api/org/* route) and applies get_
-    timeline_compat's GRADED_ROLES-off ACL verbatim: a non-ALL caller may
-    only read their own folder (?user= for anyone else is 403, silently
-    forcing to self the way D10 used to is exactly the mislabeled-data bug
-    fix wave 1 closed for /timeline -- reject, don't substitute); admin/gm
-    may pass ?user=, defaulting to their own folder when omitted, and an
-    explicit ?user= must resolve to a folder in their company (RETARGET
-    override 5, same as /timeline). Phase 3 GRADED_ROLES still defaults
-    off and this route doesn't add a graded branch -- when that flag
-    flips, /timeline's graded path is the template to extend this with.
-    The S3 read/normalize is delegated to _read_org_transcripts (mirrors
-    the legacy endpoint's shape so transcript-list.js needs no reshape)."""
+    `caller`, same as every other /api/org/* route) and authorizes through
+    _resolve_org_media_folder: graded when GRADED_ROLES is on, binary
+    fallback when off (2026-07-23 prod-media-binding plan; behaviour
+    change: site/self-scoped callers now reach exactly the folders
+    /timeline shows them). The S3 read/normalize is delegated to
+    _read_org_transcripts (mirrors the legacy endpoint's shape so
+    transcript-list.js needs no reshape)."""
     p = event.get("queryStringParameters") or {}
     date = p.get("date")
     user = (p.get("user") or "").strip()
     if not date or not REPORT_DATE_RE.match(date):
         return error("date required (YYYY-MM-DD)", 400)
-    is_all = resolve_scope(caller["global_role"]) == "ALL"
-    if not is_all:
-        own = caller.get("folder_name")
-        if not own:
-            return error("no folder mapping for your account", 403)
-        if user and user != own:
-            return error("you may only view your own transcripts", 403)
-        user = own
-    elif not user:
-        user = caller.get("folder_name") or ""
-    if not user:
-        return error("user required", 400)
-    if is_all and users.get_by_folder_name(conn, caller["company_id"], user) is None:
-        return error("user not found in your company", 404)
-    return ok(_read_org_transcripts(date, user, p.get("start") or "", p.get("end") or ""))
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="transcripts")
+    if err is not None:
+        return err
+    return ok(_read_org_transcripts(date, folder, p.get("start") or "", p.get("end") or ""))
+
+
+# ----------------------------------------------------------
+# /audio-segments + /video-segments + /media/presigned-url — Aurora-identity
+# media reads (P1, 2026-07-23 prod-media-binding plan)
+# ----------------------------------------------------------
+
+def _read_org_audio_segments(date, folder, start_time, end_time):
+    """S3 list + presign for one (folder, date) window -- mirrors
+    lambda_fieldsight_api.get_audio_segments verbatim: same BUG-01-anchored
+    regexes, same window filter (no +/-60s buffer -- the legacy audio
+    endpoint never had one), same response fields. Only the folder_name
+    spelling of the prefix is searched (same posture as
+    _read_org_transcripts: the modern frontend never hands a spaced name)."""
+    start_sec = _org_parse_time_to_seconds(start_time) if start_time else 0
+    end_sec = _org_parse_time_to_seconds(end_time) if end_time else 86400
+    prefix = f"audio_segments/{folder}/{date}/"
+    segments = []
+    for obj in _list_media_objects(prefix, "audio-segments"):
+        key = obj["Key"]
+        if not key.endswith(".wav"):
+            continue
+        filename = key.split("/")[-1]
+        base_match = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})_off", filename)
+        off_match = re.search(r"_off([\d.]+)_to([\d.]+)", filename)
+        if not base_match or not off_match:
+            continue
+        h, m, sec = (int(base_match.group(1)), int(base_match.group(2)),
+                     int(base_match.group(3)))
+        base_sec = h * 3600 + m * 60 + sec
+        abs_start = base_sec + float(off_match.group(1))
+        abs_end = base_sec + float(off_match.group(2))
+        if abs_end < start_sec or abs_start > end_sec:
+            continue
+        url = s3().generate_presigned_url(
+            "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
+            ExpiresIn=PRESIGNED_URL_EXPIRY)
+        ah, am, asec = (int(abs_start) // 3600, (int(abs_start) % 3600) // 60,
+                        int(abs_start) % 60)
+        segments.append({
+            "url": url, "filename": filename,
+            "absolute_start": abs_start, "absolute_end": abs_end,
+            "duration": round(abs_end - abs_start, 1),
+            "time_label": f"{ah:02d}:{am:02d}:{asec:02d}",
+        })
+    segments.sort(key=lambda seg: seg["absolute_start"])
+    return {"segments": segments, "count": len(segments)}
+
+
+def get_org_audio_segments(conn, caller, event):
+    """GET /api/org/audio-segments?date=&user=&start=&end= -- Aurora-identity
+    audio read (P1, 2026-07-23 prod-media-binding plan). Same bug family as
+    get_org_transcripts (see its docstring): audio.js called the legacy
+    gateway whose DynamoDB identity store 403s every Aurora-only account."""
+    p = event.get("queryStringParameters") or {}
+    date = p.get("date")
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, (p.get("user") or "").strip(),
+                                            what="audio")
+    if err is not None:
+        return err
+    return ok(_read_org_audio_segments(date, folder, p.get("start") or "", p.get("end") or ""))
+
+
+def _read_org_video_segments(date, folder, start_time, end_time):
+    """Mirrors lambda_fieldsight_api.get_video_segments: web_video/ H264
+    previews first, users/{folder}/video/ originals second, an original
+    suppressed when a preview shares its base_name, ~10-min assumed file
+    span, offset_sec = seek hint into the file. The legacy [user_folder,
+    user] name-variant loop is collapsed to folder_name only (see
+    _read_org_transcripts' identical stance)."""
+    start_sec = _org_parse_time_to_seconds(start_time) if start_time else 0
+    end_sec = _org_parse_time_to_seconds(end_time) if end_time else 86400
+    videos = []
+    for prefix, is_preview in ((f"web_video/{folder}/{date}/", True),
+                               (f"users/{folder}/video/{date}/", False)):
+        for obj in _list_media_objects(prefix, "video-segments"):
+            key = obj["Key"]
+            if not any(key.lower().endswith(e) for e in (".mp4", ".webm", ".mov")):
+                continue
+            filename = key.split("/")[-1]
+            time_match = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})", filename)
+            if not time_match:
+                continue
+            h, m, sec = (int(time_match.group(1)), int(time_match.group(2)),
+                         int(time_match.group(3)))
+            vid_start = h * 3600 + m * 60 + sec
+            if vid_start + 600 < start_sec or vid_start > end_sec:
+                continue
+            base_name = re.sub(r"\.\w+$", "", filename)
+            if not is_preview and any(v.get("base_name") == base_name for v in videos):
+                continue
+            url = s3().generate_presigned_url(
+                "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
+                ExpiresIn=PRESIGNED_URL_EXPIRY)
+            vh, vm, vs = vid_start // 3600, (vid_start % 3600) // 60, vid_start % 60
+            videos.append({
+                "url": url, "key": key, "filename": filename,
+                "base_name": base_name,
+                "video_start_sec": vid_start,
+                "time_label": f"{vh:02d}:{vm:02d}:{vs:02d}",
+                "offset_sec": round(max(0, start_sec - vid_start), 1),
+                "size_mb": round(obj["Size"] / (1024 * 1024), 1),
+                "is_preview": is_preview,
+                "codec": "h264" if is_preview else "unknown",
+            })
+    videos.sort(key=lambda v: v["video_start_sec"])
+    return {"videos": videos, "count": len(videos)}
+
+
+def get_org_video_segments(conn, caller, event):
+    """GET /api/org/video-segments -- Aurora-identity video read (P1)."""
+    p = event.get("queryStringParameters") or {}
+    date = p.get("date")
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, (p.get("user") or "").strip(),
+                                            what="video")
+    if err is not None:
+        return err
+    return ok(_read_org_video_segments(date, folder, p.get("start") or "", p.get("end") or ""))
+
+
+_ORG_MEDIA_PRESIGN_PREFIXES = ("users/", "audio_segments/", "transcripts/",
+                               "reports/", "web_video/")
+
+
+def _authorize_report_object_presign(conn, caller, folder):
+    """May this caller presign reports/{date}/{folder}/... ?
+    Returns None when allowed, else an error response.
+
+    SECURITY (adversarial review BLOCKER 2). reports/ is the ONE presignable
+    shape whose object /timeline deliberately WITHHOLDS from part of the
+    population that _can_view_folder admits: _render_timeline_for_user sets
+    doc=None and serves 404 (cross_user_clip) when a graded non-ALL caller
+    views someone else, because the target's whole-day free-text prose
+    (executive_summary / safety_observations / quality_and_compliance /
+    critical_dates_and_deadlines) is NOT site-scoped and can span sites
+    outside the caller's reach. Routing reports/ through
+    _resolve_org_media_folder like the other prefixes handed exactly those
+    callers a bearer URL to exactly that object -- /timeline 404s pm
+    Neil_Blunden on Ben_UCPK's day while the presigner returned 200 for
+    reports/{date}/Ben_UCPK/daily_report.json. It also sat outside the
+    widening the user approved, whose residual-risk paragraph scopes its
+    exemption to audio/video/transcript objects keyed by (folder, date) and
+    never mentions reports/.
+
+    The rule restores exact parity rather than blanket-denying:
+      * ALL tier  -> allowed. /timeline serves these callers the verbatim
+        doc (cross_user_clip=False), so allowing the presign IS parity.
+        Still company-pinned, via _resolve_org_media_folder's own
+        users.get_by_folder_name check (RETARGET override 5).
+      * everyone else -> own folder only. /timeline gives them nothing else
+        from this object, so denying IS parity. Dropping reports/ from the
+        allowlist entirely would break the legitimate own-report presigns
+        (meetings.js:40, reports.js:61).
+    GRADED_ROLES off is coherent by construction: /timeline's binary branch
+    already forces non-ALL callers to self, so the same two-case rule -- read
+    off resolve_scope/caller.folder_name instead of the graded envelope --
+    is parity there too."""
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)
+        is_all, self_folder = sc["user_scope"] == "ALL", sc["self_folder"]
+    else:
+        is_all = resolve_scope(caller["global_role"]) == "ALL"
+        self_folder = caller.get("folder_name")
+    if is_all:
+        # Delegate ONLY the ALL-tier case, so the company pin and its 404
+        # shape stay in one place.
+        _, err = _resolve_org_media_folder(conn, caller, folder, what="reports")
+        return err
+    if not self_folder or folder != self_folder:
+        return error("you may only access your own reports", 403)
+    return None
+
+
+def get_org_media_presigned_url(conn, caller, event):
+    """GET /api/org/media/presigned-url?key= -- Aurora-identity presigner
+    (P1, prod-media-binding plan). The legacy /media/presigned-url
+    (lambda_fieldsight_api.get_presigned_url) folder-checks through the
+    DynamoDB identity store, 403ing every Aurora-only account -- which
+    would leave P2's topic_photos bindings rendering as 'Preview
+    unavailable'. Same prefix allowlist and owner-folder extraction as the
+    legacy endpoint; authorization via _resolve_org_media_folder -- i.e. the
+    SAME graded-or-binary rule as the list routes, so a caller who can list
+    a member's photos/audio can also presign them (no half-working state
+    where the list step passes and every thumbnail 403s). Keys with no
+    derivable owner (e.g. reports/{date}/summary_report.json) are allowed
+    for platform_admin only (S-4: neither ownerless shape carries a
+    derivable company, so tier alone is not a sufficient authorization) --
+    deliberately NARROWER than both the legacy handler (which let any
+    caller presign an ownerless key) and this route's own pre-S-4 gate
+    (which allowed any ALL-tier caller, including a company admin/gm).
+    reports/{date}/{folder}/... is the ONE owner-derivable shape that does
+    NOT use the shared list-route rule -- see _authorize_report_object_presign
+    for why (/timeline withholds that exact object from graded non-ALL
+    cross-user callers, review BLOCKER 2).
+    No unquote_plus here: API Gateway already URL-decodes query params
+    once; the legacy endpoint's extra decode would corrupt a literal '+'.
+    That omission is load-bearing, not an oversight: it keeps the bytes this
+    function PARSES for the ACL identical to the bytes botocore SIGNS, which
+    is what structurally prevents the classic presign bypass. Do not add a
+    decode here."""
+    key = (event.get("queryStringParameters") or {}).get("key", "")
+    if not key:
+        return error("key required", 400)
+    if not any(key.startswith(p) for p in _ORG_MEDIA_PRESIGN_PREFIXES):
+        return error("access denied", 403)
+    parts = key.split("/")
+    # Defensive canonicalization (review FOLLOW-UP 4). 31 crafted keys failed
+    # to produce a leak -- dot-segments fail closed at S3/SigV4 in both
+    # directions -- but that safety rests on a botocore implementation detail,
+    # and "users/Ada_L/../Someone_Else/..." would otherwise pass an
+    # own-folder check while naming a different owner. Reject non-canonical
+    # keys outright instead of reasoning about the signer's behaviour.
+    if "//" in key or key.startswith("/") or any(p in (".", "..") for p in parts):
+        return error("access denied", 403)
+    target = None
+    if len(parts) >= 2 and parts[0] in ("users", "audio_segments", "transcripts", "web_video"):
+        target = parts[1]
+    elif parts[0] == "reports" and len(parts) > 3 and \
+            parts[2] not in ("summary_report.json", "sites"):
+        target = parts[2]
+    if not target:
+        if not _org_caller_may_read_ownerless(conn, caller):
+            return error("access denied", 403)
+    elif parts[0] == "reports":
+        err = _authorize_report_object_presign(conn, caller, target)
+        if err is not None:
+            return err
+    else:
+        _, err = _resolve_org_media_folder(conn, caller, target, what="media")
+        if err is not None:
+            return err
+    url = s3().generate_presigned_url(
+        "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=PRESIGNED_URL_EXPIRY)
+    return ok({"url": url, "expires_in": PRESIGNED_URL_EXPIRY})

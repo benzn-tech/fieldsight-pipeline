@@ -68,3 +68,35 @@ def test_update_action_item_fields_empty_short_circuits():
     conn = FakeConn(results=[])
     assert action_items.update_action_item_fields(conn, "a-1", {}, "sub-9") is None
     assert conn.calls == []                                    # no round-trip
+
+
+# ----------------------------------------------------------
+# updated_by_name -- the resolved display name behind the "Checked by <name>"
+# caption. updated_by on its own is a cognito sub, which no UI can render.
+# ----------------------------------------------------------
+def test_update_action_item_fields_resolves_updated_by_name_in_one_round_trip():
+    conn = FakeConn(results=[[{"id": "a-1", "status": "done",
+                               "updated_by": "sub-9", "updated_by_name": "Ada L"}]])
+    out = action_items.update_action_item_fields(conn, "a-1", {"status": "done"}, "sub-9")
+    assert out["updated_by_name"] == "Ada L"
+    assert len(conn.calls) == 1                                # single statement
+    sql = conn.calls[0]["sql"]
+    assert "WITH upd AS (" in sql and "RETURNING" in sql       # UPDATE ... RETURNING in a CTE
+    assert "SELECT upd.*" in sql
+    # updated_by is a COGNITO SUB (migration 0017: `updated_by text`), so the
+    # join must be on users.cognito_sub -- joining users.id would never match.
+    assert "LEFT JOIN users u ON u.cognito_sub = upd.updated_by" in sql
+
+
+def test_update_action_item_fields_name_sql_is_the_null_safe_concat_ws_form():
+    """Must reuse content_edits.list_content_edits' exact expression: CONCAT_WS
+    skips NULL parts (so a missing last_name yields "Ada", not "Ada ") and
+    NULLIF(TRIM(...), '') collapses a wholly-nameless account to NULL. A
+    hand-rolled `first || ' ' || last` returns NULL whenever either half is
+    NULL -- that is the bug this form exists to prevent."""
+    conn = FakeConn(results=[[{"id": "a-1"}]])
+    action_items.update_action_item_fields(conn, "a-1", {"status": "done"}, "sub-9")
+    sql = conn.calls[0]["sql"]
+    assert ("NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') "
+            "AS updated_by_name") in sql
+    assert "||" not in sql                                     # no hand-rolled concat

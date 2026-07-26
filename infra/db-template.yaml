@@ -161,6 +161,20 @@ Resources:
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Type: AWS::RDS::DBCluster
+    Metadata:
+      # W3690 fires because aurora-postgresql 16.4 can no longer be used to
+      # CREATE a cluster. The cluster this template manages already exists and
+      # already runs 16.4 (verified against the live cluster on 2026-07-23), so
+      # the warning describes a path this stack does not take.
+      #
+      # Do NOT "fix" it by bumping EngineVersion: that would queue an in-place
+      # engine upgrade of the live database on the next stack update. An engine
+      # upgrade must be a deliberate, scheduled operation with a snapshot and a
+      # rollback plan -- never a side effect of making CI green.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W3690
     Properties:
       Engine: aurora-postgresql
       # 16.4+ is required for ServerlessV2ScalingConfiguration MinCapacity 0
