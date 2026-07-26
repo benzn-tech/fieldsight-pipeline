@@ -35,6 +35,7 @@ SIDEBAR_KEYS = [  # (env key, label, is_secret)
     ("PLAUD_CLIENT_ID", "Plaud Client ID", False),
     ("PLAUD_API_KEY", "Plaud API key", True),
     ("PLAUD_SECRET_KEY", "Plaud secret (upload fallback)", True),
+    ("SONIOX_API_KEY", "Soniox key", True),
     ("ZHIPU_API_KEY", "Zhipu / z.ai key", True),
     ("DASHSCOPE_API_KEY", "DashScope key (Qwen+Fun-ASR)", True),
     ("AWS_ACCESS_KEY_ID", "AWS access key id", False),
@@ -414,8 +415,8 @@ def main():
     cfg, opts = sidebar()
     providers, selected = provider_picker(cfg)
     st.title("FieldSight ASR Benchmark")
-    st.caption("Cartesia · ElevenLabs Scribe · Plaud · AWS Transcribe · Zhipu GLM-ASR · "
-               "Qwen3-ASR · Ali Fun-ASR — accuracy, speed & speakers, side by side.")
+    st.caption("Cartesia · ElevenLabs Scribe · Plaud · Soniox · AWS Transcribe · "
+               "Zhipu GLM-ASR · Qwen3-ASR · Ali Fun-ASR — accuracy, speed & speakers, side by side.")
     t1, t2, t3 = st.tabs(["🎤 Run", "📊 History", "ℹ️ Providers & Integration"])
     with t1:
         tab_run(cfg, opts, selected)

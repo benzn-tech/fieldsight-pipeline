@@ -22,6 +22,7 @@ transcript for scoring).
 | **Cartesia Ink** (candidate) | `CARTESIA_API_KEY` | — | bytes (multipart) |
 | **ElevenLabs Scribe** (candidate) | `ELEVENLABS_API_KEY` | — | bytes (multipart) |
 | **Plaud** (candidate) | `PLAUD_CLIENT_ID` + `PLAUD_API_KEY` | ✅ presign (or Plaud upload) | audio URL (async) |
+| **Soniox** (candidate) | `SONIOX_API_KEY` | — | bytes via SDK (async upload+poll) |
 | **AWS Transcribe** (incumbent baseline) | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_TRANSCRIBE_BUCKET` | ✅ stages WAV in S3 | `s3://` URI |
 | **Anthropic Claude** (LLM judge — optional) | `ANTHROPIC_API_KEY` | — | n/a (scores text) |
 | **Zhipu GLM-ASR** | `ZHIPU_API_KEY` | — | bytes (base64) |
@@ -46,6 +47,7 @@ app scores WER/CER locally and Anthropic is not needed.
 | **Cartesia** | play.cartesia.ai → API Keys (docs.cartesia.ai) | one bearer key | needs `Cartesia-Version` header (default `2025-04-16`) |
 | **ElevenLabs** | elevenlabs.io → API Keys | one key (`xi-api-key` header) | Scribe v2; 90+ langs auto-detect (en+zh); free tier, likely no card |
 | **Plaud** | dev.plaud.ai → portal → App Settings → API Keys | `client_id` + `api_key` (api-key **≠** secret) | regional host (US / Japan); `secret_key` only for Plaud's own upload |
+| **Soniox** | console.soniox.com → API Keys | one key | model `stt-async-v5`; 60+ langs, language ID + diarization |
 | **AWS** | Console → IAM (account `509194952652` exists) | IAM user access key id + secret | keys are global; use `AWS_REGION=ap-southeast-2`. Min policy below. |
 | **Anthropic** | console.anthropic.com → API Keys | one key | reuse the existing FieldSight Claude key |
 | **Zhipu GLM-ASR** | intl: z.ai · China: open.bigmodel.cn | one key | the two platforms' keys are **not** interchangeable. Limit: wav/mp3, ≤25 MB, **≤30 s** per request |
@@ -89,6 +91,7 @@ aws iam create-access-key --user-name "$USER" --output table   # copy the secret
 | **Cartesia** Ink Whisper | ~**$0.13/hr** (Scale tier) | ✅ free plan $0/mo, 20k credits/mo ≈ **~5.5 h STT/mo**, API included | ❌ **no card** |
 | **ElevenLabs** Scribe v2 | ~**$0.40/hr** ($0.0067/min) ⚠️ confirm on /pricing/api | ✅ free plan (10k credits/mo; exact STT minutes ⚠️ unspecified) | ❌ likely no card (⚠️ unverified) |
 | **Plaud** (plaud-fast-whisper) | ⚠️ see Plaud developer portal (not public) | ⚠️ check portal | ⚠️ unverified |
+| **Soniox** (stt-async-v5) | ~**$0.10/hr** async (token-billed; $0.12/hr realtime) | ✅ free credits for new API accounts (amount ⚠️ unverified) | ⚠️ unverified |
 | **AWS Transcribe** | ~$0.024/min ≈ **$1.44/hr** (US) | ✅ **60 min/mo for 12 mo** | ⚠️ **card required** to open the account |
 | **Anthropic** (judge, optional) | Sonnet 4.6 $3 / $15 per 1M tok; judge calls ≈ cents | ✅ ~**$5** trial credit | ❌ no card to start (phone verify) |
 | **Zhipu GLM-ASR** | **¥0.06/min ≈ ¥3.6/hr** (~$0.5/hr, bigmodel.cn) | ⚠️ new-user token grant (whether it covers ASR unverified) | 🔴 bigmodel.cn needs **China real-name + prepaid**; z.ai = email + intl card, no real-name |
@@ -100,10 +103,10 @@ aws iam create-access-key --user-name "$USER" --output table   # copy the secret
 - **Running the benchmark is essentially free** — every engine has a free tier or
   trial that covers a handful of test files. The only hard gate is that opening
   an **AWS account requires a card**.
-- **Cost ranking (cheap → expensive):** Fun-ASR `~$0.04/hr` < Qwen3-ASR `~$0.12/hr`
-  ≈ Cartesia `~$0.13/hr` < ElevenLabs `~$0.40/hr` < Zhipu `~$0.5/hr` < **AWS
-  `~$1.44/hr+` (the incumbent — most expensive)**. Replacing AWS could cut
-  per-hour cost by ~3–10×.
+- **Cost ranking (cheap → expensive):** Fun-ASR `~$0.04/hr` < Soniox `~$0.10/hr`
+  < Qwen3-ASR `~$0.12/hr` ≈ Cartesia `~$0.13/hr` < ElevenLabs `~$0.40/hr` <
+  Zhipu `~$0.5/hr` < **AWS `~$1.44/hr+` (the incumbent — most expensive)**.
+  Replacing AWS could cut per-hour cost by ~3–10×.
 - **No card needed:** Cartesia, ElevenLabs (free tier), Anthropic (to start). **Card required:** AWS.
   **China real-name required:** Zhipu bigmodel, Ali China (bailian) — to
   avoid it, use the **international** route (Zhipu via z.ai, Ali via international
@@ -126,3 +129,4 @@ aws iam create-access-key --user-name "$USER" --output table   # copy the secret
 - Anthropic — <https://www.anthropic.com/pricing>
 - Zhipu — <https://bigmodel.cn/pricing> · <https://docs.z.ai/guides/audio/glm-asr-2512>
 - Alibaba (Qwen + Fun-ASR) — <https://help.aliyun.com/zh/model-studio/model-pricing> · <https://help.aliyun.com/zh/model-studio/recording-file-recognition> · <https://help.aliyun.com/zh/model-studio/new-free-quota>
+- Soniox — <https://soniox.com/pricing> · <https://soniox.com/docs/stt/async/async-transcription>

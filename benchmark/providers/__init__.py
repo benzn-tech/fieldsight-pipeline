@@ -10,6 +10,7 @@ from .base import ASRProvider, ASRResult, Segment
 from .cartesia import CartesiaProvider
 from .elevenlabs import ElevenLabsProvider
 from .plaud import PlaudProvider
+from .soniox import SonioxProvider
 from .aws_transcribe import AWSTranscribeProvider
 from .zhipu import ZhipuProvider
 from .qwen import QwenProvider
@@ -20,6 +21,7 @@ PROVIDER_CLASSES = [
     CartesiaProvider,
     ElevenLabsProvider,
     PlaudProvider,
+    SonioxProvider,
     AWSTranscribeProvider,
     ZhipuProvider,
     QwenProvider,
