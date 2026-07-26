@@ -113,6 +113,12 @@ MAX_SPEAKERS = int(os.environ.get('MAX_SPEAKERS', '5'))
 # Must be created first via: aws transcribe create-vocabulary ...
 VOCABULARY_NAME = os.environ.get('VOCABULARY_NAME', '')
 
+# --- Provider toggle (Phase: alt-ASR) --------------------------------------
+ASR_PROVIDER = os.environ.get('ASR_PROVIDER', 'transcribe')  # transcribe | elevenlabs
+KEYTERMS_PATH = os.environ.get('KEYTERMS_PATH', 'config/custom_vocabulary_construction_nz.txt')
+
+s3 = boto3.client('s3')
+
 # Supported audio/video formats for Transcribe
 SUPPORTED_FORMATS = {
     '.wav': 'wav',
@@ -339,28 +345,63 @@ def lambda_handler(event, context):
             base_name = os.path.splitext(os.path.basename(key))[0]
             job_name = sanitize_job_name(f"fieldsight_{display_name}_{base_name}")
             
-            # Check if job already exists
-            try:
-                existing = transcribe.get_transcription_job(
-                    TranscriptionJobName=job_name
-                )
-                status = existing['TranscriptionJob']['TranscriptionJobStatus']
-                logger.info(f"Job {job_name} already exists, status: {status}")
-                results.append({
-                    'key': key,
-                    'status': 'exists',
-                    'job_name': job_name,
-                    'job_status': status
-                })
-                continue
-            except transcribe.exceptions.BadRequestException:
-                # Job doesn't exist, proceed to create
-                pass
-            
+            # Check if job already exists (AWS Transcribe path only — the
+            # ElevenLabs path is synchronous and has no Transcribe job to check).
+            if ASR_PROVIDER == 'transcribe':
+                try:
+                    existing = transcribe.get_transcription_job(
+                        TranscriptionJobName=job_name
+                    )
+                    status = existing['TranscriptionJob']['TranscriptionJobStatus']
+                    logger.info(f"Job {job_name} already exists, status: {status}")
+                    results.append({
+                        'key': key,
+                        'status': 'exists',
+                        'job_name': job_name,
+                        'job_status': status
+                    })
+                    continue
+                except transcribe.exceptions.BadRequestException:
+                    # Job doesn't exist, proceed to create
+                    pass
+
             # Build S3 URIs
             media_uri = f"s3://{bucket}/{key}"
             output_key = f"{OUTPUT_PREFIX}{display_name}/{file_date}/{base_name}.json"
-            
+
+            if ASR_PROVIDER == 'elevenlabs':
+                import elevenlabs_utils
+                obj = s3.get_object(Bucket=bucket, Key=key)
+                audio_bytes = obj['Body'].read()
+                keyterms = elevenlabs_utils.load_keyterms(KEYTERMS_PATH)
+                transcript_json = elevenlabs_utils.transcribe_segment(
+                    audio_bytes,
+                    os.path.basename(key),
+                    num_speakers=min(max(MAX_SPEAKERS, 2), 10),
+                    keyterms=keyterms,
+                )
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=output_key,
+                    Body=json.dumps(transcript_json),
+                    ContentType='application/json',
+                )
+                # Deliberately NOT writing the ledger here: write_ledger_record
+                # hardcodes status='transcribing' and only the (unused, on this
+                # path) EventBridge callback flips it to done — so a ledger row
+                # would be stuck forever at 'transcribing'. The transcript S3
+                # object is the source of truth and the S3-scan fallback finds
+                # it without a ledger (the code already supports ledger-off).
+                logger.info(f"ElevenLabs transcript written: s3://{bucket}/{output_key}")
+                results.append({
+                    'key': key,
+                    'status': 'completed',
+                    'provider': 'elevenlabs',
+                    'output_key': output_key,
+                    'user': display_name,
+                })
+                continue
+
             logger.info(f"Starting transcription job: {job_name}")
             logger.info(f"  Input: {media_uri}")
             logger.info(f"  Output: s3://{bucket}/{output_key}")

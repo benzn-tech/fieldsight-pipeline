@@ -2,17 +2,17 @@
 Tests for src/lambda_ask_agent.py — Phase 5, Task 3 (TDD): RAG answer mode.
 
 Style mirrors tests/unit/test_lambda_extract_session.py (dummy AWS/Anthropic
-env vars so eager boto3.client('s3') / claude_utils import never blow up on
+env vars so eager boto3.client('s3') / llm_utils import never blow up on
 a missing credential provider) and tests/unit/test_lambda_embed_report.py
-(monkeypatch dashscope_utils.embed / claude_utils.call_claude as shared-module
+(monkeypatch dashscope_utils.embed / llm_utils.call_llm as shared-module
 attributes, since lambda_ask_agent.py calls them as `dashscope_utils.embed(...)`
-/ `claude_utils.call_claude(...)` — patching the module object affects every
+/ `llm_utils.call_llm(...)` — patching the module object affects every
 caller, no re-import needed).
 
 Covers the new RAG path (event/body carries "caller_sub"): embed the
 question -> invoke RAG_SEARCH_FUNCTION (in-VPC rag-search lambda, faked here
 via a stand-in boto3 lambda client) -> synthesize a cited markdown answer via
-claude_utils.call_claude. The pre-existing S3-file path (no caller_sub) is
+llm_utils.call_llm. The pre-existing S3-file path (no caller_sub) is
 asserted to still work unchanged (test_non_rag_event_uses_legacy_path).
 """
 import io
@@ -31,7 +31,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-dummy-key")
 os.environ.setdefault("RAG_SEARCH_FUNCTION", "fieldsight-test-rag-search")
 
 laa = pytest.importorskip("lambda_ask_agent", reason="requires boto3/urllib3 (installed in CI)")
-import claude_utils  # noqa: E402  (import after importorskip, same module the handler calls)
+import llm_utils  # noqa: E402  (import after importorskip, same module the handler calls)
 import dashscope_utils  # noqa: E402
 
 
@@ -94,7 +94,7 @@ def wire(monkeypatch, *, chunks=None, embed_vec=None, claude_answer=("Grounded a
     fake_client = FakeLambdaClient({"chunks": chunks if chunks is not None else []})
     monkeypatch.setattr(laa, "_get_lambda_client", lambda: fake_client)
 
-    monkeypatch.setattr(claude_utils, "call_claude", lambda prompt, max_tokens=4096: claude_answer)
+    monkeypatch.setattr(llm_utils, "call_llm", lambda prompt, max_tokens=4096, force_json=False: claude_answer)
 
     return fake_client
 
@@ -124,7 +124,7 @@ def test_embeds_question(monkeypatch):
     monkeypatch.setattr(dashscope_utils, "embed", fake_embed)
     fake_client = FakeLambdaClient({"chunks": []})
     monkeypatch.setattr(laa, "_get_lambda_client", lambda: fake_client)
-    monkeypatch.setattr(claude_utils, "call_claude", lambda p, max_tokens=4096: ("unused", None))
+    monkeypatch.setattr(llm_utils, "call_llm", lambda p, max_tokens=4096, force_json=False: ("unused", None))
 
     invoke(make_event(question="  What happened?  "))
 
@@ -155,29 +155,29 @@ def test_default_k_is_5(monkeypatch):
 
 
 def test_no_chunks_returns_not_found_empty_citations(monkeypatch):
-    def fail_if_called(prompt, max_tokens=4096):
-        raise AssertionError("call_claude must not be called when there are no chunks")
+    def fail_if_called(prompt, max_tokens=4096, force_json=False):
+        raise AssertionError("call_llm must not be called when there are no chunks")
 
     wire(monkeypatch, chunks=[])
-    monkeypatch.setattr(claude_utils, "call_claude", fail_if_called)
+    monkeypatch.setattr(llm_utils, "call_llm", fail_if_called)
 
     result = invoke(make_event())
 
     assert result["citations"] == []
     assert result["grounded"] is True
     assert "no relevant records" in result["answer"].lower()  # English-only user-facing string
-    assert result["model"] == claude_utils.CLAUDE_MODEL
+    assert result["model"] == llm_utils.CLAUDE_MODEL
 
 
 def test_prompt_contains_numbered_chunks(monkeypatch):
     captured = {}
 
-    def fake_call_claude(prompt, max_tokens=4096):
+    def fake_call_llm(prompt, max_tokens=4096, force_json=False):
         captured["prompt"] = prompt
         return "answer", None
 
     wire(monkeypatch, chunks=[CHUNK_A, CHUNK_B])
-    monkeypatch.setattr(claude_utils, "call_claude", fake_call_claude)
+    monkeypatch.setattr(llm_utils, "call_llm", fake_call_llm)
 
     invoke(make_event())
 
@@ -327,12 +327,13 @@ def test_caller_sub_without_rag_search_function_falls_back_to_legacy(monkeypatch
 
 
 def test_claude_and_dashscope_are_not_top_level_imports():
-    """C2: claude_utils/dashscope_utils must be imported lazily inside
-    _rag_answer, not at module top level. deploy-lambda-code.sh zips ONLY
-    lambda_ask_agent.py + transcript_utils.py for prod -- a top-level import
-    would ImportModuleError the whole module (killing the legacy path too)
-    the instant this file reaches prod."""
-    assert not hasattr(laa, "claude_utils")
+    """C2: llm_utils/dashscope_utils must be imported lazily inside
+    _rag_answer, not at module top level. deploy-lambda-code.sh zips
+    lambda_ask_agent.py + transcript_utils.py + llm_utils.py for prod, but
+    dashscope_utils.py is NOT in that bundle -- a top-level import would
+    ImportModuleError the whole module (killing the legacy path too) the
+    instant this file reaches prod."""
+    assert not hasattr(laa, "llm_utils")
     assert not hasattr(laa, "dashscope_utils")
 
 
@@ -351,7 +352,7 @@ def test_embed_failure_returns_graceful_error_not_raise(monkeypatch):
     assert result["answer"] == ""
     assert result["error"] == "dashscope upstream 503"
     assert result["citations"] == []
-    assert result["model"] == claude_utils.CLAUDE_MODEL
+    assert result["model"] == llm_utils.CLAUDE_MODEL
 
 
 def test_ask_rag_search_function_error_is_service_error_not_no_records(monkeypatch):
@@ -370,9 +371,9 @@ def test_ask_rag_search_function_error_is_service_error_not_no_records(monkeypat
     monkeypatch.setattr(laa, "_get_lambda_client", lambda: CrashClient())
 
     def no_claude(*a, **k):
-        raise AssertionError("call_claude must not run when rag-search crashed")
+        raise AssertionError("call_llm must not run when rag-search crashed")
 
-    monkeypatch.setattr(claude_utils, "call_claude", no_claude)
+    monkeypatch.setattr(llm_utils, "call_llm", no_claude)
 
     result = invoke(make_event())
 

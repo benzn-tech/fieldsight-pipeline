@@ -16,14 +16,14 @@ os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 os.environ.setdefault("AWS_DEFAULT_REGION", "ap-southeast-2")
 # M-5 added an ANTHROPIC_API_KEY-configured guard at the top of
-# extract_session(); a dummy key here (read once at claude_utils import
+# extract_session(); a dummy key here (read once at llm_utils import
 # time, same as ANTHROPIC_API_KEY itself) keeps every existing test -- which
-# monkeypatches claude_utils.call_claude directly and never hits a real
+# monkeypatches llm_utils.call_llm directly and never hits a real
 # network call -- past that guard.
 os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-dummy-key")
 
 les = pytest.importorskip("lambda_extract_session", reason="requires boto3 (installed in CI)")
-import claude_utils  # noqa: E402  (import after importorskip, same module the handler calls)
+import llm_utils  # noqa: E402  (import after importorskip, same module the handler calls)
 
 
 BUCKET = "test-bucket"
@@ -105,8 +105,8 @@ SESSION_BASE = "Benl1_2026-07-06_10-00-00"
 OUT_KEY = f"extractions/Benl1/2026-07-06/{SESSION_BASE}.json"
 
 
-def _fake_call_claude_returning(payload):
-    def _fake(prompt, max_tokens=4096):
+def _fake_call_llm_returning(payload):
+    def _fake(prompt, max_tokens=4096, force_json=False):
         return json.dumps(payload), None
     return _fake
 
@@ -162,12 +162,12 @@ def test_prompt_contains_all_segment_turns(monkeypatch):
 
     captured = {}
 
-    def fake_call_claude(prompt, max_tokens=4096):
+    def fake_call_llm(prompt, max_tokens=4096, force_json=False):
         captured["prompt"] = prompt
         captured["max_tokens"] = max_tokens
         return json.dumps({"topics": [], "declared_site": None}), None
 
-    monkeypatch.setattr(claude_utils, "call_claude", fake_call_claude)
+    monkeypatch.setattr(llm_utils, "call_llm", fake_call_llm)
 
     les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
 
@@ -176,6 +176,26 @@ def test_prompt_contains_all_segment_turns(monkeypatch):
     assert "10:00:00" in captured["prompt"]  # abs_start_str of the first turn
     # BUG-16: max_tokens scales with segment count (2 segments here)
     assert captured["max_tokens"] == 4096 + 2 * 350
+
+
+def test_extract_session_requests_force_json(monkeypatch):
+    """extract_session must ask llm_utils.call_llm for structured (JSON) output --
+    the extraction contract is parsed as JSON downstream, so a plain-text
+    completion would break parsing. Minor-T2: close the force_json polarity gap."""
+    fake_s3 = FakeS3({SEG1_KEY: json.dumps(make_transcribe_json("hello world"))})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+
+    captured = {}
+
+    def _cap(prompt, max_tokens=4096, force_json=False):
+        captured["force_json"] = force_json
+        return json.dumps({"topics": [], "declared_site": None}), None
+
+    monkeypatch.setattr(llm_utils, "call_llm", _cap)
+
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    assert captured["force_json"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +212,8 @@ def test_writes_extraction_contract(monkeypatch):
     })
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
     monkeypatch.setattr(
-        claude_utils, "call_claude",
-        _fake_call_claude_returning({"topics": [{"topic_title": "t"}], "declared_site": None}),
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [{"topic_title": "t"}], "declared_site": None}),
     )
 
     extraction = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
@@ -229,8 +249,8 @@ def test_idempotent_overwrite_same_key(monkeypatch):
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
     monkeypatch.setattr(les, "S3_BUCKET", BUCKET)
     monkeypatch.setattr(
-        claude_utils, "call_claude",
-        _fake_call_claude_returning({"topics": [], "declared_site": None}),
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
     )
 
     # S3 event notifications encode spaces as '+' -- SEG1_KEY has none here,
@@ -257,8 +277,8 @@ def test_declared_site_fuzzy_match(monkeypatch):
     })
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
     monkeypatch.setattr(
-        claude_utils, "call_claude",
-        _fake_call_claude_returning({
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({
             "topics": [],
             "declared_site": {"stated": "Ellesmere Collage", "confidence": 0.82},
         }),
@@ -280,8 +300,8 @@ def test_declared_site_null_passthrough(monkeypatch):
     })
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
     monkeypatch.setattr(
-        claude_utils, "call_claude",
-        _fake_call_claude_returning({"topics": [], "declared_site": None}),
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
     )
 
     extraction = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
@@ -290,8 +310,8 @@ def test_declared_site_null_passthrough(monkeypatch):
 
     # Missing key entirely must also passthrough as None (no KeyError).
     monkeypatch.setattr(
-        claude_utils, "call_claude",
-        _fake_call_claude_returning({"topics": []}),
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": []}),
     )
     extraction2 = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
     assert extraction2["declared_site"] is None
@@ -305,15 +325,20 @@ def test_claude_failure_raises(monkeypatch):
     fake_s3 = FakeS3({SEG1_KEY: json.dumps(make_transcribe_json("hello world"))})
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
 
-    # call_claude itself fails
-    monkeypatch.setattr(claude_utils, "call_claude", lambda prompt, max_tokens=4096: (None, "boom"))
+    # call_llm itself fails
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        lambda prompt, max_tokens=4096, force_json=False: (None, "boom"),
+    )
     with pytest.raises(RuntimeError):
         les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
     assert fake_s3.put_calls == []
 
-    # call_claude succeeds but returns unparseable JSON
-    monkeypatch.setattr(claude_utils, "call_claude",
-                         lambda prompt, max_tokens=4096: ("not json at all {{{", None))
+    # call_llm succeeds but returns unparseable JSON
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        lambda prompt, max_tokens=4096, force_json=False: ("not json at all {{{", None),
+    )
     with pytest.raises(RuntimeError):
         les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
     assert fake_s3.put_calls == []
@@ -330,8 +355,8 @@ def test_corrupt_transcript_skipped(monkeypatch):
     })
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
     monkeypatch.setattr(
-        claude_utils, "call_claude",
-        _fake_call_claude_returning({"topics": [], "declared_site": None}),
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
     )
 
     extraction = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
@@ -362,8 +387,8 @@ def test_session_grown_during_extraction_raises_no_write(monkeypatch):
     fake_s3 = GrowingFakeS3({SEG1_KEY: json.dumps(make_transcribe_json("hello world"))})
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
     monkeypatch.setattr(
-        claude_utils, "call_claude",
-        _fake_call_claude_returning({"topics": [], "declared_site": None}),
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
     )
 
     with pytest.raises(RuntimeError, match="session grew"):
@@ -379,13 +404,13 @@ def test_session_grown_during_extraction_raises_no_write(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_missing_api_key_returns_none_without_raising(monkeypatch):
-    monkeypatch.setattr(claude_utils, "ANTHROPIC_API_KEY", "")
+    monkeypatch.setattr(llm_utils, "api_key_configured", lambda: False)
 
     def fail_if_called(*a, **k):
         raise AssertionError("must not gather/call Claude when API key is missing")
 
     monkeypatch.setattr(les, "s3", fail_if_called)
-    monkeypatch.setattr(claude_utils, "call_claude", fail_if_called)
+    monkeypatch.setattr(llm_utils, "call_llm", fail_if_called)
 
     result = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
 
@@ -404,7 +429,7 @@ def test_no_turns_returns_none_without_claude_call(monkeypatch):
     def fail_if_called(*a, **k):
         raise AssertionError("must not call Claude when there are no usable turns")
 
-    monkeypatch.setattr(claude_utils, "call_claude", fail_if_called)
+    monkeypatch.setattr(llm_utils, "call_llm", fail_if_called)
 
     result = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
 
@@ -444,8 +469,8 @@ def test_extraction_topic_gains_derived_safety_flags_and_findings(monkeypatch):
     fake_s3 = FakeS3({SEG1_KEY: json.dumps(make_transcribe_json("hello world"))})
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
     monkeypatch.setattr(
-        claude_utils, "call_claude",
-        _fake_call_claude_returning({
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({
             "topics": [{
                 "topic_title": "Block C Pour",
                 "category": "safety",

@@ -42,7 +42,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 
-import claude_utils
+import llm_utils
 from transcript_utils import (
     extract_base_time_from_filename,
     extract_device_from_filename,
@@ -309,9 +309,9 @@ def extract_session(bucket, user_folder, date, session_base):
     # M-5: a stack missing the secret must not retry-storm -- an S3 event
     # retries on a raised exception, and every retry would fail the exact
     # same way. Check upfront (before any S3 gather/Claude work) and bail
-    # quietly instead of reaching claude_utils.call_claude's own check only
+    # quietly instead of reaching llm_utils.call_llm's own check only
     # after doing all that work and then raising.
-    if not claude_utils.ANTHROPIC_API_KEY:
+    if not llm_utils.api_key_configured():
         logger.warning(
             f"ANTHROPIC_API_KEY not configured -- skipping session {session_base} "
             "without retry"
@@ -357,11 +357,11 @@ def extract_session(bucket, user_folder, date, session_base):
     prompt = build_extraction_prompt(user_folder, date, session_base, turns, n_segments)
     max_tokens = min(4096 + n_segments * 350, 8000)  # BUG-16
 
-    raw_response, error = claude_utils.call_claude(prompt, max_tokens=max_tokens)
+    raw_response, error = llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=True)
     if raw_response is None:
         raise RuntimeError(f"Claude call failed for session {session_base}: {error}")
 
-    parsed = claude_utils.extract_json(raw_response)
+    parsed = llm_utils.extract_json(raw_response)
     if parsed is None:
         raise RuntimeError(f"Failed to parse Claude JSON for session {session_base}")
 

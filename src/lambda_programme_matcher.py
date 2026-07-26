@@ -114,7 +114,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 
-import claude_utils
+import llm_utils
 import dashscope_utils
 from repositories import programme
 
@@ -297,7 +297,7 @@ def parse_verdict(raw, survivor_ids, conf_min=0.70):
     confidence >= conf_min is accepted. Anything else -- unparseable JSON,
     null task_id, a task_id outside the embedding survivors, low
     confidence -- returns None (a normal fail-closed skip, not an error)."""
-    parsed = claude_utils.extract_json(raw)
+    parsed = llm_utils.extract_json(raw)
     if not parsed:
         return None
     task_id = parsed.get("task_id")
@@ -438,7 +438,7 @@ def parse_impact_verdicts(raw, survivor_ids_by_finding, finding_severity_by_id, 
     prior). An unknown finding_id or unparseable JSON drops just that
     element -- NEVER the whole batch (fail-closed per-element, not
     all-or-nothing)."""
-    parsed = claude_utils.extract_json(raw)
+    parsed = llm_utils.extract_json(raw)
     if not parsed:
         return []
     raw_impacts = parsed.get("impacts")
@@ -557,7 +557,7 @@ def _process_suggestion(req, topic, topic_id, title, summary, report_date,
     # report_date -- so build_prompt's Date line was always empty until
     # this injects it per-topic (Fable review MINOR #8).
     prompt = build_prompt({**topic, "report_date": report_date}, survivors)
-    raw, error = claude_utils.call_claude(prompt, max_tokens=512)
+    raw, error = llm_utils.call_llm(prompt, max_tokens=512, force_json=True)
     if raw is None:
         raise RuntimeError(f"Claude call failed for topic {topic_id}: {error}")
 
@@ -650,7 +650,7 @@ def _process_impacts(topic, topic_findings, finding_vecs, cands, task_vecs, prog
     n = len(surviving_findings)
     prompt = build_impact_prompt(topic, surviving_findings, cands)
     max_tokens = min(512 + 256 * n, 2000)
-    raw, error = claude_utils.call_claude(prompt, max_tokens=max_tokens)
+    raw, error = llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=True)
     if raw is None:
         raise RuntimeError(
             f"Claude call failed for impact phase, topic={topic.get('topic_id')}: {error}"

@@ -7,7 +7,7 @@ feedback plan (TDD):
 
 Pure-function tests (candidate_tasks / rank_by_embedding / parse_verdict)
 need zero I/O. Handler tests monkeypatch S3, dashscope_utils.embed,
-claude_utils.call_claude, repositories.programme.read_programme, and the
+llm_utils.call_llm, repositories.programme.read_programme, and the
 lambda-invoke client -- style of tests/unit/test_lambda_extract_session.py
 (FakeS3 double, dummy AWS env vars so an eager boto3.client('s3') at import
 time never blows up) and tests/unit/test_lambda_suggestion_writer.py
@@ -27,7 +27,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-dummy-key")
 os.environ.setdefault("DASHSCOPE_API_KEY", "dashscope-test-dummy-key")
 
 lpm = pytest.importorskip("lambda_programme_matcher", reason="requires boto3/psycopg (installed in CI)")
-import claude_utils  # noqa: E402  (import after importorskip, same module the handler calls)
+import llm_utils  # noqa: E402  (import after importorskip, same module the handler calls)
 
 BUCKET = "test-bucket"
 
@@ -113,8 +113,8 @@ def _clean_match_setup(monkeypatch, confidence=0.9, suggested_progress=100,
     monkeypatch.setattr(lpm.programme, "read_programme", lambda *a, **k: programme_doc)
     monkeypatch.setattr(lpm.dashscope_utils, "embed", lambda texts: [[1.0, 0.0]] * len(texts))
     monkeypatch.setattr(
-        claude_utils, "call_claude",
-        lambda prompt, max_tokens=512: (
+        llm_utils, "call_llm",
+        lambda prompt, max_tokens=512, force_json=False: (
             json.dumps({
                 "task_id": "T-1", "confidence": confidence,
                 "suggested_status": "completed", "suggested_progress": suggested_progress,
@@ -353,8 +353,8 @@ def test_coerce_suggested_progress_bool_to_none():
 def test_handler_invalid_progress_coerced_and_no_status_drops_suggestion(monkeypatch):
     req_key, fake_lambda = _clean_match_setup(monkeypatch)
     monkeypatch.setattr(
-        claude_utils, "call_claude",
-        lambda prompt, max_tokens=512: (
+        llm_utils, "call_llm",
+        lambda prompt, max_tokens=512, force_json=False: (
             json.dumps({
                 "task_id": "T-1", "confidence": 0.9,
                 "suggested_status": None, "suggested_progress": 105,
@@ -374,8 +374,8 @@ def test_handler_invalid_progress_coerced_valid_status_still_suggests(monkeypatc
     # real change, so a suggestion IS produced, just without a progress value.
     req_key, fake_lambda = _clean_match_setup(monkeypatch)
     monkeypatch.setattr(
-        claude_utils, "call_claude",
-        lambda prompt, max_tokens=512: (
+        llm_utils, "call_llm",
+        lambda prompt, max_tokens=512, force_json=False: (
             json.dumps({
                 "task_id": "T-1", "confidence": 0.9,
                 "suggested_status": "completed", "suggested_progress": 105,
@@ -515,7 +515,7 @@ def test_handler_missing_programme_skips_topic(monkeypatch):
         raise AssertionError("must not embed/call Claude when there's no programme")
 
     monkeypatch.setattr(lpm.dashscope_utils, "embed", fail_if_called)
-    monkeypatch.setattr(claude_utils, "call_claude", fail_if_called)
+    monkeypatch.setattr(llm_utils, "call_llm", fail_if_called)
     fake_lambda = FakeLambdaClient()
     monkeypatch.setattr(lpm, "lambda_client", lambda: fake_lambda)
 
@@ -569,8 +569,8 @@ def test_handler_progress_decrease_not_real_change(monkeypatch):
     )
     # Override the Claude stub to also propose the SAME status as current.
     monkeypatch.setattr(
-        claude_utils, "call_claude",
-        lambda prompt, max_tokens=512: (
+        llm_utils, "call_llm",
+        lambda prompt, max_tokens=512, force_json=False: (
             json.dumps({
                 "task_id": "T-1", "confidence": 0.9,
                 "suggested_status": "in_progress", "suggested_progress": 30,
@@ -694,10 +694,10 @@ def test_impact_verdict_unknown_finding_id_dropped():
 # ---------------------------------------------------------------------------
 
 def _dispatch_claude(impact_response):
-    """A call_claude stub that distinguishes the suggestion-phase prompt
+    """A call_llm stub that distinguishes the suggestion-phase prompt
     from the impact-phase prompt by content: build_impact_prompt's finding
     lines always contain "finding_id=", never present in build_prompt."""
-    def _dispatch(prompt, max_tokens=512):
+    def _dispatch(prompt, max_tokens=512, force_json=False):
         if "finding_id=" in prompt:
             return json.dumps(impact_response), None
         return json.dumps({
@@ -715,7 +715,7 @@ def test_handler_collects_impacts_and_invokes_writer_once(monkeypatch):
         "entity_name": "SteelCo", "entity_trade": "Steel",
     }]
     req_key, fake_lambda = _clean_match_setup(monkeypatch, findings=findings)
-    monkeypatch.setattr(claude_utils, "call_claude", _dispatch_claude({"impacts": [
+    monkeypatch.setattr(llm_utils, "call_llm", _dispatch_claude({"impacts": [
         {"finding_id": "F-1", "task_id": "T-1", "impact_severity": "major",
          "note": "steel delayed", "confidence": 0.9},
     ]}))
@@ -746,7 +746,7 @@ def test_report_artifact_without_findings_skips_impact_phase(monkeypatch):
     req_key, fake_lambda = _clean_match_setup(monkeypatch)
     call_count = {"n": 0}
 
-    def counting_claude(prompt, max_tokens=512):
+    def counting_claude(prompt, max_tokens=512, force_json=False):
         call_count["n"] += 1
         return json.dumps({
             "task_id": "T-1", "confidence": 0.9,
@@ -754,7 +754,7 @@ def test_report_artifact_without_findings_skips_impact_phase(monkeypatch):
             "evidence": "finished the steel frame",
         }), None
 
-    monkeypatch.setattr(claude_utils, "call_claude", counting_claude)
+    monkeypatch.setattr(llm_utils, "call_llm", counting_claude)
 
     result = lpm.lambda_handler(_match_request_event(req_key), None)
 
@@ -785,7 +785,7 @@ def test_zero_survivor_finding_excluded_from_claude_call(monkeypatch):
 
     captured_prompts = []
 
-    def dispatch_and_capture(prompt, max_tokens=512):
+    def dispatch_and_capture(prompt, max_tokens=512, force_json=False):
         captured_prompts.append(prompt)
         if "finding_id=" in prompt:
             return json.dumps({"impacts": [
@@ -798,7 +798,7 @@ def test_zero_survivor_finding_excluded_from_claude_call(monkeypatch):
             "evidence": "finished the steel frame",
         }), None
 
-    monkeypatch.setattr(claude_utils, "call_claude", dispatch_and_capture)
+    monkeypatch.setattr(llm_utils, "call_llm", dispatch_and_capture)
 
     result = lpm.lambda_handler(_match_request_event(req_key), None)
 
@@ -816,7 +816,7 @@ def test_dry_run_returns_impacts_without_invoke(monkeypatch):
         "entity_name": "SteelCo", "entity_trade": "Steel",
     }]
     req_key, fake_lambda = _clean_match_setup(monkeypatch, findings=findings)
-    monkeypatch.setattr(claude_utils, "call_claude", _dispatch_claude({"impacts": [
+    monkeypatch.setattr(llm_utils, "call_llm", _dispatch_claude({"impacts": [
         {"finding_id": "F-1", "task_id": "T-1", "impact_severity": "major",
          "note": "n", "confidence": 0.9},
     ]}))
