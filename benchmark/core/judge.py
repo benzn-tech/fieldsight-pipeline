@@ -1,9 +1,13 @@
-"""Reference-free scoring with Claude as an LLM judge.
+"""Reference-free scoring with an LLM judge.
 
-When you don't have a ground-truth transcript, we ask Claude to estimate each
+When you don't have a ground-truth transcript, we ask an LLM to estimate each
 system's accuracy by cross-referencing all outputs (consensus) plus linguistic
 plausibility. Transcripts are anonymized as "Model A/B/C..." before judging to
 reduce brand bias, then scores are mapped back.
+
+Default judge is **qwen3.7-max** via DashScope (same DASHSCOPE_API_KEY as the
+Qwen/Fun-ASR providers). Set JUDGE_MODEL to a ``claude-*`` model to use the
+Anthropic backend instead (needs ANTHROPIC_API_KEY).
 
 This is an ESTIMATE, not a true WER — surfaced clearly in the UI. When a real
 reference is provided, WER/CER is used instead and the judge is skipped.
@@ -14,7 +18,12 @@ import json
 import re
 import string
 
-DEFAULT_JUDGE_MODEL = "claude-sonnet-4-6"
+DEFAULT_JUDGE_MODEL = "qwen3.7-max"
+
+_REGION_URL = {
+    "intl": "https://dashscope-intl.aliyuncs.com/api/v1",
+    "cn": "https://dashscope.aliyuncs.com/api/v1",
+}
 
 _SYSTEM = (
     "You are a meticulous speech-recognition (ASR) evaluator. You will see "
@@ -28,18 +37,49 @@ _SYSTEM = (
 )
 
 
+def _judge_model(config: dict) -> str:
+    return config.get("JUDGE_MODEL") or DEFAULT_JUDGE_MODEL
+
+
 def judge_available(config: dict) -> bool:
-    return bool(config.get("ANTHROPIC_API_KEY"))
+    model = _judge_model(config)
+    if model.startswith("claude"):
+        return bool(config.get("ANTHROPIC_API_KEY"))
+    return bool(config.get("DASHSCOPE_API_KEY"))
+
+
+def _call_anthropic(config: dict, model: str, user: str) -> str:
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=config["ANTHROPIC_API_KEY"])
+    resp = client.messages.create(
+        model=model, max_tokens=1500, system=_SYSTEM,
+        messages=[{"role": "user", "content": user}],
+    )
+    return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+
+
+def _call_dashscope(config: dict, model: str, user: str) -> str:
+    import dashscope
+
+    region = (config.get("DASHSCOPE_REGION") or "intl").lower()
+    dashscope.base_http_api_url = _REGION_URL.get(region, _REGION_URL["intl"])
+    resp = dashscope.Generation.call(
+        api_key=config["DASHSCOPE_API_KEY"],
+        model=model,
+        messages=[{"role": "system", "content": _SYSTEM},
+                  {"role": "user", "content": user}],
+        result_format="message",
+    )
+    if getattr(resp, "status_code", 200) != 200:
+        raise RuntimeError(f"status {resp.status_code}: {getattr(resp, 'message', '')}")
+    return resp.output.choices[0].message.content or ""
 
 
 def score_transcripts(config: dict, transcripts: dict[str, str]) -> dict[str, dict]:
     """transcripts: {provider_label: text}. Returns {provider_label: {score, reason}}."""
     items = [(label, txt) for label, txt in transcripts.items() if (txt or "").strip()]
-    if not config.get("ANTHROPIC_API_KEY") or len(items) < 1:
-        return {}
-    try:
-        import anthropic
-    except Exception:
+    if not judge_available(config) or len(items) < 1:
         return {}
 
     # Anonymize: Model A, Model B, ...
@@ -55,16 +95,12 @@ def score_transcripts(config: dict, transcripts: dict[str, str]) -> dict[str, di
         'Example: {"Model A": {"score": 87, "reason": "..."}}'
     )
 
-    model = config.get("JUDGE_MODEL") or DEFAULT_JUDGE_MODEL
+    model = _judge_model(config)
     try:
-        client = anthropic.Anthropic(api_key=config["ANTHROPIC_API_KEY"])
-        resp = client.messages.create(
-            model=model,
-            max_tokens=1500,
-            system=_SYSTEM,
-            messages=[{"role": "user", "content": user}],
-        )
-        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        if model.startswith("claude"):
+            text = _call_anthropic(config, model, user)
+        else:
+            text = _call_dashscope(config, model, user)
     except Exception as exc:  # noqa: BLE001
         return {"_error": {"score": None, "reason": f"judge failed: {exc}"}}
 

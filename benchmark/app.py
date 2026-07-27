@@ -19,6 +19,7 @@ import pandas as pd
 import streamlit as st
 
 from core import audio as A
+from core import preprocess as P
 from core import storage
 from core.config import load_config
 from core.runner import prepare_audio, run_benchmark
@@ -75,7 +76,22 @@ def sidebar() -> tuple[dict, dict]:
     st.sidebar.caption("🔇 VAD: always on where it exists — Plaud (skip silence) and "
                        "Cartesia ink-2 (built-in). Other engines expose no VAD option.")
 
-    opts = {"language": language, "diarize": True}
+    st.sidebar.subheader("Experiment (A/B/C)")
+    exp_label = st.sidebar.text_input(
+        "Group label", value="",
+        placeholder="e.g. A-baseline / B-isolated / C-noVAD",
+        help="Free-text tag saved with every run in this batch — use it to compare "
+             "groups in History (e.g. raw vs voice-isolated vs VAD-chopped input).",
+    )
+    preprocess = st.sidebar.radio(
+        "Preprocess before every engine",
+        ["None (raw audio)", "Voice Isolator (ElevenLabs)"],
+        help="B-group: strip background noise with the ElevenLabs Voice Isolator "
+             "before ALL engines transcribe. Uses ELEVENLABS_API_KEY.",
+    )
+    opts = {"language": language, "diarize": True,
+            "label": exp_label.strip(),
+            "preprocess": "isolate" if preprocess.startswith("Voice") else "none"}
     return cfg, opts
 
 
@@ -254,82 +270,150 @@ def tab_run(cfg: dict, opts: dict, selected):
         st.warning("⚠️ ffmpeg/ffprobe not found — audio normalization will fail. "
                    "Install ffmpeg (the devcontainer/packages.txt do this automatically).")
 
-    up = st.file_uploader(
-        "Upload audio (wav / mp3 / m4a / mp4 / ogg …). Long files are fine — "
-        "Cartesia uses smart VAD; length-limited engines are auto-chunked.",
+    ups = st.file_uploader(
+        "Upload one or MORE audio files (wav / mp3 / m4a / mp4 / ogg …). Long files "
+        "are fine — Cartesia uses smart VAD; length-limited engines are auto-chunked.",
         type=["wav", "mp3", "m4a", "mp4", "ogg", "flac", "webm", "aac"],
+        accept_multiple_files=True,
     )
     reference = st.text_area(
-        "Reference transcript (optional) — if provided, we compute WER/CER; "
-        "otherwise Claude scores the outputs.", height=100,
+        "Reference transcript (optional, single-file runs only) — if provided, we "
+        "compute WER/CER; otherwise the LLM judge (Qwen3.7-Max by default) scores "
+        "the outputs.", height=100,
     )
-    if up:
-        st.audio(up.getvalue())
+    if ups and len(ups) == 1:
+        st.audio(ups[0].getvalue())
+    elif ups:
+        st.caption(f"🎧 {len(ups)} files queued: " + " · ".join(u.name for u in ups))
+        if reference.strip():
+            st.info("Reference is ignored for multi-file batches — the LLM judge "
+                    "scores each file instead.")
 
     cols = st.columns([1, 3])
     run = cols[0].button("▶️ Run benchmark", type="primary",
-                         disabled=not (up and selected))
+                         disabled=not (ups and selected))
     if not selected:
         cols[1].info("Select at least one configured provider in the sidebar.")
 
-    if run and up:
-        _execute(cfg, opts, selected, up, reference)
+    if run and ups:
+        _execute(cfg, opts, selected, ups, reference)
 
     # show last results (persist across reruns)
-    last = st.session_state.get("last_results")
-    if last:
+    batch = st.session_state.get("last_batch")
+    if batch:
         st.divider()
-        st.subheader(f"Results — {st.session_state.get('last_run_id','')}")
-        render_results(last, st.session_state.get("last_reference", ""))
+        render_batch(batch)
 
 
-def _execute(cfg, opts, selected, up, reference):
-    workdir = A.make_workdir()
-    src = os.path.join(workdir, up.name)
-    with open(src, "wb") as f:
-        f.write(up.getvalue())
+def _execute(cfg, opts, selected, ups, reference):
+    batch_id = storage.new_run_id()
+    multi = len(ups) > 1
+    batch = []
+    for idx, up in enumerate(ups, 1):
+        workdir = A.make_workdir()
+        src = os.path.join(workdir, up.name)
+        with open(src, "wb") as f:
+            f.write(up.getvalue())
 
-    status = st.status("Preparing audio…", expanded=True)
-    try:
-        wav, duration = prepare_audio(src, workdir)
-    except Exception as exc:  # noqa: BLE001
-        status.update(label=f"Audio prep failed: {exc}", state="error")
-        return
-    status.write(f"Normalized to 16 kHz mono · {duration:.1f}s · "
-                 f"running {len(selected)} providers in parallel…")
+        tag = f"[{idx}/{len(ups)}] {up.name}"
+        status = st.status(f"{tag}: preparing audio…", expanded=True)
+        try:
+            wav, duration = prepare_audio(src, workdir)
+        except Exception as exc:  # noqa: BLE001
+            status.update(label=f"{tag}: audio prep failed: {exc}", state="error")
+            continue
 
-    done = []
-    prog = status.progress(0.0)
+        if opts.get("preprocess") == "isolate":
+            status.write("🔇 Voice Isolator: stripping background noise…")
+            try:
+                wav = P.voice_isolate(cfg, wav, workdir)
+                duration = A.probe_duration_seconds(wav)
+            except Exception as exc:  # noqa: BLE001
+                status.update(label=f"{tag}: voice isolation failed: {exc}", state="error")
+                continue
 
-    def cb(label):
-        done.append(label)
-        prog.progress(len(done) / len(selected), text=f"finished {label}")
+        ref = reference if not multi else ""
+        status.write(f"Normalized to 16 kHz mono · {duration:.1f}s · "
+                     f"running {len(selected)} providers in parallel…")
+        done = []
+        prog = status.progress(0.0)
 
-    results = run_benchmark(
-        selected, wav, duration, reference, opts["language"], opts["diarize"],
-        cfg, workdir, progress_cb=cb,
-    )
-    status.update(label="Scoring + saving…", state="running")
+        def cb(label, _done=done, _prog=prog):
+            _done.append(label)
+            _prog.progress(len(_done) / len(selected), text=f"finished {label}")
 
-    run_id = storage.new_run_id()
-    storage.save_audio_copy(run_id, wav)
-    storage.save_run({
-        "run_id": run_id, "audio_filename": up.name, "audio_duration": duration,
-        "reference_text": reference, "language_hint": opts["language"],
-        "diarize": opts["diarize"], "audio_path": storage.run_dir(run_id) + "/audio.wav",
-    })
-    rows = []
-    for r in results:
-        row = r.to_row()
-        row["char_count"] = r.char_count
-        storage.save_result(run_id, row, raw=r.raw if isinstance(r.raw, (dict, list)) else None)
-        rows.append(row)
+        results = run_benchmark(
+            selected, wav, duration, ref, opts["language"], opts["diarize"],
+            cfg, workdir, progress_cb=cb,
+        )
+        status.update(label=f"{tag}: scoring + saving…", state="running")
 
-    st.session_state["last_results"] = rows
-    st.session_state["last_reference"] = reference
-    st.session_state["last_run_id"] = run_id
-    status.update(label=f"Done — saved as {run_id}", state="complete")
+        run_id = storage.new_run_id()
+        storage.save_audio_copy(run_id, wav)
+        storage.save_run({
+            "run_id": run_id, "audio_filename": up.name, "audio_duration": duration,
+            "reference_text": ref, "language_hint": opts["language"],
+            "diarize": opts["diarize"], "audio_path": storage.run_dir(run_id) + "/audio.wav",
+            "label": opts.get("label") or None,
+            "preprocess": opts.get("preprocess") or "none",
+            "batch_id": batch_id if multi else None,
+        })
+        rows = []
+        for r in results:
+            row = r.to_row()
+            row["char_count"] = r.char_count
+            storage.save_result(run_id, row, raw=r.raw if isinstance(r.raw, (dict, list)) else None)
+            rows.append(row)
+        batch.append({"run_id": run_id, "file": up.name, "rows": rows, "reference": ref})
+        status.update(label=f"{tag}: done — saved as {run_id}", state="complete")
+
+    st.session_state["last_batch"] = batch
     st.rerun()
+
+
+def render_batch(batch: list[dict]):
+    if not batch:
+        return
+    if len(batch) == 1:
+        st.subheader(f"Results — {batch[0]['run_id']}")
+        render_results(batch[0]["rows"], batch[0].get("reference") or "")
+        return
+
+    st.subheader(f"Batch results — {len(batch)} files")
+    st.caption("Per-provider averages across all files in this batch.")
+    agg: dict[str, dict] = {}
+    for entry in batch:
+        for r in entry["rows"]:
+            a = agg.setdefault(r["provider"],
+                               {"ok": 0, "n": 0, "lat": [], "rtf": [], "metric": [], "judge": []})
+            a["n"] += 1
+            if r.get("ok"):
+                a["ok"] += 1
+                if r.get("latency_s") is not None:
+                    a["lat"].append(r["latency_s"])
+                if r.get("rtf") is not None:
+                    a["rtf"].append(r["rtf"])
+                if r.get("metric_value") is not None:
+                    a["metric"].append(r["metric_value"])
+                if r.get("judge_score") is not None:
+                    a["judge"].append(r["judge_score"])
+
+    def _mean(xs):
+        return round(sum(xs) / len(xs), 3) if xs else None
+
+    df = pd.DataFrame([{
+        "Provider": prov,
+        "OK": f"{a['ok']}/{a['n']}",
+        "Avg latency (s)": _mean(a["lat"]),
+        "Avg RTF": _mean(a["rtf"]),
+        "Avg error %": (round(_mean(a["metric"]) * 100, 1) if a["metric"] else None),
+        "Avg judge": _mean(a["judge"]),
+    } for prov, a in agg.items()])
+    st.dataframe(df, width="stretch", hide_index=True)
+
+    for entry in batch:
+        with st.expander(f"📄 {entry['file']} — {entry['run_id']}"):
+            render_results(entry["rows"], entry.get("reference") or "")
 
 
 def tab_history():
@@ -341,6 +425,8 @@ def tab_history():
     df = pd.DataFrame([{
         "Run": r["run_id"], "When": r["created_at"][:19].replace("T", " "),
         "Audio": r["audio_filename"], "Duration (s)": round(r.get("audio_duration") or 0, 1),
+        "Label": r.get("label") or "", "Preprocess": r.get("preprocess") or "",
+        "Batch": (r.get("batch_id") or "")[-6:],
         "Providers": r["n_results"], "Has reference": "yes" if r.get("reference_text") else "no",
     } for r in runs])
     st.dataframe(df, width="stretch", hide_index=True)
@@ -351,7 +437,13 @@ def tab_history():
         if not data:
             return
         c1, c2 = st.columns([4, 1])
-        c1.caption(f"Audio: {data['audio_filename']} · {round(data.get('audio_duration') or 0,1)}s")
+        extra = []
+        if data.get("label"):
+            extra.append(f"label: {data['label']}")
+        if data.get("preprocess") and data["preprocess"] != "none":
+            extra.append(f"preprocess: {data['preprocess']}")
+        c1.caption(f"Audio: {data['audio_filename']} · {round(data.get('audio_duration') or 0,1)}s"
+                   + ("" if not extra else " · " + " · ".join(extra)))
         if c2.button("🗑️ Delete run"):
             storage.delete_run(pick)
             st.rerun()

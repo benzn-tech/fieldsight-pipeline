@@ -35,11 +35,27 @@ you can test its built-in smart VAD.
 - **With a reference transcript** → **WER** (English) and **CER** (Chinese)
   computed with `jiwer` (punctuation/case normalized). The headline metric is
   CER for Chinese-dominant audio, WER otherwise.
-- **Without a reference** → **Claude acts as an LLM judge**, estimating each
-  transcript's accuracy via cross-model consensus (transcripts anonymized to
-  reduce brand bias). This is an *estimate*, clearly labelled — not a true WER.
+- **Without a reference** → an **LLM judge** (default **qwen3.7-max** via
+  DashScope — same key as the Qwen providers; set `JUDGE_MODEL=claude-*` +
+  `ANTHROPIC_API_KEY` to judge with Claude) estimates each transcript's accuracy
+  via cross-model consensus (transcripts anonymized to reduce brand bias). This
+  is an *estimate*, clearly labelled — not a true WER.
 - Always shown: **latency**, **real-time factor (RTF)**, char count, #speakers,
   #chunks.
+
+## A/B/C experiments (noise isolation & VAD)
+
+- **Multi-file batches** — upload several recordings at once; every engine
+  transcribes each file, and the batch view shows per-provider averages plus
+  per-file breakdowns.
+- **Group label** — tag a batch (e.g. `A-baseline` / `B-isolated` / `C-noVAD`);
+  stored with every run and shown in History for group comparison.
+- **Voice Isolator preprocess (B-group)** — optionally run the ElevenLabs Voice
+  Isolator on the audio before ALL engines transcribe, to test whether
+  de-noising actually improves accuracy on noisy site audio.
+- **VAD over-processing (C-group)** — upload the original long recording and the
+  VAD-chopped-and-reassembled version (as one multi-file batch or two labelled
+  batches) and compare scores to see if the production Silero VAD hurts.
 
 ---
 
@@ -81,7 +97,7 @@ the app runs fine with just one provider.
 
 | Env var | For |
 |---|---|
-| `ANTHROPIC_API_KEY` | LLM-as-judge (reference-free scoring) |
+| `ANTHROPIC_API_KEY` | LLM judge only when `JUDGE_MODEL=claude-*` (default judge `qwen3.7-max` uses `DASHSCOPE_API_KEY`) |
 | `CARTESIA_API_KEY` | Cartesia Ink |
 | `ELEVENLABS_API_KEY` | ElevenLabs Scribe |
 | `PLAUD_CLIENT_ID` / `PLAUD_API_KEY` | Plaud Transcription API (api-key from portal, **≠** the secret) |
@@ -89,7 +105,7 @@ the app runs fine with just one provider.
 | `SONIOX_API_KEY` | Soniox |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_TRANSCRIBE_BUCKET` | AWS Transcribe **and** Fun-ASR's presigned URL |
 | `ZHIPU_API_KEY` | Zhipu GLM-ASR |
-| `DASHSCOPE_API_KEY` | Qwen3-ASR **and** Fun-ASR (one key) |
+| `DASHSCOPE_API_KEY` | Qwen3-ASR, Fun-ASR **and** the default LLM judge (one key) |
 
 `AWS_TRANSCRIBE_BUCKET` defaults to the FieldSight data bucket; AWS and
 Fun-ASR only light up 🟢 when credentials are actually resolvable (explicit

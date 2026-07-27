@@ -44,7 +44,10 @@ def init_db() -> None:
                 reference_text  TEXT,
                 language_hint   TEXT,
                 diarize         INTEGER,
-                notes           TEXT
+                notes           TEXT,
+                label           TEXT,
+                preprocess      TEXT,
+                batch_id        TEXT
             );
             CREATE TABLE IF NOT EXISTS results (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,6 +76,12 @@ def init_db() -> None:
             );
             """
         )
+        # Migrate DBs created before the A/B/C experiment columns existed.
+        for col in ("label TEXT", "preprocess TEXT", "batch_id TEXT"):
+            try:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
 
 
 def new_run_id() -> str:
@@ -96,8 +105,8 @@ def save_run(meta: dict) -> None:
         conn.execute(
             """INSERT OR REPLACE INTO runs
                (run_id, created_at, audio_filename, audio_path, audio_duration,
-                reference_text, language_hint, diarize, notes)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                reference_text, language_hint, diarize, notes, label, preprocess, batch_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 meta["run_id"],
                 meta.get("created_at") or datetime.now(timezone.utc).isoformat(),
@@ -108,6 +117,9 @@ def save_run(meta: dict) -> None:
                 meta.get("language_hint"),
                 int(bool(meta.get("diarize"))),
                 meta.get("notes"),
+                meta.get("label"),
+                meta.get("preprocess"),
+                meta.get("batch_id"),
             ),
         )
 

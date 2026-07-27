@@ -22,7 +22,7 @@ CONFIG_KEYS = [
 ]
 
 _DEFAULTS = {
-    "JUDGE_MODEL": "claude-sonnet-4-6",
+    "JUDGE_MODEL": "qwen3.7-max",
     "CARTESIA_VERSION": "2025-04-16",
     "CARTESIA_MODEL": "ink-2",
     "ELEVENLABS_MODEL": "scribe_v2",
