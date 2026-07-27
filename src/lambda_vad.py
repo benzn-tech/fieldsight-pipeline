@@ -57,6 +57,7 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
+from datetime import datetime, timedelta
 
 import boto3
 from urllib.parse import unquote_plus
@@ -501,6 +502,18 @@ def parse_source_filename(key):
         date_str = match.group(2)
         time_str = match.group(3)
 
+    # 2026-07 voice-timeliness paradigm: a ~1-min chunk key carries a
+    # device-minted session id and monotonic chunk index after the timestamp:
+    #   {device}_{date}_{HH-MM-SS}_sid{32hex}_c{NNNN}.{ext}
+    # (canonical parsers live in transcript_utils.extract_session_id_from_filename
+    #  / extract_chunk_index_from_filename; mirrored inline here so lambda_vad
+    #  stays dependency-free). Absent on legacy whole-file keys -> None, and every
+    #  downstream token is simply omitted.
+    sid_match = re.search(r'_sid([0-9a-f]{32})(?=[_.]|$)', name_no_ext)
+    session_id = sid_match.group(1) if sid_match else None
+    ci_match = re.search(r'_sid[0-9a-f]{32}_c(\d+)(?=[_.]|$)', name_no_ext)
+    chunk_index = int(ci_match.group(1)) if ci_match else None
+
     return {
         'user_name': user_name,
         'device': device,
@@ -509,18 +522,54 @@ def parse_source_filename(key):
         'source_type': source_type,
         'source_ext': ext,
         'basename_no_ext': name_no_ext,
+        'session_id': session_id,
+        'chunk_index': chunk_index,
     }
+
+
+def _segment_stem(source_info):
+    """`{device}_{date}_{time}[_sid{id}_c{NNNN}]` — the part of a segment name
+    BEFORE `_off`. Propagates the chunk/session tokens (2026-07 paradigm) into
+    every VAD segment when present, so `transcript_utils` and session grouping
+    see them; on legacy sources it is exactly the historical stem."""
+    stem = f"{source_info['device']}_{source_info['date']}_{source_info['time']}"
+    sid = source_info.get('session_id')
+    if sid:
+        stem += f"_sid{sid}"
+        ci = source_info.get('chunk_index')
+        if ci is not None:
+            stem += f"_c{ci:04d}"
+    return stem
+
+
+def _chunk_start_dt(source_info):
+    """The chunk's true wall-clock start (T1) as a datetime, or None."""
+    try:
+        return datetime.strptime(
+            f"{source_info['date']}_{source_info['time']}", '%Y-%m-%d_%H-%M-%S'
+        )
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def _absolute_start_iso(source_info, offset_start_sec):
+    """Absolute start of a VAD segment = chunk_start + VAD offset (T2 manifest).
+    Returns ISO string or None if the chunk start can't be parsed."""
+    base = _chunk_start_dt(source_info)
+    if base is None:
+        return None
+    return (base + timedelta(seconds=offset_start_sec)).isoformat()
 
 
 def build_segment_filename(source_info, start_sec, end_sec):
     """
     Build output filename with offset metadata.
-    
-    Format: {device}_{date}_{time}_off{start}_to{end}_src{ext}.wav
+
+    Format: {device}_{date}_{time}[_sid{id}_c{NNNN}]_off{start}_to{end}_src{ext}.wav
     Example: Benl1_2026-02-19_09-20-00_off180.0_to245.8_srcmp4.wav
     """
     return (
-        f"{source_info['device']}_{source_info['date']}_{source_info['time']}"
+        f"{_segment_stem(source_info)}"
         f"_off{start_sec:.1f}_to{end_sec:.1f}"
         f"_src{source_info['source_ext']}.wav"
     )
@@ -539,7 +588,7 @@ def check_segments_exist(bucket, source_info):
     """Check if segments already exist for this source file"""
     prefix = (
         f"{OUTPUT_PREFIX}{source_info['user_name']}/{source_info['date']}/"
-        f"{source_info['device']}_{source_info['date']}_{source_info['time']}_off"
+        f"{_segment_stem(source_info)}_off"
     )
     resp = s3_client.list_objects_v2(
         Bucket=bucket, Prefix=prefix, MaxKeys=1
@@ -767,7 +816,18 @@ def process_single_file(bucket, key, source_info, tmp_dir):
             'vad_result': 'fallback_full_audio',
             'codec': codec_info,
             'web_preview_key': preview_key,
-            'segments': [{'s3_key': seg_s3_key, 'offset_start': 0, 'offset_end': round(duration_sec, 1), 'duration': round(duration_sec, 1)}],
+            # T2 authoritative session/timestamp manifest (2026-07 paradigm).
+            'session_id': source_info.get('session_id'),
+            'chunk_index': source_info.get('chunk_index'),
+            'chunk_start': (_chunk_start_dt(source_info).isoformat()
+                            if _chunk_start_dt(source_info) else None),
+            'segments': [{
+                's3_key': seg_s3_key,
+                'offset_start': 0,
+                'offset_end': round(duration_sec, 1),
+                'duration': round(duration_sec, 1),
+                'absolute_start': _absolute_start_iso(source_info, 0),
+            }],
         }
         meta_key = f"{OUTPUT_PREFIX}{source_info['user_name']}/{source_info['date']}/{source_info['basename_no_ext']}_vad_metadata.json"
         s3_client.put_object(Bucket=bucket, Key=meta_key, Body=json.dumps(metadata, indent=2), ContentType='application/json')
@@ -825,6 +885,8 @@ def process_single_file(bucket, key, source_info, tmp_dir):
             'offset_end': round(seg_end, 1),
             'duration': round(seg_duration, 1),
             'size_bytes': os.path.getsize(seg_local_path),
+            # T2: absolute wall-clock start = chunk_start (T1) + VAD offset.
+            'absolute_start': _absolute_start_iso(source_info, seg_start),
         })
 
         # Clean up segment file to save /tmp space
@@ -852,6 +914,13 @@ def process_single_file(bucket, key, source_info, tmp_dir):
         'min_speech_duration': MIN_SPEECH_DURATION,
         'codec': codec_info,
         'web_preview_key': preview_key,
+        # T2 authoritative session/timestamp manifest (2026-07 paradigm): the
+        # consumed source of truth for chunk->absolute-time mapping + session
+        # grouping, cross-checkable against the device clock (BUG-37).
+        'session_id': source_info.get('session_id'),
+        'chunk_index': source_info.get('chunk_index'),
+        'chunk_start': (_chunk_start_dt(source_info).isoformat()
+                        if _chunk_start_dt(source_info) else None),
         'segments': segments_info,
     }
 

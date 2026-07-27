@@ -131,6 +131,20 @@ def test_session_base_parsing():
     ) is None
 
 
+def test_session_id_groups_all_chunks_into_one_base():
+    # 2026-07 paradigm: every ~1-min chunk of one session carries the same
+    # device-minted sid but a DIFFERENT _c{NNNN}; all must resolve to the SAME
+    # session_base = "sid{id}" so they extract together, not one-per-minute.
+    sid = "9f8c1e2a4b6d47f0a1b2c3d4e5f60718"
+    c0 = f"transcripts/Ben_UCPK/2026-07-28/Benl1_2026-07-28_14-03-00_sid{sid}_c0000_off2.0_to58.0_srcwav.json"
+    c7 = f"transcripts/Ben_UCPK/2026-07-28/Benl1_2026-07-28_14-10-00_sid{sid}_c0007_off1.0_to59.0_srcwav.json"
+    assert les.session_base_from_key(c0) == ("Ben_UCPK", "2026-07-28", f"sid{sid}")
+    assert les.session_base_from_key(c7) == ("Ben_UCPK", "2026-07-28", f"sid{sid}")
+    # a different session_id -> different base (never grouped together)
+    other = "transcripts/Ben_UCPK/2026-07-28/Benl1_2026-07-28_15-00-00_sidaaaabbbbccccddddeeeeffff00001111_c0000.json"
+    assert les.session_base_from_key(other)[2] == "sidaaaabbbbccccddddeeeeffff00001111"
+
+
 # ---------------------------------------------------------------------------
 # Session gathering — only same-session segments, never a neighboring session
 # ---------------------------------------------------------------------------

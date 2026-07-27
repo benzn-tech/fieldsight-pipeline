@@ -46,6 +46,7 @@ import llm_utils
 from transcript_utils import (
     extract_base_time_from_filename,
     extract_device_from_filename,
+    extract_session_id_from_filename,
     normalize_transcript,
 )
 
@@ -112,7 +113,18 @@ def session_base_from_key(key):
         logger.warning(f"Skipping unparseable transcript key: {key}")
         return None
 
-    session_base = filename[:-len('.json')].split('_off')[0]
+    # 2026-07 voice-timeliness paradigm: a device-minted session_id groups EVERY
+    # ~1-min chunk of one press-record->stop into a single extraction. Without
+    # this, `.split('_off')[0]` still carries the per-chunk `_c{NNNN}` token, so
+    # each chunk would become its own session_base -> one extraction per minute
+    # (the fragmentation risk). When a session_id is present it IS the stable
+    # session base (`sid{id}`, identical across all chunks); legacy whole-file
+    # keys fall back to the historical per-source-file base unchanged.
+    session_id = extract_session_id_from_filename(filename)
+    if session_id:
+        session_base = f"sid{session_id}"
+    else:
+        session_base = filename[:-len('.json')].split('_off')[0]
     return user_folder, date, session_base
 
 
