@@ -25,6 +25,7 @@ run is saved and replayable.
 | **Zhipu GLM-ASR** | `glm-asr-2512` | — | auto-chunked (>30s) | Strong Mandarin/dialect CER |
 | **Qwen3-ASR** | `qwen3-asr-flash` | — | auto-chunked (>3min) | Alibaba DashScope |
 | **Ali Fun-ASR** | `fun-asr` | ✅ | native | Needs a public URL → presigns via your S3 |
+| **Doubao Seed-ASR** | `volc.seedasr.auc` | ✅ | native (≤5 h, async) | ByteDance Volcengine; strong Mandarin/dialects; URL via your S3 |
 
 Length-limited engines are **automatically chunked and recombined**, so you can
 upload a long file and still compare everyone. Cartesia gets the whole file so
@@ -103,6 +104,7 @@ the app runs fine with just one provider.
 | `PLAUD_CLIENT_ID` / `PLAUD_API_KEY` | Plaud Transcription API (api-key from portal, **≠** the secret) |
 | `PLAUD_SECRET_KEY` | Plaud file upload (**required** — its transcription API only accepts a Plaud-hosted URL) |
 | `SONIOX_API_KEY` | Soniox |
+| `DOUBAO_API_KEY` (or `DOUBAO_APP_ID` + `DOUBAO_ACCESS_TOKEN`) | Doubao Seed-ASR (Volcengine) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_TRANSCRIBE_BUCKET` | AWS Transcribe **and** Fun-ASR's presigned URL |
 | `ZHIPU_API_KEY` | Zhipu GLM-ASR |
 | `DASHSCOPE_API_KEY` | Qwen3-ASR, Fun-ASR **and** the default LLM judge (one key) |
