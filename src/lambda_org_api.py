@@ -96,9 +96,9 @@ from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 from repositories import (action_items, aliases, classification_feedback, companies,
                           compliance_resolutions, content, content_edits, keyframes,
-                          memberships, observations, programme, programme_suggestions,
-                          recordings, redactions, rollup, scope, sites, topics, users,
-                          voice_messages)
+                          meeting_session, memberships, observations, programme,
+                          programme_suggestions, recordings, redactions, rollup, scope,
+                          sites, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates, first_match_span, normalize, occurrences
 # Keyframe Q7 telemetry derivation (all AWS-free, pure helpers): the deleted
@@ -142,6 +142,10 @@ ALLOWED_OBSERVATION_STATUS = {"open", "closed"}
 ALLOWED_ACTION_STATUS = {"open", "in_progress", "blocked", "done"}
 ALLOWED_ACTION_PRIORITY = {"low", "medium", "high"}
 RECORDING_KINDS = {"video", "audio", "photo"}
+# Voice-timeliness: mis-touch tolerance ("grace") window before a stopped session
+# finalizes + emails. A resume within it cancels the finalize (spec §3.2, §8.4).
+STOP_GRACE_SECONDS = int(os.environ.get("STOP_GRACE_SECONDS", "30"))
+_SID_RE = re.compile(r"^[0-9a-f]{32}$")
 _KIND_FOLDER = {"video": "video", "audio": "audio", "photo": "pictures"}
 
 # Site voice (off-the-record): a DEDICATED voice/ prefix that matches NO S3
@@ -378,6 +382,13 @@ def dispatch(conn, event, method, route):
     if m_rc and method == "POST":
         return complete_recording(conn, caller, m_rc.group(1), parse_body(event))
 
+    m_so = re.match(r"^/sessions/([^/]+)/open$", route)
+    if m_so and method == "POST":
+        return session_open(conn, caller, m_so.group(1), parse_body(event))
+    m_scl = re.match(r"^/sessions/([^/]+)/close$", route)
+    if m_scl and method == "POST":
+        return session_close(conn, caller, m_scl.group(1), parse_body(event))
+
     if route == "/voice/upload-url" and method == "POST":
         return create_voice_upload_url(conn, caller, parse_body(event))
     if route == "/voice/asset-url" and method == "GET":
@@ -477,6 +488,62 @@ def complete_recording(conn, caller, rec_id, body):
     if row is None:
         return error("recording not found", 404)
     return ok({"ok": True})
+
+
+# ----------------------------------------------------------
+# /sessions/{id}/open|close — voice-timeliness session lifecycle (best-effort;
+# the durable source of truth is the device manifest + uploaded chunks, so these
+# are an online optimization, never required for correctness — spec §3.5, §8.4).
+# ----------------------------------------------------------
+def session_open(conn, caller, session_id, body):
+    if body is None:
+        return error("malformed JSON body", 400)
+    if not _SID_RE.match(session_id or ""):
+        return error("session_id must be 32 lowercase hex chars", 400)
+    kind = body.get("kind")
+    if kind is not None and kind not in ("audio", "video"):
+        return error("kind must be 'audio' or 'video'", 400)
+    site_id = body.get("siteId")
+    if site_id:
+        site = sites.get_site(conn, site_id)
+        if site is None or site["company_id"] != caller["company_id"]:
+            return error("site not accessible", 403)
+    # Idempotent: whichever of the record-start signal or the first uploaded
+    # chunk arrives first opens the session; a later call never regresses it.
+    row = meeting_session.ensure_open(
+        conn, session_id, caller["company_id"], caller["id"], site_id, kind,
+        body.get("startedAt"),
+    )
+    return ok({"sessionId": row["session_id"], "status": row["status"],
+               "version": row["version"]})
+
+
+def session_close(conn, caller, session_id, body):
+    b = body or {}
+    if not _SID_RE.match(session_id or ""):
+        return error("session_id must be 32 lowercase hex chars", 400)
+    intent = b.get("intent", "idle")
+    if intent not in ("end", "idle"):
+        return error("intent must be 'end' or 'idle'", 400)
+
+    existing = meeting_session.get(conn, session_id)
+    if existing is None:
+        return error("session not found", 404)
+    if existing["user_id"] != caller["id"]:
+        return error("not your session", 403)
+    if existing["status"] in ("finalizing", "sent"):
+        # Already past the point of no return — idempotent no-op, not an error.
+        return ok({"sessionId": session_id, "status": existing["status"],
+                   "version": existing["version"], "noop": True})
+
+    row = meeting_session.mark_pending_close(conn, session_id, b.get("endedAt"), intent)
+    # A deliberate End finalizes immediately (grace 0); a plain/idle stop waits
+    # the mis-touch tolerance window. The actual scheduled finalize (EventBridge
+    # one-shot -> SES) is wired in the next slice; this endpoint records the
+    # pending_close + version the timer will be armed against.
+    grace = 0 if intent == "end" else STOP_GRACE_SECONDS
+    return ok({"sessionId": session_id, "status": row["status"],
+               "version": row["version"], "graceSeconds": grace})
 
 
 # ----------------------------------------------------------
