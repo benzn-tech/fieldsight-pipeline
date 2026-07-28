@@ -3034,6 +3034,24 @@ def _hhmm(dt):
     return dt.strftime("%H:%M") if dt is not None else None
 
 
+def _session_title(srows, site_name):
+    """Deterministic, cosmetic session title for the picker (Tier-2 T1,
+    session-report-review-export spec §4): the most-salient topic's title (the
+    one with the most open action items, ties broken by first appearance), else
+    a count summary when no topic carries a title. Like `label`, it only LABELS
+    a session — it never decides membership (that is session_id, authoritative).
+    A user override in the report modal wins for the generated doc."""
+    titled = [r for r in srows if (r.get("title") or "").strip()]
+    if titled:
+        # max() keeps the FIRST element on ties, and `titled` preserves
+        # appearance order, so the earliest-appearing top-action topic wins.
+        lead = max(titled, key=lambda r: sum(
+            1 for a in (r.get("action_items") or []) if a.get("status") == "open"))
+        return lead["title"].strip()
+    n = len(srows)
+    return f"{n} topic{'' if n == 1 else 's'} · {site_name or 'site'}"
+
+
 def build_day_sessions(conn, caller, folder, date, rows):
     """Group one (folder, date)'s extraction topic rows into sessions.
 
@@ -3073,11 +3091,13 @@ def build_day_sessions(conn, caller, folder, date, rows):
     for session_id, srows in by_session.items():
         start_dt = session_scope.session_start(session_id)
         end_dt = _session_end_dt(conn, caller, folder, date, session_id, srows, start_dt)
+        site_name = next((r.get("site_name") for r in srows if r.get("site_name")), None)
         sessions.append({
             "session_id": session_id,
             "started_at": start_dt.isoformat() if start_dt else None,   # authoritative
             "ended_at": end_dt.isoformat() if end_dt else None,         # cosmetic
-            "site_name": next((r.get("site_name") for r in srows if r.get("site_name")), None),
+            "site_name": site_name,
+            "title": _session_title(srows, site_name),   # cosmetic label (T1)
             "topic_count": len(srows),
             "open_action_count": sum(1 for r in srows for a in r["action_items"]
                                      if a["status"] == "open"),

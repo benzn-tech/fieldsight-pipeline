@@ -215,6 +215,56 @@ def test_end_label_prefers_recorded_duration_over_time_range(wired):
 
 
 # ----------------------------------------------------------
+# Session title — Tier-2 T1 (cosmetic label for the report picker/modal)
+# ----------------------------------------------------------
+
+def test_session_title_picks_most_salient_topic_by_open_actions():
+    srows = [
+        {"title": "Slab pour", "action_items": [_action("open")]},
+        {"title": "Drainage inspection", "action_items": [_action("open"), _action("open")]},
+    ]
+    assert org._session_title(srows, "UC PK") == "Drainage inspection"
+
+
+def test_session_title_ties_break_by_first_appearance():
+    srows = [
+        {"title": "First topic", "action_items": [_action("open")]},
+        {"title": "Second topic", "action_items": [_action("open")]},
+    ]
+    assert org._session_title(srows, "UC PK") == "First topic"
+
+
+def test_session_title_skips_untitled_topics():
+    srows = [
+        {"title": "   ", "action_items": [_action("open"), _action("open")]},
+        {"title": "Real title", "action_items": [_action("open")]},
+    ]
+    assert org._session_title(srows, "UC PK") == "Real title"
+
+
+def test_session_title_count_fallback_when_no_titles():
+    srows = [{"title": "", "action_items": []}, {"title": None, "action_items": []}]
+    assert org._session_title(srows, "UC PK") == "2 topics · UC PK"
+
+
+def test_session_title_singular_and_site_fallback():
+    assert org._session_title([{"title": "", "action_items": []}], None) == "1 topic · site"
+    # title is never authoritative — it only labels
+    assert org._session_title([{"title": "One", "action_items": []}], "S") == "One"
+
+
+def test_endpoint_exposes_session_title(wired):
+    _wire_rows(wired, [
+        _row(id="t-1", source_s3_key=KEY_1300, title="Morning check-in",
+             action_items=[_action("open")]),
+        _row(id="t-2", source_s3_key=KEY_1300, title="Slab pour",
+             action_items=[_action("open"), _action("open")]),
+    ])
+    s = body_of(_get(DAY))["sessions"][0]
+    assert s["title"] == "Slab pour"   # lead = most open actions
+
+
+# ----------------------------------------------------------
 # 3. Gap-merge threshold (display grouping only)
 # ----------------------------------------------------------
 
@@ -395,6 +445,7 @@ def test_one_continuous_recording_yields_exactly_one_session(wired):
         "started_at": "2026-07-25T13:00:11",
         "ended_at": "2026-07-25T14:20:00",
         "site_name": "UC PK",
+        "title": "Slab pour",                            # T1 cosmetic label (both topics' title)
         "topic_count": 2,
         "open_action_count": 2,
         "participants": ["Ben", "Neil", "James"],       # union, deduped, order kept
