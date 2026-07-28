@@ -63,10 +63,19 @@ you can test its built-in smart VAD.
 ## Quick start
 
 ### Option A — GitHub Codespaces (zero local setup) ✅ recommended
-1. Push this branch, then **Code ▸ Codespaces ▸ Create codespace**.
-   The devcontainer installs Python, **ffmpeg**, and the deps automatically.
-2. In the terminal: `streamlit run benchmark/app.py`
+1. **Code ▸ Codespaces ▸ Create codespace** on this branch. The devcontainer
+   (repo-root `.devcontainer/`) installs Python, **ffmpeg**, and the deps
+   automatically on creation.
+2. In the terminal: `python -m streamlit run benchmark/app.py --server.address 0.0.0.0`
 3. Open the forwarded **port 8501**. Paste API keys in the sidebar (🔑) — done.
+
+> **Codespace created before the devcontainer existed (or missing ffmpeg /
+> streamlit)?** Run the one-shot setup instead of rebuilding:
+> ```bash
+> bash benchmark/setup.sh
+> ```
+> (installs ffmpeg/ffprobe if absent + all Python deps). Alternatively
+> `Ctrl+Shift+P → Codespaces: Rebuild Container` now picks up the root config.
 
 ### Option B — Local
 ```bash
