@@ -42,10 +42,11 @@ from urllib.parse import unquote_plus
 
 import boto3
 
-import claude_utils
+import llm_utils
 from transcript_utils import (
     extract_base_time_from_filename,
     extract_device_from_filename,
+    extract_session_id_from_filename,
     normalize_transcript,
 )
 
@@ -112,7 +113,18 @@ def session_base_from_key(key):
         logger.warning(f"Skipping unparseable transcript key: {key}")
         return None
 
-    session_base = filename[:-len('.json')].split('_off')[0]
+    # 2026-07 voice-timeliness paradigm: a device-minted session_id groups EVERY
+    # ~1-min chunk of one press-record->stop into a single extraction. Without
+    # this, `.split('_off')[0]` still carries the per-chunk `_c{NNNN}` token, so
+    # each chunk would become its own session_base -> one extraction per minute
+    # (the fragmentation risk). When a session_id is present it IS the stable
+    # session base (`sid{id}`, identical across all chunks); legacy whole-file
+    # keys fall back to the historical per-source-file base unchanged.
+    session_id = extract_session_id_from_filename(filename)
+    if session_id:
+        session_base = f"sid{session_id}"
+    else:
+        session_base = filename[:-len('.json')].split('_off')[0]
     return user_folder, date, session_base
 
 
@@ -309,9 +321,9 @@ def extract_session(bucket, user_folder, date, session_base):
     # M-5: a stack missing the secret must not retry-storm -- an S3 event
     # retries on a raised exception, and every retry would fail the exact
     # same way. Check upfront (before any S3 gather/Claude work) and bail
-    # quietly instead of reaching claude_utils.call_claude's own check only
+    # quietly instead of reaching llm_utils.call_llm's own check only
     # after doing all that work and then raising.
-    if not claude_utils.ANTHROPIC_API_KEY:
+    if not llm_utils.api_key_configured():
         logger.warning(
             f"ANTHROPIC_API_KEY not configured -- skipping session {session_base} "
             "without retry"
@@ -357,11 +369,11 @@ def extract_session(bucket, user_folder, date, session_base):
     prompt = build_extraction_prompt(user_folder, date, session_base, turns, n_segments)
     max_tokens = min(4096 + n_segments * 350, 8000)  # BUG-16
 
-    raw_response, error = claude_utils.call_claude(prompt, max_tokens=max_tokens)
+    raw_response, error = llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=True)
     if raw_response is None:
         raise RuntimeError(f"Claude call failed for session {session_base}: {error}")
 
-    parsed = claude_utils.extract_json(raw_response)
+    parsed = llm_utils.extract_json(raw_response)
     if parsed is None:
         raise RuntimeError(f"Failed to parse Claude JSON for session {session_base}")
 

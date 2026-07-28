@@ -114,6 +114,60 @@ def extract_vad_metadata_from_filename(filename):
     return info
 
 
+# ------------------------------------------------------------------
+# Chunk/session tokens (2026-07 voice-timeliness paradigm).
+#
+# The mobile client stamps two OPTIONAL tokens on every ~1-minute chunk it
+# uploads (mobile-client-session-contract §4):
+#
+#   {device}_{YYYY-MM-DD}_{HH-MM-SS}_sid{32hex}_c{NNNN}[.ext | _off..._to..._src...]
+#
+# - sid{32hex}: device-minted session UUID (hyphen-free 32 hex) — the durable,
+#   offline-independent grouping key. Hyphen-free so it never collides with the
+#   YYYY-MM-DD_HH-MM-SS timestamp parser (BUG-01).
+# - c{NNNN}:    monotonic, zero-padded chunk index within the session.
+#
+# Both are ABSENT on legacy keys (whole-file recordings, pre-paradigm); the
+# extractors below return None then, and every caller falls back to today's
+# per-source-file behaviour. The {HH-MM-SS} in a chunk key is that chunk's TRUE
+# wall-clock start (T1), so extract_base_time_from_filename already yields the
+# chunk's absolute start with no change.
+# ------------------------------------------------------------------
+
+_SESSION_ID_RE = re.compile(r'_sid([0-9a-f]{32})(?=[_.]|$)')
+_CHUNK_INDEX_RE = re.compile(r'_sid[0-9a-f]{32}_c(\d+)(?=[_.]|$)')
+
+
+def extract_session_id_from_filename(filename):
+    """Return the 32-hex device session id, or None on a legacy/whole-file key.
+
+    Benl1_2026-07-28_14-03-00_sid9f8c1e2a4b6d47f0a1b2c3d4e5f60718_c0007.wav
+      → '9f8c1e2a4b6d47f0a1b2c3d4e5f60718'
+    Benl1_2026-03-20_12-18-34_off1465.8_to1729.8_srcwav.json → None
+    """
+    match = _SESSION_ID_RE.search(filename)
+    return match.group(1) if match else None
+
+
+def extract_chunk_index_from_filename(filename):
+    """Return the monotonic chunk index (int) for a chunk key, else None.
+
+    Only matches when it follows a valid `_sid{32hex}` token, so a stray `_c<n>`
+    in a device name can't be misread as a chunk index.
+
+      ..._sid{32hex}_c0007.wav            → 7
+      ..._sid{32hex}_c0007_off3.0_to60.0_srcwav.json → 7   (VAD segment of a chunk)
+      Benl1_2026-03-20_12-18-34.json      → None
+    """
+    match = _CHUNK_INDEX_RE.search(filename)
+    if match:
+        try:
+            return int(match.group(1))
+        except (ValueError, OverflowError):
+            pass
+    return None
+
+
 def extract_device_from_filename(filename):
     """Extract device account from filename (first segment before _)"""
     parts = filename.split('_')

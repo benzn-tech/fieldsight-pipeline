@@ -44,6 +44,7 @@ import logging
 import re
 import boto3
 import urllib3
+import llm_utils
 from datetime import datetime, timedelta
 from io import BytesIO
 from transcript_utils import (
@@ -472,72 +473,13 @@ Rules:
 # ============================================================
 
 def call_claude_structured(prompt, max_tokens=4096):
-    """Call Anthropic Claude API. Returns (raw_text, error_string)."""
-    if not ANTHROPIC_API_KEY:
-        logger.error("ANTHROPIC_API_KEY not set")
-        return None, "ANTHROPIC_API_KEY not configured"
-
-    http = urllib3.PoolManager()
-    body = json.dumps({
-        "model": CLAUDE_MODEL,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}]
-    })
-
-    try:
-        resp = http.request(
-            'POST', 'https://api.anthropic.com/v1/messages',
-            body=body,
-            headers={
-                'Content-Type': 'application/json',
-                'x-api-key': ANTHROPIC_API_KEY,
-                'anthropic-version': '2023-06-01',
-            },
-            timeout=180.0,
-        )
-        data = json.loads(resp.data.decode('utf-8'))
-
-        if resp.status == 200:
-            text_blocks = [b['text'] for b in data.get('content', []) if b.get('type') == 'text']
-            raw_text = '\n'.join(text_blocks)
-            return raw_text, None
-        else:
-            err = data.get('error', {}).get('message', f'HTTP {resp.status}')
-            logger.error(f"Claude API error: {err}")
-            return None, err
-
-    except Exception as e:
-        logger.error(f"Claude API call failed: {str(e)}")
-        return None, str(e)
+    """Delegates to llm_utils (provider-dispatched). force_json: structured task."""
+    return llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=True)
 
 
 def extract_json_from_response(raw_text):
-    """Extract JSON from Claude's response."""
-    # Try markdown fence
-    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw_text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    # Try entire response
-    try:
-        return json.loads(raw_text.strip())
-    except json.JSONDecodeError:
-        pass
-
-    # Try first { to last }
-    first_brace = raw_text.find('{')
-    last_brace = raw_text.rfind('}')
-    if first_brace != -1 and last_brace != -1:
-        try:
-            return json.loads(raw_text[first_brace:last_brace + 1])
-        except json.JSONDecodeError:
-            pass
-
-    logger.error(f"Failed to extract JSON from Claude response: {raw_text[:500]}")
-    return None
+    """Delegates to llm_utils.extract_json (identical three-tier ladder)."""
+    return llm_utils.extract_json(raw_text)
 
 
 # ============================================================

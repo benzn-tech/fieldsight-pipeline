@@ -435,48 +435,11 @@ def build_prompt(question, report_text, transcript_text, scope, metadata):
 # ============================================================
 
 def call_claude(prompt, max_tokens=MAX_ANSWER_TOKENS):
-    """Call Claude Haiku API and return (answer_text, error)."""
-    if not ANTHROPIC_API_KEY:
-        return None, "ANTHROPIC_API_KEY not configured"
-
-    http = urllib3.PoolManager()
-    body = json.dumps({
-        "model": HAIKU_MODEL,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}]
-    })
-
-    try:
-        resp = http.request(
-            'POST', 'https://api.anthropic.com/v1/messages',
-            body=body,
-            headers={
-                'Content-Type': 'application/json',
-                'x-api-key': ANTHROPIC_API_KEY,
-                'anthropic-version': '2023-06-01',
-            },
-            timeout=60.0,
-        )
-        data = json.loads(resp.data.decode('utf-8'))
-
-        if resp.status == 200:
-            text_blocks = [
-                b['text'] for b in data.get('content', [])
-                if b.get('type') == 'text'
-            ]
-            answer = '\n'.join(text_blocks)
-            usage = data.get('usage', {})
-            logger.info(f"  Haiku usage: input={usage.get('input_tokens', '?')}, "
-                        f"output={usage.get('output_tokens', '?')}")
-            return answer, None
-        else:
-            err = data.get('error', {}).get('message', f'HTTP {resp.status}')
-            logger.error(f"Claude API error: {err}")
-            return None, err
-
-    except Exception as e:
-        logger.error(f"Claude API call failed: {e}")
-        return None, str(e)
+    """Prose answer via llm_utils (provider-dispatched). Lazy import keeps the
+    legacy minimal-zip deploy target working. force_json stays False -- the ask
+    path returns markdown/plain prose, not JSON."""
+    import llm_utils
+    return llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=False)
 
 
 # ============================================================
@@ -688,19 +651,19 @@ def _citation_time_start(c):
 def _rag_answer(body):
     """RAG path: embed the question, invoke RAG_SEARCH_FUNCTION for grounded
     chunks (ACL-narrowed to caller_sub's accessible sites), then synthesize
-    a cited markdown answer via claude_utils.call_claude. Returns a plain
+    a cited markdown answer via llm_utils.call_llm. Returns a plain
     dict (never an HTTP-shaped response) -- lambda_handler wraps it with
     ok() same as every other result.
 
-    claude_utils / dashscope_utils are imported HERE (lazily), not at module
-    top level: scripts/deploy-lambda-code.sh zips ONLY lambda_ask_agent.py +
-    transcript_utils.py for the LEGACY hand-built prod (the fieldsight-*
-    lambdas outside CloudFormation/SAM entirely -- see CLAUDE.md / the
-    two-accounts note). A top-level `import claude_utils` would
-    ImportModuleError the entire module there (killing the legacy S3-file
-    path too, not just RAG) the moment this file merges to main -- that
-    legacy prod's zip genuinely has no claude_utils.py/dashscope_utils.py in
-    it and no RAG_SEARCH_FUNCTION env var (it's not SAM-managed, so
+    llm_utils / dashscope_utils are imported HERE (lazily), not at module
+    top level: scripts/deploy-lambda-code.sh zips lambda_ask_agent.py +
+    transcript_utils.py + llm_utils.py for the LEGACY hand-built prod (the
+    fieldsight-* lambdas outside CloudFormation/SAM entirely -- see CLAUDE.md
+    / the two-accounts note). A top-level `import llm_utils` would still
+    ImportModuleError the entire module there if that bundle were ever out of
+    sync (killing the legacy S3-file path too, not just RAG) -- lazy import
+    keeps this path degrading gracefully instead. That legacy prod's zip has
+    no dashscope_utils.py in it and no RAG_SEARCH_FUNCTION env var (it's not SAM-managed, so
     template.yaml doesn't apply to it at all). This is UNRELATED to whether
     THIS SAM pipeline's own prod target (fieldsight-prod-*, template.yaml)
     has RAG_SEARCH_FUNCTION -- it does, same as SAM test (see the
@@ -712,7 +675,7 @@ def _rag_answer(body):
     propagate out of lambda_handler as a raw Lambda error (stack trace and
     all) instead of a clean HTTP-shaped response.
     """
-    import claude_utils
+    import llm_utils
     import dashscope_utils
 
     question = (body.get("question") or "").strip()
@@ -740,7 +703,7 @@ def _rag_answer(body):
                 "answer": "Search service temporarily unavailable. Please try again.",
                 "error": "rag-search unavailable",
                 "citations": [],
-                "model": claude_utils.CLAUDE_MODEL,
+                "model": llm_utils.CLAUDE_MODEL,
             }
         result = json.loads(resp["Payload"].read().decode("utf-8"))
         chunks = result.get("chunks") or []
@@ -754,12 +717,12 @@ def _rag_answer(body):
             return {
                 "answer": "No relevant records found for this question.",
                 "citations": [],
-                "model": claude_utils.CLAUDE_MODEL,
+                "model": llm_utils.CLAUDE_MODEL,
                 "grounded": True,
             }
 
         prompt = build_rag_prompt(question, chunks, mode=body.get("mode"))
-        answer, err = claude_utils.call_claude(prompt, max_tokens=2048)
+        answer, err = llm_utils.call_llm(prompt, max_tokens=2048, force_json=False)
 
         if err:
             logger.error(f"  RAG Claude error: {err}")
@@ -767,7 +730,7 @@ def _rag_answer(body):
                 "answer": "",
                 "error": err,
                 "citations": [],
-                "model": claude_utils.CLAUDE_MODEL,
+                "model": llm_utils.CLAUDE_MODEL,
             }
 
         # CONTRACT: citations MUST stay in the same order as the prompt's [n]
@@ -791,7 +754,7 @@ def _rag_answer(body):
         return {
             "answer": answer,
             "citations": citations,
-            "model": claude_utils.CLAUDE_MODEL,
+            "model": llm_utils.CLAUDE_MODEL,
             "grounded": True,
         }
     except Exception as e:
@@ -800,7 +763,7 @@ def _rag_answer(body):
             "answer": "",
             "error": str(e),
             "citations": [],
-            "model": claude_utils.CLAUDE_MODEL,
+            "model": llm_utils.CLAUDE_MODEL,
         }
 
 

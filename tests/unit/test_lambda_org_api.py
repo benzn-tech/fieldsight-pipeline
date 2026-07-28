@@ -4804,6 +4804,21 @@ def test_render_report_shape_exposes_durable_topic_and_safety_ids():
     assert t["action_items"][0]["id"] == "ai-1"          # already present
     assert t["safety_flags"][0]["id"] == "so-1"          # NEW
     assert t["safety_flags"][0]["source_table"] == "safety_observations"
+    # site_id (org UUID) alongside the display name, so the client can rebuild the
+    # compliance-resolution key; site_name alone can't (would 404 / never match).
+    assert out["site_id"] == "s-1"
+    assert out["site"] == "Alpha"
+
+
+def test_render_report_shape_site_id_is_none_when_absent():
+    rows = [{
+        "id": "t-1", "site_id": None, "site_name": "Alpha", "user_name": "Ada L",
+        "time_range": None, "title": "x", "category": None, "participants": [],
+        "summary": "s", "action_items": [], "safety_observations": [],
+        "findings": [], "photos": [],
+    }]
+    out = org.render_report_shape(rows, None, "2026-07-16", "Ada_L")
+    assert out["site_id"] is None            # null-safe, never the string "None"
 
 
 def test_timeline_report_sourced_day_renders_with_ids(wired, monkeypatch):
@@ -5014,15 +5029,103 @@ def test_propagate_apply_enqueues_exactly_one_reindex(wired, monkeypatch):
     assert body["reindex_enqueued"] is True
 
 
-def test_propagate_apply_never_writes_a_field_outside_editable(wired, monkeypatch):
-    # A cell for a non-EDITABLE column (findings.impact_note) must be dropped
-    # even if it somehow reaches the planner.
+def test_propagate_apply_never_writes_a_field_outside_propagatable(wired, monkeypatch):
+    # A cell for a hard-excluded, non-propagatable column (findings.
+    # impact_severity -- an enum, never text) must be dropped even if it
+    # somehow reaches the planner. impact_note is DELIBERATELY excluded from
+    # this hostile list -- it's a _PROPAGATE_EXTRA field now (see the tests
+    # below), not a leak.
     hostile = PROP_CELLS + [{"table": "findings", "row_id": "f-1",
-                             "field": "impact_note", "value": "Mackon delayed us"}]
+                             "field": "impact_severity", "value": "Mackon delayed us"}]
     spy = _wire_propagate(monkeypatch, cells=hostile)
     assert _propagate(APPLY_ROUTE)["statusCode"] == 200
-    assert all(f != "impact_note" for _t, _r, f, _v in spy["writes"])
-    assert all(f in org.content.EDITABLE[t] for t, _r, f, _v in spy["writes"])
+    assert all(f != "impact_severity" for _t, _r, f, _v in spy["writes"])
+    assert all(org.content.is_propagatable(t, f) for t, _r, f, _v in spy["writes"])
+
+
+def test_propagate_never_touches_hard_excluded_impact_fields(wired, monkeypatch):
+    """Belt-and-braces: even if cells for the hard-excluded impact_* columns
+    somehow reach the planner (e.g. a future scan bug), they must never be
+    written -- only impact_note (the propagation-only extra) is eligible. A
+    finding with impact_severity='major', a jsonb impact_evidence blob, and a
+    name inside impact_task_name must come through untouched."""
+    hostile = PROP_CELLS + [
+        {"table": "findings", "row_id": "f-1", "field": "impact_note",
+         "value": "Mackon delayed the pour by two days"},
+        {"table": "findings", "row_id": "f-1", "field": "impact_severity",
+         "value": "major"},
+        {"table": "findings", "row_id": "f-1", "field": "impact_evidence",
+         "value": {"note": "Mackon", "task_id": "tk-1"}},
+        {"table": "findings", "row_id": "f-1", "field": "impact_task_name",
+         "value": "Mackon Roofing"},
+        {"table": "findings", "row_id": "f-1", "field": "impact_matched_at",
+         "value": "2026-07-01T00:00:00Z"},
+    ]
+    spy = _wire_propagate(monkeypatch, cells=hostile)
+    assert _propagate(APPLY_ROUTE)["statusCode"] == 200
+    written_fields = {f for _t, _r, f, _v in spy["writes"]}
+    assert "impact_note" in written_fields
+    for excluded in ("impact_severity", "impact_evidence", "impact_task_name",
+                     "impact_matched_at"):
+        assert excluded not in written_fields
+
+
+def test_propagate_preview_lists_impact_note(wired, monkeypatch):
+    cells = PROP_CELLS + [{"table": "findings", "row_id": "f-1",
+                           "field": "impact_note",
+                           "value": "Mackon delayed the pour by two days"}]
+    _wire_propagate(monkeypatch, cells=cells)
+    body = body_of(_propagate(PREVIEW_ROUTE))
+    assert ("findings", "impact_note") in {(m["table"], m["field"]) for m in body["matches"]}
+    note_match = next(m for m in body["matches"] if m["field"] == "impact_note")
+    assert "McCahon delayed" in note_match["after_snippet"]
+
+
+def test_propagate_apply_rewrites_impact_note_with_one_audit_row(wired, monkeypatch):
+    cells = PROP_CELLS + [{"table": "findings", "row_id": "f-1",
+                           "field": "impact_note",
+                           "value": "Mackon delayed the pour by two days"}]
+    spy = _wire_propagate(monkeypatch, cells=cells)
+    res = _propagate(APPLY_ROUTE)
+    assert res["statusCode"] == 200
+    written = {(t, f): v for t, _rid, f, v in spy["writes"]}
+    assert written[("findings", "impact_note")] == "McCahon delayed the pour by two days"
+    # Exactly one audit row for impact_note, before/after sourced from the
+    # actual value the propagation scan read (not a content._SELECT lookup,
+    # which has no impact_note column at all).
+    note_audits = [a for a in spy["audits"] if a[3] == "impact_note"]
+    assert len(note_audits) == 1
+    a = note_audits[0]
+    assert a[1] == "findings" and a[2] == "f-1"
+    assert a[4] == "Mackon delayed the pour by two days"
+    assert a[5] == "McCahon delayed the pour by two days"
+
+
+def test_propagate_apply_impact_note_is_noop_on_reapply(wired, monkeypatch):
+    already_corrected = [{"table": "findings", "row_id": "f-1", "field": "impact_note",
+                          "value": "McCahon delayed the pour by two days"}]
+    spy = _wire_propagate(monkeypatch, cells=already_corrected)
+    body = body_of(_propagate(APPLY_ROUTE))
+    assert body["changed_count"] == 0 and body["changed"] == []
+    assert spy["writes"] == [] and spy["audits"] == []
+
+
+FINDINGS_CONTENT_ROW = {"id": "f-1", "site_id": "s-1", "company_id": "c-uuid-1",
+                        "author_user_id": "u-9", "observation": "o",
+                        "recommended_action": None, "entity_name": "Mackon",
+                        "entity_trade": None}
+
+
+def test_patch_content_rejects_impact_note_as_individual_edit(wired, monkeypatch):
+    # impact_note is propagation-only (_PROPAGATE_EXTRA): rewritable via
+    # /topics/{id}/propagate, but NOT in EDITABLE -- a direct PATCH must still
+    # 400 exactly like any other non-whitelisted field (D1 whole-field edit).
+    _wire_content(monkeypatch, FINDINGS_CONTENT_ROW)
+    res = org.dispatch(FakeConn(),
+                       make_event("PATCH", "/api/org/content/findings/f-1",
+                                  body={"impact_note": "hand-typed edit"}),
+                       "PATCH", "/content/findings/f-1")
+    assert res["statusCode"] == 400
 
 
 def test_propagate_apply_touches_no_row_from_another_topic(wired, monkeypatch):
