@@ -5,9 +5,8 @@ system's accuracy by cross-referencing all outputs (consensus) plus linguistic
 plausibility. Transcripts are anonymized as "Model A/B/C..." before judging to
 reduce brand bias, then scores are mapped back.
 
-Default judge is **qwen3.7-max** via DashScope (same DASHSCOPE_API_KEY as the
-Qwen/Fun-ASR providers). Set JUDGE_MODEL to a ``claude-*`` model to use the
-Anthropic backend instead (needs ANTHROPIC_API_KEY).
+Judge model is **qwen3.7-max** via DashScope (same DASHSCOPE_API_KEY as the
+Qwen/Fun-ASR providers; JUDGE_MODEL can select any DashScope chat model).
 
 This is an ESTIMATE, not a true WER — surfaced clearly in the UI. When a real
 reference is provided, WER/CER is used instead and the judge is skipped.
@@ -42,21 +41,7 @@ def _judge_model(config: dict) -> str:
 
 
 def judge_available(config: dict) -> bool:
-    model = _judge_model(config)
-    if model.startswith("claude"):
-        return bool(config.get("ANTHROPIC_API_KEY"))
     return bool(config.get("DASHSCOPE_API_KEY"))
-
-
-def _call_anthropic(config: dict, model: str, user: str) -> str:
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=config["ANTHROPIC_API_KEY"])
-    resp = client.messages.create(
-        model=model, max_tokens=1500, system=_SYSTEM,
-        messages=[{"role": "user", "content": user}],
-    )
-    return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
 
 
 def _call_dashscope(config: dict, model: str, user: str) -> str:
@@ -95,12 +80,8 @@ def score_transcripts(config: dict, transcripts: dict[str, str]) -> dict[str, di
         'Example: {"Model A": {"score": 87, "reason": "..."}}'
     )
 
-    model = _judge_model(config)
     try:
-        if model.startswith("claude"):
-            text = _call_anthropic(config, model, user)
-        else:
-            text = _call_dashscope(config, model, user)
+        text = _call_dashscope(config, _judge_model(config), user)
     except Exception as exc:  # noqa: BLE001
         return {"_error": {"score": None, "reason": f"judge failed: {exc}"}}
 

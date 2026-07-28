@@ -30,7 +30,6 @@ storage.init_db()
 
 COLS_PER_ROW = 3
 SIDEBAR_KEYS = [  # (env key, label, is_secret)
-    ("ANTHROPIC_API_KEY", "Anthropic key (judge)", True),
     ("CARTESIA_API_KEY", "Cartesia key", True),
     ("ELEVENLABS_API_KEY", "ElevenLabs key", True),
     ("PLAUD_CLIENT_ID", "Plaud Client ID", False),

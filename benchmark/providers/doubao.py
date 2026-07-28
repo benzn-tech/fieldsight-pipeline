@@ -24,8 +24,9 @@ import requests
 from .base import ASRProvider, ASRResult, Segment
 from ._aws import aws_creds_available
 
-_SUBMIT = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
-_QUERY = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
+# Volcengine (China) default; BytePlus (international) uses the byteoversea host
+# via DOUBAO_API_BASE=https://openspeech.byteoversea.com
+_DEFAULT_BASE = "https://openspeech.bytedance.com"
 _OK = "20000000"
 _WORKING = {"20000001", "20000002"}
 _SILENT = "20000003"
@@ -46,6 +47,7 @@ class DoubaoProvider(ASRProvider):
         self.app_id = config.get("DOUBAO_APP_ID", "")
         self.token = config.get("DOUBAO_ACCESS_TOKEN", "")
         self.resource_id = config.get("DOUBAO_RESOURCE_ID", "volc.seedasr.auc")
+        self.api_base = (config.get("DOUBAO_API_BASE") or _DEFAULT_BASE).rstrip("/")
         self.model = self.resource_id
         # S3 reused to host the audio URL (same creds as AWS/Fun-ASR/Plaud).
         self.aws_region = config.get("AWS_REGION", "ap-southeast-2")
@@ -109,7 +111,8 @@ class DoubaoProvider(ASRProvider):
         }
         headers = {**self._headers(request_id), "X-Api-Sequence": "-1"}
         try:
-            r = requests.post(_SUBMIT, headers=headers, json=body, timeout=60)
+            r = requests.post(f"{self.api_base}/api/v3/auc/bigmodel/submit",
+                              headers=headers, json=body, timeout=60)
         except Exception as exc:  # noqa: BLE001
             return self._fail(f"submit failed: {type(exc).__name__}: {exc}")
         code = r.headers.get("X-Api-Status-Code", "")
@@ -145,7 +148,8 @@ class DoubaoProvider(ASRProvider):
             time.sleep(delay)
             delay = min(delay * 1.5, 10.0)
             try:
-                r = requests.post(_QUERY, headers=self._headers(request_id), json={}, timeout=60)
+                r = requests.post(f"{self.api_base}/api/v3/auc/bigmodel/query",
+                                  headers=self._headers(request_id), json={}, timeout=60)
             except Exception:  # noqa: BLE001
                 continue
             code = r.headers.get("X-Api-Status-Code", "")
