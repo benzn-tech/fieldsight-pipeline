@@ -644,7 +644,15 @@ Resources:
           ITEMS_TABLE: !Ref ItemsTableName
           REPORTS_TABLE: !Ref ReportsTableName
           AUDIT_TABLE: !Ref AuditTableName
-          ENABLE_DYNAMODB: 'true'
+          # ENABLE_DYNAMODB intentionally NOT set -> code defaults to 'false'
+          # (lambda_report_generator.py). The items/reports/audit mirror the
+          # report generator wrote under PK=SITE#...#DATE#... has NO active
+          # reader: the API's ITEMS_TABLE/REPORTS_TABLE decls are dead, /reports/
+          # history reads S3, and the check-off overlay (PK=ACTIONS#/AUDIT#) is a
+          # disjoint partition space written+read by the API, untouched by this.
+          # Verified no DynamoDB streams / event-source-mappings on any of the
+          # three tables. Hardcoded 'true' was a write dead-end contradicting the
+          # docs ("DynamoDB OFF in production"); removing it aligns both.
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
