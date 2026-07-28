@@ -388,6 +388,9 @@ def dispatch(conn, event, method, route):
     m_scl = re.match(r"^/sessions/([^/]+)/close$", route)
     if m_scl and method == "POST":
         return session_close(conn, caller, m_scl.group(1), parse_body(event))
+    m_srp = re.match(r"^/sessions/([^/]+)/report/preview$", route)
+    if m_srp and method == "POST":
+        return session_report_preview(conn, caller, m_srp.group(1), event)
 
     if route == "/voice/upload-url" and method == "POST":
         return create_voice_upload_url(conn, caller, parse_body(event))
@@ -544,6 +547,72 @@ def session_close(conn, caller, session_id, body):
     grace = 0 if intent == "end" else STOP_GRACE_SECONDS
     return ok({"sessionId": session_id, "status": row["status"],
                "version": row["version"], "graceSeconds": grace})
+
+
+def session_report_preview(conn, caller, session_id, event):
+    """POST /api/org/sessions/{session_id}/report/preview — Tier-2 T2
+    (session-report-review-export spec §6). Assembles ONE meeting's report
+    content for the review modal to render into the company template.
+
+    NOTE: here `session_id` is the extraction *session_base* the #11 picker
+    uses (e.g. 'Benl1_2026-07-25_13-00-11'), NOT the 32-hex device session id
+    of /open|/close. Read-only: nothing is persisted, no doc, no send.
+
+    Scope integrity: the session's topics are re-derived server-side from
+    (folder, date, session_id) — the same ACL + site clip as GET /sessions —
+    and a client CANNOT widen the scope with a supplied id list. non_work /
+    redacted topics are excluded exactly as build_day_sessions / the picker do,
+    so the preview shows only what the export may act on.
+    """
+    p = event.get("queryStringParameters") or {}
+    date, user = p.get("date"), (p.get("user") or "").strip()
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="report preview")
+    if err is not None:
+        return err
+
+    allowed = _allowed_site_ids(conn, caller)
+    rows = [r for r in topics.list_topics_for_source_prefix(conn, f"extractions/{folder}/{date}/")
+            if str(r["site_id"]) in allowed]
+    redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if rows else {}
+    srows = []
+    for r in rows:
+        sid, kind = session_scope.session_ref(r.get("source_s3_key"))
+        if kind != session_scope.KIND_EXTRACTION or sid != session_id:
+            continue
+        if r["id"] in redacted or r.get("work_class") == "non_work":
+            continue
+        srows.append(r)
+    if not srows:
+        # unknown session, all-excluded, or wrong folder/date -> nothing to preview
+        return error("session not found", 404)
+
+    site_name = next((r.get("site_name") for r in srows if r.get("site_name")), None)
+    participants = _session_participants(srows)
+    title = _session_title(srows, site_name)
+    start_dt = session_scope.session_start(session_id)
+    # Reuse the timeline's exact topic shaping (findings->flags, alias-normalized,
+    # redaction-flagged) so the modal preview matches what the page shows.
+    shaped = render_report_shape(srows, {}, date, folder, conn)
+    return ok({
+        "sessionId": session_id,
+        "date": date,
+        "title": title,
+        "siteName": site_name,
+        "siteId": shaped.get("site_id"),
+        "startedAt": start_dt.isoformat() if start_dt else None,
+        "participants": participants,
+        "topics": shaped["topics"],           # per-topic body for the template render
+        # Defaults the modal pre-fills; the template's own field set (from the
+        # frontend template store) decides which of these are shown/editable.
+        "fieldDefaults": {
+            "title": title,
+            "attendees": participants,
+            "date": date,
+            "site": site_name,
+        },
+    })
 
 
 # ----------------------------------------------------------

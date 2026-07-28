@@ -265,6 +265,62 @@ def test_endpoint_exposes_session_title(wired):
 
 
 # ----------------------------------------------------------
+# Tier-2 T2 — POST /sessions/{id}/report/preview (review-modal content)
+# ----------------------------------------------------------
+
+SESSION_1300 = "Benl1_2026-07-25_13-00-11"
+PREVIEW_PARAMS = {"date": "2026-07-25", "user": "Ada_L"}
+
+
+def _preview(session_id, params=None, sub="sub-1"):
+    path = f"/api/org/sessions/{session_id}/report/preview"
+    return org.lambda_handler(make_event("POST", path, sub=sub, params=params), None)
+
+
+def test_preview_assembles_only_this_sessions_content(wired):
+    _wire_rows(wired, [
+        _row(id="t-1", source_s3_key=KEY_1300, title="Morning check-in",
+             summary="Discussed the plan.", participants=["Ben", "Neil"],
+             action_items=[_action("open", "a-1")]),
+        _row(id="t-2", source_s3_key=KEY_1300, title="Slab pour",
+             participants=["Neil"], action_items=[_action("open", "a-2"), _action("open", "a-3")]),
+        _row(id="t-other", source_s3_key=KEY_1405, title="Other meeting"),  # different session
+    ])
+    b = body_of(_preview(SESSION_1300, PREVIEW_PARAMS))
+    assert b["sessionId"] == SESSION_1300
+    assert b["title"] == "Slab pour"                     # most open actions
+    assert b["date"] == "2026-07-25"
+    titles = {t["topic_title"] for t in b["topics"]}
+    assert titles == {"Morning check-in", "Slab pour"}   # never the 14:05 session's topic
+    assert b["fieldDefaults"]["attendees"] == b["participants"]
+    assert b["fieldDefaults"]["date"] == "2026-07-25"
+
+
+def test_preview_excludes_redacted_and_non_work(wired):
+    _wire_rows(wired, [
+        _row(id="t-work", source_s3_key=KEY_1300, title="Work topic", action_items=[_action("open")]),
+        _row(id="t-personal", source_s3_key=KEY_1300, title="Personal", work_class="non_work"),
+        _row(id="t-removed", source_s3_key=KEY_1300, title="Removed"),
+    ])
+    wired.setattr(org.redactions, "list_active_for_topics",
+                  lambda conn, ids: {"t-removed": {"id": "r-1"}})
+    b = body_of(_preview(SESSION_1300, PREVIEW_PARAMS))
+    assert {t["topic_title"] for t in b["topics"]} == {"Work topic"}
+
+
+def test_preview_unknown_session_is_404(wired):
+    _wire_rows(wired, [_row(id="t-1", source_s3_key=KEY_1300)])
+    # a valid-shaped but non-matching session_base -> no topics in scope
+    assert _preview("Benl1_2026-07-25_08-00-00", PREVIEW_PARAMS)["statusCode"] == 404
+
+
+def test_preview_requires_valid_date(wired):
+    _wire_rows(wired, [_row(source_s3_key=KEY_1300)])
+    assert _preview(SESSION_1300, {"user": "Ada_L"})["statusCode"] == 400
+    assert _preview(SESSION_1300, {"date": "nope", "user": "Ada_L"})["statusCode"] == 400
+
+
+# ----------------------------------------------------------
 # 3. Gap-merge threshold (display grouping only)
 # ----------------------------------------------------------
 
