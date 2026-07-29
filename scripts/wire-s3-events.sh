@@ -42,6 +42,7 @@ EXTRACT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-extract-s
 ITEM_WRITER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-item-writer"
 MATCHER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-programme-matcher"
 KEYFRAME_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-keyframe"
+SESSION_REPORT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-session-report"
 
 echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer ProgrammeMatcher=${PREFIX}-programme-matcher Keyframe=${PREFIX}-keyframe"
 
@@ -175,6 +176,19 @@ if fn_exists "${PREFIX}-keyframe"; then
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-keyframe not deployed — skipping keyframe trigger"
+fi
+# NOTE(Delivery-C T3): the non-VPC session-report worker triggers on
+# session_report_requests/*.json (org-api's enqueue output on the lake). Its OWN
+# outputs (session_reports/*.docx + session_report_results/*.json) match no rule
+# here — no BUG-13 loop — and the prefix is disjoint from every other wired prefix.
+if fn_exists "${PREFIX}-session-report"; then
+  WIRE_FNS+=("${PREFIX}-session-report")
+  DESIRED=$(jq -c --arg arn "$SESSION_REPORT_ARN" '. + [
+    {"Id":"fs-session-report","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"session_report_requests/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-session-report not deployed — skipping session-report trigger"
 fi
 
 CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --output json 2>/dev/null || echo '{}')

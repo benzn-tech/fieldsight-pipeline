@@ -391,6 +391,12 @@ def dispatch(conn, event, method, route):
     m_srp = re.match(r"^/sessions/([^/]+)/report/preview$", route)
     if m_srp and method == "POST":
         return session_report_preview(conn, caller, m_srp.group(1), event)
+    m_srg = re.match(r"^/sessions/([^/]+)/report$", route)
+    if m_srg and method == "POST":
+        return session_report_generate(conn, caller, m_srg.group(1), event)
+    m_srs = re.match(r"^/sessions/([^/]+)/report/status$", route)
+    if m_srs and method == "GET":
+        return session_report_status(conn, caller, m_srs.group(1), event)
 
     if route == "/voice/upload-url" and method == "POST":
         return create_voice_upload_url(conn, caller, parse_body(event))
@@ -549,28 +555,23 @@ def session_close(conn, caller, session_id, body):
                "version": row["version"], "graceSeconds": grace})
 
 
-def session_report_preview(conn, caller, session_id, event):
-    """POST /api/org/sessions/{session_id}/report/preview — Tier-2 T2
-    (session-report-review-export spec §6). Assembles ONE meeting's report
-    content for the review modal to render into the company template.
+def _assemble_session_report(conn, caller, session_id, event):
+    """Re-derive ONE session's scope + assemble its reviewed report content,
+    server-side from (folder, date, session_id). The shared core of the T2
+    preview and the T3 generate enqueue (session-report-review-export spec §6).
 
-    NOTE: here `session_id` is the extraction *session_base* the #11 picker
-    uses (e.g. 'Benl1_2026-07-25_13-00-11'), NOT the 32-hex device session id
-    of /open|/close. Read-only: nothing is persisted, no doc, no send.
-
-    Scope integrity: the session's topics are re-derived server-side from
-    (folder, date, session_id) — the same ACL + site clip as GET /sessions —
-    and a client CANNOT widen the scope with a supplied id list. non_work /
-    redacted topics are excluded exactly as build_day_sessions / the picker do,
-    so the preview shows only what the export may act on.
-    """
+    Scope integrity: membership is derived from session_id ALONE — the same ACL
+    + site clip as GET /sessions — so a client CANNOT widen the scope with a
+    supplied id list. non_work / redacted topics are excluded exactly as
+    build_day_sessions / the picker do. Returns (content, None) on success or
+    (None, error_response)."""
     p = event.get("queryStringParameters") or {}
     date, user = p.get("date"), (p.get("user") or "").strip()
     if not date or not REPORT_DATE_RE.match(date):
-        return error("date required (YYYY-MM-DD)", 400)
-    folder, err = _resolve_org_media_folder(conn, caller, user, what="report preview")
+        return None, error("date required (YYYY-MM-DD)", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="session report")
     if err is not None:
-        return err
+        return None, err
 
     allowed = _allowed_site_ids(conn, caller)
     rows = [r for r in topics.list_topics_for_source_prefix(conn, f"extractions/{folder}/{date}/")
@@ -585,34 +586,150 @@ def session_report_preview(conn, caller, session_id, event):
             continue
         srows.append(r)
     if not srows:
-        # unknown session, all-excluded, or wrong folder/date -> nothing to preview
-        return error("session not found", 404)
+        # unknown session, all-excluded, or wrong folder/date -> nothing to act on
+        return None, error("session not found", 404)
 
     site_name = next((r.get("site_name") for r in srows if r.get("site_name")), None)
-    participants = _session_participants(srows)
-    title = _session_title(srows, site_name)
     start_dt = session_scope.session_start(session_id)
     # Reuse the timeline's exact topic shaping (findings->flags, alias-normalized,
     # redaction-flagged) so the modal preview matches what the page shows.
     shaped = render_report_shape(srows, {}, date, folder, conn)
-    return ok({
+    return {
         "sessionId": session_id,
         "date": date,
-        "title": title,
+        "folder": folder,
+        "title": _session_title(srows, site_name),
         "siteName": site_name,
         "siteId": shaped.get("site_id"),
         "startedAt": start_dt.isoformat() if start_dt else None,
-        "participants": participants,
-        "topics": shaped["topics"],           # per-topic body for the template render
+        "participants": _session_participants(srows),
+        "topics": shaped["topics"],
+        "topic_row_ids": [str(r["id"]) for r in srows],   # the export's scope handle
+    }, None
+
+
+def session_report_preview(conn, caller, session_id, event):
+    """POST /api/org/sessions/{session_id}/report/preview — Tier-2 T2
+    (session-report-review-export spec §6). Assembles ONE meeting's report
+    content for the review modal to render into the company template.
+
+    NOTE: here `session_id` is the extraction *session_base* the #11 picker
+    uses (e.g. 'Benl1_2026-07-25_13-00-11'), NOT the 32-hex device session id
+    of /open|/close. Read-only: nothing is persisted, no doc, no send."""
+    content, err = _assemble_session_report(conn, caller, session_id, event)
+    if err is not None:
+        return err
+    return ok({
+        "sessionId": content["sessionId"],
+        "date": content["date"],
+        "title": content["title"],
+        "siteName": content["siteName"],
+        "siteId": content["siteId"],
+        "startedAt": content["startedAt"],
+        "participants": content["participants"],
+        "topics": content["topics"],           # per-topic body for the template render
         # Defaults the modal pre-fills; the template's own field set (from the
         # frontend template store) decides which of these are shown/editable.
         "fieldDefaults": {
-            "title": title,
-            "attendees": participants,
-            "date": date,
-            "site": site_name,
+            "title": content["title"],
+            "attendees": content["participants"],
+            "date": content["date"],
+            "site": content["siteName"],
         },
     })
+
+
+def session_report_generate(conn, caller, session_id, event):
+    """POST /api/org/sessions/{session_id}/report — Tier-2 T3
+    (session-report-review-export spec §6). ENQUEUES an async generate job.
+
+    org-api is in-VPC (no python-docx, and BUG-36 forbids reaching SES /
+    invoking a lambda without an endpoint), so it does NOT render the doc or
+    send mail here. It re-derives the session scope, assembles the reviewed
+    content + the user's confirmed fields, and writes ONE request artifact to
+    session_report_requests/ (the match_requests/ pattern). A non-VPC worker
+    (S3-triggered) renders the Word doc + optional email and writes the result
+    the frontend polls for (resultKey)."""
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    deliver = body.get("deliver", "download")
+    if deliver not in ("download", "email"):
+        return error("deliver must be 'download' or 'email'", 400)
+    recipients = body.get("recipients") or []
+    if deliver == "email" and not recipients:
+        return error("recipients required when deliver='email'", 400)
+
+    content, err = _assemble_session_report(conn, caller, session_id, event)
+    if err is not None:
+        return err
+
+    request_id = uuid.uuid4().hex
+    folder, date = content["folder"], content["date"]
+    result_key = f"session_report_results/{folder}/{date}/{session_id}/{request_id}.json"
+    request_key = f"session_report_requests/{folder}/{date}/{session_id}/{request_id}.json"
+    # The user's modal edits win over the auto-derived defaults (title/attendees).
+    artifact = {
+        "requestId": request_id,
+        "sessionId": session_id,
+        "date": date,
+        "folder": folder,
+        "companyId": str(caller["company_id"]),
+        "requestedBy": str(caller["id"]),
+        "templateId": body.get("templateId"),
+        "title": body.get("title") or content["title"],
+        "attendees": body.get("attendees") or content["participants"],
+        "fields": body.get("fields") or {},
+        "deliver": deliver,
+        "recipients": recipients,
+        "content": content,
+        "resultKey": result_key,
+    }
+    # Lake bucket (like the reindex_requests/ chain): org-api is in-VPC and hands
+    # off to the non-VPC session-report worker via an S3 request artifact (BUG-36).
+    s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
+                    Body=json.dumps(artifact), ContentType="application/json")
+    return ok({"status": "queued", "sessionId": session_id,
+               "requestId": request_id, "resultKey": result_key}, 202)
+
+
+def session_report_status(conn, caller, session_id, event):
+    """GET /api/org/sessions/{session_id}/report/status?date=&user=&requestId=
+    — Tier-2 T3 poll. The worker (lambda_session_report) writes its result to
+    session_report_results/{folder}/{date}/{session}/{requestId}.json; this
+    endpoint rebuilds that key server-side (a client cannot point it at another
+    folder's result), reads it, and presigns the finished doc.
+
+      pending = worker hasn't written a result yet (S3 404)
+      done    = { docUrl (presigned GET of the worker's docKey), emailed }
+      error   = { error } (the worker recorded a failure)"""
+    p = event.get("queryStringParameters") or {}
+    date, user = p.get("date"), (p.get("user") or "").strip()
+    request_id = (p.get("requestId") or "").strip()
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    if not request_id:
+        return error("requestId required", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="session report status")
+    if err is not None:
+        return err
+    result_key = f"session_report_results/{folder}/{date}/{session_id}/{request_id}.json"
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return ok({"status": "pending"})       # worker hasn't finished yet
+        raise
+    result = json.loads(obj["Body"].read().decode("utf-8"))
+    status = result.get("status")
+    if status == "done" and result.get("docKey"):
+        url = s3().generate_presigned_url(
+            "get_object", Params={"Bucket": LAKE_BUCKET, "Key": result["docKey"]},
+            ExpiresIn=PRESIGNED_URL_EXPIRY)
+        return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed"))})
+    if status == "error":
+        return ok({"status": "error", "error": result.get("error")})
+    return ok({"status": status or "pending"})
 
 
 # ----------------------------------------------------------

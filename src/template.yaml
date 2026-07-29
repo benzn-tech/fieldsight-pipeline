@@ -763,6 +763,56 @@ Resources:
             BucketName: !Ref DataBucketName
 
   # ----------------------------------------------------------
+  # Delivery-C session report worker (Tier-2 T3, session-report-review-export §6).
+  # Non-VPC + python-docx layer (mirrors MeetingMinutesFunction) so it can render
+  # the Word doc AND reach SES — the in-VPC org-api can do neither (BUG-36). It is
+  # S3-triggered on session_report_requests/ (org-api's enqueue output on the lake);
+  # reads the reviewed session content, renders session_reports/{...}.docx, optionally
+  # emails it via email_sender, and writes session_report_results/{...}.json (the poll
+  # target). NO Events: S3 wired manually per BUG-33 — scripts/wire-s3-events.sh
+  # (fs-session-report, triggers on session_report_requests/*.json).
+  # ----------------------------------------------------------
+  SessionReportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ["${P}-session-report", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_session_report.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24)
+      Layers: !If
+        - HasDocxLayer
+        - - !Ref DocxLayerArn
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName   # the lake — where org-api enqueues the request
+          # Email is stub (logs, sends nothing) until an SES identity is verified as
+          # part of the DNS/SES work; flip to 'ses' + set SENDER_EMAIL then.
+          EMAIL_SENDER: stub
+          SENDER_EMAIL: ''
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_reports/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_report_results/*
+            - Effect: Allow
+              # SES send for the 'email' delivery option — harmless while
+              # EMAIL_SENDER=stub (the stub never calls SES). Verified-identity
+              # send; no DNS needed to start (email_sender.py header).
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+
+  # ----------------------------------------------------------
   # Lambda 8: Ask Agent (Report Q&A)
   # Phase 5: RAG mode -- embeds the question (DashScope, public
   # internet, non-VPC) then invokes RagSearchFunction (in-VPC) for
@@ -1085,6 +1135,22 @@ Resources:
               # writes the VECTORS artifact back into the same prefix.
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/reindex_requests/*
+            - Effect: Allow
+              # Delivery-C session report (Tier-2 T3): POST /sessions/{id}/report
+              # writes a request artifact to the lake's session_report_requests/
+              # prefix — org-api is in-VPC so it can neither render docx nor reach
+              # SES (BUG-36); the non-VPC SessionReportFunction picks it up via a
+              # manual S3 trigger (wire-s3-events.sh, BUG-33). GET .../report/status
+              # then reads the worker's result JSON and presigns the finished doc,
+              # so it needs GetObject on both output prefixes (a presign is only
+              # valid if the role can GetObject the key).
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_report_results/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_reports/*
       Events:
         OrgProxy:
           Type: Api

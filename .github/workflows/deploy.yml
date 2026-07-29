@@ -98,6 +98,7 @@ jobs:
               "IngestBucketName=fieldsight-data-test-509194952652" \
               "EnableSchedules=false" \
               "EnableSiteVoice=true" \
+              "DocxLayerArn=arn:aws:lambda:ap-southeast-2:509194952652:layer:python-docx-layer:2" \
               "EnableKeyframes=${{ vars.TEST_ENABLE_KEYFRAMES || 'false' }}" \
               $KF_LAYER_PARAM \
               "ItemsTableName=fieldsight-test-items" \
