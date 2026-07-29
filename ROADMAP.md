@@ -1,5 +1,9 @@
 # FieldSight Product Roadmap
 
+> ⚠️ **STALE — see `PLAN.md` (current priorities) + `CLAUDE.md` (architecture).** Items below
+> (e.g. Ask Agent / Knowledge Base "Not started") have since shipped. Kept for historical reference
+> only. — flagged 2026-07-29
+
 > Last updated: 2026-03-22
 > Owner: Ben
 > Status tracking: ⬜ Not started | 🔲 Blocked | 🟡 In progress | ✅ Done

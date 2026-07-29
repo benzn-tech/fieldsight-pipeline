@@ -1,5 +1,11 @@
 # System Architecture Overview
 
+> ⚠️ **STALE — legacy RealPTT / Fargate / v4.0 era.** This describes the retired scraper pipeline
+> (orchestrator → realptt.com login → Fargate downloader → DynamoDB), **not** the current
+> app-upload + Aurora-SoR + org-api system. Current truth: **`CLAUDE.md`** (architecture + traps) ·
+> **`PLAN.md`** (what's next) · `docs/PROJECT-SUMMARY-*.md`. Kept for historical reference only.
+> — flagged 2026-07-29
+
 ## Complete Automated Pipeline
 
 ```

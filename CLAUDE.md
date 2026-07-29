@@ -2,64 +2,120 @@
 
 ## Project Overview
 
-FieldSight (formerly SiteSync) is an AI-powered construction site documentation platform. Bodycam video, PTT audio, and photos are captured from field workers, processed through an AWS pipeline (VAD → Transcribe → AI report generation), and delivered as structured daily/weekly/monthly reports via a React frontend.
+FieldSight (formerly SiteSync) is an AI construction-site documentation platform. Field
+workers' body-cam video / PTT audio / photos are captured **by the GrandTime mobile app**
+and uploaded to an AWS pipeline (VAD → transcription → Claude extraction → templated
+reports), producing structured daily/weekly/monthly reports plus a live dashboard. Beyond
+reporting it now also does content correction, RAG Q&A, hybrid search, and life/work
+privacy separation.
 
-- **Frontend:** Single-file React (index.html) served via CloudFront
-- **Backend:** Lambda functions + API Gateway + Cognito + DynamoDB
-- **Region:** ap-southeast-2 (Sydney)
-- **Bucket:** fieldsight-data-509194952652
-- **Account:** 509194952652
+- **System of Record:** Aurora PostgreSQL + pgvector (topics / findings / action_items —
+  editable + queryable). S3 holds media / transcripts / extractions / reports / the report lake.
+- **Frontend (live):** the `fieldsight-ui` repo — vanilla-JS dashboard on **Amplify**
+  (client site = `main`). The old single-file React `index.html` is retired.
+- **Read/write API:** `lambda_org_api` (`/api/org/{proxy+}`) over Aurora + Cognito.
+- **Region:** ap-southeast-2 · **Account (own SAM):** 509194952652 · **Data bucket:** `fieldsight-data-509194952652`
+  (test bucket `fieldsight-data-test-509194952652`). A separate company CDK prod `164088480050` exists — **don't conflate**.
 
-**Product roadmap and feature tracking: see ROADMAP.md**
+> **Living sources of truth** — this file, `ARCHITECTURE.md`, and `ROADMAP.md` all drift; the
+> latter two still describe the retired RealPTT / DynamoDB era and are stale. Current state lives in:
+> - `docs/PROJECT-SUMMARY-*.md` (latest = **2026-07-29**) — state, priorities, repos, bottleneck.
+> - `docs/superpowers/specs/` + `plans/` + `SESSION-HANDOFF-*.md` — per-feature design + session handoffs.
+> - `~/.claude/…/memory/MEMORY.md` — cross-session traps / topology (empty-list ACL, DB isolation, identity bridge …).
+> - `/fieldsight-backend` skill — fast pickup (repo layout, deploy, test harness, live traps).
+
+---
+
+## Docs & repo hygiene
+
+**Canonical doc spine — keep these current; everything else is derived or historical:**
+
+| Doc | Role | Cadence |
+|---|---|---|
+| `CLAUDE.md` (this file) | How the system works + traps (BUG-01..38). Reference. | When architecture or a trap changes. |
+| `PLAN.md` | **Living** ledger — shipped / in-flight / priorities / open questions / bottleneck. | **In place, every session — the single source for "what's next."** |
+| `~/.claude/…/memory/MEMORY.md` + files | Cross-session facts / topology / traps that outlive one task. | As facts are learned. |
+| `docs/superpowers/specs/` + `plans/` + `SESSION-HANDOFF-*.md` | Per-feature design + per-session handoff. | Per feature / session. |
+
+**Anti-drift rules (why this section exists):**
+- **Don't mint new dated status files.** `docs/PROJECT-SUMMARY-2026-07-29.md` is a one-time onboarding
+  narrative; the *living* state lives in `PLAN.md`. Update PLAN.md in place instead of dropping a new
+  dated snapshot each session.
+- **`ARCHITECTURE.md` (v4.0 RealPTT/Fargate) and `ROADMAP.md` (2026-03) are STALE** — both now carry a
+  top banner pointing here. Don't trust them; don't onboard a session from them.
+- **The real frontend is the separate `fieldsight-ui` repo.** Any UI copy *inside* this repo is stale.
+
+**Foreign / duplicate folders that don't belong here (pending cleanup — see PLAN.md §6):**
+
+| Path | What it is | Git | Cleanup |
+|---|---|---|---|
+| `ui/` | Stale full copy of the `fieldsight-ui` repo (139 files; its docs have diverged from the real repo) | tracked | `git rm -r` on a housekeeping branch (recoverable from history) |
+| `frontend/` | Dead `fieldsight_v5.jsx` + `index.html` artifact | tracked (2) | `git rm -r` |
+| `claw-code/` | A **different** project (Claude-Code-like; Containerfile / PHILOSOPHY.md / install.sh) | **untracked** | confirm with user before deleting — git can't restore it |
+| `../fieldsight-pipeline-main/` | A loose second copy of the pipeline (no `.git`) | non-repo | confirm with user before deleting — unrecoverable via git |
 
 ---
 
 ## Architecture
 
+**System of Record = Aurora PostgreSQL + pgvector.** The single-file React artifact and the
+legacy RealPTT-scraper flow (orchestrator → realptt.com login → Fargate downloader → DynamoDB)
+are **retired**; media now arrives via the GrandTime app.
+
+### Capture → report pipeline
 ```
-RealPTT Device → Lambda Orchestrator → S3 (raw media)
-  → Lambda Transcribe → AWS Transcribe → S3 (transcript JSON)
-  → Lambda Report Generator → Claude API → S3 (report JSON + Word)
-  → Lambda Meeting Minutes → Claude API → S3 (minutes JSON + Word)
+app upload → org-api create_recording_upload_url → S3 + `recordings` row stamped with site_id
+  → lambda_vad             Silero VAD (models/silero_vad.onnx); segments → audio_segments/…_off{X}_to{Y}_src{fmt}
+  → lambda_transcribe      AWS Transcribe | ElevenLabs (ASR_PROVIDER); → transcripts/{folder}/{date}/ (date subfolder)
+  → lambda_extract_session Claude → extractions/{folder}/{date}/{session_base}.json (topics/findings/action_items)
+  → lambda_item_writer     in-VPC; writes topics/findings/action_items to Aurora = SoR (identity bridge, see Traps)
+  → reports on demand      lambda_report_generator / lambda_meeting_minutes → structured JSON + python-docx Word
 ```
 
+### Serve / query
 ```
-S3 Upload (video/audio)
-  → VAD Lambda (fieldsight-vad)
-    → Detect codec (skip H264 preview if already H264)
-    → Extract audio → 16kHz WAV (numpy, NOT Python list)
-    → Load Silero model from S3 (NOT Lambda Layer)
-    → VAD: threshold 0.4 → retry 0.25 → fallback full audio
-    → Upload segments to audio_segments/
-  → Transcribe Lambda (fieldsight-transcribe, MUST be v1.3+)
-    → Start Transcribe job with speaker diarization
-    → Output to transcripts/{user}/{date}/ (WITH date subfolder)
-  → Report Generator (fieldsight-report-generator)
-    → Claude API → structured JSON report
-    → Upload to reports/{date}/{user}/
+fieldsight-ui (Amplify) → API Gateway
+  → lambda_org_api    /api/org/{proxy+} — dashboard / timeline / reports / sessions; role hierarchy
+                      (admin/gm > pm > site_manager > worker) + site-scoped ACL + graded visibility
+  → lambda_ingest     nightly report→item ingest, authority-flip aware (defers to extraction topics)
+  → lambda_ask_agent  RAG Q&A — DashScope embed (non-VPC) ↔ Aurora pgvector retrieve (in-VPC)
+Auth: Cognito pool ap-southeast-2_q88pd6XXr (fieldsight-users). **Two identity systems** — see Traps.
+```
 
-Frontend (CloudFront → S3)
-  → Cognito auth (user pool ap-southeast-2_q88pd6XXr) (fieldsight-users; old pool ps7XIQGHB deleted)
-  → API Gateway → fieldsight-api Lambda
-    → Role hierarchy: admin/gm > pm > site_manager > worker
-    → Time regex: ALWAYS \d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})
-    → Transcript search: date subfolder first, flat folder fallback
-    → Video: web_video/ first (H264), users/video/ fallback
-```
+> The legacy single-site gateway `lambda_fieldsight_api` still exists (memory
+> *two-legacy-api-lambdas*); the client site is served by org-api, not it. Filename-time regex,
+> VAD, and transcript-offset rules are unchanged — see BUG-01 / 09 / 11 below.
 
 ---
 
 ## Key Files
 
-| File | Purpose |
+> All Lambda handlers + shared modules live under **`src/`**. Migrations under
+> `src/migrations/` (0001–0023 in this checked-out tree; newest voice/session migrations land
+> on the current feature branch — see the note below the table).
+
+| File (`src/…`) | Purpose |
 |------|---------|
-| `transcript_utils.py` | **Shared module** — unified time extraction, transcript normalization. MUST be bundled in every Lambda zip. |
-| `lambda_report_generator.py` | Site inspection daily/weekly/monthly reports (v3.5) |
-| `lambda_meeting_minutes.py` | Generic meeting minutes (v1.1) |
-| `lambda_transcribe.py` | Triggers AWS Transcribe jobs on new audio |
-| `prompt_templates.json` | Hot-swappable prompt templates (S3: config/) |
-| `prompt_templates_meeting.json` | Meeting-specific prompt templates (S3: config/) |
-| `user_mapping.json` | Device → person name + role + site mapping (S3: config/) |
+| `transcript_utils.py` | **Shared module** — unified time extraction + transcript normalization. Bundle in every Lambda zip. |
+| `lambda_org_api.py` | Read/write API over Aurora (`/api/org/{proxy+}`) — dashboard/timeline/reports/sessions; role + site ACL. |
+| `lambda_item_writer.py` | **In-VPC** writer: extractions → Aurora topics/findings/action_items (System of Record). Identity bridge. |
+| `lambda_extract_session.py` | Claude extraction of a transcript session → `extractions/`. |
+| `lambda_ingest.py` | Nightly report→item ingest; authority-flip aware. |
+| `lambda_ask_agent.py` / `lambda_rag_search.py` | RAG Q&A (DashScope embed + pgvector) / hybrid semantic+lexical search. |
+| `lambda_embed_report.py` / `reindex.py` / `chunking.py` | Embedding + reindex + chunking for RAG. |
+| `lambda_vad.py` | Silero VAD (loads `models/silero_vad.onnx`, NOT a Layer — BUG-02). |
+| `lambda_transcribe.py` | Triggers AWS Transcribe (or ElevenLabs via `ASR_PROVIDER`) on new audio. |
+| `lambda_report_generator.py` / `lambda_meeting_minutes.py` | Site daily/weekly/monthly reports / meeting minutes → JSON + Word. |
+| `lambda_programme_matcher.py` / `lambda_suggestion_writer.py` | Finding→programme-task impact matching + suggestions. |
+| `claude_utils.py` / `dashscope_utils.py` | Claude API wrapper / Qwen (DashScope) STT·TTS·embed. |
+| `lambda_voice_*.py`, `lambda_ws_*.py` | Site-voice realtime (WebSocket connect/disconnect/send + fanout/resolve/reaper/audit). |
+| **Legacy** `lambda_fieldsight_api.py`, `lambda_orchestrator.py`, `lambda_downloader.py`, `fargate_downloader.py` | Old single-site gateway + RealPTT scraper (retired data path; don't extend). |
+| `prompt_templates.json` / `prompt_templates_meeting.json` / `user_mapping.json` | Hot-swappable prompts + device→person mapping (S3: `config/`). |
+
+> **On the current feature branch** (`feat/voice-chunk-session`, off `develop`) but not yet in
+> this checked-out tree: chunk/session identity, `meeting_session` migration, session-lifecycle
+> endpoints, `email_sender.py`, provider abstraction (`llm_utils.py`), Delivery-C T1/T2. See
+> `docs/PROJECT-SUMMARY-2026-07-29.md` §1 + the voice specs for what's live vs inert.
 
 ---
 
@@ -390,7 +446,27 @@ result = [u for u in all_users
 
 ---
 
-## Lambda Deployment
+## Deploy
+
+**Primary path = SAM via GitHub Actions.** Push `develop` → `deploy.yml` → **TEST** stack
+(`fieldsight-test-*`, DB `fieldsight_test`, bucket `fieldsight-data-test-509194952652`, auto-migrate).
+Push `main` → `deploy-prod.yml` → **PROD** (DB `fieldsight`) behind a **`production` GitHub-environment
+approval gate** — a human approves via `gh api … pending_deployments … -f state=approved` (often
+permission-gated; the user runs it with `!`). Test↔prod org-api share the Aurora cluster, different DBs
+(BUG-38). Adding a CFN resource? Also grant IAM on the deploy role `github-actions-fieldsight-deploy`
+(missing → CREATE_FAILED rolls back the whole stack — memory *org-api-new-route-iam-trap*). Runbook:
+`DEPLOYMENT-RUNBOOK.md`.
+
+**Test harness (Windows, Python 3.14 + uv):**
+```bash
+export UV_LINK_MODE=copy   # Dropbox cloud-sync breaks uv hardlinks
+export AWS_ACCESS_KEY_ID=testing AWS_SECRET_ACCESS_KEY=testing AWS_DEFAULT_REGION=ap-southeast-2
+uv run --with pytest --with boto3 --with "psycopg[binary]" --with urllib3 --with numpy pytest tests/unit -q
+```
+Repo unit tests use a FakeConn/FakeCursor double (no real Postgres); org-api handler tests go through
+`org.lambda_handler(make_event(...))` with repo funcs monkeypatched on `org.<module>`.
+
+### Legacy single-lambda hotfix (standalone functions only)
 
 **CRITICAL: Always bundle transcript_utils.py in every Lambda zip.**
 
