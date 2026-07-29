@@ -553,3 +553,209 @@ def test_session_with_unparseable_base_time_sorts_last_and_never_merges(wired):
     assert body["sessions"][1]["started_at"] is None
     assert body["sessions"][1]["label"] == "? – ?"
     assert [s["block"] for s in body["sessions"]] == [1, 2]
+
+
+# ----------------------------------------------------------
+# Tier-2 T3 — POST /sessions/{id}/report (async enqueue of the generate job)
+#
+# org-api is in-VPC (no python-docx, and BUG-36 forbids reaching SES / invoking
+# a lambda without an endpoint), so it does NOT render the doc: it re-derives the
+# session scope, assembles the reviewed content + the user's confirmed fields, and
+# writes ONE request artifact to session_report_requests/ (the match_requests/
+# pattern). A non-VPC worker consumes it. These tests pin the enqueue contract.
+# ----------------------------------------------------------
+
+GEN_PARAMS = {"date": "2026-07-25", "user": "Ada_L"}
+GEN_BODY = {
+    "title": "Morning site inspection",
+    "attendees": ["Ben", "Neil", "James"],
+    "fields": {"weather": "Fine", "sign_off": "A. L"},
+    "deliver": "download",
+}
+
+
+@pytest.fixture
+def s3_puts(wired):
+    """Capture s3().put_object calls so a test can inspect the enqueued artifact."""
+    puts = []
+
+    class _FakeS3:
+        def put_object(self, **kw):
+            puts.append(kw)
+            return {}
+
+    wired.setattr(org, "s3", lambda: _FakeS3())
+    return puts
+
+
+def _generate(session_id, body, params=GEN_PARAMS, sub="sub-1"):
+    ev = make_event("POST", f"/api/org/sessions/{session_id}/report", sub=sub, params=params)
+    ev["body"] = json.dumps(body) if body is not None else None
+    return org.lambda_handler(ev, None)
+
+
+def _two_topic_session(wired):
+    _wire_rows(wired, [
+        _row(id="t-1", source_s3_key=KEY_1300, title="Morning check-in",
+             participants=["Ben", "Neil"], action_items=[_action("open", "a-1")]),
+        _row(id="t-2", source_s3_key=KEY_1300, title="Slab pour",
+             participants=["Neil"], action_items=[_action("open", "a-2"), _action("open", "a-3")]),
+        _row(id="t-other", source_s3_key=KEY_1405, title="Other meeting"),   # different session
+    ])
+
+
+def test_generate_returns_202_queued_with_a_poll_handle(wired, s3_puts):
+    _two_topic_session(wired)
+    res = _generate(SESSION_1300, GEN_BODY)
+    assert res["statusCode"] == 202
+    b = body_of(res)
+    assert b["status"] == "queued"
+    assert b["sessionId"] == SESSION_1300
+    assert b["resultKey"].startswith("session_report_results/")   # frontend polls this
+
+
+def test_generate_writes_one_request_artifact_scoped_to_the_session(wired, s3_puts):
+    _two_topic_session(wired)
+    _generate(SESSION_1300, GEN_BODY)
+    assert len(s3_puts) == 1
+    put = s3_puts[0]
+    assert put["Key"].startswith("session_report_requests/")
+    req = json.loads(put["Body"])
+    # scope re-derived server-side from session_id: never the 14:05 session's topic
+    assert {t["topic_title"] for t in req["content"]["topics"]} == {"Morning check-in", "Slab pour"}
+
+
+def test_generate_carries_the_users_confirmed_fields(wired, s3_puts):
+    _two_topic_session(wired)
+    _generate(SESSION_1300, GEN_BODY)
+    req = json.loads(s3_puts[0]["Body"])
+    assert req["title"] == "Morning site inspection"       # user override wins over derived title
+    assert req["attendees"] == ["Ben", "Neil", "James"]    # user-confirmed (adds James)
+    assert req["fields"]["weather"] == "Fine"
+    assert req["deliver"] == "download"
+
+
+def test_generate_re_derives_scope_and_ignores_client_supplied_ids(wired, s3_puts):
+    """Scope integrity (spec §6): a caller cannot widen the export to another
+    meeting by supplying its own id list — the server derives topic_row_ids
+    from session_id alone."""
+    _two_topic_session(wired)
+    _generate(SESSION_1300, {**GEN_BODY, "topic_row_ids": ["t-other", "t-evil"]})
+    req = json.loads(s3_puts[0]["Body"])
+    assert sorted(req["content"]["topic_row_ids"]) == ["t-1", "t-2"]   # server's, not the client's
+
+
+def test_generate_excludes_redacted_and_non_work(wired, s3_puts):
+    _wire_rows(wired, [
+        _row(id="t-work", source_s3_key=KEY_1300, title="Work topic", action_items=[_action("open")]),
+        _row(id="t-personal", source_s3_key=KEY_1300, title="Personal", work_class="non_work"),
+        _row(id="t-removed", source_s3_key=KEY_1300, title="Removed"),
+    ])
+    wired.setattr(org.redactions, "list_active_for_topics",
+                  lambda conn, ids: {"t-removed": {"id": "r-1"}})
+    _generate(SESSION_1300, GEN_BODY)
+    req = json.loads(s3_puts[0]["Body"])
+    assert {t["topic_title"] for t in req["content"]["topics"]} == {"Work topic"}
+
+
+def test_generate_rejects_unknown_deliver(wired, s3_puts):
+    _two_topic_session(wired)
+    assert _generate(SESSION_1300, {**GEN_BODY, "deliver": "carrier-pigeon"})["statusCode"] == 400
+    assert s3_puts == []                                    # nothing enqueued on a bad request
+
+
+def test_generate_email_requires_recipients(wired, s3_puts):
+    _two_topic_session(wired)
+    assert _generate(SESSION_1300, {**GEN_BODY, "deliver": "email"})["statusCode"] == 400
+    assert _generate(SESSION_1300, {**GEN_BODY, "deliver": "email",
+                                    "recipients": ["a@x.nz"]})["statusCode"] == 202
+
+
+def test_generate_requires_a_valid_date(wired, s3_puts):
+    _two_topic_session(wired)
+    assert _generate(SESSION_1300, GEN_BODY, params={"user": "Ada_L"})["statusCode"] == 400
+    assert _generate(SESSION_1300, GEN_BODY,
+                     params={"date": "nope", "user": "Ada_L"})["statusCode"] == 400
+
+
+def test_generate_unknown_session_is_404(wired, s3_puts):
+    _wire_rows(wired, [_row(id="t-1", source_s3_key=KEY_1300)])
+    assert _generate("Benl1_2026-07-25_08-00-00", GEN_BODY)["statusCode"] == 404
+    assert s3_puts == []
+
+
+def test_generate_malformed_body_is_400(wired, s3_puts):
+    _two_topic_session(wired)
+    ev = make_event("POST", f"/api/org/sessions/{SESSION_1300}/report", params=GEN_PARAMS)
+    ev["body"] = "{not json"
+    assert org.lambda_handler(ev, None)["statusCode"] == 400
+
+
+# ----------------------------------------------------------
+# Tier-2 T3 — GET /sessions/{id}/report/status (poll the async worker's result)
+#
+# The frontend polls with the requestId from the 202. The endpoint rebuilds the
+# resultKey server-side from (folder, date, session_id, requestId) — a client
+# can't point it at another folder's result — reads it, and presigns the doc.
+# ----------------------------------------------------------
+
+STATUS_PARAMS = {"date": "2026-07-25", "user": "Ada_L", "requestId": "req123"}
+RESULT_KEY = "session_report_results/Ada_L/2026-07-25/Benl1_2026-07-25_13-00-11/req123.json"
+DOC_KEY = "session_reports/Ada_L/2026-07-25/Benl1_2026-07-25_13-00-11/req123.docx"
+
+
+@pytest.fixture
+def result_store(wired):
+    """Fake S3 for the status read: serve a result JSON (or a NoSuchKey 404) and
+    presign the doc."""
+    from io import BytesIO
+    from botocore.exceptions import ClientError as _CE
+    store = {}
+
+    class _S3:
+        def get_object(self, Bucket, Key):
+            if Key not in store:
+                raise _CE({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+            return {"Body": BytesIO(json.dumps(store[Key]).encode())}
+
+        def generate_presigned_url(self, op, Params, ExpiresIn):
+            return f"https://signed.example/{Params['Key']}"
+
+    wired.setattr(org, "s3", lambda: _S3())
+    return store
+
+
+def _status(session_id, params=STATUS_PARAMS, sub="sub-1"):
+    return org.lambda_handler(
+        make_event("GET", f"/api/org/sessions/{session_id}/report/status", sub=sub, params=params), None)
+
+
+def test_status_is_pending_before_the_worker_writes_a_result(wired, result_store):
+    assert body_of(_status(SESSION_1300))["status"] == "pending"    # result_store empty -> 404 -> pending
+
+
+def test_status_done_returns_a_presigned_docurl(wired, result_store):
+    result_store[RESULT_KEY] = {"status": "done", "docKey": DOC_KEY, "emailed": False}
+    b = body_of(_status(SESSION_1300))
+    assert b["status"] == "done"
+    assert b["docUrl"].endswith("req123.docx")     # presigned GET of the worker's docKey
+    assert b["emailed"] is False
+
+
+def test_status_surfaces_the_worker_error(wired, result_store):
+    result_store[RESULT_KEY] = {"status": "error", "error": "document generation unavailable"}
+    b = body_of(_status(SESSION_1300))
+    assert b["status"] == "error"
+    assert "unavailable" in b["error"]
+
+
+def test_status_requires_date_and_request_id(wired, result_store):
+    assert _status(SESSION_1300, {"user": "Ada_L", "requestId": "req123"})["statusCode"] == 400
+    assert _status(SESSION_1300, {"date": "2026-07-25", "user": "Ada_L"})["statusCode"] == 400
+
+
+def test_status_reads_the_server_reconstructed_result_key(wired, result_store):
+    """Only finds the result because the endpoint rebuilt exactly RESULT_KEY from
+    (folder, date, session, requestId) — scope integrity, not a client-supplied key."""
+    result_store[RESULT_KEY] = {"status": "done", "docKey": DOC_KEY}
+    assert body_of(_status(SESSION_1300))["status"] == "done"
