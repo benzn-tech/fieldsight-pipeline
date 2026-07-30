@@ -413,6 +413,12 @@ Conditions:
   # NOT depend on HasVadLayer: that layer (fieldsight-vad-layer) is cp312-only
   # and feeds VadFunction, not KeyframeFunction.
   HasKeyframeStack: !And [!Condition HasDb, !Condition HasKeyframeFfmpegLayer]
+  # QR passwordless login (2026-07-30): the code table has a FIXED TableName
+  # and DynamoDB table names are unique per account+region, but test and prod
+  # deploy from the SAME account — gating on HasOrgApi (true in both stacks)
+  # would collide (CREATE_FAILED). The table + Cognito triggers are PROD-only
+  # (v1 has no test create endpoint); see docs/superpowers/sdd/2026-07-30-qr-login-backend.
+  IsProd: !Equals [!Ref Stage, prod]
 
 # ============================================================
 # Global Settings
@@ -1006,6 +1012,10 @@ Resources:
           # AUTHORITY_FLIP (IngestFunction, above): Parameter default 'false',
           # driven per-environment by a repo variable in the deploy workflows.
           GRADED_ROLES: !Ref GradedRoles
+          # QR passwordless login (2026-07-30) — PROD-ONLY (see IsProd
+          # condition + QrLoginCodesTable). Test's OrgApi omits this var
+          # entirely (!Ref AWS::NoValue) — v1 has no test create endpoint.
+          QR_CODES_TABLE: !If [IsProd, !Ref QrLoginCodesTable, !Ref AWS::NoValue]
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
@@ -1151,6 +1161,15 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_report_results/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_reports/*
+            # QR passwordless login (2026-07-30) — PROD-ONLY. Test's
+            # OrgApiFunction omits this statement entirely (!Ref AWS::NoValue)
+            # — mirrors the QR_CODES_TABLE env var above.
+            - !If
+              - IsProd
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt QrLoginCodesTable.Arn
+              - !Ref AWS::NoValue
       Events:
         OrgProxy:
           Type: Api
@@ -1200,6 +1219,93 @@ Resources:
             - Effect: Allow
               Action: s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/config/user_mapping.json
+
+  # ----------------------------------------------------------
+  # QR passwordless login (2026-07-30) — code table + Cognito custom-auth
+  # triggers. PROD-ONLY (Condition: IsProd, not HasOrgApi) — see IsProd
+  # comment in Conditions above. Non-VPC (DynamoDB public endpoint only,
+  # never Aurora — BUG-36: a NAT-less VPC Lambda black-holes on AWS API
+  # calls, so these must NOT get VpcConfig).
+  # ----------------------------------------------------------
+  QrLoginCodesTable:
+    Type: AWS::DynamoDB::Table
+    Condition: IsProd
+    Properties:
+      TableName: fieldsight-qr-login-codes
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: code, AttributeType: S }
+      KeySchema:
+        - { AttributeName: code, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  QrAuthDefineFunction:
+    Type: AWS::Serverless::Function
+    Condition: IsProd
+    Properties:
+      FunctionName: !Sub ["${P}-qr-auth-define", { P: !FindInMap [StageConfig, !Ref Stage, Prefix] }]
+      CodeUri: src/
+      Handler: lambda_qr_auth.define_auth_challenge
+      Timeout: 10
+      MemorySize: 128
+
+  QrAuthCreateFunction:
+    Type: AWS::Serverless::Function
+    Condition: IsProd
+    Properties:
+      FunctionName: !Sub ["${P}-qr-auth-create", { P: !FindInMap [StageConfig, !Ref Stage, Prefix] }]
+      CodeUri: src/
+      Handler: lambda_qr_auth.create_auth_challenge
+      Timeout: 10
+      MemorySize: 128
+
+  QrAuthVerifyFunction:
+    Type: AWS::Serverless::Function
+    Condition: IsProd
+    Properties:
+      FunctionName: !Sub ["${P}-qr-auth-verify", { P: !FindInMap [StageConfig, !Ref Stage, Prefix] }]
+      CodeUri: src/
+      Handler: lambda_qr_auth.verify_auth_challenge_response
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          QR_CODES_TABLE: !Ref QrLoginCodesTable
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt QrLoginCodesTable.Arn
+
+  QrAuthDefinePermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsProd
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref QrAuthDefineFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${OrgUserPoolId}
+
+  QrAuthCreatePermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsProd
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref QrAuthCreateFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${OrgUserPoolId}
+
+  QrAuthVerifyPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsProd
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref QrAuthVerifyFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${OrgUserPoolId}
 
   # ----------------------------------------------------------
   # Lambda 13: Extract Session (Phase 4b) — S3 event on transcripts/,
@@ -2726,6 +2832,21 @@ Outputs:
   AskAgentFunctionArn:
     Description: Ask Agent Lambda ARN
     Value: !GetAtt AskAgentFunction.Arn
+
+  QrAuthDefineFunctionArn:
+    Description: QR passwordless login — DefineAuthChallenge trigger Lambda ARN (prod only)
+    Condition: IsProd
+    Value: !GetAtt QrAuthDefineFunction.Arn
+
+  QrAuthCreateFunctionArn:
+    Description: QR passwordless login — CreateAuthChallenge trigger Lambda ARN (prod only)
+    Condition: IsProd
+    Value: !GetAtt QrAuthCreateFunction.Arn
+
+  QrAuthVerifyFunctionArn:
+    Description: QR passwordless login — VerifyAuthChallengeResponse trigger Lambda ARN (prod only)
+    Condition: IsProd
+    Value: !GetAtt QrAuthVerifyFunction.Arn
 
   ApiEndpoint:
     Description: API Gateway endpoint URL
