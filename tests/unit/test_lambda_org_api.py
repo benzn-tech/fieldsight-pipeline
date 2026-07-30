@@ -5893,3 +5893,52 @@ def test_action_closures_rejects_a_reversed_or_oversized_window(wired):
     assert org.lambda_handler(
         _closures_event(frm="2026-01-01", to="2026-06-01"), None)["statusCode"] == 400
     assert "args" not in seen                       # rejected before any query
+
+
+class FakeQrTable:
+    def __init__(self):
+        self.items = {}
+        self.rate_hits = {}
+
+    def put_item(self, Item):
+        self.items[Item["code"]] = dict(Item)
+
+    def update_item(self, Key, UpdateExpression, ExpressionAttributeValues, ReturnValues=None):
+        # emulate the rate-limit "ADD hits :one" counter
+        k = Key["code"]
+        self.rate_hits[k] = self.rate_hits.get(k, 0) + int(ExpressionAttributeValues[":one"])
+        return {"Attributes": {"hits": self.rate_hits[k]}}
+
+
+def test_qr_create_returns_code(wired, monkeypatch):
+    table = FakeQrTable()
+    monkeypatch.setattr(org, "_qr_table", lambda: table)
+    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/create", sub="sub-1"), None)
+    assert res["statusCode"] == 201
+    body = body_of(res)
+    assert body["ttlSeconds"] == 90
+    assert len(body["code"]) >= 32
+    # the stored record binds the code to the caller's sub, unconsumed
+    stored = table.items[body["code"]]
+    assert stored["sub"] == "sub-1"
+    assert stored["consumed"] is False
+    assert stored["expiresAt"] > stored["createdAt"]
+
+
+def test_qr_create_requires_auth(wired, monkeypatch):
+    monkeypatch.setattr(org, "_qr_table", lambda: FakeQrTable())
+    # no sub in claims → caller resolves to None → 403 (handled by dispatch guard)
+    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/create", sub=""), None)
+    assert res["statusCode"] == 403
+
+
+def test_qr_create_rate_limited(wired, monkeypatch):
+    table = FakeQrTable()
+    monkeypatch.setattr(org, "_qr_table", lambda: table)
+    codes = 0
+    for _ in range(7):
+        res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/create", sub="sub-1"), None)
+        if res["statusCode"] == 201:
+            codes += 1
+    # ≤5 per minute succeed; the rest are 429
+    assert codes == 5
