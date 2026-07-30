@@ -135,11 +135,18 @@ def _call_qwen(prompt, max_tokens, force_json):
         # parses it. No max_tokens cap so the answer isn't truncated after the
         # (separate reasoning_content) chain of thought.
         payload["enable_thinking"] = True
-    elif force_json:
-        # DashScope: do NOT send max_tokens with response_format (truncation risk).
-        payload["response_format"] = {"type": "json_object"}
     else:
-        payload["max_tokens"] = max_tokens
+        # Non-thinking. DashScope's Qwen3 models DEFAULT to thinking when
+        # enable_thinking is OMITTED, so QWEN_ENABLE_THINKING=false is INERT
+        # unless we send the flag explicitly False — otherwise a "non-thinking"
+        # caller silently burns reasoning latency (measured on the summary task:
+        # qwen3.7-max 38s omitted vs 4s explicit-False; qwen3.6-flash 19s vs 3s).
+        payload["enable_thinking"] = False
+        if force_json:
+            # DashScope: do NOT send max_tokens with response_format (truncation risk).
+            payload["response_format"] = {"type": "json_object"}
+        else:
+            payload["max_tokens"] = max_tokens
     resp, err = _post_with_retry(
         f"{QWEN_BASE_URL}/chat/completions",
         json.dumps(payload),
