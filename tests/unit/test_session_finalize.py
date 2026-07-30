@@ -49,6 +49,21 @@ def test_html_escapes_content():
     assert "&lt;b&gt;" in html and "&amp;" in html   # not raw markup injected into the email
 
 
+def test_action_items_render_task_assignee_and_due():
+    _s, text, html = fin.build_confirmation_email(
+        summary="x", open_todos=[{"text": "Order steel", "responsible": "Neil", "due": "Friday"}])
+    assert "Order steel" in text and "Neil" in text and "Friday" in text
+    assert "Task" in html and "Assignee" in html and "Due" in html   # structured columns
+    assert "Order steel" in html and "Neil" in html and "Friday" in html
+
+
+def test_action_item_missing_assignee_or_due_shows_placeholders():
+    _s, text, html = fin.build_confirmation_email(
+        summary="x", open_todos=[{"text": "Do it", "responsible": None, "due": None}])
+    assert "Do it" in text and "Unassigned" in text   # text: assignee falls back to Unassigned
+    assert "—" in html                                # html: em-dash for missing assignee/due
+
+
 # ---- process_finalize_request (non-VPC send worker) ---------------------
 
 def _art(**over):
@@ -92,3 +107,30 @@ def test_worker_skips_a_request_with_no_recipient():
                                        send=lambda *a: sent.append(a),
                                        write_result=lambda *a: results.append(a))
     assert out["status"] == "skipped" and sent == [] and results == []
+
+
+def test_worker_prefers_the_fresh_complete_summary_over_the_stale_rolling_one():
+    sent = []
+    art = _art(summary="STALE partial summary",
+               openTodos=[{"text": "old", "responsible": None, "due": None}])
+    fresh = {"summary": "COMPLETE summary",
+             "open_todos": [{"text": "new task", "responsible": "Ana", "due": "Mon"}]}
+    out = fin.process_finalize_request(
+        art, send=lambda *a: sent.append(a) or "m",
+        write_result=lambda *a: None, complete_summary=lambda artifact: fresh)
+    assert out["status"] == "sent"
+    _to, _subj, text, html = sent[0]
+    assert "COMPLETE summary" in text and "STALE" not in text
+    assert "new task" in text and "Ana" in text and "Mon" in text and "old" not in text
+    assert "new task" in html and "Mon" in html
+
+
+def test_worker_falls_back_to_rolling_summary_when_resummary_returns_none():
+    sent = []
+    art = _art(summary="Rolling summary.",
+               openTodos=[{"text": "keep me", "responsible": None, "due": None}])
+    fin.process_finalize_request(
+        art, send=lambda *a: sent.append(a) or "m",
+        write_result=lambda *a: None, complete_summary=lambda artifact: None)
+    _to, _subj, text, _html = sent[0]
+    assert "Rolling summary." in text and "keep me" in text

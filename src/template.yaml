@@ -1402,22 +1402,41 @@ Resources:
       FunctionName: !Sub ["${P}-session-finalize", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_session_finalize.lambda_handler
-      Timeout: 60
+      Timeout: 120
       MemorySize: 256
       Environment:
         Variables:
           S3_BUCKET: !Ref IngestBucketName
           EMAIL_SENDER: !Ref EmailSender
           SENDER_EMAIL: !Ref SenderEmail
+          # LLM env — the worker re-summarises the FULL transcript at finalize
+          # (a complete summary; the enqueued rolling one can be stale/partial).
+          CONFIG_KEY: config/user_mapping.json
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          CLAUDE_MODEL: claude-sonnet-4-6
+          LLM_PROVIDER: !Ref LlmProvider
+          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelPlus
+          QWEN_ENABLE_THINKING: 'true'
       Policies:
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
               Action: s3:GetObject
-              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - transcripts/*
             - Effect: Allow
               Action:
                 - ses:SendEmail
