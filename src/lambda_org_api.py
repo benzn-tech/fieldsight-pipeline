@@ -79,6 +79,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import time
 import uuid
 # `date` is aliased: several handlers below bind a LOCAL `date` from
 # queryStringParameters, so an unaliased import would be shadowed there.
@@ -171,6 +173,37 @@ def cognito():
     if _cognito_client is None:
         _cognito_client = boto3.client("cognito-idp")
     return _cognito_client
+
+
+QR_CODES_TABLE = os.environ.get("QR_CODES_TABLE", "fieldsight-qr-login-codes")
+QR_TTL_SECONDS = 90
+QR_RATE_PER_MIN = 5
+_qr_ddb_table = None
+
+
+def _qr_table():
+    global _qr_ddb_table
+    if _qr_ddb_table is None:
+        _qr_ddb_table = boto3.resource("dynamodb").Table(QR_CODES_TABLE)
+    return _qr_ddb_table
+
+
+def _qr_rate_ok(sub):
+    """Per-user create limiter using a per-minute counter item in the same table
+    (PK namespaced "RATE#..." so it never collides with a random code). Fails open."""
+    minute = int(time.time() // 60)
+    key = f"RATE#{sub}#{minute}"
+    try:
+        resp = _qr_table().update_item(
+            Key={"code": key},
+            UpdateExpression="ADD hits :one SET expiresAt = :exp",
+            ExpressionAttributeValues={":one": 1, ":exp": (minute + 2) * 60},
+            ReturnValues="UPDATED_NEW",
+        )
+        return int(resp["Attributes"]["hits"]) <= QR_RATE_PER_MIN
+    except Exception:
+        logger.exception("qr rate check failed")
+        return True
 
 
 def ok(body, status=200):
@@ -405,6 +438,9 @@ def dispatch(conn, event, method, route):
     m_sv = re.match(r"^/sites/([^/]+)/voice$", route)
     if m_sv and method == "GET":
         return list_site_voice(conn, caller, m_sv.group(1), event)
+
+    if route == "/auth/qr/create" and method == "POST":
+        return create_qr_login_code(conn, caller, event)
 
     return error("not found", 404)
 
@@ -794,6 +830,32 @@ def list_site_voice(conn, caller, site_id, event):
               "createdAt": r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else str(r["created_at"])}
              for r in rows]
     return ok({"items": items, "site": str(site_id)})
+
+
+def create_qr_login_code(conn, caller, event):
+    """Self-service: mint a one-time code that logs a terminal into the CALLER's
+    own account via Cognito custom auth. Code bound to the caller's sub."""
+    claims = (event.get("requestContext", {}) or {}).get("authorizer", {}).get("claims", {})
+    sub = claims.get("sub", "")
+    if not sub:
+        return error("unauthenticated", 401)
+    if not _qr_rate_ok(sub):
+        return error("too many requests — try again in a minute", 429)
+    code = secrets.token_urlsafe(32)  # ~256-bit
+    now = int(time.time())
+    expires = now + QR_TTL_SECONDS
+    try:
+        _qr_table().put_item(Item={
+            "code": code,
+            "sub": sub,
+            "consumed": False,
+            "createdAt": now,
+            "expiresAt": expires,
+        })
+    except Exception:
+        logger.exception("qr create put_item failed")  # never log `code`
+        return error("could not create login code", 500)
+    return ok({"code": code, "expiresAt": expires, "ttlSeconds": QR_TTL_SECONDS}, 201)
 
 
 # ----------------------------------------------------------
