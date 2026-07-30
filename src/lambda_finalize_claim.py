@@ -60,6 +60,11 @@ def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_
     ctx = resolve_context(conn, row) or {}
     recipient = (ctx.get("recipient") or "").strip()
     if not recipient:
+        # Named so prod ops can see WHICH recorder has no email on file (a
+        # device-mapping identity, or a real user missing an email) instead of a
+        # silent count — this recording gets no confirmation email.
+        logger.warning("finalize: no recipient email for session %s (folder=%s) — "
+                       "marking failed, no email sent", session_id, ctx.get("folder"))
         meeting_session.mark_failed(conn, session_id)
         return {"status": "no_recipient", "sessionId": session_id}
     rolling = read_rolling(ctx.get("folder"), ctx.get("date"), session_id) or {}
