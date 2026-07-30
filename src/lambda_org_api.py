@@ -430,6 +430,9 @@ def dispatch(conn, event, method, route):
     m_srs = re.match(r"^/sessions/([^/]+)/report/status$", route)
     if m_srs and method == "GET":
         return session_report_status(conn, caller, m_srs.group(1), event)
+    m_srl = re.match(r"^/sessions/([^/]+)/rolling$", route)
+    if m_srl and method == "GET":
+        return session_rolling(conn, caller, m_srl.group(1), event)
 
     if route == "/voice/upload-url" and method == "POST":
         return create_voice_upload_url(conn, caller, parse_body(event))
@@ -582,10 +585,12 @@ def session_close(conn, caller, session_id, body):
                    "version": existing["version"], "noop": True})
 
     row = meeting_session.mark_pending_close(conn, session_id, b.get("endedAt"), intent)
-    # A deliberate End finalizes immediately (grace 0); a plain/idle stop waits
-    # the mis-touch tolerance window. The actual scheduled finalize (EventBridge
-    # one-shot -> SES) is wired in the next slice; this endpoint records the
-    # pending_close + version the timer will be armed against.
+    # A deliberate End finalizes immediately (grace 0); a plain/idle stop waits the
+    # mis-touch tolerance window. This endpoint only records pending_close + version
+    # + close_intent; a scheduled sweep (FinalizeSweepFunction, in-VPC) then claims
+    # every due session and hands off to the non-VPC send worker -> SES. A per-session
+    # EventBridge one-shot is NOT used: in-VPC org-api can't reach the Scheduler API
+    # to arm one (BUG-36). `grace` below is returned to the client for its own UX.
     grace = 0 if intent == "end" else STOP_GRACE_SECONDS
     return ok({"sessionId": session_id, "status": row["status"],
                "version": row["version"], "graceSeconds": grace})
@@ -766,6 +771,40 @@ def session_report_status(conn, caller, session_id, event):
     if status == "error":
         return ok({"status": "error", "error": result.get("error")})
     return ok({"status": status or "pending"})
+
+
+def session_rolling(conn, caller, session_id, event):
+    """GET /api/org/sessions/{session_id}/rolling?date=&user= — Tier-1 rolling
+    summary poll (voice-timeliness Point 1). The rolling-summary lambda
+    re-summarizes the meeting-so-far every ~1-2 min into
+    session_rolling/{folder}/{date}/{session}/latest.json; the mobile app polls
+    this mid-meeting to see what has been discussed so far. Read-only; the key is
+    rebuilt server-side (a client can't read another folder's summary), same ACL
+    as the picker / report status.
+
+      pending = no summary written yet this session (S3 404)
+      ready   = { summary, openTodos, updatedAt }"""
+    p = event.get("queryStringParameters") or {}
+    date, user = p.get("date"), (p.get("user") or "").strip()
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="rolling summary")
+    if err is not None:
+        return err
+    key = f"session_rolling/{folder}/{date}/{session_id}/latest.json"
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return ok({"status": "pending"})       # no rolling summary yet
+        raise
+    data = json.loads(obj["Body"].read().decode("utf-8"))
+    return ok({
+        "status": "ready",
+        "summary": data.get("summary", ""),
+        "openTodos": data.get("open_todos", []),
+        "updatedAt": data.get("updated_at"),
+    })
 
 
 # ----------------------------------------------------------

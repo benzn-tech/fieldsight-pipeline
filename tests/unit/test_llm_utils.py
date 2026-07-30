@@ -76,6 +76,7 @@ def test_qwen_success_prose(monkeypatch):
     assert body["model"] == "qwen-flash"
     assert body["max_tokens"] == 200
     assert "response_format" not in body
+    assert body["enable_thinking"] is False   # explicit — see regression test below
     assert calls["headers"][0]["Authorization"] == "Bearer sk-w"
 
 
@@ -89,6 +90,25 @@ def test_qwen_force_json_omits_max_tokens(monkeypatch):
     body = json.loads(calls["bodies"][0])
     assert body["response_format"] == {"type": "json_object"}
     assert "max_tokens" not in body
+    assert body["enable_thinking"] is False   # explicit — see regression test below
+
+
+def test_qwen_non_thinking_sends_enable_thinking_false_explicitly(monkeypatch):
+    # Regression: DashScope's Qwen3 models DEFAULT to thinking when the
+    # enable_thinking flag is OMITTED. The code used to omit it on the
+    # non-thinking path, so QWEN_ENABLE_THINKING=false was inert and every
+    # "non-thinking" call still reasoned — ~10x latency (qwen3.7-max summary
+    # 38s vs 4s). The flag MUST be sent explicitly False.
+    monkeypatch.setattr(lu, "LLM_PROVIDER", "qwen")
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "sk-w")
+    monkeypatch.setattr(lu, "QWEN_ENABLE_THINKING", False)
+    for force_json in (True, False):
+        calls = _patch_request(monkeypatch, [
+            _FakeResponse(200, {"choices": [{"message": {"content": "{}"}}]}),
+        ])
+        lu.call_llm("hi", max_tokens=200, force_json=force_json)
+        body = json.loads(calls["bodies"][0])
+        assert body["enable_thinking"] is False   # present AND False, never omitted
 
 
 def test_qwen_thinking_sets_flag_and_skips_response_format(monkeypatch):

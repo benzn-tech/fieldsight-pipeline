@@ -43,6 +43,7 @@ from urllib.parse import unquote_plus
 import boto3
 
 import llm_utils
+import chunk_stitch
 from transcript_utils import (
     extract_base_time_from_filename,
     extract_device_from_filename,
@@ -143,6 +144,39 @@ def gather_session_segments(bucket, user_folder, date, session_base):
             if parsed is not None and parsed[2] == session_base:
                 matched.append(key)
     return sorted(matched)
+
+
+def _dedup_turn_boundaries(turns, max_window=12):
+    """Remove the chunk-overlap duplication the mobile chunk-session contract
+    introduces. The device carries ~2s of PCM from one ~30s segment into the
+    next (AudioSegmentation.PcmRingBuffer: "a sentence crossing a boundary
+    appears whole in both"), so the tail of one segment's turns and the head of
+    the next's transcribe the SAME words. For each adjacent pair whose time
+    ranges OVERLAP (the later turn starts before the earlier one ends — the seam
+    signature), drop the later turn's leading duplicate word-run via
+    chunk_stitch.dedup_overlap. Genuinely sequential turns (later starts at/after
+    the earlier ends: legacy whole-file recordings, VAD segments, plain
+    back-to-back speech) never overlap in time, so this is a NO-OP outside a
+    chunked session — the pre-chunk pipeline is byte-for-byte unchanged. `turns`
+    must be abs_start-sorted. Returns a new list with fully-overlapping turns
+    dropped (the later turn's abs_start is left as-is; a <=2s label wobble is
+    immaterial at the prompt's minute granularity)."""
+    out = []
+    for t in turns:
+        if out:
+            prev_end = out[-1].get('abs_end')
+            cur_start = t.get('abs_start')
+            if prev_end is not None and cur_start is not None and cur_start < prev_end:
+                kept = chunk_stitch.dedup_overlap(
+                    (out[-1].get('text') or '').split(),
+                    (t.get('text') or '').split(),
+                    max_window=max_window)
+                if not kept:
+                    continue                          # the whole turn was overlap
+                if len(kept) != len((t.get('text') or '').split()):
+                    t = dict(t, text=' '.join(kept))  # copy — never mutate the caller's turn
+        out.append(t)
+    return out
 
 
 # ============================================================
@@ -317,21 +351,14 @@ def process_declared_site(declared):
 # Core: extract one session
 # ============================================================
 
-def extract_session(bucket, user_folder, date, session_base):
-    # M-5: a stack missing the secret must not retry-storm -- an S3 event
-    # retries on a raised exception, and every retry would fail the exact
-    # same way. Check upfront (before any S3 gather/Claude work) and bail
-    # quietly instead of reaching llm_utils.call_llm's own check only
-    # after doing all that work and then raising.
-    if not llm_utils.api_key_configured():
-        logger.warning(
-            f"ANTHROPIC_API_KEY not configured -- skipping session {session_base} "
-            "without retry"
-        )
-        return None
-
-    keys = gather_session_segments(bucket, user_folder, date, session_base)
-
+def assemble_deduped_turns(bucket, keys):
+    """Download + normalize each transcript segment for a session (skipping
+    corrupt / unnormalizable ones), collect its abs-timed speaker turns, order
+    them on the single session clock, and drop the mobile chunk-overlap
+    duplication at device seams (_dedup_turn_boundaries; a no-op on legacy /
+    VAD / sequential turns). Returns (turns, source_filenames) — the one clean
+    word stream shared by the Tier-2 extraction and the Tier-1 rolling summary,
+    so both summarise exactly the same deduped session."""
     normalized_list = []
     source_filenames = []
     for key in keys:
@@ -358,6 +385,25 @@ def extract_session(bucket, user_folder, date, session_base):
                 continue
             turns.append(turn)
     turns.sort(key=lambda t: t['abs_start'])
+    turns = _dedup_turn_boundaries(turns)   # drop mobile chunk-overlap dup at seams (no-op pre-chunk)
+    return turns, source_filenames
+
+
+def extract_session(bucket, user_folder, date, session_base):
+    # M-5: a stack missing the secret must not retry-storm -- an S3 event
+    # retries on a raised exception, and every retry would fail the exact
+    # same way. Check upfront (before any S3 gather/Claude work) and bail
+    # quietly instead of reaching llm_utils.call_llm's own check only
+    # after doing all that work and then raising.
+    if not llm_utils.api_key_configured():
+        logger.warning(
+            f"ANTHROPIC_API_KEY not configured -- skipping session {session_base} "
+            "without retry"
+        )
+        return None
+
+    keys = gather_session_segments(bucket, user_folder, date, session_base)
+    turns, source_filenames = assemble_deduped_turns(bucket, keys)
 
     # M-6: nothing usable to extract from -- skip quietly (no Claude call,
     # no write), same "don't retry-storm a dead end" reasoning as M-5.
@@ -365,7 +411,7 @@ def extract_session(bucket, user_folder, date, session_base):
         logger.warning(f"No usable speaker turns for session {session_base} -- skipping")
         return None
 
-    n_segments = len(normalized_list)
+    n_segments = len(source_filenames)
     prompt = build_extraction_prompt(user_folder, date, session_base, turns, n_segments)
     max_tokens = min(4096 + n_segments * 350, 8000)  # BUG-16
 

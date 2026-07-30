@@ -961,3 +961,88 @@ def test_no_tag_no_membership_still_skips(wired):
     result = iw.write_extraction_items("2026-07-16", "Ben_Lin", EXTRACTION_KEY)
     assert result.get("skipped") is True
     assert called == []
+
+
+# ---------------------------------------------------------------------------
+# Chunk session attribution -- meeting_session.site_id (POST /sessions/{id}/open)
+# A chunk session has no `recordings` row, so site_for_media misses; its picked
+# site lives on meeting_session. Without this source it identity-bridge missed
+# and never reached the web timeline. Key is the bare `sid{32hex}` base.
+# ---------------------------------------------------------------------------
+
+_SID = "9f8c1e2a4b6d47f0a1b2c3d4e5f60718"
+CHUNK_EXTRACTION_KEY = f"extractions/Ben_UCPK/2026-07-28/sid{_SID}.json"
+
+
+def _wire_chunk(wired):
+    """Point the S3 double + extraction at a chunk-session key (base `sid{hex}`)."""
+    wired.setattr(iw, "_s3_client", FakeS3({CHUNK_EXTRACTION_KEY: json.dumps(
+        make_extraction(user_folder="Ben_UCPK", date="2026-07-28",
+                        session_base=f"sid{_SID}"))}))
+
+
+def test_chunk_session_attributes_via_meeting_session_site(wired):
+    _wire_chunk(wired)
+    wired.setattr(iw.recordings, "site_for_media", lambda *a, **k: None)   # no recordings row
+    wired.setattr(iw.lambda_ingest, "resolve_site", lambda *a, **k: None)  # not a member
+    got = {}
+    wired.setattr(iw.meeting_session, "get",
+                  lambda conn, sid: (got.setdefault("sid", sid), {"site_id": "site-OPEN"})[1])
+    wired.setattr(iw.sites, "get_site",
+                  lambda conn, sid: {"id": "site-OPEN", "company_id": "co-1"})
+    seen = _capture_topic_site(wired)
+    result = iw.write_extraction_items("2026-07-28", "Ben_UCPK", CHUNK_EXTRACTION_KEY)
+    assert not result.get("skipped")
+    assert got["sid"] == _SID                       # looked up by the bare 32-hex id
+    assert seen and all(s == "site-OPEN" for s in seen)
+
+
+def test_recordings_tag_still_overrides_meeting_session(wired):
+    _wire_chunk(wired)
+    wired.setattr(iw.recordings, "site_for_media", lambda *a, **k: {"id": "site-TAG"})
+    called = []
+    wired.setattr(iw.meeting_session, "get",
+                  lambda *a, **k: called.append(1) or {"site_id": "site-OPEN"})
+    wired.setattr(iw.sites, "get_site", lambda conn, sid: {"id": sid, "company_id": "co-1"})
+    seen = _capture_topic_site(wired)
+    iw.write_extraction_items("2026-07-28", "Ben_UCPK", CHUNK_EXTRACTION_KEY)
+    assert seen and all(s == "site-TAG" for s in seen)
+    assert called == []                             # short-circuited before meeting_session
+
+
+def test_cross_tenant_meeting_session_site_is_rejected(wired):
+    # session_open validates company, but re-check here: a site in ANOTHER company
+    # must never attribute -> fall through to membership (multi-tenant invariant).
+    _wire_chunk(wired)
+    wired.setattr(iw.recordings, "site_for_media", lambda *a, **k: None)
+    wired.setattr(iw.meeting_session, "get", lambda *a, **k: {"site_id": "site-OTHER"})
+    wired.setattr(iw.sites, "get_site",
+                  lambda conn, sid: {"id": "site-OTHER", "company_id": "co-EVIL"})
+    wired.setattr(iw.lambda_ingest, "resolve_site", lambda *a, **k: {"id": "site-MEMBER"})
+    seen = _capture_topic_site(wired)
+    iw.write_extraction_items("2026-07-28", "Ben_UCPK", CHUNK_EXTRACTION_KEY)
+    assert seen and all(s == "site-MEMBER" for s in seen)   # NOT site-OTHER
+
+
+def test_chunk_session_without_open_site_falls_through(wired):
+    # /open never carried a siteId (site_id NULL) -> not a resolution source.
+    _wire_chunk(wired)
+    wired.setattr(iw.recordings, "site_for_media", lambda *a, **k: None)
+    wired.setattr(iw.meeting_session, "get", lambda *a, **k: {"site_id": None})
+    wired.setattr(iw.lambda_ingest, "resolve_site", lambda *a, **k: {"id": "site-MEMBER"})
+    seen = _capture_topic_site(wired)
+    iw.write_extraction_items("2026-07-28", "Ben_UCPK", CHUNK_EXTRACTION_KEY)
+    assert seen and all(s == "site-MEMBER" for s in seen)
+
+
+def test_legacy_whole_file_base_never_hits_meeting_session(wired):
+    # a legacy base (`{device}_{date}_{time}`) has no device session -> the
+    # meeting_session lookup must be skipped entirely (device_session_id -> None).
+    called = []
+    wired.setattr(iw.recordings, "site_for_media", lambda *a, **k: None)
+    wired.setattr(iw.meeting_session, "get", lambda *a, **k: called.append(1) or None)
+    wired.setattr(iw.lambda_ingest, "resolve_site", lambda *a, **k: {"id": "site-MEMBER"})
+    seen = _capture_topic_site(wired)
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+    assert seen and all(s == "site-MEMBER" for s in seen)
+    assert called == []                             # bare-base guard short-circuits

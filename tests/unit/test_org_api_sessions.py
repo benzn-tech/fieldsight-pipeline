@@ -759,3 +759,42 @@ def test_status_reads_the_server_reconstructed_result_key(wired, result_store):
     (folder, date, session, requestId) — scope integrity, not a client-supplied key."""
     result_store[RESULT_KEY] = {"status": "done", "docKey": DOC_KEY}
     assert body_of(_status(SESSION_1300))["status"] == "done"
+
+
+# ----------------------------------------------------------
+# Tier-1 rolling summary — GET /sessions/{id}/rolling (voice-timeliness Point 1)
+#
+# The rolling-summary lambda writes session_rolling/{folder}/{date}/{session}/
+# latest.json every ~1-2 min; the app polls this mid-meeting. Read-only; the key
+# is rebuilt server-side (same ACL + fake-S3 harness as report status).
+# ----------------------------------------------------------
+
+ROLLING_KEY = "session_rolling/Ada_L/2026-07-25/Benl1_2026-07-25_13-00-11/latest.json"
+
+
+def _rolling(session_id, params=None, sub="sub-1"):
+    return org.lambda_handler(make_event(
+        "GET", f"/api/org/sessions/{session_id}/rolling", sub=sub,
+        params=params if params is not None else {"date": "2026-07-25", "user": "Ada_L"}), None)
+
+
+def test_rolling_is_pending_before_any_summary(wired, result_store):
+    assert body_of(_rolling(SESSION_1300))["status"] == "pending"   # no summary yet -> 404 -> pending
+
+
+def test_rolling_ready_returns_summary_and_open_todos(wired, result_store):
+    result_store[ROLLING_KEY] = {
+        "summary": "Discussed the slab pour.",
+        "open_todos": [{"text": "Fix rebar", "responsible": "Neil"}],
+        "updated_at": "2026-07-25T13:12:00",
+    }
+    b = body_of(_rolling(SESSION_1300))
+    assert b["status"] == "ready"
+    assert b["summary"] == "Discussed the slab pour."
+    assert b["openTodos"] == [{"text": "Fix rebar", "responsible": "Neil"}]   # snake_case -> camelCase
+    assert b["updatedAt"] == "2026-07-25T13:12:00"
+
+
+def test_rolling_requires_a_valid_date(wired, result_store):
+    assert _rolling(SESSION_1300, {"user": "Ada_L"})["statusCode"] == 400
+    assert _rolling(SESSION_1300, {"date": "nope", "user": "Ada_L"})["statusCode"] == 400

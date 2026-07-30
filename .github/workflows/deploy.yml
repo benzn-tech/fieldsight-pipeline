@@ -90,6 +90,15 @@ jobs:
           if [ -n "${{ vars.TEST_KEYFRAME_FFMPEG_LAYER_ARN }}" ]; then
             KF_LAYER_PARAM="KeyframeFfmpegLayerArn=${{ vars.TEST_KEYFRAME_FFMPEG_LAYER_ARN }}"
           fi
+          # VAD (cp312 fieldsight-vad-layer) — same bare-"Key=" guard as the keyframe
+          # layer: append VadLayerArn only when TEST_VAD_LAYER_ARN is set, else the
+          # template Default ('') leaves VadFunction uncreated. Without VAD, raw audio
+          # under users/**.wav is never segmented and so never transcribed — the voice
+          # pipeline stalls before transcripts (TEST previously had no VAD wired at all).
+          VAD_LAYER_PARAM=""
+          if [ -n "${{ vars.TEST_VAD_LAYER_ARN }}" ]; then
+            VAD_LAYER_PARAM="VadLayerArn=${{ vars.TEST_VAD_LAYER_ARN }}"
+          fi
           sam deploy --config-env test \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -97,14 +106,18 @@ jobs:
               "DataBucketName=fieldsight-data-test-509194952652" \
               "IngestBucketName=fieldsight-data-test-509194952652" \
               "EnableSchedules=false" \
+              "EnableFinalize=${{ vars.TEST_ENABLE_FINALIZE || 'true' }}" \
+              "EmailSender=${{ vars.TEST_EMAIL_SENDER || 'stub' }}" \
               "EnableSiteVoice=true" \
               "DocxLayerArn=arn:aws:lambda:ap-southeast-2:509194952652:layer:python-docx-layer:2" \
               "EnableKeyframes=${{ vars.TEST_ENABLE_KEYFRAMES || 'false' }}" \
               $KF_LAYER_PARAM \
+              $VAD_LAYER_PARAM \
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \
               "GradedRoles=${{ vars.TEST_GRADED_ROLES || 'false' }}" \
+              "MultiTenantResolution=${{ vars.TEST_MULTI_TENANT_RESOLUTION || 'true' }}" \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \

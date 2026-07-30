@@ -85,6 +85,50 @@ def claim_finalize(conn, session_id, expected_version) -> dict | None:
     ).fetchone()
 
 
+def list_due_finalize(conn, idle_grace_seconds) -> list[dict]:
+    """Sessions whose grace has elapsed and are ready to finalize: still
+    `pending_close`, and either a deliberate End (grace 0 — due the moment it
+    closed) or an idle stop whose `closed_at` is now older than the grace window.
+    Returns [{session_id, version}] — the (id, version) the scheduled sweeper
+    CAS-claims against (claim_finalize no-ops if a resume bumped version in between,
+    so reading the current version here is safe)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT session_id, version FROM meeting_session "
+        "WHERE status = 'pending_close' "
+        "AND (close_intent = 'end' OR closed_at <= now() - make_interval(secs => %s))",
+        (idle_grace_seconds,),
+    ).fetchall()
+
+
+def list_idle_open(conn, idle_seconds) -> list[dict]:
+    """Sessions still `open` whose last activity — `last_segment_at` (server time,
+    advanced by touch_segment on every chunk), or `opened_at` if no chunk has
+    touched yet — is older than `idle_seconds`. The device stopped (or crashed)
+    without a `/close`, so the server INFERS close (spec §8.4: "if close is
+    missing, infer close when the session sees no new chunk for
+    SESSION_GAP_MINUTES"). Returns [{session_id, version, last_activity}] — the
+    sweep mark_pending_close's each at `last_activity` with intent 'idle'. Keys on
+    `last_segment_at`, never `opened_at` alone, so a long ACTIVE meeting (chunks
+    still arriving) is never mistaken for idle. A row whose activity time is NULL
+    (never opened with a timestamp) is excluded — nothing to anchor a close on."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT session_id, version, "
+        "COALESCE(last_segment_at, opened_at) AS last_activity "
+        "FROM meeting_session WHERE status = 'open' "
+        "AND COALESCE(last_segment_at, opened_at) <= now() - make_interval(secs => %s)",
+        (idle_seconds,),
+    ).fetchall()
+
+
+def list_finalizing(conn) -> list[dict]:
+    """Sessions the sweep has claimed (status='finalizing'). The reconcile pass moves
+    each to sent/failed once the non-VPC send worker records its outcome (that worker
+    can't touch Aurora itself — CLAUDE.md BUG-36)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT session_id, version FROM meeting_session WHERE status = 'finalizing'",
+    ).fetchall()
+
+
 def mark_sent(conn, session_id) -> dict | None:
     """Confirmation email delivered — close the session out."""
     return conn.cursor(row_factory=dict_row).execute(
