@@ -35,6 +35,14 @@ def get_user_by_sub(conn, cognito_sub) -> dict | None:
     ).fetchone()
 
 
+def get_by_id(conn, user_id) -> dict | None:
+    """Look up a user by internal id (e.g. meeting_session.user_id) -> email +
+    folder_name. Used by the Tier-0 finalize claim step to address the recorder."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM users WHERE id=%s", (str(user_id),)
+    ).fetchone()
+
+
 def get_by_folder_name(conn, company_id, folder_name) -> dict | None:
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_COLS} FROM users WHERE company_id=%s AND folder_name=%s",

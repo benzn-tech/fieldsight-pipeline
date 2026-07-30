@@ -47,3 +47,26 @@ def test_todos_without_text_are_dropped_with_their_owner():
 def test_html_escapes_content():
     _s, _t, html = fin.build_confirmation_email(summary="rebar <b>bent</b> & rusty")
     assert "&lt;b&gt;" in html and "&amp;" in html   # not raw markup injected into the email
+
+
+# ---- process_finalize_request (non-VPC send worker) ---------------------
+
+def test_worker_builds_and_sends_the_confirmation_email():
+    sent = []
+    art = {"recipient": "bob@site.com", "date": "2026-07-25", "siteName": "UC PK",
+           "summary": "Poured the slab.", "sessionId": "abc",
+           "openTodos": [{"text": "fix rebar", "responsible": "Neil"}]}
+    out = fin.process_finalize_request(art, send=lambda *a: sent.append(a) or "msg-1")
+    assert out["status"] == "sent" and out["recipient"] == "bob@site.com"
+    assert len(sent) == 1
+    to, subject, text, html = sent[0]
+    assert to == "bob@site.com"
+    assert "2026-07-25" in subject
+    assert "Poured the slab" in text and "fix rebar" in text
+    assert "Poured the slab" in html
+
+
+def test_worker_skips_a_request_with_no_recipient():
+    sent = []
+    out = fin.process_finalize_request({"recipient": "", "summary": "x"}, send=lambda *a: sent.append(a))
+    assert out["status"] == "skipped" and sent == []

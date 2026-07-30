@@ -16,6 +16,8 @@ in following slices. Pure at import — boto3 / email_sender are imported lazily
 worker, never at module load.
 """
 import html as _html
+import json
+from urllib.parse import unquote_plus
 
 
 def _clean_todos(open_todos):
@@ -70,3 +72,45 @@ def build_confirmation_email(*, date=None, site_name=None, summary=None, open_to
     body_html = "\n".join(parts)
 
     return subject, body_text, body_html
+
+
+# ============================================================
+# Non-VPC send worker — S3-triggered on session_finalize_requests/
+# ============================================================
+
+def process_finalize_request(artifact, *, send=None):
+    """Build + SES-send the recorder's confirmation email from one enqueued finalize
+    request (the in-VPC claim step wrote it). `send(to, subject, text, html)` is
+    injectable; defaults to email_sender.get_sender().send (imported lazily so this
+    module stays pure at import). A request with no recipient is skipped — the claim
+    step already marked that session failed."""
+    recipient = (artifact.get("recipient") or "").strip()
+    if not recipient:
+        return {"status": "skipped", "reason": "no recipient"}
+    subject, text, html = build_confirmation_email(
+        date=artifact.get("date"), site_name=artifact.get("siteName"),
+        summary=artifact.get("summary"), open_todos=artifact.get("openTodos"))
+    if send is None:
+        from email_sender import get_sender
+        send = get_sender().send
+    send(recipient, subject, text, html)
+    return {"status": "sent", "recipient": recipient, "sessionId": artifact.get("sessionId")}
+
+
+def lambda_handler(event, context):
+    """S3 event on session_finalize_requests/*.json — send each enqueued
+    confirmation email. Non-VPC (reaches SES, CLAUDE.md BUG-36)."""
+    import boto3
+    s3 = boto3.client("s3")
+    results = []
+    for rec in event.get("Records", []):
+        s3rec = rec.get("s3") or {}
+        key = (s3rec.get("object") or {}).get("key")
+        bucket = (s3rec.get("bucket") or {}).get("name")
+        if not key:
+            continue
+        key = unquote_plus(key)                 # S3 notifications URL-encode the key
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        artifact = json.loads(obj["Body"].read().decode("utf-8"))
+        results.append(process_finalize_request(artifact))
+    return {"results": results}
