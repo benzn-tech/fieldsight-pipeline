@@ -44,9 +44,13 @@ def parse_chunk_key(key):
 def _norm(word):
     """Comparison key for one word: lowercased, alphanumerics only. Absorbs the
     trivial ASR differences at a boundary (case, trailing punctuation) so the
-    same spoken word in two chunks matches."""
-    text = word.get("text") if isinstance(word, dict) else str(word)
-    return re.sub(r"[^0-9a-z]+", "", (text or "").lower())
+    same spoken word in two chunks matches. Accepts both the transcript_utils
+    word shape (`{'word': ...}`) and a plain `{'text': ...}`/string."""
+    if isinstance(word, dict):
+        text = word.get("word") or word.get("text") or ""
+    else:
+        text = str(word)
+    return re.sub(r"[^0-9a-z]+", "", text.lower())
 
 
 def dedup_overlap(tail, head, max_window=DEFAULT_MAX_WINDOW):

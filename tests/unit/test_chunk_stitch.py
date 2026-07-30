@@ -76,6 +76,14 @@ def test_stitch_single_chunk_passthrough():
     assert cs.stitch_chunks([(0, W("just", "one"))]) == W("just", "one")
 
 
+def test_dedup_works_on_transcript_utils_word_shape():
+    # transcript_utils.parse_transcript words use key 'word' (not 'text') + times.
+    tail = [{"word": "slab", "start_time": 28.0, "end_time": 28.4, "speaker": "spk_0"}]
+    head = [{"word": "Slab", "start_time": 0.1}, {"word": "cured", "start_time": 0.6}]
+    out = cs.dedup_overlap(tail, head)
+    assert out == [{"word": "cured", "start_time": 0.6}]   # dup dropped, survivor kept whole
+
+
 def test_stitch_tolerates_empty_and_none():
     assert cs.stitch_chunks([]) == []
     assert cs.stitch_chunks(None) == []
