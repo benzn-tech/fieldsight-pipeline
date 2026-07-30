@@ -57,3 +57,23 @@ def test_marks_failed_and_skips_when_no_recipient(monkeypatch):
 
 def test_real_resolvers_exist_for_the_handler_to_wire():
     assert callable(fc._resolve_context) and callable(fc._read_rolling) and callable(fc._enqueue)
+
+
+# ---- sweep (the scheduled grace sweeper's loop) -------------------------
+
+def test_sweep_finalizes_each_due_session(monkeypatch):
+    monkeypatch.setattr(fc.meeting_session, "list_due_finalize",
+                        lambda conn, g: [{"session_id": "s1", "version": 2},
+                                         {"session_id": "s2", "version": 5}])
+    seen = []
+    monkeypatch.setattr(fc, "finalize_claim",
+                        lambda conn, sid, ver, **kw: (seen.append((sid, ver)),
+                                                      {"status": "enqueued", "sessionId": sid})[1])
+    out = fc.sweep("CONN")
+    assert seen == [("s1", 2), ("s2", 5)]                 # each due (id, version) claimed
+    assert len(out) == 2 and all(r["status"] == "enqueued" for r in out)
+
+
+def test_sweep_is_a_noop_when_nothing_is_due(monkeypatch):
+    monkeypatch.setattr(fc.meeting_session, "list_due_finalize", lambda conn, g: [])
+    assert fc.sweep("CONN") == []

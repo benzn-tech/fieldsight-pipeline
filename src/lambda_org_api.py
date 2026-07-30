@@ -549,10 +549,12 @@ def session_close(conn, caller, session_id, body):
                    "version": existing["version"], "noop": True})
 
     row = meeting_session.mark_pending_close(conn, session_id, b.get("endedAt"), intent)
-    # A deliberate End finalizes immediately (grace 0); a plain/idle stop waits
-    # the mis-touch tolerance window. The actual scheduled finalize (EventBridge
-    # one-shot -> SES) is wired in the next slice; this endpoint records the
-    # pending_close + version the timer will be armed against.
+    # A deliberate End finalizes immediately (grace 0); a plain/idle stop waits the
+    # mis-touch tolerance window. This endpoint only records pending_close + version
+    # + close_intent; a scheduled sweep (FinalizeSweepFunction, in-VPC) then claims
+    # every due session and hands off to the non-VPC send worker -> SES. A per-session
+    # EventBridge one-shot is NOT used: in-VPC org-api can't reach the Scheduler API
+    # to arm one (BUG-36). `grace` below is returned to the client for its own UX.
     grace = 0 if intent == "end" else STOP_GRACE_SECONDS
     return ok({"sessionId": session_id, "status": row["status"],
                "version": row["version"], "graceSeconds": grace})

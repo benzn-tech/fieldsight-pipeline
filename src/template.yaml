@@ -149,6 +149,22 @@ Parameters:
     NoEcho: true
     Default: ''
 
+  EmailSender:
+    Type: String
+    Description: >-
+      Outbound channel for the Tier-0 confirmation email (email_sender.py). 'stub'
+      logs and sends nothing; 'ses' sends via SES (SENDER_EMAIL must be a verified
+      identity, and in the SES sandbox each recipient must be verified too).
+    AllowedValues: ['ses', 'stub']
+    Default: ses
+
+  SenderEmail:
+    Type: String
+    Description: >-
+      SES-verified From identity for the confirmation email. A mailbox you own needs
+      no DNS; a domain identity (DKIM) is a later swap of just this value.
+    Default: sales@fieldsightai.com
+
   DashScopeApiKey:
     Type: String
     Description: Alibaba Cloud DashScope API key (Phase 4d) for text-embedding-v4 embeddings
@@ -1315,6 +1331,85 @@ Resources:
                 object:
                   key:
                     - prefix: transcripts/
+
+  # ----------------------------------------------------------
+  # Tier-0 finalize — grace SWEEP (in-VPC) + send WORKER (non-VPC).
+  # session_close records pending_close + version + close_intent (in-VPC, Aurora)
+  # but can't reach the EventBridge Scheduler API to arm a one-shot (BUG-36), so a
+  # scheduled sweep claims due sessions instead. The sweep (in-VPC: Aurora + S3)
+  # CAS-claims each due session (a resume bumped version -> no-op) and enqueues
+  # session_finalize_requests/; the send worker (non-VPC: SES) builds + sends the
+  # confirmation email. Same in-VPC-enqueue -> non-VPC-worker shape as session-report.
+  # ----------------------------------------------------------
+  FinalizeSweepFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-finalize-sweep", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_finalize_claim.lambda_handler
+      Timeout: 120
+      MemorySize: 256
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          S3_BUCKET: !Ref IngestBucketName
+          STOP_GRACE_SECONDS: '30'
+      Policies:
+        - VPCAccessPolicy: {}
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_rolling/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
+      Events:
+        GraceSweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Description: Tier-0 finalize grace sweep — claims due pending_close sessions.
+
+  SessionFinalizeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ["${P}-session-finalize", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_session_finalize.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName
+          EMAIL_SENDER: !Ref EmailSender
+          SENDER_EMAIL: !Ref SenderEmail
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+      # NO Events: S3 wired manually per BUG-33 — scripts/wire-s3-events.sh (triggers
+      # on session_finalize_requests/*.json). Its own output is the SES email — it
+      # touches no S3 prefix, so there's no trigger loop.
 
   # ----------------------------------------------------------
   # Lambda 12: Ingest (Phase 4a) — reads reports/ + transcripts/,

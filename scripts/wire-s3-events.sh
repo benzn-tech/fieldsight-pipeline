@@ -43,6 +43,7 @@ ITEM_WRITER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-item-
 MATCHER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-programme-matcher"
 KEYFRAME_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-keyframe"
 SESSION_REPORT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-session-report"
+SESSION_FINALIZE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-session-finalize"
 
 echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer ProgrammeMatcher=${PREFIX}-programme-matcher Keyframe=${PREFIX}-keyframe"
 
@@ -189,6 +190,19 @@ if fn_exists "${PREFIX}-session-report"; then
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-session-report not deployed — skipping session-report trigger"
+fi
+# NOTE(Tier-0 finalize): the non-VPC send worker triggers on
+# session_finalize_requests/*.json (the in-VPC grace sweep's enqueue output). Its
+# OWN output is the SES email — it touches no S3 prefix, so no BUG-13 trigger loop,
+# and the prefix is disjoint from every other wired prefix.
+if fn_exists "${PREFIX}-session-finalize"; then
+  WIRE_FNS+=("${PREFIX}-session-finalize")
+  DESIRED=$(jq -c --arg arn "$SESSION_FINALIZE_ARN" '. + [
+    {"Id":"fs-session-finalize","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"session_finalize_requests/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-session-finalize not deployed — skipping session-finalize trigger"
 fi
 
 CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --output json 2>/dev/null || echo '{}')

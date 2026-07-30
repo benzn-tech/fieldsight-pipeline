@@ -1,19 +1,23 @@
-"""lambda_finalize_claim.py — the in-VPC grace-timer target for Tier-0 finalize.
+"""lambda_finalize_claim.py — the in-VPC grace SWEEP for Tier-0 finalize.
 
-When a recording's grace window elapses, the EventBridge one-shot armed in
-`session_close` fires this with the session_id + the `version` it was scheduled
-against. It CAS-claims the session (repositories.meeting_session.claim_finalize:
-pending_close -> finalizing ONLY if the version is unchanged) — the idempotency
-guard: a mis-touch stop->resume bumps `version`, so a stale one-shot no-ops here.
+A scheduled EventBridge rule (~1 min) invokes this; it finds every session whose
+grace window has elapsed (meeting_session.list_due_finalize: still `pending_close`,
+and either a deliberate End — grace 0 — or an idle stop older than the grace window)
+and finalizes each. A scheduled invoke is INBOUND, so an in-VPC lambda is fine — the
+outbound SES send is the non-VPC worker's job. A sweep (not a per-session one-shot)
+because session_close is in org-api which, in-VPC, can reach S3 + Aurora but NOT the
+EventBridge Scheduler API to arm a timer (CLAUDE.md BUG-36).
 
-When claimed it gathers, in-VPC, the recipient + folder/date/site (Aurora) and the
-rolling summary (S3, written by the Tier-1 lambda), and enqueues a request under
-session_finalize_requests/; the non-VPC worker (lambda_session_finalize) builds +
-SES-sends the confirmation email — this in-VPC step can't reach SES itself
-(CLAUDE.md BUG-36), same hand-off shape as the session-report worker.
+For each due session it CAS-claims (meeting_session.claim_finalize: pending_close ->
+finalizing ONLY if `version` is unchanged) — the idempotency guard: a mis-touch
+stop->resume bumps `version`, so a session that resumed between the sweep's query and
+its claim simply no-ops. When claimed it gathers, in-VPC, the recipient + folder/
+date/site (Aurora) and the rolling summary (S3, written by the Tier-1 lambda), and
+enqueues a request under session_finalize_requests/; the non-VPC worker
+(lambda_session_finalize) builds + SES-sends the confirmation email.
 
-The orchestration (`finalize_claim`) takes injected collaborators so it's unit
-testable without a DB/S3; `lambda_handler` supplies the real ones.
+finalize_claim / sweep take injected collaborators so they're unit testable without
+a DB/S3; lambda_handler supplies the real ones.
 """
 import json
 import logging
@@ -26,6 +30,9 @@ logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 FINALIZE_REQUESTS_PREFIX = "session_finalize_requests/"
+# The idle-stop grace window (a deliberate End is grace 0). Mirrors org-api's
+# STOP_GRACE_SECONDS so the sweep's due-check matches what session_close intended.
+STOP_GRACE_SECONDS = int(os.environ.get("STOP_GRACE_SECONDS", "30"))
 
 
 def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_rolling, enqueue):
@@ -99,16 +106,24 @@ def _enqueue(artifact):
         Body=json.dumps(artifact, ensure_ascii=False), ContentType="application/json")
 
 
+def sweep(conn, grace_seconds=None):
+    """Finalize every session on `conn` whose grace has elapsed, reusing
+    finalize_claim per session (CAS-claim -> gather -> enqueue). Returns the list of
+    per-session status dicts. Separated from lambda_handler so the sweep loop is
+    testable without a real DB connection."""
+    grace = STOP_GRACE_SECONDS if grace_seconds is None else grace_seconds
+    results = []
+    for row in meeting_session.list_due_finalize(conn, grace):
+        results.append(finalize_claim(
+            conn, row["session_id"], row["version"],
+            resolve_context=_resolve_context, read_rolling=_read_rolling, enqueue=_enqueue))
+    return results
+
+
 def lambda_handler(event, context):
-    """EventBridge one-shot target. The schedule's input carries {sessionId,
-    version}. Opens an Aurora connection (in-VPC) and runs the claim."""
-    session_id = event.get("sessionId")
-    version = event.get("version")
-    if not session_id or version is None:
-        logger.warning("finalize claim: missing sessionId/version in event: %r", event)
-        return {"status": "bad_event"}
+    """Scheduled (~1 min) grace sweep — see the module docstring. Opens an in-VPC
+    Aurora connection and finalizes every due session."""
     from db.connection import get_connection
     with get_connection() as conn:
-        return finalize_claim(conn, session_id, int(version),
-                              resolve_context=_resolve_context,
-                              read_rolling=_read_rolling, enqueue=_enqueue)
+        results = sweep(conn)
+    return {"swept": len(results), "results": results}
