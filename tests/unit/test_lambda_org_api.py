@@ -5900,10 +5900,26 @@ class FakeQrTable:
         self.items = {}
         self.rate_hits = {}
 
+    def get_item(self, Key):
+        item = self.items.get(Key["code"])
+        return {"Item": dict(item)} if item is not None else {}
+
     def put_item(self, Item):
         self.items[Item["code"]] = dict(Item)
 
-    def update_item(self, Key, UpdateExpression, ExpressionAttributeValues, ReturnValues=None):
+    def update_item(self, Key, UpdateExpression, ExpressionAttributeValues,
+                     ReturnValues=None, ConditionExpression=None):
+        if ConditionExpression:
+            # emulate the redeem single-use conditional consume:
+            # SET consumed = :t WHERE consumed = :f — mirrors
+            # test_lambda_qr_auth.py's ConsumeOnceTable/RaceLoserTable pattern.
+            k = Key["code"]
+            item = self.items.get(k)
+            if not item or item.get("consumed") is not False:
+                raise ClientError(
+                    {"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+            item["consumed"] = True
+            return {}
         # emulate the rate-limit "ADD hits :one" counter
         k = Key["code"]
         self.rate_hits[k] = self.rate_hits.get(k, 0) + int(ExpressionAttributeValues[":one"])
@@ -5960,3 +5976,33 @@ def test_qr_create_rate_limited(wired, monkeypatch):
             codes += 1
     # ≤5 per minute succeed; the rest are 429
     assert codes == 5
+
+
+def test_qr_redeem_returns_token_and_consumes(monkeypatch):
+    now = int(__import__("time").time())
+    table = FakeQrTable()
+    table.items["good"] = {"code": "good", "refreshToken": "RT-1", "sub": "s",
+                            "consumed": False, "createdAt": now, "expiresAt": now + 90}
+    monkeypatch.setattr(org, "_qr_table", lambda: table)
+    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": "good"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["refreshToken"] == "RT-1"
+    # second redeem fails (single-use)
+    res2 = org.lambda_handler(make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": "good"}), None)
+    assert res2["statusCode"] == 401
+
+
+def test_qr_redeem_rejects_expired(monkeypatch):
+    now = int(__import__("time").time())
+    table = FakeQrTable()
+    table.items["old"] = {"code": "old", "refreshToken": "RT", "sub": "s",
+                           "consumed": False, "createdAt": now - 100, "expiresAt": now - 1}
+    monkeypatch.setattr(org, "_qr_table", lambda: table)
+    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": "old"}), None)
+    assert res["statusCode"] == 401
+
+
+def test_qr_redeem_unknown_code_generic(monkeypatch):
+    monkeypatch.setattr(org, "_qr_table", lambda: FakeQrTable())
+    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": "nope"}), None)
+    assert res["statusCode"] == 401
