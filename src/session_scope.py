@@ -107,6 +107,24 @@ def session_id_from_source_key(source_s3_key):
     return session_ref(source_s3_key)[0]
 
 
+# A chunk session's session_base is the bare `sid{32hex}` token — extract_session
+# collapses every ~1-min chunk of one device session onto that single base. A
+# legacy whole-file base is `{device}_{YYYY-MM-DD}_{HH-MM-SS}` and has no device
+# session. This regex tells them apart on the read side.
+_CHUNK_SESSION_BASE_RE = re.compile(r"^sid([0-9a-f]{32})$")
+
+
+def device_session_id(session_base):
+    """The 32-hex device session id for a chunk session's base (`sid{32hex}`),
+    else None (a legacy whole-file base has no device session). This is exactly
+    the key `POST /sessions/{id}/open` stores on meeting_session, so the writer
+    can recover a chunk session's picked site from its extraction base."""
+    if not session_base:
+        return None
+    m = _CHUNK_SESSION_BASE_RE.match(session_base)
+    return m.group(1) if m else None
+
+
 def session_start(session_id):
     """AUTHORITATIVE session start: the wall-clock time encoded in
     session_base itself (e.g. `Benl1_2026-07-25_13-05-12` -> 13:05:12), via
