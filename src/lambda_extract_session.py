@@ -351,21 +351,14 @@ def process_declared_site(declared):
 # Core: extract one session
 # ============================================================
 
-def extract_session(bucket, user_folder, date, session_base):
-    # M-5: a stack missing the secret must not retry-storm -- an S3 event
-    # retries on a raised exception, and every retry would fail the exact
-    # same way. Check upfront (before any S3 gather/Claude work) and bail
-    # quietly instead of reaching llm_utils.call_llm's own check only
-    # after doing all that work and then raising.
-    if not llm_utils.api_key_configured():
-        logger.warning(
-            f"ANTHROPIC_API_KEY not configured -- skipping session {session_base} "
-            "without retry"
-        )
-        return None
-
-    keys = gather_session_segments(bucket, user_folder, date, session_base)
-
+def assemble_deduped_turns(bucket, keys):
+    """Download + normalize each transcript segment for a session (skipping
+    corrupt / unnormalizable ones), collect its abs-timed speaker turns, order
+    them on the single session clock, and drop the mobile chunk-overlap
+    duplication at device seams (_dedup_turn_boundaries; a no-op on legacy /
+    VAD / sequential turns). Returns (turns, source_filenames) — the one clean
+    word stream shared by the Tier-2 extraction and the Tier-1 rolling summary,
+    so both summarise exactly the same deduped session."""
     normalized_list = []
     source_filenames = []
     for key in keys:
@@ -393,6 +386,24 @@ def extract_session(bucket, user_folder, date, session_base):
             turns.append(turn)
     turns.sort(key=lambda t: t['abs_start'])
     turns = _dedup_turn_boundaries(turns)   # drop mobile chunk-overlap dup at seams (no-op pre-chunk)
+    return turns, source_filenames
+
+
+def extract_session(bucket, user_folder, date, session_base):
+    # M-5: a stack missing the secret must not retry-storm -- an S3 event
+    # retries on a raised exception, and every retry would fail the exact
+    # same way. Check upfront (before any S3 gather/Claude work) and bail
+    # quietly instead of reaching llm_utils.call_llm's own check only
+    # after doing all that work and then raising.
+    if not llm_utils.api_key_configured():
+        logger.warning(
+            f"ANTHROPIC_API_KEY not configured -- skipping session {session_base} "
+            "without retry"
+        )
+        return None
+
+    keys = gather_session_segments(bucket, user_folder, date, session_base)
+    turns, source_filenames = assemble_deduped_turns(bucket, keys)
 
     # M-6: nothing usable to extract from -- skip quietly (no Claude call,
     # no write), same "don't retry-storm a dead end" reasoning as M-5.
@@ -400,7 +411,7 @@ def extract_session(bucket, user_folder, date, session_base):
         logger.warning(f"No usable speaker turns for session {session_base} -- skipping")
         return None
 
-    n_segments = len(normalized_list)
+    n_segments = len(source_filenames)
     prompt = build_extraction_prompt(user_folder, date, session_base, turns, n_segments)
     max_tokens = min(4096 + n_segments * 350, 8000)  # BUG-16
 
