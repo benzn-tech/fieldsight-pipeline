@@ -1372,7 +1372,9 @@ Resources:
           Statement:
             - Effect: Allow
               Action: s3:GetObject
-              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_rolling/*
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_rolling/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
@@ -1402,6 +1404,9 @@ Resources:
             - Effect: Allow
               Action: s3:GetObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
             - Effect: Allow
               Action:
                 - ses:SendEmail

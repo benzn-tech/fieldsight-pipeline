@@ -120,10 +120,46 @@ def sweep(conn, grace_seconds=None):
     return results
 
 
+def reconcile(conn, read_result):
+    """Move claimed ('finalizing') sessions to their terminal state once the non-VPC
+    send worker has recorded an outcome under session_finalize_results/: sent ->
+    mark_sent, error -> mark_failed, no result yet -> leave for a later tick. Runs in
+    the same in-VPC sweep because the worker can't touch Aurora itself (BUG-36).
+    read_result(session_id) -> the worker's outcome dict or None. Returns
+    [(session_id, state)]."""
+    out = []
+    for row in meeting_session.list_finalizing(conn):
+        sid = row["session_id"]
+        res = read_result(sid)
+        if not res:
+            continue
+        status = res.get("status")
+        if status == "sent":
+            meeting_session.mark_sent(conn, sid)
+            out.append((sid, "sent"))
+        elif status == "error":
+            meeting_session.mark_failed(conn, sid)
+            out.append((sid, "failed"))
+    return out
+
+
+def _read_result(session_id):
+    """The send worker's recorded outcome for a session, or None if not written yet."""
+    import boto3
+    key = f"session_finalize_results/{session_id}.json"
+    try:
+        obj = boto3.client("s3").get_object(Bucket=S3_BUCKET, Key=key)
+        return json.loads(obj["Body"].read().decode("utf-8"))
+    except Exception:
+        return None
+
+
 def lambda_handler(event, context):
-    """Scheduled (~1 min) grace sweep — see the module docstring. Opens an in-VPC
-    Aurora connection and finalizes every due session."""
+    """Scheduled (~1 min) grace sweep + reconcile — see the module docstring. Opens an
+    in-VPC Aurora connection, finalizes every due session, and moves already-sent
+    claimed sessions to their terminal state."""
     from db.connection import get_connection
     with get_connection() as conn:
-        results = sweep(conn)
-    return {"swept": len(results), "results": results}
+        swept = sweep(conn)
+        reconciled = reconcile(conn, _read_result)
+    return {"swept": len(swept), "reconciled": len(reconciled)}

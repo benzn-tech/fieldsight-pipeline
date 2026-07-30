@@ -77,3 +77,21 @@ def test_sweep_finalizes_each_due_session(monkeypatch):
 def test_sweep_is_a_noop_when_nothing_is_due(monkeypatch):
     monkeypatch.setattr(fc.meeting_session, "list_due_finalize", lambda conn, g: [])
     assert fc.sweep("CONN") == []
+
+
+# ---- reconcile (finalizing -> sent/failed once the worker records an outcome) ----
+
+def test_reconcile_marks_sent_and_failed_by_the_worker_result(monkeypatch):
+    monkeypatch.setattr(fc.meeting_session, "list_finalizing",
+                        lambda conn: [{"session_id": "s1"}, {"session_id": "s2"}, {"session_id": "s3"}])
+    sent, failed = [], []
+    monkeypatch.setattr(fc.meeting_session, "mark_sent", lambda conn, sid: sent.append(sid))
+    monkeypatch.setattr(fc.meeting_session, "mark_failed", lambda conn, sid: failed.append(sid))
+    outcomes = {"s1": {"status": "sent"}, "s2": {"status": "error"}, "s3": None}  # s3: worker not run yet
+    fc.reconcile("CONN", read_result=lambda sid: outcomes.get(sid))
+    assert sent == ["s1"] and failed == ["s2"]        # s3 stays finalizing for a later tick
+
+
+def test_reconcile_is_a_noop_when_no_sessions_are_finalizing(monkeypatch):
+    monkeypatch.setattr(fc.meeting_session, "list_finalizing", lambda conn: [])
+    assert fc.reconcile("CONN", read_result=lambda sid: {"status": "sent"}) == []

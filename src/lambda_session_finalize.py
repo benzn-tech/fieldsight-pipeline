@@ -17,7 +17,11 @@ worker, never at module load.
 """
 import html as _html
 import json
+import os
 from urllib.parse import unquote_plus
+
+S3_BUCKET = os.environ.get("S3_BUCKET", "")
+FINALIZE_RESULTS_PREFIX = "session_finalize_results/"
 
 
 def _clean_todos(open_todos):
@@ -78,23 +82,43 @@ def build_confirmation_email(*, date=None, site_name=None, summary=None, open_to
 # Non-VPC send worker — S3-triggered on session_finalize_requests/
 # ============================================================
 
-def process_finalize_request(artifact, *, send=None):
+def _default_write_result(session_id, payload):
+    """Record the send outcome the in-VPC sweep's reconcile pass reads."""
+    import boto3
+    boto3.client("s3").put_object(
+        Bucket=S3_BUCKET, Key=f"{FINALIZE_RESULTS_PREFIX}{session_id}.json",
+        Body=json.dumps(payload), ContentType="application/json")
+
+
+def process_finalize_request(artifact, *, send=None, write_result=None):
     """Build + SES-send the recorder's confirmation email from one enqueued finalize
-    request (the in-VPC claim step wrote it). `send(to, subject, text, html)` is
-    injectable; defaults to email_sender.get_sender().send (imported lazily so this
-    module stays pure at import). A request with no recipient is skipped — the claim
-    step already marked that session failed."""
+    request (the in-VPC claim step wrote it), then record the outcome to
+    session_finalize_results/{sid}.json — the in-VPC sweep's reconcile pass reads it
+    and moves the session finalizing -> sent/failed (this non-VPC worker can't touch
+    Aurora, CLAUDE.md BUG-36). A send failure is RECORDED (status 'error'), not
+    re-raised: re-raising would S3-retry the trigger and risk a double-send. `send` /
+    `write_result` are injectable; they default to email_sender + an S3 write (both
+    lazy so the module stays pure at import). A request with no recipient is skipped —
+    the claim step already marked that session failed."""
     recipient = (artifact.get("recipient") or "").strip()
     if not recipient:
         return {"status": "skipped", "reason": "no recipient"}
+    session_id = artifact.get("sessionId")
     subject, text, html = build_confirmation_email(
         date=artifact.get("date"), site_name=artifact.get("siteName"),
         summary=artifact.get("summary"), open_todos=artifact.get("openTodos"))
     if send is None:
         from email_sender import get_sender
         send = get_sender().send
-    send(recipient, subject, text, html)
-    return {"status": "sent", "recipient": recipient, "sessionId": artifact.get("sessionId")}
+    if write_result is None:
+        write_result = _default_write_result
+    try:
+        send(recipient, subject, text, html)
+    except Exception as e:
+        write_result(session_id, {"status": "error", "sessionId": session_id, "error": str(e)})
+        return {"status": "error", "recipient": recipient, "sessionId": session_id}
+    write_result(session_id, {"status": "sent", "sessionId": session_id, "recipient": recipient})
+    return {"status": "sent", "recipient": recipient, "sessionId": session_id}
 
 
 def lambda_handler(event, context):

@@ -51,22 +51,44 @@ def test_html_escapes_content():
 
 # ---- process_finalize_request (non-VPC send worker) ---------------------
 
-def test_worker_builds_and_sends_the_confirmation_email():
-    sent = []
-    art = {"recipient": "bob@site.com", "date": "2026-07-25", "siteName": "UC PK",
-           "summary": "Poured the slab.", "sessionId": "abc",
-           "openTodos": [{"text": "fix rebar", "responsible": "Neil"}]}
-    out = fin.process_finalize_request(art, send=lambda *a: sent.append(a) or "msg-1")
+def _art(**over):
+    a = {"recipient": "bob@site.com", "date": "2026-07-25", "siteName": "UC PK",
+         "summary": "Poured the slab.", "sessionId": "abc",
+         "openTodos": [{"text": "fix rebar", "responsible": "Neil"}]}
+    a.update(over)
+    return a
+
+
+def test_worker_builds_sends_and_records_a_sent_result():
+    sent, results = [], []
+    out = fin.process_finalize_request(
+        _art(), send=lambda *a: sent.append(a) or "msg-1",
+        write_result=lambda sid, payload: results.append((sid, payload)))
     assert out["status"] == "sent" and out["recipient"] == "bob@site.com"
-    assert len(sent) == 1
     to, subject, text, html = sent[0]
-    assert to == "bob@site.com"
-    assert "2026-07-25" in subject
-    assert "Poured the slab" in text and "fix rebar" in text
-    assert "Poured the slab" in html
+    assert to == "bob@site.com" and "2026-07-25" in subject
+    assert "Poured the slab" in text and "fix rebar" in text and "Poured the slab" in html
+    # the in-VPC sweep reconciles this result -> mark_sent
+    assert results == [("abc", {"status": "sent", "sessionId": "abc", "recipient": "bob@site.com"})]
+
+
+def test_worker_records_an_error_result_when_the_send_fails():
+    results = []
+
+    def _boom(*a):
+        raise RuntimeError("ses down")
+
+    out = fin.process_finalize_request(
+        _art(sessionId="s9"), send=_boom,
+        write_result=lambda sid, payload: results.append((sid, payload)))
+    assert out["status"] == "error"          # recorded, NOT re-raised (no S3 retry-storm / double-send)
+    sid, payload = results[0]
+    assert sid == "s9" and payload["status"] == "error" and "ses down" in payload["error"]
 
 
 def test_worker_skips_a_request_with_no_recipient():
-    sent = []
-    out = fin.process_finalize_request({"recipient": "", "summary": "x"}, send=lambda *a: sent.append(a))
-    assert out["status"] == "skipped" and sent == []
+    sent, results = [], []
+    out = fin.process_finalize_request({"recipient": "", "summary": "x"},
+                                       send=lambda *a: sent.append(a),
+                                       write_result=lambda *a: results.append(a))
+    assert out["status"] == "skipped" and sent == [] and results == []
