@@ -50,6 +50,15 @@ Parameters:
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: Disable in test to avoid polling RealPTT / generating reports on cron.
+  EnableFinalize:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Gate for the Tier-0 finalize grace sweep (FinalizeSweepFunction's rate(1 min)
+      schedule). Default false so the feature deploys INERT (the sweep is created but
+      DISABLED); flip per environment to activate. Separate from EnableSchedules so
+      it doesn't also switch on the nightly report crons.
   EnableKeyframes:
     Type: String
     Default: 'false'
@@ -411,6 +420,7 @@ Mappings:
 
 Conditions:
   ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
+  ShouldEnableFinalize: !Equals [!Ref EnableFinalize, 'true']
   ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
   ShouldManageBucketPolicy: !And [!Condition ShouldEnableTranscribe, !Equals [!Ref ManageDataBucketPolicy, 'true']]
   ShouldCreateAlerts: !Not [!Equals [!Ref AlertEmail, '']]
@@ -1384,6 +1394,7 @@ Resources:
           Properties:
             Schedule: rate(1 minute)
             Description: Tier-0 finalize grace sweep — claims due pending_close sessions.
+            State: !If [ShouldEnableFinalize, ENABLED, DISABLED]
 
   SessionFinalizeFunction:
     Type: AWS::Serverless::Function
