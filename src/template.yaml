@@ -1151,6 +1151,7 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_report_results/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_reports/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_rolling/*
       Events:
         OrgProxy:
           Type: Api
