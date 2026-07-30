@@ -162,4 +162,9 @@ def lambda_handler(event, context):
     with get_connection() as conn:
         swept = sweep(conn)
         reconciled = reconcile(conn, _read_result)
+    # Observability: this fires every minute, so log ONLY when it did something
+    # (no per-idle-minute noise). enqueued = sessions handed to the send worker;
+    # reconciled = sessions moved to sent/failed this tick.
+    if swept or reconciled:
+        logger.info("finalize sweep: enqueued=%d reconciled=%d", len(swept), len(reconciled))
     return {"swept": len(swept), "reconciled": len(reconciled)}
