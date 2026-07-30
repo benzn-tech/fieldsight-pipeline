@@ -24,6 +24,7 @@ import logging
 import os
 
 from repositories import meeting_session, users, sites
+from session_scope import SESSION_GAP_MINUTES
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -33,6 +34,15 @@ FINALIZE_REQUESTS_PREFIX = "session_finalize_requests/"
 # The idle-stop grace window (a deliberate End is grace 0). Mirrors org-api's
 # STOP_GRACE_SECONDS so the sweep's due-check matches what session_close intended.
 STOP_GRACE_SECONDS = int(os.environ.get("STOP_GRACE_SECONDS", "30"))
+# §8.4: a session with no new chunk for SESSION_GAP_MINUTES is INFERRED closed
+# (the device stopped/crashed without a /close). Reuses the one "one session"
+# inactivity constant rather than a second literal.
+IDLE_CLOSE_SECONDS = SESSION_GAP_MINUTES * 60
+# Gated OFF until SessionActivityFunction is live to keep last_segment_at fresh:
+# without per-chunk touch, a still-active /open session (last_segment_at NULL ->
+# COALESCE falls back to opened_at) would be closed prematurely. Flipped on WITH
+# that lambda's deploy.
+INFER_IDLE_CLOSE = os.environ.get("INFER_IDLE_CLOSE", "false").lower() == "true"
 
 
 def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_rolling, enqueue):
@@ -73,7 +83,11 @@ def _resolve_context(conn, row):
     """Recipient email + folder + date + site name for a claimed session, from
     Aurora. date = the session's close (or open) day; siteName from the site pick."""
     user = users.get_by_id(conn, row["user_id"]) or {}
-    day = row.get("closed_at") or row.get("opened_at")
+    # DATE = the session's recording start (opened_at, device wall-clock) — this is
+    # the {date} the S3 transcript/rolling keys live under. Prefer it over closed_at,
+    # which for an INFERRED idle-close is a server-time last-activity that could
+    # cross a day boundary and mis-key the summary re-gather.
+    day = row.get("opened_at") or row.get("closed_at")
     date = day.date().isoformat() if hasattr(day, "date") else (str(day)[:10] if day else None)
     site_name = None
     if row.get("site_id"):
@@ -106,12 +120,31 @@ def _enqueue(artifact):
         Body=json.dumps(artifact, ensure_ascii=False), ContentType="application/json")
 
 
-def sweep(conn, grace_seconds=None):
+def infer_idle_closes(conn, idle_seconds):
+    """§8.4 close inference: an `open` session with no new chunk for idle_seconds is
+    treated as closed (the device stopped/crashed without a /close). Move each to
+    pending_close (intent 'idle'), anchored at its last activity, so the existing
+    grace + finalize path emails it. Returns the count moved. Keys on last_segment_at
+    (list_idle_open) so a still-active meeting is never closed early."""
+    closed = 0
+    for row in meeting_session.list_idle_open(conn, idle_seconds):
+        if meeting_session.mark_pending_close(conn, row["session_id"], row["last_activity"], "idle"):
+            closed += 1
+    return closed
+
+
+def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None):
     """Finalize every session on `conn` whose grace has elapsed, reusing
-    finalize_claim per session (CAS-claim -> gather -> enqueue). Returns the list of
+    finalize_claim per session (CAS-claim -> gather -> enqueue). First (when
+    enabled) infers idle closes (§8.4): an `open` session gone quiet becomes
+    pending_close and is then picked up by the same due-check. Returns the list of
     per-session status dicts. Separated from lambda_handler so the sweep loop is
-    testable without a real DB connection."""
+    testable without a real DB connection; `infer_idle` overrides the env gate."""
     grace = STOP_GRACE_SECONDS if grace_seconds is None else grace_seconds
+    idle = IDLE_CLOSE_SECONDS if idle_seconds is None else idle_seconds
+    do_infer = INFER_IDLE_CLOSE if infer_idle is None else infer_idle
+    if do_infer:
+        infer_idle_closes(conn, idle)
     results = []
     for row in meeting_session.list_due_finalize(conn, grace):
         results.append(finalize_claim(
