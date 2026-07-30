@@ -17,9 +17,12 @@ handler / summarize path) so the core is unit-testable with the LLM injected. Th
 S3-triggered handler + SAM wiring land separately.
 """
 import json
+import logging
 import re
 from datetime import datetime
 from urllib.parse import unquote_plus
+
+logger = logging.getLogger()
 
 TRANSCRIPT_LIMIT = 60000   # chars fed to the model — a live meeting-so-far is small
 
@@ -177,6 +180,7 @@ def process_transcript_key(key, s3_client=None, call_llm=None, now=None,
         Body=json.dumps(body, ensure_ascii=False, indent=2),
         ContentType="application/json",
     )
+    logger.info("rolling summary written: %s (%d turns)", out_key, len(turns))
     return out_key
 
 
