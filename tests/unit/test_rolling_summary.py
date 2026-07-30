@@ -33,7 +33,14 @@ def test_parse_valid_json():
     raw = '{"summary": "Discussed the slab pour.", "open_todos": [{"text": "Fix rebar", "responsible": "Neil"}]}'
     out = rs.parse_rolling_summary(raw)
     assert out["summary"] == "Discussed the slab pour."
-    assert out["open_todos"] == [{"text": "Fix rebar", "responsible": "Neil"}]
+    assert out["open_todos"] == [{"text": "Fix rebar", "responsible": "Neil", "due": None}]
+
+
+def test_parse_captures_assignee_and_due():
+    raw = ('{"summary": "Slab.", "open_todos": [{"text": "Order steel", '
+           '"responsible": "Neil", "due": "Friday"}]}')
+    assert rs.parse_rolling_summary(raw)["open_todos"] == \
+        [{"text": "Order steel", "responsible": "Neil", "due": "Friday"}]
 
 
 def test_parse_strips_markdown_fences():
@@ -45,8 +52,8 @@ def test_parse_normalizes_string_and_missing_responsible_todos():
     raw = '{"summary": "S", "open_todos": ["call supplier", {"text": "order steel"}]}'
     out = rs.parse_rolling_summary(raw)
     assert out["open_todos"] == [
-        {"text": "call supplier", "responsible": None},
-        {"text": "order steel", "responsible": None},
+        {"text": "call supplier", "responsible": None, "due": None},
+        {"text": "order steel", "responsible": None, "due": None},
     ]
 
 
@@ -81,7 +88,7 @@ def test_summarize_calls_llm_once_and_parses():
         return ('{"summary":"running so far","open_todos":[{"text":"x","responsible":null}]}', None)
 
     out = rs.summarize_turns([turn("spk_0", "hi")], call_llm=fake_llm)
-    assert out == {"summary": "running so far", "open_todos": [{"text": "x", "responsible": None}]}
+    assert out == {"summary": "running so far", "open_todos": [{"text": "x", "responsible": None, "due": None}]}
     assert len(calls) == 1
 
 
@@ -149,7 +156,7 @@ def test_handler_writes_rolling_summary_to_the_session_key(monkeypatch):
     assert put["Key"] == ROLLING_OUT_KEY
     body = json.loads(put["Body"])
     assert body["summary"] == "pouring the slab"
-    assert body["open_todos"] == [{"text": "order steel", "responsible": "Neil"}]
+    assert body["open_todos"] == [{"text": "order steel", "responsible": "Neil", "due": None}]
     assert body["session_base"] == "sidABC"
     assert body["turn_count"] == 1
     assert body["updated_at"] == "2026-07-25T13:02:00Z"

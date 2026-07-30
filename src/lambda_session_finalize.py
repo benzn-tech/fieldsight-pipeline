@@ -17,20 +17,26 @@ worker, never at module load.
 """
 import html as _html
 import json
+import logging
 import os
 from urllib.parse import unquote_plus
+
+logger = logging.getLogger()
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 FINALIZE_RESULTS_PREFIX = "session_finalize_results/"
 
 
 def _clean_todos(open_todos):
-    """Keep only to-dos with real text; normalise responsible to a name or None."""
+    """Keep only to-dos with real text; normalise responsible + due to a value or
+    None. Each item carries {text, responsible, due} for the structured render."""
     out = []
     for t in (open_todos or []):
         text = (t.get("text") or "").strip()
         if text:
-            out.append({"text": text, "responsible": (t.get("responsible") or None)})
+            out.append({"text": text,
+                        "responsible": (t.get("responsible") or None),
+                        "due": (t.get("due") or None)})
     return out
 
 
@@ -51,10 +57,11 @@ def build_confirmation_email(*, date=None, site_name=None, summary=None, open_to
         lines.append(f"Date: {date}")
     lines += ["", "Summary", summary_text]
     if todos:
-        lines += ["", "Open action items"]
+        lines += ["", "Action items"]
         for t in todos:
-            owner = f" — {t['responsible']}" if t["responsible"] else ""
-            lines.append(f"  • {t['text']}{owner}")
+            who = t["responsible"] or "Unassigned"
+            due = f" (due {t['due']})" if t["due"] else ""
+            lines.append(f"  • {t['text']} — {who}{due}")
     body_text = "\n".join(lines).rstrip() + "\n"
 
     esc = _html.escape
@@ -69,10 +76,23 @@ def build_confirmation_email(*, date=None, site_name=None, summary=None, open_to
         parts.append("<p>" + "<br>".join(meta) + "</p>")
     parts.append(f"<h3>Summary</h3><p>{esc(summary_text)}</p>")
     if todos:
-        items = "".join(
-            f"<li>{esc(t['text'])}" + (f" — {esc(t['responsible'])}" if t["responsible"] else "") + "</li>"
+        rows = "".join(
+            "<tr>"
+            f'<td style="padding:6px;border-bottom:1px solid #eee">{esc(t["text"])}</td>'
+            f'<td style="padding:6px;border-bottom:1px solid #eee">'
+            f'{esc(t["responsible"]) if t["responsible"] else "—"}</td>'
+            f'<td style="padding:6px;border-bottom:1px solid #eee">'
+            f'{esc(t["due"]) if t["due"] else "—"}</td>'
+            "</tr>"
             for t in todos)
-        parts.append(f"<h3>Open action items</h3><ul>{items}</ul>")
+        parts.append(
+            "<h3>Action items</h3>"
+            '<table role="presentation" cellspacing="0" cellpadding="0" '
+            'style="border-collapse:collapse;width:100%;font-size:14px">'
+            '<thead><tr style="text-align:left;border-bottom:2px solid #ccc">'
+            '<th style="padding:6px">Task</th><th style="padding:6px">Assignee</th>'
+            '<th style="padding:6px">Due</th></tr></thead>'
+            f"<tbody>{rows}</tbody></table>")
     body_html = "\n".join(parts)
 
     return subject, body_text, body_html
@@ -90,7 +110,34 @@ def _default_write_result(session_id, payload):
         Body=json.dumps(payload), ContentType="application/json")
 
 
-def process_finalize_request(artifact, *, send=None, write_result=None):
+def _complete_summary(artifact, summarize=None):
+    """Re-summarise the WHOLE session from its transcripts at finalize time. The
+    enqueued rolling summary can be stale/partial — A throttles mid-meeting and the
+    session may grow after its last tick, and C can claim before the next one. But
+    finalize runs after close + grace, so every transcript is in by now; re-gathering
+    yields a COMPLETE summary. Returns {summary, open_todos} or None (missing keys /
+    no turns / LLM failure) so the caller falls back to the rolling summary. Imports
+    are lazy (extract_session/rolling pull boto3 + llm_utils) — this worker is non-VPC
+    so the LLM is reachable; SessionFinalizeFunction carries the LLM env."""
+    folder, date, sid = artifact.get("folder"), artifact.get("date"), artifact.get("sessionId")
+    if not (folder and date and sid):
+        return None
+    try:
+        import lambda_extract_session as ex
+        keys = ex.gather_session_segments(S3_BUCKET, folder, date, "sid" + sid)
+        turns, _sources = ex.assemble_deduped_turns(S3_BUCKET, keys)
+        if not turns:
+            return None
+        if summarize is None:
+            import lambda_rolling_summary as rs
+            summarize = rs.summarize_turns
+        return summarize(turns)
+    except Exception:
+        logger.exception("finalize: complete re-summary failed for %s — using rolling summary", sid)
+        return None
+
+
+def process_finalize_request(artifact, *, send=None, write_result=None, complete_summary=None):
     """Build + SES-send the recorder's confirmation email from one enqueued finalize
     request (the in-VPC claim step wrote it), then record the outcome to
     session_finalize_results/{sid}.json — the in-VPC sweep's reconcile pass reads it
@@ -104,9 +151,16 @@ def process_finalize_request(artifact, *, send=None, write_result=None):
     if not recipient:
         return {"status": "skipped", "reason": "no recipient"}
     session_id = artifact.get("sessionId")
+    # Prefer a FRESH complete summary re-derived from the full transcript over the
+    # enqueued rolling summary (which can be stale/partial — see _complete_summary);
+    # fall back to the rolling summary on any failure.
+    summary, todos = artifact.get("summary"), artifact.get("openTodos")
+    fresh = (complete_summary if complete_summary is not None else _complete_summary)(artifact)
+    if fresh:
+        summary, todos = fresh.get("summary", summary), fresh.get("open_todos", todos)
     subject, text, html = build_confirmation_email(
         date=artifact.get("date"), site_name=artifact.get("siteName"),
-        summary=artifact.get("summary"), open_todos=artifact.get("openTodos"))
+        summary=summary, open_todos=todos)
     if send is None:
         from email_sender import get_sender
         send = get_sender().send
