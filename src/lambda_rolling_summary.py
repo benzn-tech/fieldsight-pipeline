@@ -184,14 +184,31 @@ def process_transcript_key(key, s3_client=None, call_llm=None, now=None,
     return out_key
 
 
-def lambda_handler(event, context):
-    """S3 event on transcripts/ — re-summarise each affected session. A chunk
-    landing re-runs the WHOLE session summary (locked design: transcripts are
-    short, so whole-session re-summary stays accurate and drift-free), keeping the
-    app's mid-meeting view current within a chunk of real time."""
-    written = []
+def _keys_from_event(event):
+    """The transcript key(s) this invocation is about. RollingSummaryFunction is
+    wired to EventBridge ("Object Created"), whose payload is
+    {"detail": {"object": {"key": ...}}} with the key ALREADY url-decoded — NOT the
+    {"Records": [{"s3": {"object": {"key": ...}}}]} shape of an S3 notification (whose
+    key IS url-encoded). Accept both so the handler works under either trigger; the
+    original bug was reading only `Records`, so every EventBridge invocation found no
+    key and did nothing (1-2 ms no-op, no summary ever written)."""
+    keys = []
+    detail = event.get("detail") or {}
+    obj = detail.get("object") or {}
+    if obj.get("key"):
+        keys.append(obj["key"])                                   # EventBridge — already decoded
     for record in event.get("Records", []):
-        key = unquote_plus(record["s3"]["object"]["key"])
+        keys.append(unquote_plus(record["s3"]["object"]["key"]))  # S3 notification — decode
+    return keys
+
+
+def lambda_handler(event, context):
+    """A transcript landed under transcripts/ (via EventBridge) — re-summarise each
+    affected session. A chunk landing re-runs the WHOLE session summary (locked
+    design: transcripts are short, so whole-session re-summary stays accurate and
+    drift-free), keeping the app's mid-meeting view current within a chunk of time."""
+    written = []
+    for key in _keys_from_event(event):
         out = process_transcript_key(key)
         if out:
             written.append(out)

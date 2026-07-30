@@ -201,3 +201,19 @@ def test_lambda_handler_unquotes_keys_and_collects_writes(monkeypatch):
     out = rs.lambda_handler(event, None)
     assert seen == ["transcripts/Ada_L/2026-07-25/a b.json"]   # unquote_plus turns + into space
     assert out["written"] == ["out::transcripts/Ada_L/2026-07-25/a b.json"]
+
+
+def test_lambda_handler_reads_the_eventbridge_object_created_shape(monkeypatch):
+    # RollingSummaryFunction is wired to EventBridge (not an S3 notification), so its
+    # event is {detail:{object:{key}}} with the key already decoded. Regression guard:
+    # the handler used to read only `Records`, so every real EventBridge invocation
+    # found no key and did nothing (1-2 ms no-op, no summary ever written).
+    seen = []
+    monkeypatch.setattr(rs, "process_transcript_key",
+                        lambda key: (seen.append(key), f"out::{key}")[1])
+    event = {"source": "aws.s3", "detail-type": "Object Created",
+             "detail": {"bucket": {"name": "b"},
+                        "object": {"key": "transcripts/Ada_L/2026-07-25/x_sidABC_c0000.json"}}}
+    out = rs.lambda_handler(event, None)
+    assert seen == ["transcripts/Ada_L/2026-07-25/x_sidABC_c0000.json"]
+    assert out["written"] == ["out::transcripts/Ada_L/2026-07-25/x_sidABC_c0000.json"]
