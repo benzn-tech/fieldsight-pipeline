@@ -25,6 +25,41 @@ class FakeTable:
         return {}
 
 
+class RaceLoserTable:
+    """DynamoDB Table double for the lost-race path: get_item returns a stale
+    consumed=False item (guard passes) but update_item's ConditionExpression
+    fails because another verifier already flipped `consumed` in between —
+    simulating two concurrent verifiers racing on the same one-time code."""
+    def __init__(self, item):
+        self.item = dict(item)
+
+    def get_item(self, Key):
+        if self.item.get("code") == Key["code"]:
+            return {"Item": dict(self.item)}
+        return {}
+
+    def update_item(self, Key, UpdateExpression, ConditionExpression, ExpressionAttributeValues):
+        from botocore.exceptions import ClientError
+        raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+
+
+class InfraErrorTable:
+    """DynamoDB Table double for a genuine infra failure (not a lost race):
+    get_item passes the guard, but update_item raises a non-conditional error
+    (e.g. throttling/IAM/network)."""
+    def __init__(self, item):
+        self.item = dict(item)
+
+    def get_item(self, Key):
+        if self.item.get("code") == Key["code"]:
+            return {"Item": dict(self.item)}
+        return {}
+
+    def update_item(self, Key, UpdateExpression, ConditionExpression, ExpressionAttributeValues):
+        from botocore.exceptions import ClientError
+        raise ClientError({"Error": {"Code": "ProvisionedThroughputExceededException"}}, "UpdateItem")
+
+
 def _define(session):
     return {"request": {"session": session}, "response": {}}
 
@@ -101,4 +136,24 @@ def test_verify_rejects_already_consumed(monkeypatch):
 def test_verify_rejects_unknown_code(monkeypatch):
     monkeypatch.setattr(qr, "_table", lambda: FakeTable(None))
     ev = qr.verify_auth_challenge_response(_verify_event("nope", "sub-1"), None)
+    assert ev["response"]["answerCorrect"] is False
+
+
+def test_verify_rejects_lost_race_on_consume(monkeypatch):
+    # Guard sees consumed=False (stale read), but the conditional update_item
+    # fails because a second verifier already consumed the code first.
+    now = int(time.time())
+    table = RaceLoserTable({"code": "good", "sub": "sub-1", "consumed": False, "expiresAt": now + 90})
+    monkeypatch.setattr(qr, "_table", lambda: table)
+    ev = qr.verify_auth_challenge_response(_verify_event("good", "sub-1"), None)
+    assert ev["response"]["answerCorrect"] is False
+
+
+def test_verify_rejects_on_infra_error_during_consume(monkeypatch):
+    # A non-conditional error (throttling/IAM/network) on update_item must also
+    # yield "not correct" — the security property holds regardless of cause.
+    now = int(time.time())
+    table = InfraErrorTable({"code": "good", "sub": "sub-1", "consumed": False, "expiresAt": now + 90})
+    monkeypatch.setattr(qr, "_table", lambda: table)
+    ev = qr.verify_auth_challenge_response(_verify_event("good", "sub-1"), None)
     assert ev["response"]["answerCorrect"] is False
