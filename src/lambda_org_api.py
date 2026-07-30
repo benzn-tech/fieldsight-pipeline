@@ -965,7 +965,13 @@ def redeem_qr_login_code(event):
             # lost the race to another redeemer, or a genuine infra error —
             # both collapse to the same generic 401 (never reveal which).
             return error("Invalid or expired code", 401)
-        return ok({"refreshToken": item["refreshToken"]}, 200)
+        # Consume-safe read: `item` was already fetched above (no extra DB
+        # call). A legacy row without `refreshToken` must not be allowed to
+        # consume-then-KeyError -- fall back to the same generic 401.
+        rt = item.get("refreshToken")
+        if not rt:
+            return error("Invalid or expired code", 401)
+        return ok({"refreshToken": rt}, 200)
     except Exception:
         # Outer safety net: any unexpected shape/error (never the code/token).
         logger.exception("qr redeem failed")

@@ -5978,6 +5978,12 @@ def test_qr_create_rate_limited(wired, monkeypatch):
     assert codes == 5
 
 
+def test_qr_create_missing_refresh_token_returns_400(wired, monkeypatch):
+    monkeypatch.setattr(org, "_qr_table", lambda: FakeQrTable())
+    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/create", sub="sub-1", body={}), None)
+    assert res["statusCode"] == 400
+
+
 def test_qr_redeem_returns_token_and_consumes(monkeypatch):
     now = int(__import__("time").time())
     table = FakeQrTable()
