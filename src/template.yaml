@@ -1464,6 +1464,62 @@ Resources:
                     - prefix: transcripts/
 
   # ----------------------------------------------------------
+  # Chunk-driven session lifecycle (spec §8.4). Opens + touches meeting_session
+  # from the TRANSCRIPT STREAM so the Tier-0 finalize works even when the device's
+  # best-effort live /open|/close never arrive (offline / dropped / not yet
+  # implemented). In-VPC (Aurora only — it parses the transcript KEY, never fetches
+  # the object, so no S3 read grant is needed). Same transcripts/ EventBridge
+  # trigger as the rolling summary, but gated ENABLED only with finalize, so it
+  # ships INERT on prod (mirrors the sweep's ShouldEnableFinalize gate). Resolution
+  # env mirrors IngestFunction so resolve_company routes per folder (MULTI_TENANT).
+  # ----------------------------------------------------------
+  SessionActivityFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-session-activity", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: session_activity.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          S3_BUCKET: !Ref IngestBucketName
+          CONFIG_KEY: config/user_mapping.json
+          MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
+      Policies:
+        - VPCAccessPolicy: {}
+      Events:
+        TranscriptChunkLanded:
+          Type: EventBridgeRule
+          Properties:
+            State: !If [ShouldEnableFinalize, ENABLED, DISABLED]
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - Object Created
+              detail:
+                bucket:
+                  name:
+                    - !Ref IngestBucketName
+                object:
+                  key:
+                    - prefix: transcripts/
+
+  # ----------------------------------------------------------
   # Tier-0 finalize — grace SWEEP (in-VPC) + send WORKER (non-VPC).
   # session_close records pending_close + version + close_intent (in-VPC, Aurora)
   # but can't reach the EventBridge Scheduler API to arm a one-shot (BUG-36), so a
@@ -1497,6 +1553,12 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
           STOP_GRACE_SECONDS: '30'
+          # Inferred idle-close (spec §8.4): an `open` session gone quiet becomes
+          # pending_close. Tied to ShouldEnableFinalize — it is ONLY safe when
+          # SessionActivityFunction is live to keep last_segment_at fresh, and that
+          # function's trigger is gated on the same condition, so the two flip
+          # together. OFF on prod (finalize disabled) until deliberately enabled.
+          INFER_IDLE_CLOSE: !If [ShouldEnableFinalize, 'true', 'false']
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
