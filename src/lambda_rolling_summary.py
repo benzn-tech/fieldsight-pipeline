@@ -103,6 +103,10 @@ def summarize_turns(turns, call_llm=None, max_tokens=1200):
 
 ROLLING_PREFIX = "session_rolling/"
 
+# Chunks land ~30s apart, but the user wants a ~1-2 min running summary and every
+# tick is an LLM call — so re-summarise a given session at most this often.
+MIN_RESUMMARY_INTERVAL_S = 75
+
 
 def rolling_key(user_folder, date, session_base):
     """Where one session's rolling summary lives (its short-term memory). org-api's
@@ -110,31 +114,54 @@ def rolling_key(user_folder, date, session_base):
     return f"{ROLLING_PREFIX}{user_folder}/{date}/{session_base}/latest.json"
 
 
-def process_transcript_key(key, s3_client=None, call_llm=None, now_iso=None):
+def _seconds_since_last_summary(s3_client, bucket, out_key, now):
+    """Age (seconds) of the session's existing rolling summary, or None when there
+    isn't one yet / it can't be read or parsed (-> treat as due). Parsing tolerates
+    updated_at with or without microseconds and the trailing Z."""
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key=out_key)
+        prev = datetime.fromisoformat(
+            str(json.loads(obj["Body"].read().decode("utf-8"))["updated_at"]).rstrip("Z"))
+    except Exception:
+        return None
+    return (now - prev).total_seconds()
+
+
+def process_transcript_key(key, s3_client=None, call_llm=None, now=None,
+                           min_interval_s=MIN_RESUMMARY_INTERVAL_S):
     """A transcript chunk landed: rebuild the whole session-so-far as one deduped
     word stream (extract_session.gather_session_segments + assemble_deduped_turns
     — the SAME assembly the Tier-2 extraction uses, so the rolling and final
     summaries agree), summarise it, and overwrite session_rolling/{folder}/{date}/
     {session}/latest.json with { summary, open_todos, ... }. Returns the written
-    key, or None when `key` isn't a transcript or the session has nothing to
-    summarise yet (leaving the last good summary in place). extract_session (boto3
-    / llm_utils / transcript_utils) is imported lazily so this module stays pure
-    at import for the core tests; s3_client / call_llm / now_iso are injectable."""
+    key, or None when `key` isn't a transcript, the session was summarised
+    < min_interval_s ago (cadence/cost throttle), or there's nothing to summarise
+    yet (leaving the last good summary in place). extract_session (boto3 /
+    llm_utils / transcript_utils) is imported lazily so this module stays pure at
+    import for the core tests; s3_client / call_llm / now are injectable."""
     import lambda_extract_session as ex
     parsed = ex.session_base_from_key(key)
     if parsed is None:
         return None                                    # not a transcript chunk
     user_folder, date, session_base = parsed
     bucket = ex.S3_BUCKET
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    now = now or datetime.utcnow()
+    out_key = rolling_key(user_folder, date, session_base)
+
+    # Throttle BEFORE the expensive work (the session gather + the LLM call): if we
+    # summarised this session moments ago, the last summary is still current enough.
+    age = _seconds_since_last_summary(s3_client, bucket, out_key, now)
+    if age is not None and age < min_interval_s:
+        return None
+
     keys = ex.gather_session_segments(bucket, user_folder, date, session_base)
     turns, _sources = ex.assemble_deduped_turns(bucket, keys)
     summary = summarize_turns(turns, call_llm=call_llm)
     if summary is None:
         return None                                    # empty / LLM fail -> keep last summary
-    if s3_client is None:
-        import boto3
-        s3_client = boto3.client("s3")
-    out_key = rolling_key(user_folder, date, session_base)
     body = {
         "schema_version": 1,
         "session_base": session_base,
@@ -143,7 +170,7 @@ def process_transcript_key(key, s3_client=None, call_llm=None, now_iso=None):
         "turn_count": len(turns),
         "summary": summary["summary"],
         "open_todos": summary["open_todos"],
-        "updated_at": now_iso or (datetime.utcnow().isoformat() + "Z"),
+        "updated_at": now.isoformat() + "Z",
     }
     s3_client.put_object(
         Bucket=bucket, Key=out_key,

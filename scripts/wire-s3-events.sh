@@ -205,8 +205,14 @@ MERGED=$(jq -n --argjson cur "$CURRENT" --argjson des "$DESIRED" --argjson retir
   | { LambdaFunctionConfigurations: (($lam | map(select((.Id | startswith("fs-") | not) and (.Id as $i | $retire | index($i) | not)))) + $des) }
   + ( if $cur.TopicConfigurations    then {TopicConfigurations:    $cur.TopicConfigurations}    else {} end )
   + ( if $cur.QueueConfigurations    then {QueueConfigurations:    $cur.QueueConfigurations}    else {} end )
-  + ( if $cur.EventBridgeConfiguration then {EventBridgeConfiguration: $cur.EventBridgeConfiguration} else {} end )
+  + {EventBridgeConfiguration: {}}
 ')
+# EventBridgeConfiguration:{} ENABLES bucket->EventBridge delivery (that empty object
+# is its only valid value, so overriding a present {} is a no-op) — this is what feeds
+# RollingSummaryFunction (voice Tier-1). An S3->Lambda notification can't be used for it:
+# extract-session already owns transcripts/ (fs-extract-transcripts) and S3 forbids a
+# second overlapping Lambda config, so the rolling summary consumes the SAME chunks via
+# EventBridge, an independent channel that leaves every Lambda notification above intact.
 
 echo "--- CURRENT (Lambda configs) ---"; echo "$CURRENT" | jq -c '.LambdaFunctionConfigurations // []'
 echo "--- DESIRED (after merge)     ---"; echo "$MERGED"  | jq -c '.LambdaFunctionConfigurations // []'

@@ -6,8 +6,10 @@ meeting and read by the Tier-2 finalize. This tests the pure core (prompt build
 (gather / assemble collaborators, the LLM, and the S3 client all injected). The
 pure core is pure at import; the handler reuses extract_session, which reads AWS
 creds + ANTHROPIC_API_KEY at import, so set dummies before importing it."""
+import io
 import json
 import os
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -98,15 +100,27 @@ def test_summarize_llm_failure_returns_none():
 #
 # On a new transcript chunk the handler rebuilds the whole session-so-far
 # (reusing extract_session's gather + assemble_deduped_turns), summarises it, and
-# writes session_rolling/{folder}/{date}/{session}/latest.json. Collaborators, the
-# LLM, and the S3 client are injected so this exercises the wiring without real S3.
+# writes session_rolling/{folder}/{date}/{session}/latest.json — UNLESS it
+# summarised this session < MIN_RESUMMARY_INTERVAL_S ago (cadence/cost throttle).
+# Collaborators, the LLM, and the S3 client are injected — no real S3.
 
 TRANSCRIPT_KEY = "transcripts/Ada_L/2026-07-25/Benl1_2026-07-25_13-00-11_sidABC_c0000.json"
+ROLLING_OUT_KEY = "session_rolling/Ada_L/2026-07-25/sidABC/latest.json"
+NOW = datetime(2026, 7, 25, 13, 2, 0)
 
 
-class _CapturingS3:
-    def __init__(self):
+class _FakeS3:
+    """Minimal S3 for the handler: get_object serves a preset latest.json body
+    (or raises 'no summary yet'); put_object records the writes."""
+
+    def __init__(self, existing=None):
+        self._existing = existing            # dict already at ROLLING_OUT_KEY, or None
         self.puts = []
+
+    def get_object(self, Bucket, Key):
+        if self._existing is None:
+            raise Exception("NoSuchKey")     # nothing summarised yet -> not throttled
+        return {"Body": io.BytesIO(json.dumps(self._existing).encode("utf-8"))}
 
     def put_object(self, **kw):
         self.puts.append(kw)
@@ -119,18 +133,20 @@ def _wire_session(monkeypatch, turns):
     monkeypatch.setattr(ex, "assemble_deduped_turns", lambda b, keys: (turns, ["x"]))
 
 
+def _summary_llm(prompt, **kw):
+    return ('{"summary":"pouring the slab","open_todos":'
+            '[{"text":"order steel","responsible":"Neil"}]}', None)
+
+
 def test_handler_writes_rolling_summary_to_the_session_key(monkeypatch):
     _wire_session(monkeypatch, [turn("spk_0", "pour the slab", "13:00:12")])
-    s3c = _CapturingS3()
-    llm = lambda p, **k: ('{"summary":"pouring the slab","open_todos":'
-                          '[{"text":"order steel","responsible":"Neil"}]}', None)
-    out = rs.process_transcript_key(TRANSCRIPT_KEY, s3_client=s3c, call_llm=llm,
-                                    now_iso="2026-07-25T13:02:00Z")
-    assert out == "session_rolling/Ada_L/2026-07-25/sidABC/latest.json"
+    s3c = _FakeS3()                          # no prior summary -> not throttled -> writes
+    out = rs.process_transcript_key(TRANSCRIPT_KEY, s3_client=s3c, call_llm=_summary_llm, now=NOW)
+    assert out == ROLLING_OUT_KEY
     assert len(s3c.puts) == 1
     put = s3c.puts[0]
     assert put["Bucket"] == "test-bucket"
-    assert put["Key"] == "session_rolling/Ada_L/2026-07-25/sidABC/latest.json"
+    assert put["Key"] == ROLLING_OUT_KEY
     body = json.loads(put["Body"])
     assert body["summary"] == "pouring the slab"
     assert body["open_todos"] == [{"text": "order steel", "responsible": "Neil"}]
@@ -141,7 +157,7 @@ def test_handler_writes_rolling_summary_to_the_session_key(monkeypatch):
 
 def test_handler_skips_non_transcript_keys(monkeypatch):
     monkeypatch.setattr(ex, "session_base_from_key", lambda k: None)
-    s3c = _CapturingS3()
+    s3c = _FakeS3()
     out = rs.process_transcript_key("extractions/Ada_L/2026-07-25/sidABC.json",
                                     s3_client=s3c, call_llm=lambda *a, **k: ("", None))
     assert out is None and s3c.puts == []
@@ -149,10 +165,32 @@ def test_handler_skips_non_transcript_keys(monkeypatch):
 
 def test_handler_writes_nothing_for_an_empty_session(monkeypatch):
     _wire_session(monkeypatch, [])           # no turns -> summarize returns None -> no write
-    s3c = _CapturingS3()
+    s3c = _FakeS3()
     out = rs.process_transcript_key(TRANSCRIPT_KEY, s3_client=s3c,
-                                    call_llm=lambda *a, **k: ("", None))
+                                    call_llm=lambda *a, **k: ("", None), now=NOW)
     assert out is None and s3c.puts == []
+
+
+def test_handler_throttles_when_summarised_recently(monkeypatch):
+    # latest.json was written 30s ago (< 75s): a chunk landing now must NOT
+    # re-summarise (cost + the user's 1-2 min cadence; chunks arrive ~30s apart).
+    # The LLM raises if called, proving the throttle short-circuits before it.
+    _wire_session(monkeypatch, [turn("spk_0", "pour the slab")])
+    s3c = _FakeS3(existing={"updated_at": (NOW - timedelta(seconds=30)).isoformat() + "Z"})
+
+    def _boom(*a, **k):
+        raise AssertionError("LLM must not be called when throttled")
+
+    out = rs.process_transcript_key(TRANSCRIPT_KEY, s3_client=s3c, call_llm=_boom, now=NOW)
+    assert out is None and s3c.puts == []
+
+
+def test_handler_resummarises_when_last_summary_is_stale(monkeypatch):
+    # latest.json is 5 min old (>= 75s): a new chunk re-summarises.
+    _wire_session(monkeypatch, [turn("spk_0", "pour the slab", "13:00:12")])
+    s3c = _FakeS3(existing={"updated_at": (NOW - timedelta(seconds=300)).isoformat() + "Z"})
+    out = rs.process_transcript_key(TRANSCRIPT_KEY, s3_client=s3c, call_llm=_summary_llm, now=NOW)
+    assert out == ROLLING_OUT_KEY and len(s3c.puts) == 1
 
 
 def test_lambda_handler_unquotes_keys_and_collects_writes(monkeypatch):
