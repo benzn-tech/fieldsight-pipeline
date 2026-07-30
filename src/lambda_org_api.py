@@ -878,6 +878,10 @@ def create_qr_login_code(conn, caller, event):
     sub = claims.get("sub", "")
     if not sub:
         return error("unauthenticated", 401)
+    body = parse_body(event) or {}
+    refresh_token = body.get("refreshToken")
+    if not refresh_token:
+        return error("missing refreshToken", 400)
     if not _qr_rate_ok(sub):
         return error("too many requests — try again in a minute", 429)
     code = secrets.token_urlsafe(32)  # ~256-bit
@@ -887,6 +891,7 @@ def create_qr_login_code(conn, caller, event):
         _qr_table().put_item(Item={
             "code": code,
             "sub": sub,
+            "refreshToken": refresh_token,
             "consumed": False,
             "createdAt": now,
             "expiresAt": expires,

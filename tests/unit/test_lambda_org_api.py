@@ -5913,13 +5913,29 @@ class FakeQrTable:
 def test_qr_create_returns_code(wired, monkeypatch):
     table = FakeQrTable()
     monkeypatch.setattr(org, "_qr_table", lambda: table)
-    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/create", sub="sub-1"), None)
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/auth/qr/create", sub="sub-1",
+                   body={"refreshToken": "RT-abc"}), None)
     assert res["statusCode"] == 201
     body = body_of(res)
     assert body["ttlSeconds"] == 90
     assert len(body["code"]) >= 32
     # the stored record binds the code to the caller's sub, unconsumed
     stored = table.items[body["code"]]
+    assert stored["sub"] == "sub-1"
+    assert stored["consumed"] is False
+    assert stored["expiresAt"] > stored["createdAt"]
+
+
+def test_qr_create_stores_refresh_token(wired, monkeypatch):
+    table = FakeQrTable()
+    monkeypatch.setattr(org, "_qr_table", lambda: table)
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/auth/qr/create", sub="sub-1",
+                   body={"refreshToken": "RT-abc"}), None)
+    assert res["statusCode"] == 201
+    stored = table.items[body_of(res)["code"]]
+    assert stored["refreshToken"] == "RT-abc"
     assert stored["sub"] == "sub-1"
     assert stored["consumed"] is False
     assert stored["expiresAt"] > stored["createdAt"]
@@ -5937,7 +5953,9 @@ def test_qr_create_rate_limited(wired, monkeypatch):
     monkeypatch.setattr(org, "_qr_table", lambda: table)
     codes = 0
     for _ in range(7):
-        res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/create", sub="sub-1"), None)
+        res = org.lambda_handler(
+            make_event("POST", "/api/org/auth/qr/create", sub="sub-1",
+                       body={"refreshToken": "RT-abc"}), None)
         if res["statusCode"] == 201:
             codes += 1
     # ≤5 per minute succeed; the rest are 429
