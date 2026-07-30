@@ -6006,3 +6006,48 @@ def test_qr_redeem_unknown_code_generic(monkeypatch):
     monkeypatch.setattr(org, "_qr_table", lambda: FakeQrTable())
     res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": "nope"}), None)
     assert res["statusCode"] == 401
+
+
+class RaceLoserQrTable:
+    """DynamoDB Table double for the lost-race path: get_item returns a stale
+    consumed=False item (passes the pre-check) but update_item's
+    ConditionExpression fails because another redeemer already flipped
+    `consumed` in between — simulating two concurrent redeemers racing on the
+    same one-time code. Mirrors test_lambda_qr_auth.py's RaceLoserTable
+    (that file is being deleted in Task 4, so this is defined inline here)."""
+    def __init__(self, item):
+        self.item = dict(item)
+
+    def get_item(self, Key):
+        if self.item.get("code") == Key["code"]:
+            return {"Item": dict(self.item)}
+        return {}
+
+    def update_item(self, Key, UpdateExpression, ExpressionAttributeValues,
+                     ReturnValues=None, ConditionExpression=None):
+        # Unconditional raise: emulates both the (fail-open) rate-limit
+        # counter update and the final single-use consume losing the race —
+        # either way the caller must end up with a generic 401.
+        raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+
+
+def test_qr_redeem_loses_atomic_race_returns_401(monkeypatch):
+    # get_item's pre-check sees a stale consumed=False (another redeemer flips
+    # it between our read and our conditional write) — exercises the
+    # ConditionExpression-failure branch itself, not the pre-check short-circuit.
+    now = int(__import__("time").time())
+    table = RaceLoserQrTable({"code": "good", "refreshToken": "RT-1", "sub": "s",
+                              "consumed": False, "createdAt": now, "expiresAt": now + 90})
+    monkeypatch.setattr(org, "_qr_table", lambda: table)
+    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": "good"}), None)
+    assert res["statusCode"] == 401
+    assert "refreshToken" not in body_of(res)
+
+
+def test_qr_redeem_non_string_code_returns_401_not_crash(monkeypatch):
+    # {"code": 123} used to raise AttributeError on int.strip() — must
+    # collapse to the same generic 401, not an uncaught crash.
+    monkeypatch.setattr(org, "_qr_table", lambda: FakeQrTable())
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": 123}), None)
+    assert res["statusCode"] == 401
