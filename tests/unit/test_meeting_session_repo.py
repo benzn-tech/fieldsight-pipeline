@@ -19,6 +19,9 @@ class FakeCursor:
     def fetchone(self):
         return self._rows[0] if self._rows else None
 
+    def fetchall(self):
+        return list(self._rows)
+
 
 class FakeConn:
     def __init__(self, results=None):
@@ -105,3 +108,23 @@ def test_mark_sent_and_get():
     assert "status = 'sent'" in conn.calls[0]["sql"]
     ms.get(conn, SID)
     assert conn.calls[1]["sql"].startswith("SELECT")
+
+
+def test_list_idle_open_selects_open_sessions_past_the_idle_window():
+    conn = FakeConn(results=[[
+        {"session_id": SID, "version": 2, "last_activity": "2026-07-28T14:05:00"},
+    ]])
+    out = ms.list_idle_open(conn, 900)
+    assert out == [{"session_id": SID, "version": 2, "last_activity": "2026-07-28T14:05:00"}]
+    sql = conn.calls[0]["sql"]
+    assert "status = 'open'" in sql
+    # keys on last activity (last_segment_at, else opened_at) -> a still-active
+    # long meeting (chunks arriving) is never mistaken for idle
+    assert "COALESCE(last_segment_at, opened_at)" in sql
+    assert "make_interval(secs => %s)" in sql
+    assert conn.calls[0]["params"] == (900,)
+
+
+def test_list_idle_open_empty_when_none_idle():
+    conn = FakeConn(results=[[]])
+    assert ms.list_idle_open(conn, 900) == []

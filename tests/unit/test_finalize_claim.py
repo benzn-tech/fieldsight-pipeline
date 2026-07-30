@@ -79,6 +79,59 @@ def test_sweep_is_a_noop_when_nothing_is_due(monkeypatch):
     assert fc.sweep("CONN") == []
 
 
+# ---- inferred idle close (§8.4: no /close -> close after SESSION_GAP_MINUTES) ----
+
+def test_sweep_does_not_infer_idle_closes_by_default(monkeypatch):
+    # gate OFF (default) -> list_idle_open must never be consulted (would prematurely
+    # close active /open sessions until SessionActivityFunction keeps them touched).
+    called = []
+    monkeypatch.setattr(fc.meeting_session, "list_idle_open",
+                        lambda conn, s: called.append(s) or [])
+    monkeypatch.setattr(fc.meeting_session, "list_due_finalize", lambda conn, g: [])
+    fc.sweep("CONN")
+    assert called == []
+
+
+def test_sweep_infers_idle_closes_when_enabled(monkeypatch):
+    idle = [{"session_id": "s1", "version": 2, "last_activity": "2026-07-28T14:05:00"}]
+    monkeypatch.setattr(fc.meeting_session, "list_idle_open", lambda conn, s: idle)
+    closed = []
+    monkeypatch.setattr(fc.meeting_session, "mark_pending_close",
+                        lambda conn, sid, at, intent: closed.append((sid, at, intent)) or {"ok": 1})
+    # after the inferred close, the due-check picks it up -> finalized this same tick
+    monkeypatch.setattr(fc.meeting_session, "list_due_finalize",
+                        lambda conn, g: [{"session_id": "s1", "version": 3}])
+    monkeypatch.setattr(fc, "finalize_claim",
+                        lambda conn, sid, ver, **kw: {"status": "enqueued", "sessionId": sid})
+    out = fc.sweep("CONN", infer_idle=True)
+    assert closed == [("s1", "2026-07-28T14:05:00", "idle")]   # anchored at last activity, intent idle
+    assert len(out) == 1 and out[0]["status"] == "enqueued"
+
+
+def test_infer_idle_closes_counts_only_the_ones_it_moved(monkeypatch):
+    idle = [{"session_id": "s1", "version": 2, "last_activity": "t1"},
+            {"session_id": "s2", "version": 4, "last_activity": "t2"}]
+    monkeypatch.setattr(fc.meeting_session, "list_idle_open", lambda conn, s: idle)
+    # s2 already moved on (a resume raced the sweep) -> mark_pending_close returns None
+    monkeypatch.setattr(fc.meeting_session, "mark_pending_close",
+                        lambda conn, sid, at, intent: {"ok": 1} if sid == "s1" else None)
+    assert fc.infer_idle_closes("CONN", 900) == 1
+
+
+def test_resolve_context_date_prefers_opened_at(monkeypatch):
+    import datetime as _dt
+    monkeypatch.setattr(fc.users, "get_by_id",
+                        lambda conn, uid: {"email": "b@x.com", "folder_name": "Ada_L"})
+    monkeypatch.setattr(fc.sites, "get_site", lambda conn, sid: {"name": "UC PK"})
+    # closed_at is a day LATER than opened_at (inferred idle-close, server time) —
+    # the date must follow opened_at (the S3 key day), not closed_at.
+    row = {"user_id": "u1", "site_id": "site-1",
+           "opened_at": _dt.datetime(2026, 7, 28, 23, 50),
+           "closed_at": _dt.datetime(2026, 7, 29, 0, 10)}
+    ctx = fc._resolve_context("CONN", row)
+    assert ctx["date"] == "2026-07-28"
+
+
 # ---- reconcile (finalizing -> sent/failed once the worker records an outcome) ----
 
 def test_reconcile_marks_sent_and_failed_by_the_worker_result(monkeypatch):
