@@ -62,13 +62,14 @@ from keyframe_selection import keyframe_seconds
 from photo_binding import PHOTOS_PER_TOPIC_CAP  # noqa: F401  (re-export)
 from photo_binding import list_pictures as _pb_list_pictures
 from photo_binding import photos_for_topics as _photos_for_topics
-from repositories import companies, findings, recordings, topics
+from repositories import companies, findings, meeting_session, recordings, sites, topics
 # The extraction-key shape lives in session_scope now (the read side needs the
 # SAME parse to derive session_id from topics.source_s3_key -- see that
 # module). Re-exported under the historical private names so existing callers
 # and tests keep working; same extraction pattern photo_binding/
 # keyframe_selection already followed.
 from session_scope import EXTRACTION_KEY_RE  # noqa: F401  (re-export)
+from session_scope import device_session_id as _device_session_id
 from session_scope import parse_extraction_key as _parse_extraction_key
 
 logger = logging.getLogger()
@@ -92,6 +93,29 @@ def s3():
     if _s3_client is None:
         _s3_client = boto3.client("s3")
     return _s3_client
+
+
+def _site_from_meeting_session(conn, company_id, session_base):
+    """The site the recorder picked when OPENING a chunk session
+    (meeting_session.site_id, set by POST /sessions/{id}/open), as a
+    sites.get_site()-shaped row -- else None. This is how a chunk session
+    attributes to a site: it uploads its ~1-min chunks straight to the raw-media
+    prefix (no `recordings` row, so recordings.site_for_media misses), and its
+    only explicit site tag lives on meeting_session. Returns None for a legacy
+    whole-file base (no device session). Company-scoped: session_open already
+    rejected a cross-tenant site, and we re-check the resolved site's company here
+    so a stale/rogue row can never attribute across tenants (multi-tenant
+    invariant, mirrors recordings.site_for_media)."""
+    device_sid = _device_session_id(session_base)
+    if not device_sid:
+        return None
+    row = meeting_session.get(conn, device_sid)
+    if not row or not row.get("site_id"):
+        return None
+    site = sites.get_site(conn, row["site_id"])
+    if site is None or site["company_id"] != company_id:
+        return None
+    return site
 
 
 # ----------------------------------------------------------
@@ -161,13 +185,21 @@ def write_extraction_items(date, user_folder, extraction_key):
                 f"org company {COMPANY_NAME!r} not found — run the org seed "
                 "(fieldsight-*-org-seed) before ingesting")
 
-        # G5b: the app stamps the in-app project pick onto recordings.site_id.
-        # That explicit tag is authoritative over the recorder's membership
-        # (and is the ONLY way an admin-account recording -- resolve_site returns
-        # None for ALL scope -- attributes to a site). Fall through to the legacy
-        # membership resolver only when there is no matching, company-valid tag.
+        # Site attribution, in priority order:
+        #   1. recordings.site_for_media -- G5b: the app stamps the in-app project
+        #      pick onto recordings.site_id for a WHOLE-FILE upload. Authoritative
+        #      over membership, and the only way an admin recording (resolve_site
+        #      returns None for ALL scope) attributes.
+        #   2. meeting_session.site_id -- a CHUNK session uploads its ~1-min chunks
+        #      straight to the raw-media prefix (no recordings row -> #1 misses), so
+        #      its explicit site pick lives on meeting_session via POST /sessions/
+        #      {id}/open. Without this, every chunk-session recording identity-bridge
+        #      missed and never reached the web timeline.
+        #   3. resolve_site -- legacy recorder-membership resolver.
+        # Both explicit tags are company-scoped; fall through only on no match.
         session_base = _parse_extraction_key(extraction_key)[2]
         site = recordings.site_for_media(conn, company["id"], user_folder, date, session_base) \
+            or _site_from_meeting_session(conn, company["id"], session_base) \
             or lambda_ingest.resolve_site(conn, company["id"], {}, user_folder)
         if site is None:
             reason = (f"identity bridge miss: user_folder={user_folder!r} -- "
