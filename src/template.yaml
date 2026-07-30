@@ -50,6 +50,15 @@ Parameters:
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: Disable in test to avoid polling RealPTT / generating reports on cron.
+  EnableFinalize:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Gate for the Tier-0 finalize grace sweep (FinalizeSweepFunction's rate(1 min)
+      schedule). Default false so the feature deploys INERT (the sweep is created but
+      DISABLED); flip per environment to activate. Separate from EnableSchedules so
+      it doesn't also switch on the nightly report crons.
   EnableKeyframes:
     Type: String
     Default: 'false'
@@ -148,6 +157,22 @@ Parameters:
     Description: Anthropic Claude API key (sk-ant-xxx) for report generation
     NoEcho: true
     Default: ''
+
+  EmailSender:
+    Type: String
+    Description: >-
+      Outbound channel for the Tier-0 confirmation email (email_sender.py). 'stub'
+      logs and sends nothing; 'ses' sends via SES (SENDER_EMAIL must be a verified
+      identity, and in the SES sandbox each recipient must be verified too).
+    AllowedValues: ['ses', 'stub']
+    Default: ses
+
+  SenderEmail:
+    Type: String
+    Description: >-
+      SES-verified From identity for the confirmation email. A mailbox you own needs
+      no DNS; a domain identity (DKIM) is a later swap of just this value.
+    Default: sales@fieldsightai.com
 
   DashScopeApiKey:
     Type: String
@@ -395,6 +420,7 @@ Mappings:
 
 Conditions:
   ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
+  ShouldEnableFinalize: !Equals [!Ref EnableFinalize, 'true']
   ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
   ShouldManageBucketPolicy: !And [!Condition ShouldEnableTranscribe, !Equals [!Ref ManageDataBucketPolicy, 'true']]
   ShouldCreateAlerts: !Not [!Equals [!Ref AlertEmail, '']]
@@ -1151,6 +1177,7 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_report_results/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_reports/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_rolling/*
       Events:
         OrgProxy:
           Type: Api
@@ -1248,6 +1275,157 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - transcripts/*
+
+  # ----------------------------------------------------------
+  # Rolling Tier-1 summary (voice-timeliness Point 1). Non-VPC (calls the LLM) —
+  # mirrors ExtractSessionFunction's env/model/creds. On each transcript chunk it
+  # rebuilds the session-so-far (extract_session's shared assemble) and overwrites
+  # session_rolling/{folder}/{date}/{session}/latest.json, the app's mid-meeting
+  # short-term memory; throttled to ~1-2 min per session in code.
+  # Triggered via EventBridge, NOT an S3->Lambda notification: ExtractSessionFunction
+  # already owns the transcripts/ ObjectCreated notification and S3 forbids a second
+  # overlapping one. Bucket-level EventBridge is enabled by scripts/wire-s3-events.sh
+  # (independent channel — the existing extract/item-writer notifications are
+  # untouched).
+  # ----------------------------------------------------------
+  RollingSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ["${P}-rolling-summary", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_rolling_summary.lambda_handler
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName
+          CONFIG_KEY: config/user_mapping.json
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          CLAUDE_MODEL: claude-sonnet-4-6
+          LLM_PROVIDER: !Ref LlmProvider
+          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelPlus
+          QWEN_ENABLE_THINKING: 'true'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_rolling/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_rolling/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - transcripts/*
+      Events:
+        TranscriptChunkLanded:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - Object Created
+              detail:
+                bucket:
+                  name:
+                    - !Ref IngestBucketName
+                object:
+                  key:
+                    - prefix: transcripts/
+
+  # ----------------------------------------------------------
+  # Tier-0 finalize — grace SWEEP (in-VPC) + send WORKER (non-VPC).
+  # session_close records pending_close + version + close_intent (in-VPC, Aurora)
+  # but can't reach the EventBridge Scheduler API to arm a one-shot (BUG-36), so a
+  # scheduled sweep claims due sessions instead. The sweep (in-VPC: Aurora + S3)
+  # CAS-claims each due session (a resume bumped version -> no-op) and enqueues
+  # session_finalize_requests/; the send worker (non-VPC: SES) builds + sends the
+  # confirmation email. Same in-VPC-enqueue -> non-VPC-worker shape as session-report.
+  # ----------------------------------------------------------
+  FinalizeSweepFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-finalize-sweep", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_finalize_claim.lambda_handler
+      Timeout: 120
+      MemorySize: 256
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          S3_BUCKET: !Ref IngestBucketName
+          STOP_GRACE_SECONDS: '30'
+      Policies:
+        - VPCAccessPolicy: {}
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_rolling/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
+      Events:
+        GraceSweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Description: Tier-0 finalize grace sweep — claims due pending_close sessions.
+            State: !If [ShouldEnableFinalize, ENABLED, DISABLED]
+
+  SessionFinalizeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ["${P}-session-finalize", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_session_finalize.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName
+          EMAIL_SENDER: !Ref EmailSender
+          SENDER_EMAIL: !Ref SenderEmail
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+      # NO Events: S3 wired manually per BUG-33 — scripts/wire-s3-events.sh (triggers
+      # on session_finalize_requests/*.json). Its own output is the SES email — it
+      # touches no S3 prefix, so there's no trigger loop.
 
   # ----------------------------------------------------------
   # Lambda 12: Ingest (Phase 4a) — reads reports/ + transcripts/,

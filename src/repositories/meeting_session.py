@@ -85,6 +85,30 @@ def claim_finalize(conn, session_id, expected_version) -> dict | None:
     ).fetchone()
 
 
+def list_due_finalize(conn, idle_grace_seconds) -> list[dict]:
+    """Sessions whose grace has elapsed and are ready to finalize: still
+    `pending_close`, and either a deliberate End (grace 0 — due the moment it
+    closed) or an idle stop whose `closed_at` is now older than the grace window.
+    Returns [{session_id, version}] — the (id, version) the scheduled sweeper
+    CAS-claims against (claim_finalize no-ops if a resume bumped version in between,
+    so reading the current version here is safe)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT session_id, version FROM meeting_session "
+        "WHERE status = 'pending_close' "
+        "AND (close_intent = 'end' OR closed_at <= now() - make_interval(secs => %s))",
+        (idle_grace_seconds,),
+    ).fetchall()
+
+
+def list_finalizing(conn) -> list[dict]:
+    """Sessions the sweep has claimed (status='finalizing'). The reconcile pass moves
+    each to sent/failed once the non-VPC send worker records its outcome (that worker
+    can't touch Aurora itself — CLAUDE.md BUG-36)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT session_id, version FROM meeting_session WHERE status = 'finalizing'",
+    ).fetchall()
+
+
 def mark_sent(conn, session_id) -> dict | None:
     """Confirmation email delivered — close the session out."""
     return conn.cursor(row_factory=dict_row).execute(

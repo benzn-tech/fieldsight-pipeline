@@ -97,6 +97,8 @@ jobs:
               "DataBucketName=fieldsight-data-test-509194952652" \
               "IngestBucketName=fieldsight-data-test-509194952652" \
               "EnableSchedules=false" \
+              "EnableFinalize=${{ vars.TEST_ENABLE_FINALIZE || 'true' }}" \
+              "EmailSender=${{ vars.TEST_EMAIL_SENDER || 'stub' }}" \
               "EnableSiteVoice=true" \
               "DocxLayerArn=arn:aws:lambda:ap-southeast-2:509194952652:layer:python-docx-layer:2" \
               "EnableKeyframes=${{ vars.TEST_ENABLE_KEYFRAMES || 'false' }}" \
