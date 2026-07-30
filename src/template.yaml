@@ -1306,7 +1306,9 @@ Resources:
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
-          QWEN_ENABLE_THINKING: 'true'
+          # Thinking OFF — the mid-meeting summary should be fast; summarisation
+          # needs no extended reasoning (same reason as the finalize worker).
+          QWEN_ENABLE_THINKING: 'false'
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -1409,8 +1411,10 @@ Resources:
           S3_BUCKET: !Ref IngestBucketName
           EMAIL_SENDER: !Ref EmailSender
           SENDER_EMAIL: !Ref SenderEmail
-          # LLM env — the worker re-summarises the FULL transcript at finalize
-          # (a complete summary; the enqueued rolling one can be stale/partial).
+          # LLM env — the worker re-summarises the FULL transcript at finalize (a
+          # complete summary; the rolling one can be stale/partial). Thinking OFF:
+          # summarisation needs no extended reasoning and thinking dominated latency
+          # (qwen3.7-max + thinking took ~54 s, blowing the <=2-min finalize budget).
           CONFIG_KEY: config/user_mapping.json
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
@@ -1418,7 +1422,7 @@ Resources:
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
-          QWEN_ENABLE_THINKING: 'true'
+          QWEN_ENABLE_THINKING: 'false'
       Policies:
         - Version: '2012-10-17'
           Statement:
