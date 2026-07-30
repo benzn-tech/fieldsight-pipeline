@@ -11,6 +11,7 @@ import os
 import time
 
 import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -81,6 +82,17 @@ def _verify_and_consume(sub, code):
             ConditionExpression="consumed = :f",
             ExpressionAttributeValues={":t": True, ":f": False},
         )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            # Expected: another verifier already consumed this code between our
+            # stale read and this write (lost the race) — not an infra problem.
+            logger.debug("qr verify lost race on consume")
+        else:
+            # Genuine infra failure (throttling, IAM, network, ...) — needs a
+            # signal in CloudWatch distinct from an expected lost race.
+            logger.exception("qr verify update_item failed")
+        return False  # any failure to atomically consume => not correct
     except Exception:
-        return False  # lost the race / conditional failed → invalid
+        logger.exception("qr verify update_item failed")
+        return False
     return True
