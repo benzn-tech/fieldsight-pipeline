@@ -358,8 +358,12 @@ Parameters:
     Description: >-
       When true, ingest/item-writer resolve the owning company per user folder
       via the identity directory (users.folder_name, globally unique). When
-      false, all pipeline writes are pinned to COMPANY_NAME's company — the
-      TEST stack keeps false so develop-code runs can never write customer rows.
+      false, all pipeline writes are pinned to COMPANY_NAME's company.
+      Prod is true; TEST is now true too (set in deploy.yml). The original pin
+      protected PROD rows when TEST shared prod's DB, but since the fieldsight_test
+      DB-isolation cutover (PR #114) TEST writes reach only the test DB — which
+      holds multi-company seed data (e.g. Southbase / UC PK), so a per-folder
+      resolve is required for a recorder's session to attribute to its real site.
 
   AuthorityFlip:
     Type: String
