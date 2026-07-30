@@ -43,16 +43,19 @@ def test_enqueues_full_artifact_when_claimed(monkeypatch):
     assert art["openTodos"] == [{"text": "fix rebar", "responsible": "Neil"}]
 
 
-def test_marks_failed_and_skips_when_no_recipient(monkeypatch):
+def test_marks_failed_and_skips_when_no_recipient(monkeypatch, caplog):
     monkeypatch.setattr(fc.meeting_session, "claim_finalize",
                         lambda c, s, v: {"session_id": s, "user_id": "u1"})
     failed = []
     monkeypatch.setattr(fc.meeting_session, "mark_failed", lambda c, s: failed.append(s))
     enq = []
-    out = fc.finalize_claim("CONN", "abc", 5,
-                            resolve_context=lambda c, r: {"recipient": None},
-                            read_rolling=lambda *a: {"summary": "S"}, enqueue=enq.append)
+    with caplog.at_level("WARNING"):
+        out = fc.finalize_claim("CONN", "abc", 5,
+                                resolve_context=lambda c, r: {"recipient": None, "folder": "MPI2"},
+                                read_rolling=lambda *a: {"summary": "S"}, enqueue=enq.append)
     assert out["status"] == "no_recipient" and enq == [] and failed == ["abc"]
+    # named so prod ops can see WHICH recorder had no email (not a silent count)
+    assert "abc" in caplog.text and "MPI2" in caplog.text
 
 
 def test_real_resolvers_exist_for_the_handler_to_wire():
