@@ -32,3 +32,12 @@ def test_search_sql_has_date_filter():
     # unchanged essentials still present
     assert "site_id = ANY(%(site_ids)s)" in sql
     assert "LIMIT %(k)s" in sql
+
+
+def test_search_sql_has_author_filter_with_null_guard():
+    sql = build_search_sql()
+    # None => no filter (Ask/ALL/SITE); a list => restrict by user_id.
+    assert "%(author_ids)s" in sql
+    assert "c.user_id = ANY(%(author_ids)s" in sql
+    # IS NULL guard so passing author_ids=None is a no-op (byte-identical scope)
+    assert "%(author_ids)s::uuid[] IS NULL" in sql
