@@ -3411,14 +3411,15 @@ def _hhmm(dt):
 def _chunk_session_start(conn, session_base):
     """Start time for a CHUNK session whose base is the bare `sid{hex}` token —
     which carries no timestamp for session_scope.session_start to parse, so the
-    picker showed "?". Fall back to meeting_session.opened_at (the device's
-    record-press wall-clock, set by /open or the chunk stream). None if unknown
-    (legacy whole-file base, or no meeting_session row)."""
+    picker showed "?". Fall back to meeting_session.opened_at — stored UTC, so convert
+    to NZ (session_scope.to_nz) to match the legacy session_start() and the topic
+    times; otherwise the picker mixes a UTC start with an NZ end (e.g. "06:36 – 18:39"
+    for an 18:36–18:39 meeting). None if unknown (legacy base, or no row / opened_at)."""
     sid = session_scope.device_session_id(session_base)
     if not sid:
         return None
     row = meeting_session.get(conn, sid)
-    return (row or {}).get("opened_at")
+    return session_scope.to_nz((row or {}).get("opened_at"))
 
 
 def _session_title(srows, site_name):
