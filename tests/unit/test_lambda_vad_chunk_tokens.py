@@ -71,3 +71,26 @@ class TestAbsoluteStart:
 
     def test_absolute_start_none_on_bad_time(self):
         assert lv._absolute_start_iso({"date": "", "time": ""}, 5.0) is None
+
+
+class TestPlanEmission:
+    """Per-chunk vs per-segment emission decision (whole-chunk transcription mode)."""
+
+    def test_segment_mode_returns_merged_unchanged(self):
+        segs = [(1.0, 5.0), (12.0, 18.0)]
+        assert lv.plan_emission(segs, 30.0, whole_chunk=False) == segs
+
+    def test_segment_mode_is_the_default(self):
+        segs = [(1.0, 5.0)]
+        assert lv.plan_emission(segs, 30.0) == segs
+
+    def test_whole_chunk_emits_one_full_unit_when_speech(self):
+        # any speech -> a single unit spanning the whole chunk (0 -> duration)
+        assert lv.plan_emission([(1.0, 5.0), (12.0, 18.0)], 29.7, whole_chunk=True) == [(0.0, 29.7)]
+
+    def test_whole_chunk_emits_nothing_when_no_speech(self):
+        # a fully-silent chunk -> [] (the no-speech fallback handles it separately)
+        assert lv.plan_emission([], 30.0, whole_chunk=True) == []
+
+    def test_segment_mode_empty_stays_empty(self):
+        assert lv.plan_emission([], 30.0, whole_chunk=False) == []

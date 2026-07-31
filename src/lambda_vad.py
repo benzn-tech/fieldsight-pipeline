@@ -81,6 +81,14 @@ SKIP_EXISTING = os.environ.get('SKIP_EXISTING', 'true').lower() == 'true'
 PASSTHROUGH_AUDIO = os.environ.get('PASSTHROUGH_AUDIO', 'false').lower() == 'true'
 WEB_VIDEO_PREFIX = os.environ.get('WEB_VIDEO_PREFIX', 'web_video/')
 GENERATE_PREVIEW = os.environ.get('GENERATE_PREVIEW', 'true').lower() == 'true'
+# Per-chunk transcription mode (design: docs/superpowers/specs/2026-07-31-multi-chunk-
+# block-transcription-design.md §7). false (default, legacy) = one Transcribe job PER VAD
+# speech segment — which fragments a 30s chunk into up to ~4 tiny jobs (measured: broken
+# per-segment diarization, language-ID flips on 1-2s clips, and ~2x cost under Transcribe's
+# 15s-per-request minimum). true = when a chunk has ANY speech, emit the WHOLE chunk as ONE
+# unit: one coherent job (stable language-ID, per-chunk diarization), cheaper. VAD still
+# runs (silence gating + the no-speech fallback are unchanged).
+TRANSCRIBE_WHOLE_CHUNK = os.environ.get('TRANSCRIBE_WHOLE_CHUNK', 'false').lower() == 'true'
 
 # Supported input formats
 AUDIO_FORMATS = {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg'}
@@ -443,6 +451,22 @@ def merge_close_segments(segments, merge_gap=2.0, min_duration=1.0):
     ]
 
     return filtered
+
+
+def plan_emission(merged_segments, duration_sec, whole_chunk=False):
+    """The (start_sec, end_sec) units to hand to Transcribe for this chunk.
+
+    Legacy (whole_chunk=False): the per-VAD-segment list, unchanged — one job each.
+    Per-chunk (whole_chunk=True): ONE unit spanning the whole chunk when ANY speech was
+    detected (`merged_segments` non-empty), else [] (a fully-silent chunk — the no-speech
+    fallback in process_single_file already covers that separately). Emitting the whole
+    chunk keeps sentences/dates whole and language-ID stable, and costs one 15s-minimum
+    request instead of N.
+
+    Pure: the actual export loop and the no-speech fallback stay in process_single_file."""
+    if whole_chunk:
+        return [(0.0, round(duration_sec, 1))] if merged_segments else []
+    return list(merged_segments)
 
 
 # ============================================================
@@ -843,11 +867,14 @@ def process_single_file(bucket, key, source_info, tmp_dir):
             'metadata_key': meta_key,
         }
 
-    # Step 7: Export segments
+    # Step 7: Export the transcription units. Legacy = per-VAD-segment; per-chunk mode
+    # (TRANSCRIBE_WHOLE_CHUNK) collapses to ONE whole-chunk unit — same export loop, so
+    # the S3 keys/metadata/timestamp handling below are shared by both modes.
+    emit_plan = plan_emission(merged_segments, duration_sec, TRANSCRIBE_WHOLE_CHUNK)
     speech_total = 0
     segments_info = []
 
-    for i, (seg_start, seg_end) in enumerate(merged_segments):
+    for i, (seg_start, seg_end) in enumerate(emit_plan):
         start_sample = int(seg_start * sr)
         end_sample = min(int(seg_end * sr), len(audio_samples))
         segment_samples = audio_samples[start_sample:end_sample]
@@ -874,7 +901,7 @@ def process_single_file(bucket, key, source_info, tmp_dir):
 
         seg_size_kb = os.path.getsize(seg_local_path) / 1024
         logger.info(
-            f"  Segment {i+1}/{len(merged_segments)}: "
+            f"  Segment {i+1}/{len(emit_plan)}: "
             f"{seg_start:.1f}s–{seg_end:.1f}s ({seg_duration:.1f}s, {seg_size_kb:.0f}KB) "
             f"→ {seg_s3_key}"
         )
@@ -910,6 +937,7 @@ def process_single_file(bucket, key, source_info, tmp_dir):
         'speech_duration_sec': round(speech_total, 1),
         'speech_ratio': round(speech_ratio, 3),
         'vad_threshold': VAD_THRESHOLD,
+        'emit_mode': 'whole_chunk' if TRANSCRIBE_WHOLE_CHUNK else 'segments',
         'merge_gap': MERGE_GAP,
         'min_speech_duration': MIN_SPEECH_DURATION,
         'codec': codec_info,
