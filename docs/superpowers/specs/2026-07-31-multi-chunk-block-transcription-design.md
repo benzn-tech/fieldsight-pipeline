@@ -215,3 +215,36 @@ Block assembly is 100 % server-side. Offline resilience is preserved.
 4. Compare block-chained vs whole-session finalize diarization; decide if the whole-session
    pass is required or the chained transcript suffices.
 5. Promote to prod via develop→main with the usual approval gate.
+
+## 11. Integration findings (grounded in the live assembly, 2026-08-01)
+
+Read of `lambda_extract_session.assemble_deduped_turns` / `_dedup_turn_boundaries`
+(the assembly SHARED by the Tier-1 rolling summary and Tier-2 extraction):
+
+- The pipeline assembles at the **TURN** level, not the word level. `normalize_transcript`
+  turns each Transcribe segment into `speaker_turns` = `{abs_start, abs_end, abs_start_str,
+  speaker, text}`; `assemble_deduped_turns` flattens all segments' turns, sorts by
+  `abs_start`, then `_dedup_turn_boundaries` drops the chunk-overlap duplicate at seams.
+- **`speaker` is per-segment-LOCAL** (Transcribe's `spk_N`, scoped to one job) and is never
+  unified across segments — this IS the "one person, many speakers" defect, at turn level.
+- `_dedup_turn_boundaries` **already** detects the seam: adjacent turns whose time ranges
+  overlap (`cur.abs_start < prev.abs_end`) are the same audio. That is exactly the signal
+  for chaining: at such a seam the two turns' local speakers are the SAME person.
+
+Consequences for this design:
+- The word-level `chunk_stitch.chain_speakers/stitch_blocks/plan_blocks` (rollout step 1) fit
+  a *block-transcribed-as-words* model. The CURRENT pipeline is turn-based, so wiring needs a
+  **turn-level** primitive. Added `chunk_stitch.chain_turn_speakers(turns)` (union-find over
+  `(source, local_label)` nodes, unioning across time-overlap seams from different segments)
+  — the exact function `assemble_deduped_turns` will call to globalise speakers. Pure + tested.
+- Wiring requires `normalize_transcript` to stamp each turn with its **source segment** (so
+  the same local label in two segments is two nodes) and `assemble_deduped_turns` to call
+  `chain_turn_speakers` + rewrite `speaker` to the global id — a change to SHARED live code,
+  so gate it behind the same flag and keep the legacy path default.
+- **The 2 s device seam makes chaining SPARSE**: only the one speaker bridging each ~2 s seam
+  is linked; speakers who don't happen to talk across a seam are not. So per-chunk mode alone
+  gives a *partial* diarization win. **Robust global diarization still needs the ~2 min block
+  audio join (§3.1–3.2, ffmpeg)** — the biggest remaining lift, and the one that needs real
+  audio to validate. Recommendation: validate the per-chunk flag (cost + language-ID +
+  coherence — the measured wins) on `test` with a real ≥30 min recording FIRST, then decide
+  how far to invest in seam-chaining vs the block-audio join for diarization.

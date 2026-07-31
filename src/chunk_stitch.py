@@ -220,3 +220,58 @@ def chain_speakers(blocks, max_window=DEFAULT_BLOCK_WINDOW):
                 lab = _spk(w)
                 w["global_speaker"] = gid_of.get((bi, lab)) if lab is not None else None
     return blocks
+
+
+def chain_turn_speakers(turns, source_key="source", speaker_key="speaker"):
+    """Assign a STABLE GLOBAL speaker id across abs_start-sorted `turns` whose per-segment
+    LOCAL speaker labels (`spk_0/1/…`) are only meaningful within one transcription job —
+    the measured "one person judged as many speakers" defect, at the TURN granularity the
+    live assembly (lambda_extract_session.assemble_deduped_turns) actually produces.
+
+    Uses the SAME seam signature as _dedup_turn_boundaries: where a later turn starts before
+    the previous turn ends (abs-time overlap) AND the two come from DIFFERENT source
+    segments, that overlap is the same audio, so the two turns' local speakers are the SAME
+    person — union them. Every label transitively linked through seams shares one global id;
+    unlinked labels keep their own. This is SPARSE when segment overlap is small (a ~2s
+    device seam links only the one speaker bridging it) — robust global diarization needs a
+    larger block overlap (design §3.5); this primitive is correct at either scale.
+
+    `turns` must carry a per-segment `source` (unique per transcription job — e.g. the
+    segment filename) so the same local label in two segments is two nodes, not one.
+    Mutates each dict turn in place adding `global_speaker`, and returns `turns` (as a list).
+    Pure (union-find, no I/O)."""
+    turns = list(turns or [])
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]        # path halving
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    def node(t):
+        return (t.get(source_key), t.get(speaker_key))
+
+    for t in turns:
+        find(node(t))                            # register every node
+    for i in range(1, len(turns)):
+        prev, cur = turns[i - 1], turns[i]
+        pe, cs = prev.get("abs_end"), cur.get("abs_start")
+        if (pe is not None and cs is not None and cs < pe
+                and prev.get(source_key) != cur.get(source_key)):
+            union(node(prev), node(cur))         # same audio at the seam == same person
+
+    gid = {}                                     # root -> global id, first-appearance order
+    for t in turns:
+        r = find(node(t))
+        if r not in gid:
+            gid[r] = "speaker_%d" % len(gid)
+        if isinstance(t, dict):
+            t["global_speaker"] = gid[r]
+    return turns

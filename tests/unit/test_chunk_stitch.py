@@ -210,3 +210,53 @@ def test_chain_speakers_then_stitch_keeps_global_id_on_survivors():
     out = cs.stitch_blocks(chained)
     assert [w["text"] for w in out] == ["x", "y", "z"]
     assert len({w["global_speaker"] for w in out}) == 1     # one speaker throughout
+
+
+# ---- chain_turn_speakers (turn-level, matches the live assembly) ---------
+
+def T(abs_start, abs_end, speaker, source, text=""):
+    return {"abs_start": abs_start, "abs_end": abs_end, "speaker": speaker,
+            "source": source, "text": text}
+
+
+def test_chain_turn_speakers_links_speakers_across_a_seam():
+    # seg A's tail speaker (spk_1, [8-12]) is re-heard at seg B's head (spk_0, [11-13]) —
+    # overlapping time + different source => the SAME person. B's later spk_2 is someone else.
+    turns = [T(0, 8, "spk_0", "A"), T(8, 12, "spk_1", "A"),
+             T(11, 13, "spk_0", "B"), T(13, 20, "spk_2", "B")]
+    cs.chain_turn_speakers(turns)
+    assert turns[1]["global_speaker"] == turns[2]["global_speaker"]   # A spk_1 == B spk_0
+    assert turns[3]["global_speaker"] != turns[2]["global_speaker"]   # B spk_2 is distinct
+    assert turns[0]["global_speaker"] != turns[1]["global_speaker"]   # A spk_0 != A spk_1
+
+
+def test_chain_turn_speakers_transitive_across_three_segments():
+    turns = [T(0, 10, "spk_0", "A"), T(9, 15, "spk_1", "B"), T(14, 20, "spk_0", "C")]
+    cs.chain_turn_speakers(turns)
+    assert turns[0]["global_speaker"] == turns[1]["global_speaker"] == turns[2]["global_speaker"]
+
+
+def test_chain_turn_speakers_no_seam_keeps_labels_separate():
+    # sequential turns (no time overlap) cannot be linked — same local label, different people.
+    turns = [T(0, 10, "spk_0", "A"), T(10, 20, "spk_0", "B")]
+    cs.chain_turn_speakers(turns)
+    assert turns[0]["global_speaker"] != turns[1]["global_speaker"]
+
+
+def test_chain_turn_speakers_same_segment_label_is_one_global():
+    turns = [T(0, 5, "spk_0", "A"), T(5, 10, "spk_1", "A"), T(10, 15, "spk_0", "A")]
+    cs.chain_turn_speakers(turns)
+    assert turns[0]["global_speaker"] == turns[2]["global_speaker"]   # same (A, spk_0)
+    assert turns[1]["global_speaker"] != turns[0]["global_speaker"]   # different speaker
+
+
+def test_chain_turn_speakers_does_not_merge_across_same_source_overlap():
+    # an in-segment time overlap (same source) is NOT a cross-job seam -> never unions.
+    turns = [T(0, 12, "spk_0", "A"), T(10, 18, "spk_1", "A")]
+    cs.chain_turn_speakers(turns)
+    assert turns[0]["global_speaker"] != turns[1]["global_speaker"]
+
+
+def test_chain_turn_speakers_empty():
+    assert cs.chain_turn_speakers([]) == []
+    assert cs.chain_turn_speakers(None) == []
