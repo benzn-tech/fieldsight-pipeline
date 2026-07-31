@@ -58,6 +58,10 @@ def wired(monkeypatch):
     # "nothing redacted" so FakeConn (no real .cursor()) doesn't crash tests
     # that don't care about redactions. Tests exercising it override this.
     monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {})
+    # Task 9/WS4: create_org_site now auto-slugs (dedup lookup) whenever the
+    # body omits slug; default "no collision" so existing create-site tests
+    # (which don't stub this) don't hit FakeConn's missing .cursor().
+    monkeypatch.setattr(org.sites, "get_company_site_by_slug", lambda conn, cid, slug: None)
     return monkeypatch
 
 
@@ -241,7 +245,7 @@ def test_create_site_admin_ok(wired):
 
     def fake_create(conn, company_id, name, location=None, client=None,
                     industry=None, icon_s3_key=None, address=None,
-                    latitude=None, longitude=None):
+                    latitude=None, longitude=None, slug=None):
         created.update(company_id=company_id, name=name, location=location,
                        address=address)
         return {"id": "s-new", "company_id": company_id, "name": name}
@@ -259,7 +263,7 @@ def test_create_site_persists_coordinates(wired):
 
     def fake_create(conn, company_id, name, location=None, client=None,
                     industry=None, icon_s3_key=None, address=None,
-                    latitude=None, longitude=None):
+                    latitude=None, longitude=None, slug=None):
         created.update(latitude=latitude, longitude=longitude, address=address)
         return {"id": "s-geo", "company_id": company_id, "name": name,
                 "latitude": latitude, "longitude": longitude}
@@ -318,6 +322,74 @@ def test_create_site_worker_403(wired):
 def test_create_site_requires_name(wired):
     res = org.lambda_handler(make_event("POST", "/api/org/sites", body={}), None)
     assert res["statusCode"] == 400
+
+
+# ---- Task 9 / WS4: auto-slug on create_site ----
+
+def test_slugify_basic():
+    assert org._slugify("UC PK") == "uc-pk"
+    assert org._slugify("SB1108 Ellesmere College") == "sb1108-ellesmere-college"
+
+
+def test_slugify_collapses_punctuation_repeats_and_case():
+    assert org._slugify("  Site -- Name!!  ") == "site-name"
+    assert org._slugify("O'Brien's   Yard") == "o-brien-s-yard"
+
+
+def test_create_site_generates_slug_from_name(wired):
+    created = {}
+
+    def fake_create(conn, company_id, name, location=None, client=None,
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None, slug=None):
+        created.update(name=name, slug=slug)
+        return {"id": "s-new", "company_id": company_id, "name": name, "slug": slug}
+
+    wired.setattr(org.sites, "create_site", fake_create)
+    res = org.lambda_handler(make_event("POST", "/api/org/sites",
+                                        body={"name": "UC PK"}), None)
+    assert res["statusCode"] == 201
+    assert created["slug"] == "uc-pk"
+    assert body_of(res)["slug"] == "uc-pk"
+
+
+def test_create_site_slug_dedup(wired):
+    created = {}
+
+    def fake_create(conn, company_id, name, location=None, client=None,
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None, slug=None):
+        created.update(slug=slug)
+        return {"id": "s-new", "company_id": company_id, "name": name, "slug": slug}
+
+    wired.setattr(org.sites, "create_site", fake_create)
+    # "uc-pk" is already taken in this company -> handler must fall back to "uc-pk-2"
+    wired.setattr(org.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: {"id": "s-existing"} if slug == "uc-pk" else None)
+    res = org.lambda_handler(make_event("POST", "/api/org/sites",
+                                        body={"name": "UC PK"}), None)
+    assert res["statusCode"] == 201
+    assert created["slug"] == "uc-pk-2"
+
+
+def test_create_site_explicit_slug_is_respected_and_skips_dedup_lookup(wired):
+    created = {}
+
+    def fake_create(conn, company_id, name, location=None, client=None,
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None, slug=None):
+        created.update(slug=slug)
+        return {"id": "s-new", "company_id": company_id, "name": name, "slug": slug}
+
+    called = []
+    wired.setattr(org.sites, "create_site", fake_create)
+    wired.setattr(org.sites, "get_company_site_by_slug",
+                  lambda *a, **k: called.append(1) or None)
+    res = org.lambda_handler(make_event("POST", "/api/org/sites", body={
+        "name": "UC PK", "slug": "custom-slug"}), None)
+    assert res["statusCode"] == 201
+    assert created["slug"] == "custom-slug"
+    assert called == []  # explicit slug bypasses the dedup lookup entirely
 
 
 def test_list_members_joins_memberships(wired):
@@ -4183,7 +4255,7 @@ def test_create_site_platform_admin_targets_other_company(wired):
 
     def fake_create(conn, company_id, name, location=None, client=None,
                     industry=None, icon_s3_key=None, address=None,
-                    latitude=None, longitude=None):
+                    latitude=None, longitude=None, slug=None):
         created.update(company_id=company_id, name=name)
         return {"id": "s-new", "company_id": company_id, "name": name}
 
@@ -4212,7 +4284,7 @@ def test_create_site_admin_own_company_unaffected(wired):
 
     def fake_create(conn, company_id, name, location=None, client=None,
                     industry=None, icon_s3_key=None, address=None,
-                    latitude=None, longitude=None):
+                    latitude=None, longitude=None, slug=None):
         created.update(company_id=company_id, name=name)
         return {"id": "s-new", "company_id": company_id, "name": name}
 
@@ -4246,7 +4318,7 @@ def test_create_site_default_path_unchanged_regardless_of_graded_roles_flag(wire
 
     def fake_create(conn, company_id, name, location=None, client=None,
                     industry=None, icon_s3_key=None, address=None,
-                    latitude=None, longitude=None):
+                    latitude=None, longitude=None, slug=None):
         created.update(company_id=company_id, name=name, location=location,
                        address=address)
         return {"id": "s-new", "company_id": company_id, "name": name}

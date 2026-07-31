@@ -1089,6 +1089,25 @@ def _coerce_coord(value, lo, hi, label):
     return float(value), None
 
 
+def _slugify(name: str) -> str:
+    """Kebab-case a site name for the `slug` column: lowercase, collapse any
+    run of non-alphanumeric characters to a single '-', strip leading/
+    trailing '-'. Pure (no I/O). e.g. "UC PK" -> "uc-pk",
+    "SB1108 Ellesmere College" -> "sb1108-ellesmere-college"."""
+    return re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+
+
+def _unique_site_slug(conn, company_id, base_slug):
+    """Dedup base_slug against sites.slug within company_id — idx_sites_company_slug
+    is a real UNIQUE(company_id, slug) index — by appending -2, -3, … until free."""
+    slug = base_slug
+    n = 2
+    while sites.get_company_site_by_slug(conn, company_id, slug) is not None:
+        slug = f"{base_slug}-{n}"
+        n += 1
+    return slug
+
+
 def create_org_site(conn, caller, body):
     if caller["global_role"] not in ("admin", "gm", "platform_admin"):
         return error("admin, gm, or platform_admin role required", 403)
@@ -1122,11 +1141,21 @@ def create_org_site(conn, caller, body):
     lng, lng_err = _coerce_coord(body.get("longitude"), -180.0, 180.0, "longitude")
     if lng_err:
         return lng_err
+    slug_raw = body.get("slug")
+    if slug_raw is not None and not isinstance(slug_raw, str):
+        return error("slug must be a string", 400)
+    explicit_slug = (slug_raw or "").strip() or None
+    # BUG-39/WS4: org-api-created sites had NULL slug (deep-link ?site=<slug>
+    # selector-sync only, not ACL — WS4 UUID already makes search/ACL slug-free).
+    # Explicit slug in the body is respected as-is; otherwise auto-generate from
+    # name and dedup within the (target) company against the real unique index.
+    slug = explicit_slug or _unique_site_slug(conn, target_company_id, _slugify(name))
     row = sites.create_site(
         conn, target_company_id, name,
         location=body.get("location"), client=body.get("client"),
         industry=body.get("industry"), icon_s3_key=None,
         address=body.get("address"), latitude=lat, longitude=lng,
+        slug=slug,
     )
     if icon is not None:
         fname = icon.rsplit("/", 1)[-1]
