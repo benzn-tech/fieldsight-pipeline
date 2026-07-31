@@ -571,6 +571,16 @@ Parameters:
 (`PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'`,ARN 走
 Parameter 而非 ImportValue);或为所需服务加 VPC interface endpoint。运行时零外呼是首选。
 
+**2026-07-31 复发实例(QR redeem 504)**:v2 把 QR create/redeem 放进 **in-VPC 的 `lambda_org_api`**(v1 的
+触发器是非-VPC),而 VPC `vpc-0791974a474386d1c` **只有 S3 网关端点、没有 DynamoDB 端点、且无 NAT** →
+每次 DynamoDB 调用黑洞 → 29s 挂死 → API GW 504。单测 mock 掉 DynamoDB 所以测不出,只有真部署 + curl 才暴露。
+**已修(out-of-band,非 IaC)**:`aws ec2 create-vpc-endpoint --vpc-endpoint-type Gateway --service-name
+com.amazonaws.ap-southeast-2.dynamodb --vpc-id vpc-0791974a474386d1c --route-table-ids rtb-0f167c1fa3469bafd`
+→ `vpce-01233d5b756ffefcb`。org-api 的 3 个子网都用**主路由表** `rtb-0f167c1fa3469bafd`(S3 端点也在这张表),
+test/prod **共用这个 VPC**,故一个端点同时修好两边。**⚠️ 这个端点不在任何 CFN 模板里**——直接往
+DbStack 加同名资源会 `RouteAlreadyExists` 冲突,要纳管须走 `cloudformation import`(或先删端点再由 CFN 建,
+会有短暂中断)。**通则**:任何 in-VPC lambda 新调一个 AWS 服务前,先确认该服务有 VPC 端点。
+
 ### BUG-37: Lambda 里 `datetime.now()` 是 UTC —— 拿去和 NZ 日期比会偏一天
 Lambda 运行时时区是 UTC,`datetime.now()`(naive)= UTC。RealPTT 录音按 **NZ 客户端时间**记日期。
 orchestrator 用 `end_date = datetime.now()` 算查询窗口(`lambda_orchestrator.py`),NZ 上午
@@ -607,6 +617,26 @@ dev 可把 Amplify `FS_ORG_BASEURL` 指向 test 网关(`wdsgobb7b0…/prod/api`,
 自动跑 prod**(deploy-prod.yml 夜跑),所以试验性 migration 别进 main。回滚:去掉 deploy.yml 那行重部署→
 `!If` 回落 import→test 复用 `fieldsight`;再 `DROP DATABASE fieldsight_test`。详见
 `docs/superpowers/specs/2026-07-21-test-prod-db-isolation-design.md` + runbook `scripts/db-isolation-bootstrap.md`。
+
+### BUG-39: authority-flip 让新 chunk 的 topic_id 全 NULL → 中面板 Search 恒空(2026-07-17 起回归)
+**现象**:prod 客户站 Search 对任何词返回 0(即便向量命中);Ask agent 400/403。**非**鉴权/嵌入/索引问题。
+**Search 根因**:`report_chunks.topic_id` **从 2026-07-17 起新建的全为 NULL**(按 created_at 分组实证:07-16 前有、07-17/18/22/23/30 全 0)。`lambda_ask_agent._aggregate_topics` 明确"**只保留有 topic_id 的 chunk,丢弃无 topic 的转写窗口**"(注释 user pref 2026-07-10)→ 无主 chunk 被全丢 → count:0。
+**触发**:**AUTHORITY_FLIP**(#64/#67,`PROD_AUTHORITY_FLIP`)+ **G5b #71**。authority-flip 让"有 extraction topics 的日子夜间 ingest 不建报告 topic";但 RAG chunk 从**报告** topics 切(`chunking.py` 读 `report.topics`),`report_chunks.topic_id`(UUID) 靠 **ingest 把报告 topic 匹配到 Aurora topic** 得来——报告 topic 被 defer → 匹配不到 → topic_id 落 NULL。即**真实数据的 topic 搬到 extraction 侧,RAG 索引链仍绑报告侧 topic**。
+**检索本身没坏**(排除误判):库有 254×1024 维向量;自相似 dist 0.0;`text-embedding-v4` 嵌 "recording" 距 UC PK chunk 仅 0.357<0.55;**直调 `fieldsight-prod-rag-search` 用正确 sub → 返 8 条**(site_count:1)。
+**Ask 根因(另一回事)**:`/api/search`、`/api/ask` 经 `/api/{proxy+}` → 遗留报表 Lambda `fieldsight-prod-api`(dashboard 走 `/api/org/{proxy+}` → org-api 故正常)。report API `get_caller_identity` 用遗留 DynamoDB `fieldsight-users`(仅4行)→ org 账号 Ben_UCPK 不在 → 带 user 时 **403 "Access denied to this user"**、全局 Ask 不带 user 时 **400 "Missing user"**。改用 org 新账号(UC PK 队列)才暴露;老 platform_admin 账号不会 403。参见 BUG-25 类身份坑 + memory `fieldsight-legacy-gateway-identity-403`。
+**次要**:site-scoped 搜索前端发 `site`=站点 UUID,`lambda_rag_search.py:79` 当 **slug** 查 → 11 站里 7 个 slug=NULL(含 UC PK)→ 站点范围空短路 0。
+**修法**:①让 authority-flip 天的 chunk 关联 extraction/Aurora topic(或 ingest 用 extraction topic 回填 `report_chunks.topic_id`,并重建存量 07-17 起 NULL-topic chunk);②`/search`+`/ask` 改用 org-api 的 sub→Aurora 身份或迁到 org-api;③前端发 slug 或后端接受 UUID + 回填 slug。**排查**:prod/test 共用集群 `fieldsight-db-test-dbcluster-hywiixu8ihi9` Data API 已开,`aws rds-data execute-statement --database fieldsight` 直查;可直调 rag-search/ask-agent 复现。详见 memory `fieldsight-search-ask-regression`。
+### BUG-40: DynamoDB 保留字 `consumed` 让 QR redeem 每次静默 401(2026-07-31)
+**现象**:三端全上 prod 后,每次扫码都提示 "Invalid or expired QR code",web `create` 明明 201、码明明在表里
+未过期未消费。**根因**:redeem 的原子单次消费
+`update_item(UpdateExpression="SET consumed = :t", ConditionExpression="consumed = :f")` —— `consumed` 是
+**DynamoDB 保留字**,每次都抛 `ValidationException`,而那个 `except` **静默吞掉**(不打日志)→ 一律回退成通用 401。
+**误导点**:`get_item` 其实一直命中(靠临时 prod 调试日志 `QRDBG ... item=Y` 才看出来);create 的 `put_item`
+和限流器的 `hits/expiresAt` 都不碰保留字所以正常,让人误判成"读失败"。**单测没抓到**:测试桩
+`FakeQrTable` 不校验保留字。**修**:`ExpressionAttributeNames={"#c": "consumed"}` + 表达式用 `#c`(PR #180);
+同时给那个静默 except 加 `logger.exception`,并让测试桩模拟 DynamoDB 拒绝未别名化的保留字(防回归)。
+**通则**:①DynamoDB 表达式里任何普通英文词都先查保留字表,一律用 `#别名`;②**永远别写静默的
+`except: return 通用错误`** —— 服务端至少 `logger.exception`,否则这类 bug 无从下手。
 
 ### 定时器交接(2026-07-15 schedules cutover 上线)
 录音下载 + 报告生成的 cron 已从遗留手管的 `sitesync` EventBridge 组切到 **fieldsight-prod SAM 栈**

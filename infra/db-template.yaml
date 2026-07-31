@@ -144,6 +144,25 @@ Resources:
       VpcId: !Ref VpcId
       RouteTableIds: !Ref RouteTableIds
 
+  # DynamoDB gateway endpoint - the in-VPC org-api reads/writes the QR login
+  # code table; without this the calls black-hole (no NAT in this VPC) and
+  # redeem times out at 29s -> API GW 504 (BUG-36 class). Created out-of-band
+  # on 2026-07-31 to unblock prod, then imported into this stack.
+  # DeletionPolicy Retain matches the import and keeps the (free) endpoint if
+  # the stack is ever torn down. DO NOT REMOVE: deleting it silently breaks
+  # every in-VPC DynamoDB call (QR sign-in first).
+  DynamoDBGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DeletionPolicy: Retain
+    # Paired with DeletionPolicy so a replacement can't orphan-then-drop the
+    # endpoint either (cfn-lint W3011 requires both to actually protect it).
+    UpdateReplacePolicy: Retain
+    Properties:
+      VpcEndpointType: Gateway
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcId: !Ref VpcId
+      RouteTableIds: !Ref RouteTableIds
+
   # ----------------------------------------------------------
   # DB Subnet Group
   # ----------------------------------------------------------

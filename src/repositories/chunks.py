@@ -23,11 +23,12 @@ def insert_chunk(conn, site_id, report_date, chunk_type, chunk_text, embedding, 
 
 
 def search_chunks(conn, query_embedding, accessible_site_ids, k=5,
-                  date_from=None, date_to=None) -> list[dict]:
+                  date_from=None, date_to=None, author_ids=None) -> list[dict]:
     return conn.cursor(row_factory=dict_row).execute(
         build_search_sql(),
         {"q": query_embedding, "site_ids": list(accessible_site_ids), "k": k,
-         "date_from": date_from, "date_to": date_to},
+         "date_from": date_from, "date_to": date_to,
+         "author_ids": list(author_ids) if author_ids is not None else None},
     ).fetchall()
 
 

@@ -201,6 +201,22 @@ def has_topics_for_source_prefix(conn, source_prefix) -> bool:
     return row is not None
 
 
+def list_extraction_topics_for_day(conn, site_id, user_id, report_date) -> list[dict]:
+    """Day's extraction-sourced topics (id, title, occurred_at) for one
+    (site_id, user_id, report_date) -- the match candidates lambda_ingest's
+    authority-flip defer branch links report topics to by time overlap
+    (Task 7, WS1 root fix), so defer-day chunks carry a real extraction
+    topic UUID instead of topic_id=None. source_s3_key prefix here is the
+    fixed literal 'extractions/' (not caller input), so no _escape_like()
+    call is needed -- same posture as list_extraction_folder_names_for_date."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, title, occurred_at FROM topics "
+        "WHERE site_id=%s AND user_id=%s AND report_date=%s "
+        "AND source_s3_key LIKE 'extractions/%%' ORDER BY occurred_at",
+        (site_id, user_id, report_date),
+    ).fetchall()
+
+
 _TOPIC_COLS_JOINED = (
     "t.id, t.site_id, t.user_id, t.source_s3_key, t.report_date, t.occurred_at, "
     "t.category, t.title, t.summary, t.time_range, t.participants, t.source, t.created_at, "
