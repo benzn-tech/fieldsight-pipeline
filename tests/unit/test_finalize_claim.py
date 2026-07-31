@@ -121,18 +121,30 @@ def test_infer_idle_closes_counts_only_the_ones_it_moved(monkeypatch):
     assert fc.infer_idle_closes("CONN", 900) == 1
 
 
-def test_resolve_context_date_prefers_opened_at(monkeypatch):
+def test_to_nz_converts_utc_to_nz_local_dst_aware():
+    import datetime as _dt
+    # July = NZ winter (NZST +12): 23:03 UTC 07-30 -> 11:03 NZ 07-31 (the NEXT day —
+    # the exact case that mis-keyed morning recordings to "No summary").
+    nz = fc._to_nz(_dt.datetime(2026, 7, 30, 23, 3))
+    assert nz.date().isoformat() == "2026-07-31" and nz.strftime("%H:%M") == "11:03"
+    # January = NZ summer (NZDT +13, daylight saving): 02:00 UTC -> 15:00 NZ
+    assert fc._to_nz(_dt.datetime(2026, 1, 15, 2, 0)).strftime("%H:%M") == "15:00"
+    assert fc._to_nz(None) is None
+
+
+def test_resolve_context_date_and_time_range_are_nz(monkeypatch):
     import datetime as _dt
     monkeypatch.setattr(fc.users, "get_by_id",
-                        lambda conn, uid: {"email": "b@x.com", "folder_name": "Ada_L"})
+                        lambda conn, uid: {"email": "b@x.com", "folder_name": "Ben_UCPK"})
     monkeypatch.setattr(fc.sites, "get_site", lambda conn, sid: {"name": "UC PK"})
-    # closed_at is a day LATER than opened_at (inferred idle-close, server time) —
-    # the date must follow opened_at (the S3 key day), not closed_at.
+    # opened/closed are UTC; the DATE must be the NZ day (matches the transcript S3
+    # keys) and the subject time range must be NZ wall-clock.
     row = {"user_id": "u1", "site_id": "site-1",
-           "opened_at": _dt.datetime(2026, 7, 28, 23, 50),
-           "closed_at": _dt.datetime(2026, 7, 29, 0, 10)}
+           "opened_at": _dt.datetime(2026, 7, 30, 23, 3),    # -> NZ 07-31 11:03
+           "closed_at": _dt.datetime(2026, 7, 30, 23, 6)}    # -> NZ 07-31 11:06
     ctx = fc._resolve_context("CONN", row)
-    assert ctx["date"] == "2026-07-28"
+    assert ctx["date"] == "2026-07-31"
+    assert ctx["timeRange"] == "11:03–11:06"
 
 
 # ---- reconcile (finalizing -> sent/failed once the worker records an outcome) ----
