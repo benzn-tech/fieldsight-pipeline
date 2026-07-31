@@ -53,6 +53,7 @@ report_chunks.embedding column is NOT NULL -- there is no "insert with a
 blank embedding" fallback; it means embed-report hasn't run for that chunk
 yet).
 """
+import difflib
 import hashlib
 import json
 import logging
@@ -212,6 +213,121 @@ def resolve_user(conn, company_id, user_folder):
 
 
 # ----------------------------------------------------------
+# Authority-flip defer-day matcher (Task 7, WS1 root fix): link each report
+# topic to that day's already-existing Aurora extraction topic by time
+# overlap (title as tiebreak), so defer-day chunks carry a real topic UUID
+# instead of topic_id=None. Unmatched report topics stay None -- the earlier
+# hotfix (lambda_ask_agent._aggregate_topics) keeps those searchable by
+# title, so a bad forced match is strictly worse than leaving it unmatched.
+# ----------------------------------------------------------
+_TIME_TOKEN = r"(\d{1,2}):(\d{2})(?::(\d{2}))?"
+# Range dash: en dash (U+2013, what the LLM actually writes), em dash
+# (U+2014) and ASCII hyphen, optionally space-padded -- mirrors
+# photo_binding._TIME_RANGE_RE exactly (same real-world drift risk).
+_TIME_RANGE_RE = re.compile(rf"^{_TIME_TOKEN}\s*[–—-]\s*{_TIME_TOKEN}$")
+_SINGLE_TIME_RE = re.compile(rf"^{_TIME_TOKEN}$")
+
+
+def _hms_to_seconds(h, m, s):
+    return int(h) * 3600 + int(m) * 60 + int(s or 0)
+
+
+def _parse_time_range_seconds(time_range):
+    """report_topic['time_range'] -> (start_seconds, end_seconds), tolerant
+    of 'HH:MM–HH:MM' / 'HH:MM – HH:MM' (en dash/em dash/hyphen, optional
+    spaces) and a bare single 'HH:MM' or 'HH:MM:SS' (treated as a zero-width
+    window). Missing/garbage -> None (no time signal -- never raises)."""
+    if not isinstance(time_range, str):
+        return None
+    s = time_range.strip()
+    m = _TIME_RANGE_RE.match(s)
+    if m:
+        sh, sm, ss, eh, em, es = m.groups()
+        return _hms_to_seconds(sh, sm, ss), _hms_to_seconds(eh, em, es)
+    m = _SINGLE_TIME_RE.match(s)
+    if m:
+        h, mnt, sec = m.groups()
+        t = _hms_to_seconds(h, mnt, sec)
+        return t, t
+    return None
+
+
+def _occurred_at_seconds(occurred_at):
+    """Extraction topic's occurred_at -> seconds-since-midnight. Accepts a
+    real datetime/time value (what psycopg returns for a timestamptz column)
+    via duck-typed .hour/.minute/.second, or a bare 'HH:MM[:SS]' string (test
+    doubles / any future text representation). None/unparseable -> None."""
+    if occurred_at is None:
+        return None
+    if hasattr(occurred_at, "hour") and hasattr(occurred_at, "minute"):
+        return (occurred_at.hour * 3600 + occurred_at.minute * 60
+                + getattr(occurred_at, "second", 0))
+    if isinstance(occurred_at, str):
+        m = _SINGLE_TIME_RE.match(occurred_at.strip())
+        if m:
+            h, mnt, sec = m.groups()
+            return _hms_to_seconds(h, mnt, sec)
+    return None
+
+
+def _overlap_or_title_score(report_topic, ext_topic):
+    """PURE. Comparable match score for one (report_topic, ext_topic) pair --
+    higher tuple = better. Primary signal is temporal: the extraction topic's
+    occurred_at instant falling inside the report topic's time_range window
+    scores (window_span_seconds + 1, title_ratio) -- always beats any
+    title-only match, since window_span_seconds + 1 > 0. Title similarity
+    (difflib.SequenceMatcher ratio on lowercased titles) is the tiebreak
+    among same-window candidates, and the sole fallback signal (score
+    (0, ratio)) when there is no time overlap. Returns None when neither a
+    temporal overlap NOR title_ratio > 0.5 exists -- 'no comparable
+    candidate', not a bad score, so callers don't force a fragile match."""
+    window = _parse_time_range_seconds(report_topic.get("time_range"))
+    point = _occurred_at_seconds(ext_topic.get("occurred_at"))
+    overlap = 0
+    if window is not None and point is not None:
+        start, end = window
+        if start <= point <= end:
+            overlap = (end - start) + 1
+
+    title_a = (report_topic.get("topic_title") or "").strip().lower()
+    title_b = (ext_topic.get("title") or "").strip().lower()
+    ratio = difflib.SequenceMatcher(None, title_a, title_b).ratio() if title_a and title_b else 0.0
+
+    if overlap > 0:
+        return (overlap, ratio)
+    if ratio > 0.5:
+        return (0, ratio)
+    return None
+
+
+def _match_report_topics_to_extraction(conn, site_id, user_id, date, report_topics):
+    """Best-effort seq -> extraction-topic-uuid map for one report's topics,
+    used only on an authority-flip defer day (ingest_report below). Loads
+    that day's extraction-sourced topics once, then for each report topic
+    with a real seq (topic_id is not None) picks the best-scoring candidate
+    per _overlap_or_title_score. A report topic with no scoring candidate is
+    simply absent from the returned dict -- ingest_report's
+    topic_seq_to_id.get(seq) then falls through to None, same as today's
+    defer behavior (Task 1's title-search hotfix covers it)."""
+    ext_topics = topics.list_extraction_topics_for_day(conn, site_id, user_id, date)
+    if not ext_topics:
+        return {}
+    seq_to_id = {}
+    for t in report_topics:
+        seq = t.get("topic_id")
+        if seq is None:
+            continue
+        best_ext, best_score = None, None
+        for e in ext_topics:
+            score = _overlap_or_title_score(t, e)
+            if score is not None and (best_score is None or score > best_score):
+                best_ext, best_score = e, score
+        if best_ext is not None:
+            seq_to_id[seq] = str(best_ext["id"])
+    return seq_to_id
+
+
+# ----------------------------------------------------------
 # Report-topic child shape mapping (report JSON -> repositories/topics.py)
 # ----------------------------------------------------------
 def _map_action_items(items):
@@ -338,8 +454,10 @@ def ingest_report(date, user_folder, report_key):
             # Authority flip (spec §6): the day's extraction topics ARE the
             # item store; the report is a document artifact only. No
             # extraction wipe, no report topics, no match_request. Chunks
-            # are still written below (RAG) with topic_id=None.
-            logger.info("%s: authority flip — deferring to extraction topics under %s",
+            # are still written below (RAG), linked by time-overlap to that
+            # day's extraction topics where a match exists (Task 7, WS1 root
+            # fix) -- unmatched report topics keep topic_id=None.
+            logger.info("%s: authority flip — linking chunks to extraction topics under %s",
                         report_key, extraction_prefix)
         else:
             # Nightly report supersedes that day's session-sourced (live
@@ -347,6 +465,10 @@ def ingest_report(date, user_folder, report_key):
             topics.delete_topics_for_source_prefix(conn, extraction_prefix)
 
         topic_seq_to_id = {}
+        if defer_to_extraction:
+            topic_seq_to_id = _match_report_topics_to_extraction(
+                conn, site["id"], user_id, date, report.get("topics", []))
+
         collected_topics = []
         if not defer_to_extraction:
             # P4 (2026-07-23 prod-media-binding plan): list the pictures
