@@ -154,6 +154,9 @@ Resources:
   DynamoDBGatewayEndpoint:
     Type: AWS::EC2::VPCEndpoint
     DeletionPolicy: Retain
+    # Paired with DeletionPolicy so a replacement can't orphan-then-drop the
+    # endpoint either (cfn-lint W3011 requires both to actually protect it).
+    UpdateReplacePolicy: Retain
     Properties:
       VpcEndpointType: Gateway
       ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
