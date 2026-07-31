@@ -13,6 +13,13 @@ def test_subject_carries_fieldsight_and_the_date():
     assert "2026-07-25" in subj
 
 
+def test_subject_carries_the_meeting_time_range():
+    # so a recorder with several recordings a day can tell WHICH meeting this is
+    subj, _t, _h = fin.build_confirmation_email(
+        date="2026-07-25", time_range="14:11–14:14", summary="x")
+    assert "2026-07-25" in subj and "14:11–14:14" in subj
+
+
 def test_body_contains_summary_site_and_open_todos():
     _subj, text, html = fin.build_confirmation_email(
         date="2026-07-25", site_name="UC PK",
