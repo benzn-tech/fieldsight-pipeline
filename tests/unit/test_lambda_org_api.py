@@ -3521,14 +3521,16 @@ def test_audio_segments_matches_chunk_session_key(presign_wired):
     assert seg["time_label"] == "14:13:58"
 
 
-def test_chunk_session_start_falls_back_to_meeting_session_opened_at(monkeypatch):
+def test_chunk_session_start_falls_back_to_meeting_session_opened_at_in_nz(monkeypatch):
     # A chunk session's base is `sid{hex}` (no timestamp) -> session_start can't
-    # parse a time -> the picker showed "?". Fall back to meeting_session.opened_at.
+    # parse a time -> the picker showed "?". Fall back to meeting_session.opened_at,
+    # which is UTC -> convert to NZ so it doesn't render "06:36" for an 18:36 meeting.
     import datetime as dt
+    # 02:11 UTC = 14:11 NZ (July, NZST +12)
     monkeypatch.setattr(org.meeting_session, "get",
-                        lambda conn, sid: {"opened_at": dt.datetime(2026, 7, 31, 14, 11, 56)})
+                        lambda conn, sid: {"opened_at": dt.datetime(2026, 7, 31, 2, 11, 56)})
     out = org._chunk_session_start("CONN", "sid" + "a" * 32)
-    assert out == dt.datetime(2026, 7, 31, 14, 11, 56)
+    assert out == dt.datetime(2026, 7, 31, 14, 11, 56)   # NZ local
 
 
 def test_chunk_session_start_none_for_legacy_base():
