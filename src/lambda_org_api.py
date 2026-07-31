@@ -957,13 +957,19 @@ def redeem_qr_login_code(event):
         try:
             _qr_table().update_item(
                 Key={"code": code},
-                UpdateExpression="SET consumed = :t",
-                ConditionExpression="consumed = :f",
+                # `consumed` is a DynamoDB reserved word — alias it via #c, else
+                # every redeem throws ValidationException (caught below → generic 401).
+                UpdateExpression="SET #c = :t",
+                ConditionExpression="#c = :f",
+                ExpressionAttributeNames={"#c": "consumed"},
                 ExpressionAttributeValues={":t": True, ":f": False},
             )
         except Exception:
             # lost the race to another redeemer, or a genuine infra error —
-            # both collapse to the same generic 401 (never reveal which).
+            # both collapse to the same generic 401 (never reveal which). Log it
+            # (server-side only, never the code/token): a silent swallow here hid a
+            # reserved-word ValidationException that failed every redeem.
+            logger.exception("qr redeem consume (update_item) failed")
             return error("Invalid or expired code", 401)
         # Consume-safe read: `item` was already fetched above (no extra DB
         # call). A legacy row without `refreshToken` must not be allowed to
