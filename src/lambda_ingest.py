@@ -303,27 +303,44 @@ def _overlap_or_title_score(report_topic, ext_topic):
 def _match_report_topics_to_extraction(conn, site_id, user_id, date, report_topics):
     """Best-effort seq -> extraction-topic-uuid map for one report's topics,
     used only on an authority-flip defer day (ingest_report below). Loads
-    that day's extraction-sourced topics once, then for each report topic
-    with a real seq (topic_id is not None) picks the best-scoring candidate
-    per _overlap_or_title_score. A report topic with no scoring candidate is
-    simply absent from the returned dict -- ingest_report's
-    topic_seq_to_id.get(seq) then falls through to None, same as today's
-    defer behavior (Task 1's title-search hotfix covers it)."""
+    that day's extraction-sourced topics once, scores every (report topic,
+    extraction topic) pair with a real seq (topic_id is not None) via
+    _overlap_or_title_score, then performs a GLOBAL best-first assignment
+    across ALL candidates (not a per-report-topic greedy pick) so that each
+    extraction topic id is claimed by AT MOST ONE report topic seq (fix
+    round 1): two different report topics must never collide on the same
+    extraction UUID, because lambda_ask_agent._aggregate_topics groups
+    search chunks by topic_id and keeps only the single lowest-distance row
+    per group -- a collision would silently drop one of the two topics from
+    Search entirely, which is worse than topic_id=None (the aggregator
+    special-cases that to survive via title-grouping). A report topic that
+    loses all its candidates to earlier (higher-scoring) claims is simply
+    absent from the returned dict -- ingest_report's
+    topic_seq_to_id.get(seq) then falls through to None, the correct/safe
+    outcome (Task 1's title-search hotfix covers it), never a forced
+    second-best collision."""
     ext_topics = topics.list_extraction_topics_for_day(conn, site_id, user_id, date)
     if not ext_topics:
         return {}
-    seq_to_id = {}
+
+    candidates = []
     for t in report_topics:
         seq = t.get("topic_id")
         if seq is None:
             continue
-        best_ext, best_score = None, None
         for e in ext_topics:
             score = _overlap_or_title_score(t, e)
-            if score is not None and (best_score is None or score > best_score):
-                best_ext, best_score = e, score
-        if best_ext is not None:
-            seq_to_id[seq] = str(best_ext["id"])
+            if score is not None:
+                candidates.append((score, seq, str(e["id"])))
+    candidates.sort(key=lambda c: c[0], reverse=True)
+
+    seq_to_id = {}
+    claimed_ext_ids = set()
+    for score, seq, ext_id in candidates:
+        if seq in seq_to_id or ext_id in claimed_ext_ids:
+            continue
+        seq_to_id[seq] = ext_id
+        claimed_ext_ids.add(ext_id)
     return seq_to_id
 
 

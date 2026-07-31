@@ -791,6 +791,36 @@ def test_overlap_or_title_score_no_match_returns_none():
     assert ing._overlap_or_title_score(report_topic, ext_topic) is None
 
 
+def test_defer_day_two_report_topics_do_not_collide_on_one_extraction(monkeypatch):
+    # Fix round 1: two report topics both overlap the SAME single extraction
+    # topic's window -- the global best-first assignment must claim it for
+    # at most one of them. The loser must stay unmatched (None), never a
+    # forced second-best collision (lambda_ask_agent._aggregate_topics
+    # groups search chunks by topic_id and keeps only one row per group, so
+    # a collision would silently drop one topic from Search entirely --
+    # worse than topic_id=None, which the aggregator survives via
+    # title-grouping).
+    monkeypatch.setattr(
+        ing.topics, "list_extraction_topics_for_day",
+        lambda conn, site_id, user_id, report_date: [
+            {"id": "ext-shared", "title": "Site walk", "occurred_at": "09:02:00"},
+        ],
+    )
+    report_topics = [
+        {"topic_id": 0, "time_range": "09:00 – 09:05", "topic_title": "Safety Briefing"},
+        {"topic_id": 1, "time_range": "09:01 – 09:04", "topic_title": "Toolbox Talk"},
+    ]
+
+    seq_to_id = ing._match_report_topics_to_extraction(
+        None, "site-1", "user-1", "2026-03-02", report_topics)
+
+    topic_ids = [seq_to_id.get(0), seq_to_id.get(1)]
+    assert topic_ids[0] != topic_ids[1]
+    non_none = [v for v in topic_ids if v is not None]
+    assert len(non_none) == 1
+    assert len(set(non_none)) == len(non_none)  # no duplicate non-None extraction id
+
+
 # ---------------------------------------------------------------------------
 # C1 regression — NULL-user same-site/same-date reports must NOT delete each
 # other (source-key deletes carry the report's own key, never a shared scope)
