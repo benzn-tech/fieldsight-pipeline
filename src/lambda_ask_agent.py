@@ -513,10 +513,11 @@ _NO_LEX_MAX_DIST = 0.55  # non-lexical topics past this cosine distance are drop
 
 def _aggregate_topics(chunks, question=""):
     """Collapse retrieved chunks into distinct topic rows for the Search list.
-    Only chunks tied to a formal topic (topic_id present) are kept; raw
-    transcript-window chunks with no topic are dropped (user pref 2026-07-10).
-    Group key: (report_date, site_id, topic_id). Keep the smallest cosine
-    distance per group as the relevance score. Route mirrors the client's
+    chunk_type=='topic' chunks are kept even when topic_id is NULL
+    (authority-flip data), grouped/deep-linked by title; raw transcript-window
+    chunks with no topic are still dropped (user pref 2026-07-10). Group key:
+    (report_date, site_id, topic_id-or-"title:"+title). Keep the smallest
+    cosine distance per group as the relevance score. Route mirrors the client's
     existing topic deep-link EXACTLY (String(topic_id), encodeURIComponent);
     &user is omitted only when the report folder can't be parsed.
 

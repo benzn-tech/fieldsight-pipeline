@@ -41,3 +41,11 @@ def test_search_sql_has_author_filter_with_null_guard():
     assert "c.user_id = ANY(%(author_ids)s" in sql
     # IS NULL guard so passing author_ids=None is a no-op (byte-identical scope)
     assert "%(author_ids)s::uuid[] IS NULL" in sql
+    # Pin the FULL clause verbatim: the OR must stay inside one parenthesized
+    # group. If this were ever split into two top-level ANDs, an author_ids
+    # list would silently AND against every unrelated row instead of gating
+    # the author check behind the NULL guard -- a cross-site author leak.
+    assert (
+        "AND (%(author_ids)s::uuid[] IS NULL OR c.user_id = ANY(%(author_ids)s::uuid[]))"
+        in sql
+    )
