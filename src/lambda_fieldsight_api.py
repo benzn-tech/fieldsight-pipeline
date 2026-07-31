@@ -964,7 +964,8 @@ def trigger_report_generation(body, caller):
 # ── POST /api/ask ───────────────────────────────────────────
 
 def ask_question(body, caller):
-    """Proxy question to Ask Agent Lambda with permission checks."""
+    """Proxy question to Ask Agent Lambda. ACL is enforced downstream by
+    rag-search via caller_sub (BUG-39 WS2) -- this proxy no longer gates."""
     question = body.get('question', '').strip()
     date = body.get('date', '')
     user = body.get('user', '')
@@ -977,17 +978,13 @@ def ask_question(body, caller):
     # global across the caller's accessible sites, not filtered by date.
     # date is still forwarded as soft context when the caller supplies it.
 
-    # Resolve user from caller if not specified
-    if not user:
-        user = resolve_user_display_name(caller)
-    if not user:
-        return error('Missing user')
-
-    # Permission check: workers can only ask about their own data
-    if caller['role'] == 'worker':
-        user = resolve_user_display_name(caller)
-    elif user and not can_access_user_data(caller, user):
-        return error('Access denied to this user', 403)
+    # REMOVED (BUG-39 WS2): legacy DynamoDB user/role gate. The RAG ACL is
+    # enforced downstream by caller_sub -> rag-search (graded scope.visible_scope,
+    # WS3). 'user' is optional soft context only.
+    #   was: if not user: user = resolve_user_display_name(caller)
+    #        if not user: return error('Missing user')
+    #        if caller['role'] == 'worker': user = resolve_user_display_name(caller)
+    #        elif user and not can_access_user_data(caller, user): return error('Access denied to this user', 403)
 
     payload = {
         'user': user,

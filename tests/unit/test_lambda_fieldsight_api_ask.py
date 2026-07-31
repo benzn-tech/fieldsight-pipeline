@@ -36,6 +36,14 @@ WORKER_CALLER = {
     "sites": ["s-1"], "managed_sites": [], "company_id": "c-1",
 }
 
+# Org-provisioned account: absent from the legacy DynamoDB user mapping
+# entirely -- no display_name to resolve, no legacy sites/role mapping.
+ORG_CALLER = {
+    "sub": "sub-ucpk", "email": "", "name": "",
+    "role": "viewer", "display_name": "", "device_id": "",
+    "sites": [], "managed_sites": [], "company_id": "",
+}
+
 
 class FakeLambdaClient:
     """Stand-in for boto3.client('lambda') — records the invoke() call and
@@ -118,25 +126,60 @@ def test_missing_question_still_400(monkeypatch):
     assert fake_client.calls == []  # never invoked ask-agent
 
 
-def test_worker_self_scoping_preserved(monkeypatch):
-    """Worker asking about themself (no explicit user) still resolves to
-    their own display_name — self-scoping is untouched by the date change."""
+def test_worker_self_scoping_now_via_caller_sub(monkeypatch):
+    """UPDATED (BUG-39 WS2): worker self-scoping used to be forced server-side
+    here via resolve_user_display_name(); that legacy gate is removed and the
+    scoping now happens downstream in rag-search via caller_sub. This proxy
+    forwards 'user' as empty soft context (none supplied) plus the caller_sub
+    that actually gates access."""
     fake_client = wire(monkeypatch)
 
     res = fapi.ask_question({"question": "What did I do today?"}, WORKER_CALLER)
 
     assert res["statusCode"] == 200
-    assert fake_client.calls[0]["Payload"]["user"] == "Ben_Test"
+    assert fake_client.calls[0]["Payload"]["user"] == ""
+    assert fake_client.calls[0]["Payload"]["caller_sub"] == "sub-worker-1"
 
 
-def test_worker_cannot_impersonate_other_user_via_ask(monkeypatch):
-    """Even if a worker supplies a different user in the body, self-scoping
-    forces it back to their own display_name (unchanged legacy behavior)."""
+def test_worker_impersonation_prevention_now_via_caller_sub(monkeypatch):
+    """UPDATED (BUG-39 WS2): this proxy no longer rewrites a client-supplied
+    'user' field back to the worker's own display_name -- that was the
+    legacy pre-gate. Impersonation prevention now lives downstream in
+    rag-search, which scopes retrieval by caller_sub (immutable, from the
+    Cognito token), not by the client-suppliable 'user' field. This proxy
+    forwards both unchanged; caller_sub is what actually gates access."""
     fake_client = wire(monkeypatch)
 
     fapi.ask_question({"question": "Q?", "user": "Someone_Else"}, WORKER_CALLER)
 
-    assert fake_client.calls[0]["Payload"]["user"] == "Ben_Test"
+    assert fake_client.calls[0]["Payload"]["user"] == "Someone_Else"
+    assert fake_client.calls[0]["Payload"]["caller_sub"] == "sub-worker-1"
+
+
+def test_ask_org_caller_no_dynamo_profile_not_403(monkeypatch):
+    """Org-provisioned caller absent from the legacy DynamoDB user mapping
+    (role='viewer', no sites, no display_name) must not be blocked by the
+    legacy pre-gate -- the RAG ACL is enforced downstream by caller_sub ->
+    rag-search (BUG-39 WS2)."""
+    fake_client = wire(monkeypatch)
+
+    res = fapi.ask_question({"question": "what happened on site?"}, ORG_CALLER)
+
+    assert res["statusCode"] != 403
+    assert res["statusCode"] != 400
+    assert fake_client.calls[0]["Payload"]["caller_sub"] == "sub-ucpk"
+
+
+def test_ask_global_no_user_not_400(monkeypatch):
+    """A global Ask (no 'user' in body, from an org account with no legacy
+    display_name to resolve) must not 400 -- 'user' is optional soft context
+    only; downstream ACL scopes by caller_sub."""
+    fake_client = wire(monkeypatch)
+
+    res = fapi.ask_question({"question": "site-wide question"}, ORG_CALLER)
+
+    assert res["statusCode"] != 400
+    assert fake_client.calls[0]["Payload"]["caller_sub"] == "sub-ucpk"
 
 
 def test_function_error_returns_500_without_stack_trace_leak(monkeypatch):
