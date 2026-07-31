@@ -40,12 +40,16 @@ def _clean_todos(open_todos):
     return out
 
 
-def build_confirmation_email(*, date=None, site_name=None, summary=None, open_todos=None):
+def build_confirmation_email(*, date=None, time_range=None, site_name=None,
+                             summary=None, open_todos=None):
     """(subject, body_text, body_html) for the recorder's confirmation email, built
     from the session's rolling summary + still-open to-dos. Pure — no I/O. A blank
     summary renders a placeholder (the email is never empty); to-dos with no text are
-    dropped; all HTML content is escaped so transcript text can't inject markup."""
-    subject = "FieldSight — your site notes" + (f" ({date})" if date else "")
+    dropped; all HTML content is escaped so transcript text can't inject markup. The
+    subject carries date + meeting time range so the recorder can tell WHICH meeting
+    it is (multiple recordings a day otherwise share one subject)."""
+    stamp = " ".join(p for p in (date, time_range) if p)
+    subject = "FieldSight — your site notes" + (f" ({stamp})" if stamp else "")
     summary_text = (summary or "").strip() or "No summary was generated for this recording."
     todos = _clean_todos(open_todos)
 
@@ -159,8 +163,8 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
     if fresh:
         summary, todos = fresh.get("summary", summary), fresh.get("open_todos", todos)
     subject, text, html = build_confirmation_email(
-        date=artifact.get("date"), site_name=artifact.get("siteName"),
-        summary=summary, open_todos=todos)
+        date=artifact.get("date"), time_range=artifact.get("timeRange"),
+        site_name=artifact.get("siteName"), summary=summary, open_todos=todos)
     if send is None:
         from email_sender import get_sender
         send = get_sender().send
