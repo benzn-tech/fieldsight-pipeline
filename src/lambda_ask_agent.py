@@ -529,21 +529,31 @@ def _aggregate_topics(chunks, question=""):
     groups = {}
     for c in chunks:
         topic_id = c.get("topic_id")
-        # user pref 2026-07-10: only formal topics in the Search list — drop
-        # raw transcript-window chunks that aren't tied to a topic (they read
-        # as noisy raw-transcript lines in a "topics" list).
-        if not topic_id:
+        ctype = c.get("chunk_type")
+        # user pref 2026-07-10: raw transcript-window chunks with no topic are
+        # noise in a "topics" list -> dropped. BUT authority-flip (2026-07-17+)
+        # leaves chunk_type='topic' rows with topic_id=None (ingest can't link a
+        # deferred report topic) -- those ARE formal topics and MUST survive,
+        # grouped/deeplinked by title (BUG-39 / WS1).
+        if not topic_id and ctype != "topic":
             continue
+        # Title: report_chunks JOINs topics for topic_title; a NULL topic_id
+        # yields NULL topic_title, so fall back to metadata.title then chunk_text.
+        md = c.get("metadata") if isinstance(c.get("metadata"), dict) else {}
+        derived_title = (c.get("topic_title") or md.get("title")
+                         or (c.get("chunk_text") or "")[:60])
         date = str(c.get("report_date", "") or "")
         site_id = str(c.get("site_id", "") or "")
-        key = (date, site_id, topic_id)
+        # Group key: UUID when present, else the derived title (defer-day rows).
+        group_id = str(topic_id) if topic_id else ("title:" + derived_title)
+        key = (date, site_id, group_id)
         dist = c.get("distance")
         dist = float(dist) if dist is not None else 1.0
         cur = groups.get(key)
         if cur is not None and dist >= cur["score"]:
             continue
         folder = _folder_from_source(c.get("source_s3_key"))
-        title = c.get("topic_title") or (c.get("chunk_text") or "")[:60]
+        title = derived_title
         route = "/timeline?date=" + _q(date)
         if folder:
             route += "&user=" + _q(folder)
@@ -551,9 +561,9 @@ def _aggregate_topics(chunks, question=""):
         # spotlight matches report topics by their per-report sequential id,
         # which Aurora doesn't store. The report topic title is in both places,
         # so the Timeline resolves title -> the report topic to open + flash it.
-        _ttl = c.get("topic_title") or ""
-        if _ttl:
-            route += "&topicTitle=" + _q(_ttl)
+        # (derived_title also covers the no-UUID authority-flip case.)
+        if derived_title:
+            route += "&topicTitle=" + _q(derived_title)
         # &site carries the project SLUG (the top-bar selector's identifier, NOT
         # the site UUID) so clicking a cross-project result syncs the selector
         # (联动 — the Timeline reads params.site and calls siteContext.set).
@@ -565,11 +575,11 @@ def _aggregate_topics(chunks, question=""):
         # their text usually contains a term anyway (and common words like
         # "safety" appear everywhere), which would make the lexical flag true
         # for nearly everything. The concise title is the clean signal.
-        hay = (c.get("topic_title") or "").lower()
+        hay = derived_title.lower()
         groups[key] = {
             "report_date": date,
             "site_name": c.get("site_name"),
-            "topic_id": str(topic_id),
+            "topic_id": str(topic_id) if topic_id else "",
             "title": title,
             "snippet": (c.get("chunk_text") or "")[:200],
             "chunk_type": c.get("chunk_type"),
