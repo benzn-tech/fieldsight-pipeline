@@ -65,47 +65,49 @@ def test_caller_not_provisioned_returns_error_not_raise(wired):
 
 
 def test_admin_uses_company_sites(wired):
-    seen = {}
-    wired.setattr(rag.sites, "list_company_sites",
-                  lambda conn, cid: (seen.update(cid=cid) or [{"id": "s-1"}, {"id": "s-2"}]))
+    # admin -> scope.visible_scope resolves ALL (company-wide reach), no
+    # per-author filter.
+    wired.setattr(rag.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {"s-1", "s-2"}, "user_scope": "ALL",
+                                        "author_ids": None})
     captured = {}
     wired.setattr(rag.chunks, "search_chunks",
                   lambda conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None:
-                      (captured.update(site_ids=site_ids) or []))
+                      (captured.update(site_ids=site_ids, author_ids=author_ids) or []))
 
     res = rag.lambda_handler(make_event(), None)
 
-    assert seen["cid"] == "c-uuid-1"
-    assert captured["site_ids"] == ["s-1", "s-2"]
+    assert set(captured["site_ids"]) == {"s-1", "s-2"}
+    assert captured["author_ids"] is None
     assert res["site_count"] == 2
     assert res["chunks"] == []
 
 
 def test_worker_uses_memberships(wired):
-    wired.setattr(rag.users, "get_user_by_sub",
-                  lambda conn, sub: {**CALLER, "global_role": "worker"})
-    seen = {}
-    wired.setattr(rag.memberships, "accessible_site_ids",
-                  lambda conn, uid, role: (seen.update(uid=uid, role=role) or ["s-3"]))
+    # worker -> scope.visible_scope resolves SITE reach with no per-author
+    # filter (a plain worker's own membership sites, not graded down further).
+    wired.setattr(rag.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": {"s-3"}, "user_scope": "SITE",
+                                        "author_ids": None})
     captured = {}
     wired.setattr(rag.chunks, "search_chunks",
                   lambda conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None:
-                      (captured.update(site_ids=site_ids) or []))
+                      (captured.update(site_ids=site_ids, author_ids=author_ids) or []))
 
     res = rag.lambda_handler(make_event(), None)
 
-    assert seen == {"uid": "u-uuid-1", "role": "worker"}
     assert captured["site_ids"] == ["s-3"]
+    assert captured["author_ids"] is None
     assert res["site_count"] == 1
 
 
 def test_empty_site_ids_empty_chunks(wired):
-    # deny-by-default: a worker with no memberships short-circuits to an
+    # deny-by-default: a caller with no accessible sites short-circuits to an
     # empty result WITHOUT calling search_chunks (saves the DB round-trip —
     # WHERE site_id = ANY('{}') would just match no rows anyway).
-    wired.setattr(rag.users, "get_user_by_sub",
-                  lambda conn, sub: {**CALLER, "global_role": "worker"})
-    wired.setattr(rag.memberships, "accessible_site_ids", lambda conn, uid, role: [])
+    wired.setattr(rag.scope, "visible_scope",
+                  lambda conn, caller: {"site_ids": set(), "user_scope": "SITE",
+                                        "author_ids": None})
 
     def boom(*a, **k):
         raise AssertionError("search_chunks must not be called when site_ids is empty")
@@ -286,7 +288,6 @@ def test_site_filter_inaccessible_denies(wired):
 
 
 def test_graded_site_manager_passes_self_workers_author_ids(wired, monkeypatch):
-    monkeypatch.setattr(rag, "GRADED_ROLES", True)
     monkeypatch.setattr(rag.scope, "visible_scope",
                         lambda conn, caller: {"site_ids": {"s-1"}, "user_scope": "SELF+WORKERS",
                                               "author_ids": {"me", "worker-1"}})
@@ -300,7 +301,6 @@ def test_graded_site_manager_passes_self_workers_author_ids(wired, monkeypatch):
 
 
 def test_graded_admin_passes_no_author_filter(wired, monkeypatch):
-    monkeypatch.setattr(rag, "GRADED_ROLES", True)
     monkeypatch.setattr(rag.scope, "visible_scope",
                         lambda conn, caller: {"site_ids": {"s-1", "s-2"}, "user_scope": "ALL",
                                               "author_ids": None})
@@ -310,18 +310,6 @@ def test_graded_admin_passes_no_author_filter(wired, monkeypatch):
                       (captured.update(author_ids=author_ids) or []))
     rag.lambda_handler(make_event(), None)
     assert captured["author_ids"] is None   # ALL => no per-author filter
-
-
-def test_graded_off_falls_back_to_site_only(wired, monkeypatch):
-    monkeypatch.setattr(rag, "GRADED_ROLES", False)
-    wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
-    captured = {}
-    wired.setattr(rag.chunks, "search_chunks",
-                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None:
-                      (captured.update(author_ids=author_ids, site_ids=site_ids) or []))
-    rag.lambda_handler(make_event(), None)
-    assert captured["author_ids"] is None            # legacy path, site-only
-    assert captured["site_ids"] == ["s-1"]
 
 
 def test_site_filter_accepts_uuid_directly(wired):
