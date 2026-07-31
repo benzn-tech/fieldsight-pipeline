@@ -336,6 +336,15 @@ def test_slugify_collapses_punctuation_repeats_and_case():
     assert org._slugify("O'Brien's   Yard") == "o-brien-s-yard"
 
 
+def test_slugify_punctuation_only_name_is_empty_string():
+    # _slugify is intentionally NOT total: a punctuation-only name has no
+    # alnum characters to keep, so it slugifies to "". _slugify stays a pure
+    # helper -- the non-empty fallback lives at the call site
+    # (_unique_site_slug), covered by test_create_site_punctuation_only_name_gets_nonempty_slug.
+    assert org._slugify("!!!") == ""
+    assert org._slugify("---") == ""
+
+
 def test_create_site_generates_slug_from_name(wired):
     created = {}
 
@@ -390,6 +399,26 @@ def test_create_site_explicit_slug_is_respected_and_skips_dedup_lookup(wired):
     assert res["statusCode"] == 201
     assert created["slug"] == "custom-slug"
     assert called == []  # explicit slug bypasses the dedup lookup entirely
+
+
+def test_create_site_punctuation_only_name_gets_nonempty_slug(wired):
+    # Regression: "!!!" slugifies to "" (test_slugify_punctuation_only_name_is_empty_string).
+    # The handler must not persist an empty-string slug -- _unique_site_slug
+    # falls back to a fixed non-empty placeholder ("site") before deduping.
+    created = {}
+
+    def fake_create(conn, company_id, name, location=None, client=None,
+                    industry=None, icon_s3_key=None, address=None,
+                    latitude=None, longitude=None, slug=None):
+        created.update(slug=slug)
+        return {"id": "s-new", "company_id": company_id, "name": name, "slug": slug}
+
+    wired.setattr(org.sites, "create_site", fake_create)
+    res = org.lambda_handler(make_event("POST", "/api/org/sites",
+                                        body={"name": "!!!"}), None)
+    assert res["statusCode"] == 201
+    assert created["slug"] == "site"
+    assert created["slug"] != ""
 
 
 def test_list_members_joins_memberships(wired):

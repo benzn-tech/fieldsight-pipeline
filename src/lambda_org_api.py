@@ -1099,7 +1099,10 @@ def _slugify(name: str) -> str:
 
 def _unique_site_slug(conn, company_id, base_slug):
     """Dedup base_slug against sites.slug within company_id — idx_sites_company_slug
-    is a real UNIQUE(company_id, slug) index — by appending -2, -3, … until free."""
+    is a real UNIQUE(company_id, slug) index — by appending -2, -3, … until free.
+    A punctuation-only name slugifies to "" (see _slugify); fall back to a fixed
+    non-empty placeholder here so we never persist an empty-string slug."""
+    base_slug = base_slug or "site"
     slug = base_slug
     n = 2
     while sites.get_company_site_by_slug(conn, company_id, slug) is not None:
