@@ -3521,6 +3521,21 @@ def test_audio_segments_matches_chunk_session_key(presign_wired):
     assert seg["time_label"] == "14:13:58"
 
 
+def test_chunk_session_start_falls_back_to_meeting_session_opened_at(monkeypatch):
+    # A chunk session's base is `sid{hex}` (no timestamp) -> session_start can't
+    # parse a time -> the picker showed "?". Fall back to meeting_session.opened_at.
+    import datetime as dt
+    monkeypatch.setattr(org.meeting_session, "get",
+                        lambda conn, sid: {"opened_at": dt.datetime(2026, 7, 31, 14, 11, 56)})
+    out = org._chunk_session_start("CONN", "sid" + "a" * 32)
+    assert out == dt.datetime(2026, 7, 31, 14, 11, 56)
+
+
+def test_chunk_session_start_none_for_legacy_base():
+    # a legacy whole-file base HAS a timestamp (session_start handles it) -> no fallback
+    assert org._chunk_session_start("CONN", "Benl1_2026-07-31_14-11-56") is None
+
+
 def test_audio_segments_window_filter_excludes_out_of_range(presign_wired):
     wired, fake = presign_wired
     wired.setattr(org.users, "get_user_by_sub",
