@@ -547,6 +547,6 @@ def test_prompt_asks_to_split_by_subject_and_write_scannable_titles():
     assert "Do NOT lump" in prompt and "Do NOT over-split" in prompt
     # topic_title: short + subject-first
     assert "topic_title" in prompt and "glanceable" in prompt
-    # action_items: noun-first, glanceable, no vague placeholders / generic verbs
-    assert "AT A GLANCE" in prompt and "most important NOUN" in prompt
-    assert "generic verb" in prompt
+    # action_items: subject-first, glanceable, survive truncation, no generic openers
+    assert "AT A GLANCE" in prompt and "SURVIVE TRUNCATION" in prompt
+    assert "SUBJECT/OUTCOME" in prompt and "generic word" in prompt
