@@ -147,6 +147,7 @@ jobs:
               "ReportsTableName=fieldsight-reports" \
               "AuditTableName=fieldsight-audit" \
               "MultiTenantResolution=true" \
+              "VadThreshold=${{ vars.PROD_VAD_THRESHOLD || '0.5' }}" \
               "AuthorityFlip=${{ vars.PROD_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.PROD_GRADED_ROLES || 'false' }}" \
               "ManageDataBucketPolicy=false" \

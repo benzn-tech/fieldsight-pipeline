@@ -351,6 +351,15 @@ Parameters:
       i.e. today's shared-DB behavior. Set to fieldsight_test (via deploy.yml
       --parameter-overrides, NOT samconfig) to isolate the test stack.
 
+  VadThreshold:
+    Type: String
+    Default: '0.5'
+    Description: >-
+      Silero VAD speech-confidence cutoff (0.0-1.0) for VadFunction. 0.5 over-cut
+      real quiet/continuous site speech (kept ~28% of a talky 30s chunk, dropped
+      whole sentences); 0.2 recovered ~70%. Set per stage so test can trial a value
+      before prod adopts it.
+
   MultiTenantResolution:
     Type: String
     Default: 'false'
@@ -645,8 +654,12 @@ Resources:
           OUTPUT_PREFIX: audio_segments/
           MIN_SPEECH_DURATION: '1.0'
           MIN_SILENCE_DURATION: '3.0'
+          # Silero speech-confidence cutoff. 0.5 (the old default) over-cut quiet/
+          # continuous speech on real site recordings — measured on a 30s chunk it
+          # kept only 28% and dropped whole sentences; 0.2 recovered ~70%. Tunable
+          # per stage (test trials 0.2; prod stays 0.5 until validated).
           MERGE_GAP: '2.0'
-          VAD_THRESHOLD: '0.5'
+          VAD_THRESHOLD: !Ref VadThreshold
           SAMPLE_RATE: '16000'
           SKIP_EXISTING: 'true'
           GENERATE_PREVIEW: 'true'
