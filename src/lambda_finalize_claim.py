@@ -85,25 +85,62 @@ def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_
 
 # ----- real (Aurora + S3) collaborators the handler wires -----------------
 
+def _to_nz(dt):
+    """meeting_session opened_at/closed_at are stored in UTC (the device's /open
+    sends a UTC startedAt), but the S3 transcript/rolling keys and the topic times
+    are the device's NZ wall clock. Return `dt` as Pacific/Auckland LOCAL (naive),
+    DST-aware, so (a) the email subject shows NZ time and (b) `.date()` matches the
+    device-date the transcripts live under (a morning-NZ recording is the PREVIOUS
+    UTC day — using the UTC date gathered the wrong day and produced "No summary").
+
+    Prefer the IANA tz database (exact to the hour); if the runtime lacks tzdata,
+    fall back to NZ's fixed rule: NZDT (UTC+13) from the last Sunday of September to
+    the first Sunday of April, else NZST (UTC+12)."""
+    from datetime import datetime, timedelta, timezone
+    if not hasattr(dt, "strftime"):
+        return None
+    aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+    try:
+        from zoneinfo import ZoneInfo
+        return aware.astimezone(ZoneInfo("Pacific/Auckland")).replace(tzinfo=None)
+    except Exception:
+        import calendar
+        u = aware.astimezone(timezone.utc).replace(tzinfo=None)
+        y = u.year
+
+        def _last_sun(mo):
+            d = datetime(y, mo, calendar.monthrange(y, mo)[1])
+            return d - timedelta(days=(d.weekday() - 6) % 7)
+
+        def _first_sun(mo):
+            d = datetime(y, mo, 1)
+            return d + timedelta(days=(6 - d.weekday()) % 7)
+
+        dst_start = _last_sun(9) + timedelta(hours=2) - timedelta(hours=12)   # -> UTC
+        dst_end = _first_sun(4) + timedelta(hours=3) - timedelta(hours=13)    # -> UTC
+        return u + timedelta(hours=13 if (u >= dst_start or u < dst_end) else 12)
+
+
 def _resolve_context(conn, row):
     """Recipient email + folder + date + site name for a claimed session, from
     Aurora. date = the session's close (or open) day; siteName from the site pick."""
     user = users.get_by_id(conn, row["user_id"]) or {}
-    # DATE = the session's recording start (opened_at, device wall-clock) — this is
-    # the {date} the S3 transcript/rolling keys live under. Prefer it over closed_at,
-    # which for an INFERRED idle-close is a server-time last-activity that could
-    # cross a day boundary and mis-key the summary re-gather.
-    day = row.get("opened_at") or row.get("closed_at")
-    date = day.date().isoformat() if hasattr(day, "date") else (str(day)[:10] if day else None)
+    # Work in NZ local time (opened_at/closed_at are UTC): the DATE must be the
+    # device's NZ day — that is the {date} the S3 transcript/rolling keys live under,
+    # so the summary re-gather finds them (using the UTC day mis-keyed morning-NZ
+    # recordings, which are the PREVIOUS UTC day, and yielded "No summary").
+    opened_nz, closed_nz = _to_nz(row.get("opened_at")), _to_nz(row.get("closed_at"))
+    day = opened_nz or closed_nz
+    date = day.date().isoformat() if day else None
     site_name = None
     if row.get("site_id"):
         site = sites.get_site(conn, row["site_id"])
         site_name = (site or {}).get("name")
-    # Meeting time window for the email subject — "which meeting was this?". Device
+    # Meeting time window for the email subject — "which meeting was this?". NZ
     # wall-clock HH:MM of open→close (start only if the close time is unknown).
     def _hm(dt):
-        return dt.strftime("%H:%M") if hasattr(dt, "strftime") else None
-    start_hm, end_hm = _hm(row.get("opened_at")), _hm(row.get("closed_at"))
+        return dt.strftime("%H:%M") if dt else None
+    start_hm, end_hm = _hm(opened_nz), _hm(closed_nz)
     time_range = f"{start_hm}–{end_hm}" if start_hm and end_hm else (start_hm or None)
     return {"recipient": user.get("email"), "folder": user.get("folder_name"),
             "date": date, "siteName": site_name, "timeRange": time_range}
