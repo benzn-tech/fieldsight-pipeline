@@ -238,6 +238,12 @@ def lambda_handler(event, context):
     path = event.get("path", "")
     m = re.match(r"^/api/org(/.*)?$", path)
     route = (m.group(1) or "/") if m else path
+    # PUBLIC route — the ONLY org-api route that runs before conn/caller
+    # resolution: the terminal has no session yet, so there is no sub to
+    # resolve and no reason to pay for an Aurora connection on this path.
+    # Handled here, before `get_connection()`, not inside dispatch.
+    if route == "/auth/qr/redeem" and method == "POST":
+        return redeem_qr_login_code(event)
     try:
         # psycopg3 `with conn:` commits on clean exit, rolls back on
         # exception, and closes the connection when the block ends.
@@ -878,6 +884,10 @@ def create_qr_login_code(conn, caller, event):
     sub = claims.get("sub", "")
     if not sub:
         return error("unauthenticated", 401)
+    body = parse_body(event) or {}
+    refresh_token = body.get("refreshToken")
+    if not refresh_token:
+        return error("missing refreshToken", 400)
     if not _qr_rate_ok(sub):
         return error("too many requests — try again in a minute", 429)
     code = secrets.token_urlsafe(32)  # ~256-bit
@@ -887,6 +897,7 @@ def create_qr_login_code(conn, caller, event):
         _qr_table().put_item(Item={
             "code": code,
             "sub": sub,
+            "refreshToken": refresh_token,
             "consumed": False,
             "createdAt": now,
             "expiresAt": expires,
@@ -895,6 +906,76 @@ def create_qr_login_code(conn, caller, event):
         logger.exception("qr create put_item failed")  # never log `code`
         return error("could not create login code", 500)
     return ok({"code": code, "expiresAt": expires, "ttlSeconds": QR_TTL_SECONDS}, 201)
+
+
+def _qr_redeem_rate_ok(event):
+    """Source-IP-based per-minute limiter for the PUBLIC redeem endpoint (there
+    is no caller sub pre-auth to key on). Same counter-item mechanism as
+    _qr_rate_ok, namespaced "RATE#redeem#..." so it never collides with a
+    random code or the create-side per-user counter. Fails open."""
+    src = ((event.get("requestContext", {}) or {}).get("identity", {}) or {}).get("sourceIp", "unknown")
+    minute = int(time.time() // 60)
+    key = f"RATE#redeem#{minute}#{src}"
+    try:
+        resp = _qr_table().update_item(
+            Key={"code": key},
+            UpdateExpression="ADD hits :one SET expiresAt = :exp",
+            ExpressionAttributeValues={":one": 1, ":exp": (minute + 2) * 60},
+            ReturnValues="UPDATED_NEW",
+        )
+        return int(resp["Attributes"]["hits"]) <= QR_RATE_PER_MIN
+    except Exception:
+        logger.exception("qr redeem rate check failed")
+        return True
+
+
+def redeem_qr_login_code(event):
+    """PUBLIC (pre-auth, no conn/caller — runs before conn is even opened):
+    exchange a one-time code for the refresh token create() stashed. Atomic
+    single-use consume via a DynamoDB conditional update; generic 401 on any
+    failure (unknown/expired/already-consumed all look the same). Never logs
+    `code` or the refresh token.
+
+    Wrapped in an outer try/except: this handler runs in lambda_handler
+    OUTSIDE the get_connection()/dispatch try/except, so malformed input
+    (e.g. a non-string `code`) must never propagate as an uncaught crash —
+    it has to collapse to the same generic 401 as any other bad code."""
+    try:
+        body = parse_body(event) or {}
+        code = str(body.get("code") or "").strip()
+        if not code:
+            return error("Invalid or expired code", 401)
+        if not _qr_redeem_rate_ok(event):
+            return error("too many requests", 429)
+        try:
+            item = _qr_table().get_item(Key={"code": code}).get("Item")
+        except Exception:
+            logger.exception("qr redeem get_item failed")  # never log `code`
+            return error("Invalid or expired code", 401)
+        if not item or item.get("consumed") or int(time.time()) >= int(item.get("expiresAt", 0)):
+            return error("Invalid or expired code", 401)
+        try:
+            _qr_table().update_item(
+                Key={"code": code},
+                UpdateExpression="SET consumed = :t",
+                ConditionExpression="consumed = :f",
+                ExpressionAttributeValues={":t": True, ":f": False},
+            )
+        except Exception:
+            # lost the race to another redeemer, or a genuine infra error —
+            # both collapse to the same generic 401 (never reveal which).
+            return error("Invalid or expired code", 401)
+        # Consume-safe read: `item` was already fetched above (no extra DB
+        # call). A legacy row without `refreshToken` must not be allowed to
+        # consume-then-KeyError -- fall back to the same generic 401.
+        rt = item.get("refreshToken")
+        if not rt:
+            return error("Invalid or expired code", 401)
+        return ok({"refreshToken": rt}, 200)
+    except Exception:
+        # Outer safety net: any unexpected shape/error (never the code/token).
+        logger.exception("qr redeem failed")
+        return error("Invalid or expired code", 401)
 
 
 # ----------------------------------------------------------

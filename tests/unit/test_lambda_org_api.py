@@ -5941,10 +5941,26 @@ class FakeQrTable:
         self.items = {}
         self.rate_hits = {}
 
+    def get_item(self, Key):
+        item = self.items.get(Key["code"])
+        return {"Item": dict(item)} if item is not None else {}
+
     def put_item(self, Item):
         self.items[Item["code"]] = dict(Item)
 
-    def update_item(self, Key, UpdateExpression, ExpressionAttributeValues, ReturnValues=None):
+    def update_item(self, Key, UpdateExpression, ExpressionAttributeValues,
+                     ReturnValues=None, ConditionExpression=None):
+        if ConditionExpression:
+            # emulate the redeem single-use conditional consume:
+            # SET consumed = :t WHERE consumed = :f — mirrors
+            # test_lambda_qr_auth.py's ConsumeOnceTable/RaceLoserTable pattern.
+            k = Key["code"]
+            item = self.items.get(k)
+            if not item or item.get("consumed") is not False:
+                raise ClientError(
+                    {"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+            item["consumed"] = True
+            return {}
         # emulate the rate-limit "ADD hits :one" counter
         k = Key["code"]
         self.rate_hits[k] = self.rate_hits.get(k, 0) + int(ExpressionAttributeValues[":one"])
@@ -5954,13 +5970,29 @@ class FakeQrTable:
 def test_qr_create_returns_code(wired, monkeypatch):
     table = FakeQrTable()
     monkeypatch.setattr(org, "_qr_table", lambda: table)
-    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/create", sub="sub-1"), None)
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/auth/qr/create", sub="sub-1",
+                   body={"refreshToken": "RT-abc"}), None)
     assert res["statusCode"] == 201
     body = body_of(res)
     assert body["ttlSeconds"] == 90
     assert len(body["code"]) >= 32
     # the stored record binds the code to the caller's sub, unconsumed
     stored = table.items[body["code"]]
+    assert stored["sub"] == "sub-1"
+    assert stored["consumed"] is False
+    assert stored["expiresAt"] > stored["createdAt"]
+
+
+def test_qr_create_stores_refresh_token(wired, monkeypatch):
+    table = FakeQrTable()
+    monkeypatch.setattr(org, "_qr_table", lambda: table)
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/auth/qr/create", sub="sub-1",
+                   body={"refreshToken": "RT-abc"}), None)
+    assert res["statusCode"] == 201
+    stored = table.items[body_of(res)["code"]]
+    assert stored["refreshToken"] == "RT-abc"
     assert stored["sub"] == "sub-1"
     assert stored["consumed"] is False
     assert stored["expiresAt"] > stored["createdAt"]
@@ -5978,8 +6010,91 @@ def test_qr_create_rate_limited(wired, monkeypatch):
     monkeypatch.setattr(org, "_qr_table", lambda: table)
     codes = 0
     for _ in range(7):
-        res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/create", sub="sub-1"), None)
+        res = org.lambda_handler(
+            make_event("POST", "/api/org/auth/qr/create", sub="sub-1",
+                       body={"refreshToken": "RT-abc"}), None)
         if res["statusCode"] == 201:
             codes += 1
     # ≤5 per minute succeed; the rest are 429
     assert codes == 5
+
+
+def test_qr_create_missing_refresh_token_returns_400(wired, monkeypatch):
+    monkeypatch.setattr(org, "_qr_table", lambda: FakeQrTable())
+    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/create", sub="sub-1", body={}), None)
+    assert res["statusCode"] == 400
+
+
+def test_qr_redeem_returns_token_and_consumes(monkeypatch):
+    now = int(__import__("time").time())
+    table = FakeQrTable()
+    table.items["good"] = {"code": "good", "refreshToken": "RT-1", "sub": "s",
+                            "consumed": False, "createdAt": now, "expiresAt": now + 90}
+    monkeypatch.setattr(org, "_qr_table", lambda: table)
+    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": "good"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["refreshToken"] == "RT-1"
+    # second redeem fails (single-use)
+    res2 = org.lambda_handler(make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": "good"}), None)
+    assert res2["statusCode"] == 401
+
+
+def test_qr_redeem_rejects_expired(monkeypatch):
+    now = int(__import__("time").time())
+    table = FakeQrTable()
+    table.items["old"] = {"code": "old", "refreshToken": "RT", "sub": "s",
+                           "consumed": False, "createdAt": now - 100, "expiresAt": now - 1}
+    monkeypatch.setattr(org, "_qr_table", lambda: table)
+    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": "old"}), None)
+    assert res["statusCode"] == 401
+
+
+def test_qr_redeem_unknown_code_generic(monkeypatch):
+    monkeypatch.setattr(org, "_qr_table", lambda: FakeQrTable())
+    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": "nope"}), None)
+    assert res["statusCode"] == 401
+
+
+class RaceLoserQrTable:
+    """DynamoDB Table double for the lost-race path: get_item returns a stale
+    consumed=False item (passes the pre-check) but update_item's
+    ConditionExpression fails because another redeemer already flipped
+    `consumed` in between — simulating two concurrent redeemers racing on the
+    same one-time code. Mirrors test_lambda_qr_auth.py's RaceLoserTable
+    (that file is being deleted in Task 4, so this is defined inline here)."""
+    def __init__(self, item):
+        self.item = dict(item)
+
+    def get_item(self, Key):
+        if self.item.get("code") == Key["code"]:
+            return {"Item": dict(self.item)}
+        return {}
+
+    def update_item(self, Key, UpdateExpression, ExpressionAttributeValues,
+                     ReturnValues=None, ConditionExpression=None):
+        # Unconditional raise: emulates both the (fail-open) rate-limit
+        # counter update and the final single-use consume losing the race —
+        # either way the caller must end up with a generic 401.
+        raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+
+
+def test_qr_redeem_loses_atomic_race_returns_401(monkeypatch):
+    # get_item's pre-check sees a stale consumed=False (another redeemer flips
+    # it between our read and our conditional write) — exercises the
+    # ConditionExpression-failure branch itself, not the pre-check short-circuit.
+    now = int(__import__("time").time())
+    table = RaceLoserQrTable({"code": "good", "refreshToken": "RT-1", "sub": "s",
+                              "consumed": False, "createdAt": now, "expiresAt": now + 90})
+    monkeypatch.setattr(org, "_qr_table", lambda: table)
+    res = org.lambda_handler(make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": "good"}), None)
+    assert res["statusCode"] == 401
+    assert "refreshToken" not in body_of(res)
+
+
+def test_qr_redeem_non_string_code_returns_401_not_crash(monkeypatch):
+    # {"code": 123} used to raise AttributeError on int.strip() — must
+    # collapse to the same generic 401, not an uncaught crash.
+    monkeypatch.setattr(org, "_qr_table", lambda: FakeQrTable())
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": 123}), None)
+    assert res["statusCode"] == 401
