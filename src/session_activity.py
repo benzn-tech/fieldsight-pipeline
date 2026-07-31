@@ -110,4 +110,9 @@ def lambda_handler(event, context):
                     touched.append(sid)
             except Exception:
                 logger.exception("session_activity: failed for %s", key)
+    # Log only when it did something (fires on every transcript — no per-idle noise),
+    # so prod can trace which sessions the chunk stream opened/touched.
+    if touched:
+        logger.info("session_activity: opened/touched %d session(s): %s",
+                    len(touched), ", ".join(sorted(set(touched))))
     return {"touched": touched}
