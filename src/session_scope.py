@@ -37,10 +37,43 @@ already followed) so there is exactly one definition of the key shape.
 
 Pure module: no boto3, no psycopg, no env — importable from any lambda.
 """
+import calendar
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from transcript_utils import extract_base_time_from_filename
+
+
+def to_nz(dt):
+    """A UTC datetime -> Pacific/Auckland LOCAL (naive), DST-aware. meeting_session
+    opened_at/closed_at are stored UTC (the device's /open sends a UTC startedAt),
+    but the topic times, S3 keys, and the legacy session_start() are all the device's
+    NZ wall clock -- so a chunk session's start must be converted to NZ or the picker
+    mixes a UTC start with an NZ end (e.g. "06:36 - 18:39" for an 18:36-18:39 meeting).
+    Prefers the IANA tz db (exact); falls back to NZ's fixed rule (NZDT +13 from the
+    last Sunday of September to the first Sunday of April, else NZST +12) so it never
+    crashes if the runtime lacks tzdata."""
+    if not hasattr(dt, "strftime"):
+        return None
+    aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+    try:
+        from zoneinfo import ZoneInfo
+        return aware.astimezone(ZoneInfo("Pacific/Auckland")).replace(tzinfo=None)
+    except Exception:
+        u = aware.astimezone(timezone.utc).replace(tzinfo=None)
+        y = u.year
+
+        def _last_sun(mo):
+            d = datetime(y, mo, calendar.monthrange(y, mo)[1])
+            return d - timedelta(days=(d.weekday() - 6) % 7)
+
+        def _first_sun(mo):
+            d = datetime(y, mo, 1)
+            return d + timedelta(days=(6 - d.weekday()) % 7)
+
+        dst_start = _last_sun(9) + timedelta(hours=2) - timedelta(hours=12)
+        dst_end = _first_sun(4) + timedelta(hours=3) - timedelta(hours=13)
+        return u + timedelta(hours=13 if (u >= dst_start or u < dst_end) else 12)
 
 # Depth-exact: extractions/{user_folder}/{date}/{session_base}.json — a key
 # nested any deeper (or shallower, or not ending in .json) is not this

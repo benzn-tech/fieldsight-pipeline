@@ -3521,14 +3521,16 @@ def test_audio_segments_matches_chunk_session_key(presign_wired):
     assert seg["time_label"] == "14:13:58"
 
 
-def test_chunk_session_start_falls_back_to_meeting_session_opened_at(monkeypatch):
+def test_chunk_session_start_falls_back_to_meeting_session_opened_at_in_nz(monkeypatch):
     # A chunk session's base is `sid{hex}` (no timestamp) -> session_start can't
-    # parse a time -> the picker showed "?". Fall back to meeting_session.opened_at.
+    # parse a time -> the picker showed "?". Fall back to meeting_session.opened_at,
+    # which is UTC -> convert to NZ so it doesn't render "06:36" for an 18:36 meeting.
     import datetime as dt
+    # 02:11 UTC = 14:11 NZ (July, NZST +12)
     monkeypatch.setattr(org.meeting_session, "get",
-                        lambda conn, sid: {"opened_at": dt.datetime(2026, 7, 31, 14, 11, 56)})
+                        lambda conn, sid: {"opened_at": dt.datetime(2026, 7, 31, 2, 11, 56)})
     out = org._chunk_session_start("CONN", "sid" + "a" * 32)
-    assert out == dt.datetime(2026, 7, 31, 14, 11, 56)
+    assert out == dt.datetime(2026, 7, 31, 14, 11, 56)   # NZ local
 
 
 def test_chunk_session_start_none_for_legacy_base():
@@ -5949,10 +5951,21 @@ class FakeQrTable:
         self.items[Item["code"]] = dict(Item)
 
     def update_item(self, Key, UpdateExpression, ExpressionAttributeValues,
-                     ReturnValues=None, ConditionExpression=None):
+                     ReturnValues=None, ConditionExpression=None,
+                     ExpressionAttributeNames=None):
+        # Mimic DynamoDB: `consumed` is a RESERVED WORD — a literal (un-aliased)
+        # use in an Update/Condition expression fails with ValidationException.
+        # (Regression guard: the redeem consume must alias it via #c, else every
+        # redeem 401s. Real bug fixed 2026-07-31.)
+        _exprs = f"{UpdateExpression} {ConditionExpression or ''}"
+        if "consumed" in _exprs:
+            raise ClientError(
+                {"Error": {"Code": "ValidationException",
+                           "Message": "Attribute name is a reserved keyword; "
+                                      "reserved keyword: consumed"}}, "UpdateItem")
         if ConditionExpression:
             # emulate the redeem single-use conditional consume:
-            # SET consumed = :t WHERE consumed = :f — mirrors
+            # SET #c = :t WHERE #c = :f (consumed aliased) — mirrors
             # test_lambda_qr_auth.py's ConsumeOnceTable/RaceLoserTable pattern.
             k = Key["code"]
             item = self.items.get(k)

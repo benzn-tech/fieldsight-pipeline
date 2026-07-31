@@ -957,13 +957,19 @@ def redeem_qr_login_code(event):
         try:
             _qr_table().update_item(
                 Key={"code": code},
-                UpdateExpression="SET consumed = :t",
-                ConditionExpression="consumed = :f",
+                # `consumed` is a DynamoDB reserved word — alias it via #c, else
+                # every redeem throws ValidationException (caught below → generic 401).
+                UpdateExpression="SET #c = :t",
+                ConditionExpression="#c = :f",
+                ExpressionAttributeNames={"#c": "consumed"},
                 ExpressionAttributeValues={":t": True, ":f": False},
             )
         except Exception:
             # lost the race to another redeemer, or a genuine infra error —
-            # both collapse to the same generic 401 (never reveal which).
+            # both collapse to the same generic 401 (never reveal which). Log it
+            # (server-side only, never the code/token): a silent swallow here hid a
+            # reserved-word ValidationException that failed every redeem.
+            logger.exception("qr redeem consume (update_item) failed")
             return error("Invalid or expired code", 401)
         # Consume-safe read: `item` was already fetched above (no extra DB
         # call). A legacy row without `refreshToken` must not be allowed to
@@ -3405,14 +3411,15 @@ def _hhmm(dt):
 def _chunk_session_start(conn, session_base):
     """Start time for a CHUNK session whose base is the bare `sid{hex}` token —
     which carries no timestamp for session_scope.session_start to parse, so the
-    picker showed "?". Fall back to meeting_session.opened_at (the device's
-    record-press wall-clock, set by /open or the chunk stream). None if unknown
-    (legacy whole-file base, or no meeting_session row)."""
+    picker showed "?". Fall back to meeting_session.opened_at — stored UTC, so convert
+    to NZ (session_scope.to_nz) to match the legacy session_start() and the topic
+    times; otherwise the picker mixes a UTC start with an NZ end (e.g. "06:36 – 18:39"
+    for an 18:36–18:39 meeting). None if unknown (legacy base, or no row / opened_at)."""
     sid = session_scope.device_session_id(session_base)
     if not sid:
         return None
     row = meeting_session.get(conn, sid)
-    return (row or {}).get("opened_at")
+    return session_scope.to_nz((row or {}).get("opened_at"))
 
 
 def _session_title(srows, site_name):
