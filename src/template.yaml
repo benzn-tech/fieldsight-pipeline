@@ -666,7 +666,7 @@ Resources:
           # Per-chunk transcription (design 2026-07-31): 'false' = legacy per-VAD-segment
           # jobs. Set 'true' to emit one whole-chunk unit per chunk (coherent, cheaper —
           # see lambda_vad TRANSCRIBE_WHOLE_CHUNK). Inert until flipped; try on test first.
-          TRANSCRIBE_WHOLE_CHUNK: 'false'
+          TRANSCRIBE_WHOLE_CHUNK: 'true'
           WEB_VIDEO_PREFIX: web_video/
       Policies:
         - S3CrudPolicy:
