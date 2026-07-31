@@ -19,25 +19,31 @@ Result: {"chunks": [...], "site_count": N}
         function never raises so ask-agent can degrade gracefully instead
         of surfacing a 500 to the UI.
 
-ACL mirrors lambda_org_api.list_live_items EXACTLY: resolve_scope(caller's
-global_role) == "ALL" (admin/gm) sees every site in their company; anyone
-else is narrowed to memberships.accessible_site_ids. Deny-by-default: an
-empty site_ids list short-circuits to an empty result BEFORE calling
-search_chunks (WHERE site_id = ANY('{}') would match no rows anyway — this
-just skips the DB round-trip and makes the deny-by-default case explicit)
-rather than being special-cased in the SQL — same net behavior as the
-org-api ACL branch it mirrors.
+ACL (GRADED_ROLES=true): routes through repositories/scope.visible_scope,
+the SAME primitive the dashboard uses, so Search/Ask apply the identical
+per-author tier (e.g. site_manager -> SELF+WORKERS, never other site
+managers/PM/GM) on top of the site-level reach. ACL (GRADED_ROLES off,
+legacy/default): mirrors lambda_org_api.list_live_items EXACTLY —
+resolve_scope(caller's global_role) == "ALL" (admin/gm) sees every site in
+their company; anyone else is narrowed to memberships.accessible_site_ids;
+no per-author filter. Deny-by-default in both: an empty site_ids list
+short-circuits to an empty result BEFORE calling search_chunks (WHERE
+site_id = ANY('{}') would match no rows anyway — this just skips the DB
+round-trip and makes the deny-by-default case explicit).
 """
 import json
 import logging
+import os
 
 from db.connection import get_cached_connection
-from repositories import aliases, chunks, memberships, sites, users
+from repositories import aliases, chunks, memberships, scope, sites, users
 from repositories.acl import resolve_scope
 import text_normalize
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+GRADED_ROLES = os.environ.get("GRADED_ROLES", "").lower() == "true"
 
 
 def lambda_handler(event, context):
@@ -64,12 +70,24 @@ def lambda_handler(event, context):
         logger.info("rag-search: caller not provisioned for sub=%s", sub)
         return {"chunks": [], "error": "caller not provisioned"}
 
-    # ACL branch mirrors lambda_org_api.list_live_items exactly.
-    if resolve_scope(caller["global_role"]) == "ALL":
-        site_ids = [s["id"] for s in sites.list_company_sites(conn, caller["company_id"])]
+    # ACL: when GRADED_ROLES is on, route through the SAME scope.visible_scope
+    # primitive the dashboard uses, so Search/Ask apply the identical
+    # per-author tier (e.g. site_manager -> SELF+WORKERS, never other site
+    # managers/PM/GM). When off, keep the legacy binary ACL (byte-identical
+    # to pre-graded behavior) -- mirrors lambda_org_api.list_live_items.
+    if GRADED_ROLES:
+        sc = scope.visible_scope(conn, caller)          # dashboard's ACL primitive
+        site_ids = [str(s) for s in sc["site_ids"]]
+        author_ids = ([str(a) for a in sc["author_ids"]]
+                      if sc["author_ids"] is not None else None)
     else:
-        site_ids = memberships.accessible_site_ids(
-            conn, caller["id"], caller["global_role"])
+        # legacy site-only (byte-identical to pre-graded behavior)
+        if resolve_scope(caller["global_role"]) == "ALL":
+            site_ids = [s["id"] for s in sites.list_company_sites(conn, caller["company_id"])]
+        else:
+            site_ids = memberships.accessible_site_ids(
+                conn, caller["id"], caller["global_role"])
+        author_ids = None
 
     # Project-scoped search: `site_filter` is the project SLUG (what the UI's
     # top-bar selector uses), so resolve it to the site id first, then narrow
@@ -83,7 +101,7 @@ def lambda_handler(event, context):
     if not site_ids:
         return {"chunks": [], "site_count": 0}
 
-    rows = chunks.search_chunks(conn, qv, site_ids, k=k,
+    rows = chunks.search_chunks(conn, qv, site_ids, k=k, author_ids=author_ids,
                                 date_from=date_from, date_to=date_to)
     # Synthesis-time safety net (spec §4): normalize retrieved chunk text with
     # the company's active aliases, so a chunk not yet re-embedded still reads
