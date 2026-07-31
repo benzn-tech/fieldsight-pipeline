@@ -4,12 +4,12 @@
 CL=arn:aws:rds:ap-southeast-2:509194952652:cluster:fieldsight-db-test-dbcluster-hywiixu8ihi9
 SEC=arn:aws:secretsmanager:ap-southeast-2:509194952652:secret:rds!cluster-1757a281-ee31-460d-b56e-950817921010-Ansbey
 aws rds-data execute-statement --resource-arn "$CL" --secret-arn "$SEC" --database fieldsight \
-  --sql "SELECT DISTINCT report_date, split_part(source_s3_key,'/',3) folder FROM report_chunks WHERE topic_id IS NULL AND created_at::date >= '2026-07-17' ORDER BY 1" --region ap-southeast-2
+  --sql "SELECT DISTINCT report_date, split_part(source_s3_key,'/',3) folder FROM report_chunks WHERE topic_id IS NULL AND report_date >= '2026-07-17' ORDER BY 1" --region ap-southeast-2
 
-## 2. For each (date, folder): re-trigger ingest by re-touching the report object
-# ingest fires on reports/<date>/<folder>/daily_report.json ObjectCreated.
-aws s3 cp s3://fieldsight-data-509194952652/reports/<date>/<folder>/daily_report.json \
-  s3://fieldsight-data-509194952652/reports/<date>/<folder>/daily_report.json \
+## 2. For each (date, folder): re-trigger ingest by re-touching the embeddings sidecar
+# ingest fires on embeddings/{date}/{folder}/vectors.json ObjectCreated → re-runs ingest_report (delete+reinsert chunks with the Task 7 topic-linking fix), reusing the existing embeddings — no DashScope re-embed.
+aws s3 cp s3://fieldsight-data-509194952652/embeddings/<date>/<folder>/vectors.json \
+  s3://fieldsight-data-509194952652/embeddings/<date>/<folder>/vectors.json \
   --metadata-directive REPLACE --region ap-southeast-2
 
 ## 3. Verify topic_id recovered
