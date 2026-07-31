@@ -631,7 +631,7 @@ def _assemble_session_report(conn, caller, session_id, event):
         return None, error("session not found", 404)
 
     site_name = next((r.get("site_name") for r in srows if r.get("site_name")), None)
-    start_dt = session_scope.session_start(session_id)
+    start_dt = session_scope.session_start(session_id) or _chunk_session_start(conn, session_id)
     # Reuse the timeline's exact topic shaping (findings->flags, alias-normalized,
     # redaction-flagged) so the modal preview matches what the page shows.
     shaped = render_report_shape(srows, {}, date, folder, conn)
@@ -3321,6 +3321,19 @@ def _hhmm(dt):
     return dt.strftime("%H:%M") if dt is not None else None
 
 
+def _chunk_session_start(conn, session_base):
+    """Start time for a CHUNK session whose base is the bare `sid{hex}` token —
+    which carries no timestamp for session_scope.session_start to parse, so the
+    picker showed "?". Fall back to meeting_session.opened_at (the device's
+    record-press wall-clock, set by /open or the chunk stream). None if unknown
+    (legacy whole-file base, or no meeting_session row)."""
+    sid = session_scope.device_session_id(session_base)
+    if not sid:
+        return None
+    row = meeting_session.get(conn, sid)
+    return (row or {}).get("opened_at")
+
+
 def _session_title(srows, site_name):
     """Deterministic, cosmetic session title for the picker (Tier-2 T1,
     session-report-review-export spec §4): the most-salient topic's title (the
@@ -3376,7 +3389,7 @@ def build_day_sessions(conn, caller, folder, date, rows):
 
     sessions = []
     for session_id, srows in by_session.items():
-        start_dt = session_scope.session_start(session_id)
+        start_dt = session_scope.session_start(session_id) or _chunk_session_start(conn, session_id)
         end_dt = _session_end_dt(conn, caller, folder, date, session_id, srows, start_dt)
         site_name = next((r.get("site_name") for r in srows if r.get("site_name")), None)
         sessions.append({
@@ -3956,7 +3969,12 @@ def _read_org_audio_segments(date, folder, start_time, end_time):
         if not key.endswith(".wav"):
             continue
         filename = key.split("/")[-1]
-        base_match = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})_off", filename)
+        # Base time then offset, matched SEPARATELY — a chunk-session segment keeps
+        # the sid/chunk tokens BETWEEN them (…_HH-MM-SS_sid{hex}_c{NNNN}_off…), so
+        # anchoring the time on a trailing "_off" (the old whole-file shape) skipped
+        # every chunk segment and left the web Audio tab empty. off_match below still
+        # pulls the offset; they need not be adjacent.
+        base_match = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})", filename)
         off_match = re.search(r"_off([\d.]+)_to([\d.]+)", filename)
         if not base_match or not off_match:
             continue

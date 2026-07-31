@@ -3495,6 +3495,47 @@ def test_audio_segments_non_all_caller_reads_own_folder(presign_wired):
     assert seg["url"].startswith("https://")
 
 
+def test_audio_segments_matches_chunk_session_key(presign_wired):
+    # Regression: a chunk-session segment carries sid/chunk tokens BETWEEN the
+    # HH-MM-SS and the _off (…_14-13-50_sid…_c0004_off8.9_to28.4_…). The old regex
+    # required "_off" right after the time, so every chunk segment was skipped and
+    # the web Audio tab came up empty. Must now be found.
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "site_manager",
+                                     "folder_name": "Ben_UCPK"})
+    _wire_one_audio_segment(
+        fake, "Ben_UCPK", "2026-07-31",
+        filename=("ben_ucpk_2026-07-31_14-13-50_sida71023b056824afbac819694b75ebe5a"
+                  "_c0004_off8.9_to28.4_srcwav.wav"))
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/audio-segments",
+        params={"date": "2026-07-31", "start": "14:13:00", "end": "14:15:00"}), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["count"] == 1
+    seg = b["segments"][0]
+    # base 14:13:50 = 51230s; off8.9 -> 51238.9, to28.4 -> 51258.4
+    assert seg["absolute_start"] == 51238.9
+    assert seg["absolute_end"] == 51258.4
+    assert seg["time_label"] == "14:13:58"
+
+
+def test_chunk_session_start_falls_back_to_meeting_session_opened_at(monkeypatch):
+    # A chunk session's base is `sid{hex}` (no timestamp) -> session_start can't
+    # parse a time -> the picker showed "?". Fall back to meeting_session.opened_at.
+    import datetime as dt
+    monkeypatch.setattr(org.meeting_session, "get",
+                        lambda conn, sid: {"opened_at": dt.datetime(2026, 7, 31, 14, 11, 56)})
+    out = org._chunk_session_start("CONN", "sid" + "a" * 32)
+    assert out == dt.datetime(2026, 7, 31, 14, 11, 56)
+
+
+def test_chunk_session_start_none_for_legacy_base():
+    # a legacy whole-file base HAS a timestamp (session_start handles it) -> no fallback
+    assert org._chunk_session_start("CONN", "Benl1_2026-07-31_14-11-56") is None
+
+
 def test_audio_segments_window_filter_excludes_out_of_range(presign_wired):
     wired, fake = presign_wired
     wired.setattr(org.users, "get_user_by_sub",

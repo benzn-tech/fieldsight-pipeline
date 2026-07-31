@@ -74,6 +74,7 @@ def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_
         "recipient": recipient,
         "folder": ctx.get("folder"),
         "date": ctx.get("date"),
+        "timeRange": ctx.get("timeRange"),
         "siteName": ctx.get("siteName"),
         "summary": rolling.get("summary", ""),
         "openTodos": rolling.get("open_todos", []),
@@ -98,8 +99,14 @@ def _resolve_context(conn, row):
     if row.get("site_id"):
         site = sites.get_site(conn, row["site_id"])
         site_name = (site or {}).get("name")
+    # Meeting time window for the email subject — "which meeting was this?". Device
+    # wall-clock HH:MM of open→close (start only if the close time is unknown).
+    def _hm(dt):
+        return dt.strftime("%H:%M") if hasattr(dt, "strftime") else None
+    start_hm, end_hm = _hm(row.get("opened_at")), _hm(row.get("closed_at"))
+    time_range = f"{start_hm}–{end_hm}" if start_hm and end_hm else (start_hm or None)
     return {"recipient": user.get("email"), "folder": user.get("folder_name"),
-            "date": date, "siteName": site_name}
+            "date": date, "siteName": site_name, "timeRange": time_range}
 
 
 def _read_rolling(folder, date, session_id):
