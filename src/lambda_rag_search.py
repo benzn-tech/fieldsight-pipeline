@@ -89,14 +89,21 @@ def lambda_handler(event, context):
                 conn, caller["id"], caller["global_role"])
         author_ids = None
 
-    # Project-scoped search: `site_filter` is the project SLUG (what the UI's
-    # top-bar selector uses), so resolve it to the site id first, then narrow
-    # within the caller's accessible sites (deny-by-default — an unknown or
-    # inaccessible slug yields []). Ask never passes site (stays cross-project).
+    # Project-scoped search: `site_filter` is normally the site UUID (what the
+    # UI's top-bar selector actually sends), so check it against the caller's
+    # already-resolved accessible set first; only fall back to the legacy
+    # project-SLUG lookup when it isn't a UUID already in reach. Either way
+    # this narrows within the caller's accessible sites (deny-by-default — an
+    # unknown or inaccessible id/slug yields []). Ask never passes site (stays
+    # cross-project).
     if site_filter:
-        matched = sites.get_company_site_by_slug(conn, caller["company_id"], site_filter)
-        matched_id = matched["id"] if matched else None
-        site_ids = [s for s in site_ids if str(s) == str(matched_id)]
+        sset = {str(s) for s in site_ids}
+        if str(site_filter) in sset:                  # UUID already in reach
+            site_ids = [str(site_filter)]
+        else:                                         # legacy: treat as project slug
+            matched = sites.get_company_site_by_slug(conn, caller["company_id"], site_filter)
+            matched_id = matched["id"] if matched else None
+            site_ids = [s for s in site_ids if str(s) == str(matched_id)]
 
     if not site_ids:
         return {"chunks": [], "site_count": 0}

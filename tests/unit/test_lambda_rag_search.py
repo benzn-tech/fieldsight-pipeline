@@ -322,3 +322,20 @@ def test_graded_off_falls_back_to_site_only(wired, monkeypatch):
     rag.lambda_handler(make_event(), None)
     assert captured["author_ids"] is None            # legacy path, site-only
     assert captured["site_ids"] == ["s-1"]
+
+
+def test_site_filter_accepts_uuid_directly(wired):
+    # frontend sends the site UUID; it must narrow without a slug lookup.
+    wired.setattr(rag.sites, "list_company_sites",
+                  lambda conn, cid: [{"id": "s-1"}, {"id": "s-2"}])
+    def boom_slug(*a, **k):
+        raise AssertionError("slug lookup must not run when site is an accessible UUID")
+    wired.setattr(rag.sites, "get_company_site_by_slug", boom_slug)
+    captured = {}
+    wired.setattr(rag.chunks, "search_chunks",
+                  lambda conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None:
+                      (captured.update(site_ids=site_ids) or []))
+    ev = make_event(); ev["site"] = "s-2"
+    res = rag.lambda_handler(ev, None)
+    assert captured["site_ids"] == ["s-2"]
+    assert res["site_count"] == 1
