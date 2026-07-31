@@ -5908,10 +5908,21 @@ class FakeQrTable:
         self.items[Item["code"]] = dict(Item)
 
     def update_item(self, Key, UpdateExpression, ExpressionAttributeValues,
-                     ReturnValues=None, ConditionExpression=None):
+                     ReturnValues=None, ConditionExpression=None,
+                     ExpressionAttributeNames=None):
+        # Mimic DynamoDB: `consumed` is a RESERVED WORD — a literal (un-aliased)
+        # use in an Update/Condition expression fails with ValidationException.
+        # (Regression guard: the redeem consume must alias it via #c, else every
+        # redeem 401s. Real bug fixed 2026-07-31.)
+        _exprs = f"{UpdateExpression} {ConditionExpression or ''}"
+        if "consumed" in _exprs:
+            raise ClientError(
+                {"Error": {"Code": "ValidationException",
+                           "Message": "Attribute name is a reserved keyword; "
+                                      "reserved keyword: consumed"}}, "UpdateItem")
         if ConditionExpression:
             # emulate the redeem single-use conditional consume:
-            # SET consumed = :t WHERE consumed = :f — mirrors
+            # SET #c = :t WHERE #c = :f (consumed aliased) — mirrors
             # test_lambda_qr_auth.py's ConsumeOnceTable/RaceLoserTable pattern.
             k = Key["code"]
             item = self.items.get(k)
