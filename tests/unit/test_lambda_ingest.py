@@ -622,6 +622,10 @@ def test_flip_off_behavior_unchanged(wired):
 def test_flip_on_with_extractions_defers(wired):
     wired.setattr(ing, "AUTHORITY_FLIP", True)
     wired.setattr(ing.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    # Task 7 (WS1 root fix): the day-lister returning nothing (this test
+    # isn't exercising the matcher itself -- see test_defer_day_* below) must
+    # leave topic_seq_to_id empty, same as before Task 7.
+    wired.setattr(ing.topics, "list_extraction_topics_for_day", lambda *a, **k: [])
 
     report_deletes = []
     wired.setattr(ing.chunks, "delete_chunks_for_source",
@@ -653,7 +657,8 @@ def test_flip_on_with_extractions_defers(wired):
     assert upserts == []
     assert emits == []
     assert result["topics"] == 0
-    # Chunks still flow (RAG), unlinked to any topic (topic_seq_to_id miss).
+    # Chunks still flow (RAG); with no extraction topics to match against,
+    # topic_seq_to_id stays empty and every chunk is unlinked.
     assert inserted
     assert all(kw["topic_id"] is None for kw in inserted)
 
@@ -688,6 +693,132 @@ def test_flip_env_parsing_defaults_false(monkeypatch):
         assert ing.AUTHORITY_FLIP is False
     finally:
         importlib.reload(ing)  # restore a clean module for the rest of the suite
+
+
+# ---------------------------------------------------------------------------
+# Task 7 (WS1 root fix): on a defer day, link each report topic to that day's
+# already-existing Aurora extraction topic by time overlap (title as
+# tiebreak), so chunks carry a real topic UUID instead of topic_id=None.
+# Unmatched report topics stay None -- Task 1's title-search hotfix covers
+# those, so a bad forced match would be strictly worse than leaving it be.
+# ---------------------------------------------------------------------------
+
+def test_defer_day_links_chunks_to_extraction_topic_by_time(wired):
+    # make_report()'s one topic is seq 0, time_range "09:00 – 09:05",
+    # topic_title "Safety Briefing". An extraction topic occurring inside
+    # that window (09:02) -- even with an unrelated title -- must win the
+    # match on time overlap alone.
+    wired.setattr(ing, "AUTHORITY_FLIP", True)
+    wired.setattr(ing.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    wired.setattr(
+        ing.topics, "list_extraction_topics_for_day",
+        lambda conn, site_id, user_id, report_date: [
+            {"id": "ext-a", "title": "Unrelated title", "occurred_at": "09:02:00"},
+        ],
+    )
+    captured_topic_ids = []
+    wired.setattr(
+        ing.chunks, "insert_chunk",
+        lambda conn, site_id, report_date, chunk_type, chunk_text, embedding, **kw:
+            captured_topic_ids.append(kw["topic_id"]) or {"id": "chunk-x"},
+    )
+
+    ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert captured_topic_ids
+    assert captured_topic_ids[0] == "ext-a"
+
+
+def test_defer_day_unmatched_report_topic_stays_none(wired):
+    # The extraction topic here neither overlaps the report topic's
+    # 09:00-09:05 window (it occurs at 23:00) nor resembles its title --
+    # no candidate scores, so the chunk must stay unlinked (topic_id=None),
+    # not crash and not force a fragile match.
+    wired.setattr(ing, "AUTHORITY_FLIP", True)
+    wired.setattr(ing.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    wired.setattr(
+        ing.topics, "list_extraction_topics_for_day",
+        lambda conn, site_id, user_id, report_date: [
+            {"id": "ext-z", "title": "Completely different subject",
+             "occurred_at": "23:00:00"},
+        ],
+    )
+    captured_topic_ids = []
+    wired.setattr(
+        ing.chunks, "insert_chunk",
+        lambda conn, site_id, report_date, chunk_type, chunk_text, embedding, **kw:
+            captured_topic_ids.append(kw["topic_id"]) or {"id": "chunk-x"},
+    )
+
+    ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert captured_topic_ids
+    assert captured_topic_ids[0] is None
+
+
+def test_overlap_or_title_score_temporal_overlap_wins():
+    # Time overlap present (09:02 inside 09:00-09:05) -> non-None score with
+    # a positive overlap component, REGARDLESS of title dissimilarity.
+    report_topic = {"time_range": "09:00 – 09:05", "topic_title": "Safety Briefing"}
+    ext_topic = {"title": "Unrelated title", "occurred_at": "09:02:00"}
+
+    score = ing._overlap_or_title_score(report_topic, ext_topic)
+
+    assert score is not None
+    assert score[0] > 0
+
+
+def test_overlap_or_title_score_title_similarity_fallback():
+    # No time signal at all (missing time_range) but a near-identical title
+    # -> falls back to a title-only score (overlap component 0, ratio > 0.5),
+    # not None.
+    report_topic = {"time_range": None, "topic_title": "Safety Briefing"}
+    ext_topic = {"title": "Safety Briefing", "occurred_at": None}
+
+    score = ing._overlap_or_title_score(report_topic, ext_topic)
+
+    assert score is not None
+    assert score[0] == 0
+    assert score[1] > 0.5
+
+
+def test_overlap_or_title_score_no_match_returns_none():
+    # No time overlap (13:00 outside 09:00-09:05) and no title similarity ->
+    # None, i.e. "not a comparable candidate at all".
+    report_topic = {"time_range": "09:00 – 09:05", "topic_title": "Safety Briefing"}
+    ext_topic = {"title": "Completely different subject", "occurred_at": "13:00:00"}
+
+    assert ing._overlap_or_title_score(report_topic, ext_topic) is None
+
+
+def test_defer_day_two_report_topics_do_not_collide_on_one_extraction(monkeypatch):
+    # Fix round 1: two report topics both overlap the SAME single extraction
+    # topic's window -- the global best-first assignment must claim it for
+    # at most one of them. The loser must stay unmatched (None), never a
+    # forced second-best collision (lambda_ask_agent._aggregate_topics
+    # groups search chunks by topic_id and keeps only one row per group, so
+    # a collision would silently drop one topic from Search entirely --
+    # worse than topic_id=None, which the aggregator survives via
+    # title-grouping).
+    monkeypatch.setattr(
+        ing.topics, "list_extraction_topics_for_day",
+        lambda conn, site_id, user_id, report_date: [
+            {"id": "ext-shared", "title": "Site walk", "occurred_at": "09:02:00"},
+        ],
+    )
+    report_topics = [
+        {"topic_id": 0, "time_range": "09:00 – 09:05", "topic_title": "Safety Briefing"},
+        {"topic_id": 1, "time_range": "09:01 – 09:04", "topic_title": "Toolbox Talk"},
+    ]
+
+    seq_to_id = ing._match_report_topics_to_extraction(
+        None, "site-1", "user-1", "2026-03-02", report_topics)
+
+    topic_ids = [seq_to_id.get(0), seq_to_id.get(1)]
+    assert topic_ids[0] != topic_ids[1]
+    non_none = [v for v in topic_ids if v is not None]
+    assert len(non_none) == 1
+    assert len(set(non_none)) == len(non_none)  # no duplicate non-None extraction id
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +1006,7 @@ def test_ingest_defer_day_lists_no_pictures(wired):
     # spend an S3 LIST on the pictures prefix either.
     wired.setattr(ing, "AUTHORITY_FLIP", True)
     wired.setattr(ing.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    wired.setattr(ing.topics, "list_extraction_topics_for_day", lambda *a, **k: [])
     calls = []
     wired.setattr(ing, "_list_report_pictures",
                   lambda *a, **k: calls.append(a) or [])

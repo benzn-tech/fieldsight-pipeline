@@ -16,7 +16,7 @@ def test_retrieved_chunk_text_is_alias_normalized(monkeypatch):
     monkeypatch.setattr(mod.sites, "list_company_sites",
                         lambda conn, cid: [{"id": "s-1"}])
     monkeypatch.setattr(mod.chunks, "search_chunks",
-                        lambda conn, qv, ids, k=8, date_from=None, date_to=None:
+                        lambda conn, qv, ids, k=8, date_from=None, date_to=None, author_ids=None:
                         [{"id": "c-1", "chunk_text": "Mackon poured the slab",
                           "site_id": "s-1", "topic_id": "t-1", "report_date": "2026-07-16"}])
     monkeypatch.setattr(mod.aliases, "list_active",

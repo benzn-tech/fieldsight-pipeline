@@ -238,3 +238,41 @@ def test_search_route_includes_site_for_project_sync(monkeypatch):
     wire(monkeypatch, [chunk("t-1", "2026-02-09", 0.1, "Door Hardware Issues")])
     out = run(ev())
     assert "&site=s-slug-1" in out["results"][0]["route"]
+
+
+# ============================================================
+# BUG-39 / WS1 hotfix (2026-07-31): authority-flip chunks carry
+# chunk_type='topic' but topic_id=NULL -- these are formal topics and MUST
+# survive, grouped/deeplinked by title instead of UUID.
+# ============================================================
+
+def test_search_keeps_topic_chunk_without_topic_id(monkeypatch):
+    # authority-flip (2026-07-17+): chunk_type='topic' but topic_id NULL.
+    # metadata.title / chunk_text carry the title; the row MUST survive.
+    wire(monkeypatch, [chunk(None, "2026-07-23", 0.2, None, chunk_type="topic",
+                             text="[13:30] Voice Recording System Demonstration")])
+    out = run(ev(question="recording"))
+    assert out["count"] == 1
+    r = out["results"][0]
+    assert "Voice Recording System Demonstration" in r["title"]
+    # deep-link falls back to the derived title (no UUID available)
+    assert "topicTitle=" in r["route"]
+
+def test_search_still_drops_topicless_transcript_window(monkeypatch):
+    # unchanged: raw transcript-window chunks with no topic stay dropped.
+    wire(monkeypatch, [chunk(None, "2026-07-23", 0.2, None,
+                             chunk_type="transcript_window", text="spk_0: raw line")])
+    out = run(ev(question="recording"))
+    assert out["count"] == 0
+
+def test_search_groups_topicless_topic_chunks_by_title(monkeypatch):
+    # two topic chunks, same title, no UUID -> collapse to ONE row (best dist).
+    wire(monkeypatch, [
+        chunk(None, "2026-07-23", 0.4, None, chunk_type="topic",
+              text="[13:30] Recording App Orientation"),
+        chunk(None, "2026-07-23", 0.1, None, chunk_type="topic",
+              text="[13:30] Recording App Orientation"),
+    ])
+    out = run(ev(question="recording"))
+    assert out["count"] == 1
+    assert out["results"][0]["score"] == 0.1

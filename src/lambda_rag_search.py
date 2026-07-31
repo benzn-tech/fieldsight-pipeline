@@ -19,21 +19,21 @@ Result: {"chunks": [...], "site_count": N}
         function never raises so ask-agent can degrade gracefully instead
         of surfacing a 500 to the UI.
 
-ACL mirrors lambda_org_api.list_live_items EXACTLY: resolve_scope(caller's
-global_role) == "ALL" (admin/gm) sees every site in their company; anyone
-else is narrowed to memberships.accessible_site_ids. Deny-by-default: an
-empty site_ids list short-circuits to an empty result BEFORE calling
+ACL: ALWAYS routes through repositories/scope.visible_scope, the SAME
+primitive the dashboard uses, so Search/Ask apply the identical per-author
+tier (e.g. site_manager -> SELF+WORKERS, never other site managers/PM/GM)
+on top of the site-level reach. There is no legacy/fallback mode — this is
+a new consumer with no pre-graded behavior to preserve, so it always fails
+SAFE (narrowest scope) rather than failing open to site-only. Deny-by-default:
+an empty site_ids list short-circuits to an empty result BEFORE calling
 search_chunks (WHERE site_id = ANY('{}') would match no rows anyway — this
-just skips the DB round-trip and makes the deny-by-default case explicit)
-rather than being special-cased in the SQL — same net behavior as the
-org-api ACL branch it mirrors.
+just skips the DB round-trip and makes the deny-by-default case explicit).
 """
 import json
 import logging
 
 from db.connection import get_cached_connection
-from repositories import aliases, chunks, memberships, sites, users
-from repositories.acl import resolve_scope
+from repositories import aliases, chunks, scope, sites, users
 import text_normalize
 
 logger = logging.getLogger()
@@ -64,26 +64,35 @@ def lambda_handler(event, context):
         logger.info("rag-search: caller not provisioned for sub=%s", sub)
         return {"chunks": [], "error": "caller not provisioned"}
 
-    # ACL branch mirrors lambda_org_api.list_live_items exactly.
-    if resolve_scope(caller["global_role"]) == "ALL":
-        site_ids = [s["id"] for s in sites.list_company_sites(conn, caller["company_id"])]
-    else:
-        site_ids = memberships.accessible_site_ids(
-            conn, caller["id"], caller["global_role"])
+    # Fail-safe: ALWAYS scope through the dashboard's ACL primitive (per-author
+    # graded visibility). No GRADED_ROLES gate here — rag-search is a new
+    # consumer with no legacy behavior to preserve, and failing open to
+    # site-only would over-share. org-api keeps its own GRADED_ROLES gate.
+    sc = scope.visible_scope(conn, caller)
+    site_ids = [str(s) for s in sc["site_ids"]]
+    author_ids = ([str(a) for a in sc["author_ids"]]
+                  if sc["author_ids"] is not None else None)
 
-    # Project-scoped search: `site_filter` is the project SLUG (what the UI's
-    # top-bar selector uses), so resolve it to the site id first, then narrow
-    # within the caller's accessible sites (deny-by-default — an unknown or
-    # inaccessible slug yields []). Ask never passes site (stays cross-project).
+    # Project-scoped search: `site_filter` is normally the site UUID (what the
+    # UI's top-bar selector actually sends), so check it against the caller's
+    # already-resolved accessible set first; only fall back to the legacy
+    # project-SLUG lookup when it isn't a UUID already in reach. Either way
+    # this narrows within the caller's accessible sites (deny-by-default — an
+    # unknown or inaccessible id/slug yields []). Ask never passes site (stays
+    # cross-project).
     if site_filter:
-        matched = sites.get_company_site_by_slug(conn, caller["company_id"], site_filter)
-        matched_id = matched["id"] if matched else None
-        site_ids = [s for s in site_ids if str(s) == str(matched_id)]
+        sset = {str(s) for s in site_ids}
+        if str(site_filter) in sset:                  # UUID already in reach
+            site_ids = [str(site_filter)]
+        else:                                         # legacy: treat as project slug
+            matched = sites.get_company_site_by_slug(conn, caller["company_id"], site_filter)
+            matched_id = matched["id"] if matched else None
+            site_ids = [s for s in site_ids if str(s) == str(matched_id)]
 
     if not site_ids:
         return {"chunks": [], "site_count": 0}
 
-    rows = chunks.search_chunks(conn, qv, site_ids, k=k,
+    rows = chunks.search_chunks(conn, qv, site_ids, k=k, author_ids=author_ids,
                                 date_from=date_from, date_to=date_to)
     # Synthesis-time safety net (spec §4): normalize retrieved chunk text with
     # the company's active aliases, so a chunk not yet re-embedded still reads
