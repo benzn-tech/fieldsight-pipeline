@@ -3956,7 +3956,12 @@ def _read_org_audio_segments(date, folder, start_time, end_time):
         if not key.endswith(".wav"):
             continue
         filename = key.split("/")[-1]
-        base_match = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})_off", filename)
+        # Base time then offset, matched SEPARATELY — a chunk-session segment keeps
+        # the sid/chunk tokens BETWEEN them (…_HH-MM-SS_sid{hex}_c{NNNN}_off…), so
+        # anchoring the time on a trailing "_off" (the old whole-file shape) skipped
+        # every chunk segment and left the web Audio tab empty. off_match below still
+        # pulls the offset; they need not be adjacent.
+        base_match = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})", filename)
         off_match = re.search(r"_off([\d.]+)_to([\d.]+)", filename)
         if not base_match or not off_match:
             continue
