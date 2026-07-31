@@ -33,3 +33,14 @@ def test_device_session_id_requires_the_bare_base_not_a_full_chunk_key():
     # a stray leading token or a chunk suffix is NOT a session base.
     assert ss.device_session_id(f"Benl1_2026-07-25_13-05-12_sid{HEX}") is None
     assert ss.device_session_id(f"sid{HEX}_c0007") is None
+
+
+def test_to_nz_utc_to_nz_local_dst_aware():
+    import datetime as dt
+    # July = NZST +12: 02:11 UTC -> 14:11 NZ same day
+    assert ss.to_nz(dt.datetime(2026, 7, 31, 2, 11)) == dt.datetime(2026, 7, 31, 14, 11)
+    # a late-evening NZ meeting: 06:36 UTC -> 18:36 NZ (the "06:36 - 18:39" bug case)
+    assert ss.to_nz(dt.datetime(2026, 7, 31, 6, 36)).strftime("%H:%M") == "18:36"
+    # January = NZDT +13 (daylight saving): 02:00 UTC -> 15:00 NZ
+    assert ss.to_nz(dt.datetime(2026, 1, 15, 2, 0)).strftime("%H:%M") == "15:00"
+    assert ss.to_nz(None) is None
