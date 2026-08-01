@@ -638,6 +638,26 @@ dev 可把 Amplify `FS_ORG_BASEURL` 指向 test 网关(`wdsgobb7b0…/prod/api`,
 **通则**:①DynamoDB 表达式里任何普通英文词都先查保留字表,一律用 `#别名`;②**永远别写静默的
 `except: return 通用错误`** —— 服务端至少 `logger.exception`,否则这类 bug 无从下手。
 
+### BUG-41: 报告的 `site` 来自 `SITE_NAME` env 兜底 → chunk 站点错归属(2026-08-02)
+**现象**:某用户在 RAG 搜索里**搜不到自己的内容**,而别站的人反倒搜得到;同时 defer 天的 topic 匹配恒 0。
+**根因链**:`lambda_report_generator` 对**不在遗留 `config/user_mapping.json` 里的用户**(= 所有注册制新账号),
+把 `report['site']` 填成 **env `SITE_NAME`**(prod 值 `SB1108 Ellesmere College`):`:1245` `user_primary_site.get(user_name,'')`
+→ `''` → `:1247` `.get('name', site_name)` 回退 → `:1182` `os.environ['SITE_NAME']`。`lambda_ingest.resolve_site`
+路径①按名字查站,**忠实采信这个错站名** → chunk 的 `site_id` 全错。而 `lambda_item_writer` 走 G5b
+`recordings.site_id`(App 内选站)→ 同一 user+date 的 extraction topic 站点是**对的**。两侧不一致的后果:
+①RAG 按 `site_id` 过滤 → 本人看不见自己的内容、他站的人看得见(**可见性错误**);②defer 天 topic 匹配器按
+`(site_id,user_id,report_date)` 取候选 → **恒空** → `topic_id` 全 NULL(实测 6/54)。prod 实证 40 条中招。
+**Fix(已上线 PR #196/#197)**:ingest 与 item_writer **对齐优先级**——新增
+`recordings.site_for_day(conn,company_id,user_folder,date)`(`site_for_media` 的日级兄弟,同款租户安全:
+company 双重限定 + `site_id IS NOT NULL` + `_escape_like`;一天跨站按**录音条数取多数**、同数取最新),
+调用点改 `site_for_day(...) or resolve_site(...)`。**`resolve_site` 本身不动**——`item_writer` 拿它当自己第三级。
+重跑后 topic_id 6→21、站点归属不再被重跑撤销。
+**残留(设计正确,勿"修")**:若 `recordings.company_id` 与 ingest 解析出的公司不同(遗留数据:早期录音还挂在
+`dc2eafa9` FieldSight 名下),跨租户守卫会正确拒绝 → 回落老逻辑 → 仍可能错站。**放宽 company 限定 = 租户隔离
+回归,绝不做**;正解是迁移那批 recordings 的 `company_id`。
+**通则**:①任何"站点/归属"判定都以 **App 端 `recordings.site_id`** 为权威,`user_mapping.json` 和 env 兜底只配
+当最后一级;②env 级默认值(`SITE_NAME`)用于**多租户归属**是危险设计——它把"查不到"静默变成"归到某个具体客户"。
+
 ### 定时器交接(2026-07-15 schedules cutover 上线)
 录音下载 + 报告生成的 cron 已从遗留手管的 `sitesync` EventBridge 组切到 **fieldsight-prod SAM 栈**
 的 schedule(`PROD_ENABLE_SCHEDULES=true`):orchestrator 15 分钟 sweep(工作时段 05:00–19:59 NZ)
