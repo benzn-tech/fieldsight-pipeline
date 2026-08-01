@@ -105,6 +105,10 @@ def wired(monkeypatch):
                         lambda conn, cid, name: {"id": "site-1", "name": name}
                         if name == "Test Site" else None)
     monkeypatch.setattr(ing.users, "get_by_folder_name", lambda conn, cid, folder_name: None)
+    # No app-tagged recording by default -- existing tests exercise the
+    # legacy resolve_site path unchanged; tests that care about the app pick
+    # override this explicitly.
+    monkeypatch.setattr(ing.recordings, "site_for_day", lambda conn, cid, user_folder, date: None)
     monkeypatch.setattr(ing.chunks, "delete_chunks_for_source", lambda *a, **k: 0)
     monkeypatch.setattr(ing.topics, "delete_topics_for_source", lambda *a, **k: 0)
     monkeypatch.setattr(ing.topics, "delete_topics_for_source_prefix", lambda *a, **k: 0)
@@ -248,6 +252,57 @@ def test_resolve_site_double_miss_skips(monkeypatch):
     site = ing.resolve_site(None, "co-1", report, "Jarley_Trainor")
 
     assert site is None
+
+
+def test_ingest_prefers_app_tagged_site_over_resolve_site(wired):
+    # recordings.site_for_day (the in-app project pick, G5b) is authoritative
+    # -- when it returns a site, the legacy resolve_site must NOT even be
+    # consulted.
+    wired.setattr(ing.recordings, "site_for_day",
+                  lambda conn, cid, user_folder, date: {"id": "site-app", "name": "UC PK"})
+
+    def boom(*a, **k):
+        raise AssertionError("resolve_site must not be called when site_for_day hits")
+    wired.setattr(ing, "resolve_site", boom)
+
+    result = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert result["skipped"] is not True
+
+
+def test_ingest_falls_back_to_resolve_site_when_no_app_pick(wired):
+    # No app-tagged recording for that (user_folder, date) -- existing
+    # legacy-resolver behaviour is preserved unchanged.
+    wired.setattr(ing.recordings, "site_for_day",
+                  lambda conn, cid, user_folder, date: None)
+    calls = []
+    real_resolve_site = ing.resolve_site
+    wired.setattr(ing, "resolve_site",
+                  lambda *a, **k: calls.append(a) or real_resolve_site(*a, **k))
+
+    result = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert len(calls) == 1
+    assert result["skipped"] is not True
+
+
+def test_ingest_app_pick_wins_over_report_site_name_regression(wired):
+    # The 40-row prod bug in miniature: report['site'] is the report
+    # generator's SITE_NAME env fallback ("Test Site" here, resolvable via
+    # get_company_site_by_name to site-1), but the app tagged this recording
+    # to a DIFFERENT site (site-app / "UC PK"). The app pick must win.
+    wired.setattr(ing.recordings, "site_for_day",
+                  lambda conn, cid, user_folder, date: {"id": "site-app", "name": "UC PK"})
+    captured = []
+    wired.setattr(
+        ing.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            captured.append(site_id) or {"id": "topic-uuid-0"},
+    )
+
+    ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert captured == ["site-app"]
 
 
 def test_site_bridge_miss_skips(wired):

@@ -65,3 +65,67 @@ def test_site_for_media_no_match_returns_none_and_skips_get_site(monkeypatch):
     assert recordings.site_for_media(
         conn, "co-1", "Ben_Lin", "2026-07-16", "Ben_Lin_2026-07-16_09-50-00") is None
     assert called == []
+
+
+# ---------------------------------------------------------------------------
+# site_for_day -- report-level sibling of site_for_media (no session_base;
+# matches the whole day for a folder). Same safety properties: company
+# double-scope via the sites join, r.site_id IS NOT NULL, LIKE with
+# _escape_like on the folder, ESCAPE '\'.
+# ---------------------------------------------------------------------------
+
+def test_site_for_day_escapes_like_wildcards_and_scopes_by_company(monkeypatch):
+    conn = FakeConn(results=[[{"site_id": "site-1", "cnt": 3, "latest": "t3"}]])
+    monkeypatch.setattr(recordings.sites, "get_site",
+                        lambda c, sid: {"id": sid, "company_id": "co-1"})
+
+    site = recordings.site_for_day(conn, "co-1", "Ben_Lin", "2026-07-16")
+
+    assert site == {"id": "site-1", "company_id": "co-1"}
+    sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
+    assert "LIKE %s ESCAPE '\\'" in sql
+    assert "LIMIT 1" in sql
+    assert "r.company_id = %s" in sql and "s.company_id = %s" in sql
+    assert "r.site_id IS NOT NULL" in sql
+    assert params == ("co-1", "co-1", r"users/Ben\_Lin/%/2026-07-16/%")
+
+
+def test_site_for_day_no_match_returns_none_and_skips_get_site(monkeypatch):
+    conn = FakeConn(results=[[]])
+    called = []
+    monkeypatch.setattr(recordings.sites, "get_site",
+                        lambda c, sid: called.append(sid))
+
+    assert recordings.site_for_day(conn, "co-1", "Ben_Lin", "2026-07-16") is None
+    assert called == []
+
+
+def test_site_for_day_picks_site_with_most_recordings(monkeypatch):
+    # SQL does the majority-vote grouping/ordering itself; the fake DB just
+    # returns whatever the (correctly-ordered) query would return -- this
+    # test asserts the repo function trusts the first row and the query is
+    # shaped to order by count then recency (see SQL-shape assertions above).
+    conn = FakeConn(results=[[{"site_id": "site-majority", "cnt": 5, "latest": "t5"}]])
+    monkeypatch.setattr(recordings.sites, "get_site",
+                        lambda c, sid: {"id": sid})
+
+    site = recordings.site_for_day(conn, "co-1", "Ben_Lin", "2026-07-16")
+
+    assert site == {"id": "site-majority"}
+    sql = conn.calls[0]["sql"]
+    assert "GROUP BY r.site_id" in sql
+    assert "ORDER BY cnt DESC, latest DESC" in sql
+
+
+def test_site_for_day_tie_breaks_by_most_recent_created_at(monkeypatch):
+    # Tie-break is expressed in the SQL ORDER BY (cnt DESC, latest DESC);
+    # confirm the query shape carries both keys in that order.
+    conn = FakeConn(results=[[{"site_id": "site-newer", "cnt": 2, "latest": "t9"}]])
+    monkeypatch.setattr(recordings.sites, "get_site",
+                        lambda c, sid: {"id": sid})
+
+    site = recordings.site_for_day(conn, "co-1", "Ben_Lin", "2026-07-16")
+
+    assert site == {"id": "site-newer"}
+    sql = conn.calls[0]["sql"]
+    assert sql.index("ORDER BY cnt DESC, latest DESC") > sql.index("GROUP BY r.site_id")
