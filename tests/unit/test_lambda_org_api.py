@@ -1511,6 +1511,75 @@ SITE_ID = "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
 OTHER_SITE_ID = "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2"
 
 
+class FakeProgrammeStore:
+    """In-memory stand-in for the Aurora programme tables.
+
+    The programme moved from a single S3 blob to Aurora, with the S3 document
+    regenerated as a snapshot for lambda_programme_matcher. These tests still
+    drive the real handlers and the real snapshot builder — only the storage
+    is faked — so they keep asserting the things that did not change: the ACL,
+    the role gate, the S3 key, and the updated_at stamp.
+    """
+
+    PROGRAMME_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    def __init__(self):
+        self.programme = None
+        self.tasks = []
+        self.versions = []
+
+    # -- the programme_tasks surface the handlers call -------------------
+    def get_primary_programme(self, conn, site_id):
+        return self.programme
+
+    def get_primary_programme_by_id(self, conn, programme_id):
+        return self.programme
+
+    def create_programme(self, conn, *, site_id, name, source_format):
+        self.programme = {
+            "id": self.PROGRAMME_ID, "site_id": site_id, "name": name,
+            "source_format": source_format, "current_version": 0,
+            "baseline_version": None, "is_primary": True, "status": "active",
+        }
+        return self.programme
+
+    def record_version(self, conn, programme_id, **kw):
+        self.versions.append(kw)
+        return dict(kw, programme_id=programme_id)
+
+    def replace_all_tasks(self, conn, programme_id, *, parents, leaves,
+                          version_no, updated_by):
+        self.tasks = []
+        for p in parents:
+            self.tasks.append({
+                "id": "uuid-" + p["task_id"], "source_task_id": p["task_id"],
+                "parent_id": None, "origin": "imported",
+                "name": p.get("name"), "wbs_code": p.get("wbs"),
+                "start_date": None, "end_date": None, "duration_days": None,
+                "progress_pct": 0, "status": "not_started",
+                "removed_in_version": None,
+            })
+        for t in leaves:
+            self.tasks.append({
+                "id": "uuid-" + t["task_id"], "source_task_id": t["task_id"],
+                "parent_id": ("uuid-" + t["parent_id"]) if t.get("parent_id") else None,
+                "origin": "imported", "name": t.get("name"),
+                "wbs_code": t.get("wbs"), "start_date": t.get("start"),
+                "end_date": t.get("end"), "duration_days": t.get("duration_days"),
+                "progress_pct": t.get("progress_pct") or 0,
+                "status": t.get("status") or "not_started",
+                "removed_in_version": None,
+            })
+        self.programme["current_version"] = version_no
+        return len(self.tasks)
+
+    def list_tasks(self, conn, programme_id, include_removed=False):
+        return self.tasks
+
+    def list_assignees(self, conn, task_ids):
+        return {}
+
+
 @pytest.fixture
 def programme_wired(wired):
     fake = FakeS3()
@@ -1519,6 +1588,13 @@ def programme_wired(wired):
                   lambda conn, cid, **kw: [{"id": SITE_ID}])
     wired.setattr(org.memberships, "accessible_site_ids",
                   lambda conn, uid, role: [SITE_ID])
+
+    store = FakeProgrammeStore()
+    for name in ("get_primary_programme", "get_primary_programme_by_id",
+                 "create_programme", "record_version", "replace_all_tasks",
+                 "list_tasks", "list_assignees"):
+        wired.setattr(org.programme_tasks, name, getattr(store, name))
+    fake.programme_store = store
     return wired, fake
 
 
@@ -1566,13 +1642,18 @@ def test_resolve_site_param_no_access_403(wired):
 
 
 def test_get_programme_hit(programme_wired):
+    """GET now builds its response from the Aurora rows through the snapshot
+    builder rather than echoing an S3 blob, so the wire format is asserted
+    here rather than the storage round-trip."""
     wired, fake = programme_wired
-    fake.objects[f"programmes/{SITE_ID}/programme.json"] = json.dumps(
-        {"tasks": [{"id": "t-1", "name": "Foundations"}]}).encode()
+    _seed_programme(fake)
     res = org.lambda_handler(make_event(
         "GET", "/api/org/programme", params={"site": SITE_ID}), None)
     assert res["statusCode"] == 200
-    assert body_of(res)["programme"] == {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+    doc = body_of(res)["programme"]
+    assert [p["task_id"] for p in doc["parents"]] == ["G1"]
+    assert [t["task_id"] for t in doc["leaves"]] == ["T1"]
+    assert doc["start_date"] == "2026-04-01" and doc["end_date"] == "2026-04-10"
 
 
 def test_get_programme_miss_returns_null_200(programme_wired):
@@ -1632,28 +1713,42 @@ def test_admin_any_company_site_ok(programme_wired):
     assert body_of(res)["programme"] is None
 
 
+def _seed_programme(fake):
+    """One group with one dated task, straight into the fake Aurora store."""
+    store = fake.programme_store
+    store.create_programme(None, site_id=SITE_ID, name="Main contract",
+                           source_format="csv")
+    store.replace_all_tasks(
+        None, store.PROGRAMME_ID,
+        parents=[{"task_id": "G1", "name": "Foundations", "wbs": "1"}],
+        leaves=[{"task_id": "T1", "parent_id": "G1", "name": "Pour slab",
+                 "start": "2026-04-01", "end": "2026-04-10"}],
+        version_no=1, updated_by=None)
+    return store
+
+
 def test_programme_get_by_slug_works(programme_wired):
     wired, fake = programme_wired
     wired.setattr(org.sites, "get_company_site_by_slug",
                   lambda conn, cid, slug: {"id": SITE_ID} if slug == "alpha" else None)
-    fake.objects[f"programmes/{SITE_ID}/programme.json"] = json.dumps(
-        {"tasks": [{"id": "t-1", "name": "Foundations"}]}).encode()
+    _seed_programme(fake)
     res = org.lambda_handler(make_event(
         "GET", "/api/org/programme", params={"site": "alpha"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res)["programme"] == {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+    doc = body_of(res)["programme"]
+    assert [t["task_id"] for t in doc["leaves"]] == ["T1"]
 
 
 def test_programme_get_by_uuid_still_works(programme_wired):
     # Backward compat: the S3 key stays UUID-based and the original
     # ?site=<uuid> contract still resolves without touching get_company_site_by_slug.
     wired, fake = programme_wired
-    fake.objects[f"programmes/{SITE_ID}/programme.json"] = json.dumps(
-        {"tasks": [{"id": "t-1", "name": "Foundations"}]}).encode()
+    _seed_programme(fake)
     res = org.lambda_handler(make_event(
         "GET", "/api/org/programme", params={"site": SITE_ID}), None)
     assert res["statusCode"] == 200
-    assert body_of(res)["programme"] == {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+    doc = body_of(res)["programme"]
+    assert [t["task_id"] for t in doc["leaves"]] == ["T1"]
 
 
 def test_put_programme_role_gate(programme_wired):
@@ -1679,16 +1774,36 @@ def test_put_programme_role_gate(programme_wired):
 
 
 def test_put_programme_writes_key_and_updated_at(programme_wired):
+    """PUT writes Aurora now, but must still regenerate the S3 snapshot at the
+    UUID-keyed path and stamp updated_at — that document is what
+    lambda_programme_matcher reads, and a stale one makes matching go quiet
+    with no error anywhere."""
     wired, fake = programme_wired
-    body = {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+    body = {
+        "name": "Main contract",
+        "parents": [{"task_id": "G1", "name": "Foundations", "wbs": "1"}],
+        "leaves": [{"task_id": "T1", "parent_id": "G1", "name": "Pour slab",
+                    "start": "2026-04-01", "end": "2026-04-10"}],
+    }
     res = org.lambda_handler(make_event(
         "PUT", "/api/org/programme", params={"site": SITE_ID}, body=body), None)
     assert res["statusCode"] == 200
-    saved = body_of(res)["programme"]
-    assert saved["tasks"] == [{"id": "t-1", "name": "Foundations"}]
-    assert saved["updated_at"]
+
     stored = json.loads(fake.objects[f"programmes/{SITE_ID}/programme.json"])
-    assert stored == saved
+    assert stored["updated_at"]
+    assert [p["task_id"] for p in stored["parents"]] == ["G1"]
+    assert [t["task_id"] for t in stored["leaves"]] == ["T1"]
+
+
+def test_put_programme_records_a_version(programme_wired):
+    """Every write is a version, so an import can be rolled back later."""
+    wired, fake = programme_wired
+    org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": SITE_ID},
+        body={"parents": [], "leaves": []}), None)
+    assert fake.programme_store.versions
+    assert fake.programme_store.versions[0]["version_no"] == 1
+    assert fake.programme_store.versions[0]["mode"] == "initial"
 
 
 def test_put_programme_site_required_400(programme_wired):
