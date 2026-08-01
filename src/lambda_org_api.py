@@ -1028,6 +1028,8 @@ def get_me(conn, caller):
 def patch_me(conn, caller, body):
     if body is None:
         return error("malformed JSON body", 400)
+    if "prefs" in body and not isinstance(body["prefs"], dict):
+        return error("prefs must be an object", 400)
     old_avatar = caller.get("avatar_s3_key")
     avatar = body.get("avatar_s3_key")
     clear = "avatar_s3_key" in body and avatar is None
@@ -1057,6 +1059,13 @@ def patch_me(conn, caller, body):
             _delete_asset(old_avatar)
     elif final_avatar and old_avatar and old_avatar != final_avatar:
         _delete_asset(old_avatar)
+    # Merged last so the echoed row carries the new prefs; a separate write
+    # before update_profile would have been overwritten in the response by
+    # its RETURNING.
+    if "prefs" in body:
+        merged = users.merge_prefs(conn, caller["cognito_sub"], body["prefs"])
+        if merged is not None:
+            row = merged
     return ok(row)
 
 
