@@ -68,7 +68,7 @@ import photo_binding
 import reindex
 from chunking import chunk_report, chunk_transcripts
 from db.connection import get_connection
-from repositories import chunks, companies, memberships, sites, topics, users
+from repositories import chunks, companies, memberships, recordings, sites, topics, users
 from transcript_utils import normalize_transcript
 
 logger = logging.getLogger()
@@ -447,7 +447,12 @@ def ingest_report(date, user_folder, report_key):
             raise RuntimeError(
                 f"org company {COMPANY_NAME!r} not found — run the org seed "
                 "(fieldsight-*-org-seed) before ingesting")
-        site = resolve_site(conn, company["id"], report, user_folder)
+        # Site attribution: the app's in-app project pick (recordings.site_id,
+        # G5b) is authoritative -- lambda_item_writer already prefers it, and
+        # trusting report['site'] instead let the report generator's SITE_NAME
+        # env fallback mis-stamp every user missing from user_mapping.json.
+        site = (recordings.site_for_day(conn, company["id"], user_folder, date)
+                or resolve_site(conn, company["id"], report, user_folder))
         if site is None:
             reason = (f"identity bridge miss: report.site={report.get('site')!r}, "
                       f"user_folder={user_folder!r} -- skipping, zero writes")

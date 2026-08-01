@@ -94,3 +94,32 @@ def site_for_media(conn, company_id, user_folder, date, session_base) -> dict | 
     if row is None:
         return None
     return sites.get_site(conn, row["site_id"])
+
+
+def site_for_day(conn, company_id, user_folder, date) -> dict | None:
+    """The app-tagged site (recordings.site_id) for a user's WHOLE day, or
+    None. Report-level sibling of site_for_media above: same LIKE match on
+    users/{folder}/.../{date}/ (wildcard-escaped), same company double-scope
+    via the sites join (multi-tenant invariant -- never attribute across
+    tenants), same r.site_id IS NOT NULL filter, same sites.get_site()-shaped
+    return so it drops into the same slot as resolve_site.
+
+    Unlike site_for_media there is no session_base to pin a single
+    recording, and a day's recordings can in principle span more than one
+    site. Ambiguity rule: a daily report is inherently attributed to one
+    site, so pick the site with the MOST recordings that day (majority
+    signal), tie-breaking by the most recent created_at. This is strictly
+    better than the caller's env-var default (SITE_NAME) fallback."""
+    pattern = f"users/{_escape_like(user_folder)}/%/{date}/%"
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT r.site_id, COUNT(*) AS cnt, MAX(r.created_at) AS latest "
+        "FROM recordings r JOIN sites s ON s.id = r.site_id "
+        "WHERE r.company_id = %s AND s.company_id = %s AND r.site_id IS NOT NULL "
+        "AND r.s3_key LIKE %s ESCAPE '\\' "
+        "GROUP BY r.site_id "
+        "ORDER BY cnt DESC, latest DESC LIMIT 1",
+        (company_id, company_id, pattern),
+    ).fetchone()
+    if row is None:
+        return None
+    return sites.get_site(conn, row["site_id"])
