@@ -74,6 +74,16 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
                                                     (?from=&to=&assignee=me);
                                                     serves the window view, My
                                                     Work and Today
+  POST   /api/org/programme/import                → two-phase import: dry_run
+                                                    returns the diff, then
+                                                    commit with mode
+                                                    update|replace|new
+  GET    /api/org/programme/versions              → import history + baseline
+  POST   /api/org/programme/versions/{n}/restore  → roll back (records the
+                                                    state it leaves, so the
+                                                    rollback is reversible)
+  POST   /api/org/programme/baseline              → set the version lateness is
+                                                    measured against
   POST   /api/org/programme/tasks                 → create a LOCAL task (admin/gm/pm)
   PATCH  /api/org/programme/tasks:batch           → write a whole cascade
                                                     atomically; all row_versions
@@ -114,10 +124,12 @@ import reindex
 import session_scope
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
+import programme_reconcile
 from repositories import (action_items, aliases, classification_feedback, companies,
                           compliance_resolutions, content, content_edits, keyframes,
                           meeting_session, memberships, observations, programme,
-                          programme_delay_flags, programme_snapshot,
+                          programme_delay_flags, programme_import,
+                          programme_snapshot,
                           programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, rollup, scope,
                           sites, topics, users, voice_messages)
@@ -449,6 +461,16 @@ def dispatch(conn, event, method, route):
             return list_programme_tasks(conn, caller, event)
         if method == "POST":
             return create_programme_task(conn, caller, event, parse_body(event))
+
+    if route == "/programme/import" and method == "POST":
+        return import_programme(conn, caller, event, parse_body(event))
+    if route == "/programme/versions" and method == "GET":
+        return list_programme_versions(conn, caller, event)
+    m_pv = re.match(r"^/programme/versions/(\d+)/restore$", route)
+    if m_pv and method == "POST":
+        return restore_programme_version(conn, caller, event, m_pv.group(1))
+    if route == "/programme/baseline" and method == "POST":
+        return set_programme_baseline(conn, caller, event, parse_body(event))
 
     # Batch write. Registered before the `([^/]+)$` pattern so ":batch" is
     # never mistaken for a task id.
@@ -3133,6 +3155,180 @@ def acknowledge_delay_flag(conn, caller, flag_id, state="acknowledged"):
 # A cascade touches tens of rows, not thousands. An unbounded batch is a
 # transaction held open long enough to matter.
 _MAX_BATCH_TASKS = 500
+
+
+_IMPORT_MODES = ("update", "replace", "new")
+
+
+def import_programme(conn, caller, event, body):
+    """Two-phase import.
+
+    `dry_run: true` reconciles in memory and returns the diff WITHOUT writing;
+    the client shows it, the user picks a mode, and a second call commits. The
+    user never chooses blind — which matters because Replace discards work
+    that Update would have kept, and that cost is invisible from the plan
+    itself: it is measured in what Update would have preserved, so the dry run
+    counts it separately.
+    """
+    if body is None:
+        return error("malformed JSON body", 400)
+    if caller["global_role"] not in _MANAGER_ROLES:
+        return error("importing a programme requires manager role", 403)
+
+    parents = body.get("parents") or []
+    leaves = body.get("leaves") or []
+    if not parents and not leaves:
+        return error("nothing to import", 400)
+
+    mode = body.get("mode")
+    if mode is not None and mode not in _IMPORT_MODES:
+        return error(f"mode must be one of {_IMPORT_MODES}", 400)
+
+    site_id, err = _resolve_site_param(
+        conn, caller, (event.get("queryStringParameters") or {}).get("site"))
+    if err is not None:
+        return err
+
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        prog = programme_tasks.create_programme(
+            conn, site_id=site_id, name=body.get("name") or "Programme",
+            source_format=body.get("source_format"))
+
+    existing = programme_tasks.list_tasks(conn, prog["id"], include_removed=True)
+    version_no = (prog["current_version"] or 0) + 1
+    plan = programme_reconcile.reconcile(existing, parents, leaves,
+                                         version_no=version_no)
+
+    if body.get("dry_run"):
+        live = [t for t in existing if t.get("removed_in_version") is None]
+        assignee_map = programme_tasks.list_assignees(
+            conn, [t["id"] for t in existing])
+        return ok({
+            "dry_run": True,
+            "suggested_mode": programme_reconcile.suggest_mode(
+                existing, parents, leaves),
+            "update_preview": plan["summary"],
+            "rename_candidates": plan["rename_candidates"],
+            "replace_preview": {
+                "local_tasks_discarded": len(
+                    [t for t in live if t.get("origin") == "local"]),
+                "allocations_discarded": sum(
+                    len(v) for v in assignee_map.values()),
+                "tasks_with_progress_discarded": len(
+                    [t for t in live if (t.get("progress_pct") or 0) > 0]),
+            },
+        })
+
+    if mode is None:
+        return error("mode required to commit an import", 400)
+
+    if mode == "replace":
+        # Destructive, and confirmed twice: the client requires the site name
+        # typed, and this flag has to be sent explicitly as well.
+        if not body.get("confirm_replace"):
+            return error("replace requires confirm_replace", 400)
+        programme_tasks.replace_all_tasks(
+            conn, prog["id"], parents=parents, leaves=leaves,
+            version_no=version_no, updated_by=caller["id"])
+        counts = {"replaced": len(parents) + len(leaves)}
+        summary = {"mode": "replace", "tasks": len(parents) + len(leaves)}
+    elif mode == "new":
+        prog = programme_tasks.create_programme(
+            conn, site_id=site_id, name=body.get("name") or "Programme",
+            source_format=body.get("source_format"))
+        # A second programme on the same site is never the primary one —
+        # Today and My Work roll up exactly one.
+        conn.cursor().execute(
+            "UPDATE programmes SET is_primary = false WHERE id = %s",
+            (prog["id"],))
+        version_no = 1
+        programme_tasks.replace_all_tasks(
+            conn, prog["id"], parents=parents, leaves=leaves,
+            version_no=version_no, updated_by=caller["id"])
+        counts = {"created": len(parents) + len(leaves)}
+        summary = {"mode": "new", "tasks": len(parents) + len(leaves)}
+    else:
+        renames = body.get("accept_renames") or []
+        for r in renames:
+            programme_import.apply_rename(
+                conn, r["existing_id"], r["incoming_source_task_id"])
+        if renames:
+            # RE-RECONCILE. A rename turns what looked like a remove-plus-
+            # insert into a plain update, so the plan computed above is stale.
+            # Applying it would soft-remove the row the rename just repaired —
+            # and because removal is soft, the symptom is a task quietly
+            # vanishing from the Gantt rather than an error.
+            existing = programme_tasks.list_tasks(
+                conn, prog["id"], include_removed=True)
+            plan = programme_reconcile.reconcile(existing, parents, leaves,
+                                                 version_no=version_no)
+        counts = programme_import.apply_plan(
+            conn, prog["id"], plan, version_no=version_no,
+            updated_by=caller["id"])
+        summary = plan["summary"]
+
+    conn.cursor().execute(
+        "UPDATE programmes SET current_version = %s, updated_at = now() "
+        "WHERE id = %s", (version_no, prog["id"]))
+    programme_import.record_version(
+        conn, prog["id"], version_no=version_no, filename=body.get("filename"),
+        mode="initial" if version_no == 1 else mode,
+        imported_by=caller["id"], diff_summary=summary)
+
+    _write_snapshot(conn, site_id, prog["id"])
+    return ok({"counts": counts, "version_no": version_no, "summary": summary})
+
+
+def list_programme_versions(conn, caller, event):
+    site_id, err = _resolve_site_param(
+        conn, caller, (event.get("queryStringParameters") or {}).get("site"))
+    if err is not None:
+        return err
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return ok({"versions": []})
+    return ok({"versions": programme_import.list_versions(conn, prog["id"]),
+               "baseline_version": prog["baseline_version"],
+               "current_version": prog["current_version"]})
+
+
+def restore_programme_version(conn, caller, event, version_no):
+    if caller["global_role"] not in _MANAGER_ROLES:
+        return error("restoring a programme version requires manager role", 403)
+    site_id, err = _resolve_site_param(
+        conn, caller, (event.get("queryStringParameters") or {}).get("site"))
+    if err is not None:
+        return err
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return error("no programme for this site", 404)
+    try:
+        row = programme_import.restore_version(
+            conn, prog["id"], int(version_no), restored_by=caller["id"])
+    except (ValueError, TypeError) as e:
+        return error(str(e), 400)
+    _write_snapshot(conn, site_id, prog["id"])
+    return ok({"restored_to": int(version_no), "version": row})
+
+
+def set_programme_baseline(conn, caller, event, body):
+    if caller["global_role"] not in _MANAGER_ROLES:
+        return error("setting the baseline requires manager role", 403)
+    if body is None or not isinstance(body.get("version_no"), int):
+        return error("version_no required", 400)
+    site_id, err = _resolve_site_param(
+        conn, caller, (event.get("queryStringParameters") or {}).get("site"))
+    if err is not None:
+        return err
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return error("no programme for this site", 404)
+    try:
+        return ok({"programme": programme_import.set_baseline(
+            conn, prog["id"], body["version_no"])})
+    except ValueError as e:
+        return error(str(e), 400)
 
 
 def patch_programme_tasks_batch(conn, caller, event, body):
