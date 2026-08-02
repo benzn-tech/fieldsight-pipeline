@@ -1550,6 +1550,8 @@ class FakeProgrammeStore:
         return self.programme
 
     def record_version(self, conn, programme_id, **kw):
+        # task_snapshot is accepted and ignored; the tests here assert on the
+        # version bookkeeping, and the snapshot has its own suite.
         self.versions.append(kw)
         return dict(kw, programme_id=programme_id)
 
@@ -1600,6 +1602,11 @@ def programme_wired(wired):
                  "create_programme", "record_version", "replace_all_tasks",
                  "list_tasks", "list_assignees"):
         wired.setattr(org.programme_tasks, name, getattr(store, name))
+    # PUT records its version through programme_import now, because the row
+    # carries a task_snapshot (migration 0029) that programme_tasks knows
+    # nothing about.
+    wired.setattr(org.programme_import, "record_version",
+                  lambda conn, pid, **kw: store.record_version(conn, pid, **kw))
     fake.programme_store = store
     return wired, fake
 
