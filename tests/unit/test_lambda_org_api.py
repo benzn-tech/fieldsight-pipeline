@@ -1541,6 +1541,50 @@ class FakeProgrammeStore:
     def get_primary_programme_by_id(self, conn, programme_id):
         return self.programme
 
+    def seed_tasks(self, rows):
+        """Put the store into a known state without going through an import.
+
+        `rows` is [{doc_id, status, progress_pct, origin?}] — doc_id being what
+        a suggestion carries: the file's Activity ID for imported rows, the
+        row's UUID for local ones.
+        """
+        self.programme = {"id": self.PROGRAMME_ID, "site_id": SITE_ID,
+                          "name": "P", "current_version": 1,
+                          "baseline_version": None, "is_primary": True,
+                          "status": "active"}
+        self.tasks = []
+        for r in rows:
+            origin = r.get("origin", "imported")
+            self.tasks.append({
+                "id": r["doc_id"] if origin == "local" else "uuid-" + r["doc_id"],
+                "source_task_id": None if origin == "local" else r["doc_id"],
+                "parent_id": None, "origin": origin, "name": r.get("name", "T"),
+                "wbs_code": None, "start_date": "2026-04-01",
+                "end_date": "2026-04-10", "duration_days": 10,
+                "progress_pct": r.get("progress_pct", 0),
+                "status": r.get("status", "not_started"),
+                "removed_in_version": None, "row_version": 1,
+            })
+        return self.tasks
+
+    def get_task_by_doc_id(self, conn, programme_id, doc_id):
+        """Mirrors the real resolver: imported rows answer to their
+        source_task_id, local rows to their UUID text."""
+        for t in self.tasks:
+            if t.get("removed_in_version") is not None:
+                continue
+            if (t.get("source_task_id") or str(t["id"])) == doc_id:
+                return t
+        return None
+
+    def update_task(self, conn, task_id, *, fields, row_version, updated_by):
+        row = next((t for t in self.tasks if t["id"] == task_id), None)
+        if row is None or row.get("row_version") != row_version:
+            return None          # gone, or another writer got there first
+        row.update(fields)
+        row["row_version"] += 1
+        return row
+
     def create_programme(self, conn, *, site_id, name, source_format):
         self.programme = {
             "id": self.PROGRAMME_ID, "site_id": site_id, "name": name,
@@ -1600,7 +1644,8 @@ def programme_wired(wired):
     store = FakeProgrammeStore()
     for name in ("get_primary_programme", "get_primary_programme_by_id",
                  "create_programme", "record_version", "replace_all_tasks",
-                 "list_tasks", "list_assignees"):
+                 "list_tasks", "list_assignees",
+                 "get_task_by_doc_id", "update_task"):
         wired.setattr(org.programme_tasks, name, getattr(store, name))
     # PUT records its version through programme_import now, because the row
     # carries a task_snapshot (migration 0029) that programme_tasks knows
@@ -2155,11 +2200,13 @@ def test_confirm_applies_status_and_writes(programme_wired):
     row = _suggestion_row()
     wired.setattr(org.programme_suggestions, "get",
                   lambda conn, sid: row if sid == "sugg-1" else None)
-    doc = {"leaves": [{"task_id": "t-1", "parent_id": "p-1", "name": "Foundations",
-                       "start": "2026-07-01", "end": "2026-07-15",
-                       "status": "in_progress", "progress_pct": 40}],
-           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    # Confirm writes programme_tasks and lets _write_snapshot derive the
+    # document, so the setup seeds the table. The write assertions below are
+    # unchanged and now prove something stronger: the regenerated document
+    # carries the confirmed value, which means it came from the table.
+    store = fake.programme_store
+    store.seed_tasks([{"doc_id": "t-1", "name": "Foundations",
+                       "status": "in_progress", "progress_pct": 40}])
     written = {}
 
     def fake_write(s3c, bucket, site_id, doc_, updated_at):
@@ -2182,6 +2229,10 @@ def test_confirm_applies_status_and_writes(programme_wired):
     assert written["site_id"] == SITE_ID
     assert written["doc"]["leaves"][0]["status"] == "completed"
     assert written["doc"]["leaves"][0]["progress_pct"] == 100
+    # The table, not just the document derived from it. Asserting only the
+    # document is what let the old S3-only write look correct here.
+    assert store.tasks[0]["status"] == "completed"
+    assert store.tasks[0]["progress_pct"] == 100
     assert decided == {"sid": "sugg-1", "state": "confirmed", "decided_by": "u-uuid-1",
                        "applied_status": "completed", "applied_progress": 100}
 
@@ -2190,9 +2241,8 @@ def test_confirm_reviewer_override_status_and_progress(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row()
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
-           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    store = fake.programme_store
+    store.seed_tasks([{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
     written = {}
     wired.setattr(org.programme, "write_programme",
                   lambda s3c, bucket, site_id, doc_, updated_at: (written.update(doc=doc_) or doc_))
@@ -2206,15 +2256,15 @@ def test_confirm_reviewer_override_status_and_progress(programme_wired):
     assert body_of(res)["applied_progress"] == 75
     assert written["doc"]["leaves"][0]["status"] == "in_progress"
     assert written["doc"]["leaves"][0]["progress_pct"] == 75
+    assert store.tasks[0]["progress_pct"] == 75
 
 
 def test_confirm_task_missing_marks_stale_409(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row(task_id="ghost-task")
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
-           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
     staled = {}
     wired.setattr(org.programme_suggestions, "mark_stale",
                   lambda conn, sid: (staled.update(sid=sid) or {**row, "state": "stale"}))
@@ -2241,9 +2291,8 @@ def test_confirm_task_changed_since_match_409(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row(task_status_before="in_progress", task_progress_before=40)
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 75}],
-           "parents": [], "updated_at": "2026-07-05T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 75}])
     write_calls = {"n": 0}
     wired.setattr(org.programme, "write_programme",
                   lambda *a, **k: write_calls.update(n=write_calls["n"] + 1))
@@ -2278,17 +2327,32 @@ def test_confirm_second_pending_suggestion_for_other_task_not_blocked(programme_
             suggested_status="in_progress", suggested_progress=10),
     }
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: rows.get(sid))
-    doc = {"leaves": [
-        {"task_id": "t-1", "status": "in_progress", "progress_pct": 40},
-        {"task_id": "t-2", "status": "not_started", "progress_pct": 0},
-    ], "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
 
-    def fake_write(s3c, bucket, site_id, doc_, updated_at):
-        doc_["updated_at"] = updated_at  # mirrors the real write_programme
-        return doc_
+    # The confirm path now reads and writes programme_tasks (Aurora) and lets
+    # _write_snapshot derive programme.json, so the fakes are the table rather
+    # than the document. The regression this test guards is unchanged: A and
+    # B are about DIFFERENT tasks, so deciding A must not affect B.
+    tasks = {
+        "t-1": {"id": "uuid-1", "status": "in_progress", "progress_pct": 40,
+                "row_version": 1, "origin": "imported"},
+        "t-2": {"id": "uuid-2", "status": "not_started", "progress_pct": 0,
+                "row_version": 1, "origin": "imported"},
+    }
+    wired.setattr(org.programme_tasks, "get_primary_programme",
+                  lambda conn, site_id: {"id": "prog-1", "site_id": site_id})
+    wired.setattr(org.programme_tasks, "get_task_by_doc_id",
+                  lambda conn, programme_id, doc_id: tasks.get(doc_id))
 
-    wired.setattr(org.programme, "write_programme", fake_write)
+    def fake_update_task(conn, task_id, *, fields, row_version, updated_by):
+        row_ = next(t for t in tasks.values() if t["id"] == task_id)
+        if row_["row_version"] != row_version:
+            return None                      # optimistic lock lost
+        row_.update(fields)
+        row_["row_version"] += 1
+        return row_
+
+    wired.setattr(org.programme_tasks, "update_task", fake_update_task)
+    wired.setattr(org, "_write_snapshot", lambda conn, site_id, programme_id: None)
 
     def fake_decide(conn, sid, state, decided_by, applied_status=None, applied_progress=None):
         rows[sid] = {**rows[sid], "state": state}
@@ -2299,12 +2363,17 @@ def test_confirm_second_pending_suggestion_for_other_task_not_blocked(programme_
     res_a = org.lambda_handler(make_event(
         "POST", "/api/org/programme/suggestions/sugg-A/confirm", body={}), None)
     assert res_a["statusCode"] == 200
-    # doc.updated_at has now moved on -- under the OLD whole-doc check this
-    # alone would 409 every other pending suggestion for this site.
+    # t-1 has now moved (and under the OLD whole-doc check, programme.json's
+    # updated_at moving was on its own enough to 409 every other pending
+    # suggestion for this site, forever).
+    assert tasks["t-1"]["progress_pct"] == 100, (
+        "the confirmed value must reach programme_tasks — the table the Gantt "
+        "renders from and the table _write_snapshot rebuilds the document from")
 
     res_b = org.lambda_handler(make_event(
         "POST", "/api/org/programme/suggestions/sugg-B/confirm", body={}), None)
     assert res_b["statusCode"] == 200  # THE key regression assertion -- not 409
+    assert tasks["t-2"]["progress_pct"] == 10
 
 
 def test_confirm_already_decided_409(programme_wired):
@@ -2375,9 +2444,8 @@ def test_confirm_never_lowers_progress_on_auto_value(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row(suggested_progress=60, task_progress_before=80)
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 80}],
-           "parents": [], "updated_at": row["match_evidence"]["programme_updated_at"]}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 80}])
     written = {}
     wired.setattr(org.programme, "write_programme",
                   lambda s3c, bucket, site_id, doc_, updated_at: (written.update(doc=doc_) or doc_))
@@ -2396,9 +2464,8 @@ def test_confirm_explicit_lower_progress_allowed(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row(suggested_progress=60, task_progress_before=80)
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 80}],
-           "parents": [], "updated_at": row["match_evidence"]["programme_updated_at"]}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 80}])
     written = {}
     wired.setattr(org.programme, "write_programme",
                   lambda s3c, bucket, site_id, doc_, updated_at: (written.update(doc=doc_) or doc_))
@@ -2421,12 +2488,11 @@ def test_confirm_decide_cas_second_call_gets_409_no_write(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row()
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
-           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
     write_calls = {"n": 0}
     wired.setattr(org.programme, "write_programme",
-                  lambda *a, **k: (write_calls.update(n=write_calls["n"] + 1) or doc))
+                  lambda *a, **k: write_calls.update(n=write_calls["n"] + 1))
     # 1st decide() call "wins" the race (returns the confirmed row); 2nd
     # call simulates another request having already decided it (returns
     # None, mirroring decide()'s real `WHERE state='pending'` guard).
@@ -2512,9 +2578,8 @@ def test_confirm_valid_progress_override_applied(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row()
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
-           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
     written = {}
     wired.setattr(org.programme, "write_programme",
                   lambda s3c, bucket, site_id, doc_, updated_at: (written.update(doc=doc_) or doc_))

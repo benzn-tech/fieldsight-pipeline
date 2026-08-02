@@ -90,6 +90,29 @@ def get_task(conn, task_id) -> dict | None:
     ).fetchone()
 
 
+def get_task_by_doc_id(conn, programme_id, doc_id) -> dict | None:
+    """Resolve a programme.json / suggestion `task_id` back to its row.
+
+    Mirrors programme_snapshot._doc_id, which emits source_task_id for
+    imported rows and the UUID string for local ones. The two identifier
+    spaces share one text column in programme_progress_suggestions, so this
+    has to try both.
+
+    Imported wins the (vanishingly unlikely) collision between a file's
+    Activity ID and another row's UUID text: a suggestion is far more likely
+    to be carrying the file's identifier. NULLS LAST matters — a local row's
+    source_task_id is NULL, so the comparison is NULL, and a plain DESC would
+    sort it to the front and beat the exact imported match.
+    """
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_TASK_COLS} FROM programme_tasks "
+        f"WHERE programme_id = %s AND removed_in_version IS NULL "
+        f"AND (source_task_id = %s OR id::text = %s) "
+        f"ORDER BY (source_task_id = %s) DESC NULLS LAST LIMIT 1",
+        (programme_id, doc_id, doc_id, doc_id),
+    ).fetchone()
+
+
 def create_task(conn, *, programme_id, parent_id, name, wbs_code, start_date,
                 end_date, duration_days, status, zone, sort_order,
                 updated_by) -> dict:
