@@ -28,7 +28,12 @@ wiring — that confirm calls update_task at all, and that decide() unwinds when
 the write loses the optimistic lock — is covered in
 test_lambda_org_api.py::test_confirm_second_pending_suggestion_for_other_task_not_blocked.
 """
+import pathlib
+import re
+
 from repositories import programme_snapshot as snap
+
+SRC = pathlib.Path(__file__).resolve().parents[2] / "src"
 
 PROGRAMME = {"id": "p1", "name": "Main contract"}
 
@@ -114,6 +119,38 @@ def test_a_suggestion_on_a_local_breakdown_subtask_resolves_too():
 
     regenerated = snap.build_snapshot(PROGRAMME, rows)
     assert leaf(regenerated, "uuid-local")["progress_pct"] == 100
+
+
+def test_org_api_writes_the_document_from_exactly_one_place():
+    """The invariant the confirm bug broke, stated so the next break fails
+    here rather than in production months later.
+
+    programme.json is derived. _write_snapshot is the only thing allowed to
+    produce it, because it is the only thing that produces it FROM the table.
+    A second caller is, by construction, a write that Aurora does not know
+    about — which is precisely what confirm_suggestion was.
+
+    A source-level assertion is crude, but the property is about call sites
+    and there is no runtime moment at which it can be observed.
+    """
+    src = (SRC / "lambda_org_api.py").read_text(encoding="utf-8")
+    callers = [line.strip() for line in src.splitlines()
+               if re.search(r"\bprogramme\.write_programme\(", line)]
+    assert len(callers) == 1, (
+        "programme.json must be written only by _write_snapshot, which builds "
+        f"it from programme_tasks. Found {len(callers)} call sites: {callers}")
+
+
+def test_org_api_never_reads_the_document_back():
+    """The other half. Reading the derived document inside org-api means
+    making a decision on a copy rather than on the table — the confirm path's
+    staleness check did exactly that."""
+    src = (SRC / "lambda_org_api.py").read_text(encoding="utf-8")
+    readers = [line.strip() for line in src.splitlines()
+               if re.search(r"\bprogramme\.read_programme\(", line)]
+    assert readers == [], (
+        "org-api read programme.json back; the table is the source of truth "
+        f"for every decision this Lambda makes. Found: {readers}")
 
 
 def test_the_document_and_the_table_agree_after_a_confirm():
