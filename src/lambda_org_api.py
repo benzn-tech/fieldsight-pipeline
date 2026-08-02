@@ -79,6 +79,9 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
                                                     commit with mode
                                                     update|replace|new
   GET    /api/org/programme/versions              → import history + baseline
+  GET    /api/org/programme/versions/{n}/tasks    → the dated task set as it
+                                                    stood at version n (what
+                                                    lateness measures from)
   POST   /api/org/programme/versions/{n}/restore  → roll back (records the
                                                     state it leaves, so the
                                                     rollback is reversible)
@@ -466,6 +469,9 @@ def dispatch(conn, event, method, route):
         return import_programme(conn, caller, event, parse_body(event))
     if route == "/programme/versions" and method == "GET":
         return list_programme_versions(conn, caller, event)
+    m_vt = re.match(r"^/programme/versions/(\d+)/tasks$", route)
+    if m_vt and method == "GET":
+        return get_programme_version_tasks(conn, caller, event, m_vt.group(1))
     m_pv = re.match(r"^/programme/versions/(\d+)/restore$", route)
     if m_pv and method == "POST":
         return restore_programme_version(conn, caller, event, m_pv.group(1))
@@ -3022,11 +3028,13 @@ def put_programme(conn, caller, event, body):
         leaves=body.get("leaves") or [],
         version_no=version_no,
         updated_by=caller["id"])
-    programme_tasks.record_version(
+    programme_import.record_version(
         conn, prog["id"], version_no=version_no,
         filename=body.get("filename"),
         mode="initial" if version_no == 1 else "replace",
-        imported_by=caller["id"])
+        imported_by=caller["id"], diff_summary={},
+        task_snapshot=programme_import.build_task_snapshot(
+            programme_tasks.list_tasks(conn, prog["id"])))
 
     _write_snapshot(conn, site_id, prog["id"])
 
@@ -3271,10 +3279,15 @@ def import_programme(conn, caller, event, body):
     conn.cursor().execute(
         "UPDATE programmes SET current_version = %s, updated_at = now() "
         "WHERE id = %s", (version_no, prog["id"]))
+    # Snapshot the dated task set as it now stands. This is the only moment
+    # it is certainly correct: the next import overwrites start_date/end_date
+    # in place, so without this a baseline's dates are unrecoverable.
     programme_import.record_version(
         conn, prog["id"], version_no=version_no, filename=body.get("filename"),
         mode="initial" if version_no == 1 else mode,
-        imported_by=caller["id"], diff_summary=summary)
+        imported_by=caller["id"], diff_summary=summary,
+        task_snapshot=programme_import.build_task_snapshot(
+            programme_tasks.list_tasks(conn, prog["id"])))
 
     _write_snapshot(conn, site_id, prog["id"])
     return ok({"counts": counts, "version_no": version_no, "summary": summary})
@@ -3291,6 +3304,27 @@ def list_programme_versions(conn, caller, event):
     return ok({"versions": programme_import.list_versions(conn, prog["id"]),
                "baseline_version": prog["baseline_version"],
                "current_version": prog["current_version"]})
+
+
+def get_programme_version_tasks(conn, caller, event, version_no):
+    """The dated task set as it stood at one version — what lateness against a
+    baseline is measured from. Read-only, so it uses the same site ACL as the
+    rest of the read path and needs no manager role."""
+    site_id, err = _resolve_site_param(
+        conn, caller, (event.get("queryStringParameters") or {}).get("site"))
+    if err is not None:
+        return err
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return error("no programme for this site", 404)
+    try:
+        tasks = programme_import.get_version_tasks(
+            conn, prog["id"], int(version_no))
+    except (ValueError, TypeError):
+        return error("version_no must be a number", 400)
+    if tasks is None:
+        return error(f"no such version: {version_no}", 404)
+    return ok({"version_no": int(version_no), "tasks": tasks})
 
 
 def restore_programme_version(conn, caller, event, version_no):
