@@ -75,6 +75,10 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
                                                     serves the window view, My
                                                     Work and Today
   POST   /api/org/programme/tasks                 → create a LOCAL task (admin/gm/pm)
+  PATCH  /api/org/programme/tasks:batch           → write a whole cascade
+                                                    atomically; all row_versions
+                                                    checked first, 409 names the
+                                                    rows that moved
   PATCH  /api/org/programme/tasks/{id}            → per-task write, optimistic-locked
                                                     on row_version; row-level rules in
                                                     can_edit_task (409 on a lost race)
@@ -235,8 +239,14 @@ def ok(body, status=200):
     }
 
 
-def error(message, status=400):
-    return ok({"error": message}, status)
+def error(message, status=400, extra=None):
+    """`extra` merges extra keys alongside `error` — used by the batch task
+    write to name which rows conflicted, so the client can refresh exactly
+    those instead of reloading and discarding the user's other edits."""
+    body = {"error": message}
+    if extra:
+        body.update(extra)
+    return ok(body, status)
 
 
 def parse_body(event):
@@ -439,6 +449,11 @@ def dispatch(conn, event, method, route):
             return list_programme_tasks(conn, caller, event)
         if method == "POST":
             return create_programme_task(conn, caller, event, parse_body(event))
+
+    # Batch write. Registered before the `([^/]+)$` pattern so ":batch" is
+    # never mistaken for a task id.
+    if route == "/programme/tasks:batch" and method == "PATCH":
+        return patch_programme_tasks_batch(conn, caller, event, parse_body(event))
 
     # The /delay-flag suffix MUST be matched before the bare `([^/]+)$`
     # pattern below, or `tasks/<id>/delay-flag` would never reach it.
@@ -3113,6 +3128,107 @@ def acknowledge_delay_flag(conn, caller, flag_id, state="acknowledged"):
             conn, flag_id, state)})
     except ValueError as e:
         return error(str(e), 400)
+
+
+# A cascade touches tens of rows, not thousands. An unbounded batch is a
+# transaction held open long enough to matter.
+_MAX_BATCH_TASKS = 500
+
+
+def patch_programme_tasks_batch(conn, caller, event, body):
+    """Write a whole set of task edits, or none of them.
+
+    Dragging one Gantt bar shifts every downstream dependent and recomputes
+    the critical path, so one user action produces N writes. Sending N
+    independent PATCHes is not atomic: a lost optimistic-lock race halfway
+    through leaves the programme half-shifted, and the symptom is "the Gantt
+    looks right and the database is wrong" — with no error raised anywhere.
+
+    Every row's permission and row_version is checked BEFORE anything is
+    written, and a conflict names the tasks that moved so the client can
+    refresh exactly those rather than reloading the programme and discarding
+    the user's other pending edits.
+
+    The whole call runs inside the request transaction (lambda_handler wraps
+    each request in `with get_connection() as conn:`), so even a failure
+    after the pre-flight checks rolls back rather than half-applying.
+    """
+    if body is None:
+        return error("malformed JSON body", 400)
+    items = body.get("tasks")
+    if not isinstance(items, list) or not items:
+        return error("tasks must be a non-empty list", 400)
+    if len(items) > _MAX_BATCH_TASKS:
+        return error(f"a batch may not exceed {_MAX_BATCH_TASKS} tasks", 400)
+
+    ids = [it.get("id") for it in items]
+    if any(not i for i in ids):
+        return error("every task needs an id", 400)
+    if len(set(ids)) != len(ids):
+        # The second edit would fail the lock against a version the first just
+        # bumped. Always a client bug, and confusing to debug from a 409.
+        return error("duplicate task ids in one batch", 400)
+    if any(not isinstance(it.get("row_version"), int) for it in items):
+        return error("every task needs a row_version", 400)
+
+    site_id, err = _resolve_site_param(
+        conn, caller, (event.get("queryStringParameters") or {}).get("site"))
+    if err is not None:
+        return err
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return error("no programme for this site", 404)
+
+    # ---- pre-flight: resolve, authorise and version-check everything -----
+    assignees = programme_tasks.list_assignees(conn, ids)
+    planned, conflicts = [], []
+    for it in items:
+        task = programme_tasks.get_task(conn, it["id"])
+        if task is None:
+            return error(f"task not found: {it['id']}", 404)
+        if str(task["programme_id"]) != str(prog["id"]):
+            return error("not found", 404)
+
+        fields = {k: v for k, v in it.items() if k not in ("id", "row_version")}
+        if not fields:
+            return error(f"nothing to update on {it['id']}", 400)
+
+        reason = can_edit_task(
+            caller, task, fields, assignees.get(str(it["id"]), []))
+        if reason is not None:
+            # One forbidden row rejects the batch. Applying the rest would
+            # leave the caller believing the whole cascade landed.
+            return error(reason, 403)
+
+        if task["row_version"] != it["row_version"]:
+            conflicts.append(it["id"])
+        planned.append((it["id"], fields, it["row_version"]))
+
+    if conflicts:
+        return error("these tasks were updated by someone else", 409,
+                     extra={"conflicts": conflicts})
+
+    # ---- apply -----------------------------------------------------------
+    written = []
+    for task_id, fields, row_version in planned:
+        try:
+            updated = programme_tasks.update_task(
+                conn, task_id, fields=fields, row_version=row_version,
+                updated_by=caller["id"])
+        except ValueError as e:
+            return error(str(e), 400)
+        if updated is None:
+            # Lost the race between pre-flight and here. Raising rolls the
+            # transaction back, so the earlier writes in this loop do not
+            # survive — which is the guarantee this endpoint exists to give.
+            raise RuntimeError(
+                f"programme task {task_id} changed mid-batch; rolling back")
+        written.append(updated)
+
+    # One snapshot for the whole cascade — N rebuilds would make the endpoint
+    # pointless.
+    _write_snapshot(conn, site_id, prog["id"])
+    return ok({"tasks": written, "count": len(written)})
 
 
 def patch_programme_task(conn, caller, task_id, body):
