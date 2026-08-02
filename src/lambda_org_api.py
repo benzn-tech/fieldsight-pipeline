@@ -3594,6 +3594,16 @@ def delete_programme_task(conn, caller, task_id):
 _ALLOWED_CONFIRM_STATUSES = ("in_progress", "completed", "blocked", "delayed")
 
 
+class _SuggestionAlreadyDecided(Exception):
+    """Another request decided this suggestion first — unwind rather than
+    commit a second decision."""
+
+
+class _SuggestionTaskMoved(Exception):
+    """The task's row_version changed between the staleness check and the
+    UPDATE — unwind so the suggestion stays pending and re-reviewable."""
+
+
 def list_suggestions(conn, caller, event):
     if caller["global_role"] not in ("admin", "gm", "pm"):
         return error("forbidden", 403)
@@ -3642,10 +3652,16 @@ def confirm_suggestion(conn, caller, suggestion_id, body):
                 or not (0 <= progress_override <= 100)):
             return error("progress_pct must be an integer 0-100", 400)
 
-    doc = programme.read_programme(s3(), S3_BUCKET, row["site_id"])
-    if doc is None:
+    # Aurora is the source of truth (Project 1); programme.json is derived
+    # from it by _write_snapshot. This used to read and write the derived
+    # document directly, which meant a confirmed value never reached the
+    # table the Gantt renders from and was erased by the next write of any
+    # task in the programme. See
+    # tests/unit/test_suggestion_confirm_survives_snapshot.py.
+    prog = programme_tasks.get_primary_programme(conn, row["site_id"])
+    if prog is None:
         return error("programme not found", 409)
-    task = next((t for t in doc.get("leaves", []) if t.get("task_id") == row["task_id"]), None)
+    task = programme_tasks.get_task_by_doc_id(conn, prog["id"], row["task_id"])
     if task is None:
         programme_suggestions.mark_stale(conn, suggestion_id)
         return error("task no longer in programme", 409)
@@ -3666,22 +3682,53 @@ def confirm_suggestion(conn, caller, suggestion_id, body):
             and new_progress < task["progress_pct"] and "progress_pct" not in body):
         new_progress = task["progress_pct"]
 
+    fields = {}
     if new_status is not None:
-        task["status"] = new_status
+        fields["status"] = new_status
     if new_progress is not None:
-        task["progress_pct"] = new_progress
+        fields["progress_pct"] = new_progress
 
-    # Fable review IMPORTANT #2: decide() is the compare-and-swap gate —
-    # called BEFORE the S3 write, and its return value decides whether we
-    # write at all (see module comment above list_suggestions).
-    decided = programme_suggestions.decide(
-        conn, suggestion_id, "confirmed", decided_by=caller["id"],
-        applied_status=new_status, applied_progress=new_progress)
-    if decided is None:
+    # decide() and the task write commit together or not at all. A decide()
+    # that survived a failed write would mark the suggestion confirmed while
+    # the task it is about never moved — and because decide() is one-way,
+    # nobody could confirm it again. Same shape as the action-item PATCH
+    # above: a savepoint, an exception to unwind it, the error returned
+    # outside.
+    try:
+        with conn.transaction():
+            # Fable review IMPORTANT #2: decide() is the compare-and-swap
+            # gate — called BEFORE the task write, and its return value
+            # decides whether we write at all (see module comment above
+            # list_suggestions).
+            decided = programme_suggestions.decide(
+                conn, suggestion_id, "confirmed", decided_by=caller["id"],
+                applied_status=new_status, applied_progress=new_progress)
+            if decided is None:
+                raise _SuggestionAlreadyDecided()
+
+            if fields:
+                # 0027's CHECK constrains origin against source_task_id, not
+                # status/progress, so a suggestion landing on a local
+                # breakdown subtask applies exactly as one landing on an
+                # imported row.
+                updated = programme_tasks.update_task(
+                    conn, task["id"], fields=fields,
+                    row_version=task["row_version"], updated_by=caller["id"])
+                if updated is None:
+                    # Another writer moved the row between the read above and
+                    # here. Unwinding leaves the suggestion pending, so it can
+                    # be re-reviewed against the new state — the same outcome
+                    # as the staleness check above, reached a moment later.
+                    raise _SuggestionTaskMoved()
+                # Regenerates programme.json from the table, exactly as every
+                # other programme write does. The old code wrote the derived
+                # document directly and never touched the table.
+                _write_snapshot(conn, str(row["site_id"]), prog["id"])
+    except _SuggestionAlreadyDecided:
         return error("already decided", 409)
+    except _SuggestionTaskMoved:
+        return error("task changed since this suggestion was made; re-review", 409)
 
-    new_ts = datetime.now(timezone.utc).isoformat()
-    programme.write_programme(s3(), S3_BUCKET, row["site_id"], doc, new_ts)
     return ok({"confirmed": True, "task_id": row["task_id"],
               "applied_status": new_status, "applied_progress": new_progress})
 
