@@ -156,7 +156,7 @@ def test_list_for_site_defaults_to_pending():
     sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
     assert "site_id=%s" in sql
     assert "ORDER BY report_date DESC, created_at DESC" in sql
-    assert params == ("site-1", "pending", "pending")
+    assert params == ("site-1", "pending", "pending", None, None)
 
 
 def test_list_for_site_state_none_returns_all():
@@ -165,7 +165,30 @@ def test_list_for_site_state_none_returns_all():
     repo.list_for_site(conn, "site-1", state=None)
 
     params = conn.calls[0]["params"]
-    assert params == ("site-1", None, None)
+    assert params == ("site-1", None, None, None, None)
+
+
+def test_list_for_site_unrestricted_author_is_none_not_empty():
+    """None means "do not filter by author". The distinction matters: an
+    empty collection reading as "no restriction" is a bug this codebase has
+    already shipped once, handing every user's reports to an account that
+    should have seen none."""
+    conn = FakeConn(results=[[SUGGESTION_ROW]])
+
+    repo.list_for_site(conn, "site-1", topic_user_id=None)
+
+    sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
+    assert "topic_user_id = %s" in sql
+    assert params[3] is None and params[4] is None
+
+
+def test_list_for_site_restricts_to_one_author():
+    conn = FakeConn(results=[[SUGGESTION_ROW]])
+
+    repo.list_for_site(conn, "site-1", topic_user_id="u-9")
+
+    params = conn.calls[0]["params"]
+    assert params == ("site-1", "pending", "pending", "u-9", "u-9")
 
 
 # ---------------------------------------------------------------------------

@@ -67,7 +67,7 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/programme?site=<site_id> → read site's Programme JSON (S3-backed, ACL)
   PUT   /api/org/programme?site=<site_id> → write site's Programme JSON (admin/gm/pm)
   GET   /api/org/rollup/portfolio         → per-site open-count rollup + last_activity_at + red/yellow/green (ACL)
-  GET   /api/org/programme/suggestions            → list matcher suggestions for a site (admin/gm/pm)
+  GET   /api/org/programme/suggestions            → list matcher suggestions (admin/gm/pm see the site; anyone else sees their own)
   POST  /api/org/programme/suggestions/{id}/confirm → apply + write back to programme.json (admin/gm/pm)
   POST  /api/org/programme/suggestions/{id}/reject  → dismiss a suggestion (admin/gm/pm)
   GET    /api/org/programme/tasks                 → time-window read
@@ -3593,6 +3593,10 @@ def delete_programme_task(conn, caller, task_id):
 # ----------------------------------------------------------
 _ALLOWED_CONFIRM_STATUSES = ("in_progress", "completed", "blocked", "delayed")
 
+# Who may see the WHOLE site's suggestions, and who may decide them. Everyone
+# else can read their own (list_suggestions) but not confirm or reject.
+_SUGGESTION_MANAGER_ROLES = ("admin", "gm", "pm")
+
 
 class _SuggestionAlreadyDecided(Exception):
     """Another request decided this suggestion first — unwind rather than
@@ -3605,16 +3609,32 @@ class _SuggestionTaskMoved(Exception):
 
 
 def list_suggestions(conn, caller, event):
-    if caller["global_role"] not in ("admin", "gm", "pm"):
-        return error("forbidden", 403)
+    """Managers see the whole site; everyone else sees only suggestions raised
+    from their OWN topics.
+
+    This used to 403 anyone below pm, which meant the person who actually
+    spoke on site could never see that their words had reached the programme.
+    That read is the point of the feature, so the gate narrows the result
+    instead of refusing it. Confirming stays manager-only — see
+    confirm_suggestion, which is unchanged.
+
+    The narrowing is forced from the caller, never taken from the request, so
+    there is no parameter to tamper with.
+    """
     params = event.get("queryStringParameters") or {}
     site_id, err = _resolve_site_param(conn, caller, params.get("site"))
     if err is not None:
         return err
     state = params.get("state") or "pending"
+    # None means unrestricted. A manager gets None; anyone else gets their own
+    # id. Never [] — see list_for_site's docstring for why that distinction is
+    # load-bearing here.
+    topic_user_id = (None if caller["global_role"] in _SUGGESTION_MANAGER_ROLES
+                     else caller["id"])
     rows = programme_suggestions.list_for_site(
-        conn, site_id, state=None if state == "all" else state)
-    return ok({"suggestions": rows})
+        conn, site_id, state=None if state == "all" else state,
+        topic_user_id=topic_user_id)
+    return ok({"suggestions": rows, "scope": "site" if topic_user_id is None else "own"})
 
 
 def confirm_suggestion(conn, caller, suggestion_id, body):

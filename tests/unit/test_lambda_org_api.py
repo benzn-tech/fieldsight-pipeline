@@ -2159,19 +2159,26 @@ def test_list_suggestions_admin_ok(programme_wired):
     canned = [_suggestion_row()]
     seen = {}
     wired.setattr(org.programme_suggestions, "list_for_site",
-                  lambda conn, site_id, state: (seen.update(site_id=site_id, state=state) or canned))
+                  lambda conn, site_id, state, topic_user_id: (
+                      seen.update(site_id=site_id, state=state,
+                                  topic_user_id=topic_user_id) or canned))
     res = org.lambda_handler(make_event(
         "GET", "/api/org/programme/suggestions", params={"site": SITE_ID}), None)
     assert res["statusCode"] == 200
     assert body_of(res)["suggestions"] == canned
-    assert seen == {"site_id": SITE_ID, "state": "pending"}
+    # topic_user_id None = no author restriction. NOT [] -- see
+    # list_for_site's docstring; an empty collection reading as "unrestricted"
+    # is a bug this codebase has shipped before.
+    assert seen == {"site_id": SITE_ID, "state": "pending", "topic_user_id": None}
+    assert body_of(res)["scope"] == "site"
 
 
 def test_list_suggestions_state_all_passes_none(programme_wired):
     wired, fake = programme_wired
     seen = {}
     wired.setattr(org.programme_suggestions, "list_for_site",
-                  lambda conn, site_id, state: (seen.update(state=state) or []))
+                  lambda conn, site_id, state, topic_user_id: (
+                      seen.update(state=state) or []))
     res = org.lambda_handler(make_event(
         "GET", "/api/org/programme/suggestions",
         params={"site": SITE_ID, "state": "all"}), None)
@@ -2186,12 +2193,53 @@ def test_list_suggestions_inaccessible_site_403(programme_wired):
     assert res["statusCode"] == 403
 
 
-def test_list_suggestions_worker_403(programme_wired):
+def test_list_suggestions_non_manager_sees_only_their_own(programme_wired):
+    """This endpoint used to 403 anyone below pm, which meant the person who
+    actually spoke on site could never see that their words reached the
+    programme -- the whole point of surfacing suggestions. The gate now
+    narrows the result instead of refusing it."""
+    wired, fake = programme_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "site_manager"})
+    seen = {}
+    wired.setattr(org.programme_suggestions, "list_for_site",
+                  lambda conn, site_id, state, topic_user_id: (
+                      seen.update(topic_user_id=topic_user_id) or []))
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme/suggestions", params={"site": SITE_ID}), None)
+    assert res["statusCode"] == 200
+    assert seen["topic_user_id"] == CALLER["id"]
+    assert body_of(res)["scope"] == "own"
+
+
+def test_list_suggestions_own_scope_is_forced_from_the_caller(programme_wired):
+    """The narrowing must not be reachable from the request. A site manager
+    passing someone else's id gets their own suggestions, not that person's."""
     wired, fake = programme_wired
     wired.setattr(org.users, "get_user_by_sub",
                   lambda conn, sub: {**CALLER, "global_role": "worker"})
+    seen = {}
+    wired.setattr(org.programme_suggestions, "list_for_site",
+                  lambda conn, site_id, state, topic_user_id: (
+                      seen.update(topic_user_id=topic_user_id) or []))
     res = org.lambda_handler(make_event(
-        "GET", "/api/org/programme/suggestions", params={"site": SITE_ID}), None)
+        "GET", "/api/org/programme/suggestions",
+        params={"site": SITE_ID, "topic_user_id": "u-somebody-else",
+                "user": "u-somebody-else"}), None)
+    assert res["statusCode"] == 200
+    assert seen["topic_user_id"] == CALLER["id"]
+
+
+def test_list_suggestions_non_manager_still_cannot_confirm(programme_wired):
+    """Reading is widened; deciding is not."""
+    wired, fake = programme_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "site_manager"})
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 403
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/reject"), None)
     assert res["statusCode"] == 403
 
 
