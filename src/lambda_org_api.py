@@ -70,6 +70,11 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/programme/suggestions            → list matcher suggestions for a site (admin/gm/pm)
   POST  /api/org/programme/suggestions/{id}/confirm → apply + write back to programme.json (admin/gm/pm)
   POST  /api/org/programme/suggestions/{id}/reject  → dismiss a suggestion (admin/gm/pm)
+  POST   /api/org/programme/tasks                 → create a LOCAL task (admin/gm/pm)
+  PATCH  /api/org/programme/tasks/{id}            → per-task write, optimistic-locked
+                                                    on row_version; row-level rules in
+                                                    can_edit_task (409 on a lost race)
+  DELETE /api/org/programme/tasks/{id}            → delete a LOCAL task (admin/gm/pm)
 
 Credentials: PG* env vars injected at deploy time (BUG-36 — no runtime
 Secrets Manager call from a NAT-less VPC). Cognito calls need the
@@ -99,7 +104,8 @@ from psycopg.rows import dict_row as RealDictRow
 from repositories import (action_items, aliases, classification_feedback, companies,
                           compliance_resolutions, content, content_edits, keyframes,
                           meeting_session, memberships, observations, programme,
-                          programme_suggestions, recordings, redactions, rollup, scope,
+                          programme_snapshot, programme_suggestions, programme_tasks,
+                          recordings, redactions, rollup, scope,
                           sites, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates, first_match_span, normalize, occurrences
@@ -414,6 +420,17 @@ def dispatch(conn, event, method, route):
     m_sr = re.match(r"^/programme/suggestions/([^/]+)/reject$", route)
     if m_sr and method == "POST":
         return reject_suggestion(conn, caller, m_sr.group(1))
+
+    # Per-task writes. Registered AFTER /programme/suggestions/... so the
+    # more specific suggestion routes always win — `([^/]+)` below would
+    # otherwise be free to swallow a suggestion id.
+    if route == "/programme/tasks" and method == "POST":
+        return create_programme_task(conn, caller, event, parse_body(event))
+    m_pt = re.match(r"^/programme/tasks/([^/]+)$", route)
+    if m_pt and method == "PATCH":
+        return patch_programme_task(conn, caller, m_pt.group(1), parse_body(event))
+    if m_pt and method == "DELETE":
+        return delete_programme_task(conn, caller, m_pt.group(1))
 
     if route == "/recordings/upload-url" and method == "POST":
         return create_recording_upload_url(conn, caller, parse_body(event))
@@ -2812,33 +2829,232 @@ def _resolve_site_param(conn, caller, site_param):
     return site_id, None
 
 
+_MANAGER_ROLES = ("admin", "gm", "pm")
+
+# Fields that reschedule work. Read-only on imported rows for anyone below
+# manager: the file owns those dates, and an edit here would be reverted by
+# the next import without telling anyone.
+_SCHEDULE_FIELDS = frozenset({"start_date", "end_date", "duration_days"})
+
+
+def can_edit_task(caller, task, fields, assignees):
+    """Returns a refusal reason, or None when the write is allowed.
+
+    Spec §10. Imported rows have read-only dates and writable progress; local
+    rows are writable in both. A site manager reports what happened on site
+    and reschedules their own breakdown, but cannot move a contract date —
+    the next import would overwrite it, so accepting the edit would be a lie.
+
+    Note the assignee check: `assignees` is the task's ACTUAL assignee list.
+    An empty list means nobody is assigned, which denies — it must never be
+    read as "unrestricted". That inversion has shipped in this codebase
+    before.
+    """
+    role = caller.get("global_role")
+    if role in _MANAGER_ROLES:
+        return None
+    if role != "site_manager":
+        return "programme writes require a site manager or above"
+
+    folder = caller.get("folder_name")
+    if not folder or folder not in (assignees or []):
+        return "you can only update tasks assigned to you"
+
+    if task.get("origin") == "imported" and (set(fields) & _SCHEDULE_FIELDS):
+        # Refused whole rather than partly applied: letting the progress half
+        # through would leave the caller believing the date change landed too.
+        return ("contract dates come from the imported programme and cannot be "
+                "changed here — raise a delay flag instead")
+    return None
+
+
+def _write_snapshot(conn, site_id, programme_id):
+    """Regenerate programmes/{site_id}/programme.json from Aurora.
+
+    Called inside the request's transaction (lambda_handler wraps every
+    request in `with get_connection() as conn:`), so a failed S3 write rolls
+    the Aurora write back with it. The alternative — Aurora committed, S3
+    stale — would leave lambda_programme_matcher matching against a programme
+    that no longer exists, silently.
+
+    If PATCH latency ever becomes a problem, the fix is a durable outbox, NOT
+    moving this outside the transaction.
+    """
+    prog = programme_tasks.get_primary_programme_by_id(conn, programme_id)
+    if prog is None:
+        return
+    tasks = programme_tasks.list_tasks(conn, programme_id)
+    doc = programme_snapshot.build_snapshot(prog, tasks)
+    # NZ "today"/"now" — the codebase-wide UTC+13 display convention (BUG-19
+    # / see create_org_observation's report_date default).
+    updated_at = (datetime.utcnow() + timedelta(hours=13)).isoformat()
+    programme.write_programme(s3(), S3_BUCKET, site_id, doc, updated_at)
+
+
 def get_programme(conn, caller, event):
     site_param = (event.get("queryStringParameters") or {}).get("site")
     site_id, err = _resolve_site_param(conn, caller, site_param)
     if err is not None:
         return err
-    doc = programme.read_programme(s3(), S3_BUCKET, site_id)
+
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        # No programme has ever been imported for this site — a friendly
+        # empty state, not a 404. Same contract the S3 path had.
+        return ok({"programme": None})
+
+    tasks = programme_tasks.list_tasks(conn, prog["id"])
+    assignees = programme_tasks.list_assignees(conn, [t["id"] for t in tasks])
+    for t in tasks:
+        t["assignees"] = assignees.get(str(t["id"]), [])
+
+    doc = programme_snapshot.build_snapshot(prog, tasks)
+    doc["programme_id"] = str(prog["id"])
+    doc["current_version"] = prog["current_version"]
     return ok({"programme": doc})
 
 
 def put_programme(conn, caller, event, body):
+    """Whole-document replace — today's semantics, now writing Aurora.
+
+    Everything under the programme is discarded, including local rows. That
+    is what replace means; the client confirms before calling it. Update-mode
+    reconciliation, which preserves local subtrees, is a separate change.
+    """
     site_param = (event.get("queryStringParameters") or {}).get("site")
     if not site_param:
         return error("site required", 400)
     if body is None:
         return error("malformed JSON body", 400)
-    if caller["global_role"] not in ("admin", "gm", "pm"):
+    if caller["global_role"] not in _MANAGER_ROLES:
         return error("programme write requires manager role", 403)
     # Write requires BOTH the manager-role gate above AND site access below
     # — a pm can only write programmes for sites in their own memberships.
     site_id, err = _resolve_site_param(conn, caller, site_param)
     if err is not None:
         return err
-    # NZ "today"/"now" — the codebase-wide UTC+13 display convention (BUG-19
-    # / see create_org_observation's report_date default).
-    updated_at = (datetime.utcnow() + timedelta(hours=13)).isoformat()
-    saved = programme.write_programme(s3(), S3_BUCKET, site_id, body, updated_at)
-    return ok({"programme": saved})
+
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        prog = programme_tasks.create_programme(
+            conn, site_id=site_id, name=body.get("name") or "Programme",
+            source_format=body.get("source_format"))
+
+    version_no = (prog["current_version"] or 0) + 1
+    programme_tasks.replace_all_tasks(
+        conn, prog["id"],
+        parents=body.get("parents") or [],
+        leaves=body.get("leaves") or [],
+        version_no=version_no,
+        updated_by=caller["id"])
+    programme_tasks.record_version(
+        conn, prog["id"], version_no=version_no,
+        filename=body.get("filename"),
+        mode="initial" if version_no == 1 else "replace",
+        imported_by=caller["id"])
+
+    _write_snapshot(conn, site_id, prog["id"])
+
+    tasks = programme_tasks.list_tasks(conn, prog["id"])
+    return ok({"programme": programme_snapshot.build_snapshot(prog, tasks)})
+
+
+def patch_programme_task(conn, caller, task_id, body):
+    if body is None:
+        return error("malformed JSON body", 400)
+    row_version = body.get("row_version")
+    if not isinstance(row_version, int):
+        return error("row_version required", 400)
+
+    task = programme_tasks.get_task(conn, task_id)
+    if task is None:
+        return error("not found", 404)
+
+    prog = programme_tasks.get_primary_programme_by_id(conn, task["programme_id"])
+    if prog is None or str(prog["site_id"]) not in _allowed_site_ids(conn, caller):
+        # 404 rather than 403: whether a task exists in a site you cannot see
+        # is itself information.
+        return error("not found", 404)
+
+    fields = {k: v for k, v in body.items()
+              if k not in ("row_version", "assignees")}
+    assignees = programme_tasks.list_assignees(
+        conn, [task["id"]]).get(str(task["id"]), [])
+
+    reason = can_edit_task(caller, task, fields, assignees)
+    if reason is not None:
+        return error(reason, 403)
+
+    try:
+        updated = programme_tasks.update_task(
+            conn, task_id, fields=fields, row_version=row_version,
+            updated_by=caller["id"])
+    except ValueError as e:
+        return error(str(e), 400)
+
+    if updated is None:
+        # Either the row moved on or it is gone. Both mean "re-read before
+        # writing again", which is what 409 says.
+        return error("this task was updated by someone else", 409)
+
+    if "assignees" in body and caller["global_role"] in _MANAGER_ROLES:
+        programme_tasks.set_assignees(conn, task_id, body["assignees"])
+
+    _write_snapshot(conn, str(prog["site_id"]), prog["id"])
+    return ok({"task": updated})
+
+
+def create_programme_task(conn, caller, event, body):
+    """Creates a LOCAL task — a breakdown subtask or a manual addition.
+    Imported rows only ever come from an import."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    if caller["global_role"] not in _MANAGER_ROLES:
+        return error("creating programme tasks requires manager role", 403)
+
+    site_param = (event.get("queryStringParameters") or {}).get("site") \
+        or body.get("site")
+    site_id, err = _resolve_site_param(conn, caller, site_param)
+    if err is not None:
+        return err
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return error("no programme for this site", 404)
+
+    created = programme_tasks.create_task(
+        conn, programme_id=prog["id"], parent_id=body.get("parent_id"),
+        name=body.get("name") or "Untitled", wbs_code=body.get("wbs_code"),
+        start_date=body.get("start_date"), end_date=body.get("end_date"),
+        duration_days=body.get("duration_days"),
+        status=body.get("status") or "not_started", zone=body.get("zone"),
+        sort_order=body.get("sort_order") or 0,
+        updated_by=caller["id"])
+    if body.get("assignees"):
+        programme_tasks.set_assignees(conn, created["id"], body["assignees"])
+
+    _write_snapshot(conn, site_id, prog["id"])
+    return ok({"task": created})
+
+
+def delete_programme_task(conn, caller, task_id):
+    if caller["global_role"] not in _MANAGER_ROLES:
+        return error("deleting programme tasks requires manager role", 403)
+
+    task = programme_tasks.get_task(conn, task_id)
+    if task is None:
+        return error("not found", 404)
+    prog = programme_tasks.get_primary_programme_by_id(conn, task["programme_id"])
+    if prog is None or str(prog["site_id"]) not in _allowed_site_ids(conn, caller):
+        return error("not found", 404)
+
+    if not programme_tasks.delete_local_task(conn, task_id):
+        # The repository refuses imported rows in SQL. Reaching here means
+        # the caller aimed at one.
+        return error("imported tasks are removed by re-importing the programme, "
+                     "not deleted here", 400)
+
+    _write_snapshot(conn, str(prog["site_id"]), prog["id"])
+    return ok({"deleted": task_id})
 
 
 # ----------------------------------------------------------
