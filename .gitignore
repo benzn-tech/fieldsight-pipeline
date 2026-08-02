@@ -30,3 +30,5 @@ ui/scripts/env-config.js
 *.zip
 *.bak-*
 /tmp/
+ev.json
+out.json
