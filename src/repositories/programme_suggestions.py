@@ -57,14 +57,27 @@ def upsert_suggestion(conn, *, site_id, task_id, topic_id, topic_title, topic_su
     ).fetchone()
 
 
-def list_for_site(conn, site_id, state='pending') -> list[dict]:
+def list_for_site(conn, site_id, state='pending', topic_user_id=None) -> list[dict]:
     """state=None returns all states; otherwise filtered to that state.
-    Newest report_date first, then newest created_at within a date."""
+    Newest report_date first, then newest created_at within a date.
+
+    `topic_user_id=None` means NO author restriction — a manager seeing the
+    whole site. Passing a user id restricts the result to suggestions raised
+    from that person's own topics, which is what lets a site manager see that
+    their own words landed on the programme without seeing anyone else's.
+
+    Deliberately a single id rather than a list: an empty list would be
+    ambiguous between "no restriction" and "restrict to nobody", and this
+    codebase has already shipped that bug once — `[]` read as "admin, do not
+    filter" handed every user's reports to an account that should have seen
+    none.
+    """
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_COLS} FROM programme_progress_suggestions "
         f"WHERE site_id=%s AND (%s::text IS NULL OR state=%s) "
+        f"AND (%s::uuid IS NULL OR topic_user_id = %s) "
         f"ORDER BY report_date DESC, created_at DESC",
-        (site_id, state, state),
+        (site_id, state, state, topic_user_id, topic_user_id),
     ).fetchall()
 
 
