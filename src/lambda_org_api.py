@@ -3101,7 +3101,7 @@ def _normalize_prose(value, alias_pairs):
     return value
 
 
-def render_report_shape(rows, doc, date, folder, conn=None):
+def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
     """Pure function: render Aurora extraction topics INTO the
     daily_report.json shape, optionally merging the doc's own prose fields
     (executive_summary etc.) when a same-day S3 doc also exists (e.g. an
@@ -3114,6 +3114,15 @@ def render_report_shape(rows, doc, date, folder, conn=None):
     lookup below; callers that don't pass it (or pass None) simply get
     `redacted: False` for every topic, unchanged from before this field
     existed.
+
+    `company_id` (optional) enables the KPI counts in `_report_metadata`.
+    Those counts used to come from the nightly report generator's own
+    `_report_metadata` block, which this live-extraction path never writes —
+    so the timeline's Recordings/Words KPIs read a missing field and rendered
+    a hard 0 on every real day. The live counts are read from `recordings`
+    instead (see recordings.day_stats for the session-fold and the date-clock
+    reasoning). Callers that pass no company_id (reindex's builder) omit the
+    block entirely, and the UI shows "—" rather than a misleading zero.
 
     The four prose fields merged out of the S3 doc have no Aurora row and no
     edit surface, so a name the user already corrected in the item store would
@@ -3178,6 +3187,11 @@ def render_report_shape(rows, doc, date, folder, conn=None):
         alias_pairs = _prose_alias_pairs(conn, rows[0].get("site_id"))
         if alias_pairs:
             prose = {k: _normalize_prose(v, alias_pairs) for k, v in prose.items()}
+    meta = {"source": "live_extraction", "version": "flip-v1"}
+    if conn is not None and company_id is not None:
+        stats = recordings.day_stats(conn, company_id, folder, date)
+        meta["recordings_processed"] = stats["sessions"]
+        meta["duration_seconds"] = stats["duration_s"]
     return {
         "report_date": date,
         "site": rows[0]["site_name"],
@@ -3190,7 +3204,7 @@ def render_report_shape(rows, doc, date, folder, conn=None):
         "site_id": str(rows[0]["site_id"]) if rows[0].get("site_id") else None,
         "user_name": rows[0]["user_name"] or folder.replace("_", " "),
         **prose,
-        "_report_metadata": {"source": "live_extraction", "version": "flip-v1"},
+        "_report_metadata": meta,
         "topics": topics_out,
     }
 
@@ -3230,7 +3244,8 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # prose (not site-clipped). Topic rows are already site-clipped above.
         doc = None if cross_user_clip else \
             _get_lake_json(f"reports/{date}/{user}/daily_report.json")
-        return render_report_shape(rows, doc, date, user, conn=conn)
+        return render_report_shape(rows, doc, date, user, conn=conn,
+                                   company_id=caller.get("company_id"))
 
     # D fix (spec §5.1): prefer the Aurora-rendered shape whenever Aurora topics
     # exist for this (user, date) -- extraction-sourced OR report-sourced -- so

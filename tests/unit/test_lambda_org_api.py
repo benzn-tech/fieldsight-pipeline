@@ -58,6 +58,12 @@ def wired(monkeypatch):
     # "nothing redacted" so FakeConn (no real .cursor()) doesn't crash tests
     # that don't care about redactions. Tests exercising it override this.
     monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {})
+    # Same reason for the timeline KPI counts: render_report_shape reads
+    # recordings.day_stats whenever it has both a conn and a company_id, which
+    # every /timeline request does. Default to "no recordings" so tests that
+    # aren't about the KPIs don't hit FakeConn's missing .cursor().
+    monkeypatch.setattr(org.recordings, "day_stats",
+                        lambda conn, cid, folder, date: {"sessions": 0, "duration_s": 0})
     # Task 9/WS4: create_org_site now auto-slugs (dedup lookup) whenever the
     # body omits slug; default "no collision" so existing create-site tests
     # (which don't stub this) don't hit FakeConn's missing .cursor().
@@ -2458,7 +2464,11 @@ def test_timeline_shim_renders_override_when_extraction_topics_exist(presign_wir
                                         params={"date": "2026-07-14", "user": "Ada_L"}), None)
     assert res["statusCode"] == 200
     body = body_of(res)
-    assert body["_report_metadata"] == {"source": "live_extraction", "version": "flip-v1"}
+    assert body["_report_metadata"] == {
+        "source": "live_extraction", "version": "flip-v1",
+        # live KPI counts, zero here because `wired` stubs day_stats to "no
+        # recordings" — their presence is what stops the UI showing a bare 0
+        "recordings_processed": 0, "duration_seconds": 0}
     assert body["site"] == "Alpha"
     assert body["user_name"] == "Ada L"
     assert len(body["topics"]) == 1
@@ -2471,6 +2481,41 @@ def test_render_shape_topic_ids_positional_and_ordered():
     shape = org.render_report_shape(rows, None, "2026-07-14", "Ada_L")
     assert [t["topic_id"] for t in shape["topics"]] == [0, 1, 2]
     assert [t["topic_title"] for t in shape["topics"]] == ["First", "Second", "Third"]
+
+
+def test_render_shape_omits_kpi_counts_without_company_id():
+    """No company_id (reindex's builder) -> no counts, so the UI shows "—"
+    rather than the misleading hard 0 that the missing-field read produced."""
+    shape = org.render_report_shape([_topic_row()], None, "2026-07-14", "Ada_L")
+    assert shape["_report_metadata"] == {"source": "live_extraction", "version": "flip-v1"}
+
+
+def test_render_shape_adds_live_kpi_counts_when_company_id_given(monkeypatch):
+    seen = {}
+
+    def fake_day_stats(conn, company_id, folder, date):
+        seen.update(company_id=company_id, folder=folder, date=date)
+        return {"sessions": 1, "duration_s": 569}
+
+    monkeypatch.setattr(org.recordings, "day_stats", fake_day_stats)
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {})
+    shape = org.render_report_shape([_topic_row()], None, "2026-07-31", "Ben_UCPK2",
+                                    conn=object(), company_id="co-1")
+
+    assert shape["_report_metadata"] == {
+        "source": "live_extraction", "version": "flip-v1",
+        "recordings_processed": 1, "duration_seconds": 569}
+    # counted for the rendered (folder, date), not the caller's own folder
+    assert seen == {"company_id": "co-1", "folder": "Ben_UCPK2", "date": "2026-07-31"}
+
+
+def test_render_shape_kpi_counts_need_a_conn(monkeypatch):
+    """company_id without conn must not attempt the read."""
+    monkeypatch.setattr(org.recordings, "day_stats",
+                        lambda *a, **k: pytest.fail("must not query without a conn"))
+    shape = org.render_report_shape([_topic_row()], None, "2026-07-14", "Ada_L",
+                                    company_id="co-1")
+    assert "recordings_processed" not in shape["_report_metadata"]
 
 
 def test_render_shape_safety_flags_from_findings_with_legacy_fallback():
