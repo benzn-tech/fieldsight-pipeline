@@ -2579,11 +2579,10 @@ def test_timeline_shim_renders_override_when_extraction_topics_exist(presign_wir
                                         params={"date": "2026-07-14", "user": "Ada_L"}), None)
     assert res["statusCode"] == 200
     body = body_of(res)
-    assert body["_report_metadata"] == {
-        "source": "live_extraction", "version": "flip-v1",
-        # live KPI counts, zero here because `wired` stubs day_stats to "no
-        # recordings" — their presence is what stops the UI showing a bare 0
-        "recordings_processed": 0, "duration_seconds": 0}
+    # `wired` stubs day_stats to "no recordings rows", and a day with topics
+    # but no rows means the rows are missing rather than the day being silent
+    # — so the counts are omitted and the UI dashes instead of showing 0.
+    assert body["_report_metadata"] == {"source": "live_extraction", "version": "flip-v1"}
     assert body["site"] == "Alpha"
     assert body["user_name"] == "Ada L"
     assert len(body["topics"]) == 1
@@ -2622,6 +2621,34 @@ def test_render_shape_adds_live_kpi_counts_when_company_id_given(monkeypatch):
         "recordings_processed": 1, "duration_seconds": 569}
     # counted for the rendered (folder, date), not the caller's own folder
     assert seen == {"company_id": "co-1", "folder": "Ben_UCPK2", "date": "2026-07-31"}
+
+
+def test_render_shape_omits_kpi_counts_when_no_recordings_rows_back_the_topics(monkeypatch):
+    """A zero here is not "nothing was recorded" — topics only exist because
+    something WAS recorded and transcribed, so no recordings rows means the
+    rows are missing (a capture path that doesn't register them, data older
+    than the table, a lake-only day), not that the day was silent. Emitting 0
+    would reinstate exactly the misleading zero this whole change removes."""
+    monkeypatch.setattr(org.recordings, "day_stats",
+                        lambda *a, **k: {"sessions": 0, "duration_s": 0})
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {})
+    shape = org.render_report_shape([_topic_row()], None, "2026-07-31", "Ben_UCPK2",
+                                    conn=object(), company_id="co-1")
+
+    assert shape["_report_metadata"] == {"source": "live_extraction", "version": "flip-v1"}
+
+
+def test_render_shape_omits_only_duration_when_rows_carry_no_duration(monkeypatch):
+    """Sessions counted but every duration_s null: report the count, dash the
+    time, rather than claiming a real day lasted 0 seconds."""
+    monkeypatch.setattr(org.recordings, "day_stats",
+                        lambda *a, **k: {"sessions": 2, "duration_s": 0})
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {})
+    shape = org.render_report_shape([_topic_row()], None, "2026-07-31", "Ben_UCPK2",
+                                    conn=object(), company_id="co-1")
+
+    assert shape["_report_metadata"]["recordings_processed"] == 2
+    assert "duration_seconds" not in shape["_report_metadata"]
 
 
 def test_render_shape_kpi_counts_need_a_conn(monkeypatch):

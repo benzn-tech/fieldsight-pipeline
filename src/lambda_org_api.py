@@ -3874,8 +3874,21 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
     meta = {"source": "live_extraction", "version": "flip-v1"}
     if conn is not None and company_id is not None:
         stats = recordings.day_stats(conn, company_id, folder, date)
-        meta["recordings_processed"] = stats["sessions"]
-        meta["duration_seconds"] = stats["duration_s"]
+        # A zero is NOT "nothing was recorded". We only get here because this
+        # (user, date) has extraction topics, and topics exist only because
+        # something was recorded and transcribed — so no recordings rows means
+        # the ROWS are missing, not the recordings: a capture path that never
+        # registers them (RealPTT), days predating the table (migration 0009),
+        # or a lake-fed environment where media arrived as files rather than
+        # through the upload API. Emitting 0 there would reinstate the exact
+        # misleading zero this change exists to remove, so the field is omitted
+        # and the UI shows "—". Duration is judged separately: rows can be
+        # counted while every duration_s is null, and "0s" for a real day is
+        # its own small lie.
+        if stats["sessions"] > 0:
+            meta["recordings_processed"] = stats["sessions"]
+        if stats["duration_s"] > 0:
+            meta["duration_seconds"] = stats["duration_s"]
     return {
         "report_date": date,
         "site": rows[0]["site_name"],
