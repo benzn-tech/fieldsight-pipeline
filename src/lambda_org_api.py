@@ -70,11 +70,20 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/programme/suggestions            → list matcher suggestions for a site (admin/gm/pm)
   POST  /api/org/programme/suggestions/{id}/confirm → apply + write back to programme.json (admin/gm/pm)
   POST  /api/org/programme/suggestions/{id}/reject  → dismiss a suggestion (admin/gm/pm)
+  GET    /api/org/programme/tasks                 → time-window read
+                                                    (?from=&to=&assignee=me);
+                                                    serves the window view, My
+                                                    Work and Today
   POST   /api/org/programme/tasks                 → create a LOCAL task (admin/gm/pm)
   PATCH  /api/org/programme/tasks/{id}            → per-task write, optimistic-locked
                                                     on row_version; row-level rules in
                                                     can_edit_task (409 on a lost race)
   DELETE /api/org/programme/tasks/{id}            → delete a LOCAL task (admin/gm/pm)
+  POST   /api/org/programme/tasks/{id}/delay-flag → site manager reports a slip
+                                                    they cannot fix themselves
+  GET    /api/org/programme/delay-flags           → open flags for a site
+  POST   /api/org/programme/delay-flags/{id}/acknowledge → PM has seen it
+  POST   /api/org/programme/delay-flags/{id}/resolve     → PM has dealt with it
 
 Credentials: PG* env vars injected at deploy time (BUG-36 — no runtime
 Secrets Manager call from a NAT-less VPC). Cognito calls need the
@@ -104,7 +113,8 @@ from psycopg.rows import dict_row as RealDictRow
 from repositories import (action_items, aliases, classification_feedback, companies,
                           compliance_resolutions, content, content_edits, keyframes,
                           meeting_session, memberships, observations, programme,
-                          programme_snapshot, programme_suggestions, programme_tasks,
+                          programme_delay_flags, programme_snapshot,
+                          programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, rollup, scope,
                           sites, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
@@ -421,16 +431,35 @@ def dispatch(conn, event, method, route):
     if m_sr and method == "POST":
         return reject_suggestion(conn, caller, m_sr.group(1))
 
-    # Per-task writes. Registered AFTER /programme/suggestions/... so the
-    # more specific suggestion routes always win — `([^/]+)` below would
-    # otherwise be free to swallow a suggestion id.
-    if route == "/programme/tasks" and method == "POST":
-        return create_programme_task(conn, caller, event, parse_body(event))
+    # Per-task reads and writes. Registered AFTER /programme/suggestions/...
+    # so the more specific suggestion routes always win — `([^/]+)` below
+    # would otherwise be free to swallow a suggestion id.
+    if route == "/programme/tasks":
+        if method == "GET":
+            return list_programme_tasks(conn, caller, event)
+        if method == "POST":
+            return create_programme_task(conn, caller, event, parse_body(event))
+
+    # The /delay-flag suffix MUST be matched before the bare `([^/]+)$`
+    # pattern below, or `tasks/<id>/delay-flag` would never reach it.
+    m_df = re.match(r"^/programme/tasks/([^/]+)/delay-flag$", route)
+    if m_df and method == "POST":
+        return raise_delay_flag(conn, caller, m_df.group(1), parse_body(event))
+
     m_pt = re.match(r"^/programme/tasks/([^/]+)$", route)
     if m_pt and method == "PATCH":
         return patch_programme_task(conn, caller, m_pt.group(1), parse_body(event))
     if m_pt and method == "DELETE":
         return delete_programme_task(conn, caller, m_pt.group(1))
+
+    if route == "/programme/delay-flags" and method == "GET":
+        return list_delay_flags(conn, caller, event)
+    m_da = re.match(r"^/programme/delay-flags/([^/]+)/acknowledge$", route)
+    if m_da and method == "POST":
+        return acknowledge_delay_flag(conn, caller, m_da.group(1))
+    m_dr = re.match(r"^/programme/delay-flags/([^/]+)/resolve$", route)
+    if m_dr and method == "POST":
+        return acknowledge_delay_flag(conn, caller, m_dr.group(1), state="resolved")
 
     if route == "/recordings/upload-url" and method == "POST":
         return create_recording_upload_url(conn, caller, parse_body(event))
@@ -1028,6 +1057,8 @@ def get_me(conn, caller):
 def patch_me(conn, caller, body):
     if body is None:
         return error("malformed JSON body", 400)
+    if "prefs" in body and not isinstance(body["prefs"], dict):
+        return error("prefs must be an object", 400)
     old_avatar = caller.get("avatar_s3_key")
     avatar = body.get("avatar_s3_key")
     clear = "avatar_s3_key" in body and avatar is None
@@ -1057,6 +1088,13 @@ def patch_me(conn, caller, body):
             _delete_asset(old_avatar)
     elif final_avatar and old_avatar and old_avatar != final_avatar:
         _delete_asset(old_avatar)
+    # Merged last so the echoed row carries the new prefs; a separate write
+    # before update_profile would have been overwritten in the response by
+    # its RETURNING.
+    if "prefs" in body:
+        merged = users.merge_prefs(conn, caller["cognito_sub"], body["prefs"])
+        if merged is not None:
+            row = merged
     return ok(row)
 
 
@@ -2957,6 +2995,124 @@ def put_programme(conn, caller, event, body):
 
     tasks = programme_tasks.list_tasks(conn, prog["id"])
     return ok({"programme": programme_snapshot.build_snapshot(prog, tasks)})
+
+
+# A window with no bounds would fetch the whole programme, which is the thing
+# this endpoint exists to avoid.
+_MAX_WINDOW_DAYS = 400
+
+
+def list_programme_tasks(conn, caller, event):
+    """The time-window read. Serves the Programme window view, My Work and
+    Today from one query — Today previously fanned out across every org site
+    with pooledAll and downloaded each whole programme document to select a
+    handful of rows."""
+    params = event.get("queryStringParameters") or {}
+    site_id, err = _resolve_site_param(conn, caller, params.get("site"))
+    if err is not None:
+        return err
+
+    date_from, date_to = params.get("from"), params.get("to")
+    if not date_from or not date_to:
+        return error("from and to are required", 400)
+    try:
+        span = (_date.fromisoformat(date_to) - _date.fromisoformat(date_from)).days
+    except (ValueError, TypeError):
+        return error("from and to must be YYYY-MM-DD", 400)
+    if span < 0:
+        return error("from must be on or before to", 400)
+    if span > _MAX_WINDOW_DAYS:
+        return error(f"window may not exceed {_MAX_WINDOW_DAYS} days — "
+                     f"use the overview for a whole programme", 400)
+
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return ok({"tasks": [], "programme_id": None})
+
+    # `assignee` absent means no restriction; only a present value narrows.
+    assignee = params.get("assignee")
+    if assignee == "me":
+        assignee = caller.get("folder_name")
+        if not assignee:
+            # No folder identity means no programme work can be attributed to
+            # this caller. Return nothing, not everything — resolving "me" to
+            # None here would hand them the entire programme.
+            return ok({"tasks": [], "programme_id": str(prog["id"])})
+
+    rows = programme_window.tasks_in_window(
+        conn, prog["id"], date_from=date_from, date_to=date_to, assignee=assignee)
+    amap = programme_tasks.list_assignees(conn, [r["id"] for r in rows])
+    for r in rows:
+        r["assignees"] = amap.get(str(r["id"]), [])
+    return ok({"tasks": rows, "programme_id": str(prog["id"]),
+               "baseline_version": prog["baseline_version"]})
+
+
+def _task_site_or_error(conn, caller, task_id):
+    """(task, site_id, None) or (None, None, error_response).
+
+    404 rather than 403 when the site is out of reach: whether a task exists
+    in a site you cannot see is itself information.
+    """
+    task = programme_tasks.get_task(conn, task_id)
+    if task is None:
+        return None, None, error("not found", 404)
+    prog = programme_tasks.get_primary_programme_by_id(conn, task["programme_id"])
+    if prog is None or str(prog["site_id"]) not in _allowed_site_ids(conn, caller):
+        return None, None, error("not found", 404)
+    return task, str(prog["site_id"]), None
+
+
+def raise_delay_flag(conn, caller, task_id, body):
+    """Scenario D. Open to a site manager and above — this is the route the
+    403 on editing a contract date points them at, and gating it any higher
+    would leave that refusal with nowhere to go."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    if caller["global_role"] not in _MANAGER_ROLES + ("site_manager",):
+        return error("raising a delay flag requires a site manager or above", 403)
+
+    task, _site_id, err = _task_site_or_error(conn, caller, task_id)
+    if err is not None:
+        return err
+
+    try:
+        flag = programme_delay_flags.raise_flag(
+            conn, task_id=task["id"], raised_by=caller["id"],
+            reason=body.get("reason"), expected_end=body.get("expected_end"))
+    except ValueError as e:
+        return error(str(e), 400)
+    return ok({"delay_flag": flag})
+
+
+def list_delay_flags(conn, caller, event):
+    params = event.get("queryStringParameters") or {}
+    site_id, err = _resolve_site_param(conn, caller, params.get("site"))
+    if err is not None:
+        return err
+    state = params.get("state") or "open"
+    return ok({"delay_flags": programme_delay_flags.list_for_site(
+        conn, site_id, state=None if state == "all" else state)})
+
+
+def acknowledge_delay_flag(conn, caller, flag_id, state="acknowledged"):
+    """Deciding a flag is a manager action. Letting the raiser close their own
+    flag would let the signal die before reaching anyone who can act on it."""
+    if caller["global_role"] not in _MANAGER_ROLES:
+        return error("deciding a delay flag requires manager role", 403)
+
+    flag = programme_delay_flags.get(conn, flag_id)
+    if flag is None:
+        return error("not found", 404)
+    _task, _site_id, err = _task_site_or_error(conn, caller, flag["task_id"])
+    if err is not None:
+        return err
+
+    try:
+        return ok({"delay_flag": programme_delay_flags.set_state(
+            conn, flag_id, state)})
+    except ValueError as e:
+        return error(str(e), 400)
 
 
 def patch_programme_task(conn, caller, task_id, body):
