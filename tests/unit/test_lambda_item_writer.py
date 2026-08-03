@@ -117,6 +117,9 @@ def wired(monkeypatch):
                         lambda conn, cid, report, user_folder: {"id": "site-1", "name": "Test Site"})
     monkeypatch.setattr(iw.lambda_ingest, "resolve_user", lambda conn, cid, user_folder: None)
     monkeypatch.setattr(iw.recordings, "site_for_media", lambda *a, **k: None)
+    # Same default as site_for_media: no app tag unless a test supplies one, so
+    # the pre-existing membership-fallback expectations stay meaningful.
+    monkeypatch.setattr(iw.recordings, "site_for_day", lambda *a, **k: None)
     monkeypatch.setattr(iw.topics, "delete_topics_for_source", lambda *a, **k: 0)
     monkeypatch.setattr(iw.topics, "upsert_topic", lambda *a, **k: {"id": "topic-uuid-0"})
     monkeypatch.setattr(iw.findings, "insert_findings", lambda *a, **k: [])
@@ -961,6 +964,48 @@ def test_no_tag_no_membership_still_skips(wired):
     result = iw.write_extraction_items("2026-07-16", "Ben_Lin", EXTRACTION_KEY)
     assert result.get("skipped") is True
     assert called == []
+
+
+# ---------------------------------------------------------------------------
+# recordings.site_for_day — the day-level app tag. Closes the gap that sank an
+# OFFLINE chunk session recorded by a gm on 2026-08-03: site_for_media's LIKE
+# pattern can't match a chunk filename, meeting_session.site_id was NULL because
+# the device's POST /sessions/{id}/open never reached the server at record time,
+# and resolve_site returns None for ALL-scope roles by design — so every one of
+# that day's 130 uploaded chunks hit "identity bridge miss ... zero writes" and
+# nothing ever reached the website, even though the recordings rows had carried
+# the right site_id the whole time.
+# ---------------------------------------------------------------------------
+
+def test_day_tag_rescues_a_chunk_session_membership_cannot_resolve(wired):
+    wired.setattr(iw.recordings, "site_for_media", lambda *a, **k: None)
+    wired.setattr(iw.meeting_session, "get", lambda conn, sid: None)
+    wired.setattr(iw.recordings, "site_for_day", lambda *a, **k: {"id": "site-DAY"})
+    wired.setattr(iw.lambda_ingest, "resolve_site", lambda *a, **k: None)   # gm / ALL scope
+    seen = _capture_topic_site(wired)
+    result = iw.write_extraction_items("2026-07-16", "Ben_Lin", EXTRACTION_KEY)
+    assert not result.get("skipped")
+    assert seen and all(s == "site-DAY" for s in seen)
+
+
+def test_day_tag_outranks_membership(wired):
+    """BUG-41's rule: the app's recordings.site_id is the authority, membership
+    is only the last resort."""
+    wired.setattr(iw.recordings, "site_for_day", lambda *a, **k: {"id": "site-DAY"})
+    wired.setattr(iw.lambda_ingest, "resolve_site", lambda *a, **k: {"id": "site-MEMBER"})
+    seen = _capture_topic_site(wired)
+    iw.write_extraction_items("2026-07-16", "Ben_Lin", EXTRACTION_KEY)
+    assert seen and all(s == "site-DAY" for s in seen)
+
+
+def test_per_session_tags_still_outrank_the_day_tag(wired):
+    """A day can span sites; the session-specific sources stay ahead of the
+    day-level majority so a precise tag is never diluted by it."""
+    wired.setattr(iw.recordings, "site_for_media", lambda *a, **k: {"id": "site-TAG"})
+    wired.setattr(iw.recordings, "site_for_day", lambda *a, **k: {"id": "site-DAY"})
+    seen = _capture_topic_site(wired)
+    iw.write_extraction_items("2026-07-16", "Ben_Lin", EXTRACTION_KEY)
+    assert seen and all(s == "site-TAG" for s in seen)
 
 
 # ---------------------------------------------------------------------------
