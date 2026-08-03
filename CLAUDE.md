@@ -712,8 +712,14 @@ org-api **1547 次 throttle → 88% 请求 5XX**。⚠️**被 throttle 的调�
 3. **新读自己输出的地方要补 IAM**:extract-session 原本只有 `PutObject` on `extractions/*`,节流要读旧件却没
    `GetObject` —— 而 `read_existing_extraction` 吞掉 AccessDenied 返回 None,**节流会静默失效**。
    一律 `simulate-principal-policy` 实测(同 BUG-41 一带的教训)。
-4. **in-VPC 不能 `lambda:InvokeFunction`**(BUG-36)。跨 VPC 边界一律走 **S3 请求件**
+4. **in-VPC 的函数不能主动 `lambda:InvokeFunction`**(BUG-36)——无 NAT 时任何外呼黑洞。
+   需要**由 in-VPC 侧发起**的跨边界调用一律走 **S3 请求件**
    (`extraction_requests/` / `session_finalize_requests/` / `reindex_requests/` 同一套模式)。
+   **⚠️ 反方向(VPC 外 → 调 VPC 内)是允许的,别误当成禁止。** 调用方在 VPC 外有正常网络,
+   被调的那个只是靶子、自己不发起外呼。现有先例:`AskAgentFunction`(无 `VpcConfig`)invoke
+   `RagSearchFunction`(VPC 内),`lambda_ask_agent.py:625`/`:703`;`device-report` invoke
+   `device-ledger` 同理(2026-08-04 实测 5 秒返回,非超时)。**把这个方向也禁掉的代价**:
+   会逼人去建一个本该直接 invoke 的 S3 跳,而 BUG-33 意味着每个新 S3 触发器都是模板外的手工接线。
 5. **错误率要按"输入规模"分组看**,不要只看总体。这个 bug 的错误率是录制时长的函数,
    总体指标被大量短录音稀释,所以两周没人发现。
 
