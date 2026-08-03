@@ -30,6 +30,17 @@ BUCKET = "test-bucket"
 CONFIG_KEY = "config/user_mapping.json"
 
 
+class FakeNoSuchKey(Exception):
+    """Shaped like botocore's ClientError for a missing object. The double used to
+    raise a bare KeyError, which is NOT what S3 does — and since the code now has
+    to tell 'absent' apart from 'could not read' (they license opposite actions),
+    a double that signals absence the wrong way tests the wrong branch."""
+
+    def __init__(self):
+        super().__init__("NoSuchKey")
+        self.response = {"Error": {"Code": "NoSuchKey"}}
+
+
 class FakeS3:
     """Minimal S3 client double: object store keyed by S3 key, records puts."""
 
@@ -38,6 +49,8 @@ class FakeS3:
         self.put_calls = []
 
     def get_object(self, Bucket, Key):
+        if Key not in self.objects:
+            raise FakeNoSuchKey()
         body = self.objects[Key]
         raw = body.encode("utf-8") if isinstance(body, str) else body
         return {"Body": io.BytesIO(raw)}
@@ -516,6 +529,47 @@ def test_live_pass_stands_down_when_it_covers_no_new_segments(monkeypatch):
 
     assert len(fake_s3.put_calls) == 1                       # no second write
     assert result["source_transcripts"] == wide["source_transcripts"]
+
+
+def test_unreadable_existing_extraction_does_not_license_an_overwrite(monkeypatch):
+    """'Could not read it' and 'it is not there' license opposite actions. The
+    first version returned None for both, so a denied or failed read looked like
+    an empty slot — which would silently disable the throttle AND let a live pass
+    clobber an authoritative final extraction. Standing down costs a delayed
+    refresh; overwriting on a guess cannot be taken back."""
+    class DeniedOnExtractions(FakeS3):
+        def get_object(self, Bucket, Key):
+            if Key.startswith("extractions/"):
+                raise RuntimeError("AccessDenied")     # NOT a NoSuchKey
+            return super().get_object(Bucket=Bucket, Key=Key)
+
+    fake_s3 = DeniedOnExtractions({SEG1_KEY: json.dumps(make_transcribe_json("hello"))})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    called = []
+    monkeypatch.setattr(llm_utils, "call_llm",
+                        lambda *a, **k: called.append(1) or (json.dumps(
+                            {"topics": [], "declared_site": None}), None))
+
+    result = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    assert result is None
+    assert fake_s3.put_calls == []      # nothing overwritten on a guess
+    assert called == []                 # and no LLM call wasted on a doomed pass
+
+
+def test_read_existing_extraction_separates_absent_from_unreadable(monkeypatch):
+    fake_s3 = FakeS3({})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    assert les.read_existing_extraction(BUCKET, OUT_KEY) is None          # absent
+
+    fake_s3.objects[OUT_KEY] = "{ not json"
+    assert les.read_existing_extraction(BUCKET, OUT_KEY) is les.UNKNOWN   # corrupt
+
+    fake_s3.objects[OUT_KEY] = json.dumps(["not", "a", "dict"])
+    assert les.read_existing_extraction(BUCKET, OUT_KEY) is les.UNKNOWN   # wrong shape
+
+    fake_s3.objects[OUT_KEY] = json.dumps({"tier": "live"})
+    assert les.read_existing_extraction(BUCKET, OUT_KEY) == {"tier": "live"}
 
 
 def test_final_request_artifact_routes_to_a_final_pass(monkeypatch):
