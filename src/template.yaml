@@ -45,6 +45,23 @@ Parameters:
     Default: prod
     AllowedValues: [test, prod]
     Description: Deployment stage. prod deploys fieldsight-prod-*; test deploys fieldsight-test-*. Legacy hand-built fieldsight-* lambdas are NOT CFN-managed.
+  OrgApiReservedConcurrency:
+    Type: Number
+    Default: 200
+    MinValue: 1
+    Description: >-
+      Concurrency carved out of the account pool exclusively for org-api. This is the
+      ONLY synchronous, no-retry path in the platform: mobile upload-url/complete arrive
+      through API Gateway, so a throttle here is an immediate 5XX and permanently lost
+      device data, whereas every batch lambda is S3-event driven and Lambda re-drives it
+      for up to 6 hours. On 2026-08-03 extract-session consumed half the account's
+      then-10-slot pool and starved org-api into 1547 throttles / 88% 5XX (CLAUDE.md
+      BUG-43). A reservation makes that starvation structurally impossible rather than
+      relying on every batch function staying well-behaved.
+      Sized against observed peak concurrency of 10 and a modelled 100-device
+      reconnect burst of ~13, so 200 is deliberate headroom, not a guess.
+      NOTE: reserving requires the account to keep >=100 unreserved, so this could not
+      be set at all until the account quota was raised from 10 to 1000 (2026-08-04).
   EnableSchedules:
     Type: String
     Default: 'true'
@@ -1038,6 +1055,11 @@ Resources:
       Handler: lambda_org_api.lambda_handler
       Timeout: 30
       MemorySize: 256
+      # Guarantees the synchronous mobile-upload path can never be starved by batch
+      # work sharing the account pool — see the parameter's description for why this
+      # function specifically. Also caps org-api at the same number, which is fine:
+      # observed peak concurrency is 10.
+      ReservedConcurrentExecutions: !Ref OrgApiReservedConcurrency
       Layers:
         - !Ref PsycopgLayer
       VpcConfig:
