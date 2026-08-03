@@ -60,6 +60,85 @@ def test_marks_failed_and_skips_when_no_recipient(monkeypatch, caplog):
 
 def test_real_resolvers_exist_for_the_handler_to_wire():
     assert callable(fc._resolve_context) and callable(fc._read_rolling) and callable(fc._enqueue)
+    assert callable(fc._request_extraction)
+
+
+# ---- final-extraction request (close-driven Tier-2 pass) ----------------
+# The live passes that run during recording are throttled, so the last window
+# of transcripts can land INSIDE the throttle and never reach an extraction.
+# Only this close-driven request guarantees the published extraction covers the
+# whole session.
+
+def _claimed(monkeypatch):
+    monkeypatch.setattr(fc.meeting_session, "claim_finalize",
+                        lambda c, s, v: {"session_id": s, "user_id": "u1", "version": v})
+
+
+def test_requests_final_extraction_with_the_sid_grouping_key(monkeypatch):
+    _claimed(monkeypatch)
+    reqs = []
+    fc.finalize_claim(
+        "CONN", "622a0e7fc93e4befafeda1d0442fdf35", 1,
+        resolve_context=lambda c, row: {"recipient": "b@s.com", "folder": "Sam_Yu",
+                                        "date": "2026-08-03"},
+        read_rolling=lambda *a: {}, enqueue=lambda a: None,
+        request_extraction=lambda sid, folder, date: reqs.append((sid, folder, date)))
+    assert reqs == [("622a0e7fc93e4befafeda1d0442fdf35", "Sam_Yu", "2026-08-03")]
+
+
+def test_requests_final_extraction_even_with_no_recipient(monkeypatch):
+    """A recorder with no email on file still needs their session on the
+    website — the extraction must not be gated on the email path."""
+    _claimed(monkeypatch)
+    monkeypatch.setattr(fc.meeting_session, "mark_failed", lambda c, s: None)
+    reqs = []
+    out = fc.finalize_claim(
+        "CONN", "abc", 5,
+        resolve_context=lambda c, r: {"recipient": None, "folder": "MPI2",
+                                      "date": "2026-08-03"},
+        read_rolling=lambda *a: {}, enqueue=lambda a: None,
+        request_extraction=lambda *a: reqs.append(a))
+    assert out["status"] == "no_recipient"
+    assert len(reqs) == 1
+
+
+def test_extraction_request_failure_never_blocks_finalize(monkeypatch, caplog):
+    """Best-effort — but never silent (CLAUDE.md BUG-40)."""
+    _claimed(monkeypatch)
+
+    def _boom(*a):
+        raise RuntimeError("s3 down")
+
+    enq = []
+    with caplog.at_level("ERROR"):
+        out = fc.finalize_claim(
+            "CONN", "abc", 5,
+            resolve_context=lambda c, r: {"recipient": "b@s.com", "folder": "F",
+                                          "date": "2026-08-03"},
+            read_rolling=lambda *a: {}, enqueue=enq.append, request_extraction=_boom)
+    assert out["status"] == "enqueued" and len(enq) == 1
+    assert "abc" in caplog.text
+
+
+def test_no_extraction_request_without_folder_or_date(monkeypatch):
+    """Without both, the extraction key can't be formed — asking would just
+    create a dead artifact for extract-session to log and drop."""
+    _claimed(monkeypatch)
+    reqs = []
+    fc.finalize_claim(
+        "CONN", "abc", 5,
+        resolve_context=lambda c, r: {"recipient": "b@s.com", "folder": None,
+                                      "date": "2026-08-03"},
+        read_rolling=lambda *a: {}, enqueue=lambda a: None,
+        request_extraction=lambda *a: reqs.append(a))
+    assert reqs == []
+
+
+def test_prefix_matches_the_consumer(monkeypatch):
+    """The producer and consumer agree on the channel, or the final pass never
+    fires and nothing surfaces the mismatch at deploy time."""
+    import lambda_extract_session as les
+    assert fc.EXTRACTION_REQUESTS_PREFIX == les.FINAL_REQUESTS_PREFIX
 
 
 # ---- sweep (the scheduled grace sweeper's loop) -------------------------
