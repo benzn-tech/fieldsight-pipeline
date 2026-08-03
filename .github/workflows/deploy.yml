@@ -86,6 +86,12 @@ jobs:
           # SAM's --parameter-overrides REJECTS a bare "Key=" with an empty value, so the
           # ffmpeg-layer override is only appended when the var is actually set; unset =>
           # the token is omitted and the template Default ('') keeps the stack uncreated.
+          # OrgApiReservedConcurrency: test and prod are separate stacks in the SAME
+          # account, so both reservations come out of the one 1000-slot pool. TEST
+          # carries no customer traffic, so it takes a token slice (25) and leaves
+          # prod's 200 intact. (Comments cannot live inside the --parameter-overrides
+          # continuation below: a '#' after a line-continuation backslash comments out
+          # the REST of the command.)
           KF_LAYER_PARAM=""
           if [ -n "${{ vars.TEST_KEYFRAME_FFMPEG_LAYER_ARN }}" ]; then
             KF_LAYER_PARAM="KeyframeFfmpegLayerArn=${{ vars.TEST_KEYFRAME_FFMPEG_LAYER_ARN }}"
@@ -106,6 +112,7 @@ jobs:
               "DataBucketName=fieldsight-data-test-509194952652" \
               "IngestBucketName=fieldsight-data-test-509194952652" \
               "EnableSchedules=false" \
+              "OrgApiReservedConcurrency=25" \
               "EnableFinalize=${{ vars.TEST_ENABLE_FINALIZE || 'true' }}" \
               "EmailSender=${{ vars.TEST_EMAIL_SENDER || 'stub' }}" \
               "EnableSiteVoice=true" \
