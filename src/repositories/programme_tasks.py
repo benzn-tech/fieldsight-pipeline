@@ -174,6 +174,23 @@ def delete_local_task(conn, task_id) -> bool:
     return row is not None
 
 
+def count_local_tasks(conn, programme_id) -> int:
+    """How many rows under this programme are ours rather than the client's.
+
+    replace_all_tasks discards them, which is correct for a replace and
+    catastrophic for a zone split or an AI breakdown. The caller uses this to
+    refuse rather than to warn: an assumption written in a docstring and not
+    enforced is what made this reachable in the first place.
+    """
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT count(*) AS n FROM programme_tasks "
+        "WHERE programme_id = %s AND origin = 'local' "
+        "AND removed_in_version IS NULL",
+        (programme_id,),
+    ).fetchone()
+    return int((row or {}).get("n") or 0)
+
+
 def replace_all_tasks(conn, programme_id, *, parents, leaves, version_no,
                       updated_by) -> int:
     """Whole-document replace — today's PUT semantics, moved to Aurora.
