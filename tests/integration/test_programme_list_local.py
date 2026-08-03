@@ -1,5 +1,5 @@
 """
-Integration tests for count_local_tasks against a real PostgreSQL.
+Integration tests for list_local_tasks against a real PostgreSQL.
 
 The unit tests drive the handler through FakeProgrammeStore, which
 reimplements this count in Python. That proves the guard's behaviour and
@@ -39,7 +39,7 @@ def _task(db, pid, origin, name, *, source=None, removed=None):
 
 def test_a_programme_with_no_tasks_counts_zero(db):
     _, pid = _seed(db)
-    assert programme_tasks.count_local_tasks(db, pid) == 0
+    assert programme_tasks.list_local_tasks(db, pid) == []
 
 
 def test_imported_rows_are_not_local(db):
@@ -47,7 +47,7 @@ def test_imported_rows_are_not_local(db):
     would make Save refuse for everyone."""
     _, pid = _seed(db)
     _task(db, pid, "imported", "Pour slab", source="A1")
-    assert programme_tasks.count_local_tasks(db, pid) == 0
+    assert programme_tasks.list_local_tasks(db, pid) == []
 
 
 def test_zone_children_are_counted(db):
@@ -55,7 +55,7 @@ def test_zone_children_are_counted(db):
     _task(db, pid, "imported", "Pour slab", source="A1")
     _task(db, pid, "local", "Zone L1")
     _task(db, pid, "local", "Zone L2")
-    assert programme_tasks.count_local_tasks(db, pid) == 2
+    assert len(programme_tasks.list_local_tasks(db, pid)) == 2
 
 
 def test_a_soft_removed_local_row_is_not_counted(db):
@@ -64,7 +64,7 @@ def test_a_soft_removed_local_row_is_not_counted(db):
     _, pid = _seed(db)
     _task(db, pid, "local", "Zone L1")
     _task(db, pid, "local", "Deleted zone", removed=2)
-    assert programme_tasks.count_local_tasks(db, pid) == 1
+    assert len(programme_tasks.list_local_tasks(db, pid)) == 1
 
 
 def test_another_programmes_local_rows_do_not_leak_in(db):
@@ -75,4 +75,4 @@ def test_another_programmes_local_rows_do_not_leak_in(db):
         "INSERT INTO programmes (site_id, name, is_primary) "
         "VALUES (%s,'Other',false) RETURNING id", (sid,)).fetchone()[0]
     _task(db, other, "local", "Elsewhere")
-    assert programme_tasks.count_local_tasks(db, pid) == 0
+    assert programme_tasks.list_local_tasks(db, pid) == []

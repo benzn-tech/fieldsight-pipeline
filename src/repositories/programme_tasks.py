@@ -174,21 +174,20 @@ def delete_local_task(conn, task_id) -> bool:
     return row is not None
 
 
-def count_local_tasks(conn, programme_id) -> int:
-    """How many rows under this programme are ours rather than the client's.
+def list_local_tasks(conn, programme_id) -> list[dict]:
+    """The rows under this programme that are ours rather than the client's.
 
-    replace_all_tasks discards them, which is correct for a replace and
-    catastrophic for a zone split or an AI breakdown. The caller uses this to
-    refuse rather than to warn: an assumption written in a docstring and not
-    enforced is what made this reachable in the first place.
+    Returns rows, not a count, because the caller has to name them: telling
+    someone "this would delete 3 tasks" without saying which is not a decision
+    they can make.
     """
-    row = conn.cursor(row_factory=dict_row).execute(
-        "SELECT count(*) AS n FROM programme_tasks "
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, name, parent_id FROM programme_tasks "
         "WHERE programme_id = %s AND origin = 'local' "
-        "AND removed_in_version IS NULL",
+        "AND removed_in_version IS NULL "
+        "ORDER BY name",
         (programme_id,),
-    ).fetchone()
-    return int((row or {}).get("n") or 0)
+    ).fetchall()
 
 
 def replace_all_tasks(conn, programme_id, *, parents, leaves, version_no,
