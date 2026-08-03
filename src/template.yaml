@@ -1364,7 +1364,13 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
             - Effect: Allow
               Action: s3:PutObject
-              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
+                # Asks itself for a final re-run after a live pass overtakes an
+                # early final (_request_final_rerun). Without this the re-run is
+                # dropped and the session keeps fast-tier topics forever — the
+                # exact silent-degradation shape a missing grant caused before.
+                - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
