@@ -23,9 +23,10 @@ def test_all_pgdatabase_values_are_guarded_by_the_condition():
     # bare !ImportValue (that would be an un-switched function).
     guarded = len(re.findall(r"PGDATABASE:\s*!If \[HasPgDatabaseOverride", t))
     bare = len(re.findall(r"PGDATABASE:\s*!ImportValue", t))
-    # 15 since the chunk-driven session lifecycle added the in-VPC
-    # SessionActivityFunction (14 before, when the Tier-0 finalize plan added
-    # FinalizeSweepFunction; 13 before the video-keyframe KeyframeFunction). Its
-    # PGDATABASE is correctly !If-guarded like the rest.
-    assert guarded == 15, f"expected 15 guarded PGDATABASE, found {guarded}"
+    # 16 since the device ledger added the in-VPC DeviceLedgerFunction (15 when
+    # the chunk-driven session lifecycle added SessionActivityFunction; 14 when
+    # the Tier-0 finalize plan added FinalizeSweepFunction; 13 before the
+    # video-keyframe KeyframeFunction). Its PGDATABASE is correctly !If-guarded
+    # like the rest.
+    assert guarded == 16, f"expected 16 guarded PGDATABASE, found {guarded}"
     assert bare == 0, f"found {bare} un-switched bare PGDATABASE !ImportValue"
