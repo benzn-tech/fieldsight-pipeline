@@ -175,23 +175,42 @@ def test_list_assignees_groups_by_task():
     assert repo.list_assignees(conn, [TASK_ID]) == {TASK_ID: ["Sam_SM", "Pat_PM"]}
 
 
-def test_replace_all_tasks_clears_the_programme_first():
-    """Replace means replace, including the local rows. The caller is
-    required to have obtained explicit confirmation before getting here."""
-    conn = FakeConn([[], {"id": "g-uuid"}, [], []])
+def test_replace_all_tasks_reads_local_rows_before_touching_anything():
+    """Step 1 of the rewrite. The parent's source_task_id has to be captured
+    BEFORE the delete, because the parent's uuid does not survive it and the
+    file's id is the only durable link across the rebuild."""
+    conn = FakeConn([[], [], {"id": "g-uuid"}, [], []])
     repo.replace_all_tasks(
         conn, PROG_ID,
         parents=[{"task_id": "G1", "name": "Foundations", "wbs": "1"}],
         leaves=[{"task_id": "A1", "parent_id": "G1", "name": "Pour slab",
                  "start": "2026-04-01", "end": "2026-04-10"}],
         version_no=1, updated_by=USER_ID)
-    assert conn.calls[0]["sql"].startswith("DELETE FROM programme_tasks")
+    first = conn.calls[0]["sql"]
+    assert first.startswith("SELECT")
+    assert "parent_source" in first
+    assert "origin = 'local'" in first
+
+
+def test_replace_all_tasks_deletes_imported_rows_only():
+    """The contract this rewrite changed. Deleting everything is what let a
+    plain Save destroy zone splits and AI breakdowns (fieldsight-ui#186)."""
+    conn = FakeConn([[], [], {"id": "g-uuid"}, [], []])
+    repo.replace_all_tasks(
+        conn, PROG_ID,
+        parents=[{"task_id": "G1", "name": "Foundations", "wbs": "1"}],
+        leaves=[{"task_id": "A1", "parent_id": "G1", "name": "Pour slab",
+                 "start": "2026-04-01", "end": "2026-04-10"}],
+        version_no=1, updated_by=USER_ID)
+    delete = [c for c in conn.calls if c["sql"].startswith("DELETE FROM programme_tasks")][0]
+    assert "origin = 'imported'" in delete["sql"], (
+        "an unscoped DELETE takes the local rows with it")
 
 
 def test_replace_all_tasks_parents_the_leaves_by_source_id():
     """The file expresses parentage with its own ids; the rows have to be
     linked by our uuids, so groups must be inserted before their leaves."""
-    conn = FakeConn([[], {"id": "g-uuid"}, [], []])
+    conn = FakeConn([[], [], {"id": "g-uuid"}, [], []])
     repo.replace_all_tasks(
         conn, PROG_ID,
         parents=[{"task_id": "G1", "name": "Foundations", "wbs": "1"}],
