@@ -1,6 +1,7 @@
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
-_COLS = "id, cognito_sub, company_id, email, first_name, last_name, avatar_s3_key, global_role, created_at, archived_at, folder_name, kind"
+_COLS = "id, cognito_sub, company_id, email, first_name, last_name, avatar_s3_key, global_role, created_at, archived_at, folder_name, kind, prefs"
 
 
 def upsert_user(conn, cognito_sub, email, company_id=None, first_name=None,
@@ -174,6 +175,21 @@ def update_profile(conn, cognito_sub, first_name=None, last_name=None,
         f"WHERE cognito_sub=%(sub)s RETURNING {_COLS}",
         {"sub": cognito_sub, "first": first_name, "last": last_name,
          "avatar": avatar_s3_key},
+    ).fetchone()
+
+
+def merge_prefs(conn, cognito_sub, prefs: dict) -> dict | None:
+    """Shallow-merge UI preferences (migration 0028).
+
+    `prefs || %s` rather than an assignment: a surface saving its own key
+    must not clobber preferences belonging to a surface it never read. Nested
+    objects are replaced wholesale, which is fine — every key here is a flat
+    UI choice.
+    """
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE users SET prefs = prefs || %s WHERE cognito_sub = %s "
+        f"RETURNING {_COLS}",
+        (Jsonb(prefs or {}), cognito_sub),
     ).fetchone()
 
 

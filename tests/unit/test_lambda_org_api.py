@@ -58,6 +58,12 @@ def wired(monkeypatch):
     # "nothing redacted" so FakeConn (no real .cursor()) doesn't crash tests
     # that don't care about redactions. Tests exercising it override this.
     monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {})
+    # Same reason for the timeline KPI counts: render_report_shape reads
+    # recordings.day_stats whenever it has both a conn and a company_id, which
+    # every /timeline request does. Default to "no recordings" so tests that
+    # aren't about the KPIs don't hit FakeConn's missing .cursor().
+    monkeypatch.setattr(org.recordings, "day_stats",
+                        lambda conn, cid, folder, date: {"sessions": 0, "duration_s": 0})
     # Task 9/WS4: create_org_site now auto-slugs (dedup lookup) whenever the
     # body omits slug; default "no collision" so existing create-site tests
     # (which don't stub this) don't hit FakeConn's missing .cursor().
@@ -1511,6 +1517,121 @@ SITE_ID = "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
 OTHER_SITE_ID = "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2"
 
 
+class FakeProgrammeStore:
+    """In-memory stand-in for the Aurora programme tables.
+
+    The programme moved from a single S3 blob to Aurora, with the S3 document
+    regenerated as a snapshot for lambda_programme_matcher. These tests still
+    drive the real handlers and the real snapshot builder — only the storage
+    is faked — so they keep asserting the things that did not change: the ACL,
+    the role gate, the S3 key, and the updated_at stamp.
+    """
+
+    PROGRAMME_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    def __init__(self):
+        self.programme = None
+        self.tasks = []
+        self.versions = []
+
+    # -- the programme_tasks surface the handlers call -------------------
+    def get_primary_programme(self, conn, site_id):
+        return self.programme
+
+    def get_primary_programme_by_id(self, conn, programme_id):
+        return self.programme
+
+    def seed_tasks(self, rows):
+        """Put the store into a known state without going through an import.
+
+        `rows` is [{doc_id, status, progress_pct, origin?}] — doc_id being what
+        a suggestion carries: the file's Activity ID for imported rows, the
+        row's UUID for local ones.
+        """
+        self.programme = {"id": self.PROGRAMME_ID, "site_id": SITE_ID,
+                          "name": "P", "current_version": 1,
+                          "baseline_version": None, "is_primary": True,
+                          "status": "active"}
+        self.tasks = []
+        for r in rows:
+            origin = r.get("origin", "imported")
+            self.tasks.append({
+                "id": r["doc_id"] if origin == "local" else "uuid-" + r["doc_id"],
+                "source_task_id": None if origin == "local" else r["doc_id"],
+                "parent_id": None, "origin": origin, "name": r.get("name", "T"),
+                "wbs_code": None, "start_date": "2026-04-01",
+                "end_date": "2026-04-10", "duration_days": 10,
+                "progress_pct": r.get("progress_pct", 0),
+                "status": r.get("status", "not_started"),
+                "removed_in_version": None, "row_version": 1,
+            })
+        return self.tasks
+
+    def get_task_by_doc_id(self, conn, programme_id, doc_id):
+        """Mirrors the real resolver: imported rows answer to their
+        source_task_id, local rows to their UUID text."""
+        for t in self.tasks:
+            if t.get("removed_in_version") is not None:
+                continue
+            if (t.get("source_task_id") or str(t["id"])) == doc_id:
+                return t
+        return None
+
+    def update_task(self, conn, task_id, *, fields, row_version, updated_by):
+        row = next((t for t in self.tasks if t["id"] == task_id), None)
+        if row is None or row.get("row_version") != row_version:
+            return None          # gone, or another writer got there first
+        row.update(fields)
+        row["row_version"] += 1
+        return row
+
+    def create_programme(self, conn, *, site_id, name, source_format):
+        self.programme = {
+            "id": self.PROGRAMME_ID, "site_id": site_id, "name": name,
+            "source_format": source_format, "current_version": 0,
+            "baseline_version": None, "is_primary": True, "status": "active",
+        }
+        return self.programme
+
+    def record_version(self, conn, programme_id, **kw):
+        # task_snapshot is accepted and ignored; the tests here assert on the
+        # version bookkeeping, and the snapshot has its own suite.
+        self.versions.append(kw)
+        return dict(kw, programme_id=programme_id)
+
+    def replace_all_tasks(self, conn, programme_id, *, parents, leaves,
+                          version_no, updated_by):
+        self.tasks = []
+        for p in parents:
+            self.tasks.append({
+                "id": "uuid-" + p["task_id"], "source_task_id": p["task_id"],
+                "parent_id": None, "origin": "imported",
+                "name": p.get("name"), "wbs_code": p.get("wbs"),
+                "start_date": None, "end_date": None, "duration_days": None,
+                "progress_pct": 0, "status": "not_started",
+                "removed_in_version": None,
+            })
+        for t in leaves:
+            self.tasks.append({
+                "id": "uuid-" + t["task_id"], "source_task_id": t["task_id"],
+                "parent_id": ("uuid-" + t["parent_id"]) if t.get("parent_id") else None,
+                "origin": "imported", "name": t.get("name"),
+                "wbs_code": t.get("wbs"), "start_date": t.get("start"),
+                "end_date": t.get("end"), "duration_days": t.get("duration_days"),
+                "progress_pct": t.get("progress_pct") or 0,
+                "status": t.get("status") or "not_started",
+                "removed_in_version": None,
+            })
+        self.programme["current_version"] = version_no
+        return len(self.tasks)
+
+    def list_tasks(self, conn, programme_id, include_removed=False):
+        return self.tasks
+
+    def list_assignees(self, conn, task_ids):
+        return {}
+
+
 @pytest.fixture
 def programme_wired(wired):
     fake = FakeS3()
@@ -1519,6 +1640,19 @@ def programme_wired(wired):
                   lambda conn, cid, **kw: [{"id": SITE_ID}])
     wired.setattr(org.memberships, "accessible_site_ids",
                   lambda conn, uid, role: [SITE_ID])
+
+    store = FakeProgrammeStore()
+    for name in ("get_primary_programme", "get_primary_programme_by_id",
+                 "create_programme", "record_version", "replace_all_tasks",
+                 "list_tasks", "list_assignees",
+                 "get_task_by_doc_id", "update_task"):
+        wired.setattr(org.programme_tasks, name, getattr(store, name))
+    # PUT records its version through programme_import now, because the row
+    # carries a task_snapshot (migration 0029) that programme_tasks knows
+    # nothing about.
+    wired.setattr(org.programme_import, "record_version",
+                  lambda conn, pid, **kw: store.record_version(conn, pid, **kw))
+    fake.programme_store = store
     return wired, fake
 
 
@@ -1566,13 +1700,18 @@ def test_resolve_site_param_no_access_403(wired):
 
 
 def test_get_programme_hit(programme_wired):
+    """GET now builds its response from the Aurora rows through the snapshot
+    builder rather than echoing an S3 blob, so the wire format is asserted
+    here rather than the storage round-trip."""
     wired, fake = programme_wired
-    fake.objects[f"programmes/{SITE_ID}/programme.json"] = json.dumps(
-        {"tasks": [{"id": "t-1", "name": "Foundations"}]}).encode()
+    _seed_programme(fake)
     res = org.lambda_handler(make_event(
         "GET", "/api/org/programme", params={"site": SITE_ID}), None)
     assert res["statusCode"] == 200
-    assert body_of(res)["programme"] == {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+    doc = body_of(res)["programme"]
+    assert [p["task_id"] for p in doc["parents"]] == ["G1"]
+    assert [t["task_id"] for t in doc["leaves"]] == ["T1"]
+    assert doc["start_date"] == "2026-04-01" and doc["end_date"] == "2026-04-10"
 
 
 def test_get_programme_miss_returns_null_200(programme_wired):
@@ -1632,28 +1771,42 @@ def test_admin_any_company_site_ok(programme_wired):
     assert body_of(res)["programme"] is None
 
 
+def _seed_programme(fake):
+    """One group with one dated task, straight into the fake Aurora store."""
+    store = fake.programme_store
+    store.create_programme(None, site_id=SITE_ID, name="Main contract",
+                           source_format="csv")
+    store.replace_all_tasks(
+        None, store.PROGRAMME_ID,
+        parents=[{"task_id": "G1", "name": "Foundations", "wbs": "1"}],
+        leaves=[{"task_id": "T1", "parent_id": "G1", "name": "Pour slab",
+                 "start": "2026-04-01", "end": "2026-04-10"}],
+        version_no=1, updated_by=None)
+    return store
+
+
 def test_programme_get_by_slug_works(programme_wired):
     wired, fake = programme_wired
     wired.setattr(org.sites, "get_company_site_by_slug",
                   lambda conn, cid, slug: {"id": SITE_ID} if slug == "alpha" else None)
-    fake.objects[f"programmes/{SITE_ID}/programme.json"] = json.dumps(
-        {"tasks": [{"id": "t-1", "name": "Foundations"}]}).encode()
+    _seed_programme(fake)
     res = org.lambda_handler(make_event(
         "GET", "/api/org/programme", params={"site": "alpha"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res)["programme"] == {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+    doc = body_of(res)["programme"]
+    assert [t["task_id"] for t in doc["leaves"]] == ["T1"]
 
 
 def test_programme_get_by_uuid_still_works(programme_wired):
     # Backward compat: the S3 key stays UUID-based and the original
     # ?site=<uuid> contract still resolves without touching get_company_site_by_slug.
     wired, fake = programme_wired
-    fake.objects[f"programmes/{SITE_ID}/programme.json"] = json.dumps(
-        {"tasks": [{"id": "t-1", "name": "Foundations"}]}).encode()
+    _seed_programme(fake)
     res = org.lambda_handler(make_event(
         "GET", "/api/org/programme", params={"site": SITE_ID}), None)
     assert res["statusCode"] == 200
-    assert body_of(res)["programme"] == {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+    doc = body_of(res)["programme"]
+    assert [t["task_id"] for t in doc["leaves"]] == ["T1"]
 
 
 def test_put_programme_role_gate(programme_wired):
@@ -1679,16 +1832,36 @@ def test_put_programme_role_gate(programme_wired):
 
 
 def test_put_programme_writes_key_and_updated_at(programme_wired):
+    """PUT writes Aurora now, but must still regenerate the S3 snapshot at the
+    UUID-keyed path and stamp updated_at — that document is what
+    lambda_programme_matcher reads, and a stale one makes matching go quiet
+    with no error anywhere."""
     wired, fake = programme_wired
-    body = {"tasks": [{"id": "t-1", "name": "Foundations"}]}
+    body = {
+        "name": "Main contract",
+        "parents": [{"task_id": "G1", "name": "Foundations", "wbs": "1"}],
+        "leaves": [{"task_id": "T1", "parent_id": "G1", "name": "Pour slab",
+                    "start": "2026-04-01", "end": "2026-04-10"}],
+    }
     res = org.lambda_handler(make_event(
         "PUT", "/api/org/programme", params={"site": SITE_ID}, body=body), None)
     assert res["statusCode"] == 200
-    saved = body_of(res)["programme"]
-    assert saved["tasks"] == [{"id": "t-1", "name": "Foundations"}]
-    assert saved["updated_at"]
+
     stored = json.loads(fake.objects[f"programmes/{SITE_ID}/programme.json"])
-    assert stored == saved
+    assert stored["updated_at"]
+    assert [p["task_id"] for p in stored["parents"]] == ["G1"]
+    assert [t["task_id"] for t in stored["leaves"]] == ["T1"]
+
+
+def test_put_programme_records_a_version(programme_wired):
+    """Every write is a version, so an import can be rolled back later."""
+    wired, fake = programme_wired
+    org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": SITE_ID},
+        body={"parents": [], "leaves": []}), None)
+    assert fake.programme_store.versions
+    assert fake.programme_store.versions[0]["version_no"] == 1
+    assert fake.programme_store.versions[0]["mode"] == "initial"
 
 
 def test_put_programme_site_required_400(programme_wired):
@@ -1986,19 +2159,26 @@ def test_list_suggestions_admin_ok(programme_wired):
     canned = [_suggestion_row()]
     seen = {}
     wired.setattr(org.programme_suggestions, "list_for_site",
-                  lambda conn, site_id, state: (seen.update(site_id=site_id, state=state) or canned))
+                  lambda conn, site_id, state, topic_user_id: (
+                      seen.update(site_id=site_id, state=state,
+                                  topic_user_id=topic_user_id) or canned))
     res = org.lambda_handler(make_event(
         "GET", "/api/org/programme/suggestions", params={"site": SITE_ID}), None)
     assert res["statusCode"] == 200
     assert body_of(res)["suggestions"] == canned
-    assert seen == {"site_id": SITE_ID, "state": "pending"}
+    # topic_user_id None = no author restriction. NOT [] -- see
+    # list_for_site's docstring; an empty collection reading as "unrestricted"
+    # is a bug this codebase has shipped before.
+    assert seen == {"site_id": SITE_ID, "state": "pending", "topic_user_id": None}
+    assert body_of(res)["scope"] == "site"
 
 
 def test_list_suggestions_state_all_passes_none(programme_wired):
     wired, fake = programme_wired
     seen = {}
     wired.setattr(org.programme_suggestions, "list_for_site",
-                  lambda conn, site_id, state: (seen.update(state=state) or []))
+                  lambda conn, site_id, state, topic_user_id: (
+                      seen.update(state=state) or []))
     res = org.lambda_handler(make_event(
         "GET", "/api/org/programme/suggestions",
         params={"site": SITE_ID, "state": "all"}), None)
@@ -2013,12 +2193,53 @@ def test_list_suggestions_inaccessible_site_403(programme_wired):
     assert res["statusCode"] == 403
 
 
-def test_list_suggestions_worker_403(programme_wired):
+def test_list_suggestions_non_manager_sees_only_their_own(programme_wired):
+    """This endpoint used to 403 anyone below pm, which meant the person who
+    actually spoke on site could never see that their words reached the
+    programme -- the whole point of surfacing suggestions. The gate now
+    narrows the result instead of refusing it."""
+    wired, fake = programme_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "site_manager"})
+    seen = {}
+    wired.setattr(org.programme_suggestions, "list_for_site",
+                  lambda conn, site_id, state, topic_user_id: (
+                      seen.update(topic_user_id=topic_user_id) or []))
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/programme/suggestions", params={"site": SITE_ID}), None)
+    assert res["statusCode"] == 200
+    assert seen["topic_user_id"] == CALLER["id"]
+    assert body_of(res)["scope"] == "own"
+
+
+def test_list_suggestions_own_scope_is_forced_from_the_caller(programme_wired):
+    """The narrowing must not be reachable from the request. A site manager
+    passing someone else's id gets their own suggestions, not that person's."""
     wired, fake = programme_wired
     wired.setattr(org.users, "get_user_by_sub",
                   lambda conn, sub: {**CALLER, "global_role": "worker"})
+    seen = {}
+    wired.setattr(org.programme_suggestions, "list_for_site",
+                  lambda conn, site_id, state, topic_user_id: (
+                      seen.update(topic_user_id=topic_user_id) or []))
     res = org.lambda_handler(make_event(
-        "GET", "/api/org/programme/suggestions", params={"site": SITE_ID}), None)
+        "GET", "/api/org/programme/suggestions",
+        params={"site": SITE_ID, "topic_user_id": "u-somebody-else",
+                "user": "u-somebody-else"}), None)
+    assert res["statusCode"] == 200
+    assert seen["topic_user_id"] == CALLER["id"]
+
+
+def test_list_suggestions_non_manager_still_cannot_confirm(programme_wired):
+    """Reading is widened; deciding is not."""
+    wired, fake = programme_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "site_manager"})
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 403
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/reject"), None)
     assert res["statusCode"] == 403
 
 
@@ -2027,11 +2248,13 @@ def test_confirm_applies_status_and_writes(programme_wired):
     row = _suggestion_row()
     wired.setattr(org.programme_suggestions, "get",
                   lambda conn, sid: row if sid == "sugg-1" else None)
-    doc = {"leaves": [{"task_id": "t-1", "parent_id": "p-1", "name": "Foundations",
-                       "start": "2026-07-01", "end": "2026-07-15",
-                       "status": "in_progress", "progress_pct": 40}],
-           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    # Confirm writes programme_tasks and lets _write_snapshot derive the
+    # document, so the setup seeds the table. The write assertions below are
+    # unchanged and now prove something stronger: the regenerated document
+    # carries the confirmed value, which means it came from the table.
+    store = fake.programme_store
+    store.seed_tasks([{"doc_id": "t-1", "name": "Foundations",
+                       "status": "in_progress", "progress_pct": 40}])
     written = {}
 
     def fake_write(s3c, bucket, site_id, doc_, updated_at):
@@ -2054,6 +2277,10 @@ def test_confirm_applies_status_and_writes(programme_wired):
     assert written["site_id"] == SITE_ID
     assert written["doc"]["leaves"][0]["status"] == "completed"
     assert written["doc"]["leaves"][0]["progress_pct"] == 100
+    # The table, not just the document derived from it. Asserting only the
+    # document is what let the old S3-only write look correct here.
+    assert store.tasks[0]["status"] == "completed"
+    assert store.tasks[0]["progress_pct"] == 100
     assert decided == {"sid": "sugg-1", "state": "confirmed", "decided_by": "u-uuid-1",
                        "applied_status": "completed", "applied_progress": 100}
 
@@ -2062,9 +2289,8 @@ def test_confirm_reviewer_override_status_and_progress(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row()
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
-           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    store = fake.programme_store
+    store.seed_tasks([{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
     written = {}
     wired.setattr(org.programme, "write_programme",
                   lambda s3c, bucket, site_id, doc_, updated_at: (written.update(doc=doc_) or doc_))
@@ -2078,15 +2304,15 @@ def test_confirm_reviewer_override_status_and_progress(programme_wired):
     assert body_of(res)["applied_progress"] == 75
     assert written["doc"]["leaves"][0]["status"] == "in_progress"
     assert written["doc"]["leaves"][0]["progress_pct"] == 75
+    assert store.tasks[0]["progress_pct"] == 75
 
 
 def test_confirm_task_missing_marks_stale_409(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row(task_id="ghost-task")
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
-           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
     staled = {}
     wired.setattr(org.programme_suggestions, "mark_stale",
                   lambda conn, sid: (staled.update(sid=sid) or {**row, "state": "stale"}))
@@ -2113,9 +2339,8 @@ def test_confirm_task_changed_since_match_409(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row(task_status_before="in_progress", task_progress_before=40)
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 75}],
-           "parents": [], "updated_at": "2026-07-05T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 75}])
     write_calls = {"n": 0}
     wired.setattr(org.programme, "write_programme",
                   lambda *a, **k: write_calls.update(n=write_calls["n"] + 1))
@@ -2150,17 +2375,32 @@ def test_confirm_second_pending_suggestion_for_other_task_not_blocked(programme_
             suggested_status="in_progress", suggested_progress=10),
     }
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: rows.get(sid))
-    doc = {"leaves": [
-        {"task_id": "t-1", "status": "in_progress", "progress_pct": 40},
-        {"task_id": "t-2", "status": "not_started", "progress_pct": 0},
-    ], "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
 
-    def fake_write(s3c, bucket, site_id, doc_, updated_at):
-        doc_["updated_at"] = updated_at  # mirrors the real write_programme
-        return doc_
+    # The confirm path now reads and writes programme_tasks (Aurora) and lets
+    # _write_snapshot derive programme.json, so the fakes are the table rather
+    # than the document. The regression this test guards is unchanged: A and
+    # B are about DIFFERENT tasks, so deciding A must not affect B.
+    tasks = {
+        "t-1": {"id": "uuid-1", "status": "in_progress", "progress_pct": 40,
+                "row_version": 1, "origin": "imported"},
+        "t-2": {"id": "uuid-2", "status": "not_started", "progress_pct": 0,
+                "row_version": 1, "origin": "imported"},
+    }
+    wired.setattr(org.programme_tasks, "get_primary_programme",
+                  lambda conn, site_id: {"id": "prog-1", "site_id": site_id})
+    wired.setattr(org.programme_tasks, "get_task_by_doc_id",
+                  lambda conn, programme_id, doc_id: tasks.get(doc_id))
 
-    wired.setattr(org.programme, "write_programme", fake_write)
+    def fake_update_task(conn, task_id, *, fields, row_version, updated_by):
+        row_ = next(t for t in tasks.values() if t["id"] == task_id)
+        if row_["row_version"] != row_version:
+            return None                      # optimistic lock lost
+        row_.update(fields)
+        row_["row_version"] += 1
+        return row_
+
+    wired.setattr(org.programme_tasks, "update_task", fake_update_task)
+    wired.setattr(org, "_write_snapshot", lambda conn, site_id, programme_id: None)
 
     def fake_decide(conn, sid, state, decided_by, applied_status=None, applied_progress=None):
         rows[sid] = {**rows[sid], "state": state}
@@ -2171,12 +2411,17 @@ def test_confirm_second_pending_suggestion_for_other_task_not_blocked(programme_
     res_a = org.lambda_handler(make_event(
         "POST", "/api/org/programme/suggestions/sugg-A/confirm", body={}), None)
     assert res_a["statusCode"] == 200
-    # doc.updated_at has now moved on -- under the OLD whole-doc check this
-    # alone would 409 every other pending suggestion for this site.
+    # t-1 has now moved (and under the OLD whole-doc check, programme.json's
+    # updated_at moving was on its own enough to 409 every other pending
+    # suggestion for this site, forever).
+    assert tasks["t-1"]["progress_pct"] == 100, (
+        "the confirmed value must reach programme_tasks — the table the Gantt "
+        "renders from and the table _write_snapshot rebuilds the document from")
 
     res_b = org.lambda_handler(make_event(
         "POST", "/api/org/programme/suggestions/sugg-B/confirm", body={}), None)
     assert res_b["statusCode"] == 200  # THE key regression assertion -- not 409
+    assert tasks["t-2"]["progress_pct"] == 10
 
 
 def test_confirm_already_decided_409(programme_wired):
@@ -2247,9 +2492,8 @@ def test_confirm_never_lowers_progress_on_auto_value(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row(suggested_progress=60, task_progress_before=80)
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 80}],
-           "parents": [], "updated_at": row["match_evidence"]["programme_updated_at"]}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 80}])
     written = {}
     wired.setattr(org.programme, "write_programme",
                   lambda s3c, bucket, site_id, doc_, updated_at: (written.update(doc=doc_) or doc_))
@@ -2268,9 +2512,8 @@ def test_confirm_explicit_lower_progress_allowed(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row(suggested_progress=60, task_progress_before=80)
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 80}],
-           "parents": [], "updated_at": row["match_evidence"]["programme_updated_at"]}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 80}])
     written = {}
     wired.setattr(org.programme, "write_programme",
                   lambda s3c, bucket, site_id, doc_, updated_at: (written.update(doc=doc_) or doc_))
@@ -2293,12 +2536,11 @@ def test_confirm_decide_cas_second_call_gets_409_no_write(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row()
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
-           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
     write_calls = {"n": 0}
     wired.setattr(org.programme, "write_programme",
-                  lambda *a, **k: (write_calls.update(n=write_calls["n"] + 1) or doc))
+                  lambda *a, **k: write_calls.update(n=write_calls["n"] + 1))
     # 1st decide() call "wins" the race (returns the confirmed row); 2nd
     # call simulates another request having already decided it (returns
     # None, mirroring decide()'s real `WHERE state='pending'` guard).
@@ -2384,9 +2626,8 @@ def test_confirm_valid_progress_override_applied(programme_wired):
     wired, fake = programme_wired
     row = _suggestion_row()
     wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
-    doc = {"leaves": [{"task_id": "t-1", "status": "in_progress", "progress_pct": 40}],
-           "parents": [], "updated_at": "2026-07-01T00:00:00+00:00"}
-    wired.setattr(org.programme, "read_programme", lambda s3c, bucket, site_id: doc)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
     written = {}
     wired.setattr(org.programme, "write_programme",
                   lambda s3c, bucket, site_id, doc_, updated_at: (written.update(doc=doc_) or doc_))
@@ -2458,6 +2699,9 @@ def test_timeline_shim_renders_override_when_extraction_topics_exist(presign_wir
                                         params={"date": "2026-07-14", "user": "Ada_L"}), None)
     assert res["statusCode"] == 200
     body = body_of(res)
+    # `wired` stubs day_stats to "no recordings rows", and a day with topics
+    # but no rows means the rows are missing rather than the day being silent
+    # — so the counts are omitted and the UI dashes instead of showing 0.
     assert body["_report_metadata"] == {"source": "live_extraction", "version": "flip-v1"}
     assert body["site"] == "Alpha"
     assert body["user_name"] == "Ada L"
@@ -2471,6 +2715,69 @@ def test_render_shape_topic_ids_positional_and_ordered():
     shape = org.render_report_shape(rows, None, "2026-07-14", "Ada_L")
     assert [t["topic_id"] for t in shape["topics"]] == [0, 1, 2]
     assert [t["topic_title"] for t in shape["topics"]] == ["First", "Second", "Third"]
+
+
+def test_render_shape_omits_kpi_counts_without_company_id():
+    """No company_id (reindex's builder) -> no counts, so the UI shows "—"
+    rather than the misleading hard 0 that the missing-field read produced."""
+    shape = org.render_report_shape([_topic_row()], None, "2026-07-14", "Ada_L")
+    assert shape["_report_metadata"] == {"source": "live_extraction", "version": "flip-v1"}
+
+
+def test_render_shape_adds_live_kpi_counts_when_company_id_given(monkeypatch):
+    seen = {}
+
+    def fake_day_stats(conn, company_id, folder, date):
+        seen.update(company_id=company_id, folder=folder, date=date)
+        return {"sessions": 1, "duration_s": 569}
+
+    monkeypatch.setattr(org.recordings, "day_stats", fake_day_stats)
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {})
+    shape = org.render_report_shape([_topic_row()], None, "2026-07-31", "Ben_UCPK2",
+                                    conn=object(), company_id="co-1")
+
+    assert shape["_report_metadata"] == {
+        "source": "live_extraction", "version": "flip-v1",
+        "recordings_processed": 1, "duration_seconds": 569}
+    # counted for the rendered (folder, date), not the caller's own folder
+    assert seen == {"company_id": "co-1", "folder": "Ben_UCPK2", "date": "2026-07-31"}
+
+
+def test_render_shape_omits_kpi_counts_when_no_recordings_rows_back_the_topics(monkeypatch):
+    """A zero here is not "nothing was recorded" — topics only exist because
+    something WAS recorded and transcribed, so no recordings rows means the
+    rows are missing (a capture path that doesn't register them, data older
+    than the table, a lake-only day), not that the day was silent. Emitting 0
+    would reinstate exactly the misleading zero this whole change removes."""
+    monkeypatch.setattr(org.recordings, "day_stats",
+                        lambda *a, **k: {"sessions": 0, "duration_s": 0})
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {})
+    shape = org.render_report_shape([_topic_row()], None, "2026-07-31", "Ben_UCPK2",
+                                    conn=object(), company_id="co-1")
+
+    assert shape["_report_metadata"] == {"source": "live_extraction", "version": "flip-v1"}
+
+
+def test_render_shape_omits_only_duration_when_rows_carry_no_duration(monkeypatch):
+    """Sessions counted but every duration_s null: report the count, dash the
+    time, rather than claiming a real day lasted 0 seconds."""
+    monkeypatch.setattr(org.recordings, "day_stats",
+                        lambda *a, **k: {"sessions": 2, "duration_s": 0})
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {})
+    shape = org.render_report_shape([_topic_row()], None, "2026-07-31", "Ben_UCPK2",
+                                    conn=object(), company_id="co-1")
+
+    assert shape["_report_metadata"]["recordings_processed"] == 2
+    assert "duration_seconds" not in shape["_report_metadata"]
+
+
+def test_render_shape_kpi_counts_need_a_conn(monkeypatch):
+    """company_id without conn must not attempt the read."""
+    monkeypatch.setattr(org.recordings, "day_stats",
+                        lambda *a, **k: pytest.fail("must not query without a conn"))
+    shape = org.render_report_shape([_topic_row()], None, "2026-07-14", "Ada_L",
+                                    company_id="co-1")
+    assert "recordings_processed" not in shape["_report_metadata"]
 
 
 def test_render_shape_safety_flags_from_findings_with_legacy_fallback():

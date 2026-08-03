@@ -638,6 +638,50 @@ dev 可把 Amplify `FS_ORG_BASEURL` 指向 test 网关(`wdsgobb7b0…/prod/api`,
 **通则**:①DynamoDB 表达式里任何普通英文词都先查保留字表,一律用 `#别名`;②**永远别写静默的
 `except: return 通用错误`** —— 服务端至少 `logger.exception`,否则这类 bug 无从下手。
 
+### BUG-41: 报告的 `site` 来自 `SITE_NAME` env 兜底 → chunk 站点错归属(2026-08-02)
+**现象**:某用户在 RAG 搜索里**搜不到自己的内容**,而别站的人反倒搜得到;同时 defer 天的 topic 匹配恒 0。
+**根因链**:`lambda_report_generator` 对**不在遗留 `config/user_mapping.json` 里的用户**(= 所有注册制新账号),
+把 `report['site']` 填成 **env `SITE_NAME`**(prod 值 `SB1108 Ellesmere College`):`:1245` `user_primary_site.get(user_name,'')`
+→ `''` → `:1247` `.get('name', site_name)` 回退 → `:1182` `os.environ['SITE_NAME']`。`lambda_ingest.resolve_site`
+路径①按名字查站,**忠实采信这个错站名** → chunk 的 `site_id` 全错。而 `lambda_item_writer` 走 G5b
+`recordings.site_id`(App 内选站)→ 同一 user+date 的 extraction topic 站点是**对的**。两侧不一致的后果:
+①RAG 按 `site_id` 过滤 → 本人看不见自己的内容、他站的人看得见(**可见性错误**);②defer 天 topic 匹配器按
+`(site_id,user_id,report_date)` 取候选 → **恒空** → `topic_id` 全 NULL(实测 6/54)。prod 实证 40 条中招。
+**Fix(已上线 PR #196/#197)**:ingest 与 item_writer **对齐优先级**——新增
+`recordings.site_for_day(conn,company_id,user_folder,date)`(`site_for_media` 的日级兄弟,同款租户安全:
+company 双重限定 + `site_id IS NOT NULL` + `_escape_like`;一天跨站按**录音条数取多数**、同数取最新),
+调用点改 `site_for_day(...) or resolve_site(...)`。**`resolve_site` 本身不动**——`item_writer` 拿它当自己第三级。
+重跑后 topic_id 6→21、站点归属不再被重跑撤销。
+**残留(设计正确,勿"修")**:若 `recordings.company_id` 与 ingest 解析出的公司不同(遗留数据:早期录音还挂在
+`dc2eafa9` FieldSight 名下),跨租户守卫会正确拒绝 → 回落老逻辑 → 仍可能错站。**放宽 company 限定 = 租户隔离
+回归,绝不做**;正解是迁移那批 recordings 的 `company_id`。
+**通则**:①任何"站点/归属"判定都以 **App 端 `recordings.site_id`** 为权威,`user_mapping.json` 和 env 兜底只配
+当最后一级;②env 级默认值(`SITE_NAME`)用于**多租户归属**是危险设计——它把"查不到"静默变成"归到某个具体客户"。
+
+### BUG-42: Git Bash 的 MSYS 路径改写让 Lambda 冒烟测试全部静默 404(2026-08-03)
+**现象**:用 `aws lambda invoke` 打已部署的 org-api 做冒烟测试,**每一条路由都返回 404 `{"error":"not found"}`**,
+连 `/api/org/me` 也一样。看起来完全像 Lambda 的路由 bug——事件形状对、`httpMethod`/`path` 都填了、
+caller 也能解析(否则会是 403 而不是 404)。
+**根因**:Git Bash(MSYS)会把**看起来像 Unix 路径的命令行参数**自动改写成 Windows 路径。
+传 `/api/org/me` 到达 Python 时已经变成 `C:/Program Files/Git/api/org/me`,于是
+`lambda_handler` 的 `re.match(r"^/api/org(/.*)?$", path)` 不匹配 → `route` 保持原样 → `dispatch` 走到
+末尾的兜底 `return error("not found", 404)`。**静默落空,没有任何线索指向参数被改写。**
+**Fix**:`export MSYS_NO_PATHCONV=1`(已写进 `scripts/invoke_org_api.py` 的 docstring)。
+**通则**:在 Windows 上排查"路由不匹配",**先确认进程真正收到的字符串**,再去看路由代码——
+我在这上面把一整轮排查花在了错误的层。同类风险适用于任何以 `/` 开头的参数(S3 key 前缀、API 路径、cron 表达式)。
+
+### programme 写端点尚未认识 `platform_admin`(2026-08-03,**待决策,非 bug**)
+`_MANAGER_ROLES = ("admin","gm","pm")` —— programme 的所有写端点(`put_programme`、
+`import_programme`、`create/delete task`、批量写、版本回滚、baseline)都用它做门。
+`platform_admin` **不在其中**,所以跨公司运维账号无法导入或修改任何 programme。
+
+这与本仓既有模式一致(见"platform_admin 跨公司"笔记:**分级读路径自动生效,每个写端点要单独教它 span-all**,
+Team/sites/编辑任务/编辑项目都是这么一个个加上去的),所以 programme 只是**又一个还没教的新写面**,不是回归。
+
+**没有直接放开,是因为这是权限放宽**:要不要让平台运维替客户导入 programme 是产品决定,不是实现细节。
+需要时的改法是把 `platform_admin` 加进 `_MANAGER_ROLES`,并确认 `_resolve_site_param` 的跨公司可达性
+(test 上还有 `TEST_GRADED_ROLES` 缺失 → 默认 false → platform_admin 站点恒空的坑,见 BUG-38 一带)。
+
 ### 定时器交接(2026-07-15 schedules cutover 上线)
 录音下载 + 报告生成的 cron 已从遗留手管的 `sitesync` EventBridge 组切到 **fieldsight-prod SAM 栈**
 的 schedule(`PROD_ENABLE_SCHEDULES=true`):orchestrator 15 分钟 sweep(工作时段 05:00–19:59 NZ)

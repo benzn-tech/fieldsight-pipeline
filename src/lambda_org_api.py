@@ -67,9 +67,40 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/programme?site=<site_id> → read site's Programme JSON (S3-backed, ACL)
   PUT   /api/org/programme?site=<site_id> → write site's Programme JSON (admin/gm/pm)
   GET   /api/org/rollup/portfolio         → per-site open-count rollup + last_activity_at + red/yellow/green (ACL)
-  GET   /api/org/programme/suggestions            → list matcher suggestions for a site (admin/gm/pm)
+  GET   /api/org/programme/suggestions            → list matcher suggestions (admin/gm/pm see the site; anyone else sees their own)
   POST  /api/org/programme/suggestions/{id}/confirm → apply + write back to programme.json (admin/gm/pm)
   POST  /api/org/programme/suggestions/{id}/reject  → dismiss a suggestion (admin/gm/pm)
+  GET    /api/org/programme/tasks                 → time-window read
+                                                    (?from=&to=&assignee=me);
+                                                    serves the window view, My
+                                                    Work and Today
+  POST   /api/org/programme/import                → two-phase import: dry_run
+                                                    returns the diff, then
+                                                    commit with mode
+                                                    update|replace|new
+  GET    /api/org/programme/versions              → import history + baseline
+  GET    /api/org/programme/versions/{n}/tasks    → the dated task set as it
+                                                    stood at version n (what
+                                                    lateness measures from)
+  POST   /api/org/programme/versions/{n}/restore  → roll back (records the
+                                                    state it leaves, so the
+                                                    rollback is reversible)
+  POST   /api/org/programme/baseline              → set the version lateness is
+                                                    measured against
+  POST   /api/org/programme/tasks                 → create a LOCAL task (admin/gm/pm)
+  PATCH  /api/org/programme/tasks:batch           → write a whole cascade
+                                                    atomically; all row_versions
+                                                    checked first, 409 names the
+                                                    rows that moved
+  PATCH  /api/org/programme/tasks/{id}            → per-task write, optimistic-locked
+                                                    on row_version; row-level rules in
+                                                    can_edit_task (409 on a lost race)
+  DELETE /api/org/programme/tasks/{id}            → delete a LOCAL task (admin/gm/pm)
+  POST   /api/org/programme/tasks/{id}/delay-flag → site manager reports a slip
+                                                    they cannot fix themselves
+  GET    /api/org/programme/delay-flags           → open flags for a site
+  POST   /api/org/programme/delay-flags/{id}/acknowledge → PM has seen it
+  POST   /api/org/programme/delay-flags/{id}/resolve     → PM has dealt with it
 
 Credentials: PG* env vars injected at deploy time (BUG-36 — no runtime
 Secrets Manager call from a NAT-less VPC). Cognito calls need the
@@ -96,10 +127,14 @@ import reindex
 import session_scope
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
+import programme_reconcile
 from repositories import (action_items, aliases, classification_feedback, companies,
                           compliance_resolutions, content, content_edits, keyframes,
                           meeting_session, memberships, observations, programme,
-                          programme_suggestions, recordings, redactions, rollup, scope,
+                          programme_delay_flags, programme_import,
+                          programme_snapshot,
+                          programme_suggestions, programme_tasks, programme_window,
+                          recordings, redactions, rollup, scope,
                           sites, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates, first_match_span, normalize, occurrences
@@ -219,8 +254,14 @@ def ok(body, status=200):
     }
 
 
-def error(message, status=400):
-    return ok({"error": message}, status)
+def error(message, status=400, extra=None):
+    """`extra` merges extra keys alongside `error` — used by the batch task
+    write to name which rows conflicted, so the client can refresh exactly
+    those instead of reloading and discarding the user's other edits."""
+    body = {"error": message}
+    if extra:
+        body.update(extra)
+    return ok(body, status)
 
 
 def parse_body(event):
@@ -414,6 +455,54 @@ def dispatch(conn, event, method, route):
     m_sr = re.match(r"^/programme/suggestions/([^/]+)/reject$", route)
     if m_sr and method == "POST":
         return reject_suggestion(conn, caller, m_sr.group(1))
+
+    # Per-task reads and writes. Registered AFTER /programme/suggestions/...
+    # so the more specific suggestion routes always win — `([^/]+)` below
+    # would otherwise be free to swallow a suggestion id.
+    if route == "/programme/tasks":
+        if method == "GET":
+            return list_programme_tasks(conn, caller, event)
+        if method == "POST":
+            return create_programme_task(conn, caller, event, parse_body(event))
+
+    if route == "/programme/import" and method == "POST":
+        return import_programme(conn, caller, event, parse_body(event))
+    if route == "/programme/versions" and method == "GET":
+        return list_programme_versions(conn, caller, event)
+    m_vt = re.match(r"^/programme/versions/(\d+)/tasks$", route)
+    if m_vt and method == "GET":
+        return get_programme_version_tasks(conn, caller, event, m_vt.group(1))
+    m_pv = re.match(r"^/programme/versions/(\d+)/restore$", route)
+    if m_pv and method == "POST":
+        return restore_programme_version(conn, caller, event, m_pv.group(1))
+    if route == "/programme/baseline" and method == "POST":
+        return set_programme_baseline(conn, caller, event, parse_body(event))
+
+    # Batch write. Registered before the `([^/]+)$` pattern so ":batch" is
+    # never mistaken for a task id.
+    if route == "/programme/tasks:batch" and method == "PATCH":
+        return patch_programme_tasks_batch(conn, caller, event, parse_body(event))
+
+    # The /delay-flag suffix MUST be matched before the bare `([^/]+)$`
+    # pattern below, or `tasks/<id>/delay-flag` would never reach it.
+    m_df = re.match(r"^/programme/tasks/([^/]+)/delay-flag$", route)
+    if m_df and method == "POST":
+        return raise_delay_flag(conn, caller, m_df.group(1), parse_body(event))
+
+    m_pt = re.match(r"^/programme/tasks/([^/]+)$", route)
+    if m_pt and method == "PATCH":
+        return patch_programme_task(conn, caller, m_pt.group(1), parse_body(event))
+    if m_pt and method == "DELETE":
+        return delete_programme_task(conn, caller, m_pt.group(1))
+
+    if route == "/programme/delay-flags" and method == "GET":
+        return list_delay_flags(conn, caller, event)
+    m_da = re.match(r"^/programme/delay-flags/([^/]+)/acknowledge$", route)
+    if m_da and method == "POST":
+        return acknowledge_delay_flag(conn, caller, m_da.group(1))
+    m_dr = re.match(r"^/programme/delay-flags/([^/]+)/resolve$", route)
+    if m_dr and method == "POST":
+        return acknowledge_delay_flag(conn, caller, m_dr.group(1), state="resolved")
 
     if route == "/recordings/upload-url" and method == "POST":
         return create_recording_upload_url(conn, caller, parse_body(event))
@@ -1011,6 +1100,8 @@ def get_me(conn, caller):
 def patch_me(conn, caller, body):
     if body is None:
         return error("malformed JSON body", 400)
+    if "prefs" in body and not isinstance(body["prefs"], dict):
+        return error("prefs must be an object", 400)
     old_avatar = caller.get("avatar_s3_key")
     avatar = body.get("avatar_s3_key")
     clear = "avatar_s3_key" in body and avatar is None
@@ -1040,6 +1131,13 @@ def patch_me(conn, caller, body):
             _delete_asset(old_avatar)
     elif final_avatar and old_avatar and old_avatar != final_avatar:
         _delete_asset(old_avatar)
+    # Merged last so the echoed row carries the new prefs; a separate write
+    # before update_profile would have been overwritten in the response by
+    # its RETURNING.
+    if "prefs" in body:
+        merged = users.merge_prefs(conn, caller["cognito_sub"], body["prefs"])
+        if merged is not None:
+            row = merged
     return ok(row)
 
 
@@ -2812,33 +2910,653 @@ def _resolve_site_param(conn, caller, site_param):
     return site_id, None
 
 
+_MANAGER_ROLES = ("admin", "gm", "pm")
+
+# Fields that reschedule work. Read-only on imported rows for anyone below
+# manager: the file owns those dates, and an edit here would be reverted by
+# the next import without telling anyone.
+_SCHEDULE_FIELDS = frozenset({"start_date", "end_date", "duration_days"})
+
+
+def can_edit_task(caller, task, fields, assignees):
+    """Returns a refusal reason, or None when the write is allowed.
+
+    Spec §10. Imported rows have read-only dates and writable progress; local
+    rows are writable in both. A site manager reports what happened on site
+    and reschedules their own breakdown, but cannot move a contract date —
+    the next import would overwrite it, so accepting the edit would be a lie.
+
+    Note the assignee check: `assignees` is the task's ACTUAL assignee list.
+    An empty list means nobody is assigned, which denies — it must never be
+    read as "unrestricted". That inversion has shipped in this codebase
+    before.
+    """
+    role = caller.get("global_role")
+    if role in _MANAGER_ROLES:
+        return None
+    if role != "site_manager":
+        return "programme writes require a site manager or above"
+
+    folder = caller.get("folder_name")
+    if not folder or folder not in (assignees or []):
+        return "you can only update tasks assigned to you"
+
+    if task.get("origin") == "imported" and (set(fields) & _SCHEDULE_FIELDS):
+        # Refused whole rather than partly applied: letting the progress half
+        # through would leave the caller believing the date change landed too.
+        return ("contract dates come from the imported programme and cannot be "
+                "changed here — raise a delay flag instead")
+    return None
+
+
+def _write_snapshot(conn, site_id, programme_id):
+    """Regenerate programmes/{site_id}/programme.json from Aurora.
+
+    Called inside the request's transaction (lambda_handler wraps every
+    request in `with get_connection() as conn:`), so a failed S3 write rolls
+    the Aurora write back with it. The alternative — Aurora committed, S3
+    stale — would leave lambda_programme_matcher matching against a programme
+    that no longer exists, silently.
+
+    If PATCH latency ever becomes a problem, the fix is a durable outbox, NOT
+    moving this outside the transaction.
+    """
+    prog = programme_tasks.get_primary_programme_by_id(conn, programme_id)
+    if prog is None:
+        return
+    tasks = programme_tasks.list_tasks(conn, programme_id)
+    doc = programme_snapshot.build_snapshot(prog, tasks)
+    # NZ "today"/"now" — the codebase-wide UTC+13 display convention (BUG-19
+    # / see create_org_observation's report_date default).
+    updated_at = (datetime.utcnow() + timedelta(hours=13)).isoformat()
+    programme.write_programme(s3(), S3_BUCKET, site_id, doc, updated_at)
+
+
 def get_programme(conn, caller, event):
     site_param = (event.get("queryStringParameters") or {}).get("site")
     site_id, err = _resolve_site_param(conn, caller, site_param)
     if err is not None:
         return err
-    doc = programme.read_programme(s3(), S3_BUCKET, site_id)
+
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        # No programme has ever been imported for this site — a friendly
+        # empty state, not a 404. Same contract the S3 path had.
+        return ok({"programme": None})
+
+    tasks = programme_tasks.list_tasks(conn, prog["id"])
+    assignees = programme_tasks.list_assignees(conn, [t["id"] for t in tasks])
+    for t in tasks:
+        t["assignees"] = assignees.get(str(t["id"]), [])
+
+    doc = programme_snapshot.build_snapshot(prog, tasks)
+    doc["programme_id"] = str(prog["id"])
+    doc["current_version"] = prog["current_version"]
     return ok({"programme": doc})
 
 
 def put_programme(conn, caller, event, body):
+    """Whole-document replace — today's semantics, now writing Aurora.
+
+    Everything under the programme is discarded, including local rows. That
+    is what replace means; the client confirms before calling it. Update-mode
+    reconciliation, which preserves local subtrees, is a separate change.
+    """
     site_param = (event.get("queryStringParameters") or {}).get("site")
     if not site_param:
         return error("site required", 400)
     if body is None:
         return error("malformed JSON body", 400)
-    if caller["global_role"] not in ("admin", "gm", "pm"):
+    if caller["global_role"] not in _MANAGER_ROLES:
         return error("programme write requires manager role", 403)
     # Write requires BOTH the manager-role gate above AND site access below
     # — a pm can only write programmes for sites in their own memberships.
     site_id, err = _resolve_site_param(conn, caller, site_param)
     if err is not None:
         return err
-    # NZ "today"/"now" — the codebase-wide UTC+13 display convention (BUG-19
-    # / see create_org_observation's report_date default).
-    updated_at = (datetime.utcnow() + timedelta(hours=13)).isoformat()
-    saved = programme.write_programme(s3(), S3_BUCKET, site_id, body, updated_at)
-    return ok({"programme": saved})
+
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        prog = programme_tasks.create_programme(
+            conn, site_id=site_id, name=body.get("name") or "Programme",
+            source_format=body.get("source_format"))
+
+    version_no = (prog["current_version"] or 0) + 1
+    programme_tasks.replace_all_tasks(
+        conn, prog["id"],
+        parents=body.get("parents") or [],
+        leaves=body.get("leaves") or [],
+        version_no=version_no,
+        updated_by=caller["id"])
+    programme_import.record_version(
+        conn, prog["id"], version_no=version_no,
+        filename=body.get("filename"),
+        mode="initial" if version_no == 1 else "replace",
+        imported_by=caller["id"], diff_summary={},
+        task_snapshot=programme_import.build_task_snapshot(
+            programme_tasks.list_tasks(conn, prog["id"])))
+
+    _write_snapshot(conn, site_id, prog["id"])
+
+    tasks = programme_tasks.list_tasks(conn, prog["id"])
+    return ok({"programme": programme_snapshot.build_snapshot(prog, tasks)})
+
+
+# A window with no bounds would fetch the whole programme, which is the thing
+# this endpoint exists to avoid.
+_MAX_WINDOW_DAYS = 400
+
+
+def list_programme_tasks(conn, caller, event):
+    """The time-window read. Serves the Programme window view, My Work and
+    Today from one query — Today previously fanned out across every org site
+    with pooledAll and downloaded each whole programme document to select a
+    handful of rows."""
+    params = event.get("queryStringParameters") or {}
+    site_id, err = _resolve_site_param(conn, caller, params.get("site"))
+    if err is not None:
+        return err
+
+    date_from, date_to = params.get("from"), params.get("to")
+    if not date_from or not date_to:
+        return error("from and to are required", 400)
+    try:
+        span = (_date.fromisoformat(date_to) - _date.fromisoformat(date_from)).days
+    except (ValueError, TypeError):
+        return error("from and to must be YYYY-MM-DD", 400)
+    if span < 0:
+        return error("from must be on or before to", 400)
+    if span > _MAX_WINDOW_DAYS:
+        return error(f"window may not exceed {_MAX_WINDOW_DAYS} days — "
+                     f"use the overview for a whole programme", 400)
+
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return ok({"tasks": [], "programme_id": None})
+
+    # `assignee` absent means no restriction; only a present value narrows.
+    assignee = params.get("assignee")
+    if assignee == "me":
+        assignee = caller.get("folder_name")
+        if not assignee:
+            # No folder identity means no programme work can be attributed to
+            # this caller. Return nothing, not everything — resolving "me" to
+            # None here would hand them the entire programme.
+            return ok({"tasks": [], "programme_id": str(prog["id"])})
+
+    rows = programme_window.tasks_in_window(
+        conn, prog["id"], date_from=date_from, date_to=date_to, assignee=assignee)
+    amap = programme_tasks.list_assignees(conn, [r["id"] for r in rows])
+    for r in rows:
+        r["assignees"] = amap.get(str(r["id"]), [])
+    return ok({"tasks": rows, "programme_id": str(prog["id"]),
+               "baseline_version": prog["baseline_version"]})
+
+
+def _task_site_or_error(conn, caller, task_id):
+    """(task, site_id, None) or (None, None, error_response).
+
+    404 rather than 403 when the site is out of reach: whether a task exists
+    in a site you cannot see is itself information.
+    """
+    task = programme_tasks.get_task(conn, task_id)
+    if task is None:
+        return None, None, error("not found", 404)
+    prog = programme_tasks.get_primary_programme_by_id(conn, task["programme_id"])
+    if prog is None or str(prog["site_id"]) not in _allowed_site_ids(conn, caller):
+        return None, None, error("not found", 404)
+    return task, str(prog["site_id"]), None
+
+
+def raise_delay_flag(conn, caller, task_id, body):
+    """Scenario D. Open to a site manager and above — this is the route the
+    403 on editing a contract date points them at, and gating it any higher
+    would leave that refusal with nowhere to go."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    if caller["global_role"] not in _MANAGER_ROLES + ("site_manager",):
+        return error("raising a delay flag requires a site manager or above", 403)
+
+    task, _site_id, err = _task_site_or_error(conn, caller, task_id)
+    if err is not None:
+        return err
+
+    try:
+        flag = programme_delay_flags.raise_flag(
+            conn, task_id=task["id"], raised_by=caller["id"],
+            reason=body.get("reason"), expected_end=body.get("expected_end"))
+    except ValueError as e:
+        return error(str(e), 400)
+    return ok({"delay_flag": flag})
+
+
+def list_delay_flags(conn, caller, event):
+    params = event.get("queryStringParameters") or {}
+    site_id, err = _resolve_site_param(conn, caller, params.get("site"))
+    if err is not None:
+        return err
+    state = params.get("state") or "open"
+    return ok({"delay_flags": programme_delay_flags.list_for_site(
+        conn, site_id, state=None if state == "all" else state)})
+
+
+def acknowledge_delay_flag(conn, caller, flag_id, state="acknowledged"):
+    """Deciding a flag is a manager action. Letting the raiser close their own
+    flag would let the signal die before reaching anyone who can act on it."""
+    if caller["global_role"] not in _MANAGER_ROLES:
+        return error("deciding a delay flag requires manager role", 403)
+
+    flag = programme_delay_flags.get(conn, flag_id)
+    if flag is None:
+        return error("not found", 404)
+    _task, _site_id, err = _task_site_or_error(conn, caller, flag["task_id"])
+    if err is not None:
+        return err
+
+    try:
+        return ok({"delay_flag": programme_delay_flags.set_state(
+            conn, flag_id, state)})
+    except ValueError as e:
+        return error(str(e), 400)
+
+
+# A cascade touches tens of rows, not thousands. An unbounded batch is a
+# transaction held open long enough to matter.
+_MAX_BATCH_TASKS = 500
+
+
+_IMPORT_MODES = ("update", "replace", "new")
+
+
+def import_programme(conn, caller, event, body):
+    """Two-phase import.
+
+    `dry_run: true` reconciles in memory and returns the diff WITHOUT writing;
+    the client shows it, the user picks a mode, and a second call commits. The
+    user never chooses blind — which matters because Replace discards work
+    that Update would have kept, and that cost is invisible from the plan
+    itself: it is measured in what Update would have preserved, so the dry run
+    counts it separately.
+    """
+    if body is None:
+        return error("malformed JSON body", 400)
+    if caller["global_role"] not in _MANAGER_ROLES:
+        return error("importing a programme requires manager role", 403)
+
+    parents = body.get("parents") or []
+    leaves = body.get("leaves") or []
+    if not parents and not leaves:
+        return error("nothing to import", 400)
+
+    mode = body.get("mode")
+    if mode is not None and mode not in _IMPORT_MODES:
+        return error(f"mode must be one of {_IMPORT_MODES}", 400)
+
+    site_id, err = _resolve_site_param(
+        conn, caller, (event.get("queryStringParameters") or {}).get("site"))
+    if err is not None:
+        return err
+
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        prog = programme_tasks.create_programme(
+            conn, site_id=site_id, name=body.get("name") or "Programme",
+            source_format=body.get("source_format"))
+
+    existing = programme_tasks.list_tasks(conn, prog["id"], include_removed=True)
+    version_no = (prog["current_version"] or 0) + 1
+    plan = programme_reconcile.reconcile(existing, parents, leaves,
+                                         version_no=version_no)
+
+    if body.get("dry_run"):
+        live = [t for t in existing if t.get("removed_in_version") is None]
+        assignee_map = programme_tasks.list_assignees(
+            conn, [t["id"] for t in existing])
+        return ok({
+            "dry_run": True,
+            "suggested_mode": programme_reconcile.suggest_mode(
+                existing, parents, leaves),
+            "update_preview": plan["summary"],
+            "rename_candidates": plan["rename_candidates"],
+            "replace_preview": {
+                "local_tasks_discarded": len(
+                    [t for t in live if t.get("origin") == "local"]),
+                "allocations_discarded": sum(
+                    len(v) for v in assignee_map.values()),
+                "tasks_with_progress_discarded": len(
+                    [t for t in live if (t.get("progress_pct") or 0) > 0]),
+            },
+        })
+
+    if mode is None:
+        return error("mode required to commit an import", 400)
+
+    if mode == "replace":
+        # Destructive, and confirmed twice: the client requires the site name
+        # typed, and this flag has to be sent explicitly as well.
+        if not body.get("confirm_replace"):
+            return error("replace requires confirm_replace", 400)
+        programme_tasks.replace_all_tasks(
+            conn, prog["id"], parents=parents, leaves=leaves,
+            version_no=version_no, updated_by=caller["id"])
+        counts = {"replaced": len(parents) + len(leaves)}
+        summary = {"mode": "replace", "tasks": len(parents) + len(leaves)}
+    elif mode == "new":
+        prog = programme_tasks.create_programme(
+            conn, site_id=site_id, name=body.get("name") or "Programme",
+            source_format=body.get("source_format"))
+        # A second programme on the same site is never the primary one —
+        # Today and My Work roll up exactly one.
+        conn.cursor().execute(
+            "UPDATE programmes SET is_primary = false WHERE id = %s",
+            (prog["id"],))
+        version_no = 1
+        programme_tasks.replace_all_tasks(
+            conn, prog["id"], parents=parents, leaves=leaves,
+            version_no=version_no, updated_by=caller["id"])
+        counts = {"created": len(parents) + len(leaves)}
+        summary = {"mode": "new", "tasks": len(parents) + len(leaves)}
+    else:
+        renames = body.get("accept_renames") or []
+        for r in renames:
+            programme_import.apply_rename(
+                conn, r["existing_id"], r["incoming_source_task_id"])
+        if renames:
+            # RE-RECONCILE. A rename turns what looked like a remove-plus-
+            # insert into a plain update, so the plan computed above is stale.
+            # Applying it would soft-remove the row the rename just repaired —
+            # and because removal is soft, the symptom is a task quietly
+            # vanishing from the Gantt rather than an error.
+            existing = programme_tasks.list_tasks(
+                conn, prog["id"], include_removed=True)
+            plan = programme_reconcile.reconcile(existing, parents, leaves,
+                                                 version_no=version_no)
+        counts = programme_import.apply_plan(
+            conn, prog["id"], plan, version_no=version_no,
+            updated_by=caller["id"])
+        summary = plan["summary"]
+
+    conn.cursor().execute(
+        "UPDATE programmes SET current_version = %s, updated_at = now() "
+        "WHERE id = %s", (version_no, prog["id"]))
+    # Snapshot the dated task set as it now stands. This is the only moment
+    # it is certainly correct: the next import overwrites start_date/end_date
+    # in place, so without this a baseline's dates are unrecoverable.
+    programme_import.record_version(
+        conn, prog["id"], version_no=version_no, filename=body.get("filename"),
+        mode="initial" if version_no == 1 else mode,
+        imported_by=caller["id"], diff_summary=summary,
+        task_snapshot=programme_import.build_task_snapshot(
+            programme_tasks.list_tasks(conn, prog["id"])))
+
+    _write_snapshot(conn, site_id, prog["id"])
+    return ok({"counts": counts, "version_no": version_no, "summary": summary})
+
+
+def list_programme_versions(conn, caller, event):
+    site_id, err = _resolve_site_param(
+        conn, caller, (event.get("queryStringParameters") or {}).get("site"))
+    if err is not None:
+        return err
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return ok({"versions": []})
+    return ok({"versions": programme_import.list_versions(conn, prog["id"]),
+               "baseline_version": prog["baseline_version"],
+               "current_version": prog["current_version"]})
+
+
+def get_programme_version_tasks(conn, caller, event, version_no):
+    """The dated task set as it stood at one version — what lateness against a
+    baseline is measured from. Read-only, so it uses the same site ACL as the
+    rest of the read path and needs no manager role."""
+    site_id, err = _resolve_site_param(
+        conn, caller, (event.get("queryStringParameters") or {}).get("site"))
+    if err is not None:
+        return err
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return error("no programme for this site", 404)
+    try:
+        tasks = programme_import.get_version_tasks(
+            conn, prog["id"], int(version_no))
+    except (ValueError, TypeError):
+        return error("version_no must be a number", 400)
+    if tasks is None:
+        return error(f"no such version: {version_no}", 404)
+    return ok({"version_no": int(version_no), "tasks": tasks})
+
+
+def restore_programme_version(conn, caller, event, version_no):
+    if caller["global_role"] not in _MANAGER_ROLES:
+        return error("restoring a programme version requires manager role", 403)
+    site_id, err = _resolve_site_param(
+        conn, caller, (event.get("queryStringParameters") or {}).get("site"))
+    if err is not None:
+        return err
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return error("no programme for this site", 404)
+    try:
+        row = programme_import.restore_version(
+            conn, prog["id"], int(version_no), restored_by=caller["id"])
+    except (ValueError, TypeError) as e:
+        return error(str(e), 400)
+    _write_snapshot(conn, site_id, prog["id"])
+    return ok({"restored_to": int(version_no), "version": row})
+
+
+def set_programme_baseline(conn, caller, event, body):
+    if caller["global_role"] not in _MANAGER_ROLES:
+        return error("setting the baseline requires manager role", 403)
+    if body is None or not isinstance(body.get("version_no"), int):
+        return error("version_no required", 400)
+    site_id, err = _resolve_site_param(
+        conn, caller, (event.get("queryStringParameters") or {}).get("site"))
+    if err is not None:
+        return err
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return error("no programme for this site", 404)
+    try:
+        return ok({"programme": programme_import.set_baseline(
+            conn, prog["id"], body["version_no"])})
+    except ValueError as e:
+        return error(str(e), 400)
+
+
+def patch_programme_tasks_batch(conn, caller, event, body):
+    """Write a whole set of task edits, or none of them.
+
+    Dragging one Gantt bar shifts every downstream dependent and recomputes
+    the critical path, so one user action produces N writes. Sending N
+    independent PATCHes is not atomic: a lost optimistic-lock race halfway
+    through leaves the programme half-shifted, and the symptom is "the Gantt
+    looks right and the database is wrong" — with no error raised anywhere.
+
+    Every row's permission and row_version is checked BEFORE anything is
+    written, and a conflict names the tasks that moved so the client can
+    refresh exactly those rather than reloading the programme and discarding
+    the user's other pending edits.
+
+    The whole call runs inside the request transaction (lambda_handler wraps
+    each request in `with get_connection() as conn:`), so even a failure
+    after the pre-flight checks rolls back rather than half-applying.
+    """
+    if body is None:
+        return error("malformed JSON body", 400)
+    items = body.get("tasks")
+    if not isinstance(items, list) or not items:
+        return error("tasks must be a non-empty list", 400)
+    if len(items) > _MAX_BATCH_TASKS:
+        return error(f"a batch may not exceed {_MAX_BATCH_TASKS} tasks", 400)
+
+    ids = [it.get("id") for it in items]
+    if any(not i for i in ids):
+        return error("every task needs an id", 400)
+    if len(set(ids)) != len(ids):
+        # The second edit would fail the lock against a version the first just
+        # bumped. Always a client bug, and confusing to debug from a 409.
+        return error("duplicate task ids in one batch", 400)
+    if any(not isinstance(it.get("row_version"), int) for it in items):
+        return error("every task needs a row_version", 400)
+
+    site_id, err = _resolve_site_param(
+        conn, caller, (event.get("queryStringParameters") or {}).get("site"))
+    if err is not None:
+        return err
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return error("no programme for this site", 404)
+
+    # ---- pre-flight: resolve, authorise and version-check everything -----
+    assignees = programme_tasks.list_assignees(conn, ids)
+    planned, conflicts = [], []
+    for it in items:
+        task = programme_tasks.get_task(conn, it["id"])
+        if task is None:
+            return error(f"task not found: {it['id']}", 404)
+        if str(task["programme_id"]) != str(prog["id"]):
+            return error("not found", 404)
+
+        fields = {k: v for k, v in it.items() if k not in ("id", "row_version")}
+        if not fields:
+            return error(f"nothing to update on {it['id']}", 400)
+
+        reason = can_edit_task(
+            caller, task, fields, assignees.get(str(it["id"]), []))
+        if reason is not None:
+            # One forbidden row rejects the batch. Applying the rest would
+            # leave the caller believing the whole cascade landed.
+            return error(reason, 403)
+
+        if task["row_version"] != it["row_version"]:
+            conflicts.append(it["id"])
+        planned.append((it["id"], fields, it["row_version"]))
+
+    if conflicts:
+        return error("these tasks were updated by someone else", 409,
+                     extra={"conflicts": conflicts})
+
+    # ---- apply -----------------------------------------------------------
+    written = []
+    for task_id, fields, row_version in planned:
+        try:
+            updated = programme_tasks.update_task(
+                conn, task_id, fields=fields, row_version=row_version,
+                updated_by=caller["id"])
+        except ValueError as e:
+            return error(str(e), 400)
+        if updated is None:
+            # Lost the race between pre-flight and here. Raising rolls the
+            # transaction back, so the earlier writes in this loop do not
+            # survive — which is the guarantee this endpoint exists to give.
+            raise RuntimeError(
+                f"programme task {task_id} changed mid-batch; rolling back")
+        written.append(updated)
+
+    # One snapshot for the whole cascade — N rebuilds would make the endpoint
+    # pointless.
+    _write_snapshot(conn, site_id, prog["id"])
+    return ok({"tasks": written, "count": len(written)})
+
+
+def patch_programme_task(conn, caller, task_id, body):
+    if body is None:
+        return error("malformed JSON body", 400)
+    row_version = body.get("row_version")
+    if not isinstance(row_version, int):
+        return error("row_version required", 400)
+
+    task = programme_tasks.get_task(conn, task_id)
+    if task is None:
+        return error("not found", 404)
+
+    prog = programme_tasks.get_primary_programme_by_id(conn, task["programme_id"])
+    if prog is None or str(prog["site_id"]) not in _allowed_site_ids(conn, caller):
+        # 404 rather than 403: whether a task exists in a site you cannot see
+        # is itself information.
+        return error("not found", 404)
+
+    fields = {k: v for k, v in body.items()
+              if k not in ("row_version", "assignees")}
+    assignees = programme_tasks.list_assignees(
+        conn, [task["id"]]).get(str(task["id"]), [])
+
+    reason = can_edit_task(caller, task, fields, assignees)
+    if reason is not None:
+        return error(reason, 403)
+
+    try:
+        updated = programme_tasks.update_task(
+            conn, task_id, fields=fields, row_version=row_version,
+            updated_by=caller["id"])
+    except ValueError as e:
+        return error(str(e), 400)
+
+    if updated is None:
+        # Either the row moved on or it is gone. Both mean "re-read before
+        # writing again", which is what 409 says.
+        return error("this task was updated by someone else", 409)
+
+    if "assignees" in body and caller["global_role"] in _MANAGER_ROLES:
+        programme_tasks.set_assignees(conn, task_id, body["assignees"])
+
+    _write_snapshot(conn, str(prog["site_id"]), prog["id"])
+    return ok({"task": updated})
+
+
+def create_programme_task(conn, caller, event, body):
+    """Creates a LOCAL task — a breakdown subtask or a manual addition.
+    Imported rows only ever come from an import."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    if caller["global_role"] not in _MANAGER_ROLES:
+        return error("creating programme tasks requires manager role", 403)
+
+    site_param = (event.get("queryStringParameters") or {}).get("site") \
+        or body.get("site")
+    site_id, err = _resolve_site_param(conn, caller, site_param)
+    if err is not None:
+        return err
+    prog = programme_tasks.get_primary_programme(conn, site_id)
+    if prog is None:
+        return error("no programme for this site", 404)
+
+    created = programme_tasks.create_task(
+        conn, programme_id=prog["id"], parent_id=body.get("parent_id"),
+        name=body.get("name") or "Untitled", wbs_code=body.get("wbs_code"),
+        start_date=body.get("start_date"), end_date=body.get("end_date"),
+        duration_days=body.get("duration_days"),
+        status=body.get("status") or "not_started", zone=body.get("zone"),
+        sort_order=body.get("sort_order") or 0,
+        updated_by=caller["id"])
+    if body.get("assignees"):
+        programme_tasks.set_assignees(conn, created["id"], body["assignees"])
+
+    _write_snapshot(conn, site_id, prog["id"])
+    return ok({"task": created})
+
+
+def delete_programme_task(conn, caller, task_id):
+    if caller["global_role"] not in _MANAGER_ROLES:
+        return error("deleting programme tasks requires manager role", 403)
+
+    task = programme_tasks.get_task(conn, task_id)
+    if task is None:
+        return error("not found", 404)
+    prog = programme_tasks.get_primary_programme_by_id(conn, task["programme_id"])
+    if prog is None or str(prog["site_id"]) not in _allowed_site_ids(conn, caller):
+        return error("not found", 404)
+
+    if not programme_tasks.delete_local_task(conn, task_id):
+        # The repository refuses imported rows in SQL. Reaching here means
+        # the caller aimed at one.
+        return error("imported tasks are removed by re-importing the programme, "
+                     "not deleted here", 400)
+
+    _write_snapshot(conn, str(prog["site_id"]), prog["id"])
+    return ok({"deleted": task_id})
 
 
 # ----------------------------------------------------------
@@ -2875,18 +3593,48 @@ def put_programme(conn, caller, event, body):
 # ----------------------------------------------------------
 _ALLOWED_CONFIRM_STATUSES = ("in_progress", "completed", "blocked", "delayed")
 
+# Who may see the WHOLE site's suggestions, and who may decide them. Everyone
+# else can read their own (list_suggestions) but not confirm or reject.
+_SUGGESTION_MANAGER_ROLES = ("admin", "gm", "pm")
+
+
+class _SuggestionAlreadyDecided(Exception):
+    """Another request decided this suggestion first — unwind rather than
+    commit a second decision."""
+
+
+class _SuggestionTaskMoved(Exception):
+    """The task's row_version changed between the staleness check and the
+    UPDATE — unwind so the suggestion stays pending and re-reviewable."""
+
 
 def list_suggestions(conn, caller, event):
-    if caller["global_role"] not in ("admin", "gm", "pm"):
-        return error("forbidden", 403)
+    """Managers see the whole site; everyone else sees only suggestions raised
+    from their OWN topics.
+
+    This used to 403 anyone below pm, which meant the person who actually
+    spoke on site could never see that their words had reached the programme.
+    That read is the point of the feature, so the gate narrows the result
+    instead of refusing it. Confirming stays manager-only — see
+    confirm_suggestion, which is unchanged.
+
+    The narrowing is forced from the caller, never taken from the request, so
+    there is no parameter to tamper with.
+    """
     params = event.get("queryStringParameters") or {}
     site_id, err = _resolve_site_param(conn, caller, params.get("site"))
     if err is not None:
         return err
     state = params.get("state") or "pending"
+    # None means unrestricted. A manager gets None; anyone else gets their own
+    # id. Never [] — see list_for_site's docstring for why that distinction is
+    # load-bearing here.
+    topic_user_id = (None if caller["global_role"] in _SUGGESTION_MANAGER_ROLES
+                     else caller["id"])
     rows = programme_suggestions.list_for_site(
-        conn, site_id, state=None if state == "all" else state)
-    return ok({"suggestions": rows})
+        conn, site_id, state=None if state == "all" else state,
+        topic_user_id=topic_user_id)
+    return ok({"suggestions": rows, "scope": "site" if topic_user_id is None else "own"})
 
 
 def confirm_suggestion(conn, caller, suggestion_id, body):
@@ -2924,10 +3672,16 @@ def confirm_suggestion(conn, caller, suggestion_id, body):
                 or not (0 <= progress_override <= 100)):
             return error("progress_pct must be an integer 0-100", 400)
 
-    doc = programme.read_programme(s3(), S3_BUCKET, row["site_id"])
-    if doc is None:
+    # Aurora is the source of truth (Project 1); programme.json is derived
+    # from it by _write_snapshot. This used to read and write the derived
+    # document directly, which meant a confirmed value never reached the
+    # table the Gantt renders from and was erased by the next write of any
+    # task in the programme. See
+    # tests/unit/test_suggestion_confirm_survives_snapshot.py.
+    prog = programme_tasks.get_primary_programme(conn, row["site_id"])
+    if prog is None:
         return error("programme not found", 409)
-    task = next((t for t in doc.get("leaves", []) if t.get("task_id") == row["task_id"]), None)
+    task = programme_tasks.get_task_by_doc_id(conn, prog["id"], row["task_id"])
     if task is None:
         programme_suggestions.mark_stale(conn, suggestion_id)
         return error("task no longer in programme", 409)
@@ -2948,22 +3702,53 @@ def confirm_suggestion(conn, caller, suggestion_id, body):
             and new_progress < task["progress_pct"] and "progress_pct" not in body):
         new_progress = task["progress_pct"]
 
+    fields = {}
     if new_status is not None:
-        task["status"] = new_status
+        fields["status"] = new_status
     if new_progress is not None:
-        task["progress_pct"] = new_progress
+        fields["progress_pct"] = new_progress
 
-    # Fable review IMPORTANT #2: decide() is the compare-and-swap gate —
-    # called BEFORE the S3 write, and its return value decides whether we
-    # write at all (see module comment above list_suggestions).
-    decided = programme_suggestions.decide(
-        conn, suggestion_id, "confirmed", decided_by=caller["id"],
-        applied_status=new_status, applied_progress=new_progress)
-    if decided is None:
+    # decide() and the task write commit together or not at all. A decide()
+    # that survived a failed write would mark the suggestion confirmed while
+    # the task it is about never moved — and because decide() is one-way,
+    # nobody could confirm it again. Same shape as the action-item PATCH
+    # above: a savepoint, an exception to unwind it, the error returned
+    # outside.
+    try:
+        with conn.transaction():
+            # Fable review IMPORTANT #2: decide() is the compare-and-swap
+            # gate — called BEFORE the task write, and its return value
+            # decides whether we write at all (see module comment above
+            # list_suggestions).
+            decided = programme_suggestions.decide(
+                conn, suggestion_id, "confirmed", decided_by=caller["id"],
+                applied_status=new_status, applied_progress=new_progress)
+            if decided is None:
+                raise _SuggestionAlreadyDecided()
+
+            if fields:
+                # 0027's CHECK constrains origin against source_task_id, not
+                # status/progress, so a suggestion landing on a local
+                # breakdown subtask applies exactly as one landing on an
+                # imported row.
+                updated = programme_tasks.update_task(
+                    conn, task["id"], fields=fields,
+                    row_version=task["row_version"], updated_by=caller["id"])
+                if updated is None:
+                    # Another writer moved the row between the read above and
+                    # here. Unwinding leaves the suggestion pending, so it can
+                    # be re-reviewed against the new state — the same outcome
+                    # as the staleness check above, reached a moment later.
+                    raise _SuggestionTaskMoved()
+                # Regenerates programme.json from the table, exactly as every
+                # other programme write does. The old code wrote the derived
+                # document directly and never touched the table.
+                _write_snapshot(conn, str(row["site_id"]), prog["id"])
+    except _SuggestionAlreadyDecided:
         return error("already decided", 409)
+    except _SuggestionTaskMoved:
+        return error("task changed since this suggestion was made; re-review", 409)
 
-    new_ts = datetime.now(timezone.utc).isoformat()
-    programme.write_programme(s3(), S3_BUCKET, row["site_id"], doc, new_ts)
     return ok({"confirmed": True, "task_id": row["task_id"],
               "applied_status": new_status, "applied_progress": new_progress})
 
@@ -3101,7 +3886,7 @@ def _normalize_prose(value, alias_pairs):
     return value
 
 
-def render_report_shape(rows, doc, date, folder, conn=None):
+def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
     """Pure function: render Aurora extraction topics INTO the
     daily_report.json shape, optionally merging the doc's own prose fields
     (executive_summary etc.) when a same-day S3 doc also exists (e.g. an
@@ -3114,6 +3899,15 @@ def render_report_shape(rows, doc, date, folder, conn=None):
     lookup below; callers that don't pass it (or pass None) simply get
     `redacted: False` for every topic, unchanged from before this field
     existed.
+
+    `company_id` (optional) enables the KPI counts in `_report_metadata`.
+    Those counts used to come from the nightly report generator's own
+    `_report_metadata` block, which this live-extraction path never writes —
+    so the timeline's Recordings/Words KPIs read a missing field and rendered
+    a hard 0 on every real day. The live counts are read from `recordings`
+    instead (see recordings.day_stats for the session-fold and the date-clock
+    reasoning). Callers that pass no company_id (reindex's builder) omit the
+    block entirely, and the UI shows "—" rather than a misleading zero.
 
     The four prose fields merged out of the S3 doc have no Aurora row and no
     edit surface, so a name the user already corrected in the item store would
@@ -3178,6 +3972,24 @@ def render_report_shape(rows, doc, date, folder, conn=None):
         alias_pairs = _prose_alias_pairs(conn, rows[0].get("site_id"))
         if alias_pairs:
             prose = {k: _normalize_prose(v, alias_pairs) for k, v in prose.items()}
+    meta = {"source": "live_extraction", "version": "flip-v1"}
+    if conn is not None and company_id is not None:
+        stats = recordings.day_stats(conn, company_id, folder, date)
+        # A zero is NOT "nothing was recorded". We only get here because this
+        # (user, date) has extraction topics, and topics exist only because
+        # something was recorded and transcribed — so no recordings rows means
+        # the ROWS are missing, not the recordings: a capture path that never
+        # registers them (RealPTT), days predating the table (migration 0009),
+        # or a lake-fed environment where media arrived as files rather than
+        # through the upload API. Emitting 0 there would reinstate the exact
+        # misleading zero this change exists to remove, so the field is omitted
+        # and the UI shows "—". Duration is judged separately: rows can be
+        # counted while every duration_s is null, and "0s" for a real day is
+        # its own small lie.
+        if stats["sessions"] > 0:
+            meta["recordings_processed"] = stats["sessions"]
+        if stats["duration_s"] > 0:
+            meta["duration_seconds"] = stats["duration_s"]
     return {
         "report_date": date,
         "site": rows[0]["site_name"],
@@ -3190,7 +4002,7 @@ def render_report_shape(rows, doc, date, folder, conn=None):
         "site_id": str(rows[0]["site_id"]) if rows[0].get("site_id") else None,
         "user_name": rows[0]["user_name"] or folder.replace("_", " "),
         **prose,
-        "_report_metadata": {"source": "live_extraction", "version": "flip-v1"},
+        "_report_metadata": meta,
         "topics": topics_out,
     }
 
@@ -3230,7 +4042,8 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # prose (not site-clipped). Topic rows are already site-clipped above.
         doc = None if cross_user_clip else \
             _get_lake_json(f"reports/{date}/{user}/daily_report.json")
-        return render_report_shape(rows, doc, date, user, conn=conn)
+        return render_report_shape(rows, doc, date, user, conn=conn,
+                                   company_id=caller.get("company_id"))
 
     # D fix (spec §5.1): prefer the Aurora-rendered shape whenever Aurora topics
     # exist for this (user, date) -- extraction-sourced OR report-sourced -- so

@@ -75,6 +75,49 @@ def duration_for_media(conn, company_id, user_folder, date, session_base) -> flo
     return None
 
 
+def day_stats(conn, company_id, user_folder, date) -> dict:
+    """Recording counts for ONE (user_folder, date), for the timeline KPI strip.
+
+    Returns {"sessions": int, "duration_s": int}. Never None — a day with no
+    recordings is an honest zero, not a missing metric.
+
+    Two things this deliberately does NOT do:
+
+    1. It does not count `recordings` ROWS. Under the chunk-session contract
+       one recording session arrives as N ~30s chunks, each its own row
+       (`..._sid{32hex}_c{NNNN}.wav`), so a single 9-minute meeting is 21 rows.
+       Reporting 21 would tell the user they made 21 recordings. Rows are
+       therefore folded to the session id parsed out of the key, with the key
+       itself as the fold value when there is no sid — pre-chunk-session
+       recordings are one row each, so the fold is the identity for them and
+       the count is unchanged for legacy data.
+    2. It does not filter on started_at. That column is timestamptz (UTC) while
+       `date` here is the device's NZ local day, the same clock the extraction
+       topics and the s3_key are on — filtering by UTC would move an evening
+       recording to the next day (the BUG-37/finalize-timezone family). The
+       s3_key path segment is the one date that agrees with the rest of the
+       timeline, and it is the same match duration_for_media/site_for_media use.
+
+    Only 'audio' and 'video' count: the KPI reads "Recordings" (capture
+    sessions), and photos have their own surface on the Evidence page.
+    company_id scopes the read — the multi-tenant invariant is that a folder
+    name never reaches across tenants."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT COUNT(DISTINCT COALESCE("
+        "  substring(s3_key from '_(sid[0-9a-f]{32})_c[0-9]+\\.'), s3_key"
+        ")) AS sessions, "
+        "COALESCE(SUM(duration_s), 0) AS duration_s "
+        "FROM recordings "
+        "WHERE company_id = %s AND kind IN ('audio','video') "
+        "AND s3_key LIKE %s ESCAPE '\\'",
+        (company_id, f"users/{_escape_like(user_folder)}/%/{date}/%"),
+    ).fetchone()
+    if row is None:
+        return {"sessions": 0, "duration_s": 0}
+    return {"sessions": int(row["sessions"] or 0),
+            "duration_s": int(row["duration_s"] or 0)}
+
+
 def site_for_media(conn, company_id, user_folder, date, session_base) -> dict | None:
     """The app-tagged site (recordings.site_id) for the recording whose media
     file this extraction session came from, or None. Matches recordings.s3_key
