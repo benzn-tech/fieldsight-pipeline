@@ -74,6 +74,19 @@ def test_blank_header_values_count_as_absent():
     assert dh.parse_headers({"X-Device-Tag": "   ", "X-Device-Id": ""}) is None
 
 
+def test_malformed_headers_degrade_to_no_device_rather_than_raising():
+    """parse_headers runs at the call site, outside record()'s try/except, on
+    the hot path of every org-api request. A 500 here would take down the whole
+    dashboard for the sake of telemetry."""
+
+    class Hostile:
+        def items(self):
+            raise RuntimeError("not really a mapping")
+
+    assert dh.parse_headers(Hostile()) is None
+    assert dh.parse_headers(["not", "a", "mapping"]) is None
+
+
 # --- record ----------------------------------------------------------------
 
 

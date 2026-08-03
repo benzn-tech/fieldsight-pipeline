@@ -56,16 +56,24 @@ def parse_headers(headers):
 
     A device that reports a uuid but no tag becomes an `unclaimed:` row, which
     is how it surfaces for someone to claim rather than vanishing.
+
+    Guarded like `record`: this runs at the call site, outside `record`'s own
+    try/except, on the hot path of every org-api request. Malformed headers
+    must degrade to "no device", never to a 500.
     """
-    tag = _get(headers, "X-Device-Tag")
-    device_uuid = _get(headers, "X-Device-Id")
-    version = _get(headers, "X-App-Version")
+    try:
+        tag = _get(headers, "X-Device-Tag")
+        device_uuid = _get(headers, "X-Device-Id")
+        version = _get(headers, "X-App-Version")
 
-    if not tag and not device_uuid:
+        if not tag and not device_uuid:
+            return None
+
+        asset_tag = tag.upper() if tag else "unclaimed:" + device_uuid[:8]
+        return {"asset_tag": asset_tag, "device_uuid": device_uuid, "app_version": version}
+    except Exception:
+        logger.exception("device header parse failed")
         return None
-
-    asset_tag = tag.upper() if tag else "unclaimed:" + device_uuid[:8]
-    return {"asset_tag": asset_tag, "device_uuid": device_uuid, "app_version": version}
 
 
 def record(conn, ident, account_sub):
