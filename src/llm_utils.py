@@ -16,6 +16,7 @@ Environment Variables:
     ANTHROPIC_API_KEY / CLAUDE_MODEL - anthropic path
     QWEN_API_KEY (falls back to DASHSCOPE_API_KEY) / QWEN_BASE_URL / QWEN_MODEL - qwen path
     QWEN_ENABLE_THINKING - 'true' runs qwen in thinking mode (skips response_format) - qwen path
+                           (per-function default; call_llm(enable_thinking=) overrides per call)
 """
 import json
 import logging
@@ -63,10 +64,20 @@ def api_key_configured():
     return bool(ANTHROPIC_API_KEY)
 
 
-def call_llm(prompt, max_tokens=4096, force_json=False):
-    """Return (text, None) on success or (None, error_string) on failure."""
+def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+    """Return (text, None) on success or (None, error_string) on failure.
+
+    enable_thinking (qwen path only; the anthropic path ignores it):
+      None  - use the QWEN_ENABLE_THINKING env default (every pre-existing
+              caller keeps its exact behaviour).
+      True  - force thinking mode for THIS call.
+      False - force the fast non-thinking path for THIS call.
+    The per-call override exists because one Lambda can need both modes:
+    lambda_extract_session runs a fast live pass during recording and a
+    thinking-mode final pass once the session closes.
+    """
     if LLM_PROVIDER == "qwen":
-        return _call_qwen(prompt, max_tokens, force_json)
+        return _call_qwen(prompt, max_tokens, force_json, enable_thinking)
     return _call_anthropic(prompt, max_tokens)
 
 
@@ -123,12 +134,14 @@ def _call_anthropic(prompt, max_tokens):
     return None, msg
 
 
-def _call_qwen(prompt, max_tokens, force_json):
+def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
     if not QWEN_API_KEY:
         logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
         return None, "QWEN_API_KEY not configured"
     payload = {"model": QWEN_MODEL, "messages": [{"role": "user", "content": prompt}]}
-    if QWEN_ENABLE_THINKING:
+    # Per-call override wins; None falls back to the function's env default.
+    thinking = QWEN_ENABLE_THINKING if enable_thinking is None else bool(enable_thinking)
+    if thinking:
         # Thinking mode: highest quality for batch tasks. Do NOT force
         # response_format even when force_json (thinking + json_object risks
         # non-strict JSON); the prompt already instructs JSON and extract_json()

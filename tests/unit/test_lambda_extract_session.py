@@ -106,7 +106,7 @@ OUT_KEY = f"extractions/Benl1/2026-07-06/{SESSION_BASE}.json"
 
 
 def _fake_call_llm_returning(payload):
-    def _fake(prompt, max_tokens=4096, force_json=False):
+    def _fake(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
         return json.dumps(payload), None
     return _fake
 
@@ -176,7 +176,7 @@ def test_prompt_contains_all_segment_turns(monkeypatch):
 
     captured = {}
 
-    def fake_call_llm(prompt, max_tokens=4096, force_json=False):
+    def fake_call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
         captured["prompt"] = prompt
         captured["max_tokens"] = max_tokens
         return json.dumps({"topics": [], "declared_site": None}), None
@@ -201,7 +201,7 @@ def test_extract_session_requests_force_json(monkeypatch):
 
     captured = {}
 
-    def _cap(prompt, max_tokens=4096, force_json=False):
+    def _cap(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
         captured["force_json"] = force_json
         return json.dumps({"topics": [], "declared_site": None}), None
 
@@ -272,7 +272,13 @@ def test_idempotent_overwrite_same_key(monkeypatch):
     # exercises the unquote_plus + session_base_from_key dispatch path.
     event = {"Records": [{"s3": {"object": {"key": SEG1_KEY}}}]}
     les.lambda_handler(event, None)
-    les.lambda_handler(event, None)
+
+    # A second pass only rewrites when the session actually GREW (a re-run over
+    # the identical segment set is pure item-writer churn -- see _supersedes),
+    # and min_interval_s=0 stands in for "the throttle window has passed".
+    fake_s3.objects[SEG2_KEY] = json.dumps(
+        make_transcribe_json("second segment", start=30.0))
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE, min_interval_s=0)
 
     assert len(fake_s3.put_calls) == 2
     assert all(c["Key"] == OUT_KEY for c in fake_s3.put_calls)
@@ -327,7 +333,11 @@ def test_declared_site_null_passthrough(monkeypatch):
         llm_utils, "call_llm",
         _fake_call_llm_returning({"topics": []}),
     )
-    extraction2 = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+    # final=True so this second pass is neither throttled nor stood down as
+    # redundant by the coverage check -- we want a genuinely fresh extraction
+    # built from the payload above, not the one the first call already wrote.
+    extraction2 = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                                      final=True)
     assert extraction2["declared_site"] is None
 
 
@@ -342,7 +352,7 @@ def test_claude_failure_raises(monkeypatch):
     # call_llm itself fails
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=4096, force_json=False: (None, "boom"),
+        lambda prompt, max_tokens=4096, force_json=False, enable_thinking=None: (None, "boom"),
     )
     with pytest.raises(RuntimeError):
         les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
@@ -351,7 +361,7 @@ def test_claude_failure_raises(monkeypatch):
     # call_llm succeeds but returns unparseable JSON
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=4096, force_json=False: ("not json at all {{{", None),
+        lambda prompt, max_tokens=4096, force_json=False, enable_thinking=None: ("not json at all {{{", None),
     )
     with pytest.raises(RuntimeError):
         les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
@@ -384,12 +394,13 @@ def test_corrupt_transcript_skipped(monkeypatch):
 # S3 write -> raise, zero writes (S3 event retry picks up every segment).
 # ---------------------------------------------------------------------------
 
-def test_session_grown_during_extraction_raises_no_write(monkeypatch):
+def test_session_grown_during_extraction_still_writes(monkeypatch):
+    """The old I-2 guard RAISED when the session grew mid-extraction, which was
+    a livelock: segments land ~30s apart, the call took ~170s, so the recheck
+    effectively always failed and threw away a completed extraction (94% of
+    prod invocations on 2026-08-03 produced nothing). Growth must now still
+    produce a write -- the next pass widens it."""
     class GrowingFakeS3(FakeS3):
-        """Simulates a new segment landing mid-extraction: the SECOND
-        list_objects_v2 listing (the I-2 recheck) sees one more key than
-        the first (the initial gather used to build the prompt)."""
-
         def get_paginator(self, op):
             self.list_calls = getattr(self, "list_calls", 0) + 1
             if self.list_calls == 2:
@@ -405,11 +416,147 @@ def test_session_grown_during_extraction_raises_no_write(monkeypatch):
         _fake_call_llm_returning({"topics": [], "declared_site": None}),
     )
 
-    with pytest.raises(RuntimeError, match="session grew"):
-        les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+    extraction = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
 
+    assert extraction is not None
+    assert [c["Key"] for c in fake_s3.put_calls] == [OUT_KEY]
+
+
+# ---------------------------------------------------------------------------
+# Two-tier extraction: live (throttled, thinking OFF) vs final (unthrottled,
+# thinking ON, authoritative). See lambda_extract_session's tier constants.
+# ---------------------------------------------------------------------------
+
+def _s3_with_one_segment():
+    return FakeS3({SEG1_KEY: json.dumps(make_transcribe_json("hello world"))})
+
+
+def test_live_pass_is_throttled_within_the_interval(monkeypatch):
+    fake_s3 = _s3_with_one_segment()
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    calls = []
+
+    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+        calls.append(enable_thinking)
+        return json.dumps({"topics": [], "declared_site": None}), None
+
+    monkeypatch.setattr(llm_utils, "call_llm", _counting)
+
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+    second = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    # Throttled BEFORE the expensive work: no second LLM call, no second write.
+    assert second is None
+    assert len(calls) == 1
+    assert len(fake_s3.put_calls) == 1
+
+
+def test_final_pass_ignores_the_throttle_and_uses_thinking(monkeypatch):
+    fake_s3 = _s3_with_one_segment()
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    calls = []
+
+    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+        calls.append(enable_thinking)
+        return json.dumps({"topics": [], "declared_site": None}), None
+
+    monkeypatch.setattr(llm_utils, "call_llm", _counting)
+
+    live = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+    final = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE, final=True)
+
+    assert calls == [False, True]                    # live fast, final thinking
+    assert live["tier"] == les.TIER_LIVE
+    assert final["tier"] == les.TIER_FINAL
+    assert [c["Key"] for c in fake_s3.put_calls] == [OUT_KEY, OUT_KEY]
+
+
+def test_live_pass_never_downgrades_a_final_extraction(monkeypatch):
+    fake_s3 = _s3_with_one_segment()
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
+    )
+
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE, final=True)
+    puts_after_final = len(fake_s3.put_calls)
+
+    # Throttle bypassed AND the session grew -- the only thing standing between
+    # the live pass and a write is the tier check.
+    fake_s3.objects[SEG2_KEY] = json.dumps(
+        make_transcribe_json("later segment", start=30.0))
+    result = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                                 min_interval_s=0)
+
+    assert len(fake_s3.put_calls) == puts_after_final     # no write
+    assert result["tier"] == les.TIER_FINAL              # the final one survives
+
+
+def test_live_pass_stands_down_when_it_covers_no_new_segments(monkeypatch):
+    """A slow pass finishing after a faster, wider one must not narrow what is
+    already published (the race the old raise-guard was really protecting)."""
+    fake_s3 = FakeS3({
+        SEG1_KEY: json.dumps(make_transcribe_json("hello world")),
+        SEG2_KEY: json.dumps(make_transcribe_json("second segment", start=30.0)),
+    })
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
+    )
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+    wide = json.loads(fake_s3.objects[OUT_KEY])
+    assert len(wide["source_transcripts"]) == 2
+
+    # Now a narrower pass (only SEG1 visible) tries to write over it.
+    del fake_s3.objects[SEG2_KEY]
+    result = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                                 min_interval_s=0)
+
+    assert len(fake_s3.put_calls) == 1                       # no second write
+    assert result["source_transcripts"] == wide["source_transcripts"]
+
+
+def test_final_request_artifact_routes_to_a_final_pass(monkeypatch):
+    fake_s3 = _s3_with_one_segment()
+    req_key = f"{les.FINAL_REQUESTS_PREFIX}sid-abc.json"
+    fake_s3.objects[req_key] = json.dumps({
+        "userFolder": "Benl1", "date": "2026-07-06", "sessionBase": SESSION_BASE,
+    })
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(les, "S3_BUCKET", BUCKET)
+    calls = []
+
+    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+        calls.append(enable_thinking)
+        return json.dumps({"topics": [], "declared_site": None}), None
+
+    monkeypatch.setattr(llm_utils, "call_llm", _counting)
+
+    les.lambda_handler({"Records": [{"s3": {"object": {"key": req_key}}}]}, None)
+
+    assert calls == [True]                                   # thinking mode
+    assert json.loads(fake_s3.objects[OUT_KEY])["tier"] == les.TIER_FINAL
+
+
+def test_unreadable_final_request_is_skipped_not_raised(monkeypatch):
+    """A dead artifact must not retry-storm: S3 events retry on exception, and
+    every retry would fail identically (same reasoning as M-5/M-6)."""
+    fake_s3 = _s3_with_one_segment()
+    req_key = f"{les.FINAL_REQUESTS_PREFIX}broken.json"
+    fake_s3.objects[req_key] = "{not json"
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(les, "S3_BUCKET", BUCKET)
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
+    )
+
+    result = les.lambda_handler({"Records": [{"s3": {"object": {"key": req_key}}}]}, None)
+
+    assert result == {"results": []}
     assert fake_s3.put_calls == []
-    assert fake_s3.list_calls == 2  # both the initial gather AND the recheck ran
 
 
 # ---------------------------------------------------------------------------
