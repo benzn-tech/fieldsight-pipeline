@@ -1567,6 +1567,11 @@ class FakeProgrammeStore:
             })
         return self.tasks
 
+    def count_local_tasks(self, conn, programme_id):
+        return len([t for t in self.tasks
+                    if t.get("origin") == "local"
+                    and t.get("removed_in_version") is None])
+
     def get_task_by_doc_id(self, conn, programme_id, doc_id):
         """Mirrors the real resolver: imported rows answer to their
         source_task_id, local rows to their UUID text."""
@@ -1645,7 +1650,8 @@ def programme_wired(wired):
     for name in ("get_primary_programme", "get_primary_programme_by_id",
                  "create_programme", "record_version", "replace_all_tasks",
                  "list_tasks", "list_assignees",
-                 "get_task_by_doc_id", "update_task"):
+                 "get_task_by_doc_id", "update_task",
+                 "count_local_tasks"):
         wired.setattr(org.programme_tasks, name, getattr(store, name))
     # PUT records its version through programme_import now, because the row
     # carries a task_snapshot (migration 0029) that programme_tasks knows
@@ -6519,3 +6525,45 @@ def test_qr_redeem_non_string_code_returns_401_not_crash(monkeypatch):
     res = org.lambda_handler(
         make_event("POST", "/api/org/auth/qr/redeem", sub="", body={"code": 123}), None)
     assert res["statusCode"] == 401
+
+
+# ----------------------------------------------------------
+# PUT /programme is a REPLACE, and a replace discards local rows -- zone
+# splits, AI breakdowns, anything allocated to a person. put_programme's
+# docstring used to say "the client confirms before calling it" and nothing
+# enforced it, so the ordinary Save button converted every local row to
+# imported and the next import then removed them as departed. The guard is
+# server-side because the client is what got this wrong.
+# ----------------------------------------------------------
+def test_put_programme_refuses_to_discard_local_rows(programme_wired):
+    wired, fake = programme_wired
+    store = fake.programme_store
+    store.seed_tasks([{"doc_id": "T-1"},
+                      {"doc_id": "zone-uuid", "origin": "local"}])
+    res = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": SITE_ID},
+        body={"name": "P", "parents": [], "leaves": []}), None)
+    assert res["statusCode"] == 409
+    assert "1 task" in body_of(res)["error"]
+    # and nothing was written
+    assert any(t["origin"] == "local" for t in store.tasks)
+
+
+def test_put_programme_proceeds_when_the_caller_confirms(programme_wired):
+    wired, fake = programme_wired
+    store = fake.programme_store
+    store.seed_tasks([{"doc_id": "zone-uuid", "origin": "local"}])
+    res = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": SITE_ID},
+        body={"name": "P", "parents": [], "leaves": [], "confirm_replace": True}), None)
+    assert res["statusCode"] == 200
+
+
+def test_put_programme_is_unaffected_when_there_are_no_local_rows(programme_wired):
+    """The common case must not grow a confirmation step."""
+    wired, fake = programme_wired
+    fake.programme_store.seed_tasks([{"doc_id": "T-1"}])
+    res = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": SITE_ID},
+        body={"name": "P", "parents": [], "leaves": []}), None)
+    assert res["statusCode"] == 200

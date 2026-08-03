@@ -3021,6 +3021,21 @@ def put_programme(conn, caller, event, body):
             conn, site_id=site_id, name=body.get("name") or "Programme",
             source_format=body.get("source_format"))
 
+    # A replace discards local rows -- zone splits, AI breakdowns, anything
+    # allocated to a person. The docstring above used to say "the client
+    # confirms before calling it" and nothing enforced it, so the ordinary
+    # Save button silently converted every local row to imported and the next
+    # import then removed them as departed. Enforced here rather than in the
+    # client, because the client is what got this wrong.
+    local_n = programme_tasks.count_local_tasks(conn, prog["id"])
+    if local_n and not body.get("confirm_replace"):
+        return error(
+            f"this would discard {local_n} task(s) created here "
+            f"(zone splits, breakdowns, anything allocated). Re-send with "
+            f"confirm_replace to proceed, or use import Update mode to keep "
+            f"them.",
+            409)
+
     version_no = (prog["current_version"] or 0) + 1
     programme_tasks.replace_all_tasks(
         conn, prog["id"],
