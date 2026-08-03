@@ -448,17 +448,45 @@ def extraction_key(user_folder, date, session_base):
     return f"{EXTRACTIONS_PREFIX}{user_folder}/{date}/{session_base}.json"
 
 
+#: read_existing_extraction could not determine what is published. Distinct from
+#: None, which means "nothing is published". Conflating them is what makes a
+#: silent read failure look like permission to overwrite.
+UNKNOWN = object()
+
+
 def read_existing_extraction(bucket, out_key):
-    """The session's current extraction dict, or None when there isn't one yet
-    or it can't be read/parsed (-> treat as absent, i.e. this pass is free to
-    write). Mirrors lambda_rolling_summary._seconds_since_last_summary's
-    tolerate-anything posture: a corrupt sidecar must never block extraction."""
+    """What is currently published for this session. Three distinct answers:
+
+      dict     -- the existing extraction
+      None     -- nothing published yet (S3 says the key does not exist)
+      UNKNOWN  -- we could not find out (denied, unreadable, unparseable)
+
+    UNKNOWN must NOT collapse into None. The original version returned None for
+    every failure, so a lost read read as "nothing is published" and licensed a
+    live pass to overwrite -- including overwriting an authoritative `final`
+    extraction, and including silently disabling the re-extraction throttle,
+    which is exactly the failure mode the extractions/* GetObject grant was
+    added to prevent. Granting the permission removed today's cause; returning
+    UNKNOWN removes the class, because any future reason the read fails (bucket
+    policy, KMS, a transient 5xx surviving boto3's own retries) now degrades to
+    "leave what is published alone" instead of "clobber it".
+    """
     try:
         obj = s3().get_object(Bucket=bucket, Key=out_key)
+    except Exception as e:
+        if type(e).__name__ in ('NoSuchKey', 'NoSuchBucket') or \
+                getattr(e, 'response', {}).get('Error', {}).get('Code') in ('NoSuchKey', '404'):
+            return None                      # definitively absent
+        logger.warning("%s: could not read the existing extraction (%s: %s) -- "
+                       "treating as UNKNOWN, not as absent", out_key, type(e).__name__, e)
+        return UNKNOWN
+    try:
         prev = json.loads(obj['Body'].read().decode('utf-8'))
-        return prev if isinstance(prev, dict) else None
-    except Exception:
-        return None
+    except Exception as e:
+        logger.warning("%s: existing extraction is unreadable (%s) -- treating as "
+                       "UNKNOWN, not as absent", out_key, type(e).__name__)
+        return UNKNOWN
+    return prev if isinstance(prev, dict) else UNKNOWN
 
 
 def _seconds_since(extracted_at, now):
@@ -486,13 +514,18 @@ def _supersedes(new_sources, prev):
     same wall — 94% of invocations on 2026-08-03 produced nothing. Comparing
     coverage instead keeps the race-safety (never clobber a wider extraction)
     without ever discarding usable work."""
+    if prev is UNKNOWN:
+        # We could not read what is published. Overwriting on a guess is the one
+        # outcome we can never take back, and the cost of standing down is only a
+        # delayed refresh -- a later pass (or the final one) republishes.
+        return False
     if prev is None:
         return True
     if prev.get('tier') == TIER_FINAL:
         return False
     prev_sources = prev.get('source_transcripts')
     if not isinstance(prev_sources, list):
-        return True                       # unknown coverage -> don't block
+        return True                       # readable but no coverage recorded -> don't block
     return not set(new_sources) <= set(prev_sources)
 
 
@@ -519,6 +552,12 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
     # authoritative one and runs at most once per session.
     if not final:
         prev = read_existing_extraction(bucket, out_key)
+        if prev is UNKNOWN:
+            # Can't tell how fresh the published extraction is, and _supersedes
+            # would refuse to write anyway — so spending an LLM call here would
+            # buy a result we are already committed to throwing away.
+            logger.warning("%s: skipping live pass, cannot read what is published", out_key)
+            return None
         age = _seconds_since((prev or {}).get('extracted_at'), now or datetime.utcnow())
         if age is not None and age < min_interval_s:
             return None
