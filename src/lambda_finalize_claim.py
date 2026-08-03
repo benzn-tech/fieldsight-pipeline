@@ -31,6 +31,13 @@ logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 FINALIZE_REQUESTS_PREFIX = "session_finalize_requests/"
+# Asks the (non-VPC) extraction lambda for this session's FINAL, thinking-mode
+# pass. Same artifact-on-S3 channel as FINALIZE_REQUESTS_PREFIX and for the same
+# reason: this sweep is in-VPC and cannot invoke another lambda (no NAT, no
+# lambda VPC endpoint -> the call black-holes until timeout, CLAUDE.md BUG-36),
+# but it CAN write to S3 through the gateway endpoint.
+# Must stay identical to lambda_extract_session.FINAL_REQUESTS_PREFIX.
+EXTRACTION_REQUESTS_PREFIX = "extraction_requests/"
 # The idle-stop grace window (a deliberate End is grace 0). Mirrors org-api's
 # STOP_GRACE_SECONDS so the sweep's due-check matches what session_close intended.
 STOP_GRACE_SECONDS = int(os.environ.get("STOP_GRACE_SECONDS", "30"))
@@ -45,7 +52,8 @@ IDLE_CLOSE_SECONDS = SESSION_GAP_MINUTES * 60
 INFER_IDLE_CLOSE = os.environ.get("INFER_IDLE_CLOSE", "false").lower() == "true"
 
 
-def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_rolling, enqueue):
+def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_rolling,
+                   enqueue, request_extraction=None):
     """CAS-claim the session at expected_version, then gather + enqueue a finalize
     request. Returns a small status dict:
       noop         — claim failed (a resume bumped version, or it already moved on)
@@ -58,6 +66,19 @@ def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_
     if row is None:
         return {"status": "noop", "sessionId": session_id}
     ctx = resolve_context(conn, row) or {}
+
+    # Requested BEFORE the recipient check on purpose: the final extraction is
+    # what puts this session's content on the WEBSITE, which a recorder with no
+    # email on file needs just as much. Best-effort — a failure here must never
+    # block finalize — but never silent (CLAUDE.md BUG-40: a swallowed except is
+    # how a whole feature stays broken unnoticed).
+    if request_extraction and ctx.get("folder") and ctx.get("date"):
+        try:
+            request_extraction(session_id, ctx["folder"], ctx["date"])
+        except Exception:
+            logger.exception("finalize: could not request final extraction for %s",
+                             session_id)
+
     recipient = (ctx.get("recipient") or "").strip()
     if not recipient:
         # Named so prod ops can see WHICH recorder has no email on file (a
@@ -169,6 +190,24 @@ def _enqueue(artifact):
         Body=json.dumps(artifact, ensure_ascii=False), ContentType="application/json")
 
 
+def _request_extraction(session_id, folder, date):
+    """Ask lambda_extract_session for this session's FINAL (thinking-mode,
+    unthrottled) pass now that the session has closed.
+
+    Why the sweep owns this: the live passes that ran during recording are
+    throttled, so the last window of transcripts can land INSIDE the throttle
+    and never make it into an extraction. Only a close-driven pass can
+    guarantee the published extraction covers the whole session. `sid`+
+    session_id is extract_session's grouping key (same as _read_rolling)."""
+    import boto3
+    boto3.client("s3").put_object(
+        Bucket=S3_BUCKET,
+        Key=f"{EXTRACTION_REQUESTS_PREFIX}{session_id}.json",
+        Body=json.dumps({"userFolder": folder, "date": date,
+                         "sessionBase": f"sid{session_id}"}),
+        ContentType="application/json")
+
+
 def infer_idle_closes(conn, idle_seconds):
     """§8.4 close inference: an `open` session with no new chunk for idle_seconds is
     treated as closed (the device stopped/crashed without a /close). Move each to
@@ -198,7 +237,8 @@ def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None):
     for row in meeting_session.list_due_finalize(conn, grace):
         results.append(finalize_claim(
             conn, row["session_id"], row["version"],
-            resolve_context=_resolve_context, read_rolling=_read_rolling, enqueue=_enqueue))
+            resolve_context=_resolve_context, read_rolling=_read_rolling, enqueue=_enqueue,
+            request_extraction=_request_extraction))
     return results
 
 
