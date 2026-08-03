@@ -239,18 +239,26 @@ The Notion integration token follows the ElevenLabs key's existing path: GitHub 
 `NoEcho` parameter → Lambda environment variable. No new secret store.
 
 **The database exists** (created 2026-08-04), pre-populated with twenty `FS-01`..`FS-20` rows all
-at `在库`:
+at `在库`. It lives in the **company** workspace `Preformance` (`ben.lin@preformance.co.nz`), not
+a personal one — the ledger is a company asset and must survive any one person's account:
 
-- Database: `https://app.notion.com/p/ff5e2df870494176abe308ebeab21008`
-- Data source id for the API: `9f7f9c29-9e69-4aa0-99c8-7d5207975634`
+- Database: `https://app.notion.com/p/943da8c294734365b6c7294c2055c45d`
+- Data source id for the API: `1c4d069f-3019-4210-8363-ce4c370aa433`
 
 Property names are exactly as tabled above; `Status` is a select over
 `未激活 / 使用中 / 在库 / 失联 / 未认领`. Every property carries its rule as a Notion description,
 so the hand-edited/system-written split is visible in the UI rather than only in this document.
 
-Phase 3 still needs an integration token: create one in Notion, share the database with it, then
-add it as GitHub secret `NOTION_TOKEN` and pass it through `deploy.yml` as the `NotionToken`
-parameter. Until then `device-report` stays inert.
+A first copy was built in a personal workspace and abandoned the same day. Moving it was
+impossible — Notion cannot move pages **across** workspaces, only within one — so it was rebuilt
+and the ids above replace the originals. This cost nothing because the table was still empty and
+no code referenced the ids yet; the same move after Phase 3 would have meant changing code, a
+GitHub secret and a deploy. **Confirm the workspace before wiring an id into anything.**
+
+Phase 3 still needs an integration token: create one in Notion, **connect the database to it**
+(the page's `•••` → Connections — creating the integration alone is not enough and the API
+returns a misleading 404 if this is skipped), then add it as GitHub secret `NOTION_TOKEN` and pass
+it through `deploy.yml` as the `NotionToken` parameter. Until then `device-report` stays inert.
 
 ## Delivery phases
 
