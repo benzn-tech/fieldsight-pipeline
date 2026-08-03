@@ -174,19 +174,86 @@ def delete_local_task(conn, task_id) -> bool:
     return row is not None
 
 
+def list_local_tasks(conn, programme_id) -> list[dict]:
+    """The rows under this programme that are ours rather than the client's.
+
+    Returns rows, not a count, because the caller has to name them: telling
+    someone "this would delete 3 tasks" without saying which is not a decision
+    they can make.
+    """
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, name, parent_id FROM programme_tasks "
+        "WHERE programme_id = %s AND origin = 'local' "
+        "AND removed_in_version IS NULL "
+        "ORDER BY name",
+        (programme_id,),
+    ).fetchall()
+
+
 def replace_all_tasks(conn, programme_id, *, parents, leaves, version_no,
                       updated_by) -> int:
-    """Whole-document replace — today's PUT semantics, moved to Aurora.
+    """Whole-document save that PRESERVES local rows.
 
-    Everything under the programme goes, including local rows: that is what
-    replace means, and the caller is required to have obtained explicit
-    confirmation. Update-mode reconciliation, which preserves local subtrees,
-    is a separate plan.
+    Imported rows are the client's and are rebuilt from the payload. Local
+    rows -- zone splits, AI breakdowns, anything allocated to a person -- are
+    ours, and a save must not destroy them: that path silently converted them
+    to imported and let the next import remove them as departed
+    (fieldsight-ui#186).
+
+    What makes this possible is that local rows already carry identity in the
+    payload: programme_snapshot._doc_id emits their UUID as `task_id`, so a
+    payload leaf can be matched back to the row it came from without a
+    source_task_id.
+
+    Five steps, in order:
+      1. remember each live local row and the source_task_id of its parent --
+         the only durable link across the rebuild, since imported rows are
+         re-minted with new UUIDs
+      2. delete IMPORTED rows only
+      3. re-insert imported rows, building source_task_id -> new uuid
+      4. update each surviving local row from the payload and re-point its
+         parent through that map
+      5. delete local rows the payload no longer contains -- the user removed
+         them in the UI, and silently keeping them would resurrect work
+         somebody deleted
 
     Returns the number of task rows written.
     """
+    # 1. Local rows, and what their parent was called in the FILE. Reading the
+    #    parent's source_task_id rather than its uuid is the whole trick: the
+    #    uuid does not survive step 2, the file's id does.
+    locals_before = conn.cursor(row_factory=dict_row).execute(
+        "SELECT t.id, p.source_task_id AS parent_source "
+        "FROM programme_tasks t "
+        "LEFT JOIN programme_tasks p ON p.id = t.parent_id "
+        "WHERE t.programme_id = %s AND t.origin = 'local' "
+        "AND t.removed_in_version IS NULL",
+        (programme_id,),
+    ).fetchall()
+    local_ids = {str(r["id"]) for r in locals_before}
+
+    # 2a. DETACH the local rows first. programme_tasks.parent_id is
+    #     `REFERENCES programme_tasks(id) ON DELETE CASCADE` (migration 0027),
+    #     so deleting an imported parent takes its local children with it --
+    #     scoping the DELETE to origin='imported' is not enough on its own.
+    #
+    #     This was caught only by running the rewrite against real PostgreSQL;
+    #     the unit tests pass either way, because the connection double does
+    #     not enforce foreign keys. Step 1 has already recorded where each of
+    #     these rows belongs, so cutting the link is safe.
+    if local_ids:
+        conn.cursor().execute(
+            "UPDATE programme_tasks SET parent_id = NULL "
+            "WHERE programme_id = %s AND origin = 'local' "
+            "AND removed_in_version IS NULL",
+            (programme_id,))
+
+    # 2b. Imported only. Local rows now survive the rebuild in place, keeping
+    #     their uuid -- which is what assignees and recorded progress hang off.
     conn.cursor().execute(
-        "DELETE FROM programme_tasks WHERE programme_id = %s", (programme_id,))
+        "DELETE FROM programme_tasks WHERE programme_id = %s "
+        "AND origin = 'imported'",
+        (programme_id,))
 
     # Groups first: the file expresses parentage with its own ids, and the
     # rows have to be linked by our uuids, so a group must exist before any
@@ -205,7 +272,14 @@ def replace_all_tasks(conn, programme_id, *, parents, leaves, version_no,
         by_source[p["task_id"]] = row["id"]
         order += 1
 
+    first_group_id = next(iter(by_source.values()), None)
+
     for t in leaves or []:
+        # A payload leaf whose task_id is a known local uuid is one of OUR
+        # rows coming back. Re-inserting it here would mint a duplicate and
+        # stamp it 'imported' -- the exact bug this rewrite exists to remove.
+        if str(t.get("task_id")) in local_ids:
+            continue
         conn.cursor().execute(
             "INSERT INTO programme_tasks ("
             "programme_id, source_task_id, parent_id, origin, name, wbs_code, "
@@ -220,12 +294,51 @@ def replace_all_tasks(conn, programme_id, *, parents, leaves, version_no,
         )
         order += 1
 
+    # 4 & 5. Local rows: update from the payload, or delete if the payload
+    #        dropped them.
+    payload_by_id = {str(t.get("task_id")): t for t in (leaves or [])}
+    kept = 0
+    for row in locals_before:
+        rid = str(row["id"])
+        payload = payload_by_id.get(rid)
+        if payload is None:
+            # Removed in the UI. Hard delete: local rows are ours, and
+            # soft-deletion is reserved for imported rows an import dropped.
+            conn.cursor().execute(
+                "DELETE FROM programme_tasks WHERE id = %s AND origin = 'local'",
+                (row["id"],))
+            continue
+
+        # An orphan: the parent was removed from the file in this same save,
+        # so no new uuid was minted for it. Re-parent to the first group
+        # rather than orphaning -- this work is allocated to a person and must
+        # not vanish because the client reorganised their WBS.
+        new_parent = by_source.get(row["parent_source"]) or first_group_id
+
+        # The payload is the user's INTENT; the database is only the source of
+        # identity. Ignoring the payload here would be safe for identity and
+        # wrong for content -- an edit to a zone's dates would vanish on save.
+        conn.cursor().execute(
+            "UPDATE programme_tasks SET parent_id = %s, name = %s, "
+            "wbs_code = %s, start_date = %s, end_date = %s, "
+            "duration_days = %s, progress_pct = %s, status = %s, "
+            "updated_by = %s, updated_at = now(), "
+            "row_version = row_version + 1 "
+            "WHERE id = %s AND origin = 'local'",
+            (new_parent, payload.get("name") or rid, payload.get("wbs"),
+             payload.get("start"), payload.get("end"),
+             payload.get("duration_days"), payload.get("progress_pct") or 0,
+             payload.get("status") or "not_started", updated_by, row["id"]))
+        kept += 1
+
     conn.cursor().execute(
         "UPDATE programmes SET current_version = %s, updated_at = now() "
         "WHERE id = %s",
         (version_no, programme_id))
 
-    return len(parents or []) + len(leaves or [])
+    imported_written = len(parents or []) + len(
+        [t for t in (leaves or []) if str(t.get("task_id")) not in local_ids])
+    return imported_written + kept
 
 
 def list_assignees(conn, task_ids) -> dict:
