@@ -1567,10 +1567,10 @@ class FakeProgrammeStore:
             })
         return self.tasks
 
-    def count_local_tasks(self, conn, programme_id):
-        return len([t for t in self.tasks
-                    if t.get("origin") == "local"
-                    and t.get("removed_in_version") is None])
+    def list_local_tasks(self, conn, programme_id):
+        return [t for t in self.tasks
+                if t.get("origin") == "local"
+                and t.get("removed_in_version") is None]
 
     def get_task_by_doc_id(self, conn, programme_id, doc_id):
         """Mirrors the real resolver: imported rows answer to their
@@ -1651,7 +1651,7 @@ def programme_wired(wired):
                  "create_programme", "record_version", "replace_all_tasks",
                  "list_tasks", "list_assignees",
                  "get_task_by_doc_id", "update_task",
-                 "count_local_tasks"):
+                 "list_local_tasks"):
         wired.setattr(org.programme_tasks, name, getattr(store, name))
     # PUT records its version through programme_import now, because the row
     # carries a task_snapshot (migration 0029) that programme_tasks knows
@@ -6535,27 +6535,46 @@ def test_qr_redeem_non_string_code_returns_401_not_crash(monkeypatch):
 # imported and the next import then removed them as departed. The guard is
 # server-side because the client is what got this wrong.
 # ----------------------------------------------------------
-def test_put_programme_refuses_to_discard_local_rows(programme_wired):
+def test_put_programme_refuses_to_delete_local_rows_the_payload_dropped(programme_wired):
+    """The one destructive case left. replace_all_tasks deletes local rows the
+    payload no longer contains, reading their absence as "the user removed
+    them" -- and a stale or partial client sends exactly the same thing."""
     wired, fake = programme_wired
     store = fake.programme_store
     store.seed_tasks([{"doc_id": "T-1"},
-                      {"doc_id": "zone-uuid", "origin": "local"}])
+                      {"doc_id": "zone-uuid", "origin": "local",
+                       "name": "Pour slab — Level 1"}])
     res = org.lambda_handler(make_event(
         "PUT", "/api/org/programme", params={"site": SITE_ID},
-        body={"name": "P", "parents": [], "leaves": []}), None)
+        body={"name": "P", "parents": [], "leaves": [{"task_id": "T-1"}]}), None)
     assert res["statusCode"] == 409
-    assert "1 task" in body_of(res)["error"]
-    # and nothing was written
+    # It must NAME them: "this would delete 3 tasks" is not a decision anyone
+    # can act on.
+    assert "Pour slab — Level 1" in body_of(res)["error"]
     assert any(t["origin"] == "local" for t in store.tasks)
 
 
-def test_put_programme_proceeds_when_the_caller_confirms(programme_wired):
+def test_put_programme_allows_a_save_that_keeps_the_local_rows(programme_wired):
+    """The regression that matters. The first version of this guard refused
+    ANY save once a local row existed, which made the fix behind it
+    unreachable: split a task and Save was dead."""
     wired, fake = programme_wired
     store = fake.programme_store
     store.seed_tasks([{"doc_id": "zone-uuid", "origin": "local"}])
     res = org.lambda_handler(make_event(
         "PUT", "/api/org/programme", params={"site": SITE_ID},
-        body={"name": "P", "parents": [], "leaves": [], "confirm_replace": True}), None)
+        body={"name": "P", "parents": [],
+              "leaves": [{"task_id": "zone-uuid"}]}), None)
+    assert res["statusCode"] == 200
+
+
+def test_put_programme_proceeds_when_the_caller_confirms(programme_wired):
+    wired, fake = programme_wired
+    fake.programme_store.seed_tasks([{"doc_id": "zone-uuid", "origin": "local"}])
+    res = org.lambda_handler(make_event(
+        "PUT", "/api/org/programme", params={"site": SITE_ID},
+        body={"name": "P", "parents": [], "leaves": [],
+              "confirm_replace": True}), None)
     assert res["statusCode"] == 200
 
 

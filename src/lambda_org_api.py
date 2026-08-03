@@ -3021,19 +3021,26 @@ def put_programme(conn, caller, event, body):
             conn, site_id=site_id, name=body.get("name") or "Programme",
             source_format=body.get("source_format"))
 
-    # A replace discards local rows -- zone splits, AI breakdowns, anything
-    # allocated to a person. The docstring above used to say "the client
-    # confirms before calling it" and nothing enforced it, so the ordinary
-    # Save button silently converted every local row to imported and the next
-    # import then removed them as departed. Enforced here rather than in the
-    # client, because the client is what got this wrong.
-    local_n = programme_tasks.count_local_tasks(conn, prog["id"])
-    if local_n and not body.get("confirm_replace"):
+    # replace_all_tasks now PRESERVES local rows, so a save is no longer
+    # destructive on its own and must not be refused for merely having them --
+    # the first version of this guard blocked every save once a task had been
+    # split, which made the fix behind it unreachable.
+    #
+    # One destructive case remains, and this is it: step 5 deletes local rows
+    # the payload no longer contains, on the reading that the user removed
+    # them in the UI. A stale or partial client sends the same thing, so the
+    # guard now asks the precise question -- WHICH local rows would this drop?
+    # -- instead of the blunt one.
+    payload_ids = {str(t.get("task_id"))
+                   for t in (body.get("leaves") or [])}
+    dropped = [r for r in programme_tasks.list_local_tasks(conn, prog["id"])
+               if str(r["id"]) not in payload_ids]
+    if dropped and not body.get("confirm_replace"):
+        names = ", ".join((r.get("name") or str(r["id"])) for r in dropped[:5])
         return error(
-            f"this would discard {local_n} task(s) created here "
-            f"(zone splits, breakdowns, anything allocated). Re-send with "
-            f"confirm_replace to proceed, or use import Update mode to keep "
-            f"them.",
+            f"this would delete {len(dropped)} task(s) created here: {names}"
+            + ("…" if len(dropped) > 5 else "")
+            + ". Re-send with confirm_replace if that is intended.",
             409)
 
     version_no = (prog["current_version"] or 0) + 1
