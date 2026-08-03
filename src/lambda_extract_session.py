@@ -62,6 +62,28 @@ EXTRACTIONS_PREFIX = 'extractions/'
 TRANSCRIPT_TEXT_LIMIT = 60000  # BUG-15: must match expected input size
 SITE_MATCH_CUTOFF = 0.6
 
+# Two-tier extraction (see extract_session).
+#   live  — runs while recording is still going, thinking OFF (fast, ~10x
+#           cheaper in wall-clock), throttled: the website gets topics that
+#           refresh about once a minute instead of nothing until the session ends.
+#   final — runs once the session closes, thinking ON, never throttled; it
+#           overwrites the live extraction at the same key, and item-writer's
+#           delete_topics_for_source + re-insert swaps the topics over.
+#
+# Why the throttle matters even though LLM cost is not the constraint: a Lambda
+# occupies a full account concurrency slot for its whole wall-clock duration
+# (including the time it sits idle waiting on the LLM's HTTP response), so
+# slots_used = arrival_rate x duration. Chunks land ~30s apart, so an
+# unthrottled live pass costs 3x what a 90s-throttled one does — in concurrency
+# slots AND in item-writer's delete/re-insert churn against Aurora.
+MIN_REEXTRACT_INTERVAL_S = 90
+TIER_LIVE = 'live'
+TIER_FINAL = 'final'
+# Zero overlap with transcripts/ (this Lambda's other trigger) and with
+# extractions/ (its own output -- BUG-13), so no notification is ambiguous and
+# nothing can re-trigger itself.
+FINAL_REQUESTS_PREFIX = 'extraction_requests/'
+
 _s3_client = None
 _sites_cache = None
 
@@ -418,7 +440,104 @@ def assemble_deduped_turns(bucket, keys):
     return turns, source_filenames
 
 
-def extract_session(bucket, user_folder, date, session_base):
+def extraction_key(user_folder, date, session_base):
+    """The single key a session's extraction always lands on, whichever tier
+    produced it — the live pass and the final pass deliberately collide so the
+    final one supersedes the live one (and item-writer, which keys its
+    delete-then-insert on this exact string, swaps the topics over)."""
+    return f"{EXTRACTIONS_PREFIX}{user_folder}/{date}/{session_base}.json"
+
+
+#: read_existing_extraction could not determine what is published. Distinct from
+#: None, which means "nothing is published". Conflating them is what makes a
+#: silent read failure look like permission to overwrite.
+UNKNOWN = object()
+
+
+def read_existing_extraction(bucket, out_key):
+    """What is currently published for this session. Three distinct answers:
+
+      dict     -- the existing extraction
+      None     -- nothing published yet (S3 says the key does not exist)
+      UNKNOWN  -- we could not find out (denied, unreadable, unparseable)
+
+    UNKNOWN must NOT collapse into None. The original version returned None for
+    every failure, so a lost read read as "nothing is published" and licensed a
+    live pass to overwrite -- including overwriting an authoritative `final`
+    extraction, and including silently disabling the re-extraction throttle,
+    which is exactly the failure mode the extractions/* GetObject grant was
+    added to prevent. Granting the permission removed today's cause; returning
+    UNKNOWN removes the class, because any future reason the read fails (bucket
+    policy, KMS, a transient 5xx surviving boto3's own retries) now degrades to
+    "leave what is published alone" instead of "clobber it".
+    """
+    try:
+        obj = s3().get_object(Bucket=bucket, Key=out_key)
+    except Exception as e:
+        if type(e).__name__ in ('NoSuchKey', 'NoSuchBucket') or \
+                getattr(e, 'response', {}).get('Error', {}).get('Code') in ('NoSuchKey', '404'):
+            return None                      # definitively absent
+        logger.warning("%s: could not read the existing extraction (%s: %s) -- "
+                       "treating as UNKNOWN, not as absent", out_key, type(e).__name__, e)
+        return UNKNOWN
+    try:
+        prev = json.loads(obj['Body'].read().decode('utf-8'))
+    except Exception as e:
+        logger.warning("%s: existing extraction is unreadable (%s) -- treating as "
+                       "UNKNOWN, not as absent", out_key, type(e).__name__)
+        return UNKNOWN
+    return prev if isinstance(prev, dict) else UNKNOWN
+
+
+def _seconds_since(extracted_at, now):
+    """Age in seconds of an extraction's `extracted_at`, or None when it's
+    missing/unparseable. Tolerates the trailing Z and optional microseconds."""
+    if not extracted_at:
+        return None
+    try:
+        return (now - datetime.fromisoformat(str(extracted_at).rstrip('Z'))).total_seconds()
+    except Exception:
+        return None
+
+
+def _supersedes(new_sources, prev):
+    """Should a live pass holding `new_sources` overwrite the existing `prev`
+    extraction? No when prev is a FINAL extraction (authoritative — a live pass
+    must never downgrade it), and no when prev already covers every segment this
+    pass saw (equal set = nothing new to say; superset = prev is strictly
+    better, which happens when a slow pass finishes after a faster, wider one).
+
+    This replaces the old I-2 guard, which re-listed the prefix after the LLM
+    call and RAISED if the session had grown. That was a livelock: segments land
+    ~30s apart while the call took ~170s, so the recheck effectively always
+    failed, threw away a completed (paid-for) extraction, and retried into the
+    same wall — 94% of invocations on 2026-08-03 produced nothing. Comparing
+    coverage instead keeps the race-safety (never clobber a wider extraction)
+    without ever discarding usable work."""
+    if prev is UNKNOWN:
+        # We could not read what is published. Overwriting on a guess is the one
+        # outcome we can never take back, and the cost of standing down is only a
+        # delayed refresh -- a later pass (or the final one) republishes.
+        return False
+    if prev is None:
+        return True
+    prev_sources = prev.get('source_transcripts')
+    if not isinstance(prev_sources, list):
+        return True                       # readable but no coverage recorded -> don't block
+    if set(new_sources) <= set(prev_sources):
+        return False                      # nothing new to say (equal, or prev is wider)
+    # Strictly wider than what is published. This beats tier: the final pass is
+    # scheduled off session CLOSE, but transcripts keep landing after it (idle
+    # close fires 15 min after the last chunk, while a backed-up Transcribe queue
+    # can trail by longer). A final that ran early therefore publishes a TRUNCATED
+    # session, and deferring to it on tier alone would lock the rest of the
+    # recording out permanently. Missing content is worse than fast-tier content,
+    # so more coverage wins and _request_final_rerun below buys the quality back.
+    return True
+
+
+def extract_session(bucket, user_folder, date, session_base, final=False,
+                    min_interval_s=MIN_REEXTRACT_INTERVAL_S, now=None):
     # M-5: a stack missing the secret must not retry-storm -- an S3 event
     # retries on a raised exception, and every retry would fail the exact
     # same way. Check upfront (before any S3 gather/Claude work) and bail
@@ -430,6 +549,25 @@ def extract_session(bucket, user_folder, date, session_base):
             "without retry"
         )
         return None
+
+    out_key = extraction_key(user_folder, date, session_base)
+
+    # Throttle BEFORE the expensive work (the gather + the LLM call), exactly
+    # where lambda_rolling_summary puts its own -- a skipped pass must cost one
+    # S3 GET, not a concurrency slot held for the length of an LLM round-trip.
+    # The final pass is never throttled (nor does it need this read): it is the
+    # authoritative one and runs at most once per session.
+    if not final:
+        prev = read_existing_extraction(bucket, out_key)
+        if prev is UNKNOWN:
+            # Can't tell how fresh the published extraction is, and _supersedes
+            # would refuse to write anyway — so spending an LLM call here would
+            # buy a result we are already committed to throwing away.
+            logger.warning("%s: skipping live pass, cannot read what is published", out_key)
+            return None
+        age = _seconds_since((prev or {}).get('extracted_at'), now or datetime.utcnow())
+        if age is not None and age < min_interval_s:
+            return None
 
     keys = gather_session_segments(bucket, user_folder, date, session_base)
     turns, source_filenames = assemble_deduped_turns(bucket, keys)
@@ -444,7 +582,11 @@ def extract_session(bucket, user_folder, date, session_base):
     prompt = build_extraction_prompt(user_folder, date, session_base, turns, n_segments)
     max_tokens = min(4096 + n_segments * 350, 8000)  # BUG-16
 
-    raw_response, error = llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=True)
+    # Tier selects the model mode: the live pass must stay well inside the
+    # Lambda timeout (thinking mode routinely blew past llm_utils.HTTP_TIMEOUT
+    # and got hard-killed at 180s), the final pass buys quality with time.
+    raw_response, error = llm_utils.call_llm(
+        prompt, max_tokens=max_tokens, force_json=True, enable_thinking=final)
     if raw_response is None:
         raise RuntimeError(f"Claude call failed for session {session_base}: {error}")
 
@@ -468,44 +610,110 @@ def extract_session(bucket, user_folder, date, session_base):
     for topic in parsed_topics:
         topic['safety_flags'] = _derive_safety_flags(topic.get('findings'))
 
-    # I-2: re-gather the session's segments immediately before writing. If
-    # the set differs from the one used to build the prompt, another
-    # segment landed (and re-triggered this Lambda) while THIS invocation
-    # was mid-flight -- writing now would produce an extraction that never
-    # saw that segment's turns. Raise so the S3 event retries; the retry's
-    # own gather will pick up every segment that exists by then.
-    recheck_keys = gather_session_segments(bucket, user_folder, date, session_base)
-    if set(recheck_keys) != set(keys):
-        raise RuntimeError("session grew during extraction — retry will pick up all segments")
+    # I-2 (replaces the old raise-on-growth guard -- see _supersedes): re-read
+    # the extraction that exists NOW, not the one we read before the LLM call,
+    # so a wider pass that landed while this one was in flight is respected.
+    # A live pass stands down rather than narrowing what's already published.
+    # Standing down is not a failure -- the work this pass did is simply
+    # redundant, so return the current extraction.
+    overtook_final = False
+    if not final:
+        current = read_existing_extraction(bucket, out_key)
+        if not _supersedes(source_filenames, current):
+            logger.info(
+                f"{out_key}: live pass superseded (covers {len(source_filenames)} segments, "
+                f"existing tier={(current or {}).get('tier')}) -- keeping existing extraction"
+            )
+            return current
+        overtook_final = isinstance(current, dict) and current.get('tier') == TIER_FINAL
 
     extraction = {
         'schema_version': 1,
         'user_folder': user_folder,
         'date': date,
         'session_base': session_base,
+        'tier': TIER_FINAL if final else TIER_LIVE,
         'source_transcripts': sorted(source_filenames),
+        # Stamped at WRITE time, not at entry: the throttle above measures "how
+        # long since the last extraction finished". Stamping at entry would
+        # backdate it by the whole LLM round-trip and let the next trigger
+        # through early -- the exact overlap the throttle exists to prevent.
         'extracted_at': datetime.utcnow().isoformat() + 'Z',
         'declared_site': process_declared_site(parsed.get('declared_site')),
         'topics': parsed_topics,
     }
 
-    out_key = f"{EXTRACTIONS_PREFIX}{user_folder}/{date}/{session_base}.json"
     s3().put_object(
         Bucket=bucket, Key=out_key,
         Body=json.dumps(extraction, ensure_ascii=False, indent=2),
         ContentType='application/json',
     )
+    if overtook_final:
+        _request_final_rerun(bucket, user_folder, date, session_base)
     return extraction
+
+
+def _request_final_rerun(bucket, user_folder, date, session_base):
+    """A live pass just replaced a FINAL extraction because it had strictly more
+    of the session. That restores the missing content but drops the quality back
+    to fast-tier, so ask for another final pass over the fuller set.
+
+    Self-limiting: the request only goes out when coverage GREW past a published
+    final, and coverage stops growing when the transcripts stop arriving, so the
+    live/final ping-pong terminates on its own. Best-effort — never let telemetry
+    for a quality re-run fail an extraction that already succeeded — but never
+    silent either (CLAUDE.md BUG-40)."""
+    device_sid = session_base[3:] if session_base.startswith('sid') else None
+    if not device_sid:
+        return                            # legacy whole-file base: no final pass exists
+    try:
+        s3().put_object(
+            Bucket=bucket,
+            Key=f"{FINAL_REQUESTS_PREFIX}{device_sid}.json",
+            Body=json.dumps({"userFolder": user_folder, "date": date,
+                             "sessionBase": session_base}),
+            ContentType='application/json',
+        )
+        logger.info("%s: overtook an early final pass -- requested a re-run over the "
+                    "fuller transcript set", session_base)
+    except Exception:
+        logger.exception("%s: could not request a final re-run", session_base)
 
 
 # ============================================================
 # Lambda entry point — S3 event
 # ============================================================
 
+def parse_final_request(bucket, key):
+    """Read an `extraction_requests/{session}.json` artifact and return
+    (user_folder, date, session_base), or None when it's unreadable or missing
+    a field. The artifact is written by the in-VPC finalize sweep once a session
+    closes: an in-VPC Lambda cannot invoke another Lambda (no NAT / no VPC
+    endpoint -- CLAUDE.md BUG-36 black-holes the call until timeout), but it CAN
+    write to S3 through the gateway endpoint, so the request rides the same
+    artifact-on-S3 channel as reindex_requests/ and session_finalize_results/."""
+    try:
+        obj = s3().get_object(Bucket=bucket, Key=key)
+        req = json.loads(obj['Body'].read().decode('utf-8'))
+        vals = (req.get('userFolder'), req.get('date'), req.get('sessionBase'))
+        return vals if all(vals) else None
+    except Exception as e:
+        logger.warning(f"Unreadable final-extraction request {key}: {e}")
+        return None
+
+
 def lambda_handler(event, context):
     results = []
     for record in event.get('Records', []):
         key = unquote_plus(record['s3']['object']['key'])
+        if key.startswith(FINAL_REQUESTS_PREFIX):
+            parsed = parse_final_request(S3_BUCKET, key)
+            if parsed is None:
+                continue          # already logged; a raise would retry-storm a dead artifact
+            user_folder, date, session_base = parsed
+            results.append(extract_session(S3_BUCKET, user_folder, date, session_base,
+                                           final=True))
+            continue
         parsed = session_base_from_key(key)
         if parsed is None:
             logger.warning(f"Skipping S3 event record with unparseable key: {key}")

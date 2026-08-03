@@ -195,11 +195,27 @@ def write_extraction_items(date, user_folder, extraction_key):
         #      its explicit site pick lives on meeting_session via POST /sessions/
         #      {id}/open. Without this, every chunk-session recording identity-bridge
         #      missed and never reached the web timeline.
-        #   3. resolve_site -- legacy recorder-membership resolver.
-        # Both explicit tags are company-scoped; fall through only on no match.
+        #   3. recordings.site_for_day -- the day's app-tagged site (majority of
+        #      that user's recordings). Covers the gap #1 and #2 both leave for a
+        #      CHUNK session recorded OFFLINE: #1's LIKE pattern wants the file to
+        #      BE `{session_base}.ext`, but a chunk file is
+        #      `{user}_{ts}_sid{id}_c{NNNN}.wav`, so it never matches; and #2 needs
+        #      meeting_session.site_id, which is NULL whenever the device's
+        #      POST /sessions/{id}/open could not reach the server at record time
+        #      (the session then gets opened by chunk-stream inference, which
+        #      carries no site). The recordings rows still carry the correct
+        #      site_id all along -- CLAUDE.md BUG-41's rule is that the app's
+        #      recordings.site_id is the authority, so this ranks ABOVE membership.
+        #   4. resolve_site -- legacy recorder-membership resolver. Last, and it
+        #      deliberately returns None for admin/gm (ALL scope, no single home
+        #      site), which is why an offline gm recording used to fall all the way
+        #      through to "identity bridge miss ... zero writes" and never reach
+        #      the web timeline even though every upload had succeeded.
+        # All three explicit tags are company-scoped; fall through only on no match.
         session_base = _parse_extraction_key(extraction_key)[2]
         site = recordings.site_for_media(conn, company["id"], user_folder, date, session_base) \
             or _site_from_meeting_session(conn, company["id"], session_base) \
+            or recordings.site_for_day(conn, company["id"], user_folder, date) \
             or lambda_ingest.resolve_site(conn, company["id"], {}, user_folder)
         if site is None:
             reason = (f"identity bridge miss: user_folder={user_folder!r} -- "

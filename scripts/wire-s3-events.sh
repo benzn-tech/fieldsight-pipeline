@@ -126,11 +126,18 @@ else
 fi
 # NOTE(Phase 4b): extract-session triggers on transcripts/*.json, writing to
 # extractions/ -- distinct prefix from every other trigger in this script.
+# Two-tier extraction: transcripts/ drives the throttled LIVE pass during
+# recording; extraction_requests/ (written by the in-VPC finalize sweep once a
+# session closes) drives the unthrottled thinking-mode FINAL pass. The two
+# prefixes are disjoint from each other AND from extractions/ (this function's
+# own output), so no notification is ambiguous and nothing self-triggers (BUG-13).
 if fn_exists "${PREFIX}-extract-session"; then
   WIRE_FNS+=("${PREFIX}-extract-session")
   DESIRED=$(jq -c --arg arn "$EXTRACT_ARN" '. + [
     {"Id":"fs-extract-transcripts","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
-     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"transcripts/"},{"Name":"suffix","Value":".json"}]}}}
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"transcripts/"},{"Name":"suffix","Value":".json"}]}}},
+    {"Id":"fs-extract-final","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"extraction_requests/"},{"Name":"suffix","Value":".json"}]}}}
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-extract-session not deployed — skipping extract-session trigger"

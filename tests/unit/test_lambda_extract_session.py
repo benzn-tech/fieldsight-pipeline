@@ -30,6 +30,17 @@ BUCKET = "test-bucket"
 CONFIG_KEY = "config/user_mapping.json"
 
 
+class FakeNoSuchKey(Exception):
+    """Shaped like botocore's ClientError for a missing object. The double used to
+    raise a bare KeyError, which is NOT what S3 does — and since the code now has
+    to tell 'absent' apart from 'could not read' (they license opposite actions),
+    a double that signals absence the wrong way tests the wrong branch."""
+
+    def __init__(self):
+        super().__init__("NoSuchKey")
+        self.response = {"Error": {"Code": "NoSuchKey"}}
+
+
 class FakeS3:
     """Minimal S3 client double: object store keyed by S3 key, records puts."""
 
@@ -38,6 +49,8 @@ class FakeS3:
         self.put_calls = []
 
     def get_object(self, Bucket, Key):
+        if Key not in self.objects:
+            raise FakeNoSuchKey()
         body = self.objects[Key]
         raw = body.encode("utf-8") if isinstance(body, str) else body
         return {"Body": io.BytesIO(raw)}
@@ -106,7 +119,7 @@ OUT_KEY = f"extractions/Benl1/2026-07-06/{SESSION_BASE}.json"
 
 
 def _fake_call_llm_returning(payload):
-    def _fake(prompt, max_tokens=4096, force_json=False):
+    def _fake(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
         return json.dumps(payload), None
     return _fake
 
@@ -176,7 +189,7 @@ def test_prompt_contains_all_segment_turns(monkeypatch):
 
     captured = {}
 
-    def fake_call_llm(prompt, max_tokens=4096, force_json=False):
+    def fake_call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
         captured["prompt"] = prompt
         captured["max_tokens"] = max_tokens
         return json.dumps({"topics": [], "declared_site": None}), None
@@ -201,7 +214,7 @@ def test_extract_session_requests_force_json(monkeypatch):
 
     captured = {}
 
-    def _cap(prompt, max_tokens=4096, force_json=False):
+    def _cap(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
         captured["force_json"] = force_json
         return json.dumps({"topics": [], "declared_site": None}), None
 
@@ -272,7 +285,13 @@ def test_idempotent_overwrite_same_key(monkeypatch):
     # exercises the unquote_plus + session_base_from_key dispatch path.
     event = {"Records": [{"s3": {"object": {"key": SEG1_KEY}}}]}
     les.lambda_handler(event, None)
-    les.lambda_handler(event, None)
+
+    # A second pass only rewrites when the session actually GREW (a re-run over
+    # the identical segment set is pure item-writer churn -- see _supersedes),
+    # and min_interval_s=0 stands in for "the throttle window has passed".
+    fake_s3.objects[SEG2_KEY] = json.dumps(
+        make_transcribe_json("second segment", start=30.0))
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE, min_interval_s=0)
 
     assert len(fake_s3.put_calls) == 2
     assert all(c["Key"] == OUT_KEY for c in fake_s3.put_calls)
@@ -327,7 +346,11 @@ def test_declared_site_null_passthrough(monkeypatch):
         llm_utils, "call_llm",
         _fake_call_llm_returning({"topics": []}),
     )
-    extraction2 = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+    # final=True so this second pass is neither throttled nor stood down as
+    # redundant by the coverage check -- we want a genuinely fresh extraction
+    # built from the payload above, not the one the first call already wrote.
+    extraction2 = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                                      final=True)
     assert extraction2["declared_site"] is None
 
 
@@ -342,7 +365,7 @@ def test_claude_failure_raises(monkeypatch):
     # call_llm itself fails
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=4096, force_json=False: (None, "boom"),
+        lambda prompt, max_tokens=4096, force_json=False, enable_thinking=None: (None, "boom"),
     )
     with pytest.raises(RuntimeError):
         les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
@@ -351,7 +374,7 @@ def test_claude_failure_raises(monkeypatch):
     # call_llm succeeds but returns unparseable JSON
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=4096, force_json=False: ("not json at all {{{", None),
+        lambda prompt, max_tokens=4096, force_json=False, enable_thinking=None: ("not json at all {{{", None),
     )
     with pytest.raises(RuntimeError):
         les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
@@ -384,12 +407,13 @@ def test_corrupt_transcript_skipped(monkeypatch):
 # S3 write -> raise, zero writes (S3 event retry picks up every segment).
 # ---------------------------------------------------------------------------
 
-def test_session_grown_during_extraction_raises_no_write(monkeypatch):
+def test_session_grown_during_extraction_still_writes(monkeypatch):
+    """The old I-2 guard RAISED when the session grew mid-extraction, which was
+    a livelock: segments land ~30s apart, the call took ~170s, so the recheck
+    effectively always failed and threw away a completed extraction (94% of
+    prod invocations on 2026-08-03 produced nothing). Growth must now still
+    produce a write -- the next pass widens it."""
     class GrowingFakeS3(FakeS3):
-        """Simulates a new segment landing mid-extraction: the SECOND
-        list_objects_v2 listing (the I-2 recheck) sees one more key than
-        the first (the initial gather used to build the prompt)."""
-
         def get_paginator(self, op):
             self.list_calls = getattr(self, "list_calls", 0) + 1
             if self.list_calls == 2:
@@ -405,11 +429,249 @@ def test_session_grown_during_extraction_raises_no_write(monkeypatch):
         _fake_call_llm_returning({"topics": [], "declared_site": None}),
     )
 
-    with pytest.raises(RuntimeError, match="session grew"):
-        les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+    extraction = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
 
+    assert extraction is not None
+    assert [c["Key"] for c in fake_s3.put_calls] == [OUT_KEY]
+
+
+# ---------------------------------------------------------------------------
+# Two-tier extraction: live (throttled, thinking OFF) vs final (unthrottled,
+# thinking ON, authoritative). See lambda_extract_session's tier constants.
+# ---------------------------------------------------------------------------
+
+def _s3_with_one_segment():
+    return FakeS3({SEG1_KEY: json.dumps(make_transcribe_json("hello world"))})
+
+
+# A CHUNK session (device-minted `_sid{32hex}_c{NNNN}`), as opposed to the legacy
+# whole-file SESSION_BASE above. Only chunk sessions have a final pass to
+# re-request, because the finalize sweep keys its request on the device session id.
+_SID = "9f8c1e2a4b6d47f0a1b2c3d4e5f60718"
+CHUNK_BASE = f"sid{_SID}"
+CHUNK_SEG1 = f"transcripts/Benl1/2026-07-06/Benl1_2026-07-06_10-00-00_sid{_SID}_c0001.json"
+CHUNK_SEG2 = f"transcripts/Benl1/2026-07-06/Benl1_2026-07-06_10-00-30_sid{_SID}_c0002.json"
+CHUNK_OUT_KEY = f"extractions/Benl1/2026-07-06/{CHUNK_BASE}.json"
+
+
+def test_live_pass_is_throttled_within_the_interval(monkeypatch):
+    fake_s3 = _s3_with_one_segment()
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    calls = []
+
+    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+        calls.append(enable_thinking)
+        return json.dumps({"topics": [], "declared_site": None}), None
+
+    monkeypatch.setattr(llm_utils, "call_llm", _counting)
+
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+    second = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    # Throttled BEFORE the expensive work: no second LLM call, no second write.
+    assert second is None
+    assert len(calls) == 1
+    assert len(fake_s3.put_calls) == 1
+
+
+def test_final_pass_ignores_the_throttle_and_uses_thinking(monkeypatch):
+    fake_s3 = _s3_with_one_segment()
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    calls = []
+
+    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+        calls.append(enable_thinking)
+        return json.dumps({"topics": [], "declared_site": None}), None
+
+    monkeypatch.setattr(llm_utils, "call_llm", _counting)
+
+    live = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+    final = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE, final=True)
+
+    assert calls == [False, True]                    # live fast, final thinking
+    assert live["tier"] == les.TIER_LIVE
+    assert final["tier"] == les.TIER_FINAL
+    assert [c["Key"] for c in fake_s3.put_calls] == [OUT_KEY, OUT_KEY]
+
+
+def test_live_pass_never_downgrades_a_final_extraction(monkeypatch):
+    fake_s3 = _s3_with_one_segment()
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
+    )
+
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE, final=True)
+    puts_after_final = len(fake_s3.put_calls)
+
+    # Throttle bypassed, but this pass sees exactly what the final already
+    # covered — it has nothing to add, so the better-quality one survives.
+    result = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                                 min_interval_s=0)
+
+    assert len(fake_s3.put_calls) == puts_after_final     # no write
+    assert result["tier"] == les.TIER_FINAL              # the final one survives
+
+
+def test_live_pass_replaces_an_early_final_it_has_more_of_and_asks_for_a_rerun(monkeypatch):
+    """The final pass is scheduled off session CLOSE, but transcripts keep landing
+    after it: idle close fires 15 min after the last chunk, while a backed-up
+    Transcribe queue can trail by longer. A final that ran early publishes a
+    TRUNCATED session — and deferring to it on tier alone would lock the rest of
+    the recording out permanently, which is worse than the fast-tier content it
+    was protecting. So more coverage wins, and a re-run is requested to buy the
+    quality back."""
+    # A CHUNK session — only those have a final pass to re-request (the sweep keys
+    # its request on the device session id).
+    fake_s3 = FakeS3({CHUNK_SEG1: json.dumps(make_transcribe_json("hello world"))})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(les, "S3_BUCKET", BUCKET)
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
+    )
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", CHUNK_BASE, final=True)
+    assert json.loads(fake_s3.objects[CHUNK_OUT_KEY])["tier"] == les.TIER_FINAL
+
+    # The rest of the session finally transcribes.
+    fake_s3.objects[CHUNK_SEG2] = json.dumps(
+        make_transcribe_json("the part the early final never saw", start=30.0))
+    result = les.extract_session(BUCKET, "Benl1", "2026-07-06", CHUNK_BASE,
+                                 min_interval_s=0)
+
+    assert len(result["source_transcripts"]) == 2         # content is complete again
+    assert result["tier"] == les.TIER_LIVE
+    reruns = [c["Key"] for c in fake_s3.put_calls
+              if c["Key"].startswith(les.FINAL_REQUESTS_PREFIX)]
+    assert reruns == [f"{les.FINAL_REQUESTS_PREFIX}{_SID}.json"], \
+        "must ask for a final re-run, keyed on the device session id"
+
+
+def test_no_rerun_requested_when_the_live_pass_did_not_overtake_a_final(monkeypatch):
+    """The ping-pong has to terminate: only overtaking a published final asks for
+    a re-run, and coverage stops growing when the transcripts stop arriving."""
+    fake_s3 = _s3_with_one_segment()
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(les, "S3_BUCKET", BUCKET)
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
+    )
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)      # live, fresh
+    fake_s3.objects[SEG2_KEY] = json.dumps(
+        make_transcribe_json("more", start=30.0))
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE, min_interval_s=0)
+
+    assert [c["Key"] for c in fake_s3.put_calls
+            if c["Key"].startswith(les.FINAL_REQUESTS_PREFIX)] == []
+
+
+def test_live_pass_stands_down_when_it_covers_no_new_segments(monkeypatch):
+    """A slow pass finishing after a faster, wider one must not narrow what is
+    already published (the race the old raise-guard was really protecting)."""
+    fake_s3 = FakeS3({
+        SEG1_KEY: json.dumps(make_transcribe_json("hello world")),
+        SEG2_KEY: json.dumps(make_transcribe_json("second segment", start=30.0)),
+    })
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
+    )
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+    wide = json.loads(fake_s3.objects[OUT_KEY])
+    assert len(wide["source_transcripts"]) == 2
+
+    # Now a narrower pass (only SEG1 visible) tries to write over it.
+    del fake_s3.objects[SEG2_KEY]
+    result = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                                 min_interval_s=0)
+
+    assert len(fake_s3.put_calls) == 1                       # no second write
+    assert result["source_transcripts"] == wide["source_transcripts"]
+
+
+def test_unreadable_existing_extraction_does_not_license_an_overwrite(monkeypatch):
+    """'Could not read it' and 'it is not there' license opposite actions. The
+    first version returned None for both, so a denied or failed read looked like
+    an empty slot — which would silently disable the throttle AND let a live pass
+    clobber an authoritative final extraction. Standing down costs a delayed
+    refresh; overwriting on a guess cannot be taken back."""
+    class DeniedOnExtractions(FakeS3):
+        def get_object(self, Bucket, Key):
+            if Key.startswith("extractions/"):
+                raise RuntimeError("AccessDenied")     # NOT a NoSuchKey
+            return super().get_object(Bucket=Bucket, Key=Key)
+
+    fake_s3 = DeniedOnExtractions({SEG1_KEY: json.dumps(make_transcribe_json("hello"))})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    called = []
+    monkeypatch.setattr(llm_utils, "call_llm",
+                        lambda *a, **k: called.append(1) or (json.dumps(
+                            {"topics": [], "declared_site": None}), None))
+
+    result = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    assert result is None
+    assert fake_s3.put_calls == []      # nothing overwritten on a guess
+    assert called == []                 # and no LLM call wasted on a doomed pass
+
+
+def test_read_existing_extraction_separates_absent_from_unreadable(monkeypatch):
+    fake_s3 = FakeS3({})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    assert les.read_existing_extraction(BUCKET, OUT_KEY) is None          # absent
+
+    fake_s3.objects[OUT_KEY] = "{ not json"
+    assert les.read_existing_extraction(BUCKET, OUT_KEY) is les.UNKNOWN   # corrupt
+
+    fake_s3.objects[OUT_KEY] = json.dumps(["not", "a", "dict"])
+    assert les.read_existing_extraction(BUCKET, OUT_KEY) is les.UNKNOWN   # wrong shape
+
+    fake_s3.objects[OUT_KEY] = json.dumps({"tier": "live"})
+    assert les.read_existing_extraction(BUCKET, OUT_KEY) == {"tier": "live"}
+
+
+def test_final_request_artifact_routes_to_a_final_pass(monkeypatch):
+    fake_s3 = _s3_with_one_segment()
+    req_key = f"{les.FINAL_REQUESTS_PREFIX}sid-abc.json"
+    fake_s3.objects[req_key] = json.dumps({
+        "userFolder": "Benl1", "date": "2026-07-06", "sessionBase": SESSION_BASE,
+    })
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(les, "S3_BUCKET", BUCKET)
+    calls = []
+
+    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+        calls.append(enable_thinking)
+        return json.dumps({"topics": [], "declared_site": None}), None
+
+    monkeypatch.setattr(llm_utils, "call_llm", _counting)
+
+    les.lambda_handler({"Records": [{"s3": {"object": {"key": req_key}}}]}, None)
+
+    assert calls == [True]                                   # thinking mode
+    assert json.loads(fake_s3.objects[OUT_KEY])["tier"] == les.TIER_FINAL
+
+
+def test_unreadable_final_request_is_skipped_not_raised(monkeypatch):
+    """A dead artifact must not retry-storm: S3 events retry on exception, and
+    every retry would fail identically (same reasoning as M-5/M-6)."""
+    fake_s3 = _s3_with_one_segment()
+    req_key = f"{les.FINAL_REQUESTS_PREFIX}broken.json"
+    fake_s3.objects[req_key] = "{not json"
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(les, "S3_BUCKET", BUCKET)
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
+    )
+
+    result = les.lambda_handler({"Records": [{"s3": {"object": {"key": req_key}}}]}, None)
+
+    assert result == {"results": []}
     assert fake_s3.put_calls == []
-    assert fake_s3.list_calls == 2  # both the initial gather AND the recheck ran
 
 
 # ---------------------------------------------------------------------------
