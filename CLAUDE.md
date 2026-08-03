@@ -670,6 +670,53 @@ caller 也能解析(否则会是 403 而不是 404)。
 **通则**:在 Windows 上排查"路由不匹配",**先确认进程真正收到的字符串**,再去看路由代码——
 我在这上面把一整轮排查花在了错误的层。同类风险适用于任何以 `/` 开头的参数(S3 key 前缀、API 路径、cron 表达式)。
 
+### BUG-43: 账号级 Lambda 并发只有 10 + extract-session 活锁 → 移动端上传真丢数据(2026-08-04)
+**现象**:客户 2 小时离线录制,260 个分片只有 129 个进 S3,其中 69 个"文件在、`recordings.uploaded_at` 仍 NULL";
+用户点 App 的 "Retry failed" **毫无反应**;而且**已上传的那 129 个在网页上一条也看不到**。
+
+**根因一(容量):账号 Lambda `Concurrent executions` 配额 = 10** ——**账号级、单 region、全部 18 个函数共享**,
+不是每函数。且 Lambda **按墙钟时长占槽**(包括干等 LLM/HTTP 响应的时间),所以 `占用并发 = 到达率 × 单次时长`。
+`extract-session` 一个函数就常驻 ~5 格。**后果不对称**:同步路径(APIGW→org-api)被限流 = 立刻 5XX、**无重试、真丢数据**;
+异步路径(S3 事件→vad/transcribe)被限流 = Lambda 自动重试最长 6h,**能自愈**。移动端上传走的正是同步路径:
+org-api **1547 次 throttle → 88% 请求 5XX**。⚠️**被 throttle 的调用不产生任何日志**——Lambda 日志一片干净,
+排查必须看 CloudWatch `Throttles` 指标 + API Gateway `5XXError`,别在代码里找。提额(`L-B99A9384`)不一定自动批,
+可能转 support case。**提额后必须给 org-api 设 reserved concurrency**(配额是 10 时设不了,AWS 强制留 100 unreserved)。
+
+**根因二(活锁):`extract-session` 的 I-2 守卫在持续进料下永远不可能满足。** 它在 LLM 调用**跑完之后**重新列目录,
+集合变了就 `raise` 丢弃整份结果。但 chunk 分片 30s 一个、调用要 170s(thinking 模式)→ 回头必然变了 → 每次都丢。
+**录制期间成功率为 0**。实测 381 次调用 / 360 错误(**94.5%**) / 664 次 `Duration=180000ms` 硬超时
+(`llm_utils.HTTP_TIMEOUT=150s` < `Timeout=180s` → urllib3 超时 → 重试 → 被硬杀,连一次完整调用都跑不完)。
+**错误率随录制时长单调上升**(7/29 0% → 7/30 46% → 7/31 61% → 8/3 94.5%)——**从上线起就在恶化,短测试录音一直掩盖着它**。
+
+**根因三(归属):离线 chunk session 三条站点来源同时落空** → `identity bridge miss ... zero writes`。
+`site_for_media` 的 LIKE 要求文件名**就是** `{session_base}.ext`(chunk 文件是 `{user}_{ts}_sid{id}_c{NNNN}.wav`);
+`meeting_session.site_id` 为 NULL(设备的 `/sessions/{id}/open` 是 record-start 时 fire-and-forget,当时没网,
+后来 session 由 chunk 流**推断**打开、不带 site);`resolve_site` 对 admin/gm **按设计**返回 None。
+而 `recordings.site_id` 一直是对的。
+
+**Fix**:
+- 两层抽取(PR #217/#219),**写同一个 S3 key**(复用已有幂等覆盖 + item-writer `delete_topics_for_source`,零新增管道):
+  `live` = transcripts/ 触发 / thinking **off** / **90s 节流**(照搬 `lambda_rolling_summary` 读输出件时间戳那套);
+  `final` = `extraction_requests/` 触发(finalize-sweep 在会话关闭时写) / thinking **on** / 不节流 / 权威。
+  守卫改成**覆盖比较**(`_supersedes`):已存在的是 final、或已覆盖本次全部片段 → 停手。保住竞态安全,
+  但**不再丢弃已付费的 LLM 结果**。`Timeout` 180→600 + `LLM_HTTP_TIMEOUT=540`。
+- `item-writer` 加第 3 级 `recordings.site_for_day`(**排在 membership 之前**,BUG-41 的规则:App 的
+  `recordings.site_id` 是权威),PR #218/#219。
+- App(GrandTime PR #3):`ExistingWorkPolicy.REPLACE` 用于手动 Retry、429/5xx 归为 `Busy` 不烧 8 次永久失败预算、
+  PUT 结果无论如何都调一次幂等 `complete`、并发封顶 2、PUT 用无 `callTimeout` 的 client。
+
+**通则(比这次事故本身更重要)**:
+1. **「Lambda 能并行所以随便跑」是错的。** 加任何长耗时函数前,先算 `到达率 × 时长` 占配额多少。
+2. **任何「做完昂贵操作后再校验前提、不成立就整份丢弃」的模式,在持续进料的系统里就是活锁。**
+   要么在昂贵操作**之前**校验,要么让结果可被后续覆盖。
+3. **新读自己输出的地方要补 IAM**:extract-session 原本只有 `PutObject` on `extractions/*`,节流要读旧件却没
+   `GetObject` —— 而 `read_existing_extraction` 吞掉 AccessDenied 返回 None,**节流会静默失效**。
+   一律 `simulate-principal-policy` 实测(同 BUG-41 一带的教训)。
+4. **in-VPC 不能 `lambda:InvokeFunction`**(BUG-36)。跨 VPC 边界一律走 **S3 请求件**
+   (`extraction_requests/` / `session_finalize_requests/` / `reindex_requests/` 同一套模式)。
+5. **错误率要按"输入规模"分组看**,不要只看总体。这个 bug 的错误率是录制时长的函数,
+   总体指标被大量短录音稀释,所以两周没人发现。
+
 ### programme 写端点尚未认识 `platform_admin`(2026-08-03,**待决策,非 bug**)
 `_MANAGER_ROLES = ("admin","gm","pm")` —— programme 的所有写端点(`put_programme`、
 `import_programme`、`create/delete task`、批量写、版本回滚、baseline)都用它做门。
