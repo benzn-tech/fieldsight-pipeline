@@ -128,6 +128,48 @@ def test_qwen_thinking_sets_flag_and_skips_response_format(monkeypatch):
     assert "max_tokens" not in body
 
 
+def test_qwen_per_call_enable_thinking_overrides_the_env_default(monkeypatch):
+    """One Lambda can need both modes: lambda_extract_session runs a fast live
+    pass while recording and a thinking-mode final pass at session close. The
+    override must beat the env default in BOTH directions, and must also switch
+    the response_format/max_tokens branch that rides along with it."""
+    monkeypatch.setattr(lu, "LLM_PROVIDER", "qwen")
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "sk-w")
+
+    # env says thinking ON, this call forces it OFF
+    monkeypatch.setattr(lu, "QWEN_ENABLE_THINKING", True)
+    calls = _patch_request(monkeypatch, [
+        _FakeResponse(200, {"choices": [{"message": {"content": "{}"}}]}),
+    ])
+    lu.call_llm("p", max_tokens=999, force_json=True, enable_thinking=False)
+    body = json.loads(calls["bodies"][0])
+    assert body["enable_thinking"] is False
+    assert body["response_format"] == {"type": "json_object"}
+
+    # env says thinking OFF, this call forces it ON
+    monkeypatch.setattr(lu, "QWEN_ENABLE_THINKING", False)
+    calls = _patch_request(monkeypatch, [
+        _FakeResponse(200, {"choices": [{"message": {"content": "{}"}}]}),
+    ])
+    lu.call_llm("p", max_tokens=999, force_json=True, enable_thinking=True)
+    body = json.loads(calls["bodies"][0])
+    assert body["enable_thinking"] is True
+    assert "response_format" not in body
+
+
+def test_qwen_enable_thinking_none_keeps_the_env_default(monkeypatch):
+    """Backward compatibility: every pre-existing caller omits the argument and
+    must keep its exact previous behaviour."""
+    monkeypatch.setattr(lu, "LLM_PROVIDER", "qwen")
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "sk-w")
+    monkeypatch.setattr(lu, "QWEN_ENABLE_THINKING", True)
+    calls = _patch_request(monkeypatch, [
+        _FakeResponse(200, {"choices": [{"message": {"content": "{}"}}]}),
+    ])
+    lu.call_llm("p", max_tokens=999, force_json=True)      # no enable_thinking arg
+    assert json.loads(calls["bodies"][0])["enable_thinking"] is True
+
+
 def test_qwen_retries_on_503_then_succeeds(monkeypatch):
     monkeypatch.setattr(lu, "LLM_PROVIDER", "qwen")
     monkeypatch.setattr(lu, "QWEN_API_KEY", "sk-w")

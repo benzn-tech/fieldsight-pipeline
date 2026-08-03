@@ -1332,7 +1332,14 @@ Resources:
       FunctionName: !Sub ["${P}-extract-session", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_extract_session.lambda_handler
-      Timeout: 180
+      # 600s (was 180s): the FINAL pass runs the model in thinking mode, which
+      # measured ~170s in prod on 2026-08-03 and therefore lost the race against
+      # llm_utils.HTTP_TIMEOUT (150s) -> urllib3 timeout -> retry -> hard-killed
+      # at the old 180s ceiling. 664 invocations died exactly this way in one
+      # afternoon. LLM_HTTP_TIMEOUT below stays under the Lambda Timeout so a slow
+      # call surfaces as a catchable error instead of a runtime kill.
+      # The LIVE pass is unaffected: it runs thinking OFF and returns in seconds.
+      Timeout: 600
       MemorySize: 256
       Environment:
         Variables:
@@ -1344,6 +1351,11 @@ Resources:
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_HTTP_TIMEOUT: '540'
+          # INERT for this function — lambda_extract_session passes an explicit
+          # enable_thinking on every call (live=False, final=True), so this env
+          # default is never consulted. Kept only so a future call_llm() added
+          # here without the argument fails safe (thinking on = slow, not wrong).
           QWEN_ENABLE_THINKING: 'true'
       Policies:
         - Version: '2012-10-17'
@@ -1353,6 +1365,12 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
+                # The close-driven final-pass request written by FinalizeSweepFunction.
+                - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+                # Its own previous output — read to apply the re-extraction
+                # throttle and the tier/coverage supersede check BEFORE doing
+                # any expensive work.
+                - !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
@@ -1539,7 +1557,13 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
             - Effect: Allow
               Action: s3:PutObject
-              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
+                # Asks ExtractSessionFunction for the session's final pass once it
+                # closes (lambda_finalize_claim._request_extraction). A missing
+                # grant here is silent — org-api's `except ClientError: pass`
+                # class of trap — so it is granted with the request itself.
+                - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
       Events:
         GraceSweep:
           Type: Schedule
