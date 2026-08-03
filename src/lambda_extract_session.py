@@ -521,12 +521,19 @@ def _supersedes(new_sources, prev):
         return False
     if prev is None:
         return True
-    if prev.get('tier') == TIER_FINAL:
-        return False
     prev_sources = prev.get('source_transcripts')
     if not isinstance(prev_sources, list):
         return True                       # readable but no coverage recorded -> don't block
-    return not set(new_sources) <= set(prev_sources)
+    if set(new_sources) <= set(prev_sources):
+        return False                      # nothing new to say (equal, or prev is wider)
+    # Strictly wider than what is published. This beats tier: the final pass is
+    # scheduled off session CLOSE, but transcripts keep landing after it (idle
+    # close fires 15 min after the last chunk, while a backed-up Transcribe queue
+    # can trail by longer). A final that ran early therefore publishes a TRUNCATED
+    # session, and deferring to it on tier alone would lock the rest of the
+    # recording out permanently. Missing content is worse than fast-tier content,
+    # so more coverage wins and _request_final_rerun below buys the quality back.
+    return True
 
 
 def extract_session(bucket, user_folder, date, session_base, final=False,
@@ -606,9 +613,10 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
     # I-2 (replaces the old raise-on-growth guard -- see _supersedes): re-read
     # the extraction that exists NOW, not the one we read before the LLM call,
     # so a wider pass that landed while this one was in flight is respected.
-    # A live pass stands down rather than narrowing what's already published;
-    # the final pass always wins. Standing down is not a failure -- the work
-    # this pass did is simply redundant, so return the current extraction.
+    # A live pass stands down rather than narrowing what's already published.
+    # Standing down is not a failure -- the work this pass did is simply
+    # redundant, so return the current extraction.
+    overtook_final = False
     if not final:
         current = read_existing_extraction(bucket, out_key)
         if not _supersedes(source_filenames, current):
@@ -617,6 +625,7 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
                 f"existing tier={(current or {}).get('tier')}) -- keeping existing extraction"
             )
             return current
+        overtook_final = isinstance(current, dict) and current.get('tier') == TIER_FINAL
 
     extraction = {
         'schema_version': 1,
@@ -639,7 +648,36 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         Body=json.dumps(extraction, ensure_ascii=False, indent=2),
         ContentType='application/json',
     )
+    if overtook_final:
+        _request_final_rerun(bucket, user_folder, date, session_base)
     return extraction
+
+
+def _request_final_rerun(bucket, user_folder, date, session_base):
+    """A live pass just replaced a FINAL extraction because it had strictly more
+    of the session. That restores the missing content but drops the quality back
+    to fast-tier, so ask for another final pass over the fuller set.
+
+    Self-limiting: the request only goes out when coverage GREW past a published
+    final, and coverage stops growing when the transcripts stop arriving, so the
+    live/final ping-pong terminates on its own. Best-effort — never let telemetry
+    for a quality re-run fail an extraction that already succeeded — but never
+    silent either (CLAUDE.md BUG-40)."""
+    device_sid = session_base[3:] if session_base.startswith('sid') else None
+    if not device_sid:
+        return                            # legacy whole-file base: no final pass exists
+    try:
+        s3().put_object(
+            Bucket=bucket,
+            Key=f"{FINAL_REQUESTS_PREFIX}{device_sid}.json",
+            Body=json.dumps({"userFolder": user_folder, "date": date,
+                             "sessionBase": session_base}),
+            ContentType='application/json',
+        )
+        logger.info("%s: overtook an early final pass -- requested a re-run over the "
+                    "fuller transcript set", session_base)
+    except Exception:
+        logger.exception("%s: could not request a final re-run", session_base)
 
 
 # ============================================================
