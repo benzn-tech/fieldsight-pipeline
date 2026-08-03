@@ -238,7 +238,27 @@ BUG-41. Anyone can see a stale timestamp at a glance, and a Lambda failure also 
 The Notion integration token follows the ElevenLabs key's existing path: GitHub secret → CFN
 `NoEcho` parameter → Lambda environment variable. No new secret store.
 
+**The database exists** (created 2026-08-04), pre-populated with twenty `FS-01`..`FS-20` rows all
+at `在库`:
+
+- Database: `https://app.notion.com/p/ff5e2df870494176abe308ebeab21008`
+- Data source id for the API: `9f7f9c29-9e69-4aa0-99c8-7d5207975634`
+
+Property names are exactly as tabled above; `Status` is a select over
+`未激活 / 使用中 / 在库 / 失联 / 未认领`. Every property carries its rule as a Notion description,
+so the hand-edited/system-written split is visible in the UI rather than only in this document.
+
+Phase 3 still needs an integration token: create one in Notion, share the database with it, then
+add it as GitHub secret `NOTION_TOKEN` and pass it through `deploy.yml` as the `NotionToken`
+parameter. Until then `device-report` stays inert.
+
 ## Delivery phases
+
+**Phase 1 is SHIPPED to TEST** (2026-08-04, PR #220). Verified on the live stack: migration
+`0030` applied; a request carrying device headers records a heartbeat *even when it 403s* on an
+unprovisioned account; a repeat request inside the window writes nothing while a version change
+writes through immediately; `device-report` returns `{"status": "disabled"}` and its schedule rule
+is `DISABLED`. Not deployed to prod — nothing here is useful there until the app sends headers.
 
 **Phase 1 — backend only, no app release required.**
 `devices` table, heartbeat upsert, the two Lambdas, Notion sync of telemetry columns.
