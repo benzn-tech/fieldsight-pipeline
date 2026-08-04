@@ -14,6 +14,7 @@ Design: docs/superpowers/specs/2026-07-28-session-report-review-export-design.md
 import json
 import logging
 import os
+from io import BytesIO
 from urllib.parse import unquote_plus
 
 import boto3
@@ -26,6 +27,14 @@ logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+# Photo evidence budgets. Two caps, because either one alone leaves a hole: a
+# per-topic cap does not bound a forty-topic day, and a total budget alone lets
+# one photo-heavy topic eat everything before the later topics are reached.
+# The numbers keep the doc something a site manager actually opens on a phone,
+# and keep the render inside the Lambda's memory.
+MAX_PHOTOS_PER_TOPIC = 4
+MAX_PHOTO_BYTES_TOTAL = 12 * 1024 * 1024
 
 _s3_client = None
 
@@ -50,6 +59,34 @@ def _humanize(key):
     return str(key).replace("_", " ").title()
 
 
+def _fetch_photos(folder, date, filenames, budget):
+    """Download a topic's photos as open streams, newest failure tolerated.
+
+    The renderer does no I/O and must stay that way, so the bytes are fetched
+    here and handed over. `budget` is a one-element list carrying the REMAINING
+    total allowance, mutated as it is spent — the caller walks the topics in
+    order, so an early photo-heavy topic cannot silently starve a later one of
+    its cap, only of the shared budget.
+
+    A photo that cannot be read costs only itself. The prose is the
+    deliverable; the pictures support it, and losing the report because one
+    object was deleted would be the wrong trade."""
+    streams = []
+    for name in (filenames or [])[:MAX_PHOTOS_PER_TOPIC]:
+        if budget[0] <= 0:
+            logger.info("photo budget spent; skipping %s", name)
+            break
+        key = f"users/{folder}/pictures/{date}/{name}"
+        try:
+            body = s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+        except Exception:
+            logger.warning("could not read photo %s; leaving it out", key)
+            continue
+        streams.append(BytesIO(body))
+        budget[0] -= len(body)
+    return streams
+
+
 def _content_to_minutes(artifact):
     """Map the reviewed session content + the user's confirmed fields into the
     `minutes_data` shape `generate_word_document` consumes (T4).
@@ -63,8 +100,12 @@ def _content_to_minutes(artifact):
     content = artifact.get("content") or {}
     fields = artifact.get("fields") or {}
 
+    folder, date = artifact.get("folder"), content.get("date") or artifact.get("date")
+    budget = [MAX_PHOTO_BYTES_TOTAL]
+
     topics = []
     for t in (content.get("topics") or []):
+        photos = _fetch_photos(folder, date, t.get("related_photos"), budget)
         topics.append({
             "topic_title": t.get("topic_title"),
             "category": t.get("category") or "general",
@@ -78,6 +119,9 @@ def _content_to_minutes(artifact):
                               "priority": a.get("priority") or "medium"}
                              for a in (t.get("action_items") or [])],
             "open_questions": [],
+            # Absent, not empty, when there is nothing — so the renderer's
+            # `if topic.get('photo_streams')` needs no second check.
+            **({"photo_streams": photos} if photos else {}),
         })
 
     minutes = {
