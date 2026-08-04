@@ -1618,7 +1618,7 @@ Resources:
           Properties:
             Schedule: rate(1 hour)
             Description: Tombstones + de-indexes non-work topics past their buffer.
-            Enabled: !If [ShouldEnableNonWorkExpiry, true, false]
+            State: !If [ShouldEnableNonWorkExpiry, ENABLED, DISABLED]
 
   FinalizeSweepFunction:
     Type: AWS::Serverless::Function
