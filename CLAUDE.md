@@ -779,6 +779,24 @@ org-api **1547 次 throttle → 88% 请求 5XX**。⚠️**被 throttle 的调�
 5. **错误率要按"输入规模"分组看**,不要只看总体。这个 bug 的错误率是录制时长的函数,
    总体指标被大量短录音稀释,所以两周没人发现。
 
+### 数据桶的 CORS 规则不在任何模板里(2026-08-04,带外配置,**别当成多余去删**)
+`fieldsight-data-509194952652` 上有一条名为 **`amplify-read-for-canvas`** 的 CORS 规则:
+`GET`/`HEAD`,`AllowedOrigins` = `https://main.d2fssznicvuckr.amplifyapp.com` +
+`https://dev.d2fssznicvuckr.amplifyapp.com`,暴露 `ETag`/`Content-Length`/`Content-Type`。
+
+**为什么需要**:前端的邮件预览要把照片**嵌成 data URI**(presign URL 贴进邮件会过期,收件人只看到破图),
+做法是 `img.crossOrigin='anonymous'` + canvas `toDataURL()`。没有 CORS 响应头,canvas 会被"污染"
+(tainted),`toDataURL` 抛 `SecurityError` —— 而且**图片本身照样显示正常**,所以症状是"预览里看得见、
+复制出去就没有",很容易误判成复制逻辑的 bug。
+
+**为什么不在 IaC 里**:桶是 stack 外的既有资源(BUG-34,靠 `DataBucketName` 参数引用),CFN 不管它的
+CORS。所以这条规则**只存在于线上**,`git grep` 找不到任何痕迹。
+
+**含义**:①换 Amplify 域名(自定义域、新 app id)必须同步加进 `AllowedOrigins`,否则复制照片静默失效;
+②谁要"清理没在模板里的配置"时,这条不是遗留垃圾;③改动方式:
+`aws s3api put-bucket-cors --bucket ... --cors-configuration file://...`(**整体替换**,不是追加,
+先 `get-bucket-cors` 拿全量再改)。同类带外资源:BUG-36 里那个 DynamoDB VPC endpoint。
+
 ### programme 写端点尚未认识 `platform_admin`(2026-08-03,**待决策,非 bug**)
 `_MANAGER_ROLES = ("admin","gm","pm")` —— programme 的所有写端点(`put_programme`、
 `import_programme`、`create/delete task`、批量写、版本回滚、baseline)都用它做门。

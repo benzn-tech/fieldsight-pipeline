@@ -175,8 +175,18 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
         except (KeyError, IndexError):
             logger.error(f"Qwen unexpected response shape: {str(data)[:500]}")
             return None, "unexpected Qwen response shape"
-    msg = data.get("error", {}).get("message", f"HTTP {resp.status}")
-    logger.error(f"Qwen API error: {msg}")
+    err_obj = data.get("error") or {}
+    msg = err_obj.get("message", f"HTTP {resp.status}")
+    # The CODE, not just the message. These read almost identically in a log
+    # line -- "Requests rate limit exceeded" vs "Free allocated quota
+    # exceeded" -- but they are opposite problems: the first is a burst that
+    # recovers on its own and wants backoff, the second is an account that
+    # has stopped working and wants a human. A 2026-08-04 outage was
+    # diagnosed as quota exhaustion and was in fact a per-minute TPM limit
+    # that had already self-recovered, because only the message was logged.
+    code = err_obj.get("code")
+    logger.error("Qwen API error: status=%s code=%s message=%s",
+                 resp.status, code or "-", msg)
     return None, msg
 
 
