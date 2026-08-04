@@ -438,6 +438,62 @@ aws s3 cp s3://BUCKET/KEY s3://BUCKET/KEY --metadata-directive REPLACE --region 
 
 ## Testing
 
+### Run the SQL against a real database before trusting it
+
+The unit suite drives connection doubles (`FakeConn`, `FakeProgrammeStore`).
+They prove the handler's logic and **nothing about the SQL underneath it** —
+they do not enforce foreign keys, NULL ordering, or cast semantics. Every
+entry below is a real defect that the full suite passed straight through.
+
+- **`ON DELETE CASCADE` defeats a scoped `DELETE`.** `programme_tasks.parent_id`
+  cascades, so `DELETE ... WHERE origin='imported'` also removes the *local*
+  children hanging off those rows. A fix written to **preserve** local rows
+  would have deleted them; it needs a `SET parent_id = NULL` detach first.
+  **1598 unit tests passed both before and after that fix.**
+- **`ORDER BY (col = %s) DESC` needs `NULLS LAST`.** Postgres sorts NULLs
+  first under `DESC`, so a row whose comparison is NULL beats an exact match.
+  Verified by running the query with and without the clause.
+- **`= NULL` is never true**, which is the wanted behaviour for an
+  unattributed row — but pin it, because the alternative reading ("belongs to
+  everyone") would leak it to every user on the site.
+- **A `return error(...)` does not roll back.** Only raising does. Use the
+  `conn.transaction()` + custom-exception pattern (see the action-item PATCH
+  and `confirm_suggestion`) when a partial write must unwind.
+
+The test cluster is VPC-private, so `TEST_DATABASE_URL` is usually
+unavailable locally. Drive assertions through the **RDS Data API** instead,
+inside one transaction that is rolled back:
+
+```bash
+CL=arn:aws:rds:ap-southeast-2:509194952652:cluster:fieldsight-db-test-dbcluster-hywiixu8ihi9
+SEC=arn:aws:secretsmanager:ap-southeast-2:509194952652:secret:'rds!cluster-...'
+TX=$(aws rds-data begin-transaction --resource-arn "$CL" --secret-arn "$SEC" \
+      --database fieldsight_test --query transactionId --output text)
+# ... execute-statement with --transaction-id "$TX" ...
+aws rds-data rollback-transaction --resource-arn "$CL" --secret-arn "$SEC" \
+  --transaction-id "$TX"
+```
+
+Commit the same cases as `tests/integration/*.py` so CI covers them where
+`TEST_DATABASE_URL` does exist; they skip cleanly without it. Examples:
+`test_programme_task_doc_id.py`, `test_programme_suggestions_author_scope.py`,
+`test_programme_list_local.py`.
+
+**Set `MSYS_NO_PATHCONV=1`** for any AWS CLI call carrying a `/`-prefixed
+argument (`/aws/lambda/...`, `/api/org/...`) — Git Bash rewrites it into a
+Windows path and the call fails in a way that reads like a routing bug.
+
+### Two habits worth more than more tests
+
+- **An assumption written in a docstring and not enforced will be violated.**
+  `put_programme` said *"the client confirms before calling it"*; nothing
+  checked, and the ordinary Save button silently converted every local row to
+  imported. Enforce it in the repository or the handler, not in a comment.
+- **Re-check your own claims.** The most expensive defect of that session was
+  the phrase *"now redundant but harmless"* in a commit message about a
+  guard. It was not harmless — it refused every save, which made the fix
+  behind it unreachable.
+
 ```bash
 # Test meeting minutes
 aws lambda invoke --function-name fieldsight-meeting-minutes \
@@ -669,6 +725,59 @@ caller 也能解析(否则会是 403 而不是 404)。
 **Fix**:`export MSYS_NO_PATHCONV=1`(已写进 `scripts/invoke_org_api.py` 的 docstring)。
 **通则**:在 Windows 上排查"路由不匹配",**先确认进程真正收到的字符串**,再去看路由代码——
 我在这上面把一整轮排查花在了错误的层。同类风险适用于任何以 `/` 开头的参数(S3 key 前缀、API 路径、cron 表达式)。
+
+### BUG-43: 账号级 Lambda 并发只有 10 + extract-session 活锁 → 移动端上传真丢数据(2026-08-04)
+**现象**:客户 2 小时离线录制,260 个分片只有 129 个进 S3,其中 69 个"文件在、`recordings.uploaded_at` 仍 NULL";
+用户点 App 的 "Retry failed" **毫无反应**;而且**已上传的那 129 个在网页上一条也看不到**。
+
+**根因一(容量):账号 Lambda `Concurrent executions` 配额 = 10** ——**账号级、单 region、全部 18 个函数共享**,
+不是每函数。且 Lambda **按墙钟时长占槽**(包括干等 LLM/HTTP 响应的时间),所以 `占用并发 = 到达率 × 单次时长`。
+`extract-session` 一个函数就常驻 ~5 格。**后果不对称**:同步路径(APIGW→org-api)被限流 = 立刻 5XX、**无重试、真丢数据**;
+异步路径(S3 事件→vad/transcribe)被限流 = Lambda 自动重试最长 6h,**能自愈**。移动端上传走的正是同步路径:
+org-api **1547 次 throttle → 88% 请求 5XX**。⚠️**被 throttle 的调用不产生任何日志**——Lambda 日志一片干净,
+排查必须看 CloudWatch `Throttles` 指标 + API Gateway `5XXError`,别在代码里找。提额(`L-B99A9384`)不一定自动批,
+可能转 support case。**提额后必须给 org-api 设 reserved concurrency**(配额是 10 时设不了,AWS 强制留 100 unreserved)。
+
+**根因二(活锁):`extract-session` 的 I-2 守卫在持续进料下永远不可能满足。** 它在 LLM 调用**跑完之后**重新列目录,
+集合变了就 `raise` 丢弃整份结果。但 chunk 分片 30s 一个、调用要 170s(thinking 模式)→ 回头必然变了 → 每次都丢。
+**录制期间成功率为 0**。实测 381 次调用 / 360 错误(**94.5%**) / 664 次 `Duration=180000ms` 硬超时
+(`llm_utils.HTTP_TIMEOUT=150s` < `Timeout=180s` → urllib3 超时 → 重试 → 被硬杀,连一次完整调用都跑不完)。
+**错误率随录制时长单调上升**(7/29 0% → 7/30 46% → 7/31 61% → 8/3 94.5%)——**从上线起就在恶化,短测试录音一直掩盖着它**。
+
+**根因三(归属):离线 chunk session 三条站点来源同时落空** → `identity bridge miss ... zero writes`。
+`site_for_media` 的 LIKE 要求文件名**就是** `{session_base}.ext`(chunk 文件是 `{user}_{ts}_sid{id}_c{NNNN}.wav`);
+`meeting_session.site_id` 为 NULL(设备的 `/sessions/{id}/open` 是 record-start 时 fire-and-forget,当时没网,
+后来 session 由 chunk 流**推断**打开、不带 site);`resolve_site` 对 admin/gm **按设计**返回 None。
+而 `recordings.site_id` 一直是对的。
+
+**Fix**:
+- 两层抽取(PR #217/#219),**写同一个 S3 key**(复用已有幂等覆盖 + item-writer `delete_topics_for_source`,零新增管道):
+  `live` = transcripts/ 触发 / thinking **off** / **90s 节流**(照搬 `lambda_rolling_summary` 读输出件时间戳那套);
+  `final` = `extraction_requests/` 触发(finalize-sweep 在会话关闭时写) / thinking **on** / 不节流 / 权威。
+  守卫改成**覆盖比较**(`_supersedes`):已存在的是 final、或已覆盖本次全部片段 → 停手。保住竞态安全,
+  但**不再丢弃已付费的 LLM 结果**。`Timeout` 180→600 + `LLM_HTTP_TIMEOUT=540`。
+- `item-writer` 加第 3 级 `recordings.site_for_day`(**排在 membership 之前**,BUG-41 的规则:App 的
+  `recordings.site_id` 是权威),PR #218/#219。
+- App(GrandTime PR #3):`ExistingWorkPolicy.REPLACE` 用于手动 Retry、429/5xx 归为 `Busy` 不烧 8 次永久失败预算、
+  PUT 结果无论如何都调一次幂等 `complete`、并发封顶 2、PUT 用无 `callTimeout` 的 client。
+
+**通则(比这次事故本身更重要)**:
+1. **「Lambda 能并行所以随便跑」是错的。** 加任何长耗时函数前,先算 `到达率 × 时长` 占配额多少。
+2. **任何「做完昂贵操作后再校验前提、不成立就整份丢弃」的模式,在持续进料的系统里就是活锁。**
+   要么在昂贵操作**之前**校验,要么让结果可被后续覆盖。
+3. **新读自己输出的地方要补 IAM**:extract-session 原本只有 `PutObject` on `extractions/*`,节流要读旧件却没
+   `GetObject` —— 而 `read_existing_extraction` 吞掉 AccessDenied 返回 None,**节流会静默失效**。
+   一律 `simulate-principal-policy` 实测(同 BUG-41 一带的教训)。
+4. **in-VPC 的函数不能主动 `lambda:InvokeFunction`**(BUG-36)——无 NAT 时任何外呼黑洞。
+   需要**由 in-VPC 侧发起**的跨边界调用一律走 **S3 请求件**
+   (`extraction_requests/` / `session_finalize_requests/` / `reindex_requests/` 同一套模式)。
+   **⚠️ 反方向(VPC 外 → 调 VPC 内)是允许的,别误当成禁止。** 调用方在 VPC 外有正常网络,
+   被调的那个只是靶子、自己不发起外呼。现有先例:`AskAgentFunction`(无 `VpcConfig`)invoke
+   `RagSearchFunction`(VPC 内),`lambda_ask_agent.py:625`/`:703`;`device-report` invoke
+   `device-ledger` 同理(2026-08-04 实测 5 秒返回,非超时)。**把这个方向也禁掉的代价**:
+   会逼人去建一个本该直接 invoke 的 S3 跳,而 BUG-33 意味着每个新 S3 触发器都是模板外的手工接线。
+5. **错误率要按"输入规模"分组看**,不要只看总体。这个 bug 的错误率是录制时长的函数,
+   总体指标被大量短录音稀释,所以两周没人发现。
 
 ### programme 写端点尚未认识 `platform_admin`(2026-08-03,**待决策,非 bug**)
 `_MANAGER_ROLES = ("admin","gm","pm")` —— programme 的所有写端点(`put_programme`、

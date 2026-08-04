@@ -538,3 +538,45 @@ def set_work_class(conn, topic_id, work_class):
     return conn.cursor(row_factory=dict_row).execute(
         f"UPDATE topics SET work_class=%s WHERE id=%s RETURNING {_TOPIC_COLS}",
         (work_class, topic_id)).fetchone()
+
+
+def list_expired_non_work(conn, *, older_than, created_since, limit=500) -> list[dict]:
+    """Topics the auto non-work retention sweep should tombstone: classified
+    `non_work`, older than the buffer, and not already redacted.
+
+    Returns the minimum each one needs to be tombstoned and de-indexed —
+    id, company_id, report_date, folder_name — not the content. The sweep
+    never reads the personal text it is removing.
+
+    `older_than` is the buffer cutoff (created_at strictly before it).
+
+    `created_since` is the floor, and it is REQUIRED rather than optional on
+    purpose. The policy is "new topics only" (2026-08-04): every historical
+    non_work topic predating the decision must stay untouched, and an
+    unbounded sweep would tombstone all of them on its very first run. Making
+    the caller pass a floor means forgetting it is a type error, not a silent
+    mass redaction.
+
+    Topics whose user has no folder_name are skipped: reindex.enqueue_topic_
+    reindex needs (folder, date) to locate the lake artifact, so an
+    unattributed topic could be tombstoned but never de-indexed — the one
+    outcome worse than leaving it alone, since the vector would outlive the
+    tombstone in RAG.
+
+    The NOT EXISTS covers both a human's earlier "confirm personal" and a
+    previous sweep pass, so the sweep is idempotent and never stacks
+    tombstones on one topic. A topic the recorder rescued to 'work' inside
+    the buffer stops matching on work_class and is never seen here again."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT t.id, t.company_id, t.report_date, u.folder_name "
+        "FROM topics t JOIN users u ON u.id = t.user_id "
+        "WHERE t.work_class = 'non_work' "
+        "AND t.created_at < %s AND t.created_at >= %s "
+        "AND u.folder_name IS NOT NULL "
+        "AND NOT EXISTS (SELECT 1 FROM redactions r "
+        "                WHERE r.target_type = 'topic' AND r.target_id = t.id "
+        "                AND r.reverted_at IS NULL) "
+        "ORDER BY t.created_at "
+        "LIMIT %s",
+        (older_than, created_since, limit),
+    ).fetchall()

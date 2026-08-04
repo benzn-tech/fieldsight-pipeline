@@ -76,6 +76,29 @@ Parameters:
       schedule). Default false so the feature deploys INERT (the sweep is created but
       DISABLED); flip per environment to activate. Separate from EnableSchedules so
       it doesn't also switch on the nightly report crons.
+  EnableNonWorkExpiry:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Gate for the non-work (personal) topic auto-retention sweep. Default false so
+      the feature deploys INERT. Tombstoning personal topics is a policy decision per
+      environment, and the sweep additionally refuses to run unless NonWorkExpirySince
+      is set — see that parameter.
+  NonWorkExpiryHours:
+    Type: String
+    Default: '24'
+    Description: >-
+      Buffer between a topic being classified non_work and the sweep tombstoning it.
+      The recorder can rescue a misclassification (mark it work) any time inside it.
+  NonWorkExpirySince:
+    Type: String
+    Default: ''
+    Description: >-
+      Start floor (YYYY-MM-DD or ISO timestamp): only topics CREATED at or after this
+      are ever tombstoned. Deliberately empty by default — the policy applies to new
+      topics only, and an unbounded sweep would tombstone every historical personal
+      topic on its first run. The sweep no-ops while this is empty, even if enabled.
   EnableKeyframes:
     Type: String
     Default: 'false'
@@ -227,6 +250,15 @@ Parameters:
   ElevenLabsApiKey:
     Type: String
     Description: ElevenLabs xi-api-key for scribe_v2 STT
+    NoEcho: true
+    Default: ''
+
+  NotionToken:
+    Type: String
+    Description: >
+      Notion integration token for the device ledger sync. Empty disables the
+      sync entirely — lambda_device_report returns without calling the ledger.
+      That is the Phase 1 state on both stages.
     NoEcho: true
     Default: ''
 
@@ -451,6 +483,7 @@ Mappings:
 Conditions:
   ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
   ShouldEnableFinalize: !Equals [!Ref EnableFinalize, 'true']
+  ShouldEnableNonWorkExpiry: !Equals [!Ref EnableNonWorkExpiry, 'true']
   ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
   ShouldManageBucketPolicy: !And [!Condition ShouldEnableTranscribe, !Equals [!Ref ManageDataBucketPolicy, 'true']]
   ShouldCreateAlerts: !Not [!Equals [!Ref AlertEmail, '']]
@@ -1534,6 +1567,59 @@ Resources:
   # session_finalize_requests/; the send worker (non-VPC: SES) builds + sends the
   # confirmation email. Same in-VPC-enqueue -> non-VPC-worker shape as session-report.
   # ----------------------------------------------------------
+  # Life-conversation separation phase 2: personal topics leave the product
+  # after a buffer. Tombstone + de-index only — transcript and audio are never
+  # touched (see the lambda's docstring for why a "precise" audio cut is not
+  # available). Hourly, not per-minute: the buffer is measured in hours, so a
+  # tighter schedule would only add idle Aurora connections.
+  NonWorkExpiryFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-nonwork-expiry", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_nonwork_expiry.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          # The LAKE bucket: reindex artifacts are read by the embed/ingest
+          # chain, which lives on the lake, not on org-api's DataBucket.
+          S3_BUCKET: !Ref IngestBucketName
+          NONWORK_EXPIRY_ENABLED: !Ref EnableNonWorkExpiry
+          NONWORK_EXPIRY_HOURS: !Ref NonWorkExpiryHours
+          NONWORK_EXPIRY_SINCE: !Ref NonWorkExpirySince
+      Policies:
+        - VPCAccessPolicy: {}
+        - Version: '2012-10-17'
+          Statement:
+            # Same prefix + reason as the manual redaction path's reindex enqueue
+            # (org-api Task 20). A missing grant here would be silent — the
+            # tombstone would land while the vector stayed in RAG.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/reindex_requests/*
+      Events:
+        ExpirySweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Description: Tombstones + de-indexes non-work topics past their buffer.
+            State: !If [ShouldEnableNonWorkExpiry, ENABLED, DISABLED]
+
   FinalizeSweepFunction:
     Type: AWS::Serverless::Function
     Condition: HasDb
@@ -3073,6 +3159,72 @@ Resources:
       ComparisonOperator: GreaterThanOrEqualToThreshold
       AlarmActions:
         - !Ref AlertTopic
+
+  # ============================================================
+  # Device management (spec docs/superpowers/specs/2026-08-03-device-management-design.md)
+  #
+  # Two functions on purpose. There is no NAT gateway, so an in-VPC function
+  # reaches Aurora and nothing else, while an outbound function reaches Notion
+  # and Teams but not Aurora (BUG-36). Same split as AskAgent -> RagSearch.
+  #
+  # Appended at the end of Resources deliberately: several branches edit this
+  # file concurrently and an append conflicts at worst on one adjacent line.
+  # ============================================================
+  DeviceLedgerFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-device-ledger", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_device_ledger.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+      Policies:
+        - VPCAccessPolicy: {}
+
+  DeviceReportFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-device-report", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_device_report.lambda_handler
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          # Empty token = the function returns immediately without calling the
+          # ledger. This is the Phase 1 state on both stages.
+          NOTION_TOKEN: !Ref NotionToken
+          LEDGER_FUNCTION: !Ref DeviceLedgerFunction
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt DeviceLedgerFunction.Arn
+      Events:
+        DailyDeviceReport:
+          Type: Schedule
+          Properties:
+            # 16:00 UTC = 04:00 NZST — done before anyone looks in the morning.
+            Schedule: cron(0 16 * * ? *)
+            Description: Device ledger sync to Notion.
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
 
 # ============================================================
 # Outputs

@@ -123,6 +123,7 @@ from botocore.exceptions import ClientError
 from psycopg.errors import UniqueViolation
 
 import content_hash
+import device_heartbeat
 import reindex
 import session_scope
 from db.connection import get_connection
@@ -298,6 +299,11 @@ def lambda_handler(event, context):
 def dispatch(conn, event, method, route):
     claims = (event.get("requestContext", {}) or {}).get("authorizer", {}).get("claims", {})
     sub = claims.get("sub", "")
+    # Device ledger heartbeat. Before the caller guard on purpose: a device
+    # whose account is not provisioned yet must still register as alive, or it
+    # is indistinguishable from one nobody switched on. record() swallows its
+    # own failures — telemetry never fails a request.
+    device_heartbeat.record(conn, device_heartbeat.parse_headers(event.get("headers")), sub)
     caller = users.get_user_by_sub(conn, sub) if sub else None
     if caller is None:
         return error("caller not provisioned in org database (run seed?)", 403)
