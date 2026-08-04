@@ -616,6 +616,28 @@ def generate_word_document(minutes_data, title):
                     if priority == 'HIGH' and p.runs:
                         p.runs[0].font.color.rgb = RGBColor(192, 57, 43)
 
+            # Photo evidence — inside this topic's block, right after the work
+            # it evidences. A photo strip at the end of the document would make
+            # the reader guess which claim each picture backs, which is most of
+            # what the picture was for.
+            #
+            # This function does NO I/O by design (it runs in two Lambdas with
+            # different S3 access), so the caller hands over already-open
+            # streams. One picture that python-docx refuses (a truncated JPEG,
+            # a format it does not know) must not lose the whole document.
+            photos = topic.get('photo_streams') or []
+            if photos:
+                strip = doc.add_paragraph()
+                for stream in photos:
+                    try:
+                        strip.add_run().add_picture(stream, width=Inches(2.4))
+                    except Exception:
+                        # exc_info, not a bare message (BUG-40): the first
+                        # writing of this handler hid a corrupt test fixture
+                        # behind "could not place" and cost a debugging round.
+                        logger.warning("skipping a photo python-docx could not place",
+                                       exc_info=True)
+
             # Open Questions
             questions = topic.get('open_questions', [])
             if questions:

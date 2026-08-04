@@ -198,3 +198,113 @@ def test_minutes_skips_empty_user_fields():
     joined = " ".join(minutes.get("executive_summary", []))
     assert "Sign Off: Sam" in joined
     assert "Weather" not in joined and "Notes" not in joined   # empty/None dropped
+
+
+# ---------------------------------------------------------------------------
+# Photo evidence in the doc
+#
+# A finding without its photograph is an assertion; with it, it is evidence.
+# The reviewed content has always carried related_photos (render_report_shape
+# emits them) and the doc dropped every one of them on the floor.
+#
+# The worker is where the bytes come from — generate_word_document does no I/O
+# and must stay that way, so the worker fetches and hands over open streams.
+# ---------------------------------------------------------------------------
+
+def _photo_artifact(photos, **over):
+    content = {"date": "2026-07-25", "title": "Morning site inspection",
+               "participants": ["Ben"], "topic_row_ids": [],
+               "topics": [{"topic_title": "Scaffold", "summary": "s",
+                           "action_items": [], "related_photos": photos}]}
+    return _artifact(content=content, **over)
+
+
+@pytest.fixture
+def photo_s3(monkeypatch):
+    """Like fake_s3, but also serves photo objects and records what was read."""
+    store, puts, reads = {}, {}, []
+
+    class _S3:
+        def get_object(self, Bucket, Key):
+            reads.append(Key)
+            if Key not in store:
+                raise KeyError(Key)                      # stands in for NoSuchKey
+            v = store[Key]
+            return {"Body": BytesIO(v if isinstance(v, bytes) else v.encode())}
+
+        def put_object(self, Bucket, Key, Body, ContentType=None):
+            puts[Key] = {"Body": Body, "ContentType": ContentType}
+            return {}
+
+    monkeypatch.setattr(worker, "S3_BUCKET", S3_BUCKET)
+    monkeypatch.setattr(worker, "s3", lambda: _S3())
+    return store, puts, reads
+
+
+@pytest.fixture
+def capture_minutes(monkeypatch):
+    """Keeps the minutes_data the worker handed to the renderer."""
+    seen = {}
+
+    def _gen(minutes, title):
+        seen["minutes"], seen["title"] = minutes, title
+        return BytesIO(b"PK\x03\x04")
+
+    monkeypatch.setattr(worker, "generate_word_document", _gen)
+    return seen
+
+
+def test_photos_are_fetched_from_the_recorder_folder_and_handed_to_the_renderer(
+        photo_s3, capture_minutes, fake_email):
+    store, puts, reads = photo_s3
+    store["users/Ada_L/pictures/2026-07-25/a.jpg"] = b"\xff\xd8jpeg-a"
+    store["users/Ada_L/pictures/2026-07-25/b.jpg"] = b"\xff\xd8jpeg-b"
+    _run(_photo_artifact(["a.jpg", "b.jpg"]), photo_s3[:2])
+
+    assert "users/Ada_L/pictures/2026-07-25/a.jpg" in reads
+    streams = capture_minutes["minutes"]["topics"][0]["photo_streams"]
+    assert [s.getvalue() for s in streams] == [b"\xff\xd8jpeg-a", b"\xff\xd8jpeg-b"]
+
+
+def test_one_unreadable_photo_costs_only_itself(photo_s3, capture_minutes, fake_email):
+    """A deleted object must not lose the other photo, and must not lose the
+    REPORT — the prose is the deliverable, the pictures support it."""
+    store, puts, reads = photo_s3
+    store["users/Ada_L/pictures/2026-07-25/b.jpg"] = b"\xff\xd8jpeg-b"
+    puts = _run(_photo_artifact(["gone.jpg", "b.jpg"]), photo_s3[:2])
+
+    streams = capture_minutes["minutes"]["topics"][0]["photo_streams"]
+    assert [s.getvalue() for s in streams] == [b"\xff\xd8jpeg-b"]
+    assert json.loads(puts[_photo_artifact([])["resultKey"]]["Body"])["status"] == "done"
+
+
+def test_a_topic_with_no_photos_carries_no_stream_key(photo_s3, capture_minutes, fake_email):
+    _run(_photo_artifact([]), photo_s3[:2])
+    assert not capture_minutes["minutes"]["topics"][0].get("photo_streams")
+
+
+def test_photos_per_topic_are_capped(photo_s3, capture_minutes, fake_email):
+    """A day can bind dozens of photos to one topic. The doc has to stay a
+    document someone opens, and the Lambda has to stay inside its memory."""
+    store, puts, reads = photo_s3
+    names = []
+    for i in range(worker.MAX_PHOTOS_PER_TOPIC + 3):
+        n = f"p{i}.jpg"
+        names.append(n)
+        store[f"users/Ada_L/pictures/2026-07-25/{n}"] = b"\xff\xd8" + str(i).encode()
+    _run(_photo_artifact(names), photo_s3[:2])
+
+    streams = capture_minutes["minutes"]["topics"][0]["photo_streams"]
+    assert len(streams) == worker.MAX_PHOTOS_PER_TOPIC
+
+
+def test_the_total_byte_budget_stops_the_fetch(photo_s3, capture_minutes, fake_email):
+    """Per-topic caps alone do not bound a 40-topic day."""
+    store, puts, reads = photo_s3
+    big = b"\xff\xd8" + b"x" * worker.MAX_PHOTO_BYTES_TOTAL
+    store["users/Ada_L/pictures/2026-07-25/big.jpg"] = big
+    store["users/Ada_L/pictures/2026-07-25/next.jpg"] = b"\xff\xd8small"
+    _run(_photo_artifact(["big.jpg", "next.jpg"]), photo_s3[:2])
+
+    streams = capture_minutes["minutes"]["topics"][0]["photo_streams"]
+    assert [s.getvalue() for s in streams] == [big]     # budget spent, next one skipped

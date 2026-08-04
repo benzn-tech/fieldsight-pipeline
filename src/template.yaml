@@ -947,7 +947,13 @@ Resources:
           Statement:
             - Effect: Allow
               Action: s3:GetObject
-              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+                # The topics' photo evidence, embedded into the .docx. Without
+                # this the fetch fails AccessDenied and is caught per-photo, so
+                # the report still generates — with every picture silently
+                # missing and nothing in the result to say why (BUG-43 §3).
+                - !Sub arn:aws:s3:::${IngestBucketName}/users/*/pictures/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
