@@ -3106,16 +3106,39 @@ def test_explicit_user_not_in_company_404(presign_wired):
 def test_dates_admin_scopes_to_allowed_ids(wired):
     seen = {}
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-1", "s-2"})
-    wired.setattr(org.topics, "list_report_dates",
+    wired.setattr(org.topics, "report_date_counts",
                   lambda conn, site_ids, since, author_ids=None: (
                       seen.update(site_ids=set(site_ids), since=since, author_ids=author_ids)
-                      or [_dt.date(2026, 7, 16)]))
+                      or [{"report_date": _dt.date(2026, 7, 16), "topics": 3, "safety": 1}]))
     res = org.lambda_handler(make_event("GET", "/api/org/dates", params={"months": "2"}), None)
     assert res["statusCode"] == 200
     assert seen["site_ids"] == {"s-1", "s-2"}          # no ?site -> full accessible set
     assert isinstance(seen["since"], _dt.date)          # NZ window is a date (BUG-37, not a bare str)
     assert seen["author_ids"] is None                   # graded-off byte parity: no author filter
-    assert body_of(res)["dates"] == {"2026-07-16": {"hasReport": True}}
+    # hasReport unchanged for any client that only reads it; topics/safety are
+    # what the calendar's density and safety dots are drawn from.
+    assert body_of(res)["dates"] == {
+        "2026-07-16": {"hasReport": True, "topics": 3, "safety": 1}}
+
+
+def test_dates_carry_the_counts_the_calendar_dots_need(wired):
+    """The picker draws a density dot from `topics` and an orange dot from
+    `safety`. This endpoint replied with `hasReport` alone, so both dots were
+    undrawable — they simply disappeared from the calendar when prod's timeline
+    source became Aurora. Nobody broke them; a narrower endpoint replaced a
+    wider one, and no test asserted the difference."""
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-1"})
+    wired.setattr(org.topics, "report_date_counts",
+                  lambda conn, site_ids, since, author_ids=None: [
+                      {"report_date": _dt.date(2026, 7, 23), "topics": 14, "safety": 1},
+                      {"report_date": _dt.date(2026, 7, 30), "topics": 6, "safety": 0},
+                  ])
+    res = org.lambda_handler(make_event("GET", "/api/org/dates"), None)
+    dates = body_of(res)["dates"]
+    assert dates["2026-07-23"]["topics"] == 14
+    assert dates["2026-07-23"]["safety"] == 1     # orange dot
+    assert dates["2026-07-30"]["safety"] == 0     # density dot only
+    assert all(d["hasReport"] is True for d in dates.values())
 
 
 def test_dates_graded_off_passes_no_author_filter(wired):
@@ -3123,7 +3146,7 @@ def test_dates_graded_off_passes_no_author_filter(wired):
     # narrow by author regardless of caller role.
     seen = {}
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-1"})
-    wired.setattr(org.topics, "list_report_dates",
+    wired.setattr(org.topics, "report_date_counts",
                   lambda conn, site_ids, since, author_ids=None: (
                       seen.update(author_ids=author_ids) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/dates"), None)
@@ -3137,7 +3160,7 @@ def test_dates_worker_scope_via_allowed_ids(wired):
                   lambda conn, sub: {**CALLER, "global_role": "worker"})
     seen = {}
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-3"})
-    wired.setattr(org.topics, "list_report_dates",
+    wired.setattr(org.topics, "report_date_counts",
                   lambda conn, site_ids, since, author_ids=None: (
                       seen.update(site_ids=set(site_ids)) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/dates"), None)
@@ -3150,7 +3173,7 @@ def test_dates_rejects_site_outside_accessible_set_403(wired):
     # not fall through to a lake-wide scan (legacy get_dates bug).
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
     called = []
-    wired.setattr(org.topics, "list_report_dates",
+    wired.setattr(org.topics, "report_date_counts",
                   lambda *a, **k: called.append(1) or [])
     res = org.lambda_handler(make_event("GET", "/api/org/dates",
                                         params={"site": OTHER_SITE_ID}), None)
@@ -3161,7 +3184,7 @@ def test_dates_rejects_site_outside_accessible_set_403(wired):
 def test_dates_with_accessible_site_scopes_to_it(wired):
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID, OTHER_SITE_ID})
     seen = {}
-    wired.setattr(org.topics, "list_report_dates",
+    wired.setattr(org.topics, "report_date_counts",
                   lambda conn, site_ids, since, author_ids=None: (
                       seen.update(site_ids=list(site_ids)) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/dates", params={"site": SITE_ID}), None)
@@ -3337,7 +3360,7 @@ def test_dates_worker_author_filtered(wired):
                                         "self_user_id": "u-self", "company_id": "c-uuid-1",
                                         "cross_company": False})
     seen = {}
-    wired.setattr(org.topics, "list_report_dates",
+    wired.setattr(org.topics, "report_date_counts",
                   lambda conn, site_ids, since, author_ids=None: (
                       seen.update(author_ids=author_ids) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/dates"), None)
@@ -3354,7 +3377,7 @@ def test_dates_admin_no_author_filter(wired):
                                         "self_user_id": "u-self", "company_id": "c-uuid-1",
                                         "cross_company": False})
     seen = {}
-    wired.setattr(org.topics, "list_report_dates",
+    wired.setattr(org.topics, "report_date_counts",
                   lambda conn, site_ids, since, author_ids=None: (
                       seen.update(author_ids=author_ids) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/dates"), None)

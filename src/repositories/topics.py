@@ -358,6 +358,50 @@ def list_report_dates(conn, site_ids, since_date, *, author_ids=None) -> list:
     return [r["report_date"] for r in rows]
 
 
+def report_date_counts(conn, site_ids, since_date, *, author_ids=None) -> list[dict]:
+    """Per-date {report_date, topics, safety} for the calendar's density and
+    safety dots. Same ACL scoping and windowing as list_report_dates above —
+    this is that query plus the two counts the date picker needs.
+
+    Why it exists: the picker has always rendered a topic-density dot and an
+    orange safety dot, and org-api's /dates replied with `hasReport` alone. The
+    dots therefore could not be drawn at all once prod moved its timeline
+    source to Aurora — not a regression anyone introduced, just a narrower
+    endpoint replacing a wider one.
+
+    `safety` is the UNION of three signals, deliberately:
+      * topics.category = 'safety'
+      * a linked safety_observations row  (legacy table; rollup.py still reads it)
+      * a linked findings row with domain='safety'  (the newer path)
+    They disagree by a lot on real data — 7 / 16 / 1 rows respectively at the
+    time of writing — because safety is mid-migration and double-written
+    (CLAUDE.md's D8 note). Counting from any single one silently under-reports,
+    which for a safety indicator is the one direction that must not happen.
+    A topic matching more than one signal is still counted once."""
+    if not site_ids:
+        return []
+    where = "WHERE t.site_id = ANY(%s::uuid[]) AND t.report_date >= %s"
+    params = [list(site_ids), since_date]
+    if author_ids is not None:
+        where += " AND t.user_id = ANY(%s::uuid[])"
+        params.append(list(author_ids))
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT t.report_date, "
+        f"       COUNT(*) AS topics, "
+        f"       COUNT(*) FILTER (WHERE t.category = 'safety' "
+        f"                          OR EXISTS (SELECT 1 FROM safety_observations so "
+        f"                                      WHERE so.topic_id = t.id) "
+        f"                          OR EXISTS (SELECT 1 FROM findings f "
+        f"                                      WHERE f.topic_id = t.id "
+        f"                                        AND f.domain = 'safety')) AS safety "
+        f"FROM topics t "
+        f"{where} "
+        f"GROUP BY t.report_date "
+        f"ORDER BY t.report_date",
+        tuple(params),
+    ).fetchall()
+
+
 def list_topics_for_source_prefix(conn, source_prefix) -> list[dict]:
     """org-api timeline shim read (authority-flip Task 4): all topics whose
     source_s3_key starts with source_prefix (typically
