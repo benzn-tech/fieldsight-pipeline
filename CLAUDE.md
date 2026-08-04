@@ -438,6 +438,62 @@ aws s3 cp s3://BUCKET/KEY s3://BUCKET/KEY --metadata-directive REPLACE --region 
 
 ## Testing
 
+### Run the SQL against a real database before trusting it
+
+The unit suite drives connection doubles (`FakeConn`, `FakeProgrammeStore`).
+They prove the handler's logic and **nothing about the SQL underneath it** —
+they do not enforce foreign keys, NULL ordering, or cast semantics. Every
+entry below is a real defect that the full suite passed straight through.
+
+- **`ON DELETE CASCADE` defeats a scoped `DELETE`.** `programme_tasks.parent_id`
+  cascades, so `DELETE ... WHERE origin='imported'` also removes the *local*
+  children hanging off those rows. A fix written to **preserve** local rows
+  would have deleted them; it needs a `SET parent_id = NULL` detach first.
+  **1598 unit tests passed both before and after that fix.**
+- **`ORDER BY (col = %s) DESC` needs `NULLS LAST`.** Postgres sorts NULLs
+  first under `DESC`, so a row whose comparison is NULL beats an exact match.
+  Verified by running the query with and without the clause.
+- **`= NULL` is never true**, which is the wanted behaviour for an
+  unattributed row — but pin it, because the alternative reading ("belongs to
+  everyone") would leak it to every user on the site.
+- **A `return error(...)` does not roll back.** Only raising does. Use the
+  `conn.transaction()` + custom-exception pattern (see the action-item PATCH
+  and `confirm_suggestion`) when a partial write must unwind.
+
+The test cluster is VPC-private, so `TEST_DATABASE_URL` is usually
+unavailable locally. Drive assertions through the **RDS Data API** instead,
+inside one transaction that is rolled back:
+
+```bash
+CL=arn:aws:rds:ap-southeast-2:509194952652:cluster:fieldsight-db-test-dbcluster-hywiixu8ihi9
+SEC=arn:aws:secretsmanager:ap-southeast-2:509194952652:secret:'rds!cluster-...'
+TX=$(aws rds-data begin-transaction --resource-arn "$CL" --secret-arn "$SEC" \
+      --database fieldsight_test --query transactionId --output text)
+# ... execute-statement with --transaction-id "$TX" ...
+aws rds-data rollback-transaction --resource-arn "$CL" --secret-arn "$SEC" \
+  --transaction-id "$TX"
+```
+
+Commit the same cases as `tests/integration/*.py` so CI covers them where
+`TEST_DATABASE_URL` does exist; they skip cleanly without it. Examples:
+`test_programme_task_doc_id.py`, `test_programme_suggestions_author_scope.py`,
+`test_programme_list_local.py`.
+
+**Set `MSYS_NO_PATHCONV=1`** for any AWS CLI call carrying a `/`-prefixed
+argument (`/aws/lambda/...`, `/api/org/...`) — Git Bash rewrites it into a
+Windows path and the call fails in a way that reads like a routing bug.
+
+### Two habits worth more than more tests
+
+- **An assumption written in a docstring and not enforced will be violated.**
+  `put_programme` said *"the client confirms before calling it"*; nothing
+  checked, and the ordinary Save button silently converted every local row to
+  imported. Enforce it in the repository or the handler, not in a comment.
+- **Re-check your own claims.** The most expensive defect of that session was
+  the phrase *"now redundant but harmless"* in a commit message about a
+  guard. It was not harmless — it refused every save, which made the fix
+  behind it unreachable.
+
 ```bash
 # Test meeting minutes
 aws lambda invoke --function-name fieldsight-meeting-minutes \
