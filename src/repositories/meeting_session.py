@@ -17,26 +17,68 @@ from psycopg.rows import dict_row
 _COLS = (
     "session_id, company_id, user_id, site_id, kind, status, version, "
     "opened_at, last_segment_at, closed_at, close_intent, rolling_summary, "
-    "rolling_summary_version, segment_count, word_count, created_at, updated_at"
+    "rolling_summary_version, segment_count, word_count, created_at, updated_at, "
+    "group_id"
 )
 
 
-def ensure_open(conn, session_id, company_id, user_id, site_id, kind, opened_at) -> dict:
+def ensure_open(conn, session_id, company_id, user_id, site_id, kind, opened_at,
+                group_id=None) -> dict:
     """Create the session if new, else keep it. Idempotent — safe whether the
     device's best-effort record-start signal or the first uploaded chunk reaches
     the backend first (either may open the session). Only fills `opened_at`/
-    `site_id` if not already set; never regresses status."""
+    `site_id` if not already set; never regresses status.
+
+    `group_id` is the LEAD device's session_id (multi-device merge, spec
+    2026-08-04); NULL for a solo recording, which is every pre-existing row.
+    Like the other columns here it is only ever filled in, never cleared: /open
+    is best-effort and may legitimately arrive twice, and a second call that
+    omits the group must not orphan a device that already joined."""
     return conn.cursor(row_factory=dict_row).execute(
         f"INSERT INTO meeting_session "
-        f"(session_id, company_id, user_id, site_id, kind, opened_at, status) "
-        f"VALUES (%s, %s, %s, %s, %s, %s, 'open') "
+        f"(session_id, company_id, user_id, site_id, kind, opened_at, status, group_id) "
+        f"VALUES (%s, %s, %s, %s, %s, %s, 'open', %s) "
         f"ON CONFLICT (session_id) DO UPDATE SET "
         f"opened_at = COALESCE(meeting_session.opened_at, EXCLUDED.opened_at), "
         f"site_id = COALESCE(meeting_session.site_id, EXCLUDED.site_id), "
+        f"group_id = COALESCE(meeting_session.group_id, EXCLUDED.group_id), "
         f"updated_at = now() "
         f"RETURNING {_COLS}",
-        (session_id, company_id, user_id, site_id, kind, opened_at),
+        (session_id, company_id, user_id, site_id, kind, opened_at, group_id),
     ).fetchone()
+
+
+def list_group_members(conn, group_id) -> list[dict]:
+    """Every session in one multi-device group, oldest first.
+
+    The lead is its own member — it sets its group_id to its own session_id —
+    so this returns the whole meeting, not just the joiners."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM meeting_session WHERE group_id = %s "
+        f"ORDER BY opened_at NULLS FIRST, session_id",
+        (group_id,),
+    ).fetchall()
+
+
+def group_is_settled(conn, group_id, idle_grace_seconds) -> bool:
+    """True when no member of the group could still be recording: each one is
+    either terminal (sent/failed) or has gone quiet past the idle grace.
+
+    Deliberately reuses the SAME idle judgement a solo session uses rather than
+    inventing a multi-device window. A group must not outlive the sessions
+    inside it, and a second timeout concept is a second thing to get wrong. The
+    case this exists for is real and common: an inspector forgets to press
+    stop, or walks off and syncs hours later — that must not hold everyone
+    else's report hostage."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT COUNT(*) AS unsettled FROM meeting_session "
+        "WHERE group_id = %s "
+        "AND status NOT IN ('sent','failed') "
+        "AND COALESCE(last_segment_at, opened_at, created_at) "
+        "    > now() - make_interval(secs => %s)",
+        (group_id, idle_grace_seconds),
+    ).fetchone()
+    return int((row or {}).get("unsettled") or 0) == 0
 
 
 def touch_segment(conn, session_id, at) -> dict | None:

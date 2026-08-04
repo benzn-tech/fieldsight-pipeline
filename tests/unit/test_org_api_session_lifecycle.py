@@ -20,14 +20,17 @@ def body_of(res):
 
 def test_open_creates_and_returns_status(monkeypatch):
     seen = {}
-    def fake_ensure_open(conn, sid, company_id, user_id, site_id, kind, started_at):
+    # group_id is keyword-with-default (multi-device merge, 2026-08-04): a solo
+    # open passes None and behaves exactly as before.
+    def fake_ensure_open(conn, sid, company_id, user_id, site_id, kind, started_at,
+                         group_id=None):
         seen.update(sid=sid, company_id=company_id, user_id=user_id, kind=kind)
-        return {"session_id": sid, "status": "open", "version": 0}
+        return {"session_id": sid, "status": "open", "version": 0, "group_id": group_id}
     monkeypatch.setattr(org.meeting_session, "ensure_open", fake_ensure_open)
 
     res = org.session_open(CONN, CALLER, SID, {"kind": "audio", "startedAt": "2026-07-28T14:03:00"})
     assert res["statusCode"] == 200
-    assert body_of(res) == {"sessionId": SID, "status": "open", "version": 0}
+    assert body_of(res) == {"sessionId": SID, "status": "open", "version": 0, "groupId": None}
     assert seen == {"sid": SID, "company_id": "c-1", "user_id": "u-1", "kind": "audio"}
 
 
@@ -49,6 +52,73 @@ def test_open_rejects_inaccessible_site(monkeypatch):
 
 def test_open_malformed_body_is_400(monkeypatch):
     assert org.session_open(CONN, CALLER, SID, None)["statusCode"] == 400
+
+
+# ---- multi-device groups (spec 2026-08-04) --------------------------------
+
+LEAD = "b" * 32
+
+
+def _ensure_open_capturing(seen):
+    def fake(conn, sid, company_id, user_id, site_id, kind, started_at, group_id=None):
+        seen["group_id"] = group_id
+        return {"session_id": sid, "status": "open", "version": 0, "group_id": group_id}
+    return fake
+
+
+def test_open_accepts_and_returns_group_id(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(org.meeting_session, "ensure_open", _ensure_open_capturing(seen))
+    monkeypatch.setattr(org.meeting_session, "get",
+                        lambda conn, sid: {"session_id": sid, "company_id": "c-1"})
+
+    res = org.session_open(CONN, CALLER, SID, {"kind": "audio", "groupId": LEAD})
+
+    assert res["statusCode"] == 200
+    assert body_of(res)["groupId"] == LEAD
+    assert seen["group_id"] == LEAD
+
+
+def test_open_without_group_is_unchanged(monkeypatch):
+    """The solo path must keep working exactly as before."""
+    seen = {}
+    monkeypatch.setattr(org.meeting_session, "ensure_open", _ensure_open_capturing(seen))
+    res = org.session_open(CONN, CALLER, SID, {"kind": "audio"})
+    assert res["statusCode"] == 200
+    assert seen["group_id"] is None
+    assert body_of(res)["groupId"] is None
+
+
+def test_open_rejects_malformed_group_id(monkeypatch):
+    monkeypatch.setattr(org.meeting_session, "ensure_open",
+                        lambda *a, **k: pytest.fail("must not reach the repo"))
+    assert org.session_open(CONN, CALLER, SID, {"groupId": "not-a-session"})["statusCode"] == 400
+
+
+def test_open_rejects_a_group_led_by_another_company(monkeypatch):
+    """The device scanned a code it should never have had. The UI cannot be
+    trusted to prevent this — the tenant boundary is enforced server-side."""
+    monkeypatch.setattr(org.meeting_session, "get",
+                        lambda conn, sid: {"session_id": sid, "company_id": "other-co"})
+    monkeypatch.setattr(org.meeting_session, "ensure_open",
+                        lambda *a, **k: pytest.fail("must not join across tenants"))
+
+    res = org.session_open(CONN, CALLER, SID, {"groupId": LEAD})
+    assert res["statusCode"] == 403
+
+
+def test_open_accepts_a_group_whose_leader_is_not_known_yet(monkeypatch):
+    """The joiner can legitimately reach the server BEFORE the lead does: /open
+    is best-effort and the lead's may have failed or be queued offline.
+    Rejecting here would make joining depend on call ordering, which is exactly
+    what the offline-first design refuses to do."""
+    seen = {}
+    monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: None)
+    monkeypatch.setattr(org.meeting_session, "ensure_open", _ensure_open_capturing(seen))
+
+    res = org.session_open(CONN, CALLER, SID, {"groupId": LEAD})
+    assert res["statusCode"] == 200
+    assert seen["group_id"] == LEAD
 
 
 # ---- close ----------------------------------------------------------------

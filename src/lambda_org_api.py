@@ -657,14 +657,30 @@ def session_open(conn, caller, session_id, body):
         site = sites.get_site(conn, site_id)
         if site is None or site["company_id"] != caller["company_id"]:
             return error("site not accessible", 403)
+    # Multi-device merge (spec 2026-08-04): the group's id IS the lead device's
+    # session_id, carried here by the joiner after scanning the lead's QR.
+    group_id = body.get("groupId")
+    if group_id is not None:
+        if not _SID_RE.match(group_id):
+            return error("groupId must be 32 lowercase hex chars", 400)
+        # Tenant boundary. The lead may legitimately be UNKNOWN to us at this
+        # point — /open is best-effort, so the joiner can arrive first — and
+        # rejecting that would make joining depend on call ordering, which the
+        # offline-first design explicitly refuses. But if we do know the lead,
+        # it must belong to the caller's company: never merge across tenants on
+        # a client's say-so.
+        lead = meeting_session.get(conn, group_id)
+        if lead is not None and str(lead["company_id"]) != str(caller["company_id"]):
+            return error("group not accessible", 403)
+
     # Idempotent: whichever of the record-start signal or the first uploaded
     # chunk arrives first opens the session; a later call never regresses it.
     row = meeting_session.ensure_open(
         conn, session_id, caller["company_id"], caller["id"], site_id, kind,
-        body.get("startedAt"),
+        body.get("startedAt"), group_id=group_id,
     )
     return ok({"sessionId": row["session_id"], "status": row["status"],
-               "version": row["version"]})
+               "version": row["version"], "groupId": row.get("group_id")})
 
 
 def session_close(conn, caller, session_id, body):
