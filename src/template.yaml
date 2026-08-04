@@ -262,6 +262,46 @@ Parameters:
     NoEcho: true
     Default: ''
 
+  NotionDataSource:
+    Type: String
+    Description: >
+      Data source id of the device-ledger Notion database (company workspace
+      Preformance). Not the database id — the API takes the data source.
+    Default: ''
+
+  DeviceLedgerUrl:
+    Type: String
+    Description: Link included in device alerts so a reader can open the table.
+    Default: ''
+
+  TeamsWebhook:
+    Type: String
+    Description: Incoming-webhook URL for device alerts. Empty = no Teams push.
+    NoEcho: true
+    Default: ''
+
+  DeviceAlertEmails:
+    Type: String
+    Description: Comma-separated recipients for device alerts. Empty = no email.
+    Default: ''
+
+  QuietAlertWorkingDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    Description: >
+      NZ working days of silence before an IN-USE device is called quiet.
+      Deliberately a parameter: the right value depends on how often devices at
+      signal-poor sites actually sync, which is unknown until the ledger has run
+      for a month. Set it too tight and the alert becomes noise, gets muted, and
+      is then worse than no alert at all.
+
+  DeviceGraceDays:
+    Type: Number
+    Default: 3
+    MinValue: 0
+    Description: Days after hand-over before a never-seen device is called out.
+
   ElevenLabsSttModel:
     Type: String
     Description: ElevenLabs STT model id
@@ -3211,6 +3251,13 @@ Resources:
           # ledger. This is the Phase 1 state on both stages.
           NOTION_TOKEN: !Ref NotionToken
           LEDGER_FUNCTION: !Ref DeviceLedgerFunction
+          NOTION_DATA_SOURCE: !Ref NotionDataSource
+          DEVICE_LEDGER_URL: !Ref DeviceLedgerUrl
+          TEAMS_WEBHOOK: !Ref TeamsWebhook
+          DEVICE_ALERT_EMAILS: !Ref DeviceAlertEmails
+          QUIET_ALERT_WORKING_DAYS: !Ref QuietAlertWorkingDays
+          DEVICE_GRACE_DAYS: !Ref DeviceGraceDays
+          EMAIL_SENDER: !Ref EmailSender
       Policies:
         - Version: '2012-10-17'
           Statement:
