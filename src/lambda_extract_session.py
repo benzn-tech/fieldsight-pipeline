@@ -440,6 +440,49 @@ def assemble_deduped_turns(bucket, keys):
     return turns, source_filenames
 
 
+def assemble_group_turns(bucket, keys_by_session):
+    """Assemble one MULTI-DEVICE meeting as parallel, labelled sources.
+
+    Returns ([{"session_id": str, "turns": [...]}, ...], source_filenames).
+
+    Each member is assembled with the normal per-session path above and then
+    kept SEPARATE. They are deliberately not concatenated and not time-merged,
+    because across devices there is no shared clock to merge on:
+    assemble_deduped_turns orders turns on "the single session clock" and
+    _dedup_turn_boundaries matches on time overlap — both assume one device.
+    BUG-37 is a shipped instance of a device's wall clock being 12 hours out.
+
+    Alignment therefore has to be content-based, and that is precisely what the
+    extraction LLM does natively — in a call this pipeline was going to make
+    anyway. So the merge decision is deferred to the prompt, and this function's
+    only job is to hand it clean, attributed sources: which device heard what.
+    Flattening them here would destroy exactly the signal the merge needs.
+
+    A member that yields nothing usable is dropped rather than raised. Losing
+    one device's audio (corrupt transcript, S3 failure) must never lose the
+    whole meeting — the remaining devices are still a better record than
+    nothing, and the caller reports which ones made it in.
+
+    Members are processed in sorted session_id order so the prompt's input is
+    deterministic; otherwise the same meeting could extract differently on a
+    retry."""
+    sources, filenames = [], []
+    for session_id in sorted(keys_by_session):
+        keys = keys_by_session[session_id]
+        try:
+            turns, files = assemble_deduped_turns(bucket, keys)
+        except Exception:
+            logger.exception(
+                "group merge: member %s failed to assemble; continuing without it",
+                session_id)
+            continue
+        if not turns:
+            continue
+        sources.append({"session_id": session_id, "turns": turns})
+        filenames.extend(files)
+    return sources, filenames
+
+
 def extraction_key(user_folder, date, session_base):
     """The single key a session's extraction always lands on, whichever tier
     produced it — the live pass and the final pass deliberately collide so the
