@@ -14,17 +14,33 @@ Notion table that merely looks unchanged — the silent-staleness failure this
 whole design is built to avoid.
 """
 
+import datetime as dt
 import json
 import logging
 import os
+from zoneinfo import ZoneInfo
 
 import boto3
+
+# Bare module names: the Lambda zip is flat, so `from src.x import y` works in
+# tests and fails at runtime. Imported as modules, not functions, because the
+# tests monkeypatch them as attributes of this module.
+import device_alerts
+import device_notify
+import notion_client
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 LEDGER_FUNCTION = os.environ.get("LEDGER_FUNCTION", "")
+NOTION_DATA_SOURCE = os.environ.get("NOTION_DATA_SOURCE", "")
+DATABASE_URL = os.environ.get("DEVICE_LEDGER_URL", "")
+TEAMS_WEBHOOK = os.environ.get("TEAMS_WEBHOOK", "")
+EMAIL_TO = [a.strip() for a in os.environ.get("DEVICE_ALERT_EMAILS", "").split(",") if a.strip()]
+SES_SENDER = os.environ.get("EMAIL_SENDER", "")
+QUIET_WORKING_DAYS = int(os.environ.get("QUIET_ALERT_WORKING_DAYS", "7"))
+GRACE_DAYS = int(os.environ.get("DEVICE_GRACE_DAYS", "3"))
 
 _client = None
 
@@ -49,4 +65,26 @@ def lambda_handler(event, context):
     payload = json.loads(resp["Payload"].read() or b"{}")
     devices = payload.get("devices") or []
     logger.info("device report received %d devices", len(devices))
-    return {"status": "ok", "devices": len(devices)}
+
+    rows = notion_client.list_rows(NOTION_TOKEN, NOTION_DATA_SOURCE)
+    today = dt.datetime.now(ZoneInfo("Pacific/Auckland")).date()
+    results = device_alerts.derive(devices, rows, today, QUIET_WORKING_DAYS, GRACE_DAYS)
+
+    # Per-row, on purpose: one malformed row must not leave the other nineteen
+    # stale. A stale table is indistinguishable from a correct one at a glance,
+    # which is the failure this whole design exists to avoid.
+    failed = 0
+    for r in results:
+        try:
+            notion_client.update_row(NOTION_TOKEN, r["page_id"], r["updates"])
+        except Exception:
+            failed += 1
+            logger.exception("notion update failed for %s", r["device"])
+
+    device_notify.push(
+        device_notify.format_message(results, DATABASE_URL),
+        teams_webhook=TEAMS_WEBHOOK,
+        email_to=EMAIL_TO,
+        ses_sender=SES_SENDER,
+    )
+    return {"status": "ok", "devices": len(results), "failed": failed}
