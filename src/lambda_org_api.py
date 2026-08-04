@@ -829,8 +829,17 @@ def session_report_generate(conn, caller, session_id, event):
     }
     # Lake bucket (like the reindex_requests/ chain): org-api is in-VPC and hands
     # off to the non-VPC session-report worker via an S3 request artifact (BUG-36).
+    # default=str for the same reason ok() uses it: `content` comes straight
+    # from Aurora via _assemble_session_report, and psycopg hands back real
+    # uuid.UUID objects for uuid columns (site_id, topic row ids). Without it
+    # this raised "Object of type UUID is not JSON serializable" on EVERY
+    # generate, while the preview of the very same content succeeded — because
+    # the preview leaves through ok(), which has always coerced. Two
+    # serialisers with different rules over one payload is the bug; matching
+    # them is the fix.
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
-                    Body=json.dumps(artifact), ContentType="application/json")
+                    Body=json.dumps(artifact, default=str),
+                    ContentType="application/json")
     return ok({"status": "queued", "sessionId": session_id,
                "requestId": request_id, "resultKey": result_key}, 202)
 

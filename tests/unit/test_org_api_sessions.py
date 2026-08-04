@@ -625,6 +625,39 @@ def test_generate_writes_one_request_artifact_scoped_to_the_session(wired, s3_pu
     assert {t["topic_title"] for t in req["content"]["topics"]} == {"Morning check-in", "Slab pour"}
 
 
+def test_generate_serialises_the_uuids_aurora_actually_returns(wired, s3_puts):
+    """psycopg hands back uuid.UUID for uuid columns; the fixtures above use
+    plain strings, which is why this shipped broken.
+
+    The artifact was written with a bare json.dumps while the preview of the
+    SAME content left through ok(), which has always passed default=str. So
+    the preview rendered and every single generate raised
+    "Object of type UUID is not JSON serializable" — a 100% failure the
+    existing coverage could not see, because the test double was tidier than
+    the database."""
+    import uuid as _uuid
+    # findings is an "additive passthrough" — the row goes into the topic shape
+    # untouched, unlike its neighbours (topic_row_id, action_items[].id and the
+    # safety_flags derived FROM findings all str() their ids). Aurora's findings
+    # table has three uuid columns, so a session with any finding at all carries
+    # raw UUID objects into the artifact. The failing prod session had 14.
+    _wire_rows(wired, [
+        _row(source_s3_key=KEY_1300, title="Morning check-in",
+             findings=[{"id": _uuid.uuid4(), "topic_id": _uuid.uuid4(),
+                        "site_id": _uuid.uuid4(), "domain": "quality",
+                        "observation": "Wall out of tolerance"}]),
+    ])
+
+    res = _generate(SESSION_1300, GEN_BODY)
+
+    assert res["statusCode"] == 202
+    assert len(s3_puts) == 1
+    req = json.loads(s3_puts[0]["Body"])          # would raise before the fix
+    finding = req["content"]["topics"][0]["findings"][0]
+    assert isinstance(finding["id"], str)
+    assert isinstance(finding["topic_id"], str)
+
+
 def test_generate_carries_the_users_confirmed_fields(wired, s3_puts):
     _two_topic_session(wired)
     _generate(SESSION_1300, GEN_BODY)
