@@ -2828,9 +2828,20 @@ def get_org_dates(conn, caller, event):
         site_ids = [site_id]
     else:
         site_ids = list(_allowed_site_ids(conn, caller))
-    rows = topics.list_report_dates(conn, site_ids, since,
-                                    author_ids=_author_filter(conn, caller))
-    return ok({"dates": {str(d): {"hasReport": True} for d in rows}})
+    # topics + safety alongside hasReport: the date picker draws a density dot
+    # from `topics` and an orange dot from `safety`, and this endpoint used to
+    # return neither — so both vanished from the calendar the moment prod's
+    # timeline source became Aurora. `hasReport` stays exactly as it was, so a
+    # client that only reads that field is unaffected.
+    rows = topics.report_date_counts(conn, site_ids, since,
+                                     author_ids=_author_filter(conn, caller))
+    return ok({"dates": {
+        str(r["report_date"]): {
+            "hasReport": True,
+            "topics": r["topics"],
+            "safety": r["safety"],
+        } for r in rows
+    }})
 
 
 # ----------------------------------------------------------
