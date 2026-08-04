@@ -95,21 +95,45 @@ step. Only a factory reset requires re-entry.
   Persisted the same way as the tag.
 - **`app_version`** — `BuildConfig.VERSION_NAME`.
 
-A single OkHttp `Interceptor` attaches three headers to every org-api request:
+Three headers ride every org-api request:
 
 ```
-X-Device-Tag: FS-07          (absent if not yet entered)
+X-Device-Tag: FS-07          (omitted entirely if not yet entered)
 X-Device-Id:  <uuid>
 X-App-Version: 1.4.2
 ```
 
+**Attached at the request builders, beside `Authorization` — not via an OkHttp interceptor.**
+This design originally said "a single interceptor"; reading the code showed that would leak.
+`RecordingsApiClient` derives its S3 upload client from the org-api one
+(`UPLOAD_HTTP = OK_HTTP.newBuilder()`), so an interceptor on the shared builder is inherited by
+the client that PUTs media to **S3 presigned URLs** — needless risk against a signed request, and
+it hands device identity to a service that has no use for it. Attaching where `Authorization`
+already goes (`RealHttp.postJson`, `RealSitesHttp.getJson`, never `putFile`) cannot reach S3 by
+construction.
+
 Settings screen gains: an editable device-number field, and a read-only display of the first
 six characters of `device_uuid` so a human can match a device against an unclaimed row.
 
-**Logout hygiene.** Pending upload-queue entries are stamped with the `owner_sub` that created
-them. After a different account logs in, those entries are neither uploaded nor listed. Logout
-shows "N recordings not yet uploaded" as a warning but does **not** block — a hand-over often
-happens without connectivity, and blocking would strand the person doing it.
+**Logout hygiene — and a live leak this uncovered.** Pending upload-queue entries must be stamped
+with the `owner_sub` that recorded them, at capture time. After a different account logs in, those
+entries are neither uploaded nor listed. Logout shows "N recordings not yet uploaded" as a warning
+but does **not** block — a hand-over often happens without connectivity, and blocking would strand
+the person doing it.
+
+This was written as if it were a small addition. It is not. Reading the mobile code on 2026-08-04
+showed the opposite behaviour is currently wired in:
+
+- All three `CaptureRecord(...)` sites in `capture/CaptureManager.kt` omit `authorSub`, so every
+  row is created `NULL`.
+- The only thing that ever sets it is `CaptureRecordDao.backfillAuthorSub(sub)` —
+  `UPDATE capture_records SET authorSub = :sub WHERE authorSub IS NULL` — called from
+  `CognitoAuthManager.onLoggedIn`, which claims **every** unowned row for whoever logs in.
+- `listByUploadStatus` does not filter by author at all.
+
+So a hand-over stamps client A's still-pending recordings with client B's sub and uploads them
+under B's account. Monthly rotation *is* that flow, so this is a live cross-tenant leak rather
+than a hypothetical one, and it is the **first** task of Phase 2 — a fix, not a feature.
 
 ### 2. Backend — the ledger
 
