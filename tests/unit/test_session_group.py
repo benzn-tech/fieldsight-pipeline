@@ -121,3 +121,67 @@ def test_group_is_settled_excludes_terminal_members_from_the_wait():
     sql = conn.calls[0]["sql"].lower()
     assert "status not in ('sent','failed')" in sql
     assert "make_interval" in sql, "the idle window must be parameterised, not hardcoded"
+
+
+# ---- the server-side guard (spec: "leaving a group") ----------------------
+#
+# Everything on the device trusts the device clock, and these ROMs have been
+# observed 12 hours out (BUG-37). These are the checks that make "yesterday
+# never merges into today" unconditional, because they run on the SERVER's own
+# opened_at. A test with a correct device clock would pass either way and prove
+# nothing, so the stale cases here are deliberately shaped like a device that
+# kept a group it should have dropped.
+
+def test_group_span_ok_accepts_an_ordinary_meeting_with_a_pause():
+    """A battery swap or a walk to the next building mid-meeting must still
+    merge — that is the normal case, not an anomaly."""
+    conn = FakeConn(results=[[{"span_seconds": 40 * 60}]])
+    assert meeting_session.group_span_ok(conn, SID_B, max_span_seconds=4 * 3600) is True
+
+
+def test_group_span_ok_rejects_members_from_different_days():
+    """THE guarantee. A device carried a stale group overnight; whatever it
+    believes, these two recordings are not one meeting."""
+    conn = FakeConn(results=[[{"span_seconds": 23 * 3600}]])
+    assert meeting_session.group_span_ok(conn, SID_B, max_span_seconds=4 * 3600) is False
+
+
+def test_group_span_ok_measures_server_time_not_device_time():
+    conn = FakeConn(results=[[{"span_seconds": 0}]])
+    meeting_session.group_span_ok(conn, SID_B, max_span_seconds=4 * 3600)
+    sql = conn.calls[0]["sql"].lower()
+    assert "opened_at" in sql, "must measure the server's own timestamp"
+    assert "extract(epoch" in sql
+
+
+def test_group_span_ok_measures_the_lead_too():
+    """The tests above feed a canned span, so they pin the comparison and say
+    nothing about what the query measures.
+
+    The lead carries no group_id of its own. Matching on group_id alone compares
+    the joiners against each other and leaves out the anchor — one device
+    carrying a group overnight is then the only member the span can see, spans
+    zero seconds, and passes the guard built to stop exactly that. The real
+    behaviour is pinned in tests/integration/test_session_group_sql.py."""
+    conn = FakeConn(results=[[{"span_seconds": 0}]])
+    meeting_session.group_span_ok(conn, SID_B, max_span_seconds=4 * 3600)
+    sql = conn.calls[0]["sql"].lower()
+    assert "session_id = %s" in sql, "the lead has no group_id; match it by identity"
+    assert conn.calls[0]["params"] == (SID_B, SID_B)
+    # started_at / device-reported fields must not appear: they are the device's
+    # clock, which is the thing this guard exists to not trust.
+    assert "started_at" not in sql
+
+
+def test_group_span_ok_on_a_single_member_is_true():
+    """A group of one has zero span. It must not be rejected — the solo and
+    one-device-joined cases both land here."""
+    conn = FakeConn(results=[[{"span_seconds": 0}]])
+    assert meeting_session.group_span_ok(conn, SID_B, max_span_seconds=4 * 3600) is True
+
+
+def test_group_span_ok_treats_a_missing_row_as_ok():
+    """No members yet (nothing to merge) is not a violation; returning False
+    here would block a group that has simply not been populated."""
+    conn = FakeConn(results=[[]])
+    assert meeting_session.group_span_ok(conn, SID_B, max_span_seconds=4 * 3600) is True
