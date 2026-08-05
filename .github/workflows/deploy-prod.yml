@@ -148,6 +148,21 @@ jobs:
           if [ -n "${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}" ]; then
             KF_LAYER_PARAM="KeyframeFfmpegLayerArn=${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}"
           fi
+          # Non-work (personal) topic retention sweep. Two independent gates, both
+          # off by default, because this one DELETES: it tombstones the topic and
+          # drops its vectors (the transcript and audio are left alone).
+          #   * PROD_NONWORK_EXPIRY_ENABLED -> arms the schedule at all.
+          #   * PROD_NONWORK_EXPIRY_SINCE   -> the floor. Only topics created at or
+          #     after it are ever swept, so switching this on is NOT retroactive.
+          #     Set it to the date the policy starts, NOT to when classification
+          #     began: the earlier date would sweep every historical personal
+          #     topic on the first run. The sweep refuses to run without it, so a
+          #     forgotten value fails closed rather than sweeping everything.
+          # Same bare-"Key=" guard as the layer overrides above.
+          NONWORK_SINCE_PARAM=""
+          if [ -n "${{ vars.PROD_NONWORK_EXPIRY_SINCE }}" ]; then
+            NONWORK_SINCE_PARAM="NonWorkExpirySince=${{ vars.PROD_NONWORK_EXPIRY_SINCE }}"
+          fi
           sam deploy --config-env prod \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -181,6 +196,9 @@ jobs:
               "OrgUserPoolId=ap-southeast-2_q88pd6XXr" \
               "LlmProvider=${{ vars.PROD_LLM_PROVIDER || 'anthropic' }}" \
               "AsrProvider=${{ vars.PROD_ASR_PROVIDER || 'transcribe' }}" \
+              "EnableNonWorkExpiry=${{ vars.PROD_NONWORK_EXPIRY_ENABLED || 'false' }}" \
+              "NonWorkExpiryHours=${{ vars.PROD_NONWORK_EXPIRY_HOURS || '24' }}" \
+              $NONWORK_SINCE_PARAM \
               "ElevenLabsApiKey=$ELEVENLABS_API_KEY"
 
       - name: Apply DB migrations (fieldsight-prod-migrate — idempotent, shared schema_migrations)
