@@ -1219,3 +1219,42 @@ def test_the_pass_never_sets_thread_id_itself(wired, monkeypatch):
                         lambda *a, **k: attached.append(a))
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
     assert attached == []
+
+
+# ---------------------------------------------------------------------------
+# Every outcome of the suggestion pass leaves a trace.
+#
+# The first prod run wrote 8 topics and emitted nothing at all, because the
+# empty-corpus return sat above the only log line. From the outside "the flag
+# is off", "there was nothing to compare against" and "it threw and was
+# swallowed" were one identical silence, and telling them apart meant querying
+# the database by hand.
+# ---------------------------------------------------------------------------
+
+def _logged(caplog):
+    return " | ".join(r.getMessage() for r in caplog.records)
+
+
+def test_disabled_says_so(wired, monkeypatch, caplog):
+    monkeypatch.setattr(iw, "SUGGEST_THREADS", False)
+    with caplog.at_level("INFO"):
+        iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+    assert "disabled" in _logged(caplog)
+
+
+def test_no_candidates_says_so(wired, monkeypatch, caplog):
+    monkeypatch.setattr(iw, "SUGGEST_THREADS", True)
+    monkeypatch.setattr(iw.threads, "candidate_corpus", lambda *a, **k: [])
+    with caplog.at_level("INFO"):
+        iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+    assert "no candidates" in _logged(caplog)
+
+
+def test_a_failure_says_so_and_keeps_the_topics(wired, monkeypatch, caplog):
+    monkeypatch.setattr(iw, "SUGGEST_THREADS", True)
+    monkeypatch.setattr(iw.threads, "candidate_corpus",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    with caplog.at_level("INFO"):
+        res = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+    assert "failed" in _logged(caplog)
+    assert res == {"skipped": False, "topics": 1}
