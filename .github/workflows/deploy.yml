@@ -122,6 +122,7 @@ jobs:
               "EnableSiteVoice=true" \
               "DocxLayerArn=arn:aws:lambda:ap-southeast-2:509194952652:layer:python-docx-layer:2" \
               "EnableKeyframes=${{ vars.TEST_ENABLE_KEYFRAMES || 'false' }}" \
+              "EnableThreadSuggestions=${{ vars.TEST_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
               $KF_LAYER_PARAM \
               $VAD_LAYER_PARAM \
               "ItemsTableName=fieldsight-test-items" \
