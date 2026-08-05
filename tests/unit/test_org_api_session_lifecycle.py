@@ -144,6 +144,9 @@ def test_close_end_finalizes_immediately_grace_zero(monkeypatch):
     _patch_get(monkeypatch, {"user_id": "u-1", "status": "open", "version": 1})
     monkeypatch.setattr(org.meeting_session, "mark_pending_close",
                         lambda conn, sid, ended_at, intent: {"status": "pending_close", "version": 2})
+    # An End now also settles the group (a no-op for this solo session, but the
+    # repo call happens either way).
+    monkeypatch.setattr(org.meeting_session, "end_group", lambda conn, gid: 0)
     res = org.session_close(CONN, CALLER, SID, {"intent": "end"})
     assert body_of(res)["graceSeconds"] == 0
 

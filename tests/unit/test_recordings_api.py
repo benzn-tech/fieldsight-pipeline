@@ -272,3 +272,79 @@ def test_complete_empty_gps_track_list_passed_through(wired):
                                         body={"sizeBytes": 10, "gpsTrack": []}), None)
     assert res["statusCode"] == 200
     assert captured["gps_track"] == []
+
+
+# ---- the group-ended signal, riding on the upload (spec 2026-08-04) --------
+#
+# There is no channel to a device that is not currently uploading, so "the
+# meeting has ended" travels back on the `complete` each device is already
+# doing. That makes correctness here mostly about what must NOT change.
+
+SID = "3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c"
+CHUNK_KEY = f"users/Ben/audio/2026-08-06/Ben_2026-08-06_09-00-00_sid{SID}_c0001.wav"
+
+
+def _complete(mp, s3_key, session_row=None, group_ended=False):
+    mp.setattr(org.recordings, "mark_uploaded",
+               lambda c, rid, cid, sz=None, gps_track=None: {"id": rid, "s3_key": s3_key})
+    mp.setattr(org.meeting_session, "get", lambda conn, sid: session_row)
+    mp.setattr(org.meeting_session, "group_is_ended", lambda conn, gid: group_ended)
+    return org.lambda_handler(
+        make_event("POST", "/api/org/recordings/rec-1/complete", body={}), None)
+
+
+def test_a_solo_upload_response_is_unchanged(wired):
+    """Most traffic on this endpoint is solo and has no part in this feature;
+    its response must not gain a field."""
+    mp, _ = wired
+    res = _complete(mp, CHUNK_KEY, session_row={"group_id": None, "group_ended_at": None})
+    assert res["statusCode"] == 200
+    assert body_of(res) == {"ok": True}
+
+
+def test_a_member_of_an_ended_meeting_is_told(wired):
+    mp, _ = wired
+    res = _complete(mp, CHUNK_KEY,
+                    session_row={"group_id": "b" * 32, "group_ended_at": "2026-08-06T09:10:00Z"})
+    assert body_of(res)["groupEnded"] is True
+
+
+def test_a_device_that_joined_after_the_end_is_told_too(wired):
+    """Its own row was written before the end, so it carries no timestamp. Read
+    only that row and it would keep recording into a finished meeting."""
+    mp, _ = wired
+    res = _complete(mp, CHUNK_KEY,
+                    session_row={"group_id": "b" * 32, "group_ended_at": None},
+                    group_ended=True)
+    assert body_of(res)["groupEnded"] is True
+
+
+def test_a_legacy_filename_costs_no_query(wired):
+    mp, _ = wired
+    calls = []
+    mp.setattr(org.recordings, "mark_uploaded",
+               lambda c, rid, cid, sz=None, gps_track=None: {"id": rid, "s3_key": "users/Ben/audio/x.wav"})
+    mp.setattr(org.meeting_session, "get", lambda conn, sid: calls.append(sid))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/recordings/rec-1/complete", body={}), None)
+    assert body_of(res) == {"ok": True}
+    assert calls == [], "no session token in the key — nothing to look up"
+
+
+def test_a_failing_lookup_never_breaks_the_upload(wired):
+    """A device not learning the meeting ended costs one extra prompt. A
+    `complete` that 500s strands an uploaded recording as un-uploaded and the
+    mobile retry loop re-sends the whole file."""
+    mp, _ = wired
+    mp.setattr(org.recordings, "mark_uploaded",
+               lambda c, rid, cid, sz=None, gps_track=None: {"id": rid, "s3_key": CHUNK_KEY})
+
+    def boom(conn, sid):
+        raise RuntimeError("db went away")
+
+    mp.setattr(org.meeting_session, "get", boom)
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/recordings/rec-1/complete", body={}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == {"ok": True}
+

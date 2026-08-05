@@ -125,6 +125,7 @@ import boto3
 from botocore.exceptions import ClientError
 from psycopg.errors import UniqueViolation
 
+import chunk_stitch
 import content_hash
 import device_heartbeat
 import reindex
@@ -638,12 +639,73 @@ def create_recording_upload_url(conn, caller, body):
             else:
                 return error("a recording with this s3 key already exists", 409)
 
+    _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id)
+
     url = s3().generate_presigned_url(
         "put_object",
         Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": content_type},
         ExpiresIn=PRESIGNED_URL_EXPIRY,
     )
     return ok({"recordingId": rec_id, "uploadUrl": url, "s3Key": key})
+
+
+def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
+    """Record the meeting group carried by an upload, if there is one.
+
+    Why this exists: `/sessions/{id}/open` is best-effort and fire-and-forget,
+    and being offline is the normal case on a site — the device may join a
+    meeting in a shed with no signal and not reach the server until hours
+    later. If the group only ever travelled on that one call, joining offline
+    would silently produce two unmerged recordings, which is precisely the
+    situation multi-device capture exists for. The upload is the one thing that
+    is guaranteed to reach us eventually, so the group rides on it too.
+
+    `ensure_open` only ever FILLS group_id (COALESCE), so this and `/open` can
+    both run, in either order, any number of times, without fighting.
+
+    Costs nothing on the solo path: no groupId in the body, no query at all.
+    That path is the overwhelming majority of uploads and is on the synchronous,
+    no-retry route where added latency turns into lost data (BUG-43).
+    """
+    group_id = (body or {}).get("groupId")
+    if not group_id:
+        return
+    try:
+        if not _SID_RE.match(str(group_id)):
+            logger.warning("upload-url: ignoring malformed groupId %r", group_id)
+            return
+        # The session id is in the wire filename (`_sid{32hex}_c{NNNN}`), the
+        # same token the chunk pipeline groups on. A file without it is a photo
+        # or a legacy name and has no session to attach a group to.
+        m = chunk_stitch.CHUNK_TOKENS_RE.search(file_name or "")
+        if not m:
+            return
+        # Same tenant boundary as /open: an unknown lead is allowed (the joiner
+        # can reach us first), a lead belonging to another company is not.
+        # Skipped rather than refused — failing the upload over the group would
+        # cost the recording itself, and /open already answers 403 for this.
+        lead = meeting_session.get(conn, group_id)
+        if lead is not None and str(lead["company_id"]) != str(caller["company_id"]):
+            logger.warning("upload-url: refusing cross-company group %s", group_id)
+            return
+        # opened_at comes from the FILENAME's timestamp, not the body's
+        # startedAt. The body's is this CHUNK's start; the filename's is the
+        # session's, identical on every chunk of the session (the chunk-session
+        # naming contract). Using the body's would let whichever chunk happened
+        # to arrive first — after an offline day, not necessarily the first one —
+        # set the session's start to its own, and ensure_open COALESCEs, so the
+        # wrong value would never be corrected. session_activity reads it from
+        # the same place for the same reason. None is fine: it leaves the field
+        # for whoever does know.
+        meeting_session.ensure_open(
+            conn, m.group(1), caller["company_id"], caller["id"], site_id, kind,
+            extract_base_time_from_filename(file_name), group_id=group_id,
+        )
+    except Exception:
+        # An upload that 500s strands the recording and makes the device resend
+        # the whole file. A lost group costs a merge; a lost upload costs the
+        # audio (BUG-43's family).
+        logger.exception("upload-url: could not record group %s", group_id)
 
 
 def complete_recording(conn, caller, rec_id, body):
@@ -660,7 +722,49 @@ def complete_recording(conn, caller, rec_id, body):
                                     b.get("sizeBytes"), gps_track)
     if row is None:
         return error("recording not found", 404)
-    return ok({"ok": True})
+    payload = {"ok": True}
+    if _group_ended_for(conn, row.get("s3_key")):
+        # Only present when true. A solo upload's response stays byte-identical
+        # to what it has always been, which is most of the traffic on this
+        # endpoint and none of it should change shape for a feature it has no
+        # part in.
+        payload["groupEnded"] = True
+    return ok(payload)
+
+
+def _group_ended_for(conn, s3_key) -> bool:
+    """Has someone ended the meeting this chunk belongs to?
+
+    This is the only channel back to a device that has no open connection: it
+    rides on the upload the device is already doing. That makes it a HOT path —
+    every chunk of every recording — so the cost is kept to one primary-key
+    lookup for the overwhelmingly common case:
+
+      - no `_sid` in the key (legacy filenames): zero queries
+      - solo recording: one PK lookup, `group_ended_at` and `group_id` both NULL
+      - member of an ended group: one PK lookup, already marked
+      - device that joined AFTER the end: two, and only until its next chunk
+
+    Failures are swallowed. A device not learning the meeting ended costs one
+    extra prompt; a `complete` that 500s strands an uploaded recording as
+    un-uploaded and the mobile retry loop re-sends the whole file (BUG-43's
+    family). The signal is an optimisation and must never be able to break the
+    upload it rides on.
+    """
+    m = chunk_stitch.CHUNK_TOKENS_RE.search(s3_key or "")
+    if not m:
+        return False
+    try:
+        row = meeting_session.get(conn, m.group(1))
+        if row is None:
+            return False
+        if row.get("group_ended_at") is not None:
+            return True
+        group_id = row.get("group_id")
+        return bool(group_id) and meeting_session.group_is_ended(conn, group_id)
+    except Exception:
+        logger.exception("group-ended check failed for %s; reporting not-ended", s3_key)
+        return False
 
 
 # ----------------------------------------------------------
@@ -736,6 +840,14 @@ def session_close(conn, caller, session_id, body):
                    "version": existing["version"], "noop": True})
 
     row = meeting_session.mark_pending_close(conn, session_id, b.get("endedAt"), intent)
+    # Multi-device merge: a deliberate End means "the meeting is over", so the
+    # other devices have to be told. Recorded here rather than pushed, because
+    # there is no channel to a device that is not currently uploading — the
+    # signal rides back on the upload each device is already doing
+    # (complete_recording below). end_group is a no-op unless a joiner exists,
+    # which is what keeps every ordinary solo End untouched.
+    if intent == "end":
+        meeting_session.end_group(conn, existing.get("group_id") or session_id)
     # A deliberate End finalizes immediately (grace 0); a plain/idle stop waits the
     # mis-touch tolerance window. This endpoint only records pending_close + version
     # + close_intent; a scheduled sweep (FinalizeSweepFunction, in-VPC) then claims

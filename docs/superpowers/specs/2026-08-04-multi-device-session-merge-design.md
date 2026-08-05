@@ -39,8 +39,7 @@ into a second spec and is not required by anything here.
 `meeting_session` gains one nullable column:
 
 ```sql
-ALTER TABLE meeting_session ADD COLUMN group_id text
-  REFERENCES meeting_session(session_id);
+ALTER TABLE meeting_session ADD COLUMN group_id text;
 CREATE INDEX idx_meeting_session_group ON meeting_session (group_id)
   WHERE group_id IS NOT NULL;
 ```
@@ -48,13 +47,32 @@ CREATE INDEX idx_meeting_session_group ON meeting_session (group_id)
 `NULL` means a solo recording — which every existing row is, so the migration
 carries no backfill and no behaviour change.
 
-The lead device is its own group:
+**No foreign key.** 0031 shipped with `REFERENCES meeting_session(session_id)`
+and 0034 removed it. The group id is minted on the LEAD's device, so a joiner
+can legitimately reach the server before the lead's session exists at all —
+`/open` is best-effort and on a site can be hours late or lost. The constraint
+turned that into a 23503 and answered the joiner with a 500, which meant
+joining before the lead never worked. A foreign key on an identifier that is
+generated elsewhere and arrives eventually is a bet on arrival order.
+
+The lead does **not** carry a group id:
 
 ```
-lead:      session_id = X,  group_id = X
+lead:      session_id = X,  group_id = NULL
 joiner:    session_id = Y,  group_id = X
 joiner:    session_id = Z,  group_id = X
 ```
+
+The lead never scans anything — it shows a code and keeps recording — and its
+`/open` fired before the group existed. Membership is therefore **derived**, not
+stored: every query reads `WHERE group_id = X OR session_id = X`. Making the
+lead's membership depend on a second best-effort call would drop it from its own
+meeting whenever that call failed, which on a site is routine — and the symptom
+would be a merged report that silently omits the person holding the meeting.
+
+Three queries got this wrong before it was caught (`list_group_members`,
+`group_is_settled`, `group_span_ok`). If you add a fourth, the question to ask
+is "does the lead count as a member here?" — the answer is always yes.
 
 Using the lead's `session_id` as the group key means **no identifier has to be
 allocated**. The device already mints it locally when recording starts, so a
@@ -64,9 +82,11 @@ would throw that away.
 
 ### Joining
 
-The lead shows a QR containing `fs1:<session_id>` (the prefix is a namespace
+The lead shows a QR containing `fs1:<env>:<session_id>` (the prefix is a namespace
 guard, so scanning an unrelated code fails cleanly rather than producing a
-nonsense group). The joiner records normally; the only difference is that its
+nonsense group; the environment tag stops a dev device and a prod device from
+"successfully" forming a group whose halves land in two different databases and
+never merge, with no error anywhere). The joiner records normally; the only difference is that its
 `group_id` rides along on `POST /api/org/sessions/{id}/open`, which already
 exists and is already store-and-forward for offline devices.
 

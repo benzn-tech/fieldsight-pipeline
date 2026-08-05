@@ -1,0 +1,27 @@
+-- Drop the self-referencing foreign key on meeting_session.group_id.
+--
+-- 0031 added `group_id text REFERENCES meeting_session(session_id)`, which reads
+-- as obviously correct and is the one thing this column must not have.
+--
+-- The group's id IS the lead device's session id, generated ON THE DEVICE so a
+-- group can form with no network at all — that is the whole reason joining is a
+-- QR scan rather than a server-issued token. It follows that a joiner can reach
+-- the server BEFORE the lead does: /open is best-effort and fire-and-forget, and
+-- on a site the lead's may be delayed for hours or lost entirely. The handler
+-- accepts that case deliberately (an unknown lead is a 200, not a 404) because
+-- making the merge depend on call ordering would throw away the offline-first
+-- property the feature exists for.
+--
+-- The foreign key made that impossible: the insert raised 23503 and the joiner's
+-- /open answered 500. Joining before the lead never worked at all.
+--
+-- The unit suite passed throughout — FakeConn does not enforce constraints —
+-- which is the failure mode CLAUDE.md documents. Found by running the SQL
+-- against a real database; see tests/integration/test_session_group_sql.py.
+--
+-- What is lost: nothing that was being relied on. An orphan group_id is the
+-- expected steady state until the lead checks in, and every read is written as
+-- `group_id = X OR session_id = X`, which tolerates the lead's row not existing.
+-- The value is still constrained: the handler validates it against _SID_RE
+-- (32 lowercase hex) and refuses a lead belonging to another company.
+ALTER TABLE meeting_session DROP CONSTRAINT IF EXISTS meeting_session_group_id_fkey;
