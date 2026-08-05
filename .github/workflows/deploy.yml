@@ -105,6 +105,21 @@ jobs:
           if [ -n "${{ vars.TEST_VAD_LAYER_ARN }}" ]; then
             VAD_LAYER_PARAM="VadLayerArn=${{ vars.TEST_VAD_LAYER_ARN }}"
           fi
+          # Non-work (personal) topic retention sweep. Two independent gates, both
+          # off by default, because this one DELETES: it tombstones the topic and
+          # drops its vectors (the transcript and audio are left alone).
+          #   * TEST_NONWORK_EXPIRY_ENABLED -> arms the schedule at all.
+          #   * TEST_NONWORK_EXPIRY_SINCE   -> the floor. Only topics created at or
+          #     after it are ever swept, so switching this on is NOT retroactive.
+          #     Set it to the date the policy starts, NOT to when classification
+          #     began: the earlier date would sweep every historical personal
+          #     topic on the first run. The sweep refuses to run without it, so a
+          #     forgotten value fails closed rather than sweeping everything.
+          # Same bare-"Key=" guard as the layer overrides above.
+          NONWORK_SINCE_PARAM=""
+          if [ -n "${{ vars.TEST_NONWORK_EXPIRY_SINCE }}" ]; then
+            NONWORK_SINCE_PARAM="NonWorkExpirySince=${{ vars.TEST_NONWORK_EXPIRY_SINCE }}"
+          fi
           sam deploy --config-env test \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -121,6 +136,9 @@ jobs:
               "EmailSender=${{ vars.TEST_EMAIL_SENDER || 'stub' }}" \
               "EnableSiteVoice=true" \
               "DocxLayerArn=arn:aws:lambda:ap-southeast-2:509194952652:layer:python-docx-layer:2" \
+              "EnableNonWorkExpiry=${{ vars.TEST_NONWORK_EXPIRY_ENABLED || 'false' }}" \
+              "NonWorkExpiryHours=${{ vars.TEST_NONWORK_EXPIRY_HOURS || '24' }}" \
+              $NONWORK_SINCE_PARAM \
               "EnableKeyframes=${{ vars.TEST_ENABLE_KEYFRAMES || 'false' }}" \
               $KF_LAYER_PARAM \
               $VAD_LAYER_PARAM \
