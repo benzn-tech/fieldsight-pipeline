@@ -79,3 +79,46 @@ def test_an_unknown_group_is_not_a_violation(db):
     merge yet, and refusing here would block a group that is merely empty."""
     _seed(db)
     assert meeting_session.group_span_ok(db, LEAD, FOUR_HOURS) is True
+
+
+# ---- lead_is_joinable ------------------------------------------------------
+#
+# Unlike group_span_ok this one is WIRED: session_open calls it and answers 409.
+# A wrong result here refuses live joins or lets stale ones through, today.
+
+
+def test_a_lead_opened_recently_can_still_be_joined(db):
+    cid, uid = _seed(db)
+    _session(db, cid, uid, LEAD, hours_ago=1)
+
+    assert meeting_session.lead_is_joinable(db, LEAD, FOUR_HOURS) is True
+
+
+def test_a_lead_from_this_morning_cannot(db):
+    """The overnight-carry shape, judged on the server's clock because the
+    device's is what is in question (BUG-37: these ROMs run 12 hours out)."""
+    cid, uid = _seed(db)
+    _session(db, cid, uid, LEAD, hours_ago=5)
+
+    assert meeting_session.lead_is_joinable(db, LEAD, FOUR_HOURS) is False
+
+
+def test_a_lead_with_no_open_time_is_not_this_guard_s_call(db):
+    """opened_at is nullable and genuinely ends up NULL: a session inferred from
+    the chunk stream has only whatever the filename yielded. The comparison is
+    then NULL, which must read as "no opinion" — refusing on NULL would block
+    joins for a reason that has nothing to do with staleness."""
+    cid, uid = _seed(db)
+    db.execute(
+        "INSERT INTO meeting_session (session_id, company_id, user_id, kind, status, opened_at) "
+        "VALUES (%s,%s,%s,'audio','open', NULL)", (LEAD, cid, uid))
+
+    assert meeting_session.lead_is_joinable(db, LEAD, FOUR_HOURS) is True
+
+
+def test_an_unknown_lead_is_not_refused(db):
+    """The joiner reached us before the lead. Refusing would put the merge back
+    on call ordering, which the offline-first design exists to avoid."""
+    _seed(db)
+    assert meeting_session.lead_is_joinable(db, LEAD, FOUR_HOURS) is True
+
