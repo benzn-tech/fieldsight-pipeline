@@ -62,7 +62,9 @@ from keyframe_selection import keyframe_seconds
 from photo_binding import PHOTOS_PER_TOPIC_CAP  # noqa: F401  (re-export)
 from photo_binding import list_pictures as _pb_list_pictures
 from photo_binding import photos_for_topics as _photos_for_topics
-from repositories import companies, findings, meeting_session, recordings, sites, topics
+import thread_match
+from repositories import (companies, findings, meeting_session, recordings, sites,
+                          threads, topics)
 # The extraction-key shape lives in session_scope now (the read side needs the
 # SAME parse to derive session_id from topics.source_s3_key -- see that
 # module). Re-exported under the historical private names so existing callers
@@ -82,6 +84,10 @@ COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 # video-keyframe plan: ship the pipeline change inert -- only when
 # EnableKeyframes flips this env true does item-writer emit keyframe_requests/.
 EMIT_KEYFRAME_REQUESTS = os.environ.get("EMIT_KEYFRAME_REQUESTS", "false").lower() == "true"
+# Propose which earlier subject a new topic is a restatement of. Off by
+# default so the write path ships inert: this only ever writes rows to
+# topic_thread_suggestions, which nothing reads yet.
+SUGGEST_THREADS = os.environ.get("SUGGEST_THREADS", "false").lower() == "true"
 
 EXTRACTIONS_PREFIX = "extractions/"
 
@@ -144,6 +150,72 @@ def _list_pictures(prefix):
 # ----------------------------------------------------------
 # Per-extraction write (commit-per-extraction: one `with get_connection()` here)
 # ----------------------------------------------------------
+def _suggest_threads(conn, site_id, date, written):
+    """Propose, for each topic just written, which earlier subject it is a
+    restatement of.
+
+    PROPOSES. Nothing here sets topics.thread_id -- that only happens when a
+    human confirms, because a wrong link silently closes or escalates the
+    wrong work and nobody finds out.
+
+    Runs inside the caller's transaction and inside the VPC, which is why the
+    matcher is lexical: this lambda has no outbound network (CLAUDE.md
+    BUG-36), and string maths over rows already in the database needs none.
+
+    Never fatal, and the SAVEPOINT is what makes that true rather than
+    aspirational: catching a database error in Python does NOT un-abort the
+    transaction it happened in -- Postgres refuses every later statement, so
+    the commit fails and the topics and findings this transaction just wrote
+    are lost. A bare try/except here would have silently traded the day's
+    real content for an optional suggestion. `conn.transaction()` nested
+    inside the caller's transaction issues a SAVEPOINT, so a failure unwinds
+    only this pass."""
+    try:
+        with conn.transaction():
+            return _suggest_threads_inner(conn, site_id, date, written)
+    except Exception:
+        logger.exception("thread suggestion pass failed; topics were written")
+        return 0
+
+
+def _suggest_threads_inner(conn, site_id, date, written):
+    corpus = threads.candidate_corpus(conn, site_id, date,
+                                      thread_match.MAX_GAP_DAYS)
+    if not corpus:
+        return 0
+    made = 0
+    for t in written:
+        new_topic = {
+            "id": t["topic_id"], "report_date": date, "site_id": site_id,
+            "title": t.get("title"), "summary": t.get("summary"),
+            "open_items": t.get("open_items") or 0,
+        }
+        # The new topic joins the corpus for IDF only: a word's weight
+        # should account for the document being scored, and on a small
+        # site's corpus leaving it out visibly skews the rarity of its
+        # own vocabulary. find_candidates skips it as a candidate.
+        hits = thread_match.find_candidates(new_topic, list(corpus) + [new_topic])
+        if not hits:
+            continue
+        best = hits[0]
+        # Join the parent's thread if it has one; otherwise anchor a new
+        # thread on the parent itself. Exactly one of these, which the
+        # table's CHECK enforces.
+        if best.get("thread_id"):
+            row = threads.upsert_suggestion(
+                conn, t["topic_id"], thread_id=best["thread_id"],
+                score=best["match_score"], gap_days=best["gap_days"])
+        else:
+            row = threads.upsert_suggestion(
+                conn, t["topic_id"], parent_topic_id=best["id"],
+                score=best["match_score"], gap_days=best["gap_days"])
+        if row is not None:
+            made += 1
+    logger.info("thread suggestions: %d proposed over %d candidates",
+                made, len(corpus))
+    return made
+
+
 def write_extraction_items(date, user_folder, extraction_key):
     raw = s3().get_object(Bucket=S3_BUCKET, Key=extraction_key)["Body"].read()
     extraction = json.loads(raw.decode("utf-8"))
@@ -304,6 +376,10 @@ def write_extraction_items(date, user_folder, extraction_key):
                 "title": t.get("topic_title", ""),
                 "summary": t.get("summary"),
                 "user_id": str(user_id) if user_id is not None else None,
+                # Freshly extracted items are all 'open' (upsert_topic defaults
+                # the column), and thread eligibility is "does this subject
+                # still carry outstanding work" -- so the count is the length.
+                "open_items": len(mapped_action_items),
                 "action_items": [{"text": a["text"]} for a in mapped_action_items],
                 "findings": [{
                     "finding_id": str(f["id"]),
@@ -322,6 +398,9 @@ def write_extraction_items(date, user_folder, extraction_key):
                 keyframe_topics.append({"topic_id": str(row["id"]),
                                         "time_range": t.get("time_range")})
             topics_n += 1
+
+        if SUGGEST_THREADS and collected_topics:
+            _suggest_threads(conn, site["id"], date, collected_topics)
 
     logger.info("item-writer wrote extraction=%s topics=%d", extraction_key, topics_n)
 
