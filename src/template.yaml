@@ -108,6 +108,15 @@ Parameters:
       KeyframeFunction itself deploys whenever HasKeyframeStack (HasDb &&
       HasVadLayer); this flag only gates the item-writer emission so the
       pipeline change ships inert until flipped per stage.
+  EnableThreadSuggestions:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Have item-writer propose which earlier subject a new topic restates
+      (recurring-item threading). Writes only to topic_thread_suggestions,
+      which nothing reads yet, and never sets topics.thread_id -- confirming
+      a link stays a human's call. Ships inert until flipped per stage.
   RealPTTAccount:
     Type: String
     Description: RealPTT platform account (external service)
@@ -1959,6 +1968,9 @@ Resources:
           # video-keyframe plan: emit keyframe_requests/ post-commit only when
           # this stage flag is on (ships inert otherwise).
           EMIT_KEYFRAME_REQUESTS: !Ref EnableKeyframes
+          # recurring-item threading: propose which earlier subject a new
+          # topic restates. Writes suggestions only; never links.
+          SUGGEST_THREADS: !Ref EnableThreadSuggestions
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'

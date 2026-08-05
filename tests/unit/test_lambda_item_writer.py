@@ -24,6 +24,14 @@ class _FakeCursor:
         return self._row
 
 
+class _FakeTransaction:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False          # never swallow; the caller decides
+
+
 class FakeConn:
     """report_already_ingested governs what conn.execute(...).fetchone()
     returns -- only the I-4 report-source-key query ever calls .fetchone()
@@ -43,6 +51,18 @@ class FakeConn:
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
         return _FakeCursor({"?column?": 1} if self.report_already_ingested else None)
+
+    def transaction(self):
+        """psycopg's nested transaction (a SAVEPOINT when one is already
+        open). Modelled only as far as the caller relies on it: enter, and
+        let an exception propagate so the caller's own except sees it.
+
+        What it does NOT model is the thing that makes the real one
+        necessary -- Postgres aborting the whole transaction on any error, so
+        that catching it in Python is not enough. That behaviour only exists
+        in a real database, which is why the savepoint's actual job is
+        covered by an integration test rather than here."""
+        return _FakeTransaction()
 
 
 class FakeS3:
@@ -479,6 +499,11 @@ def test_match_request_emitted_after_multi_topic_write(wired):
         "title": "Safety Briefing",
         "summary": "Discussed PPE requirements.",
         "user_id": None,
+        # Freshly extracted items are all 'open', so the count is the length.
+        # Carried on the snapshot because thread eligibility is "does this
+        # subject still have outstanding work" and the suggestion pass reads
+        # it without re-querying.
+        "open_items": 1,
         "action_items": [{"text": "Order more hard hats"}],
         "findings": [],
     }]
@@ -1096,3 +1121,101 @@ def test_legacy_whole_file_base_never_hits_meeting_session(wired):
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
     assert seen and all(s == "site-MEMBER" for s in seen)
     assert called == []                             # bare-base guard short-circuits
+
+
+# ---------------------------------------------------------------------------
+# Thread suggestions (recurring-item threading, increment 1c)
+#
+# The pass PROPOSES which earlier subject a new topic restates. It never sets
+# topics.thread_id -- a wrong link silently closes or escalates the wrong
+# work, so confirming one is a human's call.
+# ---------------------------------------------------------------------------
+
+def test_thread_suggestions_are_off_by_default(wired, monkeypatch):
+    """Ships inert: the env flag is what turns it on, so merging this cannot
+    start writing rows to a table nothing reads yet."""
+    called = []
+    monkeypatch.setattr(iw.threads, "candidate_corpus",
+                        lambda *a, **k: called.append(a) or [])
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+    assert called == []
+
+
+def test_a_failing_suggestion_pass_does_not_lose_the_topics(wired, monkeypatch):
+    """The pass is an extra; the day's real content is not. Catching a
+    database error in Python does NOT un-abort the transaction it happened
+    in, so without the SAVEPOINT this would take the topics down with it --
+    the whole point of wrapping it in conn.transaction()."""
+    monkeypatch.setattr(iw, "SUGGEST_THREADS", True)
+    monkeypatch.setattr(iw.threads, "candidate_corpus",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+    assert result == {"skipped": False, "topics": 1}
+
+
+def test_no_earlier_candidates_means_no_proposal(wired, monkeypatch):
+    """Most topics are a new subject. Inventing a parent for them is the
+    failure this design exists to avoid, so an empty corpus must simply
+    write nothing."""
+    monkeypatch.setattr(iw, "SUGGEST_THREADS", True)
+    monkeypatch.setattr(iw.threads, "candidate_corpus", lambda *a, **k: [])
+    made = []
+    monkeypatch.setattr(iw.threads, "upsert_suggestion",
+                        lambda *a, **k: made.append(k) or {"id": "s"})
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+    assert made == []
+
+
+def test_a_parent_already_on_a_thread_proposes_JOINING_that_thread(wired, monkeypatch):
+    monkeypatch.setattr(iw, "SUGGEST_THREADS", True)
+    monkeypatch.setattr(iw.threads, "candidate_corpus", lambda *a, **k: [
+        {"id": "older", "report_date": "2026-07-01", "site_id": "site-1",
+         "title": "Safety Briefing PPE", "summary": "", "open_items": 2,
+         "thread_id": "thread-9"},
+    ])
+    made = []
+    monkeypatch.setattr(iw.threads, "upsert_suggestion",
+                        lambda conn, tid, **k: made.append((tid, k)) or {"id": "s"})
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert len(made) == 1
+    _, kw = made[0]
+    assert kw["thread_id"] == "thread-9"
+    assert kw.get("parent_topic_id") is None
+
+
+def test_a_parent_with_no_thread_proposes_ANCHORING_one_on_it(wired, monkeypatch):
+    """Exactly one of thread_id / parent_topic_id, which the table's CHECK
+    enforces -- so the branch that picks between them has to be right here."""
+    monkeypatch.setattr(iw, "SUGGEST_THREADS", True)
+    monkeypatch.setattr(iw.threads, "candidate_corpus", lambda *a, **k: [
+        {"id": "older", "report_date": "2026-07-01", "site_id": "site-1",
+         "title": "Safety Briefing PPE", "summary": "", "open_items": 2,
+         "thread_id": None},
+    ])
+    made = []
+    monkeypatch.setattr(iw.threads, "upsert_suggestion",
+                        lambda conn, tid, **k: made.append((tid, k)) or {"id": "s"})
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert len(made) == 1
+    _, kw = made[0]
+    assert kw["parent_topic_id"] == "older"
+    assert kw.get("thread_id") is None
+
+
+def test_the_pass_never_sets_thread_id_itself(wired, monkeypatch):
+    """The safety property of the whole design, pinned: a thread_id means a
+    person said yes."""
+    monkeypatch.setattr(iw, "SUGGEST_THREADS", True)
+    monkeypatch.setattr(iw.threads, "candidate_corpus", lambda *a, **k: [
+        {"id": "older", "report_date": "2026-07-01", "site_id": "site-1",
+         "title": "Safety Briefing PPE", "summary": "", "open_items": 2,
+         "thread_id": "thread-9"},
+    ])
+    monkeypatch.setattr(iw.threads, "upsert_suggestion", lambda *a, **k: {"id": "s"})
+    attached = []
+    monkeypatch.setattr(iw.threads, "attach_topic",
+                        lambda *a, **k: attached.append(a))
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+    assert attached == []
