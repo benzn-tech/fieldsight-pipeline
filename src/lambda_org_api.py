@@ -122,6 +122,7 @@ import boto3
 from botocore.exceptions import ClientError
 from psycopg.errors import UniqueViolation
 
+import chunk_stitch
 import content_hash
 import device_heartbeat
 import reindex
@@ -636,7 +637,49 @@ def complete_recording(conn, caller, rec_id, body):
                                     b.get("sizeBytes"), gps_track)
     if row is None:
         return error("recording not found", 404)
-    return ok({"ok": True})
+    payload = {"ok": True}
+    if _group_ended_for(conn, row.get("s3_key")):
+        # Only present when true. A solo upload's response stays byte-identical
+        # to what it has always been, which is most of the traffic on this
+        # endpoint and none of it should change shape for a feature it has no
+        # part in.
+        payload["groupEnded"] = True
+    return ok(payload)
+
+
+def _group_ended_for(conn, s3_key) -> bool:
+    """Has someone ended the meeting this chunk belongs to?
+
+    This is the only channel back to a device that has no open connection: it
+    rides on the upload the device is already doing. That makes it a HOT path —
+    every chunk of every recording — so the cost is kept to one primary-key
+    lookup for the overwhelmingly common case:
+
+      - no `_sid` in the key (legacy filenames): zero queries
+      - solo recording: one PK lookup, `group_ended_at` and `group_id` both NULL
+      - member of an ended group: one PK lookup, already marked
+      - device that joined AFTER the end: two, and only until its next chunk
+
+    Failures are swallowed. A device not learning the meeting ended costs one
+    extra prompt; a `complete` that 500s strands an uploaded recording as
+    un-uploaded and the mobile retry loop re-sends the whole file (BUG-43's
+    family). The signal is an optimisation and must never be able to break the
+    upload it rides on.
+    """
+    m = chunk_stitch.CHUNK_TOKENS_RE.search(s3_key or "")
+    if not m:
+        return False
+    try:
+        row = meeting_session.get(conn, m.group(1))
+        if row is None:
+            return False
+        if row.get("group_ended_at") is not None:
+            return True
+        group_id = row.get("group_id")
+        return bool(group_id) and meeting_session.group_is_ended(conn, group_id)
+    except Exception:
+        logger.exception("group-ended check failed for %s; reporting not-ended", s3_key)
+        return False
 
 
 # ----------------------------------------------------------
@@ -702,6 +745,14 @@ def session_close(conn, caller, session_id, body):
                    "version": existing["version"], "noop": True})
 
     row = meeting_session.mark_pending_close(conn, session_id, b.get("endedAt"), intent)
+    # Multi-device merge: a deliberate End means "the meeting is over", so the
+    # other devices have to be told. Recorded here rather than pushed, because
+    # there is no channel to a device that is not currently uploading — the
+    # signal rides back on the upload each device is already doing
+    # (complete_recording below). end_group is a no-op unless a joiner exists,
+    # which is what keeps every ordinary solo End untouched.
+    if intent == "end":
+        meeting_session.end_group(conn, existing.get("group_id") or session_id)
     # A deliberate End finalizes immediately (grace 0); a plain/idle stop waits the
     # mis-touch tolerance window. This endpoint only records pending_close + version
     # + close_intent; a scheduled sweep (FinalizeSweepFunction, in-VPC) then claims

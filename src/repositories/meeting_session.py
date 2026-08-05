@@ -18,7 +18,7 @@ _COLS = (
     "session_id, company_id, user_id, site_id, kind, status, version, "
     "opened_at, last_segment_at, closed_at, close_intent, rolling_summary, "
     "rolling_summary_version, segment_count, word_count, created_at, updated_at, "
-    "group_id"
+    "group_id, group_ended_at"
 )
 
 
@@ -49,14 +49,24 @@ def ensure_open(conn, session_id, company_id, user_id, site_id, kind, opened_at,
 
 
 def list_group_members(conn, group_id) -> list[dict]:
-    """Every session in one multi-device group, oldest first.
+    """Every session in one multi-device group, oldest first — INCLUDING the lead.
 
-    The lead is its own member — it sets its group_id to its own session_id —
-    so this returns the whole meeting, not just the joiners."""
+    The lead does NOT carry a group_id of its own. It never scans anything: it
+    shows a code and keeps recording, and its `/open` fired before the group
+    existed. An earlier version of this assumed the lead would set group_id to
+    its own session_id; nothing on the device does that, and nothing should have
+    to — making the lead's membership depend on a second best-effort call would
+    drop it from its own meeting whenever that call failed, which on a site is
+    routine. The group id IS the lead's session id, so membership is derivable
+    without asking the device anything.
+
+    Passing a plain solo session id therefore returns that one session. Callers
+    hold a real group id; this is stated so the one-row result is not read as a
+    bug."""
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_COLS} FROM meeting_session WHERE group_id = %s "
+        f"SELECT {_COLS} FROM meeting_session WHERE group_id = %s OR session_id = %s "
         f"ORDER BY opened_at NULLS FIRST, session_id",
-        (group_id,),
+        (group_id, group_id),
     ).fetchall()
 
 
@@ -72,13 +82,57 @@ def group_is_settled(conn, group_id, idle_grace_seconds) -> bool:
     else's report hostage."""
     row = conn.cursor(row_factory=dict_row).execute(
         "SELECT COUNT(*) AS unsettled FROM meeting_session "
-        "WHERE group_id = %s "
+        # Lead included, same as list_group_members: it carries no group_id of
+        # its own, and a group settled without waiting for the lead would
+        # finalize the meeting while the person holding the code is still
+        # recording it.
+        "WHERE (group_id = %s OR session_id = %s) "
         "AND status NOT IN ('sent','failed') "
         "AND COALESCE(last_segment_at, opened_at, created_at) "
         "    > now() - make_interval(secs => %s)",
-        (group_id, idle_grace_seconds),
+        (group_id, group_id, idle_grace_seconds),
     ).fetchone()
     return int((row or {}).get("unsettled") or 0) == 0
+
+
+def end_group(conn, group_id) -> int:
+    """One member answered "the meeting has ended". Record it for the whole group.
+
+    @return how many sessions were marked; 0 when this is not a group.
+
+    The zero case is the important one. A solo session's id is indistinguishable
+    from a lead's — both are "the group id" as far as the close handler can see —
+    so without this guard every ordinary solo End would mark itself ended, and
+    the upload path would then tell that device to stop recording. Requiring a
+    joiner to exist is what makes the solo path provably untouched.
+
+    Already-ended rows are left alone so the timestamp records when the meeting
+    actually ended, not when the last device happened to ask."""
+    has_joiner = conn.cursor(row_factory=dict_row).execute(
+        "SELECT 1 AS x FROM meeting_session WHERE group_id = %s LIMIT 1", (group_id,)
+    ).fetchone()
+    if not has_joiner:
+        return 0
+    cur = conn.cursor(row_factory=dict_row).execute(
+        "UPDATE meeting_session SET group_ended_at = now(), updated_at = now() "
+        "WHERE (group_id = %s OR session_id = %s) AND group_ended_at IS NULL "
+        "RETURNING session_id",
+        (group_id, group_id),
+    )
+    return len(cur.fetchall())
+
+
+def group_is_ended(conn, group_id) -> bool:
+    """True once anyone in the group has ended the meeting.
+
+    Reads the whole group rather than one row so a device that joined AFTER the
+    end is told immediately, instead of recording into a meeting that is over."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT 1 AS x FROM meeting_session "
+        "WHERE (group_id = %s OR session_id = %s) AND group_ended_at IS NOT NULL LIMIT 1",
+        (group_id, group_id),
+    ).fetchone()
+    return row is not None
 
 
 def touch_segment(conn, session_id, at) -> dict | None:

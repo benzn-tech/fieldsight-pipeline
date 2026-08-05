@@ -142,6 +142,9 @@ def test_close_end_finalizes_immediately_grace_zero(monkeypatch):
     _patch_get(monkeypatch, {"user_id": "u-1", "status": "open", "version": 1})
     monkeypatch.setattr(org.meeting_session, "mark_pending_close",
                         lambda conn, sid, ended_at, intent: {"status": "pending_close", "version": 2})
+    # An End now also settles the group (a no-op for this solo session, but the
+    # repo call happens either way).
+    monkeypatch.setattr(org.meeting_session, "end_group", lambda conn, gid: 0)
     res = org.session_close(CONN, CALLER, SID, {"intent": "end"})
     assert body_of(res)["graceSeconds"] == 0
 
@@ -174,3 +177,42 @@ def test_close_already_sent_is_idempotent_noop(monkeypatch):
     res = org.session_close(CONN, CALLER, SID, {"intent": "end"})
     assert res["statusCode"] == 200
     assert body_of(res)["noop"] is True
+
+
+# ---- ending the meeting for the other devices -----------------------------
+
+
+def _patch_close(monkeypatch, row, ended):
+    _patch_get(monkeypatch, row)
+    monkeypatch.setattr(org.meeting_session, "mark_pending_close",
+                        lambda conn, sid, at, intent: {"status": "pending_close", "version": 1})
+    monkeypatch.setattr(org.meeting_session, "end_group",
+                        lambda conn, gid: ended.append(gid) or 1)
+
+
+def test_a_deliberate_end_ends_the_whole_group(monkeypatch):
+    ended = []
+    _patch_close(monkeypatch, {"user_id": "u-1", "status": "open", "version": 0,
+                               "group_id": LEAD}, ended)
+    assert org.session_close(CONN, CALLER, SID, {"intent": "end"})["statusCode"] == 200
+    assert ended == [LEAD]
+
+
+def test_the_lead_ending_uses_its_own_id_as_the_group(monkeypatch):
+    """The lead carries no group_id — the group id IS its session id."""
+    ended = []
+    _patch_close(monkeypatch, {"user_id": "u-1", "status": "open", "version": 0,
+                               "group_id": None}, ended)
+    org.session_close(CONN, CALLER, SID, {"intent": "end"})
+    assert ended == [SID]
+
+
+def test_an_idle_stop_ends_nothing(monkeypatch):
+    """Putting the device down is not ending the meeting. Only a deliberate End
+    speaks for everyone else."""
+    ended = []
+    _patch_close(monkeypatch, {"user_id": "u-1", "status": "open", "version": 0,
+                               "group_id": LEAD}, ended)
+    org.session_close(CONN, CALLER, SID, {"intent": "idle"})
+    assert ended == []
+
