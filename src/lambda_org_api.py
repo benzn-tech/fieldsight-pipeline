@@ -615,12 +615,64 @@ def create_recording_upload_url(conn, caller, body):
             else:
                 return error("a recording with this s3 key already exists", 409)
 
+    _adopt_group_from_upload(conn, caller, body, file_name, kind, started_at, site_id)
+
     url = s3().generate_presigned_url(
         "put_object",
         Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": content_type},
         ExpiresIn=PRESIGNED_URL_EXPIRY,
     )
     return ok({"recordingId": rec_id, "uploadUrl": url, "s3Key": key})
+
+
+def _adopt_group_from_upload(conn, caller, body, file_name, kind, started_at, site_id):
+    """Record the meeting group carried by an upload, if there is one.
+
+    Why this exists: `/sessions/{id}/open` is best-effort and fire-and-forget,
+    and being offline is the normal case on a site — the device may join a
+    meeting in a shed with no signal and not reach the server until hours
+    later. If the group only ever travelled on that one call, joining offline
+    would silently produce two unmerged recordings, which is precisely the
+    situation multi-device capture exists for. The upload is the one thing that
+    is guaranteed to reach us eventually, so the group rides on it too.
+
+    `ensure_open` only ever FILLS group_id (COALESCE), so this and `/open` can
+    both run, in either order, any number of times, without fighting.
+
+    Costs nothing on the solo path: no groupId in the body, no query at all.
+    That path is the overwhelming majority of uploads and is on the synchronous,
+    no-retry route where added latency turns into lost data (BUG-43).
+    """
+    group_id = (body or {}).get("groupId")
+    if not group_id:
+        return
+    try:
+        if not _SID_RE.match(str(group_id)):
+            logger.warning("upload-url: ignoring malformed groupId %r", group_id)
+            return
+        # The session id is in the wire filename (`_sid{32hex}_c{NNNN}`), the
+        # same token the chunk pipeline groups on. A file without it is a photo
+        # or a legacy name and has no session to attach a group to.
+        m = chunk_stitch.CHUNK_TOKENS_RE.search(file_name or "")
+        if not m:
+            return
+        # Same tenant boundary as /open: an unknown lead is allowed (the joiner
+        # can reach us first), a lead belonging to another company is not.
+        # Skipped rather than refused — failing the upload over the group would
+        # cost the recording itself, and /open already answers 403 for this.
+        lead = meeting_session.get(conn, group_id)
+        if lead is not None and str(lead["company_id"]) != str(caller["company_id"]):
+            logger.warning("upload-url: refusing cross-company group %s", group_id)
+            return
+        meeting_session.ensure_open(
+            conn, m.group(1), caller["company_id"], caller["id"], site_id, kind,
+            started_at, group_id=group_id,
+        )
+    except Exception:
+        # An upload that 500s strands the recording and makes the device resend
+        # the whole file. A lost group costs a merge; a lost upload costs the
+        # audio (BUG-43's family).
+        logger.exception("upload-url: could not record group %s", group_id)
 
 
 def complete_recording(conn, caller, rec_id, body):

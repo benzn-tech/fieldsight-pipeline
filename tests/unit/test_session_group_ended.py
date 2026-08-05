@@ -58,3 +58,82 @@ def test_an_idle_stop_ends_nothing(monkeypatch):
                                "group_id": LEAD}, ended)
     org.session_close(CONN, CALLER, SID, {"intent": "idle"})
     assert ended == []
+
+
+# ---- the group riding on the upload (offline joins) -----------------------
+#
+# /open is fire-and-forget and being offline is normal on a site. If the group
+# only travelled on that call, joining in a shed with no signal would silently
+# produce two unmerged recordings — the exact situation multi-device capture
+# exists for. The upload is the one thing guaranteed to arrive eventually.
+
+CHUNK_NAME = f"Ben_2026-08-06_09-00-00_sid{SID}_c0001.wav"
+
+
+def _capture_ensure_open(monkeypatch, seen):
+    def fake(conn, sid, company_id, user_id, site_id, kind, opened_at, group_id=None):
+        seen.append({"session_id": sid, "group_id": group_id, "company_id": company_id})
+        return {"session_id": sid, "status": "open", "version": 0, "group_id": group_id}
+    monkeypatch.setattr(org.meeting_session, "ensure_open", fake)
+
+
+def _upload(monkeypatch, body, seen, lead=None):
+    _capture_ensure_open(monkeypatch, seen)
+    monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: lead)
+    org._adopt_group_from_upload(
+        CONN, CALLER, body, body.get("fileName"), "audio", "2026-08-06T09:00:00", None)
+
+
+def test_the_group_is_recorded_against_the_session_in_the_filename(monkeypatch):
+    seen = []
+    _upload(monkeypatch, {"groupId": LEAD, "fileName": CHUNK_NAME}, seen)
+    assert seen == [{"session_id": SID, "group_id": LEAD, "company_id": "c-1"}]
+
+
+def test_a_solo_upload_costs_no_query(monkeypatch):
+    """The overwhelming majority of uploads, on the synchronous no-retry route
+    where added latency turns into lost data."""
+    seen = []
+    monkeypatch.setattr(org.meeting_session, "get",
+                        lambda *a, **k: pytest.fail("must not touch the DB"))
+    _capture_ensure_open(monkeypatch, seen)
+    org._adopt_group_from_upload(CONN, CALLER, {"fileName": CHUNK_NAME}, CHUNK_NAME,
+                                 "audio", "2026-08-06T09:00:00", None)
+    assert seen == []
+
+
+def test_a_photo_or_legacy_filename_is_skipped(monkeypatch):
+    seen = []
+    _upload(monkeypatch, {"groupId": LEAD, "fileName": "Ben_2026-08-06_09-00-00.jpg"}, seen)
+    assert seen == []
+
+
+def test_a_malformed_group_is_ignored_not_stored(monkeypatch):
+    seen = []
+    _upload(monkeypatch, {"groupId": "not-a-session", "fileName": CHUNK_NAME}, seen)
+    assert seen == []
+
+
+def test_a_cross_company_group_is_refused(monkeypatch):
+    """Skipped rather than failing the upload: refusing would cost the audio,
+    and /open already answers 403 for this."""
+    seen = []
+    _upload(monkeypatch, {"groupId": LEAD, "fileName": CHUNK_NAME}, seen,
+            lead={"session_id": LEAD, "company_id": "other-co"})
+    assert seen == []
+
+
+def test_an_unknown_lead_is_still_accepted(monkeypatch):
+    """The joiner can reach us before the lead does — that is the whole point of
+    not depending on call ordering."""
+    seen = []
+    _upload(monkeypatch, {"groupId": LEAD, "fileName": CHUNK_NAME}, seen, lead=None)
+    assert len(seen) == 1 and seen[0]["group_id"] == LEAD
+
+
+def test_a_failure_never_breaks_the_upload(monkeypatch):
+    """A lost group costs a merge; a lost upload costs the audio."""
+    monkeypatch.setattr(org.meeting_session, "get", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db")))
+    org._adopt_group_from_upload(CONN, CALLER, {"groupId": LEAD, "fileName": CHUNK_NAME},
+                                 CHUNK_NAME, "audio", "2026-08-06T09:00:00", None)
+
