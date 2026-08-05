@@ -234,12 +234,17 @@ def test_topic_children_mapped(wired):
     assert kw["source_s3_key"] == EXTRACTION_KEY
     assert kw["category"] == "safety"
     assert kw["summary"] == "Discussed PPE requirements."
-    # _map_action_items: 'action' -> 'text'; 'deadline' "Friday" is not an
-    # ISO date -> dropped to None (same rule as lambda_ingest's reports), but
-    # 'deadline_text' keeps the raw string (Task 2, authority-flip plan).
+    # _map_action_items: 'action' -> 'text'; 'deadline_text' keeps the raw
+    # string, and the DATE column is now RESOLVED from it against the report's
+    # own date -- said on Monday 2026-07-06, "Friday" is 2026-07-10.
+    #
+    # This used to assert None, on the rule "only pass through strings that
+    # are already ISO". That rule is why prod carried 18 open items with a
+    # stated deadline and zero with a date: the extractor was capturing them
+    # and the write path was throwing them away.
     assert kw["action_items"] == [{
         "text": "Order more hard hats", "responsible": "Bob",
-        "deadline": None, "deadline_text": "Friday", "priority": None,
+        "deadline": "2026-07-10", "deadline_text": "Friday", "priority": None,
     }]
     # Phase F Task 23 (D8 retirement, spec §8): the item-writer no longer
     # passes safety= to upsert_topic at all -- findings (inserted separately,

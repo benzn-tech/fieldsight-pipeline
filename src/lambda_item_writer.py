@@ -241,7 +241,7 @@ def write_extraction_items(date, user_folder, extraction_key):
         collected_topics = []
         keyframe_topics = []  # video-keyframe plan: {topic_id, time_range} of gate-passers
         for i, t in enumerate(extraction_topics):
-            mapped_action_items = lambda_ingest._map_action_items(t.get("action_items"))
+            mapped_action_items = lambda_ingest._map_action_items(t.get("action_items"), date)
             matched_photos = photos_by_topic.get(i, [])
             # Sanitize work_class/work_confidence before the upsert (Fable
             # review #7): the columns carry CHECK constraints (work_class IN
