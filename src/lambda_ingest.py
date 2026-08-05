@@ -63,6 +63,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+import deadline_parse
 import match_request
 import photo_binding
 import reindex
@@ -347,21 +348,27 @@ def _match_report_topics_to_extraction(conn, site_id, user_id, date, report_topi
 # ----------------------------------------------------------
 # Report-topic child shape mapping (report JSON -> repositories/topics.py)
 # ----------------------------------------------------------
-def _map_action_items(items):
+def _map_action_items(items, report_date=None):
     """Report action_items use 'action' for the task text; action_items'
     DB column is 'text' (see repositories/topics.py). 'deadline' in reports
     is free text ('EOD', 'Tomorrow 08:00', ...) per lambda_report_generator's
-    schema, but the column is a SQL date -- only pass through values that
-    already look like an ISO date, else drop to NULL rather than have a
-    real ingest 500 on a strptime-hostile string. 'deadline_text' (migration
-    0011, authority-flip) carries that SAME raw string verbatim -- including
-    non-ISO free text the 'deadline' column drops -- so the display layer
-    never loses "EOD"/"Tomorrow 08:00"/etc just because it isn't a SQL date."""
+    schema. 'deadline_text' (migration 0011, authority-flip) carries that raw
+    string verbatim so the display layer never loses it.
+
+    The DATE column is now RESOLVED from that text rather than only accepting
+    strings that already happened to be ISO. Requiring ISO meant prod carried
+    18 open items with a stated deadline and ZERO with a date -- the
+    extractor was capturing deadlines and the write path was dropping them,
+    so nothing that needs to compare dates (overdue, due-this-week, counting
+    how often a promised date slipped) had anything to read.
+
+    `report_date` anchors the relative phrasing ("Tomorrow", "Friday"). It is
+    optional so existing callers keep working, but WITHOUT it only absolute
+    dates resolve -- deadline_parse refuses to fall back to the server's
+    today, which would make a recording's deadlines drift on reprocessing."""
     out = []
     for a in items or []:
-        deadline = a.get("deadline")
-        if not (isinstance(deadline, str) and _ISO_DATE_RE.match(deadline)):
-            deadline = None
+        deadline = deadline_parse.resolve_deadline(a.get("deadline"), report_date)
         out.append({
             "text": a.get("action", ""),
             "responsible": a.get("responsible"),
@@ -503,7 +510,7 @@ def ingest_report(date, user_folder, report_key):
             photos_by_topic = photo_binding.photos_for_topics(
                 _list_report_pictures(user_folder, date), report_topics)
             for i, t in enumerate(report_topics):
-                mapped_action_items = _map_action_items(t.get("action_items"))
+                mapped_action_items = _map_action_items(t.get("action_items"), date)
                 row = topics.upsert_topic(
                     conn, site["id"], date, t.get("topic_title", ""),
                     user_id=user_id, source_s3_key=report_key,
