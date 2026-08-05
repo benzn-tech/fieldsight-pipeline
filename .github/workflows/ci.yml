@@ -20,6 +20,16 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       - name: Install cfn-lint
-        run: pip install cfn-lint
+        # PINNED. cfn-lint 1.54.0 (2026-08-05) started rejecting this template's
+        # CognitoAuthorizer, reading `UserPoolArn:` as a Lambda authorizer and
+        # demanding FunctionArn. The list form is valid SAM — it is how an
+        # authorizer trusts more than one pool, which is exactly what this stack
+        # does (its own pool plus the shared org pool). 1.53.3 is the last release
+        # that accepts it.
+        #
+        # Unpinned, a lint release breaks every open PR at once with a failure
+        # that points at a template nobody touched — which is how this was found.
+        # Retry a newer version deliberately; do not drop the pin to "get green".
+        run: pip install 'cfn-lint==1.53.3'
       - name: Lint CloudFormation templates (SAM transform + plain CFN)
         run: cfn-lint src/template.yaml infra/db-template.yaml
