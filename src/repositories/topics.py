@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 _TOPIC_COLS = ("id, site_id, user_id, source_s3_key, report_date, occurred_at, "
                "category, title, summary, time_range, participants, source, created_at, "
-               "work_class, work_confidence, is_mixed")
+               "work_class, work_confidence, is_mixed, thread_id")
 
 # Phase F (D8 retirement, spec §8): severity -> risk_level, for reshaping
 # safety-domain findings into the legacy safety_observations row shape.
@@ -230,7 +230,7 @@ def list_extraction_topics_for_day(conn, site_id, user_id, report_date) -> list[
 _TOPIC_COLS_JOINED = (
     "t.id, t.site_id, t.user_id, t.source_s3_key, t.report_date, t.occurred_at, "
     "t.category, t.title, t.summary, t.time_range, t.participants, t.source, t.created_at, "
-    "t.work_class, t.work_confidence, t.is_mixed"
+    "t.work_class, t.work_confidence, t.is_mixed, t.thread_id"
 )
 
 

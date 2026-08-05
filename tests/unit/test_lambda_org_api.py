@@ -6763,3 +6763,69 @@ def test_the_queue_never_widens_past_the_callers_sites(threads_wired):
     res = org.lambda_handler(make_event("GET", "/api/org/threads/suggestions"), None)
     assert res["statusCode"] == 200
     assert OTHER_SITE_ID not in seen["sites"]
+
+
+# ---------------------------------------------------------------------------
+# Thread facts on the rendered topic (recurring-item threading, increment 2).
+#
+# FACTS only -- how many days a subject was raised on, when last, how much is
+# still open. No judgement: the design deliberately does not raise priority on
+# repetition, because 44% of prod's open items are already 'high' and a
+# ratchet would finish that field off.
+# ---------------------------------------------------------------------------
+
+def _shape_row(**over):
+    row = {"id": "t-1", "site_id": SITE_ID, "user_id": None, "source_s3_key":
+           "extractions/Ada_L/2026-07-22/x.json", "report_date": "2026-07-22",
+           "occurred_at": None, "category": "progress", "title": "Walls",
+           "summary": "s", "time_range": "09:00 – 09:20", "participants": [],
+           "source": None, "created_at": None, "work_class": None,
+           "work_confidence": None, "is_mixed": False, "thread_id": None,
+           "action_items": [], "safety_observations": [], "findings": [],
+           "photos": [], "site_name": "S", "user_name": "Ada L"}
+    row.update(over)
+    return row
+
+
+def test_an_unthreaded_topic_carries_no_thread_block(wired, monkeypatch):
+    """Absent, not zeroed. A times_raised of 1 would claim this subject has
+    been raised once and tracked, when in truth it was never threaded."""
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda *a, **k: {})
+    out = org.render_report_shape([_shape_row()], {}, "2026-07-22", "Ada_L",
+                                  conn=FakeConn())
+    assert out["topics"][0]["thread"] is None
+
+
+def test_a_threaded_topic_carries_the_derived_facts(wired, monkeypatch):
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda *a, **k: {})
+    monkeypatch.setattr(org.threads, "facts_for_threads", lambda conn, ids: {
+        "th-1": {"times_raised": 3, "first_seen": "2026-06-01",
+                 "last_raised": "2026-07-22", "open_items": 5}})
+    out = org.render_report_shape([_shape_row(thread_id="th-1")], {},
+                                  "2026-07-22", "Ada_L", conn=FakeConn())
+    t = out["topics"][0]["thread"]
+    assert t["id"] == "th-1"
+    assert t["times_raised"] == 3
+    assert t["open_items"] == 5
+
+
+def test_the_facts_are_fetched_in_ONE_query_for_the_whole_day(wired, monkeypatch):
+    """This renders per topic; a per-topic lookup would be the N+1 that
+    list_topics_for_date already avoids for action_items and findings."""
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda *a, **k: {})
+    calls = []
+    monkeypatch.setattr(org.threads, "facts_for_threads",
+                        lambda conn, ids: calls.append(sorted(ids)) or {})
+    rows = [_shape_row(id="t-1", thread_id="th-1"),
+            _shape_row(id="t-2", thread_id="th-2"),
+            _shape_row(id="t-3", thread_id="th-1")]
+    org.render_report_shape(rows, {}, "2026-07-22", "Ada_L", conn=FakeConn())
+    assert calls == [["th-1", "th-2"]]        # once, deduped
+
+
+def test_no_conn_means_no_thread_block_rather_than_a_fake_one(wired, monkeypatch):
+    """reindex's builder passes no conn. Absent is honest there; a zeroed
+    block would be a claim about threading it never looked up."""
+    out = org.render_report_shape([_shape_row(thread_id="th-1")], {},
+                                  "2026-07-22", "Ada_L")
+    assert out["topics"][0]["thread"] is None

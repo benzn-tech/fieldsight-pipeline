@@ -85,6 +85,28 @@ def thread_facts(conn, thread_id):
         "WHERE t.thread_id = %s", (thread_id,)).fetchone()
 
 
+def facts_for_threads(conn, thread_ids):
+    """thread_facts for MANY threads in one query, as {thread_id: facts}.
+
+    Batched because the caller is the timeline render, which runs over every
+    topic on a day: per-topic lookups would be the N+1 that list_topics_for_date
+    already avoids for action_items and findings. Empty in, empty out -- and
+    never "all threads", which is what a missing guard would turn `= ANY(NULL)`
+    into for a day with nothing threaded."""
+    if not thread_ids:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT t.thread_id, "
+        "       count(DISTINCT t.report_date) AS times_raised, "
+        "       min(t.report_date) AS first_seen, "
+        "       max(t.report_date) AS last_raised, "
+        "       count(a.id) FILTER (WHERE a.status='open') AS open_items "
+        "FROM topics t LEFT JOIN action_items a ON a.topic_id = t.id "
+        "WHERE t.thread_id = ANY(%s) GROUP BY t.thread_id",
+        (list(thread_ids),)).fetchall()
+    return {str(r["thread_id"]): r for r in rows}
+
+
 # -------------------------------------------------------------- suggestions
 
 def upsert_suggestion(conn, topic_id, *, thread_id=None, parent_topic_id=None,
