@@ -12,6 +12,20 @@ name: Deploy FieldSight TEST (SAM)
 # All env params are passed explicitly so a TEST deploy can never touch PROD data.
 # ============================================================
 
+
+# Only one deploy against a stack at a time. CloudFormation rejects an update
+# while one is in flight ("Stack is in UPDATE_IN_PROGRESS"), and the run fails
+# for a reason that has nothing to do with the change being deployed — which is
+# how a perfectly good deploy gets diagnosed as broken code. Merging a few PRs
+# in quick succession, or two people merging at once, is enough to trigger it.
+#
+# cancel-in-progress is deliberately FALSE: queueing is the point. Cancelling a
+# run mid-CloudFormation-update would leave the stack half-applied, which is
+# strictly worse than waiting.
+concurrency:
+  group: deploy-test
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:        # manual "Run workflow" button (Actions tab, after merge)
   push:
@@ -105,6 +119,21 @@ jobs:
           if [ -n "${{ vars.TEST_VAD_LAYER_ARN }}" ]; then
             VAD_LAYER_PARAM="VadLayerArn=${{ vars.TEST_VAD_LAYER_ARN }}"
           fi
+          # Non-work (personal) topic retention sweep. Two independent gates, both
+          # off by default, because this one DELETES: it tombstones the topic and
+          # drops its vectors (the transcript and audio are left alone).
+          #   * TEST_NONWORK_EXPIRY_ENABLED -> arms the schedule at all.
+          #   * TEST_NONWORK_EXPIRY_SINCE   -> the floor. Only topics created at or
+          #     after it are ever swept, so switching this on is NOT retroactive.
+          #     Set it to the date the policy starts, NOT to when classification
+          #     began: the earlier date would sweep every historical personal
+          #     topic on the first run. The sweep refuses to run without it, so a
+          #     forgotten value fails closed rather than sweeping everything.
+          # Same bare-"Key=" guard as the layer overrides above.
+          NONWORK_SINCE_PARAM=""
+          if [ -n "${{ vars.TEST_NONWORK_EXPIRY_SINCE }}" ]; then
+            NONWORK_SINCE_PARAM="NonWorkExpirySince=${{ vars.TEST_NONWORK_EXPIRY_SINCE }}"
+          fi
           sam deploy --config-env test \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -121,12 +150,21 @@ jobs:
               "EmailSender=${{ vars.TEST_EMAIL_SENDER || 'stub' }}" \
               "EnableSiteVoice=true" \
               "DocxLayerArn=arn:aws:lambda:ap-southeast-2:509194952652:layer:python-docx-layer:2" \
+              "EnableNonWorkExpiry=${{ vars.TEST_NONWORK_EXPIRY_ENABLED || 'false' }}" \
+              "NonWorkExpiryHours=${{ vars.TEST_NONWORK_EXPIRY_HOURS || '24' }}" \
+              $NONWORK_SINCE_PARAM \
               "EnableKeyframes=${{ vars.TEST_ENABLE_KEYFRAMES || 'false' }}" \
+              "EnableThreadSuggestions=${{ vars.TEST_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
               $KF_LAYER_PARAM \
               $VAD_LAYER_PARAM \
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \
+              # Mirrors PROD_AUTHORITY_FLIP. Passed so test CAN match prod; the
+              # default keeps today's behaviour (off) until someone opts in.
+              # Prod runs this true, so anything test proves about topic
+              # authority is only transferable once this is on as well.
+              "AuthorityFlip=${{ vars.TEST_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.TEST_GRADED_ROLES || 'false' }}" \
               "MultiTenantResolution=${{ vars.TEST_MULTI_TENANT_RESOLUTION || 'true' }}" \
               "VadThreshold=${{ vars.TEST_VAD_THRESHOLD || '0.2' }}" \

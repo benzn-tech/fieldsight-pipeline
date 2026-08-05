@@ -18,7 +18,7 @@ _COLS = (
     "session_id, company_id, user_id, site_id, kind, status, version, "
     "opened_at, last_segment_at, closed_at, close_intent, rolling_summary, "
     "rolling_summary_version, segment_count, word_count, created_at, updated_at, "
-    "group_id"
+    "group_id, group_ended_at"
 )
 
 
@@ -49,14 +49,24 @@ def ensure_open(conn, session_id, company_id, user_id, site_id, kind, opened_at,
 
 
 def list_group_members(conn, group_id) -> list[dict]:
-    """Every session in one multi-device group, oldest first.
+    """Every session in one multi-device group, oldest first — INCLUDING the lead.
 
-    The lead is its own member — it sets its group_id to its own session_id —
-    so this returns the whole meeting, not just the joiners."""
+    The lead does NOT carry a group_id of its own. It never scans anything: it
+    shows a code and keeps recording, and its `/open` fired before the group
+    existed. An earlier version of this assumed the lead would set group_id to
+    its own session_id; nothing on the device does that, and nothing should have
+    to — making the lead's membership depend on a second best-effort call would
+    drop it from its own meeting whenever that call failed, which on a site is
+    routine. The group id IS the lead's session id, so membership is derivable
+    without asking the device anything.
+
+    Passing a plain solo session id therefore returns that one session. Callers
+    hold a real group id; this is stated so the one-row result is not read as a
+    bug."""
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_COLS} FROM meeting_session WHERE group_id = %s "
+        f"SELECT {_COLS} FROM meeting_session WHERE group_id = %s OR session_id = %s "
         f"ORDER BY opened_at NULLS FIRST, session_id",
-        (group_id,),
+        (group_id, group_id),
     ).fetchall()
 
 
@@ -72,13 +82,81 @@ def group_is_settled(conn, group_id, idle_grace_seconds) -> bool:
     else's report hostage."""
     row = conn.cursor(row_factory=dict_row).execute(
         "SELECT COUNT(*) AS unsettled FROM meeting_session "
-        "WHERE group_id = %s "
+        # Lead included, same as list_group_members: it carries no group_id of
+        # its own, and a group settled without waiting for the lead would
+        # finalize the meeting while the person holding the code is still
+        # recording it.
+        "WHERE (group_id = %s OR session_id = %s) "
         "AND status NOT IN ('sent','failed') "
         "AND COALESCE(last_segment_at, opened_at, created_at) "
         "    > now() - make_interval(secs => %s)",
-        (group_id, idle_grace_seconds),
+        (group_id, group_id, idle_grace_seconds),
     ).fetchone()
     return int((row or {}).get("unsettled") or 0) == 0
+
+
+def lead_is_joinable(conn, lead_session_id, max_age_seconds) -> bool:
+    """Whether a device may still join the group led by this session.
+
+    Refuses a lead that opened too long ago — the shape of a device that kept a
+    group overnight, or across a reinstall, and is now recording something
+    entirely different. Measured on `opened_at`, the server's own clock, for the
+    same reason as `group_span_ok`: the device's belief about time is exactly
+    what this is checking against.
+
+    An unknown lead is NOT handled here — the caller keeps accepting those,
+    because `/open` is best-effort and a joiner can legitimately arrive before
+    the lead. Rejecting an unseen lead would reintroduce a dependency on call
+    ordering, which the offline-first design refuses."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT (opened_at > now() - make_interval(secs => %s)) AS joinable "
+        "FROM meeting_session WHERE session_id = %s",
+        (max_age_seconds, lead_session_id),
+    ).fetchone()
+    if row is None or row.get("joinable") is None:
+        return True          # unknown, or never opened — not this guard's call
+    return bool(row["joinable"])
+
+
+def group_span_ok(conn, group_id, max_span_seconds) -> bool:
+    """Whether a group's members are close enough in time to be one meeting.
+
+    This is THE guard that makes "yesterday never merges into today"
+    unconditional, and it is the reason it measures `opened_at` — the server's
+    own timestamp — rather than anything the device reported.
+
+    Everything on the device side trusts the device clock: the pending-group
+    expiry, the end-of-meeting prompt, the stop signal. All of it is a
+    convenience layer. Devices crash, get reinstalled, and carry clocks that
+    have been observed 12 HOURS out (BUG-37), so a device that keeps a stale
+    group overnight is an ordinary occurrence, not an exotic failure. When that
+    happens, the next day's recording arrives carrying yesterday's group id and
+    nothing on the device will object.
+
+    What stops it is this: two recordings whose server-side open times are
+    further apart than one meeting could plausibly be are not one meeting, no
+    matter what either device believes.
+
+    A missing row (no members yet) is NOT a violation — there is simply nothing
+    to merge, and returning False would block a group that has merely not been
+    populated. A single member spans zero seconds and passes trivially, which is
+    what the solo and first-joiner cases both need.
+
+    The LEAD is included, and that is the whole point: it carries no group_id of
+    its own, so matching on group_id alone measured the joiners against each
+    other and left the anchor out. One device carrying a group overnight and
+    joining the next morning is then the only "member" the span can see, spans
+    zero seconds, and sails through the guard that exists to stop exactly that.
+    The lead's opened_at is the timestamp the whole question is about."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT EXTRACT(EPOCH FROM (MAX(opened_at) - MIN(opened_at))) AS span_seconds "
+        "FROM meeting_session WHERE group_id = %s OR session_id = %s",
+        (group_id, group_id),
+    ).fetchone()
+    span = (row or {}).get("span_seconds")
+    if span is None:
+        return True
+    return float(span) <= float(max_span_seconds)
 
 
 def touch_segment(conn, session_id, at) -> dict | None:
@@ -206,3 +284,43 @@ def get(conn, session_id) -> dict | None:
         f"SELECT {_COLS} FROM meeting_session WHERE session_id = %s",
         (session_id,),
     ).fetchone()
+
+
+def end_group(conn, group_id) -> int:
+    """One member answered "the meeting has ended". Record it for the whole group.
+
+    @return how many sessions were marked; 0 when this is not a group.
+
+    The zero case is the important one. A solo session's id is indistinguishable
+    from a lead's — both are "the group id" as far as the close handler can see —
+    so without this guard every ordinary solo End would mark itself ended, and
+    the upload path would then tell that device to stop recording. Requiring a
+    joiner to exist is what makes the solo path provably untouched.
+
+    Already-ended rows are left alone so the timestamp records when the meeting
+    actually ended, not when the last device happened to ask."""
+    has_joiner = conn.cursor(row_factory=dict_row).execute(
+        "SELECT 1 AS x FROM meeting_session WHERE group_id = %s LIMIT 1", (group_id,)
+    ).fetchone()
+    if not has_joiner:
+        return 0
+    cur = conn.cursor(row_factory=dict_row).execute(
+        "UPDATE meeting_session SET group_ended_at = now(), updated_at = now() "
+        "WHERE (group_id = %s OR session_id = %s) AND group_ended_at IS NULL "
+        "RETURNING session_id",
+        (group_id, group_id),
+    )
+    return len(cur.fetchall())
+
+
+def group_is_ended(conn, group_id) -> bool:
+    """True once anyone in the group has ended the meeting.
+
+    Reads the whole group rather than one row so a device that joined AFTER the
+    end is told immediately, instead of recording into a meeting that is over."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT 1 AS x FROM meeting_session "
+        "WHERE (group_id = %s OR session_id = %s) AND group_ended_at IS NOT NULL LIMIT 1",
+        (group_id, group_id),
+    ).fetchone()
+    return row is not None

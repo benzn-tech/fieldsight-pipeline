@@ -101,7 +101,77 @@ def test_list_group_members_scopes_to_the_group_and_orders_by_open():
     sql = conn.calls[0]["sql"].lower()
     assert "group_id = %s" in sql
     assert "order by opened_at" in sql
-    assert conn.calls[0]["params"] == (SID_B,)
+    assert conn.calls[0]["params"] == (SID_B, SID_B)
+
+
+def test_the_lead_is_a_member_of_its_own_group():
+    """The bug this pins cost the lead its own audio.
+
+    The lead never scans anything — it shows a code and keeps recording — so it
+    carries NO group_id, and its /open fired before the group existed. Matching
+    on group_id alone therefore returned only the joiners, and the merged report
+    would have quietly excluded the person holding the meeting. Membership is
+    derived from the group id BEING the lead's session id, so it needs nothing
+    from the device."""
+    conn = FakeConn(results=[[]])
+    meeting_session.list_group_members(conn, SID_B)
+    sql = conn.calls[0]["sql"].lower()
+    assert "session_id = %s" in sql, "the lead has no group_id; match it by identity"
+
+
+def test_settling_waits_for_the_lead_too():
+    """Settling without the lead would finalize the meeting while the person
+    holding the code is still recording it."""
+    conn = FakeConn(results=[[{"unsettled": 0}]])
+    meeting_session.group_is_settled(conn, SID_B, 900)
+    assert "session_id = %s" in conn.calls[0]["sql"].lower()
+
+
+# ---- ending a meeting for everyone ---------------------------------------
+
+
+def test_ending_a_group_marks_every_member():
+    conn = FakeConn(results=[
+        [{"x": 1}],                                        # a joiner exists
+        [{"session_id": SID_A}, {"session_id": SID_B}],    # rows marked
+    ])
+    assert meeting_session.end_group(conn, SID_B) == 2
+    sql = conn.calls[1]["sql"].lower()
+    assert "group_ended_at = now()" in sql
+    assert "group_id = %s" in sql and "session_id = %s" in sql
+
+
+def test_ending_a_solo_session_marks_nothing():
+    """THE guard on this whole feature.
+
+    A solo session's id is indistinguishable from a lead's at the close
+    handler. Without this, every ordinary End would mark itself ended, and the
+    upload path would then tell that device to stop recording — turning a
+    multi-device feature into a bug in the only path most users ever take."""
+    conn = FakeConn(results=[[]])          # no joiner
+    assert meeting_session.end_group(conn, SID_A) == 0
+    assert len(conn.calls) == 1, "must not issue the UPDATE at all"
+
+
+def test_ending_twice_keeps_the_first_time():
+    """The timestamp records when the meeting ended, not when the last device
+    got round to asking."""
+    conn = FakeConn(results=[[{"x": 1}], []])
+    meeting_session.end_group(conn, SID_B)
+    assert "group_ended_at is null" in conn.calls[1]["sql"].lower()
+
+
+def test_group_is_ended_reads_the_whole_group():
+    """A device that joined AFTER the end has group_ended_at NULL on its own
+    row. Reading only that row would let it record into a finished meeting."""
+    conn = FakeConn(results=[[{"x": 1}]])
+    assert meeting_session.group_is_ended(conn, SID_B) is True
+    sql = conn.calls[0]["sql"].lower()
+    assert "group_id = %s" in sql and "session_id = %s" in sql
+
+
+def test_group_is_ended_false_when_nobody_has_ended_it():
+    assert meeting_session.group_is_ended(FakeConn(results=[[]]), SID_B) is False
 
 
 def test_group_is_settled_false_while_a_member_could_still_be_recording():
@@ -121,3 +191,67 @@ def test_group_is_settled_excludes_terminal_members_from_the_wait():
     sql = conn.calls[0]["sql"].lower()
     assert "status not in ('sent','failed')" in sql
     assert "make_interval" in sql, "the idle window must be parameterised, not hardcoded"
+
+
+# ---- the server-side guard (spec: "leaving a group") ----------------------
+#
+# Everything on the device trusts the device clock, and these ROMs have been
+# observed 12 hours out (BUG-37). These are the checks that make "yesterday
+# never merges into today" unconditional, because they run on the SERVER's own
+# opened_at. A test with a correct device clock would pass either way and prove
+# nothing, so the stale cases here are deliberately shaped like a device that
+# kept a group it should have dropped.
+
+def test_group_span_ok_accepts_an_ordinary_meeting_with_a_pause():
+    """A battery swap or a walk to the next building mid-meeting must still
+    merge — that is the normal case, not an anomaly."""
+    conn = FakeConn(results=[[{"span_seconds": 40 * 60}]])
+    assert meeting_session.group_span_ok(conn, SID_B, max_span_seconds=4 * 3600) is True
+
+
+def test_group_span_ok_rejects_members_from_different_days():
+    """THE guarantee. A device carried a stale group overnight; whatever it
+    believes, these two recordings are not one meeting."""
+    conn = FakeConn(results=[[{"span_seconds": 23 * 3600}]])
+    assert meeting_session.group_span_ok(conn, SID_B, max_span_seconds=4 * 3600) is False
+
+
+def test_group_span_ok_measures_server_time_not_device_time():
+    conn = FakeConn(results=[[{"span_seconds": 0}]])
+    meeting_session.group_span_ok(conn, SID_B, max_span_seconds=4 * 3600)
+    sql = conn.calls[0]["sql"].lower()
+    assert "opened_at" in sql, "must measure the server's own timestamp"
+    assert "extract(epoch" in sql
+
+
+def test_group_span_ok_measures_the_lead_too():
+    """The tests above feed a canned span, so they pin the comparison and say
+    nothing about what the query measures.
+
+    The lead carries no group_id of its own. Matching on group_id alone compares
+    the joiners against each other and leaves out the anchor — one device
+    carrying a group overnight is then the only member the span can see, spans
+    zero seconds, and passes the guard built to stop exactly that. The real
+    behaviour is pinned in tests/integration/test_session_group_sql.py."""
+    conn = FakeConn(results=[[{"span_seconds": 0}]])
+    meeting_session.group_span_ok(conn, SID_B, max_span_seconds=4 * 3600)
+    sql = conn.calls[0]["sql"].lower()
+    assert "session_id = %s" in sql, "the lead has no group_id; match it by identity"
+    assert conn.calls[0]["params"] == (SID_B, SID_B)
+    # started_at / device-reported fields must not appear: they are the device's
+    # clock, which is the thing this guard exists to not trust.
+    assert "started_at" not in sql
+
+
+def test_group_span_ok_on_a_single_member_is_true():
+    """A group of one has zero span. It must not be rejected — the solo and
+    one-device-joined cases both land here."""
+    conn = FakeConn(results=[[{"span_seconds": 0}]])
+    assert meeting_session.group_span_ok(conn, SID_B, max_span_seconds=4 * 3600) is True
+
+
+def test_group_span_ok_treats_a_missing_row_as_ok():
+    """No members yet (nothing to merge) is not a violation; returning False
+    here would block a group that has simply not been populated."""
+    conn = FakeConn(results=[[]])
+    assert meeting_session.group_span_ok(conn, SID_B, max_span_seconds=4 * 3600) is True

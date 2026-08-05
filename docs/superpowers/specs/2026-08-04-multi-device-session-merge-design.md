@@ -39,8 +39,7 @@ into a second spec and is not required by anything here.
 `meeting_session` gains one nullable column:
 
 ```sql
-ALTER TABLE meeting_session ADD COLUMN group_id text
-  REFERENCES meeting_session(session_id);
+ALTER TABLE meeting_session ADD COLUMN group_id text;
 CREATE INDEX idx_meeting_session_group ON meeting_session (group_id)
   WHERE group_id IS NOT NULL;
 ```
@@ -48,13 +47,32 @@ CREATE INDEX idx_meeting_session_group ON meeting_session (group_id)
 `NULL` means a solo recording — which every existing row is, so the migration
 carries no backfill and no behaviour change.
 
-The lead device is its own group:
+**No foreign key.** 0031 shipped with `REFERENCES meeting_session(session_id)`
+and 0034 removed it. The group id is minted on the LEAD's device, so a joiner
+can legitimately reach the server before the lead's session exists at all —
+`/open` is best-effort and on a site can be hours late or lost. The constraint
+turned that into a 23503 and answered the joiner with a 500, which meant
+joining before the lead never worked. A foreign key on an identifier that is
+generated elsewhere and arrives eventually is a bet on arrival order.
+
+The lead does **not** carry a group id:
 
 ```
-lead:      session_id = X,  group_id = X
+lead:      session_id = X,  group_id = NULL
 joiner:    session_id = Y,  group_id = X
 joiner:    session_id = Z,  group_id = X
 ```
+
+The lead never scans anything — it shows a code and keeps recording — and its
+`/open` fired before the group existed. Membership is therefore **derived**, not
+stored: every query reads `WHERE group_id = X OR session_id = X`. Making the
+lead's membership depend on a second best-effort call would drop it from its own
+meeting whenever that call failed, which on a site is routine — and the symptom
+would be a merged report that silently omits the person holding the meeting.
+
+Three queries got this wrong before it was caught (`list_group_members`,
+`group_is_settled`, `group_span_ok`). If you add a fourth, the question to ask
+is "does the lead count as a member here?" — the answer is always yes.
 
 Using the lead's `session_id` as the group key means **no identifier has to be
 allocated**. The device already mints it locally when recording starts, so a
@@ -64,9 +82,11 @@ would throw that away.
 
 ### Joining
 
-The lead shows a QR containing `fs1:<session_id>` (the prefix is a namespace
+The lead shows a QR containing `fs1:<env>:<session_id>` (the prefix is a namespace
 guard, so scanning an unrelated code fails cleanly rather than producing a
-nonsense group). The joiner records normally; the only difference is that its
+nonsense group; the environment tag stops a dev device and a prod device from
+"successfully" forming a group whose halves land in two different databases and
+never merge, with no error anywhere). The joiner records normally; the only difference is that its
 `group_id` rides along on `POST /api/org/sessions/{id}/open`, which already
 exists and is already store-and-forward for offline devices.
 
@@ -135,6 +155,112 @@ report.
 
 The `updated` email reuses the resend path finalize already has for late resumes.
 
+## Leaving a group
+
+The original draft had no exit path at all, which pointed straight at the one
+failure this design exists to prevent. Without one:
+
+```
+Mon 10:00  inspector scans, joins the site manager's meeting  → device holds group X
+Mon 11:00  meeting ends, inspector walks off with the device
+Tue 09:00  inspector records at a different site
+           → device still holds group X → Tuesday's audio merges into Monday's meeting
+```
+
+That is an over-merge: two unrelated meetings in one report, delivered to both
+sets of people, and it reads perfectly fluently so nobody notices. Guest devices
+make it worse — they go to visiting inspectors who have the least reason to
+remember to "leave" anything.
+
+### Two distinct actions, not one
+
+| Action | Effect on me | Effect on the others |
+|---|---|---|
+| **Meeting ended** | leave the group | **all member devices stop recording** |
+| **I'm leaving, meeting continues** | leave the group | **none** |
+
+Both keep what was already recorded in the meeting; they differ only in whether
+the rest of the group is told to stop. An early-departing inspector must have
+the second one, or using the first would stop everybody else's recording.
+
+Whether a guest may end the whole meeting is a **product** decision, and the
+answer is yes: otherwise a meeting whose lead leaves first can never be closed
+by the people still there.
+
+### The prompt happens where the person is
+
+The user is wearing the device on their chest, in a noisy site, possibly gloved.
+They are **not looking at the screen**. So:
+
+1. Recording stops.
+2. After **20 seconds**, on **that device only** (whoever stopped — not all of
+   them, which would be chaos), a bundled audio cue plays: recording has
+   stopped, please confirm whether the meeting is over.
+3. The screen shows two large targets and one quiet escape:
+
+```
+        会议是否已结束？
+
+  ┌────────────────────────┐
+  │      会议已结束          │   → tells every member device to stop
+  └────────────────────────┘
+
+  ┌────────────────────────┐
+  │   我先走，会议继续        │   → only this device leaves
+  └────────────────────────┘
+
+          还没结束               ← small; does nothing, recording resumes later
+```
+
+Touch targets ≥56dp so a gloved hand can hit them. No countdown, no progress
+bar — in daylight they are noise.
+
+A **PTT shortcut maps to "meeting ended"**, the highest-frequency action, so the
+most common case never requires looking at the screen at all. The rarer "I'm
+leaving" needs the screen, which is the right trade.
+
+The cue is **bundled audio, not TTS**. The copy is fixed, and the moment it
+matters most is offline — a cloud TTS call that fails without network is worse
+than useless. `AskSounds` already does exactly this for the SP-Ask cues
+(`res/raw/*.wav`, explicitly "NOT downloaded"); this reuses that pattern.
+
+### Telling the other devices
+
+No new channel. Chunks upload roughly every 30 seconds, so the **upload response
+carries the signal back**: when a group has been ended, the next upload from each
+member returns that fact, and the device plays the cue and stops. Latency is one
+chunk cycle, which is nothing against "the meeting is over".
+
+Offline members simply never hear it and keep recording — handled by the
+server-side time-span guard below rather than by pretending delivery is
+guaranteed.
+
+### After leaving, ask before resuming
+
+Both exits end with the same question: **resume recording?** Ending a meeting is
+not the same as finishing work — the person may be walking to the next task, or
+may be done for the day. There is no safe default, so it is asked, and a
+resumption starts a **fresh solo session with no `group_id`** so post-meeting
+audio can never land in the meeting.
+
+### Timeouts are a backstop, not the mechanism
+
+The user's explicit answer is the primary path. Two timeouts exist only for when
+nobody answers — device in a bag, person already driving away:
+
+- **Device side:** the pending group clears after `SESSION_GAP_MINUTES` (15 min),
+  *not* `STOP_GRACE_SECONDS` (30 s). Thirty seconds is the mis-touch window; a
+  battery swap or a walk to the next building would blow through it and force a
+  re-scan for no reason.
+- **Server side, and this is the one that actually holds:** joining is refused
+  when the lead session ended long ago, and a group whose members' server-side
+  `opened_at` values span beyond the window is **not merged at all**.
+
+The server guard cannot be skipped, because the device guard depends on the
+device being correct — and devices crash, get reinstalled, and carry clocks that
+have been observed 12 hours out (BUG-37). Only the server's own timestamps make
+"yesterday never merges into today" unconditional.
+
 ## Failure behaviour
 
 The bias throughout is **under-merge, never over-merge**. A missed merge degrades
@@ -152,12 +278,21 @@ and hard to notice after the fact.
 | A member's transcript is missing or corrupt | Merge the rest; state in the report that one device's record was not included. |
 | Group extraction fails | Per-device reports already sent stay valid. No rollback. |
 | More than ~4 devices | Merge the first N, state the omission. Do not silently truncate. |
+| Nobody answers the end-of-meeting prompt | Device clears the group after 15 min; the server refuses to merge across the time-span window regardless. |
+| A member is offline when the group ends | It never receives the stop signal and keeps recording. The time-span guard keeps the stray audio out of the merge. |
+| Device carries a stale group into the next day | **Server refuses.** Join is rejected against a long-ended lead, and merge is rejected on span. This must not depend on the device clock (BUG-37: observed 12 h out). |
+| Guest ends a meeting the site manager is still in | Allowed by design — otherwise a meeting whose lead leaves first can never be closed. Every member is told, and each is asked whether to resume. |
 
 ## Testing
 
 - **Pure/unit:** group membership resolution; the company-mismatch rejection; due-group detection including the timeout; parallel-source prompt assembly and its size guard; degradation past the device cap.
 - **Contract:** `group_id` survives the offline store-and-forward path on `/open`.
-- **Live:** two devices, one meeting, one scan — assert one merged topic set, and an `updated` email to both accounts. Then the same with the second device never stopping, asserting the timeout still closes the group.
+- **Exit paths (the ones whose failure is silent):**
+  - after the group is left, the **next** recording carries no `group_id` and produces its own separate minutes — this is the anti-over-merge guarantee and gets its own test;
+  - "I'm leaving" leaves *only* the caller — every other member keeps recording;
+  - "meeting ended" reaches the others through the upload response;
+  - the **server** refuses a join against a long-ended lead, and refuses to merge a group whose members span beyond the window, **using server timestamps only** — asserted with a device clock deliberately set wrong, since a correct-clock test would pass either way and prove nothing.
+- **Live:** two devices, one meeting, one scan — assert one merged topic set, and an `updated` email to both accounts. Then the same with the second device never stopping, asserting the timeout still closes the group. Then a third run where device B records again the next day, asserting its minutes are separate.
 
 Prompt-level merge quality cannot be unit-tested meaningfully; it needs a real
 two-device recording, which is also the only way to confirm the coverage claim

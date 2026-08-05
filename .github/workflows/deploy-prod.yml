@@ -10,6 +10,20 @@ name: Deploy FieldSight PROD (SAM)
 # `fieldsight_test`. schema_migrations is per-database.
 # ============================================================
 
+
+# Only one deploy against a stack at a time. CloudFormation rejects an update
+# while one is in flight ("Stack is in UPDATE_IN_PROGRESS"), and the run fails
+# for a reason that has nothing to do with the change being deployed — which is
+# how a perfectly good deploy gets diagnosed as broken code. Merging a few PRs
+# in quick succession, or two people merging at once, is enough to trigger it.
+#
+# cancel-in-progress is deliberately FALSE: queueing is the point. Cancelling a
+# run mid-CloudFormation-update would leave the stack half-applied, which is
+# strictly worse than waiting.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
   push:
@@ -134,6 +148,21 @@ jobs:
           if [ -n "${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}" ]; then
             KF_LAYER_PARAM="KeyframeFfmpegLayerArn=${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}"
           fi
+          # Non-work (personal) topic retention sweep. Two independent gates, both
+          # off by default, because this one DELETES: it tombstones the topic and
+          # drops its vectors (the transcript and audio are left alone).
+          #   * PROD_NONWORK_EXPIRY_ENABLED -> arms the schedule at all.
+          #   * PROD_NONWORK_EXPIRY_SINCE   -> the floor. Only topics created at or
+          #     after it are ever swept, so switching this on is NOT retroactive.
+          #     Set it to the date the policy starts, NOT to when classification
+          #     began: the earlier date would sweep every historical personal
+          #     topic on the first run. The sweep refuses to run without it, so a
+          #     forgotten value fails closed rather than sweeping everything.
+          # Same bare-"Key=" guard as the layer overrides above.
+          NONWORK_SINCE_PARAM=""
+          if [ -n "${{ vars.PROD_NONWORK_EXPIRY_SINCE }}" ]; then
+            NONWORK_SINCE_PARAM="NonWorkExpirySince=${{ vars.PROD_NONWORK_EXPIRY_SINCE }}"
+          fi
           sam deploy --config-env prod \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -154,6 +183,7 @@ jobs:
               "VadLayerArn=${{ vars.PROD_VAD_LAYER_ARN }}" \
               "DocxLayerArn=${{ vars.PROD_DOCX_LAYER_ARN }}" \
               "EnableKeyframes=${{ vars.PROD_ENABLE_KEYFRAMES || 'false' }}" \
+              "EnableThreadSuggestions=${{ vars.PROD_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
               $KF_LAYER_PARAM \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
@@ -167,6 +197,9 @@ jobs:
               "OrgUserPoolId=ap-southeast-2_q88pd6XXr" \
               "LlmProvider=${{ vars.PROD_LLM_PROVIDER || 'anthropic' }}" \
               "AsrProvider=${{ vars.PROD_ASR_PROVIDER || 'transcribe' }}" \
+              "EnableNonWorkExpiry=${{ vars.PROD_NONWORK_EXPIRY_ENABLED || 'false' }}" \
+              "NonWorkExpiryHours=${{ vars.PROD_NONWORK_EXPIRY_HOURS || '24' }}" \
+              $NONWORK_SINCE_PARAM \
               "ElevenLabsApiKey=$ELEVENLABS_API_KEY"
 
       - name: Apply DB migrations (fieldsight-prod-migrate — idempotent, shared schema_migrations)

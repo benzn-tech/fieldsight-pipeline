@@ -6609,3 +6609,223 @@ def test_put_programme_is_unaffected_when_there_are_no_local_rows(programme_wire
         "PUT", "/api/org/programme", params={"site": SITE_ID},
         body={"name": "P", "parents": [], "leaves": []}), None)
     assert res["statusCode"] == 200
+
+
+# ---------------------------------------------------------------------------
+# /threads/suggestions — the review queue for recurring-item threading.
+#
+# Confirming is the ONLY way a topics.thread_id is ever set. Everything here
+# guards that: a wrong link silently closes or escalates the wrong work and
+# nobody finds out, so the decision is a human's and the endpoint must not
+# make it on their behalf, nor act on a decision it did not win.
+# ---------------------------------------------------------------------------
+
+def _thread_sugg(**over):
+    row = {"id": "sg-1", "topic_id": "tp-new", "thread_id": None,
+           "parent_topic_id": "tp-old", "score": 0.42, "gap_days": 12,
+           "status": "pending", "created_at": None, "resolved_at": None,
+           "resolved_by": None, "site_id": SITE_ID, "topic_date": "2026-07-22",
+           "topic_title": "Ground floor walls"}
+    row.update(over)
+    return row
+
+
+@pytest.fixture
+def threads_wired(wired):
+    # _allowed_site_ids reaches the real site repo otherwise, and FakeConn has
+    # no cursor -- same wiring programme_wired needs for the same reason.
+    wired.setattr(org.sites, "list_company_sites",
+                  lambda conn, cid, **kw: [{"id": SITE_ID}])
+    wired.setattr(org.memberships, "accessible_site_ids",
+                  lambda conn, uid, role: [SITE_ID])
+    wired.setattr(org.threads, "get_suggestion", lambda conn, sid: _thread_sugg())
+    wired.setattr(org.threads, "list_pending", lambda conn, sites, limit=50: [])
+    wired.setattr(org.threads, "resolve_suggestion",
+                  lambda conn, sid, status, by: _thread_sugg(status=status))
+    wired.setattr(org.threads, "attach_topic", lambda *a, **k: None)
+    wired.setattr(org.threads, "create_thread",
+                  lambda conn, site, title, first, last: {"id": "th-new"})
+    wired.setattr(org.threads, "thread_facts",
+                  lambda conn, tid: {"times_raised": 2, "open_items": 3,
+                                     "first_seen": None, "last_raised": None})
+    wired.setattr(org.topics, "get_topic",
+                  lambda conn, tid: {"id": tid, "site_id": SITE_ID,
+                                     "title": "Ground floor walls",
+                                     "report_date": "2026-07-10"})
+    return wired
+
+
+def test_a_worker_cannot_see_or_decide_the_queue(threads_wired):
+    """A thread spans several people's recordings by definition, so deciding
+    one is a site-level judgement rather than a personal one."""
+    threads_wired.setattr(org.users, "get_user_by_sub",
+                          lambda conn, sub: dict(CALLER, global_role="worker"))
+    for ev in (make_event("GET", "/api/org/threads/suggestions"),
+               make_event("POST", "/api/org/threads/suggestions/sg-1/confirm"),
+               make_event("POST", "/api/org/threads/suggestions/sg-1/reject")):
+        assert org.lambda_handler(ev, None)["statusCode"] == 403
+
+
+def test_confirming_a_suggestion_for_an_unreachable_site_is_403(threads_wired):
+    threads_wired.setattr(org.threads, "get_suggestion",
+                          lambda conn, sid: _thread_sugg(site_id=OTHER_SITE_ID))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/confirm"), None)
+    assert res["statusCode"] == 403
+
+
+def test_a_suggestion_someone_already_answered_is_409_not_an_error(threads_wired):
+    """A race, not invalid input. It must not read as "your click was wrong"."""
+    threads_wired.setattr(org.threads, "get_suggestion",
+                          lambda conn, sid: _thread_sugg(status="confirmed"))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/confirm"), None)
+    assert res["statusCode"] == 409
+
+
+def test_losing_the_race_inside_the_CAS_does_not_attach(threads_wired):
+    """resolve_suggestion's `WHERE status='pending'` is the authoritative
+    gate: None means another request decided first, and attaching on the
+    strength of a decision we did not win is exactly the wrong link this
+    design exists to prevent."""
+    threads_wired.setattr(org.threads, "resolve_suggestion",
+                          lambda conn, sid, status, by: None)
+    attached = []
+    threads_wired.setattr(org.threads, "attach_topic",
+                          lambda *a, **k: attached.append(a))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/confirm"), None)
+    assert res["statusCode"] == 409
+    assert attached == []
+
+
+def test_confirming_a_parent_with_no_thread_anchors_a_new_one_on_it(threads_wired):
+    """Both topics land on the new thread -- the earlier one is not left
+    outside the thread it defines."""
+    attached = []
+    threads_wired.setattr(org.threads, "attach_topic",
+                          lambda conn, topic_id, thread_id, when:
+                              attached.append((topic_id, thread_id)))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/confirm"), None)
+    assert res["statusCode"] == 200
+    assert attached == [("tp-old", "th-new"), ("tp-new", "th-new")]
+    assert body_of(res)["timesRaised"] == 2
+
+
+def test_confirming_into_an_existing_thread_creates_no_second_thread(threads_wired):
+    threads_wired.setattr(org.threads, "get_suggestion",
+                          lambda conn, sid: _thread_sugg(thread_id="th-9",
+                                                         parent_topic_id=None))
+    made = []
+    threads_wired.setattr(org.threads, "create_thread",
+                          lambda *a, **k: made.append(a) or {"id": "th-x"})
+    attached = []
+    threads_wired.setattr(org.threads, "attach_topic",
+                          lambda conn, topic_id, thread_id, when:
+                              attached.append((topic_id, thread_id)))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/confirm"), None)
+    assert res["statusCode"] == 200
+    assert made == []
+    assert attached == [("tp-new", "th-9")]
+
+
+def test_a_vanished_parent_stops_the_confirmation(threads_wired):
+    """The earlier topic can be redacted between proposal and review.
+    Anchoring a thread on a row that no longer exists would create an empty
+    thread and a link to nothing."""
+    threads_wired.setattr(org.topics, "get_topic", lambda conn, tid: None)
+    attached = []
+    threads_wired.setattr(org.threads, "attach_topic",
+                          lambda *a, **k: attached.append(a))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/confirm"), None)
+    assert res["statusCode"] == 409
+    assert attached == []
+
+
+def test_rejecting_keeps_the_row_and_never_attaches(threads_wired):
+    attached = []
+    threads_wired.setattr(org.threads, "attach_topic",
+                          lambda *a, **k: attached.append(a))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/reject"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["rejected"] is True
+    assert attached == []
+
+
+def test_the_queue_never_widens_past_the_callers_sites(threads_wired):
+    seen = {}
+    threads_wired.setattr(org.threads, "list_pending",
+                          lambda conn, sites, limit=50: seen.update(sites=sites) or [])
+    res = org.lambda_handler(make_event("GET", "/api/org/threads/suggestions"), None)
+    assert res["statusCode"] == 200
+    assert OTHER_SITE_ID not in seen["sites"]
+
+
+# ---------------------------------------------------------------------------
+# Thread facts on the rendered topic (recurring-item threading, increment 2).
+#
+# FACTS only -- how many days a subject was raised on, when last, how much is
+# still open. No judgement: the design deliberately does not raise priority on
+# repetition, because 44% of prod's open items are already 'high' and a
+# ratchet would finish that field off.
+# ---------------------------------------------------------------------------
+
+def _shape_row(**over):
+    row = {"id": "t-1", "site_id": SITE_ID, "user_id": None, "source_s3_key":
+           "extractions/Ada_L/2026-07-22/x.json", "report_date": "2026-07-22",
+           "occurred_at": None, "category": "progress", "title": "Walls",
+           "summary": "s", "time_range": "09:00 – 09:20", "participants": [],
+           "source": None, "created_at": None, "work_class": None,
+           "work_confidence": None, "is_mixed": False, "thread_id": None,
+           "action_items": [], "safety_observations": [], "findings": [],
+           "photos": [], "site_name": "S", "user_name": "Ada L"}
+    row.update(over)
+    return row
+
+
+def test_an_unthreaded_topic_carries_no_thread_block(wired, monkeypatch):
+    """Absent, not zeroed. A times_raised of 1 would claim this subject has
+    been raised once and tracked, when in truth it was never threaded."""
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda *a, **k: {})
+    out = org.render_report_shape([_shape_row()], {}, "2026-07-22", "Ada_L",
+                                  conn=FakeConn())
+    assert out["topics"][0]["thread"] is None
+
+
+def test_a_threaded_topic_carries_the_derived_facts(wired, monkeypatch):
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda *a, **k: {})
+    monkeypatch.setattr(org.threads, "facts_for_threads", lambda conn, ids: {
+        "th-1": {"times_raised": 3, "first_seen": "2026-06-01",
+                 "last_raised": "2026-07-22", "open_items": 5}})
+    out = org.render_report_shape([_shape_row(thread_id="th-1")], {},
+                                  "2026-07-22", "Ada_L", conn=FakeConn())
+    t = out["topics"][0]["thread"]
+    assert t["id"] == "th-1"
+    assert t["times_raised"] == 3
+    assert t["open_items"] == 5
+
+
+def test_the_facts_are_fetched_in_ONE_query_for_the_whole_day(wired, monkeypatch):
+    """This renders per topic; a per-topic lookup would be the N+1 that
+    list_topics_for_date already avoids for action_items and findings."""
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda *a, **k: {})
+    calls = []
+    monkeypatch.setattr(org.threads, "facts_for_threads",
+                        lambda conn, ids: calls.append(sorted(ids)) or {})
+    rows = [_shape_row(id="t-1", thread_id="th-1"),
+            _shape_row(id="t-2", thread_id="th-2"),
+            _shape_row(id="t-3", thread_id="th-1")]
+    org.render_report_shape(rows, {}, "2026-07-22", "Ada_L", conn=FakeConn())
+    assert calls == [["th-1", "th-2"]]        # once, deduped
+
+
+def test_no_conn_means_no_thread_block_rather_than_a_fake_one(wired, monkeypatch):
+    """reindex's builder passes no conn. Absent is honest there; a zeroed
+    block would be a claim about threading it never looked up."""
+    out = org.render_report_shape([_shape_row(thread_id="th-1")], {},
+                                  "2026-07-22", "Ada_L")
+    assert out["topics"][0]["thread"] is None

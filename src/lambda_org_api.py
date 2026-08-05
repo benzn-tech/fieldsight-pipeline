@@ -70,6 +70,9 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/programme/suggestions            → list matcher suggestions (admin/gm/pm see the site; anyone else sees their own)
   POST  /api/org/programme/suggestions/{id}/confirm → apply + write back to programme.json (admin/gm/pm)
   POST  /api/org/programme/suggestions/{id}/reject  → dismiss a suggestion (admin/gm/pm)
+  GET   /api/org/threads/suggestions                → review queue: which earlier subject a topic restates (admin/gm/pm/site_manager)
+  POST  /api/org/threads/suggestions/{id}/confirm   → link the topic to that subject — the ONLY path to a topics.thread_id
+  POST  /api/org/threads/suggestions/{id}/reject    → turn the proposal down (kept, never re-proposed)
   GET    /api/org/programme/tasks                 → time-window read
                                                     (?from=&to=&assignee=me);
                                                     serves the window view, My
@@ -122,6 +125,7 @@ import boto3
 from botocore.exceptions import ClientError
 from psycopg.errors import UniqueViolation
 
+import chunk_stitch
 import content_hash
 import device_heartbeat
 import reindex
@@ -136,7 +140,7 @@ from repositories import (action_items, aliases, classification_feedback, compan
                           programme_snapshot,
                           programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, rollup, scope,
-                          sites, topics, users, voice_messages)
+                          sites, threads, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates, first_match_span, normalize, occurrences
 # Keyframe Q7 telemetry derivation (all AWS-free, pure helpers): the deleted
@@ -183,6 +187,18 @@ RECORDING_KINDS = {"video", "audio", "photo"}
 # Voice-timeliness: mis-touch tolerance ("grace") window before a stopped session
 # finalizes + emails. A resume within it cancels the finalize (spec §3.2, §8.4).
 STOP_GRACE_SECONDS = int(os.environ.get("STOP_GRACE_SECONDS", "30"))
+
+# Multi-device merge: how old a lead session may be and still be joined, and how
+# far apart a group's members may open and still be one meeting.
+#
+# Four hours is longer than any site meeting and far shorter than a day, which
+# is the distinction that matters — the failure being prevented is a device that
+# kept a group OVERNIGHT and records somewhere else tomorrow. Being generous
+# here costs nothing (a too-late join simply records solo); being tight would
+# break a long meeting with a break in it.
+GROUP_JOIN_MAX_AGE_SECONDS = int(os.environ.get("GROUP_JOIN_MAX_AGE_SECONDS", str(4 * 3600)))
+GROUP_MAX_SPAN_SECONDS = int(os.environ.get("GROUP_MAX_SPAN_SECONDS", str(4 * 3600)))
+
 _SID_RE = re.compile(r"^[0-9a-f]{32}$")
 _KIND_FOLDER = {"video": "video", "audio": "audio", "photo": "pictures"}
 
@@ -462,6 +478,15 @@ def dispatch(conn, event, method, route):
     if m_sr and method == "POST":
         return reject_suggestion(conn, caller, m_sr.group(1))
 
+    if route == "/threads/suggestions" and method == "GET":
+        return list_thread_suggestions(conn, caller, event)
+    m_tc = re.match(r"^/threads/suggestions/([^/]+)/confirm$", route)
+    if m_tc and method == "POST":
+        return confirm_thread_suggestion(conn, caller, m_tc.group(1))
+    m_tr = re.match(r"^/threads/suggestions/([^/]+)/reject$", route)
+    if m_tr and method == "POST":
+        return reject_thread_suggestion(conn, caller, m_tr.group(1))
+
     # Per-task reads and writes. Registered AFTER /programme/suggestions/...
     # so the more specific suggestion routes always win — `([^/]+)` below
     # would otherwise be free to swallow a suggestion id.
@@ -614,12 +639,73 @@ def create_recording_upload_url(conn, caller, body):
             else:
                 return error("a recording with this s3 key already exists", 409)
 
+    _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id)
+
     url = s3().generate_presigned_url(
         "put_object",
         Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": content_type},
         ExpiresIn=PRESIGNED_URL_EXPIRY,
     )
     return ok({"recordingId": rec_id, "uploadUrl": url, "s3Key": key})
+
+
+def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
+    """Record the meeting group carried by an upload, if there is one.
+
+    Why this exists: `/sessions/{id}/open` is best-effort and fire-and-forget,
+    and being offline is the normal case on a site — the device may join a
+    meeting in a shed with no signal and not reach the server until hours
+    later. If the group only ever travelled on that one call, joining offline
+    would silently produce two unmerged recordings, which is precisely the
+    situation multi-device capture exists for. The upload is the one thing that
+    is guaranteed to reach us eventually, so the group rides on it too.
+
+    `ensure_open` only ever FILLS group_id (COALESCE), so this and `/open` can
+    both run, in either order, any number of times, without fighting.
+
+    Costs nothing on the solo path: no groupId in the body, no query at all.
+    That path is the overwhelming majority of uploads and is on the synchronous,
+    no-retry route where added latency turns into lost data (BUG-43).
+    """
+    group_id = (body or {}).get("groupId")
+    if not group_id:
+        return
+    try:
+        if not _SID_RE.match(str(group_id)):
+            logger.warning("upload-url: ignoring malformed groupId %r", group_id)
+            return
+        # The session id is in the wire filename (`_sid{32hex}_c{NNNN}`), the
+        # same token the chunk pipeline groups on. A file without it is a photo
+        # or a legacy name and has no session to attach a group to.
+        m = chunk_stitch.CHUNK_TOKENS_RE.search(file_name or "")
+        if not m:
+            return
+        # Same tenant boundary as /open: an unknown lead is allowed (the joiner
+        # can reach us first), a lead belonging to another company is not.
+        # Skipped rather than refused — failing the upload over the group would
+        # cost the recording itself, and /open already answers 403 for this.
+        lead = meeting_session.get(conn, group_id)
+        if lead is not None and str(lead["company_id"]) != str(caller["company_id"]):
+            logger.warning("upload-url: refusing cross-company group %s", group_id)
+            return
+        # opened_at comes from the FILENAME's timestamp, not the body's
+        # startedAt. The body's is this CHUNK's start; the filename's is the
+        # session's, identical on every chunk of the session (the chunk-session
+        # naming contract). Using the body's would let whichever chunk happened
+        # to arrive first — after an offline day, not necessarily the first one —
+        # set the session's start to its own, and ensure_open COALESCEs, so the
+        # wrong value would never be corrected. session_activity reads it from
+        # the same place for the same reason. None is fine: it leaves the field
+        # for whoever does know.
+        meeting_session.ensure_open(
+            conn, m.group(1), caller["company_id"], caller["id"], site_id, kind,
+            extract_base_time_from_filename(file_name), group_id=group_id,
+        )
+    except Exception:
+        # An upload that 500s strands the recording and makes the device resend
+        # the whole file. A lost group costs a merge; a lost upload costs the
+        # audio (BUG-43's family).
+        logger.exception("upload-url: could not record group %s", group_id)
 
 
 def complete_recording(conn, caller, rec_id, body):
@@ -636,7 +722,49 @@ def complete_recording(conn, caller, rec_id, body):
                                     b.get("sizeBytes"), gps_track)
     if row is None:
         return error("recording not found", 404)
-    return ok({"ok": True})
+    payload = {"ok": True}
+    if _group_ended_for(conn, row.get("s3_key")):
+        # Only present when true. A solo upload's response stays byte-identical
+        # to what it has always been, which is most of the traffic on this
+        # endpoint and none of it should change shape for a feature it has no
+        # part in.
+        payload["groupEnded"] = True
+    return ok(payload)
+
+
+def _group_ended_for(conn, s3_key) -> bool:
+    """Has someone ended the meeting this chunk belongs to?
+
+    This is the only channel back to a device that has no open connection: it
+    rides on the upload the device is already doing. That makes it a HOT path —
+    every chunk of every recording — so the cost is kept to one primary-key
+    lookup for the overwhelmingly common case:
+
+      - no `_sid` in the key (legacy filenames): zero queries
+      - solo recording: one PK lookup, `group_ended_at` and `group_id` both NULL
+      - member of an ended group: one PK lookup, already marked
+      - device that joined AFTER the end: two, and only until its next chunk
+
+    Failures are swallowed. A device not learning the meeting ended costs one
+    extra prompt; a `complete` that 500s strands an uploaded recording as
+    un-uploaded and the mobile retry loop re-sends the whole file (BUG-43's
+    family). The signal is an optimisation and must never be able to break the
+    upload it rides on.
+    """
+    m = chunk_stitch.CHUNK_TOKENS_RE.search(s3_key or "")
+    if not m:
+        return False
+    try:
+        row = meeting_session.get(conn, m.group(1))
+        if row is None:
+            return False
+        if row.get("group_ended_at") is not None:
+            return True
+        group_id = row.get("group_id")
+        return bool(group_id) and meeting_session.group_is_ended(conn, group_id)
+    except Exception:
+        logger.exception("group-ended check failed for %s; reporting not-ended", s3_key)
+        return False
 
 
 # ----------------------------------------------------------
@@ -670,8 +798,18 @@ def session_open(conn, caller, session_id, body):
         # it must belong to the caller's company: never merge across tenants on
         # a client's say-so.
         lead = meeting_session.get(conn, group_id)
-        if lead is not None and str(lead["company_id"]) != str(caller["company_id"]):
-            return error("group not accessible", 403)
+        if lead is not None:
+            if str(lead["company_id"]) != str(caller["company_id"]):
+                return error("group not accessible", 403)
+            # Staleness. A device that kept a group overnight, or across a
+            # reinstall, will happily present it again — nothing on the device
+            # objects, because the device is what got it wrong. Judged on the
+            # server's own clock for that exact reason (BUG-37: these ROMs have
+            # been seen 12 hours out). Only applied to a lead we can SEE: an
+            # unknown lead stays a 200, since /open is best-effort and the
+            # joiner may simply have arrived first.
+            if not meeting_session.lead_is_joinable(conn, group_id, GROUP_JOIN_MAX_AGE_SECONDS):
+                return error("group is no longer joinable", 409)
 
     # Idempotent: whichever of the record-start signal or the first uploaded
     # chunk arrives first opens the session; a later call never regresses it.
@@ -702,6 +840,14 @@ def session_close(conn, caller, session_id, body):
                    "version": existing["version"], "noop": True})
 
     row = meeting_session.mark_pending_close(conn, session_id, b.get("endedAt"), intent)
+    # Multi-device merge: a deliberate End means "the meeting is over", so the
+    # other devices have to be told. Recorded here rather than pushed, because
+    # there is no channel to a device that is not currently uploading — the
+    # signal rides back on the upload each device is already doing
+    # (complete_recording below). end_group is a no-op unless a joiner exists,
+    # which is what keeps every ordinary solo End untouched.
+    if intent == "end":
+        meeting_session.end_group(conn, existing.get("group_id") or session_id)
     # A deliberate End finalizes immediately (grace 0); a plain/idle stop waits the
     # mis-touch tolerance window. This endpoint only records pending_close + version
     # + close_intent; a scheduled sweep (FinalizeSweepFunction, in-VPC) then claims
@@ -3832,6 +3978,127 @@ def reject_suggestion(conn, caller, suggestion_id):
 
 
 # ----------------------------------------------------------
+# /threads/suggestions — the review queue for recurring-item threading
+# (spec docs/superpowers/specs/2026-08-05-recurring-item-threading-design.md).
+#
+# The matcher proposes which earlier SUBJECT a new topic restates. Confirming
+# is what actually links them, and it is a human's call: a wrong link
+# silently closes or escalates the wrong work and nobody finds out. So
+# item-writer only ever writes `pending` rows here and these endpoints are
+# the only path to a topics.thread_id.
+#
+# Same manager gate as the programme queue. Unlike that one there is no
+# "everyone sees their own" tier: a thread spans several people's recordings
+# by definition, so deciding one is a site-level judgement.
+# ----------------------------------------------------------
+_THREAD_MANAGER_ROLES = ("admin", "gm", "pm", "site_manager")
+
+
+def _thread_suggestion_or_error(conn, caller, suggestion_id):
+    """Shared load + guard. Returns (row, None) or (None, error-response)."""
+    if caller["global_role"] not in _THREAD_MANAGER_ROLES:
+        return None, error("forbidden", 403)
+    row = threads.get_suggestion(conn, suggestion_id)
+    if row is None:
+        return None, error("not found", 404)
+    if row["status"] != "pending":
+        # Someone else already answered. Not an error in the caller's data —
+        # a race — so it must not read as "your click was invalid".
+        return None, error("already decided", 409)
+    if str(row["site_id"]) not in _allowed_site_ids(conn, caller):
+        return None, error("access denied to this site", 403)
+    return row, None
+
+
+def list_thread_suggestions(conn, caller, event):
+    if caller["global_role"] not in _THREAD_MANAGER_ROLES:
+        return error("forbidden", 403)
+    allowed = _allowed_site_ids(conn, caller)
+    p = event.get("queryStringParameters") or {}
+    site = (p.get("site") or "").strip()
+    if site:
+        if site not in allowed:
+            return error("access denied to this site", 403)
+        allowed = [site]
+    # `allowed` empty means this caller reaches no site — list_pending returns
+    # nothing rather than everything (CLAUDE.md: [] is "restrict to nothing").
+    rows = threads.list_pending(conn, allowed)
+    return ok({"suggestions": [{
+        "id": str(r["id"]),
+        "topicId": str(r["topic_id"]),
+        "topicTitle": r["topic_title"],
+        "topicDate": str(r["topic_date"]),
+        "siteId": str(r["site_id"]),
+        # Exactly one of these is set (the table's CHECK): joining a thread
+        # that already exists, or anchoring a new one on an earlier topic.
+        "threadId": str(r["thread_id"]) if r["thread_id"] else None,
+        "threadTitle": r["thread_title"],
+        "parentTopicId": str(r["parent_topic_id"]) if r["parent_topic_id"] else None,
+        "parentTitle": r["parent_title"],
+        "parentDate": str(r["parent_date"]) if r["parent_date"] else None,
+        "score": float(r["score"]),
+        "gapDays": r["gap_days"],
+    } for r in rows]})
+
+
+def confirm_thread_suggestion(conn, caller, suggestion_id):
+    """Link the topic to the subject it restates.
+
+    Everything here runs in ONE transaction (lambda_handler's
+    `with get_connection()`), which is what keeps a resolved row from ever
+    claiming work that did not happen: if the attach fails after the row is
+    marked confirmed, both unwind together.
+
+    resolve_suggestion is the CAS. Its `WHERE status='pending'` is the
+    authoritative gate — None means another request decided this first, and
+    we must not attach on the strength of a decision we did not win."""
+    row, err = _thread_suggestion_or_error(conn, caller, suggestion_id)
+    if err is not None:
+        return err
+
+    decided = threads.resolve_suggestion(conn, suggestion_id, "confirmed",
+                                         str(caller["id"]))
+    if decided is None:
+        return error("already decided", 409)
+
+    thread_id = row["thread_id"]
+    if thread_id is None:
+        # Anchoring: the parent has no thread yet, so this confirmation
+        # creates it and puts BOTH topics on it. Titled from the parent —
+        # the earlier framing is the one people have been using.
+        parent = topics.get_topic(conn, row["parent_topic_id"])
+        if parent is None:
+            return error("the earlier topic no longer exists", 409)
+        thread = threads.create_thread(conn, parent["site_id"], parent["title"],
+                                       parent["report_date"], parent["report_date"])
+        thread_id = thread["id"]
+        threads.attach_topic(conn, row["parent_topic_id"], thread_id,
+                             parent["report_date"])
+
+    threads.attach_topic(conn, row["topic_id"], thread_id, row["topic_date"])
+    facts = threads.thread_facts(conn, thread_id)
+    return ok({
+        "confirmed": True,
+        "threadId": str(thread_id),
+        "timesRaised": facts["times_raised"],
+        "openItems": facts["open_items"],
+    })
+
+
+def reject_thread_suggestion(conn, caller, suggestion_id):
+    """Turn a proposal down. The row is kept, not deleted: the repository
+    refuses to propose the same link again, and re-asking a question someone
+    already answered is the fastest way to train them to ignore the queue."""
+    _row, err = _thread_suggestion_or_error(conn, caller, suggestion_id)
+    if err is not None:
+        return err
+    if threads.resolve_suggestion(conn, suggestion_id, "rejected",
+                                  str(caller["id"])) is None:
+        return error("already decided", 409)
+    return ok({"rejected": True})
+
+
+# ----------------------------------------------------------
 # /timeline (authority-flip Task 4 — org-api compatibility shim). D1
 # contract: byte-identical S3 daily_report.json for days without extraction
 # topics; the same shape RENDERED from Aurora extraction topics for days
@@ -3981,6 +4248,14 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
     doc = doc or {}
     topics_out = []
     _redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if conn is not None else {}
+    # Thread facts for every threaded topic on the day, in ONE query — the
+    # same batching list_topics_for_date already uses for action_items and
+    # findings, for the same reason: this renders per topic and a per-topic
+    # lookup would be the N+1. Callers without a conn (reindex's builder) get
+    # no thread block at all, which is honest: absent, not zero.
+    _thread_ids = {str(r["thread_id"]) for r in rows if r.get("thread_id")}
+    _thread_facts = (threads.facts_for_threads(conn, list(_thread_ids))
+                     if conn is not None and _thread_ids else {})
     for i, t in enumerate(rows):
         flags = [{"observation": f["observation"],
                   "risk_level": _SEV_TO_RISK.get(f["severity"], "medium"),
@@ -4014,6 +4289,25 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             "action_items": [{"id": str(a["id"]), "action": a["text"], "responsible": a["responsible"],
                               "deadline": a["deadline_text"] or (str(a["deadline"]) if a["deadline"] else None),
                               "priority": a["priority"], "status": a["status"]} for a in t["action_items"]],
+            # The subject this topic belongs to, when a human has confirmed
+            # one. FACTS ONLY -- how many days it was raised on, when last,
+            # how much is still open. No judgement: the design deliberately
+            # does not raise priority on repetition, because 44% of prod's
+            # open items are already 'high' and a ratchet would finish that
+            # field off. "Raised 3 times, slipped twice" is derivable and
+            # provable; "important" is not.
+            #
+            # Absent (not zeroed) for an unthreaded topic, which is almost
+            # all of them -- a 1 would claim this subject has been raised
+            # once and tracked, when in truth it has never been threaded.
+            "thread": (lambda _f: {
+                "id": str(t["thread_id"]),
+                "times_raised": _f["times_raised"],
+                "first_seen": str(_f["first_seen"]) if _f["first_seen"] else None,
+                "last_raised": str(_f["last_raised"]) if _f["last_raised"] else None,
+                "open_items": _f["open_items"],
+            })(_thread_facts[str(t["thread_id"])])
+            if t.get("thread_id") and str(t["thread_id"]) in _thread_facts else None,
             "safety_flags": flags,
             "related_photos": [ph["s3_key"].rsplit("/", 1)[-1] for ph in t["photos"]],
             "findings": t["findings"],              # additive passthrough (D3)
