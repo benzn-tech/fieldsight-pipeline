@@ -182,6 +182,14 @@ def _suggest_threads_inner(conn, site_id, date, written):
     corpus = threads.candidate_corpus(conn, site_id, date,
                                       thread_match.MAX_GAP_DAYS)
     if not corpus:
+        # Log the silence. The first prod run of this wrote 8 topics and
+        # emitted NOTHING, because the early return sat above the only log
+        # line -- leaving "the flag is off", "there was nothing to compare
+        # against" and "it threw and was swallowed" indistinguishable from
+        # the outside. Three states, one empty log, and the only way to tell
+        # them apart was to query the database by hand.
+        logger.info("thread suggestions: no candidates within %dd for site=%s %s",
+                    thread_match.MAX_GAP_DAYS, site_id, date)
         return 0
     made = 0
     for t in written:
@@ -399,8 +407,14 @@ def write_extraction_items(date, user_folder, extraction_key):
                                         "time_range": t.get("time_range")})
             topics_n += 1
 
-        if SUGGEST_THREADS and collected_topics:
-            _suggest_threads(conn, site["id"], date, collected_topics)
+        if collected_topics:
+            if SUGGEST_THREADS:
+                _suggest_threads(conn, site["id"], date, collected_topics)
+            else:
+                # Say that it is off. An env-gated feature that logs nothing
+                # when disabled is indistinguishable from one that is broken,
+                # and the first question anyone asks is "did it even run".
+                logger.info("thread suggestions: disabled (SUGGEST_THREADS)")
 
     logger.info("item-writer wrote extraction=%s topics=%d", extraction_key, topics_n)
 
