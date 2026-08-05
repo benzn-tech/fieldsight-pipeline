@@ -126,11 +126,18 @@ def group_span_ok(conn, group_id, max_span_seconds) -> bool:
     A missing row (no members yet) is NOT a violation — there is simply nothing
     to merge, and returning False would block a group that has merely not been
     populated. A single member spans zero seconds and passes trivially, which is
-    what the solo and first-joiner cases both need."""
+    what the solo and first-joiner cases both need.
+
+    The LEAD is included, and that is the whole point: it carries no group_id of
+    its own, so matching on group_id alone measured the joiners against each
+    other and left the anchor out. One device carrying a group overnight and
+    joining the next morning is then the only "member" the span can see, spans
+    zero seconds, and sails through the guard that exists to stop exactly that.
+    The lead's opened_at is the timestamp the whole question is about."""
     row = conn.cursor(row_factory=dict_row).execute(
         "SELECT EXTRACT(EPOCH FROM (MAX(opened_at) - MIN(opened_at))) AS span_seconds "
-        "FROM meeting_session WHERE group_id = %s",
-        (group_id,),
+        "FROM meeting_session WHERE group_id = %s OR session_id = %s",
+        (group_id, group_id),
     ).fetchone()
     span = (row or {}).get("span_seconds")
     if span is None:

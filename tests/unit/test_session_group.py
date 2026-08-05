@@ -152,6 +152,22 @@ def test_group_span_ok_measures_server_time_not_device_time():
     sql = conn.calls[0]["sql"].lower()
     assert "opened_at" in sql, "must measure the server's own timestamp"
     assert "extract(epoch" in sql
+
+
+def test_group_span_ok_measures_the_lead_too():
+    """The tests above feed a canned span, so they pin the comparison and say
+    nothing about what the query measures.
+
+    The lead carries no group_id of its own. Matching on group_id alone compares
+    the joiners against each other and leaves out the anchor — one device
+    carrying a group overnight is then the only member the span can see, spans
+    zero seconds, and passes the guard built to stop exactly that. The real
+    behaviour is pinned in tests/integration/test_session_group_sql.py."""
+    conn = FakeConn(results=[[{"span_seconds": 0}]])
+    meeting_session.group_span_ok(conn, SID_B, max_span_seconds=4 * 3600)
+    sql = conn.calls[0]["sql"].lower()
+    assert "session_id = %s" in sql, "the lead has no group_id; match it by identity"
+    assert conn.calls[0]["params"] == (SID_B, SID_B)
     # started_at / device-reported fields must not appear: they are the device's
     # clock, which is the thing this guard exists to not trust.
     assert "started_at" not in sql
