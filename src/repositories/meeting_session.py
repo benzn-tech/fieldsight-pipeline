@@ -95,46 +95,6 @@ def group_is_settled(conn, group_id, idle_grace_seconds) -> bool:
     return int((row or {}).get("unsettled") or 0) == 0
 
 
-def end_group(conn, group_id) -> int:
-    """One member answered "the meeting has ended". Record it for the whole group.
-
-    @return how many sessions were marked; 0 when this is not a group.
-
-    The zero case is the important one. A solo session's id is indistinguishable
-    from a lead's — both are "the group id" as far as the close handler can see —
-    so without this guard every ordinary solo End would mark itself ended, and
-    the upload path would then tell that device to stop recording. Requiring a
-    joiner to exist is what makes the solo path provably untouched.
-
-    Already-ended rows are left alone so the timestamp records when the meeting
-    actually ended, not when the last device happened to ask."""
-    has_joiner = conn.cursor(row_factory=dict_row).execute(
-        "SELECT 1 AS x FROM meeting_session WHERE group_id = %s LIMIT 1", (group_id,)
-    ).fetchone()
-    if not has_joiner:
-        return 0
-    cur = conn.cursor(row_factory=dict_row).execute(
-        "UPDATE meeting_session SET group_ended_at = now(), updated_at = now() "
-        "WHERE (group_id = %s OR session_id = %s) AND group_ended_at IS NULL "
-        "RETURNING session_id",
-        (group_id, group_id),
-    )
-    return len(cur.fetchall())
-
-
-def group_is_ended(conn, group_id) -> bool:
-    """True once anyone in the group has ended the meeting.
-
-    Reads the whole group rather than one row so a device that joined AFTER the
-    end is told immediately, instead of recording into a meeting that is over."""
-    row = conn.cursor(row_factory=dict_row).execute(
-        "SELECT 1 AS x FROM meeting_session "
-        "WHERE (group_id = %s OR session_id = %s) AND group_ended_at IS NOT NULL LIMIT 1",
-        (group_id, group_id),
-    ).fetchone()
-    return row is not None
-
-
 def touch_segment(conn, session_id, at) -> dict | None:
     """A chunk arrived. Advance last_segment_at + segment_count. If the session
     was `pending_close`, this arrival is a RESUME within the grace window: flip
@@ -260,3 +220,43 @@ def get(conn, session_id) -> dict | None:
         f"SELECT {_COLS} FROM meeting_session WHERE session_id = %s",
         (session_id,),
     ).fetchone()
+
+
+def end_group(conn, group_id) -> int:
+    """One member answered "the meeting has ended". Record it for the whole group.
+
+    @return how many sessions were marked; 0 when this is not a group.
+
+    The zero case is the important one. A solo session's id is indistinguishable
+    from a lead's — both are "the group id" as far as the close handler can see —
+    so without this guard every ordinary solo End would mark itself ended, and
+    the upload path would then tell that device to stop recording. Requiring a
+    joiner to exist is what makes the solo path provably untouched.
+
+    Already-ended rows are left alone so the timestamp records when the meeting
+    actually ended, not when the last device happened to ask."""
+    has_joiner = conn.cursor(row_factory=dict_row).execute(
+        "SELECT 1 AS x FROM meeting_session WHERE group_id = %s LIMIT 1", (group_id,)
+    ).fetchone()
+    if not has_joiner:
+        return 0
+    cur = conn.cursor(row_factory=dict_row).execute(
+        "UPDATE meeting_session SET group_ended_at = now(), updated_at = now() "
+        "WHERE (group_id = %s OR session_id = %s) AND group_ended_at IS NULL "
+        "RETURNING session_id",
+        (group_id, group_id),
+    )
+    return len(cur.fetchall())
+
+
+def group_is_ended(conn, group_id) -> bool:
+    """True once anyone in the group has ended the meeting.
+
+    Reads the whole group rather than one row so a device that joined AFTER the
+    end is told immediately, instead of recording into a meeting that is over."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT 1 AS x FROM meeting_session "
+        "WHERE (group_id = %s OR session_id = %s) AND group_ended_at IS NOT NULL LIMIT 1",
+        (group_id, group_id),
+    ).fetchone()
+    return row is not None
