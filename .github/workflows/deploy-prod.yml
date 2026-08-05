@@ -183,6 +183,7 @@ jobs:
               "VadLayerArn=${{ vars.PROD_VAD_LAYER_ARN }}" \
               "DocxLayerArn=${{ vars.PROD_DOCX_LAYER_ARN }}" \
               "EnableKeyframes=${{ vars.PROD_ENABLE_KEYFRAMES || 'false' }}" \
+              "EnableThreadSuggestions=${{ vars.PROD_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
               $KF_LAYER_PARAM \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
