@@ -10,6 +10,20 @@ name: Deploy FieldSight PROD (SAM)
 # `fieldsight_test`. schema_migrations is per-database.
 # ============================================================
 
+
+# Only one deploy against a stack at a time. CloudFormation rejects an update
+# while one is in flight ("Stack is in UPDATE_IN_PROGRESS"), and the run fails
+# for a reason that has nothing to do with the change being deployed — which is
+# how a perfectly good deploy gets diagnosed as broken code. Merging a few PRs
+# in quick succession, or two people merging at once, is enough to trigger it.
+#
+# cancel-in-progress is deliberately FALSE: queueing is the point. Cancelling a
+# run mid-CloudFormation-update would leave the stack half-applied, which is
+# strictly worse than waiting.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
   push:
