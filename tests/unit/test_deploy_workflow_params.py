@@ -59,6 +59,38 @@ def test_the_floor_is_passed_only_when_set():
             f"{env}: bare empty override — SAM rejects this")
 
 
+def _passed_parameters(env):
+    """Every CloudFormation parameter the workflow passes to `sam deploy`."""
+    body = _text(env)
+    inline = re.findall(r'^\s+"(\w+)=[^"]*"\s*\\?\s*$', body, re.MULTILINE)
+    guarded = re.findall(r'^\s+\w+="(\w+)=', body, re.MULTILINE)
+    return set(inline) | set(guarded)
+
+
+def test_test_can_mirror_every_behaviour_prod_runs():
+    """A parameter prod passes and test does not is a place where verifying
+    something on test says nothing about prod.
+
+    This is not hypothetical: AUTHORITY_FLIP ran true on prod and false on test
+    for weeks, and test could not even be switched to match because deploy.yml
+    did not pass the parameter at all. Anything test proved about topic
+    authority was untransferable, which is the same class of gap that made
+    BUG-39 possible.
+
+    Values are allowed to differ — that is what separate environments are for.
+    What must not differ is whether test is *capable* of matching.
+    """
+    # ManageDataBucketPolicy is environment-specific by design, documented in
+    # template.yaml: test owns its own bucket's policy, prod points at the
+    # shared lake whose policy is hand-managed and cannot be adopted by CFN.
+    BY_DESIGN = {"ManageDataBucketPolicy"}
+
+    missing = _passed_parameters("prod") - _passed_parameters("test") - BY_DESIGN
+    assert not missing, (
+        "prod passes these and test cannot: test would be unable to reproduce "
+        f"prod's behaviour for them: {sorted(missing)}")
+
+
 def test_no_override_line_can_emit_an_empty_value():
     """Generalises the trap above to every parameter, present and future.
 

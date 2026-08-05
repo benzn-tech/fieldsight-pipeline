@@ -145,6 +145,11 @@ jobs:
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \
+              # Mirrors PROD_AUTHORITY_FLIP. Passed so test CAN match prod; the
+              # default keeps today's behaviour (off) until someone opts in.
+              # Prod runs this true, so anything test proves about topic
+              # authority is only transferable once this is on as well.
+              "AuthorityFlip=${{ vars.TEST_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.TEST_GRADED_ROLES || 'false' }}" \
               "MultiTenantResolution=${{ vars.TEST_MULTI_TENANT_RESOLUTION || 'true' }}" \
               "VadThreshold=${{ vars.TEST_VAD_THRESHOLD || '0.2' }}" \
