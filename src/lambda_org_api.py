@@ -615,7 +615,7 @@ def create_recording_upload_url(conn, caller, body):
             else:
                 return error("a recording with this s3 key already exists", 409)
 
-    _adopt_group_from_upload(conn, caller, body, file_name, kind, started_at, site_id)
+    _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id)
 
     url = s3().generate_presigned_url(
         "put_object",
@@ -625,7 +625,7 @@ def create_recording_upload_url(conn, caller, body):
     return ok({"recordingId": rec_id, "uploadUrl": url, "s3Key": key})
 
 
-def _adopt_group_from_upload(conn, caller, body, file_name, kind, started_at, site_id):
+def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
     """Record the meeting group carried by an upload, if there is one.
 
     Why this exists: `/sessions/{id}/open` is best-effort and fire-and-forget,
@@ -664,9 +664,18 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, started_at, si
         if lead is not None and str(lead["company_id"]) != str(caller["company_id"]):
             logger.warning("upload-url: refusing cross-company group %s", group_id)
             return
+        # opened_at comes from the FILENAME's timestamp, not the body's
+        # startedAt. The body's is this CHUNK's start; the filename's is the
+        # session's, identical on every chunk of the session (the chunk-session
+        # naming contract). Using the body's would let whichever chunk happened
+        # to arrive first — after an offline day, not necessarily the first one —
+        # set the session's start to its own, and ensure_open COALESCEs, so the
+        # wrong value would never be corrected. session_activity reads it from
+        # the same place for the same reason. None is fine: it leaves the field
+        # for whoever does know.
         meeting_session.ensure_open(
             conn, m.group(1), caller["company_id"], caller["id"], site_id, kind,
-            started_at, group_id=group_id,
+            extract_base_time_from_filename(file_name), group_id=group_id,
         )
     except Exception:
         # An upload that 500s strands the recording and makes the device resend
