@@ -106,11 +106,30 @@ def test_settling_waits_for_the_lead(db):
     assert meeting_session.group_is_settled(db, LEAD, 900) is False
 
 
+def test_a_joiner_can_arrive_before_the_lead_exists(db):
+    """THE case the offline-first design rests on, and the one a FakeConn cannot
+    see.
+
+    The group id is generated on the LEAD's device, so a group forms with no
+    network. The joiner may therefore reach the server first — the lead's /open
+    is best-effort and on a site can be hours late or lost. 0031 declared
+    group_id REFERENCES meeting_session(session_id), which made that insert
+    raise 23503 and answered the joiner's /open with a 500: joining before the
+    lead never worked at all, while the unit suite stayed green. 0034 drops it.
+    """
+    cid, uid = _seed(db)
+    row = meeting_session.ensure_open(
+        db, J1, cid, uid, None, "audio", None, group_id="f" * 32)  # lead unknown
+
+    assert row["group_id"] == "f" * 32
+
+
 def test_the_group_is_only_filled_never_cleared(db):
     """/open is best-effort and arrives more than once. A second call that omits
     the group must not orphan a device that already joined — this is what lets
     the group travel on both /open and the upload without them fighting."""
     cid, uid = _seed(db)
+    _session(db, cid, uid, LEAD)      # the lead exists in this one
     meeting_session.ensure_open(db, J1, cid, uid, None, "audio", None, group_id=LEAD)
     row = meeting_session.ensure_open(db, J1, cid, uid, None, "audio", None, group_id=None)
 
