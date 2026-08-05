@@ -127,6 +127,18 @@ def already_resolved(conn, topic_id, *, thread_id=None, parent_topic_id=None):
         (topic_id, thread_id, parent_topic_id)).fetchone() is not None
 
 
+def get_suggestion(conn, suggestion_id):
+    """One proposal plus the site it belongs to, so the caller can ACL it
+    without a second round trip. site_id comes from the TOPIC rather than
+    being denormalised onto the suggestion: a topic's site can be corrected
+    (BUG-41's whole subject), and a stale copy here would decide access."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT s.{ ', s.'.join(_SUGG_COLS.split(', ')) }, "
+        "       t.site_id, t.report_date AS topic_date, t.title AS topic_title "
+        "FROM topic_thread_suggestions s JOIN topics t ON t.id = s.topic_id "
+        "WHERE s.id = %s", (suggestion_id,)).fetchone()
+
+
 def list_pending(conn, site_ids, limit=50):
     """The review queue, newest first. Empty site_ids returns nothing rather
     than everything — [] means "restrict to nothing", never "no restriction"

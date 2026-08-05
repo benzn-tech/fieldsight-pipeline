@@ -143,6 +143,16 @@ def get_topic_photos(conn, topic_id) -> list[dict]:
     ).fetchall()
 
 
+def get_topic(conn, topic_id):
+    """One topic row, or None. Just the columns a caller outside the render
+    path needs — anchoring a thread on it, checking it still exists — not the
+    children."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, site_id, user_id, report_date, title, summary, category, "
+        "       time_range, source_s3_key, thread_id "
+        "FROM topics WHERE id=%s", (topic_id,)).fetchone()
+
+
 def delete_topics_for_source(conn, source_s3_key) -> int:
     """Delete topics rows produced from one source report.
 

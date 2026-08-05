@@ -70,6 +70,9 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/programme/suggestions            → list matcher suggestions (admin/gm/pm see the site; anyone else sees their own)
   POST  /api/org/programme/suggestions/{id}/confirm → apply + write back to programme.json (admin/gm/pm)
   POST  /api/org/programme/suggestions/{id}/reject  → dismiss a suggestion (admin/gm/pm)
+  GET   /api/org/threads/suggestions                → review queue: which earlier subject a topic restates (admin/gm/pm/site_manager)
+  POST  /api/org/threads/suggestions/{id}/confirm   → link the topic to that subject — the ONLY path to a topics.thread_id
+  POST  /api/org/threads/suggestions/{id}/reject    → turn the proposal down (kept, never re-proposed)
   GET    /api/org/programme/tasks                 → time-window read
                                                     (?from=&to=&assignee=me);
                                                     serves the window view, My
@@ -136,7 +139,7 @@ from repositories import (action_items, aliases, classification_feedback, compan
                           programme_snapshot,
                           programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, rollup, scope,
-                          sites, topics, users, voice_messages)
+                          sites, threads, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates, first_match_span, normalize, occurrences
 # Keyframe Q7 telemetry derivation (all AWS-free, pure helpers): the deleted
@@ -461,6 +464,15 @@ def dispatch(conn, event, method, route):
     m_sr = re.match(r"^/programme/suggestions/([^/]+)/reject$", route)
     if m_sr and method == "POST":
         return reject_suggestion(conn, caller, m_sr.group(1))
+
+    if route == "/threads/suggestions" and method == "GET":
+        return list_thread_suggestions(conn, caller, event)
+    m_tc = re.match(r"^/threads/suggestions/([^/]+)/confirm$", route)
+    if m_tc and method == "POST":
+        return confirm_thread_suggestion(conn, caller, m_tc.group(1))
+    m_tr = re.match(r"^/threads/suggestions/([^/]+)/reject$", route)
+    if m_tr and method == "POST":
+        return reject_thread_suggestion(conn, caller, m_tr.group(1))
 
     # Per-task reads and writes. Registered AFTER /programme/suggestions/...
     # so the more specific suggestion routes always win — `([^/]+)` below
@@ -3828,6 +3840,127 @@ def reject_suggestion(conn, caller, suggestion_id):
     if str(row["site_id"]) not in _allowed_site_ids(conn, caller):
         return error("access denied to this site", 403)
     programme_suggestions.decide(conn, suggestion_id, "rejected", decided_by=caller["id"])
+    return ok({"rejected": True})
+
+
+# ----------------------------------------------------------
+# /threads/suggestions — the review queue for recurring-item threading
+# (spec docs/superpowers/specs/2026-08-05-recurring-item-threading-design.md).
+#
+# The matcher proposes which earlier SUBJECT a new topic restates. Confirming
+# is what actually links them, and it is a human's call: a wrong link
+# silently closes or escalates the wrong work and nobody finds out. So
+# item-writer only ever writes `pending` rows here and these endpoints are
+# the only path to a topics.thread_id.
+#
+# Same manager gate as the programme queue. Unlike that one there is no
+# "everyone sees their own" tier: a thread spans several people's recordings
+# by definition, so deciding one is a site-level judgement.
+# ----------------------------------------------------------
+_THREAD_MANAGER_ROLES = ("admin", "gm", "pm", "site_manager")
+
+
+def _thread_suggestion_or_error(conn, caller, suggestion_id):
+    """Shared load + guard. Returns (row, None) or (None, error-response)."""
+    if caller["global_role"] not in _THREAD_MANAGER_ROLES:
+        return None, error("forbidden", 403)
+    row = threads.get_suggestion(conn, suggestion_id)
+    if row is None:
+        return None, error("not found", 404)
+    if row["status"] != "pending":
+        # Someone else already answered. Not an error in the caller's data —
+        # a race — so it must not read as "your click was invalid".
+        return None, error("already decided", 409)
+    if str(row["site_id"]) not in _allowed_site_ids(conn, caller):
+        return None, error("access denied to this site", 403)
+    return row, None
+
+
+def list_thread_suggestions(conn, caller, event):
+    if caller["global_role"] not in _THREAD_MANAGER_ROLES:
+        return error("forbidden", 403)
+    allowed = _allowed_site_ids(conn, caller)
+    p = event.get("queryStringParameters") or {}
+    site = (p.get("site") or "").strip()
+    if site:
+        if site not in allowed:
+            return error("access denied to this site", 403)
+        allowed = [site]
+    # `allowed` empty means this caller reaches no site — list_pending returns
+    # nothing rather than everything (CLAUDE.md: [] is "restrict to nothing").
+    rows = threads.list_pending(conn, allowed)
+    return ok({"suggestions": [{
+        "id": str(r["id"]),
+        "topicId": str(r["topic_id"]),
+        "topicTitle": r["topic_title"],
+        "topicDate": str(r["topic_date"]),
+        "siteId": str(r["site_id"]),
+        # Exactly one of these is set (the table's CHECK): joining a thread
+        # that already exists, or anchoring a new one on an earlier topic.
+        "threadId": str(r["thread_id"]) if r["thread_id"] else None,
+        "threadTitle": r["thread_title"],
+        "parentTopicId": str(r["parent_topic_id"]) if r["parent_topic_id"] else None,
+        "parentTitle": r["parent_title"],
+        "parentDate": str(r["parent_date"]) if r["parent_date"] else None,
+        "score": float(r["score"]),
+        "gapDays": r["gap_days"],
+    } for r in rows]})
+
+
+def confirm_thread_suggestion(conn, caller, suggestion_id):
+    """Link the topic to the subject it restates.
+
+    Everything here runs in ONE transaction (lambda_handler's
+    `with get_connection()`), which is what keeps a resolved row from ever
+    claiming work that did not happen: if the attach fails after the row is
+    marked confirmed, both unwind together.
+
+    resolve_suggestion is the CAS. Its `WHERE status='pending'` is the
+    authoritative gate — None means another request decided this first, and
+    we must not attach on the strength of a decision we did not win."""
+    row, err = _thread_suggestion_or_error(conn, caller, suggestion_id)
+    if err is not None:
+        return err
+
+    decided = threads.resolve_suggestion(conn, suggestion_id, "confirmed",
+                                         str(caller["id"]))
+    if decided is None:
+        return error("already decided", 409)
+
+    thread_id = row["thread_id"]
+    if thread_id is None:
+        # Anchoring: the parent has no thread yet, so this confirmation
+        # creates it and puts BOTH topics on it. Titled from the parent —
+        # the earlier framing is the one people have been using.
+        parent = topics.get_topic(conn, row["parent_topic_id"])
+        if parent is None:
+            return error("the earlier topic no longer exists", 409)
+        thread = threads.create_thread(conn, parent["site_id"], parent["title"],
+                                       parent["report_date"], parent["report_date"])
+        thread_id = thread["id"]
+        threads.attach_topic(conn, row["parent_topic_id"], thread_id,
+                             parent["report_date"])
+
+    threads.attach_topic(conn, row["topic_id"], thread_id, row["topic_date"])
+    facts = threads.thread_facts(conn, thread_id)
+    return ok({
+        "confirmed": True,
+        "threadId": str(thread_id),
+        "timesRaised": facts["times_raised"],
+        "openItems": facts["open_items"],
+    })
+
+
+def reject_thread_suggestion(conn, caller, suggestion_id):
+    """Turn a proposal down. The row is kept, not deleted: the repository
+    refuses to propose the same link again, and re-asking a question someone
+    already answered is the fastest way to train them to ignore the queue."""
+    _row, err = _thread_suggestion_or_error(conn, caller, suggestion_id)
+    if err is not None:
+        return err
+    if threads.resolve_suggestion(conn, suggestion_id, "rejected",
+                                  str(caller["id"])) is None:
+        return error("already decided", 409)
     return ok({"rejected": True})
 
 
