@@ -767,9 +767,382 @@ git commit -am "feat(session): show and scan the meeting join code"
 
 ---
 
+### Task 10: Leaving a group — the two actions
+
+**Files:**
+- Create: `app/src/main/java/com/benzn/grandtime/capture/GroupExit.kt`
+- Test: `app/src/test/java/com/benzn/grandtime/GroupExitTest.kt`
+
+**Interfaces:**
+- Consumes: `SessionGroup` (Task 7), the persisted `pendingGroupId` (Task 8)
+- Produces: `GroupExit.Decision` = `MEETING_ENDED | I_AM_LEAVING | NOT_YET`, and
+  `GroupExit.resolve(decision, now, lastStopAt): GroupExit.Outcome` with fields
+  `clearsGroup: Boolean`, `notifiesOthers: Boolean`, `asksToResume: Boolean`
+
+- [ ] **Step 1: Write the failing test**
+
+```kotlin
+package com.benzn.grandtime
+
+import com.benzn.grandtime.capture.GroupExit
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class GroupExitTest {
+    @Test fun meetingEndedClearsMineAndTellsTheOthers() {
+        val o = GroupExit.resolve(GroupExit.Decision.MEETING_ENDED)
+        assertTrue(o.clearsGroup)
+        assertTrue(o.notifiesOthers)
+        assertTrue(o.asksToResume)
+    }
+
+    @Test fun leavingClearsOnlyMine() {
+        // An inspector who finishes early must not stop everyone else's
+        // recording — that is the whole reason this is a second action.
+        val o = GroupExit.resolve(GroupExit.Decision.I_AM_LEAVING)
+        assertTrue(o.clearsGroup)
+        assertFalse(o.notifiesOthers)
+        assertTrue(o.asksToResume)
+    }
+
+    @Test fun notYetKeepsTheGroupAndAsksNothing() {
+        val o = GroupExit.resolve(GroupExit.Decision.NOT_YET)
+        assertFalse(o.clearsGroup)
+        assertFalse(o.notifiesOthers)
+        assertFalse(o.asksToResume)
+    }
+
+    @Test fun bothExitsAskToResume() {
+        // Ending a meeting is not finishing work. Same question either way —
+        // one behaviour, not a special case per exit.
+        for (d in listOf(GroupExit.Decision.MEETING_ENDED, GroupExit.Decision.I_AM_LEAVING)) {
+            assertTrue(GroupExit.resolve(d).asksToResume)
+        }
+    }
+}
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `./gradlew test --tests '*GroupExitTest*'`
+Expected: FAIL — unresolved reference `GroupExit`
+
+- [ ] **Step 3: Implement**
+
+```kotlin
+package com.benzn.grandtime.capture
+
+/**
+ * What happens when a device leaves a meeting group.
+ *
+ * TWO actions, not one. An inspector who finishes early while the meeting
+ * continues needs I_AM_LEAVING; if MEETING_ENDED were the only option, using it
+ * would stop everybody else's recording. They are identical for content already
+ * captured — both stay in the meeting — and differ only in whether the rest of
+ * the group is told to stop.
+ *
+ * Both exits ask about resuming, because ending a meeting is not the same as
+ * finishing work: the person may be walking to the next task or done for the
+ * day. There is no safe default, so it is asked, and the same way for both —
+ * one behaviour rather than a special case per exit.
+ */
+object GroupExit {
+    enum class Decision { MEETING_ENDED, I_AM_LEAVING, NOT_YET }
+
+    data class Outcome(
+        val clearsGroup: Boolean,
+        val notifiesOthers: Boolean,
+        val asksToResume: Boolean,
+    )
+
+    fun resolve(decision: Decision): Outcome = when (decision) {
+        Decision.MEETING_ENDED -> Outcome(true, notifiesOthers = true, asksToResume = true)
+        Decision.I_AM_LEAVING -> Outcome(true, notifiesOthers = false, asksToResume = true)
+        Decision.NOT_YET -> Outcome(false, notifiesOthers = false, asksToResume = false)
+    }
+}
+```
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `./gradlew test --tests '*GroupExitTest*'`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add app/src/main/java/com/benzn/grandtime/capture/GroupExit.kt \
+        app/src/test/java/com/benzn/grandtime/GroupExitTest.kt
+git commit -m "feat(session): the two ways to leave a meeting group"
+```
+
+---
+
+### Task 11: The device-side expiry, and the guarantee it carries
+
+**Files:**
+- Modify: `app/src/main/java/com/benzn/grandtime/capture/GroupExit.kt`
+- Test: `app/src/test/java/com/benzn/grandtime/GroupExitTest.kt`
+
+**Interfaces:**
+- Produces: `GroupExit.hasExpired(lastStopAtMillis, nowMillis): Boolean`, and the
+  constant `GroupExit.EXPIRY_MILLIS` = 15 minutes
+
+- [ ] **Step 1: Write the failing test**
+
+```kotlin
+private val MIN = 60_000L
+
+@Test fun aPauseWithinTheMeetingKeepsTheGroup() {
+    // Battery swap, walking to the next building, a phone call. If these
+    // dropped the group the meeting would split into two reports and the user
+    // would have to re-scan for nothing.
+    assertFalse(GroupExit.hasExpired(lastStopAtMillis = 0, nowMillis = 2 * MIN))
+    assertFalse(GroupExit.hasExpired(lastStopAtMillis = 0, nowMillis = 14 * MIN))
+}
+
+@Test fun theGroupClearsAfterFifteenMinutesOfSilence() {
+    assertTrue(GroupExit.hasExpired(lastStopAtMillis = 0, nowMillis = 16 * MIN))
+}
+
+@Test fun expiryUsesTheSessionGapNotTheMisTouchWindow() {
+    // 30s is STOP_GRACE_SECONDS, the mis-touch window. Using it here would
+    // expire the group during an ordinary pause.
+    assertFalse(GroupExit.hasExpired(lastStopAtMillis = 0, nowMillis = 31_000))
+    assertEquals(15 * MIN, GroupExit.EXPIRY_MILLIS)
+}
+
+@Test fun nextDayHasDefinitelyExpired() {
+    assertTrue(GroupExit.hasExpired(lastStopAtMillis = 0, nowMillis = 23 * 60 * MIN))
+}
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `./gradlew test --tests '*GroupExitTest*'`
+Expected: FAIL — unresolved reference `hasExpired`
+
+- [ ] **Step 3: Implement**
+
+```kotlin
+    /**
+     * How long a group survives with no activity, when the user never answers
+     * the prompt. Matches SESSION_GAP_MINUTES on the backend (15 min), which is
+     * that codebase's definition of "one session" — deliberately NOT
+     * STOP_GRACE_SECONDS (30 s), which is the mis-touch window. Thirty seconds
+     * would expire the group during a battery swap or a walk to the next
+     * building, splitting one meeting into two reports.
+     *
+     * This is a backstop, not the mechanism: the user's explicit answer is the
+     * primary path, and it wins immediately. This only covers "the device went
+     * into a bag and nobody answered".
+     *
+     * It is also NOT the safety guarantee. That lives on the server, which
+     * refuses to merge a group whose members span beyond the window using its
+     * OWN timestamps — because this check trusts the device clock, and these
+     * clocks have been observed 12 hours out (BUG-37).
+     */
+    const val EXPIRY_MILLIS = 15L * 60_000L
+
+    fun hasExpired(lastStopAtMillis: Long, nowMillis: Long): Boolean =
+        nowMillis - lastStopAtMillis > EXPIRY_MILLIS
+```
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `./gradlew test --tests '*GroupExitTest*'`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git commit -am "feat(session): expire a stale group after the session gap, not the mis-touch window"
+```
+
+---
+
+### Task 12: The prompt, where the person actually is
+
+**Files:**
+- Create: `app/src/main/java/com/benzn/grandtime/capture/MeetingSounds.kt`
+- Create: `app/src/main/res/raw/meeting_confirm_end.wav`, `meeting_ended.wav`
+- Modify: `app/src/main/java/com/benzn/grandtime/capture/CaptureManager.kt`
+
+**Interfaces:**
+- Consumes: `GroupExit` (Tasks 10–11)
+- Produces: `MeetingSounds.confirmEnd()`, `MeetingSounds.ended()`
+
+- [ ] **Step 1: Copy the existing cue player**
+
+`AskSounds` already does exactly this and its comment states the rule: cues are
+"committed in the APK — NOT downloaded". Mirror it rather than inventing a
+second audio path:
+
+```kotlin
+package com.benzn.grandtime.capture
+
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.SoundPool
+import com.benzn.grandtime.R
+
+/**
+ * Bundled cues for the end-of-meeting prompt.
+ *
+ * Bundled, not TTS: the copy is fixed, and the moment this matters most is
+ * offline on a site — a cloud TTS call that fails without network is worse than
+ * useless. Same rule and same mechanism as [com.benzn.grandtime.ask.AskSounds].
+ */
+class MeetingSounds(context: Context) {
+    private val pool = SoundPool.Builder()
+        .setMaxStreams(1)
+        .setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build(),
+        )
+        .build()
+
+    private val confirmEnd = pool.load(context, R.raw.meeting_confirm_end, 1)
+    private val ended = pool.load(context, R.raw.meeting_ended, 1)
+
+    /** "Recording stopped — please confirm whether the meeting has ended." */
+    fun confirmEnd() { pool.play(confirmEnd, 1f, 1f, 1, 0, 1f) }
+
+    /** "The meeting has ended." — played on the OTHER devices when told. */
+    fun ended() { pool.play(ended, 1f, 1f, 1, 0, 1f) }
+
+    fun release() = pool.release()
+}
+```
+
+- [ ] **Step 2: Fire it 20s after a grouped stop**
+
+In `CaptureManager`, when a recording that carried a `groupId` stops, schedule
+the cue at 20 s. Guard it: **only when the session was in a group** — a solo
+recording must never be interrupted by this.
+
+- [ ] **Step 3: Manual verification**
+
+Unit tests cannot prove a sound was audible. On a real device: start a grouped
+recording, stop it, confirm the cue plays at ~20 s and that a solo recording
+produces no cue at all.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add app/src/main/java/com/benzn/grandtime/capture/MeetingSounds.kt \
+        app/src/main/res/raw/meeting_confirm_end.wav \
+        app/src/main/res/raw/meeting_ended.wav \
+        app/src/main/java/com/benzn/grandtime/capture/CaptureManager.kt
+git commit -m "feat(session): ask about the meeting where the person is, not on a screen they are not looking at"
+```
+
+---
+
+### Task 13: Telling the other devices, over the channel that already exists
+
+**Files:**
+- Modify: `src/lambda_org_api.py` (backend — `/sessions/{id}/close`, group fan-out)
+- Modify: `app/src/main/java/com/benzn/grandtime/net/RecordingsApiClient.kt`
+- Test: `tests/unit/test_session_group.py`, `app/src/test/.../RecordingsApiClientTest.kt`
+
+**Interfaces:**
+- Produces: upload-complete response gains `{"groupEnded": true}`; Kotlin
+  `completeStatus` returns `CompleteResult(code: Int, groupEnded: Boolean)`
+
+- [ ] **Step 1: Backend — mark the group ended**
+
+When a close carries `intent: "end"` **and** the session has a `group_id`, mark
+every member of that group. A group with one member is a no-op, so the solo path
+is untouched.
+
+- [ ] **Step 2: Backend — report it on upload**
+
+The upload-complete handler returns `groupEnded: true` when the recording's
+session belongs to a group that has been ended.
+
+- [ ] **Step 3: Mobile — stop reading only the status code**
+
+`completeStatus` currently returns `result.code` and **discards `result.body`**.
+Parse the body for `groupEnded`; keep returning the code so every existing
+caller and the whole `isTransient` retry logic is unaffected.
+
+- [ ] **Step 4: Mobile — act on it**
+
+On `groupEnded`, play `MeetingSounds.ended()`, stop recording, then ask about
+resuming — a resumption starts a **fresh solo session with no group**, so
+post-meeting audio can never land in the meeting.
+
+- [ ] **Step 5: Tests**
+
+Backend: ending a group marks every member; a solo close marks nothing.
+Mobile: `groupEnded` parsed when present, absent field is `false`, and a
+malformed body does not break the existing status-code contract.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git commit -am "feat(session): carry the group-ended signal on the upload that was already happening"
+```
+
+---
+
+### Task 14: The server-side guard that does not trust the device
+
+**Files:**
+- Modify: `src/lambda_org_api.py` (`session_open`)
+- Modify: `src/repositories/meeting_session.py`
+- Test: `tests/unit/test_session_group.py`
+
+**Interfaces:**
+- Produces: `meeting_session.group_span_ok(conn, group_id, max_span_seconds) -> bool`;
+  `/open` rejects a join against a long-ended lead
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+def test_join_is_refused_against_a_long_ended_lead():
+    """The device kept a stale group overnight. Whatever it believes, the
+    server refuses — the merge must not depend on the device being correct."""
+    # lead ended well outside the window
+    ...
+
+
+def test_group_span_rejects_members_from_different_days():
+    """THE guarantee: yesterday never merges into today. Asserted on the
+    SERVER's opened_at, never the device's — these clocks have been seen 12
+    hours out (BUG-37), so a device-clock test would prove nothing."""
+    ...
+
+
+def test_group_span_accepts_an_ordinary_meeting_with_a_pause():
+    """A battery swap mid-meeting must still merge."""
+    ...
+```
+
+- [ ] **Step 2–4:** implement `group_span_ok` against `opened_at` (server time),
+call it from the merge path, and reject the stale join in `session_open`
+alongside the existing cross-tenant check.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git commit -am "fix(session): refuse a stale group on the server's own clock"
+```
+
+---
+
 ## Self-Review Notes
 
-**Spec coverage:** §1 grouping → Tasks 1–2; §2 QR form → Tasks 7, 9; §4 storage → Task 2 (`list_group_members` is what the timeline read will union on); §5 merge → Task 4; §6 tenant guard → Task 3; §7 failure bias → Tasks 2 (`group_is_settled`), 4 (member drops).
+**Spec coverage:** §1 grouping → Tasks 1–2; §2 QR form → Tasks 7, 9; §4 storage → Task 2 (`list_group_members` is what the timeline read will union on); §5 merge → Task 4; §6 tenant guard → Task 3; §7 failure bias → Tasks 2 (`group_is_settled`), 4 (member drops); **leaving a group → Tasks 10–14** (two actions, expiry, the audible prompt, cross-device notification, server guard).
+
+**The one guarantee to not lose while implementing:** after a group is left, the
+*next* recording must carry no `group_id` and produce its own separate minutes.
+Task 14 is what makes that unconditional — Tasks 10–11 make it pleasant, but
+they trust the device.
 
 **Deliberately deferred, not forgotten:**
 - The **finalize sweep's group-level trigger** and the **`updated` email** ride on `group_is_settled` (Task 2) but are not wired here — they need Phase A on test with real two-device data first, otherwise we would be tuning a timeout against imagined traffic.
