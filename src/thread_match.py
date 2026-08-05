@@ -50,8 +50,32 @@ MAX_GAP_DAYS = 45
 # WRONG lever for recall -- 0.20 gives 15 links and 0.15 gives 44, and the
 # probe showed the extra ones are exactly the generic-process-word matches
 # ("documentation", "installation", "floor") that are not the same job.
-# Recall comes from better similarity, not a lower bar: the upgrade is the
-# non-VPC embedding shortlist the programme matcher already runs.
+# Recall does not come from a lower bar. It was ALSO assumed here that it
+# would come from embeddings -- that assumption was measured on 2026-08-05
+# and does not hold for the vectors this system already has.
+#
+# report_chunks carries a DashScope vector for every chunk, 93 of them bound
+# to a topic on prod, reachable in-VPC with no outbound call. Over the 753
+# candidate pairs those cover, cosine distance runs min 0.332 / p10 0.507 /
+# median 0.614 -- the whole corpus compressed into a narrow band, because a
+# chunk embedding of site talk captures "this is construction" far more
+# strongly than "this is about door hardware". RAG's own SIM_MAX_DIST of
+# 0.55 sits ABOVE the 10th percentile here: applied to this problem it would
+# accept most pairs on the site.
+#
+# The separation is real but thin. Against the known-true Door Hardware pair
+# it reads 0.365, versus 0.679 and 0.716 for unrelated radio topics -- usable
+# only with a threshold near 0.4, tuned on one example.
+#
+# The lexical scorer separates the SAME pair better: 0.46 against ~0 for
+# unrelated ones. That is not luck. The signal here is a shared distinctive
+# noun ("door hardware", "floor box"), which is exactly what IDF isolates and
+# exactly what a whole-chunk embedding averages away.
+#
+# So the upgrade path is NOT "swap in embeddings". If recall needs to
+# improve, the candidates are: embed the TITLE alone rather than the chunk,
+# or hand the shortlist to Claude the way lambda_programme_matcher does and
+# let it judge. Both are worth measuring before either is built.
 MIN_SCORE = 0.25
 
 # The subject lives in the title; the summary only corroborates.

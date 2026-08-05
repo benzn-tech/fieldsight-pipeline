@@ -87,6 +87,39 @@ confidence floor. Swap "finding → programme task" for "new topic → open
 thread" and the pattern carries over, including its fail-safe: below
 threshold, it declines.
 
+### …but its embedding half does not transfer (measured 2026-08-05)
+
+This section originally said the embedding shortlist was the upgrade path
+for recall. That was an assumption, and measuring it refuted it.
+
+`report_chunks` already carries a DashScope vector for every chunk — 93 of
+them bound to a topic on prod, reachable **in-VPC with no outbound call**, so
+this looked free. Over the 753 candidate pairs those cover:
+
+```
+min 0.332   p10 0.507   median 0.614   max 0.923
+```
+
+The whole corpus is compressed into a narrow band, because a chunk embedding
+of site talk captures *"this is construction"* far more strongly than *"this
+is about door hardware"*. **RAG's own `SIM_MAX_DIST` of 0.55 sits above the
+10th percentile here** — applied to this problem it would accept most pairs
+on the site.
+
+The separation is real but thin: the known-true Door Hardware pair reads
+0.365 against 0.679 and 0.716 for unrelated radio topics — usable only with a
+threshold near 0.4, tuned on one example.
+
+The lexical scorer separates the **same pair** better: 0.46 against ~0 for
+unrelated ones. That is not luck. The signal here is a shared distinctive
+noun ("door hardware", "floor box") — exactly what IDF isolates and exactly
+what a whole-chunk embedding averages away.
+
+So the upgrade is **not** "swap in embeddings". If recall needs to improve,
+the candidates are: embed the TITLE alone rather than the chunk, or hand the
+lexical shortlist to Claude the way the programme matcher does and let it
+judge. Both are worth measuring before either is built.
+
 ## Decisions
 
 1. **Status:** `open → solved → closed`. `solved` is AI-proposed and awaits a
