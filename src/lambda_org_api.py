@@ -4114,6 +4114,14 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
     doc = doc or {}
     topics_out = []
     _redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if conn is not None else {}
+    # Thread facts for every threaded topic on the day, in ONE query — the
+    # same batching list_topics_for_date already uses for action_items and
+    # findings, for the same reason: this renders per topic and a per-topic
+    # lookup would be the N+1. Callers without a conn (reindex's builder) get
+    # no thread block at all, which is honest: absent, not zero.
+    _thread_ids = {str(r["thread_id"]) for r in rows if r.get("thread_id")}
+    _thread_facts = (threads.facts_for_threads(conn, list(_thread_ids))
+                     if conn is not None and _thread_ids else {})
     for i, t in enumerate(rows):
         flags = [{"observation": f["observation"],
                   "risk_level": _SEV_TO_RISK.get(f["severity"], "medium"),
@@ -4147,6 +4155,25 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             "action_items": [{"id": str(a["id"]), "action": a["text"], "responsible": a["responsible"],
                               "deadline": a["deadline_text"] or (str(a["deadline"]) if a["deadline"] else None),
                               "priority": a["priority"], "status": a["status"]} for a in t["action_items"]],
+            # The subject this topic belongs to, when a human has confirmed
+            # one. FACTS ONLY -- how many days it was raised on, when last,
+            # how much is still open. No judgement: the design deliberately
+            # does not raise priority on repetition, because 44% of prod's
+            # open items are already 'high' and a ratchet would finish that
+            # field off. "Raised 3 times, slipped twice" is derivable and
+            # provable; "important" is not.
+            #
+            # Absent (not zeroed) for an unthreaded topic, which is almost
+            # all of them -- a 1 would claim this subject has been raised
+            # once and tracked, when in truth it has never been threaded.
+            "thread": (lambda _f: {
+                "id": str(t["thread_id"]),
+                "times_raised": _f["times_raised"],
+                "first_seen": str(_f["first_seen"]) if _f["first_seen"] else None,
+                "last_raised": str(_f["last_raised"]) if _f["last_raised"] else None,
+                "open_items": _f["open_items"],
+            })(_thread_facts[str(t["thread_id"])])
+            if t.get("thread_id") and str(t["thread_id"]) in _thread_facts else None,
             "safety_flags": flags,
             "related_photos": [ph["s3_key"].rsplit("/", 1)[-1] for ph in t["photos"]],
             "findings": t["findings"],              # additive passthrough (D3)
