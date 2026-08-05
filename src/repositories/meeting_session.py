@@ -81,6 +81,63 @@ def group_is_settled(conn, group_id, idle_grace_seconds) -> bool:
     return int((row or {}).get("unsettled") or 0) == 0
 
 
+def lead_is_joinable(conn, lead_session_id, max_age_seconds) -> bool:
+    """Whether a device may still join the group led by this session.
+
+    Refuses a lead that opened too long ago — the shape of a device that kept a
+    group overnight, or across a reinstall, and is now recording something
+    entirely different. Measured on `opened_at`, the server's own clock, for the
+    same reason as `group_span_ok`: the device's belief about time is exactly
+    what this is checking against.
+
+    An unknown lead is NOT handled here — the caller keeps accepting those,
+    because `/open` is best-effort and a joiner can legitimately arrive before
+    the lead. Rejecting an unseen lead would reintroduce a dependency on call
+    ordering, which the offline-first design refuses."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT (opened_at > now() - make_interval(secs => %s)) AS joinable "
+        "FROM meeting_session WHERE session_id = %s",
+        (max_age_seconds, lead_session_id),
+    ).fetchone()
+    if row is None or row.get("joinable") is None:
+        return True          # unknown, or never opened — not this guard's call
+    return bool(row["joinable"])
+
+
+def group_span_ok(conn, group_id, max_span_seconds) -> bool:
+    """Whether a group's members are close enough in time to be one meeting.
+
+    This is THE guard that makes "yesterday never merges into today"
+    unconditional, and it is the reason it measures `opened_at` — the server's
+    own timestamp — rather than anything the device reported.
+
+    Everything on the device side trusts the device clock: the pending-group
+    expiry, the end-of-meeting prompt, the stop signal. All of it is a
+    convenience layer. Devices crash, get reinstalled, and carry clocks that
+    have been observed 12 HOURS out (BUG-37), so a device that keeps a stale
+    group overnight is an ordinary occurrence, not an exotic failure. When that
+    happens, the next day's recording arrives carrying yesterday's group id and
+    nothing on the device will object.
+
+    What stops it is this: two recordings whose server-side open times are
+    further apart than one meeting could plausibly be are not one meeting, no
+    matter what either device believes.
+
+    A missing row (no members yet) is NOT a violation — there is simply nothing
+    to merge, and returning False would block a group that has merely not been
+    populated. A single member spans zero seconds and passes trivially, which is
+    what the solo and first-joiner cases both need."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT EXTRACT(EPOCH FROM (MAX(opened_at) - MIN(opened_at))) AS span_seconds "
+        "FROM meeting_session WHERE group_id = %s",
+        (group_id,),
+    ).fetchone()
+    span = (row or {}).get("span_seconds")
+    if span is None:
+        return True
+    return float(span) <= float(max_span_seconds)
+
+
 def touch_segment(conn, session_id, at) -> dict | None:
     """A chunk arrived. Advance last_segment_at + segment_count. If the session
     was `pending_close`, this arrival is a RESUME within the grace window: flip

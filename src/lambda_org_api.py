@@ -183,6 +183,18 @@ RECORDING_KINDS = {"video", "audio", "photo"}
 # Voice-timeliness: mis-touch tolerance ("grace") window before a stopped session
 # finalizes + emails. A resume within it cancels the finalize (spec §3.2, §8.4).
 STOP_GRACE_SECONDS = int(os.environ.get("STOP_GRACE_SECONDS", "30"))
+
+# Multi-device merge: how old a lead session may be and still be joined, and how
+# far apart a group's members may open and still be one meeting.
+#
+# Four hours is longer than any site meeting and far shorter than a day, which
+# is the distinction that matters — the failure being prevented is a device that
+# kept a group OVERNIGHT and records somewhere else tomorrow. Being generous
+# here costs nothing (a too-late join simply records solo); being tight would
+# break a long meeting with a break in it.
+GROUP_JOIN_MAX_AGE_SECONDS = int(os.environ.get("GROUP_JOIN_MAX_AGE_SECONDS", str(4 * 3600)))
+GROUP_MAX_SPAN_SECONDS = int(os.environ.get("GROUP_MAX_SPAN_SECONDS", str(4 * 3600)))
+
 _SID_RE = re.compile(r"^[0-9a-f]{32}$")
 _KIND_FOLDER = {"video": "video", "audio": "audio", "photo": "pictures"}
 
@@ -670,8 +682,18 @@ def session_open(conn, caller, session_id, body):
         # it must belong to the caller's company: never merge across tenants on
         # a client's say-so.
         lead = meeting_session.get(conn, group_id)
-        if lead is not None and str(lead["company_id"]) != str(caller["company_id"]):
-            return error("group not accessible", 403)
+        if lead is not None:
+            if str(lead["company_id"]) != str(caller["company_id"]):
+                return error("group not accessible", 403)
+            # Staleness. A device that kept a group overnight, or across a
+            # reinstall, will happily present it again — nothing on the device
+            # objects, because the device is what got it wrong. Judged on the
+            # server's own clock for that exact reason (BUG-37: these ROMs have
+            # been seen 12 hours out). Only applied to a lead we can SEE: an
+            # unknown lead stays a 200, since /open is best-effort and the
+            # joiner may simply have arrived first.
+            if not meeting_session.lead_is_joinable(conn, group_id, GROUP_JOIN_MAX_AGE_SECONDS):
+                return error("group is no longer joinable", 409)
 
     # Idempotent: whichever of the record-start signal or the first uploaded
     # chunk arrives first opens the session; a later call never regresses it.

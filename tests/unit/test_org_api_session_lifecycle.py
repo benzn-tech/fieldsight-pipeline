@@ -71,6 +71,8 @@ def test_open_accepts_and_returns_group_id(monkeypatch):
     monkeypatch.setattr(org.meeting_session, "ensure_open", _ensure_open_capturing(seen))
     monkeypatch.setattr(org.meeting_session, "get",
                         lambda conn, sid: {"session_id": sid, "company_id": "c-1"})
+    # A visible lead is also checked for staleness (2026-08-05); a live one here.
+    monkeypatch.setattr(org.meeting_session, "lead_is_joinable", lambda conn, sid, w: True)
 
     res = org.session_open(CONN, CALLER, SID, {"kind": "audio", "groupId": LEAD})
 
@@ -174,3 +176,45 @@ def test_close_already_sent_is_idempotent_noop(monkeypatch):
     res = org.session_close(CONN, CALLER, SID, {"intent": "end"})
     assert res["statusCode"] == 200
     assert body_of(res)["noop"] is True
+
+
+def test_open_refuses_a_join_against_a_long_ended_lead(monkeypatch):
+    """The device carried a stale group — overnight, or across a reinstall.
+    Whatever it believes, the server refuses: the merge must not depend on the
+    device being correct, and these clocks have been seen 12 hours out."""
+    monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: {
+        "session_id": sid, "company_id": "c-1", "status": "sent",
+        "opened_at": "2026-08-01T09:00:00+00:00",
+    })
+    monkeypatch.setattr(org.meeting_session, "lead_is_joinable", lambda conn, sid, w: False)
+    monkeypatch.setattr(org.meeting_session, "ensure_open",
+                        lambda *a, **k: pytest.fail("must not join a dead group"))
+
+    res = org.session_open(CONN, CALLER, SID, {"groupId": LEAD})
+    assert res["statusCode"] == 409
+
+
+def test_open_allows_a_join_against_a_live_lead(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: {
+        "session_id": sid, "company_id": "c-1", "status": "open"})
+    monkeypatch.setattr(org.meeting_session, "lead_is_joinable", lambda conn, sid, w: True)
+    monkeypatch.setattr(org.meeting_session, "ensure_open", _ensure_open_capturing(seen))
+
+    res = org.session_open(CONN, CALLER, SID, {"groupId": LEAD})
+    assert res["statusCode"] == 200
+    assert seen["group_id"] == LEAD
+
+
+def test_open_still_accepts_an_unknown_lead_without_calling_the_joinable_check(monkeypatch):
+    """An unknown lead stays a 200 (the joiner can arrive first — /open is
+    best-effort). The staleness check only applies to a lead we can actually
+    see, otherwise it would resurrect the call-ordering dependency."""
+    seen = {}
+    monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: None)
+    monkeypatch.setattr(org.meeting_session, "lead_is_joinable",
+                        lambda *a, **k: pytest.fail("nothing to check against"))
+    monkeypatch.setattr(org.meeting_session, "ensure_open", _ensure_open_capturing(seen))
+
+    res = org.session_open(CONN, CALLER, SID, {"groupId": LEAD})
+    assert res["statusCode"] == 200
