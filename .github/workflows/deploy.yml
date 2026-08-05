@@ -130,6 +130,16 @@ jobs:
           #     topic on the first run. The sweep refuses to run without it, so a
           #     forgotten value fails closed rather than sweeping everything.
           # Same bare-"Key=" guard as the layer overrides above.
+          # AuthorityFlip mirrors PROD_AUTHORITY_FLIP: passed so test CAN match
+          # prod, defaulted off so today's behaviour is unchanged. Prod runs it
+          # true, so anything test proves about topic authority only transfers
+          # once this is on as well.
+          #
+          # Explanations live HERE, above the command. A comment between two
+          # backslash-continued lines ENDS the command: everything from the #
+          # onward is comment, the remaining argument lines are then parsed as
+          # separate commands, and the step dies with "command not found" AFTER
+          # sam deploy has already run — taking the migration step with it.
           NONWORK_SINCE_PARAM=""
           if [ -n "${{ vars.TEST_NONWORK_EXPIRY_SINCE }}" ]; then
             NONWORK_SINCE_PARAM="NonWorkExpirySince=${{ vars.TEST_NONWORK_EXPIRY_SINCE }}"
@@ -160,10 +170,6 @@ jobs:
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \
-              # Mirrors PROD_AUTHORITY_FLIP. Passed so test CAN match prod; the
-              # default keeps today's behaviour (off) until someone opts in.
-              # Prod runs this true, so anything test proves about topic
-              # authority is only transferable once this is on as well.
               "AuthorityFlip=${{ vars.TEST_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.TEST_GRADED_ROLES || 'false' }}" \
               "MultiTenantResolution=${{ vars.TEST_MULTI_TENANT_RESOLUTION || 'true' }}" \
