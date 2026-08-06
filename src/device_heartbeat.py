@@ -40,6 +40,8 @@ having count(distinct asset_tag) > 1
 
 _DISTRUST = "update devices set uuid_trusted = false where device_uuid = %s"
 
+_DEVICE_ID = "select id from devices where asset_tag = %s"
+
 
 def _get(headers, name):
     if not headers:
@@ -73,6 +75,25 @@ def parse_headers(headers):
         return {"asset_tag": asset_tag, "device_uuid": device_uuid, "app_version": version}
     except Exception:
         logger.exception("device header parse failed")
+        return None
+
+
+def device_id(conn, ident):
+    """The devices row id for these headers, or None.
+
+    Keyed on asset_tag because the tag is the authoritative identity — the uuid is
+    advisory and may be shared across a whole flashed batch. Never raises: a caller that
+    cannot identify the device must still be able to answer it.
+    """
+    if not ident:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_DEVICE_ID, (ident["asset_tag"],))
+            rows = cur.fetchall()
+        return rows[0][0] if rows else None
+    except Exception:
+        logger.exception("device id lookup failed for %s", ident.get("asset_tag"))
         return None
 
 
