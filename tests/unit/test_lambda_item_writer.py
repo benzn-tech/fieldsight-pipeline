@@ -1258,3 +1258,54 @@ def test_a_failure_says_so_and_keeps_the_topics(wired, monkeypatch, caplog):
         res = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
     assert "failed" in _logged(caplog)
     assert res == {"skipped": False, "topics": 1}
+
+
+# ---------------------------------------------------------------------------
+# "Speaker" -> the person who made the recording (gated on ONE voice)
+# ---------------------------------------------------------------------------
+
+def _run_with(monkeypatch, *, speaker_count, responsible="Speaker"):
+    """Drive one extraction through and hand back the action items as written."""
+    extraction = make_extraction()
+    extraction["topics"][0]["action_items"] = [
+        {"action": "Follow up on the quote", "responsible": responsible}]
+    if speaker_count is not None:
+        extraction["speaker_count"] = speaker_count
+    monkeypatch.setattr(iw, "_s3_client", FakeS3({EXTRACTION_KEY: json.dumps(extraction)}))
+    monkeypatch.setattr(iw.users_repo, "get_by_folder_name",
+                        lambda conn, cid, folder: {"first_name": "Ben", "last_name": "Lin"})
+    seen = {}
+    # Capture what item-writer hands to the mapper, and return the MAPPED
+    # shape (empty is fine) so the rest of the write path is unaffected.
+    def capture(items, date):
+        seen["items"] = items
+        return []
+    monkeypatch.setattr(iw.lambda_ingest, "_map_action_items", capture)
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+    return seen.get("items") or []
+
+
+def test_one_voice_resolves_speaker_to_the_account_holder(wired):
+    items = _run_with(wired, speaker_count=1)
+    assert items[0]["responsible"] == "Ben Lin"
+
+
+def test_two_voices_leave_it_alone(wired):
+    """THE guard. With more than one voice, "the speaker" is a guess — and a
+    guess printed as a name reads as a fact, which is how mentioned people
+    became participants."""
+    items = _run_with(wired, speaker_count=2)
+    assert items[0]["responsible"] == "Speaker"
+
+
+def test_an_absent_count_is_unknown_not_one(wired):
+    """Artifacts written before speaker_count existed carry no count. Unknown
+    must not license putting a name on someone else's words."""
+    items = _run_with(wired, speaker_count=None)
+    assert items[0]["responsible"] == "Speaker"
+
+
+def test_a_named_person_survives_even_with_one_voice(wired):
+    items = _run_with(wired, speaker_count=1, responsible="Daniel")
+    assert items[0]["responsible"] == "Daniel"
+

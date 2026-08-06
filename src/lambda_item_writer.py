@@ -61,6 +61,7 @@ from db.connection import get_connection
 from keyframe_selection import keyframe_seconds
 from photo_binding import PHOTOS_PER_TOPIC_CAP  # noqa: F401  (re-export)
 from photo_binding import list_pictures as _pb_list_pictures
+from repositories import users as users_repo
 from photo_binding import photos_for_topics as _photos_for_topics
 import thread_match
 from repositories import (companies, findings, meeting_session, recordings, sites,
@@ -224,6 +225,53 @@ def _suggest_threads_inner(conn, site_id, date, written):
     return made
 
 
+# The model has no name for the person holding the recorder -- the transcript
+# never says it -- so it writes "Speaker". That is fine as a placeholder and
+# useless in a report: a task cannot be assigned to "Speaker".
+#
+# We DO know who it is: the recording belongs to an account. The resolution is
+# gated on the session having exactly ONE voice, because that is the only case
+# where "the speaker" is unambiguous. With two or more, mapping it to the
+# account holder would be a guess, and a guess printed as a name reads as a
+# fact -- the same failure that made mentioned people into participants.
+_SELF_REFERENTIAL = {
+    "speaker", "the speaker", "speaker 1", "spk_0",
+    "me", "myself", "self", "i", "the recorder", "narrator", "the narrator",
+}
+
+
+def _display_name(user_row, fallback):
+    """First+last, or the folder name when the row has neither.
+
+    Built with an explicit filter+strip rather than a concatenation: a NULL
+    last_name once produced "Ben_UCPK " with a trailing space, which then
+    became a folder that did not exist (see the display-name trailing-space
+    incident).
+    """
+    if not user_row:
+        return fallback
+    parts = [(user_row.get("first_name") or "").strip(),
+             (user_row.get("last_name") or "").strip()]
+    return " ".join(p for p in parts if p) or fallback
+
+
+def _resolve_self_responsible(action_items, name):
+    """Replace a self-referential `responsible` with the recorder's name.
+
+    Returns how many were resolved, for the log — a silent rewrite of a
+    user-facing field is not something to do without saying so.
+    """
+    resolved = 0
+    for item in action_items or []:
+        if not isinstance(item, dict):
+            continue
+        value = (item.get("responsible") or "").strip()
+        if value and value.lower() in _SELF_REFERENTIAL:
+            item["responsible"] = name
+            resolved += 1
+    return resolved
+
+
 def write_extraction_items(date, user_folder, extraction_key):
     raw = s3().get_object(Bucket=S3_BUCKET, Key=extraction_key)["Body"].read()
     extraction = json.loads(raw.decode("utf-8"))
@@ -304,6 +352,18 @@ def write_extraction_items(date, user_folder, extraction_key):
             return {"skipped": True, "reason": reason}
 
         user_id = lambda_ingest.resolve_user(conn, company["id"], user_folder)
+
+        # Only when the ASR heard exactly one voice. Absent (older artifacts) is
+        # treated as "unknown", not as one -- an unknown count must not license
+        # putting a name on someone else's words.
+        if extraction.get("speaker_count") == 1:
+            recorder = _display_name(
+                users_repo.get_by_folder_name(conn, company["id"], user_folder), user_folder)
+            resolved = sum(_resolve_self_responsible(t.get("action_items"), recorder)
+                           for t in extraction.get("topics", []))
+            if resolved:
+                logger.info("%s: resolved %d self-referential responsible -> %r",
+                            extraction_key, resolved, recorder)
 
         # Source-key idempotency (Phase 4a pattern): clear this extraction's
         # prior rows before re-inserting.

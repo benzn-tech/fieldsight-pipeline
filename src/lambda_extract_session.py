@@ -684,6 +684,12 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         'session_base': session_base,
         'tier': TIER_FINAL if final else TIER_LIVE,
         'source_transcripts': sorted(source_filenames),
+        # How many distinct voices the ASR heard. Consumers need it to know
+        # whether "the speaker" is unambiguous: with exactly one, a
+        # self-referential responsible party can only be the person wearing the
+        # recorder, and item-writer resolves it to their name. With two or
+        # more it is a guess, and a guess in a report reads as a fact.
+        'speaker_count': len({t.get('speaker') for t in turns if t.get('speaker')}),
         # Stamped at WRITE time, not at entry: the throttle above measures "how
         # long since the last extraction finished". Stamping at entry would
         # backdate it by the whole LLM round-trip and let the next trigger
