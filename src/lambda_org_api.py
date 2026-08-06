@@ -147,7 +147,7 @@ from text_normalize import diff_candidates, first_match_span, normalize, occurre
 # frame's structural signal is reconstructed from the still-live topic row.
 from keyframe_selection import keyframe_seconds
 from photo_binding import parse_time_range
-from transcript_utils import extract_base_time_from_filename
+from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -4867,8 +4867,13 @@ def _read_org_transcripts(date, folder, start_time, end_time):
             results = data.get("results", {})
             full_text = results.get("transcripts", [{}])[0].get("transcript", "")
 
-            # Speaker-segmented audio_segments from Transcribe
-            audio_segs = results.get("audio_segments", [])
+            # Speaker-segmented audio_segments from Transcribe. Providers that
+            # do not emit them (ElevenLabs, and anything added later) still give
+            # per-word items carrying speaker_label, so derive the turns rather
+            # than rendering an empty transcript for a recording that
+            # transcribed perfectly — which is exactly what test showed the day
+            # the ASR provider changed.
+            audio_segs = results.get("audio_segments") or speaker_turns_from_items(results)
             for aseg in audio_segs:
                 seg_start = float(aseg.get("start_time", 0))
                 seg_end = float(aseg.get("end_time", 0))
