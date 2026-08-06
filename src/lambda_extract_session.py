@@ -745,11 +745,24 @@ def parse_final_request(bucket, key):
     try:
         obj = s3().get_object(Bucket=bucket, Key=key)
         req = json.loads(obj['Body'].read().decode('utf-8'))
-        vals = (req.get('userFolder'), req.get('date'), req.get('sessionBase'))
-        return vals if all(vals) else None
     except Exception as e:
         logger.warning(f"Unreadable final-extraction request {key}: {e}")
         return None
+    fields = {'userFolder': req.get('userFolder'), 'date': req.get('date'),
+              'sessionBase': req.get('sessionBase')}
+    missing = [k for k, v in fields.items() if not v]
+    if missing:
+        # Say which fields, and say it at WARNING. This used to return None in
+        # silence, so a malformed artifact produced a ~100ms invocation with no
+        # application logging at all: the trigger fired, the session was never
+        # extracted, and the only visible trace was a Duration line. Anyone
+        # looking would conclude the trigger was broken and go debug S3
+        # notifications, which is exactly what happened.
+        logger.warning("Final-extraction request %s is missing %s -- not extracting. "
+                       "Present: %s", key, missing,
+                       {k: v for k, v in fields.items() if v})
+        return None
+    return fields['userFolder'], fields['date'], fields['sessionBase']
 
 
 def lambda_handler(event, context):
