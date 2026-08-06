@@ -533,3 +533,74 @@ def read_meeting_manifest(s3_client, bucket, report_prefix, target_date, user_pa
     except Exception:
         return set()
 
+
+
+def _joins_without_space(prev, nxt):
+    """True when two tokens should abut rather than take a space.
+
+    Space-joining is right for English and wrong for Chinese, and this product
+    records both in the same sentence. Without this, a bilingual site's
+    transcript reads "我 现 在 在 剪" — technically the same words, visibly
+    broken.
+    """
+    if not prev or not nxt:
+        return True
+    def cjk(ch):
+        return (
+            "\u4e00" <= ch <= "\u9fff"      # CJK unified ideographs
+            or "\u3000" <= ch <= "\u303f"   # CJK punctuation
+            or "\uff00" <= ch <= "\uffef"   # full-width forms
+        )
+    return cjk(prev[-1]) or cjk(nxt[0])
+
+
+def speaker_turns_from_items(results):
+    """Speaker turns derived from word items, for providers that emit none.
+
+    `results.audio_segments` is an AWS Transcribe field: it appears only when
+    Transcribe's own diarization runs. Other providers (ElevenLabs today, and
+    anything added later) normalize to `transcripts` + `items` and stop there,
+    which is a complete transcript — the speaker turns are simply implied by
+    consecutive items sharing a `speaker_label` rather than pre-grouped.
+
+    A reader that requires audio_segments therefore shows an EMPTY transcript
+    for a recording that transcribed perfectly. That is what happened on test
+    the day the ASR provider changed: reports and topics were correct the whole
+    time, because extraction reads `items`, while the transcript viewer read
+    audio_segments and rendered nothing.
+
+    Returns the same shape audio_segments has — start_time, end_time,
+    speaker_label, transcript — so callers can treat the two identically.
+
+    Speech only. A provider may put non-speech annotations ("[点击鼠标]") in the
+    full transcript string but not in `items`, so those do not survive here —
+    which matches what Transcribe's own audio_segments contain, and they remain
+    visible in the segment's full text either way.
+    """
+    items = results.get("items") or []
+    turns = []
+    current = None
+    for item in items:
+        alts = item.get("alternatives") or [{}]
+        content = (alts[0].get("content") or "").strip()
+        if not content:
+            continue
+        is_punct = item.get("type") == "punctuation"
+        speaker = item.get("speaker_label") or "spk_0"
+        # Punctuation carries no speaker and no timing; it belongs to whatever
+        # turn precedes it rather than starting one.
+        if current is None or (not is_punct and speaker != current["speaker_label"]):
+            if is_punct and current is not None:
+                pass
+            else:
+                current = {"speaker_label": speaker, "transcript": "",
+                           "start_time": item.get("start_time") or "0",
+                           "end_time": item.get("end_time") or "0"}
+                turns.append(current)
+        if is_punct or _joins_without_space(current["transcript"], content):
+            current["transcript"] += content
+        else:
+            current["transcript"] += " " + content
+        if item.get("end_time"):
+            current["end_time"] = item["end_time"]
+    return [t for t in turns if t["transcript"].strip()]
