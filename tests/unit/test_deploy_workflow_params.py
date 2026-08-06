@@ -120,3 +120,32 @@ def test_no_override_line_can_emit_an_empty_value():
             f"{env}: these overrides have no default and will fail the whole "
             f"deploy the day their repo variable is cleared — use the "
             f"shell-guard pattern instead: {offenders}")
+
+
+def test_no_comment_sits_inside_a_line_continuation():
+    """A comment between two backslash-continued lines silently ends the command.
+
+    This shipped and broke the test deploy. Everything from the `#` onward is
+    comment, so `sam deploy` ran with a TRUNCATED argument list; the remaining
+    argument lines were then parsed as separate commands and the step died with
+    `"AuthorityFlip=false": command not found` — but only AFTER sam deploy had
+    finished, so the failure looked cosmetic. It was not: the step exited 127,
+    which skipped the migration step behind it, and two migrations silently did
+    not reach the database.
+
+    Explanations belong above the command, not between its arguments.
+    """
+    import glob
+    import os
+    root = os.path.join(os.path.dirname(__file__), "..", "..", ".github", "workflows")
+    offenders = []
+    for path in sorted(glob.glob(os.path.join(root, "*.yml"))):
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        for i in range(1, len(lines)):
+            if lines[i - 1].rstrip().endswith("\\") and lines[i].strip().startswith("#"):
+                offenders.append(f"{os.path.basename(path)}:{i + 1}")
+    assert not offenders, (
+        "comment inside a line continuation — ends the command early: "
+        f"{offenders}")
+
