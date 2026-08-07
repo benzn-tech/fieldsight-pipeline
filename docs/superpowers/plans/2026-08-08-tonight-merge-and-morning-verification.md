@@ -29,11 +29,32 @@ rest and of each other.
 
 - `PROD_NORMALISE_AUDIO` → **false**. P0 is code-complete on prod and does nothing until
   the repo variable is set. `TEST_NORMALISE_AUDIO` → true.
-- Everything else is on in both stages. All three are additive to the extraction artifact
-  (`transcript_stats`, `device_announcements`, `generation`) and **every consumer reads
-  them with `.get()`** — checked in `lambda_item_writer`, `lambda_ingest`,
-  `lambda_org_api`, `session_scope`. No consumer validates the artifact's key set, so an
-  older reader against a newer artifact is safe, and the reverse is too.
+- Everything else is on in both stages. The three new artifact fields
+  (`transcript_stats`, `device_announcements`, `generation`) are additive and **every
+  consumer reads them with `.get()`** — checked in `lambda_item_writer`, `lambda_ingest`,
+  `lambda_org_api`, `session_scope`. No consumer validates the artifact's key set.
+
+- **But one existing field changes VALUE, not just company: `speaker_count`.** It is taken
+  after the announcement filter, so a session of one person plus a device now reports 1
+  where it used to report 2 — on prod as well, since that filter is unconditional. That is
+  the intended fix, and it means item-writer's `speaker_count == 1` gate engages more
+  often, resolving a self-referential responsible party to a real name in sessions where
+  it previously declined to. Expect *more* named attributions, and check a couple are
+  right.
+
+- **Expect an email nobody has seen before.** With #282 a recording containing no speech
+  now opens a session from the VAD sidecar and, on inferred close, sends a confirmation
+  whose body is "No summary was generated for this recording." Previously such a session
+  never opened and never emailed. Leaving a device running by accident will now produce
+  mail. Not a bug — but it will look like one.
+
+- **Known gap, deliberately not fixed tonight:** the announcement filter lives in
+  `extract_session`, while `lambda_rolling_summary` and `lambda_session_finalize` call
+  `assemble_deduped_turns` directly and so still see "Recording started" as speech. It can
+  therefore appear in the Tier-1 rolling summary and in confirmation-email content.
+  Fixing it properly means moving the filter into `assemble_deduped_turns`, which changes
+  a function with three callers and eight test stubs — not something to do on the night
+  before a hand-test, on a merge train already verified green.
 
 ## Check this before anything else, and it is not from tonight's work
 
@@ -78,9 +99,14 @@ back to the original audio rather than losing the chunk.
 **2. The free too-quiet metric.** In `/aws/lambda/fieldsight-test-extract-session`, count:
 
 ```
-"empty result"   ← transcriber found nothing in audio VAD judged to be speech
-"unreadable"     ← a genuinely malformed transcript; should be zero
+"empty result"                  ← transcriber found nothing in audio VAD judged speech
+"unreadable transcript segment" ← a genuinely malformed transcript; should be zero
 ```
+
+Grep the **full** second phrase, not just `unreadable`: that word also appears in
+"existing extraction is unreadable" on the throttle-read path, which is a problem with the
+*published extraction*, not with a transcript, and counting the two together would make
+the number meaningless.
 
 With `DROP_SILENT_CHUNKS` on, silent chunks are never transcribed, so **every "empty
 result" is a too-quiet event**. This is the before/after number for P0 and it costs no ASR
@@ -94,8 +120,14 @@ device_announcements: {removed: N, texts: [...]}
 
 `texts` is the point: the app's prompt audio (`res/raw/recording_started.mp3` and
 siblings) was staged 2026-08-07 and is not wired to any Kotlin yet, so this is how the
-real wording becomes known. **If a phrase shows up that the patterns miss, add it to
-`DEVICE_ANNOUNCEMENT_PATTERNS`** — no code deploy needed.
+real wording becomes known. **If a phrase shows up that the patterns miss, set the repo
+variable `TEST_DEVICE_ANNOUNCEMENT_PATTERNS`** (a JSON list of regexes) and redeploy — no
+code change.
+
+Set the **repo variable**, not the lambda's environment directly: a value written straight
+onto the live function is erased by the next CloudFormation reconcile. An override
+*replaces* the defaults rather than adding to them, so include the existing patterns as
+well as the new phrase.
 
 Also confirm no *person* was eaten: a turn about recording ("recording started late so
 the first bit is missing") must still be in `topics`.
@@ -109,9 +141,30 @@ during the final call, the published extraction's `source_transcripts` should re
 **last** chunk, and `generation` should be `1` rather than `0`. Exactly one rerun round is
 expected; more than one is worth reading the log for.
 
-The direct regression test for this is to re-run prod session
-`sid61be49d563524f51b17c54c67733b08c` on TEST and confirm coverage reaches `c0150`
-(it published 95 of 151 and stopped at `c0129`).
+**The obvious regression test — replaying prod session `sid61be49d5...` on TEST — is not a
+morning checkbox, and should not be treated as one.** Those 151 transcripts live in the
+prod bucket. Copying them into `fieldsight-data-test-509194952652` fires a live extract
+pass, session-activity and rolling summary on *every* PUT, and item-writer would try to
+resolve a prod user folder against the test database — an identity-bridge miss at best,
+misattribution against the seed data at worst. The coverage assertion itself would work,
+but moving customer-derived data into test is a deliberate decision with its own
+procedure, not a step to run before coffee.
+
+Use a fresh recording instead. To exercise the race on purpose, record a session and keep
+recording while the finalize sweep runs, so transcripts land during the final pass — that
+is the condition, and it needs no prod data.
+
+## One watch item, if a long session misbehaves
+
+The final pass's measured ~170 s thinking call was against the **old 60,000-character**
+cut. At 300,000 the input is five times larger, so on a genuinely long session that call
+could approach `LLM_HTTP_TIMEOUT=540` inside `Timeout=600`. A timeout there raises, the S3
+event retries with the same input, and it can keep retrying for up to six hours while
+holding a concurrency slot — the shape of BUG-43, from a different direction.
+
+No evidence it will happen; two-hour sessions render to 128k, well under the cap. But if a
+multi-hour session's final pass misbehaves, look here first, and the lever is
+`TRANSCRIPT_TEXT_LIMIT` in the template.
 
 ## What is NOT verified by any of the above
 
