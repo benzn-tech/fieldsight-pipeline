@@ -696,6 +696,11 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
         if lead is not None and str(lead["company_id"]) != str(caller["company_id"]):
             logger.warning("upload-url: refusing cross-company group %s", group_id)
             return
+        # Same door as /open: a finished meeting takes no new members, or a
+        # device whose /open was refused would be attached here instead.
+        if meeting_session.group_ended_at(conn, group_id) is not None:
+            logger.info("upload-url: group %s has ended; this recording stays solo", group_id)
+            return
         # opened_at comes from the FILENAME's timestamp, not the body's
         # startedAt. The body's is this CHUNK's start; the filename's is the
         # session's, identical on every chunk of the session (the chunk-session
@@ -769,7 +774,17 @@ def _group_ended_for(conn, s3_key) -> bool:
         if row.get("group_ended_at") is not None:
             return True
         group_id = row.get("group_id")
-        return bool(group_id) and meeting_session.group_is_ended(conn, group_id)
+        if not group_id:
+            return False
+        ended = meeting_session.group_ended_at(conn, group_id)
+        if ended is None:
+            return False
+        # Only stop a session that was in the meeting when it ended. One that
+        # STARTED afterwards is a new recording carrying a stale group id, and
+        # stopping it is how a rejoin turned into a loop. An unknown opened_at
+        # errs towards stopping: it means we cannot place the session at all.
+        opened = row.get("opened_at")
+        return opened is None or opened <= ended
     except Exception:
         logger.exception("group-ended check failed for %s; reporting not-ended", s3_key)
         return False
@@ -818,6 +833,14 @@ def session_open(conn, caller, session_id, body):
             # joiner may simply have arrived first.
             if not meeting_session.lead_is_joinable(conn, group_id, GROUP_JOIN_MAX_AGE_SECONDS):
                 return error("group is no longer joinable", 409)
+        # A meeting that is OVER takes no new members, whether or not its lead
+        # is still visible — so this sits outside the `lead is not None` block.
+        # Without it the group id stays live forever: a device that rejoined
+        # after the end was told to stop on its first upload, that stop wrote
+        # another end, and the next rejoin repeated it. Seen in production —
+        # two rejoins, killed 37s and 2m17s in.
+        if meeting_session.group_ended_at(conn, group_id) is not None:
+            return error("meeting has ended", 409)
 
     # Idempotent: whichever of the record-start signal or the first uploaded
     # chunk arrives first opens the session; a later call never regresses it.

@@ -26,6 +26,7 @@ def test_open_creates_and_returns_status(monkeypatch):
                          group_id=None):
         seen.update(sid=sid, company_id=company_id, user_id=user_id, kind=kind)
         return {"session_id": sid, "status": "open", "version": 0, "group_id": group_id}
+    monkeypatch.setattr(org.meeting_session, "group_ended_at", lambda conn, gid: None)
     monkeypatch.setattr(org.meeting_session, "ensure_open", fake_ensure_open)
 
     res = org.session_open(CONN, CALLER, SID, {"kind": "audio", "startedAt": "2026-07-28T14:03:00"})
@@ -68,6 +69,7 @@ def _ensure_open_capturing(seen):
 
 def test_open_accepts_and_returns_group_id(monkeypatch):
     seen = {}
+    monkeypatch.setattr(org.meeting_session, "group_ended_at", lambda conn, gid: None)
     monkeypatch.setattr(org.meeting_session, "ensure_open", _ensure_open_capturing(seen))
     monkeypatch.setattr(org.meeting_session, "get",
                         lambda conn, sid: {"session_id": sid, "company_id": "c-1"})
@@ -84,6 +86,7 @@ def test_open_accepts_and_returns_group_id(monkeypatch):
 def test_open_without_group_is_unchanged(monkeypatch):
     """The solo path must keep working exactly as before."""
     seen = {}
+    monkeypatch.setattr(org.meeting_session, "group_ended_at", lambda conn, gid: None)
     monkeypatch.setattr(org.meeting_session, "ensure_open", _ensure_open_capturing(seen))
     res = org.session_open(CONN, CALLER, SID, {"kind": "audio"})
     assert res["statusCode"] == 200
@@ -116,6 +119,7 @@ def test_open_accepts_a_group_whose_leader_is_not_known_yet(monkeypatch):
     what the offline-first design refuses to do."""
     seen = {}
     monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: None)
+    monkeypatch.setattr(org.meeting_session, "group_ended_at", lambda conn, gid: None)
     monkeypatch.setattr(org.meeting_session, "ensure_open", _ensure_open_capturing(seen))
 
     res = org.session_open(CONN, CALLER, SID, {"groupId": LEAD})
@@ -202,6 +206,7 @@ def test_open_allows_a_join_against_a_live_lead(monkeypatch):
     monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: {
         "session_id": sid, "company_id": "c-1", "status": "open"})
     monkeypatch.setattr(org.meeting_session, "lead_is_joinable", lambda conn, sid, w: True)
+    monkeypatch.setattr(org.meeting_session, "group_ended_at", lambda conn, gid: None)
     monkeypatch.setattr(org.meeting_session, "ensure_open", _ensure_open_capturing(seen))
 
     res = org.session_open(CONN, CALLER, SID, {"groupId": LEAD})
@@ -217,6 +222,7 @@ def test_open_still_accepts_an_unknown_lead_without_calling_the_joinable_check(m
     monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: None)
     monkeypatch.setattr(org.meeting_session, "lead_is_joinable",
                         lambda *a, **k: pytest.fail("nothing to check against"))
+    monkeypatch.setattr(org.meeting_session, "group_ended_at", lambda conn, gid: None)
     monkeypatch.setattr(org.meeting_session, "ensure_open", _ensure_open_capturing(seen))
 
     res = org.session_open(CONN, CALLER, SID, {"groupId": LEAD})

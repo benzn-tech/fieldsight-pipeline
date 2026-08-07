@@ -81,6 +81,7 @@ def _capture_ensure_open(monkeypatch, seen):
 def _upload(monkeypatch, body, seen, lead=None):
     _capture_ensure_open(monkeypatch, seen)
     monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: lead)
+    monkeypatch.setattr(org.meeting_session, "group_ended_at", lambda conn, gid: None)
     org._adopt_group_from_upload(CONN, CALLER, body, body.get("fileName"), "audio", None)
 
 
@@ -152,6 +153,7 @@ def test_the_session_start_comes_from_the_filename_not_the_chunk(monkeypatch):
     seen = []
     _capture_ensure_open(monkeypatch, seen)
     monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: None)
+    monkeypatch.setattr(org.meeting_session, "group_ended_at", lambda conn, gid: None)
     late_chunk = f"Ben_2026-08-06_09-00-00_sid{SID}_c0050.wav"
     org._adopt_group_from_upload(
         CONN, CALLER,
