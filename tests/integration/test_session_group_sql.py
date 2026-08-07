@@ -68,7 +68,7 @@ def test_ending_a_solo_session_marks_nothing(db):
     _session(db, cid, uid, SOLO)
 
     assert meeting_session.end_group(db, SOLO) == 0
-    assert meeting_session.group_is_ended(db, SOLO) is False
+    assert meeting_session.group_ended_at(db, SOLO) is None
 
 
 def test_ending_a_group_marks_every_member_once(db):
@@ -81,7 +81,7 @@ def test_ending_a_group_marks_every_member_once(db):
     # Second call marks nobody: the timestamp records when the meeting ended,
     # not when the last device got round to asking.
     assert meeting_session.end_group(db, LEAD) == 0
-    assert meeting_session.group_is_ended(db, LEAD) is True
+    assert meeting_session.group_ended_at(db, LEAD) is not None
 
 
 def test_a_device_that_joined_after_the_end_still_reads_ended(db):
@@ -93,7 +93,7 @@ def test_a_device_that_joined_after_the_end_still_reads_ended(db):
 
     own = meeting_session.get(db, LATE)
     assert own["group_ended_at"] is None, "precondition: the late row is unmarked"
-    assert meeting_session.group_is_ended(db, own["group_id"]) is True
+    assert meeting_session.group_ended_at(db, own["group_id"]) is not None
 
 
 def test_settling_waits_for_the_lead(db):
@@ -134,3 +134,53 @@ def test_the_group_is_only_filled_never_cleared(db):
     row = meeting_session.ensure_open(db, J1, cid, uid, None, "audio", None, group_id=None)
 
     assert row["group_id"] == LEAD
+
+
+def test_a_recording_started_after_the_end_is_not_in_the_meeting(db):
+    """The loop, at the SQL layer.
+
+    A device that rejoined after the meeting ended was told to stop on its first
+    upload; that stop wrote another end, which poisoned the next rejoin. Seen in
+    production on 2026-08-07 — two rejoins, killed 37s and 2m17s in.
+
+    The late session is placed a minute in the FUTURE rather than "now",
+    because `now()` inside a transaction is the transaction's start time, not
+    the wall clock: every statement here sees the same instant, so a row
+    inserted after end_group still carries an identical timestamp. Written the
+    obvious way, this test passed for the wrong reason — CI caught it.
+    """
+    cid, uid = _seed(db)
+    _session(db, cid, uid, LEAD, minutes_ago=30)
+    _session(db, cid, uid, J1, group_id=LEAD, minutes_ago=25)
+    assert meeting_session.end_group(db, LEAD) == 2
+
+    ended = meeting_session.group_ended_at(db, LEAD)
+    assert ended is not None
+
+    _session(db, cid, uid, LATE, group_id=LEAD, minutes_ago=-1)   # after the end
+    late = meeting_session.get(db, LATE)
+    assert late["opened_at"] > ended
+
+
+def test_the_end_time_is_the_first_one_not_the_last(db):
+    """end_group only fills rows that are still NULL, so a straggler marked
+    later carries a later stamp. MIN keeps "when did the meeting end" stable —
+    otherwise each late arrival would move the boundary and could pull itself
+    back inside it.
+
+    The first end is written explicitly rather than through end_group: two
+    end_group calls in one transaction would both stamp the same frozen now(),
+    and the test would prove nothing."""
+    cid, uid = _seed(db)
+    _session(db, cid, uid, LEAD, minutes_ago=30)
+    _session(db, cid, uid, J1, group_id=LEAD, minutes_ago=25)
+    db.execute(
+        "UPDATE meeting_session SET group_ended_at = now() - interval '10 minutes' "
+        "WHERE session_id IN (%s, %s)", (LEAD, J1))
+    first = meeting_session.group_ended_at(db, LEAD)
+
+    _session(db, cid, uid, J2, group_id=LEAD, minutes_ago=0)
+    assert meeting_session.end_group(db, LEAD) == 1      # only the new row
+
+    assert meeting_session.group_ended_at(db, LEAD) == first
+    assert meeting_session.get(db, J2)["group_ended_at"] > first
