@@ -603,6 +603,26 @@ def process_declared_site(declared):
 # Core: extract one session
 # ============================================================
 
+def _is_empty_transcript(data):
+    """True when this IS a transcript and it simply holds no words.
+
+    Deliberately conservative: anything that is not recognisably a
+    well-formed-but-empty transcript is left to be reported as unreadable, so a
+    genuinely broken file is never quietly downgraded to "nothing was said".
+    """
+    if not isinstance(data, dict):
+        return False
+    results = data.get('results')
+    if not isinstance(results, dict):
+        return False
+    transcripts = results.get('transcripts')
+    if not isinstance(transcripts, list):
+        return False
+    text = ''.join((t or {}).get('transcript') or '' for t in transcripts
+                   if isinstance(t, dict))
+    return not text.strip()
+
+
 def assemble_deduped_turns(bucket, keys):
     """Download + normalize each transcript segment for a session (skipping
     corrupt / unnormalizable ones), collect its abs-timed speaker turns, order
@@ -624,7 +644,31 @@ def assemble_deduped_turns(bucket, keys):
         filename = key.rsplit('/', 1)[-1]
         normalized = normalize_transcript(data, filename)
         if normalized is None:
-            logger.warning(f"Skipping unnormalizable transcript segment {key}")
+            # normalize_transcript returns None for BOTH "this file is not a
+            # transcript I can read" and "this is a perfectly good transcript
+            # with no words in it" (transcript_utils: `not parsed['full_text']`).
+            # Reporting them with one message cost a real investigation: nine
+            # segments of one prod session were logged as "unnormalizable", which
+            # reads as corruption, and they were empty transcripts of chunks VAD
+            # had already judged silent.
+            #
+            # The distinction now matters more than it did. With
+            # DROP_SILENT_CHUNKS on, a silent chunk is never transcribed at all —
+            # so from here on an EMPTY transcript means the transcriber found
+            # nothing in audio that VAD DID judge to be speech. That is the
+            # too-quiet signal the loudness work targets, and it is the metric
+            # for whether that work helped. Filed under the same message as a
+            # corrupt file, it is invisible.
+            if _is_empty_transcript(data):
+                logger.info(
+                    "No words in transcript %s -- the transcriber returned an "
+                    "empty result. This is NOT a parse failure: either the chunk "
+                    "was silent, or the speech in it was too quiet to recognise.",
+                    key)
+            else:
+                logger.warning("Skipping unreadable transcript segment %s "
+                               "(present, but not in a shape we can normalise)",
+                               key)
             continue
 
         normalized_list.append(normalized)
