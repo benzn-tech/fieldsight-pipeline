@@ -37,6 +37,7 @@ import difflib
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from urllib.parse import unquote_plus
 
@@ -82,6 +83,98 @@ TRANSCRIPT_TEXT_LIMIT = int(os.environ.get('TRANSCRIPT_TEXT_LIMIT', '300000'))
 # there at the start, and lands its decisions and actions at the end; head-only
 # truncation threw away exactly the half worth extracting.
 TRUNCATION_HEAD_SHARE = 0.6
+
+# ------------------------------------------------------------
+# Device announcements are not speech (2026-08-08)
+# ------------------------------------------------------------
+# Recorders play spoken prompts — "recording started", "please stop recording" —
+# and any device within earshot records them. The transcriber has no way to know
+# a machine said it, so they arrive as ordinary speaker turns: five of them in
+# one 70-minute session, and in the densest five minutes spk_2 and spk_3 were
+# largely machine audio, which is how that session's artifact came to report
+# speaker_count: 4 with at least one device counted as a person.
+#
+# This gets worse exactly as the product gets better. Multi-device grouping
+# means every device announces start and stop and every nearby device hears it,
+# so the count of these grows with the square of the crew size.
+#
+# Matched against the WHOLE normalised turn, never as a substring: "we should
+# stop recording now" is a person talking about the recorder and must survive.
+# The length guard is the second half of that promise.
+DEVICE_ANNOUNCEMENT_MAX_CHARS = int(
+    os.environ.get('DEVICE_ANNOUNCEMENT_MAX_CHARS', '60'))
+# Overridable as a JSON list so a phrase discovered in prod can be added without
+# a code deploy. The app's prompt audio (res/raw/recording_started.mp3 and
+# siblings) was staged on 2026-08-07 and is not wired to any Kotlin yet, so the
+# exact wording it will use is not yet fixed — hence patterns rather than
+# literals, and hence the reporting below.
+_DEFAULT_ANNOUNCEMENT_PATTERNS = [
+    # `stopp?` because English doubles the consonant: "stop", "stopped",
+    # "stopping". Without it "Stopped recording." walks straight through, which
+    # is what the tests caught.
+    r"(please\s+)?(start|stopp?|end)(ed|ing)?\s+(the\s+)?record(ing)?",
+    r"(the\s+)?record(ing)?\s+(has\s+|is\s+)?(start|stopp?|end)(ed|ing)?",
+    r"(the\s+)?meeting\s+(has\s+)?(start|stopp?|end)(ed|ing)?",
+    r"(start|end)\s+of\s+(the\s+)?meeting",
+    r"record(ing)?\s+(started|stopped|ended)",
+]
+
+
+def _announcement_patterns():
+    raw = os.environ.get('DEVICE_ANNOUNCEMENT_PATTERNS')
+    if not raw:
+        return _DEFAULT_ANNOUNCEMENT_PATTERNS
+    try:
+        loaded = json.loads(raw)
+        if isinstance(loaded, list) and all(isinstance(p, str) for p in loaded):
+            return loaded
+        logger.warning("DEVICE_ANNOUNCEMENT_PATTERNS is not a list of strings; "
+                       "using defaults")
+    except Exception as e:
+        # Never silent (BUG-40): a typo here would otherwise turn the filter off
+        # and read as "the announcements came back", sending the next person to
+        # the transcriber.
+        logger.warning("DEVICE_ANNOUNCEMENT_PATTERNS is not valid JSON (%s); "
+                       "using defaults", e)
+    return _DEFAULT_ANNOUNCEMENT_PATTERNS
+
+
+def _normalise_for_match(text):
+    """Lowercase, drop punctuation, collapse whitespace. ASR renders the same
+    prompt as "Please stop recording." or "please stop recording" depending on
+    engine and run, and neither spelling is the interesting part."""
+    return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', ' ', (text or '').lower())).strip()
+
+
+def is_device_announcement(text):
+    normalised = _normalise_for_match(text)
+    if not normalised or len(normalised) > DEVICE_ANNOUNCEMENT_MAX_CHARS:
+        return False
+    return any(re.fullmatch(p, normalised) for p in _announcement_patterns())
+
+
+def filter_device_announcements(turns):
+    """Return (kept_turns, stats).
+
+    `stats['texts']` keeps the distinct phrases removed. That is the point of
+    it: the wording the recorders will actually use is not settled, so the
+    filter is also the instrument that reports what it is meeting in the field.
+    A filter whose misses are invisible cannot be tuned.
+    """
+    kept, removed = [], []
+    for turn in turns:
+        if is_device_announcement(turn.get('text')):
+            removed.append(turn)
+        else:
+            kept.append(turn)
+    stats = {
+        'removed': len(removed),
+        'texts': sorted({(t.get('text') or '').strip() for t in removed}),
+    }
+    if removed:
+        logger.info("Filtered %d device announcement turn(s): %s",
+                    len(removed), stats['texts'][:5])
+    return kept, stats
 SITE_MATCH_CUTOFF = 0.6
 
 # Two-tier extraction (see extract_session).
@@ -711,6 +804,12 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
     keys = gather_session_segments(bucket, user_folder, date, session_base)
     turns, source_filenames = assemble_deduped_turns(bucket, keys)
 
+    # Before anything counts speakers or reads text: a recorder's spoken prompt
+    # is not a participant. Doing this here rather than in the prompt keeps it
+    # out of speaker_count too, which is where it did visible damage — one
+    # session reported four speakers with at least one of them a device.
+    turns, announcement_stats = filter_device_announcements(turns)
+
     # M-6: nothing usable to extract from -- skip quietly (no Claude call,
     # no write), same "don't retry-storm a dead end" reasoning as M-5.
     if not turns:
@@ -784,6 +883,10 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         # extraction does not cover the whole session — the previous version of
         # this code dropped 53% of a 2-hour meeting and recorded nothing.
         'transcript_stats': transcript_stats,
+        # What the filter removed, and the exact phrases. The recorders' prompt
+        # wording is not settled, so this is how the real strings get known
+        # without guessing at them.
+        'device_announcements': announcement_stats,
         # Stamped at WRITE time, not at entry: the throttle above measures "how
         # long since the last extraction finished". Stamping at entry would
         # backdate it by the whole LLM round-trip and let the next trigger
