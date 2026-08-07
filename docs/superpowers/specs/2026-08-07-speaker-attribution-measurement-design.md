@@ -1,10 +1,55 @@
 # Speaker attribution: can reasoning re-unify what per-call diarization split?
 
 **Date:** 2026-08-07
-**Revision:** 3 — see §11 (what rev 1 got wrong) and §12 (what rev 2 got wrong).
+**Revision:** 4 — see §11, §12, and **§0 below**.
 **Branch:** `docs/speaker-attribution-spec` (off `origin/develop`)
-**Status:** Design — awaiting review
+**Status:** ⛔ **WITHDRAWN 2026-08-08. Do not implement.** Kept for the measurements
+in §2–§6, which are real and were expensive; the *proposal* from §7 onward is
+superseded.
 **Relates to:** `2026-07-23-session-continuity-design.md` (Spec 1, design-only, unimplemented)
+
+## 0. Why this is withdrawn
+
+Hand-labelled ground truth from a real site recording (UCPK2, 2026-08-07, 4:49,
+`Dropbox/temp/fieldsight-audio/`) arrived after this was written and contradicts its
+central assumption in three separate ways. This is the third revision; the honest move
+is to stop revising it rather than find a fourth framing.
+
+**1. A labelled turn is not one speaker.** Three of eighteen labelled turns contain two
+sources — one contains a device announcement followed immediately by a person. The
+`person → [labels]` mapping this spec is built on cannot express a turn belonging to two
+people, so the reassembly it proposes has no correct answer to produce for those turns.
+
+**2. Fragmentation is not a chunking artefact.** It happens *inside* a single 30-second
+call: the same person is both `spk_0` and `spk_1` within one call's output. This spec
+treats fragmentation as something the chunk boundaries created and reasoning could undo
+across them. The boundaries make it worse; they do not cause it.
+
+**3. Under a whole-file call the scattering does not occur at all.** ElevenLabs
+`scribe_v2` over the whole recording holds stable ids across the file. The work this
+spec proposes has almost nothing left to do once the architecture in
+`2026-07-23-session-continuity-design.md` lands — and that architecture is being built
+anyway.
+
+**What is actually left is acoustic, and reasoning over text cannot touch it.** The two
+people the diarizer merges away are the two furthest from the microphone, captured at
+about 5.3 bits of the available 16 (−58.7 dBFS ≈ 38 LSB RMS). Distinguishing them is a
+signal problem — microphone placement, device-side AGC, whole-file diarization — and no
+amount of reasoning over a transcript recovers information that was never sampled. A
+reasoning pass asked to separate them will produce confident, plausible, unfalsifiable
+attributions, which in a construction report is worse than admitting the ambiguity.
+
+**Replacement:** none as a measurement exercise. The ordered work is in
+`2026-08-08-audio-and-attribution-roadmap.md` — loudness normalisation first (P0), then
+whole-session diarization and the provider decision (P2), then device-side gain and mic
+placement (P3). If a spec is wanted for the residual problem, it should be about
+*telling apart quiet and distant voices*, and it should be measured against the
+hand-labelled ground truth, not against `speaker_count`.
+
+**One thing from §2 is worth carrying forward and not losing:** `speaker_count` is the
+size of the union of per-call labels, not a count of people. The `== 1` gate that
+consumes it is still correct (one label across the whole session really does mean one
+voice), so **do not "fix" it** — but nothing else should read it as a number of humans.
 
 ## 1. The question this answers
 

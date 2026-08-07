@@ -22,6 +22,15 @@ no comparison between providers or architectures is measuring what it claims to 
 
 ### P0 — Loudness normalisation before ASR
 
+**✅ Implemented 2026-08-08 (PR #281).** Verified through the code path on the real
+recording: −39.7 → −19.3 dBFS overall, the quiet segment at 137 s −48.6 → −23.7,
+identical sample count and 0.989 cross-correlation at lag 0. The deployed layer's ffmpeg
+was checked for both filters rather than assumed. Gated per stage:
+`TEST_NORMALISE_AUDIO` on, `PROD_NORMALISE_AUDIO` off until the noise question below is
+measured. Two traps found while building it: `loudnorm` emits **192 kHz** unless `-ar` is
+pinned, and holding the original plus the normalised sample list would have halved the
+longest file the lambda can process (BUG-04).
+
 **Why first:** biggest measured effect, lowest cost, independent of every other decision.
 
 The recording averages −39.7 dBFS with a median second at −46. Seven identical
@@ -48,6 +57,14 @@ hallucinations. Measure on the same clip before and after.
 
 ### P1a — `TRANSCRIPT_TEXT_LIMIT` truncates long sessions
 
+**✅ Decided and implemented 2026-08-08 (PR #283): raise, not chunk.** Chunking means a
+map-reduce with cross-chunk topic dedup inside the function that livelocked, running
+opposite to BUG-43's fix. And output tokens do not scale with input on the prod path —
+`llm_utils` sends no `max_tokens` at all under `force_json`, so BUG-16's failure mode is
+not reachable here. Raised to 300,000 (~75–85k tokens, ~4.5 h). When a session still does
+not fit, head **and** tail are kept, the model is told the transcript is incomplete, and
+the artifact records `transcript_stats`.
+
 `lambda_extract_session.py:62,255` caps the prompt at 60,000 characters. A real 2-hour
 session renders to 128,427 — **47% reaches the model**, ~387 of 838 turn lines. The
 authoritative extraction of a long meeting covers only its first half, silently.
@@ -59,6 +76,17 @@ raising the limit and chunking the extraction, but decide.
 
 ### P1b — Device announcements are transcribed as speech
 
+**✅ Implemented 2026-08-08 (PR #284).** Filtered at turn assembly, **before**
+`speaker_count` is taken — that count is what did the visible damage, and
+`speaker_count == 1` is the gate item-writer uses to resolve a self-referential
+responsible party to a real name. Matched against the whole normalised turn with a length
+guard, so "we should stop recording now, mate" survives. Validated on the hand-labelled
+recording: 1 of 30 turn lines flagged, exactly the one the ground truth marks `(device)`,
+zero false positives. The artifact records the **distinct phrases** removed, because
+`res/raw/recording_started.mp3` and siblings were staged on 2026-08-07 and are not wired
+to any Kotlin yet — the wording is not settled, so the filter is also the instrument that
+reports what it meets.
+
 Five turns in one 70-minute session are another device's recording announcements
 ("Recording started", "recording stopped", "Please stop recording") transcribed as human
 speech and given speaker labels. In the 5-minute window, `spk_2` and `spk_3` are largely
@@ -69,15 +97,42 @@ person.
 device announces start and stop, and every nearby device records it. Filter these before
 they reach extraction — the phrases are fixed and short.
 
-### P1c — The final extraction pass can run before the session is fully transcribed
+### P1c — The final extraction pass cannot notice it was overtaken
 
-Today's session ran to chunk c0150; the authoritative extraction covers c0000–c0129 from
-95 transcripts. Media finished uploading at 15:35:23, the finalize request was written at
-15:33:56, and the final pass ran at 15:36:22 — before the tail was transcribed. The
-overtake-and-rerun mechanism did not fire, so **the last ten minutes are absent from the
-authoritative record**, including the discussion of steel and stair reinforcement.
+**✅ Diagnosed and fixed 2026-08-08 (PR #285). The description below was wrong on both
+of its factual claims** — corrected here rather than deleted, because the wrong version
+is what a reasonable reading of the artifact timestamps produces, and the next person
+will produce it again.
 
-Diagnose why the live-overtakes-final path did not trigger before changing anything.
+~~Media finished uploading at 15:35:23 … the final pass ran at 15:36:22 — before the
+tail was transcribed. The overtake-and-rerun mechanism did not fire.~~
+
+Both false:
+
+- **The tail was transcribed in time.** The last transcript was written at **15:35:48**,
+  34 seconds *before* the final pass wrote at 15:36:22. All 151 transcripts
+  (c0000–c0150) were on disk.
+- **The mechanism did fire.** `03:33:55.634 ... overtook an early final pass --
+  requested a re-run` is in the prod logs.
+
+The real cause is structural. `extract_session` lists the session **once**, before a
+~170 s thinking call — 21 transcripts landed during that call — and the post-call
+coverage re-check is guarded by `if not final:`, so only a *live* pass ever re-examines
+what it published. A live pass fires only on a `transcripts/` write, and the final pass
+writes *after* the last transcript by construction. When the narrow final lands, **there
+is no trigger left in the system**: the recovery path exists and is unreachable.
+
+BUG-43 in the mirror. That fix removed "discard the expensive result if the premise
+changed"; this was "keep the result but never re-examine the premise".
+
+Fix: the final pass re-lists **after** writing and requests one more final pass if the
+set grew, bounded by a generation counter. Design and the two non-obvious constraints
+(order of write vs re-list; compare S3 keys to S3 keys, not to `source_transcripts`) are
+in `2026-08-08-final-pass-coverage-recheck-design.md`.
+
+**Still open, found in the same logs:** three transcripts in that session (`c0004`,
+`c0005`, `c0064`) were dropped as `unnormalizable`. A different silent loss, not yet
+diagnosed.
 
 ### P2 — Whole-session diarization, and the provider it runs on
 
@@ -123,6 +178,11 @@ away are precisely the two furthest from the mic. That is placement, not softwar
 
 ### P4 — Reduce or withdraw the speaker-attribution spec
 
+**✅ Withdrawn 2026-08-08.** `2026-08-07-speaker-attribution-measurement-design.md` now
+carries a §0 saying so and why; §2–§6 are kept because the measurements are real, and the
+proposal from §7 on is superseded. No replacement spec: what remains of the problem is
+acoustic, and belongs to P2 and P3 rather than to a reasoning pass.
+
 `2026-08-07-speaker-attribution-measurement-design.md` proposed having the reasoning pass
 re-unify a person's identity across per-call labels. Ground truth from the real recording
 undermines its central assumption:
@@ -141,8 +201,10 @@ written.
 
 ## Carried over, unrelated to audio
 
-**Upload freeze/thaw Phase 1** is complete and unmerged: GrandTime PR #8 (478 tests) and
-pipeline PR #274 (1898 tests, ships inert). Needs real-device verification before merge —
+**Upload freeze/thaw Phase 1** — **both merged 2026-08-07**: GrandTime PR #8 and pipeline
+PR #274. The "complete and unmerged" note below was already stale when this roadmap was
+written; check `gh pr view` before trusting a status line here. Still needs real-device
+verification before Phases 2 and 3 —
 Room v5 migration over an existing install, a forced 403 freezing without a retry storm,
 a frozen record staying frozen across an account switch, and a redeploy thawing by build
 mismatch. Phases 2 and 3 wait on that.
