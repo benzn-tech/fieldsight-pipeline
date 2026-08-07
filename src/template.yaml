@@ -467,6 +467,20 @@ Parameters:
       whole sentences); 0.2 recovered ~70%. Set per stage so test can trial a value
       before prod adopts it.
 
+  DropSilentChunks:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      What VadFunction does with a chunk holding no speech at either threshold.
+      'true' (default) drops it. 'false' restores the old fallback, which sent
+      the whole chunk to Transcribe in case VAD had missed something — measured
+      against a second engine on 48 real chunks, that rescued nothing and
+      manufactured 313 fluent invented words (10.7% of a meeting's transcript)
+      that reached the minutes and action items. Declared here so the rollback
+      survives a deploy: a value set only on the live function is erased the
+      next time CloudFormation reconciles the environment.
+
   MultiTenantResolution:
     Type: String
     Default: 'false'
@@ -768,6 +782,7 @@ Resources:
           # per stage (test trials 0.2; prod stays 0.5 until validated).
           MERGE_GAP: '2.0'
           VAD_THRESHOLD: !Ref VadThreshold
+          DROP_SILENT_CHUNKS: !Ref DropSilentChunks
           SAMPLE_RATE: '16000'
           SKIP_EXISTING: 'true'
           GENERATE_PREVIEW: 'true'
