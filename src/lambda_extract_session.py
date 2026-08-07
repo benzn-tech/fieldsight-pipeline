@@ -98,16 +98,32 @@ TRUNCATION_HEAD_SHARE = 0.6
 # means every device announces start and stop and every nearby device hears it,
 # so the count of these grows with the square of the crew size.
 #
-# Matched against the WHOLE normalised turn, never as a substring: "we should
-# stop recording now" is a person talking about the recorder and must survive.
-# The length guard is the second half of that promise.
+# Matched a whole SENTENCE at a time, never as a substring, and every sentence
+# in the turn has to match: "we should stop recording now" is a person talking
+# about the recorder and must survive. The length guard is the other half of
+# that promise.
 DEVICE_ANNOUNCEMENT_MAX_CHARS = int(
     os.environ.get('DEVICE_ANNOUNCEMENT_MAX_CHARS', '60'))
-# Overridable as a JSON list so a phrase discovered in prod can be added without
-# a code deploy. The app's prompt audio (res/raw/recording_started.mp3 and
-# siblings) was staged on 2026-08-07 and is not wired to any Kotlin yet, so the
-# exact wording it will use is not yet fixed — hence patterns rather than
-# literals, and hence the reporting below.
+# Overridable as a JSON list (see the DeviceAnnouncementPatterns parameter) so a
+# phrase met in the field can be added without a code change. Patterns rather
+# than literals because a transcriber renders the same prompt differently across
+# engines and runs, and because the app can change its wording without telling
+# the backend — which is also why the artifact reports what was removed.
+#
+# These are the app's four voice lines as of GrandTime PR #13 (merged
+# 2026-08-07, wired and verified in the release apk — an earlier version of this
+# comment said they were staged but unwired, which was wrong):
+#
+#   recording_started : "Recording started."
+#   recording_stopped : "Recording stopped."
+#   meeting_prompt    : "Recording stopped. Has the meeting ended? Check the screen."
+#   meeting_ended     : "Meeting ended. Recording stopped."
+#
+# Two of those are MULTI-SENTENCE, which is why matching is done per sentence
+# rather than over the whole turn: a whole-turn match caught only the first two.
+# Per-sentence also covers the likelier field case — the prompts have audible
+# pauses between sentences, so a transcriber may well emit them as separate
+# turns, and each one has to be recognisable on its own.
 _DEFAULT_ANNOUNCEMENT_PATTERNS = [
     # `stopp?` because English doubles the consonant: "stop", "stopped",
     # "stopping". Without it "Stopped recording." walks straight through, which
@@ -117,6 +133,16 @@ _DEFAULT_ANNOUNCEMENT_PATTERNS = [
     r"(the\s+)?meeting\s+(has\s+)?(start|stopp?|end)(ed|ing)?",
     r"(start|end)\s+of\s+(the\s+)?meeting",
     r"record(ing)?\s+(started|stopped|ended)",
+    # From meeting_prompt. "check the screen" is deliberately NOT here on its
+    # own: a person can plausibly say exactly that on a site, and it carries no
+    # recording vocabulary to distinguish it. It is only ever dropped as part of
+    # a turn whose other sentences are announcements.
+    r"has\s+the\s+meeting\s+ended",
+]
+# Sentences that are not announcements by themselves, but are recognisable as
+# prompt text when they arrive attached to one.
+_ANNOUNCEMENT_COMPANIONS = [
+    r"check\s+the\s+screen",
 ]
 
 
@@ -153,10 +179,34 @@ def _normalise_for_match(text):
 
 
 def is_device_announcement(text):
-    normalised = _normalise_for_match(text)
-    if not normalised or len(normalised) > DEVICE_ANNOUNCEMENT_MAX_CHARS:
+    """True when every sentence of the turn is recorder prompt text.
+
+    Per sentence, not per turn: two of the four voice lines are multi-sentence
+    ("Meeting ended. Recording stopped."), and a whole-turn match caught neither.
+
+    "Every sentence" is what keeps a person safe. A turn has to be prompt text
+    end to end, so "Recording stopped. I'll redo that bit." survives — the second
+    sentence is a person reporting a gap in the record, which is the most useful
+    thing they could say, and it is exactly what a first-sentence-only rule would
+    have deleted.
+    """
+    if not text or len(_normalise_for_match(text)) > DEVICE_ANNOUNCEMENT_MAX_CHARS:
         return False
-    return any(re.fullmatch(p, normalised) for p in _announcement_patterns())
+    patterns = _announcement_patterns()
+    sentences = [_normalise_for_match(s) for s in re.split(r'[.!?]+', text)]
+    sentences = [s for s in sentences if s]
+    if not sentences:
+        return False
+    matched_an_announcement = False
+    for sentence in sentences:
+        if any(re.fullmatch(p, sentence) for p in patterns):
+            matched_an_announcement = True
+        elif not any(re.fullmatch(p, sentence) for p in _ANNOUNCEMENT_COMPANIONS):
+            return False
+    # A turn of nothing but companions ("Check the screen.") is not an
+    # announcement — it needs at least one sentence that actually names the
+    # recorder, or a person saying those three words loses their turn.
+    return matched_an_announcement
 
 
 def filter_device_announcements(turns):

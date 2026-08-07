@@ -14,16 +14,18 @@ these grow with the square of the crew size.
 
 The properties pinned here:
 
-1. **Whole-turn match only.** "we should stop recording now, mate" is a person
-   talking about the recorder. A substring filter would delete them. This is
-   the property most likely to be broken by a later "improvement", so it is
-   tested from several directions.
+1. **Every sentence must match, and never as a substring.** "we should stop
+   recording now, mate" is a person talking about the recorder; so is
+   "Recording stopped. I'll redo that bit.", which opens with the exact prompt
+   text and then says the thing worth keeping. A substring filter — or a
+   first-sentence-only one — deletes both. This is the property most likely to
+   be broken by a later "improvement", so it is tested from several directions.
 2. **Filtered before `speaker_count`.** Filtering only at prompt-render time
    would leave the device in the count, and `speaker_count == 1` is a gate
    item-writer uses to resolve a self-referential responsible party to a name.
 3. **The phrases are recorded in the artifact.** The app's prompt audio
    (`res/raw/recording_started.mp3` and siblings) was staged on 2026-08-07 and
-   is not yet wired to any Kotlin, so the exact wording is not settled. The
+   ships as of GrandTime PR #13; the wording can still change. The
    filter therefore also reports what it met — a filter whose misses are
    invisible cannot be tuned.
 4. **A bad override is loud.** A typo in the env pattern list turns the filter
@@ -46,6 +48,44 @@ import lambda_extract_session as les
 # ------------------------------------------------------------------
 # What must be removed
 # ------------------------------------------------------------------
+
+# The app's four voice lines, verbatim from GrandTime PR #13 (merged 2026-08-07,
+# wired and verified in the release apk). These are the strings that will
+# actually be spoken on site, so they are the ones that matter — an earlier
+# version of this file guessed at the wording and missed two of the four,
+# because both are multi-sentence and the matcher was whole-turn only.
+REAL_VOICE_LINES = [
+    "Recording started.",
+    "Recording stopped.",
+    "Recording stopped. Has the meeting ended? Check the screen.",
+    "Meeting ended. Recording stopped.",
+]
+
+
+@pytest.mark.parametrize("text", REAL_VOICE_LINES)
+def test_every_real_voice_line_is_filtered(text):
+    assert les.is_device_announcement(text), text
+
+
+@pytest.mark.parametrize("text", [
+    "Recording stopped.",
+    "Has the meeting ended?",
+    "Meeting ended.",
+])
+def test_prompt_sentences_are_caught_when_split_at_the_pauses(text):
+    """The voice lines have audible pauses between sentences, so a transcriber
+    may well emit them as separate turns rather than one. Each sentence has to
+    stand on its own.
+
+    "Check the screen." is deliberately absent: a person can say exactly that on
+    a site and it carries no recording vocabulary, so it is only ever dropped as
+    part of a turn whose other sentences name the recorder."""
+    assert les.is_device_announcement(text), text
+
+
+def test_a_bare_companion_sentence_is_kept():
+    assert not les.is_device_announcement("Check the screen.")
+
 
 @pytest.mark.parametrize("text", [
     "Please stop recording.",              # observed verbatim, 2026-08-07 02:10
@@ -84,6 +124,10 @@ def test_punctuation_and_case_do_not_matter():
     "The meeting ended up going an hour over because of the steel.",
     "Recording started late so the first bit about the scaffold tags is missing.",
     "Tell him to stop recording the wrong bay and get the east elevation.",
+    # The one a first-sentence-only rule would have deleted: it opens with the
+    # exact prompt text and then says the thing worth keeping.
+    "Recording stopped. I'll redo that bit.",
+    "Check the screen on the hoist, it's throwing a fault.",
 ])
 def test_people_talking_about_recording_are_kept(text):
     """A person discussing the recorder is content, often content about a gap in
@@ -142,7 +186,7 @@ def test_a_speaker_who_only_ever_announced_leaves_the_speaker_count():
 
 def test_the_distinct_phrases_are_reported_not_just_a_count():
     """The wording the recorders will use is not settled — res/raw/*.mp3 was
-    staged 2026-08-07 and is not wired to any Kotlin yet. The count alone would
+    can change wording without telling the backend. The count alone would
     not tell anyone what to add to the pattern list."""
     turns = [_turn("spk_1", "Recording started."), _turn("spk_1", "Recording started.")]
     _, stats = les.filter_device_announcements(turns)
