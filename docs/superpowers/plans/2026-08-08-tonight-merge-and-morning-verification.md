@@ -25,10 +25,34 @@ two get their first CI run at that moment — expect it, it is not a failure.
 Nothing here is order-sensitive beyond the stacking; #282 and #281 are independent of the
 rest and of each other.
 
+## What each stage will actually be set to
+
+Checked against `gh variable list`, not against intent — none of the new variables exist,
+so every one of them takes its workflow fallback:
+
+| variable | exists? | TEST gets | PROD gets |
+|---|---|---|---|
+| `*_NORMALISE_AUDIO` | no | `true` (fallback) | **`false`** (fallback) |
+| `*_DEVICE_ANNOUNCEMENT_PATTERNS` | no | `[]` → built-in defaults | `[]` → built-in defaults |
+| `*_ASR_PROVIDER` | prod only (`elevenlabs`) | `elevenlabs` (fallback) | `elevenlabs` (variable) |
+| `*_DROP_SILENT_CHUNKS` | no | `true` (fallback) | `true` (fallback) |
+| `*_VAD_THRESHOLD` | prod only (`0.2`) | `0.2` (fallback) | `0.2` (variable) |
+
+The row worth having checked is `ASR_PROVIDER`: `TEST_ASR_PROVIDER` does **not** exist,
+while the test lambda is currently running ElevenLabs. Had `deploy.yml`'s fallback been
+`transcribe`, tonight's merge would have silently reverted test to AWS Transcribe and every
+morning comparison would have been against a different engine. It is `elevenlabs`, so it
+does not — but that is the shape of regression a merge train produces, and it is invisible
+in the diff.
+
+`TRANSCRIPT_TEXT_LIMIT` is a template literal (`300000`) with no variable, so it is the
+same on both stages.
+
 ## What is inert on prod after this
 
-- `PROD_NORMALISE_AUDIO` → **false**. P0 is code-complete on prod and does nothing until
-  the repo variable is set. `TEST_NORMALISE_AUDIO` → true.
+- P0 is code-complete on prod and does nothing: `NormaliseAudio` resolves to `false`
+  there, and the template Parameter now also defaults to `false` so a manual `sam deploy`
+  cannot turn it on by accident.
 - Everything else is on in both stages. The three new artifact fields
   (`transcript_stats`, `device_announcements`, `generation`) are additive and **every
   consumer reads them with `.get()`** — checked in `lambda_item_writer`, `lambda_ingest`,
