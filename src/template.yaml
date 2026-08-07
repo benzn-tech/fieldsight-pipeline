@@ -483,7 +483,14 @@ Parameters:
 
   NormaliseAudio:
     Type: String
-    Default: 'true'
+    # Default OFF, even though TEST runs it on. Both workflows pass an explicit
+    # value, so this default is only ever reached by a deploy path that does
+    # NOT — a manual `sam deploy`, which is not hypothetical: the 2026-08-07
+    # prod release had to be dispatched by hand when GitHub was degraded. The
+    # failure mode of defaulting ON is that such a deploy silently starts
+    # transforming customer audio with a treatment that has not been validated
+    # for hallucinations yet, and nothing in the deploy output would say so.
+    Default: 'false'
     AllowedValues: ['true', 'false']
     Description: >-
       Whether VadFunction compresses and loudness-normalises audio before it is
