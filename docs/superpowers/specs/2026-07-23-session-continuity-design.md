@@ -20,7 +20,7 @@ time. **Naming is explicitly out of scope here.**
 
 Two facts about the current pipeline combine into the problem:
 
-1. **Media is uploaded in ~3-minute chunks** (for timeliness — raw media must land
+1. **Media is uploaded in ~30-second chunks** (for timeliness — raw media must land
    in S3 quickly, not wait for a session to finish). A real activity (a 2-hour
    inspection, or a meeting) spans **many** chunk files.
 2. The current pipeline runs **VAD per chunk → one transcription call per VAD
@@ -133,7 +133,9 @@ A new table (or a partition of the existing ledger) tracks sessions.
 
 On each chunk `ObjectCreated`:
 - Parse `{device}_{date}_{time}` from the filename → chunk start wall-clock; chunk
-  end = start + chunk duration (from the media, or a nominal 3 min if unavailable).
+  end = start + chunk duration **taken from the decoded media**. The nominal value is
+  30 s (OI-1, measured), but 6 of 260 regions in the measured session were not 30 s, so
+  the nominal is a last resort and never the basis for the overlap arithmetic (§6.4a).
 - Find the open session for `(user, device)`. If `chunk.start − session.last_ts ≤
   SESSION_GAP_MINUTES`, append; else close the old session (if any) and open a new
   one starting at this chunk.
@@ -199,28 +201,64 @@ the one that breaks the spec's own headline invariant:
    this up — it runs on the per-chunk path, not on a whole-session transcript.
 2. Diarization hears the same two seconds twice. Identity usually survives that; turn
    boundaries do not.
-3. **Two distinct positions in stitched time map to the same real time**, so the
-   stitch map stops being a function. §4 calls absolute-time correctness the #1
-   acceptance criterion, and duplicated audio violates it before any restore code runs.
+3. The restored timeline **loses monotonicity**: two stitched positions carry the same
+   real time. Note precisely what is and is not broken — the duplicated words get the
+   *correct* time, twice. The times are right; the content is doubled. (An earlier
+   draft of this addendum said the stitch map "stops being a function". It does not —
+   concat→real is still single-valued. The damage is duplication and non-monotonic
+   restored output, not wrong timestamps.)
 
 **Removal, at each seam, in this order:**
 
-1. **Estimate** from the filenames: `overlap ≈ prev_region_duration − (start_{N+1} −
-   start_N)`. Clamp to `[0, MAX_OVERLAP_S]` (3.0 s). A negative or oversized value
-   means the chunks are not contiguous — see the discontinuity case below — and the
-   estimate becomes 0.
-2. **Refine** by cross-correlating the last `2 × MAX_OVERLAP_S` of the running stream
+1. **Estimate** from the filenames, using **wall-clock endpoints, not durations**:
+
+   ```
+   overlap = (start_N + to_N) − (start_{N+1} + off_{N+1})
+   ```
+
+   where `start` is the chunk's own start from the filename and `off`/`to` bound the
+   VAD region inside it. The duration-based form (`prev_duration − chunk_gap`) is
+   correct **only when both regions start at offset 0**. Whenever VAD trims a chunk's
+   head, that form yields a spurious negative and declares a real overlap
+   "not contiguous". It happened to work on the measured session because 254 of 260
+   regions were full-chunk — which is exactly the kind of accident that ships.
+
+   Clamp to `[0, MAX_OVERLAP_S]`. **`MAX_OVERLAP_S = 10.0`**, matching the device
+   contract that `chunk_stitch.py:27-30` already documents ("capped at 10s upstream").
+   An earlier draft used 3.0 s, which would have left every seam of a 5 s-overlap
+   device build partially duplicated — while that same draft argued the ring-buffer
+   size can change without a backend deploy.
+
+2. **Estimate ≤ 0 means no overlap: stop here, do not correlate.** A genuine 30 s gap
+   or the 806 s pause below must not be handed to a correlator that will find a
+   spurious peak in repeated speech or machinery hum and trim seconds of unique audio.
+
+3. **Refine** by cross-correlating the last `2 × estimate` of the running stream
    against the head of the incoming region, taking the lag that maximises correlation.
    Filename timestamps are whole seconds, so the estimate alone carries up to ±1 s of
-   error against a 2 s overlap — half of it. The audio is already a numpy array at
-   this point (BUG-04/BUG-06 require that), and correlating ~96k samples is
-   negligible beside the ffmpeg decode already happening.
-3. **Fall back** to the clamped estimate when correlation is weak (silence at the
-   seam gives no peak). Prefer trimming **less** than more: leftover duplication is
-   cleaned downstream by the existing text-level dedup, whereas over-trimming deletes
-   speech that no later stage can recover.
-4. **Record the trim in the stitch map**, so restored times stay monotonic. The map
-   entry for a trimmed region starts at its post-trim real time, not its nominal one.
+   error against a 2 s overlap — half of it. This is well-posed and usually exact:
+   the audio path is WAV PCM decoded through the same ffmpeg→16 kHz pipeline both
+   times, so the carried ring-buffer samples are **byte-identical in both chunks**.
+   (Video chunks re-encoded as AAC lose byte-identity to encoder priming, but not
+   correlation.) The array is already numpy (BUG-04/BUG-06), and correlating ~10⁵
+   samples is negligible beside the decode already happening.
+
+4. **Trim the full estimate when correlation is weak.** Do NOT prefer under-trimming.
+   A weak peak at a seam the timestamps say *does* overlap means silence in the
+   overlap — where trimming the whole estimate deletes nothing audible. The opposite
+   default is actively unsafe here: there is **no downstream net on this path**. The
+   existing `_dedup_turn_boundaries` fires only when adjacent turns overlap in *time*
+   (`lambda_extract_session.py:171-201`), and after step 5 a short trim produces
+   *sequential* times, so it never triggers. Under-trimming therefore ships duplicated
+   seam text **and** times shifted late by the residual — quietly breaking the §4
+   invariant this addendum exists to protect.
+
+5. **Record the trim in the stitch map.** The map entry for a trimmed region starts at
+   its post-trim real time, not its nominal one.
+
+6. **Assert the invariant instead of trusting it.** Because there is no net, the
+   session path needs its own seam check: after restore, no two adjacent turns may
+   overlap in time, and the parity test in §10 asserts on the *text*.
 
 **Do not simply hard-code 2.0 s.** The measurement above is one session on one device
 build; the ring buffer's size is a mobile implementation detail that can change
