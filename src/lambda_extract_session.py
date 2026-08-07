@@ -195,9 +195,21 @@ MIN_REEXTRACT_INTERVAL_S = 90
 TIER_LIVE = 'live'
 TIER_FINAL = 'final'
 # Zero overlap with transcripts/ (this Lambda's other trigger) and with
-# extractions/ (its own output -- BUG-13), so no notification is ambiguous and
-# nothing can re-trigger itself.
+# extractions/ (its own output -- BUG-13), so no notification is ambiguous.
+#
+# It DOES re-trigger itself, deliberately: a final pass that finds the session
+# grew while it was thinking writes another request here (see extract_session).
+# That is a self-trigger in BUG-13's sense, so it is bounded twice over -- a
+# round only happens when the transcript set grew STRICTLY, and growth stops
+# when transcripts stop, with FINAL_RERUN_MAX_GENERATIONS as the backstop for
+# the case where that assumption is wrong.
 FINAL_REQUESTS_PREFIX = 'extraction_requests/'
+# How many times a final pass may ask for a fresher final pass. Reached only if
+# transcripts keep arriving for longer than N thinking calls (~170s each), which
+# on the evidence does not happen -- or if something is rewriting keys in a loop,
+# which is exactly what this bounds.
+FINAL_RERUN_MAX_GENERATIONS = int(
+    os.environ.get('FINAL_RERUN_MAX_GENERATIONS', '3'))
 
 _s3_client = None
 _sites_cache = None
@@ -769,7 +781,8 @@ def _supersedes(new_sources, prev):
 
 
 def extract_session(bucket, user_folder, date, session_base, final=False,
-                    min_interval_s=MIN_REEXTRACT_INTERVAL_S, now=None):
+                    min_interval_s=MIN_REEXTRACT_INTERVAL_S, now=None,
+                    generation=0):
     # M-5: a stack missing the secret must not retry-storm -- an S3 event
     # retries on a raised exception, and every retry would fail the exact
     # same way. Check upfront (before any S3 gather/Claude work) and bail
@@ -887,6 +900,10 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         # wording is not settled, so this is how the real strings get known
         # without guessing at them.
         'device_announcements': announcement_stats,
+        # Which round of the final chain produced this. 0 for a live pass and
+        # for the first final; >0 means an earlier final published a narrower
+        # session and this one was asked to redo it.
+        'generation': generation,
         # Stamped at WRITE time, not at entry: the throttle above measures "how
         # long since the last extraction finished". Stamping at entry would
         # backdate it by the whole LLM round-trip and let the next trigger
@@ -903,19 +920,31 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
     )
     if overtook_final:
         _request_final_rerun(bucket, user_folder, date, session_base)
+    if final:
+        # Strictly after the write — see the docstring, the ordering is the fix.
+        _rerun_if_the_session_grew(bucket, user_folder, date, session_base,
+                                   keys, generation)
     return extraction
 
 
-def _request_final_rerun(bucket, user_folder, date, session_base):
-    """A live pass just replaced a FINAL extraction because it had strictly more
-    of the session. That restores the missing content but drops the quality back
-    to fast-tier, so ask for another final pass over the fuller set.
+def _request_final_rerun(bucket, user_folder, date, session_base, generation=0,
+                         reason="overtook an early final pass"):
+    """Ask for another final pass over a fuller transcript set.
 
-    Self-limiting: the request only goes out when coverage GREW past a published
-    final, and coverage stops growing when the transcripts stop arriving, so the
-    live/final ping-pong terminates on its own. Best-effort — never let telemetry
-    for a quality re-run fail an extraction that already succeeded — but never
-    silent either (CLAUDE.md BUG-40)."""
+    Two callers, same request:
+      - a LIVE pass that just replaced a FINAL because it had strictly more of
+        the session — that restores the missing content but drops the quality
+        back to fast-tier, so buy it back;
+      - a FINAL pass that finished and found the session had grown underneath it
+        while it was thinking.
+
+    Self-limiting: a request only goes out when coverage GREW strictly, and
+    coverage stops growing when the transcripts stop arriving. `generation`
+    bounds the case where that assumption is wrong — something rewriting keys in
+    a loop would otherwise chain final passes forever.
+
+    Best-effort — never let telemetry for a quality re-run fail an extraction
+    that already succeeded — but never silent either (CLAUDE.md BUG-40)."""
     device_sid = session_base[3:] if session_base.startswith('sid') else None
     if not device_sid:
         return                            # legacy whole-file base: no final pass exists
@@ -924,13 +953,64 @@ def _request_final_rerun(bucket, user_folder, date, session_base):
             Bucket=bucket,
             Key=f"{FINAL_REQUESTS_PREFIX}{device_sid}.json",
             Body=json.dumps({"userFolder": user_folder, "date": date,
-                             "sessionBase": session_base}),
+                             "sessionBase": session_base,
+                             "generation": generation}),
             ContentType='application/json',
         )
-        logger.info("%s: overtook an early final pass -- requested a re-run over the "
-                    "fuller transcript set", session_base)
+        logger.info("%s: %s -- requested a re-run over the fuller transcript set "
+                    "(generation %d)", session_base, reason, generation)
     except Exception:
         logger.exception("%s: could not request a final re-run", session_base)
+
+
+def _rerun_if_the_session_grew(bucket, user_folder, date, session_base,
+                               gathered_keys, generation):
+    """Called by a FINAL pass AFTER it has written, never before.
+
+    The final pass lists the session once, then spends ~170s in a thinking call.
+    On the session this was written for, 21 transcripts landed during that call
+    and the pass published a record ending ten minutes early — with nothing
+    saying so. The live pass has had a coverage re-check since BUG-43; the final
+    pass never did, and it is the one that writes LAST, so no trigger remained
+    to notice.
+
+    Two things here are load-bearing:
+
+    1. **After the write, not before.** Re-listing first reopens the window this
+       closes: a transcript landing between the re-list and the put_object is
+       caught by neither this pass nor a live pass that already did its own
+       write-time re-read. Written first, anything landing before the re-list is
+       caught here, and anything after it triggers a live pass that reads the
+       published narrow final, overtakes it, and re-requests through the path
+       that already exists.
+
+    2. **S3 keys compared to S3 keys**, not to `source_transcripts`.
+       assemble_deduped_turns drops corrupt and unnormalizable segments — the
+       session this was written for had three — so comparing against what was
+       successfully PARSED would see those three as new on every round and burn
+       the whole generation budget on identical re-runs. That would manufacture
+       exactly the cost this is meant to avoid.
+    """
+    try:
+        fresh = gather_session_segments(bucket, user_folder, date, session_base)
+    except Exception:
+        # A listing failure must not fail an extraction that already succeeded.
+        logger.exception("%s: could not re-list the session after writing",
+                         session_base)
+        return
+    if not set(fresh) > set(gathered_keys):
+        return
+    grew_by = len(set(fresh) - set(gathered_keys))
+    if generation + 1 >= FINAL_RERUN_MAX_GENERATIONS:
+        logger.warning(
+            "%s: session grew by %d transcript(s) during the final pass, but "
+            "generation %d has reached FINAL_RERUN_MAX_GENERATIONS (%d) -- NOT "
+            "re-running. The published extraction is missing those segments.",
+            session_base, grew_by, generation, FINAL_RERUN_MAX_GENERATIONS)
+        return
+    _request_final_rerun(bucket, user_folder, date, session_base,
+                         generation=generation + 1,
+                         reason=f"session grew by {grew_by} transcript(s) mid-pass")
 
 
 # ============================================================
@@ -939,8 +1019,12 @@ def _request_final_rerun(bucket, user_folder, date, session_base):
 
 def parse_final_request(bucket, key):
     """Read an `extraction_requests/{session}.json` artifact and return
-    (user_folder, date, session_base), or None when it's unreadable or missing
-    a field. The artifact is written by the in-VPC finalize sweep once a session
+    (user_folder, date, session_base, generation), or None when it's unreadable
+    or missing a field. `generation` counts how many times a final pass has
+    already re-requested itself for this session; it is absent on every artifact
+    the finalize sweep writes, and on every artifact written before the field
+    existed, and both mean 0.
+    The artifact is written by the in-VPC finalize sweep once a session
     closes: an in-VPC Lambda cannot invoke another Lambda (no NAT / no VPC
     endpoint -- CLAUDE.md BUG-36 black-holes the call until timeout), but it CAN
     write to S3 through the gateway endpoint, so the request rides the same
@@ -965,7 +1049,15 @@ def parse_final_request(bucket, key):
                        "Present: %s", key, missing,
                        {k: v for k, v in fields.items() if v})
         return None
-    return fields['userFolder'], fields['date'], fields['sessionBase']
+    # Absent on every artifact the finalize sweep writes, and on every artifact
+    # written before this field existed -- both mean "first round".
+    try:
+        generation = int(req.get('generation') or 0)
+    except (TypeError, ValueError):
+        logger.warning("Final-extraction request %s has an unusable generation "
+                       "(%r) -- treating as 0", key, req.get('generation'))
+        generation = 0
+    return fields['userFolder'], fields['date'], fields['sessionBase'], generation
 
 
 def lambda_handler(event, context):
@@ -976,9 +1068,9 @@ def lambda_handler(event, context):
             parsed = parse_final_request(S3_BUCKET, key)
             if parsed is None:
                 continue          # already logged; a raise would retry-storm a dead artifact
-            user_folder, date, session_base = parsed
+            user_folder, date, session_base, generation = parsed
             results.append(extract_session(S3_BUCKET, user_folder, date, session_base,
-                                           final=True))
+                                           final=True, generation=generation))
             continue
         parsed = session_base_from_key(key)
         if parsed is None:
