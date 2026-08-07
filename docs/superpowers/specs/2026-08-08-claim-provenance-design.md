@@ -84,9 +84,12 @@ time verification runs, `assemble_deduped_turns` has returned; its
 `normalized_list` is out of scope, and a turn dict carries
 `speaker/text/start_sec/end_sec/abs_start/abs_end` and **no filename**
 (`transcript_utils.py:382-391`). So Phase A stamps `source_filename` onto each
-turn inside the assembly loop (`lambda_extract_session.py:734-738`). This is
-safe: `_dedup_turn_boundaries` copies turns with `dict(t, ...)` (`:382`), so
-extra keys survive.
+turn inside the assembly loop (`lambda_extract_session.py:734-738`, where each
+`normalized` already carries its `filename` — `transcript_utils.py:353`). This is
+safe: `_dedup_turn_boundaries` rebuilds turns with `dict(t, text=…)`
+(**`lambda_extract_session.py:382`** — not the `transcript_utils` line of the
+same number), so extra keys survive, and untrimmed turns pass through by
+reference.
 
 `offset_sec` is then the matched turn's `start_sec`, which is already the
 in-file offset (turn times are relative to segment start,
@@ -212,12 +215,15 @@ number would be biased in a language-correlated way on a bilingual product. The
 floor counts **CJK characters at roughly 2 chars ≈ 1 token**, or equivalently a
 per-script minimum; a mixed quote uses the sum.
 
-**Status is per quote.** The topic rollup is a total order, not a description:
+**Status is per quote** — except `absent`, which is topic-level only and means
+the model returned no citation at all. The rollup is a total order, not a
+description, and the empty case is tested **first** so the "worst remaining"
+rule is never a minimum over an empty set:
 
+0. empty or missing `evidence` list → `absent`
 1. any `unverified` → topic is `unverified`
 2. else any `unchecked` → topic is `unchecked`
 3. else the **worst** remaining: `weak` < `verified_fuzzy` < `verified`
-4. empty or missing `evidence` list → `absent`
 
 `unchecked` propagates rather than being masked by a sibling: a verifier crash
 beside one good citation must not read as a clean topic — that is the exact
@@ -436,6 +442,17 @@ column stays and is simply not filled.
 
 ## Out of scope
 
+- **Multi-device (group) extractions.** This is a real exclusion, not a
+  convenience one, and it exists because the matcher would otherwise contradict
+  this spec's own §1. The matcher windows candidates on `[at − W, at + W]` in
+  absolute time, while `assemble_group_turns` keeps per-device turn lists
+  *precisely because there is no shared clock* — a 12-hour skew is shipped
+  history. An honest quote from device B would sit far outside `W` of an `at` on
+  device A's clock and be manufactured into an `unverified`, poisoning the one
+  number Phase A exists to produce. Group extraction is not yet invoked from
+  `extract_session` in any case. When it is, the matcher must window **per
+  source, on each device's own clock**, and anchor to the matched device's
+  segment — specified then, with group audio in hand, not guessed at now.
 - Changing the ASR provider, `VAD_THRESHOLD`, or `DROP_SILENT_CHUNKS`
 - Evidence on action items (Phase A is topics only — see Storage)
 - Speaker identity or diarisation quality
