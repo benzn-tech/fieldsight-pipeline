@@ -167,6 +167,65 @@ existing infra and avoids per-chunk scheduling machinery.
   time.
 - Output: `sessions/{user}/{date}/{session_base}.wav` + `..._stitchmap.json`.
 
+### 6.4a Remove the device's chunk overlap BEFORE stitching
+
+> **Addendum 2026-08-07.** This section did not exist in the original spec, which was
+> written on 2026-07-23 — before the mobile chunk-session contract shipped. §6.4 as
+> written concatenates every chunk's speech regions, and those regions now contain
+> **deliberately duplicated audio**. Stitching them unchanged records each seam
+> sentence twice.
+
+The device carries the tail of chunk N into the head of chunk N+1
+(`AudioSegmentation.PcmRingBuffer` — "a sentence crossing a boundary appears whole in
+both"), so a boundary sentence is never cut in half. The overlap length is
+**deliberately not on the wire**, so the backend cannot read it; `chunk_stitch.py`
+recovers it at the **text** level by finding the longest repeated word-run at a seam.
+
+**Measured on production data** (`Sam_Yu / 2026-08-03 / sid622a0e7f…`, 260 chunks):
+
+| quantity | value | frequency |
+|---|---|---|
+| VAD region duration (`to − off`) | 30.0 s | 254 / 260 |
+| consecutive chunk start gap | 28.0 s | 249 / 259 |
+| **implied audio overlap** | **2.0 s** | |
+
+Note this also settles OI-1: chunk duration is **30 s, not the "nominal 3 min"** the
+original assumed, and chunk filenames do carry a reliable per-chunk start wall-clock.
+
+If the overlap is not removed from the audio, three things follow, and the third is
+the one that breaks the spec's own headline invariant:
+
+1. The session transcript repeats every seam sentence. `chunk_stitch` will not clean
+   this up — it runs on the per-chunk path, not on a whole-session transcript.
+2. Diarization hears the same two seconds twice. Identity usually survives that; turn
+   boundaries do not.
+3. **Two distinct positions in stitched time map to the same real time**, so the
+   stitch map stops being a function. §4 calls absolute-time correctness the #1
+   acceptance criterion, and duplicated audio violates it before any restore code runs.
+
+**Removal, at each seam, in this order:**
+
+1. **Estimate** from the filenames: `overlap ≈ prev_region_duration − (start_{N+1} −
+   start_N)`. Clamp to `[0, MAX_OVERLAP_S]` (3.0 s). A negative or oversized value
+   means the chunks are not contiguous — see the discontinuity case below — and the
+   estimate becomes 0.
+2. **Refine** by cross-correlating the last `2 × MAX_OVERLAP_S` of the running stream
+   against the head of the incoming region, taking the lag that maximises correlation.
+   Filename timestamps are whole seconds, so the estimate alone carries up to ±1 s of
+   error against a 2 s overlap — half of it. The audio is already a numpy array at
+   this point (BUG-04/BUG-06 require that), and correlating ~96k samples is
+   negligible beside the ffmpeg decode already happening.
+3. **Fall back** to the clamped estimate when correlation is weak (silence at the
+   seam gives no peak). Prefer trimming **less** than more: leftover duplication is
+   cleaned downstream by the existing text-level dedup, whereas over-trimming deletes
+   speech that no later stage can recover.
+4. **Record the trim in the stitch map**, so restored times stay monotonic. The map
+   entry for a trimmed region starts at its post-trim real time, not its nominal one.
+
+**Do not simply hard-code 2.0 s.** The measurement above is one session on one device
+build; the ring buffer's size is a mobile implementation detail that can change
+without any backend deploy, which is precisely why it is not on the wire.
+
 ### 6.5 Whole-session diarize (reuse PR #116)
 
 The stitched WAV lands under a session prefix whose `ObjectCreated` triggers the
@@ -238,6 +297,16 @@ toggles.
   and the stitched file are retained so nothing is lost.
 - **Idempotency:** re-processing a closed session overwrites the same
   `session_base` outputs deterministically.
+- **Discontinuous chunks inside one session (addendum 2026-08-07):** consecutive
+  chunk indices do **not** imply consecutive time. The measured session has one seam
+  where `c{N}` and `c{N+1}` are **806 seconds apart** — a 13-minute pause mid-session,
+  with the index sequence unbroken. Four further seams show a 30 s gap against a 30 s
+  region, i.e. **no overlap at all**. So the overlap estimator in §6.4a must derive
+  per seam and clamp, never assume a constant; and the stitch map must never infer a
+  region's real time from its index.
+- **Overlap larger than a whole region:** a short VAD region (3 s was observed) can be
+  entirely inside the previous chunk's overlap. Trimming must be able to drop a region
+  completely rather than produce a negative length.
 
 ## 10. Testing
 
@@ -253,12 +322,24 @@ toggles.
 - **Speaker consistency (integration, test stack):** a real multi-chunk recording
   yields one diarized transcript whose speaker labels are stable across chunk
   boundaries (the whole point).
+- **Overlap removal (unit, addendum 2026-08-07):** synthetic chunks built with a known
+  duplicated tail stitch to a stream containing that audio exactly once; a seam with
+  silence falls back to the timestamp estimate; a seam whose chunks are 806 s apart
+  trims nothing; a region shorter than the overlap is dropped whole, not negative.
+- **Overlap removal (parity):** the session transcript from a real chunked recording
+  contains each seam sentence **once**. Assert on the text, not on the sample count —
+  a sample-count assertion passes while the words are still doubled.
 - **Default-safe:** with `SESSION_CONTINUITY=off`, all existing tests pass unchanged.
 
 ## 11. Open items (resolve during implementation)
 
-- **OI-1:** Confirm the exact chunk duration source (media metadata vs nominal 3 min)
-  and whether chunk filenames reliably encode start wall-clock for gap detection.
+- ~~**OI-1:** Confirm the exact chunk duration source (media metadata vs nominal 3 min)
+  and whether chunk filenames reliably encode start wall-clock for gap detection.~~
+  **Answered 2026-08-07 from production data** (§6.4a): chunks are **30 s, not 3 min**;
+  filenames do carry a reliable per-chunk start wall-clock, but only to **whole-second**
+  granularity — which is why §6.4a refines the overlap by correlation rather than
+  trusting the arithmetic. Duration should still come from the decoded media, not from
+  the nominal value: 6 of 260 regions were not 30 s.
 - **OI-2:** Confirm whether stitched-session diarization on long files (up to
   `SESSION_MAX_MINUTES`) stays within ElevenLabs limits / cost expectations
   (scribe_v2 auto-splits ≥8 min internally but returns one reconciled result).
