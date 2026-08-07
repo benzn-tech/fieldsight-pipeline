@@ -481,6 +481,20 @@ Parameters:
       survives a deploy: a value set only on the live function is erased the
       next time CloudFormation reconciles the environment.
 
+  NormaliseAudio:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether VadFunction compresses and loudness-normalises audio before it is
+      written to audio_segments/. Site recordings average -39.7 dBFS; untreated,
+      seven identical transcription requests on one real clip returned 173-815
+      words and two of them silently discarded the first two minutes. Treated,
+      three runs returned 415/410/465 and all found three speakers. The raw
+      upload under users/.../audio/ is never touched either way. Declared here
+      so the rollback survives a deploy — a value set only on the live function
+      is erased the next time CloudFormation reconciles the environment.
+
   MultiTenantResolution:
     Type: String
     Default: 'false'
@@ -783,6 +797,10 @@ Resources:
           MERGE_GAP: '2.0'
           VAD_THRESHOLD: !Ref VadThreshold
           DROP_SILENT_CHUNKS: !Ref DropSilentChunks
+          # Compression + loudnorm before ASR. See lambda_vad NORMALISE_AUDIO —
+          # the biggest measured effect on transcription reproducibility, and it
+          # touches only audio_segments/, never the uploaded original.
+          NORMALISE_AUDIO: !Ref NormaliseAudio
           SAMPLE_RATE: '16000'
           SKIP_EXISTING: 'true'
           GENERATE_PREVIEW: 'true'
