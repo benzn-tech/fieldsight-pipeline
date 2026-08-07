@@ -94,3 +94,55 @@ def test_an_unprovisioned_account_still_reports_its_device(monkeypatch):
 
     assert res["statusCode"] == 403          # caller guard still rejects
     assert recorded[0]["asset_tag"] == "FS-07"  # but the device was recorded
+
+
+# --- the backlog uplink ----------------------------------------------------
+
+def _status_event(headers, body='{"pending": 3, "frozen": 1, "dead": 0}'):
+    return {
+        "httpMethod": "POST",
+        "path": "/api/org/device/status",
+        "queryStringParameters": None,
+        "body": body,
+        "headers": headers,
+        "requestContext": {"authorizer": {"claims": {"sub": "sub-1"}}},
+    }
+
+
+def test_device_status_answers_before_the_caller_guard(monkeypatch):
+    """A device whose account is not provisioned still gets to report its backlog.
+
+    Placed with the heartbeat, ahead of the caller guard, for the same reason: the
+    device most worth hearing from is the one whose account is not yet right, and a
+    403 would discard exactly that report.
+    """
+    monkeypatch.setattr(org, "get_connection", lambda *a, **k: FakeConn())
+    monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: None)
+    monkeypatch.setattr(org.device_heartbeat, "record", lambda conn, ident, sub: None)
+    monkeypatch.setattr(org.device_heartbeat, "device_id", lambda conn, ident: "dev-1")
+    seen = []
+    monkeypatch.setattr(org.device_status, "record",
+                        lambda conn, dev, vitals: seen.append((dev, vitals))
+                        or {"serverBuild": "abc123", "thaw": []})
+
+    res = org.lambda_handler(_status_event({"X-Device-Tag": "FS-07"}), None)
+
+    assert res["statusCode"] == 200
+    import json as _json
+    assert _json.loads(res["body"]) == {"serverBuild": "abc123", "thaw": []}
+    assert seen[0][0] == "dev-1"
+    assert seen[0][1]["pending"] == 3
+
+
+def test_device_status_phase1_promises_no_thaw(monkeypatch):
+    """End to end through the real device_status: the channel exists and stays shut."""
+    monkeypatch.setattr(org, "get_connection", lambda *a, **k: FakeConn())
+    monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: dict(CALLER))
+    monkeypatch.setattr(org.device_heartbeat, "record", lambda conn, ident, sub: None)
+    monkeypatch.setattr(org.device_heartbeat, "device_id", lambda conn, ident: None)
+
+    res = org.lambda_handler(_status_event({"X-Device-Tag": "FS-07"}), None)
+
+    import json as _json
+    assert res["statusCode"] == 200
+    assert _json.loads(res["body"])["thaw"] == []

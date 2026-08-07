@@ -67,6 +67,15 @@ Parameters:
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: Disable in test to avoid polling RealPTT / generating reports on cron.
+  ServerBuild:
+    Type: String
+    Default: ''
+    Description: >-
+      The deployed git sha, reported to devices on POST /org/device/status.
+      A device stamps it on any upload it freezes, so a later deploy is recognised as
+      "the thing that broke this may now be fixed" and the record thaws WITHOUT anyone
+      remembering to thaw it. Empty default means the wire reports null, which devices
+      read as unknown and never as a change.
   EnableFinalize:
     Type: String
     Default: 'false'
@@ -1176,6 +1185,8 @@ Resources:
           # AUTHORITY_FLIP (IngestFunction, above): Parameter default 'false',
           # driven per-environment by a repo variable in the deploy workflows.
           GRADED_ROLES: !Ref GradedRoles
+          # Deploy = thaw. See the ServerBuild parameter.
+          SERVER_BUILD: !Ref ServerBuild
           # QR passwordless login (2026-07-30) — PROD-ONLY (see IsProdWithOrgApi
           # condition + QrLoginCodesTable). Test's OrgApi omits this var
           # entirely (!Ref AWS::NoValue) — v1 has no test create endpoint.
