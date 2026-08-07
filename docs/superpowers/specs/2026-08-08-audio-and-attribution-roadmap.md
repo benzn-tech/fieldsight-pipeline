@@ -178,6 +178,26 @@ the ground truth with n≥3, then decide the switch, then build the stitch.
 Also unresolved before any switch: ElevenLabs quota economics. Fifteen five-minute runs
 exhausted a 10,000-credit allowance during this evaluation.
 
+**The switch already happened while this was being written.** As of 2026-08-08 both
+stages run `ASR_PROVIDER=elevenlabs` (PR #280, prod deployed 13:53 UTC 08-07). Two
+consequences that were not part of the decision above:
+
+- **Prod has not transcribed anything on ElevenLabs yet** — zero
+  `fieldsight-prod-transcribe` log events since the deploy, because it landed at 01:53 NZ
+  and no one has recorded since. The first real prod run will be the morning after. Test
+  did transcribe successfully on it at 12:54 UTC 08-07 (6 words, 4 items), so the key had
+  quota after the evaluation burn — but prod's first run is still unproven.
+- **ElevenLabs emits bracketed audio-event tags that AWS Transcribe never did** —
+  observed on real test transcripts: `[background noise]`, `[话筒碰撞声]`, `[吸气声]`,
+  `[点击鼠标]` / `[鼠标点击]`. These land in the extraction prompt as if they were speech.
+  Small in the sample available (6 tags across 6 transcripts, none of which is *only*
+  tags), and the Chinese ones are on genuinely Chinese-spoken audio rather than
+  hallucinated onto English — so this is a quality item, not a correctness bug. Worth
+  stripping in turn assembly next to the device-announcement filter; deliberately **not**
+  bundled into tonight's deploy, because the sample is thin and tonight's goal is a
+  coherent build rather than a larger one. Note the tag naming is not stable
+  (`点击鼠标` vs `鼠标点击`), so strip the bracket form, not a phrase list.
+
 ### P3 — Device-side gain, and microphone placement
 
 The only thing the backend **cannot** repair. The distant speakers are captured at about
