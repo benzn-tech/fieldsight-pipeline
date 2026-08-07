@@ -98,16 +98,32 @@ TRUNCATION_HEAD_SHARE = 0.6
 # means every device announces start and stop and every nearby device hears it,
 # so the count of these grows with the square of the crew size.
 #
-# Matched against the WHOLE normalised turn, never as a substring: "we should
-# stop recording now" is a person talking about the recorder and must survive.
-# The length guard is the second half of that promise.
+# Matched a whole SENTENCE at a time, never as a substring, and every sentence
+# in the turn has to match: "we should stop recording now" is a person talking
+# about the recorder and must survive. The length guard is the other half of
+# that promise.
 DEVICE_ANNOUNCEMENT_MAX_CHARS = int(
     os.environ.get('DEVICE_ANNOUNCEMENT_MAX_CHARS', '60'))
-# Overridable as a JSON list so a phrase discovered in prod can be added without
-# a code deploy. The app's prompt audio (res/raw/recording_started.mp3 and
-# siblings) was staged on 2026-08-07 and is not wired to any Kotlin yet, so the
-# exact wording it will use is not yet fixed — hence patterns rather than
-# literals, and hence the reporting below.
+# Overridable as a JSON list (see the DeviceAnnouncementPatterns parameter) so a
+# phrase met in the field can be added without a code change. Patterns rather
+# than literals because a transcriber renders the same prompt differently across
+# engines and runs, and because the app can change its wording without telling
+# the backend — which is also why the artifact reports what was removed.
+#
+# These are the app's four voice lines as of GrandTime PR #13 (merged
+# 2026-08-07, wired and verified in the release apk — an earlier version of this
+# comment said they were staged but unwired, which was wrong):
+#
+#   recording_started : "Recording started."
+#   recording_stopped : "Recording stopped."
+#   meeting_prompt    : "Recording stopped. Has the meeting ended? Check the screen."
+#   meeting_ended     : "Meeting ended. Recording stopped."
+#
+# Two of those are MULTI-SENTENCE, which is why matching is done per sentence
+# rather than over the whole turn: a whole-turn match caught only the first two.
+# Per-sentence also covers the likelier field case — the prompts have audible
+# pauses between sentences, so a transcriber may well emit them as separate
+# turns, and each one has to be recognisable on its own.
 _DEFAULT_ANNOUNCEMENT_PATTERNS = [
     # `stopp?` because English doubles the consonant: "stop", "stopped",
     # "stopping". Without it "Stopped recording." walks straight through, which
@@ -117,6 +133,16 @@ _DEFAULT_ANNOUNCEMENT_PATTERNS = [
     r"(the\s+)?meeting\s+(has\s+)?(start|stopp?|end)(ed|ing)?",
     r"(start|end)\s+of\s+(the\s+)?meeting",
     r"record(ing)?\s+(started|stopped|ended)",
+    # From meeting_prompt. "check the screen" is deliberately NOT here on its
+    # own: a person can plausibly say exactly that on a site, and it carries no
+    # recording vocabulary to distinguish it. It is only ever dropped as part of
+    # a turn whose other sentences are announcements.
+    r"has\s+the\s+meeting\s+ended",
+]
+# Sentences that are not announcements by themselves, but are recognisable as
+# prompt text when they arrive attached to one.
+_ANNOUNCEMENT_COMPANIONS = [
+    r"check\s+the\s+screen",
 ]
 
 
@@ -127,7 +153,13 @@ def _announcement_patterns():
     try:
         loaded = json.loads(raw)
         if isinstance(loaded, list) and all(isinstance(p, str) for p in loaded):
-            return loaded
+            # An EMPTY list means "use the defaults", not "filter nothing".
+            # '[]' is what both deploy workflows send when the repo variable is
+            # unset, because SAM's --parameter-overrides rejects a bare "Key="
+            # with an empty value. Reading it as "disable the filter" would turn
+            # the feature off on every stack that has not set the variable —
+            # which is all of them — silently.
+            return loaded or _DEFAULT_ANNOUNCEMENT_PATTERNS
         logger.warning("DEVICE_ANNOUNCEMENT_PATTERNS is not a list of strings; "
                        "using defaults")
     except Exception as e:
@@ -147,10 +179,34 @@ def _normalise_for_match(text):
 
 
 def is_device_announcement(text):
-    normalised = _normalise_for_match(text)
-    if not normalised or len(normalised) > DEVICE_ANNOUNCEMENT_MAX_CHARS:
+    """True when every sentence of the turn is recorder prompt text.
+
+    Per sentence, not per turn: two of the four voice lines are multi-sentence
+    ("Meeting ended. Recording stopped."), and a whole-turn match caught neither.
+
+    "Every sentence" is what keeps a person safe. A turn has to be prompt text
+    end to end, so "Recording stopped. I'll redo that bit." survives — the second
+    sentence is a person reporting a gap in the record, which is the most useful
+    thing they could say, and it is exactly what a first-sentence-only rule would
+    have deleted.
+    """
+    if not text or len(_normalise_for_match(text)) > DEVICE_ANNOUNCEMENT_MAX_CHARS:
         return False
-    return any(re.fullmatch(p, normalised) for p in _announcement_patterns())
+    patterns = _announcement_patterns()
+    sentences = [_normalise_for_match(s) for s in re.split(r'[.!?]+', text)]
+    sentences = [s for s in sentences if s]
+    if not sentences:
+        return False
+    matched_an_announcement = False
+    for sentence in sentences:
+        if any(re.fullmatch(p, sentence) for p in patterns):
+            matched_an_announcement = True
+        elif not any(re.fullmatch(p, sentence) for p in _ANNOUNCEMENT_COMPANIONS):
+            return False
+    # A turn of nothing but companions ("Check the screen.") is not an
+    # announcement — it needs at least one sentence that actually names the
+    # recorder, or a person saying those three words loses their turn.
+    return matched_an_announcement
 
 
 def filter_device_announcements(turns):
@@ -195,9 +251,21 @@ MIN_REEXTRACT_INTERVAL_S = 90
 TIER_LIVE = 'live'
 TIER_FINAL = 'final'
 # Zero overlap with transcripts/ (this Lambda's other trigger) and with
-# extractions/ (its own output -- BUG-13), so no notification is ambiguous and
-# nothing can re-trigger itself.
+# extractions/ (its own output -- BUG-13), so no notification is ambiguous.
+#
+# It DOES re-trigger itself, deliberately: a final pass that finds the session
+# grew while it was thinking writes another request here (see extract_session).
+# That is a self-trigger in BUG-13's sense, so it is bounded twice over -- a
+# round only happens when the transcript set grew STRICTLY, and growth stops
+# when transcripts stop, with FINAL_RERUN_MAX_GENERATIONS as the backstop for
+# the case where that assumption is wrong.
 FINAL_REQUESTS_PREFIX = 'extraction_requests/'
+# How many times a final pass may ask for a fresher final pass. Reached only if
+# transcripts keep arriving for longer than N thinking calls (~170s each), which
+# on the evidence does not happen -- or if something is rewriting keys in a loop,
+# which is exactly what this bounds.
+FINAL_RERUN_MAX_GENERATIONS = int(
+    os.environ.get('FINAL_RERUN_MAX_GENERATIONS', '3'))
 
 _s3_client = None
 _sites_cache = None
@@ -591,6 +659,26 @@ def process_declared_site(declared):
 # Core: extract one session
 # ============================================================
 
+def _is_empty_transcript(data):
+    """True when this IS a transcript and it simply holds no words.
+
+    Deliberately conservative: anything that is not recognisably a
+    well-formed-but-empty transcript is left to be reported as unreadable, so a
+    genuinely broken file is never quietly downgraded to "nothing was said".
+    """
+    if not isinstance(data, dict):
+        return False
+    results = data.get('results')
+    if not isinstance(results, dict):
+        return False
+    transcripts = results.get('transcripts')
+    if not isinstance(transcripts, list):
+        return False
+    text = ''.join((t or {}).get('transcript') or '' for t in transcripts
+                   if isinstance(t, dict))
+    return not text.strip()
+
+
 def assemble_deduped_turns(bucket, keys):
     """Download + normalize each transcript segment for a session (skipping
     corrupt / unnormalizable ones), collect its abs-timed speaker turns, order
@@ -612,7 +700,31 @@ def assemble_deduped_turns(bucket, keys):
         filename = key.rsplit('/', 1)[-1]
         normalized = normalize_transcript(data, filename)
         if normalized is None:
-            logger.warning(f"Skipping unnormalizable transcript segment {key}")
+            # normalize_transcript returns None for BOTH "this file is not a
+            # transcript I can read" and "this is a perfectly good transcript
+            # with no words in it" (transcript_utils: `not parsed['full_text']`).
+            # Reporting them with one message cost a real investigation: nine
+            # segments of one prod session were logged as "unnormalizable", which
+            # reads as corruption, and they were empty transcripts of chunks VAD
+            # had already judged silent.
+            #
+            # The distinction now matters more than it did. With
+            # DROP_SILENT_CHUNKS on, a silent chunk is never transcribed at all —
+            # so from here on an EMPTY transcript means the transcriber found
+            # nothing in audio that VAD DID judge to be speech. That is the
+            # too-quiet signal the loudness work targets, and it is the metric
+            # for whether that work helped. Filed under the same message as a
+            # corrupt file, it is invisible.
+            if _is_empty_transcript(data):
+                logger.info(
+                    "No words in transcript %s -- the transcriber returned an "
+                    "empty result. This is NOT a parse failure: either the chunk "
+                    "was silent, or the speech in it was too quiet to recognise.",
+                    key)
+            else:
+                logger.warning("Skipping unreadable transcript segment %s "
+                               "(present, but not in a shape we can normalise)",
+                               key)
             continue
 
         normalized_list.append(normalized)
@@ -769,7 +881,8 @@ def _supersedes(new_sources, prev):
 
 
 def extract_session(bucket, user_folder, date, session_base, final=False,
-                    min_interval_s=MIN_REEXTRACT_INTERVAL_S, now=None):
+                    min_interval_s=MIN_REEXTRACT_INTERVAL_S, now=None,
+                    generation=0):
     # M-5: a stack missing the secret must not retry-storm -- an S3 event
     # retries on a raised exception, and every retry would fail the exact
     # same way. Check upfront (before any S3 gather/Claude work) and bail
@@ -887,6 +1000,10 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         # wording is not settled, so this is how the real strings get known
         # without guessing at them.
         'device_announcements': announcement_stats,
+        # Which round of the final chain produced this. 0 for a live pass and
+        # for the first final; >0 means an earlier final published a narrower
+        # session and this one was asked to redo it.
+        'generation': generation,
         # Stamped at WRITE time, not at entry: the throttle above measures "how
         # long since the last extraction finished". Stamping at entry would
         # backdate it by the whole LLM round-trip and let the next trigger
@@ -903,19 +1020,31 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
     )
     if overtook_final:
         _request_final_rerun(bucket, user_folder, date, session_base)
+    if final:
+        # Strictly after the write — see the docstring, the ordering is the fix.
+        _rerun_if_the_session_grew(bucket, user_folder, date, session_base,
+                                   keys, generation)
     return extraction
 
 
-def _request_final_rerun(bucket, user_folder, date, session_base):
-    """A live pass just replaced a FINAL extraction because it had strictly more
-    of the session. That restores the missing content but drops the quality back
-    to fast-tier, so ask for another final pass over the fuller set.
+def _request_final_rerun(bucket, user_folder, date, session_base, generation=0,
+                         reason="overtook an early final pass"):
+    """Ask for another final pass over a fuller transcript set.
 
-    Self-limiting: the request only goes out when coverage GREW past a published
-    final, and coverage stops growing when the transcripts stop arriving, so the
-    live/final ping-pong terminates on its own. Best-effort — never let telemetry
-    for a quality re-run fail an extraction that already succeeded — but never
-    silent either (CLAUDE.md BUG-40)."""
+    Two callers, same request:
+      - a LIVE pass that just replaced a FINAL because it had strictly more of
+        the session — that restores the missing content but drops the quality
+        back to fast-tier, so buy it back;
+      - a FINAL pass that finished and found the session had grown underneath it
+        while it was thinking.
+
+    Self-limiting: a request only goes out when coverage GREW strictly, and
+    coverage stops growing when the transcripts stop arriving. `generation`
+    bounds the case where that assumption is wrong — something rewriting keys in
+    a loop would otherwise chain final passes forever.
+
+    Best-effort — never let telemetry for a quality re-run fail an extraction
+    that already succeeded — but never silent either (CLAUDE.md BUG-40)."""
     device_sid = session_base[3:] if session_base.startswith('sid') else None
     if not device_sid:
         return                            # legacy whole-file base: no final pass exists
@@ -924,13 +1053,64 @@ def _request_final_rerun(bucket, user_folder, date, session_base):
             Bucket=bucket,
             Key=f"{FINAL_REQUESTS_PREFIX}{device_sid}.json",
             Body=json.dumps({"userFolder": user_folder, "date": date,
-                             "sessionBase": session_base}),
+                             "sessionBase": session_base,
+                             "generation": generation}),
             ContentType='application/json',
         )
-        logger.info("%s: overtook an early final pass -- requested a re-run over the "
-                    "fuller transcript set", session_base)
+        logger.info("%s: %s -- requested a re-run over the fuller transcript set "
+                    "(generation %d)", session_base, reason, generation)
     except Exception:
         logger.exception("%s: could not request a final re-run", session_base)
+
+
+def _rerun_if_the_session_grew(bucket, user_folder, date, session_base,
+                               gathered_keys, generation):
+    """Called by a FINAL pass AFTER it has written, never before.
+
+    The final pass lists the session once, then spends ~170s in a thinking call.
+    On the session this was written for, 21 transcripts landed during that call
+    and the pass published a record ending ten minutes early — with nothing
+    saying so. The live pass has had a coverage re-check since BUG-43; the final
+    pass never did, and it is the one that writes LAST, so no trigger remained
+    to notice.
+
+    Two things here are load-bearing:
+
+    1. **After the write, not before.** Re-listing first reopens the window this
+       closes: a transcript landing between the re-list and the put_object is
+       caught by neither this pass nor a live pass that already did its own
+       write-time re-read. Written first, anything landing before the re-list is
+       caught here, and anything after it triggers a live pass that reads the
+       published narrow final, overtakes it, and re-requests through the path
+       that already exists.
+
+    2. **S3 keys compared to S3 keys**, not to `source_transcripts`.
+       assemble_deduped_turns drops corrupt and unnormalizable segments — the
+       session this was written for had three — so comparing against what was
+       successfully PARSED would see those three as new on every round and burn
+       the whole generation budget on identical re-runs. That would manufacture
+       exactly the cost this is meant to avoid.
+    """
+    try:
+        fresh = gather_session_segments(bucket, user_folder, date, session_base)
+    except Exception:
+        # A listing failure must not fail an extraction that already succeeded.
+        logger.exception("%s: could not re-list the session after writing",
+                         session_base)
+        return
+    if not set(fresh) > set(gathered_keys):
+        return
+    grew_by = len(set(fresh) - set(gathered_keys))
+    if generation + 1 >= FINAL_RERUN_MAX_GENERATIONS:
+        logger.warning(
+            "%s: session grew by %d transcript(s) during the final pass, but "
+            "generation %d has reached FINAL_RERUN_MAX_GENERATIONS (%d) -- NOT "
+            "re-running. The published extraction is missing those segments.",
+            session_base, grew_by, generation, FINAL_RERUN_MAX_GENERATIONS)
+        return
+    _request_final_rerun(bucket, user_folder, date, session_base,
+                         generation=generation + 1,
+                         reason=f"session grew by {grew_by} transcript(s) mid-pass")
 
 
 # ============================================================
@@ -939,8 +1119,12 @@ def _request_final_rerun(bucket, user_folder, date, session_base):
 
 def parse_final_request(bucket, key):
     """Read an `extraction_requests/{session}.json` artifact and return
-    (user_folder, date, session_base), or None when it's unreadable or missing
-    a field. The artifact is written by the in-VPC finalize sweep once a session
+    (user_folder, date, session_base, generation), or None when it's unreadable
+    or missing a field. `generation` counts how many times a final pass has
+    already re-requested itself for this session; it is absent on every artifact
+    the finalize sweep writes, and on every artifact written before the field
+    existed, and both mean 0.
+    The artifact is written by the in-VPC finalize sweep once a session
     closes: an in-VPC Lambda cannot invoke another Lambda (no NAT / no VPC
     endpoint -- CLAUDE.md BUG-36 black-holes the call until timeout), but it CAN
     write to S3 through the gateway endpoint, so the request rides the same
@@ -965,7 +1149,15 @@ def parse_final_request(bucket, key):
                        "Present: %s", key, missing,
                        {k: v for k, v in fields.items() if v})
         return None
-    return fields['userFolder'], fields['date'], fields['sessionBase']
+    # Absent on every artifact the finalize sweep writes, and on every artifact
+    # written before this field existed -- both mean "first round".
+    try:
+        generation = int(req.get('generation') or 0)
+    except (TypeError, ValueError):
+        logger.warning("Final-extraction request %s has an unusable generation "
+                       "(%r) -- treating as 0", key, req.get('generation'))
+        generation = 0
+    return fields['userFolder'], fields['date'], fields['sessionBase'], generation
 
 
 def lambda_handler(event, context):
@@ -976,9 +1168,9 @@ def lambda_handler(event, context):
             parsed = parse_final_request(S3_BUCKET, key)
             if parsed is None:
                 continue          # already logged; a raise would retry-storm a dead artifact
-            user_folder, date, session_base = parsed
+            user_folder, date, session_base, generation = parsed
             results.append(extract_session(S3_BUCKET, user_folder, date, session_base,
-                                           final=True))
+                                           final=True, generation=generation))
             continue
         parsed = session_base_from_key(key)
         if parsed is None:

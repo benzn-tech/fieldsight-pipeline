@@ -502,6 +502,19 @@ Parameters:
       so the rollback survives a deploy — a value set only on the live function
       is erased the next time CloudFormation reconciles the environment.
 
+  DeviceAnnouncementPatterns:
+    Type: String
+    Default: ''
+    Description: >-
+      Recorder announcement phrases ("Recording started.", "Meeting ended.
+      Recording stopped.") as a JSON list of regexes, matched a sentence at a
+      time against a normalised speaker turn. Empty uses the built-in defaults
+      in lambda_extract_session. A Parameter rather than a literal because the
+      app can change its voice lines without telling the backend — so a phrase
+      met in the field must be addable by setting a repo variable and
+      redeploying, with no code change. Setting it on the live function instead
+      is erased by the next CloudFormation reconcile.
+
   MultiTenantResolution:
     Type: String
     Default: 'false'
@@ -1517,6 +1530,17 @@ Resources:
           # against a longest-real-so-far of 2 hours (which rendered to 128,427
           # and was being cut to 60,000 — see lambda_extract_session).
           TRANSCRIPT_TEXT_LIMIT: '300000'
+          # Recorder announcement phrases, as a JSON list of regexes. Empty
+          # means "use the built-in defaults" (see lambda_extract_session).
+          #
+          # It is a Parameter rather than a literal because the recorders'
+          # wording is not settled — res/raw/recording_started.mp3 and siblings
+          # ship as of GrandTime PR #13 and may yet change wording — so a
+          # phrase found in the field has to be addable without editing code.
+          # Setting it on the live function instead would be erased by the next
+          # CloudFormation reconcile, which is the failure this whole block of
+          # comments exists to prevent.
+          DEVICE_ANNOUNCEMENT_PATTERNS: !Ref DeviceAnnouncementPatterns
       Policies:
         - Version: '2012-10-17'
           Statement:
