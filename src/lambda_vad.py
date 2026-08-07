@@ -795,20 +795,32 @@ def process_single_file(bucket, key, source_info, tmp_dir):
     logger.info(f"  Merged segments: {len(merged_segments)}")
 
     if not merged_segments:
-        logger.info(f"  No speech at threshold={VAD_THRESHOLD}, retrying at 0.25...")
-        
-        # Retry with lower threshold
+        # DERIVED from the configured threshold, never a constant. The retry is
+        # meant to be more permissive, and the old hardcoded 0.25 only was that
+        # while VAD_THRESHOLD kept its 0.5 default. Both environments now run
+        # 0.2, so "retry at 0.25" TIGHTENED the test — it could not succeed, and
+        # every chunk VAD was unsure about went straight to the fallback.
+        #
+        # On one real meeting that was 45 of 129 chunks (36%) recorded with
+        # speech_duration_sec = 0 while their transcripts came back full of
+        # sentences. Transcribe then had to find words in audio the pipeline had
+        # labelled silent, which is where the one- and two-word fragments came
+        # from.
+        retry_threshold = round(VAD_THRESHOLD / 2, 4)
+        logger.info(f"  No speech at threshold={VAD_THRESHOLD}, "
+                    f"retrying at {retry_threshold}...")
         raw_segments_retry = run_silero_vad(
             session, audio_samples, sr,
-            window_ms=32, threshold=0.25
+            window_ms=32, threshold=retry_threshold
         )
         merged_segments = merge_close_segments(
             raw_segments_retry, merge_gap=MERGE_GAP, min_duration=MIN_SPEECH_DURATION
         )
-        logger.info(f"  Retry at 0.25: {len(merged_segments)} segments")
+        logger.info(f"  Retry at {retry_threshold}: {len(merged_segments)} segments")
     
     if not merged_segments:
-        logger.info(f"  Still no speech at 0.25, fallback: sending entire audio to Transcribe")
+        logger.info("  Still no speech after the retry, fallback: "
+                    "sending entire audio to Transcribe")
         
         # Fallback: send entire audio as one segment so Transcribe can try
         # This handles cases where background noise confuses VAD but speech exists
