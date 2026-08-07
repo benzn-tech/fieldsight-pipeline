@@ -68,7 +68,7 @@ def test_ending_a_solo_session_marks_nothing(db):
     _session(db, cid, uid, SOLO)
 
     assert meeting_session.end_group(db, SOLO) == 0
-    assert meeting_session.group_is_ended(db, SOLO) is False
+    assert meeting_session.group_ended_at(db, SOLO) is None
 
 
 def test_ending_a_group_marks_every_member_once(db):
@@ -81,7 +81,7 @@ def test_ending_a_group_marks_every_member_once(db):
     # Second call marks nobody: the timestamp records when the meeting ended,
     # not when the last device got round to asking.
     assert meeting_session.end_group(db, LEAD) == 0
-    assert meeting_session.group_is_ended(db, LEAD) is True
+    assert meeting_session.group_ended_at(db, LEAD) is not None
 
 
 def test_a_device_that_joined_after_the_end_still_reads_ended(db):
@@ -93,7 +93,7 @@ def test_a_device_that_joined_after_the_end_still_reads_ended(db):
 
     own = meeting_session.get(db, LATE)
     assert own["group_ended_at"] is None, "precondition: the late row is unmarked"
-    assert meeting_session.group_is_ended(db, own["group_id"]) is True
+    assert meeting_session.group_ended_at(db, own["group_id"]) is not None
 
 
 def test_settling_waits_for_the_lead(db):
@@ -134,3 +134,47 @@ def test_the_group_is_only_filled_never_cleared(db):
     row = meeting_session.ensure_open(db, J1, cid, uid, None, "audio", None, group_id=None)
 
     assert row["group_id"] == LEAD
+
+
+def test_a_recording_started_after_the_end_is_not_in_the_meeting(db):
+    """The loop, at the SQL layer.
+
+    A device that rejoined after the meeting ended was told to stop on its first
+    upload; that stop wrote another end, which poisoned the next rejoin. Seen in
+    production on 2026-08-07 — two rejoins, killed 37s and 2m17s in.
+
+    What makes the difference is comparing the session's own start against when
+    the meeting ended, so this pins that the timestamp is readable and ordered,
+    not merely present.
+    """
+    cid, uid = _seed(db)
+    _session(db, cid, uid, LEAD, minutes_ago=30)
+    _session(db, cid, uid, J1, group_id=LEAD, minutes_ago=25)
+    assert meeting_session.end_group(db, LEAD) == 2
+
+    ended = meeting_session.group_ended_at(db, LEAD)
+    assert ended is not None
+
+    # A recording that starts now — after the end — must fall on the other side
+    # of that timestamp, which is what lets the upload path leave it alone.
+    _session(db, cid, uid, LATE, group_id=LEAD, minutes_ago=0)
+    late = meeting_session.get(db, LATE)
+    assert late["opened_at"] > ended
+
+
+def test_the_end_time_is_the_first_one_not_the_last(db):
+    """end_group only fills rows that are still NULL, so a later join carries a
+    later stamp. MIN keeps the answer to "when did the meeting end" stable as
+    stragglers arrive — otherwise every new arrival would move the boundary and
+    could pull itself back inside it."""
+    cid, uid = _seed(db)
+    _session(db, cid, uid, LEAD, minutes_ago=30)
+    _session(db, cid, uid, J1, group_id=LEAD, minutes_ago=25)
+    meeting_session.end_group(db, LEAD)
+    first = meeting_session.group_ended_at(db, LEAD)
+
+    _session(db, cid, uid, J2, group_id=LEAD, minutes_ago=0)
+    meeting_session.end_group(db, LEAD)          # marks only the new row
+
+    assert meeting_session.group_ended_at(db, LEAD) == first
+
