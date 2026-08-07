@@ -55,6 +55,13 @@ let one justify or condemn the other.
 **Watch for:** whether compression lifts site noise (machinery, wind) enough to create new
 hallucinations. Measure on the same clip before and after.
 
+**A second, free measure** (found while diagnosing P1c): count the "empty result" log
+line from `assemble_deduped_turns`. With `DROP_SILENT_CHUNKS` on, an empty transcript can
+only mean the transcriber found nothing in audio VAD judged to be speech — the too-quiet
+failure itself. It runs continuously on real sessions and costs no ASR credits, which
+matters because the last evaluation exhausted a 10,000-credit allowance. Use 30-second
+clips for anything that needs repeated ASR calls.
+
 ### P1a — `TRANSCRIPT_TEXT_LIMIT` truncates long sessions
 
 **✅ Decided and implemented 2026-08-08 (PR #283): raise, not chunk.** Chunking means a
@@ -130,9 +137,23 @@ set grew, bounded by a generation counter. Design and the two non-obvious constr
 (order of write vs re-list; compare S3 keys to S3 keys, not to `source_transcripts`) are
 in `2026-08-08-final-pass-coverage-recheck-design.md`.
 
-**Still open, found in the same logs:** three transcripts in that session (`c0004`,
-`c0005`, `c0064`) were dropped as `unnormalizable`. A different silent loss, not yet
-diagnosed.
+**Also found in the same logs, now diagnosed — and it was not a loss.** Nine transcripts
+in that session (`c0004/0005/0064/0093/0095/0096/0104/0110/0111`, 6% of 151) were logged
+as `unnormalizable`. They are 355-byte AWS Transcribe results, `status: COMPLETED`,
+`transcript: ""`, `items: []`, and **every one of their VAD sidecars reads
+`vad_result: fallback_full_audio, speech_duration_sec: 0`** — silent chunks, sent to
+Transcribe by the old fallback, which correctly returned nothing.
+
+The defect was the message. `normalize_transcript` returns `None` for both "no words in
+it" and "not a transcript at all", and the caller reported both as *unnormalizable*,
+which reads as corruption — it is why this line originally said "a different silent
+loss". Fixed in PR #285.
+
+**This one is worth keeping in view for P0's verification.** With `DROP_SILENT_CHUNKS`
+on, a silent chunk is never transcribed at all, so from here an empty transcript means
+**the transcriber found nothing in audio VAD *did* judge to be speech** — the too-quiet
+signal itself. Counting that line before and after normalisation is a cheap, continuous
+measure of whether P0 works, on real sessions, with no ElevenLabs credits spent.
 
 ### P2 — Whole-session diarization, and the provider it runs on
 
