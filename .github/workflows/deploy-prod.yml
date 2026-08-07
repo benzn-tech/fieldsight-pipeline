@@ -175,6 +175,7 @@ jobs:
               "ItemsTableName=fieldsight-items" \
               "ReportsTableName=fieldsight-reports" \
               "AuditTableName=fieldsight-audit" \
+              "DeviceAnnouncementPatterns=${{ vars.PROD_DEVICE_ANNOUNCEMENT_PATTERNS || '[]' }}" \
               "MultiTenantResolution=true" \
               "VadThreshold=${{ vars.PROD_VAD_THRESHOLD || '0.5' }}" \
               "DropSilentChunks=${{ vars.PROD_DROP_SILENT_CHUNKS || 'true' }}" \

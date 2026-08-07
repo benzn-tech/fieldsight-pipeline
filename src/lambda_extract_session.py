@@ -127,7 +127,13 @@ def _announcement_patterns():
     try:
         loaded = json.loads(raw)
         if isinstance(loaded, list) and all(isinstance(p, str) for p in loaded):
-            return loaded
+            # An EMPTY list means "use the defaults", not "filter nothing".
+            # '[]' is what both deploy workflows send when the repo variable is
+            # unset, because SAM's --parameter-overrides rejects a bare "Key="
+            # with an empty value. Reading it as "disable the filter" would turn
+            # the feature off on every stack that has not set the variable —
+            # which is all of them — silently.
+            return loaded or _DEFAULT_ANNOUNCEMENT_PATTERNS
         logger.warning("DEVICE_ANNOUNCEMENT_PATTERNS is not a list of strings; "
                        "using defaults")
     except Exception as e:

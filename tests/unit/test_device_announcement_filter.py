@@ -169,6 +169,33 @@ def test_patterns_are_overridable_without_a_deploy(monkeypatch):
         "an override replaces the defaults rather than adding to them")
 
 
+def test_an_empty_override_list_means_defaults_not_disabled(monkeypatch):
+    """`[]` is exactly what both deploy workflows send when the repo variable is
+    unset — SAM's --parameter-overrides rejects a bare "Key=" with an empty
+    value, so the fallback has to be a non-empty token. Reading `[]` as "filter
+    nothing" would silently disable the feature on every stack that has not set
+    the variable, which is all of them."""
+    monkeypatch.setenv("DEVICE_ANNOUNCEMENT_PATTERNS", "[]")
+    assert les.is_device_announcement("Recording started.")
+
+
+def test_the_pattern_env_var_is_declared_in_the_template():
+    """The docstring above says "overridable without a code deploy". That is
+    only true if CloudFormation owns the variable: a value set on the live
+    function is erased by the next reconcile, which is the trap the template
+    comments for TRANSCRIPT_TEXT_LIMIT and NormaliseAudio were written to
+    prevent. Pinned because the claim and the wiring can drift apart silently."""
+    import os.path
+    root = os.path.join(os.path.dirname(__file__), "..", "..")
+    with open(os.path.join(root, "src", "template.yaml"), encoding="utf-8") as fh:
+        template = fh.read()
+    assert "DEVICE_ANNOUNCEMENT_PATTERNS: !Ref DeviceAnnouncementPatterns" in template
+    assert "DeviceAnnouncementPatterns:" in template
+    for wf in ("deploy.yml", "deploy-prod.yml"):
+        with open(os.path.join(root, ".github", "workflows", wf), encoding="utf-8") as fh:
+            assert "DeviceAnnouncementPatterns=" in fh.read(), wf
+
+
 def test_a_malformed_override_falls_back_loudly(monkeypatch, caplog):
     """Silent fallback would read as "the announcements came back" and send the
     next person to the transcriber (BUG-40)."""
