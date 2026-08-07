@@ -1638,6 +1638,29 @@ Resources:
                 object:
                   key:
                     - prefix: transcripts/
+        # Second source, and the one that survives silence. Since DropSilentChunks
+        # a chunk nobody spoke in produces NO transcript, so the rule above goes
+        # quiet during a lull while the finalize sweep's INFER_IDLE_CLOSE keeps
+        # counting toward SESSION_GAP_MINUTES — the confirmation email would go
+        # out mid-meeting. The VAD sidecar is written for every chunk either way.
+        # Suffix-matched, not prefix-matched: the segment .wav lives under the
+        # same prefix and already reaches us as its transcript.
+        VadSidecarLanded:
+          Type: EventBridgeRule
+          Properties:
+            State: !If [ShouldEnableFinalize, ENABLED, DISABLED]
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - Object Created
+              detail:
+                bucket:
+                  name:
+                    - !Ref IngestBucketName
+                object:
+                  key:
+                    - suffix: _vad_metadata.json
 
   # ----------------------------------------------------------
   # Tier-0 finalize — grace SWEEP (in-VPC) + send WORKER (non-VPC).

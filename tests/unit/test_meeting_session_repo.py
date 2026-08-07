@@ -47,6 +47,11 @@ def test_ensure_open_upserts_without_regressing():
     assert "ON CONFLICT (session_id) DO UPDATE" in sql
     # never overwrites an existing opened_at / status
     assert "COALESCE(meeting_session.opened_at, EXCLUDED.opened_at)" in sql
+    # `kind` fills in like the rest. The VAD sidecar opens the session before any
+    # transcript exists and its key carries no _src{ext} token, so the first
+    # insert legitimately has kind=None; without this the column stays NULL for
+    # the life of the session even though the transcript arrives knowing it.
+    assert "COALESCE(meeting_session.kind, EXCLUDED.kind)" in sql
     assert conn.calls[0]["params"][0] == SID
 
 

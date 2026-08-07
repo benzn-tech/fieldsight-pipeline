@@ -8,8 +8,26 @@ best-effort live `POST /sessions/{id}/open|close` (org-api). Per §8.4 those are
 optimization, never a requirement: "start = first chunk; if close is missing,
 infer close when the session sees no new chunk for SESSION_GAP_MINUTES."
 
-This module is the OPEN + TOUCH half of that durable path. On every transcript
-chunk it:
+This module is the OPEN + TOUCH half of that durable path. It listens on TWO
+per-chunk arrivals, because since 2026-08-08 a chunk with no detected speech is
+dropped rather than transcribed (silence was being fabricated into words; see
+`specs/2026-08-07-asr-hallucination-and-vad-findings.md`). A transcript-only
+touch stream therefore goes quiet during a lull while the sweep's
+`INFER_IDLE_CLOSE` keeps counting — and the confirmation email goes out in the
+middle of the meeting. The two sources are:
+  * `transcripts/…json`   — a chunk that had speech, and
+  * `audio_segments/…_vad_metadata.json` — the VAD sidecar, written for EVERY
+    chunk including a dropped one. **This is the source that does not depend on
+    anybody speaking**, which is the whole point of it being here.
+Both fire for a chunk that HAD speech, so such a chunk touches twice. That is
+deliberate: `last_segment_at` is a high-water mark, so the second touch changes
+nothing the sweep reads, and `segment_count` — the one column that does
+double-count — has no consumer anywhere in the repo (checked 2026-08-08; it is
+written and selected, never read). Keeping both sources means a fault in either
+one still leaves the session opening and the confirmation email going out, which
+is worth more than an exact count nobody looks at.
+
+On either arrival it:
   * OPENs the session from the stream (idempotent ensure_open — a later, or an
     earlier, live `/open` never regresses it), and
   * TOUCHes it at SERVER time so `last_segment_at` tracks server-observed activity
@@ -33,6 +51,10 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 _TRANSCRIPT_KEY_RE = re.compile(r"^transcripts/([^/]+)/([^/]+)/(.+)$")
+# The VAD sidecar. Anchored on the exact suffix so the segment `.wav` sitting
+# beside it under the same prefix is NOT mistaken for a second arrival — that one
+# already reaches us as its transcript.
+_SIDECAR_KEY_RE = re.compile(r"^audio_segments/([^/]+)/([^/]+)/(.+)_vad_metadata\.json$")
 
 
 def _kind_from_key(basename):
@@ -48,18 +70,22 @@ def _kind_from_key(basename):
 
 
 def process_transcript_key(conn, key, *, resolve_company, resolve_user, now):
-    """A transcript chunk landed. If its key carries a device session (`sid{32hex}`),
-    ensure_open the session (opened_at = the chunk's device wall-clock start, T1)
-    and touch_segment it (at = `now`, SERVER time). Returns the 32-hex session id it
-    opened/touched, or None when the key isn't a device-session transcript (legacy/
-    whole-file — no sid) or the company can't be resolved. resolve_company(conn,
-    folder) / resolve_user(conn, company_id, folder) are injected."""
+    """A per-chunk artifact landed — either the chunk's transcript or its VAD
+    sidecar. If its key carries a device session (`sid{32hex}`), ensure_open the
+    session (opened_at = the chunk's device wall-clock start, T1) and
+    touch_segment it (at = `now`, SERVER time). Returns the 32-hex session id it
+    opened/touched, or None when the key is neither shape, carries no sid
+    (legacy/whole-file), or the company can't be resolved. resolve_company(conn,
+    folder) / resolve_user(conn, company_id, folder) are injected.
+
+    The sidecar arrives for a SILENT chunk too, which since the 2026-08-08 drop
+    is the only thing keeping a quiet meeting's session alive."""
     from transcript_utils import (extract_base_time_from_filename,
                                   extract_session_id_from_filename)
     sid = extract_session_id_from_filename(key)
     if not sid:
         return None                                  # legacy/whole-file — no device session
-    m = _TRANSCRIPT_KEY_RE.match(key)
+    m = _TRANSCRIPT_KEY_RE.match(key) or _SIDECAR_KEY_RE.match(key)
     if not m:
         return None
     folder, _date, basename = m.group(1), m.group(2), m.group(3)
