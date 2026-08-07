@@ -128,6 +128,7 @@ from psycopg.errors import UniqueViolation
 import chunk_stitch
 import content_hash
 import device_heartbeat
+import device_status
 import reindex
 import session_scope
 from db.connection import get_connection
@@ -319,7 +320,14 @@ def dispatch(conn, event, method, route):
     # whose account is not provisioned yet must still register as alive, or it
     # is indistinguishable from one nobody switched on. record() swallows its
     # own failures — telemetry never fails a request.
-    device_heartbeat.record(conn, device_heartbeat.parse_headers(event.get("headers")), sub)
+    device_ident = device_heartbeat.parse_headers(event.get("headers"))
+    device_heartbeat.record(conn, device_ident, sub)
+    # Backlog uplink, in the same position as the heartbeat and for the same reason: a
+    # device whose account is not provisioned yet is the one most worth hearing from, and
+    # the caller guard below would answer it 403 and discard the report.
+    if route == "/device/status" and method == "POST":
+        return ok(device_status.record(
+            conn, device_heartbeat.device_id(conn, device_ident), parse_body(event)))
     caller = users.get_user_by_sub(conn, sub) if sub else None
     if caller is None:
         return error("caller not provisioned in org database (run seed?)", 403)

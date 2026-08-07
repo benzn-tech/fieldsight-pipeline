@@ -172,6 +172,7 @@ jobs:
               "AuditTableName=fieldsight-test-audit" \
               "AuthorityFlip=${{ vars.TEST_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.TEST_GRADED_ROLES || 'false' }}" \
+              "ServerBuild=${{ github.sha }}" \
               "MultiTenantResolution=${{ vars.TEST_MULTI_TENANT_RESOLUTION || 'true' }}" \
               "VadThreshold=${{ vars.TEST_VAD_THRESHOLD || '0.2' }}" \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
