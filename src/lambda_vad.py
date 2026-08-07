@@ -90,6 +90,23 @@ GENERATE_PREVIEW = os.environ.get('GENERATE_PREVIEW', 'true').lower() == 'true'
 # runs (silence gating + the no-speech fallback are unchanged).
 TRANSCRIBE_WHOLE_CHUNK = os.environ.get('TRANSCRIBE_WHOLE_CHUNK', 'false').lower() == 'true'
 
+# What to do with a chunk that holds no speech at either threshold.
+#
+# The original answer was "send it to Transcribe anyway, in case VAD was wrong".
+# Measured on a real site meeting (2026-08-07, 135 chunks): 48 chunks reached
+# that fallback, and ElevenLabs — re-transcribing the identical audio — returned
+# nothing at all for 37 of them. AWS Transcribe returned 313 words for those 37.
+# Ordinary, fluent, entirely invented words: "That just for a little bit Do you
+# know how many No I That's the matter". They were 10.7% of everything the
+# meeting transcribed, and they flowed into the extraction prompt, the minutes
+# and the action items indistinguishable from things people said.
+#
+# So the fallback did not rescue speech; it manufactured it. Dropping is both
+# more accurate and cheaper (no Transcribe request for silence).
+#
+# Set false to restore the old behaviour without a code change.
+DROP_SILENT_CHUNKS = os.environ.get('DROP_SILENT_CHUNKS', 'true').lower() == 'true'
+
 # Supported input formats
 AUDIO_FORMATS = {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg'}
 VIDEO_FORMATS = {'.mp4', '.webm', '.mov', '.avi', '.mkv'}
@@ -819,24 +836,38 @@ def process_single_file(bucket, key, source_info, tmp_dir):
         logger.info(f"  Retry at {retry_threshold}: {len(merged_segments)} segments")
     
     if not merged_segments:
-        logger.info("  Still no speech after the retry, fallback: "
-                    "sending entire audio to Transcribe")
-        
-        # Fallback: send entire audio as one segment so Transcribe can try
-        # This handles cases where background noise confuses VAD but speech exists
-        logger.info(f"  Fallback: sending entire audio as single segment for Transcribe")
-        seg_start = 0
-        seg_end = duration_sec
-        seg_filename = build_segment_filename(source_info, seg_start, seg_end)
-        seg_s3_key = build_segment_s3_key(source_info, seg_filename)
-        
-        # Upload the full WAV
-        s3_client.upload_file(
-            wav_path, bucket, seg_s3_key,
-            ExtraArgs={'ContentType': 'audio/wav'}
-        )
-        logger.info(f"  Fallback segment uploaded: {seg_s3_key}")
-        
+        if DROP_SILENT_CHUNKS:
+            # No audio leaves this function. The sidecar below is still written,
+            # so a dropped chunk stays visible and countable — the drop must be
+            # auditable, or the next person cannot tell "silent" from "lost".
+            logger.info("  Still no speech after the retry: dropping "
+                        "(no Transcribe job; set DROP_SILENT_CHUNKS=false to send it)")
+            seg_s3_key = None
+            vad_result = 'no_speech_dropped'
+            segments_meta = []
+        else:
+            logger.info("  Still no speech after the retry, fallback: "
+                        "sending entire audio to Transcribe")
+            seg_start = 0
+            seg_end = duration_sec
+            seg_filename = build_segment_filename(source_info, seg_start, seg_end)
+            seg_s3_key = build_segment_s3_key(source_info, seg_filename)
+
+            # Upload the full WAV
+            s3_client.upload_file(
+                wav_path, bucket, seg_s3_key,
+                ExtraArgs={'ContentType': 'audio/wav'}
+            )
+            logger.info(f"  Fallback segment uploaded: {seg_s3_key}")
+            vad_result = 'fallback_full_audio'
+            segments_meta = [{
+                's3_key': seg_s3_key,
+                'offset_start': 0,
+                'offset_end': round(duration_sec, 1),
+                'duration': round(duration_sec, 1),
+                'absolute_start': _absolute_start_iso(source_info, 0),
+            }]
+
         # Save metadata
         metadata = {
             'source_key': key,
@@ -849,7 +880,7 @@ def process_single_file(bucket, key, source_info, tmp_dir):
             'speech_duration_sec': 0,
             'speech_ratio': 0,
             'vad_threshold': VAD_THRESHOLD,
-            'vad_result': 'fallback_full_audio',
+            'vad_result': vad_result,
             'codec': codec_info,
             'web_preview_key': preview_key,
             # T2 authoritative session/timestamp manifest (2026-07 paradigm).
@@ -857,13 +888,7 @@ def process_single_file(bucket, key, source_info, tmp_dir):
             'chunk_index': source_info.get('chunk_index'),
             'chunk_start': (_chunk_start_dt(source_info).isoformat()
                             if _chunk_start_dt(source_info) else None),
-            'segments': [{
-                's3_key': seg_s3_key,
-                'offset_start': 0,
-                'offset_end': round(duration_sec, 1),
-                'duration': round(duration_sec, 1),
-                'absolute_start': _absolute_start_iso(source_info, 0),
-            }],
+            'segments': segments_meta,
         }
         meta_key = f"{OUTPUT_PREFIX}{source_info['user_name']}/{source_info['date']}/{source_info['basename_no_ext']}_vad_metadata.json"
         s3_client.put_object(Bucket=bucket, Key=meta_key, Body=json.dumps(metadata, indent=2), ContentType='application/json')
@@ -871,11 +896,11 @@ def process_single_file(bucket, key, source_info, tmp_dir):
         return {
             'key': key,
             'status': 'processed',
-            'segments_created': 1,
-            'speech_duration': round(duration_sec, 1),
+            'segments_created': len(segments_meta),
+            'speech_duration': 0 if DROP_SILENT_CHUNKS else round(duration_sec, 1),
             'total_duration': round(duration_sec, 1),
             'speech_ratio': 0,
-            'vad_result': 'fallback_full_audio',
+            'vad_result': vad_result,
             'metadata_key': meta_key,
         }
 
