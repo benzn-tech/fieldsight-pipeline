@@ -27,7 +27,13 @@ def ensure_open(conn, session_id, company_id, user_id, site_id, kind, opened_at,
     """Create the session if new, else keep it. Idempotent — safe whether the
     device's best-effort record-start signal or the first uploaded chunk reaches
     the backend first (either may open the session). Only fills `opened_at`/
-    `site_id` if not already set; never regresses status.
+    `site_id`/`kind` if not already set; never regresses status.
+
+    `kind` fills in rather than sticking at whatever arrived first because the
+    VAD sidecar now opens sessions too (session_activity, 2026-08-08) and its key
+    carries no `_src{ext}` token — it legitimately passes kind=None, and the
+    transcript that does know the kind arrives second. Without the COALESCE a
+    sidecar-first session stays NULL for its whole life.
 
     `group_id` is the LEAD device's session_id (multi-device merge, spec
     2026-08-04); NULL for a solo recording, which is every pre-existing row.
@@ -41,6 +47,7 @@ def ensure_open(conn, session_id, company_id, user_id, site_id, kind, opened_at,
         f"ON CONFLICT (session_id) DO UPDATE SET "
         f"opened_at = COALESCE(meeting_session.opened_at, EXCLUDED.opened_at), "
         f"site_id = COALESCE(meeting_session.site_id, EXCLUDED.site_id), "
+        f"kind = COALESCE(meeting_session.kind, EXCLUDED.kind), "
         f"group_id = COALESCE(meeting_session.group_id, EXCLUDED.group_id), "
         f"updated_at = now() "
         f"RETURNING {_COLS}",
