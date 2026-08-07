@@ -76,6 +76,38 @@ Every conclusion here rests on the 12 hardest chunks of one meeting. Before
 treating "ElevenLabs is better" as settled, compare on normal-volume chunks —
 including cost and latency, not only word count.
 
+**Update 2026-08-08 — this recording cannot supply the comparison.** Measured
+with `ffmpeg volumedetect` over 18 speech chunks sampled evenly across the
+session (free, no ASR calls):
+
+| | mean dBFS |
+|---|---|
+| loudest | −26.3 |
+| upper quartile | −33.2 |
+| **median** | **−36.0** |
+| lower quartile | −38.7 |
+| quietest | −44.4 |
+
+13 of 18 sit within 6 dB of the median. Normal speech capture sits around −20
+to −12 dBFS, so **the entire session is quiet — there is no ordinary-volume
+material in it at all.** `c0075`, one of the "12 hardest", is 7.5 dB below the
+median: not an outlier, just the ordinary case for this recording.
+
+Two consequences:
+
+1. **The "12 hardest" framing overstated how unrepresentative they were.** They
+   are the tail of a distribution that is uniformly quiet, not a separate
+   category. The ElevenLabs result is therefore *more* generalisable to this
+   recording than the framing suggested — and says nothing about a normal one.
+2. **P1-3 needs new audio, not new analysis.** The first normal-level recording
+   is the material; nothing in the existing bucket can answer the question.
+
+**Do not run the paid comparison before prod's first real ElevenLabs
+transcription succeeds.** Prod switched providers and has never run on it, the
+previous evaluation exhausted a 10,000-credit allowance, and a quota failure
+would present exactly as "the backend changes broke transcription". Confirm
+prod, check the remaining allowance, then measure — on 30-second clips.
+
 ---
 
 ## P2 — worth doing, not blocking
