@@ -1,0 +1,275 @@
+# Audio quality and speaker attribution — what to do next, in order
+
+**Date:** 2026-08-08
+**Status:** Roadmap. Supersedes the priorities implied by
+`2026-08-07-speaker-attribution-measurement-design.md`, which was written before the
+provider testing and is now largely overtaken (§P4).
+**Evidence:** `Dropbox/temp/fieldsight-audio/` — a 4:49 clip of real site conversation
+(UCPK2, 2026-08-07 15:22–15:27), hand-labelled ground truth, and raw results from four
+ASR providers.
+
+## The one-paragraph version
+
+Speaker attribution is broken today, but not for the reason the earlier specs assumed.
+The chunk boundaries are a real problem and a single whole-session call removes them — but
+underneath that sits something cheaper and larger: **the audio is recorded so quietly that
+transcription is not reproducible at all**. Fixing loudness costs one ffmpeg filter, cuts
+run-to-run variation from 4.7× to 1.13×, and eliminates a failure mode that silently drops
+minutes of a recording. Everything else should queue behind it, because until it lands,
+no comparison between providers or architectures is measuring what it claims to measure.
+
+## Priorities
+
+### P0 — Loudness normalisation before ASR
+
+**✅ Implemented 2026-08-08 (PR #281).** Verified through the code path on the real
+recording: −39.7 → −19.3 dBFS overall, the quiet segment at 137 s −48.6 → −23.7,
+identical sample count and 0.989 cross-correlation at lag 0. The deployed layer's ffmpeg
+was checked for both filters rather than assumed. Gated per stage:
+`TEST_NORMALISE_AUDIO` on, `PROD_NORMALISE_AUDIO` off until the noise question below is
+measured. Two traps found while building it: `loudnorm` emits **192 kHz** unless `-ar` is
+pinned, and holding the original plus the normalised sample list would have halved the
+longest file the lambda can process (BUG-04).
+
+**Why first:** biggest measured effect, lowest cost, independent of every other decision.
+
+The recording averages −39.7 dBFS with a median second at −46. Seven identical
+transcription requests on the raw file returned 173–815 words, and **two of the seven
+began at 01:57**, silently discarding the first two minutes — no error, no log line. With
+`acompressor` + `loudnorm` applied first, three runs returned 415/410/465 words, all
+starting at 13 s, and all three found three speakers (no other treatment managed that).
+
+```
+acompressor=threshold=-30dB:ratio=4:attack=20:release=250:makeup=8,
+loudnorm=I=-16:TP=-1.5:LRA=11
+```
+
+**Where:** in the VAD lambda, which already runs ffmpeg — applied when writing
+`audio_segments/`, **not** to `users/.../audio/`. The raw upload stays untouched as
+evidence.
+
+**Not noise reduction.** Pre-ASR noise suppression is known here to cost accuracy; that
+still holds. NS discards information, gain and compression redistribute loudness. Do not
+let one justify or condemn the other.
+
+**Watch for:** whether compression lifts site noise (machinery, wind) enough to create new
+hallucinations. Measure on the same clip before and after.
+
+**A second, free measure** (found while diagnosing P1c): count the "empty result" log
+line from `assemble_deduped_turns`. With `DROP_SILENT_CHUNKS` on, an empty transcript can
+only mean the transcriber found nothing in audio VAD judged to be speech — the too-quiet
+failure itself. It runs continuously on real sessions and costs no ASR credits, which
+matters because the last evaluation exhausted a 10,000-credit allowance. Use 30-second
+clips for anything that needs repeated ASR calls.
+
+### P1a — `TRANSCRIPT_TEXT_LIMIT` truncates long sessions
+
+**✅ Decided and implemented 2026-08-08 (PR #283): raise, not chunk.** Chunking means a
+map-reduce with cross-chunk topic dedup inside the function that livelocked, running
+opposite to BUG-43's fix. And output tokens do not scale with input on the prod path —
+`llm_utils` sends no `max_tokens` at all under `force_json`, so BUG-16's failure mode is
+not reachable here. Raised to 300,000 (~75–85k tokens, ~4.5 h). When a session still does
+not fit, head **and** tail are kept, the model is told the transcript is incomplete, and
+the artifact records `transcript_stats`.
+
+`lambda_extract_session.py:62,255` caps the prompt at 60,000 characters. A real 2-hour
+session renders to 128,427 — **47% reaches the model**, ~387 of 838 turn lines. The
+authoritative extraction of a long meeting covers only its first half, silently.
+
+This is CLAUDE.md BUG-15 recurring in a different lambda; meeting-minutes already uses
+120,000 for the same reason. Raising the cap is not automatically right — output tokens
+and wall time scale with it on a function with a livelock history — so decide between
+raising the limit and chunking the extraction, but decide.
+
+### P1b — Device announcements are transcribed as speech
+
+**✅ Implemented 2026-08-08 (PR #284).** Filtered at turn assembly, **before**
+`speaker_count` is taken — that count is what did the visible damage, and
+`speaker_count == 1` is the gate item-writer uses to resolve a self-referential
+responsible party to a real name. Matched a sentence at a time, with every sentence in the
+turn required to match, so "we should stop recording now, mate" survives — and so does
+"Recording stopped. I'll redo that bit.", which opens with the exact prompt text.
+Validated on the hand-labelled recording: 1 of 30 turn lines flagged, exactly the one the
+ground truth marks `(device)`, zero false positives.
+
+**Corrected 2026-08-08.** An earlier version of this entry said the app's voice lines were
+"staged and not wired to any Kotlin yet". Wrong — GrandTime PR #13 merged 2026-08-07 01:11,
+wired and verified in the release apk. Its description gives the wording the filter had
+been guessing at:
+
+| file | says |
+|---|---|
+| `recording_started` | Recording started. |
+| `recording_stopped` | Recording stopped. |
+| `meeting_prompt` | Recording stopped. Has the meeting ended? Check the screen. |
+| `meeting_ended` | Meeting ended. Recording stopped. |
+
+Run against the first version of the filter, **two of the four were missed** — both
+multi-sentence, against a whole-turn matcher, and both are the meeting-end prompts a
+multi-device site hears most. Hence the move to per-sentence matching. The artifact still
+records the **distinct phrases** removed, because the app can change its lines without
+telling the backend, and this whole episode is what that reporting is for.
+
+Five turns in one 70-minute session are another device's recording announcements
+("Recording started", "recording stopped", "Please stop recording") transcribed as human
+speech and given speaker labels. In the 5-minute window, `spk_2` and `spk_3` are largely
+machine audio, so the artifact's `speaker_count: 4` counts at least one device as a
+person.
+
+**This gets worse exactly as the product gets better:** multi-device grouping means every
+device announces start and stop, and every nearby device records it. Filter these before
+they reach extraction — the phrases are fixed and short.
+
+### P1c — The final extraction pass cannot notice it was overtaken
+
+**✅ Diagnosed and fixed 2026-08-08 (PR #285). The description below was wrong on both
+of its factual claims** — corrected here rather than deleted, because the wrong version
+is what a reasonable reading of the artifact timestamps produces, and the next person
+will produce it again.
+
+~~Media finished uploading at 15:35:23 … the final pass ran at 15:36:22 — before the
+tail was transcribed. The overtake-and-rerun mechanism did not fire.~~
+
+Both false:
+
+- **The tail was transcribed in time.** The last transcript was written at **15:35:48**,
+  34 seconds *before* the final pass wrote at 15:36:22. All 151 transcripts
+  (c0000–c0150) were on disk.
+- **The mechanism did fire.** `03:33:55.634 ... overtook an early final pass --
+  requested a re-run` is in the prod logs.
+
+The real cause is structural. `extract_session` lists the session **once**, before a
+~170 s thinking call — 21 transcripts landed during that call — and the post-call
+coverage re-check is guarded by `if not final:`, so only a *live* pass ever re-examines
+what it published. A live pass fires only on a `transcripts/` write, and the final pass
+writes *after* the last transcript by construction. When the narrow final lands, **there
+is no trigger left in the system**: the recovery path exists and is unreachable.
+
+BUG-43 in the mirror. That fix removed "discard the expensive result if the premise
+changed"; this was "keep the result but never re-examine the premise".
+
+Fix: the final pass re-lists **after** writing and requests one more final pass if the
+set grew, bounded by a generation counter. Design and the two non-obvious constraints
+(order of write vs re-list; compare S3 keys to S3 keys, not to `source_transcripts`) are
+in `2026-08-08-final-pass-coverage-recheck-design.md`.
+
+**Also found in the same logs, now diagnosed — and it was not a loss.** Nine transcripts
+in that session (`c0004/0005/0064/0093/0095/0096/0104/0110/0111`, 6% of 151) were logged
+as `unnormalizable`. They are 355-byte AWS Transcribe results, `status: COMPLETED`,
+`transcript: ""`, `items: []`, and **every one of their VAD sidecars reads
+`vad_result: fallback_full_audio, speech_duration_sec: 0`** — silent chunks, sent to
+Transcribe by the old fallback, which correctly returned nothing.
+
+The defect was the message. `normalize_transcript` returns `None` for both "no words in
+it" and "not a transcript at all", and the caller reported both as *unnormalizable*,
+which reads as corruption — it is why this line originally said "a different silent
+loss". Fixed in PR #285.
+
+**This one is worth keeping in view for P0's verification.** With `DROP_SILENT_CHUNKS`
+on, a silent chunk is never transcribed at all, so from here an empty transcript means
+**the transcriber found nothing in audio VAD *did* judge to be speech** — the too-quiet
+signal itself. Counting that line before and after normalisation is a cheap, continuous
+measure of whether P0 works, on real sessions, with no ElevenLabs credits spent.
+
+### P2 — Whole-session diarization, and the provider it runs on
+
+`2026-07-23-session-continuity-design.md` (plus the 2026-08-07 overlap addendum) is the
+right architecture and its premise is now evidenced rather than argued: one call over the
+whole audio removes label resetting **by construction**. AWS Transcribe restarts speaker
+labels every ~30 s, so one person occupies eight label instances in five minutes and is
+both `spk_0` and `spk_1` inside single chunks.
+
+But **the provider matters at least as much as the stitching**:
+
+| | verdict |
+|---|---|
+| AWS Transcribe (prod today) | labels reset per chunk; "chemical side" → "mechanical side"; "spider lab" → "Before I left Oh" |
+| **ElevenLabs `scribe_v2`** | the only viable option measured — stable ids across the file, ~2× the words, no invented languages |
+| `qwen-audio-3.0-asr-flash-filetrans` | diarizes, but collapses to one speaker in 2 of 3 runs and invents 4–5 Chinese sentences per run over English audio, which normalisation does not fix |
+| `fun-asr` | 11 sentences for 4:49, Chinese mojibake. Reject |
+
+Sequence: P0 first (otherwise the comparison is noise), then re-score providers against
+the ground truth with n≥3, then decide the switch, then build the stitch.
+
+Also unresolved before any switch: ElevenLabs quota economics. Fifteen five-minute runs
+exhausted a 10,000-credit allowance during this evaluation.
+
+**The switch already happened while this was being written.** As of 2026-08-08 both
+stages run `ASR_PROVIDER=elevenlabs` (PR #280, prod deployed 13:53 UTC 08-07). Two
+consequences that were not part of the decision above:
+
+- **Prod has not transcribed anything on ElevenLabs yet** — zero
+  `fieldsight-prod-transcribe` log events since the deploy, because it landed at 01:53 NZ
+  and no one has recorded since. The first real prod run will be the morning after. Test
+  did transcribe successfully on it at 12:54 UTC 08-07 (6 words, 4 items), so the key had
+  quota after the evaluation burn — but prod's first run is still unproven.
+- **ElevenLabs emits bracketed audio-event tags that AWS Transcribe never did** —
+  observed on real test transcripts: `[background noise]`, `[话筒碰撞声]`, `[吸气声]`,
+  `[点击鼠标]` / `[鼠标点击]`. These land in the extraction prompt as if they were speech.
+  Small in the sample available (6 tags across 6 transcripts, none of which is *only*
+  tags), and the Chinese ones are on genuinely Chinese-spoken audio rather than
+  hallucinated onto English — so this is a quality item, not a correctness bug. Worth
+  stripping in turn assembly next to the device-announcement filter; deliberately **not**
+  bundled into tonight's deploy, because the sample is thin and tonight's goal is a
+  coherent build rather than a larger one. Note the tag naming is not stable
+  (`点击鼠标` vs `鼠标点击`), so strip the bracket form, not a phrase list.
+
+### P3 — Device-side gain, and microphone placement
+
+The only thing the backend **cannot** repair. The distant speakers are captured at about
+**5.3 bits of the available 16** (38 LSB RMS at −58.7 dBFS); normalising later amplifies
+the quantisation noise with the signal. Capture is `AudioSource.MIC` with no audio effects
+attached (`AudioRecorder.kt:48`, `SegmentRecorder.kt:115`).
+
+It must be AGC or compression, **not gain**: the peak is already −2.1 dBFS with zero
+clipped samples, while the median sits 44 dB down. Adding 25 dB of gain would destroy the
+loud 4%.
+
+Deliberately after P0 because it is **irreversible** — it bakes into the stored recording
+— and because the backend change is testable and revertible. Belongs to the GrandTime
+session.
+
+What no setting fixes: a chest-mounted mic is ~20 cm from the wearer and 2–5 m from
+everyone else. Inverse-square alone is 20–30 dB, and the two people the diarizer merges
+away are precisely the two furthest from the mic. That is placement, not software.
+
+### P4 — Reduce or withdraw the speaker-attribution spec
+
+**✅ Withdrawn 2026-08-08.** `2026-08-07-speaker-attribution-measurement-design.md` now
+carries a §0 saying so and why; §2–§6 are kept because the measurements are real, and the
+proposal from §7 on is superseded. No replacement spec: what remains of the problem is
+acoustic, and belongs to P2 and P3 rather than to a reasoning pass.
+
+`2026-08-07-speaker-attribution-measurement-design.md` proposed having the reasoning pass
+re-unify a person's identity across per-call labels. Ground truth from the real recording
+undermines its central assumption:
+
+- A labelled turn is **not one speaker**. Three of eighteen labelled turns contain two
+  sources — one contains a device announcement followed by a person. The spec's
+  `person → labels` shape cannot express this.
+- Fragmentation happens **inside a single 30-second call**, not only across boundaries, so
+  it is not the chunking artefact the spec treats it as.
+- With a whole-file call the scattering does not occur at all, so the reassembly the spec
+  offers has little left to do.
+
+What remains is telling apart quiet and distant voices — acoustic, not textual. Reasoning
+over text cannot help. Rewrite the spec around that or drop it; do not implement it as
+written.
+
+## Carried over, unrelated to audio
+
+**Upload freeze/thaw Phase 1** — **both merged 2026-08-07**: GrandTime PR #8 and pipeline
+PR #274. The "complete and unmerged" note below was already stale when this roadmap was
+written; check `gh pr view` before trusting a status line here. Still needs real-device
+verification before Phases 2 and 3 —
+Room v5 migration over an existing install, a forced 403 freezing without a retry storm,
+a frozen record staying frozen across an account switch, and a redeploy thawing by build
+mismatch. Phases 2 and 3 wait on that.
+
+## What was deployed during this work
+
+PR #273 merged to `main` and deployed to prod on 2026-08-07 (verified by downloading the
+deployed zip, not by trusting the workflow): the participants-are-speakers prompt fix, the
+`speaker_count` field, self-responsible resolution, transcript-view fix, and the
+skipped-request logging. The merge itself produced **zero workflow runs** — GitHub was
+degraded — and the deploy had to be dispatched manually.

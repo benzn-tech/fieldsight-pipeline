@@ -11,6 +11,10 @@ sa = pytest.importorskip("session_activity", reason="requires psycopg (installed
 SID = "9f8c1e2a4b6d47f0a1b2c3d4e5f60718"
 CHUNK_KEY = (f"transcripts/Ben_UCPK/2026-07-28/"
              f"Benl1_2026-07-28_14-03-00_sid{SID}_c0007_off3.0_to60.0_srcwav.json")
+# The VAD sidecar — written for EVERY chunk, including one dropped as silent, so
+# it is the touch source that does not depend on anybody speaking.
+SIDECAR_KEY = (f"audio_segments/Ben_UCPK/2026-07-28/"
+               f"Benl1_2026-07-28_14-03-00_sid{SID}_c0007_vad_metadata.json")
 NOW = datetime(2026, 7, 28, 14, 4, 30)
 
 
@@ -62,11 +66,51 @@ def test_unresolvable_company_skips_without_opening(captured):
 
 def test_non_transcript_key_is_ignored(captured):
     rc, ru = _resolvers()
-    # carries a sid but isn't under transcripts/ -> not our concern
+    # carries a sid but is neither a transcript nor a VAD sidecar -> not our concern
     key = f"extractions/Ben_UCPK/2026-07-28/sid{SID}.json"
     assert sa.process_transcript_key(object(), key, resolve_company=rc,
                                      resolve_user=ru, now=NOW) is None
     assert captured["open"] == []
+
+
+def test_vad_sidecar_opens_and_touches_without_any_speech(captured):
+    """The regression guard for dropping silent chunks (2026-08-08).
+
+    Silence no longer produces a transcript, so a transcript-only touch stream
+    goes quiet during a lull while the sweep's INFER_IDLE_CLOSE keeps counting —
+    and the confirmation email goes out mid-meeting. The sidecar is written for
+    every chunk whether or not anyone spoke, so it keeps the session alive."""
+    rc, ru = _resolvers()
+    out = sa.process_transcript_key(object(), SIDECAR_KEY, resolve_company=rc,
+                                    resolve_user=ru, now=NOW)
+    assert out == SID
+    sid, company_id, user_id, site, kind, opened_at = captured["open"][0]
+    assert sid == SID and company_id == "co-1" and user_id == "u-1"
+    assert opened_at == datetime(2026, 7, 28, 14, 3, 0)   # same device start (T1)
+    # The sidecar name carries no _src{ext} token, so kind is unknowable here.
+    # ensure_open must COALESCE it, or a sidecar-first session is NULL forever.
+    assert kind is None
+    assert captured["touch"] == [(SID, NOW)]
+
+
+def test_the_vad_segment_wav_itself_is_not_a_touch(captured):
+    """Only the sidecar. The segment .wav under the same prefix already leads to
+    a transcript, and counting both would touch twice for one chunk."""
+    rc, ru = _resolvers()
+    wav = (f"audio_segments/Ben_UCPK/2026-07-28/"
+           f"Benl1_2026-07-28_14-03-00_sid{SID}_c0007_off3.0_to60.0_srcwav.wav")
+    assert sa.process_transcript_key(object(), wav, resolve_company=rc,
+                                     resolve_user=ru, now=NOW) is None
+    assert captured["open"] == []
+
+
+def test_legacy_sidecar_without_a_session_is_ignored(captured):
+    rc, ru = _resolvers()
+    legacy = ("audio_segments/Ben_UCPK/2026-07-28/"
+              "Benl1_2026-07-28_14-03-00_vad_metadata.json")
+    assert sa.process_transcript_key(object(), legacy, resolve_company=rc,
+                                     resolve_user=ru, now=NOW) is None
+    assert captured["open"] == [] and captured["touch"] == []
 
 
 def test_unmapped_recorder_still_opens_with_null_user(captured):

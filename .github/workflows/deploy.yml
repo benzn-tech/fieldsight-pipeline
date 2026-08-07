@@ -173,9 +173,11 @@ jobs:
               "AuthorityFlip=${{ vars.TEST_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.TEST_GRADED_ROLES || 'false' }}" \
               "ServerBuild=${{ github.sha }}" \
+              "DeviceAnnouncementPatterns=${{ vars.TEST_DEVICE_ANNOUNCEMENT_PATTERNS || '[]' }}" \
               "MultiTenantResolution=${{ vars.TEST_MULTI_TENANT_RESOLUTION || 'true' }}" \
               "VadThreshold=${{ vars.TEST_VAD_THRESHOLD || '0.2' }}" \
               "DropSilentChunks=${{ vars.TEST_DROP_SILENT_CHUNKS || 'true' }}" \
+              "NormaliseAudio=${{ vars.TEST_NORMALISE_AUDIO || 'true' }}" \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \
