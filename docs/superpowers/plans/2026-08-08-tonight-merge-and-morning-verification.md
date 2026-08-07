@@ -35,6 +35,31 @@ rest and of each other.
   `lambda_org_api`, `session_scope`. No consumer validates the artifact's key set, so an
   older reader against a newer artifact is safe, and the reverse is too.
 
+## Check this before anything else, and it is not from tonight's work
+
+**Prod switched to ElevenLabs and has never run on it.** `ASR_PROVIDER=elevenlabs` on both
+stages (PR #280, prod deployed 13:53 UTC 08-07 = 01:53 NZ), and
+`fieldsight-prod-transcribe` has **zero log events** since — nobody has recorded on prod
+since the switch. The first real customer transcription on the new provider will be
+tomorrow's.
+
+Test transcribed successfully on it at 12:54 UTC 08-07 (6 words, 4 items), so the key had
+quota left after the evaluation that exhausted a 10,000-credit allowance. That is
+reassuring, not proof.
+
+So: **after the first prod recording, check `fieldsight-prod-transcribe` before judging
+anything else.** A quota failure there would look exactly like "the new backend work broke
+transcription", and it would not be that.
+
+```
+aws logs filter-log-events --log-group-name /aws/lambda/fieldsight-prod-transcribe \
+  --start-time <ms> --region ap-southeast-2 --filter-pattern '"ElevenLabs"'
+```
+
+Expect `ElevenLabs transcript written: s3://...`. If instead there is a 401/429/quota
+error, the fix is a repo variable — `PROD_ASR_PROVIDER` back to `transcribe` — not a code
+change.
+
 ## Morning checks, in order of what they would catch
 
 Record a short session on a device, then:
