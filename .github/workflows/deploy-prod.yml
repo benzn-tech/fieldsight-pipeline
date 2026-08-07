@@ -177,6 +177,7 @@ jobs:
               "AuditTableName=fieldsight-audit" \
               "MultiTenantResolution=true" \
               "VadThreshold=${{ vars.PROD_VAD_THRESHOLD || '0.5' }}" \
+              "DropSilentChunks=${{ vars.PROD_DROP_SILENT_CHUNKS || 'true' }}" \
               "AuthorityFlip=${{ vars.PROD_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.PROD_GRADED_ROLES || 'false' }}" \
               "ServerBuild=${{ github.sha }}" \
