@@ -1484,6 +1484,14 @@ Resources:
           # default is never consulted. Kept only so a future call_llm() added
           # here without the argument fails safe (thinking on = slow, not wrong).
           QWEN_ENABLE_THINKING: 'true'
+          # How much of a session's transcript reaches the model. Declared here
+          # rather than left to the code default so an emergency change survives
+          # the next CloudFormation reconcile — a value set only on the live
+          # function does not. 300,000 chars is ~75-85k tokens: inside both the
+          # Anthropic 200k window and qwen3.7-max's, and ~4.5 hours of session
+          # against a longest-real-so-far of 2 hours (which rendered to 128,427
+          # and was being cut to 60,000 — see lambda_extract_session).
+          TRANSCRIPT_TEXT_LIMIT: '300000'
       Policies:
         - Version: '2012-10-17'
           Statement:

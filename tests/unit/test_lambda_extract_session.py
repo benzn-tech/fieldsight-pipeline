@@ -798,12 +798,12 @@ def test_prompt_and_schema_request_work_class():
     assert '"work_class"' in les.EXTRACTION_SCHEMA
     assert '"work_confidence"' in les.EXTRACTION_SCHEMA
     assert '"is_mixed"' in les.EXTRACTION_SCHEMA
-    prompt = les.build_extraction_prompt("U", "2026-07-21", "sess", [], 0)
+    prompt, _ = les.build_extraction_prompt("U", "2026-07-21", "sess", [], 0)
     assert "work_class" in prompt and "non_work" in prompt
 
 
 def test_prompt_asks_to_split_by_subject_and_write_scannable_titles():
-    prompt = les.build_extraction_prompt("U", "2026-07-21", "sess", [], 0)
+    prompt, _ = les.build_extraction_prompt("U", "2026-07-21", "sess", [], 0)
     # topic granularity: split by subject, don't lump, don't over-split
     assert "BY SUBJECT" in prompt
     assert "Do NOT lump" in prompt and "Do NOT over-split" in prompt
