@@ -284,11 +284,16 @@ SID = "3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c"
 CHUNK_KEY = f"users/Ben/audio/2026-08-06/Ben_2026-08-06_09-00-00_sid{SID}_c0001.wav"
 
 
+ENDED_AT = __import__("datetime").datetime(2026, 8, 7, 3, 19, 36,
+                                          tzinfo=__import__("datetime").timezone.utc)
+
+
 def _complete(mp, s3_key, session_row=None, group_ended=False):
     mp.setattr(org.recordings, "mark_uploaded",
                lambda c, rid, cid, sz=None, gps_track=None: {"id": rid, "s3_key": s3_key})
     mp.setattr(org.meeting_session, "get", lambda conn, sid: session_row)
-    mp.setattr(org.meeting_session, "group_is_ended", lambda conn, gid: group_ended)
+    mp.setattr(org.meeting_session, "group_ended_at",
+               lambda conn, gid: ENDED_AT if group_ended else None)
     return org.lambda_handler(
         make_event("POST", "/api/org/recordings/rec-1/complete", body={}), None)
 
@@ -305,18 +310,38 @@ def test_a_solo_upload_response_is_unchanged(wired):
 def test_a_member_of_an_ended_meeting_is_told(wired):
     mp, _ = wired
     res = _complete(mp, CHUNK_KEY,
-                    session_row={"group_id": "b" * 32, "group_ended_at": "2026-08-06T09:10:00Z"})
+                    session_row={"group_id": "b" * 32, "group_ended_at": ENDED_AT,
+                                 "opened_at": ENDED_AT})
     assert body_of(res)["groupEnded"] is True
 
 
-def test_a_device_that_joined_after_the_end_is_told_too(wired):
-    """Its own row was written before the end, so it carries no timestamp. Read
-    only that row and it would keep recording into a finished meeting."""
+def test_a_member_whose_own_row_is_unmarked_is_still_told(wired):
+    """It was recording when the meeting ended — its row simply has not been
+    marked yet. Reading only that row would leave it recording into a finished
+    meeting."""
     mp, _ = wired
+    before = ENDED_AT - __import__("datetime").timedelta(minutes=5)
     res = _complete(mp, CHUNK_KEY,
-                    session_row={"group_id": "b" * 32, "group_ended_at": None},
+                    session_row={"group_id": "b" * 32, "group_ended_at": None,
+                                 "opened_at": before},
                     group_ended=True)
     assert body_of(res)["groupEnded"] is True
+
+
+def test_a_recording_started_after_the_end_is_left_alone(wired):
+    """This test previously asserted the opposite, and the opposite was wrong.
+
+    A recording that BEGAN after the meeting ended is a new one carrying a stale
+    group id, not a straggler in a finished meeting. Stopping it made its own
+    stop write another end, which poisoned the next rejoin — a loop seen in
+    production on 2026-08-07 (two rejoins, killed 37s and 2m17s in)."""
+    mp, _ = wired
+    after = ENDED_AT + __import__("datetime").timedelta(minutes=2)
+    res = _complete(mp, CHUNK_KEY,
+                    session_row={"group_id": "b" * 32, "group_ended_at": None,
+                                 "opened_at": after},
+                    group_ended=True)
+    assert body_of(res) == {"ok": True}
 
 
 def test_a_legacy_filename_costs_no_query(wired):
