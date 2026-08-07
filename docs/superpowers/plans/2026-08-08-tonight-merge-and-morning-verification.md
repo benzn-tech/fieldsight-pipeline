@@ -72,13 +72,24 @@ same on both stages.
   never opened and never emailed. Leaving a device running by accident will now produce
   mail. Not a bug — but it will look like one.
 
-- **Known gap, deliberately not fixed tonight:** the announcement filter lives in
-  `extract_session`, while `lambda_rolling_summary` and `lambda_session_finalize` call
-  `assemble_deduped_turns` directly and so still see "Recording started" as speech. It can
-  therefore appear in the Tier-1 rolling summary and in confirmation-email content.
-  Fixing it properly means moving the filter into `assemble_deduped_turns`, which changes
-  a function with three callers and eight test stubs — not something to do on the night
-  before a hand-test, on a merge train already verified green.
+- **Known gap, deliberately not fixed tonight.** The announcement filter lives in
+  `extract_session` only. Three other places still see "Recording started" as speech:
+
+  1. `lambda_rolling_summary` — calls `assemble_deduped_turns` directly, so announcements
+     can appear in the Tier-1 rolling summary;
+  2. `lambda_session_finalize` — same call, so they can appear in confirmation-email
+     content;
+  3. **org-api's `/transcripts`**, which the transcript viewer renders. It computes its
+     own `speaker_count` as `len(speakers)` over transcript segments (`lambda_org_api.py`
+     ~:4972) — a *different* field that happens to share the name. Checked, because if it
+     had read the artifact's `speaker_count` the P1b change would have altered what the UI
+     displays. It does not. But the viewer will still list device announcements as speaker
+     segments, and its count carries the same flaw the withdrawn attribution spec
+     identified: it is the size of a union of per-call labels, not a number of people.
+
+  Fixing 1 and 2 properly means moving the filter into `assemble_deduped_turns` — three
+  callers and eight test stubs. Fixing 3 is a separate read-path change. Neither belongs
+  on the night before a hand-test, on a merge train already verified green.
 
 ## Check this before anything else, and it is not from tonight's work
 
