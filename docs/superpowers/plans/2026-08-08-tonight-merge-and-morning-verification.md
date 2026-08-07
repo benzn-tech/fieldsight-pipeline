@@ -142,11 +142,24 @@ credits — which matters, the last evaluation exhausted a 10,000-credit allowan
 device_announcements: {removed: N, texts: [...]}
 ```
 
-`texts` is the point: the app's prompt audio (`res/raw/recording_started.mp3` and
-siblings) was staged 2026-08-07 and is not wired to any Kotlin yet, so this is how the
-real wording becomes known. **If a phrase shows up that the patterns miss, set the repo
-variable `TEST_DEVICE_ANNOUNCEMENT_PATTERNS`** (a JSON list of regexes) and redeploy — no
-code change.
+The four lines the app actually speaks (GrandTime PR #13, wired and verified in the
+release apk) are:
+
+```
+Recording started.
+Recording stopped.
+Recording stopped. Has the meeting ended? Check the screen.
+Meeting ended. Recording stopped.
+```
+
+All four are covered. `texts` is still the point, because the app can change its wording
+without telling the backend — and because two of those four were missed until the exact
+strings were read out of that PR rather than guessed at. **If a phrase shows up that the
+patterns miss, set the repo variable `TEST_DEVICE_ANNOUNCEMENT_PATTERNS`** (a JSON list of
+regexes) and redeploy — no code change.
+
+Worth an explicit look on the first recording: the meeting-end prompts are the ones a
+multi-device site hears most, and they are the two that were missed.
 
 Set the **repo variable**, not the lambda's environment directly: a value written straight
 onto the live function is erased by the next CloudFormation reconcile. An override

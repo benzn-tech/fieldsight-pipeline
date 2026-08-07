@@ -86,13 +86,29 @@ raising the limit and chunking the extraction, but decide.
 **✅ Implemented 2026-08-08 (PR #284).** Filtered at turn assembly, **before**
 `speaker_count` is taken — that count is what did the visible damage, and
 `speaker_count == 1` is the gate item-writer uses to resolve a self-referential
-responsible party to a real name. Matched against the whole normalised turn with a length
-guard, so "we should stop recording now, mate" survives. Validated on the hand-labelled
-recording: 1 of 30 turn lines flagged, exactly the one the ground truth marks `(device)`,
-zero false positives. The artifact records the **distinct phrases** removed, because
-`res/raw/recording_started.mp3` and siblings were staged on 2026-08-07 and are not wired
-to any Kotlin yet — the wording is not settled, so the filter is also the instrument that
-reports what it meets.
+responsible party to a real name. Matched a sentence at a time, with every sentence in the
+turn required to match, so "we should stop recording now, mate" survives — and so does
+"Recording stopped. I'll redo that bit.", which opens with the exact prompt text.
+Validated on the hand-labelled recording: 1 of 30 turn lines flagged, exactly the one the
+ground truth marks `(device)`, zero false positives.
+
+**Corrected 2026-08-08.** An earlier version of this entry said the app's voice lines were
+"staged and not wired to any Kotlin yet". Wrong — GrandTime PR #13 merged 2026-08-07 01:11,
+wired and verified in the release apk. Its description gives the wording the filter had
+been guessing at:
+
+| file | says |
+|---|---|
+| `recording_started` | Recording started. |
+| `recording_stopped` | Recording stopped. |
+| `meeting_prompt` | Recording stopped. Has the meeting ended? Check the screen. |
+| `meeting_ended` | Meeting ended. Recording stopped. |
+
+Run against the first version of the filter, **two of the four were missed** — both
+multi-sentence, against a whole-turn matcher, and both are the meeting-end prompts a
+multi-device site hears most. Hence the move to per-sentence matching. The artifact still
+records the **distinct phrases** removed, because the app can change its lines without
+telling the backend, and this whole episode is what that reporting is for.
 
 Five turns in one 70-minute session are another device's recording announcements
 ("Recording started", "recording stopped", "Please stop recording") transcribed as human
