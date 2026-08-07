@@ -52,6 +52,7 @@ Requires Lambda Layer:
 import os
 import re
 import json
+import math
 import struct
 import logging
 import subprocess
@@ -106,6 +107,38 @@ TRANSCRIBE_WHOLE_CHUNK = os.environ.get('TRANSCRIBE_WHOLE_CHUNK', 'false').lower
 #
 # Set false to restore the old behaviour without a code change.
 DROP_SILENT_CHUNKS = os.environ.get('DROP_SILENT_CHUNKS', 'true').lower() == 'true'
+
+# ------------------------------------------------------------
+# Loudness normalisation before ASR (2026-08-08)
+# ------------------------------------------------------------
+# Site audio arrives far too quiet to transcribe reproducibly. A real 4:49
+# recording (UCPK2, 2026-08-07) averages -39.7 dBFS with a median second at
+# -46. Seven identical transcription requests on that file returned 173-815
+# words — a 4.7x spread — and two of the seven began at 01:57, silently
+# discarding the first two minutes. No error, no log line, nothing downstream
+# could tell a short transcript from a quiet meeting.
+#
+# With the filter chain below applied first, three runs returned 415/410/465
+# words (1.13x spread), all starting at 13 s, and all three resolved three
+# speakers — which no other treatment managed.
+#
+# Compression first, then loudnorm: the recording's peak is already -2.1 dBFS
+# with zero clipped samples while the median sits 44 dB down, so plain gain
+# would destroy the loud 4%. Compression closes the spread; loudnorm then puts
+# the result at a known target.
+#
+# This is NOT noise reduction. Pre-ASR noise suppression is known here to cost
+# accuracy and that finding stands — NS discards information, gain and
+# compression redistribute it.
+#
+# Applied only to what is written to audio_segments/. users/.../audio/ is the
+# object the device uploaded and stays untouched: it is the evidence.
+NORMALISE_AUDIO = os.environ.get('NORMALISE_AUDIO', 'true').lower() == 'true'
+NORMALISE_FILTER = os.environ.get(
+    'NORMALISE_FILTER',
+    'acompressor=threshold=-30dB:ratio=4:attack=20:release=250:makeup=8,'
+    'loudnorm=I=-16:TP=-1.5:LRA=11'
+)
 
 # Supported input formats
 AUDIO_FORMATS = {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg'}
@@ -198,6 +231,102 @@ def extract_audio_ffmpeg(input_path, output_path, sample_rate=16000):
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {result.stderr[:500]}")
     return output_path
+
+
+def build_normalise_cmd(input_path, output_path, sample_rate=16000):
+    """The loudness-normalisation command line, separated so it can be asserted on.
+
+    `-ar` is not optional decoration: `loudnorm` in single-pass (dynamic) mode
+    emits **192 kHz** unless the output rate is pinned, and a 192 kHz segment
+    would be handed to a transcriber alongside offsets computed at 16 kHz.
+    """
+    return [
+        FFMPEG_PATH, '-y', '-i', input_path,
+        '-af', NORMALISE_FILTER,
+        '-acodec', 'pcm_s16le',
+        '-ar', str(sample_rate),        # see docstring — loudnorm resamples otherwise
+        '-ac', '1',
+        output_path
+    ]
+
+
+def normalise_audio_ffmpeg(input_path, output_path, sample_rate=16000, timeout=120):
+    """Apply compression + loudness normalisation. Raises on ffmpeg failure."""
+    result = subprocess.run(
+        build_normalise_cmd(input_path, output_path, sample_rate),
+        capture_output=True, text=True, timeout=timeout
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg normalise failed: {result.stderr[:500]}")
+    return output_path
+
+
+def mean_dbfs(samples):
+    """RMS of [-1, 1] samples in dBFS. Silence reports -120, not a ZeroDivision.
+
+    Recorded in the sidecar so "the audio was too quiet" is a number someone can
+    query later rather than a thing that has to be rediscovered by ear.
+    """
+    n = len(samples)
+    if n == 0:
+        return -120.0
+    # Strided: a level estimate does not need every sample, and this path also
+    # sees legacy multi-hour files where a full pass is minutes of Lambda time.
+    step = max(1, n // 1_600_000)
+    total = 0.0
+    count = 0
+    for i in range(0, n, step):
+        s = float(samples[i])
+        total += s * s
+        count += 1
+    rms = math.sqrt(total / count)
+    if rms <= 0:
+        return -120.0
+    return round(20.0 * math.log10(rms), 1)
+
+
+def normalise_for_asr(wav_path, tmp_dir, expected_len, sr):
+    """Return (path, samples, applied) for the audio that should reach ASR.
+
+    Takes the expected sample COUNT rather than the array, so the caller can
+    release the original before this reads the replacement. `read_wav_pcm`
+    returns a Python list at ~32 bytes a sample (BUG-04); holding two of them
+    would halve the longest file this lambda can process, and legacy whole-file
+    uploads are exactly where that limit already bites. On any fallback the
+    original is re-read from /tmp — cheap in bytes, which is the scarce one.
+
+    Best effort by construction: a chunk transcribed quietly is worse than one
+    transcribed loudly and far better than one that never arrives, so every
+    failure here returns the original rather than raising.
+
+    The length check is the important one. Every `audio_segments/` offset is an
+    index into the pre-normalisation array, so a filter that shifted or trimmed
+    the audio would keep producing plausible files with every timestamp wrong —
+    and nothing downstream could detect it. Measured on the real recording, the
+    chain above is sample-exact (identical count, zero cross-correlation lag),
+    so a mismatch means something changed and the safe answer is to refuse it.
+    """
+    if not NORMALISE_AUDIO:
+        return wav_path, read_wav_pcm(wav_path)[0], False
+
+    norm_path = os.path.join(tmp_dir, "audio_16k_norm.wav")
+    try:
+        normalise_audio_ffmpeg(wav_path, norm_path, sr)
+        norm_samples, norm_sr = read_wav_pcm(norm_path)
+    except Exception as e:
+        logger.warning(f"  Loudness normalisation failed ({e}); "
+                       f"sending original audio at its recorded level")
+        return wav_path, read_wav_pcm(wav_path)[0], False
+
+    if norm_sr != sr or len(norm_samples) != expected_len:
+        logger.warning(
+            f"  Loudness normalisation changed the timebase "
+            f"({expected_len}@{sr}Hz → {len(norm_samples)}@{norm_sr}Hz); "
+            f"refusing it — VAD offsets index the original array")
+        del norm_samples
+        return wav_path, read_wav_pcm(wav_path)[0], False
+
+    return norm_path, norm_samples, True
 
 
 def generate_web_preview(input_path, output_path, timeout=180):
@@ -834,7 +963,24 @@ def process_single_file(bucket, key, source_info, tmp_dir):
             raw_segments_retry, merge_gap=MERGE_GAP, min_duration=MIN_SPEECH_DURATION
         )
         logger.info(f"  Retry at {retry_threshold}: {len(merged_segments)} segments")
-    
+
+    # Loudness normalisation of everything bound for ASR. VAD has already run,
+    # deliberately: its threshold (0.2) was tuned against the recorded level and
+    # re-tuning it is a separate, measured decision. Skipped entirely when the
+    # chunk is about to be dropped, since nothing would be uploaded.
+    dbfs_before = mean_dbfs(audio_samples)
+    export_wav_path, normalised = wav_path, False
+    if merged_segments or not DROP_SILENT_CHUNKS:
+        n_samples = len(audio_samples)
+        audio_samples = None   # release before the replacement is read (see BUG-04)
+        export_wav_path, audio_samples, normalised = normalise_for_asr(
+            wav_path, tmp_dir, n_samples, sr)
+    dbfs_after = mean_dbfs(audio_samples) if normalised else dbfs_before
+    if normalised:
+        logger.info(f"  Loudness normalised: {dbfs_before} → {dbfs_after} dBFS")
+    else:
+        logger.info(f"  Loudness: {dbfs_before} dBFS (not normalised)")
+
     if not merged_segments:
         if DROP_SILENT_CHUNKS:
             # No audio leaves this function. The sidecar below is still written,
@@ -853,9 +999,9 @@ def process_single_file(bucket, key, source_info, tmp_dir):
             seg_filename = build_segment_filename(source_info, seg_start, seg_end)
             seg_s3_key = build_segment_s3_key(source_info, seg_filename)
 
-            # Upload the full WAV
+            # Upload the full WAV — the normalised one, same as the segment path
             s3_client.upload_file(
-                wav_path, bucket, seg_s3_key,
+                export_wav_path, bucket, seg_s3_key,
                 ExtraArgs={'ContentType': 'audio/wav'}
             )
             logger.info(f"  Fallback segment uploaded: {seg_s3_key}")
@@ -881,6 +1027,9 @@ def process_single_file(bucket, key, source_info, tmp_dir):
             'speech_ratio': 0,
             'vad_threshold': VAD_THRESHOLD,
             'vad_result': vad_result,
+            'normalised': normalised,
+            'loudness_dbfs_before': dbfs_before,
+            'loudness_dbfs_after': dbfs_after,
             'codec': codec_info,
             'web_preview_key': preview_key,
             # T2 authoritative session/timestamp manifest (2026-07 paradigm).
@@ -974,6 +1123,9 @@ def process_single_file(bucket, key, source_info, tmp_dir):
         'speech_duration_sec': round(speech_total, 1),
         'speech_ratio': round(speech_ratio, 3),
         'vad_threshold': VAD_THRESHOLD,
+        'normalised': normalised,
+        'loudness_dbfs_before': dbfs_before,
+        'loudness_dbfs_after': dbfs_after,
         'emit_mode': 'whole_chunk' if TRANSCRIBE_WHOLE_CHUNK else 'segments',
         'merge_gap': MERGE_GAP,
         'min_speech_duration': MIN_SPEECH_DURATION,
