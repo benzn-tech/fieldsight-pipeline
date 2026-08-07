@@ -1564,6 +1564,15 @@ Resources:
                 # dropped and the session keeps fast-tier topics forever — the
                 # exact silent-degradation shape a missing grant caused before.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+            # gather_session_segments paginates transcripts/. extractions/ is
+            # here for a different reason: S3 only answers 404 NoSuchKey for a
+            # missing object to a caller holding ListBucket for that key —
+            # otherwise it answers 403, which read_existing_extraction cannot
+            # distinguish from a real denial and must treat as UNKNOWN. Without
+            # it the FIRST pass of every new session (the key does not exist
+            # yet) logs "skipping live pass, cannot read what is published" and
+            # live extraction stops dead, silently — only the close-driven final
+            # pass still runs. Third recurrence of BUG-43 lesson 3.
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
@@ -1571,6 +1580,7 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - transcripts/*
+                    - extractions/*
 
   # ----------------------------------------------------------
   # Rolling Tier-1 summary (voice-timeliness Point 1). Non-VPC (calls the LLM) —
