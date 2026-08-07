@@ -1,236 +1,265 @@
-# Speaker attribution: measure the ground before building on it
+# Speaker attribution: can reasoning re-unify what per-call diarization split?
 
 **Date:** 2026-08-07
+**Revision:** 2 — the original asked the wrong question. See §11.
 **Branch:** `docs/speaker-attribution-spec` (off `origin/develop`)
 **Status:** Design — awaiting review
 **Relates to:** `2026-07-23-session-continuity-design.md` (Spec 1, design-only, unimplemented)
 
-## 1. What this is, and what it is not
+## 1. The question this answers
 
-This is **not** Spec 2 (speaker naming). Spec 1 already reserved that name and stated
-its precondition plainly:
+Not "how fragmented are speaker labels" — that turned out to be arithmetic, not an
+open question (§2). The real one:
 
-> you cannot map `speaker_N → real name` reliably until `speaker_N` means the same
-> person for the whole session.
+> **Can the thinking-mode extraction pass re-unify a person's identity across
+> per-call speaker labels, and name them, well enough to be worth relying on?**
 
-This spec is the **measurement that comes before both**. It produces one number
-nobody has yet — **how badly are speaker labels fragmented in real recordings** —
-and a first, unconsumed read on how well a reasoning pass can name them.
+If yes, Spec 1's audio-level stitch is an optimisation rather than a prerequisite.
+If no, Spec 1 is the only way forward and naming should wait for it.
 
-That number is the missing input to a decision already on the table: Spec 1 proposes
-audio-level session stitching plus one whole-session diarization call, which is real
-engineering and depends on an ASR provider prod is not yet running. Nothing in Spec 1
-says how much fragmentation there actually is. This spec answers that, cheaply, from
-data already flowing.
+Nothing built here is consumed. No report, no action item, no participant list, no
+search index, no UI. The output exists to answer the question above and nothing else.
 
-**Nothing here is consumed.** No report, no action item, no participant list, no
-search index, no UI changes. The output is written and read only by us, on purpose.
+## 2. What was measured, and why it changed the question
 
-## 2. Where the pipeline actually stands
+Measured on real production data, 2026-08-07.
 
-Verified against `origin/develop` at `6b48f94`, not assumed:
+**`speaker_count` does not mean what its name suggests.** It is
+`len({t['speaker'] for t in turns})` (`lambda_extract_session.py:692`) over turns
+pooled from every transcript file in the session. Each ~30s chunk is a **separate
+transcription call**, and every call starts labelling at `spk_0`
+(`transcript_utils.py:589`). The labels are therefore **raw strings that collide
+across calls**: Alice-as-`spk_0` in chunk 1 and Bob-as-`spk_0` in chunk 2 are one
+entry in that set. It is capped by the per-call `MAX_SPEAKERS` (default 5,
+`template.yaml:715`) no matter how long the recording. **It is neither an upper nor a
+lower bound on the number of people.**
 
-| Layer | State |
-|---|---|
-| Text-level session assembly (dedup the device's ~2s chunk overlap) | **Done** — `chunk_stitch.py`, used by `lambda_extract_session` |
-| Audio-level stitch + one whole-session diarization | **Spec only.** PR #150 merged a single `.md`; no implementation exists |
-| Session-consistent speaker labels | **Absent.** Labels are consistent only within one transcription call |
-| Speaker naming | Absent (Spec 2) |
-| ElevenLabs ASR path (Spec 1's dependency) | Present in code; prod runs `AsrProvider=transcribe` |
+**Real session: `Sam_Yu / 2026-08-03 / sid622a0e7f…`** — 262 transcription calls.
+Distinct speaker labels *within a single call*:
 
-So today a person speaking across several transcription calls appears as several
-unrelated labels, and `speaker_count` on every extraction is an **upper bound on the
-number of people**, not a count of them.
+| labels in one call | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|---|
+| calls | 1 | 44 | **169** | 42 | 5 | 1 |
 
-## 3. Why the measurement rides the final extraction pass
+217 of 262 calls heard two or more voices. The session's `speaker_count` would read
+**5**; the number of label *instances* is roughly **500**; the number of actual
+people is probably two or three.
 
-`lambda_extract_session` already runs twice per session:
+So fragmentation is not in doubt and does not need measuring: with per-call
+diarization and 30s chunks, **a person is re-labelled in every chunk they speak in,
+by construction**. Spec 1's premise is established. What is genuinely unknown is
+whether a reasoning pass can put the pieces back together from context alone.
 
-- **live** — while recording continues, thinking **off**, 90s throttle
-- **final** — at session close, thinking **on**, unthrottled, authoritative
+**Ground truth from multi-device groups does not exist.** Measured, not assumed:
+`meeting_session` has 15 rows in prod and 28 in test, with `group_id` non-null on
+**zero** of them. The grouping feature is wired end to end but has never been used on
+a real meeting. §6 does not depend on it.
 
-The final pass already receives the transcript as `[time] speaker: text` lines
-(`:254`), already writes an authoritative artifact, and already carries
-`speaker_count`. Adding a `speakers` block to what it writes costs one prompt section
-and zero new pipeline.
+## 3. Where the work rides, and why not the transcript
 
-**We do not write to `transcripts/`.** Three reasons, each from this codebase:
+`lambda_extract_session` already runs twice per session: **live** (thinking off, 90s
+throttle, during recording) and **final** (thinking on, unthrottled, at session close,
+authoritative). The final pass already receives the transcript as `[time] speaker:
+text` lines (`:254`) and already writes an authoritative artifact. A `speakers` block
+on that artifact costs one prompt section and no new pipeline.
 
-1. `transcripts/` is an S3 event source for extract-session. Rewriting an object
-   there re-fires extraction (CLAUDE.md BUG-13), and the live/final passes already
-   have an overtake relationship whose termination argument assumes coverage only
-   grows. A third writer invalidates that argument.
-2. It has exactly one writer today (`lambda_transcribe`). A second writer loses
-   values silently the moment ASR is re-run — and an ASR provider switch is in
-   flight, so re-runs are not hypothetical.
-3. It is evidence. Measured ASR hallucination on mixed Chinese/English runs about
-   4%, and the failure mode is fluent, complete, fabricated text. "What was heard"
-   and "what we concluded it meant" must stay separable, or nothing downstream can
-   ever be audited.
+**We do not write to `transcripts/`:**
 
-## 4. What the final pass emits
+1. It is an S3 event source for extract-session, so rewriting an object there re-fires
+   extraction (CLAUDE.md BUG-13). The live/final passes already have an overtake
+   relationship whose termination argument assumes coverage only grows; a third writer
+   invalidates it.
+2. It has one *orchestrator* today. On the prod path the object is written by the AWS
+   Transcribe service itself (`lambda_transcribe.py:405-413`, bucket policy
+   `template.yaml:1247-1249`); the Lambda writes directly only on the ElevenLabs path
+   (`:383`). Either way, a second author loses values silently the moment ASR re-runs —
+   and an ASR provider switch is in flight, so re-runs are not hypothetical.
+3. It is evidence. Measured ASR hallucination on mixed Chinese/English runs about 4%,
+   and the failure mode is fluent, complete, fabricated text. "What was heard" and
+   "what we concluded it meant" must stay separable or nothing can be audited.
 
-A new `speakers` object inside the extraction payload:
+## 4. Prerequisite: labels must be sayable
+
+The prompt currently renders every turn as `[09:14:22] spk_1: …`, so `spk_1` in chunk
+7 and `spk_1` in chunk 40 are indistinguishable **to the model as well as to us**. It
+cannot express "these two are the same person" because it cannot refer to them
+separately, and it cannot avoid conflating them either.
+
+`build_extraction_prompt` must therefore qualify each label with its source call
+before flattening — `[09:14:22] c0007/spk_1: …`, using the chunk index already present
+in the transcript filename (`chunk_stitch.CHUNK_TOKENS_RE`). This is a prompt-rendering
+change only; `speaker_turns`, `speaker_count`, and every stored field are untouched.
+
+Without this the experiment cannot be run at all, and no result from it would mean
+anything.
+
+## 5. What the final pass emits
 
 ```json
 "speakers": {
   "resolved": [
-    { "label": "spk_1",
-      "name": "Daniel",
+    { "person": "Daniel",
+      "labels": ["c0007/spk_1", "c0008/spk_0", "c0011/spk_1"],
       "confidence": "high",
       "basis": "addressed",
-      "evidence": [{ "at": "09:14:22", "by": "spk_0",
-                     "quote": "Hey Daniel, can you check the level 3 doors" }],
-      "reason": "addressed by name, answered in the next turn" }
+      "evidence": [{ "at": "09:14:22", "by": "c0007/spk_0",
+                     "quote": "Hey Daniel, can you check the level 3 doors" }] }
   ],
-  "merges": [
-    { "labels": ["spk_1", "spk_3"], "confidence": "medium",
-      "reason": "one continuous subject across a 2s gap; both refer to 'my crew'" }
-  ],
-  "effective_speaker_count": 2
+  "unresolved_labels": ["c0019/spk_2"]
 }
 ```
 
-- `basis` is one of `self_introduced` | `addressed` | `referred_to` | `role_only`.
-  Kept separate from `confidence` because the *kind* of evidence is what we want to
-  compare against accuracy — a self-introduction and a third-party reference are not
-  equally trustworthy, and only the data can say by how much.
-- `evidence` quotes the transcript verbatim with its timestamp. Without it a wrong
-  name is unexplainable, and the measurement in §6 becomes hand-grading instead of
-  checking a citation.
-- `confidence` is the model's own, and §6 treats it as a claim to be calibrated, not
-  as a fact.
+The unit is a **person**, carrying the qualified labels believed to be them. That
+inverts the original design, which keyed on label and asked for a name — ill-posed
+once labels are known to collide, and it made re-unification inexpressible.
 
-**`speaker_count` is not touched.** It stays the raw ASR count. `effective_speaker_count`
-is the post-merge proposal and is read by nobody. The existing single-speaker gate in
-item-writer (`_resolve_self_responsible`, which only fires when `speaker_count == 1`)
-is unchanged in every respect.
+- `basis` ∈ `self_introduced | addressed | referred_to | role_only`. Separate from
+  `confidence` because the *kind* of evidence is what we want to correlate with
+  accuracy; a self-introduction and a third-party reference are not equally
+  trustworthy, and only data can say by how much.
+- `evidence` quotes the transcript with its timestamp, so a claim can be checked
+  against a citation instead of by re-listening to two hours of audio. This is what
+  makes §6 cheap.
+- `unresolved_labels` is required, not optional. A model that names everything looks
+  better than one that admits doubt, and coverage without that admission is
+  unreadable.
 
-## 5. Only the final pass emits it — and the hazard that creates
+**`speaker_count` is not touched**, and the existing `speaker_count == 1` gate in
+item-writer (`lambda_item_writer.py:359`) is unchanged. Note that gate is *correct
+despite* the collision: a union of exactly one label string implies no call ever heard
+a second voice, which is precisely what it claims. It stays out of scope.
 
-`live` does not emit `speakers`. It runs with thinking off, so its attribution would
-be worse, and once written the field carries no marker saying which pass produced it.
+**Dropped from revision 1:** `merges` and `effective_speaker_count`. Merge proposals
+over a colliding label space were ill-posed, and a fragmentation ratio computed from
+the model's own proposals was circular — the model grading the problem it was asked to
+solve. §2 answers the fragmentation question directly from the transcripts instead.
 
-This creates one real hazard. A live pass **can** overtake a final one when it covers
-strictly more transcripts (`_supersedes` / `overtook_final`), and that live extraction
-carries no `speakers` block — erasing the final's. The existing code already handles
-the general case: on overtaking a final it writes an `extraction_requests/` artifact
-asking for another final pass, so the block returns within one cycle.
+## 6. How the claims get checked
 
-Two consequences that must be honoured:
+The model states claims with citations; a human marks each **right / wrong / can't
+tell**. That is minutes of work per session, not hours, and it is the only reason the
+`evidence` field exists.
 
-- The measurement in §6 samples **final-tier extractions only**, and a session whose
-  latest artifact is live-tier is **pending**, not a failure. Counting an
-  erased-then-restored block as a miss would manufacture a defect rate out of a
-  working self-heal.
-- If the re-run request ever fails, the block stays absent. That is visible as
-  `tier == "live"` on a closed session, and §6 reports it as a separate count rather
-  than folding it into accuracy.
+**Precision** — of the people claimed, how many are right. Reported per `basis` and
+per `confidence`, so we learn whether the model's stated confidence carries
+information. This is the constraint: the project's standing principle is that a guess
+printed as a name reads as a fact.
 
-## 6. The measurement
+**Re-unification** — of the label sets attached to each claimed person, are they
+actually that person throughout. This is the number the whole spec exists for. A
+correct name attached to a label set that silently includes someone else is a **worse**
+outcome than no name, and must be counted as an error, not a partial credit.
 
-### 6.1 Ground truth, from multi-device groups
+**Coverage** — what fraction of labels ended up attributed at all, with
+`unresolved_labels` as the honest denominator.
 
-When several devices record one meeting as a group, **each device's wearer is known
-from its account**, and in that device's own audio the wearer should be the dominant
-voice. A group of N devices therefore yields N labelled `(session, dominant-label →
-person)` pairs at no annotation cost.
+**Sample:** at least 3 sessions with genuine multi-person audio, chosen by the filter
+that found `Sam_Yu/2026-08-03` — calls whose *internal* label count is ≥2, which is
+hard evidence of a second voice rather than an artefact of pooling. The sessions must
+be ones a human can actually identify the voices in; a two-hour recording nobody
+remembers cannot be checked at any price.
 
-**This is a dependency, not an assumption.** Phase 0 (§8) queries how many grouped
-sessions with two or more devices actually exist. If the answer is zero or near zero,
-the fallback is hand-labelling 5–10 real sessions, and the naming half of the
-measurement waits for real group data while the fragmentation half proceeds — it
-needs no ground truth at all.
+**Selection bias, stated up front:** only new-app chunk sessions are measurable.
+Legacy whole-file (RealPTT) recordings never get a final pass at all —
+`extraction_requests/` are written only for `sid` sessions and `_request_final_rerun`
+bails on non-`sid` bases (`lambda_extract_session.py:722-724`).
 
-### 6.2 What we count
+### 6.1 What would count as an answer
 
-**Fragmentation** — the number that decides Spec 1's fate. Measured **two ways, kept
-apart**, because the obvious single measure is circular:
+Pre-registered, so the numbers cannot be read to suit a conclusion later:
 
-- *Model-estimated*: `speaker_count / effective_speaker_count` from the merge
-  proposals. Cheap and available on every session — but it is the model grading the
-  problem it was asked to solve, so on its own it proves nothing.
-- *Independent*: on a grouped session, the number of devices is a **lower bound on
-  the people present**, and it comes from the group, not from the model. Comparing
-  `speaker_count` against device count gives a fragmentation floor that no prompt can
-  flatter. This is the number to quote when arguing for or against Spec 1.
+- **Re-unification correct on most claims, precision high at `confidence: high`** →
+  reasoning can stand in for whole-session diarization; Spec 1 becomes an
+  optimisation, and naming can proceed on the current labels.
+- **Re-unification unreliable while precision looks fine** → the model is naming
+  voices it cannot actually track. This is the dangerous outcome: it produces
+  confident, checkable-looking, wrong attributions. Spec 1 first, and naming waits.
+- **Precision poor at `confidence: high`** → the reasoning pass is not ready to feed
+  anything user-visible, whatever the diarization does.
 
-Where both are available they are reported side by side; a large gap between them is
-itself a finding about the merge proposals.
+## 7. Error handling — including the one that can take topics down
 
-Both are reported as a **distribution, not a mean**. A long tail matters more than
-the average: one two-hour inspection split into nine labels is the case Spec 1 exists
-for, and it vanishes into an average dominated by short single-speaker clips. This is
-the error the BUG-43 write-up ended on — error rates must be grouped by input size,
-or long recordings hide inside short ones. Report by recording duration bucket.
+The final pass runs thinking mode, which sends **no `response_format`**
+(`llm_utils.py:144-150`) and relies on `extract_json`. If the whole document fails to
+parse, `extract_json` returns None and the caller raises (`:643-645`), the S3 event
+retries a 170s+ thinking call, **and the topics go down with it**.
 
-**Naming precision** — of the names emitted, how many are right. Reported per
-`basis`, and per `confidence`, so we learn whether the model's own confidence means
-anything.
+Verbatim transcript quotes are exactly what breaks JSON escaping — embedded quotes,
+newlines, CJK punctuation. So:
 
-**Naming coverage** — of labels that a human could name from the transcript alone,
-how many got a name. Deliberately secondary: the project's stated principle is that
-a guess printed as a name reads as a fact, so precision is the constraint and
-coverage is the thing we trade away.
+- The prompt caps each quote (one short sentence) and caps `resolved` and
+  `unresolved_labels` counts. Generation-time limits, not storage-time: output tokens
+  and wall-time scale with session length while the model is running, on a function
+  already sized against a 600s timeout (`template.yaml:1454`).
+- A `speakers` key that is absent, malformed, or the wrong shape is dropped. It never
+  fails the extraction, which carries the topics people actually depend on.
+- Nothing here can change `speaker_count`, any existing field, or any consumer's
+  behaviour. No consumer validates the artifact schema — item-writer reads named keys
+  and the only shape guard is on `topics` (`lambda_extract_session.py:650-655`) — so an
+  unknown `speakers` key passes through untouched. That is the property that makes this
+  safe to ship ungated.
 
-**Over-merge rate** — proposals that fuse two different people. Reported separately
-from under-merge, because they are not symmetric: leaving a person split is a missed
-improvement, fusing two people is a false statement about who said what.
+**Provider caveat:** the thinking on/off split between live and final is qwen-path
+only. `_call_anthropic` ignores `enable_thinking` (`llm_utils.py:79-81, 107`), so under
+`LlmProvider=anthropic` there is no quality difference between the tiers and §8's
+final-only argument weakens accordingly.
 
-### 6.3 What "good" would mean
+## 8. Only the final pass emits it
 
-Stated in advance so the numbers cannot be read to suit a conclusion later:
+`live` does not emit `speakers`: thinking is off there, so its attribution would be
+worse, and the artifact would not distinguish the two — though `tier` on the payload
+(`:685`) does say which pass wrote it, and §6 uses that.
 
-- Independent fragmentation at or near 1.0 label per person across the distribution
-  → Spec 1's audio stitch is not urgent, and naming can proceed on current labels.
-- A meaningful tail above 2 in the **independent** measure → Spec 1 is the right next
-  investment, and naming should wait for it, exactly as Spec 1 argues. A tail that
-  appears only in the model-estimated measure is a claim about the model, not about
-  the diarization, and must not be used to justify Spec 1.
-- Naming precision below roughly 90% at `confidence: high` → the reasoning pass is
-  not ready to feed anything user-visible regardless of what the diarization does.
+One hazard follows. A live pass **can** overtake a final one when it covers strictly
+more transcripts (`_supersedes` `:553-587`, `overtook_final` `:669-678`), and that live
+extraction carries no `speakers` block, erasing the final's. The existing code
+self-heals: on overtaking a final it writes an `extraction_requests/` artifact asking
+for another final pass (`:707-736`).
 
-## 7. Error handling
+Consequences that must be honoured: §6 samples **final-tier artifacts only**, and a
+closed session sitting at live tier is **pending**, not a failure — counting an
+erased-then-restored block as a miss would manufacture a defect rate out of a working
+self-heal. If the re-run request itself fails the block stays absent; that shows up as
+`tier == "live"` on a closed session and is reported as its own count.
 
-- The `speakers` block is best-effort. A malformed or absent `speakers` key in the
-  model's JSON leaves the field out; it never fails the extraction, which carries the
-  topics that people actually depend on.
-- Evidence quotes are truncated to a fixed length before storage. An unbounded quote
-  is a way for a long transcript to bloat every extraction artifact.
-- Nothing in this feature can change `speaker_count`, any existing field, or any
-  consumer's behaviour. That is the property that makes it safe to ship without
-  gating.
+## 9. Rollout
 
-## 8. Rollout
+**Phase 1 — label qualification (§4) + the `speakers` prompt section and block.** Unit
+tests pin that labels are rendered qualified, that the constraint is present in the
+prompt, and that an absent/malformed/oversized `speakers` value degrades to absent
+rather than raising.
 
-**Phase 0 — check the ground truth exists.** Count grouped sessions with ≥2 devices
-in prod. Decides whether §6.1 works as written or falls back to hand-labelling. Needs
-no code.
-
-**Phase 1 — emit and land.** Prompt section plus the `speakers` block on the final
-pass. Unit tests pin that the constraint is present in the prompt and that a missing
-or malformed block degrades to absent rather than raising.
-
-**Phase 2 — measure.** A script that reads final-tier extractions over a date range
-and reports §6.2, including the count of closed sessions still sitting at live tier.
+**Phase 2 — run it on identified sessions.** Requires recordings whose voices a human
+can name; §6 says why. Produces the check sheet.
 
 **Phase 3 — decide.** The numbers choose between Spec 1 first, naming first, or
-neither. This spec deliberately does not pre-commit to any of them.
+neither. This spec pre-commits to none of them.
 
-## 9. Out of scope
+## 10. Out of scope
 
-- Any consumer. `action_items.responsible`, `participants`, the transcript view,
-  RAG, and search are untouched.
-- Human confirmation UI, and writing to `name_aliases`.
-- Voiceprint enrolment or cross-session identity.
+- Any consumer: `action_items.responsible`, `participants`, the transcript view, RAG,
+  search — all untouched.
+- The `speaker_count == 1` gate (correct as it stands, §5).
+- Human confirmation UI; writing to `name_aliases`.
+- Voiceprint enrolment, cross-session identity.
 - Audio-level session stitching and whole-session diarization — that is Spec 1, and
   this spec exists partly to decide whether to build it.
-- Changing the ASR provider.
+- Changing the ASR provider or `MAX_SPEAKERS`.
 
-## 10. Open questions
+## 11. What revision 1 got wrong
 
-- **Does grouped multi-device data exist in prod yet?** Unverified — the AWS session
-  expired mid-design. Phase 0 answers it, and §6.1 already carries the fallback.
-- **Does the wearer-is-dominant-voice assumption hold?** It is the basis of the free
-  ground truth. A device worn by someone who mostly listens would break it. Phase 0
-  should sanity-check a couple of groups by hand before the metric is trusted.
+- It said `speaker_count` was "an upper bound on the number of people". It is neither
+  bound — it is the union of per-call label vocabularies, capped at 5 (§2).
+- It proposed measuring fragmentation and using that number to decide Spec 1's fate.
+  With colliding labels the measure returns ≈1.0 regardless of the truth, so it would
+  have **killed Spec 1 for exactly the wrong reason**. Fragmentation is now answered
+  directly from the transcripts, and the question moved to re-unification.
+- It keyed `resolved` on label → name, which cannot express re-unification. Now keyed
+  on person → labels.
+- It built its ground truth on multi-device groups. There are none, and the feature has
+  never been used on a real meeting — measured, not assumed.
+- It claimed the artifact carries no marker of which pass wrote it. It carries `tier`.
+- It said `transcripts/` has exactly one writer. On the prod path the writer is the
+  AWS Transcribe service; the Lambda is the orchestrator.
+- It treated JSON-level failure as covered by "malformed values are ignored". A quote
+  that breaks the document takes the topics down with it (§7).
