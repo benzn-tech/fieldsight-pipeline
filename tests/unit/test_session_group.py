@@ -161,17 +161,18 @@ def test_ending_twice_keeps_the_first_time():
     assert "group_ended_at is null" in conn.calls[1]["sql"].lower()
 
 
-def test_group_is_ended_reads_the_whole_group():
+def test_group_ended_at_reads_the_whole_group():
     """A device that joined AFTER the end has group_ended_at NULL on its own
     row. Reading only that row would let it record into a finished meeting."""
-    conn = FakeConn(results=[[{"x": 1}]])
-    assert meeting_session.group_is_ended(conn, SID_B) is True
+    conn = FakeConn(results=[[{"ended_at": "2026-08-07T03:19:36+00:00"}]])
+    assert meeting_session.group_ended_at(conn, SID_B) == "2026-08-07T03:19:36+00:00"
     sql = conn.calls[0]["sql"].lower()
     assert "group_id = %s" in sql and "session_id = %s" in sql
 
 
-def test_group_is_ended_false_when_nobody_has_ended_it():
-    assert meeting_session.group_is_ended(FakeConn(results=[[]]), SID_B) is False
+def test_group_ended_at_is_none_when_nobody_has_ended_it():
+    """None, not False — callers compare it against a session's own start."""
+    assert meeting_session.group_ended_at(FakeConn(results=[[{"ended_at": None}]]), SID_B) is None
 
 
 def test_group_is_settled_false_while_a_member_could_still_be_recording():

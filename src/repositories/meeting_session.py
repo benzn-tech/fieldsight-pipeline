@@ -313,14 +313,24 @@ def end_group(conn, group_id) -> int:
     return len(cur.fetchall())
 
 
-def group_is_ended(conn, group_id) -> bool:
-    """True once anyone in the group has ended the meeting.
+def group_ended_at(conn, group_id):
+    """WHEN the meeting was ended, or None if it has not been.
 
-    Reads the whole group rather than one row so a device that joined AFTER the
-    end is told immediately, instead of recording into a meeting that is over."""
+    A timestamp rather than a boolean, and the EARLIEST one, because callers
+    need to compare it against a session's own start. "Has this group ever been
+    ended" is not the same question as "should this recording stop", and
+    conflating them produced a loop in production: a device that rejoined after
+    the end was told to stop on its first upload, its stop wrote another end,
+    and the next rejoin repeated it. Rejoining an ended group must be refused at
+    the door; a recording that started after the end is a NEW recording that
+    happens to be carrying a stale id, and stopping it is wrong.
+
+    MIN, not MAX: `end_group` only ever fills rows that are still NULL, so later
+    rows carry later timestamps. The meeting ended when the FIRST person said
+    so."""
     row = conn.cursor(row_factory=dict_row).execute(
-        "SELECT 1 AS x FROM meeting_session "
-        "WHERE (group_id = %s OR session_id = %s) AND group_ended_at IS NOT NULL LIMIT 1",
+        "SELECT MIN(group_ended_at) AS ended_at FROM meeting_session "
+        "WHERE (group_id = %s OR session_id = %s) AND group_ended_at IS NOT NULL",
         (group_id, group_id),
     ).fetchone()
-    return row is not None
+    return (row or {}).get("ended_at")
