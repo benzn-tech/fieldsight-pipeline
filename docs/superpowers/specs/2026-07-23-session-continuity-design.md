@@ -79,7 +79,7 @@ required.
 ## 5. Architecture / data flow
 
 ```
-Device uploads ~3-min chunks continuously
+Device uploads ~30-second chunks continuously (each carrying ~2s of the previous one)
   → S3 users/{user}/audio|video/{date}/{device}_{date}_{time}.ext   (immediate; unchanged)
        │  S3 ObjectCreated event
        ▼
