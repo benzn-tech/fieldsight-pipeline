@@ -182,6 +182,7 @@ jobs:
               "NormaliseAudio=${{ vars.PROD_NORMALISE_AUDIO || 'false' }}" \
               "FilterAudioEventTags=${{ vars.PROD_FILTER_AUDIO_EVENT_TAGS || 'true' }}" \
               "EnableGroupMerge=${{ vars.PROD_ENABLE_GROUP_MERGE || 'false' }}" \
+              "EmitEvidence=${{ vars.PROD_EMIT_EVIDENCE || 'false' }}" \
               "AuthorityFlip=${{ vars.PROD_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.PROD_GRADED_ROLES || 'false' }}" \
               "ServerBuild=${{ github.sha }}" \

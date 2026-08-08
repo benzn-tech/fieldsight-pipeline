@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 _TOPIC_COLS = ("id, site_id, user_id, source_s3_key, report_date, occurred_at, "
                "category, title, summary, time_range, participants, source, created_at, "
-               "work_class, work_confidence, is_mixed, thread_id")
+               "work_class, work_confidence, is_mixed, thread_id, evidence")
 
 # Phase F (D8 retirement, spec §8): severity -> risk_level, for reshaping
 # safety-domain findings into the legacy safety_observations row shape.
@@ -53,7 +53,8 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
                  occurred_at=None, category=None, summary=None,
                  action_items=None, safety=None, photos=None,
                  time_range=None, participants=None,
-                 work_class=None, work_confidence=None, is_mixed=False) -> dict:
+                 work_class=None, work_confidence=None, is_mixed=False,
+                 evidence=None) -> dict:
     """Insert a topic with its children. NOTE: currently insert-only —
     no ON CONFLICT dedup. Dedup is instead handled by callers running
     delete_topics_for_scope() first to clear the (site_id, report_date, user_id)
@@ -67,16 +68,24 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
     convention as every other jsonb column in this codebase (chunks.py,
     findings.py). `source` is NOT a kwarg here: it's a passive provenance
     column that defaults to 'ai' at the DB level (spec §8 Task 5 adds the
-    'human' writer later)."""
+    'human' writer later).
+
+    evidence (migration 0037) is the extraction's own citations plus the result
+    of checking each against the transcript. NULL means the extraction predates
+    the feature or ran with EMIT_EVIDENCE off -- which is prod today -- and is
+    NOT the same as the model having cited nothing."""
     cur = conn.cursor(row_factory=dict_row)
     topic = cur.execute(
         f"INSERT INTO topics (site_id, user_id, source_s3_key, report_date, occurred_at, "
         f"category, title, summary, time_range, participants, "
-        f"work_class, work_confidence, is_mixed) "
-        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_TOPIC_COLS}",
+        f"work_class, work_confidence, is_mixed, evidence) "
+        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_TOPIC_COLS}",
         (site_id, user_id, source_s3_key, report_date, occurred_at, category, title, summary,
          time_range, Jsonb(participants) if participants is not None else None,
-         work_class, work_confidence, is_mixed),
+         work_class, work_confidence, is_mixed,
+         # NULL, not '[]', when there is nothing: absent means "never measured",
+         # an empty array would mean "measured and cited nothing".
+         Jsonb(evidence) if evidence is not None else None),
     ).fetchone()
     tid = topic["id"]
     for a in (action_items or []):

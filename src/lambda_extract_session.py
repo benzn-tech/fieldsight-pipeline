@@ -43,6 +43,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+import evidence_match
 import llm_utils
 import chunk_stitch
 from transcript_utils import (
@@ -248,6 +249,128 @@ AUDIO_EVENT_TAG_RE = re.compile(r'\[[^\[\]]{1,40}\]')
 # ElevenLabs, and nothing downstream can tell them from a person talking.
 FILTER_AUDIO_EVENT_TAGS = os.environ.get(
     'FILTER_AUDIO_EVENT_TAGS', 'true').lower() == 'true'
+# Claim provenance (P1-2): ask each topic to cite the transcript lines it came
+# from, then check those quotes mechanically. Off on prod initially -- not
+# because the write is risky (it is additive and every consumer uses .get()) but
+# because it changes the extraction PROMPT, and a prompt change is not something
+# to discover the morning after.
+EMIT_EVIDENCE = os.environ.get('EMIT_EVIDENCE', 'false').lower() == 'true'
+
+
+EVIDENCE_WINDOW_SEC = float(os.environ.get('EVIDENCE_WINDOW_SEC', '300'))
+EVIDENCE_FLOOR_TOKENS = int(os.environ.get('EVIDENCE_FLOOR_TOKENS', '5'))
+EVIDENCE_FUZZY = float(os.environ.get('EVIDENCE_FUZZY_THRESHOLD', '0.9'))
+_EVIDENCE_STATUSES = ("verified", "verified_fuzzy", "weak",
+                      "unverified", "absent", "unchecked")
+
+
+def _segment_key_for(transcript_filename, user_folder, date):
+    """transcripts/{u}/{d}/{base}.json -> audio_segments/{u}/{d}/{base}.wav.
+
+    Always .wav: an `srcmp4` token in the name records the SOURCE format, not
+    the segment's -- VAD writes 16k wav for every emitted unit, whatever came
+    in. Someone reading the name and looking for an .mp4 finds nothing."""
+    if not transcript_filename or not user_folder or not date:
+        return None
+    base = transcript_filename.rsplit('.', 1)[0]
+    return f"audio_segments/{user_folder}/{date}/{base}.wav"
+
+
+def _parse_at(at_str, session_date, turns):
+    """The model returns a bare HH:MM:SS; turns carry full datetimes.
+
+    The date comes from the session, and for a session crossing midnight `at`
+    resolves to the occurrence NEAREST the session's own span. Without that rule
+    BUG-37's family reappears inside the matcher: the stored anchor is
+    unambiguous, but the matcher still consumes the model's string."""
+    from datetime import timedelta
+    t = datetime.strptime(f"{session_date} {at_str}", "%Y-%m-%d %H:%M:%S")
+    anchored = [x for x in (a.get("abs_start") for a in turns) if x]
+    if not anchored:
+        return t
+    mid = anchored[len(anchored) // 2]
+    return min((t, t + timedelta(days=1), t - timedelta(days=1)),
+               key=lambda c: abs((c - mid).total_seconds()))
+
+
+def verify_evidence(result, turns, session_date, user_folder=None, date=None):
+    # `date` names the S3 folder; `session_date` resolves the model's bare
+    # HH:MM:SS. They are the same value today and named apart so a future
+    # session that spans midnight does not silently conflate them.
+    """Check every cited quote against the transcript the model actually saw.
+
+    Catches the EXTRACTION inventing a claim. Does NOT catch the ASR inventing
+    words that the extraction then quotes faithfully -- `verified` means "not
+    made up here", never "true", and no caller may present it otherwise.
+
+    Group extractions are skipped entirely: the matcher windows on absolute
+    time, and group turn lists deliberately have no shared clock, so an honest
+    quote from a second device would land outside the window and be manufactured
+    into evidence of fabrication -- poisoning the one number this produces.
+
+    Never raises. This is a measurement, and a measurement that can fail an
+    extraction is worse than no measurement."""
+    if result.get('tier') == TIER_GROUP:
+        logger.info("evidence: skipping a group extraction -- no shared clock "
+                    "across devices to window on")
+        return {}
+    counts = {k: 0 for k in _EVIDENCE_STATUSES}
+    for topic in result.get('topics') or []:
+        # Topic level only. The model may volunteer evidence inside children
+        # despite the instruction; Aurora drops it, but it would leave an
+        # UNVERIFIED citation in the S3 artifact for a reader to trust.
+        for child_key in ('action_items', 'findings'):
+            for child in topic.get(child_key) or []:
+                if isinstance(child, dict):
+                    child.pop('evidence', None)
+        statuses = []
+        for ev in topic.get('evidence') or []:
+            try:
+                at = _parse_at(ev.get('at', ''), session_date, turns)
+                r = evidence_match.check_quote(
+                    ev.get('quote', ''), turns, at,
+                    w_seconds=EVIDENCE_WINDOW_SEC,
+                    floor_tokens=EVIDENCE_FLOOR_TOKENS,
+                    fuzzy_threshold=EVIDENCE_FUZZY)
+            except Exception:
+                logger.exception("evidence: verifier failed on %r",
+                                 (ev.get('quote') or '')[:80])
+                r = {"status": "unchecked"}
+            ev['status'] = r['status']
+            key = _segment_key_for(r.get('segment_key_source'), user_folder, date)
+            if key:
+                ev['segment_key'] = key
+                ev['offset_sec'] = r.get('offset_sec')
+            for extra in ('found_offset_sec', 'fuzzy_ratio'):
+                if r.get(extra) is not None:
+                    ev[extra] = r[extra]
+            statuses.append(r['status'])
+        topic['evidence_status'] = evidence_match.roll_up(statuses)
+        counts[topic['evidence_status']] = counts.get(topic['evidence_status'], 0) + 1
+    # One line per extraction. found_offset feeds the W calibration; the counts
+    # ARE the Phase A deliverable.
+    logger.info("evidence: %s", counts)
+    return counts
+
+
+def _evidence_instruction():
+    """The one rule that decides whether the Phase A number means anything.
+
+    Without "VERBATIM" the model tidies as it quotes, every tidy drops to the
+    fuzzy tier or below, and the false-unverified rate swamps the fabrication
+    rate the measurement exists to find. Empty when the flag is off, so prod's
+    prompt stays byte-identical to today's."""
+    if not EMIT_EVIDENCE:
+        return ""
+    return """
+N. EVIDENCE. For each topic, give 1-2 `evidence` entries quoting the transcript
+   lines that topic came from. Quote VERBATIM -- copy the words exactly as they
+   appear above, including any that look like transcription errors. Do not
+   correct, tidy or paraphrase them. `at` is the [HH:MM:SS] of the line the
+   quote starts in. Do NOT put evidence inside action_items or findings; it is a
+   per-topic field. Prefer a full clause over a few words -- a quote of two or
+   three words proves nothing.
+"""
 
 
 def filter_audio_event_tags(turns):
@@ -463,6 +586,12 @@ EXTRACTION_SCHEMA = """{
       "time_range": "HH:MM – HH:MM",
       "participants": ["Name1", "Name2"],
       "origin": "inspection | meeting | mixed",
+      "evidence": [
+        {
+          "at": "HH:MM:SS of the line this quote starts in",
+          "quote": "VERBATIM words copied from the transcript above"
+        }
+      ],
       "action_items": [
         {
           "action": "What needs to be done",
@@ -651,7 +780,7 @@ Rules:
 - participants, action_items, findings, decisions, questions may be empty arrays
 - declared_site.confidence is YOUR OWN confidence (0.0-1.0) that this is truly an explicit
   arrival declaration, not a mention
-- Do NOT include any text outside the JSON object, stats"""
+- Do NOT include any text outside the JSON object{_evidence_instruction()}"""
 
 
 def build_extraction_prompt(user_folder, date, session_base, turns, n_segments):
@@ -818,11 +947,23 @@ def assemble_session_turns(bucket, keys):
         source_filenames.append(filename)
 
     turns = []
-    for normalized in normalized_list:
+    # Stamp each turn with the segment it came from. The two lists are built in
+    # the loop above and a skipped segment appends to NEITHER, so zip() pairs
+    # them correctly -- but the pairing is load-bearing enough to be pinned by a
+    # test, because getting it wrong attributes every quote to the wrong audio
+    # file and nothing fails.
+    #
+    # This is what makes a cited quote resolvable to audio at all. Without it
+    # the anchor has to be reverse-derived from an absolute timestamp: each
+    # segment's interval recomputed from its filename (BUG-09's arithmetic,
+    # already got wrong once here) and then the ~2s ring-buffer overlap
+    # disambiguated by hand. turn['start_sec'] is already the in-file offset,
+    # so the filename is the only missing half.
+    for normalized, filename in zip(normalized_list, source_filenames):
         for turn in normalized.get('speaker_turns', []):
             if turn.get('abs_start') is None:
                 continue
-            turns.append(turn)
+            turns.append(dict(turn, source_filename=filename))
     turns.sort(key=lambda t: t['abs_start'])
     turns = _dedup_turn_boundaries(turns)   # drop mobile chunk-overlap dup at seams (no-op pre-chunk)
     # Tags first: an announcement wearing one ("[background noise] Recording
@@ -926,8 +1067,50 @@ def merged_member_keys(artifact):
 
 def max_tokens_for(n_segments):
     """Output budget, scaled to input (BUG-16). Extracted so the group path uses
-    the same rule as the solo one rather than a second number to keep in sync."""
-    return min(4096 + n_segments * 350, 8000)
+    the same rule as the solo one rather than a second number to keep in sync.
+
+    Reaches qwen on NEITHER branch: with force_json set, llm_utils omits
+    max_tokens in thinking mode and sends response_format instead of it in
+    non-thinking mode. So this governs the anthropic fallback only, and the old
+    8000 was a limit inherited from a much smaller output model. Timeout 600 and
+    LLM_HTTP_TIMEOUT 540 leave room for the larger number."""
+    return min(4096 + n_segments * 350, 16000)
+
+
+def looks_truncated(raw):
+    """Did the model stop mid-JSON, rather than return something malformed?
+
+    Today the two are the same log line, and only one of them is fixed by
+    raising a limit -- so a ceiling hit is currently indistinguishable from a
+    model having a bad day, and the S3-event retry re-runs the full paid call
+    into the same wall either way (BUG-43's shape).
+
+    Brace balance rather than "ends with }": a response cut off inside a long
+    array very often ends on the '}' of the last complete element, which the
+    simpler test reads as complete. Quoted braces are skipped so a quote
+    containing '{' does not fake a balance."""
+    if not raw:
+        return False
+    s = raw.strip()
+    start = s.find("{")
+    if start < 0:
+        return False                       # not JSON-shaped at all; a different fault
+    depth, in_str, esc = 0, False, False
+    for ch in s[start:]:
+        if esc:
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return False           # the object closed; anything after is prose
+    return True
 
 
 def build_group_prompt(artifact, sources):
@@ -1022,6 +1205,11 @@ def extract_group(bucket, artifact):
         return None
     parsed = llm_utils.extract_json(raw_response)
     if parsed is None:
+        if looks_truncated(raw_response):
+            logger.error("group %s: output hit the token ceiling (%d chars) -- a "
+                         "group prompt carries every member's transcript, so this "
+                         "is the path most likely to hit it",
+                         artifact['groupId'], len(raw_response))
         logger.error("group %s: could not parse the model's JSON", artifact['groupId'])
         return None
     topics = parsed.get('topics', [])
@@ -1233,6 +1421,14 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
 
     parsed = llm_utils.extract_json(raw_response)
     if parsed is None:
+        if looks_truncated(raw_response):
+            # Said plainly because the S3-event retry will re-run this whole
+            # paid call into the identical wall. Raising max_tokens does not
+            # help on qwen (it is never sent) -- the fix is a shorter prompt or
+            # a model with more output headroom.
+            logger.error("%s: output hit the token ceiling (%d chars, "
+                         "max_tokens=%d, thinking=%s) -- retrying will hit it again",
+                         session_base, len(raw_response), max_tokens, final)
         raise RuntimeError(f"Failed to parse Claude JSON for session {session_base}")
 
     # M-9: never write a malformed contract. Stay on the S3-retry side
@@ -1250,6 +1446,18 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
     # action_items passes through untouched (item-writer contract).
     for topic in parsed_topics:
         topic['safety_flags'] = _derive_safety_flags(topic.get('findings'))
+
+    # Verify the citations while `turns` is still in hand -- the transcript the
+    # model actually saw, post-filter, which is the only set a quote can honestly
+    # have come from. Never raises: a measurement that can fail an extraction is
+    # worse than no measurement.
+    if EMIT_EVIDENCE:
+        try:
+            verify_evidence(parsed, turns, date,
+                            user_folder=user_folder, date=date)
+        except Exception:
+            logger.exception("evidence: verification pass failed entirely -- "
+                             "the extraction is unaffected")
 
     # I-2 (replaces the old raise-on-growth guard -- see _supersedes): re-read
     # the extraction that exists NOW, not the one we read before the LLM call,
