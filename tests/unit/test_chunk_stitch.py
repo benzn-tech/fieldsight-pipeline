@@ -88,3 +88,60 @@ def test_stitch_tolerates_empty_and_none():
     assert cs.stitch_chunks([]) == []
     assert cs.stitch_chunks(None) == []
     assert cs.stitch_chunks([(0, None), (1, W("hi"))]) == W("hi")
+
+
+# ---- dedup_overlap: the seam, and what it can and cannot recover ---------
+#
+# The overlap is the SAME ~2s of audio transcribed twice, and the engine does not
+# return the same words both times. Measured on prod session
+# sidfb57faf959ed40d68ca8b02797605a20 (2026-08-08).
+
+
+def test_a_misheard_word_at_the_seam_leaves_the_duplicate_in_place():
+    """Documented limitation, not an aspiration. c0003 ended "…back around the
+    gully" and c0004 began "Back around the galley.", so no exact run exists and
+    the duplicate survives into the extraction prompt.
+
+    A fuzzy variant was written and measured against this session, then REMOVED:
+    the engine also glues a boundary word to the next sentence ("galley。12"), so
+    the fuzzy run dropped that whole token and took the batch number with it,
+    turning "Batch 12 bricks" into "that batch of bricks". Losing a number is
+    worse than carrying a fragment. The real fix is timestamp-based and needs
+    word-level times on a turn, which speaker_turns does not carry today.
+    """
+    tail = W("cut", "the", "slab", "back", "around", "the", "gully")
+    head = W("Back", "around", "the", "galley.", "12", "bricks", "south")
+    assert cs.dedup_overlap(tail, head) == head
+
+
+def test_exact_match_still_wins_and_is_unchanged():
+    tail = W("booked", "for", "Monday", "we", "push", "it", "to", "Wednesday")
+    head = W("push", "it", "to", "Wednesday.", "next", "topic")
+    assert cs.dedup_overlap(tail, head) == W("next", "topic")
+
+
+def test_bare_punctuation_is_never_a_match():
+    """A token that normalises to nothing carries no evidence of a repeat. Letting
+    emptiness match is exactly how the CJK defect below did its damage."""
+    assert cs.dedup_overlap(W("slab", "."), W(".", "pour", "monday")) == W(".", "pour", "monday")
+
+
+def test_unrelated_chinese_is_not_a_boundary_repeat():
+    """The defect these tests were written for, and it was silent data loss.
+
+    `_norm` erased every non-ASCII character to the empty string, so any two
+    Chinese runs compared EQUAL and the longest-first loop deleted up to
+    `max_window` characters from the head of every chunk. Measured 2026-08-08:
+    these two unrelated sentences lost 7 of the head's 11 characters, at every
+    seam, on every mixed-language session, with nothing logged.
+    """
+    tail = [{"text": c} for c in "今天天气不错啊"]
+    head = [{"text": c} for c in "钢筋合格证还没到今天再催"]
+    assert cs.dedup_overlap(tail, head) == head
+
+
+def test_a_real_chinese_repeat_is_still_removed():
+    """Fixing the above must not stop it deduping when the repeat is genuine."""
+    tail = [{"text": c} for c in "剩下那一段要等电气"]
+    head = [{"text": c} for c in "要等电气套管预埋完"]
+    assert cs.dedup_overlap(tail, head) == [{"text": c} for c in "套管预埋完"]
