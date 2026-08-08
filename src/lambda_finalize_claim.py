@@ -50,6 +50,15 @@ IDLE_CLOSE_SECONDS = SESSION_GAP_MINUTES * 60
 # COALESCE falls back to opened_at) would be closed prematurely. Flipped on WITH
 # that lambda's deploy.
 INFER_IDLE_CLOSE = os.environ.get("INFER_IDLE_CLOSE", "false").lower() == "true"
+# Phase C multi-device merge. Off means the standing scan never runs, so no
+# group is ever claimed and every downstream branch stays inert.
+ENABLE_GROUP_MERGE = os.environ.get("ENABLE_GROUP_MERGE", "false").lower() == "true"
+# The longest a group may span before it is refused as stale. A device that kept
+# a group overnight presents it again the next day and nothing on the device
+# objects — merging yesterday into today reads perfectly fluently, which is why
+# the guard is unconditional. Measured on opened_at, the SERVER's timestamp:
+# these ROMs have been seen 12 hours out (BUG-37).
+GROUP_MAX_SPAN_SECONDS = int(os.environ.get("GROUP_MAX_SPAN_SECONDS", "43200"))
 
 
 def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_rolling,
@@ -208,6 +217,126 @@ def _request_extraction(session_id, folder, date):
         ContentType="application/json")
 
 
+def group_merged_key(user_folder, date, group_id):
+    """Where the merged extraction is written.
+
+    Deliberately NOT extraction_key(..., "sid"+lead): that is byte-identical to
+    the LEAD's own final-pass key, and the final pass writes blind (no supersede
+    read). A lead-solo final landing after the merge would overwrite it,
+    item-writer would then delete the MERGED topics as that key's previous
+    output, and every joiner's content would be gone from Aurora — with the
+    members' own topics already deleted. `grp` collides with nothing."""
+    return f"extractions/{user_folder}/{date}/grp{group_id}.json"
+
+
+def _member_context(conn, row, resolve_ctx):
+    """One member as the merge request needs it, or None if unresolvable.
+
+    Reuses the finalize path's own context resolver so the DATE comes from the
+    same NZ conversion — a UTC date here would name a folder that does not
+    exist, and the merge would silently gather nothing (the BUG-37 family that
+    already produced "No summary" once)."""
+    ctx = resolve_ctx(conn, row) or {}
+    if not ctx.get("folder") or not ctx.get("date"):
+        return None
+    return {"userFolder": ctx["folder"], "date": ctx["date"],
+            "sessionBase": "sid" + row["session_id"]}
+
+
+def sweep_groups(conn, *, list_due, claim, mark_result, span_ok, members_of,
+                 resolve_ctx, enqueue):
+    """Claim every settled, unmerged group and ask for its merged extraction.
+
+    A STANDING scan, run every tick regardless of whether any session was due.
+    That is the whole correction over the first design: on the tick that
+    finalizes a group's last member, that member is `finalizing` with a fresh
+    last_segment_at, so the group cannot be settled yet; it settles a tick later
+    when reconcile marks it `sent`, and by then sweep() has no due session to
+    hang a check on. The lead makes it worse — it carries no group_id of its
+    own, so a check reading the group off the finalizing row had nothing to look
+    up when the lead stopped last.
+    """
+    results = []
+    for row in list_due(conn):
+        gid = row["group_id"]
+        members = members_of(conn, gid)
+        # Both guards the parent spec called unconditional and that Phases A/B
+        # never wired. A wrong merge mixes two meetings into one report and
+        # sends it to both sets of people — contamination plus disclosure, and
+        # hard to notice after the fact, which is why the bias is under-merge.
+        companies = {str(m.get("company_id")) for m in members if m.get("company_id")}
+        stale = not span_ok(conn, gid)
+        if stale or len(companies) > 1:
+            mark_result(conn, gid, "rejected")
+            logger.warning("group %s rejected: stale=%s companies=%s",
+                           gid, stale, sorted(companies))
+            results.append({"group_id": gid, "status": "rejected"})
+            continue
+        contexts, by_base = [], {}
+        for m in members:
+            c = _member_context(conn, m, resolve_ctx)
+            if c:
+                contexts.append(c)
+                by_base[c["sessionBase"]] = c
+        if not contexts:
+            # Settled with nothing usable. Marked terminal so it leaves the
+            # candidate set instead of being re-read every minute forever.
+            mark_result(conn, gid, "empty")
+            results.append({"group_id": gid, "status": "empty"})
+            continue
+        # The artifact takes the LEAD's folder and date. A group can straddle NZ
+        # midnight, so members legitimately differ; each member's own date is
+        # used for its own key, which is extract-session's job. A lead that
+        # never uploaded has no context at all — fall back to a member rather
+        # than discard the meeting, since the group id is an identifier, not a
+        # claim of authorship.
+        lead = by_base.get("sid" + gid) or contexts[0]
+        merged_key = group_merged_key(lead["userFolder"], lead["date"], gid)
+        if not claim(conn, gid, merged_key):
+            results.append({"group_id": gid, "status": "lost-claim"})
+            continue
+        enqueue({"groupId": gid, "leadSessionId": gid, "mergedKey": merged_key,
+                 "members": contexts})
+        results.append({"group_id": gid, "status": "claimed"})
+    return results
+
+
+def sweep_groups_if_enabled(conn, scan=None):
+    """The flag gate, separated so the scan itself stays a pure function."""
+    if not ENABLE_GROUP_MERGE:
+        return []
+    return (scan or _real_group_scan)(conn)
+
+
+def _real_group_scan(conn):
+    from repositories import session_group
+    return sweep_groups(
+        conn,
+        list_due=lambda c: session_group.list_due(c, SESSION_GAP_MINUTES * 60),
+        claim=session_group.claim,
+        mark_result=session_group.mark_result,
+        span_ok=lambda c, gid: meeting_session.group_span_ok(
+            c, gid, GROUP_MAX_SPAN_SECONDS),
+        members_of=meeting_session.list_group_members,
+        resolve_ctx=_resolve_context,
+        enqueue=_enqueue_group)
+
+
+def _enqueue_group(artifact):
+    """Ask extract-session to merge this group.
+
+    Same S3-artifact crossing as every other in-VPC -> non-VPC hop: this sweep
+    cannot invoke a lambda (BUG-36 — no NAT, the call black-holes until
+    timeout), but it can write to S3 through the gateway endpoint. The `group-`
+    prefix is what routes it away from the solo final-pass path."""
+    import boto3
+    boto3.client("s3").put_object(
+        Bucket=S3_BUCKET,
+        Key=f"{EXTRACTION_REQUESTS_PREFIX}group-{artifact['groupId']}.json",
+        Body=json.dumps(artifact, ensure_ascii=False),
+        ContentType="application/json")
+
+
 def infer_idle_closes(conn, idle_seconds):
     """§8.4 close inference: an `open` session with no new chunk for idle_seconds is
     treated as closed (the device stopped/crashed without a /close). Move each to
@@ -284,9 +413,15 @@ def lambda_handler(event, context):
     with get_connection() as conn:
         swept = sweep(conn)
         reconciled = reconcile(conn, _read_result)
+        # AFTER reconcile, deliberately. reconcile is what moves a claimed
+        # session to `sent`, and `sent` is what makes its group settled — so
+        # running the group scan first would always be one tick behind.
+        groups = sweep_groups_if_enabled(conn)
     # Observability: this fires every minute, so log ONLY when it did something
     # (no per-idle-minute noise). enqueued = sessions handed to the send worker;
     # reconciled = sessions moved to sent/failed this tick.
-    if swept or reconciled:
-        logger.info("finalize sweep: enqueued=%d reconciled=%d", len(swept), len(reconciled))
-    return {"swept": len(swept), "reconciled": len(reconciled)}
+    if swept or reconciled or groups:
+        logger.info("finalize sweep: enqueued=%d reconciled=%d groups=%d",
+                    len(swept), len(reconciled), len(groups))
+    return {"swept": len(swept), "reconciled": len(reconciled),
+            "groups": len(groups)}
