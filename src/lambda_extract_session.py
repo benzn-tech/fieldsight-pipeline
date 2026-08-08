@@ -1067,8 +1067,50 @@ def merged_member_keys(artifact):
 
 def max_tokens_for(n_segments):
     """Output budget, scaled to input (BUG-16). Extracted so the group path uses
-    the same rule as the solo one rather than a second number to keep in sync."""
-    return min(4096 + n_segments * 350, 8000)
+    the same rule as the solo one rather than a second number to keep in sync.
+
+    Reaches qwen on NEITHER branch: with force_json set, llm_utils omits
+    max_tokens in thinking mode and sends response_format instead of it in
+    non-thinking mode. So this governs the anthropic fallback only, and the old
+    8000 was a limit inherited from a much smaller output model. Timeout 600 and
+    LLM_HTTP_TIMEOUT 540 leave room for the larger number."""
+    return min(4096 + n_segments * 350, 16000)
+
+
+def looks_truncated(raw):
+    """Did the model stop mid-JSON, rather than return something malformed?
+
+    Today the two are the same log line, and only one of them is fixed by
+    raising a limit -- so a ceiling hit is currently indistinguishable from a
+    model having a bad day, and the S3-event retry re-runs the full paid call
+    into the same wall either way (BUG-43's shape).
+
+    Brace balance rather than "ends with }": a response cut off inside a long
+    array very often ends on the '}' of the last complete element, which the
+    simpler test reads as complete. Quoted braces are skipped so a quote
+    containing '{' does not fake a balance."""
+    if not raw:
+        return False
+    s = raw.strip()
+    start = s.find("{")
+    if start < 0:
+        return False                       # not JSON-shaped at all; a different fault
+    depth, in_str, esc = 0, False, False
+    for ch in s[start:]:
+        if esc:
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return False           # the object closed; anything after is prose
+    return True
 
 
 def build_group_prompt(artifact, sources):
@@ -1163,6 +1205,11 @@ def extract_group(bucket, artifact):
         return None
     parsed = llm_utils.extract_json(raw_response)
     if parsed is None:
+        if looks_truncated(raw_response):
+            logger.error("group %s: output hit the token ceiling (%d chars) -- a "
+                         "group prompt carries every member's transcript, so this "
+                         "is the path most likely to hit it",
+                         artifact['groupId'], len(raw_response))
         logger.error("group %s: could not parse the model's JSON", artifact['groupId'])
         return None
     topics = parsed.get('topics', [])
@@ -1374,6 +1421,14 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
 
     parsed = llm_utils.extract_json(raw_response)
     if parsed is None:
+        if looks_truncated(raw_response):
+            # Said plainly because the S3-event retry will re-run this whole
+            # paid call into the identical wall. Raising max_tokens does not
+            # help on qwen (it is never sent) -- the fix is a shorter prompt or
+            # a model with more output headroom.
+            logger.error("%s: output hit the token ceiling (%d chars, "
+                         "max_tokens=%d, thinking=%s) -- retrying will hit it again",
+                         session_base, len(raw_response), max_tokens, final)
         raise RuntimeError(f"Failed to parse Claude JSON for session {session_base}")
 
     # M-9: never write a malformed contract. Stay on the S3-retry side
