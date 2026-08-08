@@ -292,6 +292,7 @@ def test_a_working_group_scan_still_returns_its_results(monkeypatch):
     monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
     monkeypatch.setattr(fc, "_real_group_scan",
                         lambda c: [{"group_id": "g1", "status": "claimed"}])
+    monkeypatch.setattr(fc, "_real_recover", lambda c: [])
     assert fc._sweep_groups_contained(_SavepointConn()) == [
         {"group_id": "g1", "status": "claimed"}]
 

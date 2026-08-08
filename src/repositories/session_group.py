@@ -109,6 +109,28 @@ def claim(conn, group_id, merged_key) -> bool:
     return row is not None
 
 
+def list_stuck(conn, stale_seconds) -> list[dict]:
+    """Groups CLAIMED long enough ago that the merge cannot still be running.
+
+    The gap this closes: `claim` sets merged_at, but the only thing that ever
+    sets merge_result is item-writer, when the merged ARTIFACT lands. If
+    extract_group returns None -- an LLM failure, a truncated response,
+    unparseable JSON -- no artifact is written, so merge_result stays NULL
+    forever while merged_at is set. `list_due` requires both to be NULL, so the
+    group is never looked at again and the meeting silently never merges.
+
+    `rearm` exists but its only caller is item-writer, which needs the very
+    artifact that was never produced.
+    """
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT group_id, merge_count FROM session_group "
+        "WHERE merge_result IS NULL AND merged_at IS NOT NULL "
+        "AND merged_at < now() - make_interval(secs => %s) "
+        "ORDER BY merged_at",
+        (stale_seconds,),
+    ).fetchall()
+
+
 def mark_result(conn, group_id, result) -> None:
     """Terminal state: 'merged', 'rejected' (span/company guard) or 'empty'
     (settled with nothing usable). Any of them removes the group from the

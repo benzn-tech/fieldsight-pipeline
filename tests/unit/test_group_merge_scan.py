@@ -159,7 +159,7 @@ def test_the_flag_being_off_means_the_scan_never_runs(monkeypatch):
 def test_the_flag_being_on_runs_the_scan(monkeypatch):
     monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
     called = []
-    fc._sweep_groups_contained(_SavepointConn(),
+    fc._sweep_groups_contained(_SavepointConn(), recover=lambda c: [],
                                scan=lambda conn: called.append(1) or [])
     assert called == [1]
 
@@ -202,3 +202,76 @@ def test_the_scan_runs_after_reconcile(monkeypatch):
 
     fc.lambda_handler({}, None)
     assert order == ["sweep", "reconcile", "groups"]
+
+
+# ---- a merge that fails after being claimed must not vanish -------------
+
+def test_a_claimed_group_whose_merge_failed_is_recovered(monkeypatch):
+    """The silent-stall this exists to stop.
+
+    `claim` sets merged_at. If extract_group then returns None -- an LLM
+    failure, a truncated response, unparseable JSON -- no artifact is written,
+    so item-writer never runs, so mark_result is never called and rearm (its
+    only caller) never fires. `list_due` requires BOTH merge_result IS NULL and
+    merged_at IS NULL, so the group is never looked at again.
+
+    Nothing logs, nothing errors, and the meeting simply never merges. This
+    would have been discovered on the first two-device test, on real data.
+    """
+    monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
+    seen = {"rearmed": [], "failed": []}
+    stuck = [{"group_id": "g1", "merge_count": 1}]
+    out = fc.recover_stuck_groups(
+        object(),
+        list_stuck=lambda c, secs: stuck,
+        rearm=lambda c, gid: seen["rearmed"].append(gid) or True,
+        mark_result=lambda c, gid, r: seen["failed"].append((gid, r)),
+        cap=2)
+    assert seen["rearmed"] == ["g1"], "a retryable group must go back in the queue"
+    assert seen["failed"] == []
+    assert out == [{"group_id": "g1", "status": "rearmed"}]
+
+
+def test_a_group_that_has_used_its_budget_is_marked_failed_not_retried(monkeypatch):
+    # Otherwise a group whose transcript reliably breaks the model retries
+    # forever, and every attempt is a paid thinking call (measured: 18,744
+    # tokens, 347 seconds).
+    monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
+    seen = {"rearmed": [], "failed": []}
+    out = fc.recover_stuck_groups(
+        object(),
+        list_stuck=lambda c, secs: [{"group_id": "g2", "merge_count": 2}],
+        rearm=lambda c, gid: seen["rearmed"].append(gid) or True,
+        mark_result=lambda c, gid, r: seen["failed"].append((gid, r)),
+        cap=2)
+    assert seen["rearmed"] == []
+    assert seen["failed"] == [("g2", "failed")]
+    assert out == [{"group_id": "g2", "status": "failed"}]
+
+
+def test_recovery_never_touches_a_merge_still_in_flight(monkeypatch):
+    # The timeout is the whole safety margin: a thinking call was measured at
+    # 347s, so anything shorter than that would re-arm a merge that is working
+    # and produce two of them.
+    assert fc.STUCK_MERGE_SECONDS >= 900, (
+        "must comfortably exceed a measured 347s thinking call, or recovery "
+        "duplicates live merges")
+
+
+def test_recovery_is_a_noop_when_the_flag_is_off(monkeypatch):
+    monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", False)
+    assert fc.recover_stuck_groups(
+        object(),
+        list_stuck=lambda c, s: (_ for _ in ()).throw(AssertionError("ran while off")),
+        rearm=None, mark_result=None, cap=2) == []
+
+
+def test_the_handler_runs_recovery(monkeypatch):
+    # Behavioural, not textual: drive the real entry point and prove recovery
+    # ran. A recovery nobody calls is the defect it was written to fix.
+    monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
+    ran = []
+    monkeypatch.setattr(fc, "_real_recover", lambda c: ran.append(1) or [])
+    monkeypatch.setattr(fc, "_real_group_scan", lambda c: [])
+    fc._sweep_groups_contained(_SavepointConn())
+    assert ran == [1]
