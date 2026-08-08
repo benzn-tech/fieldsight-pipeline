@@ -502,6 +502,23 @@ Parameters:
       so the rollback survives a deploy — a value set only on the live function
       is erased the next time CloudFormation reconciles the environment.
 
+  FilterAudioEventTags:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether ElevenLabs audio-event annotations ("[background noise]",
+      "[laughs]", "[鼠标点击]") are stripped from the turns handed to extraction,
+      the rolling summary and the confirmation email. Measured on the 2026-08-08
+      prod session: 19 of 27 transcripts carried them in 18 distinct forms, and
+      every one was glued to real speech rather than standing alone — so the
+      filter removes the tag and keeps the sentence. Defaults ON because these
+      have reached the model as ordinary speech since prod switched engines on
+      2026-08-07 and nothing downstream can tell them from a person talking.
+      Declared here rather than left to the code's env default so the rollback
+      survives a deploy: a value set only on the live function is erased the
+      next time CloudFormation reconciles the environment.
+
   DeviceAnnouncementPatterns:
     Type: String
     Default: ''
@@ -1541,6 +1558,9 @@ Resources:
           # CloudFormation reconcile, which is the failure this whole block of
           # comments exists to prevent.
           DEVICE_ANNOUNCEMENT_PATTERNS: !Ref DeviceAnnouncementPatterns
+          # Same reasoning one layer out: the tag vocabulary belongs to the ASR
+          # provider, not to us, so the OFF switch has to outlive a deploy.
+          FILTER_AUDIO_EVENT_TAGS: !Ref FilterAudioEventTags
       Policies:
         - Version: '2012-10-17'
           Statement:
