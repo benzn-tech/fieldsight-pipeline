@@ -414,6 +414,18 @@ def _sweep_groups_contained(conn, scan=None, recover=None):
     """
     if not ENABLE_GROUP_MERGE:
         return []
+    # Collecting a merge request is part of this transaction's work even though
+    # it touches no database, so it has to be undone with it. Without this mark,
+    # a scan that collected two requests and then raised on a third would have
+    # its claims rolled back while the unconditional flush below still sent the
+    # two -- a request outliving a rolled-back claim, which is the exact defect
+    # deferring the send was meant to remove, one layer further out.
+    #
+    # Only THIS tick's collection is dropped. The list survives between
+    # invocations (Lambda reuses containers), and truncating all of it would
+    # discard a request an earlier, successful tick had already committed a
+    # claim for -- the unrecoverable direction.
+    mark = len(_pending_enqueues)
     try:
         with conn.transaction():      # savepoint: roll back to here, keep conn usable
             # Recovery FIRST: a group stuck from an earlier tick has to be back
@@ -422,6 +434,7 @@ def _sweep_groups_contained(conn, scan=None, recover=None):
             recovered = (recover or _real_recover)(conn)
             return (recovered + (scan or _real_group_scan)(conn))
     except Exception:
+        del _pending_enqueues[mark:]
         logger.exception("group sweep failed -- finalize continues and the "
                          "merge is retried next tick")
         return []
