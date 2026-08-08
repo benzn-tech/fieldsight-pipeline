@@ -133,3 +133,47 @@ def test_the_exception_list_does_not_rot():
     assert not stale, (
         f"UNWIRED_BY_DESIGN names things that are no longer boolean template "
         f"parameters: {stale}")
+
+
+# ---- test must not spend prod's ASR allowance --------------------------
+
+def _secret_bound_to(env, var):
+    """Which repo secret a workflow binds to an env var, or None."""
+    text = open(WORKFLOWS[env], encoding="utf-8").read()
+    m = re.search(rf"^\s*{var}:\s*\$\{{\{{\s*secrets\.(\w+)\s*\}}\}}\s*$",
+                  text, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def test_test_and_prod_use_different_elevenlabs_keys():
+    """They were the SAME key until 2026-08-08.
+
+    ElevenLabs bills a shared allowance per key, so one key across both
+    environments means every test recording spends prod's budget. A spent
+    allowance presents as transcription simply stopping -- indistinguishable
+    from a backend fault, and it very nearly cost a demo.
+
+    Splitting them is a one-line change that a later edit could undo without
+    anything failing until the morning someone runs out of credit, which is why
+    it is pinned here rather than left to a comment.
+    """
+    prod = _secret_bound_to("prod", "ELEVENLABS_API_KEY")
+    test = _secret_bound_to("test", "ELEVENLABS_API_KEY")
+    assert prod and test, f"could not find the binding (prod={prod}, test={test})"
+    assert prod != test, (
+        f"both workflows read secrets.{prod} — test recordings would spend "
+        "prod's ElevenLabs allowance")
+
+
+def test_the_test_key_does_not_silently_fall_back_to_prods():
+    """`${{ secrets.A || secrets.B }}` is valid and would look like a kindness.
+
+    It is not: a missing test secret would silently restore the shared-quota
+    behaviour, and nothing would fail until prod ran out of credit. A deploy
+    that fails loudly is the better outcome.
+    """
+    text = open(WORKFLOWS["test"], encoding="utf-8").read()
+    line = [ln for ln in text.splitlines()
+            if re.match(r"\s*ELEVENLABS_API_KEY:", ln)]
+    assert len(line) == 1, f"expected one binding, found {len(line)}"
+    assert "||" not in line[0], "no silent fallback to prod's key"
