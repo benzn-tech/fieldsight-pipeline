@@ -22,8 +22,13 @@ Every command in this document was executed against real prod data on the night 
 
 ## ⚠️ Before you press record — the ElevenLabs balance
 
-**This is the most likely way tomorrow fails, and it has nothing to do with anything that
-changed tonight.**
+> **Resolved 2026-08-08:** the owner confirmed the allowance is fine, and a separate key for
+> test landed the same night (#309/#310), so evaluation runs no longer draw on the prod
+> budget. The arithmetic below is kept because the *failure mode* is the point — it is the
+> one thing that looks like a backend fault and is not.
+
+**This was the most likely way the morning could fail, and it has nothing to do with
+anything that changed that night.**
 
 August usage, read from `/v1/usage/character-stats`:
 
@@ -192,6 +197,63 @@ The fix (sidecar-driven touch) has been on prod since PR #282 and the EventBridg
 looser threshold and normalisation change which chunks produce transcripts.
 
 Check the confirmation email arrived **after** you stopped recording, not during.
+
+---
+
+## 5b. Chinese is no longer being deleted, or ignored
+
+Two defects of the same shape landed on prod later on 2026-08-08, **after the sections above
+were written**. Both were live for months; neither logged anything; every existing test was
+in English, so nothing caught them.
+
+The shape: **normalising text to ASCII makes every non-Latin character vanish**, and once
+two different things both become the empty string, they compare equal.
+
+### 5b.1 The chunk seam was deleting Chinese speech (PR #314)
+
+`chunk_stitch._norm` reduced a word to `[^0-9a-z]` characters, so every CJK character became
+`""`. Two empty strings match, and the dedup scans longest-run-first — so **any two Chinese
+runs matched at full window length** and up to `max_window` characters were dropped from the
+head of every chunk.
+
+Measured: tail `今天天气不错啊` against head `钢筋合格证还没到今天再催` deleted **7 of 11
+characters**. On a real seam it turned `我自己补充到三分钟` into `己补充到三分钟`.
+
+**To check:** in a mixed-language recording, take the extraction's evidence quotes and find
+a Chinese sentence that spans a chunk boundary. It should be whole. Before the fix, the
+first few characters after a seam were missing.
+
+```bash
+aws s3 cp s3://fieldsight-data-509194952652/extractions/Ben_UCPK2/{date}/{session_base}.json - \
+  --region ap-southeast-2 | python -m json.tool | grep -A1 '"quote"'
+```
+
+A Chinese quote starting mid-word — `己补充…` rather than `我自己补充…` — means it regressed.
+
+**Known limitation, deliberate:** a duplicate still survives when the engine transcribes the
+same overlap differently (`…around the gully` against `Back around the galley.`). A fuzzy
+match was written, measured, and removed — the engine glues a boundary word to the next
+sentence (`galley。12`), so the fuzzy run took the batch number with it and turned *"Batch 12
+bricks"* into *"that batch of bricks"*. **Losing a number is worse than carrying a
+fragment.**
+
+### 5b.2 A Chinese question could not match a single word (PR #319)
+
+Search's hybrid ranking tokenised the question with `[^a-z0-9]+` and a 3-character floor, so
+a Chinese question produced **zero terms**. No row could then be `lexical`, the
+lexical-first ordering did nothing, and only rows within 0.55 cosine distance survived —
+while an English question keeps a literal term match *regardless of distance* and ranks it
+first.
+
+**The same question asked in Chinese returned strictly less than in English, sometimes
+nothing.**
+
+**To check:** search for something in Chinese that you know appears in a topic title —
+`钢筋合格证`, `防水`, `脚手架`. It should come back, and a title containing the words should
+rank above a merely-similar one. Then search `B2` — the 3-character floor used to drop it,
+**in English too**, and zone references are what people actually search for.
+
+If Chinese search returns nothing where the English equivalent works, it regressed.
 
 ---
 
