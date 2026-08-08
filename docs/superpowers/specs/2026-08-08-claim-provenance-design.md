@@ -355,6 +355,35 @@ Phase A also adds a test for "the output hit the ceiling" distinct from
 `transcript_stats`, because today that condition is indistinguishable from a
 model returning malformed JSON.
 
+### Measured, 2026-08-08 — qwen has no low default cap
+
+Both prod call shapes, driven directly against DashScope with `qwen3.7-max` and
+a prompt demanding 300 JSON items:
+
+| shape | `finish_reason` | completion tokens | complete? | wall |
+|---|---|---|---|---|
+| non-thinking + `response_format` (**live** path) | `stop` | **10,548** | yes, all 300 items, JSON closed | 210 s |
+| thinking, no `max_tokens` (**final** path) | `stop` | **18,744** (8,343 of them reasoning) | yes, all 300 items, JSON closed | 347 s |
+
+**The feared exposure does not exist at these sizes.** DashScope did not
+truncate at ~10.5K or ~18.7K output tokens; both runs ended on `stop`, not
+`length`. Against a realistic evidence addition of 1,200–1,600 tokens there is
+an order of magnitude of headroom, so the prompt change is safe on the qwen path
+on this evidence.
+
+Two things the measurement changed rather than confirmed:
+
+- **`max_tokens_for` governs the anthropic fallback ONLY.** It reaches qwen on
+  neither branch. Raising it 8000 → 16000 is still correct, but it is not a
+  mitigation for the production path — the ceiling log line says "retrying will
+  hit it again" rather than implying a number someone can raise, because on qwen
+  the fix would be a shorter prompt or more model headroom.
+- **Latency, not tokens, is the closer constraint.** The thinking call took
+  **347 s** against `LLM_HTTP_TIMEOUT: 540`. A first probe attempt died at
+  exactly 300 s on Node's undici default header timeout — a client limit, not a
+  DashScope one, but a reminder that anything calling this path needs a timeout
+  set deliberately rather than inherited.
+
 ---
 
 ## Failure behaviour
@@ -395,6 +424,37 @@ near-zero extraction-layer number is the *expected* result, and it says nothing
 about the ASR layer, which is the measured, known-nonzero one. Only the player
 catches that. Phase A is worth doing because the extraction layer has never been
 measured at all; it is not a gate on Phase B.
+
+### First live run, 2026-08-08 — the chain reaches the sound
+
+Deployed to test (`EMIT_EVIDENCE=true`) and replayed one real device recording
+under a fresh session id:
+
+```
+evidence: {'verified': 2, 'verified_fuzzy': 0, 'weak': 0,
+           'unverified': 0, 'absent': 0, 'unchecked': 0}
+```
+
+Both topics cited verbatim and anchored:
+
+| topic | status | quote | anchor |
+|---|---|---|---|
+| Site Access PPE Compliance | `verified` | "Ask yourself gloves, glasses when you're on site with us." | `…_c0000_…srcwav.wav` @ 4.24 s |
+| Side Door Left Open | `verified` | "Oh, that side door's open, eh?" | same segment @ 4.24 s |
+
+Confirmed present in Aurora as jsonb with `status = verified` — so the whole
+path holds end to end: prompt → citation → matcher → audio anchor → S3 artifact
+→ item-writer → database.
+
+**This is a proof of the mechanism, not a measurement of the extraction layer.**
+n = 2, one session, one speaker. Both offsets being identical (4.24 s) is the
+documented turn-granularity behaviour, not a coincidence: under
+`TRANSCRIBE_WHOLE_CHUNK` a whole chunk is one turn, so every quote inside it
+anchors to that turn's start.
+
+`W` and the fuzzy threshold therefore remain at their provisional values —
+calibration needs the distribution from a real multi-chunk session, which is the
+outstanding piece of Task 7.
 
 ---
 
