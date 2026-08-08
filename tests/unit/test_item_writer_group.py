@@ -221,3 +221,55 @@ def test_the_updated_result_key_cannot_collide_with_the_solo_one():
         {"groupId": GID, "memberSessions": [GID]},
         put=lambda key, body: written.append(key))
     assert written[0].endswith("-updated.json")
+
+
+# ---- mark_result must run while the connection is still OPEN -----------
+
+def test_mark_result_is_inside_the_connection_block():
+    """It was outside it, and that made every successful merge look stuck.
+
+    psycopg3's `with conn:` CLOSES the connection on exit -- db/connection.py
+    says so in its own docstring. `mark_result` sat after the block, so it
+    raised on every merge, was swallowed by a blanket except, and was mis-logged
+    as an email failure. merge_result stayed NULL while merged_at was set, which
+    is precisely the signature the stuck-group recovery matches: every
+    successful merge would have been re-merged, re-emailed, and finally marked
+    `failed` with a log line claiming the members still had their own topics --
+    which by then they did not.
+
+    The unit suite could not see any of this: FakeConn does not close on exit,
+    so the call that always failed in production always succeeded in tests.
+    This checks the structural property instead, by source position -- the
+    behavioural version would need a connection double that closes, which is a
+    fair thing to want but a much larger change to every test in this file.
+    """
+    import inspect
+    import lambda_item_writer as iw
+
+    src = inspect.getsource(iw.write_extraction_items)
+    lines = src.splitlines()
+    open_at = next(i for i, l in enumerate(lines) if "with get_connection() as conn" in l)
+    indent = len(lines[open_at]) - len(lines[open_at].lstrip())
+    mark_at = next(i for i, l in enumerate(lines) if "mark_result(" in l)
+    assert mark_at > open_at, "mark_result must come after the block opens"
+
+    # Find where the block ends: the first line at or below the `with`'s own
+    # indentation after it.
+    end_at = next(i for i in range(open_at + 1, len(lines))
+                  if lines[i].strip() and
+                  (len(lines[i]) - len(lines[i].lstrip())) <= indent)
+    assert mark_at < end_at, (
+        "mark_result runs on a CLOSED connection — it must be inside the "
+        "`with get_connection()` block, not after it")
+
+
+def test_a_failed_email_enqueue_no_longer_hides_a_failed_mark_result():
+    # The two were in one try/except, so a mark_result failure was reported as
+    # an email failure -- which is how this survived: the log line named the
+    # wrong subsystem.
+    import inspect
+    import lambda_item_writer as iw
+    src = inspect.getsource(iw.write_extraction_items)
+    block = src[src.index("_enqueue_updated_emails(extraction)"):]
+    assert "mark_result" not in block[:400], \
+        "mark_result must not share the email try/except — it mis-attributes the failure"
