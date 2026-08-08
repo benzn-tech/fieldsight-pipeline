@@ -179,6 +179,7 @@ jobs:
               "DropSilentChunks=${{ vars.TEST_DROP_SILENT_CHUNKS || 'true' }}" \
               "NormaliseAudio=${{ vars.TEST_NORMALISE_AUDIO || 'true' }}" \
               "FilterAudioEventTags=${{ vars.TEST_FILTER_AUDIO_EVENT_TAGS || 'true' }}" \
+              "EnableGroupMerge=${{ vars.TEST_ENABLE_GROUP_MERGE || 'true' }}" \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \

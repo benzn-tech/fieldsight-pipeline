@@ -125,6 +125,43 @@ def lead_is_joinable(conn, lead_session_id, max_age_seconds) -> bool:
     return bool(row["joinable"])
 
 
+def groups_for_user_on_date(conn, user_id, report_date) -> list[str]:
+    """Group ids this user was a member of on that NZ date.
+
+    Served by idx_meeting_session_group_user (migration 0036); the existing
+    idx_meeting_session_group is keyed on group_id and answers the opposite
+    question, so it does not help here.
+
+    COALESCE(group_id, session_id) because the LEAD carries no group_id of its
+    own -- the group id IS its session id. Without it a lead would not be a
+    member of its own group and would lose the merged record from its timeline,
+    which is the one timeline guaranteed to be looked at.
+
+    The date is the device's NZ day, matching the timeline's own definition;
+    opened_at is stored UTC, and comparing the two raw is BUG-37, which has
+    already produced one "No summary".
+
+    Driven from session_group rather than from meeting_session alone. A filter
+    of `group_id IS NOT NULL` reads correctly and is wrong: it excludes the
+    LEAD, whose group_id is NULL by design -- so the person holding the meeting
+    would be the one member who lost the merged record from their timeline.
+    session_group is the authority on what a group IS, and joining through it
+    catches the lead by its session_id.
+
+    Raises like every other repository here; the caller is responsible for
+    deciding that a failed enrichment must not fail the read."""
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT DISTINCT g.group_id AS gid "
+        "FROM session_group g "
+        "JOIN meeting_session m "
+        "  ON (m.group_id = g.group_id OR m.session_id = g.group_id) "
+        "WHERE m.user_id = %s "
+        "AND (m.opened_at AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific/Auckland')::date = %s",
+        (user_id, report_date),
+    ).fetchall()
+    return [r["gid"] for r in rows]
+
+
 def group_span_ok(conn, group_id, max_span_seconds) -> bool:
     """Whether a group's members are close enough in time to be one meeting.
 

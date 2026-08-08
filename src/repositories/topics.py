@@ -197,6 +197,21 @@ def delete_topics_for_source_prefix(conn, source_prefix) -> int:
     return cur.rowcount
 
 
+def has_topics_for_source(conn, source_s3_key) -> bool:
+    """Does this exact source key have any topics?
+
+    The single-key sibling of has_topics_for_source_prefix, for the multi-device
+    merge: a joiner's own extraction prefix is empty after the merge deletes it,
+    so the nightly defer test has to ask about the MERGED artifact's key
+    instead, and that is one key rather than a prefix. Exact equality, so no
+    LIKE escaping is involved."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT 1 FROM topics WHERE source_s3_key = %s LIMIT 1",
+        (source_s3_key,),
+    ).fetchone()
+    return row is not None
+
+
 def has_topics_for_source_prefix(conn, source_prefix) -> bool:
     """Existence check for the org-api timeline shim (authority-flip Task 4):
     does ANY topic already exist for this (user, date) extraction prefix?
@@ -234,7 +249,8 @@ _TOPIC_COLS_JOINED = (
 )
 
 
-def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None) -> list[dict]:
+def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
+                         merged_keys=None) -> list[dict]:
     """Dashboard multi-site read for one report_date: topics scoped to
     site_ids (a caller-computed ACL list — ALL sites for an admin, or
     memberships.accessible_site_ids for a scoped worker/PM), joined with
@@ -286,6 +302,22 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None) -> lis
     if author_ids is not None:
         where += " AND t.user_id = ANY(%s::uuid[])"
         params.append(list(author_ids))
+    if merged_keys:
+        # Multi-device merge (Phase C): the merged record is owned by the LEAD's
+        # session, so a joiner whose own topics were just deleted would see an
+        # empty day. Unioned on source_s3_key, which names exactly the merged
+        # rows and nothing else.
+        #
+        # NOT on the lead's identity, which fails three ways and silently: a
+        # graded-role member has author_ids active and the merged topics carry
+        # the lead's user_id; a member without membership on the lead's site is
+        # cut by the site filter; and adding the lead's user_id to author_ids
+        # would leak the lead's OTHER solo topics that day to every member.
+        #
+        # The OR wraps the whole ACL, so a merged topic reaches its members
+        # regardless of which of those filters is active.
+        where = f"({where}) OR t.source_s3_key = ANY(%s)"
+        params.append(list(merged_keys))
 
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "

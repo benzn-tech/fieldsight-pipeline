@@ -181,6 +181,7 @@ jobs:
               "DropSilentChunks=${{ vars.PROD_DROP_SILENT_CHUNKS || 'true' }}" \
               "NormaliseAudio=${{ vars.PROD_NORMALISE_AUDIO || 'false' }}" \
               "FilterAudioEventTags=${{ vars.PROD_FILTER_AUDIO_EVENT_TAGS || 'true' }}" \
+              "EnableGroupMerge=${{ vars.PROD_ENABLE_GROUP_MERGE || 'false' }}" \
               "AuthorityFlip=${{ vars.PROD_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.PROD_GRADED_ROLES || 'false' }}" \
               "ServerBuild=${{ github.sha }}" \
