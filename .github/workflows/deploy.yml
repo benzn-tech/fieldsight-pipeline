@@ -188,6 +188,9 @@ jobs:
               "TranscribeWholeChunk=${{ vars.TEST_TRANSCRIBE_WHOLE_CHUNK || 'true' }}" \
               "FilterAudioEventTags=${{ vars.TEST_FILTER_AUDIO_EVENT_TAGS || 'true' }}" \
               "EnableGroupMerge=${{ vars.TEST_ENABLE_GROUP_MERGE || 'true' }}" \
+              "GroupMergeCap=${{ vars.TEST_GROUP_MERGE_CAP || '2' }}" \
+              "StuckMergeSeconds=${{ vars.TEST_STUCK_MERGE_SECONDS || '1800' }}" \
+              "GroupMaxSpanSeconds=${{ vars.TEST_GROUP_MAX_SPAN_SECONDS || '43200' }}" \
               "EmitEvidence=${{ vars.TEST_EMIT_EVIDENCE || 'true' }}" \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
