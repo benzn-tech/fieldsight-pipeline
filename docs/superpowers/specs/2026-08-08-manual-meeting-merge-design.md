@@ -1,7 +1,8 @@
 # Manual meeting merge — bundle sessions after the fact, and think harder
 
-**Status:** design v2 — v1 was reviewed and had six blocking defects. Two of them
-inverted decisions v1 had argued for. What changed and why is at the bottom.
+**Status:** design v3 — reviewed twice. v1 had six blocking defects, two of which
+inverted decisions it had argued for; v2 fixed those and introduced two more, both
+from the same minted-id change. What changed at each round is at the bottom.
 **Date:** 2026-08-08
 
 ## What is being asked for
@@ -46,6 +47,27 @@ A manual group mints a fresh id. Every member — including the earliest — get
 `group_id` set explicitly, so `list_group_members`' `group_id = X OR session_id
 = X` still returns exactly the right set; the `OR` arm just matches nothing.
 
+#### Minting breaks one thing, and it has to be replaced
+
+`_site_from_group_lead` (`lambda_item_writer.py:135-157`) resolves the merged
+artifact's site by looking up `meeting_session.get(conn, group_id)` — which only
+works because a QR group id *is* a session id. A minted id has no such row, so
+that rung returns None.
+
+That rung is not decorative: the other rungs miss `grp` bases by construction
+(its own docstring, `:541-552`). `site_for_day` may cover a worker-led merge, but
+an **admin- or gm-led one resolves no site at all and the write is skipped
+entirely** (`:569-573`) — before member deletion, so nothing is lost, but the
+merge silently never publishes, burns its attempts through the stuck-group
+recovery, and ends `failed`.
+
+So `session_group` gains a `site_id`, written at formation from the members'
+own `meeting_session.site_id` — which is the authority for site attribution
+anyway (BUG-41: the App's `recordings.site_id` outranks every fallback). The
+item-writer rung reads that column when present and falls back to the lead
+lookup for QR groups, so both origins resolve a site by the same rule and
+neither depends on a coincidence of identifiers.
+
 ### The span guard must know which kind of group it is
 
 v1 cited `group_span_ok` as *support* for allowing cross-day merges. It is the
@@ -78,7 +100,19 @@ Then:
 - **same company** — a cross-tenant merge is a data leak, not a mistake
 - **the caller can see every session selected** — otherwise merging is a way to
   read someone else's recording by bundling it with your own
-- **not already in another group** — a session belongs to one meeting
+- **not already in another group** — and this needs **two** tests, not one. A
+  member carries `group_id`, but a QR **lead carries NULL** by design
+  (`meeting_session.py:58-72`) — the group id *is* its session id. So
+  `group_id IS NULL` alone lets a lead be manually grouped a second time.
+  Membership then matches in both groups (via the `session_id = X` arm), both
+  merges claim it, both delete its topics, and two merged records overlap.
+  Eligibility must also require
+  `NOT EXISTS (SELECT 1 FROM session_group WHERE group_id = <candidate>)`.
+- **at least one member with `segment_count > 0`** — not a nicety. `list_due`
+  requires it (`session_group.py:75-77`), so a group of members that all
+  pre-date per-chunk touch is **never selected**: no merge, no error, and a
+  progress indicator that spins forever. Reusing the standing scan means
+  inheriting its preconditions as eligibility rules.
 - **not still recording** — merging a live session produces a record that is
   stale on arrival
 - **no date restriction** — now actually true, because of the `origin` branch
@@ -94,12 +128,17 @@ would produce two groups splitting the members.
 The formation is therefore one statement whose rowcount is the guard:
 
 ```sql
-UPDATE meeting_session SET group_id = %s
- WHERE session_id = ANY(%s) AND group_id IS NULL
+UPDATE meeting_session m SET group_id = %s
+ WHERE m.session_id = ANY(%s)
+   AND m.group_id IS NULL                       -- not already a member
+   AND NOT EXISTS (SELECT 1 FROM session_group g   -- and not already a LEAD,
+                    WHERE g.group_id = m.session_id)  -- which carries NULL
 ```
 
 Anything less than the full count means someone else took one first; roll back
-and tell the user which.
+and tell the user which. **Both conditions are load-bearing** — the second is
+the QR-lead case from the eligibility list, and without it the atomicity is
+only apparent.
 
 Note this is the first code that sets `group_id` on an already-closed session.
 `ensure_open` COALESCEs and never clears (`meeting_session.py:51`); undo has to
@@ -149,7 +188,8 @@ The v1 table described two behaviours the code does not have. Corrected:
 | case | behaviour |
 |---|---|
 | the merge LLM call fails or times out | `extract_group` returns `None` and writes nothing (`lambda_extract_session.py:1203-1214`). It does **not** re-arm itself — item-writer is the only caller of `rearm`, and it needs the artifact that was never produced. **The group-level recovery added in PR #311** re-queues it after `STUCK_MERGE_SECONDS`, bounded by `GROUP_MERGE_CAP`, then marks it `failed`. Without that fix this state was permanent and silent, and this feature's progress indicator would have spun forever. |
-| the merge produces nothing usable *after* the claim | same path — no artifact, recovered by #311 and eventually `failed`. The `'empty'` result (`lambda_finalize_claim.py:284`) covers only the *pre-claim* no-context case, which is a different thing. |
+| the merge produces nothing usable *after* the claim | same path — no artifact. The `'empty'` result (`lambda_finalize_claim.py:284`) covers only the *pre-claim* no-context case, which is a different thing. |
+| the merge succeeded but was never marked | recovery marks it `merged` **without re-running it**. This was not a corner case: `mark_result` ran on a closed connection (PR #313), so EVERY successful merge had this signature, and a recovery that only knew "dead or alive" would have re-merged and re-emailed all of them. |
 | members are deleted but the merged record is never written | cannot happen: `_delete_member_topics` runs in item-writer, i.e. only once an artifact exists |
 | two users merge overlapping sets | the formation rowcount guard above rejects the second |
 | a selected session has no transcript yet | allowed; the merge waits, as the QR path does |
@@ -189,8 +229,8 @@ returned nothing for two weeks). Re-indexing is part of both, not an afterthough
 ## Scope
 
 **In:** the merge endpoint with the eligibility and atomicity rules; the `origin`
-column and the span-guard branch; a minted group id; the `relationship` prompt
-parameter; the progress indicator (inherited from Phase C's gap and not tolerable
+and `site_id` columns and the span-guard branch; a minted group id; the
+`relationship` prompt parameter; the progress indicator (inherited from Phase C's gap and not tolerable
 here, because the user is watching); undo including merged-topic deletion and
 re-indexing; the member cap; the picker UI.
 
@@ -222,3 +262,25 @@ that path; Task 10 is what would find the next one.
 The pattern across four of the six: **v1 treated "we already have a mechanism for
 that" as verification.** It is a hypothesis, and the failure branches are where it
 usually breaks.
+
+## What v2 got wrong
+
+Both new defects came from the **same** change — minting the group id — and
+neither was visible from the change itself:
+
+- `_site_from_group_lead` only works because a QR group id *is* a session id.
+  Minting silently removed the merged artifact's only site source for
+  admin-led merges, and the symptom would have been a merge that never
+  publishes rather than an error.
+- excluding sessions "already in a group" via `group_id IS NULL` misses QR
+  **leads**, which carry NULL by design — the one row where the invariant this
+  design leans on is deliberately inverted.
+
+Plus one inherited: reusing `list_due` means inheriting its `segment_count > 0`
+precondition as an eligibility rule, or the group is never selected at all.
+
+The pattern, and it is the same one as v1 in a different disguise: **a change
+that is locally correct can invalidate a distant assumption that was never
+written down as a dependency.** Both here were found by asking what else in the
+codebase assumed `group_id == session_id`, which is a question worth asking of
+any identifier this design touches.

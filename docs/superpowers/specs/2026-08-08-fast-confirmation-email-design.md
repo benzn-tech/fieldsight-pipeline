@@ -1,9 +1,9 @@
 # The confirmation email should arrive in a minute, not sixteen
 
-**Status:** design v2 — v1 was reviewed and had five blocking defects, all of
-which changed the design rather than the wording. What v1 got wrong is recorded
-at the bottom, because three of the five were cases of assuming an existing
-mechanism did something it does not.
+**Status:** design v3 — reviewed twice. v1 had five blocking defects, three of
+them assumptions that an existing mechanism did something it does not. v2 fixed
+those and left one: it said the chunk count is "known at stop time", which is
+true for audio and false for video. Both rounds are recorded at the bottom.
 **Date:** 2026-08-08
 
 ## The measurement this starts from
@@ -79,8 +79,41 @@ backstop.**
 "sessionChunkCount": 37        // how many chunks this session produced, total
 ```
 
-The count is what makes the close decidable. It is known on the device at stop
-time and nowhere else.
+The count is what makes the close decidable. It is known on the device and
+nowhere else.
+
+#### Where the count is computed is load-bearing
+
+"At stop time" is too loose, and getting it wrong breaks this in the one
+direction it claims to be safe from. If `expected_chunks` under-states the true
+total, the count is reached while the last chunk is still uploading, the session
+closes, and — because `touch_segment` does not resume a `finalizing` session —
+the short email goes out irreversibly.
+
+For **audio** this is not delicate: `endAudio` (`CaptureManager.kt:661-668`)
+calls `audio.stop()` synchronously and then closes, so every row exists by then.
+
+For **video** it is. The segment's row is finalized asynchronously — the stop
+callback runs `finalizeVideoDbRow()` first (`CaptureManager.kt:297`) and only
+then, further down that same callback, fires the deliberate close (`:325`). A
+count taken when the user pressed the button would be N−1.
+
+**Rule: `expected_chunks` is the number of persisted capture rows for the
+session, read at the same point the deliberate close is fired — inside that
+callback, after `finalizeVideoDbRow()`.** The existing code already puts the
+close in the right place; the marker must be written from that site and not from
+the button handler.
+
+Two over-count vectors are excluded by inspection rather than assumption: photos
+carry no `_sid` token (`ChunkNaming.kt:32-33`) so are never counted, and
+`FilesReconciler` orphans are given a **fresh** session id
+(`FilesReconciler.kt:37`), so a recovered stray never inflates a real session's
+total — it also never completes one, which degrades to the idle backstop, i.e.
+today's behaviour.
+
+If the device miscounts anyway the session never closes by this path and idle
+catches it. That is the safe direction, and it is why the count must be a count
+and never an estimate.
 
 ### What the backend does with it
 
@@ -253,3 +286,25 @@ what it appeared to do.**
 The reusable lesson: reusing a mechanism obliges you to trace the whole lifecycle
 of the state through every path that writes it, not to satisfy yourself that the
 entry point looks right.
+
+## What v2 got wrong
+
+One item, and it is the same species as v1's three: **"the device knows the
+count" is true, but *when* it knows it was never checked.**
+
+Audio finalizes its row synchronously before closing; video finalizes
+asynchronously and fires the close from inside that callback. A count read at
+the button press would have been N−1 for every video session — and the failure
+lands in the one direction this design claims to be safe from, because a session
+that closes early cannot be resumed.
+
+The distinction that makes the fix cheap is that the *existing* code already
+fires the close from the right place. The requirement is only that the marker be
+written from that same site. A spec that had said "at stop time" and been
+implemented literally would have produced a subtly early close on every video
+recording, with the transcript arriving afterwards.
+
+Also corrected: "the worker's budget" is age-based (7 days, `UploadWorker.kt:62`),
+not an attempt count, and "chunks are 30 seconds" is a setting
+(`settings.segmentSeconds`) rather than a constant. Neither changes a conclusion;
+both were stated more confidently than they had been checked.
