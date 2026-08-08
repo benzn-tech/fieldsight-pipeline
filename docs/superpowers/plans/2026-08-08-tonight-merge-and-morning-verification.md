@@ -72,24 +72,25 @@ same on both stages.
   never opened and never emailed. Leaving a device running by accident will now produce
   mail. Not a bug — but it will look like one.
 
-- **Known gap, deliberately not fixed tonight.** The announcement filter lives in
-  `extract_session` only. Three other places still see "Recording started" as speech:
+- ~~**Known gap, deliberately not fixed tonight.**~~ **Closed 2026-08-08.** The filter has
+  moved out of `extract_session` and into the assembly itself (`assemble_session_turns`),
+  so the rolling summary, the finalize email and the multi-device group merge all get it —
+  they read the same word stream and now describe the same session. Before the move,
+  extraction stopped seeing "Recording started" while those three still did, and nothing
+  said so.
 
-  1. `lambda_rolling_summary` — calls `assemble_deduped_turns` directly, so announcements
-     can appear in the Tier-1 rolling summary;
-  2. `lambda_session_finalize` — same call, so they can appear in confirmation-email
-     content;
-  3. **org-api's `/transcripts`**, which the transcript viewer renders. It computes its
-     own `speaker_count` as `len(speakers)` over transcript segments (`lambda_org_api.py`
-     ~:4972) — a *different* field that happens to share the name. Checked, because if it
-     had read the artifact's `speaker_count` the P1b change would have altered what the UI
-     displays. It does not. But the viewer will still list device announcements as speaker
-     segments, and its count carries the same flaw the withdrawn attribution spec
-     identified: it is the size of a union of per-call labels, not a number of people.
+  `assemble_deduped_turns` survives as the two-tuple view for callers that do not need the
+  stats; only the extraction artifact reports *which* phrases were removed.
 
-  Fixing 1 and 2 properly means moving the filter into `assemble_deduped_turns` — three
-  callers and eight test stubs. Fixing 3 is a separate read-path change. Neither belongs
-  on the night before a hand-test, on a merge train already verified green.
+  **One consumer is still outside this and is left alone on purpose:** org-api's
+  `/transcripts`, which the transcript viewer renders. It computes its own `speaker_count`
+  as `len(speakers)` over transcript segments (`lambda_org_api.py` ~:4972) — a *different*
+  field that happens to share the name. It reads raw transcripts rather than the assembled
+  turn stream, so the viewer still shows announcements as speaker segments. That is
+  arguably correct for a *transcript viewer*: it is meant to show what was recorded,
+  including the recorder. Its count does carry the flaw the withdrawn attribution spec
+  identified — a union of per-call labels, not a number of people — but that is a
+  read-path question, not this one.
 
 ## Check this before anything else, and it is not from tonight's work
 
