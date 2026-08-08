@@ -301,11 +301,36 @@ def sweep_groups(conn, *, list_due, claim, mark_result, span_ok, members_of,
     return results
 
 
-def sweep_groups_if_enabled(conn, scan=None):
-    """The flag gate, separated so the scan itself stays a pure function."""
+def _sweep_groups_contained(conn, scan=None):
+    """The group scan, unable to take the tick's real work down with it.
+
+    sweep, reconcile and this share ONE transaction. Without containment a group
+    scan that raises rolls the whole tick back -- and reconcile is what moves a
+    session to `sent`, so a scan that failed every tick would present as PROD
+    EMAILS STOPPING, with a feature flag as the only thing standing in the way.
+    Merging is a convenience; delivering the email is not.
+
+    The savepoint is not decoration. A raised exception poisons the entire
+    psycopg transaction, so catching it WITHOUT a savepoint leaves the
+    connection in a failed state and every later statement in the tick fails
+    anyway -- the same lesson as the recurring-item proposal pass.
+
+    Never silent: a merge that stops happening is otherwise invisible, since
+    the sweep logs only when it did something.
+
+    This is the ONLY flag gate for the group scan. An earlier version had a
+    separate `sweep_groups_if_enabled` as well; two gates for one flag is an
+    invitation to change one of them.
+    """
     if not ENABLE_GROUP_MERGE:
         return []
-    return (scan or _real_group_scan)(conn)
+    try:
+        with conn.transaction():      # savepoint: roll back to here, keep conn usable
+            return (scan or _real_group_scan)(conn)
+    except Exception:
+        logger.exception("group sweep failed -- finalize continues and the "
+                         "merge is retried next tick")
+        return []
 
 
 def _real_group_scan(conn):
@@ -416,7 +441,7 @@ def lambda_handler(event, context):
         # AFTER reconcile, deliberately. reconcile is what moves a claimed
         # session to `sent`, and `sent` is what makes its group settled — so
         # running the group scan first would always be one tick behind.
-        groups = sweep_groups_if_enabled(conn)
+        groups = _sweep_groups_contained(conn)
     # Observability: this fires every minute, so log ONLY when it did something
     # (no per-idle-minute noise). enqueued = sessions handed to the send worker;
     # reconciled = sessions moved to sent/failed this tick.

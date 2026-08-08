@@ -138,17 +138,29 @@ def test_a_group_with_no_lead_context_still_merges():
     assert sent[0]["mergedKey"] == f"extractions/Joiner_Folder/2026-08-08/grp{GID}.json"
 
 
+class _SavepointConn:
+    """`with conn.transaction()` -> a nested savepoint. See
+    test_finalize_claim for why the scan runs inside one."""
+
+    def transaction(self):
+        class _Tx:
+            def __enter__(self_): return None
+            def __exit__(self_, *a): return False
+        return _Tx()
+
+
 def test_the_flag_being_off_means_the_scan_never_runs(monkeypatch):
     monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", False)
     called = []
-    fc.sweep_groups_if_enabled(object(), scan=lambda conn: called.append(1))
+    fc._sweep_groups_contained(_SavepointConn(), scan=lambda conn: called.append(1))
     assert called == [], "prod must be inert with the flag off"
 
 
 def test_the_flag_being_on_runs_the_scan(monkeypatch):
     monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
     called = []
-    fc.sweep_groups_if_enabled(object(), scan=lambda conn: called.append(1) or [])
+    fc._sweep_groups_contained(_SavepointConn(),
+                               scan=lambda conn: called.append(1) or [])
     assert called == [1]
 
 
@@ -159,7 +171,7 @@ def test_the_handler_actually_calls_the_scan(monkeypatch):
     monkeypatch.setattr(fc, "sweep", lambda conn: [])
     monkeypatch.setattr(fc, "reconcile", lambda conn, r: [])
     called = []
-    monkeypatch.setattr(fc, "sweep_groups_if_enabled",
+    monkeypatch.setattr(fc, "_sweep_groups_contained",
                         lambda conn: called.append(1) or [])
 
     class _Conn:
@@ -179,7 +191,7 @@ def test_the_scan_runs_after_reconcile(monkeypatch):
     monkeypatch.setattr(fc, "sweep", lambda conn: order.append("sweep") or [])
     monkeypatch.setattr(fc, "reconcile",
                         lambda conn, r: order.append("reconcile") or [])
-    monkeypatch.setattr(fc, "sweep_groups_if_enabled",
+    monkeypatch.setattr(fc, "_sweep_groups_contained",
                         lambda conn: order.append("groups") or [])
 
     class _Conn:
