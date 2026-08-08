@@ -32,6 +32,7 @@ The properties pinned here:
    off, which reads as "the announcements came back" and sends the next person
    to the transcriber (CLAUDE.md BUG-40).
 """
+import json
 import os
 
 import pytest
@@ -260,11 +261,76 @@ def test_a_wrong_shaped_override_falls_back_loudly(monkeypatch, caplog):
 # Wiring
 # ------------------------------------------------------------------
 
-def test_the_filter_runs_before_speaker_count_is_taken():
-    import inspect
-    src = inspect.getsource(les.extract_session)
-    assert src.index("filter_device_announcements") < src.index("'speaker_count'"), (
-        "filtering after the count leaves the device in it")
+def test_assembly_itself_filters_so_every_consumer_gets_the_same_turns(monkeypatch):
+    """The filter moved out of extract_session and into assemble_session_turns.
+
+    Before the move it ran in extract_session only, so extraction stopped seeing
+    "Recording started" while `lambda_rolling_summary` and
+    `lambda_session_finalize` — which call `assemble_deduped_turns` directly —
+    still did. The same session read differently depending on which consumer you
+    looked at, and nothing said so.
+
+    Checked behaviourally rather than by grepping a function's source: the
+    previous version of this test asserted an ordering inside extract_session
+    and broke the moment the call moved, even though the property it named was
+    still true."""
+    import io
+    key = "transcripts/Benl1/2026-07-06/Benl1_2026-07-06_10-00-00_off0.0_to30.0_srcwav.json"
+
+    def _transcribe_json(pairs):
+        items, t = [], 0.0
+        for spk, text in pairs:
+            for w in text.split():
+                items.append({"type": "pronunciation", "start_time": f"{t:.3f}",
+                              "end_time": f"{t + 0.4:.3f}", "speaker_label": spk,
+                              "alternatives": [{"content": w, "confidence": "0.9"}]})
+                t += 0.5
+        return {"results": {"transcripts": [{"transcript": " ".join(p[1] for p in pairs)}],
+                            "items": items}}
+
+    body = json.dumps(_transcribe_json([
+        ("spk_0", "Recording started."),
+        ("spk_1", "The scaffold tags on bay three need checking before the pour."),
+    ]))
+
+    class _Fake:
+        def get_object(self, Bucket, Key):
+            return {"Body": io.BytesIO(body.encode())}
+
+        def get_paginator(self, op):
+            class P:
+                def paginate(self, Bucket, Prefix):
+                    yield {"Contents": [{"Key": key}]}
+            return P()
+
+    monkeypatch.setattr(les, "s3", lambda: _Fake())
+
+    # The three-tuple form: extraction gets the stats.
+    turns, sources, stats = les.assemble_session_turns("bucket", [key])
+    assert stats["removed"] == 1 and stats["texts"] == ["Recording started."]
+    assert all("Recording started" not in t["text"] for t in turns)
+    assert {t["speaker"] for t in turns} == {"spk_1"}, (
+        "the device's speaker label must not survive into the turn stream, "
+        "which is what keeps it out of speaker_count")
+
+    # The two-tuple form used by rolling summary and finalize: same turns.
+    turns2, sources2 = les.assemble_deduped_turns("bucket", [key])
+    assert [t["text"] for t in turns2] == [t["text"] for t in turns]
+    assert sources2 == sources
+
+
+def test_the_other_consumers_go_through_the_filtering_assembly():
+    """Pins the wiring the move exists for. If either of these ever grew its own
+    transcript-reading path, announcements would quietly come back to the
+    rolling summary and the confirmation email."""
+    import os.path
+    root = os.path.join(os.path.dirname(__file__), "..", "..")
+    for mod in ("lambda_rolling_summary.py", "lambda_session_finalize.py"):
+        with open(os.path.join(root, "src", mod), encoding="utf-8") as fh:
+            src = fh.read()
+        assert "assemble_deduped_turns" in src, mod
+        assert "normalize_transcript" not in src, (
+            f"{mod} must not read transcripts itself — it would bypass the filter")
 
 
 def test_the_extraction_records_what_was_filtered():
