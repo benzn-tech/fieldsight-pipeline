@@ -276,3 +276,60 @@ def test_search_groups_topicless_topic_chunks_by_title(monkeypatch):
     out = run(ev(question="recording"))
     assert out["count"] == 1
     assert out["results"][0]["score"] == 0.1
+
+
+# ---- lexical terms: every script, and short identifiers -------------------
+#
+# The tokeniser split on `[^a-z0-9]+` and kept tokens of 3+ characters, so a
+# Chinese question produced NO terms at all: no row could ever be `lexical`, the
+# lexical-first ordering did nothing, and only rows within _NO_LEX_MAX_DIST
+# survived. Measured 2026-08-08: "楼梯配筋后来怎么定的" and "钢筋合格证" both
+# yielded zero terms, so the same question asked in Chinese returned strictly
+# less than in English — and sometimes nothing, which is the failure shape this
+# codebase has already been bitten by.
+#
+# The 3-character floor also dropped "B2" — a zone identifier people search for
+# constantly, in either language.
+
+
+def test_a_chinese_question_still_ranks_a_word_match_first(monkeypatch):
+    """The property the English tests already pin, asserted in Chinese."""
+    wire(monkeypatch, [
+        chunk("t-near", "2026-02-09", 0.10, "屋面排水检查", text="今天检查了屋面"),
+        chunk("t-hit", "2026-02-09", 0.50, "钢筋合格证跟进", text="供应商还没给"),
+    ])
+    out = run(ev(question="钢筋合格证"))
+    assert [r["title"] for r in out["results"]] == ["钢筋合格证跟进", "屋面排水检查"]
+    assert out["results"][0]["lexical"] is True
+
+
+def test_a_chinese_question_no_longer_loses_a_distant_match(monkeypatch):
+    """Before: zero terms meant nothing could be lexical, so this row was
+    dropped for being past the distance threshold."""
+    wire(monkeypatch, [
+        chunk("t-far", "2026-02-09", 0.70, "钢筋合格证跟进", text="供应商还没给"),
+    ])
+    out = run(ev(question="钢筋合格证"))
+    assert out["count"] == 1
+
+
+def test_a_two_character_identifier_is_a_term(monkeypatch):
+    """`B2` is a zone, not a stopword, and the floor dropped it in English too."""
+    wire(monkeypatch, [
+        chunk("t-b2", "2026-02-09", 0.70, "B2 Waterproofing Hold Point", text="k axis"),
+    ])
+    # "works" is the only other >=3 token and it appears nowhere in the row, so
+    # the row can only survive if "b2" itself became a term.
+    out = run(ev(question="B2 works"))
+    assert out["count"] == 1
+    assert out["results"][0]["lexical"] is True
+
+
+def test_short_english_words_are_still_not_terms(monkeypatch):
+    """The floor exists so "we"/"is"/"of" do not make everything lexical. Only
+    tokens that mix letters and digits are exempt."""
+    wire(monkeypatch, [
+        chunk("t-x", "2026-02-09", 0.70, "Ceiling Work", text="we are on it"),
+    ])
+    out = run(ev(question="we are on it"))
+    assert out["count"] == 0
