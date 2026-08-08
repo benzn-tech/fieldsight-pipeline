@@ -60,7 +60,16 @@ def list_due(conn, idle_grace_seconds) -> list[dict]:
         "SELECT g.group_id, g.company_id, g.merged_at, g.merge_count, "
         "       g.merge_result, g.merged_key, g.created_at "
         "FROM session_group g "
-        "WHERE g.merge_result IS NULL "
+        # Unresolved AND unclaimed. Both are needed and they mean different
+        # things: merge_result is the terminal state, merged_at is "a merge is
+        # in flight". Without the merged_at test a claimed group is returned on
+        # every tick forever -- claim() then fails each time, so nothing breaks
+        # loudly, but the candidate set never shrinks and the index that bounds
+        # this scan stops bounding it.
+        #
+        # This is also what makes rearm() meaningful: clearing merged_at is
+        # exactly how a late arrival puts its group back in front of the scan.
+        "WHERE g.merge_result IS NULL AND g.merged_at IS NULL "
         # Some member actually recorded. segment_count is maintained by
         # touch_segment, so this stays one indexed query and never lists S3.
         "AND EXISTS (SELECT 1 FROM meeting_session m "

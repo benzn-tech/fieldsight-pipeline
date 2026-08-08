@@ -64,6 +64,20 @@ def test_list_due_reads_only_unresolved_groups():
     assert conn.calls[0]["params"] == (900,)
 
 
+def test_list_due_excludes_a_group_whose_merge_is_already_in_flight():
+    # Both predicates are needed and they mean different things: merge_result is
+    # the terminal state, merged_at is "a merge is in flight". Without the
+    # merged_at test a claimed group comes back on every tick forever — claim()
+    # fails each time so nothing breaks loudly, but the candidate set never
+    # shrinks and idx_session_group_pending stops bounding the scan.
+    #
+    # Asserted HERE and not only in the integration test: that one needs
+    # TEST_DATABASE_URL, skips locally, and is exactly why this shipped green.
+    conn = FakeConn(results=[[]])
+    sg.list_due(conn, 900)
+    assert "g.merged_at IS NULL" in conn.calls[0]["sql"]
+
+
 def test_list_due_counts_the_lead_as_a_member():
     # The lead carries no group_id of its own — the group id IS its session id.
     # A membership test written as `group_id = %s` alone would exclude the lead,
