@@ -170,3 +170,59 @@ available 16 bits**. Normalisation redistributes loudness; it does not add infor
 was never recorded. If attribution is still wrong for the people standing furthest away,
 that is placement and device-side gain, not a backend setting — and no variable in this
 document changes it.
+
+---
+
+## 7. What the night of 2026-08-08 added — and why it should change nothing you see
+
+A second release went to prod that night (PR #305, merging #301–#304). **Both features in
+it ship with their flags off, so nothing above changes and nothing new should be visible.**
+This section exists so that if something *does* look different, you know where to look
+instead of assuming the checks above lied.
+
+| | prod | test |
+|---|---|---|
+| `ENABLE_GROUP_MERGE` (several devices, one record) | `false` | `true` |
+| `EMIT_EVIDENCE` (extraction cites the transcript) | `false` | `true` |
+
+Neither `PROD_*` repo variable exists, so both fall to the workflow defaults. Verified on
+the deployed functions after the release, not read from the template.
+
+**Three things did change on prod regardless of the flags**, because they are not behind
+them:
+
+1. **`topics.evidence` exists** (migration 0037) and `_TOPIC_COLS` now selects it. Every
+   prod row is `NULL`, meaning *never measured* — which is deliberately distinct from
+   "measured and cited nothing". Confirmed after the release by running the deployed
+   column list against the prod database.
+2. **`/live-items` responses now carry an extra `evidence` key** (null). The serializer has
+   no allowlist, so it passes through. The dashboard is plain JS and ignores unknown keys.
+3. **A failing group sweep can no longer roll back the finalize tick.** This one is worth
+   stating plainly because it protects *your* morning: `sweep`, `reconcile` and the new
+   group scan share one transaction, and the scan had no containment. A scan that raised
+   would have rolled back `reconcile` — the step that moves a session to `sent` — so the
+   symptom would have been **prod emails silently stopping**, looking nothing like a merge
+   feature. It is now savepoint-isolated (PR #304).
+
+### If the confirmation email does not arrive
+
+Check §5 first — it is still the more likely cause. Then:
+
+```bash
+aws logs filter-log-events --log-group-name /aws/lambda/fieldsight-prod-finalize-sweep \
+  --start-time <ms> --filter-pattern '"group sweep failed"' --region ap-southeast-2
+```
+
+Silence there means the group path is not involved. It should be silent: the flag is off,
+so the scan does not run at all.
+
+### What you cannot test yet
+
+**Multi-device merge.** The code is on prod but inert, and it should stay that way until
+two real devices, one QR scan and one meeting have been through it — that is the only
+evidence the feature delivers the coverage it claims. The synthetic run on test proves the
+plumbing (claim → merged key → request artifact → correct routing), not the outcome.
+
+Turning it on is one repo variable plus a redeploy, roughly ten minutes. It is not a thing
+to do on the same morning you are testing recording quality, because if something is wrong
+you will not know which change caused it.
