@@ -679,14 +679,23 @@ def _is_empty_transcript(data):
     return not text.strip()
 
 
-def assemble_deduped_turns(bucket, keys):
+def assemble_session_turns(bucket, keys):
     """Download + normalize each transcript segment for a session (skipping
     corrupt / unnormalizable ones), collect its abs-timed speaker turns, order
     them on the single session clock, and drop the mobile chunk-overlap
     duplication at device seams (_dedup_turn_boundaries; a no-op on legacy /
-    VAD / sequential turns). Returns (turns, source_filenames) — the one clean
-    word stream shared by the Tier-2 extraction and the Tier-1 rolling summary,
-    so both summarise exactly the same deduped session."""
+    VAD / sequential turns), and drop the recorder's own spoken announcements
+    (filter_device_announcements). Returns (turns, source_filenames,
+    announcement_stats) — the one clean word stream shared by the Tier-2
+    extraction, the Tier-1 rolling summary and the confirmation email, so all
+    three describe exactly the same session.
+
+    The announcement filter lives HERE rather than in extract_session because
+    it did not, and the gap was invisible: extraction stopped seeing "Recording
+    started" while the rolling summary and the finalize email still did, so the
+    same session read differently depending on which one you looked at. A rule
+    about what counts as speech belongs to the thing that produces the speech.
+    """
     normalized_list = []
     source_filenames = []
     for key in keys:
@@ -738,6 +747,20 @@ def assemble_deduped_turns(bucket, keys):
             turns.append(turn)
     turns.sort(key=lambda t: t['abs_start'])
     turns = _dedup_turn_boundaries(turns)   # drop mobile chunk-overlap dup at seams (no-op pre-chunk)
+    turns, announcement_stats = filter_device_announcements(turns)
+    return turns, source_filenames, announcement_stats
+
+
+def assemble_deduped_turns(bucket, keys):
+    """Two-tuple view of assemble_session_turns, for the callers that do not
+    need the announcement stats: the group-merge path, the rolling summary and
+    the finalize email. They get the filtering; only the extraction artifact
+    reports what was filtered.
+
+    Kept as a separate name rather than making the stats optional because seven
+    existing tests monkeypatch this symbol, and a caller that silently unpacks
+    two of three values would fail far from the change."""
+    turns, source_filenames, _stats = assemble_session_turns(bucket, keys)
     return turns, source_filenames
 
 
@@ -915,13 +938,11 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
             return None
 
     keys = gather_session_segments(bucket, user_folder, date, session_base)
-    turns, source_filenames = assemble_deduped_turns(bucket, keys)
-
-    # Before anything counts speakers or reads text: a recorder's spoken prompt
-    # is not a participant. Doing this here rather than in the prompt keeps it
-    # out of speaker_count too, which is where it did visible damage — one
-    # session reported four speakers with at least one of them a device.
-    turns, announcement_stats = filter_device_announcements(turns)
+    # Announcements are already gone: assemble_session_turns filters them, so
+    # every consumer of the session's turns sees the same thing. Taking the
+    # stats here is what lets the artifact report WHICH phrases were removed.
+    turns, source_filenames, announcement_stats = assemble_session_turns(
+        bucket, keys)
 
     # M-6: nothing usable to extract from -- skip quietly (no Claude call,
     # no write), same "don't retry-storm a dead end" reasoning as M-5.
