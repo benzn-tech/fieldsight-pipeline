@@ -40,7 +40,32 @@ switched to ElevenLabs on 8/7, so the natural conclusion would be that last nigh
 broke it.
 
 The API key lacks `user_read`, so the balance cannot be read from the API — **check the
-ElevenLabs dashboard before recording.** If it is short, top up rather than falling back:
+ElevenLabs dashboard before recording.** Re-confirmed 2026-08-08 night: `/v1/user` and
+`/v1/user/subscription` both return 401 `missing_permissions`, and
+`/v1/usage/character-stats` comes back with an empty `usage` map, so the figures in the
+table above cannot be refreshed programmatically either. The dashboard is the only source.
+
+### 🔴 prod and test share ONE ElevenLabs key (verified 2026-08-08 night)
+
+`fieldsight-prod-transcribe` and `fieldsight-test-transcribe` hold the **same** key —
+compared by hash, not assumed. So **every test recording spends prod's allowance**, and the
+quota that decides whether tomorrow morning works is a shared pool with no isolation
+between the environment you experiment in and the one you demo from.
+
+Two consequences worth acting on:
+
+- **Before tomorrow, do not record on test to "check something quickly".** It comes out of
+  the same budget, and the failure it causes on prod looks like a backend fault rather than
+  a spent quota.
+- **The durable fix is a separate test key, not moving the key into Secrets Manager.**
+  Only one function holds it, it is non-VPC, and `NoEcho` already masks the value at the
+  CloudFormation layer (`describe-stacks` returns `****`, confirmed). The plaintext Lambda
+  env is a real but modest exposure; the shared quota is an availability risk that has
+  already nearly cost a demo. Fix the one that bites first.
+
+Nothing done on the night of 08-08 consumed any of it: the extraction replay copied an
+existing transcript rather than re-transcribing, and both the extraction and the output-
+ceiling probes ran on qwen. If it is short, top up rather than falling back:
 `PROD_ASR_PROVIDER=transcribe` works, but reintroduces the fabrication the switch was made
 to stop (AWS invented 10.7% of one meeting's words), which defeats the purpose of a session
 meant to demonstrate quality.
