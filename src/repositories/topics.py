@@ -234,7 +234,8 @@ _TOPIC_COLS_JOINED = (
 )
 
 
-def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None) -> list[dict]:
+def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
+                         merged_keys=None) -> list[dict]:
     """Dashboard multi-site read for one report_date: topics scoped to
     site_ids (a caller-computed ACL list — ALL sites for an admin, or
     memberships.accessible_site_ids for a scoped worker/PM), joined with
@@ -286,6 +287,22 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None) -> lis
     if author_ids is not None:
         where += " AND t.user_id = ANY(%s::uuid[])"
         params.append(list(author_ids))
+    if merged_keys:
+        # Multi-device merge (Phase C): the merged record is owned by the LEAD's
+        # session, so a joiner whose own topics were just deleted would see an
+        # empty day. Unioned on source_s3_key, which names exactly the merged
+        # rows and nothing else.
+        #
+        # NOT on the lead's identity, which fails three ways and silently: a
+        # graded-role member has author_ids active and the merged topics carry
+        # the lead's user_id; a member without membership on the lead's site is
+        # cut by the site filter; and adding the lead's user_id to author_ids
+        # would leak the lead's OTHER solo topics that day to every member.
+        #
+        # The OR wraps the whole ACL, so a merged topic reaches its members
+        # regardless of which of those filters is active.
+        where = f"({where}) OR t.source_s3_key = ANY(%s)"
+        params.append(list(merged_keys))
 
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "

@@ -3007,9 +3007,42 @@ def list_live_items(conn, caller, event):
     if not date or not REPORT_DATE_RE.match(date):
         return error("date required (YYYY-MM-DD)", 400)
     site_ids = list(_allowed_site_ids(conn, caller))          # graded-aware reach
+    # Resolved on its own line, not inside the call: an exception raised while
+    # evaluating an argument escapes the callee's try, so a failed enrichment
+    # would 500 the whole timeline.
+    merged_keys = _merged_keys_for_caller(conn, caller, date)
     rows = topics.list_topics_for_date(conn, site_ids, date,
-                                       author_ids=_author_filter(conn, caller))
+                                       author_ids=_author_filter(conn, caller),
+                                       merged_keys=merged_keys)
     return ok({"topics": rows})
+
+
+def _merged_keys_for_caller(conn, caller, date):
+    """The merged-record keys this caller is entitled to see on `date`.
+
+    A multi-device merge writes ONE topic set, owned by the lead's session, and
+    deletes each member's own. Without this a joiner's day goes blank: they were
+    in the meeting and their timeline shows nothing.
+
+    Entitlement is membership in the group, established from the caller's own
+    sessions -- so this widens nothing. It cannot reach a group the caller was
+    not in, and it names individual artifact keys rather than relaxing the site
+    or author filter.
+
+    Returns [] on any failure: a missing merged record is a stale timeline, a
+    broken one is no timeline at all."""
+    try:
+        gids = meeting_session.groups_for_user_on_date(conn, caller["id"], date)
+        keys = []
+        for gid in gids:
+            row = session_group.get(conn, gid)
+            if row and row.get("merged_key"):
+                keys.append(row["merged_key"])
+        return keys
+    except Exception:
+        logger.exception("could not resolve merged records for %s on %s",
+                         caller.get("id"), date)
+        return []
 
 
 # ----------------------------------------------------------
