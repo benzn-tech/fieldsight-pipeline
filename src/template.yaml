@@ -2153,6 +2153,16 @@ Resources:
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/keyframe_requests/*
             - Effect: Allow
+              # Phase C multi-device merge: once the merged topics are durable,
+              # every member is told to look at them. Enqueued HERE and not by
+              # the finalize sweep because the email must contain the merged
+              # record, and only the step that lands the result knows it landed
+              # — item-writer is in-VPC and cannot invoke a lambda (BUG-36), so
+              # it rides the same S3 channel as match_requests/ above.
+              # Confirmed implicitDeny on the deployed test role before adding.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
+            - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:

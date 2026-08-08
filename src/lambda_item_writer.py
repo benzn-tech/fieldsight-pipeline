@@ -64,8 +64,8 @@ from photo_binding import list_pictures as _pb_list_pictures
 from repositories import users as users_repo
 from photo_binding import photos_for_topics as _photos_for_topics
 import thread_match
-from repositories import (companies, findings, meeting_session, recordings, sites,
-                          threads, topics)
+from repositories import (companies, findings, meeting_session, recordings,
+                          session_group, sites, threads, topics)
 # The extraction-key shape lives in session_scope now (the read side needs the
 # SAME parse to derive session_id from topics.source_s3_key -- see that
 # module). Re-exported under the historical private names so existing callers
@@ -123,6 +123,169 @@ def _site_from_meeting_session(conn, company_id, session_base):
     if site is None or site["company_id"] != company_id:
         return None
     return site
+
+
+def _group_id_from_base(session_base):
+    """The group id inside a MERGED artifact's base (`grp{32hex}`), else None."""
+    if not session_base or not session_base.startswith("grp"):
+        return None
+    return session_base[3:] or None
+
+
+def _site_from_group_lead(conn, company_id, session_base):
+    """A merged artifact's site, taken from the LEAD's session row.
+
+    Needed because the merged key deliberately is NOT a `sid` base (that one
+    collides with the lead's own final pass and would be overwritten), so every
+    existing rung of the ladder misses it: recordings.site_for_media matches on
+    the media filename, _site_from_meeting_session's device_session_id only
+    recognises `sid`, and an admin/gm lead has no recordings row for the day.
+    Without this rung a merge ends in "identity bridge miss ... zero writes" --
+    silently discarded AFTER the members' topics were deleted.
+
+    Company-scoped exactly as _site_from_meeting_session is, so a stale or rogue
+    row can never attribute across tenants."""
+    gid = _group_id_from_base(session_base)
+    if not gid:
+        return None
+    row = meeting_session.get(conn, gid)
+    if not row or not row.get("site_id"):
+        return None
+    site = sites.get_site(conn, row["site_id"])
+    if site is None or str(site["company_id"]) != str(company_id):
+        return None
+    return site
+
+
+ENABLE_GROUP_MERGE = os.environ.get("ENABLE_GROUP_MERGE", "false").lower() == "true"
+GROUP_MERGE_CAP = int(os.environ.get("GROUP_MERGE_CAP", "2"))
+
+
+def _group_for_session(conn, session_base):
+    """The group-merge state row for a `sid` base's group, or None."""
+    sid = _device_session_id(session_base)
+    if not sid:
+        return None
+    row = meeting_session.get(conn, sid)
+    if not row:
+        return None
+    gid = row.get("group_id") or sid      # a lead carries no group_id of its own
+    return session_group.get(conn, gid)
+
+
+def _read_merged_artifact(key):
+    """The merged extraction the group published, or None if unreadable."""
+    if not key:
+        return None
+    import boto3
+    try:
+        obj = boto3.client("s3").get_object(Bucket=S3_BUCKET, Key=key)
+        return json.loads(obj["Body"].read().decode("utf-8"))
+    except Exception:
+        logger.warning("could not read merged artifact %s", key)
+        return None
+
+
+def _group_supersedes_solo(conn, session_base, extraction):
+    """Should this SOLO extraction be written, given its group's merge state?
+
+    Returns "write" or "suppress".
+
+    Once the group has merged, writing a member's own topics reintroduces
+    exactly the duplicate the merge removed -- and this is not an edge case: the
+    sweep requests each member's final pass BEFORE the merge runs, so a
+    lead-solo final routinely lands afterwards.
+
+    A member that brings genuinely NEW transcripts is different. It is not
+    dropped; it re-arms the group so the next standing scan merges again and
+    everyone gets an updated record. Capped, because a device drip-feeding
+    chunks would otherwise re-merge and re-email all day -- and past the cap the
+    content is WRITTEN rather than lost, so only its inclusion in the merged
+    record is given up, never the content itself."""
+    if _group_id_from_base(session_base):
+        return "write"                     # the merged artifact itself
+    row = _group_for_session(conn, session_base)
+    if not row or not row.get("merged_at"):
+        return "write"                     # no group, or not merged yet
+    merged = _read_merged_artifact(row.get("merged_key"))
+    if not _brings_new_content(extraction, merged):
+        logger.info("group %s: %s adds nothing the merge did not see -- suppressed",
+                    row["group_id"], session_base)
+        return "suppress"
+    if (row.get("merge_count") or 0) >= GROUP_MERGE_CAP:
+        logger.warning(
+            "group %s: merge cap reached (%d); writing %s as solo topics instead "
+            "of re-merging -- its content is kept, its place in the merged "
+            "record is not", row["group_id"], row.get("merge_count"), session_base)
+        return "write"
+    if session_group.rearm(conn, row["group_id"]):
+        logger.info("group %s: %s brought new content -- re-armed for another merge",
+                    row["group_id"], session_base)
+    return "suppress"
+
+
+def _delete_member_topics(conn, artifact, delete=None):
+    """Remove each member's solo topics so the merged set is the only record.
+
+    A zero rowcount is logged loudly. The delete is keyed on source_s3_key and
+    delete_topics_for_source returns a count rather than raising, so a key that
+    differs by one character (a date derived in UTC instead of NZ, say) removes
+    nothing and leaves exactly the duplicate this whole feature exists to
+    eliminate -- with no error anywhere to notice."""
+    delete = delete or topics.delete_topics_for_source
+    for key in artifact.get("mergedMembers") or []:
+        n = delete(conn, key)
+        if not n:
+            logger.warning(
+                "group %s: %s removed 0 topics -- that member's solo items will "
+                "now duplicate the merged record", artifact.get("groupId"), key)
+
+
+def _brings_new_content(solo, merged):
+    """Does this solo extraction hold a transcript the merge did not see?
+
+    COVERAGE, not timing. "Anything written after the merge" would fire on the
+    lead's own final pass -- which the sweep requested BEFORE the merge ran --
+    so every group would re-merge and re-email once in the completely ordinary
+    case, and the cap would be spent before a genuinely late device arrived.
+
+    An unreadable merged artifact counts as covering nothing: erring towards a
+    wasted re-merge (costs an email) rather than towards dropping a late
+    device's content (costs the content)."""
+    if not isinstance(merged, dict):
+        return True
+    return not set((solo or {}).get("source_transcripts") or []).issubset(
+        set(merged.get("source_transcripts") or []))
+
+
+def _enqueue_updated_emails(artifact, put=None):
+    """One finalize request per member, all quoting ONE summary.
+
+    The summary rides in the artifact rather than being rebuilt per member:
+    lambda_session_finalize re-derives its own from that member's SOLO
+    transcripts, so N members would otherwise receive N different bodies -- the
+    opposite of "every member gets identical content" -- at the cost of N LLM
+    calls for one meeting.
+
+    Keyed `-updated` so the worker's result cannot be mistaken by the finalize
+    sweep's reconcile for that member's solo outcome. A member can be counted
+    settled by quietness while still `finalizing`, so the two would otherwise
+    race on session_finalize_results/{sessionId}.json."""
+    put = put or _put_finalize_request
+    for sid in artifact.get("memberSessions") or []:
+        put(f"session_finalize_requests/{sid}-updated.json",
+            {"kind": "updated", "sessionId": sid,
+             "groupId": artifact.get("groupId"),
+             "summary": artifact.get("summary"),
+             "openTodos": artifact.get("open_todos") or []})
+
+
+def _put_finalize_request(key, body):
+    import boto3
+    boto3.client("s3").put_object(
+        Bucket=S3_BUCKET, Key=key,
+        Body=json.dumps(body, ensure_ascii=False),
+        ContentType="application/json")
 
 
 # ----------------------------------------------------------
@@ -334,6 +497,12 @@ def write_extraction_items(date, user_folder, extraction_key):
         #      carries no site). The recordings rows still carry the correct
         #      site_id all along -- CLAUDE.md BUG-41's rule is that the app's
         #      recordings.site_id is the authority, so this ranks ABOVE membership.
+        #   3b. meeting_session.site_id of the group LEAD -- a MERGED artifact's
+        #      base is `grp{gid}`, not `sid{...}`, so #2 misses it by
+        #      construction (device_session_id only recognises `sid`), #1's LIKE
+        #      never matches, and an admin/gm lead has no recordings row. Every
+        #      rung would miss and the merge would end in "zero writes" AFTER
+        #      the members' topics were already deleted.
         #   4. resolve_site -- legacy recorder-membership resolver. Last, and it
         #      deliberately returns None for admin/gm (ALL scope, no single home
         #      site), which is why an offline gm recording used to fall all the way
@@ -341,8 +510,18 @@ def write_extraction_items(date, user_folder, extraction_key):
         #      the web timeline even though every upload had succeeded.
         # All three explicit tags are company-scoped; fall through only on no match.
         session_base = _parse_extraction_key(extraction_key)[2]
+
+        # A member whose group has already merged must not re-publish its own
+        # topics: that reintroduces the duplicate the merge removed. Checked
+        # BEFORE any site work — the answer does not depend on it, and doing it
+        # first keeps a suppressed pass cheap.
+        if ENABLE_GROUP_MERGE and _group_supersedes_solo(
+                conn, session_base, extraction) == "suppress":
+            return {"skipped": True, "reason": "superseded by the group merge"}
+
         site = recordings.site_for_media(conn, company["id"], user_folder, date, session_base) \
             or _site_from_meeting_session(conn, company["id"], session_base) \
+            or _site_from_group_lead(conn, company["id"], session_base) \
             or recordings.site_for_day(conn, company["id"], user_folder, date) \
             or lambda_ingest.resolve_site(conn, company["id"], {}, user_folder)
         if site is None:
@@ -368,6 +547,13 @@ def write_extraction_items(date, user_folder, extraction_key):
         # Source-key idempotency (Phase 4a pattern): clear this extraction's
         # prior rows before re-inserting.
         topics.delete_topics_for_source(conn, extraction_key)
+
+        # A MERGED artifact additionally supersedes each member's own topics.
+        # BEFORE the writes below, never after: this key's own rows were just
+        # cleared, and deleting afterwards would take the merged set with them
+        # if a member key ever equalled this one.
+        if extraction.get("tier") == "group":
+            _delete_member_topics(conn, extraction)
 
         # Task 3 (authority-flip plan) -- list the pictures prefix ONCE per
         # invocation (paginator, outside the per-topic loop below), then
@@ -477,6 +663,25 @@ def write_extraction_items(date, user_folder, extraction_key):
                 logger.info("thread suggestions: disabled (SUGGEST_THREADS)")
 
     logger.info("item-writer wrote extraction=%s topics=%d", extraction_key, topics_n)
+
+    # The updated email, AFTER the connection block commits: the merged topics
+    # must be durable before every member is told to look at them. Same ordering
+    # rule as the matcher artifact below, for the same reason.
+    #
+    # Enqueued here rather than by the sweep because the email has to contain
+    # the merged record, and only the step that LANDS the result knows it
+    # landed. This lambda is in-VPC and cannot invoke another (BUG-36), so the
+    # request rides the same S3 channel as everything else crossing that line.
+    if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
+        try:
+            _enqueue_updated_emails(extraction)
+            session_group.mark_result(conn, extraction["groupId"], "merged")
+        except Exception:
+            # The merged record is already durable; failing to announce it must
+            # not undo it. A missing email is recoverable by hand, a rolled-back
+            # merge is not.
+            logger.exception("group %s: merged topics written but the updated "
+                             "emails could not be enqueued", extraction.get("groupId"))
 
     # AFTER the connection block commits -- the topics referenced in the
     # artifact must be durable before the matcher can act on them. Only
