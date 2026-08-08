@@ -540,6 +540,31 @@ Parameters:
       survives a deploy: a value set only on the live function is erased the
       next time CloudFormation reconciles the environment.
 
+  GroupMergeCap:
+    Type: String
+    Default: '2'
+    Description: >-
+      How many times one group may be merged. Read by BOTH item-writer (may a
+      late member re-arm?) and the finalize sweep (has a failing merge spent its
+      budget?), so it is declared once here rather than left as a code default
+      in each -- given to only one of them they disagree silently, and the
+      group's behaviour then depends on which path reaches it first. Every
+      attempt is a paid thinking call, measured at 18,744 tokens / 347 seconds.
+  StuckMergeSeconds:
+    Type: String
+    Default: '1800'
+    Description: >-
+      How long after a CLAIM a merge is assumed dead rather than slow. Must
+      clear a real thinking call by a wide margin (measured: 347s against
+      LLM_HTTP_TIMEOUT 540) or recovery re-queues a merge that is still working
+      and the meeting merges twice.
+  GroupMaxSpanSeconds:
+    Type: String
+    Default: '43200'
+    Description: >-
+      The longest a group may span before it is refused as stale. A device that
+      kept a group overnight presents it again the next day and nothing on the
+      device objects -- merging yesterday into today reads perfectly fluently.
   EnableGroupMerge:
     Type: String
     Default: 'false'
@@ -1888,6 +1913,9 @@ Resources:
       Environment:
         Variables:
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
+          GROUP_MERGE_CAP: !Ref GroupMergeCap
+          STUCK_MERGE_SECONDS: !Ref StuckMergeSeconds
+          GROUP_MAX_SPAN_SECONDS: !Ref GroupMaxSpanSeconds
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
           PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
@@ -2154,6 +2182,7 @@ Resources:
       Environment:
         Variables:
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
+          GROUP_MERGE_CAP: !Ref GroupMergeCap
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"

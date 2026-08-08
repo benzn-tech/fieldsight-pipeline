@@ -331,3 +331,60 @@ def test_an_unreadable_landing_check_errs_towards_retrying(monkeypatch):
 
 def test_a_group_with_no_merged_key_is_never_treated_as_landed():
     assert fc._merge_already_landed(object(), "g1", None) is False
+
+
+# ---- the merge request must not outlive a rolled-back claim -------------
+
+def test_the_request_is_not_sent_from_inside_the_transaction(monkeypatch):
+    """claim (Aurora) and enqueue (S3) sat in one savepoint.
+
+    A later group raising rolls back every claim in the tick -- but the S3
+    requests already written do NOT roll back. extract-session then merges a
+    group whose `merged_at` is NULL, so `list_due` hands it out again on the
+    next tick and the meeting merges twice, emailing every member twice.
+
+    The safe direction is the opposite one: claim durably first, and if the
+    request then fails to go out, the group is claimed with no artifact --
+    which the stuck-group recovery already re-arms.
+    """
+    monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
+    sent = []
+    monkeypatch.setattr(fc, "_real_group_scan", lambda c: [{"group_id": "g1"}])
+    monkeypatch.setattr(fc, "_real_recover", lambda c: [])
+    monkeypatch.setattr(fc, "_pending_enqueues", [{"groupId": "g1"}])
+    monkeypatch.setattr(fc, "_enqueue_group", sent.append)
+
+    conn = _SavepointConn()
+    fc._sweep_groups_contained(conn)
+    assert sent == [], "nothing may be sent while the transaction can still roll back"
+
+    fc.flush_pending_enqueues()
+    assert sent == [{"groupId": "g1"}], "and it must actually be sent afterwards"
+
+
+def test_flushing_twice_does_not_send_twice(monkeypatch):
+    sent = []
+    monkeypatch.setattr(fc, "_pending_enqueues", [{"groupId": "g1"}])
+    monkeypatch.setattr(fc, "_enqueue_group", sent.append)
+    fc.flush_pending_enqueues()
+    fc.flush_pending_enqueues()
+    assert len(sent) == 1
+
+
+def test_one_failed_request_does_not_stop_the_others(monkeypatch, caplog):
+    # Each group is independent; a bad key for one must not strand the rest,
+    # and every failure is recoverable (claimed-with-no-artifact re-arms).
+    sent = []
+
+    def _send(a):
+        if a["groupId"] == "bad":
+            raise RuntimeError("s3 down")
+        sent.append(a)
+
+    monkeypatch.setattr(fc, "_pending_enqueues",
+                        [{"groupId": "bad"}, {"groupId": "good"}])
+    monkeypatch.setattr(fc, "_enqueue_group", _send)
+    with caplog.at_level("ERROR"):
+        fc.flush_pending_enqueues()
+    assert sent == [{"groupId": "good"}]
+    assert "bad" in caplog.text

@@ -427,6 +427,34 @@ def _sweep_groups_contained(conn, scan=None, recover=None):
         return []
 
 
+# Merge requests collected during the DB phase and sent only after the
+# transaction commits. claim (Aurora) and enqueue (S3) used to sit in one
+# savepoint: a later group raising rolled back every claim in the tick while the
+# S3 requests, which do not roll back, stayed. extract-session then merged a
+# group whose merged_at was NULL, so list_due handed it out again and the
+# meeting merged -- and emailed everyone -- twice.
+#
+# Claimed-with-no-request is the safe failure instead: the stuck-group recovery
+# re-arms it. An external side effect must never sit inside a transaction that
+# can still roll back.
+_pending_enqueues = []
+
+
+def flush_pending_enqueues():
+    """Send the collected merge requests. Called AFTER the connection block."""
+    global _pending_enqueues
+    pending, _pending_enqueues = _pending_enqueues, []
+    for artifact in pending:
+        try:
+            _enqueue_group(artifact)
+        except Exception:
+            # Independent: one bad key must not strand the others, and every
+            # failure here is recoverable -- the group is claimed with no
+            # artifact, which recovery re-arms.
+            logger.exception("group %s: merge request could not be sent",
+                             artifact.get("groupId"))
+
+
 def _real_group_scan(conn):
     from repositories import session_group
     return sweep_groups(
@@ -438,7 +466,7 @@ def _real_group_scan(conn):
             c, gid, GROUP_MAX_SPAN_SECONDS),
         members_of=meeting_session.list_group_members,
         resolve_ctx=_resolve_context,
-        enqueue=_enqueue_group)
+        enqueue=_pending_enqueues.append)
 
 
 def _enqueue_group(artifact):
@@ -536,6 +564,9 @@ def lambda_handler(event, context):
         # session to `sent`, and `sent` is what makes its group settled — so
         # running the group scan first would always be one tick behind.
         groups = _sweep_groups_contained(conn)
+    # AFTER the connection block commits: a merge request that outlives a
+    # rolled-back claim gets the meeting merged twice.
+    flush_pending_enqueues()
     # Observability: this fires every minute, so log ONLY when it did something
     # (no per-idle-minute noise). enqueued = sessions handed to the send worker;
     # reconciled = sessions moved to sent/failed this tick.

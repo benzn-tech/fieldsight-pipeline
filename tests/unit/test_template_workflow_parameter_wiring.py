@@ -188,3 +188,56 @@ def test_the_test_key_does_not_silently_fall_back_to_prods():
             if re.match(r"\s*ELEVENLABS_API_KEY:", ln)]
     assert len(line) == 1, f"expected one binding, found {len(line)}"
     assert "||" not in line[0], "no silent fallback to prod's key"
+
+
+# ---- the group-merge tunables ------------------------------------------
+
+_MERGE_TUNABLES = {
+    # env var            : (template Parameter, functions that read it)
+    "GROUP_MERGE_CAP":     ("GroupMergeCap",
+                            ("ItemWriterFunction", "FinalizeSweepFunction")),
+    "STUCK_MERGE_SECONDS": ("StuckMergeSeconds", ("FinalizeSweepFunction",)),
+    "GROUP_MAX_SPAN_SECONDS": ("GroupMaxSpanSeconds", ("FinalizeSweepFunction",)),
+}
+
+
+def _function_block(text, name):
+    start = text.index(f"\n  {name}:\n")
+    nxt = re.search(r"\n  [A-Za-z][A-Za-z0-9]*:\n", text[start + 1:])
+    return text[start:start + 1 + nxt.start()] if nxt else text[start:]
+
+
+def test_the_merge_tunables_exist_as_template_parameters():
+    """They were code-only defaults, which is the unwired-toggle trap.
+
+    Setting one on a live Lambda appears to work and is erased by the next
+    CloudFormation reconcile, with nothing logged.
+    """
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for env, (param, _) in _MERGE_TUNABLES.items():
+        assert re.search(rf"\n  {param}:\n", text), \
+            f"{env} has no {param} Parameter — it can only ever hold its code default"
+
+
+def test_every_function_that_reads_the_cap_gets_the_same_one():
+    """GROUP_MERGE_CAP is read by TWO functions.
+
+    item-writer uses it to decide whether a late member may re-arm; the sweep
+    uses it to decide when a failing merge has spent its budget. If only one is
+    given a value, they disagree silently -- one keeps re-arming past the point
+    the other has given up, and the group's behaviour depends on which code path
+    reaches it first.
+    """
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for env, (param, fns) in _MERGE_TUNABLES.items():
+        for fn in fns:
+            assert f"{env}: !Ref {param}" in _function_block(text, fn), \
+                f"{fn} reads {env} but is not given it"
+
+
+def test_both_workflows_pass_the_merge_tunables():
+    for env_name in ("prod", "test"):
+        wf = open(WORKFLOWS[env_name], encoding="utf-8").read()
+        for _, (param, _) in _MERGE_TUNABLES.items():
+            assert f"{param}=" in wf, \
+                f"{env_name} does not pass {param}; the Parameter holds its default forever"
