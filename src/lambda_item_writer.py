@@ -705,6 +705,16 @@ def write_extraction_items(date, user_folder, extraction_key):
                 # and the first question anyone asks is "did it even run".
                 logger.info("thread suggestions: disabled (SUGGEST_THREADS)")
 
+        # INSIDE the connection block, deliberately. psycopg3's `with conn:`
+        # CLOSES the connection on exit (db/connection.py says so), so this ran
+        # outside it and raised on every single successful merge -- swallowed by
+        # the except below and mis-logged as an email failure. merge_result
+        # stayed NULL with merged_at set, which is exactly the signature the
+        # stuck-group recovery looks for: every successful merge would have been
+        # re-merged and re-emailed.
+        if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
+            session_group.mark_result(conn, extraction["groupId"], "merged")
+
     logger.info("item-writer wrote extraction=%s topics=%d", extraction_key, topics_n)
 
     # The updated email, AFTER the connection block commits: the merged topics
@@ -718,7 +728,6 @@ def write_extraction_items(date, user_folder, extraction_key):
     if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
         try:
             _enqueue_updated_emails(extraction)
-            session_group.mark_result(conn, extraction["groupId"], "merged")
         except Exception:
             # The merged record is already durable; failing to announce it must
             # not undo it. A missing email is recoverable by hand, a rolled-back
