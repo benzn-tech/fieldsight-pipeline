@@ -779,6 +779,36 @@ org-api **1547 次 throttle → 88% 请求 5XX**。⚠️**被 throttle 的调�
 5. **错误率要按"输入规模"分组看**,不要只看总体。这个 bug 的错误率是录制时长的函数,
    总体指标被大量短录音稀释,所以两周没人发现。
 
+### ElevenLabs 密钥:test 与 prod 各用一把,**别再合回去**(2026-08-08)
+
+**2026-08-08 之前两个环境共用一把 key**(实测按 hash 比对相同,不是推测)。ElevenLabs 的额度
+是**按 key 计的共享池**,所以那时**每一次在 test 上试录,花的都是 prod 的额度**。
+额度耗尽的现象是**转写直接停** —— 与后端故障完全无法区分,而且它已经差点毁掉一次演示。
+
+现在的接线:
+
+| 环境 | workflow | 读的 secret |
+|---|---|---|
+| prod | `deploy-prod.yml` | `ELEVENLABS_API_KEY` |
+| test | `deploy.yml` | **`ELEVENLABS_API_KEY_TEST`** |
+
+**故意没有 fallback。** `${{ secrets.A || secrets.B }}` 是合法的、看起来还很贴心,但那会让
+「test secret 缺失」**静默退回共享额度**,直到某天 prod 没额度了才暴露。部署大声失败是更好的结局。
+
+`tests/unit/test_template_workflow_parameter_wiring.py` 钉住了这两条(两个环境不得读同一个
+secret、test 那行不得出现 `||`)。这是个一行改动,一次无心的编辑就能撤销,而在有人耗光额度的
+那个早上之前**什么都不会失败** —— 所以它靠测试守着,不是靠注释。
+
+**其余事实**(省得重新调研):只有 `fieldsight-*-transcribe` 一个函数持有这把 key,
+**该函数不在 VPC**(故 BUG-36 与它无关);`NoEcho` 在 CFN 层确实生效
+(`describe-stacks` 返回 `****`,实测);但值最终**明文落在 Lambda env**。
+额度**无法用程序读**:`/v1/user` 与 `/v1/user/subscription` 均 401 `missing_permissions`,
+`/v1/usage/character-stats` 返回空 `usage` map。只能看 dashboard。
+
+⚠️ **改动只在下一次部署时生效。** 手改线上 Lambda 的 env 会被下一次 CloudFormation 对账抹掉
+且全程零报错(同 BUG「假开关」)。验证方式:部署后分别读两个函数的 `ELEVENLABS_API_KEY`,
+hash 应当**不同**。
+
 ### 数据桶的 CORS 规则不在任何模板里(2026-08-04,带外配置,**别当成多余去删**)
 `fieldsight-data-509194952652` 上有一条名为 **`amplify-read-for-canvas`** 的 CORS 规则:
 `GET`/`HEAD`,`AllowedOrigins` = `https://main.d2fssznicvuckr.amplifyapp.com` +

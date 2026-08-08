@@ -70,7 +70,14 @@ jobs:
           REALPTT_PASSWORD: ${{ secrets.REALPTT_PASSWORD }}
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          # TEST's OWN ElevenLabs key, deliberately not prod's. They were the
+          # same key until 2026-08-08, which meant every test recording spent
+          # prod's allowance -- and a spent allowance presents as transcription
+          # simply stopping, i.e. indistinguishable from a backend fault on the
+          # morning of a demo. No fallback to secrets.ELEVENLABS_API_KEY: a
+          # silent fallback would restore the shared-quota behaviour invisibly,
+          # which is the one outcome worse than a deploy that fails loudly.
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY_TEST }}
           FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
           FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
         run: |
