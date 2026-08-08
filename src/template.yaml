@@ -519,6 +519,23 @@ Parameters:
       survives a deploy: a value set only on the live function is erased the
       next time CloudFormation reconciles the environment.
 
+  EnableGroupMerge:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Phase C of the multi-device merge: whether the finalize sweep scans for
+      settled groups and asks for one merged extraction covering every member.
+      Off means the scan never runs, no group is ever claimed, and every
+      downstream branch (item-writer's suppression, the timeline union, the
+      nightly defer) is naturally inert because nothing sets merged_at. Default
+      OFF for the same reason as NormaliseAudio above: both workflows pass an
+      explicit value, so this is only reached by a manual `sam deploy` — and
+      turning this on is not reversible in the way a read-only feature is. The
+      merge DELETES each member's own topics and writes one set in their place;
+      switching it back off leaves the merged record and does not restore what
+      was deleted. Flip it on a day when a two-device recording can be watched.
+
   DeviceAnnouncementPatterns:
     Type: String
     Default: ''
@@ -1525,6 +1542,7 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
+          ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
@@ -1829,6 +1847,7 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
           PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
@@ -1878,6 +1897,7 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
+          ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           S3_BUCKET: !Ref IngestBucketName
           EMAIL_SENDER: !Ref EmailSender
           SENDER_EMAIL: !Ref SenderEmail
@@ -1949,6 +1969,7 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -2092,6 +2113,7 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
