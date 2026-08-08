@@ -281,6 +281,26 @@ def _enqueue_updated_emails(artifact, put=None):
              "openTodos": todos})
 
 
+def _evidence_payload(topic):
+    """The citations plus the topic's rolled-up status, as one jsonb object.
+
+    An object rather than the bare array the extraction produces, because the
+    column has to distinguish three states and an array can only carry two:
+
+      NULL                        never measured (pre-feature, or flag off)
+      {"status": "absent", ...}   measured; the model cited nothing
+      {"status": "verified", ...} measured; here is what it cited
+
+    Returning None for an unmeasured topic is what keeps historical rows from
+    reading as uncited.
+    """
+    quotes = topic.get("evidence")
+    status = topic.get("evidence_status")
+    if quotes is None and status is None:
+        return None
+    return {"status": status, "quotes": quotes or []}
+
+
 def _todos_from_topics(artifact):
     """The merged record's action items, in the shape the email renderer wants.
 
@@ -622,6 +642,7 @@ def write_extraction_items(date, user_folder, extraction_key):
                 # rollback.
                 time_range=t.get("time_range"), participants=t.get("participants"),
                 work_class=_wc, work_confidence=_wconf, is_mixed=(t.get("is_mixed") is True),
+                evidence=_evidence_payload(t),
                 # video-keyframe plan (Task 4): re-bound synthetic keyframes
                 # (filename carries the '_kf_' marker) keep an "Auto keyframe"
                 # caption so the UI can still distinguish them after an

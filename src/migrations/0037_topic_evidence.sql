@@ -1,0 +1,13 @@
+-- The transcript lines a topic was derived from: each a quote the extraction
+-- chose, the status of a mechanical check of that quote against the transcript,
+-- and an audio anchor so a person can go and listen.
+--
+-- jsonb rather than a child table, matching the `findings` precedent: evidence
+-- is always read with its topic and is never queried on its own.
+--
+-- NULL means the extraction ran before this shipped, or ran with EMIT_EVIDENCE
+-- off (which is prod today). That is NOT the same as "the model cited nothing"
+-- -- that case is a present array plus evidence_status = 'absent'. Anything
+-- reporting coverage must keep the two apart or it will report every historical
+-- topic as uncited.
+ALTER TABLE topics ADD COLUMN IF NOT EXISTS evidence jsonb;
