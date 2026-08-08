@@ -123,7 +123,7 @@ def list_stuck(conn, stale_seconds) -> list[dict]:
     artifact that was never produced.
     """
     return conn.cursor(row_factory=dict_row).execute(
-        "SELECT group_id, merge_count FROM session_group "
+        "SELECT group_id, merge_count, merged_key FROM session_group "
         "WHERE merge_result IS NULL AND merged_at IS NOT NULL "
         "AND merged_at < now() - make_interval(secs => %s) "
         "ORDER BY merged_at",

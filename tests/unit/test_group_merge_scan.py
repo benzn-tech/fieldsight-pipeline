@@ -275,3 +275,59 @@ def test_the_handler_runs_recovery(monkeypatch):
     monkeypatch.setattr(fc, "_real_group_scan", lambda c: [])
     fc._sweep_groups_contained(_SavepointConn())
     assert ran == [1]
+
+
+def test_a_merge_that_landed_but_was_never_marked_is_recorded_not_rerun(monkeypatch):
+    """The third state, and the expensive one to get wrong.
+
+    `merged_at set, merge_result NULL` is produced by three different things:
+    the merge died, the merge landed but the bookkeeping did not, or it is still
+    running. Treating the second as the first buys another paid thinking call
+    AND sends every member a second `Updated:` email about a record that was
+    already correct.
+
+    This was not hypothetical: item-writer's mark_result ran on a closed
+    connection, so EVERY successful merge had this signature.
+    """
+    monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
+    seen = {"rearmed": [], "marked": []}
+    out = fc.recover_stuck_groups(
+        object(),
+        list_stuck=lambda c, s: [{"group_id": "g1", "merge_count": 1,
+                                  "merged_key": "extractions/F/D/grpg1.json"}],
+        rearm=lambda c, gid: seen["rearmed"].append(gid) or True,
+        mark_result=lambda c, gid, r: seen["marked"].append((gid, r)),
+        cap=2,
+        landed=lambda c, gid, key: True)
+    assert seen["marked"] == [("g1", "merged")]
+    assert seen["rearmed"] == [], "must not pay for a merge that already happened"
+    assert out == [{"group_id": "g1", "status": "marked"}]
+
+
+def test_landing_is_judged_by_the_result_not_the_clock(monkeypatch):
+    # A group at its cap that HAS landed must still be marked merged, not
+    # failed: the cap bounds attempts, it does not overrule evidence.
+    monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
+    marked = []
+    fc.recover_stuck_groups(
+        object(),
+        list_stuck=lambda c, s: [{"group_id": "g9", "merge_count": 9,
+                                  "merged_key": "k"}],
+        rearm=lambda c, gid: True,
+        mark_result=lambda c, gid, r: marked.append(r),
+        cap=2,
+        landed=lambda c, gid, key: True)
+    assert marked == ["merged"], "a landed merge is not a failure, whatever the count"
+
+
+def test_an_unreadable_landing_check_errs_towards_retrying(monkeypatch):
+    # A wrongly-marked group never merges at all; a wrongly-re-armed one costs a
+    # duplicate that the cap still bounds. The cheaper mistake is the retry.
+    class _Boom:
+        def cursor(self, **kw):
+            raise RuntimeError("db down")
+    assert fc._merge_already_landed(_Boom(), "g1", "k") is False
+
+
+def test_a_group_with_no_merged_key_is_never_treated_as_landed():
+    assert fc._merge_already_landed(object(), "g1", None) is False
