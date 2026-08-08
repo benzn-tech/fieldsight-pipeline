@@ -13,6 +13,40 @@ Throughout, `{sid}` is the session id in the filename and `{date}` is the NZ dat
 
 ---
 
+## ⚠️ Before you press record — the ElevenLabs balance
+
+**This is the most likely way tomorrow fails, and it has nothing to do with anything that
+changed tonight.**
+
+August usage, read from `/v1/usage/character-stats`:
+
+| day | credits |
+|---|---|
+| 8/1–8/5 | 0 |
+| 8/6 | 173 |
+| **8/7** | **7,797** ← the provider evaluation |
+| 8/8 | 802 |
+| **total** | **8,772** |
+
+That 7,797 matches the recorded note that "fifteen five-minute runs exhausted a
+10,000-credit allowance". **If the allowance is 10,000 per month, roughly 1,200 remain.**
+
+The 8/8 figure covered about 25 minutes of audio — three prod sessions plus a night of
+experiments — so roughly **32 credits per audio-minute**. At that rate a 40-minute meeting
+is ~1,300 (already over) and a 78-minute one ~2,500.
+
+**A quota failure looks exactly like a backend fault**: transcription simply stops. Prod
+switched to ElevenLabs on 8/7, so the natural conclusion would be that last night's changes
+broke it.
+
+The API key lacks `user_read`, so the balance cannot be read from the API — **check the
+ElevenLabs dashboard before recording.** If it is short, top up rather than falling back:
+`PROD_ASR_PROVIDER=transcribe` works, but reintroduces the fabrication the switch was made
+to stop (AWS invented 10.7% of one meeting's words), which defeats the purpose of a session
+meant to demonstrate quality.
+
+---
+
 ## 0. The baseline to compare against
 
 Captured from the last prod recording **before** the changes (2026-08-08 12:22 NZ, chunk
