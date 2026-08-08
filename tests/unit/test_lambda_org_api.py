@@ -1402,7 +1402,7 @@ def test_live_items_admin_uses_company_sites(wired):
                   lambda conn, cid, **kw: (seen.update(cid=cid)
                                            or [{"id": "s-1"}, {"id": "s-2"}]))
     wired.setattr(org.topics, "list_topics_for_date",
-                  lambda conn, site_ids, date, author_ids=None: (
+                  lambda conn, site_ids, date, author_ids=None, merged_keys=None: (
                       seen.update(site_ids=site_ids, date=date, author_ids=author_ids)
                       or [{"id": "t-1", "is_live": True, "action_items": [],
                            "safety_observations": []}]))
@@ -1424,7 +1424,7 @@ def test_live_items_worker_uses_accessible_site_ids(wired):
     wired.setattr(org.memberships, "accessible_site_ids",
                   lambda conn, uid, role: (seen.update(uid=uid, role=role) or ["s-3"]))
     wired.setattr(org.topics, "list_topics_for_date",
-                  lambda conn, site_ids, date, author_ids=None: (
+                  lambda conn, site_ids, date, author_ids=None, merged_keys=None: (
                       seen.update(site_ids=site_ids, author_ids=author_ids) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/live-items",
                                         params={"date": "2026-07-07"}), None)
@@ -1441,7 +1441,7 @@ def test_live_items_graded_off_passes_no_author_filter(wired):
     seen = {}
     wired.setattr(org.sites, "list_company_sites", lambda conn, cid, **kw: [{"id": "s-1"}])
     wired.setattr(org.topics, "list_topics_for_date",
-                  lambda conn, site_ids, date, author_ids=None: (
+                  lambda conn, site_ids, date, author_ids=None, merged_keys=None: (
                       seen.update(author_ids=author_ids) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/live-items",
                                         params={"date": "2026-07-07"}), None)
@@ -1459,7 +1459,7 @@ def test_live_items_response_passthrough_with_children(wired):
     }]
     wired.setattr(org.sites, "list_company_sites", lambda conn, cid, **kw: [{"id": "s-1"}])
     wired.setattr(org.topics, "list_topics_for_date",
-                  lambda conn, site_ids, date, author_ids=None: canned)
+                  lambda conn, site_ids, date, author_ids=None, merged_keys=None: canned)
     res = org.lambda_handler(make_event("GET", "/api/org/live-items",
                                         params={"date": "2026-07-07"}), None)
     assert res["statusCode"] == 200
@@ -1490,7 +1490,7 @@ def test_live_items_payload_includes_findings_with_impact(wired):
     }]
     wired.setattr(org.sites, "list_company_sites", lambda conn, cid, **kw: [{"id": "s-1"}])
     wired.setattr(org.topics, "list_topics_for_date",
-                  lambda conn, site_ids, date, author_ids=None: canned)
+                  lambda conn, site_ids, date, author_ids=None, merged_keys=None: canned)
     res = org.lambda_handler(make_event("GET", "/api/org/live-items",
                                         params={"date": "2026-07-07"}), None)
     assert res["statusCode"] == 200
@@ -3296,7 +3296,7 @@ def test_live_items_worker_filters_to_own_author(wired):
                                         "cross_company": False})
     seen = {}
     wired.setattr(org.topics, "list_topics_for_date",
-                  lambda conn, sids, date, author_ids=None: (seen.update(author_ids=author_ids) or []))
+                  lambda conn, sids, date, author_ids=None, merged_keys=None: (seen.update(author_ids=author_ids) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/live-items", params={"date": "2026-07-18"}), None)
     assert res["statusCode"] == 200
     assert seen["author_ids"] == {"u-self"}               # worker: own author only
@@ -3312,7 +3312,7 @@ def test_live_items_site_manager_self_plus_workers(wired):
                                         "cross_company": False})
     seen = {}
     wired.setattr(org.topics, "list_topics_for_date",
-                  lambda conn, sids, date, author_ids=None: (seen.update(author_ids=author_ids) or []))
+                  lambda conn, sids, date, author_ids=None, merged_keys=None: (seen.update(author_ids=author_ids) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/live-items", params={"date": "2026-07-18"}), None)
     assert res["statusCode"] == 200
     assert seen["author_ids"] == {"u-self", "u-w1", "u-w2"}   # own + site workers, never other managers
@@ -3328,7 +3328,7 @@ def test_live_items_pm_membership_no_author_filter(wired):
                                         "cross_company": False})
     seen = {}
     wired.setattr(org.topics, "list_topics_for_date",
-                  lambda conn, sids, date, author_ids=None: (seen.update(author_ids=author_ids) or []))
+                  lambda conn, sids, date, author_ids=None, merged_keys=None: (seen.update(author_ids=author_ids) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/live-items", params={"date": "2026-07-18"}), None)
     assert res["statusCode"] == 200
     assert seen["author_ids"] is None                     # SITE scope: every author on in-scope sites
@@ -3344,7 +3344,7 @@ def test_live_items_admin_unfiltered(wired):
                                         "cross_company": False})
     seen = {}
     wired.setattr(org.topics, "list_topics_for_date",
-                  lambda conn, sids, date, author_ids=None: (seen.update(author_ids=author_ids) or []))
+                  lambda conn, sids, date, author_ids=None, merged_keys=None: (seen.update(author_ids=author_ids) or []))
     res = org.lambda_handler(make_event("GET", "/api/org/live-items", params={"date": "2026-07-18"}), None)
     assert res["statusCode"] == 200
     assert seen["author_ids"] is None

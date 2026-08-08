@@ -519,6 +519,39 @@ Parameters:
       survives a deploy: a value set only on the live function is erased the
       next time CloudFormation reconciles the environment.
 
+  EnableGroupMerge:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Phase C of the multi-device merge: whether the finalize sweep scans for
+      settled groups and asks for one merged extraction covering every member.
+      Off means the scan never runs, no group is ever claimed, and every
+      downstream branch (item-writer's suppression, the timeline union, the
+      nightly defer) is naturally inert because nothing sets merged_at. Default
+      OFF for the same reason as NormaliseAudio above: both workflows pass an
+      explicit value, so this is only reached by a manual `sam deploy` — and
+      turning this on is not reversible in the way a read-only feature is. The
+      merge DELETES each member's own topics and writes one set in their place;
+      switching it back off leaves the merged record and does not restore what
+      was deleted. Flip it on a day when a two-device recording can be watched.
+
+  EmitEvidence:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether each extracted topic cites the transcript lines it came from, and
+      those quotes are then checked against the transcript mechanically. The
+      extraction layer has never been measured: it is a summarising LLM writing
+      prose from a long transcript, which is the exact operation that produces
+      plausible additions, and nothing downstream can tell an invented claim
+      from a real one. Default OFF on prod not because the write is risky (it is
+      additive and every consumer reads with .get()) but because it changes the
+      extraction PROMPT, and a prompt change is not something to discover the
+      morning after. Declared here rather than left to the code default so the
+      rollback survives a deploy.
+
   DeviceAnnouncementPatterns:
     Type: String
     Default: ''
@@ -1525,6 +1558,8 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
+          EMIT_EVIDENCE: !Ref EmitEvidence
+          ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
@@ -1829,6 +1864,7 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
           PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
@@ -1878,6 +1914,7 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
+          ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           S3_BUCKET: !Ref IngestBucketName
           EMAIL_SENDER: !Ref EmailSender
           SENDER_EMAIL: !Ref SenderEmail
@@ -1949,6 +1986,7 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -2092,6 +2130,7 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -2130,6 +2169,16 @@ Resources:
               # above). Its own PutObject grant, gated to the disjoint prefix.
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/keyframe_requests/*
+            - Effect: Allow
+              # Phase C multi-device merge: once the merged topics are durable,
+              # every member is told to look at them. Enqueued HERE and not by
+              # the finalize sweep because the email must contain the merged
+              # record, and only the step that lands the result knows it landed
+              # — item-writer is in-VPC and cannot invoke a lambda (BUG-36), so
+              # it rides the same S3 channel as match_requests/ above.
+              # Confirmed implicitDeny on the deployed test role before adding.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}

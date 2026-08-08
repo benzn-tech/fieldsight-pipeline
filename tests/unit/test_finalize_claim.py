@@ -242,3 +242,70 @@ def test_reconcile_marks_sent_and_failed_by_the_worker_result(monkeypatch):
 def test_reconcile_is_a_noop_when_no_sessions_are_finalizing(monkeypatch):
     monkeypatch.setattr(fc.meeting_session, "list_finalizing", lambda conn: [])
     assert fc.reconcile("CONN", read_result=lambda sid: {"status": "sent"}) == []
+
+
+# ---- the group scan must not take the tick's real work with it ----------
+
+class _SavepointConn:
+    """Just enough psycopg surface: `with conn.transaction()` opens a nested
+    savepoint, and an exception inside it rolls back only that far."""
+
+    def __init__(self):
+        self.savepoints = 0
+
+    def transaction(self):
+        outer = self
+
+        class _Tx:
+            def __enter__(self):
+                outer.savepoints += 1
+                return outer
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Tx()
+
+
+def test_a_failing_group_scan_does_not_roll_back_the_tick(monkeypatch, caplog):
+    """sweep and reconcile share ONE transaction with the group scan. Without
+    containment, a group scan that raises every tick rolls back the sweep and
+    reconcile of every tick too -- and reconcile is what moves a session to
+    `sent`. The visible failure would be PROD EMAILS STOPPING, with a feature
+    flag as the only thing standing in the way of it.
+    """
+    monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
+    monkeypatch.setattr(fc, "_real_group_scan",
+                        lambda c: (_ for _ in ()).throw(RuntimeError("bad SQL")))
+    conn = _SavepointConn()
+    with caplog.at_level("ERROR"):
+        out = fc._sweep_groups_contained(conn)
+    assert out == []
+    assert conn.savepoints == 1, \
+        "must run inside a savepoint — a raised exception poisons the whole " \
+        "transaction, so catching it without one leaves the connection unusable"
+    assert "group" in caplog.text.lower(), "silent is how this stays undiagnosed"
+
+
+def test_a_working_group_scan_still_returns_its_results(monkeypatch):
+    # Containment must not swallow the success case too.
+    monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
+    monkeypatch.setattr(fc, "_real_group_scan",
+                        lambda c: [{"group_id": "g1", "status": "claimed"}])
+    assert fc._sweep_groups_contained(_SavepointConn()) == [
+        {"group_id": "g1", "status": "claimed"}]
+
+
+def test_containment_is_a_noop_when_the_flag_is_off(monkeypatch):
+    monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", False)
+    monkeypatch.setattr(fc, "_real_group_scan",
+                        lambda c: (_ for _ in ()).throw(AssertionError("ran while off")))
+    assert fc._sweep_groups_contained(_SavepointConn()) == []
+
+
+def test_the_handler_uses_the_contained_version(monkeypatch):
+    # The containment is worthless if the handler still calls the raw scan.
+    import inspect
+    src = inspect.getsource(fc.lambda_handler)
+    assert "_sweep_groups_contained(conn)" in src
+    assert "sweep_groups_if_enabled(conn)" not in src

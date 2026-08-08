@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 _TOPIC_COLS = ("id, site_id, user_id, source_s3_key, report_date, occurred_at, "
                "category, title, summary, time_range, participants, source, created_at, "
-               "work_class, work_confidence, is_mixed, thread_id")
+               "work_class, work_confidence, is_mixed, thread_id, evidence")
 
 # Phase F (D8 retirement, spec §8): severity -> risk_level, for reshaping
 # safety-domain findings into the legacy safety_observations row shape.
@@ -53,7 +53,8 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
                  occurred_at=None, category=None, summary=None,
                  action_items=None, safety=None, photos=None,
                  time_range=None, participants=None,
-                 work_class=None, work_confidence=None, is_mixed=False) -> dict:
+                 work_class=None, work_confidence=None, is_mixed=False,
+                 evidence=None) -> dict:
     """Insert a topic with its children. NOTE: currently insert-only —
     no ON CONFLICT dedup. Dedup is instead handled by callers running
     delete_topics_for_scope() first to clear the (site_id, report_date, user_id)
@@ -67,16 +68,24 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
     convention as every other jsonb column in this codebase (chunks.py,
     findings.py). `source` is NOT a kwarg here: it's a passive provenance
     column that defaults to 'ai' at the DB level (spec §8 Task 5 adds the
-    'human' writer later)."""
+    'human' writer later).
+
+    evidence (migration 0037) is the extraction's own citations plus the result
+    of checking each against the transcript. NULL means the extraction predates
+    the feature or ran with EMIT_EVIDENCE off -- which is prod today -- and is
+    NOT the same as the model having cited nothing."""
     cur = conn.cursor(row_factory=dict_row)
     topic = cur.execute(
         f"INSERT INTO topics (site_id, user_id, source_s3_key, report_date, occurred_at, "
         f"category, title, summary, time_range, participants, "
-        f"work_class, work_confidence, is_mixed) "
-        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_TOPIC_COLS}",
+        f"work_class, work_confidence, is_mixed, evidence) "
+        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_TOPIC_COLS}",
         (site_id, user_id, source_s3_key, report_date, occurred_at, category, title, summary,
          time_range, Jsonb(participants) if participants is not None else None,
-         work_class, work_confidence, is_mixed),
+         work_class, work_confidence, is_mixed,
+         # NULL, not '[]', when there is nothing: absent means "never measured",
+         # an empty array would mean "measured and cited nothing".
+         Jsonb(evidence) if evidence is not None else None),
     ).fetchone()
     tid = topic["id"]
     for a in (action_items or []):
@@ -197,6 +206,21 @@ def delete_topics_for_source_prefix(conn, source_prefix) -> int:
     return cur.rowcount
 
 
+def has_topics_for_source(conn, source_s3_key) -> bool:
+    """Does this exact source key have any topics?
+
+    The single-key sibling of has_topics_for_source_prefix, for the multi-device
+    merge: a joiner's own extraction prefix is empty after the merge deletes it,
+    so the nightly defer test has to ask about the MERGED artifact's key
+    instead, and that is one key rather than a prefix. Exact equality, so no
+    LIKE escaping is involved."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT 1 FROM topics WHERE source_s3_key = %s LIMIT 1",
+        (source_s3_key,),
+    ).fetchone()
+    return row is not None
+
+
 def has_topics_for_source_prefix(conn, source_prefix) -> bool:
     """Existence check for the org-api timeline shim (authority-flip Task 4):
     does ANY topic already exist for this (user, date) extraction prefix?
@@ -234,7 +258,8 @@ _TOPIC_COLS_JOINED = (
 )
 
 
-def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None) -> list[dict]:
+def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
+                         merged_keys=None) -> list[dict]:
     """Dashboard multi-site read for one report_date: topics scoped to
     site_ids (a caller-computed ACL list — ALL sites for an admin, or
     memberships.accessible_site_ids for a scoped worker/PM), joined with
@@ -286,6 +311,22 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None) -> lis
     if author_ids is not None:
         where += " AND t.user_id = ANY(%s::uuid[])"
         params.append(list(author_ids))
+    if merged_keys:
+        # Multi-device merge (Phase C): the merged record is owned by the LEAD's
+        # session, so a joiner whose own topics were just deleted would see an
+        # empty day. Unioned on source_s3_key, which names exactly the merged
+        # rows and nothing else.
+        #
+        # NOT on the lead's identity, which fails three ways and silently: a
+        # graded-role member has author_ids active and the merged topics carry
+        # the lead's user_id; a member without membership on the lead's site is
+        # cut by the site filter; and adding the lead's user_id to author_ids
+        # would leak the lead's OTHER solo topics that day to every member.
+        #
+        # The OR wraps the whole ACL, so a merged topic reaches its members
+        # regardless of which of those filters is active.
+        where = f"({where}) OR t.source_s3_key = ANY(%s)"
+        params.append(list(merged_keys))
 
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "

@@ -141,6 +141,7 @@ from repositories import (action_items, aliases, classification_feedback, compan
                           programme_snapshot,
                           programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, rollup, scope,
+                          session_group,
                           sites, threads, topics, users, voice_messages)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates, first_match_span, normalize, occurrences
@@ -657,6 +658,27 @@ def create_recording_upload_url(conn, caller, body):
     return ok({"recordingId": rec_id, "uploadUrl": url, "s3Key": key})
 
 
+def _ensure_group_state(conn, company_id, group_id):
+    """Register the group's merge state, if this recording is in a group.
+
+    Created by the JOINER rather than the lead, and from BOTH paths that persist
+    a group_id — the live /open and the offline upload adopt. The lead's own
+    /open is fire-and-forget at record-start and a site is routinely offline
+    then, so a group row that waited for the lead would leave exactly the groups
+    this feature exists for (an inspector handed a spare unit in a shed)
+    permanently invisible to the merge scan.
+
+    Never raises. Losing this row costs a merge; raising would cost the /open
+    or — worse — the upload, which is the synchronous no-retry route where a
+    500 strands the recording itself (BUG-43's family)."""
+    if not group_id:
+        return                                  # solo recording, no group state
+    try:
+        session_group.ensure_row(conn, group_id, company_id)
+    except Exception:
+        logger.exception("could not register group state for %s", group_id)
+
+
 def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
     """Record the meeting group carried by an upload, if there is one.
 
@@ -714,6 +736,10 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
             conn, m.group(1), caller["company_id"], caller["id"], site_id, kind,
             extract_base_time_from_filename(file_name), group_id=group_id,
         )
+        # Beside ensure_open, not instead of it: this is the OFFLINE join, the
+        # one whose /open never landed, so it is the only chance this group has
+        # to become visible to the merge scan.
+        _ensure_group_state(conn, caller["company_id"], group_id)
     except Exception:
         # An upload that 500s strands the recording and makes the device resend
         # the whole file. A lost group costs a merge; a lost upload costs the
@@ -848,6 +874,9 @@ def session_open(conn, caller, session_id, body):
         conn, session_id, caller["company_id"], caller["id"], site_id, kind,
         body.get("startedAt"), group_id=group_id,
     )
+    # After ensure_open, so a group is only registered once the join itself has
+    # passed every guard above (tenant, staleness, meeting-already-ended).
+    _ensure_group_state(conn, caller["company_id"], group_id)
     return ok({"sessionId": row["session_id"], "status": row["status"],
                "version": row["version"], "groupId": row.get("group_id")})
 
@@ -2978,9 +3007,42 @@ def list_live_items(conn, caller, event):
     if not date or not REPORT_DATE_RE.match(date):
         return error("date required (YYYY-MM-DD)", 400)
     site_ids = list(_allowed_site_ids(conn, caller))          # graded-aware reach
+    # Resolved on its own line, not inside the call: an exception raised while
+    # evaluating an argument escapes the callee's try, so a failed enrichment
+    # would 500 the whole timeline.
+    merged_keys = _merged_keys_for_caller(conn, caller, date)
     rows = topics.list_topics_for_date(conn, site_ids, date,
-                                       author_ids=_author_filter(conn, caller))
+                                       author_ids=_author_filter(conn, caller),
+                                       merged_keys=merged_keys)
     return ok({"topics": rows})
+
+
+def _merged_keys_for_caller(conn, caller, date):
+    """The merged-record keys this caller is entitled to see on `date`.
+
+    A multi-device merge writes ONE topic set, owned by the lead's session, and
+    deletes each member's own. Without this a joiner's day goes blank: they were
+    in the meeting and their timeline shows nothing.
+
+    Entitlement is membership in the group, established from the caller's own
+    sessions -- so this widens nothing. It cannot reach a group the caller was
+    not in, and it names individual artifact keys rather than relaxing the site
+    or author filter.
+
+    Returns [] on any failure: a missing merged record is a stale timeline, a
+    broken one is no timeline at all."""
+    try:
+        gids = meeting_session.groups_for_user_on_date(conn, caller["id"], date)
+        keys = []
+        for gid in gids:
+            row = session_group.get(conn, gid)
+            if row and row.get("merged_key"):
+                keys.append(row["merged_key"])
+        return keys
+    except Exception:
+        logger.exception("could not resolve merged records for %s on %s",
+                         caller.get("id"), date)
+        return []
 
 
 # ----------------------------------------------------------

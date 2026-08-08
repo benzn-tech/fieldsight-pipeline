@@ -86,6 +86,50 @@ MULTI_TENANT = os.environ.get("MULTI_TENANT_RESOLUTION", "false") == "true"
 # param defaults 'false') -- this constant alone is a true no-op until a
 # later task flips the deploy param.
 AUTHORITY_FLIP = os.environ.get("AUTHORITY_FLIP", "false").lower() == "true"
+ENABLE_GROUP_MERGE = os.environ.get("ENABLE_GROUP_MERGE", "false").lower() == "true"
+
+
+def _merged_keys_for(conn, user_id, report_date):
+    """Merged artifact keys for the groups this user was in that day."""
+    from repositories import meeting_session, session_group
+    keys = []
+    for gid in meeting_session.groups_for_user_on_date(conn, user_id, report_date):
+        row = session_group.get(conn, gid)
+        if row and row.get("merged_key"):
+            keys.append(row["merged_key"])
+    return keys
+
+
+def _should_defer(conn, user_id, user_folder, date):
+    """Does this (user, date) already have authoritative extraction topics?
+
+    The plain prefix test covers the LEAD for free -- the merged artifact lives
+    under the lead's own folder. It does NOT cover a joiner: the merge deleted
+    that member's own topics, so `extractions/{joiner}/{date}/` is empty and the
+    test goes false.
+
+    Without the second clause the nightly branch below then DELETES the
+    extraction prefix and writes report-sourced topics in its place -- the
+    duplicates the merge removed, back by 05:00 NZ, sitting beside the merged
+    record. The feature would un-do itself every night.
+
+    Failures fall back to the plain test rather than propagating: this runs in
+    the nightly batch over every user, so an exception here would abort the run
+    for everyone. A false NEGATIVE costs a duplicate for one user; an exception
+    costs the whole night.
+    """
+    if topics.has_topics_for_source_prefix(conn, f"extractions/{user_folder}/{date}/"):
+        return True
+    if not ENABLE_GROUP_MERGE or not user_id:
+        return False
+    try:
+        return any(topics.has_topics_for_source(conn, k)
+                   for k in _merged_keys_for(conn, user_id, date))
+    except Exception:
+        logger.exception("could not check merged records for %s on %s -- "
+                         "falling back to the extraction-prefix test only",
+                         user_folder, date)
+        return False
 
 
 def resolve_company(conn, user_folder):
@@ -474,8 +518,8 @@ def ingest_report(date, user_folder, report_key):
         # reports (MPI1 + MPI2, both unresolved users) delete each other,
         # and identity fixes + rerun would duplicate (Fable review C1/I1).
         extraction_prefix = f"extractions/{user_folder}/{date}/"
-        defer_to_extraction = AUTHORITY_FLIP and topics.has_topics_for_source_prefix(
-            conn, extraction_prefix)
+        defer_to_extraction = AUTHORITY_FLIP and _should_defer(
+            conn, user_id, user_folder, date)
 
         chunks.delete_chunks_for_source(conn, report_key)
         topics.delete_topics_for_source(conn, report_key)  # always: clears stale pre-flip report rows
