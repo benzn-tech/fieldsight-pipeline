@@ -231,6 +231,69 @@ def filter_device_announcements(turns):
         logger.info("Filtered %d device announcement turn(s): %s",
                     len(removed), stats['texts'][:5])
     return kept, stats
+
+
+# An ElevenLabs audio-event annotation: "[background noise]", "[laughs]",
+# "[话筒碰撞声]". Matched by SHAPE, deliberately — the vocabulary is open and
+# unstable (the same event came back as both "[点击鼠标]" and "[鼠标点击]" in one
+# evaluation, and it differs per language), so a phrase table would be
+# permanently behind whatever the engine emits next.
+#
+# Bounded at 40 characters and no nested "]" so an unclosed bracket in real
+# speech cannot swallow the rest of a turn. A tag that long is not a tag.
+AUDIO_EVENT_TAG_RE = re.compile(r'\[[^\[\]]{1,40}\]')
+# Rollback without a code change, matching how the rest of tonight's changes
+# ship. Default on: these reached the extraction prompt, the rolling summary
+# and the confirmation email as ordinary speech from the day prod switched to
+# ElevenLabs, and nothing downstream can tell them from a person talking.
+FILTER_AUDIO_EVENT_TAGS = os.environ.get(
+    'FILTER_AUDIO_EVENT_TAGS', 'true').lower() == 'true'
+
+
+def filter_audio_event_tags(turns):
+    """Strip audio-event annotations from turns. Return (kept_turns, stats).
+
+    A turn that is NOTHING but tags is dropped; a turn that mixes them with
+    speech keeps the speech. That distinction is the whole design: the tags
+    arrive glued to real sentences ("[background noise] So you've got to
+    rearrange these fences"), and dropping those turns would delete site
+    conversation to remove an annotation.
+
+    Runs BEFORE filter_device_announcements, which is not cosmetic ordering.
+    `is_device_announcement` matches whole sentences, so "[background noise]
+    Recording started." does not match while the tag is attached — the
+    announcement survives as speech unless the tag goes first.
+
+    `stats['tags']` reports the distinct annotations met, for the same reason
+    the announcement filter reports its phrases: a filter whose encounters are
+    invisible cannot be tuned, and this vocabulary is set by the provider.
+    """
+    if not FILTER_AUDIO_EVENT_TAGS:
+        return list(turns), {'removed': 0, 'stripped': 0, 'tags': []}
+
+    kept, removed, stripped, seen = [], 0, 0, set()
+    for turn in turns:
+        text = turn.get('text') or ''
+        tags = AUDIO_EVENT_TAG_RE.findall(text)
+        if not tags:
+            kept.append(turn)
+            continue
+        seen.update(tags)
+        cleaned = re.sub(r'\s+', ' ', AUDIO_EVENT_TAG_RE.sub(' ', text)).strip()
+        if not cleaned:
+            removed += 1
+            continue
+        stripped += 1
+        # Copy rather than mutate: these turn dicts are also held by the
+        # normalized transcripts the caller assembled, and a caller that reads
+        # them again should see what the transcript actually said.
+        kept.append({**turn, 'text': cleaned})
+    stats = {'removed': removed, 'stripped': stripped, 'tags': sorted(seen)}
+    if removed or stripped:
+        logger.info("Audio-event tags: dropped %d tag-only turn(s), cleaned "
+                    "%d mixed turn(s); tags seen: %s",
+                    removed, stripped, stats['tags'][:8])
+    return kept, stats
 SITE_MATCH_CUTOFF = 0.6
 
 # Two-tier extraction (see extract_session).
@@ -747,6 +810,10 @@ def assemble_session_turns(bucket, keys):
             turns.append(turn)
     turns.sort(key=lambda t: t['abs_start'])
     turns = _dedup_turn_boundaries(turns)   # drop mobile chunk-overlap dup at seams (no-op pre-chunk)
+    # Tags first: an announcement wearing one ("[background noise] Recording
+    # started.") is invisible to the sentence-matching filter below until the
+    # tag is gone. See filter_audio_event_tags.
+    turns, _tag_stats = filter_audio_event_tags(turns)
     turns, announcement_stats = filter_device_announcements(turns)
     return turns, source_filenames, announcement_stats
 
