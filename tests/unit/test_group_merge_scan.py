@@ -388,3 +388,61 @@ def test_one_failed_request_does_not_stop_the_others(monkeypatch, caplog):
         fc.flush_pending_enqueues()
     assert sent == [{"groupId": "good"}]
     assert "bad" in caplog.text
+
+
+def test_a_rolled_back_tick_discards_the_requests_it_collected(monkeypatch):
+    """The hole in my own fix for the previous hole.
+
+    Moving the S3 send out of the transaction is not enough on its own. If the
+    scan collects requests for groups 1 and 2 and then raises on group 3, the
+    savepoint rolls back claims 1 and 2 -- but the collected requests are still
+    sitting in the module-level list, and the unconditional flush that follows
+    sends them anyway. Same defect, one layer further out: a merge request that
+    outlives a rolled-back claim, and the meeting merges twice.
+
+    Collecting is part of the transaction's work even though it touches no
+    database, so it has to be undone with it.
+    """
+    monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
+    monkeypatch.setattr(fc, "_pending_enqueues", [])
+    monkeypatch.setattr(fc, "_real_recover", lambda c: [])
+
+    def _scan_then_fail(conn):
+        fc._pending_enqueues.append({"groupId": "g1"})
+        fc._pending_enqueues.append({"groupId": "g2"})
+        raise RuntimeError("group 3 blew up")
+
+    monkeypatch.setattr(fc, "_real_group_scan", _scan_then_fail)
+    fc._sweep_groups_contained(_SavepointConn())
+    assert fc._pending_enqueues == [], \
+        "requests collected inside a rolled-back transaction must be dropped"
+
+
+def test_a_successful_tick_keeps_what_it_collected(monkeypatch):
+    monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
+    monkeypatch.setattr(fc, "_pending_enqueues", [])
+    monkeypatch.setattr(fc, "_real_recover", lambda c: [])
+    monkeypatch.setattr(fc, "_real_group_scan",
+                        lambda c: fc._pending_enqueues.append({"groupId": "g1"}) or [])
+    fc._sweep_groups_contained(_SavepointConn())
+    assert fc._pending_enqueues == [{"groupId": "g1"}]
+
+
+def test_a_failure_does_not_discard_an_earlier_invocations_leftovers(monkeypatch):
+    """Lambda reuses containers, so this list survives between invocations.
+
+    Only THIS tick's collection is rolled back -- truncating the whole list
+    would silently drop a request a previous, successful tick had committed a
+    claim for, which is the unrecoverable direction.
+    """
+    monkeypatch.setattr(fc, "ENABLE_GROUP_MERGE", True)
+    monkeypatch.setattr(fc, "_pending_enqueues", [{"groupId": "earlier"}])
+    monkeypatch.setattr(fc, "_real_recover", lambda c: [])
+
+    def _boom(conn):
+        fc._pending_enqueues.append({"groupId": "thistick"})
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(fc, "_real_group_scan", _boom)
+    fc._sweep_groups_contained(_SavepointConn())
+    assert fc._pending_enqueues == [{"groupId": "earlier"}]
