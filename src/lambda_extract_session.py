@@ -818,11 +818,23 @@ def assemble_session_turns(bucket, keys):
         source_filenames.append(filename)
 
     turns = []
-    for normalized in normalized_list:
+    # Stamp each turn with the segment it came from. The two lists are built in
+    # the loop above and a skipped segment appends to NEITHER, so zip() pairs
+    # them correctly -- but the pairing is load-bearing enough to be pinned by a
+    # test, because getting it wrong attributes every quote to the wrong audio
+    # file and nothing fails.
+    #
+    # This is what makes a cited quote resolvable to audio at all. Without it
+    # the anchor has to be reverse-derived from an absolute timestamp: each
+    # segment's interval recomputed from its filename (BUG-09's arithmetic,
+    # already got wrong once here) and then the ~2s ring-buffer overlap
+    # disambiguated by hand. turn['start_sec'] is already the in-file offset,
+    # so the filename is the only missing half.
+    for normalized, filename in zip(normalized_list, source_filenames):
         for turn in normalized.get('speaker_turns', []):
             if turn.get('abs_start') is None:
                 continue
-            turns.append(turn)
+            turns.append(dict(turn, source_filename=filename))
     turns.sort(key=lambda t: t['abs_start'])
     turns = _dedup_turn_boundaries(turns)   # drop mobile chunk-overlap dup at seams (no-op pre-chunk)
     # Tags first: an announcement wearing one ("[background noise] Recording
