@@ -10,6 +10,13 @@ Each check below costs nothing and takes about a minute. Record one recording, t
 down the list.
 
 Throughout, `{sid}` is the session id in the filename and `{date}` is the NZ date.
+**Substitute them before running** — they are in braces, so bash leaves them
+literal and the command SUCCEEDS and returns nothing rather than complaining. An
+empty result from an unsubstituted placeholder looks exactly like an empty result
+from the real failure the check exists to detect.
+
+Every command in this document was executed against real prod data on the night of
+08-08 — they run.
 
 ---
 
@@ -234,9 +241,14 @@ them:
 Check §5 first — it is still the more likely cause. Then:
 
 ```bash
-aws logs filter-log-events --log-group-name /aws/lambda/fieldsight-prod-finalize-sweep \
-  --start-time <ms> --filter-pattern '"group sweep failed"' --region ap-southeast-2
+aws logs tail /aws/lambda/fieldsight-prod-finalize-sweep \
+  --since 2h --filter-pattern "group sweep failed" --region ap-southeast-2
 ```
+
+No output is the pass. (`aws logs tail --since` rather than
+`filter-log-events --start-time` deliberately: the latter wants epoch
+milliseconds, and a `<ms>` placeholder in a block you are copy-pasting is read by
+bash as a redirection and fails before it ever reaches AWS.)
 
 Silence there means the group path is not involved. It should be silent: the flag is off,
 so the scan does not run at all.
