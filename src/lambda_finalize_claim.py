@@ -59,6 +59,14 @@ ENABLE_GROUP_MERGE = os.environ.get("ENABLE_GROUP_MERGE", "false").lower() == "t
 # the guard is unconditional. Measured on opened_at, the SERVER's timestamp:
 # these ROMs have been seen 12 hours out (BUG-37).
 GROUP_MAX_SPAN_SECONDS = int(os.environ.get("GROUP_MAX_SPAN_SECONDS", "43200"))
+# How long after a CLAIM a merge is assumed dead rather than slow. Must clear a
+# real thinking call by a wide margin -- one was measured at 347 seconds against
+# LLM_HTTP_TIMEOUT 540 -- or recovery re-queues a merge that is still working
+# and the meeting merges twice.
+STUCK_MERGE_SECONDS = int(os.environ.get("STUCK_MERGE_SECONDS", "1800"))
+# Mirrors item-writer's own default. Read from the environment rather than
+# imported: separate functions, separate zips.
+GROUP_MERGE_CAP = int(os.environ.get("GROUP_MERGE_CAP", "2"))
 
 
 def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_rolling,
@@ -301,7 +309,88 @@ def sweep_groups(conn, *, list_due, claim, mark_result, span_ok, members_of,
     return results
 
 
-def _sweep_groups_contained(conn, scan=None):
+def _merge_already_landed(conn, group_id, merged_key):
+    """Did this merge actually succeed and simply not get marked?
+
+    Three states share the `merged_at set, merge_result NULL` signature and they
+    need opposite treatment:
+
+      - the merge died          -> re-arm (pay for another attempt)
+      - it landed but is unmarked -> mark it; re-merging would pay again and
+                                     e-mail every member a second time
+      - it is still running      -> leave it alone
+
+    Distinguished by the durable result, not by elapsed time: an extraction that
+    ran and whose topics reached Aurora is a merge that happened, whatever the
+    clock says. Cheap -- one indexed lookup on a key we already hold.
+    """
+    if not merged_key:
+        return False
+    try:
+        from repositories import topics
+        return topics.has_topics_for_source(conn, merged_key)
+    except Exception:
+        # Err towards NOT marking: a wrongly-marked group never merges, while a
+        # wrongly-re-armed one costs a duplicate that the cap still bounds.
+        logger.exception("group %s: could not check whether the merge landed", group_id)
+        return False
+
+
+def recover_stuck_groups(conn, *, list_stuck, rearm, mark_result, cap,
+                         landed=None):
+    """Put a group back in the queue when its merge died after being claimed.
+
+    Without this, the failure is TOTALLY silent: claim sets merged_at,
+    extract_group returns None on any LLM failure so no artifact is written,
+    item-writer therefore never runs, and it is the only caller of both
+    mark_result and rearm. `list_due` requires merge_result IS NULL *and*
+    merged_at IS NULL, so the group is never seen again -- the meeting just
+    never merges, with nothing logged and nothing failed.
+
+    Retries are bounded by the SAME cap as the re-arm path, because every
+    attempt is a paid thinking call (measured: 18,744 tokens, 347 seconds). A
+    group whose transcript reliably breaks the model must stop, not spin.
+    """
+    # Gated here as well as in the caller: this is reached directly by tests and
+    # would otherwise be one refactor away from running on a prod that has the
+    # feature switched off.
+    if not ENABLE_GROUP_MERGE:
+        return []
+    out = []
+    check_landed = landed or _merge_already_landed
+    for g in list_stuck(conn, STUCK_MERGE_SECONDS):
+        gid = g["group_id"]
+        if check_landed(conn, gid, g.get("merged_key")):
+            # Succeeded; only the bookkeeping is missing. Re-merging here would
+            # buy a second paid thinking call and a second `Updated:` email to
+            # every member, for a record that is already correct.
+            mark_result(conn, gid, "merged")
+            logger.warning("group %s: merge had landed but was never marked -- "
+                           "recorded rather than re-run", gid)
+            out.append({"group_id": gid, "status": "marked"})
+        elif (g.get("merge_count") or 0) >= cap:
+            mark_result(conn, gid, "failed")
+            logger.error("group %s: merge failed %d times -- giving up. The "
+                         "members keep their own topics.", gid, g.get("merge_count"))
+            out.append({"group_id": gid, "status": "failed"})
+        elif rearm(conn, gid):
+            logger.warning("group %s: merge was claimed but never produced an "
+                           "artifact -- re-queued", gid)
+            out.append({"group_id": gid, "status": "rearmed"})
+    return out
+
+
+def _real_recover(conn):
+    from repositories import session_group
+    # The same env var item-writer reads, NOT an import from it: these are
+    # separate functions with separate deployment zips, and importing across
+    # them works locally and fails only once deployed.
+    return recover_stuck_groups(
+        conn, list_stuck=session_group.list_stuck, rearm=session_group.rearm,
+        mark_result=session_group.mark_result, cap=GROUP_MERGE_CAP)
+
+
+def _sweep_groups_contained(conn, scan=None, recover=None):
     """The group scan, unable to take the tick's real work down with it.
 
     sweep, reconcile and this share ONE transaction. Without containment a group
@@ -318,15 +407,20 @@ def _sweep_groups_contained(conn, scan=None):
     Never silent: a merge that stops happening is otherwise invisible, since
     the sweep logs only when it did something.
 
-    This is the ONLY flag gate for the group scan. An earlier version had a
-    separate `sweep_groups_if_enabled` as well; two gates for one flag is an
-    invitation to change one of them.
+    The flag is checked here and again in recover_stuck_groups, which tests
+    reach directly. That is two checks of one flag, but both are entry points --
+    unlike the `sweep_groups_if_enabled` wrapper this replaced, which was a
+    second gate on the same entry point.
     """
     if not ENABLE_GROUP_MERGE:
         return []
     try:
         with conn.transaction():      # savepoint: roll back to here, keep conn usable
-            return (scan or _real_group_scan)(conn)
+            # Recovery FIRST: a group stuck from an earlier tick has to be back
+            # in the queue before the scan looks, or it waits another minute for
+            # no reason.
+            recovered = (recover or _real_recover)(conn)
+            return (recovered + (scan or _real_group_scan)(conn))
     except Exception:
         logger.exception("group sweep failed -- finalize continues and the "
                          "merge is retried next tick")

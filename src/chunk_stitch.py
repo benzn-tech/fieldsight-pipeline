@@ -42,15 +42,30 @@ def parse_chunk_key(key):
 
 
 def _norm(word):
-    """Comparison key for one word: lowercased, alphanumerics only. Absorbs the
-    trivial ASR differences at a boundary (case, trailing punctuation) so the
-    same spoken word in two chunks matches. Accepts both the transcript_utils
-    word shape (`{'word': ...}`) and a plain `{'text': ...}`/string."""
+    """Comparison key for one word: lowercased, punctuation stripped, every
+    script kept. Absorbs the trivial ASR differences at a boundary (case,
+    trailing punctuation) so the same spoken word in two chunks matches. Accepts
+    both the transcript_utils word shape (`{'word': ...}`) and a plain
+    `{'text': ...}`/string."""
     if isinstance(word, dict):
         text = word.get("word") or word.get("text") or ""
     else:
         text = str(word)
-    return re.sub(r"[^0-9a-z]+", "", text.lower())
+    # `\w` and not `[0-9a-z]`: the ASCII class erased every CJK character to the
+    # empty string, so any two Chinese runs compared EQUAL and the longest-first
+    # loop below deleted up to `max_window` characters of unrelated real speech at
+    # every chunk seam. Measured 2026-08-08: tail "今天天气不错啊" against head
+    # "钢筋合格证还没到今天再催" removed 7 of 11 characters. Silent data loss on
+    # every mixed-language session.
+    return re.sub(r"[^\w]+", "", text.lower())
+
+
+# A token that normalises to nothing (bare punctuation) carries no evidence of a
+# repeat, so it must never satisfy a match — otherwise the emptiness itself is
+# what matches, which is how the CJK bug above did its damage.
+def _same(a, b):
+    na, nb = _norm(a), _norm(b)
+    return bool(na) and na == nb
 
 
 def dedup_overlap(tail, head, max_window=DEFAULT_MAX_WINDOW):
@@ -59,12 +74,28 @@ def dedup_overlap(tail, head, max_window=DEFAULT_MAX_WINDOW):
     a copy of `head` with the longest matching prefix removed; `head` unchanged
     when there is no boundary repeat (conservative — a little duplication beats
     dropping real speech). The KEPT words are `head`'s own objects, so their
-    per-chunk timestamps survive for the caller to re-base."""
+    per-chunk timestamps survive for the caller to re-base.
+
+    Matching is EXACT, deliberately. The engine does not return the same words
+    for both copies of the overlap — measured on prod session sidfb57faf9…, one
+    seam had "…back around the gully" against "Back around the galley." — so a
+    duplicate survives whenever a single token differs. A fuzzy variant was
+    written, measured against that session, and **removed**: the engine also glues
+    a boundary word to the next sentence ("galley。12"), so the fuzzy run deleted
+    a whole token and took the batch number "12" with it, turning "Batch 12
+    bricks" into "that batch of bricks". Losing a number is worse than carrying a
+    four-word fragment.
+
+    The correct fix is timestamp-based — drop the later turn's leading words whose
+    absolute time precedes the previous turn's end, with no string comparison at
+    all — and it needs word-level times carried on a turn, which `speaker_turns`
+    does not do today.
+    """
     tail = tail or []
     head = head or []
     lim = min(len(tail), len(head), max_window)
     for k in range(lim, 0, -1):
-        if [_norm(w) for w in tail[-k:]] == [_norm(w) for w in head[:k]]:
+        if all(_same(a, b) for a, b in zip(tail[-k:], head[:k])):
             return list(head[k:])
     return list(head)
 
