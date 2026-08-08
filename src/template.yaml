@@ -502,6 +502,27 @@ Parameters:
       so the rollback survives a deploy — a value set only on the live function
       is erased the next time CloudFormation reconciles the environment.
 
+  TranscribeWholeChunk:
+    Type: String
+    # Defaults to the CURRENT live value, not to the legacy one. This parameter is
+    # being introduced to make an existing setting reachable, not to change it, and
+    # a manual `sam deploy` that fell back to 'false' would silently switch every
+    # recording to per-segment jobs — the behaviour this setting was turned on to
+    # escape.
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether a chunk with any detected speech is emitted as ONE whole-chunk unit
+      ('true', current) or as one unit per VAD speech segment ('false', legacy).
+      Per-segment jobs were measured worse: broken diarization on 1-2s clips,
+      language-ID flips, and ~2x cost under a 15s minimum billing. It is also the
+      real lever on how much non-speech reaches the transcriber — on the 2026-08-08
+      session, whole-chunk sent 348s of 498s (70%) while segment mode would have
+      sent 134.5s (27%), and no VAD threshold changes those seconds. Declared as a
+      Parameter so that comparison costs one repo variable instead of a code change;
+      flipping it is a behaviour decision, because segment mode brings back
+      splitting one person across several speaker labels inside a single chunk.
+
   FilterAudioEventTags:
     Type: String
     Default: 'true'
@@ -875,9 +896,11 @@ Resources:
           SKIP_EXISTING: 'true'
           GENERATE_PREVIEW: 'true'
           # Per-chunk transcription (design 2026-07-31): 'false' = legacy per-VAD-segment
-          # jobs. Set 'true' to emit one whole-chunk unit per chunk (coherent, cheaper —
-          # see lambda_vad TRANSCRIBE_WHOLE_CHUNK). Inert until flipped; try on test first.
-          TRANSCRIBE_WHOLE_CHUNK: 'true'
+          # jobs. 'true' (current) emits one whole-chunk unit per chunk — coherent,
+          # cheaper, and it exists because per-segment jobs split one person across
+          # several speaker labels inside a single 30s chunk. See lambda_vad
+          # TRANSCRIBE_WHOLE_CHUNK.
+          TRANSCRIBE_WHOLE_CHUNK: !Ref TranscribeWholeChunk
           WEB_VIDEO_PREFIX: web_video/
       Policies:
         - S3CrudPolicy:
