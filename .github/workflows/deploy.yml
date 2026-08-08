@@ -185,6 +185,7 @@ jobs:
               "VadThreshold=${{ vars.TEST_VAD_THRESHOLD || '0.2' }}" \
               "DropSilentChunks=${{ vars.TEST_DROP_SILENT_CHUNKS || 'true' }}" \
               "NormaliseAudio=${{ vars.TEST_NORMALISE_AUDIO || 'true' }}" \
+              "TranscribeWholeChunk=${{ vars.TEST_TRANSCRIBE_WHOLE_CHUNK || 'true' }}" \
               "FilterAudioEventTags=${{ vars.TEST_FILTER_AUDIO_EVENT_TAGS || 'true' }}" \
               "EnableGroupMerge=${{ vars.TEST_ENABLE_GROUP_MERGE || 'true' }}" \
               "EmitEvidence=${{ vars.TEST_EMIT_EVIDENCE || 'true' }}" \

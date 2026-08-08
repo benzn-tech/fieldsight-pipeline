@@ -180,6 +180,7 @@ jobs:
               "VadThreshold=${{ vars.PROD_VAD_THRESHOLD || '0.5' }}" \
               "DropSilentChunks=${{ vars.PROD_DROP_SILENT_CHUNKS || 'true' }}" \
               "NormaliseAudio=${{ vars.PROD_NORMALISE_AUDIO || 'false' }}" \
+              "TranscribeWholeChunk=${{ vars.PROD_TRANSCRIBE_WHOLE_CHUNK || 'true' }}" \
               "FilterAudioEventTags=${{ vars.PROD_FILTER_AUDIO_EVENT_TAGS || 'true' }}" \
               "EnableGroupMerge=${{ vars.PROD_ENABLE_GROUP_MERGE || 'false' }}" \
               "EmitEvidence=${{ vars.PROD_EMIT_EVIDENCE || 'false' }}" \

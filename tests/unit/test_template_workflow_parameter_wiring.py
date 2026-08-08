@@ -117,6 +117,17 @@ def test_every_boolean_toggle_is_reachable_from_a_repo_variable():
         "UNWIRED_BY_DESIGN with a reason.")
 
 
+def test_the_whole_chunk_mode_is_wired_in_both_environments():
+    """It was hard-coded 'true' in the template with no Parameter at all, so the
+    comparison it gates — whole-chunk sent 348s of 498s to the transcriber on the
+    2026-08-08 session, segment mode would have sent 134.5s — needed a code change
+    to run. It defaults to the CURRENT value, so wiring it changes nothing."""
+    for env, path in WORKFLOWS.items():
+        assert "TranscribeWholeChunk" in _overrides(path), (
+            f"{env} does not pass TranscribeWholeChunk, so the setting cannot be "
+            f"compared without editing the template")
+
+
 def test_the_audio_event_tag_filter_is_wired_in_both_environments():
     """The specific regression this file was written for."""
     for env, path in WORKFLOWS.items():
