@@ -159,12 +159,30 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
     # enqueued rolling summary (which can be stale/partial — see _complete_summary);
     # fall back to the rolling summary on any failure.
     summary, todos = artifact.get("summary"), artifact.get("openTodos")
-    fresh = (complete_summary if complete_summary is not None else _complete_summary)(artifact)
-    if fresh:
-        summary, todos = fresh.get("summary", summary), fresh.get("open_todos", todos)
+    is_updated = artifact.get("kind") == "updated"
+    # An `updated` request already carries the ONE merged summary every member
+    # must receive. Re-deriving would summarise this member's own SOLO
+    # transcripts (_complete_summary re-gathers `sid{sessionId}`), so the N
+    # members would each get a summary of what THEY heard under a subject saying
+    # the meeting was merged -- N different bodies, N LLM calls, and the one
+    # thing the merge promised quietly not delivered.
+    if not is_updated:
+        fresh = (complete_summary if complete_summary is not None else _complete_summary)(artifact)
+        if fresh:
+            summary, todos = fresh.get("summary", summary), fresh.get("open_todos", todos)
     subject, text, html = build_confirmation_email(
         date=artifact.get("date"), time_range=artifact.get("timeRange"),
         site_name=artifact.get("siteName"), summary=summary, open_todos=todos)
+    if is_updated:
+        # A second email with a different body must not read as a duplicate of
+        # the first. The recipient already had one for this meeting.
+        subject = f"Updated: {subject}"
+        # And its result goes to its own key. reconcile reads
+        # session_finalize_results/{sessionId}.json to settle a CLAIMED session;
+        # a member can be counted settled by quietness while still `finalizing`,
+        # so an updated result on the solo key could move that session to `sent`
+        # on the wrong evidence.
+        session_id = f"{session_id}-updated"
     if send is None:
         from email_sender import get_sender
         send = get_sender().send

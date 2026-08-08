@@ -272,12 +272,34 @@ def _enqueue_updated_emails(artifact, put=None):
     settled by quietness while still `finalizing`, so the two would otherwise
     race on session_finalize_results/{sessionId}.json."""
     put = put or _put_finalize_request
+    todos = _todos_from_topics(artifact)
     for sid in artifact.get("memberSessions") or []:
         put(f"session_finalize_requests/{sid}-updated.json",
             {"kind": "updated", "sessionId": sid,
              "groupId": artifact.get("groupId"),
              "summary": artifact.get("summary"),
-             "openTodos": artifact.get("open_todos") or []})
+             "openTodos": todos})
+
+
+def _todos_from_topics(artifact):
+    """The merged record's action items, in the shape the email renderer wants.
+
+    _clean_todos expects {text, responsible, due} dicts, not strings — a list of
+    strings raises AttributeError and takes the whole email with it. The solo
+    path gets this shape from the rolling summary; a merged artifact has no
+    rolling summary at all, so it is built from the merged topics' action_items
+    here."""
+    out = []
+    for topic in artifact.get("topics") or []:
+        for item in topic.get("action_items") or []:
+            if not isinstance(item, dict):
+                continue
+            text = (item.get("action") or item.get("text") or "").strip()
+            if text:
+                out.append({"text": text,
+                            "responsible": item.get("responsible") or None,
+                            "due": item.get("deadline") or item.get("due") or None})
+    return out
 
 
 def _put_finalize_request(key, body):

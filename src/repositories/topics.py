@@ -197,6 +197,21 @@ def delete_topics_for_source_prefix(conn, source_prefix) -> int:
     return cur.rowcount
 
 
+def has_topics_for_source(conn, source_s3_key) -> bool:
+    """Does this exact source key have any topics?
+
+    The single-key sibling of has_topics_for_source_prefix, for the multi-device
+    merge: a joiner's own extraction prefix is empty after the merge deletes it,
+    so the nightly defer test has to ask about the MERGED artifact's key
+    instead, and that is one key rather than a prefix. Exact equality, so no
+    LIKE escaping is involved."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT 1 FROM topics WHERE source_s3_key = %s LIMIT 1",
+        (source_s3_key,),
+    ).fetchone()
+    return row is not None
+
+
 def has_topics_for_source_prefix(conn, source_prefix) -> bool:
     """Existence check for the org-api timeline shim (authority-flip Task 4):
     does ANY topic already exist for this (user, date) extraction prefix?

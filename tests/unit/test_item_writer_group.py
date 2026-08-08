@@ -98,10 +98,28 @@ def test_an_unreadable_merged_artifact_is_treated_as_covering_nothing():
     assert iw._brings_new_content({"source_transcripts": ["t1.json"]}, None) is True
 
 
+def test_the_todos_are_dicts_not_strings():
+    # _clean_todos in the email renderer does t.get("text"); a list of strings
+    # raises AttributeError and takes the whole email with it. The solo path
+    # gets this shape from the rolling summary, which a merged artifact does
+    # not have.
+    art = {"topics": [{"action_items": [
+        {"action": "PPE compliance", "responsible": "Unidentified worker",
+         "deadline": "Immediate"}]}]}
+    todos = iw._todos_from_topics(art)
+    assert todos == [{"text": "PPE compliance",
+                      "responsible": "Unidentified worker", "due": "Immediate"}]
+
+
+def test_todos_from_a_merge_with_no_action_items_is_empty():
+    assert iw._todos_from_topics({"topics": [{"action_items": []}]}) == []
+    assert iw._todos_from_topics({}) == []
+
+
 def test_one_updated_request_per_member_all_with_the_same_summary():
     written = []
     art = {"tier": "group", "groupId": GID, "summary": "One shared summary.",
-           "open_todos": ["x"], "memberSessions": [GID, JOINER]}
+           "topics": [], "memberSessions": [GID, JOINER]}
     iw._enqueue_updated_emails(art, put=lambda key, body: written.append((key, body)))
     assert [k for k, _ in written] == [
         f"session_finalize_requests/{GID}-updated.json",
