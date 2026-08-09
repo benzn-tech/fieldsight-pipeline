@@ -81,6 +81,32 @@ it. **Only the audio object proves arrival.**
 `scripts/missing_chunk_audit.py` implements the correct method and can be run over history
 without touching the pipeline.
 
+### And the obvious place cannot see the data — measured, not assumed
+
+`extract_session` looks like where this belongs: it already lists S3, already builds the
+artifact, and already runs once per session at the final tier. **Its IAM cannot see the
+audio.** Read from the live role rather than the template:
+
+```json
+"Action": "s3:ListBucket",
+"Resource": "arn:aws:s3:::fieldsight-data-509194952652",
+"Condition": { "StringLike": { "s3:prefix": ["transcripts/*", "extractions/*"] } }
+```
+
+`users/{folder}/audio/{date}/` is not in that list, and it is the **only** source that proves
+a chunk arrived — a chunk VAD dropped has no transcript, and a chunk that never arrived has
+no sidecar either.
+
+So building it there costs a widening of the extraction role to list raw customer audio.
+That is a real privilege increase for a 0.9% event, and it carries the failure mode this
+repo has already been bitten by three times: **add the code, miss the IAM, and the denial is
+swallowed into "no chunks found" — which reads as "the record is complete."** A field that
+silently always says everything is fine is worse than no field.
+
+If it is built later, the check must treat a listing failure as **unknown**, never as
+complete, and the IAM must be verified with `simulate-principal-policy` against the live
+role — not read from the template.
+
 ### A second signal fell out of it
 
 Running the audit over everything shows recorder restarts are not evenly spread:
