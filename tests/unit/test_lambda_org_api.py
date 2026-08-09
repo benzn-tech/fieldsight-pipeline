@@ -6829,3 +6829,146 @@ def test_no_conn_means_no_thread_block_rather_than_a_fake_one(wired, monkeypatch
     out = org.render_report_shape([_shape_row(thread_id="th-1")], {},
                                   "2026-07-22", "Ada_L")
     assert out["topics"][0]["thread"] is None
+
+
+# ----------------------------------------------------------
+# Topic-window alignment between /transcripts and /audio-segments.
+#
+# Live prod defect (2026-08-09, Ben_UCPK2 timeline): the Transcript tab and
+# the Audio tab of the SAME topic showed different moments. Topic
+# "12:07 - 12:07 Monthly Card Activity Release" read as the 12:07:15 chunk
+# but its player served the 12:06:47 chunk -- a different conversation,
+# ~28s earlier.
+#
+# Aurora stores topic.time_range at MINUTE precision and timeline.js
+# parseTimeRange (:2671) expands "12:07 - 12:07" to start="12:07:00",
+# end="12:07:00" -- a ZERO-WIDTH window. _read_org_transcripts (:4665)
+# survives it by widening +/-60s; _read_org_audio_segments (:5077) does
+# not, so its overlap test admits only the chunk STRADDLING that instant,
+# which for a recorder emitting 30s chunks every 28s is always the
+# PRECEDING chunk. Every pre-existing audio test passes an HH:MM:SS window
+# spanning minutes, so none of them could see this.
+#
+# Second defect, same symptom: _read_org_transcripts' per-file prefilter
+# (:4684) hardcodes `file_time_sec + 600`. No chunk is 10 minutes long, so
+# `segments[]` escapes windowing entirely and the Transcript tab renders
+# the whole session next to a one-chunk Audio tab.
+#
+# Fixture data is the real prod chunk set (Ben_UCPK2, 2026-08-09).
+# ----------------------------------------------------------
+
+_ALIGN_DATE = "2026-08-09"
+_ALIGN_SID = "sid0e43b52d7d654101aa01ee139c79831e"
+# (clock stamped in the filename, chunk length). The recorder emits a 30s
+# chunk every 28s, so consecutive chunks overlap ~2s; the session's last
+# chunk is short.
+_ALIGN_CHUNKS = [("12-05-21", "30.0"), ("12-05-51", "30.0"), ("12-06-19", "30.0"),
+                 ("12-06-47", "30.0"), ("12-07-15", "19.0")]
+
+
+def _align_base(clock, length):
+    return f"ben_ucpk2_{_ALIGN_DATE}_{clock}_{_ALIGN_SID}_c0000_off0.0_to{length}_srcwav"
+
+
+def _align_clock_of(filename):
+    return filename.split(f"{_ALIGN_DATE}_")[1].split("_")[0]
+
+
+def _align_transcript_doc(length):
+    """Transcribe shape for one chunk: words spread across its real length."""
+    n = 4
+    step = float(length) / n
+    return {"results": {
+        "transcripts": [{"transcript": "word " * n}],
+        "audio_segments": [{"speaker_label": "spk_0", "transcript": "word word word word",
+                            "start_time": "0.0", "end_time": length}],
+        "items": [{"type": "pronunciation", "start_time": str(round(i * step, 1)),
+                   "end_time": str(round((i + 1) * step, 1)),
+                   "alternatives": [{"content": "word"}]} for i in range(n)],
+    }}
+
+
+def _wire_align_session(fake, folder="Ben_UCPK"):
+    """Both media prefixes populated with the same nine-chunk session."""
+    contents = []
+    for clock, length in _ALIGN_CHUNKS:
+        base = _align_base(clock, length)
+        wav = f"audio_segments/{folder}/{_ALIGN_DATE}/{base}.wav"
+        js = f"transcripts/{folder}/{_ALIGN_DATE}/{base}.json"
+        contents.append({"Key": wav})
+        contents.append({"Key": js})
+        fake.objects[wav] = b""
+        fake.objects[js] = json.dumps(_align_transcript_doc(length)).encode()
+    fake.list_objects_response = {"Contents": contents}
+
+
+def _align_wired(presign_wired, folder="Ben_UCPK"):
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "site_manager",
+                                     "folder_name": folder})
+    _wire_align_session(fake, folder)
+    return wired, fake
+
+
+def _clocks(route, start, end):
+    res = org.lambda_handler(make_event(
+        "GET", f"/api/org/{route}",
+        params={"date": _ALIGN_DATE, "start": start, "end": end}), None)
+    assert res["statusCode"] == 200, body_of(res)
+    return sorted(_align_clock_of(s["filename"]) for s in body_of(res)["segments"])
+
+
+def test_audio_segments_single_minute_topic_window_is_not_zero_width(presign_wired):
+    # timeline.js sends 12:07:00-12:07:00 for topic "12:07 - 12:07". Pre-fix
+    # this returned ['12-06-47'] -- the PREVIOUS topic's audio.
+    _align_wired(presign_wired)
+    assert "12-07-15" in _clocks("audio-segments", "12:07:00", "12:07:00")
+
+
+def test_audio_segments_first_chunk_of_a_session_is_reachable(presign_wired):
+    # Topic "12:05 - 12:05" opens the session. Pre-fix the window
+    # [12:05:00, 12:05:00] straddled no chunk at all and the Audio tab
+    # rendered "No audio segments in this window."
+    _align_wired(presign_wired)
+    assert _clocks("audio-segments", "12:05:00", "12:05:00") != []
+
+
+@pytest.mark.parametrize("start,end", [
+    ("12:05:00", "12:06:00"),
+    ("12:06:00", "12:06:00"),
+    ("12:07:00", "12:07:00"),
+])
+def test_transcripts_and_audio_segments_select_the_same_chunks(presign_wired, start, end):
+    # The two tabs of one topic must describe the same moment. Pre-fix, for
+    # 12:07:00-12:07:00, transcripts returned all five chunks of the session
+    # (the 600s prefilter never excludes a 30s chunk) while audio returned
+    # exactly one -- and it was not one of the ones the transcript showed.
+    _align_wired(presign_wired)
+    assert _clocks("transcripts", start, end) == _clocks("audio-segments", start, end)
+
+
+def test_transcripts_window_uses_the_chunks_real_length_not_a_600s_assumption(presign_wired):
+    # A 30s chunk that ended 12:05:51 is not in a 12:07 topic. The `+600`
+    # prefilter kept it because it pretended every transcript file spans ten
+    # minutes.
+    _align_wired(presign_wired)
+    assert "12-05-21" not in _clocks("transcripts", "12:07:00", "12:07:00")
+
+
+def test_video_segments_single_minute_topic_window_is_not_zero_width(presign_wired):
+    # Same defect as the audio reader, same cause: timeline.js sends
+    # 12:07:00-12:07:00 for topic "12:07 - 12:07", and a video that STARTS
+    # inside that minute fails `vid_start > end_sec` and is dropped -- the
+    # Video tab goes empty for exactly the topic that owns the footage.
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "site_manager",
+                                     "folder_name": "Ben_UCPK"})
+    _wire_video_files(fake, "Ben_UCPK", "2026-08-09",
+                      previews=("Benl1_2026-08-09_12-07-15.mp4",))
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/video-segments",
+        params={"date": "2026-08-09", "start": "12:07:00", "end": "12:07:00"}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["count"] == 1

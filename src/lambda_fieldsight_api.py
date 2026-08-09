@@ -231,6 +231,39 @@ def parse_time_to_seconds(time_str):
     except (ValueError, IndexError):
         return 0
 
+# Every media read MUST widen a topic window by the same amount, or the
+# Transcript / Audio / Video tabs of ONE topic describe different moments
+# (2026-08-09 prod, via the lambda_org_api copy of these readers: topic
+# "12:07 - 12:07" read as the 12:07:15 chunk but played the 12:06:47 one).
+#
+# The buffer is not cosmetic. Aurora stores topic.time_range at MINUTE
+# precision and timeline.js parseTimeRange expands "12:07 - 12:07" to
+# start="12:07:00", end="12:07:00" -- so a topic contained in one minute
+# arrives as a ZERO-WIDTH window, and an overlap test against it admits only
+# whatever straddles that one instant. For a recorder emitting 30s chunks
+# every 28s that is reliably the PRECEDING chunk, never the topic's own.
+MEDIA_WINDOW_BUFFER_SEC = 60
+
+# Assumed span for a media file whose name carries no length. Chunk-session
+# files DO carry one (..._off{A}_to{B}_...) and are ~30s, so applying this
+# 10-minute guess to them turns a window prefilter into a no-op.
+LEGACY_MEDIA_SPAN_SEC = 600
+
+def media_window(start_time, end_time):
+    """(start_sec, end_sec) for a topic window, buffered. Absent bound -> whole day."""
+    start_sec = (parse_time_to_seconds(start_time) - MEDIA_WINDOW_BUFFER_SEC
+                 if start_time else 0)
+    end_sec = (parse_time_to_seconds(end_time) + MEDIA_WINDOW_BUFFER_SEC
+               if end_time else 86400)
+    return max(0, start_sec), end_sec
+
+def transcript_file_end_sec(filename, file_time_sec):
+    """Absolute end of one transcript file, for the per-file window prefilter."""
+    m = re.search(r'_off([\d.]+)_to([\d.]+)', filename)
+    if m:
+        return file_time_sec + (float(m.group(2)) - float(m.group(1)))
+    return file_time_sec + LEGACY_MEDIA_SPAN_SEC
+
 def extract_time_seconds_from_filename(filename):
     # Match time part after YYYY-MM-DD_ pattern: Benl1_2026-02-09_09-56-40_off...
     off_match = re.search(r'_off([\d.]+)_to', filename)
@@ -546,9 +579,7 @@ def get_transcripts(params, caller):
     if not user:
         return error('Missing user')
     user_folder = user.replace(' ', '_')
-    start_sec = parse_time_to_seconds(start_time) - 60 if start_time else 0  # 60s buffer
-    end_sec = parse_time_to_seconds(end_time) + 60 if end_time else 86400
-    if start_sec < 0: start_sec = 0
+    start_sec, end_sec = media_window(start_time, end_time)
 
     transcript_files = []
     # Try date subfolder first, then flat folder filtered by date
@@ -590,7 +621,7 @@ def get_transcripts(params, caller):
         file_time_sec = extract_time_seconds_from_filename(filename)
         if file_time_sec is None:
             continue
-        file_end_sec = file_time_sec + 600
+        file_end_sec = transcript_file_end_sec(filename, file_time_sec)
         if file_end_sec < start_sec or file_time_sec > end_sec:
             continue
         try:
@@ -690,8 +721,7 @@ def get_audio_segments(params, caller):
     if not user:
         return error('Missing user')
     user_folder = user.replace(' ', '_')
-    start_sec = parse_time_to_seconds(topic_start) if topic_start else 0
-    end_sec = parse_time_to_seconds(topic_end) if topic_end else 86400
+    start_sec, end_sec = media_window(topic_start, topic_end)
 
     prefix = f"audio_segments/{user_folder}/{date}/"
     segments = []
@@ -702,7 +732,11 @@ def get_audio_segments(params, caller):
             if not key.endswith('.wav'):
                 continue
             filename = key.split('/')[-1]
-            base_match = re.search(r'\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})_off', filename)
+            # Base time then offset, matched SEPARATELY -- a chunk-session segment
+            # keeps sid/chunk tokens BETWEEN them (..._HH-MM-SS_sid{hex}_c{NNNN}_off...),
+            # so anchoring the time on a trailing "_off" (the old whole-file shape)
+            # skipped every chunk segment and left the Audio tab empty.
+            base_match = re.search(r'\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})', filename)
             off_match = re.search(r'_off([\d.]+)_to([\d.]+)', filename)
             if not base_match or not off_match:
                 continue
@@ -810,8 +844,10 @@ def get_video_segments(params, caller):
     if not user:
         return error('Missing user')
     user_folder = user.replace(' ', '_')
-    start_sec = parse_time_to_seconds(topic_start) if topic_start else 0
-    end_sec = parse_time_to_seconds(topic_end) if topic_end else 86400
+    start_sec, end_sec = media_window(topic_start, topic_end)
+    # offset_sec is a SEEK HINT, not a filter -- it must land on the topic
+    # itself, so it is measured from the unbuffered start.
+    seek_from_sec = parse_time_to_seconds(topic_start) if topic_start else 0
 
     videos = []
     for name_variant in [user_folder, user]:
@@ -830,14 +866,14 @@ def get_video_segments(params, caller):
                         continue
                     h, m, s = int(time_match.group(1)), int(time_match.group(2)), int(time_match.group(3))
                     vid_start = h * 3600 + m * 60 + s
-                    vid_end = vid_start + 600
+                    vid_end = vid_start + LEGACY_MEDIA_SPAN_SEC
                     if vid_end < start_sec or vid_start > end_sec:
                         continue
                     # Skip if we already have a preview version of this file
                     base_name = re.sub(r'\.\w+$', '', filename)
                     if not is_preview and any(v.get('base_name') == base_name for v in videos):
                         continue
-                    offset = max(0, start_sec - vid_start)
+                    offset = max(0, seek_from_sec - vid_start)
                     url = s3_client.generate_presigned_url('get_object',
                         Params={'Bucket': S3_BUCKET, 'Key': key}, ExpiresIn=PRESIGNED_URL_EXPIRY)
                     vh, vm, vs = vid_start//3600, (vid_start%3600)//60, vid_start%60
