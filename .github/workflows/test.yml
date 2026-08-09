@@ -27,5 +27,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install --upgrade pip
-      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 pytest pytest-cov
+      # numpy is for the scripts/ tools (multichannel_probe), not for any deployed
+      # lambda — those get it from the VAD layer. Without it the probe tests fail to
+      # IMPORT, which surfaces as a red suite unrelated to the change being tested.
+      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 numpy pytest pytest-cov
       - run: python -m pytest -v
