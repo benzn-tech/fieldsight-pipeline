@@ -59,8 +59,10 @@ the absolute time on a claim is quietly off by that much for the rest of the ses
 
 ## What this means for multichannel
 
-**Naive alignment by filename timestamp will not work.** The skew is 0.75–0.92 s, roughly
-25–30× the ~100 ms that would have made it safe. Building an N-channel file that way would
+**Naive alignment by filename timestamp will not work.** The skew is 0.75–0.92 s —
+**7.5–9× the ~100 ms** that would have made it safe. (An earlier version of this line said
+"25–30×", which is simply wrong arithmetic; the same error was copied into
+`multichannel_probe.py` and has been corrected there too.) Building an N-channel file that way would
 produce confident, wrong speaker turns — worse than no attribution at all, because it looks
 authoritative.
 
@@ -102,8 +104,13 @@ What the three together say:
 
 - **There is no fixed offset to calibrate away.** The mean moves from −11 dB to −0.3 dB
   within the same meeting, so any comparison has to be relative and adaptive, not a constant.
-- **The swing is 36–42 dB and changes sign** — which is the structure "loudest channel is the
-  speaker" needs, and it is a much stronger signal than embeddings get from −54 dBFS audio.
+- **The swing ranged 16–42 dB and crossed zero in two windows of three** — which is the
+  structure "loudest channel is the speaker" needs, and a stronger signal than embeddings get
+  from −54 dBFS audio. Stating it as "36–42 dB and changes sign" cherry-picks two of the three
+  rows in the table directly above: the 14:38 window swings 15.9 dB and **never** crosses
+  zero. An independent rerun over eight pairs found swings of 2.8–55.5 dB with device A louder
+  in 0–37% of windows, so **there are multi-minute stretches where the sign does not flip at
+  all**.
 - **It is not proven.** The swing could equally come from a wearer moving, handling noise, or
   non-speech events. Establishing it needs ground truth on who spoke when *inside the
   overlap*; the existing hand-labelled set (15:22–15:27) falls after `Ben_UCPK` stops at
@@ -125,8 +132,15 @@ Correlate the tail of chunk N against the head of N+1: if a device's audio agree
 own filenames, the peak sits exactly at the expected overlap.
 
 Across 34 boundaries on `Ben_UCPK2` and 22 on `Ben_UCPK`, **every one measured +0 ms at a
-correlation of 1.00** — the carried-forward overlap is byte-identical and both devices are
-internally honest. No clock drifted; nothing slipped gradually.
+correlation of 1.00** — the carried-forward overlap is byte-identical.
+
+**Be precise about what that does and does not establish.** The check correlates a
+byte-copied buffer against itself, so a 1.00 peak at +0 ms shows the filename gap matches the
+carried PCM amount at the filenames' one-second label resolution. It rules out gradual
+drift — the flat plateaus bound any sample-rate difference at ≲20 ppm — but it is
+**structurally blind to a constant sub-second labelling offset**, which would produce exactly
+the same 1.00 at +0 ms. So "both devices are internally honest" is stronger than the evidence:
+nothing slipped *gradually*, and nothing lost audio at these boundaries.
 
 **One boundary on `Ben_UCPK` is not like the others:**
 
@@ -141,15 +155,23 @@ internally honest. No clock drifted; nothing slipped gradually.
 **About three seconds of the meeting were never recorded**, and `c0073→c0074` has no 2 s
 carry-forward either — the signature of the recorder stopping and restarting.
 
-That also explains the "165 ms step": the restart left the device's chunk-start labelling
-offset from where it had been, and the before/after measurements straddled it. **It was never
-a clock property**, which is why extrapolating a drift rate from two points was wrong.
+The restart also **coincides with** the "165 ms step", and the temporal bracketing is tight —
+an independent rerun places the step between c0069 (~14:49) and c0085 (~14:57), and the
+restart is at 14:50:59. The likely mechanism is that restarting re-samples the phase of the
+chunk-start labelling. **That mechanism is inferred, not verified in device code**, so this is
+"strongly associated with the restart" rather than "solved". What is settled either way: it
+was not gradual drift, which is why extrapolating a drift rate from two points was wrong.
 
 ### How often, and why it matters more than three seconds
 
 Across 336 chunks (two devices, 2026-08-07 and 08-08), ten are shorter than 30 s. **Nine are
 legitimate** — the final chunk of a session, or a session only one or two chunks long.
 `c0072` is the only short chunk in the *middle* of a session: **1 in 336, about 0.3%.**
+
+⚠️ **A short mid-session chunk is not always a fault.** The app has a pause feature, and
+pausing truncates the current chunk exactly as stopping does. The audit's own output shows
+short chunks sitting next to flagged pauses. So "one device restarts far more than the other"
+may substantially be *one user pausing more*, and the two cannot be separated from S3 alone.
 
 Rare, but the shape is the problem, not the rate:
 
@@ -171,6 +193,12 @@ normal and must never warn. Neither check exists today.
 
 `aws s3 cp` a chunk from each device covering the same wall-clock window, trim each by its
 own filename offset so both nominally start at the same instant, normalise, cross-correlate
-over ±3 s, take the positive peak, and repeat over several windows. Report the median and
-the spread; a spread in the hundreds of milliseconds means the windows disagree and the
-number should not be used.
+over ±3 s, take the positive peak, and repeat over several windows.
+
+Report the median **and** the spread, but do not use the spread as a pass/fail gate — an
+earlier version of this section said a spread "in the hundreds of milliseconds" invalidates
+the number, and then the table above uses a row whose spread is 213 ms. A rerun found pairs
+with spreads of 1.8–2.9 **seconds** whose medians were nonetheless exactly right (+912, +752,
++750). **The median across windows is the robust quantity; the spread flags outlier windows,
+not a bad median.** What genuinely invalidates an estimate is too few windows producing a
+peak at all, which is what the estimator already refuses on.
