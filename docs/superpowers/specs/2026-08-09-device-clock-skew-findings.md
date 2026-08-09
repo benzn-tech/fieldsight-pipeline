@@ -71,14 +71,49 @@ correlations for an hour-long meeting, all local, no ASR cost.
 
 So the path is open, with a prerequisite that is real work but not research.
 
+## Channel bleed — measured, and the first answer was wrong
+
+The docs say each channel should contain one speaker. Ours cannot: every device hears
+everyone. The question is whether that matters, and the answer turns on whether **the louder
+channel identifies who is talking**.
+
+Measured by aligning the pair with the skew above and comparing per-500 ms RMS. **The
+decisive statistic is the difference's spread and sign, not its mean** — a near-constant
+difference means both microphones hear the same room at a fixed ratio and channel index says
+nothing; a difference that swings and changes sign means different people dominate at
+different moments.
+
+| window | mean A−B | sd | min | max | swing |
+|---|---|---|---|---|---|
+| 14:18 | −7.5 dB | 8.1 | −29.3 | **+13.0** | 42.3 dB |
+| 14:38 | −11.0 dB | 3.9 | −18.6 | −2.7 | 15.9 dB |
+| 15:10 | −0.3 dB | 8.0 | −14.6 | **+22.2** | 36.8 dB |
+
+**The 14:38 window alone says the idea is dead** — 44 consecutive windows, the sign never
+flips, `Ben_UCPK` is quieter in every one of them. That reads as a fixed hardware gain
+difference, and there is a known one: two microphone part variants on the same board differ
+by 15 dB.
+
+**Two more windows overturn it.** In both, `Ben_UCPK` is at times **13–22 dB louder** than
+the other device. 14:38 was almost certainly a stretch where only someone near the other
+wearer was talking. One window was not a sample.
+
+What the three together say:
+
+- **There is no fixed offset to calibrate away.** The mean moves from −11 dB to −0.3 dB
+  within the same meeting, so any comparison has to be relative and adaptive, not a constant.
+- **The swing is 36–42 dB and changes sign** — which is the structure "loudest channel is the
+  speaker" needs, and it is a much stronger signal than embeddings get from −54 dBFS audio.
+- **It is not proven.** The swing could equally come from a wearer moving, handling noise, or
+  non-speech events. Establishing it needs ground truth on who spoke when *inside the
+  overlap*; the existing hand-labelled set (15:22–15:27) falls after `Ben_UCPK` stops at
+  15:19, so it cannot be used for this.
+
 ## What is still unknown
 
-- **Channel bleed.** Every device hears everyone, just at different levels; the docs say each
-  channel should hold one speaker. Bleed is also the opportunity — the same utterance on
-  every channel means **the loudest channel identifies the speaker**, which is standard
-  multi-microphone attribution and far more robust than embeddings on −54 dBFS audio. With
-  `multichannel_output_style=combined` every word already carries `channel_index`, which is
-  exactly the input such a rule needs. Not yet measured.
+- **Whether the level swing actually tracks speaker turns.** Measured above, but not proven
+  against ground truth — see the bleed section. This is the single question the whole
+  multichannel path rests on.
 - **Whether the step recurs**, how often, and whether it is a clock correction or lost audio.
   Two sessions is not a sample.
 - **The 5-channel ceiling** rules this out for meetings with more than five devices.
