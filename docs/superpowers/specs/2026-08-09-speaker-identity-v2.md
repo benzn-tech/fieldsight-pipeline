@@ -124,6 +124,62 @@ outcome can cancel later steps.
 
 ---
 
+## 4b. Phase 0 ran. Level does not separate the wearer — Phase A is withdrawn
+
+Measured 2026-08-09 on three real sessions, on the untouched chunks under
+`users/…/audio/`, with the wearer marking every turn by hand.
+
+Session A (wearer + one person at 2 m, 2.3 min, 30 turns, ground truth from the
+wearer):
+
+| | n | median | range |
+|---|---|---|---|
+| wearer | 17 | **−38.4 dBFS** | −59.5 … −20.8 |
+| other @2 m | 13 | **−51.0 dBFS** | −59.0 … −28.9 |
+
+A 12.6 dB median gap — and complete range overlap. The other person's loudest
+turn is 10 dB above the wearer's median; the wearer's quietest is 8 dB below the
+other's median. **The best single threshold reaches 77% accuracy, and that
+threshold was fitted on the same data, so it is an upper bound.**
+
+The decisive result is per chunk:
+
+| | wearer | other | |
+|---|---|---|---|
+| c0001 | −36.6 | **−34.7** | other louder |
+| c0002 | −52.2 | **−51.0** | other louder |
+| c0003 | **−47.7** | −55.4 | wearer louder |
+| c0004 | **−32.1** | −51.0 | wearer louder |
+
+**In two of the four chunks the person at 2 m is louder than the wearer.** Even
+the relative rule — "the louder one in this passage is the wearer" — is a coin
+flip, in a two-minute conversation where neither party moved much.
+
+The wearer-silent sessions agree: session B (wearer essentially silent, others
+standing nearby) reaches −17.0 dBFS peak with 3.05% of frames above −25, against
+session A's −16.1 and 3.31%. A "loud enough means wearer" rule fires just as
+often in a session where the wearer said nothing.
+
+The likely cause is hardware, and it was already on record: the rear microphone's
+orientation is `(0,0,−1)` — **pointing at the wearer's own body**. The wearer's
+voice arrives off-axis while the person opposite is on-axis, which cancels the
+inverse-square advantage the whole idea rested on. What remains of the level
+variation tracks head turns and vocal effort, neither of which is identity.
+
+**Phase A is withdrawn.** Level survives only as the weak prior §9's scorer may
+consume, never as a mechanism that names anyone. This is the branch §4's
+decision rule specified in advance.
+
+Two things the same measurement confirmed in passing, both already suspected:
+
+- turn 6 of session A ("子量一下。") is the tail of turn 5 duplicated across the
+  chunk seam, and the provider gave the two halves of one sentence **different
+  speaker labels**. Direct evidence for §2's claim that identity cannot come
+  from the transcriber.
+- the device announcement "Recording started" is the second loudest event in the
+  session (−23.4 dBFS) and carries a person's label. Any level-based mechanism
+  would have been poisoned by it at maximum confidence.
+
 ## 5. Phase A — the wearer, from level alone
 
 If Phase 0 passes: label the loud mode as the device's assigned owner, by name.
