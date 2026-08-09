@@ -72,6 +72,30 @@ Two places it could live, both cheap:
 The second matters more than the first. A number in a log tells whoever goes looking; a
 field in the artifact tells the person reading the report that three minutes are missing.
 
+⚠️ **Do not compute it from the transcript list.** A chunk VAD found silent is dropped before
+transcription (`DROP_SILENT_CHUNKS`), so it has no transcript either — inferring absence from
+missing transcripts would report every silent chunk as lost, which on this material is many
+per session. The field would be noise and would be ignored, which is worse than not having
+it. **Only the audio object proves arrival.**
+
+`scripts/missing_chunk_audit.py` implements the correct method and can be run over history
+without touching the pipeline.
+
+### A second signal fell out of it
+
+Running the audit over everything shows recorder restarts are not evenly spread:
+
+| session | chunks | short mid-session |
+|---|---|---|
+| `Ben_UCPK` `sid39ad6c92` | 129 | 1 |
+| `Sam_Yu` `sid622a0e7f` | 260 | **5** |
+| `Sam_Yu` `sid14697d46` | 5 | **4 of 5** (20 s, 9 s, 11 s, 8 s) |
+
+The last one is barely a recording at all — four of its five chunks were cut short. **One
+device restarts far more than the other**, and nothing surfaces that either. It is a device
+health signal sitting in data we already have.
+
+
 ## Reproducing
 
 ```bash
