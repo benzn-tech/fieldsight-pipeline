@@ -35,6 +35,10 @@ on:
       - 'docs/**'
       - 'ui/**'          # UI is deployed by Amplify (amplify.yml), not SAM
       - 'frontend/**'    # legacy frontend, not deployed here
+      # Developer tooling, not deployed: every function is built from
+      # `CodeUri: src/`, so nothing under scripts/ reaches a Lambda package.
+      # Without this, adding an analysis script redeploys byte-identical code.
+      - 'scripts/**'
 
 permissions:
   id-token: write   # OIDC → AWS, no stored keys
