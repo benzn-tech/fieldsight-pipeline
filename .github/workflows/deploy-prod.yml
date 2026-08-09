@@ -34,6 +34,15 @@ on:
       - 'ui/**'
       - 'frontend/**'
       - 'tests/**'
+      # Developer tooling, not deployed: every function is built from
+      # `CodeUri: src/`, so nothing under scripts/ reaches a Lambda package
+      # (verified against a downloaded prod zip — 147 files, none from here).
+      # Without this line, adding an analysis script triggers a full prod
+      # deploy that redeploys byte-identical code and parks a run on the
+      # approval gate. The one thing this defers is a change to
+      # scripts/smoke-test.sh, which the deploy job runs — that gets exercised
+      # on the next deploy that does touch src/.
+      - 'scripts/**'
 
 permissions:
   id-token: write
@@ -74,7 +83,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install --upgrade pip
-      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 pytest pytest-cov
+      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 numpy pytest pytest-cov
       - run: python -m pytest -v
 
   deploy-prod:
