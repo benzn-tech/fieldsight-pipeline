@@ -21,7 +21,14 @@ The second is a 62-minute meeting, so **about 4% of it is absent from the record
 nothing — no audio, no `audio_segments/` sidecar, no transcript. There is no artifact saying
 a chunk is missing, because the only thing that would have created one is the chunk itself.
 
-Six chunks across 24 sessions is **~0.9% of all chunks**, and every one is silent.
+Six chunks across 25 sessions is **~0.89% of all chunks**, and every one is silent.
+
+**This is a lower bound, not a census.** `holes()` scans only between the lowest and highest
+index *present*, so a session whose first chunks were lost looks like a session that started
+late — and one real session (`sidc30fb98d`) begins at `c0003` where every other begins at
+`c0000`. Leading losses are invisible by construction. The parser also silently dropped that
+entire session until 2026-08-09, because it read the timestamp from a fixed underscore slot
+and `AUD_…` carries one token before the date where `ben_ucpk_…` carries two.
 
 ## Two wrong answers on the way here, both worth recording
 
@@ -41,17 +48,44 @@ being absent entirely**, because a chunk that never arrived has no size to be sh
 The lesson both share: **the shape of the query decides what you are able to see.** Sizes
 find truncation; timestamps find pauses; only the index sequence finds absence.
 
-## What this is probably the same thing as
+## What it actually is — and it is not what this document first said
 
-The upload freeze/thaw design exists because the client "retries for 7 days then silently
-gives up", and the backlog work documents a path where rate-limiting is treated as permanent
-failure and burns all eight retry attempts. **A chunk that exhausts its retries and is
-dropped looks exactly like this**: an index allocated, no object, nothing logged server-side
-because the server never heard about it.
+> **Corrected 2026-08-09 after review.** The original conclusion was that these are uploads
+> that exhausted their retries, and that the freeze/thaw work covers them. **Both halves were
+> wrong**, and the data that disproves them was never consulted: the `recordings` table.
 
-That work (GrandTime PR #8, pipeline PR #274) is complete and unmerged, and ships inert.
-This audit gives it a production baseline it did not have: **6 chunks, ~3 minutes, ~0.9% of
-chunks, across every session ever recorded.**
+Every one of the six missing chunks **has a row marked as successfully uploaded**:
+
+| chunk | in S3 | `size_bytes` | created → uploaded |
+|---|---|---|---|
+| `c0010` | **no** | 960044 | 02:22:33 → 02:23:28 — **55 s** |
+| `c0011` | yes | 960044 | 02:24:16 → 02:24:18 — **2 s** |
+| `c0028` | **no** | 960044 | 02:31:39 → … |
+
+The rows claim a *complete* 30-second file. And `complete_recording` →
+`recordings.mark_uploaded` sets `uploaded_at = now()` **with no check that the object
+exists** — the client says "done", the server records "uploaded".
+
+The delay is the tell: chunks that arrived show ~2 s from created to uploaded; the missing
+ones show ~55 s. That is a PUT being attempted, failing, and `complete` being called anyway.
+
+**And the object never existed.** The bucket has versioning **enabled**, and the missing keys
+have **zero versions and zero delete markers** — so this is not an upload that was later
+deleted.
+
+So the shape is **complete-without-object**, not retry exhaustion. The difference decides
+where the fix goes:
+
+- **Freeze/thaw acts on uploads the client knows failed.** These were reported as
+  *successes*, so it would never see them. (It is also **merged** — pipeline #274 and
+  GrandTime #8 both landed 2026-08-07, before the meeting measured here. The earlier claim
+  that it was "complete and unmerged" was simply wrong.)
+- **The cheap detector is server-side**: verify the object on `complete`, or reconcile
+  `uploaded_at` against S3. Both use data the server already has, and neither depends on the
+  client noticing anything.
+
+**6 chunks, ~3 minutes, ~0.89% of chunks** remains the measured figure — but see the census
+caveat below.
 
 ## Detecting it is nearly free, and nothing does
 
@@ -93,9 +127,19 @@ audio.** Read from the live role rather than the template:
 "Condition": { "StringLike": { "s3:prefix": ["transcripts/*", "extractions/*"] } }
 ```
 
-`users/{folder}/audio/{date}/` is not in that list, and it is the **only** source that proves
-a chunk arrived — a chunk VAD dropped has no transcript, and a chunk that never arrived has
-no sidecar either.
+`users/{folder}/audio/{date}/` is not in that list.
+
+**But it is not the only proof of arrival, and the original version of this section was wrong
+to say so.** `lambda_vad` writes the `_vad_metadata.json` sidecar for **every** chunk it
+processes, including ones it drops as silent — deliberately, so that "the drop must be
+auditable". Sidecars are 1:1 with arrived chunks on every session checked (129/129, 260/260,
+5/5), and a chunk that never arrived has no sidecar either. So `audio_segments/*` — **derived
+pipeline data, not raw customer audio** — answers the same question at a much smaller
+privilege.
+
+Two caveats if that route is taken: sidecars only prove arrival from the date the
+drop-still-writes-a-sidecar behaviour deployed, and a VAD failure delays one, so **"no
+sidecar yet" must read as unknown, not as missing.**
 
 So building it there costs a widening of the extraction role to list raw customer audio.
 That is a real privilege increase for a 0.9% event, and it carries the failure mode this

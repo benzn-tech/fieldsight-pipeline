@@ -23,11 +23,13 @@ as lost. Only the audio object proves arrival.
 """
 import argparse
 import collections
+import re
 import subprocess
 import sys
 
 BYTES_PER_SEC = 32000          # PCM s16le mono @ 16 kHz
 WAV_HEADER = 44
+TIME_RE = re.compile(r"[0-9]{2}-[0-9]{2}-[0-9]{2}")
 FULL_CHUNK_S = 30.0
 
 
@@ -47,13 +49,19 @@ def parse_line(line):
     if "/audio/" not in key or not key.endswith(".wav") or "_sid" not in key:
         return None
     name = key.rsplit("/", 1)[-1][:-4]
-    bits = name.split("_")
     try:
         sid = name.split("_sid")[1].split("_c")[0]
         idx = int(name.split("_c")[-1])
-        h, m, s = (int(x) for x in bits[3].split("-"))
     except (IndexError, ValueError):
         return None
+    # Find the HH-MM-SS token by shape, not by position. Device prefixes differ
+    # in how many underscore-separated tokens they carry — `ben_ucpk_...` has two
+    # before the date, `AUD_...` has one — and indexing a fixed slot silently
+    # dropped an entire real session (sidc30fb98d, 4 chunks) from the census.
+    stamp = next((t for t in name.split("_") if TIME_RE.fullmatch(t)), None)
+    if stamp is None:
+        return None
+    h, m, s = (int(x) for x in stamp.split("-"))
     segs = key.split("/")
     if len(segs) < 4:
         return None

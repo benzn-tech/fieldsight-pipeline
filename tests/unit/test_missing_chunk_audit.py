@@ -29,9 +29,9 @@ import missing_chunk_audit as a  # noqa: E402
 SID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 
 
-def line(folder, date, hhmmss, idx, seconds=30.0):
+def line(folder, date, hhmmss, idx, seconds=30.0, prefix="ben_x"):
     size = int(seconds * a.BYTES_PER_SEC) + a.WAV_HEADER
-    name = f"ben_x_{date}_{hhmmss}_sid{SID}_c{idx:04d}.wav"
+    name = f"{prefix}_{date}_{hhmmss}_sid{SID}_c{idx:04d}.wav"
     return f"2026-08-07 10:00:00 {size} users/{folder}/audio/{date}/{name}"
 
 
@@ -110,3 +110,27 @@ def test_sessions_are_kept_apart_by_folder_date_and_sid():
     rows = [a.parse_line(line("Ben_UCPK", "2026-08-07", "14-00-00", 0)),
             a.parse_line(line("Ben_UCPK2", "2026-08-07", "14-00-00", 0))]
     assert len(a.group_sessions(rows)) == 2
+
+
+def test_a_one_token_device_prefix_is_not_dropped():
+    """`AUD_2026-07-30_23-01-42_sid…_c0003.wav` is a real production shape with
+    ONE underscore token before the date, where `ben_ucpk_…` has two. Reading the
+    time from a fixed slot silently dropped an entire session — four chunks of
+    sidc30fb98d — out of a census that was then reported as complete.
+
+    Absence is what this tool measures, so a parser that quietly discards input
+    understates exactly the number it exists to produce."""
+    got = a.parse_line(line("Ben_UCPK", "2026-07-30", "23-01-42", 3, prefix="AUD"))
+    assert got is not None
+    assert got[3] == 3 and got[4] == 23 * 3600 + 1 * 60 + 42
+
+
+def test_a_longer_device_prefix_also_parses():
+    got = a.parse_line(line("Ben_UCPK", "2026-07-30", "23-01-42", 3,
+                            prefix="some_longer_device"))
+    assert got is not None and got[3] == 3
+
+
+def test_a_name_with_no_timestamp_is_refused_rather_than_guessed():
+    bad = f"2026-08-07 10:00:00 960044 users/X/audio/2026-07-30/rec_sid{SID}_c0003.wav"
+    assert a.parse_line(bad) is None

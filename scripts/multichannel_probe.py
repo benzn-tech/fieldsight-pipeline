@@ -16,7 +16,7 @@ Two things it measures, in order, because the second is meaningless without the
 first:
 
 1. **Clock skew.** Devices timestamp chunks from their own clock and share none.
-   Measured on 2026-08-07 at 0.75-0.92 s — 25-30x the margin that would let you
+   Measured on 2026-08-07 at 0.75-0.92 s — 7.5-9x the ~100 ms margin that would let you
    align by filename — and it STEPS mid-session rather than drifting, so it must
    be measured per chunk pair, never once per session.
 
@@ -282,7 +282,7 @@ def main():
         if skew is None:
             print(f"{head}\n  skew: unusable ({used}/{total} windows had a peak)\n")
             continue
-        flag = "  ⚠ windows disagree" if spread > 100 else ""
+        flag = "  !! windows disagree" if spread > 100 else ""
         print(f"{head}\n  skew {skew:+.0f} ms  (spread {spread:.0f} ms, {used}/{total} windows){flag}")
 
         rows = level_difference(a, b, sr, skew)
