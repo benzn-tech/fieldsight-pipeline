@@ -114,9 +114,58 @@ What the three together say:
 - **Whether the level swing actually tracks speaker turns.** Measured above, but not proven
   against ground truth — see the bleed section. This is the single question the whole
   multichannel path rests on.
-- **Whether the step recurs**, how often, and whether it is a clock correction or lost audio.
-  Two sessions is not a sample.
 - **The 5-channel ceiling** rules this out for meetings with more than five devices.
+
+## The step, solved — and it is a recording gap, not a clock
+
+"Clock correction or lost audio" is answerable **on one device at a time**, which the
+cross-device comparison could never do. Consecutive chunks overlap by
+`30 s − (gap between filename timestamps)`, because the device carries ~2 s of PCM forward.
+Correlate the tail of chunk N against the head of N+1: if a device's audio agrees with its
+own filenames, the peak sits exactly at the expected overlap.
+
+Across 34 boundaries on `Ben_UCPK2` and 22 on `Ben_UCPK`, **every one measured +0 ms at a
+correlation of 1.00** — the carried-forward overlap is byte-identical and both devices are
+internally honest. No clock drifted; nothing slipped gradually.
+
+**One boundary on `Ben_UCPK` is not like the others:**
+
+| chunk | start | gap | bytes |
+|---|---|---|---|
+| c0071 | 14:50:31 | 28 s | 960044 |
+| **c0072** | **14:50:59** | 28 s | **160044 — 5 s, not 30** |
+| c0073 | 14:51:07 | **8 s** | 960044 |
+| c0074 | 14:51:37 | **30 s** | 960044 |
+
+`c0072` holds five seconds. It covers 14:50:59–14:51:04; `c0073` begins at 14:51:07.
+**About three seconds of the meeting were never recorded**, and `c0073→c0074` has no 2 s
+carry-forward either — the signature of the recorder stopping and restarting.
+
+That also explains the "165 ms step": the restart left the device's chunk-start labelling
+offset from where it had been, and the before/after measurements straddled it. **It was never
+a clock property**, which is why extrapolating a drift rate from two points was wrong.
+
+### How often, and why it matters more than three seconds
+
+Across 336 chunks (two devices, 2026-08-07 and 08-08), ten are shorter than 30 s. **Nine are
+legitimate** — the final chunk of a session, or a session only one or two chunks long.
+`c0072` is the only short chunk in the *middle* of a session: **1 in 336, about 0.3%.**
+
+Rare, but the shape is the problem, not the rate:
+
+- three seconds of a meeting are simply absent, and
+- **nothing anywhere notices.** The short chunk is transcribed normally, the extraction reads
+  it normally, and the report is silently missing whatever was said in those seconds.
+
+### Detecting it costs nothing
+
+The VAD sidecar already records `total_duration_sec`. A chunk that is materially short **and
+is not the session's last** is exactly this event — a query over data we already write, with
+no new instrumentation.
+
+The stronger check is a **gap**: chunk N's start plus its duration falling short of chunk
+N+1's start. That distinguishes the case that loses audio from a short final chunk, which is
+normal and must never warn. Neither check exists today.
 
 ## Reproducing
 
