@@ -362,6 +362,26 @@ them:
    symptom would have been **prod emails silently stopping**, looking nothing like a merge
    feature. It is now savepoint-isolated (PR #304).
 
+### Why the deploy history shows extra prod releases you did not ask for
+
+Late on 2026-08-08 the prod deploy list gained two runs that changed no behaviour, and one
+of them **failed**. Both are explained, both are fixed, and neither touched `src/`:
+
+- A merge carrying only `docs/` and `scripts/` triggered a full prod deploy, because
+  `scripts/**` was missing from `paths-ignore`. Nothing under `scripts/` is packaged — every
+  function builds from `CodeUri: src/`, and the deployed zip was byte-identical. `scripts/**`
+  is now ignored by both deploy workflows.
+- That run then **failed at pytest collection**, because `deploy-prod.yml` re-runs the tests
+  with its own dependency list which never received the `numpy` that `test.yml` got. The
+  release job reported `skipped`, not `failed` — so the prod release path was blocked with
+  no red flag anywhere. Fixed in PR #339/#340, and verified by watching the resulting main
+  run reach `tests=success` and `deploy-prod=success`. A new parity test now fails if any
+  two pytest-running workflows disagree on dependencies.
+
+After those merges the four switches this document depends on were re-read from the live
+functions: `VAD_THRESHOLD=0.15`, `NORMALISE_AUDIO=true`, `TRANSCRIBE_WHOLE_CHUNK=true`,
+`ASR_PROVIDER=elevenlabs`, `FILTER_AUDIO_EVENT_TAGS=true`. Unchanged.
+
 ### If the confirmation email does not arrive
 
 Check §5 first — it is still the more likely cause. Then:
