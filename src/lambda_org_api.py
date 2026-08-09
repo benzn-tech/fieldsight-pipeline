@@ -4873,6 +4873,50 @@ def _org_parse_time_to_seconds(time_str):
         return 0
 
 
+# Every media reader on this lambda MUST widen a topic window by the same
+# amount, or the Transcript and Audio tabs of one topic describe different
+# moments (2026-08-09 prod: topic "12:07 - 12:07" read as the 12:07:15 chunk
+# but played the 12:06:47 one).
+#
+# The buffer is not cosmetic. Aurora stores topic.time_range at MINUTE
+# precision and timeline.js parseTimeRange expands "12:07 - 12:07" to
+# start="12:07:00", end="12:07:00" -- so a topic contained in one minute
+# arrives here as a ZERO-WIDTH window, and an overlap test against it admits
+# only whatever chunk straddles that one instant. For a recorder emitting 30s
+# chunks every 28s that is reliably the PRECEDING chunk, never the topic's
+# own. _read_org_transcripts always had this buffer; the audio reader was
+# written to mirror the legacy endpoint, which never had one.
+MEDIA_WINDOW_BUFFER_SEC = 60
+
+LEGACY_TRANSCRIPT_SPAN_SEC = 600
+
+
+def _org_transcript_file_end_sec(filename, file_time_sec):
+    """Absolute end of one transcript file, for the per-file window prefilter.
+
+    A chunk-session transcript states its own length in its name
+    (..._off{A}_to{B}_..., ~30s). A pre-chunk whole-file transcript does not,
+    so those keep the 10-minute guess. Applying that guess to a 30s chunk made
+    the prefilter a no-op -- `segments[]` came back completely unwindowed and
+    the Transcript tab rendered the whole session beside a one-topic Audio
+    tab (2026-08-09 prod).
+    """
+    m = re.search(r"_off([\d.]+)_to([\d.]+)", filename)
+    if m:
+        return file_time_sec + (float(m.group(2)) - float(m.group(1)))
+    return file_time_sec + LEGACY_TRANSCRIPT_SPAN_SEC
+
+
+def _org_media_window(start_time, end_time):
+    """(start_sec, end_sec) for a topic window, buffered. Absent bound -> whole day."""
+    start_sec = (_org_parse_time_to_seconds(start_time) - MEDIA_WINDOW_BUFFER_SEC
+                 if start_time else 0)
+    end_sec = (_org_parse_time_to_seconds(end_time) + MEDIA_WINDOW_BUFFER_SEC
+               if end_time else 86400)
+    return max(0, start_sec), end_sec
+
+
+
 def _org_extract_time_seconds_from_filename(filename):
     """Mirror lambda_fieldsight_api.extract_time_seconds_from_filename
     verbatim -- see _org_parse_time_to_seconds for why this is a local
@@ -4932,10 +4976,7 @@ def _read_org_transcripts(date, folder, start_time, end_time):
     BUG-12 already normalized every write path onto it, and Aurora only
     ever hands this route a `folder_name` (never a spaced display name),
     so those extra legacy variants don't apply here."""
-    start_sec = _org_parse_time_to_seconds(start_time) - 60 if start_time else 0
-    end_sec = _org_parse_time_to_seconds(end_time) + 60 if end_time else 86400
-    if start_sec < 0:
-        start_sec = 0
+    start_sec, end_sec = _org_media_window(start_time, end_time)
 
     prefix = f"transcripts/{folder}/{date}/"
     transcript_files = [obj["Key"] for obj in _list_media_objects(prefix, "transcripts")
@@ -4951,7 +4992,7 @@ def _read_org_transcripts(date, folder, start_time, end_time):
         file_time_sec = _org_extract_time_seconds_from_filename(filename)
         if file_time_sec is None:
             continue
-        file_end_sec = file_time_sec + 600
+        file_end_sec = _org_transcript_file_end_sec(filename, file_time_sec)
         if file_end_sec < start_sec or file_time_sec > end_sec:
             continue
         try:
@@ -5345,12 +5386,10 @@ def get_org_transcripts(conn, caller, event):
 def _read_org_audio_segments(date, folder, start_time, end_time):
     """S3 list + presign for one (folder, date) window -- mirrors
     lambda_fieldsight_api.get_audio_segments verbatim: same BUG-01-anchored
-    regexes, same window filter (no +/-60s buffer -- the legacy audio
-    endpoint never had one), same response fields. Only the folder_name
+    regexes, same response fields. Only the folder_name
     spelling of the prefix is searched (same posture as
     _read_org_transcripts: the modern frontend never hands a spaced name)."""
-    start_sec = _org_parse_time_to_seconds(start_time) if start_time else 0
-    end_sec = _org_parse_time_to_seconds(end_time) if end_time else 86400
+    start_sec, end_sec = _org_media_window(start_time, end_time)
     prefix = f"audio_segments/{folder}/{date}/"
     segments = []
     for obj in _list_media_objects(prefix, "audio-segments"):
@@ -5412,8 +5451,10 @@ def _read_org_video_segments(date, folder, start_time, end_time):
     span, offset_sec = seek hint into the file. The legacy [user_folder,
     user] name-variant loop is collapsed to folder_name only (see
     _read_org_transcripts' identical stance)."""
-    start_sec = _org_parse_time_to_seconds(start_time) if start_time else 0
-    end_sec = _org_parse_time_to_seconds(end_time) if end_time else 86400
+    start_sec, end_sec = _org_media_window(start_time, end_time)
+    # offset_sec is a SEEK HINT, not a filter -- it must land on the topic
+    # itself, so it is measured from the unbuffered start.
+    seek_from_sec = _org_parse_time_to_seconds(start_time) if start_time else 0
     videos = []
     for prefix, is_preview in ((f"web_video/{folder}/{date}/", True),
                                (f"users/{folder}/video/{date}/", False)):
@@ -5442,7 +5483,7 @@ def _read_org_video_segments(date, folder, start_time, end_time):
                 "base_name": base_name,
                 "video_start_sec": vid_start,
                 "time_label": f"{vh:02d}:{vm:02d}:{vs:02d}",
-                "offset_sec": round(max(0, start_sec - vid_start), 1),
+                "offset_sec": round(max(0, seek_from_sec - vid_start), 1),
                 "size_mb": round(obj["Size"] / (1024 * 1024), 1),
                 "is_preview": is_preview,
                 "codec": "h264" if is_preview else "unknown",
