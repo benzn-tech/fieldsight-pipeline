@@ -14,16 +14,58 @@ Sequence: **Phase 0 (measure) → A (stop lying) → B (the wearer) → C (sessi
 
 ## Phase 0 — get the right recording, then measure
 
-**The existing material is not sufficient.** The 2026-08-08 22:48 session has two speakers, and
-the canonical failure — the wearer forming one clean cluster while *all* distant speakers
-collapse into a single "other" — produces exactly two clusters on a two-person recording and
-**looks like success**.
+> **Revised 2026-08-09.** A cheaper path appeared that this plan did not consider, and it
+> changes what Phase 0 has to collect. See
+> `specs/2026-08-09-device-clock-skew-findings.md`. Read §0.0 before §0.1.
+
+### 0.0 Try multichannel before building anything
+
+Scribe v2 transcribes **up to 5 channels independently and tags every word with
+`channel_index`**. For a multi-device recording that is a completely different proposition
+from everything below: each device is worn by a different person, so **channel index would
+*be* speaker identity** — no embeddings, no clustering, no thresholds, no voiceprints, no
+biometric data, and none of the consent surface Phase D carries.
+
+Two prerequisites, both now measured on the 2026-08-07 two-device meeting:
+
+**Alignment — solved, but not the way it looked.** Device clocks are **0.75–0.92 s apart**,
+25–30× the margin that would have made filename-timestamp alignment safe. Worse, the offset
+**steps mid-session** (~917 ms for 20 minutes, then ~750 ms) rather than drifting, so it
+cannot be measured once and held. Cross-correlating a chunk pair takes milliseconds and is
+stable to 10–23 ms, so alignment must be computed **per chunk pair** — ~150 local
+correlations per meeting-hour, no ASR cost. Real work, not research.
+
+**Whether the louder channel identifies the speaker — the open question.** Measured level
+difference between the two devices swings **36–42 dB and changes sign**, which is the
+structure the rule needs and a far stronger signal than embeddings get from −54 dBFS audio.
+There is **no fixed gain offset to calibrate away** — the mean moves 11 dB inside one
+meeting, so any comparison must be relative and adaptive.
+
+It is **not proven**: the swing could equally come from a wearer moving or handling noise.
+And one window measured alone said the opposite — 44 consecutive windows with the sign never
+flipping — before two more windows overturned it. **One window is not a sample.**
+
+**If this holds, Phases C and D are unnecessary for grouped meetings**, which are the
+meetings that motivated the work. Establish it first.
 
 ### 0.1 Record the session that can fail honestly
 
-Needs **≥3 people, at least two of them distant (3–5 m)**, chest-mounted as in production.
-Write down who said what and roughly when — that is the ground truth, and it costs a notepad.
-Reuse the segment structure that worked: normal, quiet/turned-away, noise-only, silence.
+**Two devices, and ground truth *inside the overlap*.** The existing hand-labelled set
+(15:22–15:27) is useless for this because `Ben_UCPK` stopped recording at 15:19 — the labels
+fall outside the window where both devices were running.
+
+So: two people each wearing a device, **each speaking several times in turn, with who-spoke-
+when written down to the nearest few seconds**. Five minutes is enough. That single recording
+settles §0.0 — and if the answer is yes, most of this plan is moot for grouped meetings.
+
+**If §0.0 fails**, the embedding path below still needs its own material: **≥3 people, at
+least two of them distant (3–5 m)**, chest-mounted as in production. The canonical failure —
+the wearer forming one clean cluster while *all* distant speakers collapse into a single
+"other" — produces exactly two clusters on a two-person recording and **looks like success**,
+which is why two speakers cannot validate it.
+
+Either way, reuse the segment structure that worked: normal, quiet/turned-away, noise-only,
+silence.
 
 **This is a blocking human task.** Everything below waits on it.
 

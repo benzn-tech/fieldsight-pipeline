@@ -264,6 +264,63 @@ If Chinese search returns nothing where the English equivalent works, it regress
 
 ---
 
+## 5c. Did the whole recording actually arrive?
+
+Everything above checks that the pipeline treated the audio correctly. This checks something
+different and more basic: **whether all of the audio is there at all.** Two ways it may not
+be, and **neither produces any warning anywhere today.**
+
+```bash
+python scripts/missing_chunk_audit.py --bucket fieldsight-data-509194952652
+```
+
+Runs over every recording ever made, costs nothing, and needs no new permission.
+
+### What it can tell you
+
+The device saves audio in ~30-second pieces, numbered in order: 0, 1, 2, 3… all uploaded
+separately.
+
+**A missing number** means a piece was recorded and never reached the server. Piece 9 and
+piece 11 are there, piece 10 is not — like a numbered page missing from a document. Those 30
+seconds are simply gone: no audio, no transcript, nothing in the report, and **nothing that
+says anything is missing**, because the only thing that would have said so is the piece
+itself.
+
+Measured across every recording to date: **6 pieces, ~3 minutes, 0.9% of all pieces.** One
+62-minute meeting lost 2.5 minutes of itself this way — about 4%.
+
+**A short piece in the middle** means the recorder stopped and restarted; the seconds between
+were never captured. A short piece at the *end* is normal — that is just where you stopped —
+and the script deliberately does not report those.
+
+### Reading the output
+
+```
+Ben_UCPK  2026-08-07  sid39ad6c92  (129 chunks present)
+   NEVER ARRIVED: 5 chunks (~2.5 min) [10, 28, 30, 37, 42]
+   short mid-session: c0072 holds 5.0s — recorder restart
+   (pauses, not loss: after c0243)
+```
+
+- **NEVER ARRIVED** — the serious one. That audio does not exist anywhere.
+- **short mid-session** — a restart. Seconds lost, and a signal about the device.
+- **pauses, not loss** — you pressed pause and came back. Listed so it is visibly *not*
+  counted as loss.
+
+### When to worry
+
+Occasional missing pieces are the upload path giving up after its retries — the freeze/thaw
+work exists for exactly this, and is written but not yet merged. **A device that starts
+losing pieces regularly, or restarting several times per meeting, is a device to swap out.**
+
+Measured so far, the two devices are not alike: `Ben_UCPK` restarted once in 129 pieces,
+while `Sam_Yu` restarted **five times in one 260-piece meeting** and produced another
+recording where **four of its five pieces were cut short**. That is a device-health signal,
+and nothing surfaces it today except running this.
+
+---
+
 ## 6. What no check here can tell you
 
 The two people furthest from a chest-mounted microphone are captured at about **5.3 of the
