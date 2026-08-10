@@ -142,3 +142,54 @@ def test_the_counts_are_logged_once_per_extraction(caplog):
     with caplog.at_level("INFO"):
         ex.verify_evidence(result, _turns(), "2026-08-07")
     assert "evidence:" in caplog.text, "the counts ARE the Phase A deliverable"
+
+
+# ---- the reason reaches the artifact ----------------------------------
+#
+# The Phase A number is not a decision input until a person has split a sample
+# of unverified quotes into "our matcher missed it" and "the model invented it".
+# That split starts from the artifact, so whatever the matcher already knew
+# about WHY has to survive into it -- otherwise a reader re-derives by hand what
+# the code had in a local variable.
+
+def test_an_unverified_citation_records_why():
+    result = _topic("the market is now coming down sharply")
+    ex.verify_evidence(result, _turns(), "2026-08-07")
+    ev = result["topics"][0]["evidence"][0]
+    assert ev["status"] == "unverified"
+    assert ev["reason"] == ex.evidence_match.REASON_BELOW_FUZZY
+
+
+def test_a_verified_citation_records_no_reason():
+    result = _topic("the slab pour is pushed to Thursday")
+    ex.verify_evidence(result, _turns(), "2026-08-07")
+    assert "reason" not in result["topics"][0]["evidence"][0]
+
+
+def test_a_malformed_at_is_not_reported_as_our_own_bug():
+    # `unchecked` exists to stop OUR bugs deflating the signal. A model emitting
+    # a garbage timestamp is not our bug, and reading the two as one thing sends
+    # the next person into the matcher looking for a crash that never happened.
+    result = _topic("the slab pour is pushed to Thursday", at="not a time")
+    ex.verify_evidence(result, _turns(), "2026-08-07")
+    ev = result["topics"][0]["evidence"][0]
+    assert ev["status"] == "unchecked"
+    assert ev["reason"] == ex.REASON_BAD_ANCHOR
+
+
+def test_a_matcher_crash_is_still_reported_as_our_own_bug(monkeypatch):
+    monkeypatch.setattr(ex.evidence_match, "check_quote",
+                        lambda *a, **k: (_ for _ in ()).throw(ValueError("bug")))
+    result = _topic("the slab pour is pushed to Thursday")
+    ex.verify_evidence(result, _turns(), "2026-08-07")
+    ev = result["topics"][0]["evidence"][0]
+    assert ev["status"] == "unchecked"
+    assert ev["reason"] == ex.REASON_VERIFIER_ERROR
+
+
+def test_the_unverified_reasons_are_logged_beside_the_counts(caplog):
+    result = _topic("the market is now coming down sharply")
+    with caplog.at_level("INFO"):
+        ex.verify_evidence(result, _turns(), "2026-08-07")
+    assert ex.evidence_match.REASON_BELOW_FUZZY in caplog.text, \
+        "a run whose unverifieds are all one cause is readable from the log alone"

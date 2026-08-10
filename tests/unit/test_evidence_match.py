@@ -154,3 +154,50 @@ def test_rollup_takes_the_worst_remaining():
     assert em.roll_up(["verified", "weak"]) == "weak"
     assert em.roll_up(["verified", "verified_fuzzy"]) == "verified_fuzzy"
     assert em.roll_up(["verified", "verified"]) == "verified"
+
+
+# ---- why it was unverified --------------------------------------------
+#
+# The status alone cannot be acted on. `unverified` has two disjoint causes with
+# disjoint fixes -- our matcher was too strict, or the model invented the quote
+# -- and the first splits again by which rule was too strict. Without a code on
+# every unverified path, a person has to re-derive by hand what the matcher
+# already knew, including for the cases the matcher knew for certain.
+
+def test_every_unverified_path_carries_a_machine_readable_reason():
+    codes = {
+        em.REASON_NO_TURNS: em.check_quote("x y z a b", [], AT, **KW),
+        em.REASON_EMPTY_QUOTE: em.check_quote("", [_turn("anything")], AT, **KW),
+        em.REASON_BELOW_FUZZY: em.check_quote(
+            "the market is coming down sharply now",
+            [_turn("the slab pour is pushed to Thursday")], AT, **KW),
+    }
+    for expected, r in codes.items():
+        assert r["status"] == "unverified"
+        assert r["reason"] == expected
+
+
+def test_a_fuzzy_miss_keeps_its_ratio_alongside_the_reason():
+    # The ratio is what says whether the THRESHOLD was too strict or the quote
+    # was never there; the reason alone cannot distinguish them.
+    r = em.check_quote("the slab pour is pushed to Friday",
+                       [_turn("the slab pour is pushed to Thursday")], AT, **KW)
+    assert r["reason"] == em.REASON_BELOW_FUZZY
+    assert 0 < r["fuzzy_ratio"] < 0.9
+
+
+def test_a_window_holding_only_empty_turns_is_told_apart_from_an_empty_window():
+    # Both used to be indistinguishable in the artifact, and they mean opposite
+    # things: one is a window too narrow, the other is a transcript with nothing
+    # in it. Widening W would never fix the second.
+    r = em.check_quote("x y z a b", [_turn("")], AT, **KW)
+    assert r["status"] == "unverified"
+    assert r["reason"] == em.REASON_NO_CANDIDATE_TEXT
+
+
+def test_a_matched_quote_carries_no_reason():
+    # Only failures explain themselves; a reason on every row would bloat the
+    # artifact for the healthy majority.
+    r = em.check_quote("the slab pour is pushed to Thursday",
+                       [_turn("the slab pour is pushed to Thursday")], AT, **KW)
+    assert "reason" not in r

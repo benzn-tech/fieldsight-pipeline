@@ -263,6 +263,14 @@ EVIDENCE_FUZZY = float(os.environ.get('EVIDENCE_FUZZY_THRESHOLD', '0.9'))
 _EVIDENCE_STATUSES = ("verified", "verified_fuzzy", "weak",
                       "unverified", "absent", "unchecked")
 
+# The two ways a citation ends up `unchecked`. They are one status because both
+# leave the claim unmeasured, but they are not one problem: a bad anchor is the
+# MODEL emitting a timestamp we cannot parse, a verifier error is OUR code
+# raising. Filed together, the second hides inside the first and the next reader
+# goes looking in the matcher for a crash that never happened.
+REASON_BAD_ANCHOR = "bad_anchor"
+REASON_VERIFIER_ERROR = "verifier_error"
+
 
 def _segment_key_for(transcript_filename, user_folder, date):
     """transcripts/{u}/{d}/{base}.json -> audio_segments/{u}/{d}/{base}.wav.
@@ -315,6 +323,11 @@ def verify_evidence(result, turns, session_date, user_folder=None, date=None):
                     "across devices to window on")
         return {}
     counts = {k: 0 for k in _EVIDENCE_STATUSES}
+    # Why the failures failed, aggregated per extraction. The counts say how big
+    # the problem is; this says which of the four unrelated problems it is, and
+    # a run whose unverifieds are all one cause is then readable from the log
+    # alone -- no artifact download, no sampling.
+    reasons = {}
     for topic in result.get('topics') or []:
         # Topic level only. The model may volunteer evidence inside children
         # despite the instruction; Aurora drops it, but it would leave an
@@ -327,29 +340,42 @@ def verify_evidence(result, turns, session_date, user_folder=None, date=None):
         for ev in topic.get('evidence') or []:
             try:
                 at = _parse_at(ev.get('at', ''), session_date, turns)
-                r = evidence_match.check_quote(
-                    ev.get('quote', ''), turns, at,
-                    w_seconds=EVIDENCE_WINDOW_SEC,
-                    floor_tokens=EVIDENCE_FLOOR_TOKENS,
-                    fuzzy_threshold=EVIDENCE_FUZZY)
             except Exception:
-                logger.exception("evidence: verifier failed on %r",
-                                 (ev.get('quote') or '')[:80])
-                r = {"status": "unchecked"}
+                # The model's timestamp, not our code. Logged at warning, not
+                # exception: a stack trace here would read as a defect on our
+                # side every time the model formats a time badly.
+                logger.warning("evidence: unparseable at=%r on %r",
+                               ev.get('at'), (ev.get('quote') or '')[:80])
+                r = {"status": "unchecked", "reason": REASON_BAD_ANCHOR}
+            else:
+                try:
+                    r = evidence_match.check_quote(
+                        ev.get('quote', ''), turns, at,
+                        w_seconds=EVIDENCE_WINDOW_SEC,
+                        floor_tokens=EVIDENCE_FLOOR_TOKENS,
+                        fuzzy_threshold=EVIDENCE_FUZZY)
+                except Exception:
+                    logger.exception("evidence: verifier failed on %r",
+                                     (ev.get('quote') or '')[:80])
+                    r = {"status": "unchecked", "reason": REASON_VERIFIER_ERROR}
             ev['status'] = r['status']
             key = _segment_key_for(r.get('segment_key_source'), user_folder, date)
             if key:
                 ev['segment_key'] = key
                 ev['offset_sec'] = r.get('offset_sec')
-            for extra in ('found_offset_sec', 'fuzzy_ratio'):
+            for extra in ('found_offset_sec', 'fuzzy_ratio', 'reason'):
                 if r.get(extra) is not None:
                     ev[extra] = r[extra]
+            if r.get('reason'):
+                reasons[r['reason']] = reasons.get(r['reason'], 0) + 1
             statuses.append(r['status'])
         topic['evidence_status'] = evidence_match.roll_up(statuses)
         counts[topic['evidence_status']] = counts.get(topic['evidence_status'], 0) + 1
     # One line per extraction. found_offset feeds the W calibration; the counts
     # ARE the Phase A deliverable.
     logger.info("evidence: %s", counts)
+    if reasons:
+        logger.info("evidence reasons: %s", reasons)
     return counts
 
 

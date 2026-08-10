@@ -18,6 +18,17 @@ import unicodedata
 # because they DOMINATE rather than rank.
 STATUS_ORDER = ["weak", "verified_fuzzy", "verified"]
 
+# Why a citation failed. `unverified` on its own is not actionable: it means
+# either "our matcher was too strict" or "the model invented it", and the first
+# splits again by WHICH rule was too strict -- each with a different fix (W, the
+# normaliser, the fuzzy cut). These codes travel into the artifact so a reader
+# starts from what the matcher already knew rather than re-deriving it by hand,
+# and so the cases the matcher knew for certain cost no reading at all.
+REASON_NO_TURNS = "no_turns_in_window"           # W too narrow, or a bad anchor
+REASON_NO_CANDIDATE_TEXT = "no_candidate_text"   # turns present but empty: ASR, not W
+REASON_EMPTY_QUOTE = "empty_quote"               # nothing was cited
+REASON_BELOW_FUZZY = "below_fuzzy_threshold"     # in the window, not close enough
+
 _PUNCT = re.compile(r"[^\w\s]", re.UNICODE)
 _WS = re.compile(r"\s+")
 # CJK ideographs + compatibility + fullwidth forms.
@@ -97,7 +108,7 @@ def check_quote(quote, turns, at, *, w_seconds, floor_tokens, fuzzy_threshold):
     """
     window = windowed_turns(turns, at, w_seconds)
     if not window:
-        return {"status": "unverified", "reason": "no turns in window"}
+        return {"status": "unverified", "reason": REASON_NO_TURNS}
 
     # Concatenated, not tested per turn: turns are per-segment and never merged
     # across chunks, so a sentence split at a chunk seam is two turns and
@@ -106,15 +117,21 @@ def check_quote(quote, turns, at, *, w_seconds, floor_tokens, fuzzy_threshold):
     haystack = " ".join(norm_turns)
     needle = normalise(quote)
     if not needle:
-        return {"status": "unverified", "reason": "empty quote"}
+        return {"status": "unverified", "reason": REASON_EMPTY_QUOTE}
 
     weak = token_count(quote) < floor_tokens
     ratio = None
     pos = haystack.find(needle)
     if pos < 0:
         pos, ratio = _best_fuzzy(needle, haystack)
-        if ratio is None or ratio < fuzzy_threshold:
-            return {"status": "unverified", "fuzzy_ratio": ratio}
+        if ratio is None:
+            # Turns were in the window but carried no words. Widening W would
+            # never fix this one, so it must not be filed beside the misses
+            # that widening W does fix.
+            return {"status": "unverified", "reason": REASON_NO_CANDIDATE_TEXT}
+        if ratio < fuzzy_threshold:
+            return {"status": "unverified", "reason": REASON_BELOW_FUZZY,
+                    "fuzzy_ratio": round(ratio, 3)}
 
     turn = _turn_at(window, norm_turns, pos)
     if weak:
