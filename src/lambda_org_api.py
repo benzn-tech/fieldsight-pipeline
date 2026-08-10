@@ -186,6 +186,18 @@ ALLOWED_OBSERVATION_STATUS = {"open", "closed"}
 ALLOWED_ACTION_STATUS = {"open", "in_progress", "blocked", "done"}
 ALLOWED_ACTION_PRIORITY = {"low", "medium", "high"}
 RECORDING_KINDS = {"video", "audio", "photo"}
+
+# Does `complete` check that the bytes actually reached S3 before it stamps
+# uploaded_at? Three states, not a boolean, because the two risks are not
+# symmetric: a wrong `enforce` rejects EVERY upload, against a measured 0.9% of
+# chunk-session recordings lost by waiting (spec 2026-08-09).
+#
+#   off      200 always — exactly the behaviour before this existed (rollback)
+#   observe  200 always, but log the verdict enforce would have reached
+#   enforce  409 when the object is absent; the row stays pending and the
+#            device re-sends inside its own 7-day budget
+UPLOAD_VERIFY_MODE = os.environ.get("UPLOAD_VERIFY_MODE", "off").lower()
+
 # Voice-timeliness: mis-touch tolerance ("grace") window before a stopped session
 # finalizes + emails. A resume within it cancels the finalize (spec §3.2, §8.4).
 STOP_GRACE_SECONDS = int(os.environ.get("STOP_GRACE_SECONDS", "30"))
@@ -747,6 +759,55 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
         logger.exception("upload-url: could not record group %s", group_id)
 
 
+def _object_size(key):
+    """Size of the object at `key`, or None when it is not there.
+
+    `list_objects_v2`, not `HeadObject`, and the difference is the whole point.
+    The org-api role's `s3:ListBucket` is granted only under a `s3:prefix`
+    condition, so a HeadObject request — which carries no prefix — cannot
+    satisfy it and S3 answers 403 for a key that simply does not exist.
+    Measured on the live role with simulate-principal-policy: with
+    `s3:prefix=users/…` allowed, with no prefix implicitDeny. Reading that 403
+    as "absent" is how a permission slip becomes a total outage (BUG-43, #288).
+
+    `Prefix=key` also matches `key` + anything, so the match is exact: a
+    half-written sibling must not certify the real object as delivered. Any
+    other key sharing this prefix sorts after it, so MaxKeys=1 is enough.
+
+    Raises whatever S3 raises — the caller decides what an unreadable bucket
+    means, and it is never "absent"."""
+    resp = s3().list_objects_v2(Bucket=S3_BUCKET, Prefix=key, MaxKeys=1)
+    for item in resp.get("Contents") or []:
+        if item.get("Key") == key:
+            return item.get("Size")
+    return None
+
+
+def _upload_is_missing(rec_id, key, claimed_size) -> bool:
+    """True only when S3 answered and the object was not there.
+
+    Never raises: a guard that cannot read its input must not be the thing that
+    stops uploads."""
+    try:
+        size = _object_size(key)
+    except Exception:
+        logger.exception("upload-verify %s: could not read %s — accepting", rec_id, key)
+        return False
+    if size is None:
+        logger.warning("upload-verify %s: object absent at %s (mode=%s)",
+                       rec_id, key, UPLOAD_VERIFY_MODE)
+        return True
+    if claimed_size is not None and size != claimed_size:
+        # Logged, never enforced. The client sends file.length() of the exact
+        # file it PUT, so a disagreement means a truncated upload — but a
+        # systematic off-by-something in how either side counts would reject
+        # every upload, and that is not a risk to take in the same release as
+        # the existence check.
+        logger.warning("upload-verify %s: size mismatch at %s — client said %s, S3 has %s",
+                       rec_id, key, claimed_size, size)
+    return False
+
+
 def complete_recording(conn, caller, rec_id, body):
     b = body or {}
     gps_track = b.get("gpsTrack")
@@ -757,6 +818,19 @@ def complete_recording(conn, caller, rec_id, body):
         logger.warning("complete_recording %s: dropping non-list gpsTrack (%s)",
                        rec_id, type(gps_track).__name__)
         gps_track = None
+    if UPLOAD_VERIFY_MODE in ("observe", "enforce"):
+        # The key lives on the row, so the check needs it before the UPDATE.
+        # Company scoping is repeated here because mark_uploaded — which used
+        # to be the only statement — carried it in its WHERE clause, and this
+        # lookup must not become a way around it.
+        rec = recordings.get_by_id(conn, rec_id)
+        if rec is None or str(rec.get("company_id")) != str(caller["company_id"]):
+            return error("recording not found", 404)
+        if _upload_is_missing(rec_id, rec.get("s3_key"), b.get("sizeBytes")) \
+                and UPLOAD_VERIFY_MODE == "enforce":
+            # Not 404: the row exists, the bytes do not. The device re-sends,
+            # and its classifier must read 409 as retryable (GrandTime #18).
+            return error("upload not found in storage — re-send the file", 409)
     row = recordings.mark_uploaded(conn, rec_id, caller["company_id"],
                                     b.get("sizeBytes"), gps_track)
     if row is None:

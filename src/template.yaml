@@ -694,6 +694,20 @@ Parameters:
       spec §3). False (default) is the pre-Phase-3 binary resolve_scope
       behavior, unchanged in every path, mirroring AuthorityFlip's rollout.
 
+  UploadVerifyMode:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['off', 'observe', 'enforce']
+    Description: >-
+      Whether POST /recordings/{id}/complete checks that the object actually
+      reached S3 before it stamps uploaded_at. off = the old behaviour, take
+      the client's word (rollback). observe = still 200, but log the verdict
+      enforce would have reached. enforce = 409 on an absent object, so the
+      row stays pending and the device re-sends. Three states rather than a
+      boolean because the risks are not symmetric: a wrong enforce rejects
+      every upload, against a measured 0.9% of chunk-session recordings lost
+      by waiting (spec 2026-08-09-upload-completion-verified).
+
   ManageDataBucketPolicy:
     Type: String
     Default: 'true'
@@ -1383,6 +1397,9 @@ Resources:
           # AUTHORITY_FLIP (IngestFunction, above): Parameter default 'false',
           # driven per-environment by a repo variable in the deploy workflows.
           GRADED_ROLES: !Ref GradedRoles
+          # Does `complete` verify the bytes arrived before stamping
+          # uploaded_at? See the UploadVerifyMode parameter.
+          UPLOAD_VERIFY_MODE: !Ref UploadVerifyMode
           # Deploy = thaw. See the ServerBuild parameter.
           SERVER_BUILD: !Ref ServerBuild
           # QR passwordless login (2026-07-30) — PROD-ONLY (see IsProdWithOrgApi
