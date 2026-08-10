@@ -241,3 +241,62 @@ def test_both_workflows_pass_the_merge_tunables():
         for _, (param, _) in _MERGE_TUNABLES.items():
             assert f"{param}=" in wf, \
                 f"{env_name} does not pass {param}; the Parameter holds its default forever"
+
+
+# ---- the evidence-matcher tunables -------------------------------------
+#
+# These are not booleans, so the boolean sweep above never covered them, and
+# they were code-only defaults until 2026-08-10: `EVIDENCE_WINDOW_SEC` did not
+# appear in the template at all. That was found while calibrating W against the
+# first real multi-chunk sessions -- the measurement said 300s was ~50x wider
+# than any honest match needed, and there was no way to apply the answer. A
+# calibration whose result cannot be deployed is not a calibration.
+
+_EVIDENCE_TUNABLES = {
+    # env var                    : (template Parameter, functions that read it)
+    "EVIDENCE_WINDOW_SEC":        ("EvidenceWindowSec", ("ExtractSessionFunction",)),
+    "EVIDENCE_FUZZY_THRESHOLD":   ("EvidenceFuzzyThreshold", ("ExtractSessionFunction",)),
+    "EVIDENCE_FLOOR_TOKENS":      ("EvidenceFloorTokens", ("ExtractSessionFunction",)),
+}
+
+
+def test_the_evidence_tunables_exist_as_template_parameters():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for env, (param, _) in _EVIDENCE_TUNABLES.items():
+        assert re.search(rf"\n  {param}:\n", text), \
+            f"{env} has no {param} Parameter — it can only ever hold its code default"
+
+
+def test_every_function_that_reads_an_evidence_tunable_is_given_it():
+    """The middle segment of the three. A Parameter that no function references
+    is as inert as no Parameter at all, and reads as wired from the template's
+    Parameters block alone."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for env, (param, fns) in _EVIDENCE_TUNABLES.items():
+        for fn in fns:
+            assert f"{env}: !Ref {param}" in _function_block(text, fn), \
+                f"{fn} reads {env} but is not given it"
+
+
+def test_both_workflows_pass_the_evidence_tunables():
+    for env_name in ("prod", "test"):
+        for _, (param, _) in _EVIDENCE_TUNABLES.items():
+            assert param in _overrides(WORKFLOWS[env_name]), \
+                (f"{env_name} does not pass {param}; the Parameter holds its "
+                 f"default forever and the calibrated value cannot be applied")
+
+
+def test_the_window_default_is_not_the_uncalibrated_one():
+    """300s was the provisional value shipped before there was a distribution.
+
+    Across 42 citations from two real multi-chunk sessions every honest match
+    landed within 6.1s of its cited time. This does not pin a specific number --
+    a later calibration may move it again -- it pins that the value stopped
+    being the one chosen before any measurement existed.
+    """
+    for env_name in ("prod", "test"):
+        wf = open(WORKFLOWS[env_name], encoding="utf-8").read()
+        line = [ln for ln in wf.splitlines() if "EvidenceWindowSec=" in ln]
+        assert len(line) == 1, f"{env_name}: expected one line, found {len(line)}"
+        assert "'300'" not in line[0], (
+            f"{env_name} still defaults W to the pre-measurement 300s")
