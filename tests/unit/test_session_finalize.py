@@ -20,28 +20,31 @@ def test_subject_carries_the_meeting_time_range():
     assert "2026-07-25" in subj and "14:11–14:14" in subj
 
 
-def test_body_contains_summary_site_and_open_todos():
+def test_body_contains_site_and_every_open_todo():
     _subj, text, html = fin.build_confirmation_email(
         date="2026-07-25", site_name="UC PK",
         summary="Poured the slab; discussed rebar.",
         open_todos=[{"text": "Fix rebar spacing", "responsible": "Neil"},
                     {"text": "Order more steel", "responsible": None}])
-    assert "Poured the slab" in text
     assert "Fix rebar spacing" in text and "Neil" in text
-    assert "Order more steel" in text
+    assert "Order more steel" in text                  # an unassigned one is not dropped
     assert "UC PK" in text
-    assert "Fix rebar spacing" in html and "Poured the slab" in html   # html carries the same
+    assert "Fix rebar spacing" in html and "Order more steel" in html  # html carries the same
 
 
-def test_no_action_items_section_when_none_open():
-    _s, text, _h = fin.build_confirmation_email(date="2026-07-25", summary="All done.", open_todos=[])
-    assert "action item" not in text.lower()
+def test_no_action_items_table_when_none_open():
+    _s, text, html = fin.build_confirmation_email(date="2026-07-25", summary="All done.",
+                                                  open_todos=[])
+    assert "Action items" not in text       # the heading -- the explanatory note reads differently
+    assert "<table" not in html
 
 
-def test_blank_summary_renders_a_placeholder_not_an_empty_body():
-    _s, text, _h = fin.build_confirmation_email(date="2026-07-25", summary="")
+def test_a_summary_is_never_echoed_into_the_body_even_when_present():
+    _s, text, _h = fin.build_confirmation_email(date="2026-07-25",
+                                                summary="Poured the slab.")
     assert text.strip()                       # never an empty email
-    assert "summary" in text.lower()
+    assert "Poured the slab" not in text
+    assert "summary" not in text.lower()      # not even the old placeholder wording
 
 
 def test_todos_without_text_are_dropped_with_their_owner():
@@ -52,8 +55,11 @@ def test_todos_without_text_are_dropped_with_their_owner():
 
 
 def test_html_escapes_content():
-    _s, _t, html = fin.build_confirmation_email(summary="rebar <b>bent</b> & rusty")
+    # proven on the field that IS rendered now -- the to-do text
+    _s, _t, html = fin.build_confirmation_email(
+        open_todos=[{"text": "rebar <b>bent</b> & rusty", "responsible": "A & B"}])
     assert "&lt;b&gt;" in html and "&amp;" in html   # not raw markup injected into the email
+    assert "<b>bent</b>" not in html
 
 
 def test_action_items_render_task_assignee_and_due():
@@ -89,7 +95,7 @@ def test_worker_builds_sends_and_records_a_sent_result():
     assert out["status"] == "sent" and out["recipient"] == "bob@site.com"
     to, subject, text, html = sent[0]
     assert to == "bob@site.com" and "2026-07-25" in subject
-    assert "Poured the slab" in text and "fix rebar" in text and "Poured the slab" in html
+    assert "fix rebar" in text and "fix rebar" in html
     # the in-VPC sweep reconciles this result -> mark_sent
     assert results == [("abc", {"status": "sent", "sessionId": "abc", "recipient": "bob@site.com"})]
 
@@ -127,7 +133,7 @@ def test_worker_prefers_the_fresh_complete_summary_over_the_stale_rolling_one():
         write_result=lambda *a: None, complete_summary=lambda artifact: fresh)
     assert out["status"] == "sent"
     _to, _subj, text, html = sent[0]
-    assert "COMPLETE summary" in text and "STALE" not in text
+    # the fresh to-dos travel with the fresh summary -- they are the observable half
     assert "new task" in text and "Ana" in text and "Mon" in text and "old" not in text
     assert "new task" in html and "Mon" in html
 
@@ -140,4 +146,40 @@ def test_worker_falls_back_to_rolling_summary_when_resummary_returns_none():
         art, send=lambda *a: sent.append(a) or "m",
         write_result=lambda *a: None, complete_summary=lambda artifact: None)
     _to, _subj, text, _html = sent[0]
-    assert "Rolling summary." in text and "keep me" in text
+    assert "keep me" in text          # the rolling to-dos were used, not dropped
+
+
+# ----------------------------------------------------------
+# Email shape, 2026-08-10: the recorder wants the ACTION TABLE, not prose.
+# The narrative Summary is dropped from the body, and the meeting's time range
+# moves onto the Date line so the email states WHEN inside the body (it was
+# only in the subject before).
+# ----------------------------------------------------------
+
+def test_date_line_carries_the_meeting_time_range():
+    _s, text, html = fin.build_confirmation_email(
+        date="2026-07-25", time_range="14:11–14:14", summary="x")
+    assert "Date: 2026-07-25 14:11–14:14" in text
+    assert "2026-07-25 14:11–14:14" in html
+
+
+def test_date_line_without_a_time_range_is_just_the_date():
+    _s, text, _h = fin.build_confirmation_email(date="2026-07-25", summary="x")
+    assert "Date: 2026-07-25\n" in text
+
+
+def test_summary_prose_is_not_rendered_in_the_body():
+    _s, text, html = fin.build_confirmation_email(
+        date="2026-07-25", summary="Poured the slab; discussed rebar.",
+        open_todos=[{"text": "Fix rebar spacing", "responsible": "Neil"}])
+    assert "Poured the slab" not in text and "Poured the slab" not in html
+    assert "Summary" not in text and "Summary" not in html
+    assert "Fix rebar spacing" in text and "Fix rebar spacing" in html
+
+
+def test_a_recording_with_no_action_items_says_so_rather_than_sending_a_blank():
+    """With the prose gone, a todo-less session would otherwise be an email with
+    a header and nothing else -- indistinguishable from a broken send."""
+    _s, text, html = fin.build_confirmation_email(
+        date="2026-07-25", summary="All done.", open_todos=[])
+    assert "No action items" in text and "No action items" in html

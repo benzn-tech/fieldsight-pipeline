@@ -46,6 +46,7 @@ import re
 from urllib.parse import unquote_plus
 
 from repositories import meeting_session
+from session_scope import to_utc
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -94,7 +95,10 @@ def process_transcript_key(conn, key, *, resolve_company, resolve_user, now):
         return None
     company_id = company["id"]
     user_id = resolve_user(conn, company_id, folder)     # may be None (recorder unmapped)
-    opened_at = extract_base_time_from_filename(basename)  # device wall-clock (T1); may be None
+    # The filename's time is the DEVICE's NZ wall clock; opened_at is a UTC
+    # column. Store it converted -- see session_scope.to_utc for what storing
+    # it raw did to the confirmation email (prod 2026-08-10).
+    opened_at = to_utc(extract_base_time_from_filename(basename))  # device T1 -> UTC; may be None
     meeting_session.ensure_open(
         conn, sid, company_id, user_id, None, _kind_from_key(basename), opened_at)
     meeting_session.touch_segment(conn, sid, now)         # server time -> skew-proof idle
