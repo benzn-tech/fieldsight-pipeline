@@ -43,29 +43,39 @@ def _clean_todos(open_todos):
 def build_confirmation_email(*, date=None, time_range=None, site_name=None,
                              summary=None, open_todos=None):
     """(subject, body_text, body_html) for the recorder's confirmation email, built
-    from the session's rolling summary + still-open to-dos. Pure — no I/O. A blank
-    summary renders a placeholder (the email is never empty); to-dos with no text are
+    from the session's still-open to-dos. Pure — no I/O. To-dos with no text are
     dropped; all HTML content is escaped so transcript text can't inject markup. The
     subject carries date + meeting time range so the recorder can tell WHICH meeting
-    it is (multiple recordings a day otherwise share one subject)."""
+    it is (multiple recordings a day otherwise share one subject), and the same stamp
+    repeats on the body's Date line so the email states WHEN without relying on the
+    client showing the subject.
+
+    2026-08-10: the narrative summary is NO LONGER RENDERED. What the recorder acts
+    on is the action table; the prose restated it at length and pushed the table
+    below the fold. `summary` is still accepted — process_finalize_request still
+    chooses between the fresh and the rolling one, and it still reaches the stored
+    result — it simply does not appear in the email. A session with no to-dos now
+    says so explicitly: with the prose gone it would otherwise be a header and
+    nothing else, which reads as a broken send."""
     stamp = " ".join(p for p in (date, time_range) if p)
     subject = "FieldSight — your site notes" + (f" ({stamp})" if stamp else "")
-    summary_text = (summary or "").strip() or "No summary was generated for this recording."
     todos = _clean_todos(open_todos)
+    no_todos_note = "No action items were captured for this recording."
 
     lines = ["Here's what we captured from your recording — reply or open FieldSight "
              "to correct anything before you leave site.", ""]
     if site_name:
         lines.append(f"Site: {site_name}")
-    if date:
-        lines.append(f"Date: {date}")
-    lines += ["", "Summary", summary_text]
+    if stamp:
+        lines.append(f"Date: {stamp}")
     if todos:
         lines += ["", "Action items"]
         for t in todos:
             who = t["responsible"] or "Unassigned"
             due = f" (due {t['due']})" if t["due"] else ""
             lines.append(f"  • {t['text']} — {who}{due}")
+    else:
+        lines += ["", no_todos_note]
     body_text = "\n".join(lines).rstrip() + "\n"
 
     esc = _html.escape
@@ -74,11 +84,10 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
     meta = []
     if site_name:
         meta.append(f"<strong>Site:</strong> {esc(site_name)}")
-    if date:
-        meta.append(f"<strong>Date:</strong> {esc(date)}")
+    if stamp:
+        meta.append(f"<strong>Date:</strong> {esc(stamp)}")
     if meta:
         parts.append("<p>" + "<br>".join(meta) + "</p>")
-    parts.append(f"<h3>Summary</h3><p>{esc(summary_text)}</p>")
     if todos:
         rows = "".join(
             "<tr>"
@@ -97,6 +106,8 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
             '<th style="padding:6px">Task</th><th style="padding:6px">Assignee</th>'
             '<th style="padding:6px">Due</th></tr></thead>'
             f"<tbody>{rows}</tbody></table>")
+    else:
+        parts.append(f"<p>{esc(no_todos_note)}</p>")
     body_html = "\n".join(parts)
 
     return subject, body_text, body_html
