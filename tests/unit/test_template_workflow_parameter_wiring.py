@@ -136,6 +136,18 @@ def test_the_audio_event_tag_filter_is_wired_in_both_environments():
             f"FILTER_AUDIO_EVENT_TAGS=false cannot be applied by redeploying")
 
 
+def test_the_upload_verify_mode_is_wired_in_both_environments():
+    """Not a boolean, so the sweep above cannot see it — and it is the one
+    switch where being stuck on a default is worst in both directions: stuck on
+    `off` keeps losing 0.9% of recordings, stuck on `enforce` rejects every
+    upload. It must be settable from a repo variable in both environments."""
+    for env, path in WORKFLOWS.items():
+        assert "UploadVerifyMode" in _overrides(path), (
+            f"{env} does not pass UploadVerifyMode, so UPLOAD_VERIFY_MODE can "
+            f"only ever hold its template default and neither rolling forward "
+            f"to enforce nor rolling back to off would work")
+
+
 def test_the_exception_list_does_not_rot():
     """An entry that no longer names a boolean Parameter is stale and hides
     nothing — it should be deleted rather than left to look load-bearing."""
