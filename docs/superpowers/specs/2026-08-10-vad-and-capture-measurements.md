@@ -163,6 +163,77 @@ the same "reports healthy, does not do the work" shape this board showed for NS/
 
 ---
 
+## 4b. Which microphone — and a wrong conclusion that looked convincing
+
+**Measured 2026-08-11, worn throughout, with a second person reading at 1 / 3 / 6 m.**
+
+§4 above reported, in passing, that the two channels differed by 7.1 dB and 7.4 dB of SNR at
+2 m and 6 m, and suggested `setPreferredDevice` might buy more than a whole microphone array
+for the cost of one line. **That was wrong, and it was wrong because the channels were
+labelled by assumption.**
+
+### The labelling error
+
+Block E's take reported `routedDeviceAddress = bottom`, and the analysis took that to mean
+"channel L is the bottom mic". **A routing report names the primary device; it says nothing
+about channel order in a two-channel capture.** Block D had already produced the warning —
+the inter-channel level difference *flipped sign* between a FRONT and a BACK request, so the
+mapping is not fixed — and that observation was written down and then not applied to the very
+table it invalidated.
+
+Block W settles it physically. The wearer taps beside each microphone in turn:
+
+| tapped | median L−R |
+|---|---|
+| bottom edge | +2.8 dB (channels comparable) |
+| **back of the case** | **+17.9 dB** (range +15.2 … +27.2) |
+
+Tapping beside the back microphone drove L to full scale while R stayed at 1.4–5.7k. **L is
+the back microphone; R is the bottom one** — the opposite of what §4's table assumed. The
+bottom taps do not discriminate (structure-borne through the case reaches both), so the
+identification rests on the back taps alone, which is enough.
+
+The advantage therefore belongs to the **bottom** microphone — which is what the platform
+already routes to by default, and what production already records. **It was never an
+available gain; it was a gain already being taken.**
+
+### What the worn measurement actually shows
+
+SNR is against the **friction** floor, which is the noise that limits this device, not room
+tone:
+
+| | back mic | **bottom mic** | bottom advantage |
+|---|---|---|---|
+| wearer speaking | +4.9 dB | **+14.6 dB** | **+9.6** |
+| other @ 1 m | −8.5 | **+0.3** | **+8.8** |
+| other @ 3 m | −10.8 | **−0.9** | **+9.9** |
+| other @ 6 m | −10.1 | **−7.1** | +3.0 |
+
+And the reason, which is the useful part:
+
+| | back mic | bottom mic | difference |
+|---|---|---|---|
+| room quiet | −33.3 | −50.2 | **back is 16.9 dB noisier** |
+| friction, no speech | −34.8 | −44.3 | **back is 9.5 dB noisier** |
+| speech, any distance | — | — | within ±0.7 dB |
+
+**Both microphones hear the speech equally well. The back one is buried under its own
+noise.** It faces the wearer's body (`orientation 0,0,−1`), which does nothing for pickup and
+is extremely efficient at collecting clothing and body movement.
+
+At 6 m the bottom advantage narrows to +3.0 dB because the speech has fallen to the noise on
+both channels — consistent with 6 m being outside this device's range regardless of
+microphone.
+
+### What this changes
+
+**Selecting a microphone is closed** — production is already on the better one.
+
+But the noise source is now *located*: it is the body-facing side, 16.9 dB above the other
+channel in a quiet room. That points at **mechanical decoupling and wear position** rather
+than a windscreen, and it turns "reduce friction by 6 dB" from a vague goal into a specific
+surface to work on.
+
 ## 5. Two things that are safe, and one that is not
 
 **Safe — enhancement does not damage diarization.** The worry that compression would flatten
