@@ -594,7 +594,13 @@ def write_extraction_items(date, user_folder, extraction_key):
         # BEFORE the writes below, never after: this key's own rows were just
         # cleared, and deleting afterwards would take the merged set with them
         # if a member key ever equalled this one.
-        if extraction.get("tier") == "group":
+        # ...but only when the merge actually produced something. An artifact
+        # with no topics would otherwise delete every member's record and write
+        # nothing in its place: on the website the meeting simply empties. The
+        # S3 extractions survive, so it is recoverable by hand, but nobody would
+        # know to look -- merge_result stays NULL (it is gated on topics_n
+        # below), so the group reads as still-in-flight rather than as damage.
+        if extraction.get("tier") == "group" and extraction.get("topics"):
             _delete_member_topics(conn, extraction)
 
         # Task 3 (authority-flip plan) -- list the pictures prefix ONCE per

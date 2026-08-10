@@ -273,3 +273,22 @@ def test_a_failed_email_enqueue_no_longer_hides_a_failed_mark_result():
     block = src[src.index("_enqueue_updated_emails(extraction)"):]
     assert "mark_result" not in block[:400], \
         "mark_result must not share the email try/except — it mis-attributes the failure"
+
+
+def test_an_empty_merge_does_not_delete_the_members_records():
+    """The merge deletes each member's topics so the merged set is the only
+    record. With no merged set, that leaves NOTHING.
+
+    A group artifact carrying zero topics would delete every member's record and
+    write nothing in its place -- on the website the meeting simply empties. The
+    S3 extractions survive so it is recoverable by hand, but nobody would know to
+    look: mark_result is gated on the same emptiness, so merge_result stays NULL
+    and the group reads as still-in-flight rather than as damage.
+    """
+    import inspect
+    import lambda_item_writer as iw
+    src = inspect.getsource(iw.write_extraction_items)
+    line = next(l for l in src.splitlines() if "_delete_member_topics(conn" in l)
+    guard = src[:src.index(line)].splitlines()[-1]
+    assert 'extraction.get("topics")' in guard, \
+        "the member delete must be conditional on the merge having produced topics"
