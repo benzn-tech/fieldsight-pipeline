@@ -43,7 +43,7 @@ def test_chunk_transcript_opens_and_touches_the_session(captured):
     assert sid == SID and company_id == "co-1" and user_id == "u-1"
     assert site is None                                   # no site pick in a chunk key
     assert kind == "audio"                                # from _srcwav
-    assert opened_at == datetime(2026, 7, 28, 14, 3, 0)   # the chunk's device start (T1)
+    assert opened_at == datetime(2026, 7, 28, 2, 3, 0)    # device start (T1) 14:03 NZST -> UTC
     # touch at SERVER now (skew-proof idle detection), NOT the device time
     assert captured["touch"] == [(SID, NOW)]
 
@@ -86,7 +86,7 @@ def test_vad_sidecar_opens_and_touches_without_any_speech(captured):
     assert out == SID
     sid, company_id, user_id, site, kind, opened_at = captured["open"][0]
     assert sid == SID and company_id == "co-1" and user_id == "u-1"
-    assert opened_at == datetime(2026, 7, 28, 14, 3, 0)   # same device start (T1)
+    assert opened_at == datetime(2026, 7, 28, 2, 3, 0)    # same device start (T1), in UTC
     # The sidecar name carries no _src{ext} token, so kind is unknowable here.
     # ensure_open must COALESCE it, or a sidecar-first session is NULL forever.
     assert kind is None
@@ -135,3 +135,50 @@ def test_keys_from_event_reads_both_shapes():
     assert sa._keys_from_event(eb) == ["transcripts/a/b/c.json"]
     s3 = {"Records": [{"s3": {"object": {"key": "transcripts/a/b/c+d.json"}}}]}
     assert sa._keys_from_event(s3) == ["transcripts/a/b/c d.json"]   # unquote_plus
+
+
+# ----------------------------------------------------------
+# opened_at is a UTC column. The chunk filename is DEVICE wall clock.
+#
+# Prod 2026-08-10: a session whose first artifact was a chunk (rather than the
+# app's /open call) got opened_at = 12:32 NZ stored as though it were UTC.
+# lambda_finalize_claim._to_nz then applied the NZ offset AGAIN, yielding
+# 2026-08-11 00:32 -- so the confirmation email was dated TOMORROW, its summary
+# re-gather looked in transcripts/{folder}/2026-08-11/ (empty), and the
+# recipient got "No summary was generated for this recording."
+#
+# Every reader of the column already assumes UTC -- meeting_session.py says so
+# outright ("opened_at is stored UTC, and comparing the two raw is BUG-37"),
+# the idle sweep and the joinable check both compare it against the server's
+# now(), and the day filter does `opened_at AT TIME ZONE 'UTC' AT TIME ZONE
+# 'Pacific/Auckland'`. This writer was the sole outlier.
+# ----------------------------------------------------------
+
+def _opened_at_for(captured, key, now=NOW):
+    rc, ru = _resolvers()
+    sa.process_transcript_key(object(), key, resolve_company=rc, resolve_user=ru, now=now)
+    return captured["open"][0][5]
+
+
+def test_opened_at_is_converted_to_utc_not_stored_as_device_wall_clock(captured):
+    # 2026-07-28 14:03 is NZST (UTC+12) -> 02:03 UTC
+    assert _opened_at_for(captured, CHUNK_KEY) == datetime(2026, 7, 28, 2, 3, 0)
+
+
+def test_opened_at_conversion_follows_nz_daylight_saving(captured):
+    # 2026-01-15 is NZDT (UTC+13): 14:03 NZ -> 01:03 UTC. A fixed offset would
+    # be wrong for half the year in either direction.
+    key = (f"transcripts/Ben_UCPK/2026-01-15/"
+           f"Benl1_2026-01-15_14-03-00_sid{SID}_c0007_off3.0_to60.0_srcwav.json")
+    assert _opened_at_for(captured, key, now=datetime(2026, 1, 15, 14, 4, 30)) \
+        == datetime(2026, 1, 15, 1, 3, 0)
+
+
+def test_round_trip_through_the_email_path_recovers_the_device_wall_clock(captured):
+    """The property that actually broke: what the email renders must equal what
+    the recorder saw. lambda_finalize_claim._to_nz reads opened_at as UTC and
+    converts to NZ -- feed it what we store and the device time must come back.
+    """
+    fc = pytest.importorskip("lambda_finalize_claim", reason="requires psycopg")
+    stored = _opened_at_for(captured, CHUNK_KEY)
+    assert fc._to_nz(stored) == datetime(2026, 7, 28, 14, 3, 0)

@@ -39,8 +39,10 @@ def test_an_updated_request_uses_the_carried_summary_verbatim(monkeypatch):
                      {"summary": "solo rewrite", "open_todos": []})
     assert called == [], "an updated email must not re-summarise per member"
     body = (sent.get("text") or "") + (sent.get("html") or "")
-    assert "The merged summary." in body
-    assert "solo rewrite" not in body
+    # The body no longer renders prose, so the carried-vs-re-derived choice is
+    # observed through the to-dos: the artifact carries "do it", the (forbidden)
+    # re-summarise would have replaced them with an empty list.
+    assert "do it" in body
 
 
 def test_a_normal_request_still_prefers_the_fresh_summary():

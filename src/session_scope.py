@@ -75,6 +75,58 @@ def to_nz(dt):
         dst_end = _first_sun(4) + timedelta(hours=3) - timedelta(hours=13)
         return u + timedelta(hours=13 if (u >= dst_start or u < dst_end) else 12)
 
+
+def to_utc(dt):
+    """The inverse of to_nz: a Pacific/Auckland LOCAL (naive) datetime -> UTC.
+
+    The chunk filename carries the DEVICE's NZ wall clock, but meeting_session
+    .opened_at is a UTC column -- meeting_session.py says so outright ("opened_at
+    is stored UTC, and comparing the two raw is BUG-37"), the idle sweep and the
+    joinable check compare it against the server's now(), and the day filter does
+    `opened_at AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific/Auckland'`. A writer that
+    stores the wall clock raw therefore plants a value every reader then shifts
+    AGAIN.
+
+    Prod 2026-08-10: session_activity did exactly that for any session whose
+    first artifact was a chunk rather than the app's /open call (ensure_open
+    COALESCEs opened_at, so whichever writer lands first sets the convention
+    permanently). A 12:32 NZ recording was stored as 12:32 "UTC";
+    lambda_finalize_claim._to_nz added the offset again and produced 2026-08-11
+    00:32, so the confirmation email was dated TOMORROW and its summary
+    re-gather read an empty S3 prefix -- the recipient got "No summary was
+    generated for this recording."
+
+    Same DST rule and same tzdata-optional fallback as to_nz. During the one
+    ambiguous hour each April the earlier (DST) reading is taken, matching
+    ZoneInfo's fold=0 default -- an hour's error in a rare window, versus the
+    12-hour error this function exists to remove.
+    """
+    if not hasattr(dt, "strftime"):
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    try:
+        from zoneinfo import ZoneInfo
+        return (dt.replace(tzinfo=ZoneInfo("Pacific/Auckland"))
+                  .astimezone(timezone.utc).replace(tzinfo=None))
+    except Exception:
+        y = dt.year
+
+        def _last_sun(mo):
+            d = datetime(y, mo, calendar.monthrange(y, mo)[1])
+            return d - timedelta(days=(d.weekday() - 6) % 7)
+
+        def _first_sun(mo):
+            d = datetime(y, mo, 1)
+            return d + timedelta(days=(6 - d.weekday()) % 7)
+
+        # Boundaries expressed in LOCAL time (this input is local): NZDT runs
+        # from 02:00 on the last Sunday of September to 03:00 on the first
+        # Sunday of April.
+        dst_start = _last_sun(9) + timedelta(hours=2)
+        dst_end = _first_sun(4) + timedelta(hours=3)
+        return dt - timedelta(hours=13 if (dt >= dst_start or dt < dst_end) else 12)
+
 # Depth-exact: extractions/{user_folder}/{date}/{session_base}.json — a key
 # nested any deeper (or shallower, or not ending in .json) is not this
 # contract's shape and must be skipped rather than guessed at. Moved here
