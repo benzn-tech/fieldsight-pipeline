@@ -153,9 +153,25 @@ def rearm(conn, group_id) -> bool:
 
     Conditional, so two late arrivals landing together re-arm once. Returns
     whether this call is the one that did it.
+
+    BOTH columns are cleared, and that is the whole point. Clearing merged_at
+    alone left `(merged_at NULL, merge_result 'merged')` after any successful
+    merge -- a state `list_due` rejects (it wants both NULL) and `list_stuck`
+    also rejects (it wants merged_at NOT NULL), so the group left every scan
+    permanently.
+
+    That was data loss rather than a stalled merge: `_group_supersedes_solo`
+    SUPPRESSES the late member's own topics on the strength of the re-merge it
+    has just armed, so the content was neither written solo nor ever merged.
+
+    The `merged_at IS NOT NULL` guard still stands, and it is what keeps a
+    never-claimed group -- one rejected on span, where merged_at was never set --
+    from being dragged into the queue by this. Re-merging past the budget is
+    prevented a step earlier: the caller checks GROUP_MERGE_CAP before it gets
+    here and writes the late member as solo topics instead.
     """
     row = conn.cursor(row_factory=dict_row).execute(
-        "UPDATE session_group SET merged_at = NULL "
+        "UPDATE session_group SET merged_at = NULL, merge_result = NULL "
         "WHERE group_id = %s AND merged_at IS NOT NULL "
         "RETURNING group_id",
         (group_id,),

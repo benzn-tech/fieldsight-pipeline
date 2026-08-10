@@ -446,3 +446,34 @@ def test_a_failure_does_not_discard_an_earlier_invocations_leftovers(monkeypatch
     monkeypatch.setattr(fc, "_real_group_scan", _boom)
     fc._sweep_groups_contained(_SavepointConn())
     assert fc._pending_enqueues == [{"groupId": "earlier"}]
+
+
+def test_rearm_returns_the_group_to_the_queue_not_to_limbo():
+    """Re-arming must clear BOTH state columns.
+
+    `rearm` cleared only merged_at. After a successful merge merge_result is
+    'merged', so a late member's re-arm produced (merged_at NULL, merge_result
+    'merged') -- a state `list_due` rejects (it needs both NULL) and `list_stuck`
+    also rejects (it needs merged_at NOT NULL). The group left both scans
+    permanently.
+
+    That is data loss, not just a stalled merge: _group_supersedes_solo
+    SUPPRESSES the late member's own topics on the promise of the re-merge it
+    just armed, so the content is neither written solo nor ever merged.
+    """
+    import re as _re
+    import inspect
+    from repositories import session_group as sg
+    src = inspect.getsource(sg.rearm)
+    set_clause = src[src.index("SET"):src.index("WHERE")]
+    assert "merged_at = NULL" in set_clause
+    assert "merge_result = NULL" in set_clause, \
+        "clearing merged_at alone leaves the group invisible to both scans"
+
+
+def test_rearm_is_still_guarded_on_having_been_claimed():
+    # The guard is what stops a never-claimed group (rejected on span, say, where
+    # merged_at was never set) from being dragged back into the queue.
+    import inspect
+    from repositories import session_group as sg
+    assert "merged_at IS NOT NULL" in inspect.getsource(sg.rearm)
