@@ -300,3 +300,44 @@ def test_the_window_default_is_not_the_uncalibrated_one():
         assert len(line) == 1, f"{env_name}: expected one line, found {len(line)}"
         assert "'300'" not in line[0], (
             f"{env_name} still defaults W to the pre-measurement 300s")
+
+
+def test_the_fuzzy_default_is_not_the_uncalibrated_one():
+    """0.9 was chosen before any distribution existed to look at.
+
+    Measured 2026-08-10 against two populations -- real quotes scored against
+    windows they do not belong to (n=1,886), and real quotes rewritten the way
+    a model tidies (n=109) -- it rejects 59.6% of honest-but-tidied quotes, and
+    30.3% of those carrying a single tidy, filing every one as the fabrication
+    signal this feature exists to measure.
+
+    Like the window test, this pins that the value stopped being the
+    pre-measurement one, not a particular number.
+    """
+    for env_name in ("prod", "test"):
+        wf = open(WORKFLOWS[env_name], encoding="utf-8").read()
+        line = [ln for ln in wf.splitlines() if "EvidenceFuzzyThreshold=" in ln]
+        assert len(line) == 1, f"{env_name}: expected one line, found {len(line)}"
+        assert "'0.9'" not in line[0], (
+            f"{env_name} still defaults the fuzzy cut to the pre-measurement 0.9")
+
+
+def test_the_code_defaults_match_the_template_defaults():
+    """When they disagree the environment wins silently, and the number in the
+    source reads like the one in force. That is how a calibrated value gets
+    quietly reverted by someone reading only the module."""
+    import re as _re
+    tpl = open(TEMPLATE, encoding="utf-8").read()
+    src = open(os.path.join(REPO, "src", "lambda_extract_session.py"),
+               encoding="utf-8").read()
+    pairs = [("EvidenceWindowSec", "EVIDENCE_WINDOW_SEC"),
+             ("EvidenceFuzzyThreshold", "EVIDENCE_FUZZY_THRESHOLD"),
+             ("EvidenceFloorTokens", "EVIDENCE_FLOOR_TOKENS")]
+    for param, env in pairs:
+        block = _re.search(rf"\n  {param}:\n(.*?)(?=\n  \w+:\n)", tpl, _re.S).group(1)
+        tpl_default = _re.search(r"Default:\s*'([^']+)'", block).group(1)
+        code_default = _re.search(
+            rf"os\.environ\.get\('{env}',\s*'([^']+)'\)", src).group(1)
+        assert float(tpl_default) == float(code_default), (
+            f"{env}: template default {tpl_default!r} != code default "
+            f"{code_default!r}")

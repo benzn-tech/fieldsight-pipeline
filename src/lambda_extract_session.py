@@ -257,9 +257,13 @@ FILTER_AUDIO_EVENT_TAGS = os.environ.get(
 EMIT_EVIDENCE = os.environ.get('EMIT_EVIDENCE', 'false').lower() == 'true'
 
 
-EVIDENCE_WINDOW_SEC = float(os.environ.get('EVIDENCE_WINDOW_SEC', '300'))
+# Calibrated 2026-08-10 against two real sessions; the reasoning is in the
+# template Parameters and the PR. The code defaults are kept EQUAL to the
+# template defaults on purpose: when they disagree, the environment silently
+# wins and the number in the source reads like the one in force.
+EVIDENCE_WINDOW_SEC = float(os.environ.get('EVIDENCE_WINDOW_SEC', '60'))
 EVIDENCE_FLOOR_TOKENS = int(os.environ.get('EVIDENCE_FLOOR_TOKENS', '5'))
-EVIDENCE_FUZZY = float(os.environ.get('EVIDENCE_FUZZY_THRESHOLD', '0.9'))
+EVIDENCE_FUZZY = float(os.environ.get('EVIDENCE_FUZZY_THRESHOLD', '0.80'))
 _EVIDENCE_STATUSES = ("verified", "verified_fuzzy", "weak",
                       "unverified", "absent", "unchecked")
 
