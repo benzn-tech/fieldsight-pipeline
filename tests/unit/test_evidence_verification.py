@@ -157,7 +157,8 @@ def test_an_unverified_citation_records_why():
     ex.verify_evidence(result, _turns(), "2026-08-07")
     ev = result["topics"][0]["evidence"][0]
     assert ev["status"] == "unverified"
-    assert ev["reason"] == ex.evidence_match.REASON_BELOW_FUZZY
+    # Nothing in the window resembles it -- not a near miss of the cut.
+    assert ev["reason"] == ex.evidence_match.REASON_NOTHING_CLOSE
 
 
 def test_a_verified_citation_records_no_reason():
@@ -191,5 +192,5 @@ def test_the_unverified_reasons_are_logged_beside_the_counts(caplog):
     result = _topic("the market is now coming down sharply")
     with caplog.at_level("INFO"):
         ex.verify_evidence(result, _turns(), "2026-08-07")
-    assert ex.evidence_match.REASON_BELOW_FUZZY in caplog.text, \
+    assert ex.evidence_match.REASON_NOTHING_CLOSE in caplog.text, \
         "a run whose unverifieds are all one cause is readable from the log alone"
