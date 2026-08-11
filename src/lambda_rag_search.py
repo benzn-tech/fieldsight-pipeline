@@ -32,7 +32,7 @@ just skips the DB round-trip and makes the deny-by-default case explicit).
 import json
 import logging
 
-from db.connection import get_cached_connection
+from db.connection import close_cached_connection, get_cached_connection
 from repositories import aliases, chunks, scope, sites, users
 import text_normalize
 
@@ -41,6 +41,22 @@ logger.setLevel(logging.INFO)
 
 
 def lambda_handler(event, context):
+    """Release the pooled Aurora connection on EVERY exit path.
+
+    The module-level cache exists because reconnecting costs ~1-2s and dominated
+    search latency. But Aurora treats any open user connection as activity, so a
+    warm container holding one keeps the cluster from ever starting its
+    auto-pause countdown (Aurora scale-to-zero, spec 2026-08-11). The handler
+    has four returns and can raise; a `finally` is the only way to cover them
+    all, and wrapping is cheaper than auditing each one forever.
+    """
+    try:
+        return _search(event, context)
+    finally:
+        close_cached_connection()
+
+
+def _search(event, context):
     sub = event.get("sub")
     try:
         k = int(event.get("k", 8))
