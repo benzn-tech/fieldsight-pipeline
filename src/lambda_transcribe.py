@@ -52,10 +52,17 @@ Note on LanguageCode vs IdentifyLanguage:
 
 import os
 import re
+import io
 import json
+import time
+import wave
 import logging
 import boto3
 from urllib.parse import unquote_plus
+
+import batch_ledger
+import batch_stitch
+import transcript_utils
 
 # Configure logging
 logger = logging.getLogger()
@@ -115,6 +122,17 @@ VOCABULARY_NAME = os.environ.get('VOCABULARY_NAME', '')
 
 # --- Provider toggle (Phase: alt-ASR) --------------------------------------
 ASR_PROVIDER = os.environ.get('ASR_PROVIDER', 'transcribe')  # transcribe | elevenlabs
+
+# Batched transcription (spec 2026-08-11): accumulate up to BATCH_MAX_CHUNKS consecutive
+# chunks of one session and send them as ONE request. Default off in code, template and
+# both workflows, so merging this changes nothing anywhere.
+BATCH_TRANSCRIPTION = os.environ.get('BATCH_TRANSCRIPTION', 'false').lower() == 'true'
+BATCH_MAX_CHUNKS = int(os.environ.get('BATCH_MAX_CHUNKS', '4'))
+BATCH_SEAL_DEADLINE_SEC = int(os.environ.get('BATCH_SEAL_DEADLINE_SEC', '150'))
+# Read here as well as in the VAD: batching assumes ONE unit per chunk, which is only true
+# in whole-chunk mode. In segment mode a chunk yields several speech islands and treating
+# one of them as "the chunk" would silently drop the rest.
+TRANSCRIBE_WHOLE_CHUNK = os.environ.get('TRANSCRIBE_WHOLE_CHUNK', 'false').lower() == 'true'
 KEYTERMS_PATH = os.environ.get('KEYTERMS_PATH', 'config/custom_vocabulary_construction_nz.txt')
 
 s3 = boto3.client('s3')
@@ -305,6 +323,133 @@ def write_ledger_record(display_name, file_date, base_name, job_name,
         logger.warning(f"  Ledger write failed (non-fatal): {e}")
 
 
+# ============================================================
+# Batched transcription (spec + plan 2026-08-11)
+# ============================================================
+
+def _wav_pcm(data):
+    """(pcm_bytes, sample_rate) from a 16-bit mono WAV payload."""
+    with wave.open(io.BytesIO(data), 'rb') as w:
+        return w.readframes(w.getnframes()), w.getframerate()
+
+
+def _wav_bytes(pcm, rate):
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _raw_key_for(unit_key):
+    """The device's own upload for a VAD unit — `users/{user}/audio/{date}/{stem}.wav`.
+
+    The overlap must be measured on THIS, not on the unit: normalisation applies
+    time-varying gain per chunk, so identical source samples come out as different bytes
+    and the measurement would find nothing — which, with the "measured zero means do not
+    trim" rule, silently switches all trimming off.
+    """
+    parts = unit_key.split('/')
+    if len(parts) < 4:
+        return None
+    stem = parts[-1].split('_off')[0]
+    return f"users/{parts[1]}/audio/{parts[2]}/{stem}.wav"
+
+
+def _measure_trim(bucket, prev_unit_key, unit_key):
+    """(seconds, measured) for the head of `unit_key`. Never raises.
+
+    A raw upload that is missing or unreadable — and 0.9% of them have been — means the
+    seam is unmeasured, not that there is no overlap. Unmeasured keeps the audio: the
+    duplicate survives into the transcript where `_dedup_turn_boundaries` still removes it,
+    whereas trimming a guessed length deletes speech with no trace.
+    """
+    try:
+        prev_raw, nxt_raw = _raw_key_for(prev_unit_key), _raw_key_for(unit_key)
+        if not prev_raw or not nxt_raw:
+            return 0.0, False
+        prev_pcm, rate = _wav_pcm(s3.get_object(Bucket=bucket, Key=prev_raw)['Body'].read())
+        nxt_pcm, _ = _wav_pcm(s3.get_object(Bucket=bucket, Key=nxt_raw)['Body'].read())
+    except Exception:
+        logger.warning("batch: could not read the raw uploads for the %s seam — "
+                       "keeping the audio, seam recorded as unmeasured", unit_key)
+        return 0.0, False
+    secs = batch_stitch.measure_overlap(prev_pcm, nxt_pcm, rate)
+    return secs, secs > 0.0
+
+
+def _seal_batch(bucket, session_id, run, by_index, now, table):
+    """Write one batch's map and audio. The WAV is last: its S3 event is what starts the
+    transcription, so a crash between the two must never leave a batch with no map."""
+    if batch_ledger.claim_seal(table, session_id, run[0], run, now) is None:
+        return                                    # someone else is sealing this batch
+
+    payloads, members, trims = [], [], []
+    for pos, idx in enumerate(run):
+        unit_key = by_index[idx]['chunk_key']
+        pcm, rate = _wav_pcm(s3.get_object(Bucket=bucket, Key=unit_key)['Body'].read())
+        if pos == 0:
+            trim, measured = 0.0, True            # nothing before it to repeat
+        else:
+            trim, measured = _measure_trim(bucket, by_index[run[pos - 1]]['chunk_key'],
+                                           unit_key)
+        base = transcript_utils.extract_base_time_from_filename(unit_key)
+        kept = (len(pcm) - int(round(trim * rate)) * 2) / (rate * 2)
+        members.append(batch_stitch.member(
+            idx, unit_key, base.isoformat() if base else '',
+            trimmed_head_sec=trim, kept_duration_sec=kept, trim_measured=measured))
+        payloads.append((pcm, rate))
+        trims.append(trim)
+
+    audio, rate = batch_stitch.concat_wavs(payloads, trims)
+    first_unit = by_index[run[0]]['chunk_key']
+    prefix, filename = first_unit.rsplit('/', 1)
+    stem = filename.split('_off')[0]
+    head_trim = members[0]['trimmed_head_sec']
+    duration = len(audio) / (rate * 2)
+    batch_name = batch_stitch.build_batch_name(stem, len(run), head_trim, duration)
+    batch_key = f"{prefix}/{batch_name}"
+    doc = batch_stitch.build_map(session_id, members, sealed_by='arrival')
+
+    s3.put_object(Bucket=bucket, Key=f"{prefix}/{batch_name[:-4]}_batch_map.json",
+                  Body=json.dumps(doc), ContentType='application/json')
+    s3.put_object(Bucket=bucket, Key=batch_key, Body=_wav_bytes(audio, rate),
+                  ContentType='audio/wav')
+    batch_ledger.mark_sealed(table, session_id, run[0], now)
+    logger.info("batch: sealed %s from chunks %s", batch_key, run)
+
+
+def _maybe_batch(bucket, key, results):
+    """Consume `key` as a batch member. False = batching does not apply, transcribe it.
+
+    Returning False rather than swallowing the key is the important half: a member that is
+    neither batched nor transcribed is audio that vanishes with no error anywhere.
+    """
+    session_id = transcript_utils.extract_session_id_from_filename(key)
+    chunk_index = transcript_utils.extract_chunk_index_from_filename(key)
+    if session_id is None or chunk_index is None:
+        return False                              # legacy / whole-file key
+    if not TRANSCRIBE_WHOLE_CHUNK:
+        logger.warning("batch: TRANSCRIBE_WHOLE_CHUNK is off, so a chunk is several units "
+                       "— falling back to per-chunk transcription for %s", key)
+        return False
+
+    now = int(time.time())
+    table = _get_dynamodb_table()
+    batch_ledger.register_chunk(table, session_id, chunk_index, key, now)
+    rows = batch_ledger.list_members(table, session_id)
+    by_index = {int(r['chunk_index']): r for r in rows}
+    for run in batch_ledger.pending_runs(rows, now, BATCH_SEAL_DEADLINE_SEC,
+                                         BATCH_MAX_CHUNKS):
+        _seal_batch(bucket, session_id, run, by_index, now, table)
+
+    results.append({'key': key, 'status': 'batched_pending',
+                    'session': session_id, 'chunk': chunk_index})
+    return True
+
+
 def lambda_handler(event, context):
     """Main Lambda handler"""
     logger.info(f"Received event: {json.dumps(event)}")
@@ -336,7 +481,17 @@ def lambda_handler(event, context):
             if key.startswith(OUTPUT_PREFIX):
                 logger.info(f"Skipping transcript file: {key}")
                 continue
-            
+
+            # Batching: a MEMBER chunk is accumulated instead of transcribed; the batch
+            # object it eventually produces arrives here as its own S3 event and takes the
+            # ordinary path below. is_batch_key is what separates the two, and getting it
+            # wrong is silent in both directions — a member transcribed as well as batched
+            # is paid for twice, a batch mistaken for a member is two minutes of audio that
+            # never gets transcribed at all.
+            if BATCH_TRANSCRIPTION and not batch_stitch.is_batch_key(key):
+                if _maybe_batch(bucket, key, results):
+                    continue
+
             # Extract user name and date from path
             display_name = extract_user_from_key(key)
             file_date = extract_date_from_key(key)
