@@ -49,6 +49,10 @@ REASON_NOTHING_CLOSE = "nothing_close_in_window"  # nothing resembling it is the
 # as "nothing there", which is the confusion this exists to end.
 NOTHING_CLOSE_RATIO = 0.63
 
+# The model's own elision marker. Matched on the RAW quote: `normalise` strips
+# punctuation, so by the time a quote is normalised the ellipsis is gone.
+_ELLIPSIS = re.compile(r"\s*(?:\.{2,}|…)\s*")
+
 _PUNCT = re.compile(r"[^\w\s]", re.UNICODE)
 _WS = re.compile(r"\s+")
 # CJK ideographs + compatibility + fullwidth forms.
@@ -141,7 +145,16 @@ def check_quote(quote, turns, at, *, w_seconds, floor_tokens, fuzzy_threshold):
 
     weak = token_count(quote) < floor_tokens
     ratio = None
+    fragments = 0
     pos = haystack.find(needle)
+    if pos < 0:
+        # An ellipsis is the model telling us it left something out. Checking
+        # each side separately turns a fuzzy guess into an exact test, and it
+        # is the only thing that works on this class: how much was elided is
+        # the model's choice, so the similarity of the joined string has no
+        # lower bound. Measured over 949 live citations, this is what nearly
+        # every fuzzy-branch citation actually was.
+        pos, fragments = _match_spliced(quote, haystack)
     if pos < 0:
         pos, ratio = _best_fuzzy(needle, haystack)
         if ratio is None:
@@ -160,8 +173,15 @@ def check_quote(quote, turns, at, *, w_seconds, floor_tokens, fuzzy_threshold):
     turn = _turn_at(window, norm_turns, pos)
     if weak:
         status = "weak"
+    elif ratio is None and not fragments:
+        status = "verified"
     else:
-        status = "verified" if ratio is None else "verified_fuzzy"
+        # A splice is exact on every fragment, so it is stronger evidence than
+        # a fuzzy match -- but it is not `verified`. "A... B" reads as one
+        # continuous sentence and is two moments, and in a feature whose whole
+        # job is provenance that difference cannot be quietly dropped. It stays
+        # in the tier that is counted apart.
+        status = "verified_fuzzy"
     out = {"status": status,
            "segment_key_source": turn.get("source_filename"),
            # Turn granularity, not sub-turn: _build_turn joins words into one
@@ -173,10 +193,45 @@ def check_quote(quote, turns, at, *, w_seconds, floor_tokens, fuzzy_threshold):
            "offset_sec": turn.get("start_sec")}
     if ratio is not None:
         out["fuzzy_ratio"] = round(ratio, 3)
+    if fragments:
+        out["spliced"] = True
+        out["fragments"] = fragments
     if turn.get("abs_start") and at is not None:
         out["found_offset_sec"] = round(
             abs(turn["abs_start"].timestamp() - at.timestamp()), 1)
     return out
+
+
+def _match_spliced(quote, haystack):
+    """Every ellipsis-separated fragment present, exactly. Returns
+    (earliest position, fragment count), or (-1, 0).
+
+    Transcripts carry no punctuation at all (parse_transcribe_json keeps
+    pronunciation items only), so "..." never occurs in the candidate text and
+    is unambiguously the model's own elision marker.
+
+    ORDER IS NOT REQUIRED, and that is not laxity. Turns sort by absolute start
+    while the mobile ring buffer overlaps chunks, so two transcriptions of the
+    same moment can land in either order -- a real 2026-08-10 citation had its
+    first-quoted fragment sitting AFTER its second in the candidate text.
+    Requiring increasing positions would have failed that honest citation while
+    looking rigorous.
+
+    All-or-nothing: one real half must never carry an invented one.
+    """
+    parts = [normalise(p) for p in _ELLIPSIS.split(quote or "")]
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return -1, 0                      # nothing was actually elided
+    positions = []
+    for part in parts:
+        i = haystack.find(part)
+        if i < 0:
+            return -1, 0
+        positions.append(i)
+    # Earliest in the candidate text, which (turns being time-ordered) is the
+    # earliest audio -- where a listener should start.
+    return min(positions), len(parts)
 
 
 def _best_fuzzy(needle, haystack):
