@@ -598,6 +598,53 @@ Parameters:
       morning after. Declared here rather than left to the code default so the
       rollback survives a deploy.
 
+  EvidenceWindowSec:
+    Type: String
+    Default: '60'
+    Description: >-
+      Half-width, in seconds, of the window a cited quote is searched in around
+      the timestamp the model gave it. A quote matching somewhere else entirely
+      is a MIS-citation, so this is what stops a wide search manufacturing
+      verifications. 300 was provisional and is now measurably far too wide:
+      across 42 citations from two real multi-chunk sessions every honest match
+      landed within 6.1s of its cited time, 40 of 42 within 1.0s -- because the
+      model copies the [HH:MM:SS] label of the line it quotes, so this measures
+      its timestamp accuracy rather than a quote's position inside a turn. Same
+      run also showed the wide window was not manufacturing anything: all 42
+      matched the turn they cited, none matched elsewhere in the +/-5min span.
+      A Parameter because the calibration this feeds is worthless if its result
+      cannot be applied -- set on the live function instead, it is erased by the
+      next CloudFormation reconcile with no error anywhere.
+
+  EvidenceFuzzyThreshold:
+    Type: String
+    Default: '0.80'
+    Description: >-
+      Similarity a quote must reach, when exact containment fails, to count as
+      `verified_fuzzy` -- the tier that absorbs honest regularisation
+      ("can't"/"cannot", digits versus words, dropped fillers) rather than
+      fabrication. 0.9 was provisional and cost far more than it looked: it
+      rejects 59.6% of honest-but-tidied quotes, and 30.3% even of quotes
+      carrying a SINGLE tidy, filing every one of them as the fabrication
+      signal. Two populations were measured -- real quotes scored against
+      windows they do not belong to (n=1,886, no assumptions) versus real
+      quotes rewritten the way a model tidies (n=109, synthetic). They barely
+      overlap: the spurious population tops out at 0.809, the honest one
+      bottoms at 0.634. 0.65-0.80 is a plateau where >=97% of honest quotes
+      survive and <=0.1% of spurious ones get in; 0.80 sits at its upper edge,
+      the conservative end of the flat region rather than a point estimate.
+      The synthetic half is the assumption to re-test -- see the PR.
+
+  EvidenceFloorTokens:
+    Type: String
+    Default: '5'
+    Description: >-
+      Below this length a matched quote is `weak`, not `verified`: "yes" is
+      contained in almost any transcript, and without a floor the headline
+      number is biased optimistic by the cheapest possible citation. Counted per
+      script (CJK at ~2 chars per token) so a fully specific Chinese quote is
+      not capped at `weak` for having no spaces in it.
+
   DeviceAnnouncementPatterns:
     Type: String
     Default: ''
@@ -646,6 +693,20 @@ Parameters:
       authority, the /live-items per-user filter -- Phase 3 graded-roles
       spec §3). False (default) is the pre-Phase-3 binary resolve_scope
       behavior, unchanged in every path, mirroring AuthorityFlip's rollout.
+
+  UploadVerifyMode:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['off', 'observe', 'enforce']
+    Description: >-
+      Whether POST /recordings/{id}/complete checks that the object actually
+      reached S3 before it stamps uploaded_at. off = the old behaviour, take
+      the client's word (rollback). observe = still 200, but log the verdict
+      enforce would have reached. enforce = 409 on an absent object, so the
+      row stays pending and the device re-sends. Three states rather than a
+      boolean because the risks are not symmetric: a wrong enforce rejects
+      every upload, against a measured 0.9% of chunk-session recordings lost
+      by waiting (spec 2026-08-09-upload-completion-verified).
 
   ManageDataBucketPolicy:
     Type: String
@@ -1336,6 +1397,9 @@ Resources:
           # AUTHORITY_FLIP (IngestFunction, above): Parameter default 'false',
           # driven per-environment by a repo variable in the deploy workflows.
           GRADED_ROLES: !Ref GradedRoles
+          # Does `complete` verify the bytes arrived before stamping
+          # uploaded_at? See the UploadVerifyMode parameter.
+          UPLOAD_VERIFY_MODE: !Ref UploadVerifyMode
           # Deploy = thaw. See the ServerBuild parameter.
           SERVER_BUILD: !Ref ServerBuild
           # QR passwordless login (2026-07-30) — PROD-ONLY (see IsProdWithOrgApi
@@ -1607,6 +1671,9 @@ Resources:
       Environment:
         Variables:
           EMIT_EVIDENCE: !Ref EmitEvidence
+          EVIDENCE_WINDOW_SEC: !Ref EvidenceWindowSec
+          EVIDENCE_FUZZY_THRESHOLD: !Ref EvidenceFuzzyThreshold
+          EVIDENCE_FLOOR_TOKENS: !Ref EvidenceFloorTokens
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json

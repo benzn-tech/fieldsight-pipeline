@@ -18,6 +18,37 @@ import unicodedata
 # because they DOMINATE rather than rank.
 STATUS_ORDER = ["weak", "verified_fuzzy", "verified"]
 
+# Why a citation failed. `unverified` on its own is not actionable: it means
+# either "our matcher was too strict" or "the model invented it", and the first
+# splits again by WHICH rule was too strict -- each with a different fix (W, the
+# normaliser, the fuzzy cut). These codes travel into the artifact so a reader
+# starts from what the matcher already knew rather than re-deriving it by hand,
+# and so the cases the matcher knew for certain cost no reading at all.
+REASON_NO_TURNS = "no_turns_in_window"           # W too narrow, or a bad anchor
+REASON_NO_CANDIDATE_TEXT = "no_candidate_text"   # turns present but empty: ASR, not W
+REASON_EMPTY_QUOTE = "empty_quote"               # nothing was cited
+REASON_BELOW_FUZZY = "below_fuzzy_threshold"     # a near miss: blame the cut
+REASON_NOTHING_CLOSE = "nothing_close_in_window"  # nothing resembling it is there
+
+# Where "not close" stops being "not close ENOUGH".
+#
+# One code for both sends the reader to the wrong place. The first real
+# unverified citation this feature produced was labelled below_fuzzy_threshold
+# at a ratio of 0.331 -- which reads as "the cut is too strict" when the truth
+# was that the quote sat 560 seconds away and nothing resembling it was in the
+# window at all. Loosening the threshold would not have helped, and looking
+# there is wasted time.
+#
+# Measured 2026-08-10 over two populations: no honestly-tidied quote scored
+# below 0.634, and 99% of quotes scored against windows they do not belong to
+# scored below 0.625. This constant is that gap.
+#
+# Deliberately NOT the fuzzy threshold, and deliberately not a deploy
+# parameter: it labels, it never decides a status. Tying it to the threshold
+# would mean tightening the cut silently starts relabelling genuine near-misses
+# as "nothing there", which is the confusion this exists to end.
+NOTHING_CLOSE_RATIO = 0.63
+
 _PUNCT = re.compile(r"[^\w\s]", re.UNICODE)
 _WS = re.compile(r"\s+")
 # CJK ideographs + compatibility + fullwidth forms.
@@ -97,7 +128,7 @@ def check_quote(quote, turns, at, *, w_seconds, floor_tokens, fuzzy_threshold):
     """
     window = windowed_turns(turns, at, w_seconds)
     if not window:
-        return {"status": "unverified", "reason": "no turns in window"}
+        return {"status": "unverified", "reason": REASON_NO_TURNS}
 
     # Concatenated, not tested per turn: turns are per-segment and never merged
     # across chunks, so a sentence split at a chunk seam is two turns and
@@ -106,15 +137,25 @@ def check_quote(quote, turns, at, *, w_seconds, floor_tokens, fuzzy_threshold):
     haystack = " ".join(norm_turns)
     needle = normalise(quote)
     if not needle:
-        return {"status": "unverified", "reason": "empty quote"}
+        return {"status": "unverified", "reason": REASON_EMPTY_QUOTE}
 
     weak = token_count(quote) < floor_tokens
     ratio = None
     pos = haystack.find(needle)
     if pos < 0:
         pos, ratio = _best_fuzzy(needle, haystack)
-        if ratio is None or ratio < fuzzy_threshold:
-            return {"status": "unverified", "fuzzy_ratio": ratio}
+        if ratio is None:
+            # Turns were in the window but carried no words. Widening W would
+            # never fix this one, so it must not be filed beside the misses
+            # that widening W does fix.
+            return {"status": "unverified", "reason": REASON_NO_CANDIDATE_TEXT}
+        if ratio < fuzzy_threshold:
+            # Which of the two failures it is decides where the next person
+            # looks: at our cut, or at the anchor and the transcript.
+            reason = (REASON_BELOW_FUZZY if ratio >= NOTHING_CLOSE_RATIO
+                      else REASON_NOTHING_CLOSE)
+            return {"status": "unverified", "reason": reason,
+                    "fuzzy_ratio": round(ratio, 3)}
 
     turn = _turn_at(window, norm_turns, pos)
     if weak:

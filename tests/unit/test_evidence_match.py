@@ -154,3 +154,91 @@ def test_rollup_takes_the_worst_remaining():
     assert em.roll_up(["verified", "weak"]) == "weak"
     assert em.roll_up(["verified", "verified_fuzzy"]) == "verified_fuzzy"
     assert em.roll_up(["verified", "verified"]) == "verified"
+
+
+# ---- why it was unverified --------------------------------------------
+#
+# The status alone cannot be acted on. `unverified` has two disjoint causes with
+# disjoint fixes -- our matcher was too strict, or the model invented the quote
+# -- and the first splits again by which rule was too strict. Without a code on
+# every unverified path, a person has to re-derive by hand what the matcher
+# already knew, including for the cases the matcher knew for certain.
+
+def test_every_unverified_path_carries_a_machine_readable_reason():
+    codes = {
+        em.REASON_NO_TURNS: em.check_quote("x y z a b", [], AT, **KW),
+        em.REASON_EMPTY_QUOTE: em.check_quote("", [_turn("anything")], AT, **KW),
+        em.REASON_NOTHING_CLOSE: em.check_quote(
+            "the market is coming down sharply now",
+            [_turn("the slab pour is pushed to Thursday")], AT, **KW),
+        em.REASON_BELOW_FUZZY: em.check_quote(
+            "the slab pour is pushed to Friday",
+            [_turn("the slab pour is pushed to Thursday")], AT, **KW),
+    }
+    for expected, r in codes.items():
+        assert r["status"] == "unverified"
+        assert r["reason"] == expected
+
+
+def test_a_fuzzy_miss_keeps_its_ratio_alongside_the_reason():
+    # The ratio is what says whether the THRESHOLD was too strict or the quote
+    # was never there; the reason alone cannot distinguish them.
+    r = em.check_quote("the slab pour is pushed to Friday",
+                       [_turn("the slab pour is pushed to Thursday")], AT, **KW)
+    assert r["reason"] == em.REASON_BELOW_FUZZY
+    assert 0 < r["fuzzy_ratio"] < 0.9
+
+
+def test_a_window_holding_only_empty_turns_is_told_apart_from_an_empty_window():
+    # Both used to be indistinguishable in the artifact, and they mean opposite
+    # things: one is a window too narrow, the other is a transcript with nothing
+    # in it. Widening W would never fix the second.
+    r = em.check_quote("x y z a b", [_turn("")], AT, **KW)
+    assert r["status"] == "unverified"
+    assert r["reason"] == em.REASON_NO_CANDIDATE_TEXT
+
+
+def test_a_matched_quote_carries_no_reason():
+    # Only failures explain themselves; a reason on every row would bloat the
+    # artifact for the healthy majority.
+    r = em.check_quote("the slab pour is pushed to Thursday",
+                       [_turn("the slab pour is pushed to Thursday")], AT, **KW)
+    assert "reason" not in r
+
+
+# ---- "not close" is not "not close ENOUGH" -----------------------------
+#
+# One code for both sends the reader to the wrong place. The first real
+# unverified citation this feature produced carried `below_fuzzy_threshold` at
+# a ratio of 0.331 -- which reads as "the cut is too strict, loosen it" when
+# the truth was that the quote was 560 seconds away and nothing resembling it
+# was in the window at all. A near-miss of genuinely similar text scores around
+# 0.85; 0.33 is the score of unrelated speech.
+
+def test_a_quote_with_nothing_resembling_it_is_told_apart_from_a_near_miss():
+    turns = [_turn("the slab pour is pushed to Thursday because of the pump")]
+    far = em.check_quote("the market is now coming down sharply in wellington",
+                         turns, AT, **KW)
+    assert far["status"] == "unverified"
+    assert far["reason"] == em.REASON_NOTHING_CLOSE
+    assert far["fuzzy_ratio"] < em.NOTHING_CLOSE_RATIO
+
+
+def test_a_genuine_near_miss_still_blames_the_threshold():
+    # One word changed out of eight: this IS the case the fuzzy tier exists for,
+    # and the reason must point at the cut rather than at the transcript.
+    turns = [_turn("the slab pour is pushed to Thursday because of the pump")]
+    near = em.check_quote("the slab pour is pushed to Friday because of the pump",
+                          turns, AT, w_seconds=90, floor_tokens=5,
+                          fuzzy_threshold=0.99)
+    assert near["status"] == "unverified"
+    assert near["reason"] == em.REASON_BELOW_FUZZY
+    assert near["fuzzy_ratio"] >= em.NOTHING_CLOSE_RATIO
+
+
+def test_the_cut_sits_where_the_two_populations_stop_overlapping():
+    # Measured 2026-08-10: no honest sample scored below 0.634, and 99% of
+    # spurious ones scored below 0.625. The constant is that gap, and it is
+    # deliberately NOT the fuzzy threshold -- tightening the threshold must not
+    # silently start relabelling near-misses as "nothing there".
+    assert 0.62 <= em.NOTHING_CLOSE_RATIO <= 0.64

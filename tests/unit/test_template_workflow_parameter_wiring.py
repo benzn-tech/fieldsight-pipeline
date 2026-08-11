@@ -136,6 +136,18 @@ def test_the_audio_event_tag_filter_is_wired_in_both_environments():
             f"FILTER_AUDIO_EVENT_TAGS=false cannot be applied by redeploying")
 
 
+def test_the_upload_verify_mode_is_wired_in_both_environments():
+    """Not a boolean, so the sweep above cannot see it — and it is the one
+    switch where being stuck on a default is worst in both directions: stuck on
+    `off` keeps losing 0.9% of recordings, stuck on `enforce` rejects every
+    upload. It must be settable from a repo variable in both environments."""
+    for env, path in WORKFLOWS.items():
+        assert "UploadVerifyMode" in _overrides(path), (
+            f"{env} does not pass UploadVerifyMode, so UPLOAD_VERIFY_MODE can "
+            f"only ever hold its template default and neither rolling forward "
+            f"to enforce nor rolling back to off would work")
+
+
 def test_the_exception_list_does_not_rot():
     """An entry that no longer names a boolean Parameter is stale and hides
     nothing — it should be deleted rather than left to look load-bearing."""
@@ -241,3 +253,103 @@ def test_both_workflows_pass_the_merge_tunables():
         for _, (param, _) in _MERGE_TUNABLES.items():
             assert f"{param}=" in wf, \
                 f"{env_name} does not pass {param}; the Parameter holds its default forever"
+
+
+# ---- the evidence-matcher tunables -------------------------------------
+#
+# These are not booleans, so the boolean sweep above never covered them, and
+# they were code-only defaults until 2026-08-10: `EVIDENCE_WINDOW_SEC` did not
+# appear in the template at all. That was found while calibrating W against the
+# first real multi-chunk sessions -- the measurement said 300s was ~50x wider
+# than any honest match needed, and there was no way to apply the answer. A
+# calibration whose result cannot be deployed is not a calibration.
+
+_EVIDENCE_TUNABLES = {
+    # env var                    : (template Parameter, functions that read it)
+    "EVIDENCE_WINDOW_SEC":        ("EvidenceWindowSec", ("ExtractSessionFunction",)),
+    "EVIDENCE_FUZZY_THRESHOLD":   ("EvidenceFuzzyThreshold", ("ExtractSessionFunction",)),
+    "EVIDENCE_FLOOR_TOKENS":      ("EvidenceFloorTokens", ("ExtractSessionFunction",)),
+}
+
+
+def test_the_evidence_tunables_exist_as_template_parameters():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for env, (param, _) in _EVIDENCE_TUNABLES.items():
+        assert re.search(rf"\n  {param}:\n", text), \
+            f"{env} has no {param} Parameter — it can only ever hold its code default"
+
+
+def test_every_function_that_reads_an_evidence_tunable_is_given_it():
+    """The middle segment of the three. A Parameter that no function references
+    is as inert as no Parameter at all, and reads as wired from the template's
+    Parameters block alone."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for env, (param, fns) in _EVIDENCE_TUNABLES.items():
+        for fn in fns:
+            assert f"{env}: !Ref {param}" in _function_block(text, fn), \
+                f"{fn} reads {env} but is not given it"
+
+
+def test_both_workflows_pass_the_evidence_tunables():
+    for env_name in ("prod", "test"):
+        for _, (param, _) in _EVIDENCE_TUNABLES.items():
+            assert param in _overrides(WORKFLOWS[env_name]), \
+                (f"{env_name} does not pass {param}; the Parameter holds its "
+                 f"default forever and the calibrated value cannot be applied")
+
+
+def test_the_window_default_is_not_the_uncalibrated_one():
+    """300s was the provisional value shipped before there was a distribution.
+
+    Across 42 citations from two real multi-chunk sessions every honest match
+    landed within 6.1s of its cited time. This does not pin a specific number --
+    a later calibration may move it again -- it pins that the value stopped
+    being the one chosen before any measurement existed.
+    """
+    for env_name in ("prod", "test"):
+        wf = open(WORKFLOWS[env_name], encoding="utf-8").read()
+        line = [ln for ln in wf.splitlines() if "EvidenceWindowSec=" in ln]
+        assert len(line) == 1, f"{env_name}: expected one line, found {len(line)}"
+        assert "'300'" not in line[0], (
+            f"{env_name} still defaults W to the pre-measurement 300s")
+
+
+def test_the_fuzzy_default_is_not_the_uncalibrated_one():
+    """0.9 was chosen before any distribution existed to look at.
+
+    Measured 2026-08-10 against two populations -- real quotes scored against
+    windows they do not belong to (n=1,886), and real quotes rewritten the way
+    a model tidies (n=109) -- it rejects 59.6% of honest-but-tidied quotes, and
+    30.3% of those carrying a single tidy, filing every one as the fabrication
+    signal this feature exists to measure.
+
+    Like the window test, this pins that the value stopped being the
+    pre-measurement one, not a particular number.
+    """
+    for env_name in ("prod", "test"):
+        wf = open(WORKFLOWS[env_name], encoding="utf-8").read()
+        line = [ln for ln in wf.splitlines() if "EvidenceFuzzyThreshold=" in ln]
+        assert len(line) == 1, f"{env_name}: expected one line, found {len(line)}"
+        assert "'0.9'" not in line[0], (
+            f"{env_name} still defaults the fuzzy cut to the pre-measurement 0.9")
+
+
+def test_the_code_defaults_match_the_template_defaults():
+    """When they disagree the environment wins silently, and the number in the
+    source reads like the one in force. That is how a calibrated value gets
+    quietly reverted by someone reading only the module."""
+    import re as _re
+    tpl = open(TEMPLATE, encoding="utf-8").read()
+    src = open(os.path.join(REPO, "src", "lambda_extract_session.py"),
+               encoding="utf-8").read()
+    pairs = [("EvidenceWindowSec", "EVIDENCE_WINDOW_SEC"),
+             ("EvidenceFuzzyThreshold", "EVIDENCE_FUZZY_THRESHOLD"),
+             ("EvidenceFloorTokens", "EVIDENCE_FLOOR_TOKENS")]
+    for param, env in pairs:
+        block = _re.search(rf"\n  {param}:\n(.*?)(?=\n  \w+:\n)", tpl, _re.S).group(1)
+        tpl_default = _re.search(r"Default:\s*'([^']+)'", block).group(1)
+        code_default = _re.search(
+            rf"os\.environ\.get\('{env}',\s*'([^']+)'\)", src).group(1)
+        assert float(tpl_default) == float(code_default), (
+            f"{env}: template default {tpl_default!r} != code default "
+            f"{code_default!r}")

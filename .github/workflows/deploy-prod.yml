@@ -196,8 +196,12 @@ jobs:
               "StuckMergeSeconds=${{ vars.PROD_STUCK_MERGE_SECONDS || '1800' }}" \
               "GroupMaxSpanSeconds=${{ vars.PROD_GROUP_MAX_SPAN_SECONDS || '43200' }}" \
               "EmitEvidence=${{ vars.PROD_EMIT_EVIDENCE || 'false' }}" \
+              "EvidenceWindowSec=${{ vars.PROD_EVIDENCE_WINDOW_SEC || '60' }}" \
+              "EvidenceFuzzyThreshold=${{ vars.PROD_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
+              "EvidenceFloorTokens=${{ vars.PROD_EVIDENCE_FLOOR_TOKENS || '5' }}" \
               "AuthorityFlip=${{ vars.PROD_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.PROD_GRADED_ROLES || 'false' }}" \
+              "UploadVerifyMode=${{ vars.PROD_UPLOAD_VERIFY_MODE || 'observe' }}" \
               "ServerBuild=${{ github.sha }}" \
               "ManageDataBucketPolicy=false" \
               "VadLayerArn=${{ vars.PROD_VAD_LAYER_ARN }}" \

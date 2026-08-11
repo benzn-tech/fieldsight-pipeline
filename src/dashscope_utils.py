@@ -56,6 +56,28 @@ DASHSCOPE_AIGC_URL = os.environ.get(
     "DASHSCOPE_AIGC_URL",
     "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
 )
+
+# --- File transcription (async) --------------------------------------------
+# A DIFFERENT API from DASHSCOPE_AIGC_URL above, with a different body shape.
+# Conflating the two is how four separate sessions wrote a broken call: the
+# single-shot path takes base64 under input.messages, this one takes a URL
+# under input.file_urls and answers with a task id to poll.
+DASHSCOPE_TRANSCRIPTION_URL = os.environ.get(
+    "DASHSCOPE_TRANSCRIPTION_URL",
+    "https://dashscope-intl.aliyuncs.com/api/v1/services/audio/asr/transcription",
+)
+DASHSCOPE_TASK_URL = os.environ.get(
+    "DASHSCOPE_TASK_URL", "https://dashscope-intl.aliyuncs.com/api/v1/tasks/{task_id}",
+)
+# Only this id accepts INLINE hotwords. Others take a precompiled vocabulary_id
+# or nothing; an id without "filetrans" is rejected as "Model not exist." on
+# this endpoint, because it belongs to the other API.
+DASHSCOPE_FILETRANS_MODEL = os.environ.get(
+    "DASHSCOPE_FILETRANS_MODEL", "qwen-audio-3.0-asr-flash-filetrans",
+)
+# Vendor capacity, not a bad request -- the identical body succeeds minutes
+# later. Treated as retryable so a queue spike is never read as a model verdict.
+TRANSCRIPTION_RETRYABLE_CODES = {"INSTANCE_POOL_EXHAUSTED"}
 DASHSCOPE_ASR_MODEL = os.environ.get("DASHSCOPE_ASR_MODEL", "qwen3-asr-flash")
 DASHSCOPE_ASR_LANG = os.environ.get("DASHSCOPE_ASR_LANG", "en")
 
@@ -260,6 +282,110 @@ def stt(audio_bytes, fmt="m4a"):
         "parameters": {"asr_options": {"language": DASHSCOPE_ASR_LANG, "enable_lid": False}},
     })
     return _extract_asr_text(_aigc_request(body))
+
+
+def transcribe_file(file_url, diarize=True, speaker_count=None, hotwords=None,
+                    language_hints=("zh", "en"), model=None, poll_seconds=3.0,
+                    budget_seconds=300.0, _sleep=time.sleep):
+    """Transcribe an audio file by URL. Returns the parsed transcription payload.
+
+    This is the ASYNC file-transcription API, not stt() above. The differences
+    are the ones that have repeatedly been guessed wrong, so they are encoded
+    here once instead of being remembered:
+
+      - the input field is `file_urls` (plural, a list). Passing the singular
+        name is reported as `InvalidParameter.MalformedURL` -- "A valid file
+        URL is required" -- which points at the URL and not at the field.
+      - diarization is OFF unless `diarization_enabled` is sent. A run without
+        it says nothing about whether the model supports speakers; that
+        mistake is how "qwen does not diarize" became a believed fact.
+      - `hotwords` go inline as {term: weight 1-5}, and ONLY
+        qwen-audio-3.0-asr-flash-filetrans accepts them inline.
+      - the task payload does NOT contain the transcript. It contains a
+        `transcription_url` that must be fetched separately.
+
+    A caller passing an expired presigned URL gets `FILE_DOWNLOAD_FAILED`,
+    which also reads like a model fault. Note that an S3 URL signed with
+    TEMPORARY credentials dies with the session token, not at --expires-in.
+    """
+    if not DASHSCOPE_API_KEY:
+        raise RuntimeError("DASHSCOPE_API_KEY not set")
+    params = {}
+    if diarize:
+        params["diarization_enabled"] = True
+        if speaker_count:
+            params["speaker_count"] = int(speaker_count)
+    if language_hints:
+        params["language_hints"] = list(language_hints)
+    if hotwords:
+        params["vocabulary"] = {
+            str(t): int(w) for t, w in (hotwords.items() if isinstance(hotwords, dict)
+                                        else ((t, 5) for t in hotwords))
+        }
+    body = json.dumps({
+        "model": model or DASHSCOPE_FILETRANS_MODEL,
+        "input": {"file_urls": [file_url]},
+        "parameters": params,
+    })
+    http = urllib3.PoolManager()
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
+        "X-DashScope-Async": "enable",
+    }
+    for attempt in range(MAX_ATTEMPTS):
+        resp = http.request("POST", DASHSCOPE_TRANSCRIPTION_URL, body=body,
+                            headers=headers, timeout=60.0)
+        if resp.status != 200:
+            raise RuntimeError(
+                f"DashScope transcription submit HTTP {resp.status}: {resp.data[:300]}")
+        task_id = json.loads(resp.data.decode("utf-8")).get("output", {}).get("task_id")
+        if not task_id:
+            raise RuntimeError(f"no task_id in submit response: {resp.data[:300]}")
+        code, payload = _await_transcription(http, headers, task_id, poll_seconds,
+                                             budget_seconds, _sleep)
+        if code == "SUCCEEDED":
+            return payload
+        if code in TRANSCRIPTION_RETRYABLE_CODES and attempt < MAX_ATTEMPTS - 1:
+            logger.warning("DashScope transcription %s (attempt %d), retrying", code, attempt + 1)
+            _sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
+            continue
+        raise RuntimeError(f"DashScope transcription failed: {code}")
+    raise RuntimeError("DashScope transcription failed after retries")
+
+
+def _await_transcription(http, headers, task_id, poll_seconds, budget_seconds, _sleep):
+    """Poll one task. Returns (code, payload); payload is None unless SUCCEEDED."""
+    waited = 0.0
+    poll_headers = {"Authorization": headers["Authorization"]}
+    while waited < budget_seconds:
+        _sleep(poll_seconds)
+        waited += poll_seconds
+        r = http.request("GET", DASHSCOPE_TASK_URL.format(task_id=task_id),
+                         headers=poll_headers, timeout=60.0)
+        out = json.loads(r.data.decode("utf-8")).get("output", {})
+        status = out.get("task_status")
+        if status == "SUCCEEDED":
+            return "SUCCEEDED", _fetch_transcription(http, out)
+        if status in ("FAILED", "CANCELED"):
+            return out.get("code") or status, None
+    return "TIMEOUT", None
+
+
+def _fetch_transcription(http, output):
+    """The transcript lives behind a URL in the task result, not in the task.
+
+    Two shapes in the wild: qwen models put it at output.result, fun-asr at
+    output.results[0]. Both are checked so a model swap does not silently
+    return nothing."""
+    url = (output.get("result") or {}).get("transcription_url")
+    if not url:
+        results = output.get("results") or []
+        url = (results[0] if results else {}).get("transcription_url")
+    if not url:
+        raise RuntimeError(f"SUCCEEDED but no transcription_url: {json.dumps(output)[:300]}")
+    r = http.request("GET", url, timeout=60.0)
+    return json.loads(r.data.decode("utf-8", "replace"))
 
 
 # Lazy-loaded handles for the DashScope realtime SDK. Stay None until the
