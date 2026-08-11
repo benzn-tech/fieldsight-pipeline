@@ -647,6 +647,25 @@ Parameters:
       the conservative end of the flat region rather than a point estimate.
       The synthetic half is the assumption to re-test -- see the PR.
 
+  LlmTemperature:
+    Type: String
+    Default: ''
+    Description: >-
+      Sampling temperature for whichever LLM provider is in use. EMPTY means
+      the parameter is not sent at all and the provider's own default applies
+      -- which is what every call in this repo did until 2026-08-12, DashScope
+      documenting 0.7 for the non-thinking Qwen path.
+      It does NOT make extraction reproducible: a preregistered 2x2 (10 calls
+      per cell on one fixed session) found the action count still ranged 1-9 at
+      temperature 0 against 1-10 at the default, with the coverage difference
+      inside the noise. The reason to have the knob is a different, much larger
+      effect from the same run -- the share of action items carrying a
+      `responsible` went from 79% to 92%, and that is the field a misheard name
+      has already put wrong into a customer email.
+      Default empty rather than 0 because `call_llm` is shared by the rolling
+      summary, finalize, the matcher and the ask agent, and one experiment on
+      one task does not license changing all of them.
+
   EvidenceFloorTokens:
     Type: String
     Default: '5'
@@ -1027,6 +1046,7 @@ Resources:
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
@@ -1142,6 +1162,7 @@ Resources:
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
@@ -1254,6 +1275,7 @@ Resources:
           # matches the legacy S3 path's HAIKU_MODEL.
           CLAUDE_MODEL: claude-haiku-4-5-20251001
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelFast
@@ -1702,6 +1724,7 @@ Resources:
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
@@ -1801,6 +1824,7 @@ Resources:
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
@@ -2098,6 +2122,7 @@ Resources:
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
@@ -2552,6 +2577,7 @@ Resources:
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus

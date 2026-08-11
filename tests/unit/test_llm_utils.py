@@ -210,3 +210,67 @@ def test_extract_json_braces_fallback():
 
 def test_extract_json_failure_returns_none():
     assert lu.extract_json("no json here") is None
+
+
+# ---- sampling temperature ----------------------------------------------
+#
+# Nothing in this repo has ever set `temperature`, so every call has taken the
+# provider default (DashScope documents 0.7 for the non-thinking Qwen path).
+#
+# Measured 2026-08-12 over a preregistered 2x2, 10 calls per cell on one fixed
+# session: temperature=0 did NOT make the extraction reproducible -- the action
+# count still ranged 1-9 against the default's 1-10, and the coverage
+# difference was inside the noise (p = 0.29). That hypothesis is dead.
+#
+# What it DID do, and the effect is far too large to be noise: the share of
+# action items carrying a `responsible` went from 79% to 92%. That field is the
+# one that has already cost something -- a misheard name put the wrong
+# responsible party into a customer email -- so the knob is worth having for
+# that reason alone, and for no other.
+#
+# Shipped as a knob rather than a new default: one experiment, one session, one
+# task, and `call_llm` is shared by the rolling summary, finalize, the matcher
+# and the ask agent, none of which were measured.
+
+def test_temperature_is_sent_when_configured(monkeypatch):
+    monkeypatch.setattr(lu, "LLM_TEMPERATURE", 0.0)
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "k")
+    sent = {}
+    monkeypatch.setattr(lu, "_post_with_retry",
+                        lambda url, body, headers: (sent.update(body=json.loads(body)), (None, "stop"))[1])
+    lu._call_qwen("p", 100, True, enable_thinking=False)
+    assert sent["body"]["temperature"] == 0.0
+
+
+def test_temperature_is_absent_when_not_configured(monkeypatch):
+    """Unset must mean UNSENT, not zero. Sending 0 by default would change
+    every caller in the repo on the strength of one experiment."""
+    monkeypatch.setattr(lu, "LLM_TEMPERATURE", None)
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "k")
+    sent = {}
+    monkeypatch.setattr(lu, "_post_with_retry",
+                        lambda url, body, headers: (sent.update(body=json.loads(body)), (None, "stop"))[1])
+    lu._call_qwen("p", 100, True, enable_thinking=False)
+    assert "temperature" not in sent["body"]
+
+
+def test_the_anthropic_path_honours_it_too(monkeypatch):
+    """A knob that silently does nothing on one provider is the unwired-toggle
+    shape: flipping LLM_PROVIDER would quietly drop it."""
+    monkeypatch.setattr(lu, "LLM_TEMPERATURE", 0.0)
+    monkeypatch.setattr(lu, "ANTHROPIC_API_KEY", "k")
+    sent = {}
+    monkeypatch.setattr(lu, "_post_with_retry",
+                        lambda url, body, headers: (sent.update(body=json.loads(body)), (None, "stop"))[1])
+    lu._call_anthropic("p", 100)
+    assert sent["body"]["temperature"] == 0.0
+
+
+def test_a_thinking_call_also_carries_it(monkeypatch):
+    monkeypatch.setattr(lu, "LLM_TEMPERATURE", 0.0)
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "k")
+    sent = {}
+    monkeypatch.setattr(lu, "_post_with_retry",
+                        lambda url, body, headers: (sent.update(body=json.loads(body)), (None, "stop"))[1])
+    lu._call_qwen("p", 100, True, enable_thinking=True)
+    assert sent["body"]["temperature"] == 0.0
