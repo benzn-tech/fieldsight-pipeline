@@ -258,7 +258,35 @@ def _brings_new_content(solo, merged):
         set(merged.get("source_transcripts") or []))
 
 
-def _enqueue_updated_emails(artifact, put=None):
+def _resolve_member_contexts(conn, artifact):
+    """Each member session's {recipient, date, timeRange, siteName}, keyed by sid.
+
+    MUST run inside the connection block: the caller's `with get_connection()`
+    closes the connection on exit (the comment above the enqueue call is the
+    scar from finding that out), and the enqueue itself has to happen after the
+    commit so the merged topics are durable before anyone is told to look.
+    Resolving here and enqueueing there satisfies both.
+
+    Reuses finalize-claim's own resolver rather than re-deriving it. The date is
+    an NZ-local conversion of a UTC timestamp, and a second implementation of
+    that is how BUG-37 keeps coming back -- a UTC date names a folder that does
+    not exist and the email quietly says "No summary". Imported lazily so the
+    module graph stays acyclic at load time.
+    """
+    from lambda_finalize_claim import _resolve_context
+    out = {}
+    for sid in artifact.get("memberSessions") or []:
+        try:
+            row = meeting_session.get(conn, sid)
+            if row:
+                out[sid] = _resolve_context(conn, row) or {}
+        except Exception:
+            # One unresolvable member must not cost the others their email.
+            logger.exception("updated-email: could not resolve context for member %s", sid)
+    return out
+
+
+def _enqueue_updated_emails(artifact, contexts, put=None):
     """One finalize request per member, all quoting ONE summary.
 
     The summary rides in the artifact rather than being rebuilt per member:
@@ -274,9 +302,25 @@ def _enqueue_updated_emails(artifact, put=None):
     put = put or _put_finalize_request
     todos = _todos_from_topics(artifact)
     for sid in artifact.get("memberSessions") or []:
+        ctx = (contexts or {}).get(sid) or {}
+        recipient = (ctx.get("recipient") or "").strip()
+        if not recipient:
+            # This used to be written anyway, with no recipient at all, and the
+            # worker skipped it BEFORE writing a result -- so the member got no
+            # email and nothing anywhere recorded that. Refusing to write the
+            # request, loudly, is the same outcome with a trace.
+            logger.warning("updated-email: no recipient for member %s of group %s "
+                           "-- not enqueued", sid, artifact.get("groupId"))
+            continue
         put(f"session_finalize_requests/{sid}-updated.json",
             {"kind": "updated", "sessionId": sid,
              "groupId": artifact.get("groupId"),
+             "recipient": recipient,
+             # The email renders Site and Date in its header; without these it
+             # is delivered with blanks, which is worse than not delivered.
+             "date": ctx.get("date"),
+             "timeRange": ctx.get("timeRange"),
+             "siteName": ctx.get("siteName"),
              "summary": artifact.get("summary"),
              "openTodos": todos})
 
@@ -720,6 +764,10 @@ def write_extraction_items(date, user_folder, extraction_key):
         # re-merged and re-emailed.
         if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
             session_group.mark_result(conn, extraction["groupId"], "merged")
+            # Resolved HERE because the connection dies with the block below,
+            # and used AFTER it because the merged topics must be committed
+            # before anyone is emailed about them.
+            member_contexts = _resolve_member_contexts(conn, extraction)
 
     logger.info("item-writer wrote extraction=%s topics=%d", extraction_key, topics_n)
 
@@ -733,7 +781,7 @@ def write_extraction_items(date, user_folder, extraction_key):
     # request rides the same S3 channel as everything else crossing that line.
     if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
         try:
-            _enqueue_updated_emails(extraction)
+            _enqueue_updated_emails(extraction, member_contexts)
         except Exception:
             # The merged record is already durable; failing to announce it must
             # not undo it. A missing email is recoverable by hand, a rolled-back

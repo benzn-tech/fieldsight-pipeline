@@ -120,7 +120,13 @@ def test_one_updated_request_per_member_all_with_the_same_summary():
     written = []
     art = {"tier": "group", "groupId": GID, "summary": "One shared summary.",
            "topics": [], "memberSessions": [GID, JOINER]}
-    iw._enqueue_updated_emails(art, put=lambda key, body: written.append((key, body)))
+    # Contexts are resolved by the caller (inside the connection block) and
+    # handed in; a member with no resolved recipient is not enqueued at all.
+    ctx = {sid: {"recipient": f"{sid[:4]}@example.com", "date": "2026-08-07",
+                 "timeRange": "14:00–15:00", "siteName": "UC PK"}
+           for sid in (GID, JOINER)}
+    iw._enqueue_updated_emails(art, ctx,
+                               put=lambda key, body: written.append((key, body)))
     assert [k for k, _ in written] == [
         f"session_finalize_requests/{GID}-updated.json",
         f"session_finalize_requests/{JOINER}-updated.json"]
@@ -219,6 +225,7 @@ def test_the_updated_result_key_cannot_collide_with_the_solo_one():
     written = []
     iw._enqueue_updated_emails(
         {"groupId": GID, "memberSessions": [GID]},
+        {GID: {"recipient": "x@example.com"}},
         put=lambda key, body: written.append(key))
     assert written[0].endswith("-updated.json")
 
@@ -270,7 +277,7 @@ def test_a_failed_email_enqueue_no_longer_hides_a_failed_mark_result():
     import inspect
     import lambda_item_writer as iw
     src = inspect.getsource(iw.write_extraction_items)
-    block = src[src.index("_enqueue_updated_emails(extraction)"):]
+    block = src[src.index("_enqueue_updated_emails(extraction,"):]
     assert "mark_result" not in block[:400], \
         "mark_result must not share the email try/except — it mis-attributes the failure"
 
