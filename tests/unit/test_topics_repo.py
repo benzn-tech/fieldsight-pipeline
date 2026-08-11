@@ -143,7 +143,10 @@ def test_list_topics_for_date_joins_and_children_and_is_live():
 
     rows = topics.list_topics_for_date(conn, ["site-1", "site-2"], "2026-07-06")
 
-    assert len(conn.calls) == 4
+    # main + 4 batched children (action_items, safety_observations,
+    # findings, decisions). One more child means one more QUERY, never
+    # one per topic.
+    assert len(conn.calls) == 5
     main_sql, main_params = conn.calls[0]["sql"], conn.calls[0]["params"]
     assert "site_id = ANY(%s)" in main_sql
     assert "report_date=%s" in main_sql
@@ -210,7 +213,10 @@ def test_list_topics_attaches_findings_batched():
 
     # exactly 4 execute() calls total for 3 topics: main + 3 batched children.
     # An N+1 findings implementation would need 3 extra calls (one per topic) -> 6.
-    assert len(conn.calls) == 4
+    # main + 4 batched children (action_items, safety_observations,
+    # findings, decisions). One more child means one more QUERY, never
+    # one per topic.
+    assert len(conn.calls) == 5
     findings_sql, findings_params = conn.calls[3]["sql"], conn.calls[3]["params"]
     assert "FROM findings" in findings_sql
     assert "topic_id = ANY(%s)" in findings_sql
@@ -398,32 +404,36 @@ def test_list_for_source_prefix_orders_by_time_range_and_batches_four_children()
                   "risk_level": "medium", "location": None, "status": "open", "created_at": "c2"}
     finding_row = {"id": "f-1", "topic_id": "t-1", "observation": "x"}
     photo_row = {"id": "p-1", "topic_id": "t-2", "s3_key": "k.jpg", "caption_text": None}
+    decision_row = {"id": "d-1", "topic_id": "t-1", "decision": "Seal the panel",
+                    "rationale": None, "decided_by": None}
 
     conn = FakeConn(results=[
         [topic_a, topic_b],   # main topics query
         [action_row],         # action_items children
         [safety_row],         # safety_observations children
         [finding_row],        # findings children
-        [photo_row],          # photos children -- the fourth batched child
+        [decision_row],       # decisions children (0038)
+        [photo_row],          # photos children -- the fifth batched child
     ])
 
     rows = topics.list_topics_for_source_prefix(
         conn, "extractions/Jarley_Trainor/2026-07-06/")
 
-    assert len(conn.calls) == 5  # main + 4 batched children, never N+1
+    assert len(conn.calls) == 6  # main + 5 batched children, never N+1
     main_sql, main_params = conn.calls[0]["sql"], conn.calls[0]["params"]
     assert "source_s3_key LIKE %s" in main_sql
     assert "ESCAPE '\\'" in main_sql
     assert "ORDER BY t.time_range NULLS LAST, t.created_at, t.id" in main_sql
     assert main_params == (r"extractions/Jarley\_Trainor/2026-07-06/%",)
 
-    for i in (1, 2, 3, 4):
+    for i in (1, 2, 3, 4, 5):
         assert conn.calls[i]["params"] == (["t-1", "t-2"],)
     assert "action_items" in conn.calls[1]["sql"]
     assert "deadline_text" in conn.calls[1]["sql"]
     assert "safety_observations" in conn.calls[2]["sql"]
     assert "findings" in conn.calls[3]["sql"]
-    assert "topic_photos" in conn.calls[4]["sql"]
+    assert "topic_decisions" in conn.calls[4]["sql"]
+    assert "topic_photos" in conn.calls[5]["sql"]
 
     by_id = {r["id"]: r for r in rows}
     assert by_id["t-1"]["action_items"] == [action_row]

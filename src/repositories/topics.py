@@ -4,7 +4,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from repositories import findings
+from repositories import decisions, findings
 
 logger = logging.getLogger(__name__)
 
@@ -364,8 +364,13 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
     for f in findings.list_for_topics(conn, topic_ids):
         findings_by_topic.setdefault(f["topic_id"], []).append(f)
 
+    decisions_by_topic = {}
+    for d in decisions.list_for_topics(conn, topic_ids):
+        decisions_by_topic.setdefault(d["topic_id"], []).append(d)
+
     for t in topic_rows:
         t["action_items"] = action_items_by_topic.get(t["id"], [])
+        t["decisions"] = decisions_by_topic.get(t["id"], [])
         t_findings = findings_by_topic.get(t["id"], [])
         # Phase F / D8 retirement (spec §8): findings-first, legacy-fallback.
         t["safety_observations"] = (_findings_as_safety_rows(t_findings)
@@ -517,6 +522,10 @@ def list_topics_for_source_prefix(conn, source_prefix) -> list[dict]:
     for f in findings.list_for_topics(conn, topic_ids):
         findings_by_topic.setdefault(f["topic_id"], []).append(f)
 
+    decisions_by_topic = {}
+    for d in decisions.list_for_topics(conn, topic_ids):
+        decisions_by_topic.setdefault(d["topic_id"], []).append(d)
+
     photos_by_topic = {}
     for p in conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, s3_key, caption_text FROM topic_photos "
@@ -527,6 +536,7 @@ def list_topics_for_source_prefix(conn, source_prefix) -> list[dict]:
 
     for t in topic_rows:
         t["action_items"] = action_items_by_topic.get(t["id"], [])
+        t["decisions"] = decisions_by_topic.get(t["id"], [])
         t_findings = findings_by_topic.get(t["id"], [])
         # Phase F / D8 retirement (spec §8): findings-first, legacy-fallback.
         t["safety_observations"] = (_findings_as_safety_rows(t_findings)
@@ -586,6 +596,7 @@ def get_topic_full(conn, topic_id) -> dict | None:
         "created_at FROM safety_observations WHERE topic_id = ANY(%s) "
         "ORDER BY created_at", (tids,)).fetchall()
     t["findings"] = findings.list_for_topics(conn, tids)
+    t["decisions"] = decisions.list_for_topics(conn, tids)
     t["photos"] = conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, s3_key, caption_text FROM topic_photos "
         "WHERE topic_id = ANY(%s) ORDER BY created_at", (tids,)).fetchall()

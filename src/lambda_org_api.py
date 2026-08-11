@@ -4473,7 +4473,13 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             "category": t["category"],
             "participants": t["participants"] or [],
             "summary": t["summary"],
-            "key_decisions": [],                    # D3: v1, decisions table deferred
+            # Migration 0038 landed the table this line was waiting for.
+            # `.get(...) or []` rather than `t["decisions"]`: this function is
+            # also called with report-sourced rows, which have no such key.
+            "key_decisions": [{"decision": d["decision"],
+                               "rationale": d.get("rationale"),
+                               "decided_by": d.get("decided_by")}
+                              for d in (t.get("decisions") or [])],
             "action_items": [{"id": str(a["id"]), "action": a["text"], "responsible": a["responsible"],
                               "deadline": a["deadline_text"] or (str(a["deadline"]) if a["deadline"] else None),
                               "priority": a["priority"], "status": a["status"]} for a in t["action_items"]],
