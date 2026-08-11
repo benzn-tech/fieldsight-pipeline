@@ -64,7 +64,8 @@ from photo_binding import list_pictures as _pb_list_pictures
 from repositories import users as users_repo
 from photo_binding import photos_for_topics as _photos_for_topics
 import thread_match
-from repositories import (companies, findings, meeting_session, recordings,
+from repositories import (companies, decisions, findings, meeting_session,
+                          recordings,
                           session_group, sites, threads, topics)
 # The extraction-key shape lives in session_scope now (the read side needs the
 # SAME parse to derive session_id from topics.source_s3_key -- see that
@@ -746,6 +747,16 @@ def write_extraction_items(date, user_folder, extraction_key):
             # [] -> insert_findings returns [] -> zero rows, zero crash.
             finding_rows = findings.insert_findings(
                 conn, row["id"], site["id"], t.get("findings") or [])
+
+            # Decisions, in the SAME transaction as the topic upsert for the
+            # same reason findings are: it inherits the I-3 advisory lock, the
+            # I-4 supersession guard, and the scope-delete-then-reinsert
+            # idempotency keyed on source_s3_key -- which is the only thing
+            # standing between a re-processed extraction and duplicate rows,
+            # since decisions carry no dedup of their own. Extractions written
+            # before migration 0038, and the report/ingest path, have no
+            # `decisions` key -> [] -> zero rows, zero crash.
+            decisions.insert_decisions(conn, row["id"], t.get("decisions") or [])
 
             # Snapshot for the match_requests/ artifact (Task 4) -- the
             # non-VPC MatcherFunction reads this, never Aurora directly, so
