@@ -129,6 +129,22 @@ def list_finalizing(conn) -> list[dict]:
     ).fetchall()
 
 
+def count_live(conn) -> int:
+    """How many sessions are in a state the finalize sweep could still act on:
+    `open` (may yet be closed, or inferred-closed when it goes quiet),
+    `pending_close` (waiting out its grace), or `finalizing` (claimed, waiting on
+    the send worker's result).
+
+    Drives the sweep's DynamoDB pending flag (see sweep_state): zero here is the
+    ONLY thing that may clear it, so this predicate and the flag can never
+    disagree about what "idle" means. Deliberately counts rather than lists — the
+    sweep only needs to know whether the set is empty."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT count(*) AS n FROM meeting_session "
+        "WHERE status IN ('open', 'pending_close', 'finalizing')",
+    ).fetchone()["n"]
+
+
 def mark_sent(conn, session_id) -> dict | None:
     """Confirmation email delivered — close the session out."""
     return conn.cursor(row_factory=dict_row).execute(

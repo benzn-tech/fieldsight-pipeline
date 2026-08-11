@@ -76,6 +76,18 @@ Parameters:
       schedule). Default false so the feature deploys INERT (the sweep is created but
       DISABLED); flip per environment to activate. Separate from EnableSchedules so
       it doesn't also switch on the nightly report crons.
+  EnableSweepPendingGate:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Aurora scale-to-zero (spec 2026-08-11): let the finalize sweep skip its
+      Aurora connection on ticks whose DynamoDB flag reports no live session.
+      Default false so the flag path deploys INERT — it sits on the confirmation
+      email, and a flag that wrongly reads "idle" would delay one. Turn on for
+      test first. Verify by reading the DEPLOYED function's env for
+      SWEEP_REQUIRE_PENDING, never the template (unwired-toggle trap).
+
   EnableNonWorkExpiry:
     Type: String
     Default: 'false'
@@ -108,6 +120,15 @@ Parameters:
       KeyframeFunction itself deploys whenever HasKeyframeStack (HasDb &&
       HasVadLayer); this flag only gates the item-writer emission so the
       pipeline change ships inert until flipped per stage.
+  EnableThreadSuggestions:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Have item-writer propose which earlier subject a new topic restates
+      (recurring-item threading). Writes only to topic_thread_suggestions,
+      which nothing reads yet, and never sets topics.thread_id -- confirming
+      a link stays a human's call. Ships inert until flipped per stage.
   RealPTTAccount:
     Type: String
     Description: RealPTT platform account (external service)
@@ -523,6 +544,7 @@ Mappings:
 Conditions:
   ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
   ShouldEnableFinalize: !Equals [!Ref EnableFinalize, 'true']
+  ShouldEnableSweepPendingGate: !Equals [!Ref EnableSweepPendingGate, 'true']
   ShouldEnableNonWorkExpiry: !Equals [!Ref EnableNonWorkExpiry, 'true']
   ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
   ShouldManageBucketPolicy: !And [!Condition ShouldEnableTranscribe, !Equals [!Ref ManageDataBucketPolicy, 'true']]
@@ -947,7 +969,13 @@ Resources:
           Statement:
             - Effect: Allow
               Action: s3:GetObject
-              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+                # The topics' photo evidence, embedded into the .docx. Without
+                # this the fetch fails AccessDenied and is caught per-photo, so
+                # the report still generates — with every picture silently
+                # missing and nothing in the result to say why (BUG-43 §3).
+                - !Sub arn:aws:s3:::${IngestBucketName}/users/*/pictures/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
@@ -1165,8 +1193,17 @@ Resources:
           # condition + QrLoginCodesTable). Test's OrgApi omits this var
           # entirely (!Ref AWS::NoValue) — v1 has no test create endpoint.
           QR_CODES_TABLE: !If [IsProdWithOrgApi, !Ref QrLoginCodesTable, !Ref AWS::NoValue]
+          # Sets the sweep's pending flag on POST /sessions/{id}/open (Aurora
+          # scale-to-zero, spec 2026-08-11). Best-effort: a failed flag write
+          # never fails the open, and the sweep's hourly pass recovers it.
+          SWEEP_STATE_TABLE: !Ref ItemsTableName
+          STAGE: !Ref Stage
       Policies:
         - VPCAccessPolicy: {}
+        # DynamoDB reached through the existing gateway endpoint from in-VPC
+        # (vpce-01233d5b756ffefcb) — the same route that carries QR login.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTableName
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -1578,8 +1615,19 @@ Resources:
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
           MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
+          # Sets the sweep's pending flag (Aurora scale-to-zero, spec
+          # 2026-08-11). This is the path that matters most: a device that dies
+          # without /close is only ever finalized by the sweep's idle-close
+          # inference, so an `open` from the chunk stream that failed to raise
+          # the flag would be a silently lost confirmation email.
+          SWEEP_STATE_TABLE: !Ref ItemsTableName
+          STAGE: !Ref Stage
       Policies:
         - VPCAccessPolicy: {}
+        # In-VPC, but DynamoDB is reachable via the existing gateway endpoint
+        # (vpce-01233d5b756ffefcb) — no NAT, no new paid interface endpoint.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTableName
       Events:
         TranscriptChunkLanded:
           Type: EventBridgeRule
@@ -1685,6 +1733,21 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
           STOP_GRACE_SECONDS: '30'
+          # Aurora scale-to-zero (spec 2026-08-11). This sweep's once-a-minute
+          # Aurora connection is the sole reason the cluster can never reach the
+          # 300s+ continuous idle window auto-pause needs, so it rents the
+          # 0.5-ACU floor 24/7 (~$73/month) while 99% of its ticks do nothing.
+          # With the gate on, a tick whose DynamoDB flag says "no live session"
+          # returns without connecting. Default OFF — proven on test first.
+          SWEEP_REQUIRE_PENDING: !If [ShouldEnableSweepPendingGate, 'true', 'false']
+          SWEEP_STATE_TABLE: !Ref ItemsTableName
+          STAGE: !Ref Stage
+          # Minute of each hour for the unconditional safety pass. MUST match
+          # across stages (they share one cluster) and MUST keep the resulting
+          # 1-hour cadence well above SecondsUntilAutoPause — equal intervals
+          # mean the idle timer never expires. Pinned by
+          # tests/unit/test_sweep_cadence_vs_autopause.py.
+          SAFETY_SWEEP_MINUTE: '7'
           # Inferred idle-close (spec §8.4): an `open` session gone quiet becomes
           # pending_close. Tied to ShouldEnableFinalize — it is ONLY safe when
           # SessionActivityFunction is live to keep last_segment_at fresh, and that
@@ -1693,6 +1756,12 @@ Resources:
           INFER_IDLE_CLOSE: !If [ShouldEnableFinalize, 'true', 'false']
       Policies:
         - VPCAccessPolicy: {}
+        # Reads/clears the sweep pending flag. Reuses the existing items table
+        # deliberately: the deploy role has no dynamodb:CreateTable (verified via
+        # simulate-principal-policy), so a new table would CREATE_FAILED and roll
+        # the whole stack back.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTableName
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -1953,6 +2022,9 @@ Resources:
           # video-keyframe plan: emit keyframe_requests/ post-commit only when
           # this stage flag is on (ships inert otherwise).
           EMIT_KEYFRAME_REQUESTS: !Ref EnableKeyframes
+          # recurring-item threading: propose which earlier subject a new
+          # topic restates. Writes suggestions only; never links.
+          SUGGEST_THREADS: !Ref EnableThreadSuggestions
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'

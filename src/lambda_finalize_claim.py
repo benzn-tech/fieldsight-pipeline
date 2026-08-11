@@ -23,6 +23,7 @@ import json
 import logging
 import os
 
+import sweep_state
 from repositories import meeting_session, users, sites
 from session_scope import SESSION_GAP_MINUTES
 
@@ -50,6 +51,18 @@ IDLE_CLOSE_SECONDS = SESSION_GAP_MINUTES * 60
 # COALESCE falls back to opened_at) would be closed prematurely. Flipped on WITH
 # that lambda's deploy.
 INFER_IDLE_CLOSE = os.environ.get("INFER_IDLE_CLOSE", "false").lower() == "true"
+# Aurora scale-to-zero (spec 2026-08-11): skip the Aurora connection on ticks the
+# DynamoDB flag says have no work. Default OFF — the saving is not worth risking
+# the confirmation email until the flag path is proven in test. Verify it is live
+# by reading the DEPLOYED function's env, not the template (unwired-toggle trap).
+SWEEP_REQUIRE_PENDING = os.environ.get("SWEEP_REQUIRE_PENDING", "false").lower() == "true"
+STAGE = os.environ.get("STAGE", "prod")
+# The minute of each hour on which the sweep connects regardless of the flag.
+# MUST be identical across stages sharing a cluster (see _is_safety_minute), and
+# the resulting 1-hour interval MUST stay several times SecondsUntilAutoPause —
+# an interval equal to the pause threshold means the idle timer never expires and
+# the cluster never sleeps. test_sweep_cadence_vs_autopause.py pins that.
+SAFETY_SWEEP_MINUTE = int(os.environ.get("SAFETY_SWEEP_MINUTE", "7"))
 
 
 def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_rolling,
@@ -276,14 +289,63 @@ def _read_result(session_id):
         return None
 
 
+def _is_safety_minute(now) -> int:
+    """Is this the tick that connects no matter what the flag says?
+
+    Both stages share one cluster, so both must pick the SAME minute — two
+    unaligned hourly passes would halve the effective idle window and stop the
+    cluster pausing at all. A wall-clock minute aligns by construction; a second
+    EventBridge `rate(1 hour)` rule could NOT (its phase is fixed by whenever the
+    rule happened to be created, and the two stacks are deployed separately).
+    """
+    return now.minute == SAFETY_SWEEP_MINUTE
+
+
 def lambda_handler(event, context):
     """Scheduled (~1 min) grace sweep + reconcile — see the module docstring. Opens an
     in-VPC Aurora connection, finalizes every due session, and moves already-sent
-    claimed sessions to their terminal state."""
+    claimed sessions to their terminal state.
+
+    When SWEEP_REQUIRE_PENDING is on, a tick with no pending work returns without
+    connecting at all: those connections are the only reason Aurora can never
+    auto-pause (AWS needs 300s+ of continuous idle; one connection a minute never
+    allows it). ~99% of ticks are no-ops, so this is the whole saving. The hourly
+    safety pass and sweep_state's fail-open contract mean a lost flag delays an
+    email by up to an hour — it can never drop one.
+    """
+    from datetime import datetime, timezone
+
     from db.connection import get_connection
+
+    now = datetime.now(timezone.utc)
+    safety_pass = _is_safety_minute(now)
+    flag_said_pending = True
+    if SWEEP_REQUIRE_PENDING and not safety_pass:
+        flag_said_pending = sweep_state.is_pending(STAGE)
+        if not flag_said_pending:
+            # Must be logged: without it there is no way to verify the skip path
+            # actually runs, and "it deployed" is not evidence that it works.
+            logger.info("finalize sweep: skipped (no pending work)")
+            return {"swept": 0, "reconciled": 0, "skipped": "no-pending"}
+
     with get_connection() as conn:
         swept = sweep(conn)
         reconciled = reconcile(conn, _read_result)
+        live = meeting_session.count_live(conn)
+        if live == 0:
+            sweep_state.clear_pending(STAGE)
+
+    if safety_pass and SWEEP_REQUIRE_PENDING and (swept or reconciled):
+        # The flag claimed there was nothing to do, yet the unconditional pass
+        # found work: a flag write was lost. The safety net did its job, but this
+        # is a correctness bug in the flag path and must never pass quietly.
+        if not sweep_state.is_pending(STAGE):
+            logger.error(
+                "finalize sweep: FLAG MISS — safety pass found work the pending "
+                "flag denied (enqueued=%d reconciled=%d sessions=%s)",
+                len(swept), len(reconciled),
+                [r.get("sessionId") for r in swept] or None)
+
     # Observability: this fires every minute, so log ONLY when it did something
     # (no per-idle-minute noise). enqueued = sessions handed to the send worker;
     # reconciled = sessions moved to sent/failed this tick.
