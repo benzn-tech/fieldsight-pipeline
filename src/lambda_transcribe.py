@@ -52,15 +52,14 @@ Note on LanguageCode vs IdentifyLanguage:
 
 import os
 import re
-import io
 import json
 import time
-import wave
 import logging
 import boto3
 from urllib.parse import unquote_plus
 
 import batch_ledger
+import batch_seal
 import batch_stitch
 import transcript_utils
 
@@ -326,99 +325,10 @@ def write_ledger_record(display_name, file_date, base_name, job_name,
 # ============================================================
 # Batched transcription (spec + plan 2026-08-11)
 # ============================================================
-
-def _wav_pcm(data):
-    """(pcm_bytes, sample_rate) from a 16-bit mono WAV payload."""
-    with wave.open(io.BytesIO(data), 'rb') as w:
-        return w.readframes(w.getnframes()), w.getframerate()
-
-
-def _wav_bytes(pcm, rate):
-    buf = io.BytesIO()
-    with wave.open(buf, 'wb') as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(rate)
-        w.writeframes(pcm)
-    return buf.getvalue()
-
-
-def _raw_key_for(unit_key):
-    """The device's own upload for a VAD unit — `users/{user}/audio/{date}/{stem}.wav`.
-
-    The overlap must be measured on THIS, not on the unit: normalisation applies
-    time-varying gain per chunk, so identical source samples come out as different bytes
-    and the measurement would find nothing — which, with the "measured zero means do not
-    trim" rule, silently switches all trimming off.
-    """
-    parts = unit_key.split('/')
-    if len(parts) < 4:
-        return None
-    stem = parts[-1].split('_off')[0]
-    return f"users/{parts[1]}/audio/{parts[2]}/{stem}.wav"
-
-
-def _measure_trim(bucket, prev_unit_key, unit_key):
-    """(seconds, measured) for the head of `unit_key`. Never raises.
-
-    A raw upload that is missing or unreadable — and 0.9% of them have been — means the
-    seam is unmeasured, not that there is no overlap. Unmeasured keeps the audio: the
-    duplicate survives into the transcript where `_dedup_turn_boundaries` still removes it,
-    whereas trimming a guessed length deletes speech with no trace.
-    """
-    try:
-        prev_raw, nxt_raw = _raw_key_for(prev_unit_key), _raw_key_for(unit_key)
-        if not prev_raw or not nxt_raw:
-            return 0.0, False
-        prev_pcm, rate = _wav_pcm(s3.get_object(Bucket=bucket, Key=prev_raw)['Body'].read())
-        nxt_pcm, _ = _wav_pcm(s3.get_object(Bucket=bucket, Key=nxt_raw)['Body'].read())
-    except Exception:
-        logger.warning("batch: could not read the raw uploads for the %s seam — "
-                       "keeping the audio, seam recorded as unmeasured", unit_key)
-        return 0.0, False
-    secs = batch_stitch.measure_overlap(prev_pcm, nxt_pcm, rate)
-    return secs, secs > 0.0
-
-
-def _seal_batch(bucket, session_id, run, by_index, now, table):
-    """Write one batch's map and audio. The WAV is last: its S3 event is what starts the
-    transcription, so a crash between the two must never leave a batch with no map."""
-    if batch_ledger.claim_seal(table, session_id, run[0], run, now) is None:
-        return                                    # someone else is sealing this batch
-
-    payloads, members, trims = [], [], []
-    for pos, idx in enumerate(run):
-        unit_key = by_index[idx]['chunk_key']
-        pcm, rate = _wav_pcm(s3.get_object(Bucket=bucket, Key=unit_key)['Body'].read())
-        if pos == 0:
-            trim, measured = 0.0, True            # nothing before it to repeat
-        else:
-            trim, measured = _measure_trim(bucket, by_index[run[pos - 1]]['chunk_key'],
-                                           unit_key)
-        base = transcript_utils.extract_base_time_from_filename(unit_key)
-        kept = (len(pcm) - int(round(trim * rate)) * 2) / (rate * 2)
-        members.append(batch_stitch.member(
-            idx, unit_key, base.isoformat() if base else '',
-            trimmed_head_sec=trim, kept_duration_sec=kept, trim_measured=measured))
-        payloads.append((pcm, rate))
-        trims.append(trim)
-
-    audio, rate = batch_stitch.concat_wavs(payloads, trims)
-    first_unit = by_index[run[0]]['chunk_key']
-    prefix, filename = first_unit.rsplit('/', 1)
-    stem = filename.split('_off')[0]
-    head_trim = members[0]['trimmed_head_sec']
-    duration = len(audio) / (rate * 2)
-    batch_name = batch_stitch.build_batch_name(stem, len(run), head_trim, duration)
-    batch_key = f"{prefix}/{batch_name}"
-    doc = batch_stitch.build_map(session_id, members, sealed_by='arrival')
-
-    s3.put_object(Bucket=bucket, Key=f"{prefix}/{batch_name[:-4]}_batch_map.json",
-                  Body=json.dumps(doc), ContentType='application/json')
-    s3.put_object(Bucket=bucket, Key=batch_key, Body=_wav_bytes(audio, rate),
-                  ContentType='audio/wav')
-    batch_ledger.mark_sealed(table, session_id, run[0], now)
-    logger.info("batch: sealed %s from chunks %s", batch_key, run)
+# The sealing itself lives in `batch_seal`, because the finalize sweep has to do exactly
+# the same work for a session's last 1-3 chunks and must not import this module to get it
+# (it would pay for a transcribe client it never uses, on a function that runs every
+# minute).
 
 
 def _maybe_batch(bucket, key, results):
@@ -439,11 +349,9 @@ def _maybe_batch(bucket, key, results):
     now = int(time.time())
     table = _get_dynamodb_table()
     batch_ledger.register_chunk(table, session_id, chunk_index, key, now)
-    rows = batch_ledger.list_members(table, session_id)
-    by_index = {int(r['chunk_index']): r for r in rows}
-    for run in batch_ledger.pending_runs(rows, now, BATCH_SEAL_DEADLINE_SEC,
-                                         BATCH_MAX_CHUNKS):
-        _seal_batch(bucket, session_id, run, by_index, now, table)
+    batch_seal.seal_ready_runs(s3, bucket, session_id, table, now,
+                               BATCH_SEAL_DEADLINE_SEC, BATCH_MAX_CHUNKS,
+                               sealed_by='arrival')
 
     results.append({'key': key, 'status': 'batched_pending',
                     'session': session_id, 'chunk': chunk_index})

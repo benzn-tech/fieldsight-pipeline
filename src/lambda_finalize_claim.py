@@ -22,6 +22,7 @@ a DB/S3; lambda_handler supplies the real ones.
 import json
 import logging
 import os
+import time
 
 import sweep_state
 from repositories import meeting_session, users, sites
@@ -31,6 +32,14 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
+
+# Batched transcription (spec 2026-08-11). Read here too because the sweep is the only
+# thing that can seal a session's LAST run — it has no fourth chunk coming. Defaults off,
+# same as the transcriber's, so this deploys inert.
+BATCH_TRANSCRIPTION = os.environ.get("BATCH_TRANSCRIPTION", "false").lower() == "true"
+BATCH_MAX_CHUNKS = int(os.environ.get("BATCH_MAX_CHUNKS", "4"))
+BATCH_SEAL_DEADLINE_SEC = int(os.environ.get("BATCH_SEAL_DEADLINE_SEC", "150"))
+TRANSCRIPT_TABLE = os.environ.get("TRANSCRIPT_TABLE", "fieldsight-transcripts")
 FINALIZE_REQUESTS_PREFIX = "session_finalize_requests/"
 # Asks the (non-VPC) extraction lambda for this session's FINAL, thinking-mode
 # pass. Same artifact-on-S3 channel as FINALIZE_REQUESTS_PREFIX and for the same
@@ -525,6 +534,37 @@ def infer_idle_closes(conn, idle_seconds):
     return closed
 
 
+def _seal_tail_batches(session_id):
+    """Seal this session's last 1–3 chunks, BEFORE it is finalized.
+
+    Nothing in the transcriber will ever do it: a tail run has no fourth arrival to
+    complete it, so it sits in the ledger until someone notices the session is over. That
+    someone is this sweep.
+
+    The ordering is the point. Finalizing first requests the extraction against transcripts
+    that do not yet include the tail, and the confirmation email that follows reads
+    perfectly well while missing the end of the meeting — the grew-rerun coverage recheck
+    would eventually catch up, but the first email is the one people act on.
+
+    Never raises. A missing tail costs the end of one email; a sweep that dies costs every
+    email after it, which is the same trade the group scan already had to learn.
+    """
+    if not BATCH_TRANSCRIPTION:
+        return
+    try:
+        import boto3
+
+        import batch_seal
+        batch_seal.seal_ready_runs(
+            boto3.client("s3"), S3_BUCKET, session_id,
+            boto3.resource("dynamodb").Table(TRANSCRIPT_TABLE),
+            int(time.time()), BATCH_SEAL_DEADLINE_SEC, BATCH_MAX_CHUNKS,
+            sealed_by="session_close")
+    except Exception:
+        logger.exception("batch: could not seal the tail of session %s — the final "
+                         "extraction may be missing its last chunks", session_id)
+
+
 def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None):
     """Finalize every session on `conn` whose grace has elapsed, reusing
     finalize_claim per session (CAS-claim -> gather -> enqueue). First (when
@@ -539,6 +579,7 @@ def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None):
         infer_idle_closes(conn, idle)
     results = []
     for row in meeting_session.list_due_finalize(conn, grace):
+        _seal_tail_batches(row["session_id"])
         results.append(finalize_claim(
             conn, row["session_id"], row["version"],
             resolve_context=_resolve_context, read_rolling=_read_rolling, enqueue=_enqueue,
