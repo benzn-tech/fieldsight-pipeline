@@ -242,3 +242,126 @@ def test_the_cut_sits_where_the_two_populations_stop_overlapping():
     # deliberately NOT the fuzzy threshold -- tightening the threshold must not
     # silently start relabelling near-misses as "nothing there".
     assert 0.62 <= em.NOTHING_CLOSE_RATIO <= 0.64
+
+
+# ---- quotes the model spliced with an ellipsis -------------------------
+#
+# The dominant real cause of a fuzzy-branch citation, measured across 949 live
+# citations: the model joins two non-contiguous spans with "..." and the elided
+# middle reads as a missing chunk, scoring 0.75-0.92. Both spans are verbatim.
+# The threshold cannot fix this class -- how much was elided is the model's
+# choice, so the ratio has no lower bound -- and a quote with 0.746 was being
+# filed as the fabrication signal while every word of it was in the transcript.
+#
+# Transcripts carry no punctuation (parse_transcribe_json keeps pronunciation
+# items only), so "..." never occurs in the candidate text. It is unambiguously
+# the model saying "I left something out here".
+
+def test_a_spliced_quote_verifies_when_every_fragment_is_verbatim():
+    turns = [_turn("the slab pour is pushed to Thursday because the pump is late "
+                   "and we cannot get one until the morning")]
+    r = em.check_quote("the slab pour is pushed to Thursday... "
+                       "we cannot get one until the morning", turns, AT, **KW)
+    assert r["status"] == "verified_fuzzy"
+    assert r["spliced"] is True
+    assert r["fragments"] == 2
+
+
+def test_a_spliced_quote_is_not_promoted_to_verified():
+    # "A... B" reads as one continuous sentence and is two moments. In a
+    # feature whose whole job is provenance, that difference cannot be quietly
+    # dropped -- so it stays in the tier that is counted apart.
+    turns = [_turn("alpha bravo charlie delta echo foxtrot golf hotel india")]
+    r = em.check_quote("alpha bravo charlie... golf hotel india", turns, AT, **KW)
+    assert r["status"] == "verified_fuzzy"
+
+
+def test_fragments_need_not_appear_in_the_order_they_were_quoted():
+    # Real case, 2026-08-10: overlapping chunks put the LATER-spoken fragment
+    # first in the candidate text, because turns sort by absolute start and the
+    # ring buffer overlaps. Requiring increasing positions would fail an honest
+    # citation -- and this is exactly the shape that produced the 0.746.
+    turns = [_turn("golf hotel india juliet kilo", 0.0, fn="c0068.json"),
+             _turn("alpha bravo charlie delta echo", 0.0, fn="c0069.json")]
+    r = em.check_quote("alpha bravo charlie... india juliet kilo", turns, AT, **KW)
+    assert r["status"] == "verified_fuzzy"
+    assert r["spliced"] is True
+
+
+def test_a_spliced_quote_with_one_invented_fragment_does_not_verify():
+    turns = [_turn("the slab pour is pushed to Thursday because the pump is late")]
+    r = em.check_quote("the slab pour is pushed to Thursday... "
+                       "and the budget was approved on Tuesday", turns, AT, **KW)
+    assert r["status"] == "unverified", \
+        "every fragment must be present -- one real half cannot carry an invented one"
+
+
+def test_a_short_fragment_does_not_make_a_specific_quote_weak():
+    # The floor is about how much was cited in total, not how the model chose
+    # to break it up.
+    turns = [_turn("the slab pour is pushed to Thursday because the pump is late "
+                   "and we cannot get one until the morning yes")]
+    r = em.check_quote("the slab pour is pushed to Thursday because the pump "
+                       "is late... yes", turns, AT, **KW)
+    assert r["status"] == "verified_fuzzy"
+
+
+def test_an_ellipsis_with_nothing_either_side_falls_back_to_the_normal_path():
+    turns = [_turn("the slab pour is pushed to Thursday")]
+    r = em.check_quote("... the slab pour is pushed to Thursday", turns, AT, **KW)
+    assert r["status"] == "verified", "one fragment is not a splice"
+
+
+# ---- the model wrote the wrong hour ------------------------------------
+#
+# Measured over 1,576 real citations: of the nine distinct quotes that came out
+# `unverified`, SEVEN existed verbatim in the transcript exactly one hour after
+# the time the model cited -- minutes and seconds identical, hour off by one.
+# Not fabrication, and not our rendering either: every one of the 279 turns in
+# that session had its prompt label equal to its abs_start, so the prompt said
+# 15:13:58 and the model wrote 14:13:58.
+#
+# The probe never verifies. Accepting a match an hour away would destroy the
+# property that makes the number mean anything -- a quote matching somewhere
+# else is a mis-citation. It labels, so the class can be subtracted from the
+# headline and a reader is pointed at the audio instead of hunting for it.
+
+def _hour_turns(text):
+    later = datetime(2026, 8, 7, 15, 23, 7)
+    return [_turn(text, 4.0, at=later, fn="c0121.json")]
+
+
+def test_a_quote_an_hour_off_is_named_rather_than_called_fabrication():
+    turns = _hour_turns("it is because in the enabling it says remove that panel")
+    r = em.check_quote("it is because in the enabling it says", turns, AT, **KW)
+    assert r["status"] == "unverified", "an hour away must never verify"
+    assert r["reason"] == em.REASON_ANCHOR_HOUR_SLIP
+    assert r["slip_hours"] == 1
+
+
+def test_the_slip_reports_where_to_listen():
+    turns = _hour_turns("it is because in the enabling it says remove that panel")
+    r = em.check_quote("it is because in the enabling it says", turns, AT, **KW)
+    assert r["segment_key_source"] == "c0121.json"
+    assert r["offset_sec"] == 4.0
+
+
+def test_a_short_quote_is_not_slip_probed():
+    # "yes" turns up an hour later in almost any recording. Probing below the
+    # specificity floor would manufacture slips out of coincidence.
+    turns = _hour_turns("yes we should stop")
+    r = em.check_quote("yes", turns, AT, **KW)
+    assert r.get("reason") != em.REASON_ANCHOR_HOUR_SLIP
+
+
+def test_a_genuinely_absent_quote_reports_no_slip():
+    turns = _hour_turns("we talked about the crane and the weather today")
+    r = em.check_quote("the budget was approved on Tuesday afternoon", turns, AT, **KW)
+    assert r["status"] == "unverified"
+    assert "slip_hours" not in r
+
+
+def test_the_slip_probe_also_catches_a_spliced_quote_an_hour_off():
+    turns = _hour_turns("alpha bravo charlie delta echo foxtrot golf hotel india")
+    r = em.check_quote("alpha bravo charlie... golf hotel india", turns, AT, **KW)
+    assert r["reason"] == em.REASON_ANCHOR_HOUR_SLIP

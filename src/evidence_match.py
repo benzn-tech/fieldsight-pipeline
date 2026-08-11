@@ -13,6 +13,7 @@ detail here is noise added directly to it.
 import difflib
 import re
 import unicodedata
+from datetime import timedelta
 
 # Worst -> best. `unverified` and `unchecked` are handled separately in roll_up
 # because they DOMINATE rather than rank.
@@ -29,6 +30,17 @@ REASON_NO_CANDIDATE_TEXT = "no_candidate_text"   # turns present but empty: ASR,
 REASON_EMPTY_QUOTE = "empty_quote"               # nothing was cited
 REASON_BELOW_FUZZY = "below_fuzzy_threshold"     # a near miss: blame the cut
 REASON_NOTHING_CLOSE = "nothing_close_in_window"  # nothing resembling it is there
+REASON_ANCHOR_HOUR_SLIP = "anchor_hour_slip"      # verbatim, but an hour away
+
+# How far the hour-slip probe looks, and no further.
+#
+# Measured over 1,576 real citations: of the nine distinct quotes that came out
+# unverified, SEVEN existed verbatim exactly one hour after the cited time --
+# minutes and seconds identical. Not our rendering: all 279 turns in that
+# session had prompt label == abs_start, so the prompt said 15:13:58 and the
+# model wrote 14:13:58. Every timestamp confusion this repo has produced
+# (BUG-19, BUG-37) has also been a whole-hour one.
+_SLIP_HOURS = (1, -1)
 
 # Where "not close" stops being "not close ENOUGH".
 #
@@ -48,6 +60,10 @@ REASON_NOTHING_CLOSE = "nothing_close_in_window"  # nothing resembling it is the
 # would mean tightening the cut silently starts relabelling genuine near-misses
 # as "nothing there", which is the confusion this exists to end.
 NOTHING_CLOSE_RATIO = 0.63
+
+# The model's own elision marker. Matched on the RAW quote: `normalise` strips
+# punctuation, so by the time a quote is normalised the ellipsis is gone.
+_ELLIPSIS = re.compile(r"\s*(?:\.{2,}|…)\s*")
 
 _PUNCT = re.compile(r"[^\w\s]", re.UNICODE)
 _WS = re.compile(r"\s+")
@@ -128,7 +144,8 @@ def check_quote(quote, turns, at, *, w_seconds, floor_tokens, fuzzy_threshold):
     """
     window = windowed_turns(turns, at, w_seconds)
     if not window:
-        return {"status": "unverified", "reason": REASON_NO_TURNS}
+        return _unverified(REASON_NO_TURNS, quote, turns, at,
+                           w_seconds, floor_tokens)
 
     # Concatenated, not tested per turn: turns are per-segment and never merged
     # across chunks, so a sentence split at a chunk seam is two turns and
@@ -141,27 +158,44 @@ def check_quote(quote, turns, at, *, w_seconds, floor_tokens, fuzzy_threshold):
 
     weak = token_count(quote) < floor_tokens
     ratio = None
+    fragments = 0
     pos = haystack.find(needle)
+    if pos < 0:
+        # An ellipsis is the model telling us it left something out. Checking
+        # each side separately turns a fuzzy guess into an exact test, and it
+        # is the only thing that works on this class: how much was elided is
+        # the model's choice, so the similarity of the joined string has no
+        # lower bound. Measured over 949 live citations, this is what nearly
+        # every fuzzy-branch citation actually was.
+        pos, fragments = _match_spliced(quote, haystack)
     if pos < 0:
         pos, ratio = _best_fuzzy(needle, haystack)
         if ratio is None:
             # Turns were in the window but carried no words. Widening W would
             # never fix this one, so it must not be filed beside the misses
             # that widening W does fix.
-            return {"status": "unverified", "reason": REASON_NO_CANDIDATE_TEXT}
+            return _unverified(REASON_NO_CANDIDATE_TEXT, quote, turns, at,
+                               w_seconds, floor_tokens)
         if ratio < fuzzy_threshold:
             # Which of the two failures it is decides where the next person
             # looks: at our cut, or at the anchor and the transcript.
             reason = (REASON_BELOW_FUZZY if ratio >= NOTHING_CLOSE_RATIO
                       else REASON_NOTHING_CLOSE)
-            return {"status": "unverified", "reason": reason,
-                    "fuzzy_ratio": round(ratio, 3)}
+            return _unverified(reason, quote, turns, at, w_seconds,
+                               floor_tokens, fuzzy_ratio=round(ratio, 3))
 
     turn = _turn_at(window, norm_turns, pos)
     if weak:
         status = "weak"
+    elif ratio is None and not fragments:
+        status = "verified"
     else:
-        status = "verified" if ratio is None else "verified_fuzzy"
+        # A splice is exact on every fragment, so it is stronger evidence than
+        # a fuzzy match -- but it is not `verified`. "A... B" reads as one
+        # continuous sentence and is two moments, and in a feature whose whole
+        # job is provenance that difference cannot be quietly dropped. It stays
+        # in the tier that is counted apart.
+        status = "verified_fuzzy"
     out = {"status": status,
            "segment_key_source": turn.get("source_filename"),
            # Turn granularity, not sub-turn: _build_turn joins words into one
@@ -173,10 +207,96 @@ def check_quote(quote, turns, at, *, w_seconds, floor_tokens, fuzzy_threshold):
            "offset_sec": turn.get("start_sec")}
     if ratio is not None:
         out["fuzzy_ratio"] = round(ratio, 3)
+    if fragments:
+        out["spliced"] = True
+        out["fragments"] = fragments
     if turn.get("abs_start") and at is not None:
         out["found_offset_sec"] = round(
             abs(turn["abs_start"].timestamp() - at.timestamp()), 1)
     return out
+
+
+def _unverified(reason, quote, turns, at, w_seconds, floor_tokens, **extra):
+    """An unverified result, with the hour-slip probe attached when it fires.
+
+    The probe NEVER verifies. Accepting a match an hour away would destroy the
+    property that makes this number mean anything -- a quote matching somewhere
+    else is a mis-citation, not a verification. It labels, so that the class can
+    be subtracted from the headline instead of inflating it, and so a reader is
+    pointed at the audio rather than left to hunt for it.
+    """
+    out = {"status": "unverified", "reason": reason}
+    out.update(extra)
+    slip = _anchor_slip(quote, turns, at, w_seconds, floor_tokens)
+    if slip:
+        out["reason"] = REASON_ANCHOR_HOUR_SLIP
+        out["slip_hours"] = slip["slip_hours"]
+        out["segment_key_source"] = slip["turn"].get("source_filename")
+        out["offset_sec"] = slip["turn"].get("start_sec")
+    return out
+
+
+def _anchor_slip(quote, turns, at, w_seconds, floor_tokens):
+    """Is this quote sitting verbatim a whole hour from where it was cited?
+
+    EXACT containment (or an exact splice) only -- never fuzzy. A fuzzy probe
+    over a second window would manufacture slips out of coincidence, which is
+    the opposite of what a diagnostic is for.
+
+    Below the specificity floor it does not run at all: "yes" turns up an hour
+    later in almost any recording.
+    """
+    if at is None or token_count(quote) < floor_tokens:
+        return None
+    needle = normalise(quote)
+    if not needle:
+        return None
+    for hours in _SLIP_HOURS:
+        window = windowed_turns(turns, at + timedelta(hours=hours), w_seconds)
+        if not window:
+            continue
+        norm_turns = [normalise(t.get("text", "")) for t in window]
+        haystack = " ".join(norm_turns)
+        pos = haystack.find(needle)
+        if pos < 0:
+            pos, _frags = _match_spliced(quote, haystack)
+        if pos < 0:
+            continue
+        return {"slip_hours": hours,
+                "turn": _turn_at(window, norm_turns, pos)}
+    return None
+
+
+def _match_spliced(quote, haystack):
+    """Every ellipsis-separated fragment present, exactly. Returns
+    (earliest position, fragment count), or (-1, 0).
+
+    Transcripts carry no punctuation at all (parse_transcribe_json keeps
+    pronunciation items only), so "..." never occurs in the candidate text and
+    is unambiguously the model's own elision marker.
+
+    ORDER IS NOT REQUIRED, and that is not laxity. Turns sort by absolute start
+    while the mobile ring buffer overlaps chunks, so two transcriptions of the
+    same moment can land in either order -- a real 2026-08-10 citation had its
+    first-quoted fragment sitting AFTER its second in the candidate text.
+    Requiring increasing positions would have failed that honest citation while
+    looking rigorous.
+
+    All-or-nothing: one real half must never carry an invented one.
+    """
+    parts = [normalise(p) for p in _ELLIPSIS.split(quote or "")]
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return -1, 0                      # nothing was actually elided
+    positions = []
+    for part in parts:
+        i = haystack.find(part)
+        if i < 0:
+            return -1, 0
+        positions.append(i)
+    # Earliest in the candidate text, which (turns being time-ordered) is the
+    # earliest audio -- where a listener should start.
+    return min(positions), len(parts)
 
 
 def _best_fuzzy(needle, haystack):
