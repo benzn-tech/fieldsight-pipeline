@@ -1,6 +1,6 @@
 # Decisions are extracted and then discarded
 
-**Status:** design v1
+**Status:** design v2 (reviewed once; the review found the backfill under-specified and one read surface I had not looked at)
 **Date:** 2026-08-11
 
 ## The finding
@@ -9,7 +9,9 @@ The extraction prompt asks for decisions, the model supplies them, and nothing
 stores them.
 
 **Measured over 90 real extractions, 1,127 topics: 101 topics (9.0%) carry a
-non-empty `decisions` array.** The content is not filler:
+non-empty `decisions` array.** (The artifacts live in the test bucket, not in
+this repo, so nothing here can re-derive that number — the plan should carry
+the artifact list rather than restate the figure.) The content is not filler:
 
 > `{"decision": "Restrict subcontractor access to basement except for three
 > designated pool areas", "rationale": "…"}`
@@ -25,10 +27,13 @@ and then dropped at the database boundary.
 The open-issues note filed this as *"the model produced a topic but
 `key_decisions` was empty"* and read it as a prompt defect. Two corrections:
 
-- **`key_decisions` is a different field on a different pipeline.**
-  `lambda_meeting_minutes` (the legacy report path) uses `key_decisions`;
-  `lambda_extract_session` produces `decisions`. Only `chunking.py` and
-  `lambda_ask_agent` read `key_decisions`, and both read it off reports.
+- **`key_decisions` is a different field, fed by a different LLM pass.**
+  `lambda_meeting_minutes` **and** the nightly `lambda_report_generator` both
+  produce `key_decisions`; `lambda_session_report`, `chunking._topic_text` and
+  `lambda_ask_agent` read it off the report shape. `lambda_extract_session`
+  produces `decisions`. The two never converge today -- which is why the
+  premise holds -- but my first map of this was wrong in a way that hid a read
+  surface (below).
 - **The prompt is fine.** 9% of topics carry decisions, which is a plausible
   rate for site conversation. Rewriting the prompt would have been work against
   a component that was already doing its job — the failure is one layer down.
@@ -65,6 +70,10 @@ create table if not exists topic_decisions (
 create index if not exists idx_topic_decisions_topic on topic_decisions (topic_id);
 ```
 
+One supersession edge, same exposure as findings and not new: if the nightly
+ingest's defer test throws, it falls back to superseding, deleting extraction
+topics and cascading their decisions away while the report path writes none.
+
 `ON DELETE CASCADE` matches the siblings, and item-writer's existing
 scope-delete-then-reinsert idempotency (keyed on `source_s3_key`) then covers
 decisions for free — the topic row goes, its decisions go with it.
@@ -76,19 +85,32 @@ nothing a cascade can destroy that should have survived. That is the reason it
 is safe here, and it should be checked rather than inherited if a decision ever
 becomes user-editable.
 
-## The read path is not free
+## The read path is not free, and there are TWO of them
 
 `list_topics_for_date` attaches children by **explicit per-child query**, not
-generically. `/live-items` passes whatever the repository attaches, so the
-frontend needs no change to receive them — but the repository does. One more
-batched query, mirroring `findings.list_for_topics`.
+generically. `/live-items` passes whatever the repository attaches
+(`ok({"topics": rows})`, no allowlist), so the frontend needs no change to
+receive them — but the repository does. One more batched query, mirroring
+`findings.list_for_topics`.
+
+**The second surface is the one I missed.** `render_report_shape`
+(`lambda_org_api.py:4455`) hardcodes `"key_decisions": []` with the comment
+*"D3: v1, decisions table deferred"* — the codebase's own pre-planned wiring
+point for exactly this table. That function serves the **Timeline day view**,
+the **session-report modal and Word export**, and the **reindex builder** that
+feeds RAG chunks (`chunking._topic_text` reads `key_decisions`).
+
+Wiring only `/live-items` would put decisions in one place and leave Timeline,
+the Word export and RAG showing nothing — a half-landed feature that reads as
+"decisions still don't work". **Both surfaces are in scope**; the second is one
+line, and the comment invites it.
 
 ## Scope
 
-**In:** the migration; `repositories/decisions.py` mirroring
-`repositories/findings.py`; item-writer writes them alongside action_items and
-findings; `list_topics_for_date` attaches them; a backfill script over existing
-extraction artifacts.
+**In:** the migration; `repositories/decisions.py` (the shape of `findings`,
+without its NOT-NULL hazard); item-writer writes them alongside action_items and
+findings; **both** read surfaces -- `list_topics_for_date` and
+`render_report_shape:4455`; the backfill specified below.
 
 **Out:** rendering them in the UI; the legacy `key_decisions` path
 (`lambda_meeting_minutes`), which is a different pipeline and out of this
@@ -104,6 +126,40 @@ rows, no lock of consequence on a table that does not yet exist.
 merged and waiting on approval; adding a schema change to it means the one
 thing that cannot be rolled back by re-deploying an earlier stack goes out
 alongside changes that can. It costs nothing to land tomorrow.
+
+## The backfill, specified
+
+**The mapping key is `(source_s3_key, topic_title)`, and ambiguity is skipped.**
+Position cannot be used: all topics of one extraction insert in a single
+transaction, so `created_at DEFAULT now()` is identical across them and the `id`
+tiebreaker is a random uuid — ordering by either does not reproduce artifact
+order. Where a title repeats within one extraction, skip both and log; a wrong
+attachment is worse than a missing one.
+
+**101 is an upper bound, not a yield.** Artifacts whose topics were superseded
+by the nightly report path, or deleted by a group merge, have no target row.
+The backfill reports what it matched and what it could not, and the difference
+is expected rather than a fault.
+
+**Idempotency is the backfill's own problem.** Item-writer's dedup is
+delete-by-`source_s3_key` on *topics*; a direct insert bypasses it entirely and
+the table has no unique constraint, so a second run would duplicate every row.
+The script inserts only for topics that currently have **zero** decisions.
+
+## One thing not to inherit from findings
+
+`insert_findings` passes `f.get("observation")` straight into an
+`observation text NOT NULL` column. One malformed row therefore aborts the
+whole topics transaction — a latent hazard in the file that otherwise takes
+care ("one malformed finding must never abort the whole topic's insert").
+
+The decisions repository **skips rows with an empty or missing `decision`**
+rather than mirroring that. The mirror is for the shape, not for the bug.
+
+**`site_id` is deliberately omitted.** `findings` carries one plus a
+`(site_id, domain)` index; decisions reach a site through `topics`, which
+already cascades from `sites`. Stated so a future site-scoped query is not
+built on a column that was assumed present.
 
 ## Verification
 
