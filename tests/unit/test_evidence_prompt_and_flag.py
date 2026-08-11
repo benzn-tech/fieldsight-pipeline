@@ -79,3 +79,13 @@ def test_extract_session_receives_the_flag():
     nxt = re.search(r"\n  [A-Za-z][A-Za-z0-9]*:\n", text[start + 1:])
     block = text[start:start + 1 + nxt.start()] if nxt else text[start:]
     assert "EMIT_EVIDENCE: !Ref EmitEvidence" in block
+
+
+def test_the_prompt_tells_the_model_not_to_adjust_the_hour(monkeypatch):
+    """Seven of nine distinct unverified quotes were an hour off, minutes and
+    seconds exact. The prompt said "`at` is the [HH:MM:SS] of the line" without
+    ever saying "copy it, do not compute it"."""
+    monkeypatch.setattr(ex, "EMIT_EVIDENCE", True)
+    text = ex._evidence_instruction().lower()
+    assert "hour" in text, \
+        "the one field the model gets wrong is the one the prompt never mentions"

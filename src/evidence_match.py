@@ -13,6 +13,7 @@ detail here is noise added directly to it.
 import difflib
 import re
 import unicodedata
+from datetime import timedelta
 
 # Worst -> best. `unverified` and `unchecked` are handled separately in roll_up
 # because they DOMINATE rather than rank.
@@ -29,6 +30,17 @@ REASON_NO_CANDIDATE_TEXT = "no_candidate_text"   # turns present but empty: ASR,
 REASON_EMPTY_QUOTE = "empty_quote"               # nothing was cited
 REASON_BELOW_FUZZY = "below_fuzzy_threshold"     # a near miss: blame the cut
 REASON_NOTHING_CLOSE = "nothing_close_in_window"  # nothing resembling it is there
+REASON_ANCHOR_HOUR_SLIP = "anchor_hour_slip"      # verbatim, but an hour away
+
+# How far the hour-slip probe looks, and no further.
+#
+# Measured over 1,576 real citations: of the nine distinct quotes that came out
+# unverified, SEVEN existed verbatim exactly one hour after the cited time --
+# minutes and seconds identical. Not our rendering: all 279 turns in that
+# session had prompt label == abs_start, so the prompt said 15:13:58 and the
+# model wrote 14:13:58. Every timestamp confusion this repo has produced
+# (BUG-19, BUG-37) has also been a whole-hour one.
+_SLIP_HOURS = (1, -1)
 
 # Where "not close" stops being "not close ENOUGH".
 #
@@ -132,7 +144,8 @@ def check_quote(quote, turns, at, *, w_seconds, floor_tokens, fuzzy_threshold):
     """
     window = windowed_turns(turns, at, w_seconds)
     if not window:
-        return {"status": "unverified", "reason": REASON_NO_TURNS}
+        return _unverified(REASON_NO_TURNS, quote, turns, at,
+                           w_seconds, floor_tokens)
 
     # Concatenated, not tested per turn: turns are per-segment and never merged
     # across chunks, so a sentence split at a chunk seam is two turns and
@@ -161,14 +174,15 @@ def check_quote(quote, turns, at, *, w_seconds, floor_tokens, fuzzy_threshold):
             # Turns were in the window but carried no words. Widening W would
             # never fix this one, so it must not be filed beside the misses
             # that widening W does fix.
-            return {"status": "unverified", "reason": REASON_NO_CANDIDATE_TEXT}
+            return _unverified(REASON_NO_CANDIDATE_TEXT, quote, turns, at,
+                               w_seconds, floor_tokens)
         if ratio < fuzzy_threshold:
             # Which of the two failures it is decides where the next person
             # looks: at our cut, or at the anchor and the transcript.
             reason = (REASON_BELOW_FUZZY if ratio >= NOTHING_CLOSE_RATIO
                       else REASON_NOTHING_CLOSE)
-            return {"status": "unverified", "reason": reason,
-                    "fuzzy_ratio": round(ratio, 3)}
+            return _unverified(reason, quote, turns, at, w_seconds,
+                               floor_tokens, fuzzy_ratio=round(ratio, 3))
 
     turn = _turn_at(window, norm_turns, pos)
     if weak:
@@ -200,6 +214,57 @@ def check_quote(quote, turns, at, *, w_seconds, floor_tokens, fuzzy_threshold):
         out["found_offset_sec"] = round(
             abs(turn["abs_start"].timestamp() - at.timestamp()), 1)
     return out
+
+
+def _unverified(reason, quote, turns, at, w_seconds, floor_tokens, **extra):
+    """An unverified result, with the hour-slip probe attached when it fires.
+
+    The probe NEVER verifies. Accepting a match an hour away would destroy the
+    property that makes this number mean anything -- a quote matching somewhere
+    else is a mis-citation, not a verification. It labels, so that the class can
+    be subtracted from the headline instead of inflating it, and so a reader is
+    pointed at the audio rather than left to hunt for it.
+    """
+    out = {"status": "unverified", "reason": reason}
+    out.update(extra)
+    slip = _anchor_slip(quote, turns, at, w_seconds, floor_tokens)
+    if slip:
+        out["reason"] = REASON_ANCHOR_HOUR_SLIP
+        out["slip_hours"] = slip["slip_hours"]
+        out["segment_key_source"] = slip["turn"].get("source_filename")
+        out["offset_sec"] = slip["turn"].get("start_sec")
+    return out
+
+
+def _anchor_slip(quote, turns, at, w_seconds, floor_tokens):
+    """Is this quote sitting verbatim a whole hour from where it was cited?
+
+    EXACT containment (or an exact splice) only -- never fuzzy. A fuzzy probe
+    over a second window would manufacture slips out of coincidence, which is
+    the opposite of what a diagnostic is for.
+
+    Below the specificity floor it does not run at all: "yes" turns up an hour
+    later in almost any recording.
+    """
+    if at is None or token_count(quote) < floor_tokens:
+        return None
+    needle = normalise(quote)
+    if not needle:
+        return None
+    for hours in _SLIP_HOURS:
+        window = windowed_turns(turns, at + timedelta(hours=hours), w_seconds)
+        if not window:
+            continue
+        norm_turns = [normalise(t.get("text", "")) for t in window]
+        haystack = " ".join(norm_turns)
+        pos = haystack.find(needle)
+        if pos < 0:
+            pos, _frags = _match_spliced(quote, haystack)
+        if pos < 0:
+            continue
+        return {"slip_hours": hours,
+                "turn": _turn_at(window, norm_turns, pos)}
+    return None
 
 
 def _match_spliced(quote, haystack):
