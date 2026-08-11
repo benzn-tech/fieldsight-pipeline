@@ -209,6 +209,25 @@ Resources:
       ServerlessV2ScalingConfiguration:
         MinCapacity: 0
         MaxCapacity: 2
+        # Idle seconds before the instance pauses. AWS allows 300-86400 and
+        # defaults to 300; 600 is chosen against the sweep's cadence, not for
+        # its own sake.
+        #
+        # The finalize sweep connects unconditionally once an hour (a fixed
+        # minute-of-hour, gated inside the handler so both stages align -- they
+        # share this cluster). That interval MUST stay several times this value.
+        # The first draft of the design set both to 900s, so the idle timer was
+        # reset ~15s before it could ever expire: the cluster would have paused
+        # never, the feature would have saved nothing, and every test would have
+        # been green. tests/unit/test_sweep_cadence_vs_autopause.py pins the
+        # relationship; changing this number without reading it is how that
+        # returns.
+        #
+        # Also long enough to let autovacuum finish. These tables are
+        # append-heavy (transcripts) with an HNSW vector index, and Aurora
+        # CANCELS a running autovacuum when the pause fires -- and never wakes
+        # for one, nor for pg_cron.
+        SecondsUntilAutoPause: 600
       EnableHttpEndpoint: true
       StorageEncrypted: true
       BackupRetentionPeriod: 7
