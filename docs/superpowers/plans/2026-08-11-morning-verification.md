@@ -58,10 +58,24 @@ Expect `true` on all three. Anything else means the repo variable
 2026-08-07) predates the row that queues a merge, so nothing will be retro-merged. Seeing no
 merge activity in the morning is the expected result, not a failure.
 
-Two fixes shipped with it and both are the reason it could not be turned on earlier:
-re-arming used to leave the group invisible to every scan (#346), and an empty merge used to
-delete the records it replaced (#348). If a merge does run and produces nothing, check that
-the members kept their own topics — that is #348's guarantee.
+Three fixes shipped with it and they are the reason it could not be turned on earlier:
+re-arming used to leave the group invisible to every scan (#346); an empty merge used to
+delete the records it replaced (#348); and the "updated" email was written with **no
+recipient at all**, so the worker skipped it *before* writing a result — the member got no
+email and nothing anywhere recorded that (#363). If a merge does run and produces nothing,
+check that the members kept their own topics — that is #348's guarantee.
+
+If a merge runs and you expect emails, the thing to look for is the log line
+`updated-email: no recipient for member … — not enqueued`. It is now loud on purpose: the
+previous behaviour was the same silence with no trace.
+
+One thing to know about #363's shape, in case it misbehaves: `lambda_item_writer` now
+imports `_resolve_context` from `lambda_finalize_claim`. That is safe under a SAM deploy —
+every function is built from `CodeUri: src/`, so the whole tree is in each package, and
+`lambda_finalize_claim` has no module-level work beyond `os.environ.get` with defaults. It
+would **not** be safe under a single-entry hot-fix zip, which is a deployment technique this
+repo has used before. If item-writer ever starts failing on the group path with an
+`ImportError`, that is the reason.
 
 ---
 
@@ -138,7 +152,7 @@ The rest of tonight's prod payload is meant to be invisible:
 
 | change | what to look at | what "no harm" looks like |
 |---|---|---|
-| evidence matcher (#349–#352) | a fresh extraction's topics | citations present, not fewer than yesterday; the "wrong hour" case no longer flagged as fabrication |
+| evidence matcher (#349–#352, #358, #360) | a fresh extraction's topics | citations present, not fewer than yesterday; a spliced quote checked fragment by fragment; a wrong hour no longer called fabrication |
 | DashScope file transcription (#354) | nothing — contract tests only | no change |
 | `opened_at` in UTC + action-table email (#345) | the confirmation email's subject and times | local NZ time, not a day off |
 
@@ -152,6 +166,8 @@ A report that renders is not evidence for any of these. Each one acts before ren
   it. Closing it needs 0.6.4 on the devices, then `enforce`.
 - **Speaker attribution.** Unchanged tonight. The Phase 0 gate — can two people at 6 m be
   told apart — has no material yet; the recording script is at
-  `fieldsight-vad-check/2026-08-11-blockV-script/`.
+  `fieldsight-vad-check/2026-08-11-blockV-script/` and the analysis harness is
+  `scripts/speaker_phase0.py` (run it on the raw *and* the normalised copy; §0.3 requires
+  both and they have disagreed before).
 - **Microphone silence.** The device now records the evidence; the backend does not yet read
   those fields.
