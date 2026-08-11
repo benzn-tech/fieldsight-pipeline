@@ -168,3 +168,37 @@ def test_flag_miss_on_the_safety_pass_is_an_error(monkeypatch, wired, caplog):
     with caplog.at_level("ERROR"):
         fc.lambda_handler({}, None)
     assert any("FLAG MISS" in r.getMessage() for r in caplog.records)
+
+
+# --- the stuck-session trap --------------------------------------------------
+
+def test_count_live_sql_excludes_open_sessions_with_no_activity_anchor():
+    """A permanently stuck `open` row must not pin the flag on forever.
+
+    Both stages carry one today (created 2026-08-04, segment_count 0, both
+    timestamps NULL). `list_idle_open` cannot infer a close on a row with no
+    anchor, so the sweep can never act on it. Counting it as live would keep the
+    pending flag raised for good and the cluster would never sleep — a feature
+    that deploys clean, logs nothing, and whose only symptom is that the bill
+    does not move.
+    """
+    from repositories import meeting_session as ms
+
+    class _Cur:
+        def __init__(self): self.sql = None
+        def execute(self, sql, params=None):
+            self.sql = " ".join(sql.split())
+            return self
+        def fetchone(self): return {"n": 0}
+
+    class _Conn:
+        def __init__(self): self.cur = _Cur()
+        def cursor(self, **kw): return self.cur
+
+    c = _Conn()
+    ms.count_live(c)
+    sql = c.cur.sql
+    assert "COALESCE(last_segment_at, opened_at) IS NOT NULL" in sql, (
+        "count_live must ignore open sessions the sweep can never close")
+    # pending_close / finalizing stay unconditional — they are always actionable.
+    assert "'pending_close', 'finalizing'" in sql

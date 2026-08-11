@@ -988,6 +988,13 @@ def session_close(conn, caller, session_id, body):
                    "version": existing["version"], "noop": True})
 
     row = meeting_session.mark_pending_close(conn, session_id, b.get("endedAt"), intent)
+    # The sweep now has a session to finalize (Aurora scale-to-zero, spec
+    # 2026-08-11). Belt and braces next to the /open write: an `open` session
+    # normally holds the flag up by itself, but a session with no activity
+    # anchor is excluded from count_live (it can never be idle-closed, so
+    # counting it would pin the flag on forever), and a late /close is exactly
+    # how such a session becomes actionable again.
+    sweep_state.mark_pending(_STAGE)
     # Multi-device merge: a deliberate End means "the meeting is over", so the
     # other devices have to be told. Recorded here rather than pushed, because
     # there is no channel to a device that is not currently uploading — the
