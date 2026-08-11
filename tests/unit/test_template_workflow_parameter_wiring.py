@@ -353,3 +353,40 @@ def test_the_code_defaults_match_the_template_defaults():
         assert float(tpl_default) == float(code_default), (
             f"{env}: template default {tpl_default!r} != code default "
             f"{code_default!r}")
+
+
+# ----------------------------------------------------------
+# Batched transcription (spec 2026-08-11). Two functions read BATCH_TRANSCRIPTION and both
+# must be given it: the transcriber accumulates members, and the sweep seals a session's
+# LAST run — the one that has no fourth chunk coming. Give it to only one and the failure
+# is silent in the worse direction: members accumulate, nothing ever seals the tail, and
+# the end of every session goes untranscribed with no error anywhere.
+# ----------------------------------------------------------
+
+_BATCH_READERS = ("TranscribeFunction", "FinalizeSweepFunction")
+
+
+def test_the_batch_switch_is_wired_in_both_environments():
+    for env, path in WORKFLOWS.items():
+        assert "BatchTranscription" in _overrides(path), (
+            f"{env} does not pass BatchTranscription, so BATCH_TRANSCRIPTION can only "
+            f"ever hold its template default and neither turning batching on nor rolling "
+            f"it back would work")
+
+
+def test_every_function_that_reads_the_batch_switch_is_given_it():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for fn in _BATCH_READERS:
+        assert "BATCH_TRANSCRIPTION: !Ref BatchTranscription" in _function_block(text, fn), \
+            (f"{fn} reads BATCH_TRANSCRIPTION but is not given it — it would silently take "
+             f"the code default and disagree with the other function")
+
+
+def test_the_transcriber_is_told_whether_chunks_are_whole():
+    """Batching's precondition. The function refuses to batch per-VAD-segment units, so it
+    has to be able to see which mode the VAD is in — reading a code default here would let
+    it batch fragments the moment someone flips whole-chunk off."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert "TRANSCRIBE_WHOLE_CHUNK: !Ref TranscribeWholeChunk" in \
+        _function_block(text, "TranscribeFunction"), \
+        "TranscribeFunction reads TRANSCRIBE_WHOLE_CHUNK but is not given it"
