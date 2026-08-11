@@ -131,7 +131,12 @@ def wired(monkeypatch):
     monkeypatch.setattr(mod, "BATCH_TRANSCRIPTION", True)
     monkeypatch.setattr(mod, "TRANSCRIBE_WHOLE_CHUNK", True)
     monkeypatch.setattr(mod, "BATCH_MAX_CHUNKS", 4)
+    # Both: the handler registers members through its own import, and `batch_seal` holds a
+    # separate one. Patching only the handler's leaves the seal talking to real DynamoDB —
+    # which is how this fixture first failed, with an auth error rather than a wrong answer.
+    import batch_seal
     monkeypatch.setattr(mod, "batch_ledger", ledger, raising=False)
+    monkeypatch.setattr(batch_seal, "batch_ledger", ledger, raising=False)
     calls = []
     monkeypatch.setattr(mod, "ASR_PROVIDER", "elevenlabs")
     import elevenlabs_utils
