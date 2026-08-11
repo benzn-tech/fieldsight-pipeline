@@ -168,6 +168,7 @@ jobs:
               "DeviceLedgerUrl=${{ vars.DEVICE_LEDGER_URL }}" \
               "QuietAlertWorkingDays=${{ vars.QUIET_ALERT_WORKING_DAYS || '7' }}" \
               "EnableFinalize=${{ vars.TEST_ENABLE_FINALIZE || 'true' }}" \
+              "EnableSweepPendingGate=${{ vars.TEST_ENABLE_SWEEP_PENDING_GATE || 'false' }}" \
               "EmailSender=${{ vars.TEST_EMAIL_SENDER || 'stub' }}" \
               "EnableSiteVoice=true" \
               "DocxLayerArn=arn:aws:lambda:ap-southeast-2:509194952652:layer:python-docx-layer:2" \

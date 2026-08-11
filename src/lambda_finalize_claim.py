@@ -23,6 +23,7 @@ import json
 import logging
 import os
 
+import sweep_state
 from repositories import meeting_session, users, sites
 from session_scope import SESSION_GAP_MINUTES
 
@@ -67,6 +68,20 @@ STUCK_MERGE_SECONDS = int(os.environ.get("STUCK_MERGE_SECONDS", "1800"))
 # Mirrors item-writer's own default. Read from the environment rather than
 # imported: separate functions, separate zips.
 GROUP_MERGE_CAP = int(os.environ.get("GROUP_MERGE_CAP", "2"))
+# Aurora scale-to-zero (spec 2026-08-11). This sweep's once-a-minute Aurora
+# connection is the only reason the cluster never reaches the 300s+ continuous
+# idle window auto-pause needs, so it rents the 0.5-ACU floor 24/7 while ~99% of
+# its ticks do nothing. With the gate on, a tick whose flag reports no work
+# returns without connecting. Default OFF: this sits on the confirmation email.
+# Verify it is live by reading the DEPLOYED function env, not the template.
+SWEEP_REQUIRE_PENDING = os.environ.get("SWEEP_REQUIRE_PENDING", "false").lower() == "true"
+STAGE = os.environ.get("STAGE", "prod")
+# Minute of each hour on which the sweep connects regardless of the flag. MUST be
+# identical across stages (they share one cluster -- see _is_safety_minute) and
+# the resulting 1-hour cadence MUST stay several times SecondsUntilAutoPause:
+# equal intervals mean the idle timer never expires and the cluster never sleeps.
+# Pinned by tests/unit/test_sweep_cadence_vs_autopause.py.
+SAFETY_SWEEP_MINUTE = int(os.environ.get("SAFETY_SWEEP_MINUTE", "7"))
 
 
 def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_rolling,
@@ -565,11 +580,41 @@ def _read_result(session_id):
         return None
 
 
+def _is_safety_minute(now) -> bool:
+    """Is this the tick that connects no matter what the flag says?
+
+    Both stages share one cluster, so both must pick the SAME minute -- two
+    unaligned hourly passes would halve the effective idle window and stop the
+    cluster pausing at all. A wall-clock minute aligns by construction; a second
+    EventBridge `rate(1 hour)` rule could NOT (its phase is fixed by whenever the
+    rule happened to be created, and the two stacks deploy separately).
+    """
+    return now.minute == SAFETY_SWEEP_MINUTE
+
+
 def lambda_handler(event, context):
     """Scheduled (~1 min) grace sweep + reconcile — see the module docstring. Opens an
     in-VPC Aurora connection, finalizes every due session, and moves already-sent
-    claimed sessions to their terminal state."""
+    claimed sessions to their terminal state.
+
+    With SWEEP_REQUIRE_PENDING on, a tick whose DynamoDB flag reports no work
+    returns WITHOUT connecting: those connections are the only reason Aurora can
+    never auto-pause. sweep_state fails open and the hourly safety pass runs
+    regardless, so a lost flag delays work by up to an hour -- never drops it.
+    """
+    from datetime import datetime, timezone
+
     from db.connection import get_connection
+
+    safety_pass = _is_safety_minute(datetime.now(timezone.utc))
+    if SWEEP_REQUIRE_PENDING and not safety_pass:
+        if not sweep_state.is_pending(STAGE):
+            # Must be logged: without this line there is no way to verify the
+            # skip path runs, and "it deployed" is not evidence that it works.
+            logger.info("finalize sweep: skipped (no pending work)")
+            return {"swept": 0, "reconciled": 0, "groups": 0,
+                    "skipped": "no-pending"}
+
     with get_connection() as conn:
         swept = sweep(conn)
         reconciled = reconcile(conn, _read_result)
@@ -577,9 +622,33 @@ def lambda_handler(event, context):
         # session to `sent`, and `sent` is what makes its group settled — so
         # running the group scan first would always be one tick behind.
         groups = _sweep_groups_contained(conn)
+        # Only when the gate is on. "Deploys inert" has to mean the tick does not
+        # run one extra query either -- the group-merge tests drive this handler
+        # with a bare connection double, which is exactly the right pressure.
+        live = meeting_session.count_live(conn) if SWEEP_REQUIRE_PENDING else None
     # AFTER the connection block commits: a merge request that outlives a
     # rolled-back claim gets the meeting merged twice.
     flush_pending_enqueues()
+
+    if SWEEP_REQUIRE_PENDING:
+        # Clear ONLY on a tick that did nothing at all. No live session is not
+        # sufficient: session_group.list_due deems a group mergeable exactly when
+        # every member has reached sent/failed -- the very moment count_live()
+        # hits zero. Clearing on liveness alone would retire the flag on the tick
+        # a group first becomes mergeable and push the merge, and its updated
+        # email, to the hourly safety pass. Requiring a completely quiet tick
+        # costs one extra connection and removes that whole class of race.
+        if live == 0 and not swept and not reconciled and not groups:
+            sweep_state.clear_pending(STAGE)
+        elif safety_pass and (swept or reconciled or groups)                 and not sweep_state.is_pending(STAGE):
+            # The flag denied work the unconditional pass then found: a write was
+            # lost. The safety net did its job, but this is a correctness bug in
+            # the flag path and must never pass quietly.
+            logger.error(
+                "finalize sweep: FLAG MISS — safety pass found work the pending "
+                "flag denied (enqueued=%d reconciled=%d groups=%d)",
+                len(swept), len(reconciled), len(groups))
+
     # Observability: this fires every minute, so log ONLY when it did something
     # (no per-idle-minute noise). enqueued = sessions handed to the send worker;
     # reconciled = sessions moved to sent/failed this tick.

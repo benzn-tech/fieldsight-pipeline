@@ -293,6 +293,26 @@ def list_finalizing(conn) -> list[dict]:
     ).fetchall()
 
 
+def count_live(conn) -> int:
+    """How many sessions are in a state the finalize sweep could still act on:
+    `open` (may yet be closed, or inferred-closed when it goes quiet),
+    `pending_close` (waiting out its grace), or `finalizing` (claimed, waiting on
+    the send worker's result).
+
+    One input to the sweep's DynamoDB pending flag (see sweep_state) — NOT the
+    whole test. Zero here does not mean the sweep has nothing to do: a group
+    becomes mergeable precisely when its last member reaches sent/failed, which
+    is the moment this hits zero. The handler therefore also requires the tick
+    itself to have been completely quiet before clearing the flag.
+
+    Counts rather than lists: the caller only needs to know whether the set is
+    empty."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT count(*) AS n FROM meeting_session "
+        "WHERE status IN ('open', 'pending_close', 'finalizing')",
+    ).fetchone()["n"]
+
+
 def mark_sent(conn, session_id) -> dict | None:
     """Confirmation email delivered — close the session out."""
     return conn.cursor(row_factory=dict_row).execute(

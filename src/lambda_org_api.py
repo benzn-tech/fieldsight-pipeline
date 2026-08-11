@@ -131,6 +131,7 @@ import device_heartbeat
 import device_status
 import reindex
 import session_scope
+import sweep_state
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
@@ -240,6 +241,11 @@ def cognito():
         _cognito_client = boto3.client("cognito-idp")
     return _cognito_client
 
+
+# Which stage's sweep flag this API writes (Aurora scale-to-zero, spec
+# 2026-08-11). Each stage has its own items table, so the stage only has to
+# be right enough to make a mis-pointed table obvious when reading the row.
+_STAGE = os.environ.get("STAGE", "prod")
 
 QR_CODES_TABLE = os.environ.get("QR_CODES_TABLE", "fieldsight-qr-login-codes")
 QR_TTL_SECONDS = 90
@@ -752,6 +758,9 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
         # one whose /open never landed, so it is the only chance this group has
         # to become visible to the merge scan.
         _ensure_group_state(conn, caller["company_id"], group_id)
+        # A live session now exists, so the finalize sweep must connect until it
+        # closes (Aurora scale-to-zero, spec 2026-08-11).
+        sweep_state.mark_pending(_STAGE)
     except Exception:
         # An upload that 500s strands the recording and makes the device resend
         # the whole file. A lost group costs a merge; a lost upload costs the
@@ -951,6 +960,11 @@ def session_open(conn, caller, session_id, body):
     # After ensure_open, so a group is only registered once the join itself has
     # passed every guard above (tenant, staleness, meeting-already-ended).
     _ensure_group_state(conn, caller["company_id"], group_id)
+    # There is now something for the finalize sweep to act on, so let it know it
+    # must connect (Aurora scale-to-zero, spec 2026-08-11). Best-effort: a failed
+    # flag write is recovered by the sweep's hourly unconditional pass and must
+    # never fail the open itself.
+    sweep_state.mark_pending(_STAGE)
     return ok({"sessionId": row["session_id"], "status": row["status"],
                "version": row["version"], "groupId": row.get("group_id")})
 
