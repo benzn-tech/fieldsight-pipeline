@@ -396,8 +396,10 @@ def _evidence_instruction():
 N. EVIDENCE. For each topic, give 1-2 `evidence` entries quoting the transcript
    lines that topic came from. Quote VERBATIM -- copy the words exactly as they
    appear above, including any that look like transcription errors. Do not
-   correct, tidy or paraphrase them. `at` is the [HH:MM:SS] of the line the
-   quote starts in. Do NOT put evidence inside action_items or findings; it is a
+   correct, tidy or paraphrase them. `at` is the [HH:MM:SS] printed on the line
+   the quote starts in -- copy all three fields exactly as printed, THE HOUR
+   INCLUDED. Do not recompute it, do not convert it, do not assume it matches
+   when the session started. Do NOT put evidence inside action_items or findings; it is a
    per-topic field. Prefer a full clause over a few words -- a quote of two or
    three words proves nothing.
 """

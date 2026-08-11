@@ -310,3 +310,58 @@ def test_an_ellipsis_with_nothing_either_side_falls_back_to_the_normal_path():
     turns = [_turn("the slab pour is pushed to Thursday")]
     r = em.check_quote("... the slab pour is pushed to Thursday", turns, AT, **KW)
     assert r["status"] == "verified", "one fragment is not a splice"
+
+
+# ---- the model wrote the wrong hour ------------------------------------
+#
+# Measured over 1,576 real citations: of the nine distinct quotes that came out
+# `unverified`, SEVEN existed verbatim in the transcript exactly one hour after
+# the time the model cited -- minutes and seconds identical, hour off by one.
+# Not fabrication, and not our rendering either: every one of the 279 turns in
+# that session had its prompt label equal to its abs_start, so the prompt said
+# 15:13:58 and the model wrote 14:13:58.
+#
+# The probe never verifies. Accepting a match an hour away would destroy the
+# property that makes the number mean anything -- a quote matching somewhere
+# else is a mis-citation. It labels, so the class can be subtracted from the
+# headline and a reader is pointed at the audio instead of hunting for it.
+
+def _hour_turns(text):
+    later = datetime(2026, 8, 7, 15, 23, 7)
+    return [_turn(text, 4.0, at=later, fn="c0121.json")]
+
+
+def test_a_quote_an_hour_off_is_named_rather_than_called_fabrication():
+    turns = _hour_turns("it is because in the enabling it says remove that panel")
+    r = em.check_quote("it is because in the enabling it says", turns, AT, **KW)
+    assert r["status"] == "unverified", "an hour away must never verify"
+    assert r["reason"] == em.REASON_ANCHOR_HOUR_SLIP
+    assert r["slip_hours"] == 1
+
+
+def test_the_slip_reports_where_to_listen():
+    turns = _hour_turns("it is because in the enabling it says remove that panel")
+    r = em.check_quote("it is because in the enabling it says", turns, AT, **KW)
+    assert r["segment_key_source"] == "c0121.json"
+    assert r["offset_sec"] == 4.0
+
+
+def test_a_short_quote_is_not_slip_probed():
+    # "yes" turns up an hour later in almost any recording. Probing below the
+    # specificity floor would manufacture slips out of coincidence.
+    turns = _hour_turns("yes we should stop")
+    r = em.check_quote("yes", turns, AT, **KW)
+    assert r.get("reason") != em.REASON_ANCHOR_HOUR_SLIP
+
+
+def test_a_genuinely_absent_quote_reports_no_slip():
+    turns = _hour_turns("we talked about the crane and the weather today")
+    r = em.check_quote("the budget was approved on Tuesday afternoon", turns, AT, **KW)
+    assert r["status"] == "unverified"
+    assert "slip_hours" not in r
+
+
+def test_the_slip_probe_also_catches_a_spliced_quote_an_hour_off():
+    turns = _hour_turns("alpha bravo charlie delta echo foxtrot golf hotel india")
+    r = em.check_quote("alpha bravo charlie... golf hotel india", turns, AT, **KW)
+    assert r["reason"] == em.REASON_ANCHOR_HOUR_SLIP
