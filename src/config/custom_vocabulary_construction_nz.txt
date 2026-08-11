@@ -128,3 +128,33 @@ thickenings	thick-en-ings		thickenings
 FieldSight		fiːldsaɪt	FieldSight
 SiteSync		saɪtsɪŋk	SiteSync
 RealPTT	real-pee-tee-tee		RealPTT
+# --- People. Added 2026-08-11. ASR errors measured on this product are
+# --- concentrated in names: Theo->Phil put the wrong responsible party into a
+# --- customer email. Common English words that happen to be names (Ben, Mark,
+# --- Jack, Brown, Lamb) are DELIBERATELY excluded: keyterms bias recognition
+# --- toward the listed term, so 'Ben' would pull 'been' and 'Mark' would pull
+# --- 'mark it'. Full names are listed so the pair reinforces the surname.
+Neil Blunden		niːl blʌndən	Neil Blunden
+Blunden		blʌndən	Blunden
+James Alcock		dʒeɪmz ɔːlkɒk	James Alcock
+Alcock		ɔːlkɒk	Alcock
+Jarley Trainor		dʒɑːli treɪnə	Jarley Trainor
+Jarley		dʒɑːli	Jarley
+Trainor		treɪnə	Trainor
+Jethro Ramsay		dʒeθroʊ ræmzi	Jethro Ramsay
+Jethro		dʒeθroʊ	Jethro
+Ramsay		ræmzi	Ramsay
+Sneha Wadkar		sneɪhɑː wɑːdkər	Sneha Wadkar
+Sneha		sneɪhɑː	Sneha
+Wadkar		wɑːdkər	Wadkar
+David Barillaro		deɪvɪd bæriːlɑːroʊ	David Barillaro
+Barillaro		bæriːlɑːroʊ	Barillaro
+Jack Gibson		dʒæk ɡɪbsən	Jack Gibson
+Gibson		ɡɪbsən	Gibson
+Travis Brown		trævɪs braʊn	Travis Brown
+Travis		trævɪs	Travis
+James Lamb		dʒeɪmz læm	James Lamb
+Sam Yu		sæm juː	Sam Yu
+Ben Lin		bɛn lɪn	Ben Lin
+Provista		prəviːstə	Provista
+Provista Balustrades		prəviːstə bæləstreɪdz	Provista Balustrades

@@ -203,3 +203,41 @@ def test_transcribe_segment_retries_then_succeeds(monkeypatch):
     out = eu.transcribe_segment(b"\x00", "seg.wav")
     assert out["results"]["transcripts"][0]["transcript"] == "pour the slab today"
     assert seq == []  # both responses consumed (one retry)
+
+
+# ---- the shipped vocabulary itself ------------------------------------
+#
+# The file is data, so nothing type-checks it and nothing fails when it drifts
+# out of scribe_v2's limits -- the request just stops carrying keyterms, which
+# looks exactly like keyterms not helping.
+
+import os
+
+_VOCAB = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "src", "config",
+    "custom_vocabulary_construction_nz.txt")
+
+
+def test_the_shipped_vocab_parses_and_stays_inside_scribe_limits():
+    terms = eu.load_keyterms(_VOCAB)
+    assert terms, "the shipped vocab must load"
+    assert len(terms) <= eu.MAX_KEYTERMS
+    assert all(len(t) < 50 for t in terms), "scribe_v2 requires each term < 50 chars"
+    assert not any(t.startswith("#") for t in terms), "comment lines are not terms"
+
+
+def test_the_vocab_carries_people_not_only_materials():
+    """Measured ASR errors on this product are concentrated in names -- one of
+    them (Theo heard as Phil) put the wrong responsible party into a customer
+    email. A vocab of materials alone cannot help with that."""
+    terms = {t.lower() for t in eu.load_keyterms(_VOCAB)}
+    assert "blunden" in terms and "alcock" in terms
+
+
+def test_common_english_words_are_not_listed_as_names():
+    """Keyterms bias recognition toward the listed term. 'Ben' would pull
+    'been', 'Mark' would pull 'mark it'. Surnames and distinctive first names
+    carry the benefit without that cost; the bare common words must stay out."""
+    terms = {t.lower() for t in eu.load_keyterms(_VOCAB)}
+    for w in ("ben", "mark", "jack", "brown", "lamb"):
+        assert w not in terms, f"{w!r} as a bare keyterm biases the common word"
