@@ -2105,6 +2105,21 @@ Resources:
                 # grant here is silent — org-api's `except ClientError: pass`
                 # class of trap — so it is granted with the request itself.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+            # Sealing a session's tail (spec 2026-08-11) is real S3 work: read the member
+            # units, read the RAW uploads the overlap is measured on, write the batch and
+            # its map. Phase 4 wired the code and the switch and not these, and the
+            # failure was invisible by design -- the guard caught the AccessDenied and the
+            # session finalized without its last chunks. Verified after deploy with
+            # simulate-principal-policy, not by reading this file.
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/users/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*
       Events:
         GraceSweep:
           Type: Schedule
