@@ -53,16 +53,31 @@ NO_INVENT_LINE = (
 
 
 def _no_invent(prompt):
-    """Insert the escape hatch into the findings instruction (spec v4).
+    """Insert the escape hatch above the entity bullet in the findings instruction (spec v4).
 
-    Anchored on the severity bullet because that is the last line of the findings block; if the
-    anchor ever stops matching, the variant must FAIL rather than silently return the baseline
-    and report "no difference".
+    Two guards, and the second one exists because the first was not enough.
+
+    The anchor must still match, or the arm would silently be a copy of the baseline and report
+    "no difference" -- the most expensive possible wrong answer from this tool.
+
+    The line must ALSO not already be present. Once the change is merged, the baseline prompt
+    contains it, and this function would happily add a SECOND copy: the comparison silently
+    becomes line-once versus line-twice instead of without versus with. That is the same
+    silent-no-op failure the first guard is written to prevent, arriving through the other door,
+    and it appears precisely when someone re-runs the harness to confirm a shipped change.
     """
     anchor = "   - entity: the party RESPONSIBLE"
     if anchor not in prompt:
         raise SystemExit("no_invent: anchor not found -- the findings instruction moved. "
                          "Fix the anchor rather than shipping a silent no-op arm.")
+    # Matched on a short fragment, NOT on NO_INVENT_LINE itself. The shipped line is wrapped
+    # across two source lines, so comparing the full string silently found nothing and the guard
+    # did not fire -- the very failure it was written to catch, arriving through a third door.
+    if "do NOT invent one" in prompt:
+        raise SystemExit(
+            "no_invent: the line is ALREADY in the prompt -- this change is merged. Comparing "
+            "now would measure line-once vs line-twice. To re-measure against the pre-change "
+            "prompt, check out the parent commit of the change and run there.")
     return prompt.replace(anchor, NO_INVENT_LINE + anchor, 1)
 
 
@@ -127,6 +142,25 @@ def build_prompt_from_turns(user_folder, date, session_base, turns, n_segments):
     return prompt, n_segments, turns, tstats
 
 
+def build_group_prompt_from_turns(date, turn_sets):
+    """The multi-device merge prompt, from local turns.
+
+    `build_group_prompt` reuses `_instructions_block()` verbatim, so any edit to the findings
+    instruction changes group extractions too -- on the path where meetings, and therefore
+    findings, matter most. Measuring only the solo prompt would ship an unmeasured surface while
+    reporting the change as measured.
+
+    The group path is not reachable from a single session id: it needs a claim artifact naming
+    several devices. Rather than manufacture one in S3, the two fixture recordings stand in for
+    two body-worn recorders that heard the same meeting. `extract_group` always calls with
+    enable_thinking=True, so that is the only mode worth running here.
+    """
+    artifact = {"groupId": "fixture", "members": [{"date": date, "userFolder": "Fixture_User"}]}
+    sources = [{"session_id": f"sidfixture_dev{i}", "turns": t}
+               for i, t in enumerate(turn_sets, 1)]
+    return ex.build_group_prompt(artifact, sources)
+
+
 def build_prompt(bucket, user_folder, date, session_base):
     """Exactly what extract_session would send, minus the model call."""
     keys = ex.gather_session_segments(bucket, user_folder, date, session_base)
@@ -163,6 +197,25 @@ def summarise(parsed):
             "actions": len(actions), "questions": len(questions),
             "observations": findings, "action_texts": actions,
             "summaries": [(t.get("summary") or "").strip() for t in topics]}
+
+
+def _env_stamp():
+    """Which model, at what temperature, with which flags -- recorded on every row.
+
+    Without this the results are counts with no provenance: a reader cannot tell whether they
+    describe the model production actually runs. The provider is env-driven and differs between
+    environments, so "we measured it" is not a claim the data can support on its own.
+
+    EMIT_EVIDENCE matters because it changes the PROMPT, not just the post-processing: prod ships
+    it off and test ships it on, so the two environments do not send the same request.
+    """
+    return {
+        "provider": llm_utils.LLM_PROVIDER,
+        "model": (llm_utils.QWEN_MODEL if llm_utils.LLM_PROVIDER == "qwen"
+                  else llm_utils.CLAUDE_MODEL),
+        "temperature": os.environ.get("LLM_TEMPERATURE"),
+        "emit_evidence": bool(getattr(ex, "EMIT_EVIDENCE", False)),
+    }
 
 
 def run_once(prompt, n_segments, thinking):
@@ -275,6 +328,10 @@ def main():
     ap.add_argument("--session", help="session_base; omit with --list")
     ap.add_argument("--turns-file", help="JSON list of turns (abs_start_str/speaker/text) to use "
                                          "instead of reading S3. For the both-languages check.")
+    ap.add_argument("--group-turns", nargs="+", metavar="JSON",
+                    help="two or more turns files, treated as separate devices' recordings of one "
+                         "meeting; exercises build_group_prompt, which shares the same "
+                         "instructions block and would otherwise ship unmeasured")
     ap.add_argument("--bucket", default=BUCKET)
     ap.add_argument("--runs", type=int, default=3,
                     help="runs per arm; 1 measures sampling, not the change")
@@ -316,7 +373,16 @@ def main():
     variants = args.variant or ["baseline", "no_invent"]
     modes = {"off": [False], "on": [True], "both": [False, True]}[args.thinking]
 
-    if args.turns_file:
+    if args.group_turns:
+        sets = []
+        for path in args.group_turns:
+            with open(path, encoding="utf-8") as fh:
+                sets.append(json.load(fh))
+        base_prompt = build_group_prompt_from_turns(args.date, sets)
+        n_segments = sum(len(s) for s in sets)
+        turns, tstats = [t for s in sets for t in s], {"truncated": False}
+        print(f"# SYNTHETIC GROUP prompt from {len(sets)} fixture recordings", file=sys.stderr)
+    elif args.turns_file:
         with open(args.turns_file, encoding="utf-8") as fh:
             fixture = json.load(fh)
         base_prompt, n_segments, turns, tstats = build_prompt_from_turns(
@@ -362,7 +428,7 @@ def main():
                 r = run_once(prompt, n_segments, thinking)
                 r.update(variant=variant, thinking=thinking, run=i + 1,
                          prompt_chars=len(prompt), session=args.session,
-                         user=args.user, date=args.date)
+                         user=args.user, date=args.date, **_env_stamp())
                 results.append(r)
                 if args.out:
                     with open(args.out, "a", encoding="utf-8") as fh:
