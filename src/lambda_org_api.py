@@ -4809,6 +4809,18 @@ def _session_end_dt(conn, caller, folder, date, session_id, rows, start_dt):
     return _time_range_end_dt(rows, start_dt)
 
 
+def _session_label(start_dt, end_dt):
+    """The picker row's time label. Delegates the rule; keeps "?" for the unknown end."""
+    text, note = session_scope.format_time_range(start_dt, end_dt, sep=" – ")
+    if note:
+        logger.warning("session picker: %s", note)
+    if text is None:
+        return "? – ?"
+    if end_dt is None or (end_dt is not None and start_dt is not None and end_dt < start_dt):
+        return f"{text} – ?"
+    return text
+
+
 def _hhmm(dt):
     return dt.strftime("%H:%M") if dt is not None else None
 
@@ -4914,7 +4926,11 @@ def build_day_sessions(conn, caller, folder, date, rows):
                                      if a["status"] == "open"),
             "participants": _session_participants(srows),
             "topic_row_ids": [str(r["id"]) for r in srows],   # the export's scope handle
-            "label": f"{_hhmm(start_dt) or '?'} – {_hhmm(end_dt) or '?'}",   # cosmetic
+            # ONE rule, shared with the confirmation email (session_scope.format_time_range):
+            # both render the same fact, and the two used to drift — the email learned that
+            # a span crossing a day must say so while this did not. "?" is kept for a
+            # genuinely unknown end; it is honest, and better than a guess.
+            "label": _session_label(start_dt, end_dt),   # cosmetic
             "_start_dt": start_dt,
             "_end_dt": end_dt,
         })
