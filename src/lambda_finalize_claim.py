@@ -183,6 +183,44 @@ def _to_nz(dt):
         return u + timedelta(hours=13 if (u >= dst_start or u < dst_end) else 12)
 
 
+def _time_range(opened_nz, closed_nz, session_id=None):
+    """The "which meeting was this?" line, in NZ wall clock.
+
+    The two ends come from DIFFERENT CLOCKS, which is the whole reason this is a function.
+    `opened_at` is set from the chunk filename — the device's wall clock (session_activity:
+    "The filename's time is the DEVICE's NZ wall clock") — while `closed_at` is the
+    server's, from /close or from the idle inference. These ROMs have been seen 12 hours
+    out; GROUP_MAX_SPAN_SECONDS above exists for the same reason.
+
+    Rendered as a bare `HH:MM–HH:MM` the day disappears, so a 22-hour span reads as an
+    ordinary afternoon meeting. Observed on TEST 2026-08-12: `16:48–14:29`.
+
+    - same NZ day → unchanged, `11:03–11:06`
+    - a later day → `23:40–00:15 (+1d)`; a real meeting over midnight is legitimate and
+      now readable, and a clock fault is visible instead of disguised
+    - an end BEFORE its start → the start alone. Only a broken clock produces that, and
+      printing a self-contradictory range hides the fault rather than reporting it.
+    """
+    if not opened_nz:
+        return closed_nz.strftime("%H:%M") if closed_nz else None
+    start = opened_nz.strftime("%H:%M")
+    if not closed_nz:
+        return start
+    if closed_nz < opened_nz:
+        logger.warning("finalize: session %s closed (%s) before it opened (%s) — the "
+                       "device and server clocks disagree; showing the start only",
+                       session_id, closed_nz.isoformat(), opened_nz.isoformat())
+        return start
+    days = (closed_nz.date() - opened_nz.date()).days
+    end = closed_nz.strftime("%H:%M")
+    if days == 0:
+        return f"{start}–{end}"
+    logger.warning("finalize: session %s spans %d day(s) (%s → %s) — legitimate over "
+                   "midnight, otherwise a device clock that disagrees with the server",
+                   session_id, days, opened_nz.isoformat(), closed_nz.isoformat())
+    return f"{start}–{end} (+{days}d)"
+
+
 def _resolve_context(conn, row):
     """Recipient email + folder + date + site name for a claimed session, from
     Aurora. date = the session's close (or open) day; siteName from the site pick."""
@@ -200,10 +238,7 @@ def _resolve_context(conn, row):
         site_name = (site or {}).get("name")
     # Meeting time window for the email subject — "which meeting was this?". NZ
     # wall-clock HH:MM of open→close (start only if the close time is unknown).
-    def _hm(dt):
-        return dt.strftime("%H:%M") if dt else None
-    start_hm, end_hm = _hm(opened_nz), _hm(closed_nz)
-    time_range = f"{start_hm}–{end_hm}" if start_hm and end_hm else (start_hm or None)
+    time_range = _time_range(opened_nz, closed_nz, session_id=row.get("session_id"))
     return {"recipient": user.get("email"), "folder": user.get("folder_name"),
             "date": date, "siteName": site_name, "timeRange": time_range}
 
