@@ -194,6 +194,8 @@ jobs:
               "NormaliseAudio=${{ vars.TEST_NORMALISE_AUDIO || 'true' }}" \
               "TranscribeWholeChunk=${{ vars.TEST_TRANSCRIBE_WHOLE_CHUNK || 'true' }}" \
               "BatchTranscription=${{ vars.TEST_BATCH_TRANSCRIPTION || 'false' }}" \
+              "BatchMaxChunks=${{ vars.TEST_BATCH_MAX_CHUNKS || '4' }}" \
+              "BatchSealDeadlineSec=${{ vars.TEST_BATCH_SEAL_DEADLINE_SEC || '150' }}" \
               "FilterAudioEventTags=${{ vars.TEST_FILTER_AUDIO_EVENT_TAGS || 'true' }}" \
               "EnableGroupMerge=${{ vars.TEST_ENABLE_GROUP_MERGE || 'true' }}" \
               "GroupMergeCap=${{ vars.TEST_GROUP_MERGE_CAP || '2' }}" \
