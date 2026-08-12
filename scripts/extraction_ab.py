@@ -35,6 +35,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 import boto3                                    # noqa: E402
+import agent_turn_filter                        # noqa: E402
 import lambda_extract_session as ex             # noqa: E402
 import llm_utils                                # noqa: E402
 
@@ -84,17 +85,28 @@ def build_prompt(bucket, user_folder, date, session_base):
 
 
 def summarise(parsed):
-    """The few numbers worth comparing. Counts alone are not the verdict -- the observations are
-    printed too, because a wording change leaves every count identical."""
+    """Counts, plus the TEXT of every finding and every action item.
+
+    The action texts are not decoration. The acceptance criterion is "read the findings, do not
+    count them": for each finding present in control and absent in the treatment arm, decide
+    whether it MOVED to `action_items` or actually vanished. In the pilot the finding count fell
+    while nothing was lost -- the scaffolding item had become an action, which was the better
+    answer. Recording only observations makes that distinction unanswerable from the data and
+    sends you back to the model for another hour of runs to ask a question you already paid for.
+    """
     topics = (parsed or {}).get("topics") or []
-    findings, actions, questions = [], 0, 0
+    findings, actions, questions = [], [], []
     for t in topics:
         for f in t.get("findings") or []:
             findings.append((f.get("observation") or "").strip())
-        actions += len(t.get("action_items") or [])
-        questions += len(t.get("questions") or [])
+        for a in t.get("action_items") or []:
+            actions.append((a.get("action") or "").strip())
+        for q in t.get("questions") or []:
+            questions.append((q.get("question") if isinstance(q, dict) else str(q) or "").strip())
     return {"topics": len(topics), "findings": len(findings),
-            "actions": actions, "questions": questions, "observations": findings}
+            "actions": len(actions), "questions": len(questions),
+            "observations": findings, "action_texts": actions,
+            "summaries": [(t.get("summary") or "").strip() for t in topics]}
 
 
 def run_once(prompt, n_segments, thinking):
@@ -109,13 +121,101 @@ def run_once(prompt, n_segments, thinking):
                 "truncated": ex.looks_truncated(raw), "chars": len(raw)}
     out = summarise(parsed)
     out["chars"] = len(raw)
+    # The whole parsed object, kept verbatim. Every LLM call here costs real money and ~3 minutes
+    # in thinking mode; a question thought of after the run should never require re-buying it.
+    out["raw"] = parsed
     return out
+
+
+def analyse(paths):
+    """Pair the arms per session and show what MOVED versus what VANISHED.
+
+    This is the acceptance criterion made mechanical up to the last step. It does not decide
+    whether a drop is acceptable -- it presents each dropped observation next to the treatment
+    arm's action items so a person can see at a glance which of the two happened.
+    """
+    import glob as _glob
+    rows = []
+    for pat in paths:
+        for path in _glob.glob(pat):
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        rows.append(json.loads(line))
+
+    by = {}
+    for r in rows:
+        by.setdefault((r.get("date"), r.get("session")), []).append(r)
+
+    for (date, session), rs in sorted(by.items()):
+        print(f"\n=== {date} {session} ===")
+        for thinking in (False, True):
+            arms = {}
+            for v in ("baseline", "no_invent"):
+                arms[v] = [r for r in rs if r.get("variant") == v
+                           and r.get("thinking") == thinking and "observations" in r]
+            if not arms["baseline"] or not arms["no_invent"]:
+                continue
+            def counts(v):
+                return [r["findings"] for r in arms[v]]
+            print(f"  thinking={thinking}  findings  baseline={counts('baseline')}  "
+                  f"no_invent={counts('no_invent')}")
+
+            # An observation is "kept" if ANY treatment run produced something similar. Comparing
+            # run-to-run would report normal sampling noise as loss.
+            treat_obs = [o for r in arms["no_invent"] for o in r["observations"]]
+            treat_act = [a for r in arms["no_invent"] for a in r.get("action_texts", [])]
+            seen = set()
+            for r in arms["baseline"]:
+                for text in r["observations"]:
+                    k = _key(text)
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    if _matches_any(text, treat_obs):
+                        continue
+                    where = ("MOVED to action_items" if _matches_any(text, treat_act)
+                             else "*** VANISHED ***")
+                    print(f"    {where}: {text[:100]}")
+
+
+def _key(text):
+    """Content words, via the pipeline's own CJK-safe tokenizer.
+
+    `re.findall(r"\\w+", ...)` would make a whole Chinese clause ONE token, because Chinese is not
+    whitespace-delimited -- so overlap would degrade to exact string match and every CJK finding
+    would read as vanished-and-new. This repo has shipped that bug twice (chunk_stitch._norm and
+    lambda_ask_agent's lexical split), so the tokenizer is imported rather than rewritten.
+
+    The `len > 3` filter that usually accompanies this is deliberately NOT applied: it drops every
+    single-character CJK token, i.e. all of them.
+    """
+    return frozenset(agent_turn_filter._tokens(text or ""))
+
+
+def _matches_any(text, candidates, threshold=0.4):
+    """Two runs phrase the same item differently -- 'Six brackets ... are missing' vs 'Shortage of
+    six brackets'. Exact comparison would report every item as both vanished and new, so identity
+    is content-word overlap against the SHORTER side (a terse action item legitimately carries
+    fewer words than the finding it came from; normalising by the union would sink it below any
+    threshold)."""
+    a = _key(text)
+    if not a:
+        return False
+    for c in candidates:
+        b = _key(c)
+        if b and len(a & b) / min(len(a), len(b)) >= threshold:
+            return True
+    return False
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--user", required=True, help="user_folder, as in transcripts/{user}/")
-    ap.add_argument("--date", required=True)
+    ap.add_argument("--analyse", nargs="+", metavar="JSONL",
+                    help="read result files and print moved-vs-vanished per session; no LLM calls")
+    ap.add_argument("--user", help="user_folder, as in transcripts/{user}/")
+    ap.add_argument("--date")
     ap.add_argument("--session", help="session_base; omit with --list")
     ap.add_argument("--bucket", default=BUCKET)
     ap.add_argument("--runs", type=int, default=3,
@@ -130,6 +230,13 @@ def main():
                                   "A thinking-on matrix runs for over an hour; without this, a "
                                   "run that dies at 80%% has measured nothing.")
     args = ap.parse_args()
+
+    if args.analyse:
+        analyse(args.analyse)
+        return
+
+    if not (args.user and args.date):
+        ap.error("--user and --date are required (or use --analyse)")
 
     if args.list:
         s3 = boto3.client("s3")
