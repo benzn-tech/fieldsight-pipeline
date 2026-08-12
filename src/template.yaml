@@ -689,7 +689,7 @@ Parameters:
 
   LlmTemperature:
     Type: String
-    Default: ''
+    Default: 'unset'
     Description: >-
       Sampling temperature for whichever LLM provider is in use. EMPTY means
       the parameter is not sent at all and the provider's own default applies

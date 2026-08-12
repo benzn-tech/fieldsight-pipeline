@@ -38,7 +38,13 @@ def _optional_float(name):
     """A knob that is UNSET must stay unsent, not become 0.0. Sending a default
     would change every caller in this repo silently."""
     raw = os.environ.get(name, "").strip()
-    if not raw:
+    # `unset` is the sentinel the deploy has to use, not a typo: SAM CLI REJECTS an
+    # empty --parameter-overrides value ("LlmTemperature= is not a valid format"), so
+    # "no temperature" cannot be spelled as the empty string once it has to travel
+    # through a workflow. It failed the prod deploy on 2026-08-12 and only prod, because
+    # test passes a real number. Treated here rather than warned about, so the ordinary
+    # production configuration does not log a warning on every cold start.
+    if not raw or raw.lower() in ("unset", "none", "default"):
         return None
     try:
         return float(raw)

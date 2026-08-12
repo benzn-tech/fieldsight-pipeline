@@ -383,7 +383,11 @@ def test_prod_temperature_defaults_to_unset():
     prod = open(WORKFLOWS["prod"], encoding="utf-8").read()
     line = [ln for ln in prod.splitlines() if "LlmTemperature=" in ln]
     assert len(line) == 1
-    assert "|| ''" in line[0], "prod must default to unset, not to a number"
+    assert "|| 'unset'" in line[0], (
+        "prod must default to the unset SENTINEL, not to a number and not to the "
+        "empty string. It was `|| ''` until 2026-08-12, and that failed the prod "
+        "deploy outright: SAM rejects an empty --parameter-overrides value. This "
+        "assertion previously pinned the exact spelling that broke it.")
 
 
 # ----------------------------------------------------------
@@ -596,3 +600,50 @@ def test_the_batch_dials_are_settable_from_a_repo_variable():
                 f"{env} does not pass {name}, so it can only ever hold its template "
                 f"default -- changing how many chunks make a batch would still need a "
                 f"template edit and a deploy, not a repo variable")
+
+
+# ----------------------------------------------------------
+# No override may render EMPTY. This is not a style rule: SAM CLI refuses the whole
+# deploy with
+#
+#   Invalid value for '--parameter-overrides': LlmTemperature= is not a valid format
+#
+# and it refused it on PROD on 2026-08-12, after CI was green and cfn-lint passed and
+# the same workflow shape had deployed to TEST all evening -- because test's fallback
+# was a real number and prod's was ''. A parameter whose meaning is "not set" has to be
+# spelled with a sentinel the CLI will carry.
+# ----------------------------------------------------------
+
+
+def _override_lines(path):
+    lines = open(path, encoding="utf-8").read().splitlines()
+    start = next(i for i, ln in enumerate(lines) if "--parameter-overrides" in ln
+                 and ln.strip().startswith("--parameter-overrides"))
+    out = []
+    for ln in lines[start + 1:]:
+        stripped = ln.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if re.match(r'"(\w+)=', stripped):
+            out.append(stripped)
+            continue
+        if not stripped.endswith("\\"):
+            break
+    return out
+
+
+def test_no_parameter_override_can_render_empty():
+    """An empty value fails the deploy, not the parameter."""
+    bad = []
+    for env, path in WORKFLOWS.items():
+        for ln in _override_lines(path):
+            name = re.match(r'"(\w+)=', ln).group(1)
+            value = ln.split("=", 1)[1].rsplit('"', 1)[0]
+            # a literal empty value, or a `||` fallback to the empty string
+            if value == "" or re.search(r"\|\|\s*''\s*\}\}", value):
+                bad.append(f"{env}: {name}")
+    assert not bad, (
+        "These overrides can render as `Name=` with nothing after the equals sign, "
+        "which SAM rejects and which fails the entire deploy: " + ", ".join(bad) +
+        ". Use a sentinel the CLI will carry (e.g. 'unset') and decode it in the code "
+        "that reads the value.")
