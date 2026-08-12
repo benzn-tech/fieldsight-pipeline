@@ -1,173 +1,146 @@
-# Evidence status has no consequences
+# The schema leaves no way to say "I have no basis for this"
 
-**Repo:** `fieldsight-pipeline`. Behaviour of an already-built feature, plus one small gate.
-**v2 — the first draft was reworked after review and after measurement.** Three of its claims
-were wrong and are corrected below, because the reasons they were wrong are the design.
+**Repo:** `fieldsight-pipeline`.
+**v3.** v1 proposed a prompt rule about epistemic stance; v2 proposed mechanical gating after the
+fact. Both were treating the symptom. The measured cause is that the extraction schema **requires**
+an observation and offers no way to decline, so the model manufactures one. v3 gives it the slot
+and verifies what it puts there.
 
-## What started this
+## The measurement that decides the design
 
-A finding on the daily timeline read:
+Same input as the incident (`When will the concrete pour? Oops. No. Not yet.` — four of those
+words are an ASR fabrication from wind noise), `qwen3.7-max`, three runs each:
 
-> *"It **was confirmed** that the pour has not yet taken place or is not yet ready."*
-
-Nobody confirmed anything. The topic's entire substance was one question and four words that
-ElevenLabs produced from wind and metal noise (`Oops. No. Not yet.` — 0 of 3 runs on the raw
-audio, 1 of 3 on the normalised audio).
-
-## Three corrections to the first draft
-
-### C1 — "Turning on EMIT_EVIDENCE would not have helped" is FALSE, and it was free to check
-
-`token_count("Oops. No. Not yet.")` is **4**, below `EVIDENCE_FLOOR_TOKENS = 5`, so
-`check_quote` returns **`weak`** (`evidence_match.py:159,188`). `STATUS_ORDER = ["weak",
-"verified_fuzzy", "verified"]` and `roll_up` takes the **worst** (`:344-367`), so one good
-citation plus that fragment still rolls up `weak`. And `weak` is **persisted** —
-`_evidence_payload` → `upsert_topic(evidence=...)` (`lambda_item_writer.py:341-351,695`).
-
-**The existing machinery already detects the exact shape of this failure**: a claim standing on
-a four-word fragment. The floor exists for that reason — "a quote of two or three words proves
-nothing" (`lambda_extract_session.py:404`).
-
-What is missing is not detection. **It is that the detection has no consequence.** `EMIT_EVIDENCE`
-is `false` on prod, and even with it on, a topic that rolls up `weak` is written with exactly the
-same confident wording as one that rolls up `verified`. Nothing reads the status back.
-
-### C2 — The second motivating incident is already fixed, on this same branch
-
-The agent's own spoken answer becoming a site fact is cut by `agent_turn_filter` (this branch,
-commits `eb22877`/`e451206`): the turns are removed before the prompt is built. It cannot
-motivate this change, and — importantly — an A/B that re-extracts the 2026-08-12 session would
-have its delta dominated by that filter, not by anything proposed here.
-
-### C3 — Routing content into `questions` would have hidden it, not fixed it
-
-The first draft proposed sending unanswered questions to the `questions` field. Two things kill
-that:
-
-- **Nothing reads it.** `questions` appears once in `src/` — its own schema definition
-  (`lambda_extract_session.py:652`). `item_writer` persists title/category/summary/action_items/
-  participants/findings/evidence and **not** questions; `chunking._topic_text` embeds
-  participants/summary/key_decisions/action_items and **not** questions. It is write-only.
-- **The model already does it.** Measured below: 3 of 3 runs filed the question correctly.
-
-So the model has been filing questions correctly all along, into a field with no consumers, and
-the proposal would have moved *more* content there — turning a visible wrong answer into an
-invisible one. The acceptance criterion ("the question appears in `questions`") would have
-verified a write nobody loads.
-
-**Filed separately:** `questions` and `decisions` are produced every run and consumed by nothing.
-Either wire them up or drop them from the schema; leaving them is a standing invitation to
-"fix" something by writing into a void.
-
-## What the measurement actually says
-
-Same input as the incident, `qwen3.7-max`, non-thinking, production-shaped schema, three runs:
-
-| field | result |
+| asked | result |
 |---|---|
-| `questions` | ✅ 3/3 correct — "When will the concrete pour take place?" |
-| `summary` | 2/3 correctly hedged ("inquired about… and indicated"); **1/3 asserts** ("with confirmation that") |
-| `findings.observation` | ❌ **3/3 flatly assertive** — "Concrete pour has not yet taken place as of 12:10:52" |
+| plainly, no schema | ✅ **3/3 hedged correctly** — "the speaker asked … then corrected themselves" |
+| with the production schema | ❌ **3/3 flatly assertive** — "Concrete pour has not yet taken place as of 12:10:52" |
 
-And asked plainly, with no schema, the same model hedges correctly 3/3 ("the speaker asked …
-then corrected themselves").
+The model is not careless about certainty. `findings: capture EVERY notable observation/issue`
+has no floor and no escape hatch, so a topic whose entire content is a question plus a false start
+still has to yield an observation — and it gets manufactured, in the one field that is embedded
+and displayed.
 
-**So the model is not careless about certainty. The schema demand is.** `findings: capture EVERY
-notable observation/issue` has no floor: given a topic whose whole content is a question plus a
-false start, the model must still produce an observation, so it manufactures one and states it as
-fact. The damage concentrates in exactly the field that gets embedded and displayed.
+## The model is already trying to do this, and the code deletes it
 
-## Also measured: extraction is not reproducible
+```python
+# The model may volunteer evidence inside children despite the instruction;
+for child_key in ('action_items', 'findings'):
+    for child in topic.get(child_key) or []:
+        child.pop('evidence', None)
+```
+(`lambda_extract_session.py:337-343`)
 
-`llm_utils._call_qwen` sends **no `temperature` and no `seed`** (`:141-162`), so the provider
-default applies. Three identical prompts produced three different summaries.
+It attaches a citation to individual findings unprompted. We strip it.
 
-Two consequences, and the second is bigger than this spec:
-
-1. **Any A/B needs N runs per arm**, or a pinned temperature. One run per arm measures sampling.
-2. **Production extraction is non-reproducible.** The same transcript extracted twice yields
-   different findings and wording — and this pipeline extracts more than once by design (live
-   pass, final pass, backfills, reruns). Worth its own decision; not resolved here.
+**And the reason it is stripped is the reason v3 is shaped the way it is**, not an argument
+against: the comment says such a citation "would leave an UNVERIFIED citation in the S3 artifact
+for a reader to trust." The problem was never that per-finding citations are unwanted — it is that
+nothing checked them. **Naively deleting the `pop` would reintroduce exactly the defect that line
+was added to prevent.** The fix is to verify them, then keep them.
 
 ## Design
 
-Two layers, deliberately split by what each is good at.
+### Order, and why this order
 
-### Layer 1 — mechanical detection, no judgment
+**0. Build the offline harness. Prerequisite, not a phase.**
 
-Turn `EMIT_EVIDENCE` on, and give the status a consequence. The mechanism is already built and
-is mechanical end to end: the model may only *point* at a quote; whether that quote exists is
-decided by string containment inside a 60s window, an ellipsis-splice test, then a 0.80 fuzzy
-floor, plus a 5-token specificity floor counted per writing system (so a fully specific Chinese
-quote is not capped at `weak` by whitespace counting). Same input, same output, whatever the
-sampler does.
+Nothing below can be evaluated without it:
 
-**The consequence:** a topic whose evidence rolls up `weak` or `absent` must not present its
-findings as settled fact. Minimum viable form — annotate, do not delete:
+- `_call_qwen` sends **no `temperature` and no `seed`** (`llm_utils.py:141-162`). Measured: three
+  identical prompts, three different summaries. A single A/B run measures sampling, not the change.
+- Re-extracting through the deployed lambda writes the real `extraction_key`, which fires
+  item-writer's delete-then-insert and **mutates a real customer's Aurora topics**
+  (`lambda_item_writer.py:635`). **Evaluation must never run through prod.**
 
-- the topic carries its evidence status where the UI and the report can see it;
-- a finding on `weak`/`absent` evidence is marked as unsupported rather than rendered as a
-  statement of fact.
+The harness: download a session's transcripts → build the prompt locally → call qwen directly →
+compare structured output across N runs and across prompt variants. `enable_thinking` pinned (live
+and final passes use opposite modes, so "same model" is otherwise under-specified).
 
-**And a floor on emitting findings at all.** `capture EVERY notable observation` is what
-manufactures an observation out of a false start. A topic whose material cannot support one
-should be allowed to return an empty `findings` array — the schema already permits it
-("may be empty arrays").
+**1. Ask for per-finding evidence, and stop deleting it.**
 
-### Layer 2 — model judgment, only on what Layer 1 flags
+Add `evidence` to the `findings[]` shape in the extraction schema, alongside the topic-level one
+that already exists. Remove the `child.pop` **only together with step 2** — unverified citations
+in the artifact is the exact failure that line prevents.
 
-"Does this quote actually support this claim?" is an entailment question. A regex cannot do it,
-and in Chinese a phrase list is hopeless — this repo has shipped two ASCII-normalisation bugs
-that erased CJK entirely.
+**2. Run the existing checker one level down.**
 
-But it runs **only on the small set Layer 1 marks weak/absent**, and its output **annotates**.
-Reasons, all specific rather than a preference for simplicity:
+`check_quote` is already mechanical end to end: string containment inside a 60s window, an
+ellipsis-splice test, a 0.80 fuzzy floor, and a 5-token specificity floor counted per writing
+system. It needs no changes — only to be called per finding as well as per topic.
 
-- **Circularity.** The tendency that produced "It was confirmed" is the same one that would judge
-  it. Measured: the assertive finding is 3/3, not an occasional slip.
-- **Non-determinism.** A gate that fires 1/3 of the time is noise, not a gate. Confining the model
-  to annotation means the jitter cannot swing the main path.
-- **Concurrency.** Extraction already carries a 600s timeout and has caused a livelock that lost
-  customer uploads (account concurrency is charged by wall-clock, BUG-43). One extra LLM call per
-  topic goes the wrong way; one per flagged topic does not.
+This is what makes the model's self-report trustworthy. **Self-reported confidence is not
+evidence** — the generator that writes "It was confirmed" will equally write `"support": "stated"`.
+But a *citation* is checkable: the model may only point, and whether the quote exists and how
+specific it is, is decided by string matching. That distinction is the whole design.
 
-## Why not a prompt rule (the first draft's proposal)
+**3. Persist it: `findings.evidence` / `evidence_status`.**
 
-It fails its own motivating case. The rule was "no settled language unless the transcript
-contains someone stating it as settled" — and in the transcript **the model saw**, someone did:
-`Oops. No. Not yet.` is, to the model, an answer. The rule removes the words "it was confirmed"
-and leaves the false claim.
+A migration, following `0037_topic_evidence.sql`'s precedent (jsonb on the row, not a child
+table). This is no longer "deferred until topic granularity proves too coarse" — with per-finding
+citations it is where the result lives.
 
-No epistemic-stance instruction can separate a real "no, not yet" from a hallucinated one. That
-defence belongs upstream (the normalisation-amplifies-noise finding) and in thin-support gating —
-not in prompt wording.
+Topic-level status can then roll up from its findings instead of being a separate assertion.
 
-Supporting precedent: every prompt contract in this repo has needed a code-side check anyway —
-the model "may volunteer evidence inside children **despite the instruction**"
-(`lambda_extract_session.py:337-343`), `work_class` is sanitised post-hoc
-(`item_writer.py:664-676`), `declared_site` gets a fuzzy post-check.
+**4. Let `findings` be empty.**
+
+The schema already permits it ("may be empty arrays"); the instruction does not. With an
+evidence slot, "I have no basis" is expressible — a topic made of a question and a false start
+should return no finding rather than invent one. The floor is the same 5-token specificity rule,
+now applied where the claim is made.
+
+### What this does NOT do
+
+- **It does not judge whether a real quote supports the claim built on it.** A model can attach a
+  genuine quote to an unsupported conclusion. That is entailment, it needs a model, and it is
+  deliberately out of scope here — run it later over the small set this layer marks weak, and have
+  it annotate rather than delete.
+- **It does not detect ASR fabrication.** `Oops. No. Not yet.` is in the transcript, so a citation
+  to it is genuine. What changes is that a finding standing on four words is *marked* as standing
+  on four words. The fabrication itself is the normalisation-amplifies-noise finding, separate.
+- **It does not make the report right.** It makes the report say how much it knows.
+
+## Corrections carried forward from v2
+
+- **"Turning EMIT_EVIDENCE on would not have helped" was false**, and free to check.
+  `token_count("Oops. No. Not yet.")` is 4, below the 5-token floor, so `check_quote` returns
+  `weak`; `roll_up` takes the worst; `weak` is persisted. Detection existed; consequence did not.
+- **The agent-answer incident is already fixed on this branch** (`agent_turn_filter`), so it cannot
+  motivate this, and an A/B over that session would measure the filter instead.
+- **`questions` is write-only** — one occurrence in `src/`, its own schema definition. Not
+  persisted by item-writer, not embedded by chunking. The model fills it correctly 3/3 into a
+  field with no readers. Same for `decisions`. Filed separately: wire them up or drop them; do not
+  "fix" anything by writing into them.
+
+## Costs, stated rather than discovered
+
+- **Every finding now carries a citation.** More output tokens per topic, more `check_quote` calls
+  per session. Extraction already runs to a 600s timeout and has caused a livelock that lost
+  customer uploads — account concurrency is charged by wall clock (BUG-43). Measure prompt and
+  response size in the harness before shipping, not after.
+- **It is a prompt change**, so no existing test can pin it: the code path is unchanged and every
+  test passes either way. The harness is the only instrument.
+- **Artifact size** grows with per-finding citations; the S3 extraction artifact is read by the
+  matcher and the rolling summary.
 
 ## Acceptance
 
-**Mechanical layer — testable normally.** Unit tests over `roll_up`/`check_quote` already exist;
-add: a topic whose only citation is below the token floor rolls up `weak`; a `weak` topic's
-findings are marked unsupported; an empty `findings` array survives the schema and item-writer.
+**Harness, N ≥ 3 runs per arm, thinking pinned, both languages** (the prompt is shared; two
+ASCII-normalisation bugs have already erased CJK in this repo):
 
-**Never re-extract through prod to evaluate.** `extract_session` writes the real
-`extraction_key`, which fires item-writer's delete-then-insert and **mutates a real customer's
-Aurora topics** (`lambda_item_writer.py:635`). Any A/B needs a local harness: download
-transcripts → build the prompt → call qwen directly → compare. That harness does not exist and
-must be budgeted.
+1. **The incident case**: with per-finding evidence, the fabricated observation either disappears
+   or is marked `weak`. Requirement is the marking, not the disappearance — a model that still
+   writes it but declares a four-word basis has done the right thing.
+2. **Regression sample**, ≥5 unrelated historical sessions: genuine findings keep their citations
+   and do not collapse to empty. **An extractor that finds nothing is as useless as one that
+   invents.** Compare finding counts *and* the fraction rolling up `verified`.
+3. **Cost**: prompt/response tokens and wall-clock per session, before and after.
 
-**If Layer 2 is built**, it needs ≥3 runs per arm with `enable_thinking` pinned (live and final
-passes use opposite modes), and the metric cannot be topic/action/finding **counts** — a wording
-change leaves counts identical. Compare the wording of findings on `weak` evidence specifically.
+Counts alone cannot be the metric — a wording change leaves them identical. Compare the wording
+of findings whose evidence rolls up `weak`.
 
 ## Rollout
 
-Behind an env toggle, wired through the workflow **and** the template Parameter — not just the
-code. This repo has shipped a toggle that could only ever take its default and reported success
-the whole way.
-
-(The first draft said this matched `FILTER_AUDIO_EVENT_TAGS` shipping off. It ships **on**
-(`lambda_extract_session.py:251`). `EMIT_EVIDENCE` is the one that ships off.)
+Behind an env toggle wired through the workflow **and** the template Parameter — not just the
+code. This repo has shipped a toggle that could only take its default and reported success the
+whole way. `EMIT_EVIDENCE` is the existing precedent and it ships off.
