@@ -1791,6 +1791,13 @@ Resources:
                 # throttle and the tier/coverage supersede check BEFORE doing
                 # any expensive work.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
+                # A batched transcript's time map, which the seal writes beside
+                # the batch WAV rather than beside the transcript. Without this
+                # `_rebase_batch_turns` cannot read it and every batched session
+                # keeps filename arithmetic — the failure is one WARNING per
+                # extraction and correct-looking timestamps, which is how it
+                # survived from #368 to 2026-08-12.
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:

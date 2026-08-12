@@ -478,3 +478,23 @@ def test_the_sweep_may_do_the_s3_work_that_sealing_a_tail_requires():
             f"FinalizeSweepFunction has no {action} on {prefix}; the tail seal fails with "
             f"AccessDenied behind the guard and every session's last chunks go "
             f"untranscribed with nothing failing")
+
+
+# ----------------------------------------------------------
+# The reader half of the same map. `_rebase_batch_turns` fetches
+# `audio_segments/…_batch_map.json`, a prefix the extractor has never had. Fixing only the
+# key (PR #392) moved the failure from "wrong key" to "AccessDenied on the right key" and
+# the symptom did not change at all: one WARNING, filename arithmetic, plausible times.
+# Found by re-running the deployed function on TEST after that fix and reading the log
+# instead of trusting the unit suite.
+# ----------------------------------------------------------
+
+
+def test_the_extractor_may_read_the_batch_maps_it_looks_for():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "ExtractSessionFunction")
+    reads = [s for s in blk.split("- Effect: Allow") if "s3:GetObject" in s]
+    assert any("audio_segments/*" in s for s in reads), (
+        "ExtractSessionFunction has no s3:GetObject on audio_segments/*, where the seal "
+        "writes every batch's time map — batched sessions silently keep filename "
+        "arithmetic and only a WARNING says so")
