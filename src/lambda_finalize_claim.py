@@ -26,6 +26,7 @@ import time
 
 import sweep_state
 from repositories import meeting_session, users, sites
+import session_scope
 from session_scope import SESSION_GAP_MINUTES
 
 logger = logging.getLogger()
@@ -184,41 +185,16 @@ def _to_nz(dt):
 
 
 def _time_range(opened_nz, closed_nz, session_id=None):
-    """The "which meeting was this?" line, in NZ wall clock.
+    """The email's "which meeting was this?" line.
 
-    The two ends come from DIFFERENT CLOCKS, which is the whole reason this is a function.
-    `opened_at` is set from the chunk filename — the device's wall clock (session_activity:
-    "The filename's time is the DEVICE's NZ wall clock") — while `closed_at` is the
-    server's, from /close or from the idle inference. These ROMs have been seen 12 hours
-    out; GROUP_MAX_SPAN_SECONDS above exists for the same reason.
-
-    Rendered as a bare `HH:MM–HH:MM` the day disappears, so a 22-hour span reads as an
-    ordinary afternoon meeting. Observed on TEST 2026-08-12: `16:48–14:29`.
-
-    - same NZ day → unchanged, `11:03–11:06`
-    - a later day → `23:40–00:15 (+1d)`; a real meeting over midnight is legitimate and
-      now readable, and a clock fault is visible instead of disguised
-    - an end BEFORE its start → the start alone. Only a broken clock produces that, and
-      printing a self-contradictory range hides the fault rather than reporting it.
+    The rule itself lives in `session_scope.format_time_range`, shared with the session
+    picker: both render the same fact, and two implementations of one rule is how they
+    drift — which is exactly what happened between 2026-08-12 morning and afternoon.
     """
-    if not opened_nz:
-        return closed_nz.strftime("%H:%M") if closed_nz else None
-    start = opened_nz.strftime("%H:%M")
-    if not closed_nz:
-        return start
-    if closed_nz < opened_nz:
-        logger.warning("finalize: session %s closed (%s) before it opened (%s) — the "
-                       "device and server clocks disagree; showing the start only",
-                       session_id, closed_nz.isoformat(), opened_nz.isoformat())
-        return start
-    days = (closed_nz.date() - opened_nz.date()).days
-    end = closed_nz.strftime("%H:%M")
-    if days == 0:
-        return f"{start}–{end}"
-    logger.warning("finalize: session %s spans %d day(s) (%s → %s) — legitimate over "
-                   "midnight, otherwise a device clock that disagrees with the server",
-                   session_id, days, opened_nz.isoformat(), closed_nz.isoformat())
-    return f"{start}–{end} (+{days}d)"
+    text, note = session_scope.format_time_range(opened_nz, closed_nz)
+    if note:
+        logger.warning("finalize: session %s time range — %s", session_id, note)
+    return text
 
 
 def _resolve_context(conn, row):

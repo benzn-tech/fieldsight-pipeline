@@ -245,3 +245,44 @@ def assign_blocks(sessions):
         s["block"] = block
         prev_end = s.get("_end_dt")
     return sessions
+
+
+def format_time_range(start, end, sep="–"):
+    """"Which meeting was this?", as one rule for everyone who shows it.
+
+    Returns `(text, note)`. `note` is None when nothing is odd, otherwise a short reason
+    the caller should log — this function never logs, so it stays pure and testable.
+
+    Both callers — the confirmation email and the session picker — render the same fact,
+    and until 2026-08-12 they did it with two separate bits of code. The email learned that
+    a span crossing a day must say so; the picker did not. Two implementations of one rule
+    is how they drift.
+
+    Why any of this is needed: the two ends can come from different clocks. `opened_at` is
+    set from the chunk filename (the DEVICE's wall clock) and `closed_at` from the device's
+    /close, and before 2026-08-10 the backend stored device-local time into a UTC column —
+    eight prod sessions still carry that. A 12-hour error renders as a perfectly plausible
+    meeting unless something says otherwise.
+
+        same day      11:03–11:06        (`sep` keeps each caller's own spacing:
+                                             the email joins bare, the picker with " – ")
+        later day     16:48–14:29 (+1d)      -- readable overnight, visible clock fault
+        end < start   16:48                  -- only a broken clock; the start is what is
+                                                true, and a self-contradictory range hides
+                                                the fault rather than reporting it
+    """
+    if start is None:
+        return (end.strftime("%H:%M"), None) if end is not None else (None, None)
+    start_hm = start.strftime("%H:%M")
+    if end is None:
+        return start_hm, None
+    if end < start:
+        return start_hm, (f"the end ({end.isoformat()}) is before the start "
+                          f"({start.isoformat()}) — the clocks disagree")
+    days = (end.date() - start.date()).days
+    text = f"{start_hm}{sep}{end.strftime('%H:%M')}"
+    if days == 0:
+        return text, None
+    return f"{text} (+{days}d)", (f"spans {days} day(s) ({start.isoformat()} → "
+                                  f"{end.isoformat()}) — legitimate over midnight, "
+                                  f"otherwise a clock that disagrees with the server")
