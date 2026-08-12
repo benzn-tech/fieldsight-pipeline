@@ -1,146 +1,133 @@
-# The schema leaves no way to say "I have no basis for this"
+# One instruction line, measured
 
-**Repo:** `fieldsight-pipeline`.
-**v3.** v1 proposed a prompt rule about epistemic stance; v2 proposed mechanical gating after the
-fact. Both were treating the symptom. The measured cause is that the extraction schema **requires**
-an observation and offers no way to decline, so the model manufactures one. v3 gives it the slot
-and verifies what it puts there.
+**Repo:** `fieldsight-pipeline`. One line in the extraction prompt. No schema change, no
+migration, no flag.
 
-## The measurement that decides the design
+**v4.** v1 proposed a rule about epistemic stance. v2 proposed mechanical gating. v3 proposed
+per-finding citations plus a migration. **All three are wrong, and v3 is wrong in a way that
+would have made things worse.** What follows is what the measurements actually support.
 
-Same input as the incident (`When will the concrete pour? Oops. No. Not yet.` — four of those
-words are an ASR fabrication from wind noise), `qwen3.7-max`, three runs each:
+## The incident
 
-| asked | result |
+A finding on the daily timeline read *"It **was confirmed** that the pour has not yet taken
+place."* Nobody confirmed anything: the topic's whole content was one question plus four words
+ElevenLabs produced from wind noise (`Oops. No. Not yet.` — 0/3 runs on the raw audio, 1/3 on the
+normalised).
+
+## The measurement that decides it
+
+`qwen3.7-max`, non-thinking, `response_format: json_object`, identical task and schema in every
+arm, three runs each. Only the instruction differs.
+
+| arm | added to the prompt | findings produced |
+|---|---|---|
+| control | — | **3/3 the fabricated assertion** |
+| `evid_only` | an `evidence` field per finding | **3/3 the assertion, with a citation** |
+| `perm_only` | *"If no line states an observation, do NOT invent one — findings may be an empty array."* | **3/3 zero findings** |
+| both | both | 3/3 zero findings |
+
+**The escape hatch is what works. The citation field does nothing on its own.**
+
+### v3 would have made this worse, and the measurement shows how
+
+Every `evid_only` run cited the same string: `"When will the concrete pour? Oops. No. Not yet."`
+That is ~9 tokens — **above `EVIDENCE_FLOOR_TOKENS = 5`** — and verbatim in the transcript. So
+`check_quote` returns **`verified`**.
+
+v3's whole premise was that per-finding citations would mark this claim as thinly supported. The
+model does not cite the narrow fragment; it cites the whole line. **The design would have stamped
+the fabricated assertion `verified` and shipped it with a receipt** — more trustworthy-looking
+than the unmarked version it replaced.
+
+`check_quote` measures existence and specificity. It never measures whether the quote *supports*
+the claim, and v3 explicitly carved entailment out of scope — so it had no mechanism left to
+catch its own motivating case.
+
+### And the regression arm says the cost is acceptable
+
+Real session content (brackets, building wrap, timber, scaffolding), three runs each:
+
+| | findings |
 |---|---|
-| plainly, no schema | ✅ **3/3 hedged correctly** — "the speaker asked … then corrected themselves" |
-| with the production schema | ❌ **3/3 flatly assertive** — "Concrete pour has not yet taken place as of 12:10:52" |
+| control | 8, 8, 8 |
+| with the escape hatch | 5, 7, 8 |
 
-The model is not careless about certainty. `findings: capture EVERY notable observation/issue`
-has no floor and no escape hatch, so a topic whose entire content is a question plus a false start
-still has to yield an observation — and it gets manufactured, in the one field that is embedded
-and displayed.
+The count drops. **Reading them shows what moved rather than vanished:** the only item missing
+from a lower-count run was *"Scaffolding requires inspection prior to Monday"* — and across three
+runs it appeared as an **action item every time** (once as both). The transcript says *"We should
+check the scaffolding before Monday"*, which is an instruction to do something. Filing it as an
+action rather than an observation is the better answer, not a loss.
 
-## The model is already trying to do this, and the code deletes it
+**This is one item on one session.** It is the evidence there is, and it is not enough to call the
+regression risk closed — see acceptance.
 
-```python
-# The model may volunteer evidence inside children despite the instruction;
-for child_key in ('action_items', 'findings'):
-    for child in topic.get(child_key) or []:
-        child.pop('evidence', None)
-```
-(`lambda_extract_session.py:337-343`)
+## The change
 
-It attaches a citation to individual findings unprompted. We strip it.
+One line, in `_instructions_block`'s findings section:
 
-**And the reason it is stripped is the reason v3 is shaped the way it is**, not an argument
-against: the comment says such a citation "would leave an UNVERIFIED citation in the S3 artifact
-for a reader to trust." The problem was never that per-finding citations are unwanted — it is that
-nothing checked them. **Naively deleting the `pop` would reintroduce exactly the defect that line
-was added to prevent.** The fix is to verify them, then keep them.
+> If no line in the transcript states an observation, do NOT invent one — `findings` may be an
+> empty array.
 
-## Design
+### Why it is a line and not a rule about wording
 
-### Order, and why this order
+The diagnosis in v3 was also wrong in its wording: the schema does **not** require an observation —
+`lambda_extract_session.py:813` already says findings "may be empty arrays". The pressure comes
+from instruction 4, **"capture EVERY notable observation/issue"** (`:782`), which has no floor. The
+schema permits silence; the instruction does not. That is why one line in the instruction, rather
+than a schema change, is the whole fix.
 
-**0. Build the offline harness. Prerequisite, not a phase.**
+The evidence that the model is not otherwise careless: with the same schema, `summary` still
+hedged 2/3 and `questions` was filled correctly 3/3. Hedging survives everywhere except the field
+the instruction pressures.
 
-Nothing below can be evaluated without it:
+## What this does not do
 
-- `_call_qwen` sends **no `temperature` and no `seed`** (`llm_utils.py:141-162`). Measured: three
-  identical prompts, three different summaries. A single A/B run measures sampling, not the change.
-- Re-extracting through the deployed lambda writes the real `extraction_key`, which fires
-  item-writer's delete-then-insert and **mutates a real customer's Aurora topics**
-  (`lambda_item_writer.py:635`). **Evaluation must never run through prod.**
+- **It does not detect the ASR fabrication.** `Oops. No. Not yet.` is in the transcript. What
+  changes is that a topic with nothing observable in it now yields no observation.
+- **It does not fix `summary`**, which asserted 1/3. The finding was the field that mattered
+  (3/3, and it is what `/live-items` shows), but the summary is untouched and unmeasured here.
+- **It does not touch grouped meetings' verification gap** — see below.
 
-The harness: download a session's transcripts → build the prompt locally → call qwen directly →
-compare structured output across N runs and across prompt variants. `enable_thinking` pinned (live
-and final passes use opposite modes, so "same model" is otherwise under-specified).
+## Two things found along the way, filed separately
 
-**1. Ask for per-finding evidence, and stop deleting it.**
+**`questions` and `decisions` are write-only.** `item_writer` persists neither; `chunking`
+embeds neither. The model fills `questions` correctly 3/3 into a field with no readers. Wire them
+up or drop them — but do not "fix" anything by writing into them.
 
-Add `evidence` to the `findings[]` shape in the extraction schema, alongside the topic-level one
-that already exists. Remove the `child.pop` **only together with step 2** — unverified citations
-in the artifact is the exact failure that line prevents.
-
-**2. Run the existing checker one level down.**
-
-`check_quote` is already mechanical end to end: string containment inside a 60s window, an
-ellipsis-splice test, a 0.80 fuzzy floor, and a 5-token specificity floor counted per writing
-system. It needs no changes — only to be called per finding as well as per topic.
-
-This is what makes the model's self-report trustworthy. **Self-reported confidence is not
-evidence** — the generator that writes "It was confirmed" will equally write `"support": "stated"`.
-But a *citation* is checkable: the model may only point, and whether the quote exists and how
-specific it is, is decided by string matching. That distinction is the whole design.
-
-**3. Persist it: `findings.evidence` / `evidence_status`.**
-
-A migration, following `0037_topic_evidence.sql`'s precedent (jsonb on the row, not a child
-table). This is no longer "deferred until topic granularity proves too coarse" — with per-finding
-citations it is where the result lives.
-
-Topic-level status can then roll up from its findings instead of being a separate assertion.
-
-**4. Let `findings` be empty.**
-
-The schema already permits it ("may be empty arrays"); the instruction does not. With an
-evidence slot, "I have no basis" is expressible — a topic made of a question and a false start
-should return no finding rather than invent one. The floor is the same 5-token specificity rule,
-now applied where the claim is made.
-
-### What this does NOT do
-
-- **It does not judge whether a real quote supports the claim built on it.** A model can attach a
-  genuine quote to an unsupported conclusion. That is entailment, it needs a model, and it is
-  deliberately out of scope here — run it later over the small set this layer marks weak, and have
-  it annotate rather than delete.
-- **It does not detect ASR fabrication.** `Oops. No. Not yet.` is in the transcript, so a citation
-  to it is genuine. What changes is that a finding standing on four words is *marked* as standing
-  on four words. The fabrication itself is the normalisation-amplifies-noise finding, separate.
-- **It does not make the report right.** It makes the report say how much it knows.
-
-## Corrections carried forward from v2
-
-- **"Turning EMIT_EVIDENCE on would not have helped" was false**, and free to check.
-  `token_count("Oops. No. Not yet.")` is 4, below the 5-token floor, so `check_quote` returns
-  `weak`; `roll_up` takes the worst; `weak` is persisted. Detection existed; consequence did not.
-- **The agent-answer incident is already fixed on this branch** (`agent_turn_filter`), so it cannot
-  motivate this, and an A/B over that session would measure the filter instead.
-- **`questions` is write-only** — one occurrence in `src/`, its own schema definition. Not
-  persisted by item-writer, not embedded by chunking. The model fills it correctly 3/3 into a
-  field with no readers. Same for `decisions`. Filed separately: wire them up or drop them; do not
-  "fix" anything by writing into them.
-
-## Costs, stated rather than discovered
-
-- **Every finding now carries a citation.** More output tokens per topic, more `check_quote` calls
-  per session. Extraction already runs to a 600s timeout and has caused a livelock that lost
-  customer uploads — account concurrency is charged by wall clock (BUG-43). Measure prompt and
-  response size in the harness before shipping, not after.
-- **It is a prompt change**, so no existing test can pin it: the code path is unchanged and every
-  test passes either way. The harness is the only instrument.
-- **Artifact size** grows with per-finding citations; the S3 extraction artifact is read by the
-  matcher and the rolling summary.
+**Group extractions persist unverified citations today.** `build_group_prompt` reuses
+`_instructions_block()` verbatim, so with `EMIT_EVIDENCE=true` the group prompt asks for evidence,
+but `verify_evidence` returns early for `TIER_GROUP` **before** the child-strip loop
+(`:326-329`) — so `_evidence_payload` writes `{"status": None, "quotes": [...]}` into Aurora.
+That is the exact defect the child-strip exists to prevent, on the path where meetings matter
+most. It is live on test today. **This is a bug, not a design gap, and it is independent of
+everything above.**
 
 ## Acceptance
 
-**Harness, N ≥ 3 runs per arm, thinking pinned, both languages** (the prompt is shared; two
-ASCII-normalisation bugs have already erased CJK in this repo):
+**A prompt change cannot be pinned by a unit test** — the code path is identical and every
+existing test passes either way. The instrument is the harness, and the harness must import
+`assemble_session_turns`, `build_extraction_prompt` and the real payload builder rather than
+re-deriving them, or it measures a request prod never sends.
 
-1. **The incident case**: with per-finding evidence, the fabricated observation either disappears
-   or is marked `weak`. Requirement is the marking, not the disappearance — a model that still
-   writes it but declares a four-word basis has done the right thing.
-2. **Regression sample**, ≥5 unrelated historical sessions: genuine findings keep their citations
-   and do not collapse to empty. **An extractor that finds nothing is as useless as one that
-   invents.** Compare finding counts *and* the fraction rolling up `verified`.
-3. **Cost**: prompt/response tokens and wall-clock per session, before and after.
+Required before shipping:
 
-Counts alone cannot be the metric — a wording change leaves them identical. Compare the wording
-of findings whose evidence rolls up `weak`.
+1. **≥5 unrelated historical sessions**, ≥3 runs per arm, **both thinking modes** — prod runs
+   non-thinking for the live pass and thinking for the final (`:1479-1480`), so pinning one leaves
+   the other unmeasured.
+2. **Both languages.** The prompt is shared, and this repo has shipped two ASCII-normalisation
+   bugs that erased CJK entirely.
+3. **Read the findings, do not count them.** The scaffolding case is exactly why: the count fell
+   and nothing was lost. For each finding present in control and absent in the treatment arm,
+   decide by hand whether it moved (`action_items`) or vanished.
+4. **Never re-extract through prod.** `extract_session` writes the real `extraction_key`, which
+   fires item-writer's delete-then-insert and mutates a real customer's Aurora topics.
 
 ## Rollout
 
-Behind an env toggle wired through the workflow **and** the template Parameter — not just the
-code. This repo has shipped a toggle that could only take its default and reported success the
-whole way. `EMIT_EVIDENCE` is the existing precedent and it ships off.
+No flag. A one-line instruction change with no schema, no migration, no new field and no new
+consumer has nothing to roll back except itself, and `EMIT_EVIDENCE` — which this no longer
+depends on — stays off.
+
+That is a deliberate reversal of v3's rollout section: a toggle is worth its cost when the change
+has a persistence or contract surface. This one has neither, and this repo has shipped a toggle
+that could only ever take its default while reporting success the whole way.
