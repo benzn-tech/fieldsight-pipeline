@@ -66,7 +66,42 @@ def _no_invent(prompt):
     return prompt.replace(anchor, NO_INVENT_LINE + anchor, 1)
 
 
-VARIANTS = {"baseline": lambda p: p, "no_invent": _no_invent}
+DROP_BLOCK = '''      "decisions": [
+        {
+          "decision": "What was decided",
+          "rationale": "Why this decision was made",
+          "decided_by": "Who decided, or null if not stated"
+        }
+      ],
+      "questions": [
+        {"question": "An open/unresolved question raised in the session"}
+      ]
+'''
+
+
+def _no_qd(prompt):
+    """Remove `decisions` and `questions` from the requested schema.
+
+    Both are write-only today: item_writer persists neither and chunking embeds neither (the
+    `key_decisions` that chunking and ask_agent read lives on the REPORT artifact, a different
+    shape with a different key). So they are output tokens bought on every extraction and thrown
+    away, on a path with a live truncation history.
+
+    Deleting them is not obviously safe, which is why this is a measured arm and not a patch.
+    `questions` is where the model puts what it is unsure about -- it filled that field correctly
+    in 3/3 pilot runs. Removing the relief valve may push the same uncertain content into
+    `findings` as assertions, which is precisely the defect `no_invent` exists to fix. If the
+    findings count rises here, dropping them is the wrong move regardless of the token saving.
+    """
+    if DROP_BLOCK not in prompt:
+        raise SystemExit("no_qd: schema block not found -- it moved. Fix the anchor rather than "
+                         "shipping an arm that silently measures the baseline twice.")
+    # The preceding block's closing "]," must become "]" or the JSON example is malformed.
+    return prompt.replace("      ],\n" + DROP_BLOCK, "      ]\n", 1)
+
+
+VARIANTS = {"baseline": lambda p: p, "no_invent": _no_invent, "no_qd": _no_qd,
+            "both": lambda p: _no_qd(_no_invent(p))}
 
 
 # --------------------------------------------------------------------------
