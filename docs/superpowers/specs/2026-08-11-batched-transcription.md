@@ -83,7 +83,7 @@ data until someone searched for themselves and found nothing.
 The trim is the dangerous edit. Too little and the transcript stutters; too much and real
 speech is deleted with no trace, which is exactly what PR #314 was.
 
-The sources disagree about how long the overlap is:
+The sources disagreed about how long the overlap is:
 
 | source | says |
 |---|---|
@@ -92,8 +92,12 @@ The sources disagree about how long the overlap is:
 | observed chunk start times in real material (`14-18-47 → 14-19-15 → 14-19-43`) | 28 s cadence, consistent with a 30 s file and a 2.0 s overlap |
 | a measurement recorded on 2026-08-10 | "exactly 1.50 s, byte-identical" |
 
-Three of four say 2.0 s. The outlier is not dismissed here, because it was a direct
-measurement of real files and the others are all inferences from the same assumption.
+**Settled by running it: 2.0 s.** On the TEST stack, 2026-08-12, four real device chunks
+were batched and all three seams measured **exactly 2.000 s with `trim_measured: true`** —
+a byte comparison of the raw uploads, not an inference. The 1.50 s outlier is not
+reproducible on this device's audio. Nothing below changes: the trim stays measured rather
+than configured, because the value being knowable today does not make it constant, and the
+`segmentSeconds` device setting can move it.
 
 **Therefore the trim length is measured per seam, not configured.** Compare the tail of
 chunk *N* with the head of chunk *N+1* at PCM level, take the longest byte-identical run up
@@ -213,3 +217,55 @@ the speaker-identity track, and its Phase 0 gate is a separate, still-unrecorded
    `_vad_metadata.json` sidecar the batcher could read, though the plan seals at gaps
    instead. Unverifiable from this repo (flagged, not contradicted): the EL latency table,
    6.7 %, 0.9 %, `overlapBytesFor(2)`, the 1.50 s measurement, the 28 s cadence.
+
+---
+
+## It ran (TEST, 2026-08-12)
+
+Phase 6b, driven with real material rather than a new recording: the six chunks of the
+2026-08-11 Block V session A (three people, two of them at 5 m) were uploaded to the test
+bucket twice under fresh session ids — once with the flag off, once on — so both paths saw
+byte-identical audio on the same stack.
+
+**The check that could have stopped this: no speech was lost.**
+
+| | words |
+|---|---|
+| per-chunk baseline, c0000–c0003 | 219 |
+| …of which fall in the 2 s each chunk repeats from the one before | 17 |
+| baseline with the duplication removed | **202** |
+| batched | **205** |
+
+`+3`, i.e. the safe direction. The rule was "more words at the seams means the trim is not
+happening; **fewer** means stop-ship". Three extra words out of 202 is inside run-to-run
+ASR variation, and some of them are plausibly words that used to be cut in half by a
+boundary.
+
+**The batch object and its map came out as designed:** one
+`_bn4_off0.0_to114.0_srcwav.wav` — 120 s of chunks minus 6 s of overlap — plus its sidecar,
+and **zero member transcripts**. The members were accumulated, not transcribed.
+
+**Speaker labels moved in the right direction**, which was the point of the exercise:
+
+| | labels | extraction |
+|---|---|---|
+| per-chunk (4 chunks) | `spk_0`, `spk_1` | 1 topic, `speaker_count=2` |
+| batched | `spk_0`, `spk_1`, `spk_2` | 2 topics, `speaker_count=3` |
+
+Three people were in the room. The batched extraction also separated out the missing
+scaffold handrail as its own topic; the per-chunk one did not. **More labels is not the same
+as correct labels** — the same day's voiceprint work showed this transcriber's labels
+scramble their contents — but 2→3 with three people present, and a safety item surfacing
+that had been buried, is the shape the design predicted.
+
+### What this run did not exercise
+
+- **The tail seal (phase 4).** `c0004` was registered and left unsealed: in a real session
+  the finalize sweep seals it at close, but these chunks were uploaded straight to S3 with
+  no `meeting_session` row, so the sweep could not see them. A limitation of the method,
+  not a defect found.
+- **Latency and cost on the real path** were not separately timed.
+- **`c0005` was dropped by VAD as silent**, on test exactly as it was on prod — so the
+  comparison covers c0000–c0004 and the batch covers c0000–c0003.
+
+TEST is left with batching on. Prod is untouched; phase 7 remains a separate decision.
