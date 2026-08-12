@@ -31,6 +31,9 @@ class Recorder:
 
     def seal(self, *a, **kw):
         self.calls.append(("seal", kw.get("session_id") or a[2]))
+        # Kept so the deadline can be asserted. Erased once already, together with the
+        # fix it guarded — see the last test in this file.
+        self.seal_args, self.seal_kwargs = a, kw
         return ["audio_segments/u/d/x_bn2_off0.0_to60.0_srcwav.wav"]
 
     def finalize(self, conn, session_id, version, **kw):
@@ -101,3 +104,20 @@ def test_the_claim_being_lost_is_not_an_error(swept):
     mp.setattr(batch_seal, "seal_ready_runs", lambda *a, **kw: [])
     out = mod.sweep(FakeConn(), grace_seconds=0, infer_idle=False)
     assert out and out[0]["session_id"] == S1
+
+
+def test_a_closing_session_seals_its_tail_now_rather_than_waiting_out_the_deadline(swept):
+    """The deadline exists so a run of 1-3 does not seal while a fourth chunk might still
+    arrive. At session close nothing more can arrive, so waiting is not caution — it is the
+    failure this phase was written to prevent.
+
+    This test has been written twice. The first time it was erased together with the fix it
+    guarded, by a whole-file rewrite in an unrelated commit — so CI stayed green while the
+    path was dead, and the next real recording (6 minutes, 13 chunks) lost its last 19
+    seconds with nothing failing anywhere.
+    """
+    mp, rec = swept
+    mod.sweep(FakeConn(), grace_seconds=0, infer_idle=False)
+    deadline = rec.seal_args[5] if len(rec.seal_args) > 5 else rec.seal_kwargs.get("deadline_sec")
+    assert deadline == 0, \
+        "sealing at close must use a zero deadline; nothing else is coming"
