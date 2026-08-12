@@ -7037,3 +7037,25 @@ def test_a_legacy_whole_file_session_is_unaffected(monkeypatch):
     end = org._session_end_dt("CONN", {"company_id": "c"}, "Ben_UCPK", "2026-07-31",
                               "Benl1_2026-07-31_14-11-56", [], start)
     assert end == dt.datetime(2026, 7, 31, 14, 21)
+
+
+def test_a_session_with_only_an_end_still_shows_which_end_it_is(monkeypatch):
+    """`16:48` alone reads as a start time. When the START is what is unknown, the label
+    has to say so — a lone time that means the opposite of what it looks like is worse than
+    the "?" it replaced.
+
+    Caught in the final review pass, not by the tests: the shared time-range rule returns
+    the one known end bare, and `_session_label` only re-attached a "?" for the unknown-END
+    side.
+    """
+    import datetime as dt
+    assert org._session_label(None, dt.datetime(2026, 8, 12, 16, 48)) == "? – 16:48"
+
+
+def test_a_session_with_only_a_start_is_unchanged(monkeypatch):
+    import datetime as dt
+    assert org._session_label(dt.datetime(2026, 8, 12, 16, 48), None) == "16:48 – ?"
+
+
+def test_a_session_with_neither_end_is_unchanged():
+    assert org._session_label(None, None) == "? – ?"
