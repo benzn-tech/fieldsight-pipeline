@@ -390,3 +390,34 @@ def test_the_transcriber_is_told_whether_chunks_are_whole():
     assert "TRANSCRIBE_WHOLE_CHUNK: !Ref TranscribeWholeChunk" in \
         _function_block(text, "TranscribeFunction"), \
         "TranscribeFunction reads TRANSCRIBE_WHOLE_CHUNK but is not given it"
+
+
+# ----------------------------------------------------------
+# The batch ledger lives in the transcriber's existing table, and TWO functions now reach
+# it. Found by running phase 4 on TEST, 2026-08-12: the sweep queried
+# `fieldsight-transcripts` -- the PROD table -- from the TEST stack, because the env var was
+# never wired and the code default names prod's table. IAM refused the Query, which is the
+# only reason it was a stack trace instead of a test environment writing prod's ledger.
+#
+# A default that names another environment's resource is not an inert default.
+# ----------------------------------------------------------
+
+_LEDGER_READERS = ("TranscribeFunction", "FinalizeSweepFunction")
+
+
+def test_every_function_that_reaches_the_batch_ledger_is_told_which_table():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for fn in _LEDGER_READERS:
+        assert "TRANSCRIPT_TABLE: !Ref TranscriptTableName" in _function_block(text, fn), (
+            f"{fn} reads TRANSCRIPT_TABLE but is not given it, so it falls back to the code "
+            f"default -- which names the PROD table and would be used from test")
+
+
+def test_every_function_that_reaches_the_batch_ledger_may_actually_use_it():
+    """The grant, not just the name. Without it the failure is an AccessDeniedException
+    deep inside the seal, caught by the guard and visible only in a log line."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for fn in _LEDGER_READERS:
+        blk = _function_block(text, fn)
+        assert "DynamoDBCrudPolicy" in blk and "TableName: !Ref TranscriptTableName" in blk, \
+            f"{fn} is given TRANSCRIPT_TABLE but no DynamoDB policy for it"
