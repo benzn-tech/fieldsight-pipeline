@@ -205,6 +205,32 @@ def is_batch_key(key: str) -> bool:
 # The map — the only sanctioned way to turn a batch offset into a real time
 # ============================================================
 
+def map_key_for_audio(batch_audio_key: str) -> str:
+    """Where the map for this batch WAV lives: beside the audio that produced it.
+
+    One function so the writer and the reader cannot drift apart. They already did:
+    the seal wrote the map under `audio_segments/` while the extractor looked for it
+    under `transcripts/`, so every batched session in test fell back to filename
+    arithmetic — and the tests agreed with the reader instead of with the writer,
+    which is why nothing failed.
+    """
+    return f"{batch_audio_key.rsplit('.', 1)[0]}_batch_map.json"
+
+
+def map_key_for_transcript(transcript_key: str, audio_prefix: str = 'audio_segments'):
+    """The map belonging to a batched transcript, or None if the key is not shaped like one.
+
+    A transcript key is `{transcripts}/{user}/{date}/{stem}.json` and its audio is
+    `{audio_prefix}/{user}/{date}/{stem}.wav` — the same swap `batch_seal.raw_key_for`
+    makes to reach the device's own upload.
+    """
+    parts = transcript_key.split('/')
+    if len(parts) < 4:
+        return None
+    stem = parts[-1].rsplit('.', 1)[0]
+    return f"{audio_prefix}/{'/'.join(parts[1:-1])}/{stem}_batch_map.json"
+
+
 def member(chunk_index: int, chunk_key: str, abs_start: str, trimmed_head_sec: float,
            kept_duration_sec: float, trim_measured: bool = True) -> dict:
     """One member of a batch. `abs_start` is the chunk's own filename clock, ISO-8601."""
