@@ -43,6 +43,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+import agent_turn_filter
 import evidence_match
 import llm_utils
 import chunk_stitch
@@ -1003,7 +1004,36 @@ def assemble_session_turns(bucket, keys):
     # tag is gone. See filter_audio_event_tags.
     turns, _tag_stats = filter_audio_event_tags(turns)
     turns, announcement_stats = filter_device_announcements(turns)
+    # The Ask agent's own answer, played aloud into the running recording. Same family as the
+    # announcements above -- machine speech arriving as an ordinary speaker turn -- but it cannot
+    # be pattern-matched, because the text is whatever the model said. It is matched against what
+    # the agent is recorded as having said, published per ask by the in-VPC voice-audit function.
+    #
+    # Derived from the key rather than taken as a parameter so the five callers (extraction,
+    # rolling summary, finalize email, group merge) need no signature change and cannot forget it.
+    user_folder, date = _user_and_date_from_key(keys[0] if keys else None)
+    if user_folder and date:
+        turns, agent_stats = agent_turn_filter.apply_agent_filter(
+            turns, s3(), bucket, user_folder, date)
+        # Dropped from the stream, not from the record: the transcript JSON and the audio are
+        # untouched, so the viewer still shows the exchange. What must not see them is anything
+        # derived -- `speaker_count` (a solo wearer plus an agent turn counts as 2 and silently
+        # disables item-writer's speaker_count==1 gate), the extraction prompt (whose
+        # participants rule would list the agent as a person), and the embedded windows.
+        # Removing them here covers all three at one site instead of three.
+        turns = [t for t in turns if not t.get('from_agent')]
+        announcement_stats = dict(announcement_stats or {}, agent_turns=agent_stats)
     return turns, source_filenames, announcement_stats
+
+
+def _user_and_date_from_key(key):
+    """transcripts/{user_folder}/{date}/{file}.json -> (user_folder, date)."""
+    if not key:
+        return None, None
+    parts = key.split('/')
+    if len(parts) < 4 or parts[0] != 'transcripts':
+        return None, None
+    return parts[1], parts[2]
 
 
 def assemble_deduped_turns(bucket, keys):

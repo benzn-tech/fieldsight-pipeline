@@ -1718,6 +1718,9 @@ Resources:
               Action: s3:GetObject
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                # Agent-answer sidecars, read by the shared agent_turn_filter. Granted
+                # wherever transcripts are, because the code that reads one reads the other.
+                - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
                 # The close-driven final-pass request written by FinalizeSweepFunction.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
@@ -1751,6 +1754,13 @@ Resources:
                   s3:prefix:
                     - transcripts/*
                     - extractions/*
+                    # The agent-answer sidecars. ListBucket is not optional here: without it S3
+                    # answers 403 for a key that simply does not exist, which the reader cannot
+                    # tell from a real denial -- and a reader that silently sees "no sidecar"
+                    # while another one filters is not a gap, it is a hash mismatch that fails
+                    # the whole report in embed_from_sidecar. Same trap as the extractions/*
+                    # line above.
+                    - voice_ask/*
 
   # ----------------------------------------------------------
   # Rolling Tier-1 summary (voice-timeliness Point 1). Non-VPC (calls the LLM) —
@@ -1792,6 +1802,9 @@ Resources:
               Action: s3:GetObject
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                # Agent-answer sidecars, read by the shared agent_turn_filter. Granted
+                # wherever transcripts are, because the code that reads one reads the other.
+                - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_rolling/*
             - Effect: Allow
               Action: s3:PutObject
@@ -1803,6 +1816,7 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - transcripts/*
+                    - voice_ask/*
       Events:
         TranscriptChunkLanded:
           Type: EventBridgeRule
@@ -2056,6 +2070,9 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                # Agent-answer sidecars, read by the shared agent_turn_filter. Granted
+                # wherever transcripts are, because the code that reads one reads the other.
+                - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
@@ -2066,6 +2083,7 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - transcripts/*
+                    - voice_ask/*
             - Effect: Allow
               Action:
                 - ses:SendEmail
@@ -2124,6 +2142,9 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/reports/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                # Agent-answer sidecars, read by the shared agent_turn_filter. Granted
+                # wherever transcripts are, because the code that reads one reads the other.
+                - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/embeddings/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
             - Effect: Allow
@@ -2151,6 +2172,7 @@ Resources:
                   s3:prefix:
                     - reports/*
                     - transcripts/*
+                    - voice_ask/*
 
   # ----------------------------------------------------------
   # Lambda 15: Embed Report (Phase 4d) — S3 event on reports/,
@@ -2196,6 +2218,9 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/reports/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                # Agent-answer sidecars, read by the shared agent_turn_filter. Granted
+                # wherever transcripts are, because the code that reads one reads the other.
+                - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
             - Effect: Allow
               Action: s3:PutObject
@@ -2219,6 +2244,7 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - transcripts/*
+                    - voice_ask/*
 
   # ----------------------------------------------------------
   # Lambda 14: Item Writer (Phase 4b) — S3 event on extractions/,
@@ -2600,8 +2626,17 @@ Resources:
           PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          # Publishes what the agent said, for the extraction path to exclude. This function is
+          # the only one that can: it is in-VPC (so it can resolve caller_sub -> folder_name,
+          # which the non-VPC ask lambda cannot) and S3 is reachable from the VPC through the
+          # existing gateway endpoint.
+          S3_BUCKET: !Ref IngestBucketName
       Policies:
         - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
 
   # ==========================================================
   # SITE VOICE (WebSocket) — Lambdas. WS API wiring is in the
