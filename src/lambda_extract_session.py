@@ -927,6 +927,10 @@ def _rebase_batch_turns(bucket, key, normalized):
     and then drifts by however much overlap was trimmed at each earlier seam: a second or
     two, invisible in a rendered report, wrong in every timestamp after the first chunk.
 
+    The map is written beside the batch WAV under `audio_segments/`, never beside the
+    transcript — putting a `.json` under `transcripts/` would fire this very lambda's own
+    S3 trigger. `batch_stitch.map_key_for_transcript` is the one place that swap lives.
+
     `start_sec` / `end_sec` are deliberately left batch-relative. They are the in-file
     offsets the evidence and playback paths seek with, and the file they name
     (`source_filename`) is the batch WAV — re-basing them would point every quote at a
@@ -938,8 +942,11 @@ def _rebase_batch_turns(bucket, key, normalized):
     """
     if not batch_stitch.is_batch_key(key):
         return normalized
-    prefix, filename = key.rsplit('/', 1)
-    map_key = f"{prefix}/{filename.rsplit('.', 1)[0]}_batch_map.json"
+    map_key = batch_stitch.map_key_for_transcript(key)
+    if map_key is None:
+        logger.warning("batch transcript %s is not shaped like a session key — keeping "
+                       "filename arithmetic", key)
+        return normalized
     try:
         doc = json.loads(s3().get_object(Bucket=bucket, Key=map_key)['Body'].read())
     except Exception:

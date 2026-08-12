@@ -111,7 +111,8 @@ def seal_batch(s3, bucket, session_id, run, by_index, now, table, sealed_by='arr
     batch_key = f"{prefix}/{batch_name}"
     doc = batch_stitch.build_map(session_id, members, sealed_by=sealed_by)
 
-    s3.put_object(Bucket=bucket, Key=f"{prefix}/{batch_name[:-4]}_batch_map.json",
+    s3.put_object(Bucket=bucket,
+                  Key=batch_stitch.map_key_for_audio(f"{prefix}/{batch_name}"),
                   Body=json.dumps(doc), ContentType='application/json')
     s3.put_object(Bucket=bucket, Key=batch_key, Body=_wav_bytes(audio, rate),
                   ContentType='audio/wav')
