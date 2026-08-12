@@ -4810,13 +4810,23 @@ def _session_end_dt(conn, caller, folder, date, session_id, rows, start_dt):
 
 
 def _session_label(start_dt, end_dt):
-    """The picker row's time label. Delegates the rule; keeps "?" for the unknown end."""
+    """The picker row's time label. Delegates the rule, then says which end is missing.
+
+    The shared rule returns whichever end it knows, bare. That is right for an email
+    sentence and wrong for a two-ended label: `16:48` alone reads as a start time, so a
+    session with only an END would be shown as though it began then. A lone time that means
+    the opposite of what it looks like is worse than the "?" it replaced.
+    """
     text, note = session_scope.format_time_range(start_dt, end_dt, sep=" – ")
     if note:
         logger.warning("session picker: %s", note)
     if text is None:
         return "? – ?"
-    if end_dt is None or (end_dt is not None and start_dt is not None and end_dt < start_dt):
+    if start_dt is None:
+        return f"? – {text}"
+    # An end before its start is declined by the shared rule, which returns the start
+    # alone — the label still has to show that the other end is missing.
+    if end_dt is None or end_dt < start_dt:
         return f"{text} – ?"
     return text
 
