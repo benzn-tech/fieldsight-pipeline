@@ -498,3 +498,43 @@ def test_the_extractor_may_read_the_batch_maps_it_looks_for():
         "ExtractSessionFunction has no s3:GetObject on audio_segments/*, where the seal "
         "writes every batch's time map — batched sessions silently keep filename "
         "arithmetic and only a WARNING says so")
+
+
+# ----------------------------------------------------------
+# The transcript ledger holds the batch ledger: which chunks are in a batch, and the
+# SEAL# claim that stops two workers concatenating the same one. Until 2026-08-12 both
+# stacks resolved the template default, so TEST wrote its rows into PROD's table --
+# found by scanning it and seeing BATCH# rows prod could not have written, because prod
+# has never had batching on.
+#
+# The failure mode of the fix is not a broken deploy, it is a fix that half-lands:
+# `fieldsight-users-test` exists in this account and NOTHING wires it, a table created
+# for a split that never happened. This test is the difference.
+# ----------------------------------------------------------
+
+
+def _effective_parameter(path, name):
+    """What the stack really gets: the workflow's override, else the template default.
+
+    Comparing the two override LINES is not enough. A stage that passes nothing takes
+    the template default, so `prod=None, test='fieldsight-transcripts'` reads as two
+    different values and is in fact the same table."""
+    for ln in open(path, encoding="utf-8").read().splitlines():
+        m = re.match(rf'"{name}=(.*)"\s*\\?$', ln.strip())
+        if m:
+            return m.group(1)
+    text = open(TEMPLATE, encoding="utf-8").read()
+    block = re.search(rf"\n  {name}:\n(.*?)(?=\n  \w+:)", text, re.S)
+    default = re.search(r"Default:\s*(\S+)", block.group(1)) if block else None
+    return default.group(1).strip("'\"") if default else None
+
+
+def test_the_two_stacks_do_not_share_the_transcript_ledger():
+    prod = _effective_parameter(WORKFLOWS["prod"], "TranscriptTableName")
+    test = _effective_parameter(WORKFLOWS["test"], "TranscriptTableName")
+    assert test and prod, f"could not resolve the table for both stages: {test=} {prod=}"
+    assert test != prod, (
+        f"both stacks resolve TranscriptTableName={test!r}. The batch ledger lives in "
+        f"this table, including the SEAL# claim that stops two workers concatenating "
+        f"the same batch -- sharing it puts TEST's rows, and TEST's failures, in PROD's "
+        f"table. Found that way on 2026-08-12.")
