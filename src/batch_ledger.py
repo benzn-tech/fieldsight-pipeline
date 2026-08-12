@@ -123,6 +123,93 @@ def pending_runs(rows, now: int, deadline_sec: int,
     return out
 
 
+def consumed_indices(rows) -> set:
+    """Members already sealed into a batch.
+
+    Kept as a named function rather than an inline comprehension because it is the one
+    thing standing between a late upload and a second bill.
+    """
+    return {int(r["chunk_index"]) for r in rows if r.get("sealed_into") is not None}
+
+
+def _base_times(rows):
+    """chunk index -> device base time, out of the filename that carries it.
+
+    Parsed rather than stored so a row written before this change still plans correctly,
+    and so a filename shape the real parser cannot read fails here instead of silently
+    getting a made-up time.
+    """
+    from transcript_utils import extract_base_time_from_filename
+
+    out = {}
+    for r in rows:
+        key = r.get("chunk_key") or ""
+        base = extract_base_time_from_filename(key.rsplit("/", 1)[-1])
+        if base is not None:
+            out[int(r["chunk_index"])] = base
+    return out
+
+
+def pending_windows(rows, now: int, grace_sec: int,
+                    window_sec: float = 120.0,
+                    cap: int = DEFAULT_MAX_BATCH) -> list[list[int]]:
+    """The wall-clock windows that may be sealed right now. Replaces `pending_runs`.
+
+    **Two clocks, one job each.** Membership is decided on the device base times in the
+    filenames, only ever compared to each other. Readiness is decided on `registered_at`,
+    the server epoch — a window seals once its newest member has been quiet for
+    `grace_sec`. Judging readiness on the device clock would find a backlogged session's
+    window long closed and seal its first chunk alone, with zero effective grace, while its
+    sisters were still uploading.
+
+    **The common case does not wait.** A window whose indices are contiguous can gain no
+    new member once its successor has registered outside it, or once the cap is hit, so it
+    seals on arrival exactly as `pending_runs` did. Making everything wait for grace would
+    add 150 s to 383 batches in order to remove it from 26.
+
+    **A window with an interior hole always waits.** The hole is either a VAD drop that is
+    never coming or an upload that is merely slow, and no event distinguishes them. Grace
+    is the only arbiter of that, and it stays the only one.
+    """
+    consumed = consumed_indices(rows)
+    times = _base_times(rows)
+    by_index = {int(r["chunk_index"]): r for r in rows}
+    known = sorted(times)
+
+    from batch_stitch import plan_windows
+
+    # A member whose filename the parser cannot read has no place on the device clock, so it
+    # cannot be given a window — but it must not be dropped either: that would leave a
+    # registered chunk nothing ever seals and nothing ever transcribes, which is audio gone
+    # with no error anywhere. It travels alone. One extra request; the words survive.
+    unplaceable = [int(r["chunk_index"]) for r in rows
+                   if int(r["chunk_index"]) not in times
+                   and int(r["chunk_index"]) not in consumed]
+
+    out = []
+    for window in plan_windows(times, window_sec=window_sec, cap=cap, consumed=consumed) \
+            + [[i] for i in sorted(unplaceable)]:
+        if _cannot_grow(window, times, known, window_sec, cap):
+            out.append(window)
+            continue
+        newest = max(int(by_index[i].get("registered_at") or 0) for i in window)
+        if now - newest >= grace_sec:
+            out.append(window)
+    return out
+
+
+def _cannot_grow(window, times, known, window_sec, cap) -> bool:
+    """True when no chunk that has not arrived could still join this window."""
+    if window != list(range(window[0], window[0] + len(window))):
+        return False                       # an interior index is missing; it may yet land
+    if len(window) >= cap:
+        return True
+    nxt = window[-1] + 1
+    if nxt not in times:
+        return False                       # the successor has not registered
+    return (times[nxt] - times[window[0]]).total_seconds() >= window_sec
+
+
 # ============================================================
 # Sealing
 # ============================================================
@@ -160,6 +247,26 @@ def claim_seal(table, session_id: str, first_index: int, members, now: int,
         return None
     table.put_item(Item=item)
     return item
+
+
+def mark_members_consumed(table, session_id: str, indices, batch_first_index: int) -> None:
+    """Record that these members now belong to a sealed batch.
+
+    Written between the map and `mark_sealed`, so a crash leaves members marked for a batch
+    that has no artifact — the conservative direction: that audio is skipped once, whereas
+    the other order would let it be sealed and billed twice.
+
+    The row is rewritten in full rather than replaced by a marker: `chunk_key` is the only
+    record of which object a member was, and losing it makes a sealed batch impossible to
+    diagnose afterwards.
+    """
+    wanted = {int(i) for i in indices}
+    for row in list_members(table, session_id):
+        if int(row["chunk_index"]) not in wanted:
+            continue
+        item = dict(row)
+        item["sealed_into"] = int(batch_first_index)
+        table.put_item(Item=item)
 
 
 def mark_sealed(table, session_id: str, first_index: int, now: int) -> None:
