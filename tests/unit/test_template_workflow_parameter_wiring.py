@@ -88,6 +88,49 @@ def _overrides(path):
     return names
 
 
+def _raw_override_lines(path):
+    """The `--parameter-overrides` continuation block verbatim, including the
+    `$SHELL_VAR` entries `_overrides` skips because they carry no literal name."""
+    lines = open(path, encoding="utf-8").read().splitlines()
+    start = next(i for i, ln in enumerate(lines)
+                 if ln.strip().startswith("--parameter-overrides"))
+    out = []
+    for ln in lines[start + 1:]:
+        stripped = ln.strip()
+        out.append(stripped)
+        if not stripped.endswith("\\"):
+            break
+    return "\n".join(out)
+
+
+def test_no_override_can_evaluate_to_a_bare_key():
+    """`sam deploy` REJECTS `Key=` with an empty value — it does not fall back to
+    the template default.
+
+    So an override whose expression can produce nothing is not "unset", it is a
+    deploy that never runs. On 2026-08-12 `"LlmTemperature=${{ vars.X || '' }}"`
+    shipped to `main` and the prod deploy died at argument parsing with the whole
+    release still un-deployed and every check downstream reading the OLD stack.
+    The idiom for optional is the conditional `$SOME_PARAM` shell variable a few
+    lines above it, appended only when the repo variable is non-empty.
+
+    Scanning for the shape rather than the one name, because the two existing
+    conditional overrides prove this is a repeated temptation.
+    """
+    for env, path in WORKFLOWS.items():
+        lines = open(path, encoding="utf-8").read().splitlines()
+        start = next(i for i, ln in enumerate(lines)
+                     if ln.strip().startswith("--parameter-overrides"))
+        for ln in lines[start + 1:]:
+            stripped = ln.strip()
+            if not stripped.endswith("\\") and not stripped.startswith('"'):
+                break
+            assert not re.search(r"\|\|\s*''\s*\}\}", stripped), (
+                f"{env} deploy: {stripped!r} evaluates to a bare Key= when the "
+                f"repo variable is unset, and SAM exits 2 on that. Use the "
+                f"conditional $PARAM idiom instead.")
+
+
 def test_every_override_names_a_real_template_parameter():
     names, _ = _template_parameters()
     for env, path in WORKFLOWS.items():
@@ -368,22 +411,35 @@ def test_the_temperature_knob_reaches_every_function_that_calls_an_llm():
         f"LLM_TEMPERATURE -- every LLM caller must get both or neither")
 
 
-def test_both_workflows_pass_the_temperature():
-    for env_name in ("prod", "test"):
-        assert "LlmTemperature" in _overrides(WORKFLOWS[env_name]), (
-            f"{env_name} does not pass LlmTemperature; the Parameter holds its "
-            f"default forever")
+def test_both_workflows_can_set_the_temperature():
+    """Test passes it inline; prod passes it conditionally. Either way the repo
+    variable must be able to reach CloudFormation — a Parameter no workflow can
+    set holds its default forever."""
+    assert "LlmTemperature" in _overrides(WORKFLOWS["test"]), (
+        "test does not pass LlmTemperature; the Parameter holds its default forever")
+    prod = open(WORKFLOWS["prod"], encoding="utf-8").read()
+    assert 'LLM_TEMP_PARAM="LlmTemperature=${{ vars.PROD_LLM_TEMPERATURE }}"' in prod, (
+        "PROD_LLM_TEMPERATURE cannot reach the stack")
+    assert "$LLM_TEMP_PARAM" in _raw_override_lines(WORKFLOWS["prod"]), (
+        "the conditional is built and then never appended")
 
 
 def test_prod_temperature_defaults_to_unset():
-    """Empty means UNSENT, and that is deliberate: the measurement behind this
-    knob covered one task on one session, while call_llm serves the rolling
-    summary, finalize, the matcher and the ask agent. Test runs it at 0 so the
-    effect is observed somewhere before prod inherits it."""
+    """Unset means the override is ABSENT, not empty.
+
+    Absent lets the template default (`''`) through, which is what makes the call
+    omit `temperature` entirely — deliberate, because the 2x2 behind this knob
+    covered one task on one session while call_llm serves the rolling summary,
+    finalize, the matcher and the ask agent. Test runs it at 0 so the effect is
+    observed somewhere before prod inherits it.
+
+    Empty means the deploy does not happen at all; that is the 2026-08-12 failure
+    and `test_no_override_can_evaluate_to_a_bare_key` is what stops it returning.
+    """
     prod = open(WORKFLOWS["prod"], encoding="utf-8").read()
-    line = [ln for ln in prod.splitlines() if "LlmTemperature=" in ln]
-    assert len(line) == 1
-    assert "|| ''" in line[0], "prod must default to unset, not to a number"
+    assert "LlmTemperature" not in _overrides(WORKFLOWS["prod"]), (
+        "prod must not pass the parameter unconditionally")
+    assert 'if [ -n "${{ vars.PROD_LLM_TEMPERATURE }}" ]' in prod
 
 
 # ----------------------------------------------------------
