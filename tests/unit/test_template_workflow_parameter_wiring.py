@@ -578,3 +578,21 @@ def test_the_batch_dials_are_parameters_not_literals():
     text = open(TEMPLATE, encoding="utf-8").read()
     for p in ("BatchMaxChunks", "BatchSealDeadlineSec"):
         assert re.search(rf"\n  {p}:\n", text), f"{p} is not a template Parameter"
+
+
+def test_the_batch_dials_are_settable_from_a_repo_variable():
+    """A Parameter is only the LAST of three links.
+
+    `test_every_boolean_toggle_is_reachable_from_a_repo_variable` sweeps booleans;
+    these two are strings, which is exactly how they slipped through. Adding the
+    Parameter (#402) moved them from "edit the code" to "edit the template" -- better,
+    and still not the documented rollback, which is "set a repo variable and redeploy".
+    Found by an adversarial review of the PR that claimed to have fixed them.
+    """
+    for env, path in WORKFLOWS.items():
+        passed = _overrides(path)
+        for name in ("BatchMaxChunks", "BatchSealDeadlineSec"):
+            assert name in passed, (
+                f"{env} does not pass {name}, so it can only ever hold its template "
+                f"default -- changing how many chunks make a batch would still need a "
+                f"template edit and a deploy, not a repo variable")
