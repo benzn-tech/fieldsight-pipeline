@@ -182,6 +182,7 @@ jobs:
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \
+              "TranscriptTableName=fieldsight-test-transcripts" \
               "AuthorityFlip=${{ vars.TEST_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.TEST_GRADED_ROLES || 'false' }}" \
               "UploadVerifyMode=${{ vars.TEST_UPLOAD_VERIFY_MODE || 'observe' }}" \

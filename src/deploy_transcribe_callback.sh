@@ -30,8 +30,25 @@ RULE_NAME="sitesync-transcribe-state-change"
 # Existing Transcribe Lambda (update)
 TR_FUNCTION_NAME="realptt-transcribe"
 
-# Shared
+# Shared. This is PROD's ledger, and it is hardcoded on purpose: this script only ever
+# targeted the legacy sitesync/realptt functions, which have no test twin.
+#
+# Since 2026-08-12 the two stacks no longer share this table -- TEST runs against
+# `fieldsight-test-transcripts` (spec: 2026-08-12-ledger-tenant-isolation). Pointing
+# this script at a fieldsight-*-test-* function would silently re-point that function
+# at prod's table, undoing the split with no error anywhere, so it refuses instead.
 TABLE_NAME="fieldsight-transcripts"
+
+for _target in "${CB_FUNCTION_NAME}" "${TR_FUNCTION_NAME}"; do
+    case "${_target}" in
+        *-test-*|*-test)
+            echo "REFUSING: ${_target} looks like a test function, and this script would" >&2
+            echo "set its TRANSCRIPT_TABLE to ${TABLE_NAME} -- prod's ledger. TEST has its" >&2
+            echo "own table; use the SAM deploy (deploy.yml), not this script." >&2
+            exit 1
+            ;;
+    esac
+done
 
 echo "============================================================"
 echo "Deploying Lambda 3b + Updating Lambda 3"
