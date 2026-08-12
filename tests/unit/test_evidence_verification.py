@@ -93,10 +93,17 @@ def test_a_group_extraction_is_skipped_entirely():
     # clock by design (a device 12 hours out is shipped history), so an honest
     # quote from the second device would land outside W and be counted as
     # fabrication — poisoning the one number this exists to produce.
+    #
+    # Skipped now means STRIPPED, not "left alone with no status". The group prompt reuses
+    # _instructions_block verbatim, so the model is asked for citations here too; leaving them
+    # unverified in the artifact put {"status": None, "quotes": [...]} into Aurora via
+    # _evidence_payload -- a fourth state that column has no meaning for, on the multi-device
+    # path. This assertion used to read `"status" not in ...evidence[0]`, which passed because
+    # nothing was checked; it now passes because there is nothing left to check.
     result = dict(_topic("the slab pour is pushed to Thursday"), tier="group")
     counts = ex.verify_evidence(result, _turns(), "2026-08-07")
     assert counts == {}
-    assert "status" not in result["topics"][0]["evidence"][0]
+    assert not result["topics"][0].get("evidence")
 
 
 def test_the_at_string_is_resolved_against_the_session_date():
