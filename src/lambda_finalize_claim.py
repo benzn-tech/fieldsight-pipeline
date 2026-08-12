@@ -558,7 +558,12 @@ def _seal_tail_batches(session_id):
         batch_seal.seal_ready_runs(
             boto3.client("s3"), S3_BUCKET, session_id,
             boto3.resource("dynamodb").Table(TRANSCRIPT_TABLE),
-            int(time.time()), BATCH_SEAL_DEADLINE_SEC, BATCH_MAX_CHUNKS,
+            # Deadline ZERO, not BATCH_SEAL_DEADLINE_SEC. That deadline exists so a run of
+            # 1-3 does not seal while a fourth chunk might still arrive; at close nothing
+            # more can arrive, so waiting is not caution, it is the failure this function
+            # was written to prevent. Measured on TEST 2026-08-12: a session whose last
+            # chunk was 93s old finalized with its tail unsealed, because this passed 150.
+            int(time.time()), 0, BATCH_MAX_CHUNKS,
             sealed_by="session_close")
     except Exception:
         logger.exception("batch: could not seal the tail of session %s — the final "
