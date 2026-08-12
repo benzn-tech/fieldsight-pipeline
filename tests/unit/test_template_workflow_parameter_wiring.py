@@ -538,3 +538,43 @@ def test_the_two_stacks_do_not_share_the_transcript_ledger():
         f"this table, including the SEAL# claim that stops two workers concatenating "
         f"the same batch -- sharing it puts TEST's rows, and TEST's failures, in PROD's "
         f"table. Found that way on 2026-08-12.")
+
+
+# ----------------------------------------------------------
+# BATCH_MAX_CHUNKS and BATCH_SEAL_DEADLINE_SEC were read from the environment by two
+# functions and appeared NOWHERE in the template, so they could only ever hold their code
+# defaults: the latency/cost dial of this feature was reachable only by editing code, and
+# not rollable back by changing a stack parameter. Same shape as the unwired-toggle trap,
+# one layer down.
+#
+# They are deliberately NOT wired symmetrically. The sweep passes deadline zero at close
+# on purpose -- see the comment at its seal_ready_runs call -- so giving it
+# BATCH_SEAL_DEADLINE_SEC would advertise a knob it ignores.
+# ----------------------------------------------------------
+
+
+def test_both_batch_sides_agree_on_how_many_chunks_make_a_batch():
+    """The transcriber accumulates to this size and the sweep treats a run of it as
+    complete. Different values there would seal runs the transcriber is still filling."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for fn in ("TranscribeFunction", "FinalizeSweepFunction"):
+        assert "BATCH_MAX_CHUNKS: !Ref BatchMaxChunks" in _function_block(text, fn), (
+            f"{fn} reads BATCH_MAX_CHUNKS but is not given it -- it takes the code "
+            f"default and can disagree with the other side about what a full batch is")
+
+
+def test_the_seal_deadline_reaches_the_transcriber_and_only_it():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert "BATCH_SEAL_DEADLINE_SEC: !Ref BatchSealDeadlineSec" in \
+        _function_block(text, "TranscribeFunction"), \
+        "the transcriber reads BATCH_SEAL_DEADLINE_SEC but is not given it"
+    assert "BATCH_SEAL_DEADLINE_SEC" not in _function_block(text, "FinalizeSweepFunction"), \
+        ("the sweep passes deadline zero at close on purpose; wiring the parameter to it "
+         "would advertise a knob that path ignores")
+
+
+def test_the_batch_dials_are_parameters_not_literals():
+    """A knob that exists only in code takes its default forever and raises no error."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for p in ("BatchMaxChunks", "BatchSealDeadlineSec"):
+        assert re.search(rf"\n  {p}:\n", text), f"{p} is not a template Parameter"
