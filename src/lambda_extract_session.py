@@ -803,6 +803,8 @@ def _instructions_block():
    - domain: which of safety/quality/progress the finding belongs to.
    - severity: the finding's impact on the SCHEDULE/programme -- "major" (likely to delay or
      block work), "minor" (noticeable but manageable), "none" (informational).
+   - If no line in the transcript states an observation, do NOT invent one -- findings may be an
+     empty array.
    - entity: the party RESPONSIBLE for what the finding is about -- name and/or trade. Set BOTH
      name and trade to null if the transcript does not identify a responsible party -- do NOT guess.
    - recommended_action: what should be done, or null.

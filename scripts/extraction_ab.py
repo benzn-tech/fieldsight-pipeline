@@ -106,6 +106,27 @@ VARIANTS = {"baseline": lambda p: p, "no_invent": _no_invent, "no_qd": _no_qd,
 
 # --------------------------------------------------------------------------
 
+def build_prompt_from_turns(user_folder, date, session_base, turns, n_segments):
+    """Same prompt builder, turns supplied locally instead of read from S3.
+
+    This exists for the both-languages criterion. The bucket holds exactly one day with any CJK at
+    all, and that session turns out to be English speech containing a few Chinese names -- 51 CJK
+    characters total -- so it tests nothing about a Chinese transcript.
+
+    The obvious alternative, uploading a Chinese transcript to S3, is not available: `transcripts/`
+    is the live production trigger for extract-session, so writing a fixture there would run the
+    real pipeline on a real customer's folder. Turns go in from a file instead, and
+    build_extraction_prompt -- the real one -- does the rest.
+
+    Fixture turns are SYNTHETIC and must be labelled as such wherever the results are reported.
+    They demonstrate the prompt's behaviour on Chinese input; they are not evidence about any
+    real recording.
+    """
+    prompt, tstats = ex.build_extraction_prompt(
+        user_folder, date, session_base, turns, n_segments)
+    return prompt, n_segments, turns, tstats
+
+
 def build_prompt(bucket, user_folder, date, session_base):
     """Exactly what extract_session would send, minus the model call."""
     keys = ex.gather_session_segments(bucket, user_folder, date, session_base)
@@ -252,6 +273,8 @@ def main():
     ap.add_argument("--user", help="user_folder, as in transcripts/{user}/")
     ap.add_argument("--date")
     ap.add_argument("--session", help="session_base; omit with --list")
+    ap.add_argument("--turns-file", help="JSON list of turns (abs_start_str/speaker/text) to use "
+                                         "instead of reading S3. For the both-languages check.")
     ap.add_argument("--bucket", default=BUCKET)
     ap.add_argument("--runs", type=int, default=3,
                     help="runs per arm; 1 measures sampling, not the change")
@@ -293,18 +316,49 @@ def main():
     variants = args.variant or ["baseline", "no_invent"]
     modes = {"off": [False], "on": [True], "both": [False, True]}[args.thinking]
 
-    base_prompt, n_segments, turns, tstats = build_prompt(
-        args.bucket, args.user, args.date, args.session)
+    if args.turns_file:
+        with open(args.turns_file, encoding="utf-8") as fh:
+            fixture = json.load(fh)
+        base_prompt, n_segments, turns, tstats = build_prompt_from_turns(
+            args.user, args.date, args.session, fixture,
+            max(1, len(fixture) // 10))
+        print("# SYNTHETIC turns from " + args.turns_file, file=sys.stderr)
+    else:
+        base_prompt, n_segments, turns, tstats = build_prompt(
+            args.bucket, args.user, args.date, args.session)
     print(f"# {args.user}/{args.date}/{args.session}", file=sys.stderr)
     print(f"# turns={len(turns)} segments={n_segments} prompt_chars={len(base_prompt)} "
           f"truncated={tstats.get('truncated')} max_tokens={ex.max_tokens_for(n_segments)}",
           file=sys.stderr)
+
+    # Resume. A full matrix is ~72 calls over an hour and gets killed -- by a timeout, a laptop
+    # lid, a stopped background task. Re-buying completed calls is the expensive kind of waste,
+    # so an existing --out file is treated as work already done.
+    done = set()
+    if args.out and os.path.exists(args.out):
+        with open(args.out, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue          # a torn last line from a kill mid-write
+                if "error" in d:
+                    continue          # a failed call is not a completed one; retry it
+                done.add((d.get("session"), d.get("variant"),
+                          bool(d.get("thinking")), d.get("run")))
+        if done:
+            print(f"# resuming: {len(done)} results already present", file=sys.stderr)
 
     results = []
     for variant in variants:
         prompt = VARIANTS[variant](base_prompt)
         for thinking in modes:
             for i in range(args.runs):
+                if (args.session, variant, bool(thinking), i + 1) in done:
+                    continue
                 r = run_once(prompt, n_segments, thinking)
                 r.update(variant=variant, thinking=thinking, run=i + 1,
                          prompt_chars=len(prompt), session=args.session,

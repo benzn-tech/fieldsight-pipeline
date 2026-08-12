@@ -102,6 +102,83 @@ That is the exact defect the child-strip exists to prevent, on the path where me
 most. It is live on test today. **This is a bug, not a design gap, and it is independent of
 everything above.**
 
+## v5 — the acceptance runs, and what they changed
+
+The harness is `scripts/extraction_ab.py`. 108 calls: 6 real sessions × 2 arms × both thinking
+modes × 3 runs, plus a matched-content language pair and the `no_qd` arms below.
+
+### The regression risk is closed, and the change also makes the output *stabler*
+
+Findings per run, non-thinking (the arm that varies):
+
+| session | baseline | with the line |
+|---|---|---|
+| 2026-08-08 `sid754a…` | **4, 6, 8** | **4, 4, 4** |
+| 2026-08-12 `sid2c30…` | 3, 3, **7** | 3, 3, 4 |
+| 2026-08-10 `sid97f0…` | 3, 3, 3 | 3, 3, 3 |
+| 2026-08-11 `sid5321…` | 4, 4, 4 | 3, 4, 4 |
+| 2026-08-08 `sidb8bd…` | 2, 3, 4 | 2, 3, 3 |
+
+The mean barely moves. **The spread collapses.** Baseline's 8-finding run on `sid754a…` produced
+three separate findings for one situation — *"Temporary irrigation timer installed"*, *"Newly
+seeded grass requires consistent moisture"*, *"requires twice-daily watering in hot weather"* —
+where the treatment arm keeps the installed-irrigation fact as a finding and files the watering
+requirement as an action. Same content, no duplicate rows on the timeline.
+
+Thinking mode moves less than non-thinking in every session, which is expected: `enable_thinking`
+already suppresses some of the same over-production.
+
+### Reading them, not counting them — and a caution about the tool
+
+Every item the analyser flagged as dropped was checked by hand. **None was a real loss.** They fall
+into three groups: re-filed to `action_items` (the watering requirement), consolidated into a
+neighbouring finding, or ordinary sampling — items baseline itself only produced in 1 of 3 runs.
+
+**The `*** VANISHED ***` label has false positives and must not be read as a verdict.** *"Rain has
+cleaned mud from new asphalt surface"* was flagged, and the treatment arm says *"Asphalt surface is
+trafficable and clean after rain"* — the same fact, scoring 0.375 against a 0.40 threshold. The
+analyser narrows what a person must read; it does not decide.
+
+### Both languages — the bucket could not answer this, so a fixture does
+
+The one day in the bucket with any CJK (2026-07-31) turned out to be **English speech containing a
+few Chinese names — 51 CJK characters in total**. It tests nothing about a Chinese transcript, and
+reporting it as the both-languages arm would have been the "verified the wrong thing" failure
+again. Uploading a Chinese transcript to S3 was not an option either: `transcripts/` is the live
+production trigger for extract-session.
+
+So `--turns-file` feeds turns to the *real* `build_extraction_prompt` locally, with a matched pair
+of **synthetic** fixtures — the same site conversation in Chinese and in English:
+
+| | baseline | with the line |
+|---|---|---|
+| `lang_pair_zh` | 5, 5, 5 | 5, 4, 5 |
+| `lang_pair_en` | 4, 4, 4 | 4, 5, 5 |
+
+Same five items, same behaviour, in both languages. Nothing is erased on the CJK side — the failure
+this repo has shipped twice. (Unrelated and out of scope: findings come back in English for Chinese
+input. That is pre-existing and the line does not change it.)
+
+### `decisions` / `questions`: measured, and the answer is "not as a rider"
+
+They have no readers — `item_writer` persists neither and `chunking` embeds neither; the
+`key_decisions` those modules do read belongs to the *report* artifact, a name collision. Across
+84 runs, `decisions` is non-empty in **81** and `questions` in **22**, so this is real output token
+cost on a path with a 47%-truncation history.
+
+Deleting them is still not free. `questions` is where the model parks what it is unsure about, and
+removing the relief valve was measured to push content *into* findings:
+
+| session | baseline | `no_qd` | `no_invent` | both |
+|---|---|---|---|---|
+| `lang_pair_en` | 4, 4, 4 | **5, 5, 5** | 4, 5, 5 | 5, 5, 5 |
+| `sid754a…` | 4, 6, 8 | **5, 6, 7** | 4, 4, 4 | 4, 4, 5 |
+
+`no_qd` does not reduce findings and raises them on two of four; the escape-hatch line contains the
+rise, but that is a second behavioural change bought for a token saving. **So: not shipped here.**
+Wiring them up or dropping them stays a separate decision with its own measurement — the point of
+recording this is that "they're unused, just delete them" is now known to be false.
+
 ## Acceptance
 
 **A prompt change cannot be pinned by a unit test** — the code path is identical and every
