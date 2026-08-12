@@ -172,6 +172,15 @@ jobs:
           if [ -n "${{ vars.PROD_NONWORK_EXPIRY_SINCE }}" ]; then
             NONWORK_SINCE_PARAM="NonWorkExpirySince=${{ vars.PROD_NONWORK_EXPIRY_SINCE }}"
           fi
+          # LLM sampling temperature. Prod deliberately sends NOTHING, so the provider's
+          # own default applies: the 2x2 behind this knob measured one task on one session
+          # while call_llm also serves the rolling summary, finalize, the matcher and the
+          # ask agent. Same bare-"Key=" guard -- writing it as "LlmTemperature=" made the
+          # 2026-08-12 prod deploy exit 2 at argument parsing, before CloudFormation.
+          LLM_TEMP_PARAM=""
+          if [ -n "${{ vars.PROD_LLM_TEMPERATURE }}" ]; then
+            LLM_TEMP_PARAM="LlmTemperature=${{ vars.PROD_LLM_TEMPERATURE }}"
+          fi
           sam deploy --config-env prod \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -203,7 +212,7 @@ jobs:
               "EvidenceWindowSec=${{ vars.PROD_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.PROD_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
               "EvidenceFloorTokens=${{ vars.PROD_EVIDENCE_FLOOR_TOKENS || '5' }}" \
-              "LlmTemperature=${{ vars.PROD_LLM_TEMPERATURE || '' }}" \
+              $LLM_TEMP_PARAM \
               "AuthorityFlip=${{ vars.PROD_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.PROD_GRADED_ROLES || 'false' }}" \
               "UploadVerifyMode=${{ vars.PROD_UPLOAD_VERIFY_MODE || 'observe' }}" \
