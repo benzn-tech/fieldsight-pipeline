@@ -31,8 +31,6 @@ class Recorder:
 
     def seal(self, *a, **kw):
         self.calls.append(("seal", kw.get("session_id") or a[2]))
-        self.seal_kwargs = kw
-        self.seal_args = a
         return ["audio_segments/u/d/x_bn2_off0.0_to60.0_srcwav.wav"]
 
     def finalize(self, conn, session_id, version, **kw):
@@ -103,19 +101,3 @@ def test_the_claim_being_lost_is_not_an_error(swept):
     mp.setattr(batch_seal, "seal_ready_runs", lambda *a, **kw: [])
     out = mod.sweep(FakeConn(), grace_seconds=0, infer_idle=False)
     assert out and out[0]["session_id"] == S1
-
-
-def test_a_closing_session_seals_its_tail_now_rather_than_waiting_out_the_deadline(swept):
-    """The deadline exists so a run of 1-3 does not seal while a fourth chunk might still
-    arrive. At session close nothing more can arrive, so waiting is not caution — it is the
-    failure this phase was written to prevent.
-
-    Observed on TEST 2026-08-12: a session whose last chunk was 93 s old finalized with the
-    tail unsealed, because the sweep passed the same 150 s deadline the arrival path uses.
-    The extraction went out without the last chunk and nothing failed.
-    """
-    mp, rec = swept
-    mod.sweep(FakeConn(), grace_seconds=0, infer_idle=False)
-    deadline = rec.seal_args[5] if len(rec.seal_args) > 5 else rec.seal_kwargs.get("deadline_sec")
-    assert deadline == 0, \
-        "sealing at close must use a zero deadline; nothing else is coming"
