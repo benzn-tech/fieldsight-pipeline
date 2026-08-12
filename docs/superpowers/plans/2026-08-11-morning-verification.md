@@ -152,9 +152,15 @@ Open any day with a recording and read a row in the picker. Expect `HH:MM – HH
 - A `?` still appearing means the session genuinely has no `closed_at` — check the row
   before assuming the fix regressed.
 - A span that crosses a day now renders `(+1d)`, and one that runs backwards renders the
-  start alone. Both are deliberate: the two ends come from device clocks, and eight prod
-  sessions still carry a 12-hour error from the pre-2026-08-10 storage bug. Seeing `(+1d)`
+  start alone. Both are deliberate: the two ends come from device clocks. Seeing `(+1d)`
   on a short meeting is a **clock** finding, not a display bug.
+- **Those eight prod sessions were backfilled on 2026-08-13** and no longer carry the
+  12-hour error, so this is no longer the first explanation to reach for. They were found
+  with `opened_at > last_segment_at` — a session cannot start after it ends — and each was
+  exactly 12 hours out, the device's NZ wall clock written into a column that stores UTC.
+  Afterwards: zero rows NULL, zero impossible, zero whose NZ date disagrees with their
+  segments. If a **new** session shows the same shape, it is a fresh instance of the
+  BUG-37 family and worth reporting, not the known backlog.
 
 ## 2d. A merged meeting's email quotes something
 
