@@ -452,3 +452,29 @@ def test_every_function_that_reaches_the_batch_ledger_may_actually_use_it():
         blk = _function_block(text, fn)
         assert "DynamoDBCrudPolicy" in blk and "TableName: !Ref TranscriptTableName" in blk, \
             f"{fn} is given TRANSCRIPT_TABLE but no DynamoDB policy for it"
+
+
+# ----------------------------------------------------------
+# Sealing a session's tail is real S3 work: read the member units, read the raw uploads to
+# measure the overlap, write the batch and its map. Phase 4 wired the code and the switch
+# and not the grants, and the failure was invisible in the intended way -- the guard caught
+# the AccessDenied, the sweep carried on, the session finalized WITHOUT its last chunks.
+# Found on TEST 2026-08-12, twice in a row: first the ledger Query, then s3:GetObject.
+# ----------------------------------------------------------
+
+_SWEEP_SEAL_GRANTS = (
+    ("s3:GetObject", "audio_segments/*"),   # the member units being joined
+    ("s3:GetObject", "users/*"),            # the raw uploads the trim is measured on
+    ("s3:PutObject", "audio_segments/*"),   # the batch and its map
+)
+
+
+def test_the_sweep_may_do_the_s3_work_that_sealing_a_tail_requires():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "FinalizeSweepFunction")
+    for action, prefix in _SWEEP_SEAL_GRANTS:
+        stmts = [s for s in blk.split("- Effect: Allow") if action in s]
+        assert any(prefix in s for s in stmts), (
+            f"FinalizeSweepFunction has no {action} on {prefix}; the tail seal fails with "
+            f"AccessDenied behind the guard and every session's last chunks go "
+            f"untranscribed with nothing failing")
