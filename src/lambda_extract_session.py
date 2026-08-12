@@ -324,8 +324,26 @@ def verify_evidence(result, turns, session_date, user_folder=None, date=None):
     Never raises. This is a measurement, and a measurement that can fail an
     extraction is worse than no measurement."""
     if result.get('tier') == TIER_GROUP:
+        # Skip the CHECK, but still strip what cannot be checked. The group prompt reuses
+        # _instructions_block verbatim, so with EMIT_EVIDENCE on the model is asked for citations
+        # here too -- and returning early used to leave them in the artifact with no status, which
+        # _evidence_payload then wrote to Aurora as {"status": None, "quotes": [...]}. That is a
+        # fourth state the column was never designed for (its three are NULL for never-measured,
+        # `absent` for measured-and-uncited, and a real status), and a reader sees quotes with no
+        # reason to doubt them. Exactly the defect the child strip below exists to prevent.
+        #
+        # Stripped rather than marked `unchecked`: that status means OUR code failed to measure
+        # something, and it exists to stop our own bugs deflating the signal. Borrowing it for
+        # "we never try on groups" would make that number unreadable. No quotes and no status
+        # leaves the column NULL -- never measured, which is the truth.
         logger.info("evidence: skipping a group extraction -- no shared clock "
-                    "across devices to window on")
+                    "across devices to window on; citations stripped, not shipped unverified")
+        for topic in result.get('topics') or []:
+            topic.pop('evidence', None)
+            for child_key in ('action_items', 'findings'):
+                for child in topic.get(child_key) or []:
+                    if isinstance(child, dict):
+                        child.pop('evidence', None)
         return {}
     counts = {k: 0 for k in _EVIDENCE_STATUSES}
     # Why the failures failed, aggregated per extraction. The counts say how big
