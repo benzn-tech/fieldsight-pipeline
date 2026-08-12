@@ -202,6 +202,7 @@ jobs:
               "EvidenceWindowSec=${{ vars.TEST_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.TEST_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
               "EvidenceFloorTokens=${{ vars.TEST_EVIDENCE_FLOOR_TOKENS || '5' }}" \
+              "LlmTemperature=${{ vars.TEST_LLM_TEMPERATURE || '0' }}" \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \

@@ -355,6 +355,37 @@ def test_the_code_defaults_match_the_template_defaults():
             f"{code_default!r}")
 
 
+def test_the_temperature_knob_reaches_every_function_that_calls_an_llm():
+    """`call_llm` is shared. A knob wired to some of its callers and not others
+    means the extraction runs at one temperature and the summary at another,
+    with nothing saying so."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert re.search(r"\n  LlmTemperature:\n", text), "no LlmTemperature Parameter"
+    providers = text.count("LLM_PROVIDER: !Ref LlmProvider")
+    temps = text.count("LLM_TEMPERATURE: !Ref LlmTemperature")
+    assert providers == temps, (
+        f"{providers} functions carry LLM_PROVIDER but {temps} carry "
+        f"LLM_TEMPERATURE -- every LLM caller must get both or neither")
+
+
+def test_both_workflows_pass_the_temperature():
+    for env_name in ("prod", "test"):
+        assert "LlmTemperature" in _overrides(WORKFLOWS[env_name]), (
+            f"{env_name} does not pass LlmTemperature; the Parameter holds its "
+            f"default forever")
+
+
+def test_prod_temperature_defaults_to_unset():
+    """Empty means UNSENT, and that is deliberate: the measurement behind this
+    knob covered one task on one session, while call_llm serves the rolling
+    summary, finalize, the matcher and the ask agent. Test runs it at 0 so the
+    effect is observed somewhere before prod inherits it."""
+    prod = open(WORKFLOWS["prod"], encoding="utf-8").read()
+    line = [ln for ln in prod.splitlines() if "LlmTemperature=" in ln]
+    assert len(line) == 1
+    assert "|| ''" in line[0], "prod must default to unset, not to a number"
+
+
 # ----------------------------------------------------------
 # Batched transcription (spec 2026-08-11). Two functions read BATCH_TRANSCRIPTION and both
 # must be given it: the transcriber accumulates members, and the sweep seals a session's
