@@ -353,3 +353,148 @@ def test_the_code_defaults_match_the_template_defaults():
         assert float(tpl_default) == float(code_default), (
             f"{env}: template default {tpl_default!r} != code default "
             f"{code_default!r}")
+
+
+def test_the_temperature_knob_reaches_every_function_that_calls_an_llm():
+    """`call_llm` is shared. A knob wired to some of its callers and not others
+    means the extraction runs at one temperature and the summary at another,
+    with nothing saying so."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert re.search(r"\n  LlmTemperature:\n", text), "no LlmTemperature Parameter"
+    providers = text.count("LLM_PROVIDER: !Ref LlmProvider")
+    temps = text.count("LLM_TEMPERATURE: !Ref LlmTemperature")
+    assert providers == temps, (
+        f"{providers} functions carry LLM_PROVIDER but {temps} carry "
+        f"LLM_TEMPERATURE -- every LLM caller must get both or neither")
+
+
+def test_both_workflows_pass_the_temperature():
+    for env_name in ("prod", "test"):
+        assert "LlmTemperature" in _overrides(WORKFLOWS[env_name]), (
+            f"{env_name} does not pass LlmTemperature; the Parameter holds its "
+            f"default forever")
+
+
+def test_prod_temperature_defaults_to_unset():
+    """Empty means UNSENT, and that is deliberate: the measurement behind this
+    knob covered one task on one session, while call_llm serves the rolling
+    summary, finalize, the matcher and the ask agent. Test runs it at 0 so the
+    effect is observed somewhere before prod inherits it."""
+    prod = open(WORKFLOWS["prod"], encoding="utf-8").read()
+    line = [ln for ln in prod.splitlines() if "LlmTemperature=" in ln]
+    assert len(line) == 1
+    assert "|| ''" in line[0], "prod must default to unset, not to a number"
+
+
+# ----------------------------------------------------------
+# Batched transcription (spec 2026-08-11). Two functions read BATCH_TRANSCRIPTION and both
+# must be given it: the transcriber accumulates members, and the sweep seals a session's
+# LAST run — the one that has no fourth chunk coming. Give it to only one and the failure
+# is silent in the worse direction: members accumulate, nothing ever seals the tail, and
+# the end of every session goes untranscribed with no error anywhere.
+# ----------------------------------------------------------
+
+_BATCH_READERS = ("TranscribeFunction", "FinalizeSweepFunction")
+
+
+def test_the_batch_switch_is_wired_in_both_environments():
+    for env, path in WORKFLOWS.items():
+        assert "BatchTranscription" in _overrides(path), (
+            f"{env} does not pass BatchTranscription, so BATCH_TRANSCRIPTION can only "
+            f"ever hold its template default and neither turning batching on nor rolling "
+            f"it back would work")
+
+
+def test_every_function_that_reads_the_batch_switch_is_given_it():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for fn in _BATCH_READERS:
+        assert "BATCH_TRANSCRIPTION: !Ref BatchTranscription" in _function_block(text, fn), \
+            (f"{fn} reads BATCH_TRANSCRIPTION but is not given it — it would silently take "
+             f"the code default and disagree with the other function")
+
+
+def test_the_transcriber_is_told_whether_chunks_are_whole():
+    """Batching's precondition. The function refuses to batch per-VAD-segment units, so it
+    has to be able to see which mode the VAD is in — reading a code default here would let
+    it batch fragments the moment someone flips whole-chunk off."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert "TRANSCRIBE_WHOLE_CHUNK: !Ref TranscribeWholeChunk" in \
+        _function_block(text, "TranscribeFunction"), \
+        "TranscribeFunction reads TRANSCRIBE_WHOLE_CHUNK but is not given it"
+
+
+# ----------------------------------------------------------
+# The batch ledger lives in the transcriber's existing table, and TWO functions now reach
+# it. Found by running phase 4 on TEST, 2026-08-12: the sweep queried
+# `fieldsight-transcripts` -- the PROD table -- from the TEST stack, because the env var was
+# never wired and the code default names prod's table. IAM refused the Query, which is the
+# only reason it was a stack trace instead of a test environment writing prod's ledger.
+#
+# A default that names another environment's resource is not an inert default.
+# ----------------------------------------------------------
+
+_LEDGER_READERS = ("TranscribeFunction", "FinalizeSweepFunction")
+
+
+def test_every_function_that_reaches_the_batch_ledger_is_told_which_table():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for fn in _LEDGER_READERS:
+        assert "TRANSCRIPT_TABLE: !Ref TranscriptTableName" in _function_block(text, fn), (
+            f"{fn} reads TRANSCRIPT_TABLE but is not given it, so it falls back to the code "
+            f"default -- which names the PROD table and would be used from test")
+
+
+def test_every_function_that_reaches_the_batch_ledger_may_actually_use_it():
+    """The grant, not just the name. Without it the failure is an AccessDeniedException
+    deep inside the seal, caught by the guard and visible only in a log line."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for fn in _LEDGER_READERS:
+        blk = _function_block(text, fn)
+        assert "DynamoDBCrudPolicy" in blk and "TableName: !Ref TranscriptTableName" in blk, \
+            f"{fn} is given TRANSCRIPT_TABLE but no DynamoDB policy for it"
+
+
+# ----------------------------------------------------------
+# Sealing a session's tail is real S3 work: read the member units, read the raw uploads to
+# measure the overlap, write the batch and its map. Phase 4 wired the code and the switch
+# and not the grants, and the failure was invisible in the intended way -- the guard caught
+# the AccessDenied, the sweep carried on, the session finalized WITHOUT its last chunks.
+# Found on TEST 2026-08-12, twice in a row: first the ledger Query, then s3:GetObject.
+# ----------------------------------------------------------
+
+_SWEEP_SEAL_GRANTS = (
+    ("s3:GetObject", "audio_segments/*"),   # the member units being joined
+    ("s3:GetObject", "users/*"),            # the raw uploads the trim is measured on
+    ("s3:PutObject", "audio_segments/*"),   # the batch and its map
+)
+
+
+def test_the_sweep_may_do_the_s3_work_that_sealing_a_tail_requires():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "FinalizeSweepFunction")
+    for action, prefix in _SWEEP_SEAL_GRANTS:
+        stmts = [s for s in blk.split("- Effect: Allow") if action in s]
+        assert any(prefix in s for s in stmts), (
+            f"FinalizeSweepFunction has no {action} on {prefix}; the tail seal fails with "
+            f"AccessDenied behind the guard and every session's last chunks go "
+            f"untranscribed with nothing failing")
+
+
+# ----------------------------------------------------------
+# The reader half of the same map. `_rebase_batch_turns` fetches
+# `audio_segments/…_batch_map.json`, a prefix the extractor has never had. Fixing only the
+# key (PR #392) moved the failure from "wrong key" to "AccessDenied on the right key" and
+# the symptom did not change at all: one WARNING, filename arithmetic, plausible times.
+# Found by re-running the deployed function on TEST after that fix and reading the log
+# instead of trusting the unit suite.
+# ----------------------------------------------------------
+
+
+def test_the_extractor_may_read_the_batch_maps_it_looks_for():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "ExtractSessionFunction")
+    reads = [s for s in blk.split("- Effect: Allow") if "s3:GetObject" in s]
+    assert any("audio_segments/*" in s for s in reads), (
+        "ExtractSessionFunction has no s3:GetObject on audio_segments/*, where the seal "
+        "writes every batch's time map — batched sessions silently keep filename "
+        "arithmetic and only a WARNING says so")

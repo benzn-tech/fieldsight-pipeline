@@ -168,6 +168,7 @@ jobs:
               "DeviceLedgerUrl=${{ vars.DEVICE_LEDGER_URL }}" \
               "QuietAlertWorkingDays=${{ vars.QUIET_ALERT_WORKING_DAYS || '7' }}" \
               "EnableFinalize=${{ vars.TEST_ENABLE_FINALIZE || 'true' }}" \
+              "EnableSweepPendingGate=${{ vars.TEST_ENABLE_SWEEP_PENDING_GATE || 'false' }}" \
               "EmailSender=${{ vars.TEST_EMAIL_SENDER || 'stub' }}" \
               "EnableSiteVoice=true" \
               "DocxLayerArn=arn:aws:lambda:ap-southeast-2:509194952652:layer:python-docx-layer:2" \
@@ -191,6 +192,7 @@ jobs:
               "DropSilentChunks=${{ vars.TEST_DROP_SILENT_CHUNKS || 'true' }}" \
               "NormaliseAudio=${{ vars.TEST_NORMALISE_AUDIO || 'true' }}" \
               "TranscribeWholeChunk=${{ vars.TEST_TRANSCRIBE_WHOLE_CHUNK || 'true' }}" \
+              "BatchTranscription=${{ vars.TEST_BATCH_TRANSCRIPTION || 'false' }}" \
               "FilterAudioEventTags=${{ vars.TEST_FILTER_AUDIO_EVENT_TAGS || 'true' }}" \
               "EnableGroupMerge=${{ vars.TEST_ENABLE_GROUP_MERGE || 'true' }}" \
               "GroupMergeCap=${{ vars.TEST_GROUP_MERGE_CAP || '2' }}" \
@@ -200,6 +202,7 @@ jobs:
               "EvidenceWindowSec=${{ vars.TEST_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.TEST_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
               "EvidenceFloorTokens=${{ vars.TEST_EVIDENCE_FLOOR_TOKENS || '5' }}" \
+              "LlmTemperature=${{ vars.TEST_LLM_TEMPERATURE || '0' }}" \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \

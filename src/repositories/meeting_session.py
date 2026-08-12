@@ -293,6 +293,37 @@ def list_finalizing(conn) -> list[dict]:
     ).fetchall()
 
 
+def count_live(conn) -> int:
+    """How many sessions the finalize sweep can still ACT on.
+
+    `pending_close` (waiting out its grace) and `finalizing` (claimed, awaiting
+    the send worker) always count. An `open` session counts only if it has an
+    activity anchor -- COALESCE(last_segment_at, opened_at) -- because that is
+    exactly the condition list_idle_open requires to infer a close. An `open` row
+    with neither timestamp can never be closed by the sweep no matter how long it
+    waits, so counting it as live would pin the pending flag on FOREVER and the
+    cluster would never sleep. Both stages carry one such row today (created
+    2026-08-04, segment_count 0, both timestamps NULL) -- a permanently stuck
+    session that, counted naively, silently turns the whole scale-to-zero feature
+    into a no-op whose only symptom is that the bill never drops.
+
+    Such a session is not unreachable, just not by the SWEEP: a late `/close`
+    from the device still moves it to pending_close, and session_close raises the
+    flag itself for exactly that reason.
+
+    One input to the flag, not the whole test -- the handler additionally
+    requires the tick to have been completely quiet, because a group becomes
+    mergeable at the very moment this reaches zero.
+
+    Counts rather than lists: the caller only needs to know whether it is empty."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT count(*) AS n FROM meeting_session "
+        "WHERE status IN ('pending_close', 'finalizing') "
+        "   OR (status = 'open' "
+        "       AND COALESCE(last_segment_at, opened_at) IS NOT NULL)",
+    ).fetchone()["n"]
+
+
 def mark_sent(conn, session_id) -> dict | None:
     """Confirmation email delivered — close the session out."""
     return conn.cursor(row_factory=dict_row).execute(

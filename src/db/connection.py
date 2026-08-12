@@ -96,3 +96,35 @@ def get_cached_connection():
             _cached_conn = None
     _cached_conn = get_connection(autocommit=True)
     return _cached_conn
+
+
+def close_cached_connection():
+    """Drop the cached connection, giving up warm-invoke reuse on purpose.
+
+    Aurora counts any open user-initiated connection as activity, and a frozen
+    Lambda container's socket stays established server-side. So one Search/Ask
+    leaves the cluster unable to begin its auto-pause idle countdown until that
+    container is reclaimed — an interval we neither control nor observe (Aurora
+    scale-to-zero, spec 2026-08-11).
+
+    The cost is the ~1-2s reconnect this cache existed to avoid, paid again on
+    the next search. That is the trade the design accepts: the reconnect is
+    visible only to someone actively searching, while a held connection silently
+    bills the 0.5-ACU floor around the clock.
+
+    Idempotent and never raises — it runs in a `finally`, where an exception
+    would replace the handler's real result (or its real error) with this one.
+    """
+    global _cached_conn
+    conn, _cached_conn = _cached_conn, None
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception:
+        # Not re-raised, but not silent either: a close that keeps failing is
+        # the difference between the cluster sleeping and not.
+        import logging
+
+        logging.getLogger().warning("could not close cached connection",
+                                    exc_info=True)

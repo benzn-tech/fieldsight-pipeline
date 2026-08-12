@@ -85,6 +85,18 @@ Parameters:
       schedule). Default false so the feature deploys INERT (the sweep is created but
       DISABLED); flip per environment to activate. Separate from EnableSchedules so
       it doesn't also switch on the nightly report crons.
+  EnableSweepPendingGate:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Aurora scale-to-zero (spec 2026-08-11): let the finalize sweep skip its
+      Aurora connection on ticks whose DynamoDB flag reports no work. Default
+      false so the flag path deploys INERT -- it sits on the confirmation email,
+      and a flag that wrongly reads "idle" would delay one. Enable on test first.
+      Verify by reading the DEPLOYED function env for SWEEP_REQUIRE_PENDING,
+      never the template (unwired-toggle trap).
+
   EnableNonWorkExpiry:
     Type: String
     Default: 'false'
@@ -523,6 +535,19 @@ Parameters:
       flipping it is a behaviour decision, because segment mode brings back
       splitting one person across several speaker labels inside a single chunk.
 
+  BatchTranscription:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether lambda_transcribe accumulates up to four consecutive chunks of one session
+      into a single ASR request (spec 2026-08-11-batched-transcription). Default false, so
+      it deploys inert. Requires TranscribeWholeChunk=true — the function refuses to batch
+      per-VAD-segment units, because a chunk in segment mode is several speech islands and
+      treating one of them as "the chunk" would drop the rest. Declared as a Parameter so
+      the rollback survives a deploy: a switch that exists only in code takes its default
+      forever and raises no error.
+
   FilterAudioEventTags:
     Type: String
     Default: 'true'
@@ -635,6 +660,25 @@ Parameters:
       the conservative end of the flat region rather than a point estimate.
       The synthetic half is the assumption to re-test -- see the PR.
 
+  LlmTemperature:
+    Type: String
+    Default: ''
+    Description: >-
+      Sampling temperature for whichever LLM provider is in use. EMPTY means
+      the parameter is not sent at all and the provider's own default applies
+      -- which is what every call in this repo did until 2026-08-12, DashScope
+      documenting 0.7 for the non-thinking Qwen path.
+      It does NOT make extraction reproducible: a preregistered 2x2 (10 calls
+      per cell on one fixed session) found the action count still ranged 1-9 at
+      temperature 0 against 1-10 at the default, with the coverage difference
+      inside the noise. The reason to have the knob is a different, much larger
+      effect from the same run -- the share of action items carrying a
+      `responsible` went from 79% to 92%, and that is the field a misheard name
+      has already put wrong into a customer email.
+      Default empty rather than 0 because `call_llm` is shared by the rolling
+      summary, finalize, the matcher and the ask agent, and one experiment on
+      one task does not license changing all of them.
+
   EvidenceFloorTokens:
     Type: String
     Default: '5'
@@ -746,6 +790,7 @@ Mappings:
 Conditions:
   ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
   ShouldEnableFinalize: !Equals [!Ref EnableFinalize, 'true']
+  ShouldEnableSweepPendingGate: !Equals [!Ref EnableSweepPendingGate, 'true']
   ShouldEnableNonWorkExpiry: !Equals [!Ref EnableNonWorkExpiry, 'true']
   ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
   ShouldManageBucketPolicy: !And [!Condition ShouldEnableTranscribe, !Equals [!Ref ManageDataBucketPolicy, 'true']]
@@ -925,6 +970,14 @@ Resources:
           ELEVENLABS_STT_MODEL: !Ref ElevenLabsSttModel
           ELEVENLABS_LANGUAGE: !Ref ElevenLabsLanguage
           KEYTERMS_PATH: config/custom_vocabulary_construction_nz.txt
+          # Batched transcription (spec 2026-08-11). Default false: deploys inert.
+          BATCH_TRANSCRIPTION: !Ref BatchTranscription
+          # Batching's precondition, read here as well as by the VAD. The transcriber
+          # refuses to batch per-VAD-segment units — a chunk in segment mode is several
+          # speech islands, and treating one of them as "the chunk" would drop the rest —
+          # so it has to be able to see which mode the VAD is actually in rather than
+          # assuming a code default.
+          TRANSCRIBE_WHOLE_CHUNK: !Ref TranscribeWholeChunk
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
@@ -1014,6 +1067,7 @@ Resources:
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
@@ -1129,6 +1183,7 @@ Resources:
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
@@ -1241,6 +1296,7 @@ Resources:
           # matches the legacy S3 path's HAIKU_MODEL.
           CLAUDE_MODEL: claude-haiku-4-5-20251001
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelFast
@@ -1406,8 +1462,17 @@ Resources:
           # condition + QrLoginCodesTable). Test's OrgApi omits this var
           # entirely (!Ref AWS::NoValue) — v1 has no test create endpoint.
           QR_CODES_TABLE: !If [IsProdWithOrgApi, !Ref QrLoginCodesTable, !Ref AWS::NoValue]
+          # Sets the sweep's pending flag on session open (Aurora scale-to-zero,
+          # spec 2026-08-11). Best-effort: a failed flag write never fails the
+          # open, and the sweep's hourly pass recovers it.
+          SWEEP_STATE_TABLE: !Ref ItemsTableName
+          STAGE: !Ref Stage
       Policies:
         - VPCAccessPolicy: {}
+        # DynamoDB reached through the existing gateway endpoint from in-VPC
+        # (vpce-01233d5b756ffefcb) -- the same route that carries QR login.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTableName
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -1680,6 +1745,7 @@ Resources:
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
@@ -1728,6 +1794,13 @@ Resources:
                 # throttle and the tier/coverage supersede check BEFORE doing
                 # any expensive work.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
+                # A batched transcript's time map, which the seal writes beside
+                # the batch WAV rather than beside the transcript. Without this
+                # `_rebase_batch_turns` cannot read it and every batched session
+                # keeps filename arithmetic — the failure is one WARNING per
+                # extraction and correct-looking timestamps, which is how it
+                # survived from #368 to 2026-08-12.
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
@@ -1789,6 +1862,7 @@ Resources:
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
@@ -1870,8 +1944,19 @@ Resources:
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
           MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
+          # Sets the sweep's pending flag (Aurora scale-to-zero, spec 2026-08-11).
+          # This is the path that matters most: a device that dies without
+          # /close is finalized only by idle-close inference, so an `open` from
+          # the chunk stream that failed to raise the flag would be a silently
+          # lost confirmation email.
+          SWEEP_STATE_TABLE: !Ref ItemsTableName
+          STAGE: !Ref Stage
       Policies:
         - VPCAccessPolicy: {}
+        # In-VPC, but DynamoDB is reachable through the existing gateway
+        # endpoint (vpce-01233d5b756ffefcb) -- no NAT, no new paid endpoint.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTableName
       Events:
         TranscriptChunkLanded:
           Type: EventBridgeRule
@@ -1994,6 +2079,11 @@ Resources:
       Environment:
         Variables:
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
+          # Batched transcription (spec 2026-08-11): the sweep is the only thing that
+          # can seal a session's LAST run — it has no fourth chunk coming. Same switch
+          # as the transcriber's, and both must be given it or they disagree in
+          # silence: members accumulate and the tail never seals.
+          BATCH_TRANSCRIPTION: !Ref BatchTranscription
           GROUP_MERGE_CAP: !Ref GroupMergeCap
           STUCK_MERGE_SECONDS: !Ref StuckMergeSeconds
           GROUP_MAX_SPAN_SECONDS: !Ref GroupMaxSpanSeconds
@@ -2004,6 +2094,27 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
           STOP_GRACE_SECONDS: '30'
+          # Aurora scale-to-zero (spec 2026-08-11). This sweep's once-a-minute
+          # Aurora connection is the sole reason the cluster never reaches the
+          # 300s+ continuous idle window auto-pause needs, so it rents the
+          # 0.5-ACU floor 24/7 (~$73/month) while ~99% of its ticks do nothing.
+          # With the gate on, a tick whose flag reports no work returns without
+          # connecting. Default OFF -- proven on test first.
+          SWEEP_REQUIRE_PENDING: !If [ShouldEnableSweepPendingGate, 'true', 'false']
+          SWEEP_STATE_TABLE: !Ref ItemsTableName
+          # The batch ledger lives in the transcriber's table, and the sweep reaches it
+          # to seal a session's last run. Wired explicitly because the code default
+          # names the PROD table: on 2026-08-12 the TEST sweep queried
+          # `fieldsight-transcripts` and only IAM stopped it. A default that names
+          # another environment's resource is not an inert default.
+          TRANSCRIPT_TABLE: !Ref TranscriptTableName
+          STAGE: !Ref Stage
+          # Minute of each hour for the unconditional safety pass. MUST match
+          # across stages (they share one cluster) and MUST keep the resulting
+          # 1-hour cadence well above SecondsUntilAutoPause -- equal intervals
+          # mean the idle timer never expires. Pinned by
+          # tests/unit/test_sweep_cadence_vs_autopause.py.
+          SAFETY_SWEEP_MINUTE: '7'
           # Inferred idle-close (spec §8.4): an `open` session gone quiet becomes
           # pending_close. Tied to ShouldEnableFinalize — it is ONLY safe when
           # SessionActivityFunction is live to keep last_segment_at fresh, and that
@@ -2012,6 +2123,17 @@ Resources:
           INFER_IDLE_CLOSE: !If [ShouldEnableFinalize, 'true', 'false']
       Policies:
         - VPCAccessPolicy: {}
+        # Reads/clears the sweep pending flag. Reuses the existing items table
+        # deliberately: the deploy role has no dynamodb:CreateTable (verified
+        # with simulate-principal-policy), so a new table would CREATE_FAILED
+        # and roll the whole stack back.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTableName
+        # The batch ledger (spec 2026-08-11). Without this the seal fails with an
+        # AccessDeniedException deep inside, caught by the guard and visible only as a
+        # log line -- the tail of every session would silently go untranscribed.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TranscriptTableName
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -2028,6 +2150,21 @@ Resources:
                 # grant here is silent — org-api's `except ClientError: pass`
                 # class of trap — so it is granted with the request itself.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+            # Sealing a session's tail (spec 2026-08-11) is real S3 work: read the member
+            # units, read the RAW uploads the overlap is measured on, write the batch and
+            # its map. Phase 4 wired the code and the switch and not these, and the
+            # failure was invisible by design -- the guard caught the AccessDenied and the
+            # session finalized without its last chunks. Verified after deploy with
+            # simulate-principal-policy, not by reading this file.
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/users/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*
       Events:
         GraceSweep:
           Type: Schedule
@@ -2058,6 +2195,7 @@ Resources:
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
@@ -2524,6 +2662,7 @@ Resources:
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus

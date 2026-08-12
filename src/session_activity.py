@@ -42,10 +42,14 @@ though both trigger on the same `transcripts/` arrival. Pure core takes injected
 conn + resolvers + now for unit tests; lambda_handler wires the real ones.
 """
 import logging
+import os
 import re
 from urllib.parse import unquote_plus
 
+import sweep_state
 from repositories import meeting_session
+
+_STAGE = os.environ.get("STAGE", "prod")
 from session_scope import to_utc
 
 logger = logging.getLogger()
@@ -141,6 +145,13 @@ def lambda_handler(event, context):
             except Exception:
                 logger.exception("session_activity: failed for %s", key)
     # Log only when it did something (fires on every transcript — no per-idle noise),
+    # A live session now exists, so the finalize sweep must connect until it
+    # closes (Aurora scale-to-zero, spec 2026-08-11). This path matters most:
+    # a device that dies without /close is finalized only by idle-close
+    # inference, so an `open` that failed to raise the flag would be a
+    # silently lost confirmation email. Best-effort — the hourly pass backs it up.
+    if touched:
+        sweep_state.mark_pending(_STAGE)
     # so prod can trace which sessions the chunk stream opened/touched.
     if touched:
         logger.info("session_activity: opened/touched %d session(s): %s",

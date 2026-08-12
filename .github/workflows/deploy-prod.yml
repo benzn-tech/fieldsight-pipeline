@@ -180,6 +180,7 @@ jobs:
               "IngestBucketName=fieldsight-data-509194952652" \
               "EnableSchedules=${{ vars.PROD_ENABLE_SCHEDULES || 'false' }}" \
               "EnableFinalize=${{ vars.PROD_ENABLE_FINALIZE || 'false' }}" \
+              "EnableSweepPendingGate=${{ vars.PROD_ENABLE_SWEEP_PENDING_GATE || 'false' }}" \
               "EnableSiteVoice=${{ vars.PROD_ENABLE_SITE_VOICE || 'false' }}" \
               "ItemsTableName=fieldsight-items" \
               "ReportsTableName=fieldsight-reports" \
@@ -190,6 +191,7 @@ jobs:
               "DropSilentChunks=${{ vars.PROD_DROP_SILENT_CHUNKS || 'true' }}" \
               "NormaliseAudio=${{ vars.PROD_NORMALISE_AUDIO || 'false' }}" \
               "TranscribeWholeChunk=${{ vars.PROD_TRANSCRIBE_WHOLE_CHUNK || 'true' }}" \
+              "BatchTranscription=${{ vars.PROD_BATCH_TRANSCRIPTION || 'false' }}" \
               "FilterAudioEventTags=${{ vars.PROD_FILTER_AUDIO_EVENT_TAGS || 'true' }}" \
               "EnableGroupMerge=${{ vars.PROD_ENABLE_GROUP_MERGE || 'false' }}" \
               "GroupMergeCap=${{ vars.PROD_GROUP_MERGE_CAP || '2' }}" \
@@ -199,6 +201,7 @@ jobs:
               "EvidenceWindowSec=${{ vars.PROD_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.PROD_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
               "EvidenceFloorTokens=${{ vars.PROD_EVIDENCE_FLOOR_TOKENS || '5' }}" \
+              "LlmTemperature=${{ vars.PROD_LLM_TEMPERATURE || '' }}" \
               "AuthorityFlip=${{ vars.PROD_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.PROD_GRADED_ROLES || 'false' }}" \
               "UploadVerifyMode=${{ vars.PROD_UPLOAD_VERIFY_MODE || 'observe' }}" \

@@ -301,6 +301,7 @@ def _enqueue_updated_emails(artifact, contexts, put=None):
     race on session_finalize_results/{sessionId}.json."""
     put = put or _put_finalize_request
     todos = _todos_from_topics(artifact)
+    summary = artifact.get("summary") or _summary_from_topics(artifact)
     for sid in artifact.get("memberSessions") or []:
         ctx = (contexts or {}).get(sid) or {}
         recipient = (ctx.get("recipient") or "").strip()
@@ -321,7 +322,12 @@ def _enqueue_updated_emails(artifact, contexts, put=None):
              "date": ctx.get("date"),
              "timeRange": ctx.get("timeRange"),
              "siteName": ctx.get("siteName"),
-             "summary": artifact.get("summary"),
+             # An explicit summary wins if the extraction ever starts writing
+             # one; today it never does, so this is the fallback that keeps the
+             # email from quoting nothing. Computed once, outside the loop, so
+             # every member genuinely quotes the SAME account of the meeting —
+             # which is the one thing the merged record promises.
+             "summary": summary,
              "openTodos": todos})
 
 
@@ -343,6 +349,36 @@ def _evidence_payload(topic):
     if quotes is None and status is None:
         return None
     return {"status": status, "quotes": quotes or []}
+
+
+def _summary_from_topics(artifact):
+    """What the merged meeting was about, for the email.
+
+    The same gap `_todos_from_topics` covers, one field along: the solo path
+    takes its summary from the rolling summary, and a merged artifact has no
+    rolling summary — nor any top-level `summary` of its own. Verified against a
+    real group extraction on the test stack, 2026-08-11: the artifact carries
+    topics, memberSessions, source_transcripts and nothing resembling a summary,
+    so reading one sent every member an email that quoted nothing.
+
+    Built from the merged topics rather than by asking the model again. The
+    merge is already a paid thinking call, and a second one to summarise what it
+    just produced would be a second thing that can fail after the record is
+    durable.
+
+    Returns "" when the merge produced no topics. An empty merge is guarded
+    earlier — it must not delete the members' own records — and if one reaches
+    here the email should say nothing rather than invent something.
+    """
+    parts = []
+    for topic in artifact.get("topics") or []:
+        title = (topic.get("topic_title") or topic.get("title") or "").strip()
+        body = (topic.get("summary") or "").strip()
+        if title and body:
+            parts.append(f"{title}: {body}")
+        elif title or body:
+            parts.append(title or body)
+    return "\n".join(parts)
 
 
 def _todos_from_topics(artifact):

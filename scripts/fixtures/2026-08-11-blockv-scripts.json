@@ -1,0 +1,142 @@
+{
+  "318601b22d36478d968b8c2a3b72b5c0": [
+    {
+      "speaker": "Ben",
+      "line": "Morning Zoe. Let's start with the level three slab. Is your rebar finished?"
+    },
+    {
+      "speaker": "Zoe",
+      "line": "Almost. East side, two openings, trimmer bars not done. Drawing not clear."
+    },
+    {
+      "speaker": "Ben",
+      "line": "Right, I'll raise an RFI with the designer and get you an answer before knock off. Mike, when's the pre pour inspection booked for?"
+    },
+    {
+      "speaker": "Mike",
+      "line": "Engineer's coming eight thirty tomorrow. If those trimmer bars aren't sorted we'll fail the hold point and lose the pour."
+    },
+    {
+      "speaker": "Ben",
+      "line": "Hear that, Zoe? Eight thirty tomorrow. It has to be done today."
+    },
+    {
+      "speaker": "Zoe",
+      "line": "Not enough men. I have four guys only. Still need to tie column starter bars."
+    },
+    {
+      "speaker": "Ben",
+      "line": "Park the columns. Slab is the priority. Mike, can we get two extra hands off the labour hire?"
+    },
+    {
+      "speaker": "Mike",
+      "line": "I'll ring them now. Two from midday, but that's a variation, so I'll need it in writing."
+    },
+    {
+      "speaker": "Ben",
+      "line": "No worries, I'll send you a site instruction this arvo and cc the QS."
+    },
+    {
+      "speaker": "Zoe",
+      "line": "One more thing. Scaffold, someone take away the handrail yesterday. Now that spot, no edge protection."
+    },
+    {
+      "speaker": "Ben",
+      "line": "Sorry, what? That's a critical safety issue. Who took it out?"
+    },
+    {
+      "speaker": "Zoe",
+      "line": "Don't know. Maybe the facade subbie."
+    },
+    {
+      "speaker": "Mike",
+      "line": "Righto, I'll barricade it and tag it out before anyone gets near that edge. Ben, that one goes in the H and S report."
+    },
+    {
+      "speaker": "Ben",
+      "line": "Noted, I'll raise it at the toolbox talk this morning. Alright, that's us. Zoe, go sort those trimmer bars. Same spot, eight thirty tomorrow."
+    },
+    {
+      "speaker": "Zoe",
+      "line": "Okay, no problem."
+    },
+    {
+      "speaker": "Mike",
+      "line": "Sweet as, see you then."
+    }
+  ],
+  "b49627d7a6a4400783d796eae6f5f600": [
+    {
+      "speaker": "Ben",
+      "line": "Leo, what's happening with the panels? Truck was meant to be here first thing."
+    },
+    {
+      "speaker": "Leo",
+      "line": "Yeah, it's running late. Couple of hours, maybe more. It's the north elevation ones on that load."
+    },
+    {
+      "speaker": "Ben",
+      "line": "Joe, is that still alright for you? We've only got the crane till the end of the week."
+    },
+    {
+      "speaker": "Joe",
+      "line": "Bit marginal, mate. It's picking up out there. If it keeps going the way it is, we'll have to have a think about it."
+    },
+    {
+      "speaker": "Ben",
+      "line": "Okay, well, just sing out if it gets to that point."
+    },
+    {
+      "speaker": "Leo",
+      "line": "I had a look at the ferrules yesterday, most of them are fine. One of the panels isn't quite right though. There's a hole in it that's not where the drawing says."
+    },
+    {
+      "speaker": "Ben",
+      "line": "How far out are we talking?"
+    },
+    {
+      "speaker": "Leo",
+      "line": "Enough that it's going to be in the way of the ducting. I've mentioned it to the designer but haven't heard back."
+    },
+    {
+      "speaker": "Ben",
+      "line": "Right. Well, don't hold up the lift for it, we can deal with the hole afterwards. Just make sure it doesn't get forgotten about, eh. Put it somewhere."
+    },
+    {
+      "speaker": "Leo",
+      "line": "Yeah, I'll write it down."
+    },
+    {
+      "speaker": "Ben",
+      "line": "And I'll have another crack at the designer."
+    },
+    {
+      "speaker": "Joe",
+      "line": "Oh, while you're here. Yesterday when we were lifting, a couple of the blockwork fellas came through where they shouldn't have been. Right underneath."
+    },
+    {
+      "speaker": "Ben",
+      "line": "Under the load?"
+    },
+    {
+      "speaker": "Joe",
+      "line": "Yeah. My dogman pulled them up but it was close. Cones aren't doing the job. I'd want something a bit more solid today, and someone standing there watching it."
+    },
+    {
+      "speaker": "Ben",
+      "line": "Fair enough. Leo, can you get that sorted before we start? And have a word with their guys."
+    },
+    {
+      "speaker": "Leo",
+      "line": "Yep, I'll do it at the pre lift."
+    },
+    {
+      "speaker": "Ben",
+      "line": "Good. I'll do something about yesterday too, and I'll bring it up this morning when everyone's together. We'll have another look at it once the truck turns up."
+    },
+    {
+      "speaker": "Joe",
+      "line": "Sweet as."
+    }
+  ]
+}

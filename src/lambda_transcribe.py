@@ -53,9 +53,15 @@ Note on LanguageCode vs IdentifyLanguage:
 import os
 import re
 import json
+import time
 import logging
 import boto3
 from urllib.parse import unquote_plus
+
+import batch_ledger
+import batch_seal
+import batch_stitch
+import transcript_utils
 
 # Configure logging
 logger = logging.getLogger()
@@ -115,6 +121,17 @@ VOCABULARY_NAME = os.environ.get('VOCABULARY_NAME', '')
 
 # --- Provider toggle (Phase: alt-ASR) --------------------------------------
 ASR_PROVIDER = os.environ.get('ASR_PROVIDER', 'transcribe')  # transcribe | elevenlabs
+
+# Batched transcription (spec 2026-08-11): accumulate up to BATCH_MAX_CHUNKS consecutive
+# chunks of one session and send them as ONE request. Default off in code, template and
+# both workflows, so merging this changes nothing anywhere.
+BATCH_TRANSCRIPTION = os.environ.get('BATCH_TRANSCRIPTION', 'false').lower() == 'true'
+BATCH_MAX_CHUNKS = int(os.environ.get('BATCH_MAX_CHUNKS', '4'))
+BATCH_SEAL_DEADLINE_SEC = int(os.environ.get('BATCH_SEAL_DEADLINE_SEC', '150'))
+# Read here as well as in the VAD: batching assumes ONE unit per chunk, which is only true
+# in whole-chunk mode. In segment mode a chunk yields several speech islands and treating
+# one of them as "the chunk" would silently drop the rest.
+TRANSCRIBE_WHOLE_CHUNK = os.environ.get('TRANSCRIBE_WHOLE_CHUNK', 'false').lower() == 'true'
 KEYTERMS_PATH = os.environ.get('KEYTERMS_PATH', 'config/custom_vocabulary_construction_nz.txt')
 
 s3 = boto3.client('s3')
@@ -305,6 +322,42 @@ def write_ledger_record(display_name, file_date, base_name, job_name,
         logger.warning(f"  Ledger write failed (non-fatal): {e}")
 
 
+# ============================================================
+# Batched transcription (spec + plan 2026-08-11)
+# ============================================================
+# The sealing itself lives in `batch_seal`, because the finalize sweep has to do exactly
+# the same work for a session's last 1-3 chunks and must not import this module to get it
+# (it would pay for a transcribe client it never uses, on a function that runs every
+# minute).
+
+
+def _maybe_batch(bucket, key, results):
+    """Consume `key` as a batch member. False = batching does not apply, transcribe it.
+
+    Returning False rather than swallowing the key is the important half: a member that is
+    neither batched nor transcribed is audio that vanishes with no error anywhere.
+    """
+    session_id = transcript_utils.extract_session_id_from_filename(key)
+    chunk_index = transcript_utils.extract_chunk_index_from_filename(key)
+    if session_id is None or chunk_index is None:
+        return False                              # legacy / whole-file key
+    if not TRANSCRIBE_WHOLE_CHUNK:
+        logger.warning("batch: TRANSCRIBE_WHOLE_CHUNK is off, so a chunk is several units "
+                       "— falling back to per-chunk transcription for %s", key)
+        return False
+
+    now = int(time.time())
+    table = _get_dynamodb_table()
+    batch_ledger.register_chunk(table, session_id, chunk_index, key, now)
+    batch_seal.seal_ready_runs(s3, bucket, session_id, table, now,
+                               BATCH_SEAL_DEADLINE_SEC, BATCH_MAX_CHUNKS,
+                               sealed_by='arrival')
+
+    results.append({'key': key, 'status': 'batched_pending',
+                    'session': session_id, 'chunk': chunk_index})
+    return True
+
+
 def lambda_handler(event, context):
     """Main Lambda handler"""
     logger.info(f"Received event: {json.dumps(event)}")
@@ -336,7 +389,17 @@ def lambda_handler(event, context):
             if key.startswith(OUTPUT_PREFIX):
                 logger.info(f"Skipping transcript file: {key}")
                 continue
-            
+
+            # Batching: a MEMBER chunk is accumulated instead of transcribed; the batch
+            # object it eventually produces arrives here as its own S3 event and takes the
+            # ordinary path below. is_batch_key is what separates the two, and getting it
+            # wrong is silent in both directions — a member transcribed as well as batched
+            # is paid for twice, a batch mistaken for a member is two minutes of audio that
+            # never gets transcribed at all.
+            if BATCH_TRANSCRIPTION and not batch_stitch.is_batch_key(key):
+                if _maybe_batch(bucket, key, results):
+                    continue
+
             # Extract user name and date from path
             display_name = extract_user_from_key(key)
             file_date = extract_date_from_key(key)
