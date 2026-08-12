@@ -28,6 +28,19 @@ READERS = [
     "EmbedReportFunction",       # calls _load_turns
 ]
 
+# These two reach the filter as well, but hold a bucket-wide SAM `S3ReadPolicy` instead of the
+# scoped inline statements the five above use. That already grants GetObject and ListBucket on
+# every prefix, so a scoped voice_ask/ grant would be redundant -- and adding one anyway would
+# teach the next reader that the scoped form is required when it is not.
+BROAD_READERS = [
+    "ReportGeneratorFunction",   # sentence-level filter over full_text
+    "MeetingMinutesFunction",    # turn-level, same as the others
+]
+
+
+def _reads_whole_bucket(block):
+    return "S3ReadPolicy:" in block or "S3CrudPolicy:" in block
+
 
 def _list_prefixes(block):
     """The prefixes under a ListBucket condition.
@@ -67,6 +80,9 @@ def test_every_reader_can_get_the_sidecar_objects():
     blocks = _blocks()
     for fn in READERS:
         assert "/voice_ask/*" in blocks[fn], f"{fn} cannot read the agent-answer sidecars"
+    for fn in BROAD_READERS:
+        assert _reads_whole_bucket(blocks[fn]), (
+            f"{fn} lost its bucket-wide read policy -- it now needs a scoped voice_ask/ grant")
 
 
 def test_every_reader_can_list_the_sidecar_prefix():
@@ -77,6 +93,9 @@ def test_every_reader_can_list_the_sidecar_prefix():
         prefixes = _list_prefixes(blocks[fn])
         assert prefixes, f"{fn} has no ListBucket prefix condition at all"
         assert "voice_ask/*" in prefixes, f"{fn} cannot LIST voice_ask/ (has {prefixes})"
+    for fn in BROAD_READERS:
+        # Bucket-wide ListBucket comes with S3ReadPolicy; no prefix condition to check.
+        assert _reads_whole_bucket(blocks[fn])
 
 
 def test_the_writer_can_write_and_knows_the_bucket():

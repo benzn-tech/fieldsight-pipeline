@@ -205,3 +205,45 @@ def apply_agent_filter(turns, s3, bucket, user_folder, date):
             "device clock skew or a missed playback",
             stats["answers_with_no_match"], len(answers), user_folder, date)
     return marked, stats
+
+
+# Sentence terminators: ASCII plus the CJK forms. Splitting on '.' alone never fires on Chinese,
+# which ends sentences with U+3002 -- the same blind spot that made two earlier ASCII-only
+# normalisations erase CJK entirely.
+_SENTENCE_SPLIT = re.compile(r'(?<=[.!?。！？])\s*')
+
+
+def filter_agent_text(full_text, answers, file_start_local, duration_sec):
+    """Drop agent sentences from a flat transcript string. Returns (text, stats).
+
+    For the report generator, which has no speaker turns -- it keeps `full_text` from
+    `parse_transcribe_json` and never builds them. Rebuilding turns there just to filter would
+    change the text of EVERY report, including the ones with no agent answer in them, to fix a
+    narrow case. This touches the text only when something actually matches.
+
+    The time condition survives, at file granularity: the file's own span must overlap the
+    answer's window. Coarser than the per-turn check, and deliberately kept anyway -- containment
+    alone would strip a person quoting the agent an hour later, which is a person reporting a
+    fact and the only human record of it.
+
+    Same `_contained` underneath as the turn-level path. Two fuzzy matchers meant to agree
+    eventually do not.
+    """
+    if not full_text or not answers or not isinstance(file_start_local, datetime):
+        return full_text, {"removed": 0}
+    file_end = file_start_local + timedelta(seconds=duration_sec or 0)
+    live = [a for a in answers
+            if a.at_local - WINDOW_BEFORE <= file_end
+            and file_start_local <= a.at_local + WINDOW_AFTER]
+    if not live:
+        return full_text, {"removed": 0}
+
+    kept, removed = [], 0
+    for sentence in _SENTENCE_SPLIT.split(full_text):
+        if not sentence.strip():
+            continue
+        if any(_contained(sentence, a.text) for a in live):
+            removed += 1
+            continue
+        kept.append(sentence.strip())
+    return (" ".join(kept) if removed else full_text), {"removed": removed}
