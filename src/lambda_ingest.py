@@ -67,6 +67,7 @@ import deadline_parse
 import match_request
 import photo_binding
 import reindex
+import agent_turn_filter
 from chunking import chunk_report, chunk_transcripts
 from db.connection import get_connection
 from repositories import chunks, companies, memberships, recordings, sites, topics, users
@@ -469,7 +470,16 @@ def _load_turns(user_folder, date):
                 if turn.get("abs_start") is None:
                     continue
                 turns.append({**turn, "src": filename})
-    return turns
+    # The Ask agent's own answer, played aloud into the recording it is answering. Marked here
+    # rather than in the caller because embed-report calls THIS function too -- the two rebuild
+    # chunk_text independently and embed_from_sidecar looks vectors up by its hash, so if only one
+    # of them filtered, every transcript-window hash would miss and the whole report would fail to
+    # ingest. One shared call site is what keeps them identical by construction.
+    turns, _agent_stats = agent_turn_filter.apply_agent_filter(
+        turns, s3(), S3_BUCKET, user_folder, date)
+    # Dropped so they never reach chunk_transcripts and therefore never reach report_chunks --
+    # which is the half of the loop that feeds the next answer back to the agent.
+    return [t for t in turns if not t.get("from_agent")]
 
 
 # ----------------------------------------------------------

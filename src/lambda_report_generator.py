@@ -63,6 +63,7 @@ import logging
 import re
 import boto3
 import urllib3
+import agent_turn_filter
 import weather
 import llm_utils
 from datetime import datetime, timedelta
@@ -1007,6 +1008,13 @@ def process_user_data(bucket, user_name, target_date, exclude_keys=None):
     all_text_parts = []
     total_words = 0
     total_duration = 0.0
+    # What the Ask agent said aloud on this day, so its own answers do not come back as report
+    # prose. This consumer keeps a flat string per file rather than speaker turns, so it uses the
+    # sentence-level entry point -- same containment rule underneath as extraction and ingest.
+    # Loaded once per user/day, not per file.
+    agent_answers = agent_turn_filter.load_agent_answers(
+        s3_client, bucket, user_name, target_date)
+    agent_removed = 0
 
     for obj in transcript_objects:
         key = obj['key']
@@ -1023,6 +1031,15 @@ def process_user_data(bucket, user_name, target_date, exclude_keys=None):
         parsed = parse_transcript(data)
         if parsed and parsed['full_text']:
             timestamp = extract_timestamp_from_filename(filename)
+            if agent_answers:
+                cleaned, _ag = agent_turn_filter.filter_agent_text(
+                    parsed['full_text'], agent_answers, timestamp,
+                    parsed.get('duration_seconds', 0.0))
+                agent_removed += _ag['removed']
+                parsed = dict(parsed, full_text=cleaned)
+                if not cleaned.strip():
+                    # The whole file was the agent talking. Nothing left to report on.
+                    continue
             device = extract_device_from_filename(filename)
             total_words += parsed['word_count']
             total_duration += parsed.get('duration_seconds', 0.0)
@@ -1063,6 +1080,11 @@ def process_user_data(bucket, user_name, target_date, exclude_keys=None):
 
     logger.info(f"  Found {len(transcripts)} transcripts, {len(photos)} photos, "
                 f"{total_words} words, {total_duration:.0f}s audio")
+    if agent_answers:
+        # Counted out loud. A filter that removes nothing looks identical to one that was never
+        # reached, and the gap this closes stayed invisible for exactly that reason.
+        logger.info("  agent playback: %d answer(s) known, %d sentence(s) removed",
+                    len(agent_answers), agent_removed)
 
     return {
         'transcripts': transcripts, 'photos': photos,
