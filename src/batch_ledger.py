@@ -270,8 +270,14 @@ def mark_bypassed(table, session_id: str, index: int, now: int) -> None:
     there no `_bn` object for this stretch" has an answer in the ledger instead of looking
     like the seal that never happened.
     """
+    # `claimed_at` as well as `bypassed_at`: the staleness check in `claim_seal` reads
+    # `claimed_at`, and a record without one is `now - 0` old — i.e. instantly abandoned, so
+    # the 900-second window that is supposed to bound the two-sealers race did not exist for
+    # bypassed records at all. `bypassed_at` stays because it says WHEN, which `claimed_at`
+    # on a bypass record would read as a claim that is still in flight.
     table.put_item(Item={"PK": _pk(session_id), "SK": _seal_sk(index),
-                         "status": "bypassed", "bypassed_at": now})
+                         "status": "bypassed", "bypassed_at": now,
+                         "claimed_at": now})
 
 
 def mark_sealed(table, session_id: str, first_index: int, now: int) -> None:

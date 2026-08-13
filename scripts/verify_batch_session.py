@@ -84,6 +84,15 @@ def main():
 
     problems, notes = [], []
 
+    # A typo'd session id finds nothing, and "nothing" satisfied every check below -- so the
+    # script printed PASS. An empty session is not a healthy session; it is a session this
+    # script knows nothing about, and it has to say which.
+    if not uploaded and not units and not batches:
+        print()
+        print("NOTHING FOUND for that session id on this bucket "
+              "- check the id and --env")
+        return 2
+
     bn1 = [k for k, (_, n) in batches.items() if n == 1]
     if bn1:
         problems.append(f"{len(bn1)} `_bn1` object(s) - the singleton bypass did not run: "
@@ -115,8 +124,25 @@ def main():
             transcribed_alone.add(int(m.group(2)))
     unaccounted = sorted(units - set(covered) - transcribed_alone)
     if unaccounted:
-        problems.append(f"chunks in NO batch, no bypass and no transcript — audio lost "
+        problems.append(f"chunks in NO batch, no bypass and no transcript - audio lost "
                         f"with no error anywhere: {unaccounted}")
+
+    # Being in a batch MAP is not being transcribed. A batch that sealed and whose
+    # transcription then failed leaves its members "covered" and their words nowhere, and
+    # the check above cannot see it because it only asks whether someone claimed them.
+    batch_stems = {k.rsplit("/", 1)[-1].rsplit(".", 1)[0] for k in batches}
+    transcribed_stems = {k.rsplit("/", 1)[-1].rsplit(".", 1)[0] for k in transcripts}
+    sealed_untranscribed = sorted(batch_stems - transcribed_stems)
+    if sealed_untranscribed:
+        problems.append(f"batch object(s) with no transcript - sealed, billed for storage, "
+                        f"and never turned into words: {', '.join(sealed_untranscribed[:3])}")
+
+    # The double-billing this feature can actually produce is a chunk that is BOTH inside a
+    # batch and transcribed on its own -- two paid requests for one stretch of audio. The
+    # in-two-batches check above never sees that shape.
+    both = sorted(set(covered) & transcribed_alone)
+    if both:
+        problems.append(f"chunks both batched and transcribed alone - paid for twice: {both}")
 
     from datetime import datetime
     cutoff = datetime.fromisoformat(args.embed_since)
