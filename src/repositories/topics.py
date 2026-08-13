@@ -1,5 +1,9 @@
 import logging
 
+# The deleted-topic predicate lives with the tombstone it reads, so a caller cannot
+# accidentally write a second copy that drifts.
+from repositories.redactions import DELETED_TOPIC_PREDICATE
+
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -110,9 +114,32 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
     return topic
 
 
+def _visible(sql: str, alias: str = "topics") -> str:
+    """Append the deleted-topic exclusion to a SELECT.
+
+    One wrapper rather than ten copies of the predicate: a copy that drifts is how the
+    previous "single choke point" in this file ended up with two callers and a dozen
+    unfiltered reads. Grep for `_visible(` to see every read that honours a delete.
+
+    Placed after the caller's own WHERE so it cannot change their parameter order — the
+    predicate is a correlated NOT EXISTS and binds nothing.
+    """
+    if " WHERE " in sql or sql.rstrip().endswith("WHERE"):
+        marker = " ORDER BY "
+        pred = " AND " + DELETED_TOPIC_PREDICATE.format(alias=alias) + " "
+        if marker in sql:
+            head, _, tail = sql.partition(marker)
+            return head + pred + marker + tail
+        if " GROUP BY " in sql:
+            head, _, tail = sql.partition(" GROUP BY ")
+            return head + pred + " GROUP BY " + tail
+        return sql.rstrip() + pred
+    return sql.rstrip() + " WHERE " + DELETED_TOPIC_PREDICATE.format(alias=alias) + " "
+
+
 def list_site_topics(conn, site_id, report_date) -> list[dict]:
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_TOPIC_COLS} FROM topics WHERE site_id=%s AND report_date=%s "
+        f"SELECT {_TOPIC_COLS} FROM topics WHERE site_id=%s AND report_date=%s  AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)"
         f"ORDER BY occurred_at NULLS LAST, created_at",
         (site_id, report_date),
     ).fetchall()
@@ -138,7 +165,7 @@ def list_contributor_folders_for_site_date(conn, site_id, report_date) -> list[s
         "  WHEN source_s3_key LIKE 'extractions/%%' THEN split_part(source_s3_key, '/', 2) "
         "  WHEN source_s3_key LIKE 'reports/%%'     THEN split_part(source_s3_key, '/', 3) "
         "END AS folder "
-        "FROM topics WHERE site_id=%s AND report_date=%s",
+        "FROM topics WHERE site_id=%s AND report_date=%s AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)",
         (site_id, report_date),
     ).fetchall()
     return sorted({r["folder"] for r in rows if r["folder"]})
@@ -159,7 +186,7 @@ def get_topic(conn, topic_id):
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT id, site_id, user_id, report_date, title, summary, category, "
         "       time_range, source_s3_key, thread_id "
-        "FROM topics WHERE id=%s", (topic_id,)).fetchone()
+        "FROM topics WHERE id=%s AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)", (topic_id,)).fetchone()
 
 
 def delete_topics_for_source(conn, source_s3_key) -> int:
@@ -246,7 +273,7 @@ def list_extraction_topics_for_day(conn, site_id, user_id, report_date) -> list[
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT id, title, occurred_at FROM topics "
         "WHERE site_id=%s AND user_id=%s AND report_date=%s "
-        "AND source_s3_key LIKE 'extractions/%%' ORDER BY occurred_at",
+        "AND source_s3_key LIKE 'extractions/%%' AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL) ORDER BY occurred_at",
         (site_id, user_id, report_date),
     ).fetchall()
 
@@ -347,7 +374,7 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
     action_items_by_topic = {}
     for a in conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, text, responsible, deadline, priority, status, created_at "
-        "FROM action_items WHERE topic_id = ANY(%s) ORDER BY created_at",
+        "FROM action_items WHERE topic_id = ANY(%s) AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = t.id AND r.scope = 'deleted' AND r.reverted_at IS NULL) ORDER BY created_at",
         (topic_ids,),
     ).fetchall():
         action_items_by_topic.setdefault(a["topic_id"], []).append(a)
@@ -395,7 +422,7 @@ def list_report_dates(conn, site_ids, since_date, *, author_ids=None) -> list:
     Empty site_ids -> [] without a round-trip (mirrors list_topics_for_date)."""
     if not site_ids:
         return []
-    where = "WHERE site_id = ANY(%s::uuid[]) AND report_date >= %s"
+    where = "WHERE site_id = ANY(%s::uuid[]) AND report_date >= %s AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)"
     params = [list(site_ids), since_date]
     if author_ids is not None:
         where += " AND user_id = ANY(%s::uuid[])"
@@ -443,7 +470,7 @@ def report_date_counts(conn, site_ids, since_date, *, author_ids=None) -> list[d
         f"                          OR EXISTS (SELECT 1 FROM safety_observations so "
         f"                                      WHERE so.topic_id = t.id) "
         f"                          OR EXISTS (SELECT 1 FROM findings f "
-        f"                                      WHERE f.topic_id = t.id "
+        f"                                      WHERE f.topic_id = t.id  AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = t.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)"
         f"                                        AND f.domain = 'safety')) AS safety "
         f"FROM topics t "
         f"{where} "
@@ -466,7 +493,7 @@ def list_topics_for_source_prefix(conn, source_prefix) -> list[dict]:
     escaping as delete_topics_for_source_prefix/has_topics_for_source_prefix
     (S3 user folders contain literal underscores).
 
-    ORDER BY time_range NULLS LAST, created_at, id gives D3 stable ordering
+    AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = t.id AND r.scope = 'deleted' AND r.reverted_at IS NULL) ORDER BY time_range NULLS LAST, created_at, id gives D3 stable ordering
     (time_range is a free-text display field, not sortable as a real range,
     but groups topics that share one, with created_at/id as tiebreakers for
     topics with no time_range).
@@ -550,7 +577,7 @@ def list_extraction_folder_names_for_date(conn, company_id, report_date) -> list
     needed -- the '%%' is escaped inline for psycopg's %s paramstyle."""
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT DISTINCT u.folder_name FROM topics t JOIN users u ON u.id = t.user_id "
-        "WHERE t.report_date=%s AND u.company_id=%s "
+        "WHERE t.report_date=%s AND u.company_id=%s  AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = t.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)"
         "AND t.source_s3_key LIKE 'extractions/%%' AND u.folder_name IS NOT NULL",
         (report_date, company_id),
     ).fetchall()
@@ -588,7 +615,7 @@ def get_topic_full(conn, topic_id) -> dict | None:
     t["findings"] = findings.list_for_topics(conn, tids)
     t["photos"] = conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, s3_key, caption_text FROM topic_photos "
-        "WHERE topic_id = ANY(%s) ORDER BY created_at", (tids,)).fetchall()
+        "WHERE topic_id = ANY(%s) AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = t.id AND r.scope = 'deleted' AND r.reverted_at IS NULL) ORDER BY created_at", (tids,)).fetchall()
     return t
 
 

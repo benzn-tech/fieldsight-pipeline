@@ -7069,3 +7069,36 @@ def test_a_session_with_only_a_start_is_unchanged(monkeypatch):
 
 def test_a_session_with_neither_end_is_unchanged():
     assert org._session_label(None, None) == "? – ?"
+
+
+def test_a_deleted_topic_is_dropped_by_the_renderer_not_flagged(monkeypatch):
+    """`render_report_shape` returns the full topic body with `redacted: true`.
+
+    That is CORRECT for life-conversation separation -- the site tier shows the topic in a
+    "removed" area so its own author can see what was held back, which needs the body. It
+    is a direct leak for a customer-facing delete: the customer was told the content is
+    gone and the payload would still carry every word of it.
+
+    So the two scopes part company here, and `analysis` must stay byte-identical or a live
+    feature breaks while this one is being built.
+    """
+    import repositories.redactions as red
+
+    keep = _topic_row(id="11111111-1111-1111-1111-111111111111", title="kept")
+    gone = _topic_row(id="22222222-2222-2222-2222-222222222222", title="deleted",
+                      summary="the secret words")
+    held = _topic_row(id="33333333-3333-3333-3333-333333333333", title="personal")
+
+    monkeypatch.setattr(red, "list_active_for_topics", lambda conn, ids: {
+        gone["id"]: {"target_id": gone["id"], "scope": "deleted", "reason": "user deleted"},
+        held["id"]: {"target_id": held["id"], "scope": "analysis", "reason": "non-work"}})
+
+    shape = org.render_report_shape([keep, gone, held], None, "2026-07-14", "Ada_L",
+                                    conn=object())
+    out = shape.get("topics") or []
+    ids = {t.get("topic_row_id") for t in out}
+    assert gone["id"] not in ids, "a deleted topic must be ABSENT, not flagged"
+    assert "the secret words" not in str(shape), "and its body must not travel at all"
+    assert held["id"] in ids, "the analysis-scope redaction keeps today's behaviour"
+    assert any(t.get("redacted") for t in out), "and it keeps its flag"
+    assert keep["id"] in ids
