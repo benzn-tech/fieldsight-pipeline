@@ -96,6 +96,7 @@ class FakeLedger:
         self.members = {}
         self.seals = {}
         self.registered = []
+        self.bypassed = set()
 
     def register_chunk(self, table, session_id, index, chunk_key, now):
         self.registered.append(index)
@@ -113,6 +114,34 @@ class FakeLedger:
         return batch_ledger.pending_windows(rows, now, grace_sec,
                                             window_sec=window_sec, cap=cap)
 
+    def pending_buckets(self, rows, now, grace_sec, window_sec=120.0, cap=4,
+                        table=None, session_id=None):
+        """Real planner, but the straggler lookup is answered from this fake's own seals.
+
+        `seal_ready_runs` hands through the module-level DynamoDB table, which in this
+        fixture is a real boto3 resource — letting the real `seal_status` reach for it would
+        make these tests depend on AWS."""
+        import batch_ledger
+
+        class _T:
+            def __init__(self, seals): self.seals = seals
+            def query(self_inner, KeyConditionExpression=None, ExpressionAttributeValues=None):
+                sk = (ExpressionAttributeValues or {}).get(":sk", "")
+                for k, v in self_inner.seals.items():
+                    if sk.endswith(f"{k:04d}"):
+                        return {"Items": [v]}
+                return {"Items": []}
+        return batch_ledger.pending_buckets(rows, now, grace_sec, window_sec=window_sec,
+                                            cap=cap, table=_T(self.seals),
+                                            session_id=session_id)
+
+    def bucket_for_index(self, row, window_sec=120.0):
+        import batch_ledger
+        return batch_ledger.bucket_for_index(row, window_sec)
+
+    def seal_status(self, table, session_id, key):
+        return (self.seals.get(key) or {}).get("status")
+
     def consumed_indices(self, rows):
         import batch_ledger
         return batch_ledger.consumed_indices(rows)
@@ -123,6 +152,7 @@ class FakeLedger:
 
     def mark_bypassed(self, table, session_id, index, now):
         self.seals[index] = {"status": "bypassed"}
+        self.bypassed.add(index)
 
     def claim_seal(self, table, session_id, first_index, members, now):
         if first_index in self.seals:
@@ -133,8 +163,8 @@ class FakeLedger:
     def mark_sealed(self, table, session_id, first_index, now):
         self.seals[first_index] = {"status": "sealed"}
 
-    def seal_status(self, table, session_id, first_index):
-        return (self.seals.get(first_index) or {}).get("status")
+    def bypass_status(self, table, session_id, index):
+        return "bypassed" if index in self.bypassed else None
 
 
 @pytest.fixture
@@ -290,7 +320,9 @@ def test_a_bypassed_member_is_transcribed_when_its_event_comes_back(wired):
     monkeypatch, s3, ledger, calls = wired
     ledger.members[0] = {"chunk_index": 0, "chunk_key": unit_key(0),
                          "registered_at": 0, "sealed_into": 0}
-    ledger.seals[0] = {"status": "bypassed"}
+    # Member-scoped since the seal key became the wall-clock bucket: a lookup by chunk
+    # index against the seal record no longer finds anything.
+    ledger.bypassed.add(0)
 
     results = []
     handled = mod._maybe_batch("b", unit_key(0), results)
@@ -411,3 +443,16 @@ def test_the_window_length_is_read_from_the_environment_not_hardcoded(monkeypatc
     finally:
         monkeypatch.delenv("BATCH_WINDOW_SEC")
         importlib.reload(mod)
+
+
+def test_the_bypass_check_reads_the_member_record_not_the_seal_key(wired):
+    """Under bucket seal keys, `seal_status(sid, chunk_index)` misses.
+
+    The copy-to-self event for a bypassed chunk would then re-enter batching, find itself
+    consumed, and report `batched_pending` — the exact vanish the bypass exists to prevent.
+    """
+    monkeypatch, s3, ledger, calls = wired
+    ledger.members[0] = {"chunk_index": 0, "chunk_key": unit_key(0),
+                         "registered_at": 0, "sealed_into": 0}
+    ledger.bypassed.add(0)
+    assert mod._maybe_batch("b", unit_key(0), []) is False
