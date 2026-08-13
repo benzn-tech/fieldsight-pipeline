@@ -181,3 +181,16 @@ def revert_batch(conn, batch_id, company_id) -> list:
         f"UPDATE redactions SET reverted_at = now() "
         f"WHERE batch_id = %s AND company_id = %s AND reverted_at IS NULL "
         f"RETURNING {_COLS}", (batch_id, company_id)).fetchall()
+
+
+def list_deleted_batches_for_prefix(conn, prefix) -> list:
+    """The active delete batches whose tombstone covers this source key.
+
+    Used by the re-stamp: a topic the pipeline just re-created must join the SAME batch as
+    the tombstone that hid its predecessor, or one revert stops restoring exactly what one
+    delete hid — and that equality is the only check that proves the feature is reversible.
+    """
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT DISTINCT batch_id, company_id FROM redactions "
+        "WHERE target_type = 'recording' AND scope = 'deleted' AND reverted_at IS NULL "
+        "AND target_key IS NOT NULL AND %s LIKE target_key || '%%'", (prefix,)).fetchall()
