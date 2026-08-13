@@ -351,36 +351,64 @@ piece of work.
 
 ---
 
-## 10. The action-item admission bar did NOT reproduce a measurable improvement
+## 10. The action-item admission bar, measured properly
 
-Recorded because the commit that added it (`568d25e`) reads as though it fixes
-the failure in §1, and the one run available does not support that.
+An earlier version of this section concluded the bar produced **no measurable
+improvement**. That conclusion was drawn from one run per arm on the 244 K
+transcript — the wrong input, because the control on that input was already
+clean. Replaced with the controlled result below. The earlier text is in the
+history (`73f70d1`); it was wrong and is not worth preserving inline.
 
-**What was run.** The same 244 K transcript through the extraction prompt with
-and without the admission bar, same model, thinking on.
+**Design.** Same assembled turns, same prompt, the only difference being
+whether the admission paragraph and its two Bad examples are present — removed
+by string surgery so no other byte differs. `qwen3.7-max`, thinking on. Two
+sessions from **prod**, both from 2026-08-13.
 
-| arm | action items | items |
-|---|---|---|
-| no bar (§1's arm B) | 3 | `Product positioning -- market as known IT asset` · `Privacy controls -- implement visible audio deletion` · `Photo linking bug -- investigate missing dashboard photos` |
-| with bar | 3 | `Hardware positioning -- package as company phone` · `Privacy controls -- implement visible deletion features` · `Photo-linking UI -- fix missing image display` |
+### Strategy discussion (`sid15770a…`, 153 files, 1,858 turns, 103,924 chars)
 
-**The control already produced only tickable tasks.** All three of arm B's
-items name an act someone can finish. The four directions
-(`Target market strategy -- focus high-hourly professionals` and friends) came
-only from **arm A** — the shorter 104 K transcript that prod actually ran. So
-whatever produced them, this run does not show it was the missing bar.
+| arm | runs | action items | of which directions |
+|---|---|---|---|
+| no bar | 3 | 5, 10, 5 — **6.7/run** | 2, 5, 1 = 8 of 20 — **40 %** |
+| bar | 4 | 3, 0, 2, 2 — **1.75/run** | ~0 of 7 — **~0 %** |
 
-The verbs did firm up (`market as` → `package as`, `investigate` → `fix`), but
-that is one run against one run and is not evidence.
+The directions the control invented are the §1 failure verbatim:
+`Identify and leverage internal advocates`, `Evaluate high-billable-hour niches`,
+`Re-evaluate if audio note-taking is the most effective technology`,
+`Define top-down enforcement policy or bottom-up value proposition`. None
+survive with the bar. What does survive is the same two or three real tasks
+every time: the visible-deletion control, the photo-linking bug, the AWS
+summary email.
 
-**What the change still stands on.** The prompt taught the failing shape with
-its own first positive example, and naming the criterion — test the verb, not
-the subject — is correct regardless of whether this session happens to exercise
-it. It is a defensible prompt, not a demonstrated fix.
+### Site walk (`sidb6d5d2ab…`, Neil, 17 files, 184 turns, 12,411 chars)
 
-**What would actually establish it.** Several runs per arm on the *arm A*
-input (the 104 K transcript, which is the one that produced the failure), plus
-sessions of both kinds — a site walk, where the bar must not suppress real
-tasks, matters more than the strategy chat. `scripts/extraction_ab.py` on
-PR #404 exists for exactly this and should be the vehicle; do not merge a claim
-of improvement before it has been run.
+| arm | runs | action items | of which directions |
+|---|---|---|---|
+| no bar | 2 | 8, 7 — **7.5/run** | 0 |
+| bar | 2 | 7, 8 — **7.5/run** | 0 |
+
+**This is the result that matters most.** The bar is neutral on real site work:
+same volume, same character. `Ducting -- relocate for 1200mm drilling
+clearance`, `Pipework -- cut and cap 2m from wall`, `Taps -- salvage for reuse`
+all come through. The fear that a stricter rule would suppress genuine tasks is
+not borne out on the session type where suppression would actually cost
+something.
+
+### The failure mode to watch
+
+**One of four bar runs on the strategy session returned zero action items** —
+losing the three genuine ones with the directions. On a discussion-type session
+that is roughly a one-in-four chance of an empty list. The bar is doing its job
+too enthusiastically at the tail, and the fix is not obvious: the same session
+legitimately contains only two or three tasks, so "empty" and "correct" sit
+very close together. Worth watching in the rollout counters rather than tuned
+blind.
+
+### Caveats
+
+- Three and four runs per arm. Enough to see a 40 %→0 % shift and a neutral
+  site walk; not enough to put an interval on either.
+- The direction/tickable tally is a regex over verbs and it is crude: it marks
+  `Photo linking -- investigate missing photos` a direction, when investigating
+  one named bug is plainly tickable. The raw item lists, not the tally, are the
+  evidence.
+- Both sessions are from one day and one company.
