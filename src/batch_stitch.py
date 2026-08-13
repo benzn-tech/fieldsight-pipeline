@@ -21,10 +21,13 @@ against a second copy of the format.
 """
 from __future__ import annotations
 
+import logging
 import re
 from datetime import timedelta
 
 from transcript_utils import extract_base_time_from_filename
+
+_log = logging.getLogger()
 
 BYTES_PER_SAMPLE = 2                     # PCM s16le mono, the capture format throughout
 DEFAULT_MAX_BATCH = 4                    # four ~30 s chunks ≈ two minutes
@@ -379,7 +382,9 @@ def rebase_turns_from_embedded_map(normalized, transcript_data):
     doc = (transcript_data or {}).get(EMBEDDED_MAP_KEY)
     if not doc or not (doc.get("members") if isinstance(doc, dict) else None):
         return normalized
-    for turn in (normalized or {}).get("speaker_turns") or []:
+    turns = (normalized or {}).get("speaker_turns") or []
+    crossings = 0
+    for turn in turns:
         if turn.get("abs_start") is None:
             continue                       # no time to re-base; do not invent one
         start = resolve_abs_time(doc, turn.get("start_sec") or 0.0)
@@ -391,7 +396,45 @@ def rebase_turns_from_embedded_map(normalized, transcript_data):
         if end is not None:
             turn["abs_end"] = end
             turn["abs_end_str"] = end.strftime("%H:%M:%S")
+        turn["crosses_gap"] = spans_a_gap(doc, turn.get("start_sec") or 0.0,
+                                          turn.get("end_sec") or 0.0)
+        crossings += 1 if turn["crosses_gap"] else 0
+    # Logged unconditionally, zero included. A guard that speaks only on failure cannot be
+    # told apart from a guard that was never reached — which is how three missing IAM grants
+    # each looked like nothing at all.
+    _log.info("batch: rebased %d turns through the embedded map, batch_splice_turns=%d",
+              len(turns), crossings)
     return normalized
+
+
+def spans_a_gap(batch_map: dict, start_sec: float, end_sec: float) -> bool:
+    """True when a turn runs across a member boundary that is discontinuous in time.
+
+    A bridged gap splices audio that was never adjacent, and the provider cannot know that:
+    it can emit one turn whose text runs across the join, fusing utterances up to a window
+    apart into a single interval that covers time when nobody spoke. Each end of that turn
+    is individually correct after rebasing, which is exactly why nothing downstream notices.
+    Photo binding and claim provenance both consume the interval.
+
+    Only DISCONTINUOUS boundaries count. Every batch has boundaries; flagging them all would
+    make the signal mean "this is a batch" and bury the cases that matter.
+    """
+    members = batch_map.get("members") or []
+    for prev, nxt in zip(members, members[1:]):
+        boundary = float(nxt["batch_offset_sec"])
+        if not (start_sec < boundary < end_sec):
+            continue
+        a, b = _parse_abs_start(prev["abs_start"]), _parse_abs_start(nxt["abs_start"])
+        if a is None or b is None:
+            continue
+        expected_end = a + timedelta(seconds=float(prev["trimmed_head_sec"])
+                                     + float(prev["kept_duration_sec"]))
+        actual_start = b + timedelta(seconds=float(nxt["trimmed_head_sec"]))
+        # A second of slack. A seam trim is measured to the sample and a real gap is a whole
+        # dropped chunk, so nothing legitimate lands between those two scales.
+        if (actual_start - expected_end).total_seconds() > 1.0:
+            return True
+    return False
 
 
 # ============================================================
