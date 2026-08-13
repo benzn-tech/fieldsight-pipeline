@@ -213,3 +213,68 @@ def test_collapses_a_run_of_four_copies():
     out, stats = les._dedup_batch_window_repeats(copies)
     assert len(out) == 1
     assert stats["dropped"] == 3
+
+
+# --- the blind spot the first version of this file had ----------------------
+# Every guard above puts its differing token inside the 12-character opening
+# probe (door at char 4, "Level 2" at 6, electricians at 4). That made them pass
+# for the wrong reason and hid a whole failure class: a difference LATER in the
+# sentence sailed through the opening gate and merged. All six below were
+# reproduced against the live function before `_diff_is_only_noise` existed, and
+# four of them lost the number.
+
+@pytest.mark.parametrize("a,b,what", [
+    ("Cut the pipe at 2400 and cap it off before the pour on Friday.",
+     "Cut the pipe at 3400 and cap it off before the pour on Friday.", "a measurement"),
+    ("Make sure you cut it at two metres from the slab edge.",
+     "Make sure you cut it at three metres from the slab edge.", "a spelled number"),
+    ("Leave them 1200mm of clearance off the wall for the drill rig.",
+     "Leave them 1500mm of clearance off the wall for the drill rig.", "a clearance"),
+    ("The rebar inspection on level six is booked for Thursday.",
+     "The rebar inspection on level six is booked for Tuesday.", "a weekday"),
+    ("Level 2 needs the tiles out by Friday for the ceiling crew.",
+     "Level 2 needs the soffit out by Friday for the ceiling crew.", "a parallel instruction"),
+    ("师傅说这个礼拜五之前一定要把三楼的瓷砖跟天花板全部拆出来运走",
+     "师傅说这个礼拜五之前一定要把四楼的瓷砖跟天花板全部拆出来运走", "a floor number in Chinese"),
+])
+def test_a_difference_past_the_opening_probe_is_never_merged(a, b, what):
+    out, _ = les._dedup_batch_window_repeats([T(a, 0), T(b, 1)])
+    assert len(out) == 2, f"lost {what}"
+
+
+def test_a_later_turn_is_compared_against_what_was_originally_said():
+    # A absorbs B (a window clipped A short). C is a correction — Monday, not
+    # Friday — and never resembled A. Comparing C against B's replacement text
+    # dropped it, leaving the transcript asserting Friday. Reproduced.
+    a = T("He said the fire door schedule changes on Friday.", 0)
+    b = T("He said the fire door schedule changes on Friday, after the audit.", 1)
+    c = T("He said the fire door schedule changes on Monday, after the audit.", 2)
+    out, _ = les._dedup_batch_window_repeats([a, b, c])
+    assert len(out) == 2                       # a+b are one utterance; c is not
+    assert out[0]["text"].endswith("on Friday, after the audit.")
+    assert "Monday" in out[1]["text"]
+
+
+def test_the_merged_turn_does_not_leak_bookkeeping_to_callers():
+    a = T("Reality capture. He doesn't do reality capture, right? So now he's got", 0)
+    b = T("Reality capture. He doesn't do reality capture, right? So now he's got a factory.", 0)
+    out, _ = les._dedup_batch_window_repeats([a, b])
+    assert all("_dedup_orig_text" not in t for t in out)
+
+
+def test_morphology_alone_still_merges():
+    # The whole point of similarity over equality: "want"/"wanted" share a stem,
+    # so this is still one utterance decoded twice.
+    a = T("Well, they said they want it for defense security.", 0)
+    b = T("Well, they said they wanted it for defense security.", 0)
+    out, _ = les._dedup_batch_window_repeats([a, b])
+    assert len(out) == 1
+
+
+def test_a_full_word_swap_late_in_the_sentence_is_refused_even_when_similar():
+    # 0.9+ similarity, aligned opening, sub-second apart — everything the pass
+    # looks for — but "sparkies"/"plumbers" is a different trade being told.
+    a = T("Can you get the sparkies onto that riser first thing tomorrow?", 0)
+    b = T("Can you get the plumbers onto that riser first thing tomorrow?", 0)
+    out, _ = les._dedup_batch_window_repeats([a, b])
+    assert len(out) == 2

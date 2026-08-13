@@ -663,7 +663,83 @@ def _opens_alike(a, b, probe=DUP_OPEN_PROBE, window=DUP_OPEN_WINDOW):
 
 
 def _open_key(s):
-    return re.sub(r'[^0-9a-z一-鿿]+', ' ', (s or '').lower()).strip()
+    return re.sub(r'[^0-9a-z㐀-䶿一-鿿豈-﫿]+', ' ',
+                  (s or '').lower()).strip()
+
+
+_NUMBERY = re.compile(
+    r'[0-9０-９]|[一二三四五六七八九十'
+    r'百千万两]|'
+    r'\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty|thirty|'
+    r'forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|first|second|third|'
+    r'monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
+    r'january|february|march|april|june|july|august|september|october|november|december)\b',
+    re.I)
+
+_MORPH_PREFIX = 4     # "want"/"wanted" share this much; "tiles"/"soffit" share none
+_WORDISH = re.compile(r'[^0-9a-z一-鿿]')
+
+
+def _diff_is_only_noise(a, b):
+    """Are these two texts different only in the ways a RE-DECODE differs?
+
+    The opening-alignment gate stops two statements that BEGIN on different
+    subjects. It does nothing about a difference further in, and that is where
+    this pass was quietly losing real content. Every one of these merged
+    against the live function before this guard existed:
+
+        "Cut the pipe at 2400 and cap it off..."  / "...at 3400..."
+        "Make sure you cut it at two metres..."   / "...at three metres..."
+        "Leave them 1200mm of clearance..."       / "...1500mm..."
+        "...booked for Thursday."                 / "...booked for Tuesday."
+        "Level 2 needs the tiles out by Friday"   / "...the soffit out..."
+        "...把三楼的瓷砖跟天花板全部拆出来"        / "...把四楼的..."
+
+    Four of the six lost the number. Those are measurements, delivery times and
+    floor numbers -- the exact payload the design says must survive. The test
+    suite caught none of it, because every guard case happened to put its
+    differing token inside the 12-character opening probe.
+
+    So: compare word by word and refuse when a REPLACED span carries meaning.
+
+      - a number, ordinal, weekday or month on either side -> refuse. A
+        re-decode of one piece of audio almost never disagrees about a digit,
+        and when it does ("150" against "one hundred and fifty") letting the
+        duplicate through costs tokens, while merging costs the number.
+      - two words of >=4 letters not sharing a 4-letter prefix -> refuse.
+        "want"/"wanted" share one; "tiles"/"soffit", "Thursday"/"Tuesday",
+        "door"/"window" do not.
+
+    INSERTED and DELETED spans are left alone: a window clipping an utterance
+    short, or one copy carrying a leading "You know,", are the ordinary shapes
+    of a re-decode.
+
+    This refuses genuine merges too -- "Why has he got his GM" against "Why is
+    he called his GM" is a real duplicate this now keeps. That is the intended
+    direction: a missed duplicate costs tokens, a false merge costs a record of
+    something that was said.
+    """
+    # Punctuation is stripped BEFORE the word diff, or "friday." against
+    # "friday," reads as a replaced span carrying a weekday and vetoes a
+    # perfectly ordinary truncation merge.
+    wa = [_WORDISH.sub('', w) for w in (a or '').lower().split()]
+    wb = [_WORDISH.sub('', w) for w in (b or '').lower().split()]
+    wa, wb = [w for w in wa if w], [w for w in wb if w]
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, wa, wb).get_opcodes():
+        if tag != 'replace':
+            continue
+        left, right = ' '.join(wa[i1:i2]), ' '.join(wb[j1:j2])
+        if _NUMBERY.search(left) or _NUMBERY.search(right):
+            return False
+        for side, partners in ((wa[i1:i2], wb[j1:j2]), (wb[j1:j2], wa[i1:i2])):
+            for x in side:
+                word = _WORDISH.sub('', x)
+                if len(word) < _MORPH_PREFIX:
+                    continue                      # function words and fillers
+                if not any(_WORDISH.sub('', p)[:_MORPH_PREFIX] == word[:_MORPH_PREFIX]
+                           for p in partners):
+                    return False
+    return True
 
 
 def _dedup_batch_window_repeats(turns, max_gap=DUP_MAX_GAP_SEC,
@@ -720,12 +796,22 @@ def _dedup_batch_window_repeats(turns, max_gap=DUP_MAX_GAP_SEC,
                     continue
                 if len(p_text) < min_chars:
                     continue
-                if not _opens_alike(p_text, text):
+                # Compare against what that turn ORIGINALLY said, not the text a
+                # previous merge may have written over it. Without this, A absorbs
+                # B, then C is measured against B's words and gets dropped even
+                # though C never resembled A -- reproduced, and it deleted a
+                # "changes on Monday" correction, leaving the transcript
+                # asserting Friday.
+                p_orig = prev.get('_dedup_orig_text', p_text)
+                if not _opens_alike(p_orig, text):
                     continue      # different subjects, not one utterance twice
-                if difflib.SequenceMatcher(None, p_text.lower(),
-                                           text.lower()).ratio() >= min_ratio:
-                    match = prev
-                    break
+                if difflib.SequenceMatcher(None, p_orig.lower(),
+                                           text.lower()).ratio() < min_ratio:
+                    continue
+                if not _diff_is_only_noise(p_orig, text):
+                    continue      # the difference carries meaning: keep both
+                match = prev
+                break
         if match is None:
             kept.append(t)
             continue
@@ -733,9 +819,16 @@ def _dedup_batch_window_repeats(turns, max_gap=DUP_MAX_GAP_SEC,
         chars_saved += min(len(match.get('text') or ''), len(text))
         if len(text) > len(match.get('text') or ''):
             # Replace in place so the surviving turn keeps its position and
-            # timestamps; copy so a caller's turn dict is never mutated.
-            kept[kept.index(match)] = dict(match, text=text)
-    return kept, {'dropped': dropped, 'chars_saved': chars_saved}
+            # timestamps; copy so a caller's turn dict is never mutated. Carry
+            # the original words alongside so later turns are still compared
+            # against what was actually said here (see the loop above).
+            idx = next(k for k, v in enumerate(kept) if v is match)
+            kept[idx] = dict(match, text=text,
+                             _dedup_orig_text=match.get('_dedup_orig_text')
+                             or (match.get('text') or '').strip())
+    out = [{k: v for k, v in t.items() if k != '_dedup_orig_text'} if
+           '_dedup_orig_text' in t else t for t in kept]
+    return out, {'dropped': dropped, 'chars_saved': chars_saved}
 
 
 # ============================================================
