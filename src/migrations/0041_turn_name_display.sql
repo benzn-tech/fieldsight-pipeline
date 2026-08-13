@@ -1,0 +1,17 @@
+-- 0041 — a named turn needs somewhere to put the name.
+--
+-- 0038 built this table for Phase 5 matching, where every row is justified by a stored
+-- profile and the name is read from that profile. 0040 made `voiceprint_id` nullable so a
+-- correction that creates NO profile can still be recorded — which is the consent position:
+-- propagating a name inside one meeting does not require the enrolment that future
+-- recognition does.
+--
+-- The two changes together left the name with no home. The whole chain carried it — the
+-- correction body, the request artifact, the embedder's result — and the writer dropped it
+-- on the floor, silently, because there was no column to drop it into. A real correction on
+-- TEST reached the database and produced a row that named nobody.
+--
+-- Nullable on purpose: an unnamed cluster is a real answer ("someone consistent, not
+-- identified"), and it must stay distinguishable from a named one rather than being given
+-- a placeholder.
+ALTER TABLE speaker_turn_names ADD COLUMN IF NOT EXISTS display_name text;

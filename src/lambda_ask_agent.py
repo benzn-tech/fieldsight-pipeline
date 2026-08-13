@@ -59,6 +59,7 @@ from datetime import datetime, timedelta
 
 # Import shared utilities — bundled in the same src/ directory
 import batch_stitch
+import deletion_mirror
 from transcript_utils import (
     normalize_transcript, format_turns_for_prompt, get_time_bounds,
 )
@@ -156,12 +157,40 @@ def load_user_mapping(bucket):
 # Load Report
 # ============================================================
 
+def _deleted_sessions(bucket, user_folder, date, user=None):
+    """The deleted session ids for one day, under either folder spelling.
+
+    The folder is written two ways throughout this file (`user` and `user.replace(' ','_')`)
+    and the loaders try both, so the deletion check has to try both as well — checking one
+    spelling would hide the content only for the users whose folder happens to match, which
+    is indistinguishable from working."""
+    found = set(deletion_mirror.deleted_sessions(s3_client, bucket, user_folder, date))
+    if user and user != user_folder:
+        found |= set(deletion_mirror.deleted_sessions(s3_client, bucket, user, date))
+    return found
+
+
 def load_report(bucket, date, user):
     """
     Load daily report JSON. Tries per-user report first, then summary.
     Returns (report_dict, report_type) or (None, None).
+
+    A day with a deleted recording is served NO stored report. This lambda has no database,
+    so none of the SQL filters that hide a deleted recording reach it; the S3 mirror is the
+    copy of the answer it can read. The stored report was written BEFORE the delete and
+    contains that session's content verbatim, so serving it is the leak — and Ask is one of
+    the two surfaces (with search) a customer checks first to see whether their delete
+    actually worked.
+
+    Falling back to `(None, None)` degrades Ask to the day's transcripts, which
+    `load_transcripts` filters. Answering from less is the correct failure direction here.
     """
     user_folder = user.replace(' ', '_')
+
+    if _deleted_sessions(bucket, user_folder, date, user):
+        logger.info("ask: %s/%s has deleted recordings — not serving a stored report",
+                    user_folder, date)
+        return None, None
 
     # Try per-user daily report
     for name_variant in [user_folder, user]:
@@ -212,6 +241,19 @@ def load_transcripts(bucket, date, user, topic_time_range=None):
 
     if not transcript_files:
         return []
+
+    # A deleted recording's transcript must not reach the model. Ask answers verbatim from
+    # these files, so a filter anywhere else in the stack does nothing here.
+    deleted = _deleted_sessions(bucket, user_folder, date, user)
+    if deleted:
+        kept = set(deletion_mirror.drop_deleted(
+            [o['key'] for o in transcript_files], deleted))
+        dropped = len(transcript_files) - len(kept)
+        transcript_files = [o for o in transcript_files if o['key'] in kept]
+        logger.info("ask: %s/%s dropped %d transcript file(s) for %d deleted session(s)",
+                    user_folder, date, dropped, len(deleted))
+        if not transcript_files:
+            return []
 
     # Parse time range filter if provided (e.g. "09:15 – 09:45")
     filter_start_sec = None

@@ -143,7 +143,8 @@ from repositories import (action_items, aliases, classification_feedback, compan
                           programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, rollup, scope,
                           session_group,
-                          sites, threads, topics, users, voice_messages)
+                          sites, threads, topics, users, voice_messages,
+                          voiceprints)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates, first_match_span, normalize, occurrences
 # Keyframe Q7 telemetry derivation (all AWS-free, pure helpers): the deleted
@@ -151,6 +152,8 @@ from text_normalize import diff_candidates, first_match_span, normalize, occurre
 from keyframe_selection import keyframe_seconds
 from photo_binding import parse_time_range
 import batch_stitch
+import deletion_mirror
+import turn_name_overlay
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
 logger = logging.getLogger()
@@ -198,7 +201,20 @@ RECORDING_KINDS = {"video", "audio", "photo"}
 #   observe  200 always, but log the verdict enforce would have reached
 #   enforce  409 when the object is absent; the row stays pending and the
 #            device re-sends inside its own 7-day budget
+# A customer-facing delete: the user selects recordings, and everything derived from them
+# stops being visible to anyone. TEMPORARY BY REQUEST — the switch gates the WRITE endpoint
+# only. The read filters are deliberately unconditional: making them follow the flag would
+# mean that turning it off un-hides every recording a customer was told was gone, which is
+# a second incident rather than a rollback. Recall is per-batch and lives in the data:
+#   SELECT * FROM redactions WHERE scope='deleted' AND reverted_at IS NULL;
+ENABLE_USER_DELETION = os.environ.get("ENABLE_USER_DELETION", "false").lower() == "true"
 UPLOAD_VERIFY_MODE = os.environ.get("UPLOAD_VERIFY_MODE", "off").lower()
+# off | shadow | on. `off` is the deployed default and the rollback: the correction routes
+# 404 and nothing downstream is reachable. Read from the environment rather than a constant
+# because a rollback that needs a code change is not a rollback (the unwired-toggle trap:
+# a switch is only real when repo variable, workflow override and template Parameter all
+# exist -- this repo has shipped a documented rollback that was never wired, twice).
+SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 
 # Voice-timeliness: mis-touch tolerance ("grace") window before a stopped session
 # finalizes + emails. A resume within it cancels the finalize (spec §3.2, §8.4).
@@ -227,6 +243,16 @@ ALLOWED_VOICE_TYPES = {"audio/wav": "wav", "audio/x-wav": "wav",
 
 _s3_client = None
 _cognito_client = None
+
+
+def profiles_for_matching(conn, company_id, site_id=None):
+    """The consent/withdrawn filter, reached through one name.
+
+    Bound here rather than called inline so this module has exactly one place a profile can
+    come from — and so the endpoint's tests can supply rows without a database while still
+    failing if the call disappears.
+    """
+    return voiceprints.profiles_for_matching(conn, company_id, site_id=site_id)
 
 
 def s3():
@@ -449,6 +475,10 @@ def dispatch(conn, event, method, route):
     if route == "/aliases" and method == "POST":
         return create_alias_endpoint(conn, caller, parse_body(event), event)
 
+    if route == "/recordings/delete" and method == "POST":
+        return delete_recordings_endpoint(conn, caller, parse_body(event))
+    if route == "/recordings/undelete" and method == "POST":
+        return undelete_recordings_endpoint(conn, caller, parse_body(event))
     if route == "/redactions" and method == "POST":
         return create_redaction_endpoint(conn, caller, parse_body(event))
     m_rr = re.match(r"^/redactions/([^/]+)/revert$", route)
@@ -584,6 +614,9 @@ def dispatch(conn, event, method, route):
     m_srs = re.match(r"^/sessions/([^/]+)/report/status$", route)
     if m_srs and method == "GET":
         return session_report_status(conn, caller, m_srs.group(1), event)
+    m_sc = re.match(r"^/sessions/([^/]+)/speaker-corrections$", route)
+    if m_sc and method == "POST":
+        return speaker_corrections(conn, caller, m_sc.group(1), event)
     m_srl = re.match(r"^/sessions/([^/]+)/rolling$", route)
     if m_srl and method == "GET":
         return session_rolling(conn, caller, m_srl.group(1), event)
@@ -1173,6 +1206,165 @@ def session_report_generate(conn, caller, session_id, event):
                     ContentType="application/json")
     return ok({"status": "queued", "sessionId": session_id,
                "requestId": request_id, "resultKey": result_key}, 202)
+
+
+# ----------------------------------------------------------
+# Speaker corrections — the only entry to the voiceprint chain.
+# ----------------------------------------------------------
+_CORRECTION_ROLES = ("admin", "gm", "pm", "site_manager", "platform_admin")
+
+
+def _session_turns(folder, date, session_base):
+    """Every turn of one session, as (file, offset) pairs the embedder can cut audio with.
+
+    Reads the same transcripts the viewer does and keeps only this session — a day can hold
+    several, and two sessions routinely have turns starting at the same offset, so filtering
+    by session id is not optional. (Not filtering cost two rounds of debugging on 08-14, when
+    a turn from another session at the same offset looked like a matching failure.)
+    """
+    try:
+        payload = _read_org_transcripts(date, folder, "", "")
+    except Exception:
+        logger.warning("speaker correction: no transcripts for %s/%s", folder, date)
+        return []
+    # Both sides through the same normaliser. Comparing a normalised filename key against
+    # the raw URL parameter is how one of these ends up matching nothing — the two spellings
+    # of a session are not equal as strings, only as sessions.
+    want = turn_name_overlay.session_base(session_base)
+    out = []
+    for seg in payload.get("speaker_segments") or []:
+        name = seg.get("source_filename") or ""
+        if not want or turn_name_overlay.session_base(name) != want:
+            continue
+        start = seg.get("chunk_start")
+        if start is None:
+            continue
+        out.append({"source_filename": name, "start_sec": float(start),
+                    "end_sec": float(start) + float(seg.get("duration") or 0.0)})
+    return out
+
+
+def speaker_corrections(conn, caller, session_base, event):
+    """POST /api/org/sessions/{session_base}/speaker-corrections
+
+    The user marks a passage as a person. This queues ONE request artifact and returns 202;
+    everything after it happens outside the VPC.
+
+    org-api cannot invoke the embedder directly — it is in-VPC with no NAT, and a
+    `lambda:InvokeFunction` there black-holes until timeout with no log line at all
+    (BUG-36). So the handoff is an S3 artifact, the same shape as
+    `session_report_requests/`, and the trigger on it is wired by hand outside the template
+    (BUG-33).
+
+    **This half owns the profiles.** The embedder has no database and no other way to obtain
+    one, which is what keeps `profiles_for_matching`'s consent and `withdrawn` filters in a
+    single place. Those are the filters whose failure is invisible: a withdrawn profile that
+    still matches keeps naming people and nothing downstream can tell.
+
+    Two effects follow from one gesture and they are reported separately: the name propagates
+    **within this meeting**, and it may become an enrolment sample for **future** ones. The
+    second requires consent from the person whose voice it is (v2 §10) and the first does
+    not, so a single "success" would hide which one the user actually got.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    name = (body.get("display_name") or "").strip()
+    if not name:
+        return error("display_name is required", 400)
+    src = (body.get("source_filename") or "").strip()
+    if not src:
+        return error("source_filename is required", 400)
+    try:
+        start = float(body.get("start_sec"))
+        end = float(body.get("end_sec"))
+    except (TypeError, ValueError):
+        return error("start_sec and end_sec must be numbers", 400)
+    if end <= start:
+        return error("end_sec must be after start_sec", 400)
+    # In-file offsets -- the coordinate the transcript response calls `chunk_start`, NOT the
+    # absolute clock seconds it calls `start`. Sending the wrong one still returns 202 and
+    # still writes a row; the row then matches no turn and surfaces only as `unmatchedNames`,
+    # a silence nobody investigates. It cost two rounds of debugging on 2026-08-14.
+    #
+    # A numeric threshold cannot separate the two -- 7200 is a legitimate offset into a
+    # two-hour recording AND a legitimate clock second. But the filename carries the real
+    # bound for any segment or batch object (`_off{T}_to{E}`), so where that exists it is
+    # checked against the thing itself rather than against a guess.
+    span = re.search(r"_off([\d.]+)_to([\d.]+)_", src)
+    if span:
+        length = float(span.group(2)) - float(span.group(1))
+        if start > length:
+            return error(
+                f"start_sec {start} is past the end of {src} ({length:.1f}s). It is an "
+                f"offset within that file — the transcript response's `chunk_start` — not "
+                f"absolute clock seconds (`start`).", 400)
+
+    # Never from the body: a caller-supplied company would let one tenant queue work
+    # scoped to another's profiles.
+    company_id = str(caller["company_id"])
+    rows = profiles_for_matching(conn, company_id, site_id=body.get("site_id"))
+    profiles = [{"person_key": r["user_id"] or r["id"],
+                 "display_name": r.get("display_name"),
+                 "status": r.get("status"),
+                 "embedding": list(r["embedding"] or [])} for r in rows]
+
+    # The producer knows the folder and the date; the consumer must not guess them. A first
+    # version of the embedder derived them from `session_base` and built
+    # `users/{session}/audio//x.wav` — a key that cannot exist, so a missing field would
+    # have surfaced as a NoSuchKey far from its cause.
+    folder, err = _resolve_org_media_folder(conn, caller, body.get("user") or "",
+                                            what="speaker correction")
+    if err is not None:
+        return err
+    date_m = re.search(r"(\d{4}-\d{2}-\d{2})", session_base or "")
+    if not date_m:
+        return error("session id must carry its date (…_YYYY-MM-DD_…)", 400)
+
+    # The CANONICAL key, through the same function the reader uses. Storing the URL
+    # spelling and querying the normalised one is how rows land and are never found again —
+    # twice tonight, one layer apart each time. Two spellings of a session are equal as
+    # sessions and not as strings, so only one of them may ever be persisted.
+    session_key = turn_name_overlay.session_base(session_base)
+    if not session_key:
+        return error("session id must carry its sid (…_sid<32 hex>)", 400)
+
+    request_id = uuid.uuid4().hex
+    artifact = {
+        "request_id": request_id,
+        "session_base": session_key,
+        "company_id": company_id,
+        "user_folder": folder,
+        "date": date_m.group(1),
+        "requested_by": str(caller["id"]),
+        "mode": SPEAKER_IDENTITY_MODE,
+        "correction": {"source_filename": src, "start_sec": start, "end_sec": end,
+                       "display_name": name},
+        "profiles": profiles,
+        # The session's own turns, so the embedder can cluster it and let the correction
+        # name a VOICE rather than a single passage. Without them it can only write the one
+        # turn the user pointed at, and "the whole meeting follows" is a claim about a
+        # mechanism that never runs. org-api is the half that can read transcripts.
+        "turns": _session_turns(folder, date_m.group(1), session_base),
+    }
+    s3().put_object(Bucket=LAKE_BUCKET,
+                    Key=f"voiceprint_requests/{company_id}/{session_base}/{request_id}.json",
+                    Body=json.dumps(artifact, default=str),
+                    ContentType="application/json")
+    logger.info("speaker correction queued: session=%s mode=%s profiles=%d",
+                session_base, SPEAKER_IDENTITY_MODE, len(profiles))
+    return ok({
+        "requestId": request_id,
+        # Named separately because they carry different consent obligations, and because a
+        # user who was told "done" deserves to know which of the two they got.
+        "propagation": "queued",
+        "enrolment": "not_requested",
+    }, 202)
 
 
 def session_report_status(conn, caller, session_id, event):
@@ -2789,6 +2981,247 @@ def apply_topic_correction(conn, caller, topic_id, body):
                      "occurrences": p["occurrences"]} for p in plan],
         "reindex_enqueued": reindexed,
     })
+
+
+def _source_prefixes_for(rec):
+    """The source prefix one recording's topics live under. One entry, or none.
+
+    Live extraction writes `source_s3_key = extractions/{folder}/{date}/{base}…`, and that
+    prefix is what survives supersession, so it is the tombstone's anchor.
+
+    THERE IS DELIBERATELY NO `reports/` ARM HERE, and the first version of this function
+    had one. Report-sourced topics carry `reports/{date}/{folder}/daily_report.json` -- no
+    session base at all (`lambda_item_writer.py`), so the per-session prefix matched
+    nothing and the docstring claiming it closed "the same day by another door" was simply
+    false. Widening it to the day prefix would be worse: it is a DAY-level rollup, so a
+    permanent day tombstone would hide the other sessions the customer kept, and would keep
+    hiding the CLEAN report that the next nightly run regenerates without the deleted
+    session. The day's stale rollup is handled instead by hiding those topics BY ID in the
+    same batch (see `delete_recordings_endpoint`) -- reversible, and self-healing once the
+    regenerated report lands under a new set of uuids that no tombstone names.
+
+    `sessionBase` is required. Without it the prefix degrades to the whole day, which would
+    hide recordings the customer never selected -- silently, and phrased as success.
+    """
+    folder, date = rec.get("folder"), rec.get("date")
+    base = (rec.get("sessionBase") or "").strip()
+    if not folder or not date or not base:
+        return []
+    return [f"extractions/{folder}/{date}/{base}"]
+
+
+def _can_delete_folder(conn, caller, folder):
+    """May `caller` delete `folder`'s recordings? Plan §0.9.
+
+    Deleting is strictly stronger than viewing, so this is `_can_view_folder` AND an
+    ownership/authority test -- a pm can read a worker's day but must not be able to erase
+    it from everyone's view.
+
+    Own folder, or admin/gm/platform_admin. Nothing else. The tuple's second element is the
+    company the tombstone must be stamped with: the TARGET's company, not the caller's,
+    because `revert_batch` is company-guarded and stamping a cross-company delete with the
+    platform admin's company would leave the affected company unable to undo it.
+    """
+    if not folder:
+        return False, None
+    sc = scope.visible_scope(conn, caller)
+    if folder == sc.get("self_folder"):
+        return True, caller["company_id"]
+    if not _can_view_folder(conn, caller, folder):
+        return False, None
+    if not (sc.get("user_scope") == "ALL" or sc.get("cross_company")):
+        return False, None
+    target = (users.get_by_folder_name_global(conn, folder) if sc.get("cross_company")
+              else users.get_by_folder_name(conn, caller["company_id"], folder))
+    if target is None:
+        return False, None
+    return True, target["company_id"]
+
+
+def delete_recordings_endpoint(conn, caller, body):
+    """Hide everything derived from the selected recordings. Nothing is destroyed.
+
+    Order: tombstones + per-topic redactions -> **commit** -> S3 mirror. The commit is
+    explicit and is NOT the `with conn.transaction()` block: `lambda_handler` opens the
+    connection with `with get_connection() as conn`, and the device heartbeat and the
+    caller lookup have already run statements by the time we get here, so a nested
+    `transaction()` is a SAVEPOINT and commits nothing. An earlier version of this function
+    relied on it and wrote the mirror inside the still-open transaction -- if the request
+    had then failed, S3 would advertise a deletion no database row recorded, with no
+    batch_id to undo it. That is the one direction this feature must never fail in.
+
+    Authorization is per recording, not per request: one unreachable folder is a 403 for
+    that entry, and the rest still go through. `folder` arrives from the request body, so
+    without this check any authenticated account could hide another company's day -- and
+    could not be undone by that company, because `revert_batch` is company-guarded.
+
+    The response carries per-recording counts INCLUDING ZERO. A delete that matched nothing
+    and reported success is the worst outcome available here: the customer is told their
+    recording is gone and it is not.
+    """
+    if not ENABLE_USER_DELETION:
+        return error("recording deletion is not enabled (ENABLE_USER_DELETION)", 403)
+    recs = (body or {}).get("recordings") or []
+    if not recs:
+        return error("no recordings given", 400)
+    reason = ((body or {}).get("reason") or "deleted by the user").strip()
+
+    import uuid as _uuid
+    batch_id = str(_uuid.uuid4())
+    results, days, sessions_by_day = [], set(), {}
+    for rec in recs:
+        prefixes = _source_prefixes_for(rec)
+        if not prefixes:
+            results.append({"recording": rec, "topics_hidden": 0,
+                            "error": "folder, date and sessionBase are all required"})
+            continue
+        allowed, target_company = _can_delete_folder(conn, caller, rec.get("folder"))
+        if not allowed:
+            results.append({"recording": rec, "topics_hidden": 0,
+                            "error": "not permitted to delete this user's recordings"})
+            continue
+        hidden = 0
+        for prefix in prefixes:
+            redactions.create_recording_tombstone(
+                conn, target_company, prefix, reason,
+                caller.get("id"), caller.get("global_role"), batch_id=batch_id)
+            for row in topics.list_topics_for_source_prefix(conn, prefix) or []:
+                if redactions.create_redaction(
+                        conn, target_company, row["id"], reason,
+                        caller.get("id"), caller.get("global_role"),
+                        target_type="topic", scope="deleted", batch_id=batch_id,
+                        skip_if_already_deleted=True):
+                    hidden += 1
+        # The day's report-sourced topics are a rollup that MIXES this session with the
+        # ones the customer kept, so the stale copy has to go -- by id, in this batch, so
+        # the undelete brings it back. Not by source prefix: the next nightly run
+        # regenerates the report WITHOUT the deleted session and re-inserts clean topics
+        # under new uuids, and a prefix tombstone would keep hiding those forever.
+        for row in topics.list_topics_for_source_prefix(
+                conn, f"reports/{rec['date']}/{rec['folder']}/") or []:
+            if redactions.create_redaction(
+                    conn, target_company, row["id"], reason,
+                    caller.get("id"), caller.get("global_role"),
+                    target_type="topic", scope="deleted", batch_id=batch_id,
+                    skip_if_already_deleted=True):
+                hidden += 1
+        results.append({"recording": rec, "topics_hidden": hidden})
+        days.add((rec["folder"], rec["date"]))
+        sessions_by_day.setdefault((rec["folder"], rec["date"]), set()).add(
+            (rec.get("sessionBase") or "").strip())
+
+    conn.commit()
+
+    # The mirror the non-VPC lambdas read. Written AFTER the commit above so it can never
+    # advertise a deletion the database did not keep. MERGED, not overwritten: a second
+    # delete on the same day used to replace the document and thereby un-hide the first
+    # batch from every reader that has no database -- the nightly report and its email.
+    for folder, date in sorted(days):
+        try:
+            existing = deletion_mirror.deleted_sessions_strict(
+                s3(), S3_BUCKET, folder, date)
+            merged = set(existing) | sessions_by_day.get((folder, date), set())
+            deletion_mirror.write_mirror(s3(), S3_BUCKET, folder, date, merged)
+        except deletion_mirror.MirrorUnreadable:
+            # STRICT on purpose: the lenient read returns an empty set, which would turn
+            # this merge into an overwrite and un-hide every earlier deletion for the day.
+            # Not writing leaves the earlier deletions hidden and this one visible to the
+            # database-less readers until a retry — one leak instead of all of them.
+            logger.exception("deletion mirror for %s/%s unreadable — NOT writing, or this "
+                             "batch (%s) would erase the day's earlier deletions",
+                             folder, date, batch_id)
+        except Exception:
+            logger.exception("deletion mirror write failed for %s/%s (batch %s) — the "
+                             "database filters already hide it; retry is idempotent",
+                             folder, date, batch_id)
+
+    logger.info("user deletion: batch=%s recordings=%d topics_hidden=%d refused=%d",
+                batch_id, len(recs), sum(r["topics_hidden"] for r in results),
+                sum(1 for r in results if r.get("error")))
+    return ok({"batch_id": batch_id, "results": results})
+
+
+def undelete_recordings_endpoint(conn, caller, body):
+    """Restore exactly one delete batch. The audit rows survive (`reverted_at`).
+
+    Authorized the same way the delete was, and for the same reason. Gating only on the
+    company (which is all `revert_batch` does) would let any provisioned worker undo an
+    admin's delete of a colleague's recordings, and would let a platform_admin un-delete any
+    company's batch on global_role alone. Delete is per-folder authorized; an undelete that
+    is not is the same hole facing the other way.
+    """
+    if not ENABLE_USER_DELETION:
+        return error("recording deletion is not enabled (ENABLE_USER_DELETION)", 403)
+    batch_id = (body or {}).get("batchId")
+    if not batch_id:
+        return error("batchId is required", 400)
+    cross = is_cross_company(caller["global_role"])
+    existing = redactions.list_batch(
+        conn, batch_id, caller["company_id"], cross_company=cross) or []
+    if not existing:
+        return error("batch not found", 404)
+    folders = {(r.get("target_key") or "").split("/")[1]
+               for r in existing if r.get("target_type") == "recording"
+               and (r.get("target_key") or "").startswith("extractions/")}
+    for folder in sorted(folders):
+        allowed, _ = _can_delete_folder(conn, caller, folder)
+        if not allowed:
+            return error("not permitted to restore this batch", 403)
+
+    rows = redactions.revert_batch(
+        conn, batch_id, caller["company_id"], cross_company=cross) or []
+    # Only THIS batch's sessions come out of the mirror. The first version wrote the day's
+    # document as `[]`, which un-hid every other active batch for that day from the readers
+    # that have no database -- an undelete that restores more than the delete hid.
+    freed = {}
+    for r in rows:
+        if r.get("target_type") != "recording":
+            continue
+        parts = (r.get("target_key") or "").split("/")
+        if len(parts) >= 4 and parts[0] == "extractions":
+            freed.setdefault((parts[1], parts[2]), set()).add(parts[3])
+
+    # The day's stale report rollup is hidden BY TOPIC ID, and `ON CONFLICT DO NOTHING`
+    # means the FIRST batch to touch a day owns those rows. Reverting that batch therefore
+    # republishes a rollup that still contains a second, still-deleted batch's content.
+    # Re-hide them under a batch that is still active, so they remain revertible and die
+    # with the day's last remaining deletion rather than never.
+    reason = "still deleted by another batch"
+    for (folder, date) in sorted(freed):
+        still = redactions.active_batches_for_day(conn, folder, date,
+                                                  exclude_batch=batch_id)
+        if not still:
+            continue
+        company = next((r["company_id"] for r in existing), caller["company_id"])
+        for row in topics.list_topics_for_source_prefix(
+                conn, f"reports/{date}/{folder}/") or []:
+            redactions.create_redaction(
+                conn, company, row["id"], reason, caller.get("id"),
+                caller.get("global_role"), target_type="topic", scope="deleted",
+                batch_id=still[0], skip_if_already_deleted=True)
+        logger.info("undelete %s: %s/%s still deleted by %d other batch(es) — the day's "
+                    "report topics stay hidden under %s",
+                    batch_id, folder, date, len(still), still[0])
+
+    conn.commit()
+    for (folder, date), sessions in sorted(freed.items()):
+        try:
+            remaining = deletion_mirror.deleted_sessions_strict(
+                s3(), S3_BUCKET, folder, date) - sessions
+            deletion_mirror.write_mirror(s3(), S3_BUCKET, folder, date, remaining)
+        except deletion_mirror.MirrorUnreadable:
+            # A lenient read here is worse than anywhere else: `set() - sessions` is empty,
+            # so a blipped GetObject writes an EMPTY document and frees every other active
+            # batch for the day. Leaving the mirror alone keeps this batch's sessions hidden
+            # from the database-less readers a while longer, which is the safe direction.
+            logger.exception("deletion mirror for %s/%s unreadable — NOT rewriting on "
+                             "undelete %s, or it would free the day's other batches",
+                             folder, date, batch_id)
+        except Exception:
+            logger.exception("deletion mirror rewrite failed for %s/%s on undelete %s",
+                             folder, date, batch_id)
+    logger.info("user deletion: undelete batch=%s restored=%d", batch_id, len(rows))
+    return ok({"batch_id": batch_id, "restored": len(rows)})
 
 
 def create_redaction_endpoint(conn, caller, body):
@@ -4450,6 +4883,17 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
     doc = doc or {}
     topics_out = []
     _redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if conn is not None else {}
+    # `scope='deleted'` DROPS the topic; every other scope keeps today's flag-and-show.
+    #
+    # The two are not variations of one behaviour. An `analysis` redaction hides a personal
+    # conversation from the company while its own author still sees it in the "removed"
+    # area, so the body has to travel. A customer-facing delete was told the content is
+    # gone, and shipping the full body with a `redacted: true` beside it is the leak this
+    # feature exists to prevent -- the payload would still carry every word.
+    _deleted_ids = {tid for tid, r in _redacted.items() if r.get("scope") == "deleted"}
+    if _deleted_ids:
+        rows = [r for r in rows if str(r["id"]) not in _deleted_ids
+                and r["id"] not in _deleted_ids]
     # Thread facts for every threaded topic on the day, in ONE query — the
     # same batching list_topics_for_date already uses for action_items and
     # findings, for the same reason: this renders per topic and a per-topic
@@ -4567,6 +5011,25 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
     }
 
 
+def _day_has_deleted_sources(conn, folder, date) -> bool:
+    """Whether anything on this (folder, date) has been deleted by its owner.
+
+    Never raises: a guard that cannot read its input must not take down the timeline. It
+    fails OPEN here deliberately -- refusing to serve a day because the tombstone table was
+    briefly unreachable would break every customer's dashboard to protect a case that may
+    not exist. The SQL-level filters (phase 3) still apply in that window; only the
+    verbatim S3 fallback loses its guard, and that fallback is reached solely when the day
+    has no Aurora topics at all.
+    """
+    if conn is None:
+        return False
+    try:
+        return bool(redactions.deleted_source_prefixes(conn, folder, date))
+    except Exception:
+        logger.exception("deleted-source check failed for %s/%s", folder, date)
+        return False
+
+
 def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     """The single-(user, date) D1 read: Aurora override when extraction
     topics exist AND at least one survives the site ACL filter, else S3
@@ -4618,6 +5081,15 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # verbatim S3 daily_report.json is NOT site-clipped, so serving it would
         # leak the target's out-of-scope content. Nothing safe to show -> 404.
         return ok({"message": f"No in-scope report for {user} on {date}", "date": date}, 404)
+    # A day whose sources were DELETED must not fall through to the pre-rendered doc.
+    #
+    # The comment above says the verbatim contract holds only for a day with no Aurora
+    # topics at all -- and deleting every topic of a day creates exactly that condition. So
+    # the redaction that was supposed to hide the day would instead serve the pre-deletion
+    # `daily_report.json` byte for byte. Filtering SQL and forgetting the artifact rendered
+    # from it is not a deletion.
+    if _day_has_deleted_sources(conn, user, date):
+        return ok({"message": f"No report for {user} on {date}", "date": date}, 404)
     doc = _get_lake_json(f"reports/{date}/{user}/daily_report.json")
     if doc is not None:
         return ok(doc)                              # VERBATIM (byte-identical history)
@@ -4639,7 +5111,10 @@ def admin_disambiguation(conn, caller, date):
     envelope the UI's meeting-picker expects; none is a 404."""
     owner = companies.get_company_by_name(conn, COMPANY_NAME)
     if owner is not None and str(caller["company_id"]) == str(owner["id"]):
-        doc = _get_lake_json(f"reports/{date}/summary_report.json")
+        # Same door, aggregate form: summary_report.json is lake-wide and byte-verbatim,
+        # so a deleted session's words sit inside it whatever the SQL filters say.
+        doc = (None if _day_has_deleted_sources(conn, None, date)
+               else _get_lake_json(f"reports/{date}/summary_report.json"))
         if doc is not None:
             return ok(doc)
     candidates = set()
@@ -5165,7 +5640,53 @@ def _list_media_objects(prefix, what):
         raise
 
 
-def _read_org_transcripts(date, folder, start_time, end_time):
+def _deleted_sessions_for_day(conn, folder, date):
+    """Tombstoned source prefixes for one (folder, date), or an empty set.
+
+    org-api is IN-VPC and holds a connection, so this is the authority rather than the S3
+    mirror the non-VPC lambdas fall back to.
+
+    Fails OPEN like every other guard in this feature: an unreadable tombstone table must
+    not take the media endpoints down. It logs, because "nothing was deleted" and "the
+    check could not run" are otherwise the same answer.
+    """
+    if conn is None:
+        return set()
+    try:
+        raw = redactions.deleted_source_prefixes(conn, folder, date) or []
+    except Exception:
+        logger.exception("media: tombstone lookup failed for %s/%s", folder, date)
+        return set()
+    # Only real prefixes. A repository that hands back anything else -- a fake connection
+    # in a test, a driver returning row objects -- would otherwise be TRUTHY and filter
+    # every file out, which is a silent outage dressed as a privacy feature.
+    return {p for p in raw if isinstance(p, str) and p}
+
+
+def _drop_deleted_media(items, deleted, keyfn, what):
+    """Filter media rows whose session was deleted, and say how many went.
+
+    Zero is logged too: "the list was served" and "the exclusion ran" are otherwise the
+    same observation, which is the shape that hid three separate silent failures here.
+    """
+    if not deleted:
+        logger.info("media %s: tombstoned=0 dropped=0 of %d", what, len(items))
+        return items
+    kept = [it for it in items
+            if not any(_session_of(keyfn(it)) and _session_of(keyfn(it)) in p
+                       for p in deleted)]
+    logger.info("media %s: tombstoned=%d dropped=%d of %d",
+                what, len(deleted), len(items) - len(kept), len(items))
+    return kept
+
+
+def _session_of(key):
+    """The `sid{32hex}` inside a media key, or None."""
+    m = re.search(r"sid[0-9a-f]{32}", key or "")
+    return m.group(0) if m else None
+
+
+def _read_org_transcripts(date, folder, start_time, end_time, conn=None):
     """S3 read + normalize for one (folder, date) window -- mirrors
     lambda_fieldsight_api.get_transcripts's locate/parse/response-shape
     verbatim (same per-file `segments[]` and speaker-turn `speaker_
@@ -5181,6 +5702,21 @@ def _read_org_transcripts(date, folder, start_time, end_time):
     prefix = f"transcripts/{folder}/{date}/"
     transcript_files = [obj["Key"] for obj in _list_media_objects(prefix, "transcripts")
                         if obj["Key"].endswith(".json")]
+
+    # Filtered HERE, at the listing, not at the return: by the time the loop below finishes,
+    # a deleted session's words are already merged into `filtered_full` and there is nothing
+    # left to remove them from.
+    _deleted = _deleted_sessions_for_day(conn, folder, date)
+    if _deleted:
+        _before = len(transcript_files)
+        transcript_files = [k for k in transcript_files
+                            if not any(_session_of(k) and _session_of(k) in p
+                                       for p in _deleted)]
+        logger.info("media transcripts: tombstoned=%d dropped=%d of %d",
+                    len(_deleted), _before - len(transcript_files), _before)
+    else:
+        logger.info("media transcripts: tombstoned=0 dropped=0 of %d",
+                    len(transcript_files))
 
     if not transcript_files:
         return {"text": "", "segments": [], "speaker_segments": [], "message": "No transcripts found"}
@@ -5242,6 +5778,12 @@ def _read_org_transcripts(date, folder, start_time, end_time):
                     "end": round(abs_end, 1),
                     "time_label": f"{ah:02d}:{am:02d}:{asec_v:02d}",
                     "duration": round(seg_end - seg_start, 1),
+                    # The pair a stored name is keyed by. `start` above is ABSOLUTE clock
+                    # seconds; `speaker_turn_names.turn_ref` is source_filename + the
+                    # in-file offset, so the overlay needs the un-shifted value or it
+                    # matches nothing and every name silently fails to appear.
+                    "source_filename": filename,
+                    "chunk_start": round(seg_start, 3),
                 })
 
             # Word-level filtered text
@@ -5560,6 +6102,45 @@ def get_org_report_history(conn, caller, event):
     return ok(_read_org_report_history(folder_scope, limit))
 
 
+def _apply_speaker_names(conn, caller, payload):
+    """Lay the stored names over the turns this response is already carrying.
+
+    Read-time, never baked in: a correction can be withdrawn, and re-running extraction
+    rewrites the artifact underneath. Gated on the same switch as everything else, so `off`
+    returns exactly what this endpoint returned before the feature existed.
+
+    Two things are reported rather than hidden. `speaker_name` always arrives with its
+    `speaker_state`, because a caller holding a bare name cannot tell tentative from
+    confirmed — and tentative must not leave the transcript viewer. And `unmatchedNames`
+    counts rows that matched no turn: an orphan is a name the user set that is no longer
+    being shown, and silence there reads as "this turn was never named", which is a
+    different and wrong statement.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return payload
+    segs = payload.get("speaker_segments") or []
+    if not segs:
+        return payload
+    # The SESSION, not the segment filename. Rows are stored under the session id, and
+    # looking them up by filename returned nothing every time — quietly, because no rows
+    # also means no orphans, so the count read 0 and it looked like nobody had ever
+    # corrected this session.
+    bases = {turn_name_overlay.session_base(s.get("source_filename"))
+             for s in segs if s.get("source_filename")}
+    rows = []
+    for base in sorted(b for b in bases if b):
+        rows.extend(voiceprints.live_turn_names(conn, str(caller["company_id"]), base))
+    index = turn_name_overlay.build(rows)
+    # One row names one turn. Per-segment lookup let a single assertion produce two
+    # `confirmed` names on TEST, because a neighbouring turn 0.28 s away was inside the
+    # tolerance and claimed the same row.
+    for i, hit in turn_name_overlay.resolve(index, segs).items():
+        segs[i]["speaker_name"] = hit["display_name"]
+        segs[i]["speaker_state"] = hit["state"]
+    payload["unmatchedNames"] = turn_name_overlay.orphans(index)
+    return payload
+
+
 def get_org_transcripts(conn, caller, event):
     """GET /api/org/transcripts?date=&user=&start=&end= -- Aurora-identity
     transcript read (Timeline "Transcript" tab bug fix). scripts/api/
@@ -5586,7 +6167,9 @@ def get_org_transcripts(conn, caller, event):
     folder, err = _resolve_org_media_folder(conn, caller, user, what="transcripts")
     if err is not None:
         return err
-    return ok(_read_org_transcripts(date, folder, p.get("start") or "", p.get("end") or ""))
+    out = _read_org_transcripts(date, folder, p.get("start") or "", p.get("end") or "",
+                                conn=conn)
+    return ok(_apply_speaker_names(conn, caller, out))
 
 
 # ----------------------------------------------------------
@@ -5594,7 +6177,7 @@ def get_org_transcripts(conn, caller, event):
 # media reads (P1, 2026-07-23 prod-media-binding plan)
 # ----------------------------------------------------------
 
-def _read_org_audio_segments(date, folder, start_time, end_time):
+def _read_org_audio_segments(date, folder, start_time, end_time, conn=None):
     """S3 list + presign for one (folder, date) window -- mirrors
     lambda_fieldsight_api.get_audio_segments verbatim: same BUG-01-anchored
     regexes, same response fields. Only the folder_name
@@ -5636,6 +6219,8 @@ def _read_org_audio_segments(date, folder, start_time, end_time):
             "time_label": f"{ah:02d}:{am:02d}:{asec:02d}",
         })
     segments.sort(key=lambda seg: seg["absolute_start"])
+    segments = _drop_deleted_media(segments, _deleted_sessions_for_day(conn, folder, date),
+                                   lambda it: it.get("key") or it.get("url") or "", "audio")
     return {"segments": segments, "count": len(segments)}
 
 
@@ -5652,10 +6237,11 @@ def get_org_audio_segments(conn, caller, event):
                                             what="audio")
     if err is not None:
         return err
-    return ok(_read_org_audio_segments(date, folder, p.get("start") or "", p.get("end") or ""))
+    return ok(_read_org_audio_segments(date, folder, p.get("start") or "",
+                                       p.get("end") or "", conn=conn))
 
 
-def _read_org_video_segments(date, folder, start_time, end_time):
+def _read_org_video_segments(date, folder, start_time, end_time, conn=None):
     """Mirrors lambda_fieldsight_api.get_video_segments: web_video/ H264
     previews first, users/{folder}/video/ originals second, an original
     suppressed when a preview shares its base_name, ~10-min assumed file
@@ -5700,6 +6286,8 @@ def _read_org_video_segments(date, folder, start_time, end_time):
                 "codec": "h264" if is_preview else "unknown",
             })
     videos.sort(key=lambda v: v["video_start_sec"])
+    videos = _drop_deleted_media(videos, _deleted_sessions_for_day(conn, folder, date),
+                                 lambda it: it.get("key") or it.get("url") or "", "video")
     return {"videos": videos, "count": len(videos)}
 
 
@@ -5713,7 +6301,8 @@ def get_org_video_segments(conn, caller, event):
                                             what="video")
     if err is not None:
         return err
-    return ok(_read_org_video_segments(date, folder, p.get("start") or "", p.get("end") or ""))
+    return ok(_read_org_video_segments(date, folder, p.get("start") or "",
+                                       p.get("end") or "", conn=conn))
 
 
 _ORG_MEDIA_PRESIGN_PREFIXES = ("users/", "audio_segments/", "transcripts/",
@@ -5767,6 +6356,28 @@ def _authorize_report_object_presign(conn, caller, folder):
     if not self_folder or folder != self_folder:
         return error("you may only access your own reports", 403)
     return None
+
+
+def _presign_target_is_deleted(conn, key) -> bool:
+    """Whether this exact object belongs to a session its owner deleted.
+
+    Matches on the `sid{32hex}` inside the key, which is what a tombstone's source prefix
+    also carries -- the same identity the media listings filter on, so a key that survives
+    one and fails the other cannot exist.
+
+    Fails OPEN and logs, like every guard here: an unreadable tombstone table must not stop
+    every customer from playing their own audio.
+    """
+    if conn is None or not key:
+        return False
+    sid = _session_of(key)
+    if not sid:
+        return False
+    try:
+        return any(sid in p for p in redactions.deleted_source_prefixes(conn) or [])
+    except Exception:
+        logger.exception("media presign: tombstone lookup failed for %s", key)
+        return False
 
 
 def get_org_media_presigned_url(conn, caller, event):
@@ -5827,6 +6438,16 @@ def get_org_media_presigned_url(conn, caller, event):
         _, err = _resolve_org_media_folder(conn, caller, target, what="media")
         if err is not None:
             return err
+    # The most literal door of all: hand over a key, get back a playable link, with no
+    # topic anywhere in the path. Every protection this feature built routes through
+    # topics, so a customer who deleted a recording could still press play on it -- which
+    # is exactly the trust failure the request named.
+    #
+    # The object is NOT deleted; it stays on S3 for analysis. What changes is who may
+    # reach it. 404, not 403: an access-denied would confirm the key exists.
+    if _presign_target_is_deleted(conn, key):
+        logger.info("media presign refused: %s belongs to a deleted session", key)
+        return error("not found", 404)
     url = s3().generate_presigned_url(
         "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
         ExpiresIn=PRESIGNED_URL_EXPIRY)

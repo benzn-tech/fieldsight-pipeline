@@ -244,7 +244,185 @@ def _match(event):
     return {"session": event.get("session"), "results": results}
 
 
+WRITER_FUNCTION = os.environ.get("VOICEPRINT_WRITER_FUNCTION", "")
+
+
+def invoke_writer(payload):
+    """Hand the result to the in-VPC half.
+
+    RequestResponse, not Event, and the reason is not latency: under async invocation the
+    192-d vector would sit in Lambda's internal queue and any DLQ — durable biometric
+    storage in a place nobody would think to sweep, which is this design's defect relocating
+    for a fourth time. Synchronous also means a failure surfaces here rather than being
+    retried invisibly by the service.
+    """
+    import boto3
+    resp = boto3.client("lambda").invoke(
+        FunctionName=WRITER_FUNCTION, InvocationType="RequestResponse",
+        Payload=json.dumps(payload).encode())
+    if resp.get("FunctionError"):
+        raise RuntimeError(f"voiceprint writer failed: "
+                           f"{resp['Payload'].read()[:400]!r}")
+    return resp
+
+
+MAX_PROPAGATION_TURNS = int(os.environ.get("SPEAKER_PROPAGATION_MAX_TURNS", "300"))
+
+
+def _propagate(folder, date, turns, reference, display_name, asserted_ref):
+    """Correct one passage, name that person's other passages in the same session.
+
+    The unit is a VOICE, not a turn. Two spec revisions died scoring turns against the
+    corrected window directly, because `decide_name` refuses to confirm on a single
+    candidate — deliberately, since confirming on one candidate means confirming on an
+    absolute similarity. Clustering the session and letting the correction NAME A CLUSTER
+    removes that: the reference selects a cluster instead of competing beside it.
+
+    Everything here is capped at `tentative`. Gate A froze the CLUSTERING threshold (0.85,
+    measured); the margin that would justify `confirmed` has never been measured, so an
+    inferred name is a suggestion and says so.
+
+    An empty turn list degrades to naming only the corrected turn — an older producer, or a
+    session whose transcript is not ready, must not fail.
+    """
+    usable = [t for t in turns
+              if float(t.get("end_sec", 0)) - float(t.get("start_sec", 0))
+              >= vp.DEFAULT_MIN_TURN_S][:MAX_PROPAGATION_TURNS]
+    if len(usable) < 2:
+        return []
+
+    vectors, refs = [], []
+    for t in usable:
+        try:
+            _, clip, sr = _window_audio(folder, date, t["source_filename"],
+                                        float(t["start_sec"]), float(t["end_sec"]))
+        except Exception:
+            # One unreadable turn must not lose the whole propagation. It simply goes
+            # unnamed, which is the honest outcome for audio nobody could read.
+            logger.warning("propagation: could not read %s", t.get("source_filename"))
+            continue
+        vectors.append(embed_audio(clip, sr))
+        refs.append(f"{t['source_filename']}@{float(t['start_sec'])}")
+    if len(vectors) < 2:
+        return []
+
+    labels = vp.cluster_turns(vectors)
+    groups = {}
+    for i, lab in enumerate(labels):
+        groups.setdefault(lab, []).append(i)
+
+    # The corrected turn is IN this clustering, so its label already says which voice it is.
+    # An earlier version instead scored the reference against every centroid — which meant
+    # comparing it against a centroid that contained itself, and `leave_one_out_centroid`
+    # sat written, tested and uncalled. Reading the label removes the self-comparison
+    # entirely rather than correcting for it.
+    self_i = next((i for i, r in enumerate(refs) if r == asserted_ref), None)
+    if self_i is None:
+        # The corrected window is not among the turns (an older producer, or a window the
+        # user drew across a boundary). Nothing to propagate from, and guessing a cluster
+        # for it would be the two-voice failure by another route.
+        logger.info("propagation: corrected turn not among the session's turns")
+        return []
+
+    own = labels[self_i]
+    members = groups[own]
+    if len(members) < 2:
+        # This voice spoke once. There is nothing to propagate, and that is the answer —
+        # not a reason to look for a different cluster to name.
+        logger.info("propagation: the corrected voice has only this turn")
+        return []
+
+    v_self = vectors[self_i]
+    own_score = vp.cosine(
+        vp.leave_one_out_centroid([vectors[i] for i in members], members.index(self_i)),
+        v_self)
+    others = [vp.cosine(sum(vectors[i] for i in idxs) / len(idxs), v_self)
+              for lab, idxs in groups.items() if lab != own]
+    if others:
+        margin = own_score - max(others)
+        if margin < vp.DEFAULT_MIN_MARGIN:
+            # The corrected window sits between two voices — §2 measured 1 turn in 6 holding
+            # two. Naming a cluster from it spreads one person's name over another's whole
+            # session.
+            logger.warning("propagation refused: the corrected turn is between voices "
+                           "(margin %.3f)", margin)
+            return []
+
+    out = []
+    for i in members:
+        if refs[i] == asserted_ref:
+            continue
+        out.append({"turn_ref": refs[i], "state": "tentative",
+                    "cluster_ref": f"C{own}", "asserted": False,
+                    "display_name": display_name})
+    logger.info("propagation: %d turns in %d voices, named %d",
+                len(vectors), len(groups), len(out))
+    return out
+
+
+def _from_request_artifact(bucket, key):
+    """One correction, start to finish.
+
+    The artifact is org-api's output: it holds the window the user marked and the profiles
+    that survived the consent and withdrawn filters. This function has no database and no
+    other way to obtain a profile, which is what keeps those filters in one place.
+    """
+    req = json.loads(_get(key))
+    c = req.get("correction") or {}
+    folder, date = req.get("user_folder"), req.get("date")
+    if not folder or not date:
+        # Deliberately not derived from `session_base`. A first version guessed, and the
+        # guess produced `users/s1/audio//x.wav` — a key that cannot exist, which would have
+        # surfaced as a NoSuchKey far from the missing field. The producer knows both; if it
+        # ever stops sending them, this says so.
+        raise ValueError(
+            f"request artifact {key} carries no user_folder/date; the producer has both and "
+            f"guessing them puts the read on a key that cannot exist")
+    start, end = float(c["start_sec"]), float(c["end_sec"])
+    s3_key, clip, sr = _window_audio(folder, date, c["source_filename"], start, end)
+    v = embed_audio(clip, sr)
+
+    profiles = req.get("profiles") or []
+    rows = [{"person_key": p["person_key"], "score": vp.cosine(v, p["embedding"])}
+            for p in profiles]
+    d = vp.decide_name(vp.aggregate_scores(rows), duration_s=end - start)
+
+    # The turn the user asserted. Its name is not an inference and is written as
+    # `correction`; the writer refuses to give it a profile id unless it is marked asserted.
+    turn_ref = f"{c['source_filename']}@{start}"
+    results = [{"turn_ref": turn_ref, "state": "confirmed",
+                "cluster_ref": None, "asserted": True,
+                "display_name": c.get("display_name"),
+                "score": d.margin}]
+    results.extend(_propagate(folder, date, req.get("turns") or [], v,
+                              c.get("display_name"), turn_ref))
+
+    payload = {
+        "op": "propagation",
+        "company_id": req.get("company_id"),
+        "session_base": req.get("session_base"),
+        "correction_ref": req.get("request_id"),
+        "cluster_threshold": vp.DEFAULT_CLUSTER_TAU,
+        "results": results,
+    }
+    invoke_writer(payload)
+    logger.info("correction applied: session=%s ref=%s audio=%s",
+                req.get("session_base"), turn_ref, s3_key)
+    return {"status": "applied", "turn_ref": turn_ref}
+
+
 def lambda_handler(event, context):
+    records = (event or {}).get("Records")
+    if records:
+        # An S3 event carries `Records`, not `op`. Without this branch the function dies in
+        # 3 ms with `unknown op None` -- which is exactly what a real correction on TEST did
+        # on 2026-08-14, after the trigger was wired and this entry point was not.
+        out = None
+        for r in records:
+            b = r["s3"]["bucket"]["name"]
+            k = r["s3"]["object"]["key"]
+            out = _from_request_artifact(b, k)
+        return out or {"status": "empty"}
     op = (event or {}).get("op")
     if op == "enrol":
         return _enrol(event)

@@ -44,6 +44,7 @@ MATCHER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-programme
 KEYFRAME_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-keyframe"
 SESSION_REPORT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-session-report"
 SESSION_FINALIZE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-session-finalize"
+SPEAKER_EMBED_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-speaker-embed"
 
 echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer ProgrammeMatcher=${PREFIX}-programme-matcher Keyframe=${PREFIX}-keyframe"
 
@@ -210,6 +211,25 @@ if fn_exists "${PREFIX}-session-finalize"; then
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-session-finalize not deployed — skipping session-finalize trigger"
+fi
+# NOTE(speaker corrections): the embedder triggers on voiceprint_requests/*.json — the
+# artifact org-api writes when a user names a passage. org-api is in-VPC with no NAT, so it
+# cannot invoke the embedder directly (BUG-36); the embedder is outside the VPC because it
+# needs no Aurora, and it hands its result to the in-VPC writer by DIRECT invoke, which is
+# the permitted direction (BUG-43 note 4).
+#
+# The embedder writes NOTHING to S3 — its result travels in the invoke payload, which is
+# also what keeps the 192-d enrolment vector out of durable storage. So there is no output
+# prefix here at all, and therefore no BUG-13 self-trigger loop to reason about, and no
+# second rule that could share a prefix with this one.
+if fn_exists "${PREFIX}-speaker-embed"; then
+  WIRE_FNS+=("${PREFIX}-speaker-embed")
+  DESIRED=$(jq -c --arg arn "$SPEAKER_EMBED_ARN" '. + [
+    {"Id":"fs-speaker-embed","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"voiceprint_requests/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-speaker-embed not deployed — skipping speaker-embed trigger"
 fi
 
 CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --output json 2>/dev/null || echo '{}')

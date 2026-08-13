@@ -191,7 +191,7 @@ def confirmations_count(conn, company_id, voiceprint_id) -> int:
 def record_turn_name(conn, company_id, session_base, turn_ref, state, source,
                      correction_ref=None, cluster_ref=None, cluster_threshold=None,
                      voiceprint_id=None, score=None, margin=None,
-                     label_disagreement=None) -> dict | None:
+                     label_disagreement=None, display_name=None) -> dict | None:
     """One name for one turn, replacing whatever was live for it.
 
     Supersede-then-insert, in the CALLER'S transaction. S3 events are unordered and more
@@ -213,10 +213,12 @@ def record_turn_name(conn, company_id, session_base, turn_ref, state, source,
     return cur.execute(
         "INSERT INTO speaker_turn_names "
         "(company_id, voiceprint_id, session_base, turn_ref, state, score, margin, "
-        " source, correction_ref, cluster_ref, cluster_threshold, label_disagreement) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        " source, correction_ref, cluster_ref, cluster_threshold, label_disagreement, "
+        " display_name) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (company_id, voiceprint_id, session_base, turn_ref, state, score, margin,
-         source, correction_ref, cluster_ref, cluster_threshold, label_disagreement),
+         source, correction_ref, cluster_ref, cluster_threshold, label_disagreement,
+         display_name),
     ).fetchone()
 
 
@@ -232,7 +234,8 @@ def live_turn_names(conn, company_id, session_base) -> list[dict]:
     _require_company(company_id)
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT id, voiceprint_id, turn_ref, state, score, margin, source, correction_ref, "
-        "       cluster_ref, cluster_threshold, label_disagreement, created_at "
+        "       cluster_ref, cluster_threshold, label_disagreement, display_name, "
+        "       created_at "
         "FROM speaker_turn_names "
         "WHERE company_id = %s AND session_base = %s AND superseded_at IS NULL "
         "ORDER BY created_at",

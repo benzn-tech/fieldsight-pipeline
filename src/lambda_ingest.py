@@ -70,7 +70,8 @@ import reindex
 import agent_turn_filter
 from chunking import chunk_report, chunk_transcripts
 from db.connection import get_connection
-from repositories import chunks, companies, memberships, recordings, sites, topics, users
+from repositories import (chunks, companies, memberships, recordings, redactions,
+                          sites, topics, users)
 import batch_stitch
 from transcript_utils import normalize_transcript
 
@@ -489,6 +490,43 @@ def _load_turns(user_folder, date):
 # ----------------------------------------------------------
 # Per-report ingest (commit-per-report: one `with get_connection()` here)
 # ----------------------------------------------------------
+def _restamp_deleted_topics(conn, rows) -> int:
+    """Re-hide topics the pipeline just re-created under a deleted source.
+
+    RE-STAMP, NOT SKIP, and the difference is load-bearing. Skipping looks safer and is
+    not: an absent Aurora row is precisely what makes the timeline fall through to the
+    pre-deletion `daily_report.json` and serve it verbatim, so skipping here would re-open
+    the leak that guard closed. A hidden row beats an absent one.
+
+    The new tombstone joins the SAME batch as the one that hid the predecessor, or one
+    revert stops restoring exactly what one delete hid — and that equality is the only
+    check that proves this feature is reversible.
+
+    Never raises, and reports its count including zero: a pass that speaks only when it
+    acts cannot be told apart from one that was never reached.
+    """
+    stamped = 0
+    try:
+        prefixes = redactions.deleted_source_prefixes(conn)
+        if prefixes:
+            for row in rows or []:
+                key = row.get("source_s3_key") or ""
+                if not any(key.startswith(p) for p in prefixes):
+                    continue
+                batches = redactions.list_deleted_batches_for_prefix(conn, key)
+                b = batches[0] if batches else {}
+                redactions.create_redaction(
+                    conn, b.get("company_id"), row["id"],
+                    "re-stamped: the source was deleted before this row was re-created",
+                    None, "system", target_type="topic", scope="deleted",
+                    batch_id=b.get("batch_id"))
+                stamped += 1
+    except Exception:
+        logger.exception("restamp of deleted topics failed — the read filters still apply")
+    logger.info("restamp: %d re-created topic(s) hidden under a deleted source", stamped)
+    return stamped
+
+
 def ingest_report(date, user_folder, report_key):
     raw = s3().get_object(Bucket=S3_BUCKET, Key=report_key)["Body"].read()
     report = json.loads(raw.decode("utf-8"))
@@ -594,6 +632,13 @@ def ingest_report(date, user_folder, report_key):
                     "user_id": str(user_id) if user_id is not None else None,
                     "action_items": [{"text": a["text"]} for a in mapped_action_items],
                 })
+
+        # Re-hide anything just re-created under a source its owner deleted. IN THE SAME
+        # TRANSACTION as the insert, so there is no window in which the resurrected rows
+        # are readable.
+        _restamp_deleted_topics(conn, [
+            {"id": tid, "source_s3_key": extraction_prefix}
+            for tid in topic_seq_to_id.values()])
 
         chunks_n = 0
         for c in chunk_report(report):

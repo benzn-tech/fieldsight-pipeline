@@ -3761,9 +3761,19 @@ def test_transcripts_non_all_caller_reads_own_folder(presign_wired):
     assert b["speaker_count"] == 2
     assert b["total_speaker_segments"] == 2
     assert b["speakers"] == ["spk_0", "spk_1"]
+    # An exact-shape assertion, and it earned its keep: adding the two keys below made it
+    # fail, which is the only reason anybody looked at whether the WRITER emits them.
+    #
+    # `source_filename` + `chunk_start` are the pair a stored speaker name is keyed by
+    # (`speaker_turn_names.turn_ref`). `start` is ABSOLUTE clock seconds and cannot serve —
+    # the overlay would match nothing and every name would silently fail to appear. This is
+    # the writer side of that contract; the reader side is test_org_api_transcript_names.py,
+    # and both are needed, because a reader tested against a fixture agrees with the fixture
+    # rather than with the writer.
     assert b["speaker_segments"][0] == {
         "speaker": "spk_0", "text": "Hello there.",
         "start": 28800.0, "end": 28802.0, "time_label": "08:00:00", "duration": 2.0,
+        "source_filename": "Ben_UCPK_2026-07-18_08-00-00.json", "chunk_start": 0.0,
     }
     assert b["speaker_segments"][1]["time_label"] == "08:00:02"
     assert b["segments"][0]["filename"] == "Ben_UCPK_2026-07-18_08-00-00.json"
@@ -7059,3 +7069,93 @@ def test_a_session_with_only_a_start_is_unchanged(monkeypatch):
 
 def test_a_session_with_neither_end_is_unchanged():
     assert org._session_label(None, None) == "? – ?"
+
+
+def test_a_deleted_topic_is_dropped_by_the_renderer_not_flagged(monkeypatch):
+    """`render_report_shape` returns the full topic body with `redacted: true`.
+
+    That is CORRECT for life-conversation separation -- the site tier shows the topic in a
+    "removed" area so its own author can see what was held back, which needs the body. It
+    is a direct leak for a customer-facing delete: the customer was told the content is
+    gone and the payload would still carry every word of it.
+
+    So the two scopes part company here, and `analysis` must stay byte-identical or a live
+    feature breaks while this one is being built.
+    """
+    import repositories.redactions as red
+
+    keep = _topic_row(id="11111111-1111-1111-1111-111111111111", title="kept")
+    gone = _topic_row(id="22222222-2222-2222-2222-222222222222", title="deleted",
+                      summary="the secret words")
+    held = _topic_row(id="33333333-3333-3333-3333-333333333333", title="personal")
+
+    monkeypatch.setattr(red, "list_active_for_topics", lambda conn, ids: {
+        gone["id"]: {"target_id": gone["id"], "scope": "deleted", "reason": "user deleted"},
+        held["id"]: {"target_id": held["id"], "scope": "analysis", "reason": "non-work"}})
+
+    shape = org.render_report_shape([keep, gone, held], None, "2026-07-14", "Ada_L",
+                                    conn=object())
+    out = shape.get("topics") or []
+    ids = {t.get("topic_row_id") for t in out}
+    assert gone["id"] not in ids, "a deleted topic must be ABSENT, not flagged"
+    assert "the secret words" not in str(shape), "and its body must not travel at all"
+    assert held["id"] in ids, "the analysis-scope redaction keeps today's behaviour"
+    assert any(t.get("redacted") for t in out), "and it keeps its flag"
+    assert keep["id"] in ids
+
+
+def test_the_verbatim_timeline_fallback_is_refused_when_the_day_has_deleted_sources(monkeypatch):
+    """The hole the review predicted, and deleting MAKES it happen.
+
+    The fallback's own comment says it: "Only a day with NO Aurora topics at all keeps the
+    byte-verbatim S3 contract." Deleting every topic of a day creates exactly that
+    condition -- so the redaction that was supposed to hide the day instead serves the
+    pre-deletion `daily_report.json` verbatim, with every word intact.
+
+    A guard that filters SQL and forgets the pre-rendered artifact is not a deletion.
+    """
+    import repositories.redactions as red
+
+    served = {}
+    monkeypatch.setattr(org, "_get_lake_json",
+                        lambda key: served.setdefault("key", key) or
+                        {"executive_summary": "the deleted day, in full"})
+    monkeypatch.setattr(red, "deleted_source_prefixes",
+                        lambda conn, folder=None, date=None: ["extractions/Ada_L/2026-07-14/"])
+    # The timeline asks "does this day have any Aurora topics" first; a deleted day
+    # answers no, which is precisely what opens the verbatim fallback.
+    monkeypatch.setattr(org.topics, "has_topics_for_source_prefix", lambda *a, **k: False)
+    monkeypatch.setattr(org.topics, "list_topics_for_source_prefix", lambda *a, **k: [])
+
+    res = org._render_timeline_for_user(object(), CALLER, "2026-07-14", "Ada_L")
+    body = json.loads(res["body"])
+    assert res["statusCode"] == 404, f"served the pre-deletion doc: {body}"
+    assert "the deleted day, in full" not in str(body)
+
+
+def test_the_admin_summary_verbatim_serve_is_refused_for_a_date_with_deleted_sources(monkeypatch):
+    """Same shape, the aggregate door. `summary_report.json` is lake-wide and served
+    byte-verbatim to the owner company -- a deleted session's content sits inside it."""
+    import repositories.redactions as red
+
+    monkeypatch.setattr(org, "_get_lake_json",
+                        lambda key: {"summary": "everything, including the deleted"})
+    monkeypatch.setattr(red, "deleted_source_prefixes",
+                        lambda conn, folder=None, date=None: ["extractions/Ada_L/2026-07-14/"])
+
+    # The owner-company check runs before the verbatim serve; make the caller the owner so
+    # the branch is actually reached, which is the branch under test.
+    monkeypatch.setattr(org.companies, "get_company_by_name",
+                        lambda conn, name: {"id": CALLER["company_id"]})
+    # Everything after the verbatim branch is irrelevant to this test: if the guard works,
+    # the doc is never fetched. Assert on the FETCH, not on the response shape, so the
+    # test cannot pass because some later step happened to fail.
+    fetched = []
+    monkeypatch.setattr(org, "_get_lake_json",
+                        lambda key: fetched.append(key) or
+                        {"summary": "everything, including the deleted"})
+    try:
+        org.admin_disambiguation(object(), CALLER, "2026-07-14")
+    except Exception:
+        pass                       # the later candidate-listing needs a real conn
+    assert not any("summary_report.json" in k for k in fetched),         f"the pre-deletion aggregate was fetched: {fetched}"

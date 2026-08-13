@@ -853,3 +853,110 @@ def test_the_embedder_may_invoke_the_writer_and_nothing_else():
     assert "lambda:InvokeFunction" in block
     assert "voiceprint-writer" in block
     assert "Resource: '*'" not in block and 'Resource: "*"' not in block
+
+
+def test_the_speaker_identity_mode_is_wired_in_both_environments():
+    """Not a boolean, so the sweep cannot see it. This is the switch the whole speaker
+    feature hangs off — the endpoints 404 when it is `off`, which is also the rollback. A
+    Parameter with no `--parameter-overrides` behind it can only ever hold its default, and
+    this repo has shipped that twice: FILTER_AUDIO_EVENT_TAGS documented a rollback that was
+    not real, and TRANSCRIBE_WHOLE_CHUNK had no Parameter at all.
+    """
+    for env, path in WORKFLOWS.items():
+        assert "SpeakerIdentityMode" in _overrides(path), (
+            f"{env} does not pass SpeakerIdentityMode, so SPEAKER_IDENTITY_MODE can only "
+            f"ever hold its template default — the feature could not be switched on, and "
+            f"more importantly could not be switched back off")
+
+
+def test_the_speaker_identity_mode_defaults_to_off_everywhere():
+    """Merging this must change nothing until somebody sets a repo variable. Both the
+    template default and both workflow fallbacks have to say so, or 'the merge is inert' is
+    a claim rather than a fact."""
+    t = open(TEMPLATE, encoding="utf-8").read()
+    block = _top_level_block(t, "  SpeakerIdentityMode:")
+    assert "Default: 'off'" in block, "the template default is not off"
+    for env, path in WORKFLOWS.items():
+        line = [ln for ln in open(path, encoding="utf-8") if "SpeakerIdentityMode" in ln][0]
+        assert "|| 'off'" in line, f"{env}'s fallback is not off: {line.strip()}"
+
+
+def test_every_function_that_reads_the_speaker_mode_is_given_it():
+    """The middle segment. A function that reads SPEAKER_IDENTITY_MODE but was never handed
+    it reads an empty string, which is not `off` and not any AllowedValue — it is whatever
+    the code's own default happens to be, decided somewhere nobody is looking."""
+    t = open(TEMPLATE, encoding="utf-8").read()
+    for fn in ("OrgApiFunction:",):
+        block = _top_level_block(t, "  " + fn)
+        assert "SPEAKER_IDENTITY_MODE: !Ref SpeakerIdentityMode" in block, (
+            f"{fn} reads the mode but the template never gives it")
+
+
+def _top_level_block(text, header):
+    """The YAML block under `header`, ending at the next key of the SAME indent.
+
+    NOT `block.index("\\n  ", 20)`: two spaces is a prefix of four, so that ends the block at
+    its own first child and every `in block` assertion after it passes on two lines of YAML.
+    I wrote exactly that bug twice within ten minutes tonight — once in an edit script, where
+    it merely failed, and once here, where it would have shipped a guard that cannot fail.
+    """
+    i = text.index(header)
+    rest = text[i + len(header):]
+    m = re.search(r"^  [A-Za-z]", rest, re.M)
+    return header + (rest[:m.start()] if m else rest)
+
+
+def test_org_api_may_write_the_voiceprint_request_but_not_read_the_results():
+    """org-api hands work OUTWARD across the VPC boundary and takes nothing back from that
+    prefix — the results are consumed by the in-VPC writer, invoked by the embedder. A read
+    grant here would be an invitation to build a second consumer nobody designed."""
+    t = open(TEMPLATE, encoding="utf-8").read()
+    assert "voiceprint_requests/*" in t, "org-api cannot queue a correction"
+    assert "voiceprint_results/*" not in t, (
+        "something was granted the results prefix; the writer receives them by invoke")
+
+
+def test_the_embedder_has_an_s3_trigger_wired_outside_the_template():
+    """SAM cannot attach S3 events to an external bucket (BUG-33), so every S3-driven
+    function here is wired by `scripts/wire-s3-events.sh` after the deploy. A function whose
+    template says `NO Events` and whose script entry was never added deploys **green with
+    nothing firing** — the canonical trap in this repo, and one nothing else would catch: the
+    endpoint returns 202, the artifact lands, and it sits there forever.
+    """
+    script = os.path.join(REPO, "scripts", "wire-s3-events.sh")
+    text = open(script, encoding="utf-8").read()
+    assert "voiceprint_requests/" in text, (
+        "org-api queues corrections into voiceprint_requests/ and nothing is wired to read "
+        "them")
+    assert "speaker-embed" in text, "the trigger names no function"
+
+
+def test_the_voiceprint_prefix_collides_with_no_other_rule():
+    """S3 rejects two rules whose prefixes overlap ('Configuration is ambiguously defined'),
+    and the failure lands at wiring time on a bucket the whole pipeline shares — so it is
+    cheaper to know here."""
+    import re as _re
+    text = open(os.path.join(REPO, "scripts", "wire-s3-events.sh"), encoding="utf-8").read()
+    prefixes = _re.findall(r'"Name":"prefix","Value":"([^"]+)"', text)
+    mine = "voiceprint_requests/"
+    others = [p for p in prefixes if p != mine]
+    assert mine in prefixes
+    for p in others:
+        assert not (p.startswith(mine) or mine.startswith(p)), (
+            f"{mine} overlaps {p}; S3 will refuse the whole notification config")
+
+
+def test_every_wired_trigger_prefix_is_readable_by_the_function_it_triggers():
+    """A trigger without a matching read grant is a function that gets invoked and then
+    AccessDenied on the object that invoked it. Nothing static compares the two today, and
+    on 2026-08-14 that gap survived a template review, a cfn-lint run and a full suite —
+    it took a real correction on TEST to surface.
+
+    Scoped to the speaker chain, whose trigger this file already knows about.
+    """
+    t = open(TEMPLATE, encoding="utf-8").read()
+    script = open(os.path.join(REPO, "scripts", "wire-s3-events.sh"), encoding="utf-8").read()
+    assert "voiceprint_requests/" in script, "the trigger is gone; this test is stale"
+    block = _top_level_block(t, "  SpeakerEmbedFunction:")
+    assert "/voiceprint_requests/*" in block, (
+        "the embedder is triggered by voiceprint_requests/ and cannot read it")

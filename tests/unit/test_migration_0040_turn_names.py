@@ -64,3 +64,18 @@ def test_the_threshold_that_produced_a_row_is_recorded_with_it():
     """Frozen at 0.85 and expected never to change — the column is what disqualifies stale
     rows from calibration automatically if it ever does."""
     assert "cluster_threshold double precision" in _sql()
+
+
+# ---- 0041 ---------------------------------------------------------------
+
+
+def test_a_named_turn_has_somewhere_to_put_the_name():
+    """0038 read the name from the profile; 0040 allowed rows with no profile. Together they
+    left the name homeless, and the chain carried it all the way to a writer that dropped it
+    without a word. A real correction on TEST produced a row that named nobody."""
+    path = os.path.join(REPO, "src", "migrations", "0041_turn_name_display.sql")
+    assert os.path.exists(path), "no migration adds display_name"
+    sql = open(path, encoding="utf-8").read()
+    assert "ADD COLUMN IF NOT EXISTS display_name" in sql
+    assert "NOT NULL" not in sql, (
+        "an unnamed cluster is a real answer and must stay distinguishable from a named one")

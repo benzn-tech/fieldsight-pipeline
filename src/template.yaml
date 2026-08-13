@@ -552,6 +552,27 @@ Parameters:
       the rollback survives a deploy: a switch that exists only in code takes its default
       forever and raises no error.
 
+  EnableUserDeletion:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      The customer-facing "delete these recordings" endpoint. TEMPORARY by request.
+
+      This gates the WRITE endpoint only. The read filters are deliberately
+      unconditional: making them follow the flag would mean that turning it off un-hides
+      every recording a customer was told was gone, which is a second incident rather
+      than a rollback.
+
+      Recall lives in the data, not in this switch --
+        SELECT * FROM redactions WHERE scope='deleted' AND reverted_at IS NULL;
+      and one batch is `AND batch_id = :id`. A flag that is turned off leaves no way to
+      find what it did, which is why the marker is a column.
+
+      NOTHING IS DESTROYED when this is on: no S3 object is deleted and no row is
+      dropped. The content stops being readable, and POST /recordings/undelete with the
+      batch id restores exactly what one delete hid.
+
   TranscribeReservedConcurrency:
     Type: String
     Default: '0'
@@ -818,6 +839,24 @@ Parameters:
       authority, the /live-items per-user filter -- Phase 3 graded-roles
       spec §3). False (default) is the pre-Phase-3 binary resolve_scope
       behavior, unchanged in every path, mirroring AuthorityFlip's rollout.
+
+  SpeakerIdentityMode:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['off', 'shadow', 'on']
+    Description: >-
+      The one switch the speaker-naming feature hangs off. off = the correction
+      endpoints 404 and nothing invokes the embedder; prod and test stay byte-identical
+      to before the feature existed, and this is also the rollback. shadow = corrections
+      are accepted, rows land, and NAMES DO APPEAR in the transcript viewer -- that is
+      deliberate (the correction affordance is the only way step 1 collects anything to
+      calibrate from), and it is the ONLY surface they reach: minutes, email and the
+      action-item responsible party are untouched, because the email is the artifact that
+      leaves the building. on = names may additionally reach those surfaces. `on` is PROHIBITED until a calibrated margin exists: Gate A froze the
+      clustering threshold at 0.85 on 2026-08-13, but the margin that decides
+      confirmed-vs-tentative has never been measured.
+      Three states rather than a boolean because shadow is where the evidence for the
+      third state comes from, and a boolean has nowhere to collect it.
 
   UploadVerifyMode:
     Type: String
@@ -1551,7 +1590,11 @@ Resources:
           GRADED_ROLES: !Ref GradedRoles
           # Does `complete` verify the bytes arrived before stamping
           # uploaded_at? See the UploadVerifyMode parameter.
+          ENABLE_USER_DELETION: !Ref EnableUserDeletion
           UPLOAD_VERIFY_MODE: !Ref UploadVerifyMode
+          # off -> the correction routes 404. See the SpeakerIdentityMode parameter;
+          # this is the rollback, so it must be a deployed value, not a code constant.
+          SPEAKER_IDENTITY_MODE: !Ref SpeakerIdentityMode
           # Deploy = thaw. See the ServerBuild parameter.
           SERVER_BUILD: !Ref ServerBuild
           # QR passwordless login (2026-07-30) — PROD-ONLY (see IsProdWithOrgApi
@@ -1615,6 +1658,20 @@ Resources:
                 - s3:PutObject
                 - s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/voice/*
+            - Effect: Allow
+              # The user-deletion mirror. This function's other grants are all
+              # prefix-scoped, so redactions/* needs its own or the mirror write
+              # 403s. That failure is CAUGHT AND LOGGED by the endpoint (the
+              # database filters already hide the content, so failing the whole
+              # delete would be worse), which means without this statement the
+              # delete reports success while every reader that has no database —
+              # the nightly report generator and Ask — keeps serving the deleted
+              # recording. Read as well as write: the mirror is MERGED, so a
+              # second delete on the same day must see the first one's sessions.
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/redactions/*
             - Effect: Allow
               # GET /api/org/transcripts (Aurora-identity /transcripts fix) —
               # read-only, same transcripts/* objects the legacy fieldsight-api
@@ -1707,6 +1764,13 @@ Resources:
               # valid if the role can GetObject the key).
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+            # A speaker correction, handed OUTWARD across the VPC boundary the same way.
+            # Write only, and no grant on voiceprint_results/: those go to the in-VPC
+            # writer by direct invoke from the embedder, and a read grant here would be an
+            # invitation to build a second consumer nobody designed.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/voiceprint_requests/*
             - Effect: Allow
               Action: s3:GetObject
               Resource:
@@ -2723,7 +2787,11 @@ Resources:
       CodeUri: src/
       Handler: lambda_speaker_embed.lambda_handler
       Runtime: python3.12
-      Timeout: 120
+      # 600, not 120: this path is asynchronous (S3-triggered), so no API Gateway ceiling
+      # applies, and propagation now embeds every turn of a session rather than one window.
+      # Capping COVERAGE to fit a timeout would trade a visible promise for a number that
+      # costs nothing to raise.
+      Timeout: 600
       MemorySize: 1769
       ReservedConcurrentExecutions: 5
       Layers:
@@ -2739,6 +2807,9 @@ Resources:
         Variables:
           S3_BUCKET: !Ref IngestBucketName
           ECAPA_MODEL_S3_KEY: models/ecapa_tdnn.onnx
+          # The in-VPC half. Its name rather than a constant, so the two stacks cannot
+          # cross-invoke each other's writer.
+          VOICEPRINT_WRITER_FUNCTION: !Sub ["${P}-voiceprint-writer", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -2755,6 +2826,11 @@ Resources:
                 # object; the map is what takes both back to the device's own upload,
                 # which is the audio every voiceprint threshold was measured on.
                 - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*_batch_map.json
+                # Its own input. Wiring the trigger without this grant produces a function
+                # that is invoked and then AccessDenied on the very object that invoked it —
+                # found by a real correction on TEST, because no static check compares the
+                # trigger's prefix against the read grants.
+                - !Sub arn:aws:s3:::${IngestBucketName}/voiceprint_requests/*
             # Without ListBucket a missing key answers 403, not 404, and "not allowed"
             # becomes indistinguishable from "not there" inside the function.
             - Effect: Allow

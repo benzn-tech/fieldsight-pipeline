@@ -1,4 +1,5 @@
 """Pure search-SQL construction. MUST NOT import psycopg."""
+from deleted_predicates import visible_chunks_predicate
 
 
 def build_search_sql() -> str:
@@ -20,6 +21,11 @@ def build_search_sql() -> str:
         "AND (%(author_ids)s::uuid[] IS NULL OR c.user_id = ANY(%(author_ids)s::uuid[])) "
         "AND (%(date_from)s::date IS NULL OR c.report_date >= %(date_from)s::date) "
         "AND (%(date_to)s::date IS NULL OR c.report_date <= %(date_to)s::date) "
+        # A recording the customer deleted must not come back through the search box or
+        # through Ask -- both run this one query. This was missing when the delete endpoint
+        # was first written, which meant every other surface hid the content and the two
+        # the customer is most likely to try still returned it verbatim.
+        "AND " + visible_chunks_predicate("c") + " "
         "ORDER BY c.embedding <=> %(q)s::vector "
         "LIMIT %(k)s"
     )
