@@ -340,3 +340,48 @@ def test_the_window_length_is_reachable_from_the_environment():
     that way and was documented as a rollback while no workflow passed it."""
     assert isinstance(mod.BATCH_WINDOW_SEC, (int, float))
     assert mod.BATCH_WINDOW_SEC == 120
+
+
+# ---- the map travels inside the transcript (phase 5b) ----
+
+def test_a_batch_transcript_carries_its_map(wired):
+    """Without this the four consumers that resolve absolute times have nothing to correct
+    with, and a batched turn renders early -- by the trimmed overlap, and by the whole of
+    any VAD-dropped chunk the window bridged."""
+    mp, s3, ledger, calls = wired
+    batch_key = (f"audio_segments/{USER}/{DATE}/Benl1_{DATE}_14-18-47_sid{SID}_c0000"
+                 f"_bn4_off0.0_to114.0_srcwav.wav")
+    s3.objects[batch_key] = _wav(0)
+    s3.objects[bs.map_key_for_audio(batch_key)] = json.dumps(
+        {"schema": 1, "session_id": SID, "members": [], "sealed_by": "arrival"})
+
+    mod.lambda_handler(_event(batch_key), None)
+
+    written = [p for p in s3.puts if p["Key"].startswith("transcripts/")]
+    assert len(written) == 1, f"the batch must be transcribed: {s3.put_keys()}"
+    assert bs.EMBEDDED_MAP_KEY in json.loads(written[0]["Body"])
+
+
+def test_a_batch_whose_map_is_missing_fails_loudly(wired):
+    """The seal writes the map BEFORE the WAV so that the WAV's existence implies the
+    map's. An absent map is therefore a real fault, and this feature's whole history is
+    faults that were logged and stepped over."""
+    mp, s3, ledger, calls = wired
+    batch_key = (f"audio_segments/{USER}/{DATE}/Benl1_{DATE}_14-18-47_sid{SID}_c0000"
+                 f"_bn4_off0.0_to114.0_srcwav.wav")
+    s3.objects[batch_key] = _wav(0)          # no sidecar alongside it
+
+    out = _results(mod.lambda_handler(_event(batch_key), None))
+    assert out and out[0].get("status") == "error", \
+        "a missing map must not produce a silently un-rebasable transcript"
+    assert [p for p in s3.puts if p["Key"].startswith("transcripts/")] == []
+
+
+def test_a_per_chunk_transcript_gains_nothing_and_reads_nothing(wired):
+    """The common case must cost neither a key in the object nor an S3 GET."""
+    mp, s3, ledger, calls = wired
+    mp.setattr(mod, "BATCH_TRANSCRIPTION", False)
+    mod.lambda_handler(_event(unit_key(0)), None)
+    written = [p for p in s3.puts if p["Key"].startswith("transcripts/")][0]
+    assert bs.EMBEDDED_MAP_KEY not in json.loads(written["Body"])
+    assert not any(k.endswith("_batch_map.json") for k in s3.gets)

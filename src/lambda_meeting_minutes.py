@@ -48,6 +48,7 @@ import agent_turn_filter
 import llm_utils
 from datetime import datetime, timedelta
 from io import BytesIO
+import batch_stitch
 from transcript_utils import (
     normalize_transcript, format_turns_for_prompt, get_time_bounds,
     extract_device_from_filename, write_meeting_manifest,
@@ -291,7 +292,11 @@ def collect_transcripts(bucket, target_date, user_filter=None, custom_prefix=Non
         data = download_json_from_s3(bucket, key)
         if not data:
             return
-        normalized = normalize_transcript(data, filename, user_mapping=user_mapping)
+        # A batched transcript's word times count from the concatenated file's first
+        # sample, not from anything in its filename. The map rides inside the object;
+        # a per-chunk transcript has no map and this is a no-op.
+        normalized = batch_stitch.rebase_turns_from_embedded_map(
+            normalize_transcript(data, filename, user_mapping=user_mapping), data)
         if normalized and normalized.get('full_text'):
             normalized['key'] = key
             # The Ask agent's own answer, played aloud into the meeting it is minuting. Same

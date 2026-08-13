@@ -71,6 +71,7 @@ import agent_turn_filter
 from chunking import chunk_report, chunk_transcripts
 from db.connection import get_connection
 from repositories import chunks, companies, memberships, recordings, sites, topics, users
+import batch_stitch
 from transcript_utils import normalize_transcript
 
 logger = logging.getLogger()
@@ -460,7 +461,10 @@ def _load_turns(user_folder, date):
                 # Fable review minor 3).
                 logger.warning("unparseable transcript skipped: %s", key)
                 continue
-            normalized = normalize_transcript(data, filename)
+            # Same as the other consumers: a batch's word times need its embedded map, and
+            # a per-chunk transcript has none, so this is a no-op there.
+            normalized = batch_stitch.rebase_turns_from_embedded_map(
+                normalize_transcript(data, filename), data)
             if normalized is None:
                 continue
             for turn in normalized["speaker_turns"]:

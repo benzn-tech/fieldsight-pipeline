@@ -58,6 +58,7 @@ def _folder_from_source(src):
 from datetime import datetime, timedelta
 
 # Import shared utilities — bundled in the same src/ directory
+import batch_stitch
 from transcript_utils import (
     normalize_transcript, format_turns_for_prompt, get_time_bounds,
 )
@@ -229,7 +230,11 @@ def load_transcripts(bucket, date, user, topic_time_range=None):
             continue
 
         filename = os.path.basename(obj['key'])
-        norm = normalize_transcript(data, filename, user_mapping=user_mapping)
+        # A batched transcript's word times count from the concatenated file's first
+        # sample, not from anything in its filename. The map rides inside the object;
+        # a per-chunk transcript has no map and this is a no-op.
+        norm = batch_stitch.rebase_turns_from_embedded_map(
+            normalize_transcript(data, filename, user_mapping=user_mapping), data)
         if not norm or not norm.get('full_text'):
             continue
 
