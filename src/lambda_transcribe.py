@@ -348,6 +348,18 @@ def _maybe_batch(bucket, key, results):
 
     now = int(time.time())
     table = _get_dynamodb_table()
+
+    # A window of one is not worth a batch, so `batch_seal.bypass_singleton` copies the unit
+    # onto its own key to re-drive it here. That copy arrives as an ordinary event, and
+    # without this check it would be registered, found already consumed, planned into no
+    # window, and reported as `batched_pending` — neither batched nor transcribed. The
+    # consumed mark is precisely what silences the planner, so the audio would vanish with
+    # no error anywhere.
+    if batch_ledger.seal_status(table, session_id, chunk_index) == 'bypassed':
+        logger.info("batch: chunk %s was bypassed as a window of one — transcribing it",
+                    chunk_index)
+        return False
+
     batch_ledger.register_chunk(table, session_id, chunk_index, key, now)
     batch_seal.seal_ready_runs(s3, bucket, session_id, table, now,
                                BATCH_SEAL_DEADLINE_SEC, BATCH_MAX_CHUNKS,

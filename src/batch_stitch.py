@@ -167,6 +167,59 @@ def plan_batches(indices, max_size: int = DEFAULT_MAX_BATCH) -> list[list[int]]:
     return out
 
 
+DEFAULT_WINDOW_SEC = 120.0               # two minutes of wall clock — the actual target
+
+
+def plan_windows(members, window_sec: float = DEFAULT_WINDOW_SEC,
+                 cap: int = DEFAULT_MAX_BATCH, consumed=None) -> list[list[int]]:
+    """Chunk indices grouped into wall-clock windows. Supersedes `plan_batches`.
+
+    `members` maps chunk index -> that chunk's own base time (the device clock out of its
+    filename). Only ever compared to each other, never to `time.time()`: the two are
+    different clocks, ~13 hours apart, and mixing them seals a backlogged session's first
+    chunk alone with zero effective grace.
+
+    A window opens at the earliest unconsumed member and takes everything strictly inside
+    `anchor + window_sec`. **A VAD-dropped chunk is not a boundary.** That is the whole
+    point: batching's one measured benefit is a shared speaker namespace (33 labels -> 9),
+    and splitting at a 30-second silence hands the same person an unrelated label on each
+    side of it — in 37% of real sessions.
+
+    Anchored greedily on the window's own first member, not on a grid aligned to the
+    session start: a grid cuts dense stretches at its boundaries (480 requests against 470
+    measured over every session in the lake) and can split a run of four that a boundary
+    happens to straddle.
+
+    `consumed` are members already sealed into a batch, and excluding them is load-bearing
+    rather than tidy. The seal record is keyed by a window's FIRST index, so a chunk that
+    arrives late and earlier than a sealed window's anchor would shift that anchor, claim a
+    key nobody holds, and transcribe — and bill — every member of that window a second
+    time. A late chunk forms its own window.
+
+    `cap` is a safety net, not the rule. Nothing reaches it while chunks are 30 s; a device
+    emitting much shorter ones would otherwise build one unbounded request.
+    """
+    consumed = consumed or set()
+    ordered = sorted((i for i in members if i not in consumed),
+                     key=lambda i: (members[i], i))
+    out: list[list[int]] = []
+    window: list[int] = []
+    anchor = None
+    for i in ordered:
+        if anchor is not None and len(window) < cap:
+            elapsed = (members[i] - anchor).total_seconds() \
+                if hasattr(members[i], "timestamp") else members[i] - anchor
+            if elapsed < window_sec:
+                window.append(i)
+                continue
+        if window:
+            out.append(window)
+        window, anchor = [i], members[i]
+    if window:
+        out.append(window)
+    return out
+
+
 # ============================================================
 # The filename contract
 # ============================================================
@@ -232,7 +285,8 @@ def map_key_for_transcript(transcript_key: str, audio_prefix: str = 'audio_segme
 
 
 def member(chunk_index: int, chunk_key: str, abs_start: str, trimmed_head_sec: float,
-           kept_duration_sec: float, trim_measured: bool = True) -> dict:
+           kept_duration_sec: float, trim_measured: bool = True,
+           seam: str = "adjacent") -> dict:
     """One member of a batch. `abs_start` is the chunk's own filename clock, ISO-8601."""
     return {
         "chunk_index": chunk_index,
@@ -243,6 +297,10 @@ def member(chunk_index: int, chunk_key: str, abs_start: str, trimmed_head_sec: f
         # False means the seam measured zero unexpectedly: the audio was kept whole and this
         # says so, rather than leaving a 0.0 that reads as "there was no overlap".
         "trim_measured": bool(trim_measured),
+        # "first" | "adjacent" | "gap". A gap seam bridges a chunk VAD dropped: those two
+        # were never adjacent, so zero overlap is the CORRECT answer and must be kept out of
+        # the unmeasured-seam alarm, which exists to catch the byte comparison breaking.
+        "seam": seam,
     }
 
 
