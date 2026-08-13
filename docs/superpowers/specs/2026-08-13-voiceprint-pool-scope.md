@@ -76,9 +76,22 @@ in expectation, and the margin rule therefore gets harder to clear as the pool g
 much harder is unknown and is what the experiment is for.**
 
 One more correction to the first draft: it cited +0.104 as "the weakest true score", but
-that is the 2.1 s turn the duration floor now excludes. **The weakest floor-eligible
-same-person score is not reported in either document** and should be extracted when the
-experiment runs — it is the number the margin actually has to clear.
+that is the 2.1 s turn the duration floor now excludes.
+
+**Measured 2026-08-13, and it changes the outlook.** The rebuilt harness reports the
+weakest **floor-eligible** same-person score as **+0.411** (n=23), against a cross-person
+maximum of **+0.205**. After the duration floor, on this material, the two distributions
+**do not overlap at all** — they are 0.2 apart, and the overlap the first draft argued from
+was entirely produced by turns the shipped rule already refuses.
+
+That is a far healthier picture than the spec assumed, and it does **not** settle the pool
+question: five voices still cannot tell you where a hundred would put the runner-up. What it
+does mean is that the headroom may be much larger than feared, and the experiment is worth
+running to find the ceiling rather than to confirm a problem.
+
+The same run gives the baseline the pool sweep needs: 6 profiles / 5 people →
+nearest-profile **32/32**, `confirmed` **23 (72%)**, `tentative` **0**, `unknown` **9 (28%,
+all below the duration floor)**, wrong-confident **0**.
 
 ## 3. The experiment — runnable, but not cheap
 
@@ -118,13 +131,26 @@ the wearer (`speaker_session_eval.py:145,152,156`). Distractor names colliding o
 would silently corrupt the accuracy figures — a distractor called `benny` would be scored as
 the wearer.
 
-**Distractors cannot honestly reach K=95.** Adding them needs no code change (the eval globs
-`enrol/*.wav`), but source (1) — other real sessions on the same device — is limited by a
-~20-device fleet and a small user base, and each distractor needs a clean single-voice
-stretch hand-cut from unlabelled conversation. Realistically source (1) yields around a
-dozen voices. **The 50 and 100 points will be almost entirely public-corpus voices**, which
-are cleaner than site audio and therefore easier to beat. Those points must be labelled
-corpus-flattered in the result, or the curve is optimistic exactly where it matters.
+**Distractors from real material: attempted 2026-08-13, and it produced none.** Adding them
+needs no code change (the eval globs `enrol/*.wav`), and the review estimated source (1)
+would yield "about a dozen voices". It yielded **zero**.
+
+Method and result, so nobody repeats it: eight candidate windows were pulled from six other
+prod accounts (Sam_Yu, Neil_Blunden, James_Alcock, Jack_Gibson, Jarley_Trainor — one more,
+David_Barillaro, is 8 kHz legacy audio and was excluded outright, the model needs 16 kHz).
+Each was screened with `window_is_homogeneous`, the guard the enrolment path already uses
+for this exact purpose. **All eight were rejected.** A site recording holds the wearer plus
+whoever is nearby; a stretch that is provably one voice is not something these recordings
+readily contain.
+
+The control run matters as much: four of the six real enrolments **passed** the same screen,
+so the screen discriminates rather than refusing everything.
+
+**Consequence for this experiment: the pool-size curve cannot currently be measured on real
+material.** The options are (a) public-corpus distractors, in which case *every* point above
+6 is corpus-flattered rather than only the large ones, or (b) fix enrolment quality first
+(§6) and try again. Neither is free, and the first draft's "cheap, because the harness
+exists" was wrong in every particular.
 
 ### Method
 
@@ -232,3 +258,59 @@ Recorded because the corrections are the useful part:
    tighter scoping makes worse.
 7. Exposed the `user_id IS NULL` hole in site scoping, and the prefix-match and `ben`-merge
    hazards inside the harness.
+
+---
+
+## 6. Enrolment quality — found while trying to run §3, and it outranks §2
+
+Two of the six Phase 0 enrolments fail the homogeneity guard: `ben` (max frame spread
+0.511) and `ben_chinese` (0.441), against a threshold of 0.35. The other four pass at
+0.166–0.268. Since Ben is the wearer — the person who speaks most in every session — this
+looked like the guard refusing the one profile that matters most.
+
+**It is not the guard, and it is not the audio level.** Two wrong explanations were
+eliminated by measurement before the right one was found:
+
+**Rejected — "the recording is too quiet."** Ben's frames sit at −37 to −44 dBFS against
+Zoe's −21 to −26, which matches this product's documented recording-level problem exactly.
+So: amplify and re-measure. `ben_chinese` gained 7.1× (−42 → −25 dBFS, **louder than Zoe**)
+and its spread moved from **0.441 to 0.441** — not one decimal place. Ben's likewise,
+0.511 → 0.511.
+
+The reason is in `cosine`'s own docstring: it is **loudness-invariant on purpose**, because
+across 0–6 m the level moves ~20 dB and a score that tracked it would be measuring the
+microphone. **The whole chain is immune to gain.** Normalisation cannot repair any
+voiceprint metric, and any future proposal to try it can be answered with this measurement.
+
+**Rejected — "the threshold is wrong for near-field speech."** A spec to make the guard
+distinguish "too quiet" from "two voices" was drafted and abandoned; it rested on the
+explanation above.
+
+**The actual cause, from a second engine rather than more inference** — transcribing the
+enrolments (the T2 step in this project's own free-methods-then-T1-then-T2-then-ears order):
+
+- `ben.wav` is **the blockV script being performed**: *"Morning, Zoe. Let's start with the
+  level three slab. Is your rebar finished?"* / *"Almost. It's the side top opening trim bar
+  not down."* / *"Right. I'll raise an RFI…"* — **one person playing several parts**;
+- `ben_chinese.wav` is a Chinese statement that ends *"Finish, finish, finish。结束，结束，
+  结束。"* — **switching language mid-recording**;
+- Zoe's is a flat self-introduction, which is what an enrolment should be.
+
+All three transcribe as a single `spk_0`, so no second person is present. **The guard was
+reporting something true — acoustic properties changing sharply — and attributing it to the
+wrong cause.**
+
+### What follows
+
+- **Phase 4's enrolment flow needs instruction copy, not a code change**: an enrolment must
+  be *natural continuous speech*, not a performance, and must not change language partway.
+  Zoe's recording is the model.
+- **Ben's two enrolments are not usable as voiceprint samples.** This also explains the Phase
+  0 note that his Chinese profile twice scored nearest of all: that profile is a blend, not a
+  stable rendering of one voice.
+- **It weakens the example in the aggregation change (#412), not the change.** `decide_name`
+  genuinely needs per-person aggregation. But the 0.08 gap between Ben's two profiles is the
+  distance between two unfit recordings, not the natural distance between one person's two
+  languages, and it should not be quoted as the latter.
+- The same guard is what blocked every real distractor in §3. Better enrolment material would
+  unblock both.
