@@ -96,6 +96,9 @@ class _FakeCur:
     def fetchone(self):
         return {"id": "r-1"}
 
+    def fetchall(self):
+        return [{"id": "r-1"}]
+
 
 class _FakeConn:
     def __init__(self):
@@ -141,3 +144,64 @@ def test_the_existing_callers_are_untouched():
                          "non-work", "u-1", "pm")
     sql, params = conn.calls[-1]
     assert "analysis" in params and None in params, "batch_id/target_key default to NULL"
+
+
+# ============================================================
+# Phase 2 — the two choke predicates
+# ============================================================
+# The old "single choke point" (`company_excluded_topic_ids`) has two callers while
+# `topics.py` holds a dozen reads. These two predicates are what the read paths will
+# actually carry, and they are TWO because the tombstone has two arms:
+#
+#   * by topic id     -- the rows that exist right now;
+#   * by source key   -- the rows the pipeline will re-create tomorrow with new uuids.
+#
+# A filter with only the first arm passes every test written today and lets the deleted
+# content back in overnight.
+
+def _red():
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "src"))
+    import repositories.redactions as red
+    return red
+
+
+def test_the_topic_predicate_names_all_three_conditions():
+    """`scope='deleted'` alone would also hide the life-conversation redactions, which are
+    supposed to stay visible to the person they belong to. All three conditions or none."""
+    p = _red().DELETED_TOPIC_PREDICATE
+    assert "scope = 'deleted'" in p
+    assert "reverted_at IS NULL" in p, "a reverted delete must come back"
+    assert "target_type = 'topic'" in p
+
+
+def test_the_source_predicate_exists_and_is_separate():
+    """The second arm. Without it a topic re-created by the nightly supersession has a new
+    uuid that no tombstone names, and the deleted day returns."""
+    red = _red()
+    assert hasattr(red, "DELETED_SOURCE_PREDICATE")
+    p = red.DELETED_SOURCE_PREDICATE
+    assert "target_key" in p and "scope = 'deleted'" in p and "reverted_at IS NULL" in p
+
+
+def test_a_recording_tombstone_carries_its_source_key():
+    red = _red()
+    conn = _FakeConn()
+    red.create_recording_tombstone(conn, "c-1", "extractions/Ben/2026-08-13/",
+                                   "user deleted", "u-1", "pm", batch_id="b-1")
+    sql, params = conn.calls[-1]
+    assert "recording" in params and "extractions/Ben/2026-08-13/" in params
+    assert "deleted" in params and "b-1" in params
+
+
+def test_revert_is_per_batch_and_company_guarded():
+    """Reverting by batch is the whole rollback story. Company-guarded because one
+    company's revert must never resurrect another's deleted content."""
+    red = _red()
+    conn = _FakeConn()
+    red.revert_batch(conn, "b-1", "c-1")
+    sql, params = conn.calls[-1]
+    assert "reverted_at" in sql and "batch_id" in sql
+    assert "company_id" in sql, "an ungarded revert crosses tenants"
+    assert "reverted_at IS NULL" in sql, "reverting twice must not double-count"
