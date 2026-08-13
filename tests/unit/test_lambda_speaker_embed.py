@@ -275,26 +275,53 @@ def test_a_per_chunk_turn_costs_no_map_fetch(stub_embedder, monkeypatch):
     assert s3.gets == [key]
 
 
+def _ramp_wav(seconds=30.0, sr=16000):
+    """Every sample encodes its own index, so the audio that comes back says WHERE it was
+    cut from. A wav of zeros cannot tell a right offset from a wrong one."""
+    import io as _io
+    import wave as _wave
+    n = int(seconds * sr)
+    data = (np.arange(n, dtype=np.int64) % 30000).astype("<i2")
+    buf = _io.BytesIO()
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(data.tobytes())
+    return buf.getvalue()
+
+
 def test_the_batch_offset_is_applied_to_the_audio_that_is_embedded(stub_embedder,
                                                                    monkeypatch):
-    """Not merely the right file -- the right seconds inside it. Batch 35-40s is member 1's
-    5-10s plus its 0.5s head trim, and a version that read the file but ignored the offset
-    would pass the file assertion above while embedding the wrong person."""
+    """Not merely the right file and the right LENGTH -- the right seconds inside it.
+
+    This test used to assert only that five seconds came back, which a version that
+    dropped or double-counted the 0.5 s head trim would also satisfy while embedding a
+    different person's syllables. The audio now carries its own position.
+
+    Batch 35 s lands in member 1 (whose kept audio starts at batch 30 s) at 5 s in, and
+    member 1's kept audio begins 0.5 s into its chunk -- so the first sample embedded is
+    chunk sample 5.5 s.
+    """
     raw = "users/u/audio/2026-08-13/x_c0001.wav"
     monkeypatch.setattr(se, "s3", lambda: FakeS3({MAP_KEY: _batch_map_bytes(),
-                                                  raw: _wav_bytes(seconds=30.0)}))
+                                                  raw: _ramp_wav(seconds=30.0)}))
     seen = {}
 
     def embed(audio, sr):
-        seen["n"] = len(audio)
+        seen["audio"] = np.asarray(audio)
         return np.ones(192, dtype=np.float32)
     monkeypatch.setattr(se, "embed_audio", embed)
     se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
                        "date": "2026-08-13", "company_id": "c1",
                        "turns": [{"source_filename": BATCH_NAME,
                                   "start_sec": 35.0, "end_sec": 40.0}]}, None)
-    assert seen["n"] == pytest.approx(5.0 * 16000, abs=16), (
-        f"embedded {seen['n']} samples for a 5s window")
+    got = seen["audio"]
+    assert len(got) == pytest.approx(5.0 * 16000, abs=16), f"embedded {len(got)} samples"
+    first = round(float(got[0]) * 32768.0)
+    assert first == pytest.approx(int(5.5 * 16000) % 30000, abs=2), (
+        f"the window starts at chunk sample {first}, expected {int(5.5 * 16000)} — the "
+        f"head trim was dropped or counted twice")
 
 
 # ---- pure compute: no database, no VPC ----------------------------------

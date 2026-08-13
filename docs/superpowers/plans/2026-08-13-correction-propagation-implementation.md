@@ -253,3 +253,20 @@ toward accepting a plausible wrong name.
 
 Cross-session propagation (Phase 5), names inside the LLM artifact (Phase 5 `on`), identity
 merging across a multi-device group, un-naming on withdrawal (Phase 6).
+
+
+## Known latent item, deliberately not touched (2026-08-13)
+
+`batch_seal.measure_trim` measures seam overlap against the **raw** chunk but trims the head
+of the **unit** pcm. Today every unit carries `off0.0` because `TRANSCRIBE_WHOLE_CHUNK` is on,
+so the two coincide and nothing is wrong. **If whole-chunk transcription is ever switched off
+and units acquire non-zero offsets, the trim misaligns** — and it misaligns quietly, as audio
+cut from slightly the wrong place rather than as an error.
+
+The code's own docstring records the assumption; there is no guard enforcing it.
+
+Not fixed here on purpose: that is live batching code owned by another session tonight, and
+the same reasoning that holds P5 applies — a change there costs a real feature if it collides,
+while the item itself is latent and cannot fire under the current configuration. It belongs
+with whoever next changes `TRANSCRIBE_WHOLE_CHUNK`, and the guard to write is a loud refusal
+when a member's `_off` is non-zero.
