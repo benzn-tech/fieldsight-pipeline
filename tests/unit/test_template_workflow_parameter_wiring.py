@@ -914,3 +914,33 @@ def test_org_api_may_write_the_voiceprint_request_but_not_read_the_results():
     assert "voiceprint_requests/*" in t, "org-api cannot queue a correction"
     assert "voiceprint_results/*" not in t, (
         "something was granted the results prefix; the writer receives them by invoke")
+
+
+def test_the_embedder_has_an_s3_trigger_wired_outside_the_template():
+    """SAM cannot attach S3 events to an external bucket (BUG-33), so every S3-driven
+    function here is wired by `scripts/wire-s3-events.sh` after the deploy. A function whose
+    template says `NO Events` and whose script entry was never added deploys **green with
+    nothing firing** — the canonical trap in this repo, and one nothing else would catch: the
+    endpoint returns 202, the artifact lands, and it sits there forever.
+    """
+    script = os.path.join(REPO, "scripts", "wire-s3-events.sh")
+    text = open(script, encoding="utf-8").read()
+    assert "voiceprint_requests/" in text, (
+        "org-api queues corrections into voiceprint_requests/ and nothing is wired to read "
+        "them")
+    assert "speaker-embed" in text, "the trigger names no function"
+
+
+def test_the_voiceprint_prefix_collides_with_no_other_rule():
+    """S3 rejects two rules whose prefixes overlap ('Configuration is ambiguously defined'),
+    and the failure lands at wiring time on a bucket the whole pipeline shares — so it is
+    cheaper to know here."""
+    import re as _re
+    text = open(os.path.join(REPO, "scripts", "wire-s3-events.sh"), encoding="utf-8").read()
+    prefixes = _re.findall(r'"Name":"prefix","Value":"([^"]+)"', text)
+    mine = "voiceprint_requests/"
+    others = [p for p in prefixes if p != mine]
+    assert mine in prefixes
+    for p in others:
+        assert not (p.startswith(mine) or mine.startswith(p)), (
+            f"{mine} overlaps {p}; S3 will refuse the whole notification config")
