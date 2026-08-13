@@ -12,9 +12,14 @@ beside the Silero VAD model and for the same recorded reason (BUG-02: loading th
 a Layer shipped a different version whose output was silently wrong). A few KB of reference
 vectors detect the same class of drift.
 
-Skipped when the model or onnxruntime is absent, so CI stays green without an 84 MB
-download. **Phase 5 may not start until this has actually run and passed** — a permanently
-skipped gate is not a gate.
+The comparison is skipped when the model is absent, so CI stays green without an 84 MB
+download — but the two anti-vacuity tests are NOT, because their whole job is to fire on the
+machines that skip the comparison.
+
+**Phase 5 may not start until the comparison has actually run and passed** — a permanently
+skipped gate is not a gate. **It has: 2026-08-13, 3 passed against the model in S3, run with
+`ECAPA_ONNX_PATH` pointed at a local copy.** Before that date this file had never once
+executed its own assertion.
 
 Measured 2026-08-13: 6 of 6 real enrolments at cosine 1.000000. The 0.999 threshold is the
 tolerance the design allows, not the accuracy observed.
@@ -31,7 +36,12 @@ REFS = os.path.join(FIXTURES, "references.json")
 MODEL = os.environ.get("ECAPA_ONNX_PATH", os.path.join(REPO, "models", "ecapa_tdnn.onnx"))
 GATE = 0.999
 
-pytestmark = pytest.mark.skipif(
+# Only the comparison itself needs the model. The other two tests here exist to stop THIS
+# FILE passing vacuously, and until 2026-08-13 they were under a file-level skip alongside it
+# — so on any machine without the 84 MB artifact (which is every CI runner, since the model
+# ships in S3) somebody could delete references.json or commit the 83 MB weight sidecar and
+# nothing would go red. A guard that is skipped wherever it would fire is not a guard.
+needs_model = pytest.mark.skipif(
     not os.path.exists(MODEL),
     reason=f"no ONNX model at {MODEL}; export it with scripts/export_ecapa_onnx.py or set "
            f"ECAPA_ONNX_PATH. The references are committed, so this skip is about the "
@@ -55,6 +65,7 @@ def test_the_references_exist_and_name_real_audio():
             f"could not re-derive it")
 
 
+@needs_model
 def test_every_reference_survives_the_export():
     import voiceprint_utils as vp
 
