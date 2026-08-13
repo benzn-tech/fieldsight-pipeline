@@ -3,8 +3,13 @@
 Design: docs/superpowers/specs/2026-08-09-speaker-identity-v2.md §6, §8
 Schema: src/migrations/0038_speaker_voiceprints.sql
 
-Nothing calls this yet (Phase 2 ships inert). It exists now so the queries that must never
-be wrong are written and tested before anything depends on them being right.
+Live since 2026-08-14: org-api calls `profiles_for_matching` when a correction is queued,
+the voiceprint writer calls `record_turn_name`, and the transcript endpoint calls
+`live_turn_names` to lay names over the turns it returns. (This paragraph said "nothing calls
+this yet" for a day after that stopped being true.)
+
+`add_sample` and `withdraw` are still uncalled — enrolment is Phase 4 and consent is its
+precondition.
 
 Two of those queries have failure modes that are invisible in production:
 

@@ -319,10 +319,17 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref):
     # entirely rather than correcting for it.
     self_i = next((i for i, r in enumerate(refs) if r == asserted_ref), None)
     if self_i is None:
-        # The corrected window is not among the turns (an older producer, or a window the
-        # user drew across a boundary). Nothing to propagate from, and guessing a cluster
-        # for it would be the two-voice failure by another route.
-        logger.info("propagation: corrected turn not among the session's turns")
+        # Nothing to propagate from, and guessing a cluster for it would be the two-voice
+        # failure by another route. But say WHICH reason: a turn under the duration floor is
+        # filtered out of `usable` above and then arrives here looking identical to a window
+        # that genuinely is not part of the session. The first is ordinary — roughly a fifth
+        # of turns are under 3 s — and the second means the producer and consumer disagree.
+        # One log line for both would send tomorrow's debugging at the wrong one.
+        short = any(turn_name_overlay.turn_ref(t["source_filename"], t["start_sec"])
+                    == asserted_ref for t in turns)
+        logger.info("propagation: %s",
+                    "the corrected turn is under the %.1fs floor" % vp.DEFAULT_MIN_TURN_S
+                    if short else "corrected turn not among the session's turns")
         return []
 
     own = labels[self_i]

@@ -262,18 +262,8 @@ def test_a_singleton_cluster_has_no_centroid_to_speak_of():
         vp.leave_one_out_centroid([_v(1, 0)], 0)
 
 
-def test_the_reference_selects_the_nearest_cluster_and_reports_its_margin():
-    a, b = _v(1, 0), _v(0, 1)
-    idx, margin = vp.assign(a * 0.97, [a, b])
-    assert idx == 0
-    assert margin > 0.5
-
-
-def test_an_ambiguous_reference_is_reported_as_such_rather_than_picking_one():
-    """A corrected turn that sits between two voices is the 1-in-6 two-voice turn v2 measured.
-    Naming a cluster from it would spread one person's name over another's whole session."""
-    import math
-    a = _v(1, 0)
-    b = _v(math.cos(1.0), math.sin(1.0))
-    idx, margin = vp.assign(_v(math.cos(0.5), math.sin(0.5)), [a, b])
-    assert margin < vp.DEFAULT_MIN_MARGIN, f"margin {margin} — the caller cannot refuse this"
+# `assign()`'s two tests lived here and went with it. What they pinned — the corrected
+# window must select a voice, and an ambiguous one must be refusable — is now pinned where
+# the behaviour actually lives: test_lambda_speaker_embed's
+# `test_the_reference_is_never_scored_against_a_centroid_holding_itself` and
+# `test_a_corrected_turn_sitting_between_two_voices_names_nothing`, both mutation-verified.
