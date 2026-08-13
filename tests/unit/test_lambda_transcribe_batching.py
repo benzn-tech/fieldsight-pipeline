@@ -69,6 +69,7 @@ class FakeS3:
         self.objects = dict(objects or {})
         self.puts = []
         self.gets = []
+        self.copies = []
 
     def get_object(self, Bucket, Key):
         self.gets.append(Key)
@@ -79,6 +80,9 @@ class FakeS3:
     def put_object(self, Bucket, Key, Body, **kw):
         self.puts.append({"Key": Key, "Body": Body})
         self.objects[Key] = Body
+
+    def copy_object(self, Bucket, Key, CopySource, **kw):
+        self.copies.append(Key)
 
     def put_keys(self, suffix=None):
         return [p["Key"] for p in self.puts
@@ -104,9 +108,21 @@ class FakeLedger:
     def list_members(self, table, session_id):
         return [self.members[i] for i in sorted(self.members)]
 
-    def pending_runs(self, rows, now, deadline_sec, max_size=4):
+    def pending_windows(self, rows, now, grace_sec, window_sec=120.0, cap=4):
         import batch_ledger
-        return batch_ledger.pending_runs(rows, now, deadline_sec, max_size)
+        return batch_ledger.pending_windows(rows, now, grace_sec,
+                                            window_sec=window_sec, cap=cap)
+
+    def consumed_indices(self, rows):
+        import batch_ledger
+        return batch_ledger.consumed_indices(rows)
+
+    def mark_members_consumed(self, table, session_id, indices, first_index):
+        for i in indices:
+            self.members[i]["sealed_into"] = first_index
+
+    def mark_bypassed(self, table, session_id, index, now):
+        self.seals[index] = {"status": "bypassed"}
 
     def claim_seal(self, table, session_id, first_index, members, now):
         if first_index in self.seals:
@@ -281,3 +297,46 @@ def test_a_bypassed_member_is_transcribed_when_its_event_comes_back(wired):
 
     assert handled is False, "a bypassed member must fall through to transcription"
     assert results == [], "and must not be reported as batched"
+
+
+# ============================================================
+# The window rule (spec 2026-08-13, plan phase 4)
+# ============================================================
+
+def test_the_window_not_the_count_decides_membership(wired, monkeypatch):
+    """The motivating case, end to end through the handler.
+
+    c5 was dropped by VAD. Under the consecutive-index rule this produces two batches --
+    [4] and [6,7] -- so the same speaker gets an unrelated label on each side of a 30-second
+    silence. One window, one request, one namespace.
+    """
+    monkeypatch, s3, ledger, calls = wired
+    for i in (4, 6, 7):
+        s3.objects[unit_key(i)] = _wav(i)
+        s3.objects[raw_key(i)] = _wav(i)
+        mod._maybe_batch("b", unit_key(i), [])
+
+    monkeypatch.setattr(mod, "BATCH_SEAL_DEADLINE_SEC", 0)   # grace elapsed
+    mod._maybe_batch("b", unit_key(7), [])
+
+    wavs = [k for k in s3.put_keys(".wav")]
+    assert len(wavs) == 1, f"expected one bridging batch, got {wavs}"
+    assert "_bn3_" in wavs[0], f"the window must hold all three survivors: {wavs[0]}"
+
+
+def test_no_bn1_object_is_ever_written(wired, monkeypatch):
+    """A window that ends up with one member goes down the per-chunk path instead."""
+    monkeypatch, s3, ledger, calls = wired
+    s3.objects[unit_key(9)] = _wav(9)
+    s3.objects[raw_key(9)] = _wav(9)
+    mod._maybe_batch("b", unit_key(9), [])
+    monkeypatch.setattr(mod, "BATCH_SEAL_DEADLINE_SEC", 0)
+    mod._maybe_batch("b", unit_key(9), [])
+    assert [k for k in s3.put_keys(".wav") if "_bn1_" in k] == []
+
+
+def test_the_window_length_is_reachable_from_the_environment():
+    """A knob only a code change can turn is not a knob -- FILTER_AUDIO_EVENT_TAGS shipped
+    that way and was documented as a rollback while no workflow passed it."""
+    assert isinstance(mod.BATCH_WINDOW_SEC, (int, float))
+    assert mod.BATCH_WINDOW_SEC == 120

@@ -164,14 +164,22 @@ def seal_batch(s3, bucket, session_id, run, by_index, now, table, sealed_by='arr
 
 
 def seal_ready_runs(s3, bucket, session_id, table, now, deadline_sec, max_chunks,
-                    sealed_by='arrival'):
-    """Seal every run of this session that is ready. Returns the batch keys written."""
+                    sealed_by='arrival', window_sec=120.0):
+    """Seal every window of this session that is ready. Returns the batch keys written.
+
+    `deadline_sec` is the grace a window that could still grow waits for; pass 0 at session
+    close, where nothing more can arrive and waiting is the failure this exists to prevent.
+
+    A window that seals with one member returns no key — it was handed back to the
+    per-chunk path — so the returned list is batches written, not windows sealed.
+    """
     rows = batch_ledger.list_members(table, session_id)
     if not rows:
         return []
     by_index = {int(r['chunk_index']): r for r in rows}
     out = []
-    for run in batch_ledger.pending_runs(rows, now, deadline_sec, max_chunks):
+    for run in batch_ledger.pending_windows(rows, now, deadline_sec,
+                                            window_sec=window_sec, cap=max_chunks):
         key = seal_batch(s3, bucket, session_id, run, by_index, now, table,
                          sealed_by=sealed_by)
         if key:

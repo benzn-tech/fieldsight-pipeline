@@ -94,54 +94,12 @@ def test_one_session_never_sees_another_session_s_chunks(table):
     assert [m["chunk_index"] for m in bl.list_members(table, SID)] == [1]
 
 
-# ---- which runs are ready to seal ----
-
-def _rows(indices, at=NOW):
-    return [{"chunk_index": i, "chunk_key": f"k{i}", "registered_at": at} for i in indices]
-
-
-def test_four_consecutive_chunks_seal_immediately():
-    assert bl.pending_runs(_rows([4, 5, 6, 7]), NOW, deadline_sec=300) == [[4, 5, 6, 7]]
-
-
-def test_three_chunks_that_are_still_young_wait_for_a_fourth():
-    assert bl.pending_runs(_rows([4, 5, 6]), NOW + 10, deadline_sec=300) == []
-
-
-def test_three_chunks_past_the_deadline_seal_short():
-    """A session that ended mid-batch must not wait for a fourth chunk that will never come."""
-    assert bl.pending_runs(_rows([4, 5, 6]), NOW + 400, deadline_sec=300) == [[4, 5, 6]]
-
-
-def test_chunk_zero_alone_and_young_seals_nothing():
-    assert bl.pending_runs(_rows([0]), NOW + 1, deadline_sec=300) == []
-
-
-def test_a_gap_does_not_seal_the_earlier_run_early_because_the_hole_may_still_arrive():
-    """Uploads arrive out of order and can be hours late. Sealing `[4,5]` the moment `7`
-    shows up would permanently exclude a chunk 6 that was merely slow — and a sealed batch
-    is never reopened, so that exclusion is forever."""
-    rows = _rows([4, 5]) + _rows([7, 8], at=NOW + 5)
-    assert bl.pending_runs(rows, NOW + 10, deadline_sec=300) == []
-
-
-def test_after_the_deadline_the_gap_is_accepted_and_both_runs_seal():
-    rows = _rows([4, 5]) + _rows([7, 8], at=NOW + 5)
-    assert bl.pending_runs(rows, NOW + 400, deadline_sec=300) == [[4, 5], [7, 8]]
-
-
-def test_a_dropped_index_behaves_exactly_like_a_gap():
-    """`DROP_SILENT_CHUNKS` removes a chunk before this stage. Nothing here can tell that
-    apart from a lost upload, and nothing should: both mean the batch stops there."""
-    rows = _rows([0, 1, 2]) + _rows([4, 5], at=NOW)
-    assert bl.pending_runs(rows, NOW + 400, deadline_sec=300) == [[0, 1, 2], [4, 5]]
-
-
-def test_a_long_unbroken_stretch_is_cut_into_fours_and_the_tail_waits():
-    """Eight chunks give two full batches. Nine give two full batches and a remainder that
-    is still young, so the remainder waits rather than being sent alone."""
-    assert bl.pending_runs(_rows(range(9)), NOW + 10, deadline_sec=300) == \
-        [[0, 1, 2, 3], [4, 5, 6, 7]]
+# ---- which windows are ready to seal ----
+#
+# The consecutive-index tests that lived here were removed with `pending_runs` on
+# 2026-08-13. They asserted that a gap ends the run, which is the behaviour this
+# change exists to remove; keeping them would have pinned the old rule in place.
+# Their replacements are in the window section below.
 
 
 # ---- sealing is single-winner ----

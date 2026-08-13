@@ -142,30 +142,10 @@ def _first_informative_length(pcm: bytes, distinct_needed: int = 8):
 # Which chunks may travel together
 # ============================================================
 
-def plan_batches(indices, max_size: int = DEFAULT_MAX_BATCH) -> list[list[int]]:
-    """Runs of consecutive chunk indices, split at every gap, capped at `max_size`.
-
-    A batch never spans a gap. Recording the gap in the map instead was considered and
-    rejected: only extract-session reads the map, while reports, minutes, the transcript
-    viewer and ingest all resolve time by filename arithmetic and would be a whole chunk
-    wrong past it. A VAD-dropped index is a gap for the same reason.
-
-    Indices arrive out of order routinely — a retried upload can land after its successor —
-    so they are sorted first.
-    """
-    out: list[list[int]] = []
-    run: list[int] = []
-    for i in sorted(set(indices)):
-        if run and i == run[-1] + 1 and len(run) < max_size:
-            run.append(i)
-            continue
-        if run:
-            out.append(run)
-        run = [i]
-    if run:
-        out.append(run)
-    return out
-
+# `plan_batches` — runs of consecutive indices, split at every gap — was removed on
+# 2026-08-13 rather than left beside its replacement. Its rule made a VAD-dropped chunk a
+# batch boundary, which shattered 31% of real sessions into short runs, and a dead function
+# with a plausible name is how a superseded rule comes back.
 
 DEFAULT_WINDOW_SEC = 120.0               # two minutes of wall clock — the actual target
 

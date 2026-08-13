@@ -115,32 +115,6 @@ def test_the_measurement_is_in_seconds_so_a_different_rate_still_answers_in_seco
                               8000) == pytest.approx(2.0, abs=1e-6)
 
 
-# ---- which chunks may travel together ----
-
-def test_consecutive_chunks_group_into_fours():
-    assert bs.plan_batches([0, 1, 2, 3, 4, 5, 6, 7]) == [[0, 1, 2, 3], [4, 5, 6, 7]]
-
-
-def test_a_gap_splits_the_run_because_a_batch_never_spans_one():
-    """A missing index must not be spliced shut, and must not merely be recorded — every
-    consumer except extract resolves time by filename arithmetic and would be a whole chunk
-    wrong past the gap."""
-    assert bs.plan_batches([4, 5, 7, 8, 9, 10, 11]) == [[4, 5], [7, 8, 9, 10], [11]]
-
-
-def test_a_lone_chunk_is_a_batch_of_one():
-    assert bs.plan_batches([9]) == [[9]]
-
-
-def test_nothing_present_is_no_batches():
-    assert bs.plan_batches([]) == []
-
-
-def test_indices_arriving_out_of_order_are_still_grouped_by_sequence():
-    """Uploads arrive out of order routinely — a retry can land hours after its successor."""
-    assert bs.plan_batches([5, 4, 7, 6]) == [[4, 5, 6, 7]]
-
-
 # ---- the filename contract, asserted against the real parsers ----
 
 def test_the_batch_name_is_read_correctly_by_every_existing_parser():
