@@ -310,28 +310,50 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref):
     groups = {}
     for i, lab in enumerate(labels):
         groups.setdefault(lab, []).append(i)
-    centroids, keys = [], []
-    for lab, idxs in groups.items():
-        keys.append(lab)
-        centroids.append(sum(vectors[i] for i in idxs) / len(idxs))
 
-    which, margin = vp.assign(reference, centroids)
-    if which is None:
+    # The corrected turn is IN this clustering, so its label already says which voice it is.
+    # An earlier version instead scored the reference against every centroid — which meant
+    # comparing it against a centroid that contained itself, and `leave_one_out_centroid`
+    # sat written, tested and uncalled. Reading the label removes the self-comparison
+    # entirely rather than correcting for it.
+    self_i = next((i for i, r in enumerate(refs) if r == asserted_ref), None)
+    if self_i is None:
+        # The corrected window is not among the turns (an older producer, or a window the
+        # user drew across a boundary). Nothing to propagate from, and guessing a cluster
+        # for it would be the two-voice failure by another route.
+        logger.info("propagation: corrected turn not among the session's turns")
         return []
-    if margin is not None and margin < vp.DEFAULT_MIN_MARGIN:
-        # The corrected window sits between two voices — §2 measured 1 turn in 6 holding
-        # two. Naming a cluster from it would spread one person's name over another's whole
-        # session, so it names nothing and the asserted turn stands alone.
-        logger.warning("propagation refused: reference is between clusters (margin %.3f)",
-                       margin)
+
+    own = labels[self_i]
+    members = groups[own]
+    if len(members) < 2:
+        # This voice spoke once. There is nothing to propagate, and that is the answer —
+        # not a reason to look for a different cluster to name.
+        logger.info("propagation: the corrected voice has only this turn")
         return []
+
+    v_self = vectors[self_i]
+    own_score = vp.cosine(
+        vp.leave_one_out_centroid([vectors[i] for i in members], members.index(self_i)),
+        v_self)
+    others = [vp.cosine(sum(vectors[i] for i in idxs) / len(idxs), v_self)
+              for lab, idxs in groups.items() if lab != own]
+    if others:
+        margin = own_score - max(others)
+        if margin < vp.DEFAULT_MIN_MARGIN:
+            # The corrected window sits between two voices — §2 measured 1 turn in 6 holding
+            # two. Naming a cluster from it spreads one person's name over another's whole
+            # session.
+            logger.warning("propagation refused: the corrected turn is between voices "
+                           "(margin %.3f)", margin)
+            return []
 
     out = []
-    for i in groups[keys[which]]:
+    for i in members:
         if refs[i] == asserted_ref:
             continue
         out.append({"turn_ref": refs[i], "state": "tentative",
-                    "cluster_ref": f"C{keys[which]}", "asserted": False,
+                    "cluster_ref": f"C{own}", "asserted": False,
                     "display_name": display_name})
     logger.info("propagation: %d turns in %d voices, named %d",
                 len(vectors), len(groups), len(out))

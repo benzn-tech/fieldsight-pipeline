@@ -596,3 +596,122 @@ def test_a_session_with_no_turns_still_names_the_corrected_one(stub_embedder,
     monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
     se.lambda_handler(_s3_event(key), None)
     assert len(sent["results"]) == 1 and sent["results"][0]["asserted"]
+
+
+def test_the_reference_is_never_scored_against_a_centroid_holding_itself(monkeypatch):
+    """The corrected turn is IN the clustering, so its label already says which voice it is.
+
+    An earlier version scored the reference against every centroid — including the one that
+    contained the corrected turn's own vector, which made it match itself. That inflation
+    worked against the only refusal propagation has, and `leave_one_out_centroid` sat
+    written, tested and never called. Reading the label removes the comparison instead of
+    correcting it.
+
+    Pinned by the case the old code got wrong: a corrected turn that is the ONLY member of
+    its voice. Scoring by similarity, its own cluster was a perfect self-match; the honest
+    answer is that this person spoke once and there is nothing to propagate.
+    """
+    import json as _json
+    import math
+    key = "voiceprint_requests/c1/s1/r1.json"
+    turns = [{"source_filename": "x_c0000.wav", "start_sec": float(i * 10),
+              "end_sec": float(i * 10 + 5)} for i in range(3)]
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(_prop_request(turns)).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=40.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+
+    def unit(theta):
+        v = np.zeros(192, dtype=np.float32)
+        v[0], v[1] = math.cos(theta), math.sin(theta)
+        return v
+    # reference == turn0, alone; turns 1 and 2 are one other voice, far away.
+    seq = [unit(0.0), unit(0.0), unit(2.4), unit(2.45)]
+    calls = {"n": 0}
+
+    def embed(audio, sr):
+        v = seq[min(calls["n"], len(seq) - 1)]
+        calls["n"] += 1
+        return v
+    monkeypatch.setattr(se, "embed_audio", embed)
+    se.lambda_handler(_s3_event(key), None)
+    assert [r for r in sent["results"] if not r.get("asserted")] == [], (
+        "a voice that spoke once propagated a name to somebody else's turns")
+
+
+def test_a_corrected_window_that_is_not_one_of_the_turns_propagates_nothing(monkeypatch):
+    """A window drawn across a boundary, or an older producer. Guessing which cluster it
+    belongs to would be the two-voice failure by another route."""
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    turns = [{"source_filename": "x_c0000.wav", "start_sec": float(20 + i * 10),
+              "end_sec": float(25 + i * 10)} for i in range(3)]
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(_prop_request(turns)).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=60.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    monkeypatch.setattr(se, "embed_audio", lambda a, sr: np.ones(192, dtype=np.float32))
+    se.lambda_handler(_s3_event(key), None)
+    assert [r for r in sent["results"] if not r.get("asserted")] == []
+
+
+def test_a_single_voice_session_is_named_but_never_confirmed(stub_embedder, monkeypatch):
+    """k=1 -- a solo narration walk, the most common recording shape here. `assign` returns
+    no margin because there is no other voice to beat, so the only thing that could make the
+    name wrong (clustering having merged two people) has no evidence against it. Named, and
+    permanently capped at tentative."""
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    turns = [{"source_filename": "x_c0000.wav", "start_sec": float(i * 10),
+              "end_sec": float(i * 10 + 5)} for i in range(3)]
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(_prop_request(turns)).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=40.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    se.lambda_handler(_s3_event(key), None)
+    propagated = [r for r in sent["results"] if not r.get("asserted")]
+    assert propagated, "a single-voice session named nothing"
+    assert all(r["state"] == "tentative" for r in propagated)
+
+
+def test_a_corrected_turn_sitting_between_two_voices_names_nothing(monkeypatch):
+    """§2 measured 1 turn in 6 holding two voices. Naming a cluster from such a turn spreads
+    one person's name across another person's whole session, so the margin gate refuses.
+
+    The corrected turn is the one at 0.7 rad: complete linkage puts it with the turn at 0,
+    but it is nearly as close to the other voice — leave-one-out margin ≈0.086, under the
+    0.15 floor. Constructed against the real tau (0.85), not a convenient one.
+
+    This test exists because a mutation pass found the refusal branch could be deleted with
+    the whole suite still green — the previous version of it was swallowed by an edit.
+    """
+    import json as _json
+    import math
+    key = "voiceprint_requests/c1/s1/r1.json"
+    turns = [{"source_filename": "x_c0000.wav", "start_sec": float(i * 10),
+              "end_sec": float(i * 10 + 5)} for i in range(4)]
+    req = _prop_request(turns, ref_start=10.0, ref_end=15.0)
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=60.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+
+    def unit(theta):
+        v = np.zeros(192, dtype=np.float32)
+        v[0], v[1] = math.cos(theta), math.sin(theta)
+        return v
+    seq = [unit(0.7), unit(0.0), unit(0.7), unit(1.5), unit(1.55)]
+    calls = {"n": 0}
+
+    def embed(audio, sr):
+        v = seq[min(calls["n"], len(seq) - 1)]
+        calls["n"] += 1
+        return v
+    monkeypatch.setattr(se, "embed_audio", embed)
+    se.lambda_handler(_s3_event(key), None)
+    assert [r for r in sent["results"] if not r.get("asserted")] == [], (
+        "a turn sitting between two voices named a whole cluster")
