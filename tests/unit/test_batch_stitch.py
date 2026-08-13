@@ -421,7 +421,7 @@ def test_a_consumed_member_is_not_placed_in_any_bucket():
 # voiceprint_utils was measured on raw audio and does not transfer to the normalised,
 # stitched copy under audio_segments/. Batching breaks that by construction -- a batched
 # turn's source_filename IS the stitched file and its offsets are batch-relative
-# (see `apply_batch_map`'s docstring) -- so the coordinates have to come back through the
+# (see `rebase_turns_from_embedded_map`'s docstring) -- so the coordinates have to come back
 # map rather than the rule being abandoned.
 #
 # This arithmetic lives here, next to build_map, for the reason build_map's own docstring
