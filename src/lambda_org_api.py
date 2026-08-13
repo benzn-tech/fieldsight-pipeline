@@ -4556,6 +4556,17 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
     doc = doc or {}
     topics_out = []
     _redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if conn is not None else {}
+    # `scope='deleted'` DROPS the topic; every other scope keeps today's flag-and-show.
+    #
+    # The two are not variations of one behaviour. An `analysis` redaction hides a personal
+    # conversation from the company while its own author still sees it in the "removed"
+    # area, so the body has to travel. A customer-facing delete was told the content is
+    # gone, and shipping the full body with a `redacted: true` beside it is the leak this
+    # feature exists to prevent -- the payload would still carry every word.
+    _deleted_ids = {tid for tid, r in _redacted.items() if r.get("scope") == "deleted"}
+    if _deleted_ids:
+        rows = [r for r in rows if str(r["id"]) not in _deleted_ids
+                and r["id"] not in _deleted_ids]
     # Thread facts for every threaded topic on the day, in ONE query — the
     # same batching list_topics_for_date already uses for action_items and
     # findings, for the same reason: this renders per topic and a per-topic
