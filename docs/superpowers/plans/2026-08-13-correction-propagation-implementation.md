@@ -170,7 +170,7 @@ and `correction_ref` chains them to it.
 
 Remove `VpcConfig`, the PG environment, and every database import path. Add the S3-artifact
 entry point — the handler is op-keyed today and **raises `ValueError` on an S3 `Records`
-event**. Add `PutObject` on `voiceprint_results/*`; the function has `GetObject` only.
+event**. ~~Add `PutObject` on `voiceprint_results/*`~~ — **stale**: the result goes to the writer by direct invoke, so that prefix does not exist. What the function actually needed was `GetObject` on `voiceprint_requests/*`, its own input, which was missed until a real correction was denied on the very object that triggered it.
 
 A test pins that the embedder has **no** way to obtain a profile except from the artifact, and
 that neither artifact serializes a vector — one field is all it would take for biometrics to
