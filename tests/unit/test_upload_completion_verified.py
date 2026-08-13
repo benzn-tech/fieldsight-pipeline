@@ -212,3 +212,35 @@ def test_another_company_cannot_complete_this_recording(wired):
     res = _run(mp, "enforce", FakeS3(objects={KEY: 1}))
     assert res["statusCode"] == 404
     assert marked == {}
+
+
+def test_a_verified_upload_says_so(wired, caplog):
+    """The check must leave a mark when it PASSES, not only when it fails.
+
+    Measured 2026-08-13: 1078 uploads reached the prod bucket in a day and the log carried
+    zero `upload-verify` lines. That reads as "nothing was lost" and it reads exactly the
+    same as "the check never ran" — and the second is what happened three times over in the
+    batching feature, each time behind a missing IAM grant. `enforce` is gated on a day of
+    observe logs being explainable, and a silent day explains nothing.
+
+    So: one line per verified upload, carrying the mode. Then `ok` count against
+    `object absent` count is the measurement, and a day with neither is a fault report.
+    """
+    import logging
+    mp, marked = wired
+    s3 = FakeS3(objects={KEY: 1024})
+    with caplog.at_level(logging.INFO):
+        res = _run(mp, "observe", s3, body={"sizeBytes": 1024})
+    assert res["statusCode"] == 200
+    lines = [r.getMessage() for r in caplog.records if "upload-verify" in r.getMessage()]
+    assert any("ok" in ln for ln in lines), f"no success line: {lines}"
+    assert any("observe" in ln for ln in lines), "the mode must be on the line"
+
+
+def test_the_success_line_is_not_written_when_verification_is_off(wired, caplog):
+    """`off` must stay a true rollback — no S3 call and no new log volume."""
+    import logging
+    mp, marked = wired
+    with caplog.at_level(logging.INFO):
+        _run(mp, "off", FakeS3(objects={}))
+    assert [r for r in caplog.records if "upload-verify" in r.getMessage()] == []
