@@ -1,6 +1,28 @@
 # Correcting one turn should name the whole meeting — design
 
-**Status:** spec, revision 4
+**Status:** spec, revision 4 — **built 2026-08-14, with the deferrals listed below**
+
+> **What is implemented differs from this document, and the differences are deliberate.**
+> Step 1 ships blanket-`tentative` for everything inferred, which subsumes several of the
+> refinements described here as current. Still **deferred**, and none of them is inert
+> silence — each was checked and left out:
+>
+> * **per-turn `decide_name` inside the named cluster** — every propagated turn is
+>   `tentative`, so grading them against a margin would change nothing a reader can see.
+> * **the 0.05 cosine floor** — the margin gate on the corrected turn already refuses the
+>   case it was invented for, and Phase 0's distributions leave it almost nothing to do.
+> * **the label-disagreement cap** — the column exists and the writer accepts it; the
+>   embedder never sends it, because everything it sends is already capped.
+> * **the k = 1 reason in the artifact** — a solo session's rows are indistinguishable from a
+>   multi-voice session's. Worth adding before step 2, not before step 1.
+> * **`SPEAKER_PROPAGATION_MAX_TURNS` reported in the result** — the cap is 300 and no real
+>   session has approached it, but silent truncation is exactly what this document forbids
+>   elsewhere, so it is a real debt.
+> * **corrections processed together** — each correction is its own run. Same-voice
+>   re-correction is safe (per-turn supersession); what is missing is the mutual competition
+>   two named clusters would give each other.
+> * **run-level supersession** — supersession is per `turn_ref`, so a re-extraction that
+>   shifts offsets leaves prior rows live and they surface as `unmatchedNames`.
 **Date:** 2026-08-13
 **Extends:** `2026-08-09-speaker-identity-v2.md` §6, phase 4 of
 `../plans/2026-08-11-speaker-identity-implementation.md`

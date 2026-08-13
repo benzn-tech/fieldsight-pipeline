@@ -5681,9 +5681,12 @@ def _drop_deleted_media(items, deleted, keyfn, what):
 
 
 def _session_of(key):
-    """The `sid{32hex}` inside a media key, or None."""
-    m = re.search(r"sid[0-9a-f]{32}", key or "")
-    return m.group(0) if m else None
+    """The `sid{32hex}` inside a media key, or None.
+
+    Delegates rather than carrying its own regex: two identical patterns are two things that
+    can drift, and every key-shaped disagreement in this feature has been exactly that.
+    """
+    return turn_name_overlay.session_base(key)
 
 
 def _read_org_transcripts(date, folder, start_time, end_time, conn=None):

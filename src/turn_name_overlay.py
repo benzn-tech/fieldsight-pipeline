@@ -15,7 +15,9 @@ a seam dedup shifts `start_sec` by a fraction of a second. Under a strict join t
 matches nothing and **the name silently disappears**, which is the same class of failure the
 overlay was chosen to avoid. So:
 
-  * the join is by proximity within `TOLERANCE_SEC`, nearest wins;
+  * the join is by proximity within `TOLERANCE_SEC`, and `resolve` pairs rows and turns
+    ONE-TO-ONE — a row describes one turn, and letting several turns claim the same row
+    turned a single assertion into two confirmed names on TEST;
   * a row that never matches anything is **counted**, and the caller reports the count.
 
 Precedence has to be applied HERE and not left to the database. The partial unique index
@@ -147,10 +149,12 @@ def _rank(row, distance):
 
 
 def lookup(index, source_filename, start_sec):
-    """The name for this turn, or None.
+    """One turn, considered alone. **Not the path the endpoint uses** — see `resolve`.
 
-    Every row within tolerance is considered, not merely the nearest: the nearest may be a
-    propagated guess sitting beside the correction the user actually made.
+    Kept because the ranking rules are worth exercising in isolation, and removed from
+    production on purpose: asking this per segment lets one row be claimed by several turns,
+    which on TEST turned one assertion into two `confirmed` names. A test asserts that
+    nothing in `src/` calls it.
     """
     entries = index["by_file"].get(_stem(source_filename))
     if not entries:
