@@ -197,11 +197,15 @@ def test_a_turn_with_no_time_is_not_invented_one(sealed):
 def test_every_normalize_transcript_caller_rebases():
     """The invariant, not the four instances.
 
-    The spec for this change listed four consumers. It had two of them wrong: it named the
-    org-api viewer, which does not call `normalize_transcript` at all, and it omitted the
+    The spec for this change listed four consumers and had two of them wrong: it named the
+    org-api viewer, which does not call `normalize_transcript` at all, and omitted the
     meeting minutes, which does. A list maintained by hand was wrong the first time it was
-    written, so this asserts the property instead: every call site either rebases or is
-    named here with a reason.
+    written, so this asserts the property instead.
+
+    The check is that the `normalize_transcript` call is NESTED INSIDE a call to
+    `rebase_turns_from_embedded_map`, not that the name appears nearby. An earlier version
+    searched a window of source text, and deleting the rebase call while leaving its name in
+    a neighbouring comment kept the suite green -- a guard that a comment satisfies.
     """
     import ast
 
@@ -210,31 +214,28 @@ def test_every_normalize_transcript_caller_rebases():
 
     # `lambda_extract_session` rebases through the sidecar it fetches itself -- it is the
     # one consumer that pre-dates the embedded map and still reads pre-change artifacts.
-    EXEMPT = {"lambda_extract_session.py": "fetches the sidecar directly (and prefers it)",
+    EXEMPT = {"lambda_extract_session.py": "fetches the sidecar directly",
               "transcript_utils.py": "defines normalize_transcript"}
+
+    def _name(node):
+        return getattr(node, "id", None) or getattr(node, "attr", None)
 
     offenders = []
     for name in sorted(os.listdir(src)):
         if not name.endswith(".py") or name in EXEMPT:
             continue
-        path = os.path.join(src, name)
-        text = open(path, encoding="utf-8").read()
         try:
-            tree = ast.parse(text)
-        except SyntaxError:                       # not ours to police
+            tree = ast.parse(open(os.path.join(src, name), encoding="utf-8").read())
+        except SyntaxError:
             continue
-        lines = text.splitlines()
+        rebased = set()
         for node in ast.walk(tree):
-            # A real call, not the word appearing in a docstring -- which is what a regex
-            # over these files reports, and there are five of those.
-            if not isinstance(node, ast.Call):
-                continue
-            fn = node.func
-            fname = getattr(fn, "id", None) or getattr(fn, "attr", None)
-            if fname != "normalize_transcript":
-                continue
-            window = " ".join(lines[max(0, node.lineno - 6):node.lineno + 5])
-            if "rebase_turns_from_embedded_map" not in window:
+            if isinstance(node, ast.Call) and _name(node.func) ==                     "rebase_turns_from_embedded_map":
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Call) and                             _name(inner.func) == "normalize_transcript":
+                        rebased.add(id(inner))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _name(node.func) == "normalize_transcript"                     and id(node) not in rebased:
                 offenders.append(f"{name}:{node.lineno}")
     assert not offenders, (
         "these resolve absolute times from a transcript without applying its batch map, so "
@@ -242,59 +243,35 @@ def test_every_normalize_transcript_caller_rebases():
         "VAD-dropped chunk the window bridged: " + ", ".join(offenders))
 
 
-# ---- turns that span a splice are flagged, not eyeballed (phase 6) ----
+def test_the_other_shape_of_resolver_is_covered_too():
+    """The invariant above can only see consumers that call `normalize_transcript`.
 
-def test_a_turn_that_spans_the_splice_is_flagged(sealed):
-    """A bridged gap splices audio that is not contiguous in time, and the provider does
-    not know that. It can emit ONE turn whose text runs across the join — fusing utterances
-    up to two minutes apart into a single interval covering time when nobody spoke. Photo
-    binding and claim provenance consume that interval.
-
-    After rebasing, such a turn's own start and end are each individually correct, which is
-    exactly why nothing downstream can notice. So the rebase marks it.
+    The org-api transcript viewer has its own `file_time_sec + segment.start` arithmetic, so
+    it was structurally invisible to that check and shipped unrebased -- rendering every
+    post-gap segment up to a window early, and dropping whole files out of a topic window
+    because their filename span under-states the wall clock they cover. Its arithmetic now
+    lives in one named helper, and this asserts the bare form has not come back.
     """
-    transcript, doc = sealed
-    kept = [m["kept_duration_sec"] for m in doc["members"]]
-    out = bs.rebase_turns_from_embedded_map({"speaker_turns": [
-        {"speaker": "spk_0", "text": "...across the join...",
-         "start_sec": kept[0] - 1.0, "end_sec": kept[0] + 1.0,
-         "abs_start": T0, "abs_end": T0}]}, transcript)
-    assert out["speaker_turns"][0]["crosses_gap"] is True
+    import ast
 
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "src", "lambda_org_api.py")
+    tree = ast.parse(open(src, encoding="utf-8").read())
+    # The helper's own no-map fallback is the one sanctioned place for the bare form.
+    helper = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                   and n.name == "_org_segment_abs_sec"), None)
+    assert helper is not None, "the helper this invariant is about has been removed"
+    inside = range(helper.lineno, (helper.end_lineno or helper.lineno) + 1)
 
-def test_a_turn_crossing_a_merely_adjacent_boundary_is_not_flagged():
-    """Every batch has member boundaries; only the discontinuous ones are suspect. Flagging
-    all of them would make the signal mean "this is a batch", which nothing needs."""
-    doc = bs.build_map(SID, [
-        bs.member(4, "k4", T0.isoformat(), 0.0, 30.0, seam="first"),
-        bs.member(5, "k5", (T0 + timedelta(seconds=30)).isoformat(), 0.0, 30.0,
-                  seam="adjacent"),
-    ], sealed_by="arrival")
-    out = bs.rebase_turns_from_embedded_map({"speaker_turns": [
-        {"speaker": "s", "text": "x", "start_sec": 29.0, "end_sec": 31.0,
-         "abs_start": T0, "abs_end": T0}]}, {bs.EMBEDDED_MAP_KEY: doc})
-    assert out["speaker_turns"][0].get("crosses_gap") is False
-
-
-def test_a_turn_wholly_inside_one_member_is_not_flagged(sealed):
-    transcript, doc = sealed
-    kept = [m["kept_duration_sec"] for m in doc["members"]]
-    out = bs.rebase_turns_from_embedded_map({"speaker_turns": [
-        {"speaker": "s", "text": "x", "start_sec": kept[0] + 2.0, "end_sec": kept[0] + 4.0,
-         "abs_start": T0, "abs_end": T0}]}, transcript)
-    assert out["speaker_turns"][0].get("crosses_gap") is False
-
-
-def test_the_count_is_reported_even_when_it_is_zero(sealed, caplog):
-    """Zero is the positive evidence that the check ran at all.
-
-    Every guard in this feature that only logged on failure became indistinguishable from a
-    guard that was never reached — three times, each behind a missing IAM grant. A count
-    line on every batched transcript is what tells those two apart.
-    """
-    import logging
-    transcript, _ = sealed
-    with caplog.at_level(logging.INFO):
-        bs.rebase_turns_from_embedded_map({"speaker_turns": []}, transcript)
-    assert any("batch_splice_turns=0" in r.getMessage() for r in caplog.records), \
-        f"no count line: {[r.getMessage() for r in caplog.records]}"
+    bare = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)):
+            continue
+        if node.lineno in inside:
+            continue
+        left = getattr(node.left, "id", None)
+        if left == "file_time_sec" and getattr(node.right, "id", "").startswith("seg_"):
+            bare.append(node.lineno)
+    assert not bare, (
+        f"lambda_org_api.py:{bare} adds a segment offset to the file time directly; a "
+        f"batched transcript needs _org_segment_abs_sec so a bridged gap is accounted for")

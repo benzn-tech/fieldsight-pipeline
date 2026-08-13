@@ -335,11 +335,6 @@ def test_no_bn1_object_is_ever_written(wired, monkeypatch):
     assert [k for k in s3.put_keys(".wav") if "_bn1_" in k] == []
 
 
-def test_the_window_length_is_reachable_from_the_environment():
-    """A knob only a code change can turn is not a knob -- FILTER_AUDIO_EVENT_TAGS shipped
-    that way and was documented as a rollback while no workflow passed it."""
-    assert isinstance(mod.BATCH_WINDOW_SEC, (int, float))
-    assert mod.BATCH_WINDOW_SEC == 120
 
 
 # ---- the map travels inside the transcript (phase 5b) ----
@@ -385,3 +380,34 @@ def test_a_per_chunk_transcript_gains_nothing_and_reads_nothing(wired):
     written = [p for p in s3.puts if p["Key"].startswith("transcripts/")][0]
     assert bs.EMBEDDED_MAP_KEY not in json.loads(written["Body"])
     assert not any(k.endswith("_batch_map.json") for k in s3.gets)
+
+
+# ---- batching only works on a provider whose output we write ourselves ----
+
+def test_batching_refuses_the_async_transcribe_provider(wired):
+    """AWS Transcribe writes its own output object; there is no hook to embed the map in it.
+
+    Batching plus that provider therefore produces batch transcripts with no
+    `fieldsight_batch_map`, and every consumer silently falls back to filename arithmetic --
+    mis-timed by the trimmed overlap and by the whole of any bridged gap, with no error
+    anywhere. The plan promised this refusal and it was never written.
+    """
+    mp, s3, ledger, calls = wired
+    mp.setattr(mod, "ASR_PROVIDER", "transcribe")
+    handled = mod._maybe_batch("b", unit_key(0), [])
+    assert handled is False, "must fall through to per-chunk, not accumulate a batch"
+    assert ledger.registered == [], "nothing may be registered under a provider we cannot embed for"
+
+
+def test_the_window_length_is_read_from_the_environment_not_hardcoded(monkeypatch):
+    """The previous version of this asserted `BATCH_WINDOW_SEC == 120`, which passes just as
+    well if the env read is deleted and 120 written in its place -- so it guarded the value
+    and not the wiring. Reload the module with the variable set to something else."""
+    import importlib
+    monkeypatch.setenv("BATCH_WINDOW_SEC", "45")
+    reloaded = importlib.reload(mod)
+    try:
+        assert reloaded.BATCH_WINDOW_SEC == 45
+    finally:
+        monkeypatch.delenv("BATCH_WINDOW_SEC")
+        importlib.reload(mod)

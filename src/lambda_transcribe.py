@@ -375,6 +375,16 @@ def _maybe_batch(bucket, key, results):
         logger.warning("batch: TRANSCRIBE_WHOLE_CHUNK is off, so a chunk is several units "
                        "— falling back to per-chunk transcription for %s", key)
         return False
+    if ASR_PROVIDER != 'elevenlabs':
+        # AWS Transcribe writes its own output object and there is no hook to embed the map
+        # in it. A batch transcribed that way carries no `fieldsight_batch_map`, so every
+        # consumer silently falls back to filename arithmetic — wrong by the trimmed overlap
+        # and by the whole of any bridged gap, with no error anywhere. Refuse loudly instead:
+        # per-chunk transcription is correct, just more requests.
+        logger.warning("batch: ASR_PROVIDER=%s writes its own output, so a batch could not "
+                       "carry its time map — falling back to per-chunk for %s",
+                       ASR_PROVIDER, key)
+        return False
 
     now = int(time.time())
     table = _get_dynamodb_table()
