@@ -466,3 +466,56 @@ def test_withdrawal_reaches_names_from_corrections_that_never_enrolled():
     assert "correction_ref IN" in sql
     assert "voiceprint_id = %s" in sql, (
         "a correction whose enrolment was refused leaves names nothing can reach")
+
+
+# ---- removing a name without touching a voiceprint ---------------------
+#
+# Verified live on TEST: a session held seven named turns and withdrawal could reach exactly
+# one. The other six came from corrections made WITHOUT consent — no profile was created, so
+# there is nothing to withdraw and nothing to point a withdrawal at.
+#
+# "Delete my voiceprint" and "take my name off this meeting" are different requests, and the
+# second is the ordinary one. It had no API at all.
+
+
+def test_a_name_can_be_removed_from_one_session():
+    conn = FakeConn([[{"id": "t1"}, {"id": "t2"}]])
+    n = voiceprints.unname(conn, CO, session_base="sid" + "a" * 32, display_name="Ben L")
+    assert n == 2
+    sql = " ".join(conn.calls[0]["sql"].split())
+    assert "UPDATE speaker_turn_names SET superseded_at" in sql
+    assert "display_name = %s" in sql
+    assert "session_base = %s" in sql
+
+
+def test_removing_a_name_is_company_scoped():
+    conn = FakeConn([[]])
+    voiceprints.unname(conn, CO, session_base="s", display_name="Ben L")
+    assert "company_id = %s" in conn.calls[0]["sql"]
+    assert CO in conn.calls[0]["params"]
+
+
+def test_removing_a_name_leaves_other_sessions_alone():
+    """A person may be named correctly in twenty meetings and wrongly in one. Removing the
+    name everywhere would be a different request nobody made."""
+    conn = FakeConn([[]])
+    voiceprints.unname(conn, CO, session_base="only-this-one", display_name="Ben L")
+    assert "only-this-one" in conn.calls[0]["params"]
+
+
+def test_names_are_superseded_not_deleted():
+    """Same reason as everywhere else here: the audit of a removal is partly the record that
+    something was shown, and a deleted row cannot say so."""
+    conn = FakeConn([[]])
+    voiceprints.unname(conn, CO, session_base="s", display_name="Ben L")
+    assert "DELETE" not in conn.calls[0]["sql"].upper()
+
+
+def test_removing_a_name_does_not_touch_the_voiceprint():
+    """Deliberately separate. Somebody who wants their name off one transcript has not asked
+    for their profile to be destroyed, and doing both would answer a question they did not
+    ask."""
+    conn = FakeConn([[]])
+    voiceprints.unname(conn, CO, session_base="s", display_name="Ben L")
+    assert len(conn.calls) == 1
+    assert "speaker_voiceprint" not in conn.calls[0]["sql"]

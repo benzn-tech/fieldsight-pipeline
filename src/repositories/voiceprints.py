@@ -340,3 +340,37 @@ def live_turn_names(conn, company_id, session_base) -> list[dict]:
         "ORDER BY created_at",
         (company_id, session_base),
     ).fetchall()
+
+
+def unname(conn, company_id, session_base, display_name) -> int:
+    """Take a name off one session's transcript. Returns how many turns stopped showing it.
+
+    Separate from `withdraw` on purpose, because they answer different questions and only one
+    of them has a handle in every case:
+
+    * `withdraw` removes a stored voiceprint and everything it justified. It needs a profile,
+      and a correction made without consent creates none — so on TEST a session held seven
+      named turns and withdrawal could reach exactly one.
+    * this removes a NAME from a TRANSCRIPT. It is the ordinary request ("that is not me"),
+      it needs no profile, and it had no API at all until 2026-08-14.
+
+    It deliberately does not touch the voiceprint. Somebody who wants their name off one
+    meeting has not asked for their profile to be destroyed, and doing both would answer a
+    question they did not ask.
+
+    Scoped to ONE session: a person may be named correctly in twenty meetings and wrongly in
+    one. Superseded rather than deleted, like every other removal here — the audit of a
+    removal is partly the record that something was once shown.
+    """
+    _require_company(company_id)
+    if not display_name:
+        raise ValueError("display_name is required — an absent one would clear every name "
+                         "in the session, which is a different request")
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "UPDATE speaker_turn_names SET superseded_at = now() "
+        "WHERE company_id = %s AND session_base = %s AND display_name = %s "
+        "  AND superseded_at IS NULL "
+        "RETURNING id",
+        (company_id, session_base, display_name),
+    ).fetchall()
+    return len(rows)

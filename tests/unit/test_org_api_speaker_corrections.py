@@ -457,3 +457,55 @@ def test_the_request_artifact_carries_no_voice_vectors(wired):
     assert "profiles" not in doc, (
         "the artifact still carries a profile list; even empty, the field invites somebody "
         "to fill it")
+
+
+# ---- taking a name off a meeting ---------------------------------------
+
+
+def _unname_event(name="Ben L", sub="sub-1", session=None):
+    return {"httpMethod": "DELETE",
+            "path": f"/api/org/sessions/{session or SESSION}/speaker-names",
+            "queryStringParameters": {"name": name}, "body": None,
+            "requestContext": {"authorizer": {"claims": {"sub": sub}}}}
+
+
+def test_a_name_can_be_taken_off_a_meeting(wired, monkeypatch):
+    monkeypatch.setattr(org.voiceprints, "unname",
+                        lambda conn, company_id, session_base, display_name: 3)
+    res = org.lambda_handler(_unname_event(), None)
+    assert res["statusCode"] == 200
+    assert _body(res)["turnsUnnamed"] == 3
+
+
+def test_it_works_when_there_is_no_voiceprint_to_withdraw(wired, monkeypatch):
+    """The case that has no other route. A correction made without consent creates no
+    profile, so `DELETE /voiceprints/{id}` has nothing to point at — on TEST that left six of
+    seven named turns unreachable."""
+    seen = {}
+    monkeypatch.setattr(org.voiceprints, "unname",
+                        lambda conn, company_id, session_base, display_name:
+                        seen.update({"co": company_id, "s": session_base,
+                                     "n": display_name}) or 6)
+    org.lambda_handler(_unname_event(), None)
+    assert seen["co"] == "c-1", "the company came from somewhere other than the caller"
+    assert seen["n"] == "Ben L"
+    import turn_name_overlay as tno
+    assert seen["s"] == tno.session_base(SESSION), "the session key was not normalised"
+
+
+def test_a_missing_name_is_refused(wired):
+    ev = _unname_event()
+    ev["queryStringParameters"] = None
+    res = org.lambda_handler(ev, None)
+    assert res["statusCode"] == 400
+
+
+def test_a_worker_cannot_take_a_name_off(wired, monkeypatch):
+    monkeypatch.setattr(org.users, "get_user_by_sub",
+                        lambda conn, sub: dict(CALLER, global_role="worker"))
+    assert org.lambda_handler(_unname_event(), None)["statusCode"] == 403
+
+
+def test_unnaming_404s_when_the_feature_is_off(wired, monkeypatch):
+    monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "off")
+    assert org.lambda_handler(_unname_event(), None)["statusCode"] == 404
