@@ -377,3 +377,31 @@ def test_a_withdrawn_profile_is_not_reused():
     sql = " ".join(conn.calls[0]["sql"].split())
     assert "status <> 'withdrawn'" in sql, (
         f"the lookup does not exclude withdrawn profiles: {sql}")
+
+
+def test_two_people_with_the_same_name_get_two_profiles():
+    """Matching on `display_name` alone merges them — one person's voice stored under the
+    other's consent, and no way to tell afterwards which samples belong to whom. That is the
+    UNSAFE direction: duplicate profiles merely degrade into refusals (a person becomes his
+    own runner-up and the margin refuses), while a merge is a wrong confident answer about
+    somebody's biometric data.
+
+    `consented_by` is the anchor, and it is required whenever a name is given, so it exists
+    exactly when it is needed.
+    """
+    conn = FakeConn([[], [{"id": "vp-b"}]])
+    voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True,
+                               consented_by="person-B")
+    lookup = conn.calls[0]
+    assert "person-B" in lookup["params"], (
+        "the lookup matched on the name alone, so two different people sharing one merge")
+
+
+def test_the_same_person_correcting_twice_reuses_one_profile():
+    """The other side of it: two profiles for one voice make that person his own runner-up,
+    which is the failure `aggregate_scores` was written for."""
+    conn = FakeConn([[{"id": "vp-existing"}]])
+    got = voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True,
+                                     consented_by="person-A")
+    assert got["id"] == "vp-existing"
+    assert len(conn.calls) == 1

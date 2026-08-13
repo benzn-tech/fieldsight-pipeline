@@ -98,11 +98,21 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
             "voice it is (§6) — an unnamed profile may be created instead")
     cur = conn.cursor(row_factory=dict_row)
     if display_name:
+        # Matched on the PERSON, not on the string. Two real people in one company can share
+        # a display name, and merging them stores one person's voice under the other's
+        # consent with no way to tell afterwards which samples belong to whom.
+        #
+        # The two failure directions are not symmetric, which is what decides this: a
+        # duplicate profile degrades into a REFUSAL — the person becomes his own runner-up
+        # and the margin declines to confirm — while a merge is a wrong confident answer
+        # about somebody's biometric data. `consented_by` is required whenever a name is
+        # given, so the anchor exists exactly when it is needed.
         found = cur.execute(
             "SELECT id FROM speaker_voiceprints "
-            "WHERE company_id = %s AND display_name = %s AND status <> 'withdrawn' "
+            "WHERE company_id = %s AND display_name = %s AND consented_by = %s "
+            "  AND status <> 'withdrawn' "
             "ORDER BY created_at LIMIT 1",
-            (company_id, display_name)).fetchone()
+            (company_id, display_name, consented_by)).fetchone()
         if found:
             return found
     return cur.execute(
