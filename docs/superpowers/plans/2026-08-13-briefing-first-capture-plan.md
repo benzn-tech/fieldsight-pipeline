@@ -76,7 +76,7 @@ T1, T2, T5 are each independently shippable and improve the EXISTING pipeline on
 
 **Goal.** Give Aurora the literal-keyword instruments the retrieval layer needs (spec §3 measured: zero GIN/tsvector/trigram indexes today, `"Plaud"` → 0) and the entity/alias store, plus a turn-level transcript store that carries **word-level time anchors** natively (today they die when windows are cut to a topic's minute-granularity `time_range`).
 
-**Migration number: `0042`** — 0040 is the highest on develop, 0038's header reserves 0039, and **0041 was claimed by `feat/user-deletion-schema` (PR #459) while this plan was being written**. That is exactly the collision to watch for: re-check `src/migrations/` on `origin/develop` AND every open PR immediately before writing the file, and renumber upward. Never reuse a number — two migrations sharing one number means whichever deploys second is silently skipped by the runner.
+**Migration number: `0042`** — 0040 is the highest on develop, 0038's header reserves 0039, and **0041 was claimed by `feat/user-deletion-schema` (PR #459) while this plan was being written**. That is exactly the collision to watch for: re-check `src/migrations/` on `origin/develop` AND every open PR immediately before writing the file, and renumber upward. Never reuse a number. Not because the runner drops one — it tracks applied migrations by full FILENAME (`schema_migrations.version` stores `fname`), so two files sharing a number both run. The hazard is ORDER: `apply_migrations` reads `os.listdir(migrations_dir)` and sorts by the integer alone, and that sort is stable, so two files with equal numbers execute in whatever order the filesystem happened to return. Nobody chose it, and it can differ between a local run and the Lambda package. Harmless while the two are unrelated; silent corruption the first time they are not.
 
 **What changes — `src/migrations/0042_briefing_search.sql`:**
 - `CREATE EXTENSION IF NOT EXISTS pg_trgm;` (0001 created `vector` + `pgcrypto` the same way; the migration role can create extensions).
@@ -322,8 +322,22 @@ and so does an open PR.
   same prompt block. If #404's author is still active, the one-line addition
   is better landed there than here.
 
-**The migration collision is the lesson worth keeping.** `0041` was claimed at
-01:01 and this plan allocated the same number at 01:06. Git would have merged
-both files without complaint — two migrations sharing a number is not a text
-conflict, it is a silent skip at deploy time. Numbers must be checked against
-open PRs, not just against the working tree.
+**The migration collision is the lesson worth keeping — and it has since
+happened for real.** `0041` was claimed by `feat/user-deletion-schema` at 01:01
+and this plan allocated the same number at 01:06. Renumbering to `0042` avoided
+one collision; another landed anyway. As of ~02:45 `origin/develop` carries
+**both** `0041_turn_name_display.sql` and `0041_user_deletion.sql`.
+
+Git merges two same-numbered files without complaint — it is not a text
+conflict. **Correction to an earlier version of this plan:** neither file is
+skipped. `src/db/migrate.py` keys `schema_migrations` on the full filename, so
+both run. What is undefined is their ORDER: `all_files = os.listdir(...)` then
+`sorted(todo, key=parse_version)`, a stable sort on the integer alone, leaves
+equal numbers in filesystem order. Those two are independent —
+`speaker_turn_names` and `redactions` — so tonight is safe. The next pair may
+not be.
+
+Numbers must be checked against open PRs, not just the working tree. A stricter
+guard worth considering separately: make `parse_version` reject a duplicate
+number outright, so the collision fails loudly at deploy instead of resolving
+itself by directory listing.
