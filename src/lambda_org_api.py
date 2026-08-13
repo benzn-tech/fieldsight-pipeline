@@ -614,6 +614,9 @@ def dispatch(conn, event, method, route):
     m_srs = re.match(r"^/sessions/([^/]+)/report/status$", route)
     if m_srs and method == "GET":
         return session_report_status(conn, caller, m_srs.group(1), event)
+    m_vw = re.match(r"^/voiceprints/([^/]+)$", route)
+    if m_vw and method == "DELETE":
+        return withdraw_voiceprint(conn, caller, m_vw.group(1))
     m_sc = re.match(r"^/sessions/([^/]+)/speaker-corrections$", route)
     if m_sc and method == "POST":
         return speaker_corrections(conn, caller, m_sc.group(1), event)
@@ -1242,6 +1245,32 @@ def _session_turns(folder, date, session_base):
         out.append({"source_filename": name, "start_sec": float(start),
                     "end_sec": float(start) + float(seg.get("duration") or 0.0)})
     return out
+
+
+def withdraw_voiceprint(conn, caller, voiceprint_id):
+    """DELETE /api/org/voiceprints/{id} — honour a withdrawal.
+
+    §6 requires this to exist, and until enrolment landed there was nothing to withdraw, so
+    it did not. A feature that can create biometric data and offers no way to take it back
+    is not a smaller version of the right thing.
+
+    The vectors go; the profile row survives as `withdrawn`, because a record that something
+    existed and was removed is what an audit of a withdrawal consists of — and because a
+    deleted row would be silently re-created by the next correction naming the same person.
+
+    The count of removed samples comes back rather than a bare 200: "we did it" and "there
+    was nothing there" look identical otherwise, and they mean different things to whoever
+    asked.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    # Company from the caller, never the path: a valid uuid from another tenant would
+    # otherwise be a delete button on their data.
+    removed = voiceprints.withdraw(conn, str(caller["company_id"]), voiceprint_id)
+    logger.info("voiceprint withdrawn: %s (%d samples)", voiceprint_id, len(removed))
+    return ok({"voiceprintId": voiceprint_id, "samplesRemoved": len(removed)})
 
 
 def speaker_corrections(conn, caller, session_base, event):

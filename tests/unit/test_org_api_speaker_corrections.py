@@ -392,3 +392,50 @@ def test_the_response_does_not_promise_an_enrolment_it_cannot_guarantee(wired, m
                                              consented_by="u-9")), None))
     assert b["enrolment"] == "requested"
     assert b["enrolmentMayBeRefused"] is True
+
+
+# ---- withdrawal ---------------------------------------------------------
+#
+# §6 requires a voiceprint to be withdrawable, and until now `withdraw()` existed with no
+# endpoint — the feature could create biometric data and offered no way to take it back.
+# That was tolerable while nothing was stored; enrolment made it not.
+
+
+def _del_event(vp_id="vp-1", sub="sub-1"):
+    return {"httpMethod": "DELETE",
+            "path": f"/api/org/voiceprints/{vp_id}",
+            "queryStringParameters": None, "body": None,
+            "requestContext": {"authorizer": {"claims": {"sub": sub}}}}
+
+
+def test_a_withdrawal_removes_the_vectors_and_reports_what_it_removed(wired, monkeypatch):
+    monkeypatch.setattr(org.voiceprints, "withdraw",
+                        lambda conn, company_id, vp: ["s1", "s2"])
+    res = org.lambda_handler(_del_event(), None)
+    assert res["statusCode"] == 200
+    assert _body(res)["samplesRemoved"] == 2
+
+
+def test_a_withdrawal_is_company_scoped(wired, monkeypatch):
+    """The company comes from the caller, never the path. Otherwise a valid uuid from
+    another tenant is a delete button on their data."""
+    seen = {}
+    monkeypatch.setattr(org.voiceprints, "withdraw",
+                        lambda conn, company_id, vp: seen.update(
+                            {"co": company_id, "vp": vp}) or [])
+    org.lambda_handler(_del_event("vp-other"), None)
+    assert seen["co"] == "c-1"
+
+
+def test_a_worker_cannot_withdraw(wired, monkeypatch):
+    monkeypatch.setattr(org.users, "get_user_by_sub",
+                        lambda conn, sub: dict(CALLER, global_role="worker"))
+    assert org.lambda_handler(_del_event(), None)["statusCode"] == 403
+
+
+def test_withdrawal_404s_when_the_feature_is_off(wired, monkeypatch):
+    """The rollback has to remove the whole surface, including the way out. Rows left behind
+    by a switched-off feature are still rows somebody may need removed — but the route not
+    existing is what `off` means everywhere else, and a half-present feature is worse."""
+    monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "off")
+    assert org.lambda_handler(_del_event(), None)["statusCode"] == 404
