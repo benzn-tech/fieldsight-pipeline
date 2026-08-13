@@ -3916,11 +3916,17 @@ Resources:
         Transcription failed for at least one segment. Each failure is audio that has no
         transcript and that nothing retries -- check for HTTP 429 (provider concurrency)
         first, then re-drive the affected keys.
-      Namespace: AWS/Lambda
-      MetricName: Errors
+      # NOT AWS/Lambda Errors. A provider rejection is caught by the per-record `except`
+      # and the handler returns 200, so that metric stays at zero -- the 27 batches lost to
+      # HTTP 429 on one replay would have left an Errors alarm green, which is how this
+      # alarm was first written. The transcriber emits this count itself, as an Embedded
+      # Metric Format log line: `logs:PutMetricFilter` is implicitDeny on the deploy role,
+      # and EMF needs no permission and no resource at all.
+      Namespace: FieldSight/Transcribe
+      MetricName: TranscriptionFailures
       Dimensions:
-        - Name: FunctionName
-          Value: !Ref TranscribeFunction
+        - Name: Stage
+          Value: !Ref Stage
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1

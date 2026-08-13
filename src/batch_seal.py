@@ -169,8 +169,16 @@ def _seal_claimed(s3, bucket, session_id, run, by_index, now, table, sealed_by,
                   claim_key):
     """The work, once this worker owns the claim."""
     if len(run) == 1:
-        return bypass_singleton(s3, bucket, session_id, run[0],
-                                by_index[run[0]]['chunk_key'], now, table)
+        out = bypass_singleton(s3, bucket, session_id, run[0],
+                               by_index[run[0]]['chunk_key'], now, table)
+        # Close the claim we took. It is on the BUCKET; the bypass records are on the
+        # MEMBER, so nothing else marks it and it sat at `sealing` forever -- after which a
+        # sibling of that bucket arriving later found a fresh-looking claim, `claim_seal`
+        # refused, and within the 900-second takeover window (which includes the one-shot
+        # close pass) that chunk was never sealed, bypassed or transcribed.
+        if claim_key is not None and claim_key != run[0]:
+            batch_ledger.mark_bypassed(table, session_id, claim_key, now)
+        return out
 
     payloads, members, trims = [], [], []
     for pos, idx in enumerate(run):

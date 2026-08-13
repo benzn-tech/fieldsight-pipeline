@@ -434,3 +434,31 @@ def test_a_member_key_that_is_not_a_unit_raises():
     of the voiceprint thresholds hold — plausible numbers instead of an error."""
     with pytest.raises(ValueError):
         batch_seal.raw_window_for_member("nonsense.wav", 0.0, 1.0)
+
+
+def test_a_singleton_bypass_closes_the_bucket_claim_it_took(s3):
+    """The claim is on the BUCKET; the bypass records are on the MEMBER. Nothing closed the
+    claim, so it sat at `sealing` forever.
+
+    Consequence: a sibling chunk of that same bucket arriving later plans, finds a
+    fresh-looking `sealing` record, and `claim_seal` refuses. Within the 900-second takeover
+    window -- which includes the one-shot close pass -- that chunk is never sealed, never
+    bypassed and never transcribed.
+    """
+    import batch_ledger as bl
+    table = FakeTable()
+    bl.register_chunk(table, SID, 4, unit_key(4, "09-00-00"), 0)
+    bucket = bl.bucket_for_index({"chunk_key": unit_key(4, "09-00-00")})
+
+    batch_seal.seal_batch(s3, "b", SID, [4], _by_index((4, "09-00-00")), 100, table,
+                          claim_key=bucket)
+
+    assert bl.seal_status(table, SID, bucket) == "bypassed", \
+        "the bucket claim must be closed, not left in flight"
+
+    # and a sibling that turns up later can still be dealt with
+    bl.register_chunk(table, SID, 5, unit_key(5, "09-00-30"), 200)
+    rows = bl.list_members(table, SID)
+    out = bl.pending_buckets(rows, 100000, grace_sec=150, table=table, session_id=SID)
+    assert out["stragglers"] == [5] or any(5 in v for _, v in out["ready"]), \
+        f"chunk 5 must be actionable, not stuck behind a dead claim: {out}"

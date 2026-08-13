@@ -338,6 +338,42 @@ def write_ledger_record(display_name, file_date, base_name, job_name,
 # minute).
 
 
+def _emit_failure_metric(key, exc):
+    """Count a caught transcription failure where something outside the log can see it.
+
+    The failure is caught here and the handler returns 200, so Lambda's own `Errors` metric
+    stays at zero -- the 27 batches lost to provider 429s on one replay would have left an
+    Errors alarm green. This is the one signal that reaches CloudWatch.
+
+    Embedded Metric Format rather than a metric filter: `logs:PutMetricFilter` is
+    implicitDeny on the deploy role, and EMF needs no permission and no resource at all --
+    CloudWatch Logs extracts the metric from the log line itself.
+
+    Printed, not logged: the logger's formatter would prefix the line and EMF requires the
+    record to be bare JSON. Never raises; a metric that fails to emit must not become a
+    second failure on top of the first.
+    """
+    try:
+        import time as _t
+
+        print(json.dumps({
+            "_aws": {
+                "Timestamp": int(_t.time() * 1000),
+                "CloudWatchMetrics": [{
+                    "Namespace": "FieldSight/Transcribe",
+                    "Dimensions": [["Stage"]],
+                    "Metrics": [{"Name": "TranscriptionFailures", "Unit": "Count"}],
+                }],
+            },
+            "Stage": os.environ.get("STAGE", "unknown"),
+            "TranscriptionFailures": 1,
+            "key": key,
+            "reason": str(exc)[:200],
+        }))
+    except Exception:
+        logger.warning("could not emit the failure metric for %s", key)
+
+
 def _embed_batch_map(bucket, key, transcript_json):
     """Carry a batch's time map inside the transcript that needs it.
 
@@ -552,6 +588,7 @@ def lambda_handler(event, context):
             
         except Exception as e:
             logger.error(f"Error processing {key}: {str(e)}")
+            _emit_failure_metric(key, e)
             results.append({
                 'key': key,
                 'status': 'error',

@@ -717,8 +717,10 @@ def test_the_transcriber_has_an_error_alarm():
     block = re.search(r"\n  TranscribeErrorAlarm:\n(.*?)(?=\n  \w+:\n)", text, re.S)
     assert block, "no TranscribeErrorAlarm in the template"
     body = block.group(1)
-    assert "MetricName: Errors" in body
-    assert "!Ref TranscribeFunction" in body
+    # NOT AWS/Lambda Errors: a caught provider rejection returns 200, so that metric never
+    # moves. The alarm has to watch a count the function emits itself.
+    assert "MetricName: TranscriptionFailures" in body
+    assert "Namespace: FieldSight/Transcribe" in body
     assert "!Ref AlertTopic" in body, "an alarm nobody is told about is not an alarm"
 
 
