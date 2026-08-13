@@ -2702,22 +2702,18 @@ Resources:
       ReservedConcurrentExecutions: 5
       Layers:
         - !Ref VadLayerArn
-      VpcConfig:
-        SubnetIds: !Ref DbSubnetIds
-        SecurityGroupIds:
-          - !ImportValue
-            Fn::Sub: "${DbStackName}-LambdaSG"
+      # NO VpcConfig and NO PG credentials, deliberately. This function reaches nothing but
+      # S3, and it CANNOT hold a database connection: it runs on python3.12 because that is
+      # where onnxruntime comes from (fieldsight-vad-layer is cp312-only) while PsycopgLayer
+      # is cp311-only. Carrying PGDATABASE here once made every invocation raise
+      # ModuleNotFoundError while the deploy stayed green and every unit test passed.
+      # Profiles arrive in the event from org-api, which is in-VPC and already owns the
+      # consent/withdrawn filters that must not exist in two places.
       Environment:
         Variables:
           S3_BUCKET: !Ref IngestBucketName
           ECAPA_MODEL_S3_KEY: models/ecapa_tdnn.onnx
-          PGHOST: !ImportValue
-            Fn::Sub: "${DbStackName}-ClusterEndpoint"
-          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
-          PGUSER: postgres
-          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
       Policies:
-        - VPCAccessPolicy: {}
         - Version: '2012-10-17'
           Statement:
             # The raw device uploads -- never audio_segments/. Phase 0's numbers are

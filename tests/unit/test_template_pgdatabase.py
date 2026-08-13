@@ -23,7 +23,11 @@ def test_all_pgdatabase_values_are_guarded_by_the_condition():
     # bare !ImportValue (that would be an un-switched function).
     guarded = len(re.findall(r"PGDATABASE:\s*!If \[HasPgDatabaseOverride", t))
     bare = len(re.findall(r"PGDATABASE:\s*!ImportValue", t))
-    # 18 since speaker identity phase 3 added the in-VPC SpeakerEmbedFunction
+    # Back to 17: SpeakerEmbedFunction took its PGDATABASE away again when it became pure
+    # compute. It briefly had one (18) and that was the defect — it runs on python3.12 for
+    # onnxruntime while PsycopgLayer is cp311-only, so holding a connection made every
+    # invocation raise ModuleNotFoundError with a green deploy behind it. The count moving
+    # DOWN is as informative as it moving up.
     # (17 with life-conversation phase 2's NonWorkExpiryFunction; 16 with the device
     # ledger's DeviceLedgerFunction; 15 when the chunk-driven session lifecycle added
     # SessionActivityFunction; 14 when the Tier-0 finalize plan added
@@ -33,5 +37,5 @@ def test_all_pgdatabase_values_are_guarded_by_the_condition():
     # The count is the point: a new in-VPC function is meant to make this test fail, so
     # that whoever adds one has to look at whether they guarded PGDATABASE rather than
     # discovering months later that test writes went to the prod database.
-    assert guarded == 18, f"expected 18 guarded PGDATABASE, found {guarded}"
+    assert guarded == 17, f"expected 17 guarded PGDATABASE, found {guarded}"
     assert bare == 0, f"found {bare} un-switched bare PGDATABASE !ImportValue"
