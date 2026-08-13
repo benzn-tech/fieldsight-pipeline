@@ -293,7 +293,8 @@ def locate_in_members(map_doc, start_sec, end_sec) -> list[dict]:
     """Batch-relative coordinates back to the device's own chunks.
 
     A batched turn's `source_filename` is the stitched object under `audio_segments/` and
-    its offsets are batch-relative (see `apply_batch_map`). Any consumer that needs the RAW
+    its offsets are batch-relative (see `rebase_turns_from_embedded_map`). Any consumer that
+    needs the RAW
     audio — the voiceprint path, whose every threshold was measured on raw audio and does
     not transfer to the normalised copy — has to come back through here rather than
     abandoning that rule or parsing the filename.
