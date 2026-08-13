@@ -733,3 +733,52 @@ def test_the_transcriber_has_a_throttle_alarm():
     block = re.search(r"\n  TranscribeThrottleAlarm:\n(.*?)(?=\n  \w+:\n)", text, re.S)
     assert block, "no TranscribeThrottleAlarm in the template"
     assert "MetricName: Throttles" in block.group(1)
+
+
+# ----------------------------------------------------------
+# The speaker embedder. Three things about it have already gone wrong once each elsewhere
+# in this stack, so each is pinned rather than trusted:
+#   * a function that reads S3 without the grant (three times tonight, each a single
+#     WARNING behind a guard);
+#   * a missing ListBucket, which turns "not there" into 403 and makes it look like "not
+#     allowed" — or the reverse, depending on which one you were expecting;
+#   * a cp312-only layer attached to a function on another runtime, which fails at import.
+# ----------------------------------------------------------
+
+
+def test_the_embedder_may_read_the_audio_and_the_model():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "SpeakerEmbedFunction")
+    reads = [s for s in blk.split("- Effect: Allow") if "s3:GetObject" in s]
+    for prefix in ("users/*", "models/*"):
+        assert any(prefix in s for s in reads), (
+            f"SpeakerEmbedFunction has no s3:GetObject on {prefix} — it reads the raw "
+            f"upload and downloads its own model, and a denial there is invisible")
+
+
+def test_the_embedder_can_tell_a_missing_key_from_a_denied_one():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "SpeakerEmbedFunction")
+    assert "s3:ListBucket" in blk, (
+        "without ListBucket S3 answers 403 for a key that does not exist, so the function "
+        "cannot distinguish a missing recording from a permissions fault")
+
+
+def test_the_embedder_runs_on_the_runtime_its_layer_was_built_for():
+    """`fieldsight-vad-layer` is cp312-only. Attached to a function on another runtime it
+    fails at import, not at deploy."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "SpeakerEmbedFunction")
+    assert "VadLayerArn" in blk, "the embedder needs onnxruntime, which that layer carries"
+    assert "python3.12" in blk, (
+        "the embedder attaches the cp312-only VAD layer but does not pin Runtime to "
+        "python3.12 — a runtime bump would break it at import with a green deploy")
+
+
+def test_the_embedder_has_no_event_trigger():
+    """It is invoked directly. An S3 event here would embed every upload in the lake."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "SpeakerEmbedFunction")
+    assert "Events:" not in blk, (
+        "SpeakerEmbedFunction must have no Events — it is invoked on demand, and a "
+        "trigger would run a model over every file that lands")
