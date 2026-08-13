@@ -334,7 +334,7 @@ def test_consent_enrols_and_the_artifact_carries_the_profile(wired, monkeypatch)
     monkeypatch.setattr(org.voiceprints, "upsert_profile", upsert)
     b = _body(org.lambda_handler(_event(dict(BODY, consent_given=True,
                                                 consented_by="u-9")), None))
-    assert b["enrolment"] == "queued"
+    assert b["enrolment"] == "requested"
     doc = json.loads(wired.puts[0]["Body"])
     assert doc["enrol"]["voiceprint_id"] == "vp-1"
     assert seen["display_name"] == "Ben L"
@@ -376,3 +376,19 @@ def test_consent_without_naming_who_gave_it_is_refused(wired):
     assert res["statusCode"] == 400
     assert "consented_by" in _body(res)["error"]
     assert wired.puts == []
+
+
+def test_the_response_does_not_promise_an_enrolment_it_cannot_guarantee(wired, monkeypatch):
+    """`queued` said the thing would happen. All that had happened was that it had been
+    asked for — and the embedder refuses a window it cannot judge as one voice, which on
+    TEST produced `enrolment: queued` in the response and `enrolment refused: window too
+    short` in the log for the same request.
+
+    This endpoint cannot know: the audio is read downstream, outside the VPC. So it says
+    what it did, not what will come of it."""
+    monkeypatch.setattr(org.voiceprints, "upsert_profile",
+                        lambda conn, company_id, **kw: {"id": "vp-1"})
+    b = _body(org.lambda_handler(_event(dict(BODY, consent_given=True,
+                                             consented_by="u-9")), None))
+    assert b["enrolment"] == "requested"
+    assert b["enrolmentMayBeRefused"] is True

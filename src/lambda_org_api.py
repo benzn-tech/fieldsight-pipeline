@@ -1391,7 +1391,16 @@ def speaker_corrections(conn, caller, session_base, event):
         # Named separately because they carry different consent obligations, and because a
         # user who was told "done" deserves to know which of the two they got.
         "propagation": "queued",
-        "enrolment": "queued" if enrol else "not_requested",
+        # "requested", not "queued". Everything downstream may still refuse — a window under
+        # ten seconds cannot be judged homogeneous and is not enrolled, and propagation
+        # refusing on the same window refuses the enrolment with it. Saying "queued" told the
+        # user the thing would happen, when all that had happened was that it had been asked
+        # for. Seen on TEST: this endpoint answered `queued` while the embedder logged
+        # `enrolment refused: window too short to check homogeneity`.
+        "enrolment": "requested" if enrol else "not_requested",
+        # The refusals are not errors and not rare, so name them where the caller is already
+        # looking rather than leaving a silence for them to interpret.
+        "enrolmentMayBeRefused": bool(enrol),
     }, 202)
 
 
