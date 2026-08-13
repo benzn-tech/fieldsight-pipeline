@@ -2751,7 +2751,11 @@ Resources:
       CodeUri: src/
       Handler: lambda_speaker_embed.lambda_handler
       Runtime: python3.12
-      Timeout: 120
+      # 600, not 120: this path is asynchronous (S3-triggered), so no API Gateway ceiling
+      # applies, and propagation now embeds every turn of a session rather than one window.
+      # Capping COVERAGE to fit a timeout would trade a visible promise for a number that
+      # costs nothing to raise.
+      Timeout: 600
       MemorySize: 1769
       ReservedConcurrentExecutions: 5
       Layers:
