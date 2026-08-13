@@ -88,7 +88,6 @@ def test_audio_is_read_from_the_raw_upload_never_from_audio_segments(stub_embedd
     key = "users/Ben_UCPK2/audio/2026-08-11/x_c0000.wav"
     s3 = FakeS3({key: _wav_bytes()})
     monkeypatch.setattr(se, "s3", lambda: s3)
-    monkeypatch.setattr(se, "load_profiles", lambda *a, **k: [])
     se.lambda_handler({"op": "match", "session": "s", "user_folder": "Ben_UCPK2",
                        "date": "2026-08-11",
                        "turns": [{"source_filename": "x_c0000.wav",
@@ -102,7 +101,6 @@ def test_an_access_denied_raises_rather_than_returning_an_empty_result(stub_embe
     200-with-nothing before. A denial must be loud."""
     key = "users/u/audio/2026-08-11/x_c0000.wav"
     monkeypatch.setattr(se, "s3", lambda: FakeS3({}, denied={key}))
-    monkeypatch.setattr(se, "load_profiles", lambda *a, **k: [])
     with pytest.raises(Exception) as exc:
         se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
                            "date": "2026-08-11",
@@ -115,7 +113,6 @@ def test_a_sample_rate_that_is_not_16k_raises(stub_embedder, monkeypatch):
     """The model is 16 kHz. At another rate it degrades silently rather than failing."""
     key = "users/u/audio/2026-08-11/x_c0000.wav"
     monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(sr=8000)}))
-    monkeypatch.setattr(se, "load_profiles", lambda *a, **k: [])
     with pytest.raises(ValueError, match="16"):
         se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
                            "date": "2026-08-11",
@@ -130,7 +127,6 @@ def test_a_turn_under_the_floor_is_never_embedded_at_all(stub_embedder, monkeypa
     """Not merely unnamed — not paid for either. The one Phase 0 miss was a 2.1 s turn."""
     key = "users/u/audio/2026-08-11/x_c0000.wav"
     monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes()}))
-    monkeypatch.setattr(se, "load_profiles", lambda *a, **k: [])
     out = se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
                              "date": "2026-08-11",
                              "turns": [{"source_filename": "x_c0000.wav",
@@ -145,16 +141,15 @@ def test_two_samples_of_one_person_are_one_candidate(stub_embedder, monkeypatch)
     key = "users/u/audio/2026-08-11/x_c0000.wav"
     monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes()}))
     v_ben, v_other = np.ones(192), np.concatenate([np.ones(96), -np.ones(96)])
-    monkeypatch.setattr(se, "load_profiles", lambda *a, **k: [
-        {"person_key": "ben", "display_name": "Ben", "status": "confirmed",
-         "embedding": v_ben * 0.9},
-        {"person_key": "ben", "display_name": "Ben", "status": "confirmed",
-         "embedding": v_ben},
-        {"person_key": "zoe", "display_name": "Zoe", "status": "confirmed",
-         "embedding": v_other},
-    ])
     out = se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
                              "date": "2026-08-11",
+                             "profiles": [
+                                 {"person_key": "ben", "display_name": "Ben",
+                                  "status": "confirmed", "embedding": v_ben * 0.9},
+                                 {"person_key": "ben", "display_name": "Ben",
+                                  "status": "confirmed", "embedding": v_ben},
+                                 {"person_key": "zoe", "display_name": "Zoe",
+                                  "status": "confirmed", "embedding": v_other}],
                              "turns": [{"source_filename": "x_c0000.wav",
                                         "start_sec": 0.0, "end_sec": 5.0}]}, None)
     r = out["results"][0]
@@ -166,14 +161,15 @@ def test_a_tentative_profile_can_only_produce_a_tentative_name(stub_embedder, mo
     cannot hand out a confirmed name."""
     key = "users/u/audio/2026-08-11/x_c0000.wav"
     monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes()}))
-    monkeypatch.setattr(se, "load_profiles", lambda *a, **k: [
-        {"person_key": "ben", "display_name": "Ben", "status": "tentative",
-         "embedding": np.ones(192)},
-        {"person_key": "zoe", "display_name": "Zoe", "status": "confirmed",
-         "embedding": np.concatenate([np.ones(96), -np.ones(96)])},
-    ])
     out = se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
                              "date": "2026-08-11",
+                             "profiles": [
+                                 {"person_key": "ben", "display_name": "Ben",
+                                  "status": "tentative", "embedding": np.ones(192)},
+                                 {"person_key": "zoe", "display_name": "Zoe",
+                                  "status": "confirmed",
+                                  "embedding": np.concatenate([np.ones(96),
+                                                               -np.ones(96)])}],
                              "turns": [{"source_filename": "x_c0000.wav",
                                         "start_sec": 0.0, "end_sec": 5.0}]}, None)
     assert out["results"][0]["status"] == "tentative"
@@ -186,8 +182,6 @@ def test_an_inhomogeneous_window_is_refused_and_nothing_is_stored(stub_embedder,
                                                                   monkeypatch):
     key = "users/u/audio/2026-08-11/x_c0000.wav"
     monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=15.0)}))
-    stored = []
-    monkeypatch.setattr(se, "store_sample", lambda **kw: stored.append(kw))
     # two frames pointing opposite ways -> spread 2.0, far above the threshold
     stub_embedder["vectors"] = [np.ones(192), -np.ones(192), np.ones(192)]
     out = se.lambda_handler({"op": "enrol", "voiceprint_id": "vp1", "user_folder": "u",
@@ -195,7 +189,7 @@ def test_an_inhomogeneous_window_is_refused_and_nothing_is_stored(stub_embedder,
                              "start_sec": 0.0, "end_sec": 15.0}, None)
     assert out["status"] == "refused"
     assert "homogene" in out["reason"].lower()
-    assert stored == [], "a window that may hold two voices must not reach the profile"
+    assert "embedding" not in out, "a window that may hold two voices must not be embedded"
 
 
 def test_a_window_too_short_to_judge_is_refused_not_accepted(stub_embedder, monkeypatch):
@@ -203,13 +197,11 @@ def test_a_window_too_short_to_judge_is_refused_not_accepted(stub_embedder, monk
     conflation is how a guard becomes decoration."""
     key = "users/u/audio/2026-08-11/x_c0000.wav"
     monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=4.0)}))
-    stored = []
-    monkeypatch.setattr(se, "store_sample", lambda **kw: stored.append(kw))
     out = se.lambda_handler({"op": "enrol", "voiceprint_id": "vp1", "user_folder": "u",
                              "date": "2026-08-11", "source_filename": "x_c0000.wav",
                              "start_sec": 0.0, "end_sec": 4.0}, None)
     assert out["status"] == "refused"
-    assert stored == []
+    assert "embedding" not in out
 
 
 def test_a_homogeneous_window_is_stored_with_its_provenance(stub_embedder, monkeypatch):
@@ -218,17 +210,14 @@ def test_a_homogeneous_window_is_stored_with_its_provenance(stub_embedder, monke
     added later."""
     key = "users/u/audio/2026-08-11/x_c0000.wav"
     monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=15.0)}))
-    stored = []
-    monkeypatch.setattr(se, "store_sample", lambda **kw: stored.append(kw))
     out = se.lambda_handler({"op": "enrol", "voiceprint_id": "vp1", "user_folder": "u",
                              "date": "2026-08-11", "source_filename": "x_c0000.wav",
                              "start_sec": 0.0, "end_sec": 15.0,
                              "correction_ref": "corr-7"}, None)
-    assert out["status"] == "stored"
-    assert len(stored) == 1
-    assert stored[0]["s3_key"] == key
-    assert stored[0]["correction_ref"] == "corr-7"
-    assert stored[0]["window"] == (0.0, 15.0)
+    assert out["status"] == "embedded"
+    assert out["s3_key"] == key
+    assert out["correction_ref"] == "corr-7"
+    assert out["window"] == [0.0, 15.0]
 
 
 def test_an_unknown_op_is_rejected_rather_than_silently_doing_nothing(monkeypatch):
@@ -262,7 +251,6 @@ def test_a_batched_turn_reads_the_raw_chunk_not_the_stitched_object(stub_embedde
     raw = "users/u/audio/2026-08-13/x_c0001.wav"
     s3 = FakeS3({MAP_KEY: _batch_map_bytes(), raw: _wav_bytes(seconds=30.0)})
     monkeypatch.setattr(se, "s3", lambda: s3)
-    monkeypatch.setattr(se, "load_profiles", lambda *a, **k: [])
     se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
                        "date": "2026-08-13", "company_id": "c1",
                        "turns": [{"source_filename": BATCH_NAME,
@@ -278,7 +266,6 @@ def test_a_per_chunk_turn_costs_no_map_fetch(stub_embedder, monkeypatch):
     key = "users/u/audio/2026-08-13/x_c0000.wav"
     s3 = FakeS3({key: _wav_bytes()})
     monkeypatch.setattr(se, "s3", lambda: s3)
-    monkeypatch.setattr(se, "load_profiles", lambda *a, **k: [])
     se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
                        "date": "2026-08-13", "company_id": "c1",
                        "turns": [{"source_filename": "x_c0000.wav",
@@ -294,7 +281,6 @@ def test_the_batch_offset_is_applied_to_the_audio_that_is_embedded(stub_embedder
     raw = "users/u/audio/2026-08-13/x_c0001.wav"
     monkeypatch.setattr(se, "s3", lambda: FakeS3({MAP_KEY: _batch_map_bytes(),
                                                   raw: _wav_bytes(seconds=30.0)}))
-    monkeypatch.setattr(se, "load_profiles", lambda *a, **k: [])
     seen = {}
 
     def embed(audio, sr):
@@ -307,3 +293,72 @@ def test_the_batch_offset_is_applied_to_the_audio_that_is_embedded(stub_embedder
                                   "start_sec": 35.0, "end_sec": 40.0}]}, None)
     assert seen["n"] == pytest.approx(5.0 * 16000, abs=16), (
         f"embedded {seen['n']} samples for a 5s window")
+
+
+# ---- pure compute: no database, no VPC ----------------------------------
+#
+# The function runs on python3.12 because that is where onnxruntime comes from
+# (fieldsight-vad-layer is cp312-only), and PsycopgLayer is cp311-only. One function cannot
+# have both, so the deployed function raised ModuleNotFoundError on EVERY invocation while
+# deploying green -- no test caught it, because they all stubbed load_profiles.
+#
+# The cure is not a second psycopg layer. It is that this function has no business holding
+# a database connection: org-api is in-VPC, already has psycopg, and already owns the
+# consent and withdrawn filters that must not be duplicated. It passes what it read.
+
+
+def test_the_function_imports_no_database_module():
+    """The defect, pinned. Import-level, because that is where it actually fired."""
+    import ast
+    import pathlib
+    src = pathlib.Path(se.__file__).read_text(encoding="utf-8")
+    names = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            names.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module.split(".")[0])
+    forbidden = names & {"psycopg", "db", "repositories"}
+    assert not forbidden, (
+        f"{sorted(forbidden)} is imported; psycopg cannot be installed alongside the cp312 "
+        f"VAD layer, so this is the ModuleNotFoundError that made the deployed function "
+        f"100% non-functional while every test passed")
+
+
+def test_profiles_come_from_the_event_and_there_is_no_other_way_to_get_them():
+    """The consent and withdrawn filters live in profiles_for_matching, which is the one
+    query whose mistakes are invisible -- a withdrawn profile that still matches is not a
+    withdrawal. This function must not acquire a second way to reach profiles."""
+    assert not hasattr(se, "load_profiles"), (
+        "load_profiles still exists; a caller could reach profiles without the filters")
+
+
+def test_a_match_scores_against_the_profiles_in_the_payload(stub_embedder, monkeypatch):
+    key = "users/u/audio/2026-08-13/x_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes()}))
+    out = se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
+                             "date": "2026-08-13",
+                             "profiles": [
+                                 {"person_key": "ben", "status": "confirmed",
+                                  "embedding": list(np.ones(192))},
+                                 {"person_key": "zoe", "status": "confirmed",
+                                  "embedding": list(np.concatenate([np.ones(96),
+                                                                    -np.ones(96)]))}],
+                             "turns": [{"source_filename": "x_c0000.wav",
+                                        "start_sec": 0.0, "end_sec": 5.0}]}, None)
+    assert out["results"][0]["name"] == "ben"
+
+
+def test_an_enrolment_returns_the_vector_instead_of_storing_it(stub_embedder, monkeypatch):
+    """The writer stores it, in VPC, in the column that already requires consent. Returning
+    it keeps the vector out of S3 entirely -- the biometric-residence defect that moved
+    twice during review."""
+    key = "users/u/audio/2026-08-13/x_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=15.0)}))
+    out = se.lambda_handler({"op": "enrol", "voiceprint_id": "vp1", "user_folder": "u",
+                             "date": "2026-08-13", "source_filename": "x_c0000.wav",
+                             "start_sec": 0.0, "end_sec": 15.0,
+                             "correction_ref": "corr-7"}, None)
+    assert out["status"] == "embedded"
+    assert len(out["embedding"]) == 192
+    assert out["s3_key"] == key and out["correction_ref"] == "corr-7"

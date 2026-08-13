@@ -5,8 +5,15 @@ a file landing):
 
     {"op": "enrol", "voiceprint_id", "user_folder", "date", "source_filename",
      "start_sec", "end_sec", "correction_ref"?}
-    {"op": "match", "session", "user_folder", "date", "site_id"?,
+    {"op": "match", "session", "user_folder", "date", "company_id",
+     "profiles": [{"person_key", "status", "embedding"}, ...],
      "turns": [{"source_filename", "start_sec", "end_sec"}, ...]}
+
+Pure compute: **no database, no VPC.** This function runs on python3.12 because that is where
+onnxruntime comes from (the VAD layer is cp312-only) and `PsycopgLayer` is cp311-only — one
+function cannot carry both, and holding a connection here made every invocation raise
+`ModuleNotFoundError` while the deploy stayed green. Profiles arrive in the event from
+org-api, which is in-VPC and already owns the consent/withdrawn filters.
 
 They fail in opposite directions, and the code is shaped around that asymmetry:
 
@@ -163,32 +170,6 @@ def _window_audio(user_folder, date, source_filename, start, end):
     return pieces[0]["chunk_key"], np.concatenate(parts), rate
 
 
-def load_profiles(company_id, site_id=None):
-    """Every profile this company may match against, one row per SAMPLE.
-
-    Separated so tests can supply rows without a database, and so the in-VPC connection is
-    not made at import time."""
-    from db.connection import get_connection
-    from repositories import voiceprints
-    with get_connection() as conn:
-        rows = voiceprints.profiles_for_matching(conn, company_id, site_id=site_id)
-    return [{"person_key": r["user_id"] or r["id"],
-             "display_name": r.get("display_name"),
-             "status": r.get("status"),
-             "embedding": r["embedding"]} for r in rows]
-
-
-def store_sample(voiceprint_id, company_id, embedding, s3_key, window, created_by=None,
-                 correction_ref=None):
-    from db.connection import get_connection
-    from repositories import voiceprints
-    with get_connection() as conn:
-        return voiceprints.add_sample(
-            conn, company_id, voiceprint_id, embedding, source="correction",
-            s3_key=s3_key, window=window, created_by=created_by,
-            correction_ref=correction_ref)
-
-
 def _frames(audio, sr):
     step = int(FRAME_SECONDS * sr)
     return [audio[i:i + step] for i in range(0, len(audio) - step + 1, step)]
@@ -209,17 +190,23 @@ def _enrol(event):
         logger.warning("enrol refused for %s [%s-%s]: %s", key, start, end, reason)
         return {"status": "refused", "reason": reason, "s3_key": key}
 
-    store_sample(voiceprint_id=event["voiceprint_id"],
-                 company_id=event.get("company_id"),
-                 embedding=embed_audio(clip, sr),
-                 s3_key=key, window=(start, end),
-                 created_by=event.get("created_by"),
-                 correction_ref=event.get("correction_ref"))
-    return {"status": "stored", "s3_key": key, "window": [start, end]}
+    # Returned, not stored. The in-VPC writer persists it into the column that already
+    # requires consent, so the vector never lands in S3 — the biometric-residence defect
+    # that relocated twice during review (first a cache, then a request artifact).
+    return {"status": "embedded",
+            "voiceprint_id": event["voiceprint_id"],
+            "embedding": [float(x) for x in embed_audio(clip, sr)],
+            "s3_key": key, "window": [start, end],
+            "created_by": event.get("created_by"),
+            "correction_ref": event.get("correction_ref")}
 
 
 def _match(event):
-    profiles = load_profiles(event.get("company_id"), event.get("site_id"))
+    # From the caller, never from a database. org-api is in-VPC, holds psycopg, and owns
+    # `profiles_for_matching` — the one query whose mistakes are invisible, because a
+    # withdrawn profile that still matches is not a withdrawal. Duplicating that filter
+    # here would be a second place for it to be forgotten.
+    profiles = event.get("profiles") or []
     by_key = {}
     for p in profiles:
         by_key.setdefault(p["person_key"], p)
