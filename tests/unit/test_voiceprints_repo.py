@@ -206,3 +206,41 @@ def test_site_scoping_does_not_weaken_consent_or_withdrawal():
         sql = conn.calls[-1]["sql"]
         assert "consent_at IS NOT NULL" in sql
         assert "status <> 'withdrawn'" in sql
+
+
+# ---- reading a vector without pgvector ----------------------------------
+#
+# The function that matches voiceprints cannot carry pgvector. It runs on python3.12
+# (fieldsight-vad-layer is cp312-only, and that layer is where onnxruntime comes from),
+# while the psycopg layer that ships pgvector is cp311-only — the two cannot sit on one
+# function. Writes were never affected: `_vector_literal` sends text. Reads were: without
+# `register_vector`, psycopg hands a `vector` column back as the STRING '[0.1,0.2,…]',
+# and `cosine` on a string is not an error that says "no pgvector" — it is a shape error
+# thirty lines away, or worse, a number.
+
+
+def test_a_vector_column_read_without_pgvector_comes_back_as_numbers():
+    import repositories.voiceprints as vr
+    got = vr._parse_vector("[0.5,-0.25,0.125]")
+    assert [float(x) for x in got] == [0.5, -0.25, 0.125]
+
+
+def test_a_vector_that_pgvector_already_parsed_is_left_alone():
+    """When the layer DOES have pgvector the value arrives as a sequence, and parsing must
+    be a no-op rather than a second interpretation of it."""
+    import repositories.voiceprints as vr
+    assert list(vr._parse_vector([0.5, -0.25])) == [0.5, -0.25]
+    assert vr._parse_vector(None) is None
+
+
+def test_profiles_for_matching_returns_numbers_not_text():
+    """The end the caller actually touches. `profiles_for_matching` is the only read of an
+    embedding in the codebase, so this is where the conversion has to be — not in each
+    caller, which is how one of them ends up without it."""
+    import repositories.voiceprints as vr
+    rows = [{"id": "p1", "display_name": "Ben", "status": "confirmed", "user_id": None,
+             "sample_id": "s1", "embedding": "[1,2,3]"}]
+    conn = FakeConn([rows])
+    out = vr.profiles_for_matching(conn, CO)
+    assert [float(x) for x in out[0]["embedding"]] == [1.0, 2.0, 3.0], (
+        "the embedding reached the caller as text; cosine would not have said so")

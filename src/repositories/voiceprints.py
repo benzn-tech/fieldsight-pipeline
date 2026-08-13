@@ -32,6 +32,33 @@ def _vector_literal(embedding):
     return "[" + ",".join(str(float(v)) for v in values) + "]"
 
 
+def _parse_vector(value):
+    """The inverse of `_vector_literal`, for a runtime without pgvector.
+
+    `register_vector` is what normally turns a `vector` column back into numbers, and it
+    needs pgvector, which needs numpy, and the psycopg layer that ships it is cp311-only —
+    while the function that reads these embeddings runs on cp312 (that is where onnxruntime
+    lives). One function cannot have both layers.
+
+    Without registration psycopg hands the column back as the literal text `'[0.1,0.2,…]'`.
+    Passing that to `cosine` does not raise "you forgot pgvector"; numpy will happily make a
+    zero-dimensional object array out of it, and the failure surfaces far from the cause, as
+    a similarity score rather than an error. So the conversion happens here, at the single
+    read, and is a no-op when pgvector already did it.
+    """
+    if value is None or not isinstance(value, str):
+        return value
+    return [float(x) for x in value.strip().strip("[]").split(",") if x.strip()]
+
+
+def _decode(rows):
+    """Every row leaving this module carries numbers, not a vector literal."""
+    for r in rows:
+        if "embedding" in r:
+            r["embedding"] = _parse_vector(r["embedding"])
+    return rows
+
+
 def _require_company(company_id):
     if not company_id:
         raise ValueError("company_id is required on every voiceprint query — an absent one "
@@ -102,16 +129,16 @@ def profiles_for_matching(conn, company_id, site_id=None) -> list[dict]:
             "  AND p.consent_at IS NOT NULL "
             "  AND p.status <> 'withdrawn' ")
     if site_id is None:
-        return conn.cursor(row_factory=dict_row).execute(
-            cols + "ORDER BY p.created_at", (company_id,)).fetchall()
-    return conn.cursor(row_factory=dict_row).execute(
+        return _decode(conn.cursor(row_factory=dict_row).execute(
+            cols + "ORDER BY p.created_at", (company_id,)).fetchall())
+    return _decode(conn.cursor(row_factory=dict_row).execute(
         cols
         + "  AND (p.user_id IS NULL OR EXISTS ("
           "        SELECT 1 FROM memberships m "
           "         WHERE m.user_id = p.user_id AND m.site_id = %s)) "
           "ORDER BY p.created_at",
         (company_id, site_id),
-    ).fetchall()
+    ).fetchall())
 
 
 def withdraw(conn, company_id, voiceprint_id) -> list:
