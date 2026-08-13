@@ -48,6 +48,7 @@ import numpy as np
 
 import batch_seal
 import batch_stitch
+import turn_name_overlay
 import voiceprint_utils as vp
 
 logger = logging.getLogger()
@@ -302,7 +303,7 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref):
             logger.warning("propagation: could not read %s", t.get("source_filename"))
             continue
         vectors.append(embed_audio(clip, sr))
-        refs.append(f"{t['source_filename']}@{float(t['start_sec'])}")
+        refs.append(turn_name_overlay.turn_ref(t["source_filename"], t["start_sec"]))
     if len(vectors) < 2:
         return []
 
@@ -389,7 +390,7 @@ def _from_request_artifact(bucket, key):
 
     # The turn the user asserted. Its name is not an inference and is written as
     # `correction`; the writer refuses to give it a profile id unless it is marked asserted.
-    turn_ref = f"{c['source_filename']}@{start}"
+    turn_ref = turn_name_overlay.turn_ref(c["source_filename"], start)
     results = [{"turn_ref": turn_ref, "state": "confirmed",
                 "cluster_ref": None, "asserted": True,
                 "display_name": c.get("display_name"),

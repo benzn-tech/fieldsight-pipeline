@@ -306,3 +306,28 @@ def test_resolve_keeps_precedence_when_both_rows_reach_one_turn():
             _row("x.wav@5.0", "Said", source="correction")]
     out = tno.resolve(tno.build(rows), [_seg("x.json", 5.0)])
     assert out[0]["display_name"] == "Said"
+
+
+# ---- one function builds a turn reference -------------------------------
+#
+# The embedder built refs with two f-strings while the reader normalised with _stem, so a
+# correction carrying `…_srcwav.wav` and a turn list carrying `…_srcwav.json` described the
+# same turn and never compared equal. Propagation refused every real correction with
+# "corrected turn not among the session's turns" — the fourth appearance tonight of two
+# spellings of one thing.
+
+
+def test_a_turn_reference_is_the_same_whichever_artifact_you_hold():
+    assert tno.turn_ref("x_c0000_srcwav.wav", 2.86) == \
+           tno.turn_ref("x_c0000_srcwav.json", 2.86)
+
+
+def test_a_built_reference_parses_back_to_what_built_it():
+    ref = tno.turn_ref("x_c0000_srcwav.wav", 2.86)
+    idx = tno.build([_row(ref, "Ben L")])
+    assert tno.lookup(idx, "x_c0000_srcwav.json", 2.86)["display_name"] == "Ben L"
+
+
+def test_the_offset_survives_as_a_number_not_a_rendering():
+    """2.0 and 2 must not be two different turns."""
+    assert tno.turn_ref("x.wav", 2) == tno.turn_ref("x.wav", 2.0)
