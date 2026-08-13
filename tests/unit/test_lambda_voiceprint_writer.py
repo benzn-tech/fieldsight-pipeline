@@ -1,0 +1,166 @@
+"""Unit: the in-VPC half of the voiceprint chain.
+
+The embedder cannot write. It runs on python3.12 for onnxruntime, and the psycopg layer is
+cp311-only, so it holds no connection and has no VpcConfig — which is also why it cannot be
+the thing that persists anything. This function is the other half: in VPC, psycopg, no model,
+no audio.
+
+It is invoked DIRECTLY by the embedder (non-VPC → in-VPC is permitted; the callee initiates
+nothing outward, BUG-43 note 4), not through a second S3 artifact. That choice is what keeps
+the enrolment vector out of S3 entirely: it travels in the invoke payload and lands in the
+column that already requires consent.
+
+Everything here is stubbed at the repository boundary. The SQL those functions emit is pinned
+in test_voiceprints_repo.py, and duplicating it would mean two places to update and one to
+forget.
+"""
+import pytest
+
+vw = pytest.importorskip("lambda_voiceprint_writer")
+
+CO = "11111111-1111-1111-1111-111111111111"
+
+
+class FakeConn:
+    def __init__(self):
+        self.committed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.committed = a[0] is None
+        return False
+
+
+@pytest.fixture
+def calls(monkeypatch):
+    seen = {"turns": [], "samples": []}
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "record_turn_name",
+                        lambda conn, company_id, **kw: seen["turns"].append(kw) or {"id": "t"})
+    monkeypatch.setattr(vw, "add_sample",
+                        lambda conn, company_id, *a, **kw: seen["samples"].append(kw) or {"id": "s"})
+    return seen
+
+
+# ---- propagation results ------------------------------------------------
+
+
+def test_each_named_turn_becomes_a_row(calls):
+    out = vw.lambda_handler({
+        "op": "propagation", "company_id": CO, "session_base": "s1",
+        "cluster_threshold": 0.85,
+        "results": [
+            {"turn_ref": "f.wav@1.0", "state": "tentative", "cluster_ref": "C1",
+             "score": 0.7, "margin": 0.1},
+            {"turn_ref": "f.wav@9.0", "state": "unknown", "cluster_ref": None},
+        ]}, None)
+    assert out["written"] == 2
+    assert [t["turn_ref"] for t in calls["turns"]] == ["f.wav@1.0", "f.wav@9.0"]
+
+
+def test_a_propagated_row_never_carries_a_profile_id(calls):
+    """The promotion loop, cut at the writer as well as in the query. A propagated
+    `confirmed` row with a voiceprint_id counts as an independent human confirmation and the
+    system promotes profiles with its own output."""
+    vw.lambda_handler({
+        "op": "propagation", "company_id": CO, "session_base": "s1",
+        "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed", "cluster_ref": "C1"}]},
+        None)
+    assert calls["turns"][0].get("voiceprint_id") is None
+    assert calls["turns"][0]["source"] == "correction_propagation"
+
+
+def test_the_threshold_that_produced_the_run_is_stamped_on_every_row(calls):
+    """A row that cannot say which clustering produced it cannot be disqualified from
+    calibration when the threshold moves."""
+    vw.lambda_handler({
+        "op": "propagation", "company_id": CO, "session_base": "s1",
+        "cluster_threshold": 0.85,
+        "results": [{"turn_ref": "a", "state": "tentative", "cluster_ref": "C1"},
+                    {"turn_ref": "b", "state": "tentative", "cluster_ref": "C1"}]}, None)
+    assert {t["cluster_threshold"] for t in calls["turns"]} == {0.85}
+
+
+def test_the_turn_the_user_corrected_is_written_as_a_correction_not_a_propagation(calls):
+    """It is the one row a human asserted. Marking it `correction_propagation` would both
+    lose that fact and leave the profile-promotion count with nothing to count."""
+    vw.lambda_handler({
+        "op": "propagation", "company_id": CO, "session_base": "s1",
+        "correction_ref": "corr-1", "voiceprint_id": "vp1",
+        "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed", "cluster_ref": "C1",
+                     "asserted": True},
+                    {"turn_ref": "f.wav@9.0", "state": "tentative", "cluster_ref": "C1"}]},
+        None)
+    asserted = [t for t in calls["turns"] if t["source"] == "correction"]
+    assert len(asserted) == 1 and asserted[0]["turn_ref"] == "f.wav@1.0"
+    assert asserted[0]["voiceprint_id"] == "vp1"
+
+
+def test_every_row_carries_the_correction_that_caused_it(calls):
+    """Withdrawal has to enumerate what a correction justified (§6). Without this pointer
+    that means grepping S3 artifacts."""
+    vw.lambda_handler({
+        "op": "propagation", "company_id": CO, "session_base": "s1",
+        "correction_ref": "corr-1",
+        "results": [{"turn_ref": "a", "state": "tentative", "cluster_ref": "C1"}]}, None)
+    assert calls["turns"][0]["correction_ref"] == "corr-1"
+
+
+# ---- enrolment results --------------------------------------------------
+
+
+def test_an_embedded_vector_is_stored_with_its_provenance(calls):
+    vw.lambda_handler({
+        "op": "enrol", "company_id": CO, "voiceprint_id": "vp1",
+        "embedding": [0.1] * 192, "s3_key": "users/u/audio/d/x.wav",
+        "window": [0.0, 15.0], "correction_ref": "corr-1", "created_by": "u1"}, None)
+    assert len(calls["samples"]) == 1
+    assert calls["samples"][0]["correction_ref"] == "corr-1"
+    assert calls["samples"][0]["s3_key"] == "users/u/audio/d/x.wav"
+
+
+def test_a_refused_enrolment_stores_nothing(calls):
+    """The embedder refuses a window it cannot judge as one voice. That refusal must not
+    become a stored sample here — a profile cannot be un-poisoned."""
+    out = vw.lambda_handler({
+        "op": "enrol", "company_id": CO, "voiceprint_id": "vp1",
+        "status": "refused", "reason": "window is not homogeneous"}, None)
+    assert calls["samples"] == []
+    assert out["stored"] == 0
+
+
+def test_an_enrolment_without_a_vector_raises_rather_than_storing_a_blank(calls):
+    with pytest.raises((KeyError, ValueError)):
+        vw.lambda_handler({"op": "enrol", "company_id": CO, "voiceprint_id": "vp1"}, None)
+
+
+# ---- shared -------------------------------------------------------------
+
+
+def test_a_missing_company_raises(calls):
+    with pytest.raises(ValueError):
+        vw.lambda_handler({"op": "propagation", "session_base": "s1", "results": []}, None)
+
+
+def test_an_unknown_op_is_rejected(calls):
+    with pytest.raises(ValueError):
+        vw.lambda_handler({"op": "sing"}, None)
+
+
+def test_the_writer_holds_no_model_and_no_audio():
+    """The split is the point: this half has psycopg and no onnxruntime, the other half has
+    onnxruntime and no psycopg. A writer that grew an embedder would need both layers, which
+    is the cp311/cp312 conflict that made the deployed function non-functional."""
+    import ast
+    import pathlib
+    src = pathlib.Path(vw.__file__).read_text(encoding="utf-8")
+    names = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            names.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module.split(".")[0])
+    assert not (names & {"onnxruntime", "wave", "batch_stitch", "batch_seal"}), (
+        f"the writer reached for audio or the model: {sorted(names)}")

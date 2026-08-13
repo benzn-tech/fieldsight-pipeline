@@ -23,7 +23,11 @@ def test_all_pgdatabase_values_are_guarded_by_the_condition():
     # bare !ImportValue (that would be an un-switched function).
     guarded = len(re.findall(r"PGDATABASE:\s*!If \[HasPgDatabaseOverride", t))
     bare = len(re.findall(r"PGDATABASE:\s*!ImportValue", t))
-    # Back to 17: SpeakerEmbedFunction took its PGDATABASE away again when it became pure
+    # 18 again, and for the opposite reason to last time: VoiceprintWriterFunction is the
+    # in-VPC half the embedder needs precisely BECAUSE the embedder cannot hold a
+    # connection. The count went 17 -> 18 -> 17 -> 18 in one night and every move was
+    # informative.
+    # Back to 17 was: SpeakerEmbedFunction took its PGDATABASE away when it became pure
     # compute. It briefly had one (18) and that was the defect — it runs on python3.12 for
     # onnxruntime while PsycopgLayer is cp311-only, so holding a connection made every
     # invocation raise ModuleNotFoundError with a green deploy behind it. The count moving
@@ -37,5 +41,5 @@ def test_all_pgdatabase_values_are_guarded_by_the_condition():
     # The count is the point: a new in-VPC function is meant to make this test fail, so
     # that whoever adds one has to look at whether they guarded PGDATABASE rather than
     # discovering months later that test writes went to the prod database.
-    assert guarded == 17, f"expected 17 guarded PGDATABASE, found {guarded}"
+    assert guarded == 18, f"expected 18 guarded PGDATABASE, found {guarded}"
     assert bare == 0, f"found {bare} un-switched bare PGDATABASE !ImportValue"
