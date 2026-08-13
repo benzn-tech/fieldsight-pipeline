@@ -17,9 +17,11 @@
 #     preserve every entry EXCEPT our own (Id prefix "fs-"). Other
 #     consumers (SNS/SQS/EventBridge/other Lambdas) are kept intact.
 #   * Dry-run by default. Pass --apply to actually write.
-#   * deploy.yml runs --apply for TEST (fresh bucket) but DRY-RUN for PROD
-#     — re-point prod's existing manual config to "fs-" Ids once, by hand,
-#     then prod can be switched to --apply. See DEPLOYMENT-RUNBOOK.md.
+#   * deploy.yml runs --apply for TEST. deploy-prod.yml applies too, gated on the
+#     PROD_WIRE_LAKE repo variable — which IS set, so prod's triggers are managed
+#     here, not by hand. (This comment said prod was dry-run until 2026-08-14; the
+#     hand-over to --apply happened and the note did not follow. Reading it, I
+#     concluded a trigger present on the prod bucket had been added out of band.)
 # ============================================================
 set -euo pipefail
 
