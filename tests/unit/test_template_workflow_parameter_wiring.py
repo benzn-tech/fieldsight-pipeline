@@ -554,3 +554,182 @@ def test_the_extractor_may_read_the_batch_maps_it_looks_for():
         "ExtractSessionFunction has no s3:GetObject on audio_segments/*, where the seal "
         "writes every batch's time map — batched sessions silently keep filename "
         "arithmetic and only a WARNING says so")
+
+
+# ----------------------------------------------------------
+# The transcript ledger holds the batch ledger: which chunks are in a batch, and the
+# SEAL# claim that stops two workers concatenating the same one. Until 2026-08-12 both
+# stacks resolved the template default, so TEST wrote its rows into PROD's table --
+# found by scanning it and seeing BATCH# rows prod could not have written, because prod
+# has never had batching on.
+#
+# The failure mode of the fix is not a broken deploy, it is a fix that half-lands:
+# `fieldsight-users-test` exists in this account and NOTHING wires it, a table created
+# for a split that never happened. This test is the difference.
+# ----------------------------------------------------------
+
+
+def _effective_parameter(path, name):
+    """What the stack really gets: the workflow's override, else the template default.
+
+    Comparing the two override LINES is not enough. A stage that passes nothing takes
+    the template default, so `prod=None, test='fieldsight-transcripts'` reads as two
+    different values and is in fact the same table."""
+    for ln in open(path, encoding="utf-8").read().splitlines():
+        m = re.match(rf'"{name}=(.*)"\s*\\?$', ln.strip())
+        if m:
+            return m.group(1)
+    text = open(TEMPLATE, encoding="utf-8").read()
+    block = re.search(rf"\n  {name}:\n(.*?)(?=\n  \w+:)", text, re.S)
+    default = re.search(r"Default:\s*(\S+)", block.group(1)) if block else None
+    return default.group(1).strip("'\"") if default else None
+
+
+def test_the_two_stacks_do_not_share_the_transcript_ledger():
+    prod = _effective_parameter(WORKFLOWS["prod"], "TranscriptTableName")
+    test = _effective_parameter(WORKFLOWS["test"], "TranscriptTableName")
+    assert test and prod, f"could not resolve the table for both stages: {test=} {prod=}"
+    assert test != prod, (
+        f"both stacks resolve TranscriptTableName={test!r}. The batch ledger lives in "
+        f"this table, including the SEAL# claim that stops two workers concatenating "
+        f"the same batch -- sharing it puts TEST's rows, and TEST's failures, in PROD's "
+        f"table. Found that way on 2026-08-12.")
+
+
+# ----------------------------------------------------------
+# BATCH_MAX_CHUNKS and BATCH_SEAL_DEADLINE_SEC were read from the environment by two
+# functions and appeared NOWHERE in the template, so they could only ever hold their code
+# defaults: the latency/cost dial of this feature was reachable only by editing code, and
+# not rollable back by changing a stack parameter. Same shape as the unwired-toggle trap,
+# one layer down.
+#
+# They are deliberately NOT wired symmetrically. The sweep passes deadline zero at close
+# on purpose -- see the comment at its seal_ready_runs call -- so giving it
+# BATCH_SEAL_DEADLINE_SEC would advertise a knob it ignores.
+# ----------------------------------------------------------
+
+
+def test_both_batch_sides_agree_on_how_many_chunks_make_a_batch():
+    """The transcriber accumulates to this size and the sweep treats a run of it as
+    complete. Different values there would seal runs the transcriber is still filling."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for fn in ("TranscribeFunction", "FinalizeSweepFunction"):
+        assert "BATCH_MAX_CHUNKS: !Ref BatchMaxChunks" in _function_block(text, fn), (
+            f"{fn} reads BATCH_MAX_CHUNKS but is not given it -- it takes the code "
+            f"default and can disagree with the other side about what a full batch is")
+
+
+def test_the_seal_deadline_reaches_the_transcriber_and_only_it():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert "BATCH_SEAL_DEADLINE_SEC: !Ref BatchSealDeadlineSec" in \
+        _function_block(text, "TranscribeFunction"), \
+        "the transcriber reads BATCH_SEAL_DEADLINE_SEC but is not given it"
+    assert "BATCH_SEAL_DEADLINE_SEC" not in _function_block(text, "FinalizeSweepFunction"), \
+        ("the sweep passes deadline zero at close on purpose; wiring the parameter to it "
+         "would advertise a knob that path ignores")
+
+
+def test_the_batch_dials_are_parameters_not_literals():
+    """A knob that exists only in code takes its default forever and raises no error."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for p in ("BatchMaxChunks", "BatchSealDeadlineSec"):
+        assert re.search(rf"\n  {p}:\n", text), f"{p} is not a template Parameter"
+
+
+def test_the_batch_dials_are_settable_from_a_repo_variable():
+    """A Parameter is only the LAST of three links.
+
+    `test_every_boolean_toggle_is_reachable_from_a_repo_variable` sweeps booleans;
+    these two are strings, which is exactly how they slipped through. Adding the
+    Parameter (#402) moved them from "edit the code" to "edit the template" -- better,
+    and still not the documented rollback, which is "set a repo variable and redeploy".
+    Found by an adversarial review of the PR that claimed to have fixed them.
+    """
+    for env, path in WORKFLOWS.items():
+        passed = _overrides(path)
+        for name in ("BatchMaxChunks", "BatchSealDeadlineSec"):
+            assert name in passed, (
+                f"{env} does not pass {name}, so it can only ever hold its template "
+                f"default -- changing how many chunks make a batch would still need a "
+                f"template edit and a deploy, not a repo variable")
+
+
+# ----------------------------------------------------------
+# The three failure alarms MONITORING.md promises ("you'll receive emails when...") were
+# never created in either account. They are gated on `ShouldCreateAlerts`, which is gated on
+# `AlertEmail`, which NO WORKFLOW PASSED -- so the Parameter held its empty default forever
+# and the condition was permanently false. Verified 2026-08-13: `describe-alarms` returned
+# nothing at all.
+#
+# This is the worst shape a monitoring gap can take, because the documentation says the
+# monitoring exists. Nobody goes looking for an alarm they have been told they have.
+# ----------------------------------------------------------
+
+
+def test_the_failure_alarms_can_actually_be_switched_on():
+    for env, path in WORKFLOWS.items():
+        assert "AlertEmail" in _overrides(path), (
+            f"{env} does not pass AlertEmail, so ShouldCreateAlerts can only ever be false "
+            f"and the three alarms MONITORING.md promises are never created")
+
+
+def test_no_alerts_is_spelled_with_a_sentinel_the_cli_will_carry():
+    """`|| ''` here would repeat the failure that killed the 2026-08-12 prod deploy."""
+    for env, path in WORKFLOWS.items():
+        line = [ln for ln in open(path, encoding="utf-8").read().splitlines()
+                if "AlertEmail=" in ln]
+        assert len(line) == 1
+        assert "|| 'none'" in line[0], (
+            f"{env} must default AlertEmail to the sentinel `none`, not to the empty "
+            f"string -- SAM rejects an empty --parameter-overrides value and fails the "
+            f"entire deploy")
+
+
+def test_both_spellings_of_no_alerts_are_inert():
+    """The sentinel AND the empty string must both mean "no alarms".
+
+    Changing the default without changing the condition would flip it from permanently
+    false to permanently TRUE, and subscribe SNS to the literal address `none`."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    cond = re.search(r"ShouldCreateAlerts:(.*?)(?=\n  \w+:)", text, re.S).group(1)
+    assert "''" in cond, "the empty string must still mean no alarms"
+    assert "'none'" in cond, "the sentinel the workflows send must also mean no alarms"
+
+
+# ----------------------------------------------------------
+# Alarms on the function that spends money and can lose audio
+# ----------------------------------------------------------
+
+def test_the_transcriber_has_an_error_alarm():
+    """It had none, and that is why 27 lost batches were silent.
+
+    2026-08-13, replaying a real 71-minute session into TEST: 27 transcription requests
+    were rejected with HTTP 429 (the provider caps concurrent requests at 20; peak Lambda
+    concurrency was 141). Each one left a batch WAV with no transcript and nothing to
+    re-drive it — about 54 minutes of audio gone. The only trace was ERROR lines nobody
+    was watching, because every other significant function has an alarm and this one
+    does not.
+
+    Threshold 1 is deliberate and is not noisy: seven days of prod transcribe logs contain
+    zero `Error processing` lines. An error here means audio is at risk.
+    """
+    text = open(TEMPLATE, encoding="utf-8").read()
+    block = re.search(r"\n  TranscribeErrorAlarm:\n(.*?)(?=\n  \w+:\n)", text, re.S)
+    assert block, "no TranscribeErrorAlarm in the template"
+    body = block.group(1)
+    assert "MetricName: Errors" in body
+    assert "!Ref TranscribeFunction" in body
+    assert "!Ref AlertTopic" in body, "an alarm nobody is told about is not an alarm"
+
+
+def test_the_transcriber_has_a_throttle_alarm():
+    """A throttled async invocation writes NO log line at all.
+
+    So the moment a concurrency ceiling is put on this function — which is the fix for the
+    429s — the failure mode becomes completely invisible unless the Throttles metric is
+    watched. This alarm has to exist BEFORE the ceiling does, not after.
+    """
+    text = open(TEMPLATE, encoding="utf-8").read()
+    block = re.search(r"\n  TranscribeThrottleAlarm:\n(.*?)(?=\n  \w+:\n)", text, re.S)
+    assert block, "no TranscribeThrottleAlarm in the template"
+    assert "MetricName: Throttles" in block.group(1)

@@ -76,30 +76,93 @@ def measure_trim(s3, bucket, prev_unit_key, unit_key):
     return secs, secs > 0.0
 
 
+def bypass_singleton(s3, bucket, session_id, index, unit_key, now, table):
+    """A window with one member is not a batch — hand the chunk back to the ordinary path.
+
+    A one-member batch saves no request and shares no speaker namespace, which is the only
+    benefit batching has ever been measured to deliver. What it costs is the whole grace
+    wait, a map, a seal record and a `_bn1` object. 10% of the batches in the lake are this.
+
+    The re-drive is a copy of the object onto its own key: the fresh S3 event re-enters
+    `lambda_transcribe` through the path it would have taken with batching off. Calling the
+    transcriber directly would pull its client into the sweep's import graph, and the sweep
+    runs every minute.
+
+    Three writes, and the order of all three is load-bearing:
+
+    1. `bypassed` is recorded BEFORE the copy, because the copy's event can be delivered
+       before the next line runs. An event arriving while the record still said `sealing`
+       would fall through to batching, find the member unplannable, and report
+       `batched_pending` for audio nothing would ever transcribe.
+    2. the copy.
+    3. consumed LAST. A failed copy then leaves the member unconsumed, so the planner
+       proposes it again and `claim_seal` retakes the stale `bypassed` record after its
+       retry window. Marking consumed first — which this did until the review — made a
+       failed copy permanent: never re-planned, never re-copied, never transcribed, and the
+       comment here claimed it was "skipped once".
+    """
+    batch_ledger.mark_bypassed(table, session_id, index, now)
+    # `MetadataDirective=REPLACE` is not optional: S3 refuses a copy of an object onto its
+    # own key when nothing about it changes ("this copy request is illegal because it is
+    # trying to copy an object to itself"). REPLACE also drops the existing metadata, so
+    # the content type is restated rather than inherited.
+    s3.copy_object(Bucket=bucket, Key=unit_key,
+                   CopySource={'Bucket': bucket, 'Key': unit_key},
+                   MetadataDirective='REPLACE', ContentType='audio/wav')
+    batch_ledger.mark_members_consumed(table, session_id, [index], index)
+    logger.info("batch: window of one — chunk %s re-driven per-chunk, no batch written",
+                index)
+    return None
+
+
 def seal_batch(s3, bucket, session_id, run, by_index, now, table, sealed_by='arrival'):
     """Write one batch's map and audio, or do nothing if another worker owns it.
 
     The WAV is written LAST: its S3 event is what starts the transcription, so a crash
     between the two must never leave a batch whose map is missing. Returns the batch key,
-    or None if the claim was lost.
+    or None if the claim was lost or the window held a single member.
     """
     if batch_ledger.claim_seal(table, session_id, run[0], run, now) is None:
         return None
+    try:
+        return _seal_claimed(s3, bucket, session_id, run, by_index, now, table, sealed_by)
+    except Exception:
+        # Hand the claim back. Holding it after a failure does not protect anything -- no
+        # artifact was written -- and it silences every retry for SEAL_RETRY_SECONDS, which
+        # for a session's tail means forever: the close sweep visits a session once.
+        batch_ledger.release_claim(table, session_id, run[0], now)
+        raise
+
+
+def _seal_claimed(s3, bucket, session_id, run, by_index, now, table, sealed_by):
+    """The work, once this worker owns the claim."""
+    if len(run) == 1:
+        return bypass_singleton(s3, bucket, session_id, run[0],
+                                by_index[run[0]]['chunk_key'], now, table)
 
     payloads, members, trims = [], [], []
     for pos, idx in enumerate(run):
         unit_key = by_index[idx]['chunk_key']
         pcm, rate = _wav_pcm(s3.get_object(Bucket=bucket, Key=unit_key)['Body'].read())
         if pos == 0:
-            trim, measured = 0.0, True            # nothing before it to repeat
+            trim, measured, seam = 0.0, True, 'first'   # nothing before it to repeat
+        elif idx != run[pos - 1] + 1:
+            # A window may now bridge a chunk that VAD dropped. Those two were never
+            # adjacent in the ring buffer, so they share no samples and the overlap is
+            # genuinely zero. Measuring anyway would spend two S3 reads to find nothing and
+            # then record `trim_measured: false` — and a wall of `false` is the alarm for
+            # the byte comparison being broken, which an expected zero must not set off.
+            trim, measured, seam = 0.0, True, 'gap'
         else:
             trim, measured = measure_trim(s3, bucket,
                                           by_index[run[pos - 1]]['chunk_key'], unit_key)
+            seam = 'adjacent'
         base = transcript_utils.extract_base_time_from_filename(unit_key)
         kept = (len(pcm) - int(round(trim * rate)) * 2) / (rate * 2)
         members.append(batch_stitch.member(
             idx, unit_key, base.isoformat() if base else '',
-            trimmed_head_sec=trim, kept_duration_sec=kept, trim_measured=measured))
+            trimmed_head_sec=trim, kept_duration_sec=kept, trim_measured=measured,
+            seam=seam))
         payloads.append((pcm, rate))
         trims.append(trim)
 
@@ -116,20 +179,39 @@ def seal_batch(s3, bucket, session_id, run, by_index, now, table, sealed_by='arr
                   Body=json.dumps(doc), ContentType='application/json')
     s3.put_object(Bucket=bucket, Key=batch_key, Body=_wav_bytes(audio, rate),
                   ContentType='audio/wav')
+    # AFTER both artifacts, BEFORE mark_sealed. This call was missing until the review, and
+    # its absence made the whole consumed-member mechanism decorative on the multi-member
+    # path -- the planner kept re-proposing sealed windows, with two live consequences: a
+    # late EARLIER chunk shifted the first index, claimed a key nobody held and billed the
+    # window twice; a late INTERIOR chunk re-planned a window whose key IS held, lost the
+    # claim, and was then never transcribed by anything, including the close sweep.
+    #
+    # Placed after the WAV so a crash before the artifacts exist leaves the members
+    # unconsumed and the stale `sealing` claim retakeable -- the re-drive window survives.
+    batch_ledger.mark_members_consumed(table, session_id, run, run[0])
     batch_ledger.mark_sealed(table, session_id, run[0], now)
-    logger.info("batch: sealed %s from chunks %s (%s)", batch_key, run, sealed_by)
+    logger.info("batch: sealed %s from chunks %s (%s), members consumed",
+                batch_key, run, sealed_by)
     return batch_key
 
 
 def seal_ready_runs(s3, bucket, session_id, table, now, deadline_sec, max_chunks,
-                    sealed_by='arrival'):
-    """Seal every run of this session that is ready. Returns the batch keys written."""
+                    sealed_by='arrival', window_sec=120.0):
+    """Seal every window of this session that is ready. Returns the batch keys written.
+
+    `deadline_sec` is the grace a window that could still grow waits for; pass 0 at session
+    close, where nothing more can arrive and waiting is the failure this exists to prevent.
+
+    A window that seals with one member returns no key — it was handed back to the
+    per-chunk path — so the returned list is batches written, not windows sealed.
+    """
     rows = batch_ledger.list_members(table, session_id)
     if not rows:
         return []
     by_index = {int(r['chunk_index']): r for r in rows}
     out = []
-    for run in batch_ledger.pending_runs(rows, now, deadline_sec, max_chunks):
+    for run in batch_ledger.pending_windows(rows, now, deadline_sec,
+                                            window_sec=window_sec, cap=max_chunks):
         key = seal_batch(s3, bucket, session_id, run, by_index, now, table,
                          sealed_by=sealed_by)
         if key:

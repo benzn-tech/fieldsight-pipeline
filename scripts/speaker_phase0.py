@@ -115,15 +115,12 @@ def split_on_silence(audio: np.ndarray, sr: int, min_silence_s: float = 3.0,
     return segments
 
 
-def cosine(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity. Loudness-invariant on purpose: across 0–6 m the level moves by
-    ~20 dB, and a score that moved with it would be measuring the microphone."""
-    a = np.asarray(a, dtype=np.float64).ravel()
-    b = np.asarray(b, dtype=np.float64).ravel()
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
+# `cosine` now lives in src/voiceprint_utils.py, imported rather than copied: the
+# reproducer that produced the Phase 0 numbers and the pipeline that will act on them must
+# not be able to disagree about what a similarity is.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "src"))
+from voiceprint_utils import cosine  # noqa: E402
 
 
 @dataclass

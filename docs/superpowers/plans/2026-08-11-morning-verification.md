@@ -120,6 +120,55 @@ python scripts/missing_chunk_audit.py
 
 ---
 
+## 2b. Batching is present and OFF on prod
+
+The whole batched-transcription feature (phases 1–6a) shipped with this release and is
+**inert**: `BatchTranscription` defaults `'false'` in the template, both workflows fall back
+to `'false'`, and `PROD_BATCH_TRANSCRIPTION` is unset.
+
+```bash
+aws lambda get-function-configuration --function-name fieldsight-prod-transcribe \
+  --query 'Environment.Variables.BATCH_TRANSCRIPTION'          # expect: false
+aws lambda get-function-configuration --function-name fieldsight-prod-finalize-sweep \
+  --query 'Environment.Variables.BATCH_TRANSCRIPTION'          # expect: false
+```
+
+**`false` is the pass. The key being ABSENT is not** — that would mean the parameter never
+reached Lambda, and the switch could not be turned on or off later without a code change.
+Both readings look like "batching is off" and only one of them is.
+
+On TEST it is **on**, and has run end to end on a real 6-minute recording: 13 chunks, three
+batches of four plus a sealed tail, four transcripts, zero member transcripts, and a final
+extraction whose topics land inside the true 16:50–16:56 window.
+
+## 2c. The session picker shows an end time
+
+Every chunk session used to render `12:11 – ?`, because the end-time lookup asked
+`recordings` with a pattern that matches **0 of 87** chunk sessions while
+`meeting_session.closed_at` sat unread in the row the picker already loads.
+
+Open any day with a recording and read a row in the picker. Expect `HH:MM – HH:MM`.
+
+- A `?` still appearing means the session genuinely has no `closed_at` — check the row
+  before assuming the fix regressed.
+- A span that crosses a day now renders `(+1d)`, and one that runs backwards renders the
+  start alone. Both are deliberate: the two ends come from device clocks. Seeing `(+1d)`
+  on a short meeting is a **clock** finding, not a display bug.
+- **Those eight prod sessions were backfilled on 2026-08-13** and no longer carry the
+  12-hour error, so this is no longer the first explanation to reach for. They were found
+  with `opened_at > last_segment_at` — a session cannot start after it ends — and each was
+  exactly 12 hours out, the device's NZ wall clock written into a column that stores UTC.
+  Afterwards: zero rows NULL, zero impossible, zero whose NZ date disagrees with their
+  segments. If a **new** session shows the same shape, it is a fresh instance of the
+  BUG-37 family and worth reporting, not the known backlog.
+
+## 2d. A merged meeting's email quotes something
+
+Only reachable once a real two-device recording happens. The group artifact has no
+top-level summary and nothing built one from its topics, so every member of every merged
+meeting would have been emailed a record that quoted nothing. If a merge does run, open the
+"updated" email and check the summary is not empty.
+
 ## 3. The seam de-duplication is not eating Chinese again
 
 Two ASCII-normalisation bugs shipped and were fixed this week; both deleted content and both

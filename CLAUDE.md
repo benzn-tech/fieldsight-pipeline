@@ -809,6 +809,31 @@ secret、test 那行不得出现 `||`)。这是个一行改动,一次无心的�
 且全程零报错(同 BUG「假开关」)。验证方式:部署后分别读两个函数的 `ELEVENLABS_API_KEY`,
 hash 应当**不同**。
 
+### `fieldsight-test-transcripts` 不在任何模板里(2026-08-12,带外资源,**删掉会静默弄坏 TEST 攒批**)
+
+TEST 的转写账本表。手工创建(PK/SK 均 S、PAY_PER_REQUEST、无 GSI/TTL,与 prod 那张逐项比对过),
+由 `deploy.yml` 的 `"TranscriptTableName=fieldsight-test-transcripts"` 接线。
+
+**为什么不在模板里**:prod 那张 `fieldsight-transcripts` 是栈外既有资源(BUG-34),而且
+**部署角色没有 `dynamodb:CreateTable`**(`template.yaml:2126-2129` 已记录,用 simulate-principal-policy
+验过)——在模板里声明会 CREATE_FAILED 并把整个栈回滚。建表要用有该权限的凭据(`fieldsight-deployer` 有)。
+
+**为什么需要**:这张表装的是攒批账本,含 `SEAL#` 那把"防止两个 worker 拼同一批"的认领锁。
+2026-08-12 之前两套栈都取模板默认值 → **TEST 的行写进了 PROD 的表**(实测扫到 prod 表里有
+BATCH# 行,而 prod 从没开过攒批)。
+
+**删了会怎样**:不会部署失败。`register_chunk` 打不存在的表会抛异常,被 `lambda_transcribe.py:496`
+的 per-key `except` 吞掉,那个 chunk **既不入批也不被转写**——静默丢音频。
+
+**守卫**:`test_the_two_stacks_do_not_share_the_transcript_ledger` 钉住两个 workflow 解析出的
+**生效值**(不是字面量,prod 不传参会落到模板默认值)必须不同。另外 `src/deploy_transcribe_callback.sh`
+硬编码 prod 表名,现在遇到 `-test-` 目标会直接拒绝执行。
+⚠️ 切换时机:若有 TEST 会话正卡在 `SEAL#…status=sealing`,split 之后那把锁会成为孤儿
+(test 的 sweep 改看新表,而 `_seal_tail_batches` 只在 finalize 前跑一次,不会再回来)。
+本次切换前已扫表确认 sealing=0。
+
+**同类带外资源**:S3 CORS 规则(下一条)、DynamoDB VPC endpoint(BUG-36)。
+
 ### 数据桶的 CORS 规则不在任何模板里(2026-08-04,带外配置,**别当成多余去删**)
 `fieldsight-data-509194952652` 上有一条名为 **`amplify-read-for-canvas`** 的 CORS 规则:
 `GET`/`HEAD`,`AllowedOrigins` = `https://main.d2fssznicvuckr.amplifyapp.com` +

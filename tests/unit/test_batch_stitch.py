@@ -115,32 +115,6 @@ def test_the_measurement_is_in_seconds_so_a_different_rate_still_answers_in_seco
                               8000) == pytest.approx(2.0, abs=1e-6)
 
 
-# ---- which chunks may travel together ----
-
-def test_consecutive_chunks_group_into_fours():
-    assert bs.plan_batches([0, 1, 2, 3, 4, 5, 6, 7]) == [[0, 1, 2, 3], [4, 5, 6, 7]]
-
-
-def test_a_gap_splits_the_run_because_a_batch_never_spans_one():
-    """A missing index must not be spliced shut, and must not merely be recorded — every
-    consumer except extract resolves time by filename arithmetic and would be a whole chunk
-    wrong past the gap."""
-    assert bs.plan_batches([4, 5, 7, 8, 9, 10, 11]) == [[4, 5], [7, 8, 9, 10], [11]]
-
-
-def test_a_lone_chunk_is_a_batch_of_one():
-    assert bs.plan_batches([9]) == [[9]]
-
-
-def test_nothing_present_is_no_batches():
-    assert bs.plan_batches([]) == []
-
-
-def test_indices_arriving_out_of_order_are_still_grouped_by_sequence():
-    """Uploads arrive out of order routinely — a retry can land hours after its successor."""
-    assert bs.plan_batches([5, 4, 7, 6]) == [[4, 5, 6, 7]]
-
-
 # ---- the filename contract, asserted against the real parsers ----
 
 def test_the_batch_name_is_read_correctly_by_every_existing_parser():
@@ -273,3 +247,90 @@ def test_concatenation_refuses_to_mix_sample_rates():
 def test_a_trim_longer_than_the_chunk_is_refused_rather_than_emptying_it():
     with pytest.raises(ValueError):
         bs.concat_wavs([(pcm(1.0), RATE), (pcm(1.0), RATE)], trims_sec=[0.0, 5.0])
+
+
+# ============================================================
+# Window planning (spec 2026-08-13, plan phase 1)
+# ============================================================
+# `plan_batches` groups four CONSECUTIVE indices, so a chunk VAD dropped is a gap and the
+# batch stops there. Measured over every chunk session in the lake: 37% of sessions with
+# four or more chunks lose an interior chunk that way, and 31% shatter into short runs --
+# one session of 46 chunks produced batches of [1,1,1,2,1,1]. A one-member batch is a pure
+# loss: it saves no request and adds the whole grace wait.
+#
+# The target was never four chunks. It is two minutes of wall clock, and a VAD-dropped
+# chunk inside that window must not end it.
+
+from datetime import datetime, timedelta  # noqa: E402
+
+T0 = datetime(2026, 8, 13, 9, 0, 0)
+
+
+def _at(*offsets_by_index):
+    return {idx: T0 + timedelta(seconds=off) for idx, off in offsets_by_index}
+
+
+def test_a_vad_dropped_chunk_does_not_split_the_window():
+    """The motivating case: c5 was silent, so c4/c6/c7 are one 90-second conversation."""
+    got = bs.plan_windows(_at((4, 0), (6, 60), (7, 90)), window_sec=120, cap=4)
+    assert got == [[4, 6, 7]]
+
+
+def test_a_chunk_at_the_window_boundary_starts_the_next_batch():
+    """Exclusive end. Four 30 s chunks stay one batch; a fifth at +120 does not make a
+    150-second request out of a 120-second rule."""
+    got = bs.plan_windows(_at((0, 0), (1, 30), (2, 60), (3, 90), (4, 120)),
+                          window_sec=120, cap=8)
+    assert got == [[0, 1, 2, 3], [4]]
+
+
+def test_the_window_anchors_on_its_first_member_not_on_a_grid():
+    """A grid aligned to the session start cuts dense stretches at the boundary -- 480
+    requests against 470 for greedy anchoring, and it can split a run of four that a
+    boundary happens to straddle."""
+    got = bs.plan_windows(_at((10, 110), (11, 140), (12, 170)), window_sec=120, cap=4)
+    assert got == [[10, 11, 12]]
+
+
+def test_a_consumed_chunk_is_invisible_to_the_planner():
+    """The double-billing pin, at the pure layer.
+
+    Members {4,5} seal. Chunk 3 -- an earlier index -- arrives an hour later. Without
+    consumption tracking the planner proposes [3,4,5], which claims a different seal key
+    and transcribes 4 and 5 a SECOND time. A late chunk forms its own batch instead.
+    """
+    got = bs.plan_windows(_at((3, -30), (4, 0), (5, 30)), window_sec=120, cap=4,
+                          consumed={4, 5})
+    assert got == [[3]]
+
+
+def test_the_count_cap_still_binds_when_chunks_are_short():
+    """The cap is a safety net, not the rule: a device emitting 10 s chunks must not build
+    an unbounded request just because they all fit in two minutes."""
+    got = bs.plan_windows(_at(*[(i, i * 10) for i in range(12)]),
+                          window_sec=120, cap=4)
+    assert got == [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]]
+
+
+def test_the_map_resolves_correctly_across_a_bridged_gap():
+    """Pins the claim that the map format needs no change for gapped batches.
+
+    Each member carries its own absolute start, so the 30 s a dropped chunk occupied is
+    simply not addressable: no `t` resolves into it. If this fails, the design decision
+    reopens -- do not "fix" the test.
+    """
+    doc = bs.build_map(SID, [
+        bs.member(4, "k4", T0.isoformat(), 0.0, 28.0),
+        bs.member(6, "k6", (T0 + timedelta(seconds=60)).isoformat(), 2.0, 30.0),
+    ], sealed_by="arrival")
+    assert bs.resolve_abs_time(doc, 0.0) == T0
+    assert bs.resolve_abs_time(doc, 27.9) == T0 + timedelta(seconds=27.9)
+    # the instant the first member's kept audio ends, we are in the SECOND member --
+    # 60 s later on the wall clock, not 28 s.
+    assert bs.resolve_abs_time(doc, 28.0) == T0 + timedelta(seconds=62.0)
+    assert bs.resolve_abs_time(doc, 57.9) == T0 + timedelta(seconds=91.9)
+    # nothing lands in the 28 s .. 60 s hole where the dropped chunk used to be
+    for t in [i / 10 for i in range(0, 580)]:
+        got = bs.resolve_abs_time(doc, t)
+        offset = (got - T0).total_seconds()
+        assert not (28.0 < offset < 62.0), f"t={t} resolved into the gap at +{offset}"

@@ -1,5 +1,13 @@
 # Transcribe two minutes at a time, not thirty seconds at a time
 
+> **SUPERSEDED IN PART, 2026-08-13.** The batching RULE described here — four
+> consecutive chunk indices, split at every gap — was replaced by a 120-second
+> wall-clock window in `2026-08-13-batch-by-wall-clock.md`. `plan_batches` and
+> `pending_runs` no longer exist. Measured reason: a chunk VAD dropped ended the
+> batch, which shattered 31% of real sessions into short runs (one 46-chunk session
+> produced [1,1,1,2,1,1]). Everything else here — the map, the filename contract,
+> the ledger's two races, the tail seal — still stands.
+
 **Status:** spec · 2026-08-11
 **Scope:** a batching stage between `lambda_vad` and the transcriber. VAD stays per-chunk.
 No mobile change.

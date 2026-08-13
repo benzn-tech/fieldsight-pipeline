@@ -21,10 +21,13 @@ against a second copy of the format.
 """
 from __future__ import annotations
 
+import logging
 import re
 from datetime import timedelta
 
 from transcript_utils import extract_base_time_from_filename
+
+_log = logging.getLogger()
 
 BYTES_PER_SAMPLE = 2                     # PCM s16le mono, the capture format throughout
 DEFAULT_MAX_BATCH = 4                    # four ~30 s chunks ≈ two minutes
@@ -142,28 +145,61 @@ def _first_informative_length(pcm: bytes, distinct_needed: int = 8):
 # Which chunks may travel together
 # ============================================================
 
-def plan_batches(indices, max_size: int = DEFAULT_MAX_BATCH) -> list[list[int]]:
-    """Runs of consecutive chunk indices, split at every gap, capped at `max_size`.
+# `plan_batches` — runs of consecutive indices, split at every gap — was removed on
+# 2026-08-13 rather than left beside its replacement. Its rule made a VAD-dropped chunk a
+# batch boundary, which shattered 31% of real sessions into short runs, and a dead function
+# with a plausible name is how a superseded rule comes back.
 
-    A batch never spans a gap. Recording the gap in the map instead was considered and
-    rejected: only extract-session reads the map, while reports, minutes, the transcript
-    viewer and ingest all resolve time by filename arithmetic and would be a whole chunk
-    wrong past it. A VAD-dropped index is a gap for the same reason.
+DEFAULT_WINDOW_SEC = 120.0               # two minutes of wall clock — the actual target
 
-    Indices arrive out of order routinely — a retried upload can land after its successor —
-    so they are sorted first.
+
+def plan_windows(members, window_sec: float = DEFAULT_WINDOW_SEC,
+                 cap: int = DEFAULT_MAX_BATCH, consumed=None) -> list[list[int]]:
+    """Chunk indices grouped into wall-clock windows. Supersedes `plan_batches`.
+
+    `members` maps chunk index -> that chunk's own base time (the device clock out of its
+    filename). Only ever compared to each other, never to `time.time()`: the two are
+    different clocks, ~13 hours apart, and mixing them seals a backlogged session's first
+    chunk alone with zero effective grace.
+
+    A window opens at the earliest unconsumed member and takes everything strictly inside
+    `anchor + window_sec`. **A VAD-dropped chunk is not a boundary.** That is the whole
+    point: batching's one measured benefit is a shared speaker namespace (33 labels -> 9),
+    and splitting at a 30-second silence hands the same person an unrelated label on each
+    side of it — in 37% of real sessions.
+
+    Anchored greedily on the window's own first member, not on a grid aligned to the
+    session start: a grid cuts dense stretches at its boundaries (480 requests against 470
+    measured over every session in the lake) and can split a run of four that a boundary
+    happens to straddle.
+
+    `consumed` are members already sealed into a batch, and excluding them is load-bearing
+    rather than tidy. The seal record is keyed by a window's FIRST index, so a chunk that
+    arrives late and earlier than a sealed window's anchor would shift that anchor, claim a
+    key nobody holds, and transcribe — and bill — every member of that window a second
+    time. A late chunk forms its own window.
+
+    `cap` is a safety net, not the rule. Nothing reaches it while chunks are 30 s; a device
+    emitting much shorter ones would otherwise build one unbounded request.
     """
+    consumed = consumed or set()
+    ordered = sorted((i for i in members if i not in consumed),
+                     key=lambda i: (members[i], i))
     out: list[list[int]] = []
-    run: list[int] = []
-    for i in sorted(set(indices)):
-        if run and i == run[-1] + 1 and len(run) < max_size:
-            run.append(i)
-            continue
-        if run:
-            out.append(run)
-        run = [i]
-    if run:
-        out.append(run)
+    window: list[int] = []
+    anchor = None
+    for i in ordered:
+        if anchor is not None and len(window) < cap:
+            elapsed = (members[i] - anchor).total_seconds() \
+                if hasattr(members[i], "timestamp") else members[i] - anchor
+            if elapsed < window_sec:
+                window.append(i)
+                continue
+        if window:
+            out.append(window)
+        window, anchor = [i], members[i]
+    if window:
+        out.append(window)
     return out
 
 
@@ -232,7 +268,8 @@ def map_key_for_transcript(transcript_key: str, audio_prefix: str = 'audio_segme
 
 
 def member(chunk_index: int, chunk_key: str, abs_start: str, trimmed_head_sec: float,
-           kept_duration_sec: float, trim_measured: bool = True) -> dict:
+           kept_duration_sec: float, trim_measured: bool = True,
+           seam: str = "adjacent") -> dict:
     """One member of a batch. `abs_start` is the chunk's own filename clock, ISO-8601."""
     return {
         "chunk_index": chunk_index,
@@ -243,6 +280,10 @@ def member(chunk_index: int, chunk_key: str, abs_start: str, trimmed_head_sec: f
         # False means the seam measured zero unexpectedly: the audio was kept whole and this
         # says so, rather than leaving a 0.0 that reads as "there was no overlap".
         "trim_measured": bool(trim_measured),
+        # "first" | "adjacent" | "gap". A gap seam bridges a chunk VAD dropped: those two
+        # were never adjacent, so zero overlap is the CORRECT answer and must be kept out of
+        # the unmeasured-seam alarm, which exists to catch the byte comparison breaking.
+        "seam": seam,
     }
 
 
@@ -313,6 +354,87 @@ def resolve_abs_time(batch_map: dict, t_sec: float):
     within = t_sec - chosen["batch_offset_sec"]
     within = max(0.0, min(within, float(chosen["kept_duration_sec"])))
     return base + timedelta(seconds=chosen["trimmed_head_sec"] + within)
+
+
+EMBEDDED_MAP_KEY = "fieldsight_batch_map"
+
+
+def rebase_turns_from_embedded_map(normalized, transcript_data):
+    """Re-time a batched transcript's turns using the map carried inside it.
+
+    A batch's `word.start` counts from the first sample of the concatenated file — an origin
+    that appears in no filename. Filename arithmetic gets the batch's start right and then
+    drifts by the trimmed overlap at every seam, and since 2026-08-13 by the whole of any
+    VAD-dropped chunk the window bridges. A second or two used to be invisible; thirty is not.
+
+    **No S3 client, by design.** Four consumers need this, and the alternative — each one
+    fetching the sidecar — is one new `audio_segments/*` grant per reader behind one
+    `except`-and-log. Three missing grants have already broken this feature silently. The map
+    travels inside the object every reader already holds, so a reader cannot lose one.
+
+    Absent key: return `normalized` untouched. Per-chunk transcripts have no map and must
+    cost nothing, and a batch transcript written before this change still has its sidecar for
+    the one consumer that fetches it.
+
+    `start_sec`/`end_sec` stay batch-relative on purpose: they are the in-file offsets the
+    evidence and playback paths seek `source_filename` with, and that file is the batch WAV.
+    """
+    doc = (transcript_data or {}).get(EMBEDDED_MAP_KEY)
+    if not doc or not (doc.get("members") if isinstance(doc, dict) else None):
+        return normalized
+    turns = (normalized or {}).get("speaker_turns") or []
+    crossings = 0
+    for turn in turns:
+        if turn.get("abs_start") is None:
+            continue                       # no time to re-base; do not invent one
+        start = resolve_abs_time(doc, turn.get("start_sec") or 0.0)
+        if start is None:
+            continue
+        turn["abs_start"] = start
+        turn["abs_start_str"] = start.strftime("%H:%M:%S")
+        end = resolve_abs_time(doc, turn.get("end_sec") or 0.0)
+        if end is not None:
+            turn["abs_end"] = end
+            turn["abs_end_str"] = end.strftime("%H:%M:%S")
+        turn["crosses_gap"] = spans_a_gap(doc, turn.get("start_sec") or 0.0,
+                                          turn.get("end_sec") or 0.0)
+        crossings += 1 if turn["crosses_gap"] else 0
+    # Logged unconditionally, zero included. A guard that speaks only on failure cannot be
+    # told apart from a guard that was never reached — which is how three missing IAM grants
+    # each looked like nothing at all.
+    _log.info("batch: rebased %d turns through the embedded map, batch_splice_turns=%d",
+              len(turns), crossings)
+    return normalized
+
+
+def spans_a_gap(batch_map: dict, start_sec: float, end_sec: float) -> bool:
+    """True when a turn runs across a member boundary that is discontinuous in time.
+
+    A bridged gap splices audio that was never adjacent, and the provider cannot know that:
+    it can emit one turn whose text runs across the join, fusing utterances up to a window
+    apart into a single interval that covers time when nobody spoke. Each end of that turn
+    is individually correct after rebasing, which is exactly why nothing downstream notices.
+    Photo binding and claim provenance both consume the interval.
+
+    Only DISCONTINUOUS boundaries count. Every batch has boundaries; flagging them all would
+    make the signal mean "this is a batch" and bury the cases that matter.
+    """
+    members = batch_map.get("members") or []
+    for prev, nxt in zip(members, members[1:]):
+        boundary = float(nxt["batch_offset_sec"])
+        if not (start_sec < boundary < end_sec):
+            continue
+        a, b = _parse_abs_start(prev["abs_start"]), _parse_abs_start(nxt["abs_start"])
+        if a is None or b is None:
+            continue
+        expected_end = a + timedelta(seconds=float(prev["trimmed_head_sec"])
+                                     + float(prev["kept_duration_sec"]))
+        actual_start = b + timedelta(seconds=float(nxt["trimmed_head_sec"]))
+        # A second of slack. A seam trim is measured to the sample and a real gap is a whole
+        # dropped chunk, so nothing legitimate lands between those two scales.
+        if (actual_start - expected_end).total_seconds() > 1.0:
+            return True
+    return False
 
 
 # ============================================================

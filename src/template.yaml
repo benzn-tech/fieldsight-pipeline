@@ -219,8 +219,12 @@ Parameters:
 
   AlertEmail:
     Type: String
-    Description: Email address for failure alerts (leave empty to skip)
-    Default: ''
+    Description: >-
+      Email address for the three failure alarms. `none` means no alarms, and it is a
+      SENTINEL rather than the empty string because SAM rejects an empty
+      --parameter-overrides value outright -- that failed the whole prod deploy on
+      2026-08-12.
+    Default: 'none'
 
   ClaudeApiKey:
     Type: String
@@ -548,6 +552,55 @@ Parameters:
       the rollback survives a deploy: a switch that exists only in code takes its default
       forever and raises no error.
 
+  BatchWindowSec:
+    Type: String
+    Default: '120'
+    Description: >-
+      How much WALL CLOCK one batch covers. This, not BatchMaxChunks, is the rule as of
+      2026-08-13: a window takes every surviving chunk within this many seconds of its
+      first member, so a chunk VAD dropped no longer ends the batch.
+
+      Measured over every chunk session in the lake, the consecutive-index rule shattered
+      31% of sessions into short runs — one 46-chunk session produced batches of
+      [1,1,1,2,1,1]. The saving is NOT the reason to change it (486 requests against 470);
+      the reason is that a conversation interrupted by one silent chunk was split into two
+      requests, and the same person got an unrelated speaker label on each side.
+
+      Read by lambda_transcribe and by lambda_finalize_claim, and the two MUST agree for
+      the same reason BatchMaxChunks must.
+
+  BatchMaxChunks:
+    Type: String
+    Default: '4'
+    Description: >-
+      A SAFETY CAP since 2026-08-13, no longer the rule — BatchWindowSec is. Nothing
+      reaches it while chunks are 30 s; a device emitting much shorter ones would
+      otherwise build one unbounded request. If segmentSeconds ever changes on a real
+      device, revisit with a duration cap rather than a count.
+
+      How many consecutive chunks may be joined into one ASR request. Read by
+      lambda_transcribe (accumulating) and lambda_finalize_claim (sealing the tail), and
+      the two MUST agree: the sweep decides a run of this size is complete, so a smaller
+      value there would seal runs the transcriber is still filling.
+
+      This is the latency/cost dial, and it was previously reachable only by editing
+      code. Four chunks arrive 28 s apart, so a batch makes the first chunk in it wait
+      ~84 s before transcription starts — measured 2026-08-12, along with the finding
+      that batching saves requests and not wall-clock. Whoever needs to trade some of
+      that latency back should not have to redeploy code to do it.
+
+  BatchSealDeadlineSec:
+    Type: String
+    Default: '150'
+    Description: >-
+      How long a run of 1-3 chunks waits for a fourth before the transcriber seals it
+      anyway. Given ONLY to lambda_transcribe. The close-driven path in
+      lambda_finalize_claim deliberately passes zero instead (see the comment at its
+      seal_ready_runs call): at session close no fourth chunk can arrive, so waiting
+      there is not caution, it is how a session's last chunks went untranscribed twice.
+      Wiring this parameter to the sweep as well would advertise a knob that path
+      ignores.
+
   FilterAudioEventTags:
     Type: String
     Default: 'true'
@@ -794,7 +847,12 @@ Conditions:
   ShouldEnableNonWorkExpiry: !Equals [!Ref EnableNonWorkExpiry, 'true']
   ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
   ShouldManageBucketPolicy: !And [!Condition ShouldEnableTranscribe, !Equals [!Ref ManageDataBucketPolicy, 'true']]
-  ShouldCreateAlerts: !Not [!Equals [!Ref AlertEmail, '']]
+  # Both spellings of "no alerts": the sentinel the workflows send, and the empty string a
+  # manual `sam deploy` might still pass. Testing only one leaves the other creating an SNS
+  # subscription to a literal address of "none".
+  ShouldCreateAlerts: !And
+    - !Not [!Equals [!Ref AlertEmail, '']]
+    - !Not [!Equals [!Ref AlertEmail, 'none']]
   HasVadLayer: !Not [!Equals [!Ref VadLayerArn, '']]
   HasKeyframeFfmpegLayer: !Not [!Equals [!Ref KeyframeFfmpegLayerArn, '']]
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
@@ -972,6 +1030,9 @@ Resources:
           KEYTERMS_PATH: config/custom_vocabulary_construction_nz.txt
           # Batched transcription (spec 2026-08-11). Default false: deploys inert.
           BATCH_TRANSCRIPTION: !Ref BatchTranscription
+          BATCH_WINDOW_SEC: !Ref BatchWindowSec
+          BATCH_MAX_CHUNKS: !Ref BatchMaxChunks
+          BATCH_SEAL_DEADLINE_SEC: !Ref BatchSealDeadlineSec
           # Batching's precondition, read here as well as by the VAD. The transcriber
           # refuses to batch per-VAD-segment units — a chunk in segment mode is several
           # speech islands, and treating one of them as "the chunk" would drop the rest —
@@ -2084,6 +2145,8 @@ Resources:
           # as the transcriber's, and both must be given it or they disagree in
           # silence: members accumulate and the tail never seals.
           BATCH_TRANSCRIPTION: !Ref BatchTranscription
+          BATCH_WINDOW_SEC: !Ref BatchWindowSec
+          BATCH_MAX_CHUNKS: !Ref BatchMaxChunks
           GROUP_MERGE_CAP: !Ref GroupMergeCap
           STUCK_MERGE_SECONDS: !Ref StuckMergeSeconds
           GROUP_MAX_SPAN_SECONDS: !Ref GroupMaxSpanSeconds
@@ -3655,6 +3718,61 @@ Resources:
       EvaluationPeriods: 1
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # Added 2026-08-13. The transcriber had no alarm at all, which is why 27 rejected
+  # transcriptions were silent: replaying a real 71-minute session into TEST drove peak
+  # Lambda concurrency to 141 against the provider's 20-concurrent ceiling, and each
+  # HTTP 429 left a batch WAV with no transcript and nothing to re-drive it -- about 54
+  # minutes of audio, recovered only by hand. Every other significant function here has
+  # an alarm; this is the one that spends money and loses words.
+  TranscribeErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlerts
+    Properties:
+      AlarmName: !Sub ["${P}-transcribe-errors", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        Transcription failed for at least one segment. Each failure is audio that has no
+        transcript and that nothing retries -- check for HTTP 429 (provider concurrency)
+        first, then re-drive the affected keys.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TranscribeFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # A throttled ASYNC invocation writes no log line whatsoever. So the moment a concurrency
+  # ceiling is put on this function -- which is the fix for the 429s -- that failure mode
+  # becomes completely invisible unless this metric is watched. The alarm has to exist
+  # BEFORE the ceiling, not after it.
+  TranscribeThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlerts
+    Properties:
+      AlarmName: !Sub ["${P}-transcribe-throttles", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        Transcribe invocations are being throttled. Async events retry with backoff and are
+        then DISCARDED silently past MaximumEventAge, so a sustained throttle is audio loss.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TranscribeFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
       AlarmActions:
         - !Ref AlertTopic
 

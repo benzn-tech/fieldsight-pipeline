@@ -182,9 +182,11 @@ jobs:
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \
+              "TranscriptTableName=fieldsight-test-transcripts" \
               "AuthorityFlip=${{ vars.TEST_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.TEST_GRADED_ROLES || 'false' }}" \
               "UploadVerifyMode=${{ vars.TEST_UPLOAD_VERIFY_MODE || 'observe' }}" \
+              "AlertEmail=${{ vars.TEST_ALERT_EMAIL || 'none' }}" \
               "ServerBuild=${{ github.sha }}" \
               "DeviceAnnouncementPatterns=${{ vars.TEST_DEVICE_ANNOUNCEMENT_PATTERNS || '[]' }}" \
               "MultiTenantResolution=${{ vars.TEST_MULTI_TENANT_RESOLUTION || 'true' }}" \
@@ -193,6 +195,9 @@ jobs:
               "NormaliseAudio=${{ vars.TEST_NORMALISE_AUDIO || 'true' }}" \
               "TranscribeWholeChunk=${{ vars.TEST_TRANSCRIBE_WHOLE_CHUNK || 'true' }}" \
               "BatchTranscription=${{ vars.TEST_BATCH_TRANSCRIPTION || 'false' }}" \
+              "BatchWindowSec=${{ vars.TEST_BATCH_WINDOW_SEC || '120' }}" \
+              "BatchMaxChunks=${{ vars.TEST_BATCH_MAX_CHUNKS || '4' }}" \
+              "BatchSealDeadlineSec=${{ vars.TEST_BATCH_SEAL_DEADLINE_SEC || '150' }}" \
               "FilterAudioEventTags=${{ vars.TEST_FILTER_AUDIO_EVENT_TAGS || 'true' }}" \
               "EnableGroupMerge=${{ vars.TEST_ENABLE_GROUP_MERGE || 'true' }}" \
               "GroupMergeCap=${{ vars.TEST_GROUP_MERGE_CAP || '2' }}" \

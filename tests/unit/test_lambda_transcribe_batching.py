@@ -69,6 +69,7 @@ class FakeS3:
         self.objects = dict(objects or {})
         self.puts = []
         self.gets = []
+        self.copies = []
 
     def get_object(self, Bucket, Key):
         self.gets.append(Key)
@@ -79,6 +80,9 @@ class FakeS3:
     def put_object(self, Bucket, Key, Body, **kw):
         self.puts.append({"Key": Key, "Body": Body})
         self.objects[Key] = Body
+
+    def copy_object(self, Bucket, Key, CopySource, **kw):
+        self.copies.append(Key)
 
     def put_keys(self, suffix=None):
         return [p["Key"] for p in self.puts
@@ -104,9 +108,21 @@ class FakeLedger:
     def list_members(self, table, session_id):
         return [self.members[i] for i in sorted(self.members)]
 
-    def pending_runs(self, rows, now, deadline_sec, max_size=4):
+    def pending_windows(self, rows, now, grace_sec, window_sec=120.0, cap=4):
         import batch_ledger
-        return batch_ledger.pending_runs(rows, now, deadline_sec, max_size)
+        return batch_ledger.pending_windows(rows, now, grace_sec,
+                                            window_sec=window_sec, cap=cap)
+
+    def consumed_indices(self, rows):
+        import batch_ledger
+        return batch_ledger.consumed_indices(rows)
+
+    def mark_members_consumed(self, table, session_id, indices, first_index):
+        for i in indices:
+            self.members[i]["sealed_into"] = first_index
+
+    def mark_bypassed(self, table, session_id, index, now):
+        self.seals[index] = {"status": "bypassed"}
 
     def claim_seal(self, table, session_id, first_index, members, now):
         if first_index in self.seals:
@@ -116,6 +132,9 @@ class FakeLedger:
 
     def mark_sealed(self, table, session_id, first_index, now):
         self.seals[first_index] = {"status": "sealed"}
+
+    def seal_status(self, table, session_id, first_index):
+        return (self.seals.get(first_index) or {}).get("status")
 
 
 @pytest.fixture
@@ -255,3 +274,140 @@ def test_an_unreadable_raw_upload_does_not_block_the_batch(wired):
     doc = json.loads(s3.puts[[p["Key"] for p in s3.puts].index(maps[0])]["Body"])
     third = doc["members"][2]
     assert third["trimmed_head_sec"] == 0.0 and third["trim_measured"] is False
+
+
+# ---- a bypassed singleton must come back as a transcription, not as a member ----
+
+def test_a_bypassed_member_is_transcribed_when_its_event_comes_back(wired):
+    """The half of the singleton bypass that lives on this side.
+
+    `bypass_singleton` copies the unit onto its own key so a fresh S3 event re-enters this
+    handler. Without a check here the handler registers it, finds it already consumed,
+    plans no window for it, and returns "batched_pending" — so the chunk is neither
+    batched nor transcribed, which is audio gone with no error anywhere. The consumed mark
+    is what makes it silent: it stops the planner, which is exactly what it is for.
+    """
+    monkeypatch, s3, ledger, calls = wired
+    ledger.members[0] = {"chunk_index": 0, "chunk_key": unit_key(0),
+                         "registered_at": 0, "sealed_into": 0}
+    ledger.seals[0] = {"status": "bypassed"}
+
+    results = []
+    handled = mod._maybe_batch("b", unit_key(0), results)
+
+    assert handled is False, "a bypassed member must fall through to transcription"
+    assert results == [], "and must not be reported as batched"
+
+
+# ============================================================
+# The window rule (spec 2026-08-13, plan phase 4)
+# ============================================================
+
+def test_the_window_not_the_count_decides_membership(wired, monkeypatch):
+    """The motivating case, end to end through the handler.
+
+    c5 was dropped by VAD. Under the consecutive-index rule this produces two batches --
+    [4] and [6,7] -- so the same speaker gets an unrelated label on each side of a 30-second
+    silence. One window, one request, one namespace.
+    """
+    monkeypatch, s3, ledger, calls = wired
+    for i in (4, 6, 7):
+        s3.objects[unit_key(i)] = _wav(i)
+        s3.objects[raw_key(i)] = _wav(i)
+        mod._maybe_batch("b", unit_key(i), [])
+
+    monkeypatch.setattr(mod, "BATCH_SEAL_DEADLINE_SEC", 0)   # grace elapsed
+    mod._maybe_batch("b", unit_key(7), [])
+
+    wavs = [k for k in s3.put_keys(".wav")]
+    assert len(wavs) == 1, f"expected one bridging batch, got {wavs}"
+    assert "_bn3_" in wavs[0], f"the window must hold all three survivors: {wavs[0]}"
+
+
+def test_no_bn1_object_is_ever_written(wired, monkeypatch):
+    """A window that ends up with one member goes down the per-chunk path instead."""
+    monkeypatch, s3, ledger, calls = wired
+    s3.objects[unit_key(9)] = _wav(9)
+    s3.objects[raw_key(9)] = _wav(9)
+    mod._maybe_batch("b", unit_key(9), [])
+    monkeypatch.setattr(mod, "BATCH_SEAL_DEADLINE_SEC", 0)
+    mod._maybe_batch("b", unit_key(9), [])
+    assert [k for k in s3.put_keys(".wav") if "_bn1_" in k] == []
+
+
+
+
+# ---- the map travels inside the transcript (phase 5b) ----
+
+def test_a_batch_transcript_carries_its_map(wired):
+    """Without this the four consumers that resolve absolute times have nothing to correct
+    with, and a batched turn renders early -- by the trimmed overlap, and by the whole of
+    any VAD-dropped chunk the window bridged."""
+    mp, s3, ledger, calls = wired
+    batch_key = (f"audio_segments/{USER}/{DATE}/Benl1_{DATE}_14-18-47_sid{SID}_c0000"
+                 f"_bn4_off0.0_to114.0_srcwav.wav")
+    s3.objects[batch_key] = _wav(0)
+    s3.objects[bs.map_key_for_audio(batch_key)] = json.dumps(
+        {"schema": 1, "session_id": SID, "members": [], "sealed_by": "arrival"})
+
+    mod.lambda_handler(_event(batch_key), None)
+
+    written = [p for p in s3.puts if p["Key"].startswith("transcripts/")]
+    assert len(written) == 1, f"the batch must be transcribed: {s3.put_keys()}"
+    assert bs.EMBEDDED_MAP_KEY in json.loads(written[0]["Body"])
+
+
+def test_a_batch_whose_map_is_missing_fails_loudly(wired):
+    """The seal writes the map BEFORE the WAV so that the WAV's existence implies the
+    map's. An absent map is therefore a real fault, and this feature's whole history is
+    faults that were logged and stepped over."""
+    mp, s3, ledger, calls = wired
+    batch_key = (f"audio_segments/{USER}/{DATE}/Benl1_{DATE}_14-18-47_sid{SID}_c0000"
+                 f"_bn4_off0.0_to114.0_srcwav.wav")
+    s3.objects[batch_key] = _wav(0)          # no sidecar alongside it
+
+    out = _results(mod.lambda_handler(_event(batch_key), None))
+    assert out and out[0].get("status") == "error", \
+        "a missing map must not produce a silently un-rebasable transcript"
+    assert [p for p in s3.puts if p["Key"].startswith("transcripts/")] == []
+
+
+def test_a_per_chunk_transcript_gains_nothing_and_reads_nothing(wired):
+    """The common case must cost neither a key in the object nor an S3 GET."""
+    mp, s3, ledger, calls = wired
+    mp.setattr(mod, "BATCH_TRANSCRIPTION", False)
+    mod.lambda_handler(_event(unit_key(0)), None)
+    written = [p for p in s3.puts if p["Key"].startswith("transcripts/")][0]
+    assert bs.EMBEDDED_MAP_KEY not in json.loads(written["Body"])
+    assert not any(k.endswith("_batch_map.json") for k in s3.gets)
+
+
+# ---- batching only works on a provider whose output we write ourselves ----
+
+def test_batching_refuses_the_async_transcribe_provider(wired):
+    """AWS Transcribe writes its own output object; there is no hook to embed the map in it.
+
+    Batching plus that provider therefore produces batch transcripts with no
+    `fieldsight_batch_map`, and every consumer silently falls back to filename arithmetic --
+    mis-timed by the trimmed overlap and by the whole of any bridged gap, with no error
+    anywhere. The plan promised this refusal and it was never written.
+    """
+    mp, s3, ledger, calls = wired
+    mp.setattr(mod, "ASR_PROVIDER", "transcribe")
+    handled = mod._maybe_batch("b", unit_key(0), [])
+    assert handled is False, "must fall through to per-chunk, not accumulate a batch"
+    assert ledger.registered == [], "nothing may be registered under a provider we cannot embed for"
+
+
+def test_the_window_length_is_read_from_the_environment_not_hardcoded(monkeypatch):
+    """The previous version of this asserted `BATCH_WINDOW_SEC == 120`, which passes just as
+    well if the env read is deleted and 120 written in its place -- so it guarded the value
+    and not the wiring. Reload the module with the variable set to something else."""
+    import importlib
+    monkeypatch.setenv("BATCH_WINDOW_SEC", "45")
+    reloaded = importlib.reload(mod)
+    try:
+        assert reloaded.BATCH_WINDOW_SEC == 45
+    finally:
+        monkeypatch.delenv("BATCH_WINDOW_SEC")
+        importlib.reload(mod)

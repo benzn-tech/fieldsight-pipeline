@@ -93,34 +93,103 @@ def list_members(table, session_id: str) -> list[dict]:
 # Which runs are ready
 # ============================================================
 
-def pending_runs(rows, now: int, deadline_sec: int,
-                 max_size: int = DEFAULT_MAX_BATCH) -> list[list[int]]:
-    """The runs that may be sealed right now.
+# `pending_runs` was removed on 2026-08-13 with `plan_batches`, not deprecated alongside
+# `pending_windows`. It grouped consecutive indices, so it could not see a window that
+# bridges a VAD-dropped chunk — and it planned over consumed members, which is how a late
+# earlier chunk could get a sealed window transcribed and billed twice.
 
-    A run of `max_size` consecutive indices is complete and seals immediately. A shorter run
-    seals only once its newest member is older than `deadline_sec`.
 
-    **A gap does not seal the run before it.** Sealing `[4,5]` the moment `7` appears would
-    permanently exclude a chunk 6 that was merely slow — uploads arrive out of order and can
-    be hours late, and a sealed batch is never reopened, so that exclusion is forever.
-    Waiting for the deadline is what makes lateness recoverable and the deadline the only
-    place the decision is made.
+def consumed_indices(rows) -> set:
+    """Members already sealed into a batch.
 
-    A chunk dropped as silent is indistinguishable from a lost upload here, and should be:
-    both mean the batch stops at that index.
+    Kept as a named function rather than an inline comprehension because it is the one
+    thing standing between a late upload and a second bill.
     """
-    from batch_stitch import plan_batches
+    return {int(r["chunk_index"]) for r in rows if r.get("sealed_into") is not None}
 
-    by_index = {int(r["chunk_index"]): r for r in rows}
-    out = []
-    for run in plan_batches(by_index.keys(), max_size=max_size):
-        if len(run) >= max_size:
-            out.append(run)
-            continue
-        newest = max(int(by_index[i].get("registered_at") or 0) for i in run)
-        if now - newest >= deadline_sec:
-            out.append(run)
+
+def _base_times(rows):
+    """chunk index -> device base time, out of the filename that carries it.
+
+    Parsed rather than stored so a row written before this change still plans correctly,
+    and so a filename shape the real parser cannot read fails here instead of silently
+    getting a made-up time.
+    """
+    from transcript_utils import extract_base_time_from_filename
+
+    out = {}
+    for r in rows:
+        key = r.get("chunk_key") or ""
+        base = extract_base_time_from_filename(key.rsplit("/", 1)[-1])
+        if base is not None:
+            out[int(r["chunk_index"])] = base
     return out
+
+
+def pending_windows(rows, now: int, grace_sec: int,
+                    window_sec: float = 120.0,
+                    cap: int = DEFAULT_MAX_BATCH) -> list[list[int]]:
+    """The wall-clock windows that may be sealed right now. Replaces `pending_runs`.
+
+    **Two clocks, one job each.** Membership is decided on the device base times in the
+    filenames, only ever compared to each other. Readiness is decided on `registered_at`,
+    the server epoch — a window seals once its newest member has been quiet for
+    `grace_sec`. Judging readiness on the device clock would find a backlogged session's
+    window long closed and seal its first chunk alone, with zero effective grace, while its
+    sisters were still uploading.
+
+    **The common case does not wait.** A window whose indices are contiguous can gain no
+    new member once its successor has registered outside it, or once the cap is hit, so it
+    seals on arrival exactly as `pending_runs` did. Making everything wait for grace would
+    add 150 s to 383 batches in order to remove it from 26.
+
+    **A window with an interior hole always waits.** The hole is either a VAD drop that is
+    never coming or an upload that is merely slow, and no event distinguishes them. Grace
+    is the only arbiter of that, and it stays the only one.
+    """
+    consumed = consumed_indices(rows)
+    times = _base_times(rows)
+    by_index = {int(r["chunk_index"]): r for r in rows}
+    known = sorted(times)
+
+    from batch_stitch import plan_windows
+
+    # A member whose filename the parser cannot read has no place on the device clock, so it
+    # cannot be given a window — but it must not be dropped either: that would leave a
+    # registered chunk nothing ever seals and nothing ever transcribes, which is audio gone
+    # with no error anywhere. It travels alone. One extra request; the words survive.
+    unplaceable = [int(r["chunk_index"]) for r in rows
+                   if int(r["chunk_index"]) not in times
+                   and int(r["chunk_index"]) not in consumed]
+
+    out = []
+    for window in plan_windows(times, window_sec=window_sec, cap=cap, consumed=consumed) \
+            + [[i] for i in sorted(unplaceable)]:
+        if _cannot_grow(window, times, known, window_sec, cap):
+            out.append(window)
+            continue
+        newest = max(int(by_index[i].get("registered_at") or 0) for i in window)
+        if now - newest >= grace_sec:
+            out.append(window)
+    return out
+
+
+def _cannot_grow(window, times, known, window_sec, cap) -> bool:
+    """True when no chunk that has not arrived could still join this window."""
+    if window != list(range(window[0], window[0] + len(window))):
+        return False                       # an interior index is missing; it may yet land
+    if len(window) >= cap:
+        return True
+    nxt = window[-1] + 1
+    if nxt not in times or window[0] not in times:
+        # Either the successor has not registered, or this window's own anchor has no
+        # readable base time (an unplaceable member travelling alone). Subtracting a
+        # missing anchor raised KeyError, which propagated out of `pending_windows` --
+        # so EVERY arrival for that session errored and `_seal_tail_batches` swallowed
+        # it, leaving the whole session's audio sealed by nothing and transcribed by
+        # nothing. Wait for grace instead; it is the safe answer to both.
+        return False
+    return (times[nxt] - times[window[0]]).total_seconds() >= window_sec
 
 
 # ============================================================
@@ -154,12 +223,88 @@ def claim_seal(table, session_id: str, first_index: int, members, now: int,
     existing = _get_seal(table, session_id, first_index)
     if existing is None:
         return None
-    if existing.get("status") != "sealing":
+    # A stale `bypassed` record is retakeable for the same reason a stale `sealing` one
+    # is: it means the copy-to-self never completed. It can only be reached while the
+    # member is still unconsumed -- once consumed, the planner never proposes it again
+    # and nothing calls this -- so there is no path by which a bypass that DID work
+    # gets re-driven and paid for twice.
+    if existing.get("status") not in ("sealing", "bypassed"):
         return None
     if now - int(existing.get("claimed_at") or 0) < retry_after_sec:
         return None
     table.put_item(Item=item)
     return item
+
+
+def mark_members_consumed(table, session_id: str, indices, batch_first_index: int) -> None:
+    """Record that these members now belong to a sealed batch.
+
+    Written after BOTH artifacts and before `mark_sealed`, so a crash before they exist
+    leaves the members unconsumed and the stale claim retakeable — the re-drive window
+    survives. Once the artifacts are on S3 the batch is real, and consuming its members is
+    what stops a late sibling re-planning and re-billing the same audio.
+
+    The row is rewritten in full rather than replaced by a marker: `chunk_key` is the only
+    record of which object a member was, and losing it makes a sealed batch impossible to
+    diagnose afterwards.
+    """
+    wanted = {int(i) for i in indices}
+    for row in list_members(table, session_id):
+        if int(row["chunk_index"]) not in wanted:
+            continue
+        item = dict(row)
+        item["sealed_into"] = int(batch_first_index)
+        table.put_item(Item=item)
+
+
+def seal_status(table, session_id: str, first_index: int):
+    """"sealing" | "sealed" | "bypassed" | None for the batch anchored at this index."""
+    existing = _get_seal(table, session_id, first_index)
+    return existing.get("status") if existing else None
+
+
+def mark_bypassed(table, session_id: str, index: int, now: int) -> None:
+    """A window of one was handed back to the per-chunk path; no artifact exists.
+
+    Recorded with its own status rather than as `sealed`, so a later question of "why is
+    there no `_bn` object for this stretch" has an answer in the ledger instead of looking
+    like the seal that never happened.
+    """
+    # `claimed_at` as well as `bypassed_at`: the staleness check in `claim_seal` reads
+    # `claimed_at`, and a record without one is `now - 0` old — i.e. instantly abandoned, so
+    # the 900-second window that is supposed to bound the two-sealers race did not exist for
+    # bypassed records at all. `bypassed_at` stays because it says WHEN, which `claimed_at`
+    # on a bypass record would read as a claim that is still in flight.
+    table.put_item(Item={"PK": _pk(session_id), "SK": _seal_sk(index),
+                         "status": "bypassed", "bypassed_at": now,
+                         "claimed_at": now})
+
+
+def release_claim(table, session_id: str, first_index: int, claimed_at: int) -> bool:
+    """Give up a claim whose work failed, so the next tick can retry instead of waiting.
+
+    A seal that raises leaves a `sealing` claim behind, and that claim silences every later
+    attempt for `SEAL_RETRY_SECONDS`. For a session's TAIL that is not a delay but a
+    permanent loss: `_seal_tail_batches` runs once per session at finalize and nothing calls
+    it again, so the takeover never fires and those chunks are never transcribed. Twice on
+    TEST, both times a missing S3 grant, both times found by reading logs.
+
+    Conditional on the claim still being OURS. An unconditional delete would let a slow
+    failing worker wipe the claim of the worker that took over from it, after which both
+    would seal the same audio.
+    """
+    try:
+        table.delete_item(
+            Key={"PK": _pk(session_id), "SK": _seal_sk(first_index)},
+            ConditionExpression="#s = :sealing AND claimed_at = :mine",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":sealing": "sealing", ":mine": claimed_at},
+        )
+        return True
+    except Exception as e:
+        if _is_conditional_failure(e):
+            return False            # someone else holds it, or it finished
+        raise
 
 
 def mark_sealed(table, session_id: str, first_index: int, now: int) -> None:

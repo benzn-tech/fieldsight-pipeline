@@ -150,6 +150,7 @@ from text_normalize import diff_candidates, first_match_span, normalize, occurre
 # frame's structural signal is reconstructed from the still-live topic row.
 from keyframe_selection import keyframe_seconds
 from photo_binding import parse_time_range
+import batch_stitch
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
 logger = logging.getLogger()
@@ -4823,13 +4824,23 @@ def _session_end_dt(conn, caller, folder, date, session_id, rows, start_dt):
 
 
 def _session_label(start_dt, end_dt):
-    """The picker row's time label. Delegates the rule; keeps "?" for the unknown end."""
+    """The picker row's time label. Delegates the rule, then says which end is missing.
+
+    The shared rule returns whichever end it knows, bare. That is right for an email
+    sentence and wrong for a two-ended label: `16:48` alone reads as a start time, so a
+    session with only an END would be shown as though it began then. A lone time that means
+    the opposite of what it looks like is worse than the "?" it replaced.
+    """
     text, note = session_scope.format_time_range(start_dt, end_dt, sep=" – ")
     if note:
         logger.warning("session picker: %s", note)
     if text is None:
         return "? – ?"
-    if end_dt is None or (end_dt is not None and start_dt is not None and end_dt < start_dt):
+    if start_dt is None:
+        return f"? – {text}"
+    # An end before its start is declined by the shared rule, which returns the start
+    # alone — the label still has to show that the other end is missing.
+    if end_dt is None or end_dt < start_dt:
         return f"{text} – ?"
     return text
 
@@ -5047,7 +5058,7 @@ MEDIA_WINDOW_BUFFER_SEC = 60
 LEGACY_TRANSCRIPT_SPAN_SEC = 600
 
 
-def _org_transcript_file_end_sec(filename, file_time_sec):
+def _org_transcript_file_end_sec(filename, file_time_sec, batch_map=None):
     """Absolute end of one transcript file, for the per-file window prefilter.
 
     A chunk-session transcript states its own length in its name
@@ -5056,11 +5067,44 @@ def _org_transcript_file_end_sec(filename, file_time_sec):
     the prefilter a no-op -- `segments[]` came back completely unwindowed and
     the Transcript tab rendered the whole session beside a one-topic Audio
     tab (2026-08-09 prod).
+
+    A BATCH's tokens describe the CONCATENATED audio, which since the wall-clock window
+    rule is shorter than the wall clock it covers whenever it bridges a chunk VAD dropped:
+    88 s of audio can span 118 s of meeting. Comparing the short span against a topic
+    window drops the whole file out of the Transcript tab for a topic the Audio tab plays
+    quite happily. Given the map, the end comes from the last member's own clock.
     """
+    members = (batch_map or {}).get("members") or []
+    if members:
+        first = batch_stitch._parse_abs_start(members[0]["abs_start"])
+        last = members[-1]
+        last_start = batch_stitch._parse_abs_start(last["abs_start"])
+        if first is not None and last_start is not None:
+            offset = ((last_start - first).total_seconds()
+                      + float(last["trimmed_head_sec"]))
+            return file_time_sec + offset + float(last["kept_duration_sec"])
     m = re.search(r"_off([\d.]+)_to([\d.]+)", filename)
     if m:
         return file_time_sec + (float(m.group(2)) - float(m.group(1)))
     return file_time_sec + LEGACY_TRANSCRIPT_SPAN_SEC
+
+
+def _org_segment_abs_sec(file_time_sec, seg_sec, batch_map=None):
+    """Where a segment offset lands on the session clock.
+
+    The viewer resolves absolute time with its own arithmetic rather than through
+    `normalize_transcript` — which is exactly why the AST invariant that guards that
+    function's callers is structurally blind to this file. Without the map, every segment
+    after a bridged gap renders up to a whole window early.
+    """
+    if not (batch_map or {}).get("members"):
+        return file_time_sec + seg_sec
+    members = batch_map["members"]
+    first = batch_stitch._parse_abs_start(members[0]["abs_start"])
+    landed = batch_stitch.resolve_abs_time(batch_map, seg_sec)
+    if first is None or landed is None:
+        return file_time_sec + seg_sec
+    return file_time_sec + (landed - first).total_seconds()
 
 
 def _org_media_window(start_time, end_time):
@@ -5149,12 +5193,23 @@ def _read_org_transcripts(date, folder, start_time, end_time):
         if file_time_sec is None:
             continue
         file_end_sec = _org_transcript_file_end_sec(filename, file_time_sec)
-        if file_end_sec < start_sec or file_time_sec > end_sec:
+        # A batch's map lives INSIDE the object, so the exact span is not knowable until it
+        # is read. Excluding on the filename span would drop a file that really does reach
+        # into the window -- up to a whole bridged gap further than its tokens admit. So a
+        # batch is loaded first and re-checked below; the cost is one S3 read.
+        is_batch = batch_stitch.is_batch_key(filename)
+        if not is_batch and (file_end_sec < start_sec or file_time_sec > end_sec):
+            continue
+        if is_batch and file_time_sec > end_sec:
             continue
         try:
             obj = s3().get_object(Bucket=S3_BUCKET, Key=key)
             data = json.loads(obj["Body"].read().decode("utf-8"))
             results = data.get("results", {})
+            batch_map = data.get(batch_stitch.EMBEDDED_MAP_KEY)
+            if is_batch and batch_map and _org_transcript_file_end_sec(
+                    filename, file_time_sec, batch_map) < start_sec:
+                continue
             full_text = results.get("transcripts", [{}])[0].get("transcript", "")
 
             # Speaker-segmented audio_segments from Transcribe. Providers that
@@ -5167,8 +5222,8 @@ def _read_org_transcripts(date, folder, start_time, end_time):
             for aseg in audio_segs:
                 seg_start = float(aseg.get("start_time", 0))
                 seg_end = float(aseg.get("end_time", 0))
-                abs_start = file_time_sec + seg_start
-                abs_end = file_time_sec + seg_end
+                abs_start = _org_segment_abs_sec(file_time_sec, seg_start, batch_map)
+                abs_end = _org_segment_abs_sec(file_time_sec, seg_end, batch_map)
 
                 # Filter to topic time range
                 if abs_end < start_sec or abs_start > end_sec:
@@ -5198,7 +5253,7 @@ def _read_org_transcripts(date, folder, start_time, end_time):
                     continue
                 total_words += 1
                 word_start = float(item.get("start_time", 0))
-                abs_ws = file_time_sec + word_start
+                abs_ws = _org_segment_abs_sec(file_time_sec, word_start, batch_map)
                 if start_sec <= abs_ws <= end_sec:
                     in_range_words.append(item.get("alternatives", [{}])[0].get("content", ""))
 

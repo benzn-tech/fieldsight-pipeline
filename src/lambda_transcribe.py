@@ -122,11 +122,18 @@ VOCABULARY_NAME = os.environ.get('VOCABULARY_NAME', '')
 # --- Provider toggle (Phase: alt-ASR) --------------------------------------
 ASR_PROVIDER = os.environ.get('ASR_PROVIDER', 'transcribe')  # transcribe | elevenlabs
 
-# Batched transcription (spec 2026-08-11): accumulate up to BATCH_MAX_CHUNKS consecutive
-# chunks of one session and send them as ONE request. Default off in code, template and
-# both workflows, so merging this changes nothing anywhere.
+# Batched transcription (spec 2026-08-11, window rule 2026-08-13): accumulate one session's
+# chunks over BATCH_WINDOW_SEC of wall clock and send them as ONE request. Default off in
+# code, template and both workflows, so merging this changes nothing anywhere.
 BATCH_TRANSCRIPTION = os.environ.get('BATCH_TRANSCRIPTION', 'false').lower() == 'true'
+BATCH_WINDOW_SEC = float(os.environ.get('BATCH_WINDOW_SEC', '120'))
+# A SAFETY CAP, not the rule — nothing reaches it while chunks are 30 s. A device emitting
+# much shorter ones would otherwise build one unbounded request.
 BATCH_MAX_CHUNKS = int(os.environ.get('BATCH_MAX_CHUNKS', '4'))
+# How long a window that could still grow stays open. Named "deadline" from when it was one;
+# under the window rule it is a grace period. NOT renamed: the name is wired through both
+# workflows and the template, and a three-segment rename for a word is how a switch ends up
+# holding its default forever.
 BATCH_SEAL_DEADLINE_SEC = int(os.environ.get('BATCH_SEAL_DEADLINE_SEC', '150'))
 # Read here as well as in the VAD: batching assumes ONE unit per chunk, which is only true
 # in whole-chunk mode. In segment mode a chunk yields several speech islands and treating
@@ -331,6 +338,29 @@ def write_ledger_record(display_name, file_date, base_name, job_name,
 # minute).
 
 
+def _embed_batch_map(bucket, key, transcript_json):
+    """Carry a batch's time map inside the transcript that needs it.
+
+    Four consumers turn `word.start` into a wall-clock time, and a batch's origin is the
+    first sample of the concatenated file — an origin no filename carries. The alternative,
+    each reader fetching the sidecar itself, is one new `audio_segments/*` grant per reader
+    behind one `except`-and-log; three missing grants have already broken this feature
+    silently. Inside the object, a reader cannot lose it.
+
+    **A missing sidecar RAISES.** The seal writes the map before the WAV precisely so that
+    the WAV's existence implies the map's, so absence here is a real fault and not a
+    condition to log past. This is the fail-loud site this feature has never had.
+    """
+    if not batch_stitch.is_batch_key(key):
+        return transcript_json
+    map_key = batch_stitch.map_key_for_audio(key)
+    doc = json.loads(s3.get_object(Bucket=bucket, Key=map_key)['Body'].read())
+    out = dict(transcript_json)
+    out[batch_stitch.EMBEDDED_MAP_KEY] = doc
+    logger.info("batch: embedded %s in the transcript for %s", map_key, key)
+    return out
+
+
 def _maybe_batch(bucket, key, results):
     """Consume `key` as a batch member. False = batching does not apply, transcribe it.
 
@@ -345,13 +375,35 @@ def _maybe_batch(bucket, key, results):
         logger.warning("batch: TRANSCRIBE_WHOLE_CHUNK is off, so a chunk is several units "
                        "— falling back to per-chunk transcription for %s", key)
         return False
+    if ASR_PROVIDER != 'elevenlabs':
+        # AWS Transcribe writes its own output object and there is no hook to embed the map
+        # in it. A batch transcribed that way carries no `fieldsight_batch_map`, so every
+        # consumer silently falls back to filename arithmetic — wrong by the trimmed overlap
+        # and by the whole of any bridged gap, with no error anywhere. Refuse loudly instead:
+        # per-chunk transcription is correct, just more requests.
+        logger.warning("batch: ASR_PROVIDER=%s writes its own output, so a batch could not "
+                       "carry its time map — falling back to per-chunk for %s",
+                       ASR_PROVIDER, key)
+        return False
 
     now = int(time.time())
     table = _get_dynamodb_table()
+
+    # A window of one is not worth a batch, so `batch_seal.bypass_singleton` copies the unit
+    # onto its own key to re-drive it here. That copy arrives as an ordinary event, and
+    # without this check it would be registered, found already consumed, planned into no
+    # window, and reported as `batched_pending` — neither batched nor transcribed. The
+    # consumed mark is precisely what silences the planner, so the audio would vanish with
+    # no error anywhere.
+    if batch_ledger.seal_status(table, session_id, chunk_index) == 'bypassed':
+        logger.info("batch: chunk %s was bypassed as a window of one — transcribing it",
+                    chunk_index)
+        return False
+
     batch_ledger.register_chunk(table, session_id, chunk_index, key, now)
     batch_seal.seal_ready_runs(s3, bucket, session_id, table, now,
                                BATCH_SEAL_DEADLINE_SEC, BATCH_MAX_CHUNKS,
-                               sealed_by='arrival')
+                               sealed_by='arrival', window_sec=BATCH_WINDOW_SEC)
 
     results.append({'key': key, 'status': 'batched_pending',
                     'session': session_id, 'chunk': chunk_index})
@@ -443,6 +495,7 @@ def lambda_handler(event, context):
                     num_speakers=min(max(MAX_SPEAKERS, 2), 10),
                     keyterms=keyterms,
                 )
+                transcript_json = _embed_batch_map(bucket, key, transcript_json)
                 s3.put_object(
                     Bucket=bucket,
                     Key=output_key,
