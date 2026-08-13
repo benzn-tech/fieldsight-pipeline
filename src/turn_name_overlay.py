@@ -86,6 +86,20 @@ def _parse_ref(ref):
         return None
 
 
+def turn_ref(source_filename, start_sec):
+    """The one way a turn is named, for everybody who names one.
+
+    A correction carries the audio (`…_srcwav.wav`), the transcript endpoint holds the
+    transcript (`…_srcwav.json`), and the embedder used to build refs with an f-string in
+    each of two places. The same turn then had two spellings and they never compared equal —
+    propagation refused every real correction with "corrected turn not among the session's
+    turns", which is the fourth appearance in one night of two names for one thing.
+
+    Both halves call this. That is the only property that makes the comparison mean anything.
+    """
+    return f"{_stem(source_filename)}@{float(start_sec)}"
+
+
 def build(rows, confirmed_only=False):
     """An index over live rows, carrying its own orphan bookkeeping.
 
