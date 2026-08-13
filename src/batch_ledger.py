@@ -21,6 +21,8 @@ Both are settled by a conditional write, not by reading first and then writing.
 """
 from __future__ import annotations
 
+import logging
+
 DEFAULT_MAX_BATCH = 4
 
 # How long a `sealing` claim may sit before another worker may take it over. The order of
@@ -71,9 +73,63 @@ def register_chunk(table, session_id: str, index: int, chunk_key: str, now: int)
         )
     except Exception as e:
         if _is_conditional_failure(e):
+            _mark_active(table, session_id)
             return "already_present"
         raise
+    _mark_active(table, session_id)
     return "registered"
+
+
+def _mark_active(table, session_id: str) -> None:
+    """Idempotent, and written on duplicate deliveries too: the index must be present
+    whenever any member is, including when this delivery is the second one."""
+    try:
+        table.put_item(Item={"PK": ACTIVE_PK, "SK": _active_sk(session_id),
+                             "session_id": session_id})
+    except Exception:
+        logging.getLogger().warning("batch: could not index session %s as active",
+                                    session_id)
+
+
+ACTIVE_PK = "BATCH_ACTIVE"
+
+
+def _active_sk(session_id: str) -> str:
+    return f"SESSION#{session_id}"
+
+
+def active_sessions(table) -> list[str]:
+    """Sessions with batching work that may still be owed.
+
+    Nothing periodic knew this. Sealing runs when a chunk arrives; the close pass runs once
+    and only for sessions the finalize sweep sees. A device whose `/open` never reached the
+    server has no row at all, so after a backlog burst every bucket sits registered and
+    unsealed forever — zero transcripts, zero errors. That is a real device behaviour, and
+    the acceptance replay reproduced it exactly.
+
+    One partition, so the periodic pass is a single Query — no table scan, no S3 walk.
+    """
+    resp = table.query(
+        KeyConditionExpression="PK = :pk AND begins_with(SK, :sk)",
+        ExpressionAttributeValues={":pk": ACTIVE_PK, ":sk": "SESSION#"},
+    )
+    return [i["SK"].split("#", 1)[1] for i in (resp.get("Items") or [])]
+
+
+def retire_if_finished(table, session_id: str) -> bool:
+    """Drop a session from the active list once every member is consumed.
+
+    Without this the list only grows, and the periodic pass gets slower every day until it
+    is the thing that times the sweep out.
+    """
+    rows = list_members(table, session_id)
+    if rows and consumed_indices(rows) != {int(r["chunk_index"]) for r in rows}:
+        return False
+    try:
+        table.delete_item(Key={"PK": ACTIVE_PK, "SK": _active_sk(session_id)})
+    except Exception:
+        return False
+    return True
 
 
 def list_members(table, session_id: str) -> list[dict]:

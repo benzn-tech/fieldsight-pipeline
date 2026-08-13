@@ -54,6 +54,17 @@ class FakeTable:
         self.items[key] = dict(Item)
         self.writes += 1
 
+    def delete_item(self, Key=None, ConditionExpression=None,
+                    ExpressionAttributeNames=None, ExpressionAttributeValues=None):
+        k = (Key["PK"], Key["SK"])
+        item = self.items.get(k)
+        vals = ExpressionAttributeValues or {}
+        if ConditionExpression and (item is None
+                                    or item.get("status") != vals.get(":sealing")
+                                    or item.get("claimed_at") != vals.get(":mine")):
+            raise ConditionalCheckFailedException(k)
+        self.items.pop(k, None)
+
     def query(self, KeyConditionExpression=None, ExpressionAttributeValues=None):
         pk = ExpressionAttributeValues[":pk"]
         prefix = (ExpressionAttributeValues or {}).get(":sk", "")
@@ -70,15 +81,19 @@ def table():
 
 def test_a_chunk_registers_once(table):
     assert bl.register_chunk(table, SID, 4, "users/…/c0004.wav", NOW) == "registered"
-    assert table.writes == 1
+    assert len(bl.list_members(table, SID)) == 1
 
 
 def test_the_same_chunk_delivered_twice_is_not_two_members(table):
     """S3 event notifications are at-least-once. A second delivery that added a member would
-    put the same audio in the batch twice and pay to transcribe it."""
+    put the same audio in the batch twice and pay to transcribe it.
+
+    Asserted on the MEMBER COUNT, not on the table's write count: registration also writes
+    the active-session index, and a raw write count would make that look like a duplicate
+    member. What matters is how many members exist."""
     bl.register_chunk(table, SID, 4, "users/…/c0004.wav", NOW)
     assert bl.register_chunk(table, SID, 4, "users/…/c0004.wav", NOW + 5) == "already_present"
-    assert table.writes == 1
+    assert len(bl.list_members(table, SID)) == 1
 
 
 def test_members_come_back_in_index_order_however_they_arrived(table):
@@ -405,3 +420,46 @@ def test_a_partial_snapshot_spanning_buckets_does_not_seal_an_incomplete_one():
 
     out = bl.pending_buckets(rows, NOW + 400, grace_sec=150)
     assert len(out["ready"]) == 2, "past grace, both seal"
+
+
+# ============================================================
+# The index of sessions that still owe work (prod blocker #1)
+# ============================================================
+
+def test_registering_a_chunk_puts_its_session_on_the_active_list(table):
+    """Nothing periodic knows which sessions have unfinished batching.
+
+    Sealing runs on chunk arrival; the close pass runs once, and only for sessions in
+    `pending_close`. A device whose `/open` never reached the server has no row at all, so
+    after a backlog burst every bucket sits registered and unsealed forever -- zero
+    transcripts, zero errors. That is the acceptance replay, and it is a real device
+    behaviour, not a test artefact.
+
+    A one-partition index makes the periodic pass cheap and precise: no table scan, no S3
+    walk, just "who still owes work".
+    """
+    bl.register_chunk(table, SID, 4, "audio_segments/U/2026-08-13/x_c0004.wav", NOW)
+    assert bl.active_sessions(table) == [SID]
+
+
+def test_a_session_leaves_the_active_list_once_every_member_is_consumed(table):
+    """Otherwise the list grows forever and the periodic pass gets slower every day."""
+    for i in (4, 5):
+        bl.register_chunk(table, SID, i, f"audio_segments/U/2026-08-13/x_c{i:04d}.wav", NOW)
+    bl.mark_members_consumed(table, SID, [4, 5], 4)
+    bl.retire_if_finished(table, SID)
+    assert bl.active_sessions(table) == []
+
+
+def test_a_session_with_one_unconsumed_member_stays_active(table):
+    for i in (4, 5):
+        bl.register_chunk(table, SID, i, f"audio_segments/U/2026-08-13/x_c{i:04d}.wav", NOW)
+    bl.mark_members_consumed(table, SID, [4], 4)
+    bl.retire_if_finished(table, SID)
+    assert bl.active_sessions(table) == [SID], "chunk 5 still owes a batch"
+
+
+def test_the_active_list_survives_a_duplicate_registration(table):
+    bl.register_chunk(table, SID, 4, "audio_segments/U/2026-08-13/x_c0004.wav", NOW)
+    bl.register_chunk(table, SID, 4, "audio_segments/U/2026-08-13/x_c0004.wav", NOW)
+    assert bl.active_sessions(table) == [SID]
