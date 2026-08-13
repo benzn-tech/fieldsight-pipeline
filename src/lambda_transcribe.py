@@ -395,7 +395,11 @@ def _maybe_batch(bucket, key, results):
     # window, and reported as `batched_pending` — neither batched nor transcribed. The
     # consumed mark is precisely what silences the planner, so the audio would vanish with
     # no error anywhere.
-    if batch_ledger.seal_status(table, session_id, chunk_index) == 'bypassed':
+    # By MEMBER, not by seal key. The seal key is now the wall-clock bucket, so asking
+    # `seal_status(sid, chunk_index)` would miss the record entirely and this event
+    # would fall back into batching, find itself consumed, and report batched_pending
+    # for audio nothing will ever transcribe.
+    if batch_ledger.bypass_status(table, session_id, chunk_index) == 'bypassed':
         logger.info("batch: chunk %s was bypassed as a window of one — transcribing it",
                     chunk_index)
         return False

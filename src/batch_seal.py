@@ -115,26 +115,34 @@ def bypass_singleton(s3, bucket, session_id, index, unit_key, now, table):
     return None
 
 
-def seal_batch(s3, bucket, session_id, run, by_index, now, table, sealed_by='arrival'):
+def seal_batch(s3, bucket, session_id, run, by_index, now, table, sealed_by='arrival',
+               claim_key=None):
     """Write one batch's map and audio, or do nothing if another worker owns it.
 
     The WAV is written LAST: its S3 event is what starts the transcription, so a crash
     between the two must never leave a batch whose map is missing. Returns the batch key,
     or None if the claim was lost or the window held a single member.
     """
-    if batch_ledger.claim_seal(table, session_id, run[0], run, now) is None:
+    # The claim is keyed on the BUCKET, not on the run's first index. A first-index key can
+    # only exclude a worker that computed the same anchor, and under concurrent arrival two
+    # workers compute different anchors over the same chunks — 123 batches for 153 chunks on
+    # a real replay. `claim_key=None` keeps the old shape for direct callers and tests.
+    key = run[0] if claim_key is None else claim_key
+    if batch_ledger.claim_seal(table, session_id, key, run, now) is None:
         return None
     try:
-        return _seal_claimed(s3, bucket, session_id, run, by_index, now, table, sealed_by)
+        return _seal_claimed(s3, bucket, session_id, run, by_index, now, table,
+                             sealed_by, key)
     except Exception:
         # Hand the claim back. Holding it after a failure does not protect anything -- no
         # artifact was written -- and it silences every retry for SEAL_RETRY_SECONDS, which
         # for a session's tail means forever: the close sweep visits a session once.
-        batch_ledger.release_claim(table, session_id, run[0], now)
+        batch_ledger.release_claim(table, session_id, key, now)
         raise
 
 
-def _seal_claimed(s3, bucket, session_id, run, by_index, now, table, sealed_by):
+def _seal_claimed(s3, bucket, session_id, run, by_index, now, table, sealed_by,
+                  claim_key):
     """The work, once this worker owns the claim."""
     if len(run) == 1:
         return bypass_singleton(s3, bucket, session_id, run[0],
@@ -189,7 +197,7 @@ def _seal_claimed(s3, bucket, session_id, run, by_index, now, table, sealed_by):
     # Placed after the WAV so a crash before the artifacts exist leaves the members
     # unconsumed and the stale `sealing` claim retakeable -- the re-drive window survives.
     batch_ledger.mark_members_consumed(table, session_id, run, run[0])
-    batch_ledger.mark_sealed(table, session_id, run[0], now)
+    batch_ledger.mark_sealed(table, session_id, claim_key if claim_key is not None else run[0], now)
     logger.info("batch: sealed %s from chunks %s (%s), members consumed",
                 batch_key, run, sealed_by)
     return batch_key
@@ -209,11 +217,20 @@ def seal_ready_runs(s3, bucket, session_id, table, now, deadline_sec, max_chunks
     if not rows:
         return []
     by_index = {int(r['chunk_index']): r for r in rows}
+    plan = batch_ledger.pending_buckets(rows, now, deadline_sec, window_sec=window_sec,
+                                        cap=max_chunks, table=table, session_id=session_id)
     out = []
-    for run in batch_ledger.pending_windows(rows, now, deadline_sec,
-                                            window_sec=window_sec, cap=max_chunks):
+    for bucket_id, run in plan['ready']:
         key = seal_batch(s3, bucket, session_id, run, by_index, now, table,
-                         sealed_by=sealed_by)
+                         sealed_by=sealed_by, claim_key=bucket_id)
         if key:
             out.append(key)
+    # A member whose bucket sealed without it would be re-planned into that bucket forever
+    # and refused every time, because a sealed claim is never re-driven. It goes down the
+    # per-chunk path instead — the same mechanism a window of one uses.
+    for idx in plan['stragglers']:
+        row = by_index.get(idx)
+        if row is None:
+            continue
+        bypass_singleton(s3, bucket, session_id, idx, row['chunk_key'], now, table)
     return out
