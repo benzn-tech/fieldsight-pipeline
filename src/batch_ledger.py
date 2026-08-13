@@ -280,6 +280,33 @@ def mark_bypassed(table, session_id: str, index: int, now: int) -> None:
                          "claimed_at": now})
 
 
+def release_claim(table, session_id: str, first_index: int, claimed_at: int) -> bool:
+    """Give up a claim whose work failed, so the next tick can retry instead of waiting.
+
+    A seal that raises leaves a `sealing` claim behind, and that claim silences every later
+    attempt for `SEAL_RETRY_SECONDS`. For a session's TAIL that is not a delay but a
+    permanent loss: `_seal_tail_batches` runs once per session at finalize and nothing calls
+    it again, so the takeover never fires and those chunks are never transcribed. Twice on
+    TEST, both times a missing S3 grant, both times found by reading logs.
+
+    Conditional on the claim still being OURS. An unconditional delete would let a slow
+    failing worker wipe the claim of the worker that took over from it, after which both
+    would seal the same audio.
+    """
+    try:
+        table.delete_item(
+            Key={"PK": _pk(session_id), "SK": _seal_sk(first_index)},
+            ConditionExpression="#s = :sealing AND claimed_at = :mine",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":sealing": "sealing", ":mine": claimed_at},
+        )
+        return True
+    except Exception as e:
+        if _is_conditional_failure(e):
+            return False            # someone else holds it, or it finished
+        raise
+
+
 def mark_sealed(table, session_id: str, first_index: int, now: int) -> None:
     """The artifacts are written; this batch is finished and must never be re-driven."""
     table.put_item(Item={"PK": _pk(session_id), "SK": _seal_sk(first_index),

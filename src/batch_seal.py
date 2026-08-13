@@ -124,7 +124,18 @@ def seal_batch(s3, bucket, session_id, run, by_index, now, table, sealed_by='arr
     """
     if batch_ledger.claim_seal(table, session_id, run[0], run, now) is None:
         return None
+    try:
+        return _seal_claimed(s3, bucket, session_id, run, by_index, now, table, sealed_by)
+    except Exception:
+        # Hand the claim back. Holding it after a failure does not protect anything -- no
+        # artifact was written -- and it silences every retry for SEAL_RETRY_SECONDS, which
+        # for a session's tail means forever: the close sweep visits a session once.
+        batch_ledger.release_claim(table, session_id, run[0], now)
+        raise
 
+
+def _seal_claimed(s3, bucket, session_id, run, by_index, now, table, sealed_by):
+    """The work, once this worker owns the claim."""
     if len(run) == 1:
         return bypass_singleton(s3, bucket, session_id, run[0],
                                 by_index[run[0]]['chunk_key'], now, table)

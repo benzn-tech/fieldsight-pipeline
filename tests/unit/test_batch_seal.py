@@ -94,6 +94,17 @@ class FakeTable:
     def put_item(self, Item=None, ConditionExpression=None):
         self.items[(Item["PK"], Item["SK"])] = dict(Item)
 
+    def delete_item(self, Key=None, ConditionExpression=None,
+                    ExpressionAttributeNames=None, ExpressionAttributeValues=None):
+        k = (Key["PK"], Key["SK"])
+        item = self.items.get(k)
+        vals = ExpressionAttributeValues or {}
+        if ConditionExpression and (item is None
+                                    or item.get("status") != vals.get(":sealing")
+                                    or item.get("claimed_at") != vals.get(":mine")):
+            raise type("ConditionalCheckFailedException", (Exception,), {})()
+        self.items.pop(k, None)
+
     def query(self, KeyConditionExpression=None, ExpressionAttributeValues=None):
         pk = ExpressionAttributeValues[":pk"]
         sk = ExpressionAttributeValues.get(":sk", "")
@@ -268,3 +279,54 @@ def test_a_late_earlier_chunk_cannot_rebuild_a_sealed_window(s3):
     bl.register_chunk(table, SID, 4, unit_key(4, "09-00-00"), 5000)   # an hour late
     got = bl.pending_windows(bl.list_members(table, SID), 9000, 150)
     assert got == [[4]], f"the sealed window must not be re-planned, got {got}"
+
+
+# ---- a failed seal must not strand its claim ----
+
+def test_a_failed_seal_releases_its_claim_so_the_next_tick_can_retry(s3):
+    """A seal that raises leaves a `sealing` claim, and that claim blocks every retry for
+    `SEAL_RETRY_SECONDS` — fifteen minutes.
+
+    For a session's TAIL that is not a delay, it is permanent: `_seal_tail_batches` runs
+    once per session at finalize and nothing ever calls it again, so the 900-second takeover
+    never fires and those chunks are never transcribed. It has happened twice on TEST, both
+    times a missing S3 grant, both times found by reading logs rather than by anything
+    failing.
+
+    Releasing on failure makes a transient fault retryable on the NEXT tick instead of
+    after 900 seconds, which is what makes any retry design possible at all.
+    """
+    import batch_ledger as bl
+    table = FakeTable()
+    for i, hms in ((6, "09-01-00"), (7, "09-01-30")):
+        bl.register_chunk(table, SID, i, unit_key(i, hms), 0)
+
+    class Exploding(RecordingS3):
+        def put_object(self, Bucket, Key, Body, **kw):
+            raise RuntimeError("AccessDenied")
+
+    with pytest.raises(RuntimeError):
+        batch_seal.seal_batch(Exploding(s3.objects), "b", SID, [6, 7],
+                              _by_index((6, "09-01-00"), (7, "09-01-30")), 100, table)
+
+    assert bl.seal_status(table, SID, 6) is None, \
+        "the claim must be gone, not left as `sealing` for another 900 seconds"
+    assert bl.consumed_indices(bl.list_members(table, SID)) == set(), \
+        "and nothing may be marked consumed by a seal that produced no artifact"
+
+    # the retry, on the very next tick rather than in fifteen minutes
+    out = batch_seal.seal_batch(s3, "b", SID, [6, 7],
+                                _by_index((6, "09-01-00"), (7, "09-01-30")), 101, table)
+    assert out is not None and bs.is_batch_key(out)
+
+
+def test_a_release_does_not_touch_a_claim_someone_else_now_holds(s3):
+    """The release is conditional on the claim still being ours. Deleting unconditionally
+    would let a slow failing worker wipe the claim of the worker that took over from it,
+    and then both would seal."""
+    import batch_ledger as bl
+    table = FakeTable()
+    bl.claim_seal(table, SID, 6, [6, 7], 100)
+    table.items[(f"BATCH#{SID}", "SEAL#0006")]["claimed_at"] = 999   # taken over
+    bl.release_claim(table, SID, 6, 100)
+    assert bl.seal_status(table, SID, 6) == "sealing", "the newer claim must survive"
