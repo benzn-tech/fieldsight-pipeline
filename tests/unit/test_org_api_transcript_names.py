@@ -98,3 +98,30 @@ def test_switching_the_feature_off_returns_the_old_response_exactly(wired, monke
     out = _get()
     assert "unmatchedNames" not in out
     assert all("speaker_name" not in s for s in out["speaker_segments"])
+
+
+def test_one_assertion_does_not_confirm_a_neighbouring_turn(wired, monkeypatch):
+    """The defect real data found: the user marked the turn at 12.5, and the turn at 12.3 —
+    a different speaker — came back confirmed too, because it sits inside the tolerance and
+    claimed the same row. A wrong CONFIRMED name is the failure this layer exists to avoid."""
+    base = ("ben_ucpk2_2026-08-13_11-49-00_sid9db9293e82b94a4d9611572b1233f82d"
+            "_c0000_bn4_off0.0_to114.0_srcwav.json")
+    monkeypatch.setattr(org, "_read_org_transcripts", lambda d, f, a, b, **kw: {
+        "text": "", "segments": [], "speaker_segments": [
+            {"speaker": "spk_1", "text": "Go.", "start": 1.0, "end": 1.4,
+             "time_label": "x", "duration": 0.4,
+             "source_filename": base, "chunk_start": 12.3},
+            {"speaker": "spk_0", "text": "hello", "start": 2.0, "end": 8.0,
+             "time_label": "y", "duration": 6.0,
+             "source_filename": base, "chunk_start": 12.5},
+        ]})
+    monkeypatch.setattr(org.voiceprints, "live_turn_names", lambda conn, co, s: [
+        {"turn_ref": base[:-5] + ".wav@12.5", "display_name": "Ben L",
+         "state": "confirmed", "source": "correction",
+         "created_at": "2026-08-13T01:00:00", "cluster_ref": None}])
+    out = _get()
+    assert "speaker_segments" in out, out
+    segs = out["speaker_segments"]
+    assert segs[1]["speaker_name"] == "Ben L"
+    assert "speaker_name" not in segs[0], (
+        "the assertion bled onto the neighbouring turn and confirmed a name nobody gave")

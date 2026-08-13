@@ -163,3 +163,47 @@ def orphans(index):
     statement.
     """
     return len(index["unmatched"])
+
+
+def resolve(index, segments):
+    """Pair every row with at most ONE turn, and every turn with at most one row.
+
+    Per-segment lookup was wrong in a way only real data showed: one row could be claimed by
+    several segments, so a single assertion produced two `confirmed` names — the user marked
+    the turn at 2.86 and the turn at 2.58, a different speaker saying "Go.", came back
+    confirmed as well, because it sits within tolerance.
+
+    A wrong confident name is the failure this layer is shaped around, and it arrived from
+    the direction nobody was watching: not a bad score, but a good row claimed twice. A
+    stored row describes ONE turn, and the resolution has to say so.
+
+    Greedy over every (row, turn) pair by distance, tightest first, so the best-supported
+    pairing is made before any looser one can steal either side. Precedence still decides
+    when two rows reach the same turn at the same distance.
+
+    `segments` are dicts carrying `source_filename` and `chunk_start`. Returns
+    `{segment_index: {display_name, state, source, cluster_ref}}` for the turns that got a
+    name; anything absent simply has none.
+    """
+    pairs = []
+    for si, seg in enumerate(segments or []):
+        entries = index["by_file"].get(_stem(seg.get("source_filename"))) or []
+        at_seg = float(seg.get("chunk_start") or 0.0)
+        for at, ri, row in entries:
+            d = abs(at - at_seg)
+            if d <= TOLERANCE_SEC:
+                pairs.append((d, si, ri, row))
+    # Distance first; then precedence, so an equally-close correction beats an inference.
+    pairs.sort(key=lambda p: (p[0], -_SOURCE_RANK.get(p[3].get("source"), -1)))
+
+    out, used_rows, used_segs = {}, set(), set()
+    for d, si, ri, row in pairs:
+        if si in used_segs or ri in used_rows:
+            continue
+        used_segs.add(si)
+        used_rows.add(ri)
+        index["unmatched"].discard(ri)
+        if row.get("display_name"):
+            out[si] = {"display_name": row["display_name"], "state": row.get("state"),
+                       "source": row.get("source"), "cluster_ref": row.get("cluster_ref")}
+    return out

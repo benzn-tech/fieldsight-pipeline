@@ -252,3 +252,57 @@ def test_the_correction_path_parameter_resolves_to_the_same_session():
     """org-api receives the session in the URL as `{device}_{time}_sid{hex}` — the form the
     device reports. It has to land on the same key as the filenames do."""
     assert tno.session_base(f"ben_ucpk2_2026-08-13_11-49-00_{SID}") == tno.session_base(CHUNK_A)
+
+
+# ---- one row describes one turn ----------------------------------------
+#
+# Per-segment lookup let ONE row be claimed by SEVERAL segments. On TEST that turned a
+# single assertion into two confirmed names: the user marked the turn at 2.86 and the turn
+# at 2.58 — a different speaker saying "Go." — came back confirmed too, because it sits
+# within tolerance.
+#
+# A wrong CONFIRMED name is the failure this whole layer is shaped around, and it arrived
+# from the direction nobody was watching: not a bad score, but a good row claimed twice.
+# The offsets below are the real ones from that session.
+
+
+def _seg(name, at):
+    return {"source_filename": name, "chunk_start": at}
+
+
+def test_a_row_names_the_nearest_turn_and_only_that_one():
+    rows = [_row("x.wav@2.86", "Ben L", source="correction")]
+    out = tno.resolve(tno.build(rows), [_seg("x.json", 2.58), _seg("x.json", 2.86)])
+    assert out.get(1, {}).get("display_name") == "Ben L"
+    assert 0 not in out, "the assertion bled onto a neighbouring turn"
+
+
+def test_two_rows_claim_two_turns_not_the_same_one():
+    rows = [_row("x.wav@50.26", "Ben L"), _row("x.wav@50.28", "Zoe")]
+    out = tno.resolve(tno.build(rows),
+                      [_seg("x.json", 50.26), _seg("x.json", 50.28)])
+    assert out[0]["display_name"] == "Ben L"
+    assert out[1]["display_name"] == "Zoe"
+
+
+def test_the_closer_pairing_wins_when_two_rows_compete_for_one_turn():
+    """Greedy by distance over every (row, turn) pair, so the tightest pairing is made first
+    and the loser looks elsewhere rather than being dropped."""
+    rows = [_row("x.wav@10.0", "Far"), _row("x.wav@10.4", "Near")]
+    out = tno.resolve(tno.build(rows), [_seg("x.json", 10.45), _seg("x.json", 10.05)])
+    assert out[0]["display_name"] == "Near"
+    assert out[1]["display_name"] == "Far"
+
+
+def test_a_row_with_no_turn_within_tolerance_is_still_an_orphan():
+    idx = tno.build([_row("x.wav@2.0", "Ben L"), _row("x.wav@99.0", "Zoe")])
+    out = tno.resolve(idx, [_seg("x.json", 2.0)])
+    assert out[0]["display_name"] == "Ben L"
+    assert tno.orphans(idx) == 1
+
+
+def test_resolve_keeps_precedence_when_both_rows_reach_one_turn():
+    rows = [_row("x.wav@5.0", "Guess", source="correction_propagation"),
+            _row("x.wav@5.0", "Said", source="correction")]
+    out = tno.resolve(tno.build(rows), [_seg("x.json", 5.0)])
+    assert out[0]["display_name"] == "Said"
