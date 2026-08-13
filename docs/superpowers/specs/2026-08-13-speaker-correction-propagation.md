@@ -1,6 +1,6 @@
 # Correcting one turn should name the whole meeting — design
 
-**Status:** spec, revision 3
+**Status:** spec, revision 4
 **Date:** 2026-08-13
 **Extends:** `2026-08-09-speaker-identity-v2.md` §6, phase 4 of
 `../plans/2026-08-11-speaker-identity-implementation.md`
@@ -82,6 +82,35 @@ provider got wrong, and the user's correction supplies the name.** Phase 0 measu
 voiceprint correcting exactly those provider errors. The user is not labelling turns one by
 one; they are labelling a voice.
 
+### One voice in the room: k = 1
+
+A session that clusters to a **single voice** — a solo narration walk, which is the most
+common FieldSight recording shape — hands `decide_name` one candidate, and that is the branch
+that returns `tentative` unconditionally. Revision 3 did not mention this, so the first
+defect ever found in this design would have come back untouched for the majority of
+recordings.
+
+It is not fixed by special-casing. It is the honest answer: with one cluster there is no
+competing voice, so the only thing that could make the name wrong — clustering having merged
+two people — is exactly the thing that has no evidence against it. **k = 1 caps at
+`tentative`, permanently and by policy**, and the reason is written into the result artifact
+so it does not read as a bug. A visitor's few turns absorbed into that single cluster then get
+a tentative name and not a confirmed one, which is the correct outcome.
+
+Propagation beyond the corrected turn therefore requires **k ≥ 2** to produce anything
+`confirmed`, ever.
+
+### The centroid must not include the turn being scored
+
+`cos(centroid_own, v_i)` is inflated because `v_i` is part of that centroid, and inflated
+*most* for the smallest clusters — a two-turn cluster scores its own members highly even when
+they are barely alike. Margins would be systematically largest exactly where the evidence is
+weakest, and step 1 would then calibrate on the biased quantity and freeze a cluster-size
+dependence into the threshold.
+
+Leave-one-out, which is two lines of numpy: `(n·c − v_i)/(n − 1)`, renormalized. Pinned by a
+test that a two-member cluster does not out-score a ten-member one on identical audio.
+
 ### The short-window problem disappears
 
 Revision 2 required `window_is_homogeneous` on the corrected window. That check returns `None`
@@ -90,10 +119,28 @@ under 10 seconds propagated nothing** — which is the most natural gesture a us
 would have hollowed out the feature while looking like a safety property.
 
 Under cluster naming the short turn only has to *indicate which cluster*, not carry the
-evidence. The homogeneity requirement moves to where it belongs — the **cluster**, whose
-member turns are checked for coherence, with far more audio than any single turn. A corrected
-turn that sits between two clusters (the 1-in-6 two-voice turn v2 §2 measured) names nothing
-and says so, rather than silently naming the wrong voice.
+evidence — **but indicating still requires an embedding**, and the pipeline refuses to embed
+any turn below `DEFAULT_MIN_TURN_S` = 3.0 s before the model is asked
+(`lambda_speaker_embed.py:197`). Revision 3 claimed the floor disappeared; it had moved from
+10 s to 3 s. Two things follow, and both must be stated rather than discovered:
+
+* **The corrected turn is embedded regardless of its duration.** Its *name* is user-asserted
+  and carries no inference risk; only its *assignment to a cluster* does. So it is embedded,
+  and if its distance to the top two clusters is too close to separate, it names **nothing**
+  and says which two it was between. That replaces revision 3's undefined "sits between two
+  clusters" hand-wave, and is the two-voice-turn detector that removing
+  `window_is_homogeneous` left missing (v2 §2's 1-turn-in-6).
+* **Turns under 3 s are in no cluster**, so "the whole meeting renamed" silently excludes
+  every short interjection — "Yeah", "Right" — which the batching work measured as 18–20% of
+  turns. They render as `unknown`, and the count is reported, because a user who sees a third
+  of the transcript unnamed deserves to know it is a floor and not a failure.
+
+The homogeneity requirement moves to the **cluster**, and needs its linkage stated or it is
+decoration: with **complete linkage** at merge threshold τ, "all pairs within τ" holds *by
+construction*, so the guard can never fire — the precise failure `window_is_homogeneous`'s own
+docstring warns about. The check is therefore run at a **tighter bound than τ** and is a
+genuine second opinion, and a cluster with fewer than two usable turns is `None` — "cannot
+tell" — and names only the corrected turn itself.
 
 ### Clustering is the new load-bearing threshold, and it is uncalibrated
 
@@ -105,13 +152,29 @@ opposite directions:
 * **merged too far** → two people in one cluster → one correction names both, and the
   runner-up that would have caught it is gone. Over-confirmation.
 * **split too far** → one person in two clusters → the second cluster is unnamed, and its
-  turns compete with the named one at ~0 margin. Under-confirmation.
+  turns compete with the named one at ~0 margin. Under-confirmation. The user then sees **half
+  the meeting renamed and half not**, which reads as a broken feature rather than a cautious
+  one — so the viewer asks directly: *"another unnamed voice resembles Ben L — same person?"*
+  One tap merges the clusters, and that tap is also the highest-quality calibration row the
+  system can obtain, because it is a human answering the exact question the threshold governs.
 
 It has the same no-calibration problem as the margin, and **changing it invalidates every
-calibration row collected before the change**. So it is measured and **frozen before
-collection starts**, using the Phase 0 recordings plus whatever the tentative-only step
-produces, and the frozen value is recorded in the artifact so a row can be attributed to the
-clustering that produced it.
+calibration row collected before the change**. Revision 3 said to freeze it "before collection
+starts, using the Phase 0 recordings plus whatever the tentative-only step produces" — which
+is incoherent, because the tentative-only step *is* the collection and cannot supply an input
+to a decision made before it runs.
+
+So: frozen from the **Phase 0 recordings alone**, before any calibration row is written. The
+per-row `cluster_threshold` column stays, not because the value is expected to change but as
+the audit trail of a rule intended never to fire — if it ever does, every row not carrying the
+current value is disqualified from calibration, automatically rather than by memory.
+
+**A kill criterion, decided before building.** Phase 0's own numbers make the split case the
+expected case, not a tail: same-person similarity spans +0.104 to +0.639 while different-person
+reaches +0.205, so the bands overlap and for some speakers **no threshold exists** that holds
+them together without merging others. Clustering the Phase 0 audio is therefore the first task,
+not a later validation: if no threshold cleanly separates its three known speakers, this
+mechanism does not ship and the effort moves to Phase 5 matching instead.
 
 ### An absolute floor, stated with its value and its modesty
 
@@ -180,6 +243,32 @@ Added: `source text` (`correction` | `correction_propagation` | `match`), `corre
 text`, `cluster_ref text`, `label_disagreement boolean`, `superseded_at timestamptz`,
 `cluster_threshold double precision`; `voiceprint_id` made nullable; the partial unique index.
 
+### Propagation must not promote profiles from its own output
+
+`confirmations_count` (`repositories/voiceprints.py:169`) counts `DISTINCT session_base` over
+`speaker_turn_names` rows with `state = 'confirmed'` — **regardless of source** — and that
+count is what promotes a profile from `tentative` to `confirmed` after N *independent human*
+confirmations (v2 §6). The moment propagation writes confirmed rows carrying a
+`voiceprint_id`, the machine satisfies its own promotion criterion with its own output, across
+sessions, and the profile that then names people was confirmed by nothing.
+
+Two ways to cut it; both are taken, because either alone is one edit away from being undone:
+propagation rows write `voiceprint_id NULL`, **and** `confirmations_count` filters
+`source = 'correction'`. A test pins that a table full of propagated rows promotes nothing.
+
+This is invisible in the schema — the loop only exists because two features share one table —
+and it is the kind of thing that would have been found in production as "profiles confirming
+themselves overnight".
+
+### A cluster key is not a name
+
+`decide_name` returns the winning key as `Decision.name`, and here the keys are cluster
+references. When the best cluster is an **unnamed** one, the decision reads `confirmed C_3`,
+and `C_3` must never reach a user-visible surface — the existing status-cap idiom in `_match`
+keys off profiles and does not apply. Unnamed clusters render as the anonymous label, and the
+Phase-A-style test applies: **fail if a raw cluster key or `spk_N` string reaches a
+user-visible surface.**
+
 **Numbered 0040, not 0039** — 0038's own header reserves 0039 as its revert migration, and
 quietly repurposing that number would remove a recorded rollback path.
 
@@ -206,22 +295,32 @@ The established in-VPC→outside handoff is an S3 request artifact:
 
 ```
 org-api (in VPC)  ──writes──►  voiceprint_requests/{id}.json
-                                  │ S3 event
+                                  │ S3 event  (the ONLY new S3 trigger)
 SpeakerEmbedFunction (NOT in VPC, pure compute, no database)
-                   ──writes──►  voiceprint_results/{id}.json
-                                  │ S3 event
-an in-VPC writer  ──persists──►  speaker_turn_names
+                   ──invokes──►  an in-VPC writer  ──persists──►  speaker_turn_names
 ```
 
-**Both S3 triggers must be wired manually outside the template** (BUG-33 — SAM cannot attach
-events to an external bucket; every S3-triggered function here carries a "NO Events: wired
-manually" comment and `scripts/wire-s3-events.sh` does it). Forgetting this **deploys green
-with nothing firing**, which is this repo's canonical trap.
+**Only the first hop is an S3 artifact, and revision 3 got the second one wrong.** BUG-43
+note 4 states the rule in both directions: an in-VPC function cannot invoke outward (no NAT),
+but **non-VPC → in-VPC is explicitly permitted** — the callee is only a target and initiates
+nothing — and the note warns by name against "forcing an S3 hop that should have been a direct
+invoke", because BUG-33 makes every new S3 trigger hand-wired. Revision 3 applied the first
+hop's constraint to both hops. The `Matcher → SuggestionWriter` precedent runs exactly this
+way and is cited in the template.
 
-The in-VPC writer is a **new function**, not a reuse: it needs `GetObject` on
-`voiceprint_results/*` and `DeleteObject` (below), and the deploy role must be checked for
-every new resource type it introduces — a missing IAM prefix here has twice produced a silent
-success rather than an error.
+Making the second hop a direct invoke also removes the enrolment vector's S3 residence
+entirely, along with the deletion, the lifecycle rule, and the Phase 6 sweep that residence
+would have required. That is the third time a biometric-storage problem has been solved by
+noticing the storage did not need to exist.
+
+**The one remaining S3 trigger must be wired manually outside the template** (BUG-33 — SAM
+cannot attach events to an external bucket; every S3-triggered function here carries a "NO
+Events: wired manually" comment and `scripts/wire-s3-events.sh` does it). Forgetting it
+**deploys green with nothing firing**, this repo's canonical trap.
+
+The in-VPC writer is a **new function**: it needs `lambda:InvokeFunction` granted to the
+embedder, and the deploy role must be checked for every new resource type it introduces — a
+missing IAM prefix here has twice produced a silent success rather than an error.
 
 ### This resolves the layer conflict, and a defect found tonight
 
@@ -253,11 +352,14 @@ So:
 * **Propagation carries no profiles at all.** Its candidates are session-local clusters, so
   `voiceprint_requests/` for propagation contains audio references and windows — no vectors.
   This is not a mitigation, it is a consequence of the mechanism.
-* **Enrolment must transit a vector** (the embedder computes it, an in-VPC writer stores it).
-  That artifact is **deleted by the writer after commit**, with an S3 lifecycle rule as the
-  backstop for a writer that dies mid-run, and Phase 6 withdrawal must sweep the prefix —
-  `repositories.voiceprints.withdraw` deletes DB rows only, so a withdrawn person's vector
-  would otherwise survive in a stale artifact.
+* **Results carry no vectors either** — assignments, scores, and references only, never a
+  centroid. A centroid is the voice pattern of whoever is in that cluster, consenting or not,
+  and serializing one would relocate this defect a third time, into `voiceprint_results/`.
+  Pinned by a test, because it is a single field away at any moment.
+* **Enrolment's vector never reaches S3 at all**, now that the second hop is a direct invoke:
+  the embedder passes it in the invoke payload to the in-VPC writer, which stores it in the
+  column that already requires consent. No artifact, no deletion, no lifecycle rule, nothing
+  for Phase 6 to sweep.
 * The consent section names these prefixes as **transient biometric storage** rather than
   claiming they do not exist.
 
@@ -271,8 +373,10 @@ The product decision on record (2026-08-13) is to ship the mechanism and formali
 a real-world process. The engineering seam exists now because retrofitting it means finding
 every profile created before it:
 
-* the **within-session overlay** stores no vector, and with propagation carrying no profiles
-  that is now structurally true rather than asserted;
+* the **within-session overlay** stores no vector — structurally, since neither artifact
+  carries one. That is a claim about *storage* only: clustering every speaker in the room is
+  still biometric **processing** of people who have not consented, and the product decision
+  above is what covers it. Revision 3's "structurally true" was scoped too widely;
 * the **enrolment** — a stored vector attached to a named person, which is what makes future
   detection possible — still requires `consent_at` (v2 §6). Not relaxed.
 
