@@ -960,3 +960,19 @@ def test_every_wired_trigger_prefix_is_readable_by_the_function_it_triggers():
     block = _top_level_block(t, "  SpeakerEmbedFunction:")
     assert "/voiceprint_requests/*" in block, (
         "the embedder is triggered by voiceprint_requests/ and cannot read it")
+
+
+def test_the_correction_requests_expire():
+    """These artifacts are handed across the VPC boundary and consumed within seconds, and
+    the prefix had NO lifecycle rule — so every correction ever made stayed in the bucket
+    indefinitely.
+
+    That mattered more than housekeeping while they carried voice vectors (they no longer
+    do), and it still matters: an artifact records who was named on which passage, which is
+    a claim about a person that nobody asked to keep forever.
+    """
+    script = open(os.path.join(REPO, "scripts", "wire-bucket-lifecycle.sh"),
+                  encoding="utf-8").read()
+    assert "voiceprint_requests/" in script, (
+        "the correction artifacts never expire; the prefix is unmanaged")
+    assert "voiceprint-requests-expiry" in script, "the rule has no id, so it cannot be kept"
