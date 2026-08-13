@@ -283,11 +283,26 @@ def list_s3_objects(bucket, prefix):
     return objects
 
 def download_json_from_s3(bucket, key):
+    """Read a JSON object, or None.
+
+    A key that does not exist is NOT an error. Most days that get asked for a
+    `summary_report.json` simply had no content, and logging that at ERROR has kept
+    `fieldsight-prod-report-errors` permanently in ALARM -- which is strictly worse than
+    having no alarm at all, because a real failure now arrives at an alarm that is already
+    red and that everyone has learned to ignore.
+
+    Everything else still logs at ERROR. The distinction that matters is absent vs
+    unreadable: a permissions fault and an empty day look identical from here otherwise,
+    and that indistinguishability has cost this project several silent breakages.
+    """
     try:
         response = s3_client.get_object(Bucket=bucket, Key=key)
         content = response['Body'].read().decode('utf-8')
         return json.loads(content)
     except Exception as e:
+        if type(e).__name__ in ('NoSuchKey', '404') or 'NoSuchKey' in str(e):
+            logger.info(f"No object at {key} — nothing to merge for it")
+            return None
         logger.error(f"Failed to download {key}: {str(e)}")
         return None
 
