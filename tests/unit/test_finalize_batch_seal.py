@@ -121,3 +121,20 @@ def test_a_closing_session_seals_its_tail_now_rather_than_waiting_out_the_deadli
     deadline = rec.seal_args[5] if len(rec.seal_args) > 5 else rec.seal_kwargs.get("deadline_sec")
     assert deadline == 0, \
         "sealing at close must use a zero deadline; nothing else is coming"
+
+
+def test_the_tail_seal_uses_the_same_window_as_the_transcriber(swept):
+    """Both sides group the same chunks into the same windows, or they disagree in silence.
+
+    The sweep decides a window is complete and seals it; if it measured the window with a
+    different width than the transcriber, it would seal one the transcriber was still
+    filling — or leave one the transcriber thought was already handled. Same reason
+    BatchMaxChunks has always had to match, now for the parameter that actually decides
+    membership.
+    """
+    mp, rec = swept
+    mod.sweep(FakeConn(), grace_seconds=0, infer_idle=False)
+    window = rec.seal_kwargs.get("window_sec")
+    assert window == mod.BATCH_WINDOW_SEC, \
+        f"the tail seal grouped by {window}, the transcriber by {mod.BATCH_WINDOW_SEC}"
+    assert mod.BATCH_WINDOW_SEC == 120

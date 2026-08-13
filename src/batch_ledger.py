@@ -93,34 +93,10 @@ def list_members(table, session_id: str) -> list[dict]:
 # Which runs are ready
 # ============================================================
 
-def pending_runs(rows, now: int, deadline_sec: int,
-                 max_size: int = DEFAULT_MAX_BATCH) -> list[list[int]]:
-    """The runs that may be sealed right now.
-
-    A run of `max_size` consecutive indices is complete and seals immediately. A shorter run
-    seals only once its newest member is older than `deadline_sec`.
-
-    **A gap does not seal the run before it.** Sealing `[4,5]` the moment `7` appears would
-    permanently exclude a chunk 6 that was merely slow — uploads arrive out of order and can
-    be hours late, and a sealed batch is never reopened, so that exclusion is forever.
-    Waiting for the deadline is what makes lateness recoverable and the deadline the only
-    place the decision is made.
-
-    A chunk dropped as silent is indistinguishable from a lost upload here, and should be:
-    both mean the batch stops at that index.
-    """
-    from batch_stitch import plan_batches
-
-    by_index = {int(r["chunk_index"]): r for r in rows}
-    out = []
-    for run in plan_batches(by_index.keys(), max_size=max_size):
-        if len(run) >= max_size:
-            out.append(run)
-            continue
-        newest = max(int(by_index[i].get("registered_at") or 0) for i in run)
-        if now - newest >= deadline_sec:
-            out.append(run)
-    return out
+# `pending_runs` was removed on 2026-08-13 with `plan_batches`, not deprecated alongside
+# `pending_windows`. It grouped consecutive indices, so it could not see a window that
+# bridges a VAD-dropped chunk — and it planned over consumed members, which is how a late
+# earlier chunk could get a sealed window transcribed and billed twice.
 
 
 def consumed_indices(rows) -> set:

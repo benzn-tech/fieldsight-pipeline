@@ -122,11 +122,18 @@ VOCABULARY_NAME = os.environ.get('VOCABULARY_NAME', '')
 # --- Provider toggle (Phase: alt-ASR) --------------------------------------
 ASR_PROVIDER = os.environ.get('ASR_PROVIDER', 'transcribe')  # transcribe | elevenlabs
 
-# Batched transcription (spec 2026-08-11): accumulate up to BATCH_MAX_CHUNKS consecutive
-# chunks of one session and send them as ONE request. Default off in code, template and
-# both workflows, so merging this changes nothing anywhere.
+# Batched transcription (spec 2026-08-11, window rule 2026-08-13): accumulate one session's
+# chunks over BATCH_WINDOW_SEC of wall clock and send them as ONE request. Default off in
+# code, template and both workflows, so merging this changes nothing anywhere.
 BATCH_TRANSCRIPTION = os.environ.get('BATCH_TRANSCRIPTION', 'false').lower() == 'true'
+BATCH_WINDOW_SEC = float(os.environ.get('BATCH_WINDOW_SEC', '120'))
+# A SAFETY CAP, not the rule — nothing reaches it while chunks are 30 s. A device emitting
+# much shorter ones would otherwise build one unbounded request.
 BATCH_MAX_CHUNKS = int(os.environ.get('BATCH_MAX_CHUNKS', '4'))
+# How long a window that could still grow stays open. Named "deadline" from when it was one;
+# under the window rule it is a grace period. NOT renamed: the name is wired through both
+# workflows and the template, and a three-segment rename for a word is how a switch ends up
+# holding its default forever.
 BATCH_SEAL_DEADLINE_SEC = int(os.environ.get('BATCH_SEAL_DEADLINE_SEC', '150'))
 # Read here as well as in the VAD: batching assumes ONE unit per chunk, which is only true
 # in whole-chunk mode. In segment mode a chunk yields several speech islands and treating
@@ -363,7 +370,7 @@ def _maybe_batch(bucket, key, results):
     batch_ledger.register_chunk(table, session_id, chunk_index, key, now)
     batch_seal.seal_ready_runs(s3, bucket, session_id, table, now,
                                BATCH_SEAL_DEADLINE_SEC, BATCH_MAX_CHUNKS,
-                               sealed_by='arrival')
+                               sealed_by='arrival', window_sec=BATCH_WINDOW_SEC)
 
     results.append({'key': key, 'status': 'batched_pending',
                     'session': session_id, 'chunk': chunk_index})

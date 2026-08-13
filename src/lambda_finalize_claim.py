@@ -38,6 +38,10 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "")
 # thing that can seal a session's LAST run — it has no fourth chunk coming. Defaults off,
 # same as the transcriber's, so this deploys inert.
 BATCH_TRANSCRIPTION = os.environ.get("BATCH_TRANSCRIPTION", "false").lower() == "true"
+BATCH_WINDOW_SEC = float(os.environ.get("BATCH_WINDOW_SEC", "120"))
+# A safety cap since the window rule (2026-08-13), not the rule. Must match the
+# transcriber's, as must the window: the two group the same chunks or they disagree
+# in silence, one sealing a window the other is still filling.
 BATCH_MAX_CHUNKS = int(os.environ.get("BATCH_MAX_CHUNKS", "4"))
 BATCH_SEAL_DEADLINE_SEC = int(os.environ.get("BATCH_SEAL_DEADLINE_SEC", "150"))
 TRANSCRIPT_TABLE = os.environ.get("TRANSCRIPT_TABLE", "fieldsight-transcripts")
@@ -580,7 +584,7 @@ def _seal_tail_batches(session_id):
             # by a whole-file rewrite in an unrelated commit, so CI stayed green while the
             # path was dead, and a real 6-minute recording lost its last 19 seconds.
             int(time.time()), 0, BATCH_MAX_CHUNKS,
-            sealed_by="session_close")
+            sealed_by="session_close", window_sec=BATCH_WINDOW_SEC)
     except Exception:
         logger.exception("batch: could not seal the tail of session %s — the final "
                          "extraction may be missing its last chunks", session_id)
