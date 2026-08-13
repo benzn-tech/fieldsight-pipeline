@@ -54,6 +54,17 @@ class FakeTable:
         self.items[key] = dict(Item)
         self.writes += 1
 
+    def delete_item(self, Key=None, ConditionExpression=None,
+                    ExpressionAttributeNames=None, ExpressionAttributeValues=None):
+        k = (Key["PK"], Key["SK"])
+        item = self.items.get(k)
+        vals = ExpressionAttributeValues or {}
+        if ConditionExpression and (item is None
+                                    or item.get("status") != vals.get(":sealing")
+                                    or item.get("claimed_at") != vals.get(":mine")):
+            raise ConditionalCheckFailedException(k)
+        self.items.pop(k, None)
+
     def query(self, KeyConditionExpression=None, ExpressionAttributeValues=None):
         pk = ExpressionAttributeValues[":pk"]
         prefix = (ExpressionAttributeValues or {}).get(":sk", "")
@@ -70,15 +81,19 @@ def table():
 
 def test_a_chunk_registers_once(table):
     assert bl.register_chunk(table, SID, 4, "users/…/c0004.wav", NOW) == "registered"
-    assert table.writes == 1
+    assert len(bl.list_members(table, SID)) == 1
 
 
 def test_the_same_chunk_delivered_twice_is_not_two_members(table):
     """S3 event notifications are at-least-once. A second delivery that added a member would
-    put the same audio in the batch twice and pay to transcribe it."""
+    put the same audio in the batch twice and pay to transcribe it.
+
+    Asserted on the MEMBER COUNT, not on the table's write count: registration also writes
+    the active-session index, and a raw write count would make that look like a duplicate
+    member. What matters is how many members exist."""
     bl.register_chunk(table, SID, 4, "users/…/c0004.wav", NOW)
     assert bl.register_chunk(table, SID, 4, "users/…/c0004.wav", NOW + 5) == "already_present"
-    assert table.writes == 1
+    assert len(bl.list_members(table, SID)) == 1
 
 
 def test_members_come_back_in_index_order_however_they_arrived(table):
@@ -298,3 +313,153 @@ def test_a_fresh_bypass_record_is_not_instantly_stale(table):
         "a bypass 400s old is still in flight; the window is 900"
     assert bl.claim_seal(table, SID, 4, [4], NOW + 1000) is not None, \
         "past the window it must still be retakeable -- a failed copy has to be recoverable"
+
+
+# ============================================================
+# Bucket keys and the straggler rule (2026-08-13-burst-arrival-defects)
+# ============================================================
+
+def test_two_workers_with_different_snapshots_contend_for_one_key(table):
+    """Defect A at the ledger layer.
+
+    Under first-index keys, a worker seeing {5,6,7,8} claims SEAL#0005 and a worker seeing
+    {0..8} claims SEAL#0004 -- both granted, both sealing chunks 5,6,7. Under bucket keys
+    they compute the same SK and exactly one wins.
+    """
+    rows = _wrows([(i, i * 30) for i in range(9)])
+    snap_a = [r for r in rows if int(r["chunk_index"]) in (5, 6, 7, 8)]
+    a = bl.pending_buckets(snap_a, NOW + 400, grace_sec=150)
+    b = bl.pending_buckets(rows, NOW + 400, grace_sec=150)
+    key_a = next(k for k, v in a["ready"] if 6 in v)
+    key_b = next(k for k, v in b["ready"] if 6 in v)
+    assert key_a == key_b, "the same chunk must be under the same claim for both workers"
+    assert bl.claim_seal(table, SID, key_a, [6], NOW) is not None
+    assert bl.claim_seal(table, SID, key_b, [6], NOW) is None, "only one may win"
+
+
+def test_a_member_of_a_sealed_bucket_is_redriven_not_orphaned(table):
+    """The trap in the fix. Without this rule the bucket key is WORSE than what it replaces.
+
+    A worker that saw only 3 of a bucket's 4 chunks seals it and marks those consumed. The
+    4th then plans into the same bucket, whose claim is `sealed` -- and `claim_seal` refuses
+    a sealed record forever, by design. That chunk would never be transcribed by anything:
+    duplication traded for silent loss, which is the worse direction.
+    """
+    rows = _wrows([(8, 0), (9, 30), (10, 60), (11, 90)])
+    bucket = next(k for k, v in bl.pending_buckets(rows, NOW + 400, 150)["ready"] if 8 in v)
+    bl.claim_seal(table, SID, bucket, [8, 9, 10], NOW)
+    bl.mark_sealed(table, SID, bucket, NOW)
+    for r in rows[:3]:
+        r["sealed_into"] = bucket
+
+    out = bl.pending_buckets(rows, NOW + 400, grace_sec=150, table=table, session_id=SID)
+    assert out["stragglers"] == [11], f"chunk 11 must be redriven, got {out}"
+    assert not any(11 in v for _, v in out["ready"]), "and never proposed as a claim"
+
+
+def test_a_bypass_record_is_member_scoped_not_bucket_scoped(table):
+    """`_maybe_batch` asks "was THIS chunk bypassed" to decide whether a copy-to-self event
+    falls through to transcription. Under bucket keys a lookup by chunk index misses the
+    claim entirely, and the re-driven audio vanishes -- so the bypass record has to carry
+    the member, not the window."""
+    bl.mark_bypassed(table, SID, 11, NOW)
+    assert bl.bypass_status(table, SID, 11) == "bypassed"
+    assert bl.bypass_status(table, SID, 12) is None
+
+
+def test_a_legacy_first_index_seal_cannot_shadow_a_bucket_claim(table):
+    """Records written before this change use SEAL#0000..SEAL#9999. Bucket numbers are
+    epoch/120 -- about 14.9 million -- so the two ranges cannot collide. Tested, because
+    'cannot collide' is the kind of claim that is wrong once."""
+    bl.claim_seal(table, SID, 5, [5, 6], NOW)           # legacy shape
+    bucket = bl.bucket_for_index(_wrows([(5, 0)])[0])
+    assert bucket > 9999
+    assert bl.claim_seal(table, SID, bucket, [5, 6], NOW) is not None
+
+
+def test_reaching_the_cap_does_not_seal_a_bucket_that_can_still_grow():
+    """Real chunks arrive 28 s apart, not 30, so FIVE fit in a 120 s bucket.
+
+    Treating `len(members) >= cap` as "ready" seals the first four and orphans the fifth
+    into a straggler redrive -- one wasted per-chunk transcription per bucket, and on the
+    real 153-chunk session ten buckets hold five. The cap bounds the REQUEST; what makes a
+    bucket ready is that nothing can still join it.
+
+    Found by computing the buckets offline before re-running the replay, which is the only
+    reason it was not paid for again.
+    """
+    rows = _wrows([(i, i * 28) for i in range(5)])          # all five inside one 120 s bucket
+    out = bl.pending_buckets(rows, NOW + 10, grace_sec=150, cap=4)
+    assert out["ready"] == [], "the bucket can still grow; the cap is not a reason to seal"
+
+    # A member of the NEXT bucket does NOT make this one ready either -- that rule was
+    # tried and removed the same day: during a burst a worker can see a later chunk before
+    # this bucket's own members have registered, and it sealed them one at a time.
+    rows += _wrows([(5, 140)], at=NOW)
+    assert bl.pending_buckets(rows, NOW + 10, grace_sec=150, cap=4)["ready"] == []
+
+    ready = {k: v for k, v in bl.pending_buckets(rows, NOW + 400, grace_sec=150, cap=4)["ready"]}
+    assert [0, 1, 2, 3, 4] in ready.values(), f"past grace it seals WHOLE, all five: {ready}"
+
+
+def test_a_partial_snapshot_spanning_buckets_does_not_seal_an_incomplete_one():
+    """The acceptance replay failed on exactly this, and it is a defect I introduced.
+
+    153 chunks arrived at once. Each worker sees only part of the session -- not merely
+    because DynamoDB reads are eventually consistent, but because chunk 100's event can be
+    processed before chunk 5 has registered at all. A worker holding {5, 100} concluded that
+    bucket(5) was over, because it could see a LATER bucket, and sealed it with one member.
+    153 chunks became 72 singleton bypasses and ZERO batches.
+
+    Seeing a later member cannot prove this bucket is complete. Only elapsed quiet can.
+    """
+    rows = _wrows([(5, 150)]) + _wrows([(100, 3000)])
+    out = bl.pending_buckets(rows, NOW + 10, grace_sec=150)
+    assert out["ready"] == [], \
+        f"an incomplete bucket must wait, whatever else is visible: {out}"
+
+    out = bl.pending_buckets(rows, NOW + 400, grace_sec=150)
+    assert len(out["ready"]) == 2, "past grace, both seal"
+
+
+# ============================================================
+# The index of sessions that still owe work (prod blocker #1)
+# ============================================================
+
+def test_registering_a_chunk_puts_its_session_on_the_active_list(table):
+    """Nothing periodic knows which sessions have unfinished batching.
+
+    Sealing runs on chunk arrival; the close pass runs once, and only for sessions in
+    `pending_close`. A device whose `/open` never reached the server has no row at all, so
+    after a backlog burst every bucket sits registered and unsealed forever -- zero
+    transcripts, zero errors. That is the acceptance replay, and it is a real device
+    behaviour, not a test artefact.
+
+    A one-partition index makes the periodic pass cheap and precise: no table scan, no S3
+    walk, just "who still owes work".
+    """
+    bl.register_chunk(table, SID, 4, "audio_segments/U/2026-08-13/x_c0004.wav", NOW)
+    assert bl.active_sessions(table) == [SID]
+
+
+def test_a_session_leaves_the_active_list_once_every_member_is_consumed(table):
+    """Otherwise the list grows forever and the periodic pass gets slower every day."""
+    for i in (4, 5):
+        bl.register_chunk(table, SID, i, f"audio_segments/U/2026-08-13/x_c{i:04d}.wav", NOW)
+    bl.mark_members_consumed(table, SID, [4, 5], 4)
+    bl.retire_if_finished(table, SID)
+    assert bl.active_sessions(table) == []
+
+
+def test_a_session_with_one_unconsumed_member_stays_active(table):
+    for i in (4, 5):
+        bl.register_chunk(table, SID, i, f"audio_segments/U/2026-08-13/x_c{i:04d}.wav", NOW)
+    bl.mark_members_consumed(table, SID, [4], 4)
+    bl.retire_if_finished(table, SID)
+    assert bl.active_sessions(table) == [SID], "chunk 5 still owes a batch"
+
+
+def test_the_active_list_survives_a_duplicate_registration(table):
+    bl.register_chunk(table, SID, 4, "audio_segments/U/2026-08-13/x_c0004.wav", NOW)
+    bl.register_chunk(table, SID, 4, "audio_segments/U/2026-08-13/x_c0004.wav", NOW)
+    assert bl.active_sessions(table) == [SID]

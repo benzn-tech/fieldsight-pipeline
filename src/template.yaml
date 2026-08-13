@@ -552,6 +552,34 @@ Parameters:
       the rollback survives a deploy: a switch that exists only in code takes its default
       forever and raises no error.
 
+  TranscribeReservedConcurrency:
+    Type: String
+    Default: '0'
+    Description: >-
+      Maximum concurrent invocations of the transcriber. '0' means NO reservation --
+      not a reservation of zero, which would stop the function dead.
+
+      The provider caps CONCURRENT requests and Lambda does not. Replaying one real
+      71-minute session drove this function to 141 concurrent against an ElevenLabs
+      Creator ceiling of 20; 27 requests came back HTTP 429, each leaving a batch WAV
+      with no transcript and nothing to re-drive it -- about 54 minutes of audio,
+      recovered by hand. Reserved concurrency is the only mechanism that bounds this
+      BEFORE the request is made; everything else reacts to a rejection that has already
+      lost the audio.
+
+      DERIVED, NOT GUESSED. Enumerate every deployed function whose live env carries
+      ELEVENLABS_API_KEY and check whether the stages share a key:
+        aws lambda get-function-configuration --function-name <fn>           --query 'Environment.Variables.ELEVENLABS_API_KEY'
+      As of 2026-08-13 each stage has its OWN key and exactly one consumer
+      (fieldsight-{stage}-transcribe), so the whole ceiling belongs to this function.
+      TEST: plan `creator` = 20 concurrent, reserve 12, margin for in-handler retries.
+      PROD: key is permission-scoped so the plan cannot be read from here, and the
+      observed peak is 54 with zero rate-limit errors -- so the ceiling is higher than
+      Creator's and a guessed number would throttle a working pipeline. Left at '0'
+      until someone reads the plan from the ElevenLabs console.
+
+      Record the pair (provider limit, reserve) together whenever either changes.
+
   BatchWindowSec:
     Type: String
     Default: '120'
@@ -853,6 +881,7 @@ Conditions:
   ShouldCreateAlerts: !And
     - !Not [!Equals [!Ref AlertEmail, '']]
     - !Not [!Equals [!Ref AlertEmail, 'none']]
+  HasTranscribeReserve: !Not [!Equals [!Ref TranscribeReservedConcurrency, '0']]
   HasVadLayer: !Not [!Equals [!Ref VadLayerArn, '']]
   HasKeyframeFfmpegLayer: !Not [!Equals [!Ref KeyframeFfmpegLayerArn, '']]
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
@@ -1014,6 +1043,12 @@ Resources:
       FunctionName: !Sub ["${P}-transcribe", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_transcribe.lambda_handler
+      # '0' omits the property entirely. Reserving zero would stop the function dead, which
+      # is the opposite of the protection intended.
+      ReservedConcurrentExecutions: !If
+        - HasTranscribeReserve
+        - !Ref TranscribeReservedConcurrency
+        - !Ref AWS::NoValue
       Timeout: 300
       MemorySize: 128
       Environment:
@@ -2228,6 +2263,29 @@ Resources:
               Action: s3:PutObject
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*
+            # The re-drive sweep (spec 2026-08-13): find batch WAVs that were sealed and
+            # never transcribed -- 27 of them on one replay, all provider 429s, each caught
+            # by a per-record except and never revisited. It LISTS audio_segments/ and reads
+            # transcripts/ to decide.
+            #
+            # Both of these were implicitDeny when the code was written, and the second is
+            # the dangerous one: without it every head of a transcript raises, every batch
+            # reads as "never transcribed", and the sweep re-transcribes the entire session
+            # up to the attempt cap. Remember also that without ListBucket a missing key
+            # answers 403, not 404, so "it is not there" and "I may not look" are the same
+            # answer (memory: s3-missing-key-403-vs-404).
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - audio_segments/*
+                    - transcripts/*
       Events:
         GraceSweep:
           Type: Schedule
@@ -2633,6 +2691,131 @@ Resources:
   # env verbatim. Gated by HasDb. NO Events (manual/invoke only, like
   # RagSearchFunction below).
   # ----------------------------------------------------------
+  # ----------------------------------------------------------
+  # Speaker identity: the embedder. Two ops, invoked DIRECTLY -- `enrol` (a corrected
+  # passage becomes a voiceprint sample) and `match` (a session's turns get names).
+  # NO Events: nothing here fires because a file landed.
+  #
+  # NOT in VPC, and holds no database. It was in VPC to reach Aurora, and that was the
+  # defect: the function runs on python3.12 for onnxruntime while PsycopgLayer is
+  # cp311-only, so it could never have had a connection -- every invocation raised
+  # ModuleNotFoundError behind a green deploy. Profiles now arrive in the event from
+  # org-api, which is in-VPC and owns the consent/withdrawn filters, and the database half
+  # is VoiceprintWriterFunction. See that resource's comment for the invoke direction.
+  #
+  # Reuses VadLayerArn rather than adding a layer: fieldsight-vad-layer already carries
+  # onnxruntime and numpy for cp312 and no torch, verified by downloading and listing it.
+  # That is also why Runtime is pinned to python3.12 -- the layer is cp312-only and a
+  # mismatch fails at import (BUG-24 class).
+  #
+  # The MODEL is not in the layer and not in the package. It is fetched from S3 at cold
+  # start, like the Silero VAD model and for the recorded reason: BUG-02 is a Layer that
+  # shipped a different model version whose output was silently wrong, and a voiceprint
+  # model that drifts moves every threshold in voiceprint_utils with no error anywhere.
+  # 84 MB (graph + external .data), so MemorySize and Timeout carry a cold start that
+  # downloads it.
+  # ----------------------------------------------------------
+  SpeakerEmbedFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-speaker-embed", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_speaker_embed.lambda_handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 1769
+      ReservedConcurrentExecutions: 5
+      Layers:
+        - !Ref VadLayerArn
+      # NO VpcConfig and NO PG credentials, deliberately. This function reaches nothing but
+      # S3, and it CANNOT hold a database connection: it runs on python3.12 because that is
+      # where onnxruntime comes from (fieldsight-vad-layer is cp312-only) while PsycopgLayer
+      # is cp311-only. Carrying PGDATABASE here once made every invocation raise
+      # ModuleNotFoundError while the deploy stayed green and every unit test passed.
+      # Profiles arrive in the event from org-api, which is in-VPC and already owns the
+      # consent/withdrawn filters that must not exist in two places.
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName
+          ECAPA_MODEL_S3_KEY: models/ecapa_tdnn.onnx
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            # The raw device uploads -- never audio_segments/. Phase 0's numbers are
+            # raw-audio numbers and do not transfer to the normalised copy.
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/users/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/models/*
+                # The batch map sidecar ONLY -- narrowed to *_batch_map.json so this
+                # function still cannot read the normalised audio beside it. A batched
+                # turn's offsets are batch-relative and its filename is the stitched
+                # object; the map is what takes both back to the device's own upload,
+                # which is the audio every voiceprint threshold was measured on.
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*_batch_map.json
+            # Without ListBucket a missing key answers 403, not 404, and "not allowed"
+            # becomes indistinguishable from "not there" inside the function.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - users/*
+                    - models/*
+                    - audio_segments/*
+            # The in-VPC half. This function cannot write to Aurora itself (no psycopg on
+            # cp312), so the only way its work reaches the database is this invoke.
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !Sub
+                - "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${P}-voiceprint-writer"
+                - P: !FindInMap [StageConfig, !Ref Stage, Prefix]
+
+  # ----------------------------------------------------------
+  # Voiceprint writer — the in-VPC half of the voiceprint chain. The embedder holds the
+  # model and the audio (python3.12, cp312-only VAD layer, NO psycopg); this holds the
+  # database (PsycopgLayer, cp311-only). One function cannot have both layers, and giving
+  # the embedder a connection anyway is what made it raise ModuleNotFoundError on every
+  # invocation while the deploy stayed green.
+  #
+  # Invoked DIRECTLY by SpeakerEmbedFunction. Non-VPC -> in-VPC is permitted (BUG-43 note 4:
+  # the callee initiates nothing outward) and the note warns against forcing an S3 hop where
+  # a direct invoke belongs, since BUG-33 makes every new S3 trigger hand-wired. Same shape
+  # as Matcher -> SuggestionWriter.
+  #
+  # NO Events, deliberately: nothing invokes this yet, so it costs nothing at rest.
+  # ----------------------------------------------------------
+  VoiceprintWriterFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-voiceprint-writer", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_voiceprint_writer.lambda_handler
+      Timeout: 120
+      MemorySize: 512
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection — see MigrateFunction notes (BUG-36: in-VPC with
+          # no NAT, so a Secrets Manager call at runtime black-holes with zero log output).
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+      Policies:
+        - VPCAccessPolicy: {}
+
   SuggestionWriterFunction:
     Type: AWS::Serverless::Function
     Condition: HasDb
@@ -3736,11 +3919,17 @@ Resources:
         Transcription failed for at least one segment. Each failure is audio that has no
         transcript and that nothing retries -- check for HTTP 429 (provider concurrency)
         first, then re-drive the affected keys.
-      Namespace: AWS/Lambda
-      MetricName: Errors
+      # NOT AWS/Lambda Errors. A provider rejection is caught by the per-record `except`
+      # and the handler returns 200, so that metric stays at zero -- the 27 batches lost to
+      # HTTP 429 on one replay would have left an Errors alarm green, which is how this
+      # alarm was first written. The transcriber emits this count itself, as an Embedded
+      # Metric Format log line: `logs:PutMetricFilter` is implicitDeny on the deploy role,
+      # and EMF needs no permission and no resource at all.
+      Namespace: FieldSight/Transcribe
+      MetricName: TranscriptionFailures
       Dimensions:
-        - Name: FunctionName
-          Value: !Ref TranscribeFunction
+        - Name: Stage
+          Value: !Ref Stage
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1

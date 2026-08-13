@@ -21,6 +21,8 @@ Both are settled by a conditional write, not by reading first and then writing.
 """
 from __future__ import annotations
 
+import logging
+
 DEFAULT_MAX_BATCH = 4
 
 # How long a `sealing` claim may sit before another worker may take it over. The order of
@@ -71,9 +73,63 @@ def register_chunk(table, session_id: str, index: int, chunk_key: str, now: int)
         )
     except Exception as e:
         if _is_conditional_failure(e):
+            _mark_active(table, session_id)
             return "already_present"
         raise
+    _mark_active(table, session_id)
     return "registered"
+
+
+def _mark_active(table, session_id: str) -> None:
+    """Idempotent, and written on duplicate deliveries too: the index must be present
+    whenever any member is, including when this delivery is the second one."""
+    try:
+        table.put_item(Item={"PK": ACTIVE_PK, "SK": _active_sk(session_id),
+                             "session_id": session_id})
+    except Exception:
+        logging.getLogger().warning("batch: could not index session %s as active",
+                                    session_id)
+
+
+ACTIVE_PK = "BATCH_ACTIVE"
+
+
+def _active_sk(session_id: str) -> str:
+    return f"SESSION#{session_id}"
+
+
+def active_sessions(table) -> list[str]:
+    """Sessions with batching work that may still be owed.
+
+    Nothing periodic knew this. Sealing runs when a chunk arrives; the close pass runs once
+    and only for sessions the finalize sweep sees. A device whose `/open` never reached the
+    server has no row at all, so after a backlog burst every bucket sits registered and
+    unsealed forever — zero transcripts, zero errors. That is a real device behaviour, and
+    the acceptance replay reproduced it exactly.
+
+    One partition, so the periodic pass is a single Query — no table scan, no S3 walk.
+    """
+    resp = table.query(
+        KeyConditionExpression="PK = :pk AND begins_with(SK, :sk)",
+        ExpressionAttributeValues={":pk": ACTIVE_PK, ":sk": "SESSION#"},
+    )
+    return [i["SK"].split("#", 1)[1] for i in (resp.get("Items") or [])]
+
+
+def retire_if_finished(table, session_id: str) -> bool:
+    """Drop a session from the active list once every member is consumed.
+
+    Without this the list only grows, and the periodic pass gets slower every day until it
+    is the thing that times the sweep out.
+    """
+    rows = list_members(table, session_id)
+    if rows and consumed_indices(rows) != {int(r["chunk_index"]) for r in rows}:
+        return False
+    try:
+        table.delete_item(Key={"PK": ACTIVE_PK, "SK": _active_sk(session_id)})
+    except Exception:
+        return False
+    return True
 
 
 def list_members(table, session_id: str) -> list[dict]:
@@ -126,6 +182,94 @@ def _base_times(rows):
     return out
 
 
+def _bypass_sk(index: int) -> str:
+    return f"BYPASS#{index:04d}"
+
+
+def bucket_for_index(row, window_sec: float = 120.0):
+    """The wall-clock bucket a member row belongs to, from its filename."""
+    from batch_stitch import bucket_of
+    from transcript_utils import extract_base_time_from_filename
+
+    base = extract_base_time_from_filename((row.get("chunk_key") or "").rsplit("/", 1)[-1])
+    return None if base is None else bucket_of(base, window_sec)
+
+
+def bypass_status(table, session_id: str, index: int):
+    """Whether THIS member was handed back to the per-chunk path.
+
+    Member-scoped on purpose. The transcriber asks "was this chunk bypassed" to decide
+    whether a copy-to-self event falls through to transcription, and under bucket seal keys
+    a lookup by chunk index against the seal record misses entirely — after which the
+    re-driven audio is neither batched nor transcribed.
+    """
+    resp = table.query(
+        KeyConditionExpression="PK = :pk AND begins_with(SK, :sk)",
+        ExpressionAttributeValues={":pk": _pk(session_id), ":sk": _bypass_sk(index)},
+    )
+    items = resp.get("Items") or []
+    return items[0].get("status") if items else None
+
+
+def pending_buckets(rows, now: int, grace_sec: int, window_sec: float = 120.0,
+                    cap: int = DEFAULT_MAX_BATCH, table=None, session_id=None) -> dict:
+    """`{"ready": [(bucket, [idx…])…], "stragglers": [idx…]}`. Supersedes `pending_windows`.
+
+    The bucket comes from each chunk's own base time, so every worker computes the same key
+    for the same chunk however much of the session it can see. That is what makes the claim
+    able to exclude a rival: under the previous greedy anchor, two workers with different
+    snapshots produced two different keys over the same chunks and neither saw the other —
+    123 batch objects for 153 chunks on a real replay.
+
+    **Stragglers are the other half, and without them this change is worse than the bug it
+    fixes.** A worker that saw 3 of a bucket's 4 chunks seals it; the 4th then plans into a
+    bucket whose claim is already `sealed`, and a sealed claim is never re-driven by design.
+    That member would never be transcribed by anything. It is handed to the per-chunk path
+    instead. Detecting it needs the table, so a caller that passes none simply gets no
+    straggler list — the planning half still works for the pure tests.
+    """
+    from batch_stitch import plan_buckets
+
+    consumed = consumed_indices(rows)
+    times = _base_times(rows)
+    by_index = {int(r["chunk_index"]): r for r in rows}
+    planned = plan_buckets(times, window_sec=window_sec, consumed=consumed)
+
+    ready, stragglers = [], []
+    for bucket, idxs in sorted(planned.items()):
+        if table is not None and session_id is not None                 and seal_status(table, session_id, bucket) == "sealed":
+            stragglers.extend(idxs)
+            continue
+        # ELAPSED QUIET IS THE ONLY SOUND READINESS TEST, and both cheaper-looking ones
+        # have now been measured wrong:
+        #
+        #   * `len(members) >= cap` -- real chunks arrive 28 s apart, so FIVE fit a 120 s
+        #     bucket; sealing at four orphaned the fifth on ten buckets of one real session.
+        #   * "a member of a LATER bucket is visible" -- during a burst a worker sees only
+        #     part of the session, and not merely from eventual consistency: chunk 100's
+        #     event can be processed before chunk 5 has registered at all. A worker holding
+        #     {5, 100} concluded bucket(5) was over and sealed it with one member. The
+        #     acceptance replay turned 153 chunks into 72 singleton bypasses and ZERO
+        #     batches.
+        #
+        # Seeing a later member cannot prove this bucket is complete. Waiting costs
+        # `grace_sec` of latency on every batch; not waiting costs the batching doing
+        # nothing at all under exactly the arrival pattern it was built for.
+        newest = max(int(by_index[i].get("registered_at") or 0) for i in idxs)
+        if now - newest >= grace_sec:
+            ready.append((bucket, idxs))
+
+    # Unplaceable members travel alone rather than vanishing, same rule as before.
+    for r in rows:
+        i = int(r["chunk_index"])
+        if i not in times and i not in consumed:
+            stragglers.append(i)
+    return {"ready": ready, "stragglers": sorted(set(stragglers))}
+
+
+# `_bucket_is_closed` was removed on 2026-08-13. It judged a bucket complete because a
+# later one was visible, which a partial burst snapshot makes false — and a dead
+# function with a plausible name is how a wrong rule comes back.
 def pending_windows(rows, now: int, grace_sec: int,
                     window_sec: float = 120.0,
                     cap: int = DEFAULT_MAX_BATCH) -> list[list[int]]:
@@ -275,9 +419,12 @@ def mark_bypassed(table, session_id: str, index: int, now: int) -> None:
     # the 900-second window that is supposed to bound the two-sealers race did not exist for
     # bypassed records at all. `bypassed_at` stays because it says WHEN, which `claimed_at`
     # on a bypass record would read as a claim that is still in flight.
-    table.put_item(Item={"PK": _pk(session_id), "SK": _seal_sk(index),
-                         "status": "bypassed", "bypassed_at": now,
-                         "claimed_at": now})
+    item = {"status": "bypassed", "bypassed_at": now, "claimed_at": now}
+    # BOTH keys. The seal-shaped one keeps the existing claim/takeover machinery working;
+    # the member-scoped one is what the transcriber can actually look up when the seal key
+    # is a bucket rather than this chunk's index.
+    table.put_item(Item={"PK": _pk(session_id), "SK": _seal_sk(index), **item})
+    table.put_item(Item={"PK": _pk(session_id), "SK": _bypass_sk(index), **item})
 
 
 def release_claim(table, session_id: str, first_index: int, claimed_at: int) -> bool:

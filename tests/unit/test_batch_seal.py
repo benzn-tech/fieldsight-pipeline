@@ -330,3 +330,135 @@ def test_a_release_does_not_touch_a_claim_someone_else_now_holds(s3):
     table.items[(f"BATCH#{SID}", "SEAL#0006")]["claimed_at"] = 999   # taken over
     bl.release_claim(table, SID, 6, 100)
     assert bl.seal_status(table, SID, 6) == "sealing", "the newer claim must survive"
+
+
+# ============================================================
+# Bucket keys end to end (2026-08-13-burst-arrival-defects, phase 3)
+# ============================================================
+
+def test_a_burst_of_interleaved_workers_produces_one_seal_per_bucket(s3, monkeypatch):
+    """The 123-vs-39 defect as a unit test.
+
+    The defect needs a STALE snapshot: a worker that plans from the member list as it was
+    when its own event arrived, while other members have registered since. A loop that
+    registers and then immediately seals cannot produce it -- every worker sees everything,
+    the greedy anchor is stable, and the test passes for the wrong reason. (It did, first
+    time round.) So each worker's snapshot is frozen at its own step and replayed
+    afterwards, which is what 153 concurrent Lambdas actually do.
+
+    Under the greedy anchor this writes overlapping batches. Under bucket keys it writes
+    exactly one per bucket, and every member is accounted for exactly once.
+    """
+    import random
+
+    import batch_ledger as bl
+    table = FakeTable()
+    n = 12
+    keys = {}
+    for i in range(n):
+        hms = f"09-{i // 2:02d}-{(i % 2) * 30:02d}"
+        keys[i] = unit_key(i, hms)
+        s3.objects[keys[i]] = wav()
+
+    order = list(range(n))
+    random.Random(7).shuffle(order)
+    snapshots = []
+    for i in order:
+        bl.register_chunk(table, SID, i, keys[i], 100 + i)
+        snapshots.append(list(bl.list_members(table, SID)))     # frozen, as this worker saw it
+
+    real = bl.list_members
+    for snap in snapshots:
+        monkeypatch.setattr(bl, "list_members", lambda t, sid, _s=snap: _s)
+        batch_seal.seal_ready_runs(s3, "b", SID, table, 500, 150, 4, window_sec=120.0)
+    monkeypatch.setattr(bl, "list_members", real)
+    batch_seal.seal_ready_runs(s3, "b", SID, table, 99999, 0, 4, window_sec=120.0)
+
+    wavs = [k for k in s3.puts if k.endswith(".wav") and "_bn" in k]
+    expected = len({bl.bucket_for_index({"chunk_key": keys[i]}) for i in range(n)})
+    assert len(wavs) == expected, f"expected {expected} batches, wrote {len(wavs)}: {wavs}"
+    assert bl.consumed_indices(bl.list_members(table, SID)) == set(range(n)),         "every member must be accounted for exactly once"
+
+
+def test_a_straggler_of_a_sealed_bucket_is_redriven_not_left(s3):
+    """The half that makes the bucket key safe. Without it this member is orphaned."""
+    import batch_ledger as bl
+    table = FakeTable()
+    keys = {i: unit_key(i, f"09-00-{i * 30:02d}" if i < 2 else f"09-01-{(i - 2) * 30:02d}")
+            for i in range(4)}
+    for i, k in keys.items():
+        s3.objects[k] = wav()
+    for i in (0, 1, 2):
+        bl.register_chunk(table, SID, i, keys[i], 100)
+    batch_seal.seal_ready_runs(s3, "b", SID, table, 9999, 0, 4, window_sec=120.0)
+
+    bl.register_chunk(table, SID, 3, keys[3], 200)      # arrives after its bucket sealed
+    batch_seal.seal_ready_runs(s3, "b", SID, table, 9999, 0, 4, window_sec=120.0)
+
+    assert 3 in bl.consumed_indices(bl.list_members(table, SID)), \
+        "the straggler must be consumed, not left to be re-planned forever"
+    assert bl.bypass_status(table, SID, 3) == "bypassed"
+    assert any(k == keys[3] for k, _ in s3.copies), "and re-driven down the per-chunk path"
+
+
+# ---- a batch member is a VAD unit, not the device's upload ---------------
+#
+# Found by invoking the deployed function, not by a test: the batch map's `chunk_key` points
+# at `audio_segments/…_off{T}_to{E}_srcwav.wav`, the VAD unit — NOT at `users/…`. The unit
+# tests had fabricated maps carrying `users/` keys, so they agreed with the assumption rather
+# than with what the seal actually writes. `map_key_for_audio`'s own docstring records the
+# same shape of accident happening once before.
+#
+# Two conversions, and the second is the one that would have gone unnoticed: the unit itself
+# begins `_off{T}` into the raw chunk, so a position inside the unit is NOT a position inside
+# the chunk. Every member in test currently carries off0.0 (whole-chunk transcription is on),
+# which is exactly why a test using a real-looking zero would have proved nothing.
+
+
+def test_a_position_inside_a_unit_becomes_a_position_inside_the_raw_chunk():
+    key, s, e = batch_seal.raw_window_for_member(
+        "audio_segments/u/2026-08-13/x_c0001_off12.5_to42.5_srcwav.wav", 5.0, 9.0)
+    assert key == "users/u/audio/2026-08-13/x_c0001.wav"
+    assert (s, e) == (17.5, 21.5), "the unit's own offset was dropped"
+
+
+def test_the_zero_offset_case_that_test_currently_produces():
+    key, s, e = batch_seal.raw_window_for_member(
+        "audio_segments/u/2026-08-13/x_c0000_off0.0_to30.0_srcwav.wav", 5.0, 9.0)
+    assert key == "users/u/audio/2026-08-13/x_c0000.wav"
+    assert (s, e) == (5.0, 9.0)
+
+
+def test_a_member_key_that_is_not_a_unit_raises():
+    """Silently returning the key unchanged would read the normalised audio, on which none
+    of the voiceprint thresholds hold — plausible numbers instead of an error."""
+    with pytest.raises(ValueError):
+        batch_seal.raw_window_for_member("nonsense.wav", 0.0, 1.0)
+
+
+def test_a_singleton_bypass_closes_the_bucket_claim_it_took(s3):
+    """The claim is on the BUCKET; the bypass records are on the MEMBER. Nothing closed the
+    claim, so it sat at `sealing` forever.
+
+    Consequence: a sibling chunk of that same bucket arriving later plans, finds a
+    fresh-looking `sealing` record, and `claim_seal` refuses. Within the 900-second takeover
+    window -- which includes the one-shot close pass -- that chunk is never sealed, never
+    bypassed and never transcribed.
+    """
+    import batch_ledger as bl
+    table = FakeTable()
+    bl.register_chunk(table, SID, 4, unit_key(4, "09-00-00"), 0)
+    bucket = bl.bucket_for_index({"chunk_key": unit_key(4, "09-00-00")})
+
+    batch_seal.seal_batch(s3, "b", SID, [4], _by_index((4, "09-00-00")), 100, table,
+                          claim_key=bucket)
+
+    assert bl.seal_status(table, SID, bucket) == "bypassed", \
+        "the bucket claim must be closed, not left in flight"
+
+    # and a sibling that turns up later can still be dealt with
+    bl.register_chunk(table, SID, 5, unit_key(5, "09-00-30"), 200)
+    rows = bl.list_members(table, SID)
+    out = bl.pending_buckets(rows, 100000, grace_sec=150, table=table, session_id=SID)
+    assert out["stragglers"] == [5] or any(5 in v for _, v in out["ready"]), \
+        f"chunk 5 must be actionable, not stuck behind a dead claim: {out}"

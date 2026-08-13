@@ -717,8 +717,10 @@ def test_the_transcriber_has_an_error_alarm():
     block = re.search(r"\n  TranscribeErrorAlarm:\n(.*?)(?=\n  \w+:\n)", text, re.S)
     assert block, "no TranscribeErrorAlarm in the template"
     body = block.group(1)
-    assert "MetricName: Errors" in body
-    assert "!Ref TranscribeFunction" in body
+    # NOT AWS/Lambda Errors: a caught provider rejection returns 200, so that metric never
+    # moves. The alarm has to watch a count the function emits itself.
+    assert "MetricName: TranscriptionFailures" in body
+    assert "Namespace: FieldSight/Transcribe" in body
     assert "!Ref AlertTopic" in body, "an alarm nobody is told about is not an alarm"
 
 
@@ -733,3 +735,121 @@ def test_the_transcriber_has_a_throttle_alarm():
     block = re.search(r"\n  TranscribeThrottleAlarm:\n(.*?)(?=\n  \w+:\n)", text, re.S)
     assert block, "no TranscribeThrottleAlarm in the template"
     assert "MetricName: Throttles" in block.group(1)
+
+
+# ----------------------------------------------------------
+# The speaker embedder. Three things about it have already gone wrong once each elsewhere
+# in this stack, so each is pinned rather than trusted:
+#   * a function that reads S3 without the grant (three times tonight, each a single
+#     WARNING behind a guard);
+#   * a missing ListBucket, which turns "not there" into 403 and makes it look like "not
+#     allowed" — or the reverse, depending on which one you were expecting;
+#   * a cp312-only layer attached to a function on another runtime, which fails at import.
+# ----------------------------------------------------------
+
+
+def test_the_embedder_may_read_the_audio_and_the_model():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "SpeakerEmbedFunction")
+    reads = [s for s in blk.split("- Effect: Allow") if "s3:GetObject" in s]
+    for prefix in ("users/*", "models/*"):
+        assert any(prefix in s for s in reads), (
+            f"SpeakerEmbedFunction has no s3:GetObject on {prefix} — it reads the raw "
+            f"upload and downloads its own model, and a denial there is invisible")
+
+
+def test_the_embedder_can_tell_a_missing_key_from_a_denied_one():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "SpeakerEmbedFunction")
+    assert "s3:ListBucket" in blk, (
+        "without ListBucket S3 answers 403 for a key that does not exist, so the function "
+        "cannot distinguish a missing recording from a permissions fault")
+
+
+def test_the_embedder_runs_on_the_runtime_its_layer_was_built_for():
+    """`fieldsight-vad-layer` is cp312-only. Attached to a function on another runtime it
+    fails at import, not at deploy."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "SpeakerEmbedFunction")
+    assert "VadLayerArn" in blk, "the embedder needs onnxruntime, which that layer carries"
+    assert "python3.12" in blk, (
+        "the embedder attaches the cp312-only VAD layer but does not pin Runtime to "
+        "python3.12 — a runtime bump would break it at import with a green deploy")
+
+
+def test_the_embedder_has_no_event_trigger():
+    """It is invoked directly. An S3 event here would embed every upload in the lake."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "SpeakerEmbedFunction")
+    assert "Events:" not in blk, (
+        "SpeakerEmbedFunction must have no Events — it is invoked on demand, and a "
+        "trigger would run a model over every file that lands")
+
+
+def test_the_transcriber_can_be_given_a_concurrency_ceiling():
+    """The provider caps CONCURRENT requests; Lambda does not, and 141 met a limit of 20.
+
+    Reserved concurrency is the only mechanism that bounds this before the request is made
+    -- everything else reacts to the rejection, and the rejection loses the audio. It has to
+    be a parameter rather than a constant because the two stages hold different keys on
+    different plans, and the number must be derived from the live consumer list, not guessed.
+    """
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert re.search(r"\n  TranscribeReservedConcurrency:\n", text), "no parameter"
+    assert "ReservedConcurrentExecutions: !Ref TranscribeReservedConcurrency" in text \
+        or "ReservedConcurrentExecutions: !If" in text, "the parameter reaches no function"
+    for env in ("prod", "test"):
+        assert "TranscribeReservedConcurrency" in _overrides(WORKFLOWS[env]), \
+            f"{env} cannot set it, so it holds its default forever"
+
+
+def test_an_unset_ceiling_means_no_reservation_at_all():
+    """`0` must omit the property, not reserve zero -- reserving zero would stop the
+    function dead. Prod's plan is unknown from this repo and its observed peak is 54, so a
+    guessed number there would throttle a working pipeline."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert re.search(r"HasTranscribeReserve:\s*!Not \[!Equals \[!Ref TranscribeReservedConcurrency, '0'\]\]", text)
+
+
+def test_the_embedder_can_read_the_batch_map_but_not_the_audio_beside_it():
+    """A batched turn's audio is reached THROUGH the map, and the map lives under
+    audio_segments/ next to the normalised copy this function must never read.
+
+    So the grant is narrowed to `*_batch_map.json`. Granting `audio_segments/*` would be one
+    character shorter and would silently permit reading the normalised audio, on which none
+    of the Phase 0 thresholds hold — a measurement error that produces plausible numbers
+    rather than an error.
+    """
+    t = open(TEMPLATE, encoding="utf-8").read()
+    assert "/audio_segments/*_batch_map.json" in t, (
+        "the embedder cannot read the batch map, so every batched turn 403s or reads the "
+        "wrong seconds")
+    assert "/audio_segments/*'" not in t and '/audio_segments/*"' not in t, (
+        "audio_segments/* is granted wholesale somewhere — the narrowing is the point")
+
+
+def test_the_voiceprint_writer_has_the_layer_the_embedder_cannot_have():
+    """The split, pinned from both sides. The embedder carries VadLayerArn (cp312, for
+    onnxruntime) and the writer carries PsycopgLayer (cp311) — one function cannot have
+    both, and the night this was learned the embedder had a connection and no psycopg,
+    raising ModuleNotFoundError on every invocation behind a green deploy.
+    """
+    t = open(TEMPLATE, encoding="utf-8").read()
+    block = t[t.index("  VoiceprintWriterFunction:"):t.index("  SuggestionWriterFunction:")]
+    assert "!Ref PsycopgLayer" in block, "the writer cannot reach Aurora without psycopg"
+    assert "VadLayerArn" not in block, (
+        "the writer took the cp312 layer as well; the two are mutually exclusive")
+    assert "VpcConfig" in block, "Aurora is only reachable from inside the VPC"
+    assert "Events:" not in block, (
+        "the writer acquired a trigger; it is invoked by the embedder and nothing else")
+
+
+def test_the_embedder_may_invoke_the_writer_and_nothing_else():
+    """Its own work reaches the database only through this invoke — it has no psycopg. A
+    missing grant here fails at runtime with an AccessDenied nobody sees until a real
+    correction is made."""
+    t = open(TEMPLATE, encoding="utf-8").read()
+    block = t[t.index("  SpeakerEmbedFunction:"):t.index("  VoiceprintWriterFunction:")]
+    assert "lambda:InvokeFunction" in block
+    assert "voiceprint-writer" in block
+    assert "Resource: '*'" not in block and 'Resource: "*"' not in block

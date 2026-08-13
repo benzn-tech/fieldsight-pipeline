@@ -206,3 +206,95 @@ def test_site_scoping_does_not_weaken_consent_or_withdrawal():
         sql = conn.calls[-1]["sql"]
         assert "consent_at IS NOT NULL" in sql
         assert "status <> 'withdrawn'" in sql
+
+
+# ---- reading a vector without pgvector ----------------------------------
+#
+# The function that matches voiceprints cannot carry pgvector. It runs on python3.12
+# (fieldsight-vad-layer is cp312-only, and that layer is where onnxruntime comes from),
+# while the psycopg layer that ships pgvector is cp311-only — the two cannot sit on one
+# function. Writes were never affected: `_vector_literal` sends text. Reads were: without
+# `register_vector`, psycopg hands a `vector` column back as the STRING '[0.1,0.2,…]',
+# and `cosine` on a string is not an error that says "no pgvector" — it is a shape error
+# thirty lines away, or worse, a number.
+
+
+def test_a_vector_column_read_without_pgvector_comes_back_as_numbers():
+    import repositories.voiceprints as vr
+    got = vr._parse_vector("[0.5,-0.25,0.125]")
+    assert [float(x) for x in got] == [0.5, -0.25, 0.125]
+
+
+def test_a_vector_that_pgvector_already_parsed_is_left_alone():
+    """When the layer DOES have pgvector the value arrives as a sequence, and parsing must
+    be a no-op rather than a second interpretation of it."""
+    import repositories.voiceprints as vr
+    assert list(vr._parse_vector([0.5, -0.25])) == [0.5, -0.25]
+    assert vr._parse_vector(None) is None
+
+
+def test_profiles_for_matching_returns_numbers_not_text():
+    """The end the caller actually touches. `profiles_for_matching` is the only read of an
+    embedding in the codebase, so this is where the conversion has to be — not in each
+    caller, which is how one of them ends up without it."""
+    import repositories.voiceprints as vr
+    rows = [{"id": "p1", "display_name": "Ben", "status": "confirmed", "user_id": None,
+             "sample_id": "s1", "embedding": "[1,2,3]"}]
+    conn = FakeConn([rows])
+    out = vr.profiles_for_matching(conn, CO)
+    assert [float(x) for x in out[0]["embedding"]] == [1.0, 2.0, 3.0], (
+        "the embedding reached the caller as text; cosine would not have said so")
+
+
+# ---- the loop that would have confirmed profiles from machine output ----
+#
+# `confirmations_count` counts DISTINCT sessions with a `confirmed` turn name as the
+# "N independent confirmations" that promote a profile from tentative (§6). Propagation
+# writes confirmed rows too. Without a source filter the machine satisfies its own promotion
+# criterion with its own output, across sessions, and the profile that then names people was
+# confirmed by nothing.
+#
+# Nothing in the schema shows this: the loop exists only because two features share one
+# table. Two independent cuts, because either alone is one edit from being undone.
+
+
+def test_only_human_corrections_count_towards_promotion():
+    conn = FakeConn([[{"n": 2}]])
+    voiceprints.confirmations_count(conn, CO, VP)
+    sql = conn.calls[0]["sql"]
+    assert "source = 'correction'" in sql, (
+        "propagated rows count as human confirmations — the system promotes profiles with "
+        "its own output")
+
+
+def test_a_propagated_row_carries_no_profile_id():
+    """The second cut. `n.voiceprint_id = %s` can never match NULL, so propagation rows are
+    outside the count even if the source filter is ever removed."""
+    conn = FakeConn([[{"id": "t1"}]])
+    voiceprints.record_turn_name(conn, CO, session_base="s1", turn_ref="f.wav@1.0",
+                                 state="confirmed", source="correction_propagation",
+                                 correction_ref="corr-1", cluster_ref="C1",
+                                 cluster_threshold=0.85)
+    params = conn.calls[-1]["params"]
+    assert None in params, "a propagated row was given a voiceprint_id"
+
+
+def test_a_correction_row_supersedes_the_live_row_for_that_turn_first():
+    """Supersede-then-insert, in the caller's transaction. S3 events are unordered, so two
+    runs can overlap; without the supersede first the partial unique index turns a race into
+    a write failure instead of a replacement."""
+    conn = FakeConn([[], [{"id": "t2"}]])
+    voiceprints.record_turn_name(conn, CO, session_base="s1", turn_ref="f.wav@1.0",
+                                 state="confirmed", source="correction",
+                                 correction_ref="corr-2", voiceprint_id=VP)
+    assert "UPDATE speaker_turn_names" in conn.calls[0]["sql"]
+    assert "superseded_at" in conn.calls[0]["sql"]
+    assert "INSERT INTO speaker_turn_names" in conn.calls[1]["sql"]
+
+
+def test_the_live_overlay_excludes_superseded_rows():
+    conn = FakeConn([[]])
+    voiceprints.live_turn_names(conn, CO, "s1")
+    sql = conn.calls[0]["sql"]
+    assert "superseded_at IS NULL" in sql
+    assert "company_id = %s" in sql

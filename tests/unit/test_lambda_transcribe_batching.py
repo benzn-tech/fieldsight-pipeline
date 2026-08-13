@@ -96,6 +96,7 @@ class FakeLedger:
         self.members = {}
         self.seals = {}
         self.registered = []
+        self.bypassed = set()
 
     def register_chunk(self, table, session_id, index, chunk_key, now):
         self.registered.append(index)
@@ -113,6 +114,34 @@ class FakeLedger:
         return batch_ledger.pending_windows(rows, now, grace_sec,
                                             window_sec=window_sec, cap=cap)
 
+    def pending_buckets(self, rows, now, grace_sec, window_sec=120.0, cap=4,
+                        table=None, session_id=None):
+        """Real planner, but the straggler lookup is answered from this fake's own seals.
+
+        `seal_ready_runs` hands through the module-level DynamoDB table, which in this
+        fixture is a real boto3 resource — letting the real `seal_status` reach for it would
+        make these tests depend on AWS."""
+        import batch_ledger
+
+        class _T:
+            def __init__(self, seals): self.seals = seals
+            def query(self_inner, KeyConditionExpression=None, ExpressionAttributeValues=None):
+                sk = (ExpressionAttributeValues or {}).get(":sk", "")
+                for k, v in self_inner.seals.items():
+                    if sk.endswith(f"{k:04d}"):
+                        return {"Items": [v]}
+                return {"Items": []}
+        return batch_ledger.pending_buckets(rows, now, grace_sec, window_sec=window_sec,
+                                            cap=cap, table=_T(self.seals),
+                                            session_id=session_id)
+
+    def bucket_for_index(self, row, window_sec=120.0):
+        import batch_ledger
+        return batch_ledger.bucket_for_index(row, window_sec)
+
+    def seal_status(self, table, session_id, key):
+        return (self.seals.get(key) or {}).get("status")
+
     def consumed_indices(self, rows):
         import batch_ledger
         return batch_ledger.consumed_indices(rows)
@@ -123,6 +152,7 @@ class FakeLedger:
 
     def mark_bypassed(self, table, session_id, index, now):
         self.seals[index] = {"status": "bypassed"}
+        self.bypassed.add(index)
 
     def claim_seal(self, table, session_id, first_index, members, now):
         if first_index in self.seals:
@@ -133,8 +163,8 @@ class FakeLedger:
     def mark_sealed(self, table, session_id, first_index, now):
         self.seals[first_index] = {"status": "sealed"}
 
-    def seal_status(self, table, session_id, first_index):
-        return (self.seals.get(first_index) or {}).get("status")
+    def bypass_status(self, table, session_id, index):
+        return "bypassed" if index in self.bypassed else None
 
 
 @pytest.fixture
@@ -191,6 +221,10 @@ def test_the_fourth_member_produces_a_batch_and_its_map(wired):
     mp, s3, ledger, calls = wired
     for i in range(4):
         mod.lambda_handler(_event(unit_key(i)), None)
+    # Grace elapses only now. Setting it to zero BEFORE the loop makes the first chunk a
+    # bucket of one and bypasses it -- which is correct behaviour and the wrong test.
+    mp.setattr(mod, "BATCH_SEAL_DEADLINE_SEC", 0)
+    mod.lambda_handler(_event(unit_key(3)), None)
     maps = s3.put_keys("_batch_map.json")
     wavs = [k for k in s3.put_keys(".wav") if bs.is_batch_key(k)]
     assert len(maps) == 1 and len(wavs) == 1
@@ -205,6 +239,8 @@ def test_the_map_is_written_before_the_wav_that_triggers_transcription(wired):
     mp, s3, ledger, calls = wired
     for i in range(4):
         mod.lambda_handler(_event(unit_key(i)), None)
+    mp.setattr(mod, "BATCH_SEAL_DEADLINE_SEC", 0)
+    mod.lambda_handler(_event(unit_key(3)), None)
     keys = s3.put_keys()
     # `is_batch_key` matches the map too — it carries the same `_bn{K}` stem — so the WAV
     # has to be selected by extension as well. Harmless in the handler (a .json has no
@@ -269,6 +305,8 @@ def test_an_unreadable_raw_upload_does_not_block_the_batch(wired):
     del s3.objects[raw_key(2)]
     for i in range(4):
         mod.lambda_handler(_event(unit_key(i)), None)
+    mp.setattr(mod, "BATCH_SEAL_DEADLINE_SEC", 0)      # the bucket is over
+    mod.lambda_handler(_event(unit_key(3)), None)
     maps = s3.put_keys("_batch_map.json")
     assert len(maps) == 1
     doc = json.loads(s3.puts[[p["Key"] for p in s3.puts].index(maps[0])]["Body"])
@@ -290,7 +328,9 @@ def test_a_bypassed_member_is_transcribed_when_its_event_comes_back(wired):
     monkeypatch, s3, ledger, calls = wired
     ledger.members[0] = {"chunk_index": 0, "chunk_key": unit_key(0),
                          "registered_at": 0, "sealed_into": 0}
-    ledger.seals[0] = {"status": "bypassed"}
+    # Member-scoped since the seal key became the wall-clock bucket: a lookup by chunk
+    # index against the seal record no longer finds anything.
+    ledger.bypassed.add(0)
 
     results = []
     handled = mod._maybe_batch("b", unit_key(0), results)
@@ -411,3 +451,44 @@ def test_the_window_length_is_read_from_the_environment_not_hardcoded(monkeypatc
     finally:
         monkeypatch.delenv("BATCH_WINDOW_SEC")
         importlib.reload(mod)
+
+
+def test_the_bypass_check_reads_the_member_record_not_the_seal_key(wired):
+    """Under bucket seal keys, `seal_status(sid, chunk_index)` misses.
+
+    The copy-to-self event for a bypassed chunk would then re-enter batching, find itself
+    consumed, and report `batched_pending` — the exact vanish the bypass exists to prevent.
+    """
+    monkeypatch, s3, ledger, calls = wired
+    ledger.members[0] = {"chunk_index": 0, "chunk_key": unit_key(0),
+                         "registered_at": 0, "sealed_into": 0}
+    ledger.bypassed.add(0)
+    assert mod._maybe_batch("b", unit_key(0), []) is False
+
+
+def test_a_transcription_failure_emits_a_metric_the_alarm_can_see(wired, capsys):
+    """The Errors alarm I added cannot fire for the incident its own description cites.
+
+    A provider 429 is caught by the per-record `except`, recorded as `status: error`, and
+    the handler returns 200 -- so Lambda's `Errors` metric stays at zero. The 27-batch,
+    54-minute loss would have left that alarm green.
+
+    An EMF line is the fix that needs no new IAM and no new resource type: CloudWatch Logs
+    extracts the metric from the log itself. `logs:PutMetricFilter` is implicitDeny on the
+    deploy role, so a metric filter was not available.
+    """
+    import json as _json
+    monkeypatch, s3, ledger, calls = wired
+    monkeypatch.setattr(mod, "BATCH_TRANSCRIPTION", False)
+    import elevenlabs_utils
+    monkeypatch.setattr(elevenlabs_utils, "transcribe_segment",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 429")))
+
+    mod.lambda_handler(_event(unit_key(0)), None)
+
+    emitted = [ln for ln in capsys.readouterr().out.splitlines() if "_aws" in ln]
+    assert emitted, "no EMF line, so nothing outside the log can count this failure"
+    doc = _json.loads(emitted[-1])
+    names = [m["Name"] for d in doc["_aws"]["CloudWatchMetrics"] for m in d["Metrics"]]
+    assert "TranscriptionFailures" in names
+    assert doc["TranscriptionFailures"] == 1

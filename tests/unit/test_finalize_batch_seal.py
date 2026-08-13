@@ -138,3 +138,84 @@ def test_the_tail_seal_uses_the_same_window_as_the_transcriber(swept):
     assert window == mod.BATCH_WINDOW_SEC, \
         f"the tail seal grouped by {window}, the transcriber by {mod.BATCH_WINDOW_SEC}"
     assert mod.BATCH_WINDOW_SEC == 120
+
+
+def test_the_sweep_redrives_batches_that_were_never_transcribed(swept, monkeypatch):
+    """Somebody has to come back, and nothing did.
+
+    A batch whose transcription was rejected (27 of them on one replay, all HTTP 429 from
+    the provider's concurrency ceiling) leaves a WAV with no transcript. The per-record
+    `except` recorded `status: error` and returned 200, so S3's async retry never fired;
+    there is no DLQ; and the ledger says `sealed` so no planner looks at it again. About 54
+    minutes of audio, recovered by hand.
+
+    The per-minute sweep already visits every session. This asserts it now looks.
+    """
+    mp, rec = swept
+    monkeypatch.setattr(mod, "_batch_prefix_for",
+                        lambda sid, table=None: "audio_segments/Ben/2026-08-13/")
+    seen = []
+    import batch_redrive
+    monkeypatch.setattr(batch_redrive, "redrive_untranscribed",
+                        lambda *a, **k: seen.append(a[2]) or
+                        {"candidates": 0, "redriven": 0, "exhausted": 0})
+    mod.sweep(FakeConn(), grace_seconds=0, infer_idle=False)
+    assert seen, "the sweep never asked whether any sealed batch is missing its transcript"
+
+
+def test_the_sweep_visits_active_sessions_that_no_database_row_knows_about(swept, monkeypatch):
+    """The prod blocker, made structural.
+
+    Sealing runs on chunk arrival; the close pass runs once, for sessions in
+    `pending_close`. A device whose `/open` never reached the server has NO row -- so after
+    a backlog burst every bucket sits registered and unsealed forever, with zero transcripts
+    and zero errors. The acceptance replay is exactly that shape and needed a manual poke.
+
+    The sweep now also walks the ledger's own list of sessions that still owe work, which is
+    one Query and is true whatever the database thinks.
+    """
+    mp, rec = swept
+    import batch_ledger
+    monkeypatch.setattr(batch_ledger, "active_sessions", lambda t: ["deadbeef" * 4])
+    seen = []
+    import batch_seal
+    monkeypatch.setattr(batch_seal, "seal_ready_runs",
+                        lambda *a, **k: seen.append(a[2]) or [])
+    mod.sweep(FakeConn(), grace_seconds=0, infer_idle=False)
+    assert "deadbeef" * 4 in seen, \
+        "a session the database has never heard of still owes its audio a batch"
+
+
+def test_the_redrive_listing_is_scoped_to_the_session_folder(swept, monkeypatch):
+    """Prod's audio_segments/ already holds 5,542 objects and nothing expires them.
+
+    Walking the whole prefix once per session, inside a 120-second sweep that also does
+    finalize, is a timeout waiting to happen -- and a timeout there kills the tick before
+    `finalize_claim`, so the session stays pending_close and the next tick repeats it.
+    Confirmation emails would stall behind a listing.
+    """
+    mp, rec = swept
+    monkeypatch.setattr(mod, "_batch_prefix_for",
+                        lambda sid, table=None: "audio_segments/Ben/2026-08-13/")
+    prefixes = []
+    import batch_redrive
+    monkeypatch.setattr(batch_redrive, "redrive_untranscribed",
+                        lambda *a, **k: prefixes.append(k.get("prefix")) or
+                        {"candidates": 0, "redriven": 0, "exhausted": 0})
+    mod.sweep(FakeConn(), grace_seconds=0, infer_idle=False)
+    assert prefixes and all(p and p != "audio_segments/" for p in prefixes), \
+        f"the sweep listed the whole lake: {prefixes}"
+
+
+def test_a_session_with_no_ledger_rows_is_not_redriven_at_all(swept, monkeypatch):
+    """No prefix means nothing of this session's to re-drive. Calling anyway would list
+    everything under audio_segments/ -- 5,542 objects on prod, growing, inside a 120 s
+    sweep whose timeout would strand every confirmation email behind it."""
+    mp, rec = swept
+    monkeypatch.setattr(mod, "_batch_prefix_for", lambda sid, table=None: None)
+    called = []
+    import batch_redrive
+    monkeypatch.setattr(batch_redrive, "redrive_untranscribed",
+                        lambda *a, **k: called.append(k.get("prefix")) or {})
+    mod.sweep(FakeConn(), grace_seconds=0, infer_idle=False)
+    assert called == [], "an unscoped re-drive is worse than no re-drive"

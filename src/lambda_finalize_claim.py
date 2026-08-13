@@ -549,6 +549,74 @@ def infer_idle_closes(conn, idle_seconds):
     return closed
 
 
+def _batch_prefix_for(session_id, table=None):
+    """`audio_segments/{folder}/{date}/` for this session, from its own ledger rows.
+
+    Prod's `audio_segments/` already holds 5,542 objects and nothing expires them. Walking
+    the whole prefix once per session, inside a 120-second sweep that also does finalize, is
+    a timeout waiting to happen — and a timeout there kills the tick before `finalize_claim`,
+    so the session stays `pending_close` and the next tick repeats the same listing, with
+    every confirmation email queued behind it.
+    """
+    import boto3
+
+    import batch_ledger
+    try:
+        t = table or boto3.resource("dynamodb").Table(TRANSCRIPT_TABLE)
+        rows = batch_ledger.list_members(t, session_id)
+        for r in rows:
+            key = r.get("chunk_key") or ""
+            if key.startswith("audio_segments/") and key.count("/") >= 3:
+                return "/".join(key.split("/")[:3]) + "/"
+    except Exception:
+        logger.warning("batch: no prefix for %s; skipping the re-drive rather than "
+                       "listing the whole lake", session_id)
+    return None
+
+
+def revisit_active_batch_sessions():
+    """Seal and re-drive for every session the LEDGER says still owes work.
+
+    Sealing runs on chunk arrival and the close pass runs once, for sessions the database
+    has as `pending_close`. A device whose `/open` never reached the server has no row at
+    all, so after a backlog burst every bucket sits registered and unsealed forever — zero
+    transcripts, zero errors, and the only recovery is a human noticing. This is that
+    human, once a minute.
+
+    Never raises: a sweep that dies here stops every confirmation email after it.
+    """
+    if not BATCH_TRANSCRIPTION:
+        return []
+    import boto3
+
+    import batch_ledger
+    import batch_redrive
+    import batch_seal
+    out = []
+    try:
+        s3 = boto3.client("s3")
+        table = boto3.resource("dynamodb").Table(TRANSCRIPT_TABLE)
+        sessions = batch_ledger.active_sessions(table)
+        for sid in sessions:
+            try:
+                prefix = _batch_prefix_for(sid, table)
+                batch_seal.seal_ready_runs(s3, S3_BUCKET, sid, table, int(time.time()),
+                                           BATCH_SEAL_DEADLINE_SEC, BATCH_MAX_CHUNKS,
+                                           sealed_by="revisit",
+                                           window_sec=BATCH_WINDOW_SEC)
+                if prefix:
+                    batch_redrive.redrive_untranscribed(s3, S3_BUCKET, sid, table,
+                                                        prefix=prefix)
+                batch_ledger.retire_if_finished(table, sid)
+                out.append(sid)
+            except Exception:
+                logger.exception("batch: revisit failed for session %s", sid)
+        logger.info("batch: revisited %d active session(s)", len(sessions))
+    except Exception:
+        logger.exception("batch: the active-session revisit failed")
+    return out
+
+
 def _seal_tail_batches(session_id):
     """Seal this session's last 1–3 chunks, BEFORE it is finalized.
 
@@ -585,6 +653,23 @@ def _seal_tail_batches(session_id):
             # path was dead, and a real 6-minute recording lost its last 19 seconds.
             int(time.time()), 0, BATCH_MAX_CHUNKS,
             sealed_by="session_close", window_sec=BATCH_WINDOW_SEC)
+
+        # And come back for anything that was sealed but never transcribed. The rejection
+        # was caught per-record, recorded as `status: error`, and returned 200 -- so S3's
+        # async retry never fired, there is no DLQ, and the ledger says `sealed` so no
+        # planner will look again. 27 batches (~54 minutes of audio) went that way on one
+        # replay and were recovered by hand.
+        import batch_redrive
+        prefix = _batch_prefix_for(session_id)
+        if prefix:
+            batch_redrive.redrive_untranscribed(
+                boto3.client("s3"), S3_BUCKET, session_id,
+                boto3.resource("dynamodb").Table(TRANSCRIPT_TABLE), prefix=prefix)
+        else:
+            # No prefix means no ledger rows to derive it from, so there is nothing of
+            # this session's to re-drive anyway. Calling without one would list the whole
+            # lake — 5,542 objects on prod and growing, inside a 120 s sweep.
+            logger.info("batch: no prefix for %s, skipping the re-drive", session_id)
     except Exception:
         logger.exception("batch: could not seal the tail of session %s — the final "
                          "extraction may be missing its last chunks", session_id)
@@ -602,6 +687,10 @@ def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None):
     do_infer = INFER_IDLE_CLOSE if infer_idle is None else infer_idle
     if do_infer:
         infer_idle_closes(conn, idle)
+    # A STANDING pass, before the due-session loop and independent of it. Sealing otherwise
+    # only ever happens on chunk arrival or at a close the database knows about, and a
+    # device whose `/open` never reached the server has neither.
+    revisit_active_batch_sessions()
     results = []
     for row in meeting_session.list_due_finalize(conn, grace):
         _seal_tail_batches(row["session_id"])

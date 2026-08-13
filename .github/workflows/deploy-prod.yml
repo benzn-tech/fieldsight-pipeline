@@ -202,6 +202,7 @@ jobs:
               "TranscribeWholeChunk=${{ vars.PROD_TRANSCRIBE_WHOLE_CHUNK || 'true' }}" \
               "BatchTranscription=${{ vars.PROD_BATCH_TRANSCRIPTION || 'false' }}" \
               "BatchWindowSec=${{ vars.PROD_BATCH_WINDOW_SEC || '120' }}" \
+              "TranscribeReservedConcurrency=${{ vars.PROD_TRANSCRIBE_RESERVED_CONCURRENCY || '0' }}" \
               "BatchMaxChunks=${{ vars.PROD_BATCH_MAX_CHUNKS || '4' }}" \
               "BatchSealDeadlineSec=${{ vars.PROD_BATCH_SEAL_DEADLINE_SEC || '150' }}" \
               "FilterAudioEventTags=${{ vars.PROD_FILTER_AUDIO_EVENT_TAGS || 'true' }}" \

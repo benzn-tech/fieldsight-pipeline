@@ -284,12 +284,12 @@ def test_a_chunk_at_the_window_boundary_starts_the_next_batch():
     assert got == [[0, 1, 2, 3], [4]]
 
 
-def test_the_window_anchors_on_its_first_member_not_on_a_grid():
-    """A grid aligned to the session start cuts dense stretches at the boundary -- 480
-    requests against 470 for greedy anchoring, and it can split a run of four that a
-    boundary happens to straddle."""
-    got = bs.plan_windows(_at((10, 110), (11, 140), (12, 170)), window_sec=120, cap=4)
-    assert got == [[10, 11, 12]]
+# `test_the_window_anchors_on_its_first_member_not_on_a_grid` was DELETED on 2026-08-13,
+# not edited. It pinned greedy anchoring, chosen hours earlier to save 2% of requests, and
+# a real 71-minute replay then showed greedy producing 123 batches for 153 chunks under
+# concurrent arrival. The reversal is deliberate; its replacement is
+# `test_a_boundary_straddling_run_splits_at_the_bucket_edge`, which asserts the cost the 2%
+# was buying and says why it is now being paid.
 
 
 def test_a_consumed_chunk_is_invisible_to_the_planner():
@@ -334,3 +334,162 @@ def test_the_map_resolves_correctly_across_a_bridged_gap():
         got = bs.resolve_abs_time(doc, t)
         offset = (got - T0).total_seconds()
         assert not (28.0 < offset < 62.0), f"t={t} resolved into the gap at +{offset}"
+
+
+# ============================================================
+# Bucket anchoring (spec 2026-08-13-burst-arrival-defects)
+# ============================================================
+# Replaying one real 71-minute session into TEST produced 123 batch objects for 153 chunks
+# instead of 39, because 153 concurrent workers each planned from a different snapshot of
+# "who is left" and so each computed a different anchor. The seal key is the anchor, so two
+# anchors covering the same chunks held two different keys and neither saw the other.
+#
+# A greedy anchor is a function of the snapshot. Under concurrency that is not a function.
+
+def test_the_bucket_is_a_pure_function_of_the_filename():
+    """Two workers, different snapshots, same chunk -- one answer. This is the property the
+    seal key needs and the greedy anchor cannot provide."""
+    t = datetime(2026, 8, 13, 9, 1, 30)
+    assert bs.bucket_of(t, 120) == bs.bucket_of(t, 120)
+    assert isinstance(bs.bucket_of(t, 120), int)
+
+
+def test_two_snapshots_plan_the_same_bucket_for_every_common_member():
+    """The exact trace from the replay: one worker saw {5,6,7,8}, another saw {0..8}."""
+    members = _at(*[(i, i * 30) for i in range(9)])
+    a = bs.plan_buckets({i: members[i] for i in (5, 6, 7, 8)}, window_sec=120)
+    b = bs.plan_buckets(members, window_sec=120)
+    for idx in (5, 6, 7, 8):
+        ka = next(k for k, v in a.items() if idx in v)
+        kb = next(k for k, v in b.items() if idx in v)
+        assert ka == kb, f"chunk {idx} landed in bucket {ka} for one worker and {kb} for another"
+
+
+def test_naive_base_times_bucket_by_a_fixed_convention_not_the_server_zone(monkeypatch):
+    """`datetime.timestamp()` on a naive value interprets it in the SERVER's zone, so the
+    same filename would bucket differently on two machines -- which is the determinism this
+    whole change exists for, quietly undone."""
+    import importlib
+    import os as _os
+    t = datetime(2026, 8, 13, 9, 1, 30)
+    seen = set()
+    for tz in ("UTC", "Pacific/Auckland", "America/New_York"):
+        monkeypatch.setenv("TZ", tz)
+        try:
+            import time as _time
+            _time.tzset()                      # no-op on Windows; real on the CI runner
+        except AttributeError:
+            pass
+        importlib.reload(bs)
+        seen.add(bs.bucket_of(t, 120))
+    assert len(seen) == 1, f"the bucket moved with the server timezone: {seen}"
+    assert _os.environ  # keep the import meaningful
+
+
+def test_a_boundary_straddling_run_splits_at_the_bucket_edge():
+    """The accepted cost. Greedy would have kept these together; the grid does not, and
+    that is the 2% (480 requests against 470) being paid for determinism.
+
+    This REPLACES test_the_window_anchors_on_its_first_member_not_on_a_grid, deleted by name
+    in the same commit -- the reversal is deliberate and this pair of edits is its record.
+    """
+    T = datetime(2026, 8, 13, 9, 0, 0)
+    base = bs.bucket_of(T, 120)
+    members = {10: T + timedelta(seconds=110), 11: T + timedelta(seconds=140)}
+    out = bs.plan_buckets(members, window_sec=120)
+    assert len(out) == 2 and bs.bucket_of(members[11], 120) == base + 1
+
+
+def test_at_most_cap_base_times_fit_one_bucket_at_thirty_seconds():
+    """The count cap cannot bind while chunks are 30 s, so a bucket is never split by it."""
+    T = datetime(2026, 8, 13, 9, 0, 0)
+    members = {i: T + timedelta(seconds=30 * i) for i in range(40)}
+    for idxs in bs.plan_buckets(members, window_sec=120).values():
+        assert len(idxs) <= 4
+
+
+def test_a_consumed_member_is_not_placed_in_any_bucket():
+    T = datetime(2026, 8, 13, 9, 0, 0)
+    members = {i: T + timedelta(seconds=30 * i) for i in range(4)}
+    out = bs.plan_buckets(members, window_sec=120, consumed={1, 2})
+    assert sorted(i for v in out.values() for i in v) == [0, 3]
+
+
+# ---- reading a batch window back as raw chunk audio ---------------------
+#
+# The voiceprint path must read the DEVICE'S OWN upload: every threshold in
+# voiceprint_utils was measured on raw audio and does not transfer to the normalised,
+# stitched copy under audio_segments/. Batching breaks that by construction -- a batched
+# turn's source_filename IS the stitched file and its offsets are batch-relative
+# (see `rebase_turns_from_embedded_map`'s docstring) -- so the coordinates have to come back
+# map rather than the rule being abandoned.
+#
+# This arithmetic lives here, next to build_map, for the reason build_map's own docstring
+# gives: a caller recomputing offsets independently is a second implementation of the one
+# piece of arithmetic that must not drift.
+
+
+def _map3():
+    """Three chunks, 30s each, the first with a 1.5s head trim."""
+    ms = [bs.member(0, "audio_segments/u/2026-08-13/x_c0000_off0.0_to30.0_srcwav.wav",
+                    "2026-08-13T09:00:00", 1.5, 30.0),
+          bs.member(1, "audio_segments/u/2026-08-13/x_c0001_off0.0_to30.0_srcwav.wav",
+                    "2026-08-13T09:00:30", 0.5, 30.0),
+          bs.member(2, "audio_segments/u/2026-08-13/x_c0002_off0.0_to30.0_srcwav.wav",
+                    "2026-08-13T09:01:00", 0.25, 30.0)]
+    return bs.build_map("sid1", ms, sealed_by="session_close")
+
+
+def test_a_window_inside_one_member_maps_to_that_chunk():
+    got = bs.locate_in_members(_map3(), 35.0, 40.0)
+    assert len(got) == 1
+    assert "x_c0001_off" in got[0]["chunk_key"]
+    # 35s into the batch is 5s into member 1's KEPT audio, and its kept audio starts
+    # trimmed_head_sec into the chunk itself.
+    assert got[0]["start_sec"] == pytest.approx(5.0 + 0.5)
+    assert got[0]["end_sec"] == pytest.approx(10.0 + 0.5)
+
+
+def test_the_head_trim_is_added_not_ignored():
+    """Member 0 keeps audio from 1.5s in, so batch time 0 is chunk time 1.5 -- dropping the
+    trim silently shifts every window by up to a second, which is a different person's
+    syllables at a 3s floor."""
+    got = bs.locate_in_members(_map3(), 0.0, 4.0)
+    assert got[0]["start_sec"] == pytest.approx(1.5)
+    assert got[0]["end_sec"] == pytest.approx(5.5)
+
+
+def test_a_window_spanning_two_members_returns_both_pieces_in_order():
+    got = bs.locate_in_members(_map3(), 28.0, 33.0)
+    assert [g["chunk_key"].split("_off")[0][-5:] for g in got] == ["c0000", "c0001"]
+    assert got[0]["start_sec"] == pytest.approx(28.0 + 1.5)
+    assert got[0]["end_sec"] == pytest.approx(30.0 + 1.5)      # to the end of its kept audio
+    assert got[1]["start_sec"] == pytest.approx(0.0 + 0.5)     # from the start of the next
+    assert got[1]["end_sec"] == pytest.approx(3.0 + 0.5)
+
+
+def test_a_window_past_the_end_of_the_batch_raises():
+    """Silently clipping would hand back a shorter clip than asked for, and a shorter clip
+    is a worse voiceprint with nothing anywhere saying why."""
+    with pytest.raises(ValueError, match="beyond"):
+        bs.locate_in_members(_map3(), 100.0, 110.0)
+
+
+def test_an_empty_map_raises_rather_than_returning_nothing():
+    with pytest.raises(ValueError):
+        bs.locate_in_members({"schema": 1, "members": []}, 0.0, 5.0)
+
+
+def test_the_map_key_for_a_batch_audio_object():
+    k = bs.map_key_for_audio(
+        "audio_segments/u/2026-08-13/x_c0000_bn4_off0.0_to114.0_srcwav.wav")
+    assert k == "audio_segments/u/2026-08-13/x_c0000_bn4_off0.0_to114.0_srcwav_batch_map.json"
+
+
+def test_a_per_chunk_filename_is_not_batched():
+    """The discriminator. A raw per-chunk turn must keep costing nothing -- no map fetch,
+    no translation -- and the two shapes are told apart by `_bn`, which build_batch_name
+    puts there and nothing else uses."""
+    assert bs.is_batched("x_c0000_bn4_off0.0_to114.0_srcwav.wav") is True
+    assert bs.is_batched("x_c0000.wav") is False
+    assert bs.is_batched("x_c0000_off1.5_to31.5_srcwav.wav") is False
