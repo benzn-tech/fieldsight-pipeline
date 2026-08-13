@@ -82,7 +82,10 @@ def _propagation(event):
                 voiceprint_id=vp_id if asserted else None,
                 score=r.get("score"),
                 margin=r.get("margin"),
-                label_disagreement=r.get("label_disagreement"))
+                label_disagreement=r.get("label_disagreement"),
+                # Carried all the way from the correction body. Without a column to land in
+                # it was dropped here without a word, and the row named nobody.
+                display_name=r.get("display_name"))
             written += 1
     logger.info("propagation: %d rows for %s (tau=%s)", written, session_base, tau)
     return {"written": written}
