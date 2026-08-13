@@ -108,14 +108,12 @@ def test_the_artifact_lands_under_the_prefix_the_embedder_watches(wired):
     assert key.endswith(".json"), key
 
 
-def test_the_artifact_carries_the_profiles_the_query_allowed(wired):
-    """org-api reads them because it is the half with a database. The embedder has no way
-    to obtain a profile except from here, which is what keeps the consent filter in one
-    place instead of two."""
-    org.lambda_handler(_event(BODY), None)
-    doc = json.loads(wired.puts[0]["Body"])
-    assert [p["person_key"] for p in doc["profiles"]] == ["u-9"]
-    assert len(doc["profiles"][0]["embedding"]) == 192
+# `test_the_artifact_carries_the_profiles_the_query_allowed` was here and is deleted with the
+# behaviour it pinned. It asserted the artifact contained a 192-dimension embedding — which
+# was the defect, not the contract: those vectors went to an S3 object with no lifecycle
+# rule and outlived the withdrawal of the person they belonged to. The consent filter it was
+# really about is still in one place; there is simply nothing for it to filter INTO, because
+# propagation names a cluster and scores against no stored profile.
 
 
 def test_the_company_comes_from_the_caller_never_from_the_body(wired):
@@ -439,3 +437,23 @@ def test_withdrawal_404s_when_the_feature_is_off(wired, monkeypatch):
     existing is what `off` means everywhere else, and a half-present feature is worse."""
     monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "off")
     assert org.lambda_handler(_del_event(), None)["statusCode"] == 404
+
+
+def test_the_request_artifact_carries_no_voice_vectors(wired):
+    """The biometric-residence defect, fifth home. The reviews chased it out of an embedding
+    cache and out of the enrolment result, and it was sitting in the `profiles` list all
+    along: every correction wrote the full 192-d embedding of every consented profile in the
+    company into an S3 object with no lifecycle rule and no deletion — so a withdrawn
+    person's voiceprint stayed in the bucket after the withdrawal returned 200.
+
+    They are not needed. Propagation names the cluster the corrected turn belongs to and
+    never scores against a stored profile; the only thing the vectors produced was a `score`
+    on the one row whose name the user typed himself.
+    """
+    org.lambda_handler(_event(BODY), None)
+    doc = json.loads(wired.puts[0]["Body"])
+    blob = json.dumps(doc)
+    assert "embedding" not in blob, "a voice vector was written to S3"
+    assert "profiles" not in doc, (
+        "the artifact still carries a profile list; even empty, the field invites somebody "
+        "to fill it")

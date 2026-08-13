@@ -310,7 +310,8 @@ def test_the_live_overlay_excludes_superseded_rows():
 
 def test_a_named_profile_cannot_be_created_without_consent():
     with pytest.raises(ValueError, match="consent"):
-        voiceprints.upsert_profile(FakeConn([[]]), CO, display_name="Ben L")
+        voiceprints.upsert_profile(FakeConn([[]]), CO, display_name="Ben L",
+                                   consented_by="u-9")
 
 
 def test_an_unnamed_profile_needs_no_consent():
@@ -353,14 +354,16 @@ def test_an_existing_profile_for_the_same_name_is_reused_not_duplicated():
     """Two corrections naming the same person must feed ONE profile. Two profiles for one
     voice make that person his own runner-up — the failure `aggregate_scores` exists for."""
     conn = FakeConn([[{"id": "vp-existing"}]])
-    got = voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True)
+    got = voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True,
+                                     consented_by="u-9")
     assert got["id"] == "vp-existing"
     assert len(conn.calls) == 1, "an existing profile was looked up and then inserted anyway"
 
 
 def test_the_lookup_is_company_scoped():
     conn = FakeConn([[{"id": "vp1"}]])
-    voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True)
+    voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True,
+                               consented_by="u-9")
     assert "company_id = %s" in conn.calls[0]["sql"]
     assert CO in conn.calls[0]["params"]
 
@@ -373,7 +376,8 @@ def test_a_withdrawn_profile_is_not_reused():
     operator is the behaviour, so the operator is what is asserted.
     """
     conn = FakeConn([[], [{"id": "vp-new"}]])
-    voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True)
+    voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True,
+                               consented_by="u-9")
     sql = " ".join(conn.calls[0]["sql"].split())
     assert "status <> 'withdrawn'" in sql, (
         f"the lookup does not exclude withdrawn profiles: {sql}")
@@ -405,3 +409,38 @@ def test_the_same_person_correcting_twice_reuses_one_profile():
                                      consented_by="person-A")
     assert got["id"] == "vp-existing"
     assert len(conn.calls) == 1
+
+
+def test_withdrawing_also_un_names_the_turns_the_profile_justified():
+    """§6: a withdrawal must reach "everything it justified". Removing the vectors while the
+    names stay on the transcript is a withdrawal in the database and not in the product —
+    and on TEST the endpoint returned 200 with seven rows still reading "Ben L".
+
+    The rows are superseded rather than deleted: the audit of a withdrawal is partly the
+    record of what it removed, and a deleted row cannot say a name was ever shown.
+    """
+    conn = FakeConn([[{"id": "s1"}], [], [], []])
+    voiceprints.withdraw(conn, CO, VP)
+    sqls = " | ".join(" ".join(c["sql"].split()) for c in conn.calls)
+    assert "UPDATE speaker_turn_names SET superseded_at" in sqls, (
+        "the names this profile justified were left standing")
+    assert "correction_ref IN" in sqls, (
+        "the un-naming is keyed on voiceprint_id, and every propagated row carries NULL "
+        "there by design — it would match nothing and look like a fix")
+
+
+def test_un_naming_is_company_scoped_like_everything_else():
+    conn = FakeConn([[], [], [], []])
+    voiceprints.withdraw(conn, CO, VP)
+    for c in conn.calls:
+        assert "company_id = %s" in c["sql"], c["sql"]
+
+
+def test_a_named_profile_needs_the_consenter_named_too():
+    """The docstring said this was required and the code did not check — so the layer that
+    actually stores the row would have accepted what the endpoint refuses. Three fixtures in
+    this very file created named, consented profiles with no consenter, which is how the
+    review demonstrated the claim was false."""
+    with pytest.raises(ValueError, match="consented_by"):
+        voiceprints.upsert_profile(FakeConn([[]]), CO, display_name="Ben L",
+                                   consent_given=True)

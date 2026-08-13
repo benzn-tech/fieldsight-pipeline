@@ -892,3 +892,47 @@ def test_a_window_propagation_refused_is_not_enrolled_either(monkeypatch):
         "propagation did not refuse; this test is no longer about what it says it is")
     assert not sent.get("enrol"), (
         "the window propagation would not trust was stored as somebody's voiceprint")
+
+
+def test_someone_who_spoke_once_can_still_be_enrolled(stub_embedder, monkeypatch):
+    """The most ordinary correction there is — a visitor says one thing and you name them.
+
+    A first version refused it: every empty propagation was treated as a refusal, so "this
+    person has only this turn" (which the propagation log calls a normal answer) blocked the
+    enrolment, and the log claimed the window was untrustworthy. Less evidence should not
+    become more suspicion when the evidence is about a different question.
+    """
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    # Three turns, all one other voice, plus the corrected one — so the corrected speaker's
+    # cluster has a single member and propagation returns nothing.
+    turns = [{"source_filename": "x_c0000.wav", "start_sec": float(i * 20),
+              "end_sec": float(i * 20 + 15)} for i in range(4)]
+    req = _enrol_request(turns, ref_start=0.0, ref_end=15.0)
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=90.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    import math
+
+    def unit(theta):
+        v = np.zeros(192, dtype=np.float32)
+        v[0], v[1] = math.cos(theta), math.sin(theta)
+        return v
+    order = [unit(0.0), unit(0.0), unit(2.4), unit(2.42), unit(2.44)]
+    st = {"i": 0}
+
+    def embed(audio, sr):
+        if len(audio) <= 5 * 16000 + 8:      # homogeneity frames
+            return unit(0.0)
+        v = order[min(st["i"], len(order) - 1)]
+        st["i"] += 1
+        return v
+    monkeypatch.setattr(se, "embed_audio", embed)
+    se.lambda_handler(_s3_event(key), None)
+    assert [r for r in sent["results"] if not r.get("asserted")] == [], (
+        "propagation named something; this test is no longer about a lone speaker")
+    assert sent.get("enrol"), (
+        "a person who spoke once could not be enrolled — the most ordinary correction there "
+        "is was permanently refused")

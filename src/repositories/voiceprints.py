@@ -92,6 +92,14 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
     profile is never reused — that would resurrect a withdrawal by the back door.
     """
     _require_company(company_id)
+    if display_name and not consented_by:
+        # The docstring claimed this was required and the code did not check, so the layer
+        # that actually stores the row would accept what the endpoint refuses. A rule
+        # enforced in exactly one caller is a rule until somebody adds a second caller.
+        raise ValueError(
+            "a named voiceprint needs consented_by: whose voice this is, recorded — a "
+            "timestamp alone cannot tell the subject agreeing from somebody agreeing on "
+            "their behalf (§6)")
     if display_name and not consent_given:
         raise ValueError(
             "a named voiceprint cannot be created without consent from the person whose "
@@ -214,6 +222,26 @@ def withdraw(conn, company_id, voiceprint_id) -> list:
         "WHERE company_id = %s AND voiceprint_id = %s",
         (company_id, voiceprint_id),
     ).fetchall()
+    # The names this profile justified stop being shown. §6 requires a withdrawal to reach
+    # "everything it justified", and removing the vectors while the transcript still reads
+    # the person's name is a withdrawal in the database and not in the product — TEST showed
+    # exactly that: 200 returned, seven rows still naming them.
+    #
+    # Reached through `correction_ref`, NOT `voiceprint_id`. Every propagated row carries a
+    # NULL profile id by design — that is what stops the machine confirming its own profiles
+    # — so an UPDATE keyed on the profile would match nothing at all and look like a fix.
+    # The correction is the link the spec named for exactly this, and it is on both.
+    #
+    # Superseded, not deleted: the audit of a withdrawal is partly the record of what it
+    # removed, and a deleted row cannot say a name was ever shown.
+    cur.execute(
+        "UPDATE speaker_turn_names SET superseded_at = now() "
+        "WHERE company_id = %s AND superseded_at IS NULL "
+        "  AND correction_ref IN ("
+        "        SELECT correction_ref FROM speaker_voiceprint_samples "
+        "         WHERE company_id = %s AND voiceprint_id = %s "
+        "           AND correction_ref IS NOT NULL)",
+        (company_id, company_id, voiceprint_id))
     cur.execute(
         "DELETE FROM speaker_voiceprint_samples "
         "WHERE company_id = %s AND voiceprint_id = %s",
