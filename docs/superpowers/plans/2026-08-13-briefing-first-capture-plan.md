@@ -172,23 +172,61 @@ T1, T2, T5 are each independently shippable and improve the EXISTING pipeline on
 
 ---
 
-## Task 5 — Decouple `report_chunks` transcript windows from `topic_id` (BUG-39: 220 of 373 discarded)
+## Task 5 — Keep per-turn time anchors in chunk metadata (REVISED — do NOT touch the topics list)
 
-**Goal.** A transcript window without a topic survives to the reader. Today `report_chunks.topic_id` is already nullable and `chunking.py` already ingests an "unassigned" bucket — the loss is (a) at READ time in `lambda_ask_agent._aggregate_topics`, which by explicit comment "只保留有 topic_id 的 chunk" drops every topic-less window, and (b) authority-flip days matching zero report-topics to Aurora topics so everything lands NULL. This task fixes the read path and stops the writer coupling windows to topics; it deliberately does NOT try to re-attach topics (that is BUG-39's fix ①, a separate remediation).
+> **Revised 2026-08-13 after reading the code.** The original wording told the
+> engineer to stop discarding topic-less windows in
+> `lambda_ask_agent._aggregate_topics` and to "supersede" the user preference
+> recorded there. That was wrong on both counts, and the code says so plainly.
 
-**What changes.**
-- `src/lambda_ask_agent.py` (`_aggregate_topics`): topic-less `transcript_window` chunks are no longer discarded — they aggregate under a per-session/per-date "transcript" group (the chunk's `metadata.window_span` + `report_date` + `user_name` give the display frame), so RAG answers can cite un-topiced speech. Keep the existing behaviour for topic-ed chunks byte-for-byte; the change is additive to the aggregation, not a rewrite. NOTE the 2026-07-10 user-pref comment at that site records the discard as a deliberate choice at the time — this plan supersedes it per the spec's requirement ("a transcript window must be storable without a topic"); say so in the code comment replacing it.
-- `src/chunking.py` (`_window_metadata` / `chunk_transcripts`): windows keep their per-turn word anchors — add `"turn_anchors": [{abs_start_str, abs_end_str, src}]` (one entry per turn in the window) to the window metadata so the minute-granularity `time_range` stops being the only surviving time information (spec §3 requirement 1). Metadata-only, additive; the embedded `chunk_text` is unchanged, so **existing sidecar embedding hashes still match** (the sha256-of-text contract between ingest and embed-report at `lambda_ingest.embed_from_sidecar` is not disturbed — this is the trap that fails whole reports; test pins it).
-- `src/lambda_rag_search.py`: stop excluding NULL-topic windows anywhere it does (verify — the vector search itself doesn't filter on topic; the loss was in ask-agent's aggregation).
-- **Backfill/remediation of the existing 220 NULL-topic rows: none needed** — the rows already exist; fixing the reader resurfaces them.
+**What the code actually does.** `_aggregate_topics` builds the **Search topics
+list**. Its comment reads:
 
-**Files touched.** `src/lambda_ask_agent.py`, `src/chunking.py`, `src/lambda_rag_search.py` (audit; possibly no change), tests (`test_chunking*.py`, ask-agent aggregation tests).
+> `user pref 2026-07-10: raw transcript-window chunks with no topic are noise in a "topics" list -> dropped. BUT authority-flip (2026-07-17+) leaves chunk_type='topic' rows with topic_id=None ... those ARE formal topics and MUST survive, grouped/deeplinked by title (BUG-39 / WS1).`
 
-**Tested how.** Unit: an aggregation input mixing topic-ed and NULL-topic windows returns both, NULL-topic grouped by session/date; chunking metadata carries anchors; **hash-stability test**: `chunk_text` for a fixed report+turns fixture is byte-identical before and after (guards the embedding-sidecar contract). TEST e2e: ask a question on a TEST day known to have only NULL-topic windows; expect hits where today's count is 0.
+So the half of BUG-39 that was a genuine loss — formal topics going NULL on
+authority-flip days — **is already fixed**. What remains dropped is raw
+`transcript_window` rows, deliberately, because a list of topics is the wrong
+place to show an untitled fragment of speech.
 
-**How you'd know it FAILED in production.** The exact BUG-39 signature returning: middle-panel Search returns 0 for words that are audibly in the transcript, `SELECT count(*) FROM report_chunks WHERE topic_id IS NULL AND created_at > <deploy>` growing while ask-agent answers cite none of them. Conversely, over-inclusion would show as RAG answers citing raw casual talk with no topic frame — check the aggregation grouping, not the search. Direct-invoke `fieldsight-prod-rag-search`/ask-agent (the BUG-39 debugging path, documented in CLAUDE.md) reproduces either in minutes.
+**Why the revision matters.** The 220 discarded windows are not a defect in
+this function. They are evidence that **no transcript-level search surface
+exists at all**. "Which conversation, at what timestamp, said Plaud" is a
+different result type from a topic list, and answering it by polluting the
+topic list would degrade that list while still not giving the reader a
+timestamp. The recall belongs in Task 6's `GET /search/transcript`, which
+returns turns, not topics.
 
-**IAM / VPC / migrations.** None, none, none. Purely code. Independently shippable; also independently valuable (it un-breaks today's search).
+**Do not change `_aggregate_topics`.** Leave the 2026-07-10 preference standing.
+
+**What this task still does** — the half that was always correct:
+
+- `src/chunking.py` (`_window_metadata` / `chunk_transcripts`): windows keep
+  their per-turn anchors — add `"turn_anchors": [{abs_start_str, abs_end_str,
+  src}]`, one entry per turn in the window, so a topic's minute-granularity
+  `time_range` stops being the only surviving time information (spec §3
+  requirement 1). Metadata-only and additive: `chunk_text` is untouched, so the
+  sha256-of-text contract between `lambda_ingest.embed_from_sidecar` and
+  embed-report still matches. That contract failing takes out whole reports, so
+  it gets its own test.
+- `src/lambda_rag_search.py`: audit only. The vector search does not filter on
+  `topic_id`; confirm and leave it.
+
+**Files touched.** `src/chunking.py`, tests. `src/lambda_rag_search.py` audit,
+likely no change. **Not** `src/lambda_ask_agent.py`.
+
+**Tested how.** Unit: window metadata carries one anchor per turn, in order,
+with the source filename that makes a quote resolvable to audio. **Hash-stability
+test**: `chunk_text` for a fixed report+turns fixture is byte-identical before
+and after.
+
+**How you'd know it FAILED in production.** Reports stop embedding — the
+sidecar hash no longer matches and `embed_from_sidecar` rejects the batch. That
+is the loud failure and the test above is what stops it reaching prod. The quiet
+one is `turn_anchors` present but empty, which shows up as Task 6 returning
+windows it cannot timestamp.
+
+**IAM / VPC / migrations.** None, none, none. Independently shippable.
 
 ---
 
