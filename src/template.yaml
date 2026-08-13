@@ -2263,6 +2263,29 @@ Resources:
               Action: s3:PutObject
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*
+            # The re-drive sweep (spec 2026-08-13): find batch WAVs that were sealed and
+            # never transcribed -- 27 of them on one replay, all provider 429s, each caught
+            # by a per-record except and never revisited. It LISTS audio_segments/ and reads
+            # transcripts/ to decide.
+            #
+            # Both of these were implicitDeny when the code was written, and the second is
+            # the dangerous one: without it every head of a transcript raises, every batch
+            # reads as "never transcribed", and the sweep re-transcribes the entire session
+            # up to the attempt cap. Remember also that without ListBucket a missing key
+            # answers 403, not 404, so "it is not there" and "I may not look" are the same
+            # answer (memory: s3-missing-key-403-vs-404).
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - audio_segments/*
+                    - transcripts/*
       Events:
         GraceSweep:
           Type: Schedule
