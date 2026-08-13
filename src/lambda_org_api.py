@@ -1337,11 +1337,6 @@ def speaker_corrections(conn, caller, session_base, event):
     # Never from the body: a caller-supplied company would let one tenant queue work
     # scoped to another's profiles.
     company_id = str(caller["company_id"])
-    rows = profiles_for_matching(conn, company_id, site_id=body.get("site_id"))
-    profiles = [{"person_key": r["user_id"] or r["id"],
-                 "display_name": r.get("display_name"),
-                 "status": r.get("status"),
-                 "embedding": list(r["embedding"] or [])} for r in rows]
 
     # The producer knows the folder and the date; the consumer must not guess them. A first
     # version of the embedder derived them from `session_base` and built
@@ -1401,7 +1396,6 @@ def speaker_corrections(conn, caller, session_base, event):
         "mode": SPEAKER_IDENTITY_MODE,
         "correction": {"source_filename": src, "start_sec": start, "end_sec": end,
                        "display_name": name},
-        "profiles": profiles,
         # The session's own turns, so the embedder can cluster it and let the correction
         # name a VOICE rather than a single passage. Without them it can only write the one
         # turn the user pointed at, and "the whole meeting follows" is a claim about a
@@ -1413,8 +1407,8 @@ def speaker_corrections(conn, caller, session_base, event):
                     Key=f"voiceprint_requests/{company_id}/{session_base}/{request_id}.json",
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
-    logger.info("speaker correction queued: session=%s mode=%s profiles=%d",
-                session_base, SPEAKER_IDENTITY_MODE, len(profiles))
+    logger.info("speaker correction queued: session=%s mode=%s turns=%d",
+                session_base, SPEAKER_IDENTITY_MODE, len(artifact["turns"]))
     return ok({
         "requestId": request_id,
         # Named separately because they carry different consent obligations, and because a

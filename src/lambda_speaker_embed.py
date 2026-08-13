@@ -6,7 +6,6 @@ a file landing):
     {"op": "enrol", "voiceprint_id", "user_folder", "date", "source_filename",
      "start_sec", "end_sec", "correction_ref"?}
     {"op": "match", "session", "user_folder", "date", "company_id",
-     "profiles": [{"person_key", "status", "embedding"}, ...],
      "turns": [{"source_filename", "start_sec", "end_sec"}, ...]}
 
 Pure compute: **no database, no VPC.** This function runs on python3.12 because that is where
@@ -270,7 +269,8 @@ def invoke_writer(payload):
 MAX_PROPAGATION_TURNS = int(os.environ.get("SPEAKER_PROPAGATION_MAX_TURNS", "300"))
 
 
-def _propagate(folder, date, turns, reference, display_name, asserted_ref):
+def _propagate(folder, date, turns, reference, display_name, asserted_ref,
+               why=None):
     """Correct one passage, name that person's other passages in the same session.
 
     The unit is a VOICE, not a turn. Two spec revisions died scoring turns against the
@@ -336,7 +336,9 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref):
     members = groups[own]
     if len(members) < 2:
         # This voice spoke once. There is nothing to propagate, and that is the answer —
-        # not a reason to look for a different cluster to name.
+        # not a reason to look for a different cluster to name, and NOT a reason to refuse
+        # an enrolment: naming somebody who said one thing is the most ordinary correction
+        # there is.
         logger.info("propagation: the corrected voice has only this turn")
         return []
 
@@ -354,6 +356,8 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref):
             # session.
             logger.warning("propagation refused: the corrected turn is between voices "
                            "(margin %.3f)", margin)
+            if why is not None:
+                why.append("between-voices")
             return []
 
     out = []
@@ -371,9 +375,14 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref):
 def _from_request_artifact(bucket, key):
     """One correction, start to finish.
 
-    The artifact is org-api's output: it holds the window the user marked and the profiles
-    that survived the consent and withdrawn filters. This function has no database and no
-    other way to obtain a profile, which is what keeps those filters in one place.
+    The artifact is org-api's output: the window the user marked and the session's turns.
+
+    It carries NO voice vectors. It used to carry every consented profile in the company,
+    192 dimensions each, into an S3 object with no lifecycle rule — so a withdrawn person's
+    voiceprint stayed in the bucket after the withdrawal returned 200. They were never
+    needed: propagation names the cluster the corrected turn belongs to and scores against
+    no stored profile. The only thing those vectors produced was a similarity score on the
+    one row whose name the user had typed himself.
     """
     req = json.loads(_get(key))
     c = req.get("correction") or {}
@@ -390,20 +399,16 @@ def _from_request_artifact(bucket, key):
     s3_key, clip, sr = _window_audio(folder, date, c["source_filename"], start, end)
     v = embed_audio(clip, sr)
 
-    profiles = req.get("profiles") or []
-    rows = [{"person_key": p["person_key"], "score": vp.cosine(v, p["embedding"])}
-            for p in profiles]
-    d = vp.decide_name(vp.aggregate_scores(rows), duration_s=end - start)
-
     # The turn the user asserted. Its name is not an inference and is written as
     # `correction`; the writer refuses to give it a profile id unless it is marked asserted.
     turn_ref = turn_name_overlay.turn_ref(c["source_filename"], start)
     results = [{"turn_ref": turn_ref, "state": "confirmed",
                 "cluster_ref": None, "asserted": True,
-                "display_name": c.get("display_name"),
-                "score": d.margin}]
+                "display_name": c.get("display_name")}]
+    why = []
     propagated = _propagate(folder, date, req.get("turns") or [], v,
-                            c.get("display_name"), turn_ref)
+                            c.get("display_name"), turn_ref, why=why)
+    refusal = why[0] if why else None
     results.extend(propagated)
 
     # The vector is already computed for the propagation decision, so enrolling the same
@@ -428,11 +433,18 @@ def _from_request_artifact(bucket, key):
                            "window is not homogeneous" if verdict is False
                            else "window too short to check homogeneity")
             enrol = None
-        elif not propagated and (req.get("turns") or []):
-            # Propagation had turns to work with and still refused. Same evidence, same
-            # answer.
-            logger.warning("enrolment refused: propagation would not name a cluster from "
-                           "this window")
+        elif refusal == "between-voices":
+            # Propagation judged this window to hold more than one voice. Storing it as
+            # somebody's profile would be disbelieving that in one direction and acting on
+            # it in the other.
+            #
+            # ONLY that verdict. A first version treated every empty propagation as a
+            # refusal, which swept in three benign ones — too few usable turns, the corrected
+            # window not among them, and "this person spoke once". The last is the most
+            # ordinary enrolment there is (a visitor says one thing and you name them), and
+            # it was permanently refused with a log line claiming the window was untrustworthy.
+            logger.warning("enrolment refused: the corrected window holds more than one "
+                           "voice")
             enrol = None
     payload = {
         "op": "propagation",
