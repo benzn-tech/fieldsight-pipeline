@@ -338,6 +338,29 @@ def write_ledger_record(display_name, file_date, base_name, job_name,
 # minute).
 
 
+def _embed_batch_map(bucket, key, transcript_json):
+    """Carry a batch's time map inside the transcript that needs it.
+
+    Four consumers turn `word.start` into a wall-clock time, and a batch's origin is the
+    first sample of the concatenated file — an origin no filename carries. The alternative,
+    each reader fetching the sidecar itself, is one new `audio_segments/*` grant per reader
+    behind one `except`-and-log; three missing grants have already broken this feature
+    silently. Inside the object, a reader cannot lose it.
+
+    **A missing sidecar RAISES.** The seal writes the map before the WAV precisely so that
+    the WAV's existence implies the map's, so absence here is a real fault and not a
+    condition to log past. This is the fail-loud site this feature has never had.
+    """
+    if not batch_stitch.is_batch_key(key):
+        return transcript_json
+    map_key = batch_stitch.map_key_for_audio(key)
+    doc = json.loads(s3.get_object(Bucket=bucket, Key=map_key)['Body'].read())
+    out = dict(transcript_json)
+    out[batch_stitch.EMBEDDED_MAP_KEY] = doc
+    logger.info("batch: embedded %s in the transcript for %s", map_key, key)
+    return out
+
+
 def _maybe_batch(bucket, key, results):
     """Consume `key` as a batch member. False = batching does not apply, transcribe it.
 
@@ -462,6 +485,7 @@ def lambda_handler(event, context):
                     num_speakers=min(max(MAX_SPEAKERS, 2), 10),
                     keyterms=keyterms,
                 )
+                transcript_json = _embed_batch_map(bucket, key, transcript_json)
                 s3.put_object(
                     Bucket=bucket,
                     Key=output_key,

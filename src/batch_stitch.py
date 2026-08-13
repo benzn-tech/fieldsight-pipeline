@@ -353,6 +353,47 @@ def resolve_abs_time(batch_map: dict, t_sec: float):
     return base + timedelta(seconds=chosen["trimmed_head_sec"] + within)
 
 
+EMBEDDED_MAP_KEY = "fieldsight_batch_map"
+
+
+def rebase_turns_from_embedded_map(normalized, transcript_data):
+    """Re-time a batched transcript's turns using the map carried inside it.
+
+    A batch's `word.start` counts from the first sample of the concatenated file — an origin
+    that appears in no filename. Filename arithmetic gets the batch's start right and then
+    drifts by the trimmed overlap at every seam, and since 2026-08-13 by the whole of any
+    VAD-dropped chunk the window bridges. A second or two used to be invisible; thirty is not.
+
+    **No S3 client, by design.** Four consumers need this, and the alternative — each one
+    fetching the sidecar — is one new `audio_segments/*` grant per reader behind one
+    `except`-and-log. Three missing grants have already broken this feature silently. The map
+    travels inside the object every reader already holds, so a reader cannot lose one.
+
+    Absent key: return `normalized` untouched. Per-chunk transcripts have no map and must
+    cost nothing, and a batch transcript written before this change still has its sidecar for
+    the one consumer that fetches it.
+
+    `start_sec`/`end_sec` stay batch-relative on purpose: they are the in-file offsets the
+    evidence and playback paths seek `source_filename` with, and that file is the batch WAV.
+    """
+    doc = (transcript_data or {}).get(EMBEDDED_MAP_KEY)
+    if not doc or not (doc.get("members") if isinstance(doc, dict) else None):
+        return normalized
+    for turn in (normalized or {}).get("speaker_turns") or []:
+        if turn.get("abs_start") is None:
+            continue                       # no time to re-base; do not invent one
+        start = resolve_abs_time(doc, turn.get("start_sec") or 0.0)
+        if start is None:
+            continue
+        turn["abs_start"] = start
+        turn["abs_start_str"] = start.strftime("%H:%M:%S")
+        end = resolve_abs_time(doc, turn.get("end_sec") or 0.0)
+        if end is not None:
+            turn["abs_end"] = end
+            turn["abs_end_str"] = end.strftime("%H:%M:%S")
+    return normalized
+
+
 # ============================================================
 # Concatenation
 # ============================================================
