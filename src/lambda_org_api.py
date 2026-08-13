@@ -614,6 +614,9 @@ def dispatch(conn, event, method, route):
     m_srs = re.match(r"^/sessions/([^/]+)/report/status$", route)
     if m_srs and method == "GET":
         return session_report_status(conn, caller, m_srs.group(1), event)
+    m_un = re.match(r"^/sessions/([^/]+)/speaker-names$", route)
+    if m_un and method == "DELETE":
+        return unname_speaker(conn, caller, m_un.group(1), event)
     m_vw = re.match(r"^/voiceprints/([^/]+)$", route)
     if m_vw and method == "DELETE":
         return withdraw_voiceprint(conn, caller, m_vw.group(1))
@@ -1245,6 +1248,37 @@ def _session_turns(folder, date, session_base):
         out.append({"source_filename": name, "start_sec": float(start),
                     "end_sec": float(start) + float(seg.get("duration") or 0.0)})
     return out
+
+
+def unname_speaker(conn, caller, session_base, event):
+    """DELETE /api/org/sessions/{session}/speaker-names?name=… — take a name off a meeting.
+
+    Not the same request as `DELETE /voiceprints/{id}`, and the difference is why this
+    exists. Withdrawal removes a stored voiceprint and everything it justified — but it needs
+    a profile, and a correction made without consent creates none. On TEST that left six of
+    seven named turns with no route to removal at all.
+
+    "That is not me, take it off" is the ordinary request. It needs no profile, and until now
+    there was no way to make it.
+
+    It does not touch the voiceprint: somebody who wants their name off one transcript has
+    not asked for their profile to be destroyed.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    name = ((event.get("queryStringParameters") or {}).get("name") or "").strip()
+    if not name:
+        return error("name is required (?name=…): removing every name in the session is a "
+                     "different request", 400)
+    key = turn_name_overlay.session_base(session_base)
+    if not key:
+        return error("session id must carry its sid (…_sid<32 hex>)", 400)
+    n = voiceprints.unname(conn, str(caller["company_id"]), session_base=key,
+                           display_name=name)
+    logger.info("speaker name removed: session=%s name=%s turns=%d", key, name, n)
+    return ok({"sessionBase": key, "name": name, "turnsUnnamed": n})
 
 
 def withdraw_voiceprint(conn, caller, voiceprint_id):
