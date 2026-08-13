@@ -814,6 +814,19 @@ def _upload_is_missing(rec_id, key, claimed_size) -> bool:
         # the existence check.
         logger.warning("upload-verify %s: size mismatch at %s — client said %s, S3 has %s",
                        rec_id, key, claimed_size, size)
+    else:
+        # The success signal, and it is not decoration. Measured 2026-08-13: 1078 uploads
+        # reached the prod bucket in a day and the log carried ZERO `upload-verify` lines,
+        # because the healthy path said nothing at all. That reads as "nothing was lost" and
+        # reads identically to "the check never ran" — which is what happened three times in
+        # the batching feature, each time behind a missing IAM grant and a guard that only
+        # spoke on failure.
+        #
+        # `enforce` is gated on a day of observe logs being explainable, and a silent day
+        # explains nothing. With this line, `ok` against `object absent` IS the measurement,
+        # and a day with neither is itself a fault report.
+        logger.info("upload-verify %s: ok at %s (%s bytes, mode=%s)",
+                    rec_id, key, size, UPLOAD_VERIFY_MODE)
     return False
 
 
