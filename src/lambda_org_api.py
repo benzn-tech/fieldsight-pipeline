@@ -3118,9 +3118,18 @@ def delete_recordings_endpoint(conn, caller, body):
     # batch from every reader that has no database -- the nightly report and its email.
     for folder, date in sorted(days):
         try:
-            existing = deletion_mirror.deleted_sessions(s3(), S3_BUCKET, folder, date)
+            existing = deletion_mirror.deleted_sessions_strict(
+                s3(), S3_BUCKET, folder, date)
             merged = set(existing) | sessions_by_day.get((folder, date), set())
             deletion_mirror.write_mirror(s3(), S3_BUCKET, folder, date, merged)
+        except deletion_mirror.MirrorUnreadable:
+            # STRICT on purpose: the lenient read returns an empty set, which would turn
+            # this merge into an overwrite and un-hide every earlier deletion for the day.
+            # Not writing leaves the earlier deletions hidden and this one visible to the
+            # database-less readers until a retry — one leak instead of all of them.
+            logger.exception("deletion mirror for %s/%s unreadable — NOT writing, or this "
+                             "batch (%s) would erase the day's earlier deletions",
+                             folder, date, batch_id)
         except Exception:
             logger.exception("deletion mirror write failed for %s/%s (batch %s) — the "
                              "database filters already hide it; retry is idempotent",
@@ -3133,15 +3142,34 @@ def delete_recordings_endpoint(conn, caller, body):
 
 
 def undelete_recordings_endpoint(conn, caller, body):
-    """Restore exactly one delete batch. The audit rows survive (`reverted_at`)."""
+    """Restore exactly one delete batch. The audit rows survive (`reverted_at`).
+
+    Authorized the same way the delete was, and for the same reason. Gating only on the
+    company (which is all `revert_batch` does) would let any provisioned worker undo an
+    admin's delete of a colleague's recordings, and would let a platform_admin un-delete any
+    company's batch on global_role alone. Delete is per-folder authorized; an undelete that
+    is not is the same hole facing the other way.
+    """
     if not ENABLE_USER_DELETION:
         return error("recording deletion is not enabled (ENABLE_USER_DELETION)", 403)
     batch_id = (body or {}).get("batchId")
     if not batch_id:
         return error("batchId is required", 400)
+    cross = is_cross_company(caller["global_role"])
+    existing = redactions.list_batch(
+        conn, batch_id, caller["company_id"], cross_company=cross) or []
+    if not existing:
+        return error("batch not found", 404)
+    folders = {(r.get("target_key") or "").split("/")[1]
+               for r in existing if r.get("target_type") == "recording"
+               and (r.get("target_key") or "").startswith("extractions/")}
+    for folder in sorted(folders):
+        allowed, _ = _can_delete_folder(conn, caller, folder)
+        if not allowed:
+            return error("not permitted to restore this batch", 403)
+
     rows = redactions.revert_batch(
-        conn, batch_id, caller["company_id"],
-        cross_company=is_cross_company(caller["global_role"])) or []
+        conn, batch_id, caller["company_id"], cross_company=cross) or []
     # Only THIS batch's sessions come out of the mirror. The first version wrote the day's
     # document as `[]`, which un-hid every other active batch for that day from the readers
     # that have no database -- an undelete that restores more than the delete hid.
@@ -3152,12 +3180,43 @@ def undelete_recordings_endpoint(conn, caller, body):
         parts = (r.get("target_key") or "").split("/")
         if len(parts) >= 4 and parts[0] == "extractions":
             freed.setdefault((parts[1], parts[2]), set()).add(parts[3])
+
+    # The day's stale report rollup is hidden BY TOPIC ID, and `ON CONFLICT DO NOTHING`
+    # means the FIRST batch to touch a day owns those rows. Reverting that batch therefore
+    # republishes a rollup that still contains a second, still-deleted batch's content.
+    # Re-hide them under a batch that is still active, so they remain revertible and die
+    # with the day's last remaining deletion rather than never.
+    reason = "still deleted by another batch"
+    for (folder, date) in sorted(freed):
+        still = redactions.active_batches_for_day(conn, folder, date,
+                                                  exclude_batch=batch_id)
+        if not still:
+            continue
+        company = next((r["company_id"] for r in existing), caller["company_id"])
+        for row in topics.list_topics_for_source_prefix(
+                conn, f"reports/{date}/{folder}/") or []:
+            redactions.create_redaction(
+                conn, company, row["id"], reason, caller.get("id"),
+                caller.get("global_role"), target_type="topic", scope="deleted",
+                batch_id=still[0], skip_if_already_deleted=True)
+        logger.info("undelete %s: %s/%s still deleted by %d other batch(es) — the day's "
+                    "report topics stay hidden under %s",
+                    batch_id, folder, date, len(still), still[0])
+
     conn.commit()
     for (folder, date), sessions in sorted(freed.items()):
         try:
-            remaining = deletion_mirror.deleted_sessions(
+            remaining = deletion_mirror.deleted_sessions_strict(
                 s3(), S3_BUCKET, folder, date) - sessions
             deletion_mirror.write_mirror(s3(), S3_BUCKET, folder, date, remaining)
+        except deletion_mirror.MirrorUnreadable:
+            # A lenient read here is worse than anywhere else: `set() - sessions` is empty,
+            # so a blipped GetObject writes an EMPTY document and frees every other active
+            # batch for the day. Leaving the mirror alone keeps this batch's sessions hidden
+            # from the database-less readers a while longer, which is the safe direction.
+            logger.exception("deletion mirror for %s/%s unreadable — NOT rewriting on "
+                             "undelete %s, or it would free the day's other batches",
+                             folder, date, batch_id)
         except Exception:
             logger.exception("deletion mirror rewrite failed for %s/%s on undelete %s",
                              folder, date, batch_id)

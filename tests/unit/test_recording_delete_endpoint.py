@@ -285,19 +285,33 @@ def test_a_second_delete_the_same_day_does_not_unhide_the_first(monkeypatch):
     assert s3.written[key]["sessions"] == ["sid-a", "sid-first"]
 
 
+BATCH_ROWS = [{"id": "r-1", "target_type": "recording", "company_id": "c-1",
+               "target_key": "extractions/Ben/2026-08-14/sid-a"}]
+
+
+def _undelete_stubs(monkeypatch, rows=None, still=()):
+    monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
+    monkeypatch.setattr(org.redactions, "list_batch",
+                        lambda conn, b, c, **kw: list(rows if rows is not None
+                                                      else BATCH_ROWS))
+    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f: (True, "c-1"))
+    monkeypatch.setattr(org.redactions, "active_batches_for_day",
+                        lambda conn, f, d, **kw: list(still))
+    monkeypatch.setattr(org.topics, "list_topics_for_source_prefix", lambda *a, **k: [])
+
+
 def test_undelete_restores_exactly_one_batch(monkeypatch):
     """`one revert restores exactly what one delete hid` is the only check that proves this
     feature is reversible, and it is unimplementable without the batch id."""
-    monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
     monkeypatch.setattr(org, "_s3_client", _S3())
+    _undelete_stubs(monkeypatch)
     reverted = {}
 
     def _revert(conn, b, c, **kw):
         # NOT `setdefault(...) or [...]`: setdefault returns the truthy batch id, the `or`
         # short-circuits, and the double hands back a string where the caller expects rows.
         reverted["b"] = b
-        return [{"id": "r-1", "target_type": "recording",
-                 "target_key": "extractions/Ben/2026-08-14/sid-a"}]
+        return list(BATCH_ROWS)
 
     monkeypatch.setattr(org.redactions, "revert_batch", _revert)
 
@@ -306,13 +320,30 @@ def test_undelete_restores_exactly_one_batch(monkeypatch):
     assert reverted["b"] == "b-1"
 
 
+def test_undelete_refuses_a_batch_the_caller_could_not_have_deleted(monkeypatch):
+    """Delete is per-folder authorized; an undelete gated only on the company is the same
+    hole facing the other way — any worker could undo an admin's delete of a colleague's
+    recordings."""
+    monkeypatch.setattr(org, "_s3_client", _S3())
+    _undelete_stubs(monkeypatch)
+    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f: (False, None))
+    called = []
+    monkeypatch.setattr(org.redactions, "revert_batch",
+                        lambda *a, **k: called.append(a))
+
+    res = org.undelete_recordings_endpoint(_Conn(), CALLER, {"batchId": "b-1"})
+    assert res["statusCode"] == 403
+    assert called == [], "a refused undelete must not revert anything"
+
+
 def test_undelete_frees_only_its_own_sessions_from_the_mirror(monkeypatch):
     """The first version rewrote the day's mirror as `[]`, which un-hid every OTHER active
     batch for that day — an undelete that restores more than its delete hid."""
     key = "redactions/Ben/2026-08-14/deleted_sessions.json"
     s3 = _S3(existing={key: {"sessions": ["sid-a", "sid-other"]}})
-    monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
     monkeypatch.setattr(org, "_s3_client", s3)
+    _undelete_stubs(monkeypatch, rows=BATCH_ROWS + [
+        {"id": "r-2", "target_type": "topic", "company_id": "c-1", "target_key": None}])
     monkeypatch.setattr(org.redactions, "revert_batch", lambda conn, b, c, **kw: [
         {"id": "r-1", "target_type": "recording",
          "target_key": "extractions/Ben/2026-08-14/sid-a"},
@@ -321,3 +352,70 @@ def test_undelete_frees_only_its_own_sessions_from_the_mirror(monkeypatch):
 
     org.undelete_recordings_endpoint(_Conn(), CALLER, {"batchId": "b-1"})
     assert s3.written[key]["sessions"] == ["sid-other"]
+
+
+def test_undelete_keeps_the_day_hidden_while_another_batch_still_holds_it(monkeypatch):
+    """The day's report is a rollup of every session, hidden BY TOPIC ID, and
+    `ON CONFLICT DO NOTHING` means the FIRST batch to touch a day owns those rows.
+    Reverting that batch republished a rollup that still contained a second, still-deleted
+    batch's content. They are re-hidden under a batch that is still active — so they stay
+    revertible and die with the day's last deletion rather than never."""
+    monkeypatch.setattr(org, "_s3_client", _S3())
+    _undelete_stubs(monkeypatch, still=["b-2"])
+    monkeypatch.setattr(org.topics, "list_topics_for_source_prefix",
+                        lambda conn, p: [{"id": "t-report"}] if p.startswith("reports/") else [])
+    monkeypatch.setattr(org.redactions, "revert_batch", lambda conn, b, c, **kw: BATCH_ROWS)
+    rehidden = []
+    monkeypatch.setattr(org.redactions, "create_redaction",
+                        lambda *a, **k: rehidden.append((a[2], k.get("batch_id"))))
+
+    org.undelete_recordings_endpoint(_Conn(), CALLER, {"batchId": "b-1"})
+    assert rehidden == [("t-report", "b-2")], \
+        "the still-deleted day's rollup must stay hidden, under the surviving batch"
+
+
+def test_undelete_does_not_rehide_when_nothing_else_holds_the_day(monkeypatch):
+    """The other half of the same rule: with no surviving batch, the day comes back."""
+    monkeypatch.setattr(org, "_s3_client", _S3())
+    _undelete_stubs(monkeypatch, still=[])
+    monkeypatch.setattr(org.topics, "list_topics_for_source_prefix",
+                        lambda conn, p: [{"id": "t-report"}])
+    monkeypatch.setattr(org.redactions, "revert_batch", lambda conn, b, c, **kw: BATCH_ROWS)
+    rehidden = []
+    monkeypatch.setattr(org.redactions, "create_redaction",
+                        lambda *a, **k: rehidden.append(a))
+
+    org.undelete_recordings_endpoint(_Conn(), CALLER, {"batchId": "b-1"})
+    assert rehidden == []
+
+
+# ---- the mirror must never be clobbered by a failed read ---------------
+
+class _UnreadableS3(_S3):
+    def get_object(self, **kw):
+        raise RuntimeError("transient")
+
+
+def test_an_unreadable_mirror_does_not_clobber_the_days_earlier_deletions(monkeypatch):
+    """`deleted_sessions` reads an unreadable mirror as EMPTY — right for a reader, fatal
+    for a read-modify-write: the merge silently becomes an overwrite."""
+    s3 = _UnreadableS3()
+    monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
+    monkeypatch.setattr(org, "_s3_client", s3)
+    _allow_all(monkeypatch)
+    _stub_writes(monkeypatch, [{"id": "t-1"}])
+
+    org.delete_recordings_endpoint(_Conn(), CALLER, {"recordings": [REC]})
+    assert s3.written == {}, "wrote a mirror built from a failed read"
+
+
+def test_an_unreadable_mirror_does_not_free_everything_on_undelete(monkeypatch):
+    """Worst case of the same bug: `set() - sessions` is empty, so a blipped GetObject
+    writes an EMPTY document and frees every other active batch for the day."""
+    s3 = _UnreadableS3()
+    monkeypatch.setattr(org, "_s3_client", s3)
+    _undelete_stubs(monkeypatch)
+    monkeypatch.setattr(org.redactions, "revert_batch", lambda conn, b, c, **kw: BATCH_ROWS)
+
+    org.undelete_recordings_endpoint(_Conn(), CALLER, {"batchId": "b-1"})
+    assert s3.written == {}

@@ -171,10 +171,34 @@ def is_source_deleted(conn, source_s3_key) -> bool:
         "AND %s LIKE target_key || '%%' LIMIT 1", (source_s3_key,)).fetchone() is not None
 
 
-def list_batch(conn, batch_id, company_id) -> list:
+def list_batch(conn, batch_id, company_id, *, cross_company=False) -> list:
+    if cross_company:
+        return conn.cursor(row_factory=dict_row).execute(
+            f"SELECT {_COLS} FROM redactions WHERE batch_id = %s", (batch_id,)).fetchall()
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_COLS} FROM redactions WHERE batch_id = %s AND company_id = %s",
         (batch_id, company_id)).fetchall()
+
+
+def active_batches_for_day(conn, folder, date, exclude_batch=None) -> list:
+    """Batch ids that still hide a recording in `folder` on `date`.
+
+    Undelete needs this to answer "is this day still partly deleted?". The day's report is
+    a rollup that mixes every session, so its stale topics have to stay hidden while ANY of
+    that day's recordings is deleted — but they can only be hidden under a batch that is
+    still active, or nothing will ever bring them back.
+    """
+    sql = ("SELECT DISTINCT batch_id FROM redactions "
+           "WHERE target_type = 'recording' AND scope = 'deleted' "
+           "AND reverted_at IS NULL AND batch_id IS NOT NULL "
+           "AND target_key LIKE %s")
+    params = [f"extractions/{folder}/{date}/%"]
+    if exclude_batch:
+        sql += " AND batch_id <> %s"
+        params.append(exclude_batch)
+    sql += " ORDER BY batch_id"
+    rows = conn.cursor(row_factory=dict_row).execute(sql, tuple(params)).fetchall()
+    return [r["batch_id"] for r in rows]
 
 
 def revert_batch(conn, batch_id, company_id, *, cross_company=False) -> list:
