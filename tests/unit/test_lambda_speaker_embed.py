@@ -730,20 +730,28 @@ def test_an_enrolment_reuses_the_vector_the_correction_already_produced(stub_emb
     """
     import json as _json
     key = "voiceprint_requests/c1/s1/r1.json"
+    # 15 s, not 5: the homogeneity guard compares 5-second frames and needs at least two,
+    # so a window under 10 s is "cannot tell" and is refused. A five-second fixture here was
+    # not a shorter version of the real thing — it was a case that cannot be enrolled at all.
     req = {"request_id": "r1", "session_base": "s1", "company_id": "c1",
            "user_folder": "u", "date": "2026-08-13",
            "correction": {"source_filename": "x_c0000.wav", "start_sec": 0.0,
-                          "end_sec": 5.0, "display_name": "Ben L"},
+                          "end_sec": 15.0, "display_name": "Ben L"},
            "enrol": {"voiceprint_id": "vp-1"}, "turns": [], "profiles": []}
     monkeypatch.setattr(se, "s3", lambda: FakeS3(
         {key: _json.dumps(req).encode(),
-         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes()}))
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=20.0)}))
     sent = {}
     monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
     se.lambda_handler(_s3_event(key), None)
     assert sent["enrol"]["voiceprint_id"] == "vp-1"
     assert len(sent["enrol"]["embedding"]) == 192
-    assert stub_embedder["n"] == 1, "the window was embedded twice for one answer"
+    # The stored vector IS the one the propagation decision used — not a second embedding of
+    # the same window, which would pay twice for one answer and let the two results differ.
+    # (Counting calls no longer works: the homogeneity guard embeds FRAMES of the window,
+    # which is a different and necessary cost.)
+    assert sent["enrol"]["window"] == [0.0, 15.0]
+    assert sent["enrol"]["s3_key"].endswith("x_c0000.wav")
 
 
 def test_no_enrolment_means_no_vector_in_the_payload(stub_embedder, monkeypatch):
@@ -762,3 +770,125 @@ def test_no_enrolment_means_no_vector_in_the_payload(stub_embedder, monkeypatch)
     monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
     se.lambda_handler(_s3_event(key), None)
     assert not sent.get("enrol")
+
+
+# ---- the guard the enrolment path was routing around --------------------
+#
+# `op=enrol` has run `window_is_homogeneous` since it was written, and this module's own
+# docstring says the guard runs "before anything is stored". The enrolment carried by a
+# correction did not run it — so a window holding two voices could be stored as one person's
+# profile, permanently, and a profile cannot be un-poisoned.
+#
+# Worse: `_propagate` already decides the corrected turn sits between two voices and refuses
+# to propagate for exactly that reason, and the enrolment stored the same vector anyway. The
+# system disbelieved itself in one direction and acted in the other.
+
+
+def _enrol_request(turns, ref_start=0.0, ref_end=15.0):
+    r = _prop_request(turns, ref_start=ref_start, ref_end=ref_end)
+    r["enrol"] = {"voiceprint_id": "vp-1"}
+    return r
+
+
+def test_a_window_holding_two_voices_is_not_enrolled(monkeypatch):
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(_enrol_request([])).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=20.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    # Frames pointing opposite ways: the window is not one voice.
+    seq = [np.ones(192, dtype=np.float32), -np.ones(192, dtype=np.float32),
+           np.ones(192, dtype=np.float32)]
+    calls = {"n": 0}
+
+    def embed(audio, sr):
+        v = seq[calls["n"] % len(seq)]
+        calls["n"] += 1
+        return v
+    monkeypatch.setattr(se, "embed_audio", embed)
+    se.lambda_handler(_s3_event(key), None)
+    assert not sent.get("enrol"), (
+        "a window that may hold two voices was stored as one person's profile, and a "
+        "profile cannot be un-poisoned")
+
+
+def test_a_window_too_short_to_judge_is_not_enrolled(stub_embedder, monkeypatch):
+    """`window_is_homogeneous` returns None for 'cannot tell', which is not a pass. Treating
+    them alike in the permissive direction is how a guard becomes decoration — the enrol op
+    has said so in a comment since it was written."""
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    req = _enrol_request([], ref_start=0.0, ref_end=4.0)
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=10.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    se.lambda_handler(_s3_event(key), None)
+    assert not sent.get("enrol")
+
+
+def test_the_turn_names_still_land_when_the_enrolment_is_refused(stub_embedder,
+                                                                  monkeypatch):
+    """Refusing to STORE a voice pattern is not a reason to lose the name the user typed.
+    The two effects are separate obligations and they fail separately."""
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    req = _enrol_request([], ref_start=0.0, ref_end=4.0)
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=10.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    se.lambda_handler(_s3_event(key), None)
+    assert sent["results"] and sent["results"][0]["asserted"]
+
+
+def test_a_window_propagation_refused_is_not_enrolled_either(monkeypatch):
+    """The system disbelieving itself in one direction and acting in the other.
+
+    `_propagate` refuses when the corrected turn sits between two voices — that IS the
+    system saying it does not believe this window is one person. Storing the same vector as
+    somebody's profile on the strength of it would be incoherent, and permanent: a profile
+    cannot be un-poisoned, only the contributing sample deleted.
+
+    The window here is long enough to pass the homogeneity check, so only the propagation
+    refusal can stop the enrolment — which is what makes this test about that branch.
+    """
+    import json as _json
+    import math
+    key = "voiceprint_requests/c1/s1/r1.json"
+    turns = [{"source_filename": "x_c0000.wav", "start_sec": float(i * 20),
+              "end_sec": float(i * 20 + 15)} for i in range(4)]
+    req = _enrol_request(turns, ref_start=20.0, ref_end=35.0)
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=90.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+
+    def unit(theta):
+        v = np.zeros(192, dtype=np.float32)
+        v[0], v[1] = math.cos(theta), math.sin(theta)
+        return v
+    # reference (0.7) then the four turns; the corrected one sits between two voices, and
+    # every homogeneity frame of the window is the same vector so the guard passes.
+    order = [unit(0.7)] + [unit(0.0), unit(0.7), unit(1.5), unit(1.55)]
+    state = {"i": 0, "frames": 0}
+
+    def embed(audio, sr):
+        # The guard embeds 5-second frames of a 15s window; feed it a constant so it passes.
+        if len(audio) <= 5 * 16000 + 8:
+            state["frames"] += 1
+            return unit(0.7)
+        v = order[min(state["i"], len(order) - 1)]
+        state["i"] += 1
+        return v
+    monkeypatch.setattr(se, "embed_audio", embed)
+    se.lambda_handler(_s3_event(key), None)
+    assert [r for r in sent["results"] if not r.get("asserted")] == [], (
+        "propagation did not refuse; this test is no longer about what it says it is")
+    assert not sent.get("enrol"), (
+        "the window propagation would not trust was stored as somebody's voiceprint")

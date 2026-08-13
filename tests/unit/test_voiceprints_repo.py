@@ -326,13 +326,27 @@ def test_an_unnamed_profile_needs_no_consent():
 
 def test_consent_is_stamped_by_the_server_not_taken_from_the_caller():
     """A client-supplied timestamp is a claim about when somebody agreed. This one is a
-    record of when the system was told."""
+    record of when the system was told.
+
+    Asserting that the SQL merely CONTAINS `now()` was vacuous — mutation showed an
+    unconditional `now()` (stamping consent on profiles nobody consented to) kept it green.
+    The stamp has to be conditional on the flag, so both branches are exercised.
+    """
     conn = FakeConn([[], [{"id": "vp1"}]])
     voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True,
                                consented_by="u-9")
-    sql = conn.calls[-1]["sql"]
-    assert "now()" in sql.lower()
-    assert "consent_at" in sql
+    consented = conn.calls[-1]
+    assert True in consented["params"], "the consent flag never reached the statement"
+
+    conn2 = FakeConn([[{"id": "vp2"}]])
+    voiceprints.upsert_profile(conn2, CO, display_name=None)
+    unconsented = conn2.calls[-1]
+    assert False in unconsented["params"], (
+        "an unnamed profile was stamped as consented; a consent_at it never earned makes it "
+        "matchable, and matchable is the whole point of the filter")
+    assert "CASE WHEN" in unconsented["sql"], (
+        "the stamp is unconditional, so every profile carries consent whether or not anyone "
+        "gave it")
 
 
 def test_an_existing_profile_for_the_same_name_is_reused_not_duplicated():
@@ -352,7 +366,14 @@ def test_the_lookup_is_company_scoped():
 
 
 def test_a_withdrawn_profile_is_not_reused():
-    """Re-using it would resurrect a withdrawal by the back door."""
+    """Re-using it would resurrect a withdrawal by the back door.
+
+    Asserting the SQL contains the word "withdrawn" was vacuous: mutation flipped the
+    comparison to `=` — reusing ONLY withdrawn profiles — and the test stayed green. The
+    operator is the behaviour, so the operator is what is asserted.
+    """
     conn = FakeConn([[], [{"id": "vp-new"}]])
     voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True)
-    assert "withdrawn" in conn.calls[0]["sql"]
+    sql = " ".join(conn.calls[0]["sql"].split())
+    assert "status <> 'withdrawn'" in sql, (
+        f"the lookup does not exclude withdrawn profiles: {sql}")

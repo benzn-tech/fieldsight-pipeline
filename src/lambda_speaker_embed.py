@@ -402,14 +402,38 @@ def _from_request_artifact(bucket, key):
                 "cluster_ref": None, "asserted": True,
                 "display_name": c.get("display_name"),
                 "score": d.margin}]
-    results.extend(_propagate(folder, date, req.get("turns") or [], v,
-                              c.get("display_name"), turn_ref))
+    propagated = _propagate(folder, date, req.get("turns") or [], v,
+                            c.get("display_name"), turn_ref)
+    results.extend(propagated)
 
     # The vector is already computed for the propagation decision, so enrolling the same
     # window costs nothing more — and embedding it twice would pay twice for one answer and
     # let the two results differ. It travels in the invoke payload and never through S3,
     # which is what stopped the biometric-residence defect the reviews chased twice.
+    # Enrolment runs the same guard `op=enrol` has always run, and this module's docstring
+    # has always claimed: a window that may hold two voices, or that is too short to judge,
+    # is not stored. A profile cannot be un-poisoned — only the contributing sample deleted —
+    # and until now the correction-carried path skipped the check entirely.
+    #
+    # It also refuses whenever PROPAGATION refused. `_propagate` returning nothing because
+    # the corrected turn sits between two voices is the system saying it does not believe the
+    # window is one person; storing that same vector as somebody's profile would be
+    # disbelieving it in one direction and acting on it in the other.
     enrol = req.get("enrol")
+    if enrol:
+        verdict = vp.window_is_homogeneous(
+            [embed_audio(f, sr) for f in _frames(clip, sr)])
+        if verdict is not True:
+            logger.warning("enrolment refused: %s",
+                           "window is not homogeneous" if verdict is False
+                           else "window too short to check homogeneity")
+            enrol = None
+        elif not propagated and (req.get("turns") or []):
+            # Propagation had turns to work with and still refused. Same evidence, same
+            # answer.
+            logger.warning("enrolment refused: propagation would not name a cluster from "
+                           "this window")
+            enrol = None
     payload = {
         "op": "propagation",
         "company_id": req.get("company_id"),

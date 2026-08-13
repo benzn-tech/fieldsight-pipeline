@@ -1342,6 +1342,17 @@ def speaker_corrections(conn, caller, session_base, event):
     # person again. The two effects are reported separately for that reason.
     enrol = None
     if body.get("consent_given"):
+        # WHO consented, not just that somebody did. 0042 added the column precisely because
+        # a timestamp cannot tell the subject agreeing apart from the wearer clicking a box
+        # on their behalf — and leaving it optional meant the column recorded nothing in the
+        # common case, which is the same silence with an extra field.
+        #
+        # This does not make the claim TRUE: the value is still typed by whoever is at the
+        # keyboard, and no code here can verify it. It makes the claim ATTRIBUTED, which is
+        # the most an API can do and the least an audit needs.
+        if not body.get("consented_by"):
+            return error("consented_by is required with consent_given: record whose voice "
+                         "this is, not who is doing the labelling", 400)
         try:
             profile = voiceprints.upsert_profile(
                 conn, company_id, display_name=name,
