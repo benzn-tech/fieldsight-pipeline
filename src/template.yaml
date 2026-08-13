@@ -2696,9 +2696,12 @@ Resources:
   # passage becomes a voiceprint sample) and `match` (a session's turns get names).
   # NO Events: nothing here fires because a file landed.
   #
-  # In VPC because it reads and writes Aurora. That is affordable here and is not for the
-  # transcriber: this function makes no outbound internet call at all -- the model comes
-  # from S3, which has a gateway endpoint (BUG-36).
+  # NOT in VPC, and holds no database. It was in VPC to reach Aurora, and that was the
+  # defect: the function runs on python3.12 for onnxruntime while PsycopgLayer is
+  # cp311-only, so it could never have had a connection -- every invocation raised
+  # ModuleNotFoundError behind a green deploy. Profiles now arrive in the event from
+  # org-api, which is in-VPC and owns the consent/withdrawn filters, and the database half
+  # is VoiceprintWriterFunction. See that resource's comment for the invoke direction.
   #
   # Reuses VadLayerArn rather than adding a layer: fieldsight-vad-layer already carries
   # onnxruntime and numpy for cp312 and no torch, verified by downloading and listing it.
