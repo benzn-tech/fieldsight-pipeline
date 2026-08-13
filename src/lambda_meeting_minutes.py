@@ -52,6 +52,7 @@ import batch_stitch
 from transcript_utils import (
     normalize_transcript, format_turns_for_prompt, get_time_bounds,
     extract_device_from_filename, write_meeting_manifest,
+    elide_middle,
 )
 
 # Configure logging
@@ -432,14 +433,18 @@ def build_meeting_prompt(transcripts, meeting_config):
         lines = format_turns_for_prompt(t, label_override=label, use_absolute_time=True)
         transcript_lines.extend(lines)
 
-    transcripts_text = '\n\n'.join(transcript_lines)
+    # Head AND tail. A meeting states its purpose at the start and lands its decisions and
+    # actions at the END, so a bare head slice drops precisely what minutes are for — and
+    # drops it silently, producing minutes that read as complete. Same defect and same fix
+    # as the extraction layer and the rolling summary the stop-recording email is built on.
+    transcripts_text, _ = elide_middle(transcript_lines, 120000, sep='\n\n')
 
     # Use S3 prompt template if loaded, otherwise use inline default
     if prompt_template and prompt_template.get('prompt'):
         prompt_body = prompt_template['prompt']
         prompt_body = prompt_body.replace('{metadata_block}', metadata_block)
         prompt_body = prompt_body.replace('{attendee_reference}', attendee_reference)
-        prompt_body = prompt_body.replace('{transcripts_text}', transcripts_text[:120000])
+        prompt_body = prompt_body.replace('{transcripts_text}', transcripts_text)
         prompt_body = prompt_body.replace('{schema}', MEETING_MINUTES_SCHEMA)
 
         system_context = prompt_template.get('system_context', '')
@@ -455,7 +460,7 @@ def build_meeting_prompt(transcripts, meeting_config):
 Analyze the following meeting transcript and produce STRUCTURED meeting minutes.
 
 ## Transcript (chronological)
-{transcripts_text[:120000]}
+{transcripts_text}
 
 ## Instructions
 1. Write an executive_summary as a bullet-point array (3-5 bullets). Cover: meeting purpose, key outcomes, overall direction.
