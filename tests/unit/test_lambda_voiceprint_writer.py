@@ -216,3 +216,30 @@ def test_an_enrolment_with_no_vector_is_refused_rather_than_stored_blank(calls):
         vw.lambda_handler({
             "op": "propagation", "company_id": CO, "session_base": "s1", "results": [],
             "enrol": {"voiceprint_id": "vp-1"}}, None)
+
+
+def test_the_names_and_the_sample_land_in_one_transaction(monkeypatch):
+    """The docstring claims one transaction; nothing asserted it, and a mutation moving the
+    sample into a second connection stayed green. Half-applied is the bad state here: turn
+    names pointing at a profile that has no sample, or a sample justified by names that
+    never landed."""
+    conns = []
+
+    class C(FakeConn):
+        def __enter__(self):
+            conns.append(self)
+            return self
+    monkeypatch.setattr(vw, "get_connection", lambda: C())
+    seen = []
+    monkeypatch.setattr(vw, "record_turn_name",
+                        lambda conn, company_id, **kw: seen.append(("turn", conn)) or {"id": "t"})
+    monkeypatch.setattr(vw, "add_sample",
+                        lambda conn, company_id, *a, **kw: seen.append(("sample", conn)) or {"id": "s"})
+    vw.lambda_handler({
+        "op": "propagation", "company_id": CO, "session_base": "s1",
+        "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed", "cluster_ref": None,
+                     "display_name": "Ben L", "asserted": True}],
+        "enrol": {"voiceprint_id": "vp-1", "embedding": [0.1] * 192,
+                  "s3_key": "k", "window": [0.0, 15.0]}}, None)
+    assert len(conns) == 1, f"{len(conns)} connections opened; the two halves can differ"
+    assert {c for _, c in seen} == {conns[0]}, "the sample used a different connection"

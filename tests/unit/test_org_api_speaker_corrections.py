@@ -332,7 +332,8 @@ def test_consent_enrols_and_the_artifact_carries_the_profile(wired, monkeypatch)
         seen.update(kw)
         return {"id": "vp-1"}
     monkeypatch.setattr(org.voiceprints, "upsert_profile", upsert)
-    b = _body(org.lambda_handler(_event(dict(BODY, consent_given=True)), None))
+    b = _body(org.lambda_handler(_event(dict(BODY, consent_given=True,
+                                                consented_by="u-9")), None))
     assert b["enrolment"] == "queued"
     doc = json.loads(wired.puts[0]["Body"])
     assert doc["enrol"]["voiceprint_id"] == "vp-1"
@@ -360,7 +361,18 @@ def test_a_refused_profile_refuses_the_whole_request(wired, monkeypatch):
     def boom(conn, company_id, **kw):
         raise ValueError("a named voiceprint cannot be created without consent")
     monkeypatch.setattr(org.voiceprints, "upsert_profile", boom)
-    res = org.lambda_handler(_event(dict(BODY, consent_given=True)), None)
+    res = org.lambda_handler(_event(dict(BODY, consent_given=True,
+                                         consented_by="u-9")), None)
     assert res["statusCode"] == 400
     assert "consent" in _body(res)["error"]
+    assert wired.puts == []
+
+
+def test_consent_without_naming_who_gave_it_is_refused(wired):
+    """0042 added `consented_by` because a timestamp cannot tell the subject agreeing apart
+    from the wearer clicking a box on their behalf. Optional, it recorded nothing in the
+    common case — the same silence with an extra column."""
+    res = org.lambda_handler(_event(dict(BODY, consent_given=True)), None)
+    assert res["statusCode"] == 400
+    assert "consented_by" in _body(res)["error"]
     assert wired.puts == []
