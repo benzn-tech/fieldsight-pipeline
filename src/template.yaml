@@ -552,6 +552,27 @@ Parameters:
       the rollback survives a deploy: a switch that exists only in code takes its default
       forever and raises no error.
 
+  EnableUserDeletion:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      The customer-facing "delete these recordings" endpoint. TEMPORARY by request.
+
+      This gates the WRITE endpoint only. The read filters are deliberately
+      unconditional: making them follow the flag would mean that turning it off un-hides
+      every recording a customer was told was gone, which is a second incident rather
+      than a rollback.
+
+      Recall lives in the data, not in this switch --
+        SELECT * FROM redactions WHERE scope='deleted' AND reverted_at IS NULL;
+      and one batch is `AND batch_id = :id`. A flag that is turned off leaves no way to
+      find what it did, which is why the marker is a column.
+
+      NOTHING IS DESTROYED when this is on: no S3 object is deleted and no row is
+      dropped. The content stops being readable, and POST /recordings/undelete with the
+      batch id restores exactly what one delete hid.
+
   TranscribeReservedConcurrency:
     Type: String
     Default: '0'
@@ -1569,6 +1590,7 @@ Resources:
           GRADED_ROLES: !Ref GradedRoles
           # Does `complete` verify the bytes arrived before stamping
           # uploaded_at? See the UploadVerifyMode parameter.
+          ENABLE_USER_DELETION: !Ref EnableUserDeletion
           UPLOAD_VERIFY_MODE: !Ref UploadVerifyMode
           # off -> the correction routes 404. See the SpeakerIdentityMode parameter;
           # this is the rollback, so it must be a deployed value, not a code constant.

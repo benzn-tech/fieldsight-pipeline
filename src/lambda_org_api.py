@@ -152,6 +152,7 @@ from text_normalize import diff_candidates, first_match_span, normalize, occurre
 from keyframe_selection import keyframe_seconds
 from photo_binding import parse_time_range
 import batch_stitch
+import deletion_mirror
 import turn_name_overlay
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
@@ -200,6 +201,13 @@ RECORDING_KINDS = {"video", "audio", "photo"}
 #   observe  200 always, but log the verdict enforce would have reached
 #   enforce  409 when the object is absent; the row stays pending and the
 #            device re-sends inside its own 7-day budget
+# A customer-facing delete: the user selects recordings, and everything derived from them
+# stops being visible to anyone. TEMPORARY BY REQUEST — the switch gates the WRITE endpoint
+# only. The read filters are deliberately unconditional: making them follow the flag would
+# mean that turning it off un-hides every recording a customer was told was gone, which is
+# a second incident rather than a rollback. Recall is per-batch and lives in the data:
+#   SELECT * FROM redactions WHERE scope='deleted' AND reverted_at IS NULL;
+ENABLE_USER_DELETION = os.environ.get("ENABLE_USER_DELETION", "false").lower() == "true"
 UPLOAD_VERIFY_MODE = os.environ.get("UPLOAD_VERIFY_MODE", "off").lower()
 # off | shadow | on. `off` is the deployed default and the rollback: the correction routes
 # 404 and nothing downstream is reachable. Read from the environment rather than a constant
@@ -467,6 +475,10 @@ def dispatch(conn, event, method, route):
     if route == "/aliases" and method == "POST":
         return create_alias_endpoint(conn, caller, parse_body(event), event)
 
+    if route == "/recordings/delete" and method == "POST":
+        return delete_recordings_endpoint(conn, caller, parse_body(event))
+    if route == "/recordings/undelete" and method == "POST":
+        return undelete_recordings_endpoint(conn, caller, parse_body(event))
     if route == "/redactions" and method == "POST":
         return create_redaction_endpoint(conn, caller, parse_body(event))
     m_rr = re.match(r"^/redactions/([^/]+)/revert$", route)
@@ -2969,6 +2981,100 @@ def apply_topic_correction(conn, caller, topic_id, body):
                      "occurrences": p["occurrences"]} for p in plan],
         "reindex_enqueued": reindexed,
     })
+
+
+def _source_prefixes_for(rec):
+    """Both source shapes one recording can produce topics under.
+
+    Live extraction writes `extractions/{folder}/{date}/{base}`; the nightly report writes
+    `reports/{date}/{folder}/`. A tombstone naming only the first leaves the report-sourced
+    rows visible, which is the same day's content by another door.
+    """
+    folder, date = rec.get("folder"), rec.get("date")
+    base = rec.get("sessionBase") or ""
+    if not folder or not date:
+        return []
+    return [f"extractions/{folder}/{date}/{base}", f"reports/{date}/{folder}/{base}"]
+
+
+def delete_recordings_endpoint(conn, caller, body):
+    """Hide everything derived from the selected recordings. Nothing is destroyed.
+
+    Order: one transaction (tombstones + per-topic redactions) -> commit -> S3 mirror. A
+    mirror failure after commit leaves the DB filters already hiding everything, so the
+    failure mode is "the S3 artifacts lag", never "the customer sees content".
+
+    The response carries per-recording counts INCLUDING ZERO. A delete that matched nothing
+    and reported success is the worst outcome available here: the customer is told their
+    recording is gone and it is not.
+    """
+    if not ENABLE_USER_DELETION:
+        return error("recording deletion is not enabled (ENABLE_USER_DELETION)", 403)
+    recs = (body or {}).get("recordings") or []
+    if not recs:
+        return error("no recordings given", 400)
+    reason = ((body or {}).get("reason") or "deleted by the user").strip()
+
+    import uuid as _uuid
+    batch_id = str(_uuid.uuid4())
+    results, days = [], set()
+    with conn.transaction():
+        for rec in recs:
+            hidden = 0
+            for prefix in _source_prefixes_for(rec):
+                redactions.create_recording_tombstone(
+                    conn, caller["company_id"], prefix, reason,
+                    caller.get("id"), caller.get("global_role"), batch_id=batch_id)
+                for row in topics.list_topics_for_source_prefix(conn, prefix) or []:
+                    redactions.create_redaction(
+                        conn, caller["company_id"], row["id"], reason,
+                        caller.get("id"), caller.get("global_role"),
+                        target_type="topic", scope="deleted", batch_id=batch_id)
+                    hidden += 1
+            results.append({"recording": rec, "topics_hidden": hidden})
+            if rec.get("folder") and rec.get("date"):
+                days.add((rec["folder"], rec["date"]))
+
+    # The mirror the non-VPC lambdas read. Written AFTER commit so it can never advertise a
+    # deletion the database did not keep.
+    for folder, date in sorted(days):
+        try:
+            sessions = [r.get("sessionBase") for r in recs
+                        if r.get("folder") == folder and r.get("date") == date
+                        and r.get("sessionBase")]
+            deletion_mirror.write_mirror(s3(), S3_BUCKET, folder, date, sessions)
+        except Exception:
+            logger.exception("deletion mirror write failed for %s/%s (batch %s) — the "
+                             "database filters already hide it; retry is idempotent",
+                             folder, date, batch_id)
+
+    logger.info("user deletion: batch=%s recordings=%d topics_hidden=%d",
+                batch_id, len(recs), sum(r["topics_hidden"] for r in results))
+    return ok({"batch_id": batch_id, "results": results})
+
+
+def undelete_recordings_endpoint(conn, caller, body):
+    """Restore exactly one delete batch. The audit rows survive (`reverted_at`)."""
+    if not ENABLE_USER_DELETION:
+        return error("recording deletion is not enabled (ENABLE_USER_DELETION)", 403)
+    batch_id = (body or {}).get("batchId")
+    if not batch_id:
+        return error("batchId is required", 400)
+    rows = redactions.revert_batch(conn, batch_id, caller["company_id"]) or []
+    days = set()
+    for r in rows:
+        key = r.get("target_key") or ""
+        parts = key.split("/")
+        if len(parts) >= 3:
+            days.add((parts[1], parts[2]))
+    for folder, date in sorted(days):
+        try:
+            deletion_mirror.write_mirror(s3(), S3_BUCKET, folder, date, [])
+        except Exception:
+            logger.exception("deletion mirror rewrite failed for %s/%s on undelete %s",
+                             folder, date, batch_id)
+    logger.info("user deletion: undelete batch=%s restored=%d", batch_id, len(rows))
+    return ok({"batch_id": batch_id, "restored": len(rows)})
 
 
 def create_redaction_endpoint(conn, caller, body):
