@@ -971,8 +971,17 @@ def test_the_correction_requests_expire():
     do), and it still matters: an artifact records who was named on which passage, which is
     a claim about a person that nobody asked to keep forever.
     """
+    import json as _json
+    import re as _re
     script = open(os.path.join(REPO, "scripts", "wire-bucket-lifecycle.sh"),
                   encoding="utf-8").read()
-    assert "voiceprint_requests/" in script, (
-        "the correction artifacts never expire; the prefix is unmanaged")
-    assert "voiceprint-requests-expiry" in script, "the rule has no id, so it cannot be kept"
+    # Parsed, not grepped: asserting the two strings kept the test green with the rule set
+    # to `Disabled` and 3650 days, which is the same as no rule with extra ceremony.
+    body = _re.search(r"--lifecycle-configuration '(\{.*?\})'", script, _re.S).group(1)
+    rules = {r["ID"]: r for r in _json.loads(body)["Rules"]}
+    rule = rules.get("voiceprint-requests-expiry")
+    assert rule, "the correction artifacts never expire; the prefix is unmanaged"
+    assert rule["Status"] == "Enabled", "the rule exists and does nothing"
+    assert rule["Filter"]["Prefix"] == "voiceprint_requests/"
+    assert 1 <= rule["Expiration"]["Days"] <= 30, (
+        f"{rule['Expiration']['Days']} days is retention, not a handoff window")
