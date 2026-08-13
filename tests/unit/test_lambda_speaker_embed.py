@@ -391,3 +391,80 @@ def test_an_enrolment_returns_the_vector_instead_of_storing_it(stub_embedder, mo
     assert out["status"] == "embedded"
     assert len(out["embedding"]) == 192
     assert out["s3_key"] == key and out["correction_ref"] == "corr-7"
+
+
+# ---- the S3 entry point -------------------------------------------------
+#
+# Found by a real correction on TEST, not by reading code. The trigger was wired, the
+# artifact landed, and the function died in 3 ms with `unknown op None` -- because the
+# handler is op-keyed and an S3 event carries `Records`, not `op`. The plan said this in
+# writing and the wiring shipped without it, so the gap is pinned here rather than trusted.
+
+
+def _s3_event(key, bucket="b"):
+    return {"Records": [{"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}]}
+
+
+def test_an_s3_event_is_understood_rather_than_rejected(stub_embedder, monkeypatch):
+    import json as _json
+    req = {"request_id": "r1", "session_base": "s1", "company_id": "c1",
+           "user_folder": "u", "date": "2026-08-13",
+           "correction": {"source_filename": "x_c0000.wav", "start_sec": 0.0,
+                          "end_sec": 5.0, "display_name": "Ben L"},
+           "profiles": []}
+    key = "voiceprint_requests/c1/s1/r1.json"
+    audio = "users/u/audio/2026-08-13/x_c0000.wav"
+    s3 = FakeS3({key: _json.dumps(req).encode(), audio: _wav_bytes()})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda payload: sent.update(payload) or {})
+    out = se.lambda_handler(_s3_event(key), None)
+    assert out.get("status") != "error", out
+    assert key in s3.gets, "the request artifact was never read"
+
+
+def test_the_result_goes_to_the_writer_and_not_to_s3(stub_embedder, monkeypatch):
+    """The vector never lands in durable storage — that defect relocated twice during review
+    and only died when the storage turned out not to need to exist."""
+    import json as _json
+    req = {"request_id": "r1", "session_base": "s1", "company_id": "c1",
+           "user_folder": "u", "date": "2026-08-13",
+           "correction": {"source_filename": "x_c0000.wav", "start_sec": 0.0,
+                          "end_sec": 5.0, "display_name": "Ben L"},
+           "profiles": []}
+    key = "voiceprint_requests/c1/s1/r1.json"
+    s3 = FakeS3({key: _json.dumps(req).encode(),
+                 "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes()})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda payload: sent.update(payload) or {})
+    se.lambda_handler(_s3_event(key), None)
+    assert sent.get("op") == "propagation"
+    assert sent.get("company_id") == "c1"
+    assert not hasattr(s3, "puts") or not getattr(s3, "puts", None), (
+        "the embedder wrote to S3; its result belongs in the invoke payload")
+
+
+def test_the_direct_op_form_still_works(stub_embedder, monkeypatch):
+    """The S3 entry is an addition, not a replacement — the ops are how it is smoke-tested
+    by hand, and that is how tonight's two defects were both found."""
+    key = "users/u/audio/2026-08-13/x_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes()}))
+    out = se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
+                             "date": "2026-08-13", "profiles": [],
+                             "turns": [{"source_filename": "x_c0000.wav",
+                                        "start_sec": 0.0, "end_sec": 5.0}]}, None)
+    assert "results" in out
+
+
+def test_an_artifact_without_folder_or_date_fails_loudly(stub_embedder, monkeypatch):
+    """Guessing them from session_base produced `users/s1/audio//x.wav` — a key that cannot
+    exist, so the missing field would have surfaced as NoSuchKey somewhere else entirely."""
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    req = {"request_id": "r1", "session_base": "s1", "company_id": "c1",
+           "correction": {"source_filename": "x.wav", "start_sec": 0.0, "end_sec": 5.0,
+                          "display_name": "Ben L"}, "profiles": []}
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _json.dumps(req).encode()}))
+    with pytest.raises(ValueError, match="user_folder"):
+        se.lambda_handler(_s3_event(key), None)

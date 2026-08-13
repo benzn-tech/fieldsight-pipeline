@@ -64,6 +64,8 @@ def wired(monkeypatch):
     monkeypatch.setattr(org, "s3", lambda: s3)
     monkeypatch.setattr(org, "get_connection", lambda *a, **k: FakeConn())
     monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: dict(CALLER))
+    monkeypatch.setattr(org, "_resolve_org_media_folder",
+                        lambda conn, caller, user, what=None: ("Ada_L", None))
     monkeypatch.setattr(org, "profiles_for_matching",
                         lambda conn, company_id, site_id=None: [
                             {"id": "vp-1", "user_id": "u-9", "display_name": "Ben L",
@@ -178,3 +180,37 @@ def test_a_platform_admin_may_correct(wired, monkeypatch):
                         lambda conn, sub: dict(CALLER, global_role="platform_admin"))
     res = org.lambda_handler(_event(BODY), None)
     assert res["statusCode"] == 202, _body(res)
+
+
+def test_the_folder_comes_from_the_authorising_resolver_not_the_body(wired, monkeypatch):
+    """A body-supplied folder would let a caller queue work against a recording they cannot
+    see. `_resolve_org_media_folder` is the same gate every other media route uses, and its
+    answer is what travels."""
+    seen = {}
+
+    def resolver(conn, caller, user, what=None):
+        seen["user"] = user
+        return "Ada_L", None
+    monkeypatch.setattr(org, "_resolve_org_media_folder", resolver)
+    org.lambda_handler(_event(dict(BODY, user="Someone_Else",
+                                   user_folder="Hacked")), None)
+    doc = json.loads(wired.puts[0]["Body"])
+    assert doc["user_folder"] == "Ada_L", "the artifact carried a body-supplied folder"
+    assert seen["user"] == "Someone_Else", "the resolver never saw the requested user"
+
+
+def test_a_session_id_without_a_date_is_refused(wired):
+    """The date is half the S3 key the audio lives under. Deriving it wrongly puts the read
+    on a path that cannot exist, far from the cause."""
+    ev = _event(BODY)
+    ev["path"] = "/api/org/sessions/no-date-here/speaker-corrections"
+    res = org.lambda_handler(ev, None)
+    assert res["statusCode"] == 400
+    assert wired.puts == []
+
+
+def test_the_artifact_names_the_folder_and_the_date_the_consumer_needs(wired):
+    org.lambda_handler(_event(BODY), None)
+    doc = json.loads(wired.puts[0]["Body"])
+    assert doc["user_folder"] == "Ada_L"
+    assert doc["date"] == "2026-08-13"
