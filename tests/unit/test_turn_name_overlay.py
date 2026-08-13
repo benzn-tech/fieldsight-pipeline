@@ -50,8 +50,33 @@ def test_a_row_never_belongs_to_another_file():
 
 
 def test_the_nearest_row_wins_when_two_are_within_tolerance():
-    idx = tno.build([_row("x.wav@12.4", "Ben L"), _row("x.wav@12.9", "Zoe")])
-    assert tno.lookup(idx, "x.wav", 12.85)["display_name"] == "Zoe"
+    """Both orderings and a query point far from the tie, because the first version of this
+    test asked at 12.85 — right next to the row that happened to sort last — and passed while
+    the implementation returned the FARTHER row for every other query point.
+
+    Equal `created_at` is the normal case, not an edge one: Postgres `now()` is constant
+    within a transaction, so one writer run stamps every row it writes identically.
+    """
+    for rows in ([_row("x.wav@12.4", "Ben L"), _row("x.wav@12.9", "Zoe")],
+                 [_row("x.wav@12.9", "Zoe"), _row("x.wav@12.4", "Ben L")]):
+        idx = tno.build(rows)
+        assert tno.lookup(idx, "x.wav", 12.45)["display_name"] == "Ben L", (
+            "the farther row won; distance is what identifies which turn a row is about")
+        idx = tno.build(rows)
+        assert tno.lookup(idx, "x.wav", 12.85)["display_name"] == "Zoe"
+
+
+def test_distance_outranks_recency_but_not_the_source():
+    """A newer row at a different offset is probably about a different TURN, so recency must
+    not drag a name across turns. But a direct correction still beats a nearer inference."""
+    old_near = _row("x.wav@12.4", "Near", created="2026-08-13T01:00:00")
+    new_far = _row("x.wav@12.9", "Far", created="2026-08-13T09:00:00")
+    assert tno.lookup(tno.build([old_near, new_far]), "x.wav", 12.45)["display_name"] == "Near"
+
+    guess_near = _row("x.wav@12.4", "Guess", source="correction_propagation")
+    said_far = _row("x.wav@12.8", "Said", source="correction")
+    assert tno.lookup(tno.build([guess_near, said_far]),
+                      "x.wav", 12.45)["display_name"] == "Said"
 
 
 # ---- precedence ---------------------------------------------------------

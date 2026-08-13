@@ -468,3 +468,27 @@ def test_an_artifact_without_folder_or_date_fails_loudly(stub_embedder, monkeypa
     monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _json.dumps(req).encode()}))
     with pytest.raises(ValueError, match="user_folder"):
         se.lambda_handler(_s3_event(key), None)
+
+
+def test_the_name_the_user_typed_reaches_the_writer(stub_embedder, monkeypatch):
+    """The hop that dropped it. The name travelled from the correction body all the way to a
+    writer that had no column to put it in, and nothing raised — the row simply named nobody.
+
+    Pinned here rather than trusted, because a closing mutation pass showed that deleting
+    this one field from the payload left 171 tests green.
+    """
+    import json as _json
+    req = {"request_id": "r1", "session_base": "s1", "company_id": "c1",
+           "user_folder": "u", "date": "2026-08-13",
+           "correction": {"source_filename": "x_c0000.wav", "start_sec": 0.0,
+                          "end_sec": 5.0, "display_name": "Ben L"},
+           "profiles": []}
+    key = "voiceprint_requests/c1/s1/r1.json"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes()}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda payload: sent.update(payload) or {})
+    se.lambda_handler(_s3_event(key), None)
+    assert sent["results"][0]["display_name"] == "Ben L", (
+        "the name never left the embedder; the row would name nobody")

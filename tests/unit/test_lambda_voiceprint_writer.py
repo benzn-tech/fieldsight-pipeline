@@ -164,3 +164,24 @@ def test_the_writer_holds_no_model_and_no_audio():
             names.add(node.module.split(".")[0])
     assert not (names & {"onnxruntime", "wave", "batch_stitch", "batch_seal"}), (
         f"the writer reached for audio or the model: {sorted(names)}")
+
+
+def test_the_name_reaches_the_row(calls):
+    """The second hop that dropped it. `record_turn_name` gained `display_name` in 0041 and
+    the writer has to actually pass it — a closing mutation pass showed that deleting this
+    one keyword left every test green while every row named nobody."""
+    vw.lambda_handler({
+        "op": "propagation", "company_id": CO, "session_base": "s1",
+        "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed", "cluster_ref": "C1",
+                     "display_name": "Ben L", "asserted": True}]}, None)
+    assert calls["turns"][0]["display_name"] == "Ben L", (
+        "the writer dropped the name; nothing raises, the row is simply anonymous")
+
+
+def test_an_unnamed_result_stays_unnamed_rather_than_becoming_a_placeholder(calls):
+    """An unnamed cluster is a real answer — 'someone consistent, not identified'."""
+    vw.lambda_handler({
+        "op": "propagation", "company_id": CO, "session_base": "s1",
+        "results": [{"turn_ref": "f.wav@1.0", "state": "tentative", "cluster_ref": "C2"}]},
+        None)
+    assert calls["turns"][0].get("display_name") is None
