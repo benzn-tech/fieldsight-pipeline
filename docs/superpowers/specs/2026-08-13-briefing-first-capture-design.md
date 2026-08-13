@@ -276,3 +276,75 @@ and `mcp`; it cannot fetch. Production requires a backend endpoint.
   formulation that survives.
 - **Page weight.** 2,135 turns embed as 182 KB (220 KB page). Fine for one
   session, not for a corpus — cross-session search needs the server index.
+
+---
+
+## 9. Decisions on gaps found while planning
+
+Seven questions the sections above left open, resolved here so the plan does
+not have to guess.
+
+### 9.1 How the phone browser authenticates — **signed, single-session link**
+
+GrandTime hands the URL to the system browser (`Intent.ACTION_VIEW`), which
+arrives cold with no Cognito session. Making the recorder log in on a phone
+keyboard, on site, immediately after every recording, reintroduces exactly the
+friction the hardware exists to remove — the same reasoning that put the device
+in the field in the first place.
+
+So the link carries its own authority: a signed token scoped to **one session's
+briefing**, short-lived, revocable, granting read on that one artifact and
+nothing else. It is not a login and must never widen into one.
+
+This is a real security surface — a link that leaks is a meeting that leaks —
+so it gets its own review before it ships, and the token must not be reusable
+across sessions, sites, or users. Until it exists, the surface is reachable only
+by an already-authenticated browser.
+
+### 9.2 The "common English words" alias rule — **derive it, don't hardcode it**
+
+A checked-in word list is a maintenance liability and wrong in a second
+language. The signal is already in the data: count how many turns each word
+appears in *within this corpus*, and treat a phrase made only of high-frequency
+words as a misheard phrase rather than a name. `record include` fails because
+both words are everywhere; `PV Tech` survives because `PV` is not.
+
+The prototype computes exactly this document-frequency table while building the
+index, at no extra cost.
+
+### 9.3 The dedup matching rule — **measurement first, invariant pinned**
+
+`_dedup_turn_boundaries` already removes adjacent ring-buffer overlap, so the
+31 % that survives it is non-adjacent batch-window repetition. The rule that
+worked in the prototype: same speaker, within 8 s, ≥ 0.85 similarity, keep the
+longer decode. Ship it with the drop count in the artifact stats and tune
+against real sessions. The load-bearing test is the invariant, not the
+threshold: **no-op on legacy and VAD-only sessions.**
+
+### 9.4 Model and provider — **inherit the `llm_utils` switch**
+
+The experiment ran `qwen3.7-max` with thinking on, but nothing in the design
+depends on that. Pinning a model here would duplicate a decision that already
+has one home.
+
+### 9.5 Why not reuse `report_chunks` — **`embedding` is `NOT NULL`**
+
+Keyword-searchable turns would have to buy an embedding each to ride that
+table, for a search path that does not use embeddings. `session_turns` exists
+for this reason. (Good catch during planning; it belongs in the design, not
+only in the plan.)
+
+### 9.6 Entity scope for cross-session search — **company/site, via the existing ACL**
+
+Entities are extracted per session but are only useful across sessions — the
+point is asking what has ever been said about Plaud. Scope them through the
+same company/site machinery every other read path uses. BUG-41 is the standing
+warning: a tenancy shortcut here shows one customer another customer's meetings.
+
+### 9.7 Historic backfill — **out of scope, and separately urgent**
+
+Sessions predating the briefing pass stay unindexed. Worth stating plainly that
+this is not a small gap: prod holds 532 chunks total, covering 2026-02-09 to
+08-12, with **zero** for 08-13. Task 5 resurfaces the 220 discarded windows,
+which is the cheapest real recall available; a genuine backfill is its own
+piece of work.
