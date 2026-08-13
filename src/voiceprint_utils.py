@@ -73,6 +73,34 @@ def cosine(a, b) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
+def aggregate_scores(rows) -> dict:
+    """One score per PERSON, from one row per SAMPLE.
+
+    `profiles_for_matching` JOINs `speaker_voiceprint_samples`, so a person with three
+    enrolments arrives as three rows. `decide_name` compares a flat mapping and cannot see
+    that two of its entries are the same voice, so ungrouped rows make a person their own
+    runner-up: Phase 0's Ben holds an English and a Chinese profile ~0.08 apart, which is
+    below the 0.15 margin, so he would be reported `tentative` against himself.
+
+    That is also why Phase 0's 31 of 32 is a NEAREST-PROFILE figure and not what this rule
+    confirms. Aggregation has to happen before the margin means anything.
+
+    **Max, not mean.** Max is what "nearest profile" already did implicitly, and a mean
+    would dilute a genuinely matching sample against a weak one — the enrolment that fits
+    this turn is the evidence, and averaging it with an unrelated one throws that away.
+
+    `person_key` is supplied by the caller and must be an identity, never a display name:
+    two people share a first name in this data already.
+    """
+    out: dict = {}
+    for row in rows or []:
+        key = row["person_key"]
+        score = float(row["score"])
+        if key not in out or score > out[key]:
+            out[key] = score
+    return out
+
+
 def decide_name(scores, duration_s: float,
                 min_turn_s: float = DEFAULT_MIN_TURN_S,
                 min_margin: float = DEFAULT_MIN_MARGIN) -> Decision:

@@ -129,3 +129,59 @@ def test_a_single_frame_cannot_be_shown_to_be_homogeneous():
 
 def test_no_frames_at_all_is_not_a_pass():
     assert vp.window_is_homogeneous([]) is None
+
+
+# ----------------------------------------------------------
+# Per-person aggregation. `profiles_for_matching` returns one row per SAMPLE
+# (repositories/voiceprints.py JOINs speaker_voiceprint_samples), and decide_name takes a
+# flat mapping with no notion of person. Phase 0 enrolled SIX profiles for FIVE people --
+# Ben has an English and a Chinese one, ~0.08 apart, and twice the Chinese one scored
+# nearest of all. Fed in as two keys, Ben becomes his own runner-up, the margin is 0.08,
+# and the answer is `tentative`: a person losing to himself.
+#
+# So Phase 0's 31/32 is NEAREST-PROFILE accuracy, not what this rule would confirm.
+# ----------------------------------------------------------
+
+
+def test_two_samples_of_one_person_collapse_to_their_best():
+    rows = [
+        {"person_key": "ben", "score": 0.31},
+        {"person_key": "ben", "score": 0.43},
+        {"person_key": "zoe", "score": 0.08},
+    ]
+    assert vp.aggregate_scores(rows) == {"ben": 0.43, "zoe": 0.08}
+
+
+def test_a_person_with_two_profiles_no_longer_beats_himself():
+    """The Phase 0 case, with its measured numbers rather than invented ones.
+
+    Ben's own two profiles sit ~0.08 apart and the nearest other voice is far below both.
+    Ungrouped they are each other's runner-up and the margin never clears 0.15."""
+    ungrouped = {"ben_en": 0.425, "ben_zh": 0.505, "zoe": 0.078}
+    assert vp.decide_name(ungrouped, duration_s=5.0).status == "tentative", (
+        "precondition: without aggregation the two Ben profiles defeat each other")
+
+    rows = [
+        {"person_key": "ben", "score": 0.425},
+        {"person_key": "ben", "score": 0.505},
+        {"person_key": "zoe", "score": 0.078},
+    ]
+    decision = vp.decide_name(vp.aggregate_scores(rows), duration_s=5.0)
+    assert decision.status == "confirmed"
+    assert decision.name == "ben"
+
+
+def test_profiles_without_a_user_do_not_collide():
+    """`user_id` is nullable by design -- an unnamed recurring voice may hold a profile
+    before anyone names it (0038). Two such profiles are two people until told otherwise,
+    so they must not merge on a shared null."""
+    rows = [
+        {"person_key": "profile-a1b2", "score": 0.40},
+        {"person_key": "profile-c3d4", "score": 0.12},
+    ]
+    assert vp.aggregate_scores(rows) == {"profile-a1b2": 0.40, "profile-c3d4": 0.12}
+
+
+def test_an_empty_row_set_is_unknown_rather_than_a_crash():
+    assert vp.aggregate_scores([]) == {}
+    assert vp.decide_name(vp.aggregate_scores([]), duration_s=5.0).status == "unknown"
