@@ -308,3 +308,59 @@ def test_a_session_without_a_sid_is_refused_rather_than_stored_unfindable(wired)
     res = org.lambda_handler(ev, None)
     assert res["statusCode"] == 400
     assert wired.puts == []
+
+
+# ---- enrolment: the half that makes NEXT time work ---------------------
+#
+# The correction already names this meeting. Enrolment is what makes the person recognisable
+# in future ones, and it is the half that stores biometric data — so it is opt-in, separate,
+# and reported separately. A flat "success" would tell the user they got both when they
+# asked for one.
+
+
+def test_without_consent_nothing_is_enrolled_and_the_response_says_so(wired):
+    b = _body(org.lambda_handler(_event(BODY), None))
+    assert b["enrolment"] == "not_requested"
+    doc = json.loads(wired.puts[0]["Body"])
+    assert not doc.get("enrol"), "an enrolment was queued without being asked for"
+
+
+def test_consent_enrols_and_the_artifact_carries_the_profile(wired, monkeypatch):
+    seen = {}
+
+    def upsert(conn, company_id, **kw):
+        seen.update(kw)
+        return {"id": "vp-1"}
+    monkeypatch.setattr(org.voiceprints, "upsert_profile", upsert)
+    b = _body(org.lambda_handler(_event(dict(BODY, consent_given=True)), None))
+    assert b["enrolment"] == "queued"
+    doc = json.loads(wired.puts[0]["Body"])
+    assert doc["enrol"]["voiceprint_id"] == "vp-1"
+    assert seen["display_name"] == "Ben L"
+    assert seen["consent_given"] is True
+
+
+def test_the_consenting_person_is_recorded_not_assumed_to_be_the_caller(wired,
+                                                                        monkeypatch):
+    """§6: consent comes from the person whose voice it is. The caller is whoever is doing
+    the labelling, and those are routinely different people — the wearer corrects a
+    subcontractor's name. Recording the caller as the consenter would make the record say
+    something nobody claimed."""
+    seen = {}
+    monkeypatch.setattr(org.voiceprints, "upsert_profile",
+                        lambda conn, company_id, **kw: seen.update(kw) or {"id": "vp-1"})
+    org.lambda_handler(_event(dict(BODY, consent_given=True,
+                                   consented_by="u-the-person")), None)
+    assert seen["consented_by"] == "u-the-person"
+
+
+def test_a_refused_profile_refuses_the_whole_request(wired, monkeypatch):
+    """If the repository will not create the profile, queuing the work anyway would leave an
+    artifact pointing at nothing and an enrolment that silently never happens."""
+    def boom(conn, company_id, **kw):
+        raise ValueError("a named voiceprint cannot be created without consent")
+    monkeypatch.setattr(org.voiceprints, "upsert_profile", boom)
+    res = org.lambda_handler(_event(dict(BODY, consent_given=True)), None)
+    assert res["statusCode"] == 400
+    assert "consent" in _body(res)["error"]
+    assert wired.puts == []

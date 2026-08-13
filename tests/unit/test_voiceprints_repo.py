@@ -298,3 +298,61 @@ def test_the_live_overlay_excludes_superseded_rows():
     sql = conn.calls[0]["sql"]
     assert "superseded_at IS NULL" in sql
     assert "company_id = %s" in sql
+
+
+# ---- creating the profile a name attaches to ----------------------------
+#
+# §6: a voiceprint is biometric information, and consent must come from THE PERSON WHOSE
+# VOICE IT IS — not the wearer, not the employer, not the person doing the labelling. So a
+# profile that carries a NAME cannot be created without it; a profile with no name can,
+# because an unnamed recurring voice identifies nobody.
+
+
+def test_a_named_profile_cannot_be_created_without_consent():
+    with pytest.raises(ValueError, match="consent"):
+        voiceprints.upsert_profile(FakeConn([[]]), CO, display_name="Ben L")
+
+
+def test_an_unnamed_profile_needs_no_consent():
+    """A recurring voice may hold a profile before anyone names it — that is what makes
+    'the same person again' visible without knowing who they are, and it links no biometric
+    to an identity."""
+    # One query, not two: with no name there is nothing to look up first.
+    conn = FakeConn([[{"id": "vp1"}]])
+    got = voiceprints.upsert_profile(conn, CO, display_name=None)
+    assert got["id"] == "vp1"
+    assert len(conn.calls) == 1
+
+
+def test_consent_is_stamped_by_the_server_not_taken_from_the_caller():
+    """A client-supplied timestamp is a claim about when somebody agreed. This one is a
+    record of when the system was told."""
+    conn = FakeConn([[], [{"id": "vp1"}]])
+    voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True,
+                               consented_by="u-9")
+    sql = conn.calls[-1]["sql"]
+    assert "now()" in sql.lower()
+    assert "consent_at" in sql
+
+
+def test_an_existing_profile_for_the_same_name_is_reused_not_duplicated():
+    """Two corrections naming the same person must feed ONE profile. Two profiles for one
+    voice make that person his own runner-up — the failure `aggregate_scores` exists for."""
+    conn = FakeConn([[{"id": "vp-existing"}]])
+    got = voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True)
+    assert got["id"] == "vp-existing"
+    assert len(conn.calls) == 1, "an existing profile was looked up and then inserted anyway"
+
+
+def test_the_lookup_is_company_scoped():
+    conn = FakeConn([[{"id": "vp1"}]])
+    voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True)
+    assert "company_id = %s" in conn.calls[0]["sql"]
+    assert CO in conn.calls[0]["params"]
+
+
+def test_a_withdrawn_profile_is_not_reused():
+    """Re-using it would resurrect a withdrawal by the back door."""
+    conn = FakeConn([[], [{"id": "vp-new"}]])
+    voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True)
+    assert "withdrawn" in conn.calls[0]["sql"]

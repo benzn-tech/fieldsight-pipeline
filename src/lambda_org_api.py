@@ -1334,6 +1334,22 @@ def speaker_corrections(conn, caller, session_base, event):
     if not session_key:
         return error("session id must carry its sid (…_sid<32 hex>)", 400)
 
+    # Enrolment is the OTHER half, and it is opt-in because it is the half that stores
+    # biometric data. Propagating a name inside one meeting compares audio the company
+    # already holds; enrolling keeps a voice pattern so the person is recognisable in future
+    # meetings, and §10 requires consent from the person whose voice it is — not the wearer,
+    # not the employer, and not whoever is doing the labelling, who is usually a third
+    # person again. The two effects are reported separately for that reason.
+    enrol = None
+    if body.get("consent_given"):
+        try:
+            profile = voiceprints.upsert_profile(
+                conn, company_id, display_name=name,
+                consent_given=True, consented_by=body.get("consented_by"))
+        except ValueError as exc:
+            return error(str(exc), 400)
+        enrol = {"voiceprint_id": str(profile["id"])}
+
     request_id = uuid.uuid4().hex
     artifact = {
         "request_id": request_id,
@@ -1351,6 +1367,7 @@ def speaker_corrections(conn, caller, session_base, event):
         # turn the user pointed at, and "the whole meeting follows" is a claim about a
         # mechanism that never runs. org-api is the half that can read transcripts.
         "turns": _session_turns(folder, date_m.group(1), session_base),
+        "enrol": enrol,
     }
     s3().put_object(Bucket=LAKE_BUCKET,
                     Key=f"voiceprint_requests/{company_id}/{session_base}/{request_id}.json",
@@ -1363,7 +1380,7 @@ def speaker_corrections(conn, caller, session_base, event):
         # Named separately because they carry different consent obligations, and because a
         # user who was told "done" deserves to know which of the two they got.
         "propagation": "queued",
-        "enrolment": "not_requested",
+        "enrolment": "queued" if enrol else "not_requested",
     }, 202)
 
 
