@@ -78,6 +78,41 @@ display, and that is a viewer change with no effect on what has been collected.
 * **Singleton clusters**: leave-one-out is undefined at n=1, so a cluster with fewer than two
   usable turns names only the corrected turn and propagates nothing.
 
+## P0 — batching already broke the audio contract, and TEST is live
+
+Found by the closing verification pass, confirmed against the code and against TEST's actual
+objects. **This blocks P3 and changes the spec's audio rule.**
+
+A batched turn's `source_filename` is `{first_chunk_stem}_bn{K}_off{T}_to{E}_srcwav.wav`, and
+`_raw_key` splits on `_off`, so it builds `users/{f}/audio/{d}/…_c0000_bn4.wav` — **a key that
+does not exist**, because raw uploads are per chunk. Worse, `start_sec`/`end_sec` are
+**deliberately batch-relative** (`batch_stitch.py:417`): they index into the batch WAV, so even
+a corrected filename would cut the wrong audio.
+
+`TEST_BATCH_TRANSCRIPTION` is **true**, and the batch objects are already in TEST
+(`audio_segments/Ben_UCPK2/2026-08-13/…_c0000_bn4_off0.0_to114.0_srcwav.wav`, today). So every
+turn from a newly recorded TEST session is batched, and `match` would raise `NoSuchKey` on all
+of them. It is inert — nothing invokes it — so nothing breaks tonight, but it is an interface
+defect, not a bug in either feature: **both features' tests pass**, because the speaker tests
+only ever feed per-chunk filenames.
+
+The spec says "always the raw upload, never `audio_segments/`" because Phase 0's numbers are
+raw-audio numbers. Batching puts the audio a turn points at **inside `audio_segments/`**, so
+that rule and the deployed pipeline contradict each other. The resolution is neither to
+abandon the rule nor to read the stitched copy:
+
+**Translate through the batch map.** `{batch}_batch_map.json` sits beside the batch WAV and
+exists for exactly this — it maps batch-relative coordinates back to member chunks. So when a
+`source_filename` carries `_bn`, `match` reads the map, converts (batch WAV, batch offsets) →
+(member chunk, chunk offsets), and then reads the **raw** chunk as before. The raw-audio rule
+survives intact.
+
+IAM: `GetObject` on `audio_segments/*_batch_map.json` only — narrow enough that the function
+still cannot read the normalised audio, which is the thing the rule exists to prevent.
+
+Tests must feed **both** filename shapes. A test suite that only knows one of them is what let
+two green features disagree.
+
 ## Phase order
 
 Each phase is independently revertible and inert until the one after it.
