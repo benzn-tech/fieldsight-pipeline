@@ -3,6 +3,14 @@
 **Date:** 2026-08-11 · **Spec:** `docs/superpowers/specs/2026-08-11-batched-transcription.md`
 (read its "Review corrections" section — two of its factual claims were corrected in review)
 **Branch:** `feat/batched-transcription` off `origin/develop`.
+
+> **SUPERSEDED IN PART, 2026-08-13.** The batching RULE described here — four
+> consecutive chunk indices, split at every gap — was replaced by a 120-second
+> wall-clock window in `2026-08-13-batch-by-wall-clock.md`. `plan_batches` and
+> `pending_runs` no longer exist. Measured reason: a chunk VAD dropped ended the
+> batch, which shattered 31% of real sessions into short runs (one 46-chunk session
+> produced [1,1,1,2,1,1]). Everything else here — the map, the filename contract,
+> the ledger's two races, the tail seal — still stands.
 **Discipline:** strict TDD — every phase writes its tests FIRST and watches them fail before
 any implementation. Unit tests use monkeypatched boto3 clients / fake table objects, never
 real AWS, never real Postgres (this feature touches no Aurora table; if any phase grows a DB
