@@ -24,7 +24,7 @@ what it did while it was on.
 
 ```sql
 -- everything currently hidden by this feature, newest first
-SELECT batch_id, company_id, target_type, target_key, actor_sub, created_at
+SELECT batch_id, company_id, target_type, target_key, actor_user_id, actor_role, created_at
 FROM redactions
 WHERE scope = 'deleted' AND reverted_at IS NULL
 ORDER BY created_at DESC;
@@ -111,7 +111,7 @@ the non-VPC lambdas read those and have no database.
    aws s3 ls s3://<bucket>/audio_segments/<Folder>/<date>/ | grep <base>   # still there
    ```
    ```sql
-   SELECT count(*) FROM topics WHERE source_key LIKE 'extractions/<Folder>/<date>/<base>%';
+   SELECT count(*) FROM topics WHERE source_s3_key LIKE 'extractions/<Folder>/<date>/<base>%';
    -- still non-zero: the rows are hidden, not deleted
    ```
 5. **Undo, and check it comes back.**
@@ -130,7 +130,10 @@ curl -sS -X POST "$ORG_API/api/org/recordings/undelete" -H "Authorization: $ID_T
   -H 'Content-Type: application/json' -d '{"batchId":"<batch-id>"}'
 ```
 
-The endpoint is company-guarded: one company's revert cannot resurrect another's content.
+Both endpoints are authorized: a delete is refused per recording unless the caller owns
+that folder or is admin/gm/platform_admin, and the tombstone is stamped with the TARGET's
+company so that company can always undo it. The revert is company-guarded, with a
+platform_admin cross-company span for the case where nobody at that company can.
 It also skips already-reverted rows, so running it twice does not double-count.
 
 If the endpoint is unavailable, the SQL equivalent is:

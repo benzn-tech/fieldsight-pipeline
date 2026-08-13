@@ -1659,6 +1659,20 @@ Resources:
                 - s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/voice/*
             - Effect: Allow
+              # The user-deletion mirror. This function's other grants are all
+              # prefix-scoped, so redactions/* needs its own or the mirror write
+              # 403s. That failure is CAUGHT AND LOGGED by the endpoint (the
+              # database filters already hide the content, so failing the whole
+              # delete would be worse), which means without this statement the
+              # delete reports success while every reader that has no database —
+              # the nightly report generator and Ask — keeps serving the deleted
+              # recording. Read as well as write: the mirror is MERGED, so a
+              # second delete on the same day must see the first one's sessions.
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/redactions/*
+            - Effect: Allow
               # GET /api/org/transcripts (Aurora-identity /transcripts fix) —
               # read-only, same transcripts/* objects the legacy fieldsight-api
               # role and ExtractSessionFunction already read (different bucket
