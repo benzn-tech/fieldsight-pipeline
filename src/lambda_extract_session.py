@@ -622,6 +622,122 @@ def _dedup_turn_boundaries(turns, max_window=12):
     return out
 
 
+DUP_MAX_GAP_SEC = 3.0     # a person cannot say the same sentence twice this fast
+DUP_MIN_RATIO = 0.85      # SequenceMatcher on the lowercased text
+DUP_MIN_CHARS = 25        # below this, a repeat is speech, not a re-decode
+DUP_LOOKBACK = 6          # turns to compare against; the time gate does the real work
+DUP_OPEN_PROBE = 12       # chars of one opening that must appear in...
+DUP_OPEN_WINDOW = 24      # ...this much of the other's opening
+
+
+def _opens_alike(a, b, probe=DUP_OPEN_PROBE, window=DUP_OPEN_WINDOW):
+    """Do these two turns START on the same words?
+
+    Similarity alone cannot be trusted here, and the counter-example is a site
+    sentence, not a contrived one:
+
+        "The door on level one is damaged and needs replacing."
+        "The window on level three is damaged and needs replacing."
+
+    Those score 0.891 — INSIDE the range measured for real re-decodes of the
+    same audio (0.857 to 0.980), because they share a long tail. No single
+    ratio can separate them, and collapsing them loses a defect report.
+
+    What does separate them: a re-decode of one piece of audio begins on the
+    same words, while two observations begin on their two different subjects.
+    The probe is offset-tolerant (looked for anywhere in the other's opening)
+    so a copy carrying a leading filler — "like, like we're gonna use this"
+    against "You know, like, like we're gonna use this" — still matches.
+
+    Measured cost of this gate on the session it was built from: 61 of 750
+    duplicates go unmerged (33.2% of characters saved instead of 35.7%). That
+    is the right side to err on — a missed duplicate costs tokens, a false one
+    costs a record of something that was said.
+
+    Punctuation is stripped before comparing. Two windows over one utterance
+    disagree about it freely — the four decodes measured at 13:44:45 split on
+    "Oh." against "Oh," alone — and no subject is ever distinguished by a comma.
+    """
+    a, b = _open_key(a), _open_key(b)
+    return bool(a and b) and (a[:probe] in b[:window] or b[:probe] in a[:window])
+
+
+def _open_key(s):
+    return re.sub(r'[^0-9a-z一-鿿]+', ' ', (s or '').lower()).strip()
+
+
+def _dedup_batch_window_repeats(turns, max_gap=DUP_MAX_GAP_SEC,
+                                min_ratio=DUP_MIN_RATIO, min_chars=DUP_MIN_CHARS,
+                                lookback=DUP_LOOKBACK):
+    """Collapse the SAME audio transcribed more than once by overlapping batch
+    windows. Returns (turns, stats).
+
+    `_dedup_turn_boundaries` above already handles the device seam, and it is
+    the right tool there: it trims an exact leading word-run. It cannot help
+    here, for two measured reasons (session sid15770a…, 3,715 turns, after that
+    pass had already run):
+
+      1. The recogniser decodes the same audio DIFFERENTLY in each window —
+         "they want it" / "they wanted it", "Why has he got his GM" / "Why is he
+         called his GM", one copy carrying a leading "You know," the other not.
+         An exact word-run match finds nothing to trim in any of those.
+      2. 201 pairs were BYTE-IDENTICAL, adjacent, and still survived — because
+         that pass is gated on `cur_start < prev_end`, and a batch-rebased turn
+         may carry no usable `abs_end` (`_rebase_batch_turns` only overwrites it
+         when the end offset resolves). So the gate never fires and the exact
+         path is never even reached.
+
+    Hence: no dependence on `abs_end`, and similarity rather than equality.
+
+    The TIME window is the real guard, not the ratio. Two turns from one speaker
+    starting within `max_gap` seconds of each other cannot both be genuine — a
+    person cannot repeat a 25-character sentence in three seconds — so a
+    speaker who really does say something twice is left alone. Measured on that
+    session, the drop count saturates at a 3s gap (751 pairs at 3s, 5s and 8s
+    alike), so widening the window buys nothing and only risks eating real
+    repetition.
+
+    The LONGER text wins: overlapping windows clip the same utterance at
+    different points, and the fuller decode is the one worth keeping. The
+    surviving turn keeps its original position and timestamps.
+
+    A no-op wherever windows do not overlap (legacy whole-file, VAD segments,
+    unbatched chunk sessions): those never produce two same-speaker turns
+    starting within 3s with 85% of their text in common.
+    """
+    kept, dropped, chars_saved = [], 0, 0
+    for t in turns:
+        text = (t.get('text') or '').strip()
+        start = t.get('abs_start')
+        match = None
+        if len(text) >= min_chars and start is not None:
+            for prev in reversed(kept[-lookback:]):
+                p_start = prev.get('abs_start')
+                p_text = (prev.get('text') or '').strip()
+                if p_start is None or prev.get('speaker') != t.get('speaker'):
+                    continue
+                if abs((start - p_start).total_seconds()) > max_gap:
+                    continue
+                if len(p_text) < min_chars:
+                    continue
+                if not _opens_alike(p_text, text):
+                    continue      # different subjects, not one utterance twice
+                if difflib.SequenceMatcher(None, p_text.lower(),
+                                           text.lower()).ratio() >= min_ratio:
+                    match = prev
+                    break
+        if match is None:
+            kept.append(t)
+            continue
+        dropped += 1
+        chars_saved += min(len(match.get('text') or ''), len(text))
+        if len(text) > len(match.get('text') or ''):
+            # Replace in place so the surviving turn keeps its position and
+            # timestamps; copy so a caller's turn dict is never mutated.
+            kept[kept.index(match)] = dict(match, text=text)
+    return kept, {'dropped': dropped, 'chars_saved': chars_saved}
+
+
 # ============================================================
 # Prompt construction
 # ============================================================
@@ -1071,6 +1187,16 @@ def assemble_session_turns(bucket, keys):
             turns.append(dict(turn, source_filename=filename))
     turns.sort(key=lambda t: t['abs_start'])
     turns = _dedup_turn_boundaries(turns)   # drop mobile chunk-overlap dup at seams (no-op pre-chunk)
+    turns, repeat_stats = _dedup_batch_window_repeats(turns)  # drop re-decoded audio (no-op pre-batch)
+    if repeat_stats['dropped']:
+        # Logged, not silent: this number IS the batching rollout's health check.
+        # It should be ~0 while BATCH_TRANSCRIPTION is off and jump the moment it
+        # is switched on. A session where it stays 0 under batching means the
+        # windows stopped overlapping; one where it climbs past ~half the turns
+        # means they overlap too far.
+        logger.info("Batch-window repeats collapsed: %d turn(s), %d chars, "
+                    "%d turn(s) remain", repeat_stats['dropped'],
+                    repeat_stats['chars_saved'], len(turns))
     # Tags first: an announcement wearing one ("[background noise] Recording
     # started.") is invisible to the sentence-matching filter below until the
     # tag is gone. See filter_audio_event_tags.
