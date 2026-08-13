@@ -234,3 +234,76 @@ def test_a_homogeneous_window_is_stored_with_its_provenance(stub_embedder, monke
 def test_an_unknown_op_is_rejected_rather_than_silently_doing_nothing(monkeypatch):
     with pytest.raises(ValueError):
         se.lambda_handler({"op": "sing"}, None)
+
+
+# ---- batched turns -------------------------------------------------------
+#
+# TEST has TEST_BATCH_TRANSCRIPTION=true, so every turn from a newly recorded session
+# points at a stitched object under audio_segments/ with batch-relative offsets. Reading
+# the raw upload is not optional -- the Phase 0 thresholds are raw-audio numbers -- so the
+# coordinates come back through the batch map. Both filename shapes are fed here on
+# purpose: a suite that only knows one of them is how two green features came to disagree.
+
+
+def _batch_map_bytes():
+    import json
+    import batch_stitch as bs
+    ms = [bs.member(0, "users/u/audio/2026-08-13/x_c0000.wav", "2026-08-13T09:00:00", 1.5, 30.0),
+          bs.member(1, "users/u/audio/2026-08-13/x_c0001.wav", "2026-08-13T09:00:30", 0.5, 30.0)]
+    return json.dumps(bs.build_map("sid1", ms, sealed_by="session_close")).encode()
+
+
+BATCH_NAME = "x_c0000_bn2_off0.0_to60.0_srcwav.wav"
+MAP_KEY = "audio_segments/u/2026-08-13/x_c0000_bn2_off0.0_to60.0_srcwav_batch_map.json"
+
+
+def test_a_batched_turn_reads_the_raw_chunk_not_the_stitched_object(stub_embedder,
+                                                                    monkeypatch):
+    raw = "users/u/audio/2026-08-13/x_c0001.wav"
+    s3 = FakeS3({MAP_KEY: _batch_map_bytes(), raw: _wav_bytes(seconds=30.0)})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    monkeypatch.setattr(se, "load_profiles", lambda *a, **k: [])
+    se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
+                       "date": "2026-08-13", "company_id": "c1",
+                       "turns": [{"source_filename": BATCH_NAME,
+                                  "start_sec": 35.0, "end_sec": 40.0}]}, None)
+    assert raw in s3.gets, f"never read the raw chunk; read {s3.gets}"
+    assert not any(g.endswith("_srcwav.wav") for g in s3.gets), (
+        "read the stitched object under audio_segments/ — the Phase 0 thresholds do not "
+        "transfer to it")
+
+
+def test_a_per_chunk_turn_costs_no_map_fetch(stub_embedder, monkeypatch):
+    """The old shape must keep working and keep costing nothing."""
+    key = "users/u/audio/2026-08-13/x_c0000.wav"
+    s3 = FakeS3({key: _wav_bytes()})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    monkeypatch.setattr(se, "load_profiles", lambda *a, **k: [])
+    se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
+                       "date": "2026-08-13", "company_id": "c1",
+                       "turns": [{"source_filename": "x_c0000.wav",
+                                  "start_sec": 0.0, "end_sec": 5.0}]}, None)
+    assert s3.gets == [key]
+
+
+def test_the_batch_offset_is_applied_to_the_audio_that_is_embedded(stub_embedder,
+                                                                   monkeypatch):
+    """Not merely the right file -- the right seconds inside it. Batch 35-40s is member 1's
+    5-10s plus its 0.5s head trim, and a version that read the file but ignored the offset
+    would pass the file assertion above while embedding the wrong person."""
+    raw = "users/u/audio/2026-08-13/x_c0001.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({MAP_KEY: _batch_map_bytes(),
+                                                  raw: _wav_bytes(seconds=30.0)}))
+    monkeypatch.setattr(se, "load_profiles", lambda *a, **k: [])
+    seen = {}
+
+    def embed(audio, sr):
+        seen["n"] = len(audio)
+        return np.ones(192, dtype=np.float32)
+    monkeypatch.setattr(se, "embed_audio", embed)
+    se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
+                       "date": "2026-08-13", "company_id": "c1",
+                       "turns": [{"source_filename": BATCH_NAME,
+                                  "start_sec": 35.0, "end_sec": 40.0}]}, None)
+    assert seen["n"] == pytest.approx(5.0 * 16000, abs=16), (
+        f"embedded {seen['n']} samples for a 5s window")

@@ -807,3 +807,20 @@ def test_an_unset_ceiling_means_no_reservation_at_all():
     guessed number there would throttle a working pipeline."""
     text = open(TEMPLATE, encoding="utf-8").read()
     assert re.search(r"HasTranscribeReserve:\s*!Not \[!Equals \[!Ref TranscribeReservedConcurrency, '0'\]\]", text)
+
+
+def test_the_embedder_can_read_the_batch_map_but_not_the_audio_beside_it():
+    """A batched turn's audio is reached THROUGH the map, and the map lives under
+    audio_segments/ next to the normalised copy this function must never read.
+
+    So the grant is narrowed to `*_batch_map.json`. Granting `audio_segments/*` would be one
+    character shorter and would silently permit reading the normalised audio, on which none
+    of the Phase 0 thresholds hold — a measurement error that produces plausible numbers
+    rather than an error.
+    """
+    t = open(TEMPLATE, encoding="utf-8").read()
+    assert "/audio_segments/*_batch_map.json" in t, (
+        "the embedder cannot read the batch map, so every batched turn 403s or reads the "
+        "wrong seconds")
+    assert "/audio_segments/*'" not in t and '/audio_segments/*"' not in t, (
+        "audio_segments/* is granted wholesale somewhere — the narrowing is the point")

@@ -279,6 +279,58 @@ def is_batch_key(key: str) -> bool:
 # The map — the only sanctioned way to turn a batch offset into a real time
 # ============================================================
 
+def is_batched(source_filename: str) -> bool:
+    """Is this turn's audio a batch object rather than the device's own chunk?
+
+    `_bn` is put there by `build_batch_name` and by nothing else, which is what makes it a
+    safe discriminator. A per-chunk turn must keep costing nothing — no map fetch, no
+    translation — so this is checked before any S3 call.
+    """
+    return "_bn" in (source_filename or "")
+
+
+def locate_in_members(map_doc, start_sec, end_sec) -> list[dict]:
+    """Batch-relative coordinates back to the device's own chunks.
+
+    A batched turn's `source_filename` is the stitched object under `audio_segments/` and
+    its offsets are batch-relative (see `apply_batch_map`). Any consumer that needs the RAW
+    audio — the voiceprint path, whose every threshold was measured on raw audio and does
+    not transfer to the normalised copy — has to come back through here rather than
+    abandoning that rule or parsing the filename.
+
+    Returns one entry per member the window touches, in order, each with the chunk's own key
+    and the window expressed in that chunk's own time. A window spanning a seam returns two
+    entries and the caller concatenates; that is deliberate, because the alternative is
+    silently returning only the first piece.
+
+    `trimmed_head_sec` is ADDED: a member's kept audio begins that far into its chunk, so
+    batch time 0 is chunk time `trimmed_head_sec`. Dropping it shifts every window by up to
+    a second, which at a 3 s floor is a meaningful fraction of somebody else's syllables.
+    """
+    members = (map_doc or {}).get("members") or []
+    if not members:
+        raise ValueError("batch map has no members — cannot place a window without one")
+    start, end = float(start_sec), float(end_sec)
+    out = []
+    for m in members:
+        off = float(m["batch_offset_sec"])
+        kept = float(m["kept_duration_sec"])
+        lo, hi = max(start, off), min(end, off + kept)
+        if hi <= lo:
+            continue
+        head = float(m.get("trimmed_head_sec") or 0.0)
+        out.append({"chunk_key": m["chunk_key"],
+                    "start_sec": lo - off + head,
+                    "end_sec": hi - off + head})
+    if not out:
+        last = float(members[-1]["batch_offset_sec"]) + float(members[-1]["kept_duration_sec"])
+        raise ValueError(
+            f"window [{start}, {end}] lies beyond the batch, which ends at {last}s. Clipping "
+            f"would hand back a shorter clip than asked for, and a short clip is a worse "
+            f"voiceprint with nothing anywhere saying why")
+    return out
+
+
 def map_key_for_audio(batch_audio_key: str) -> str:
     """Where the map for this batch WAV lives: beside the audio that produced it.
 

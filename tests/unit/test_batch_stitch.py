@@ -413,3 +413,80 @@ def test_a_consumed_member_is_not_placed_in_any_bucket():
     members = {i: T + timedelta(seconds=30 * i) for i in range(4)}
     out = bs.plan_buckets(members, window_sec=120, consumed={1, 2})
     assert sorted(i for v in out.values() for i in v) == [0, 3]
+
+
+# ---- reading a batch window back as raw chunk audio ---------------------
+#
+# The voiceprint path must read the DEVICE'S OWN upload: every threshold in
+# voiceprint_utils was measured on raw audio and does not transfer to the normalised,
+# stitched copy under audio_segments/. Batching breaks that by construction -- a batched
+# turn's source_filename IS the stitched file and its offsets are batch-relative
+# (see `apply_batch_map`'s docstring) -- so the coordinates have to come back through the
+# map rather than the rule being abandoned.
+#
+# This arithmetic lives here, next to build_map, for the reason build_map's own docstring
+# gives: a caller recomputing offsets independently is a second implementation of the one
+# piece of arithmetic that must not drift.
+
+
+def _map3():
+    """Three chunks, 30s each, the first with a 1.5s head trim."""
+    ms = [bs.member(0, "users/u/audio/2026-08-13/x_c0000.wav", "2026-08-13T09:00:00", 1.5, 30.0),
+          bs.member(1, "users/u/audio/2026-08-13/x_c0001.wav", "2026-08-13T09:00:30", 0.5, 30.0),
+          bs.member(2, "users/u/audio/2026-08-13/x_c0002.wav", "2026-08-13T09:01:00", 0.25, 30.0)]
+    return bs.build_map("sid1", ms, sealed_by="session_close")
+
+
+def test_a_window_inside_one_member_maps_to_that_chunk():
+    got = bs.locate_in_members(_map3(), 35.0, 40.0)
+    assert len(got) == 1
+    assert got[0]["chunk_key"].endswith("x_c0001.wav")
+    # 35s into the batch is 5s into member 1's KEPT audio, and its kept audio starts
+    # trimmed_head_sec into the chunk itself.
+    assert got[0]["start_sec"] == pytest.approx(5.0 + 0.5)
+    assert got[0]["end_sec"] == pytest.approx(10.0 + 0.5)
+
+
+def test_the_head_trim_is_added_not_ignored():
+    """Member 0 keeps audio from 1.5s in, so batch time 0 is chunk time 1.5 -- dropping the
+    trim silently shifts every window by up to a second, which is a different person's
+    syllables at a 3s floor."""
+    got = bs.locate_in_members(_map3(), 0.0, 4.0)
+    assert got[0]["start_sec"] == pytest.approx(1.5)
+    assert got[0]["end_sec"] == pytest.approx(5.5)
+
+
+def test_a_window_spanning_two_members_returns_both_pieces_in_order():
+    got = bs.locate_in_members(_map3(), 28.0, 33.0)
+    assert [g["chunk_key"][-9:] for g in got] == ["c0000.wav", "c0001.wav"]
+    assert got[0]["start_sec"] == pytest.approx(28.0 + 1.5)
+    assert got[0]["end_sec"] == pytest.approx(30.0 + 1.5)      # to the end of its kept audio
+    assert got[1]["start_sec"] == pytest.approx(0.0 + 0.5)     # from the start of the next
+    assert got[1]["end_sec"] == pytest.approx(3.0 + 0.5)
+
+
+def test_a_window_past_the_end_of_the_batch_raises():
+    """Silently clipping would hand back a shorter clip than asked for, and a shorter clip
+    is a worse voiceprint with nothing anywhere saying why."""
+    with pytest.raises(ValueError, match="beyond"):
+        bs.locate_in_members(_map3(), 100.0, 110.0)
+
+
+def test_an_empty_map_raises_rather_than_returning_nothing():
+    with pytest.raises(ValueError):
+        bs.locate_in_members({"schema": 1, "members": []}, 0.0, 5.0)
+
+
+def test_the_map_key_for_a_batch_audio_object():
+    k = bs.map_key_for_audio(
+        "audio_segments/u/2026-08-13/x_c0000_bn4_off0.0_to114.0_srcwav.wav")
+    assert k == "audio_segments/u/2026-08-13/x_c0000_bn4_off0.0_to114.0_srcwav_batch_map.json"
+
+
+def test_a_per_chunk_filename_is_not_batched():
+    """The discriminator. A raw per-chunk turn must keep costing nothing -- no map fetch,
+    no translation -- and the two shapes are told apart by `_bn`, which build_batch_name
+    puts there and nothing else uses."""
+    assert bs.is_batched("x_c0000_bn4_off0.0_to114.0_srcwav.wav") is True
+    assert bs.is_batched("x_c0000.wav") is False
+    assert bs.is_batched("x_c0000_off1.5_to31.5_srcwav.wav") is False

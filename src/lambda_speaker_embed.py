@@ -32,12 +32,14 @@ Spec: docs/superpowers/specs/2026-08-09-speaker-identity-v2.md
 Plan: docs/superpowers/plans/2026-08-11-speaker-identity-implementation.md (phase 3)
 """
 import io
+import json
 import logging
 import os
 import wave
 
 import numpy as np
 
+import batch_stitch
 import voiceprint_utils as vp
 
 logger = logging.getLogger()
@@ -116,16 +118,49 @@ def _read_wav(data):
     return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0, EXPECTED_RATE
 
 
-def _fetch(user_folder, date, source_filename):
+def _get(key):
     """Raises on a denial rather than returning nothing.
 
     `except ClientError: pass` turned a missing IAM prefix into a 200-with-an-empty-result
     before, and without ListBucket a missing key answers 403 rather than 404, so "not
     allowed" and "not there" are indistinguishable from inside. Both must be loud."""
+    return s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+
+
+def _fetch(user_folder, date, source_filename):
     key = _raw_key(user_folder, date, source_filename)
-    obj = s3().get_object(Bucket=S3_BUCKET, Key=key)
-    audio, sr = _read_wav(obj["Body"].read())
+    audio, sr = _read_wav(_get(key))
     return key, audio, sr
+
+
+def _window_audio(user_folder, date, source_filename, start, end):
+    """The audio of one turn, always taken from the device's own upload.
+
+    A batched turn does not point at a chunk. Its `source_filename` is the stitched object
+    under `audio_segments/` and its offsets are batch-relative — so the naive read builds a
+    key that does not exist, and a merely-corrected filename would still cut the wrong
+    seconds. Both features' tests passed while disagreeing about this, because the speaker
+    tests only ever fed per-chunk names.
+
+    Reading the stitched copy instead is not the fix: every threshold in `voiceprint_utils`
+    was measured on raw audio and none of them transfer to the normalised one. So the
+    coordinates come back through the batch map, which exists for exactly this, and the raw
+    rule survives. A window spanning a seam is concatenated from both chunks rather than
+    silently truncated to the first.
+    """
+    if not batch_stitch.is_batched(source_filename):
+        key, audio, sr = _fetch(user_folder, date, source_filename)
+        return key, audio[int(start * sr):int(end * sr)], sr
+
+    batch_key = f"audio_segments/{user_folder}/{date}/{source_filename}"
+    doc = json.loads(_get(batch_stitch.map_key_for_audio(batch_key)))
+    pieces = batch_stitch.locate_in_members(doc, start, end)
+    parts, rate = [], None
+    for p in pieces:
+        audio, sr = _read_wav(_get(p["chunk_key"]))
+        rate = sr
+        parts.append(audio[int(p["start_sec"] * sr):int(p["end_sec"] * sr)])
+    return pieces[0]["chunk_key"], np.concatenate(parts), rate
 
 
 def load_profiles(company_id, site_id=None):
@@ -160,10 +195,9 @@ def _frames(audio, sr):
 
 
 def _enrol(event):
-    key, audio, sr = _fetch(event["user_folder"], event["date"],
-                            event["source_filename"])
     start, end = float(event["start_sec"]), float(event["end_sec"])
-    clip = audio[int(start * sr):int(end * sr)]
+    key, clip, sr = _window_audio(event["user_folder"], event["date"],
+                                  event["source_filename"], start, end)
 
     verdict = vp.window_is_homogeneous([embed_audio(f, sr) for f in _frames(clip, sr)])
     if verdict is not True:
@@ -201,9 +235,9 @@ def _match(event):
             results.append({"turn": turn, "status": d.status, "name": None,
                             "reason": d.reason})
             continue
-        key, audio, sr = _fetch(event["user_folder"], event["date"],
-                                turn["source_filename"])
-        v = embed_audio(audio[int(start * sr):int(end * sr)], sr)
+        key, clip, sr = _window_audio(event["user_folder"], event["date"],
+                                      turn["source_filename"], start, end)
+        v = embed_audio(clip, sr)
         rows = [{"person_key": p["person_key"],
                  "score": vp.cosine(v, p["embedding"])} for p in profiles]
         d = vp.decide_name(vp.aggregate_scores(rows), duration_s=duration)

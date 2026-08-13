@@ -2727,6 +2727,12 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/users/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/models/*
+                # The batch map sidecar ONLY -- narrowed to *_batch_map.json so this
+                # function still cannot read the normalised audio beside it. A batched
+                # turn's offsets are batch-relative and its filename is the stitched
+                # object; the map is what takes both back to the device's own upload,
+                # which is the audio every voiceprint threshold was measured on.
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*_batch_map.json
             # Without ListBucket a missing key answers 403, not 404, and "not allowed"
             # becomes indistinguishable from "not there" inside the function.
             - Effect: Allow
@@ -2737,6 +2743,7 @@ Resources:
                   s3:prefix:
                     - users/*
                     - models/*
+                    - audio_segments/*
 
   SuggestionWriterFunction:
     Type: AWS::Serverless::Function
