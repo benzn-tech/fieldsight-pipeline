@@ -360,3 +360,24 @@ def test_a_legacy_first_index_seal_cannot_shadow_a_bucket_claim(table):
     bucket = bl.bucket_for_index(_wrows([(5, 0)])[0])
     assert bucket > 9999
     assert bl.claim_seal(table, SID, bucket, [5, 6], NOW) is not None
+
+
+def test_reaching_the_cap_does_not_seal_a_bucket_that_can_still_grow():
+    """Real chunks arrive 28 s apart, not 30, so FIVE fit in a 120 s bucket.
+
+    Treating `len(members) >= cap` as "ready" seals the first four and orphans the fifth
+    into a straggler redrive -- one wasted per-chunk transcription per bucket, and on the
+    real 153-chunk session ten buckets hold five. The cap bounds the REQUEST; what makes a
+    bucket ready is that nothing can still join it.
+
+    Found by computing the buckets offline before re-running the replay, which is the only
+    reason it was not paid for again.
+    """
+    rows = _wrows([(i, i * 28) for i in range(5)])          # all five inside one 120 s bucket
+    out = bl.pending_buckets(rows, NOW + 10, grace_sec=150, cap=4)
+    assert out["ready"] == [], "the bucket can still grow; the cap is not a reason to seal"
+
+    rows += _wrows([(5, 140)], at=NOW)                       # a member of the NEXT bucket
+    out = bl.pending_buckets(rows, NOW + 10, grace_sec=150, cap=4)
+    ready = {k: v for k, v in out["ready"]}
+    assert [0, 1, 2, 3, 4] in ready.values(), f"now it is closed and seals whole: {out}"

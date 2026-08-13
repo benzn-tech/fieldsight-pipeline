@@ -221,6 +221,10 @@ def test_the_fourth_member_produces_a_batch_and_its_map(wired):
     mp, s3, ledger, calls = wired
     for i in range(4):
         mod.lambda_handler(_event(unit_key(i)), None)
+    # Grace elapses only now. Setting it to zero BEFORE the loop makes the first chunk a
+    # bucket of one and bypasses it -- which is correct behaviour and the wrong test.
+    mp.setattr(mod, "BATCH_SEAL_DEADLINE_SEC", 0)
+    mod.lambda_handler(_event(unit_key(3)), None)
     maps = s3.put_keys("_batch_map.json")
     wavs = [k for k in s3.put_keys(".wav") if bs.is_batch_key(k)]
     assert len(maps) == 1 and len(wavs) == 1
@@ -235,6 +239,8 @@ def test_the_map_is_written_before_the_wav_that_triggers_transcription(wired):
     mp, s3, ledger, calls = wired
     for i in range(4):
         mod.lambda_handler(_event(unit_key(i)), None)
+    mp.setattr(mod, "BATCH_SEAL_DEADLINE_SEC", 0)
+    mod.lambda_handler(_event(unit_key(3)), None)
     keys = s3.put_keys()
     # `is_batch_key` matches the map too — it carries the same `_bn{K}` stem — so the WAV
     # has to be selected by extension as well. Harmless in the handler (a .json has no
@@ -299,6 +305,8 @@ def test_an_unreadable_raw_upload_does_not_block_the_batch(wired):
     del s3.objects[raw_key(2)]
     for i in range(4):
         mod.lambda_handler(_event(unit_key(i)), None)
+    mp.setattr(mod, "BATCH_SEAL_DEADLINE_SEC", 0)      # the bucket is over
+    mod.lambda_handler(_event(unit_key(3)), None)
     maps = s3.put_keys("_batch_map.json")
     assert len(maps) == 1
     doc = json.loads(s3.puts[[p["Key"] for p in s3.puts].index(maps[0])]["Body"])
