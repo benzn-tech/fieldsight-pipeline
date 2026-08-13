@@ -192,14 +192,20 @@ REAL_SESSION = "ben_ucpk2_2026-08-13_11-49-00_sid9db9293e82b94a4d9611572b1233f82
 def test_the_session_is_derived_from_a_real_transcript_filename():
     """The overlay looked rows up by the SEGMENT FILENAME, while every row is stored under
     the session id. Two different keys, so the query returned nothing, every time, silently
-    — `unmatchedNames: 0` because there were no rows to orphan."""
-    assert tno.session_base(REAL_TRANSCRIPT) == REAL_SESSION
+    — `unmatchedNames: 0` because there were no rows to orphan.
+
+    This test originally asserted the whole prefix up to `_sid…`, which encoded a contract
+    that turned out to be wrong: that prefix holds the CHUNK's start time, so the chunks of
+    one recording keyed differently. The session is the sid.
+    """
+    assert tno.session_base(REAL_TRANSCRIPT) == tno.session_base(REAL_SESSION)
+    assert tno.session_base(REAL_TRANSCRIPT) in REAL_SESSION
 
 
 def test_a_per_chunk_filename_yields_the_same_session():
     plain = ("ben_ucpk2_2026-08-13_11-49-00_sid9db9293e82b94a4d9611572b1233f82d"
              "_c0000.wav")
-    assert tno.session_base(plain) == REAL_SESSION
+    assert tno.session_base(plain) == tno.session_base(REAL_TRANSCRIPT)
 
 
 def test_a_filename_with_no_session_id_yields_nothing_rather_than_a_guess():
@@ -212,3 +218,37 @@ def test_the_audio_and_the_transcript_name_the_same_turn():
     idx = tno.build([_row(f"{REAL_AUDIO}@35.0", "Ben L")])
     assert tno.lookup(idx, REAL_TRANSCRIPT, 35.0)["display_name"] == "Ben L"
     assert tno.lookup(idx, REAL_AUDIO, 35.0)["display_name"] == "Ben L"
+
+
+# ---- what makes two files the same session -----------------------------
+#
+# The prefix before `_sid` carries the CHUNK's own start time, not the session's. So the
+# per-chunk files of one recording — …_11-49-00_sid9db…_c0000, …_11-49-32_sid9db…_c0001 —
+# produced DIFFERENT session keys, and a session of eleven chunks looked like eleven
+# sessions of one turn each. Propagation then had nothing to cluster and correctly did
+# nothing, which read as "the feature does not work".
+#
+# Two files are the same session iff their sid matches. Nothing else in the name is stable.
+
+SID = "sid9db9293e82b94a4d9611572b1233f82d"
+CHUNK_A = f"ben_ucpk2_2026-08-13_11-49-00_{SID}_c0000_bn4_off0.0_to114.0_srcwav.json"
+CHUNK_B = f"ben_ucpk2_2026-08-13_11-49-32_{SID}_c0001.wav"
+
+
+def test_two_chunks_of_one_recording_are_one_session():
+    assert tno.session_base(CHUNK_A) == tno.session_base(CHUNK_B)
+
+
+def test_the_session_key_is_the_sid():
+    assert SID[3:] in tno.session_base(CHUNK_A)
+
+
+def test_a_different_recording_is_a_different_session():
+    other = "ben_ucpk2_2026-08-13_18-10-00_sida2d5c7ee7fa843959481f88040259d05_c0000.wav"
+    assert tno.session_base(other) != tno.session_base(CHUNK_A)
+
+
+def test_the_correction_path_parameter_resolves_to_the_same_session():
+    """org-api receives the session in the URL as `{device}_{time}_sid{hex}` — the form the
+    device reports. It has to land on the same key as the filenames do."""
+    assert tno.session_base(f"ben_ucpk2_2026-08-13_11-49-00_{SID}") == tno.session_base(CHUNK_A)

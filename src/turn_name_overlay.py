@@ -53,17 +53,21 @@ def _stem(name):
 
 
 def session_base(filename):
-    """The session a turn belongs to: everything up to and including `_sid{32hex}`.
+    """The session a turn belongs to: the `sid{32hex}` and nothing else.
 
-    Rows are stored under the session id, and the overlay was looking them up by the segment
-    FILENAME — two different keys, so the query returned nothing every time, and returned it
-    quietly: no rows means no orphans, so `unmatchedNames` read 0 and the failure looked like
-    "this session was never corrected".
+    NOT the prefix before it. That prefix carries the CHUNK's own start time, so the files
+    of one recording — `…_11-49-00_sid9db…_c0000`, `…_11-49-32_sid9db…_c0001` — produced
+    different keys, and a session of eleven chunks looked like eleven sessions holding one
+    turn each. Propagation then had nothing to cluster and correctly did nothing, which
+    reads as "the feature does not work".
+
+    Accepts both the filenames and the `{device}_{time}_sid{hex}` form org-api receives in
+    the URL, because they have to land on the same key.
 
     None rather than a guess when there is no session id: a wrong session key reads another
     session's names onto this one, which is worse than no names.
     """
-    m = re.match(r"^(.*_sid[0-9a-f]{32})", str(filename or ""))
+    m = re.search(r"(sid[0-9a-f]{32})", str(filename or ""))
     return m.group(1) if m else None
 
 

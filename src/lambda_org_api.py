@@ -1215,10 +1215,14 @@ def _session_turns(folder, date, session_base):
     except Exception:
         logger.warning("speaker correction: no transcripts for %s/%s", folder, date)
         return []
+    # Both sides through the same normaliser. Comparing a normalised filename key against
+    # the raw URL parameter is how one of these ends up matching nothing — the two spellings
+    # of a session are not equal as strings, only as sessions.
+    want = turn_name_overlay.session_base(session_base)
     out = []
     for seg in payload.get("speaker_segments") or []:
         name = seg.get("source_filename") or ""
-        if turn_name_overlay.session_base(name) != session_base:
+        if not want or turn_name_overlay.session_base(name) != want:
             continue
         start = seg.get("chunk_start")
         if start is None:
