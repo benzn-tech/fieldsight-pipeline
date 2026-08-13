@@ -184,6 +184,16 @@ of building a second psycopg layer and adding python3.12 to both deploy workflow
 **Verify after deploy by invoking it**, not by reading the template — that is how the defect
 was found, and no test could have caught it.
 
+### P4 — the in-VPC writer — **DONE 2026-08-13**
+
+Deployed to test and verified by invoking it, not by reading the template: a deliberately
+fake `company_id` came back `ForeignKeyViolation`, which proves psycopg imported, the VPC
+reached Aurora, the SQL executed against the real table and 0040's columns exist — with zero
+rows written. That is the same check that caught the embedder being 100% non-functional
+behind a green deploy.
+
+`simulate-principal-policy` on the live roles: the embedder may invoke the writer, `allowed`.
+
 ### P4 — the in-VPC writer (new function, inert without a caller)
 
 Persists rows, applies precedence and supersession **in one transaction** (supersede then
@@ -194,6 +204,18 @@ new resource type** — a missing IAM prefix here has twice produced a silent su
 than an error. `simulate-principal-policy` against the deployed roles, using the bucket name
 read from the function's own environment (checking against a guessed bucket name produced
 three false denials on 2026-08-13).
+
+### P5 — the org-api endpoints — **HELD 2026-08-13, deliberately**
+
+Not blocked on anything technical. **Another session is actively editing `lambda_org_api`'s
+tests**, and P5 is the first phase here that touches that file — the highest-traffic function
+in the platform and the one synchronous, no-retry path (a throttle there is an immediate 5XX
+and permanently lost device data, BUG-43).
+
+Two sessions editing it the same night is how a merge conflict becomes a silent behaviour
+change in the one place that cannot absorb one. Everything before this point ships inert and
+composes with anything; this does not. It waits until the other session's work has landed and
+the file has one owner again.
 
 ### P5 — the org-api endpoints (changes live behaviour, gated)
 
