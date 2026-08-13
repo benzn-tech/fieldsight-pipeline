@@ -16,11 +16,13 @@ different-person ≤ +0.205); clustering runs on **turn-vs-turn**, a distributio
 measured. If no merge threshold separates three speakers whose ground truth is known, the
 mechanism does not ship and the effort moves to Phase 5 matching.
 
-1. **Preserve the inputs first.** The session audio (`sid318601b2…`, `sidb49627d7…`,
-   Ben_UCPK2, 2026-08-11) lives in prod S3 under `users/…/audio/`; Phase 0 recorded **"no
-   preserved artifacts"**, so confirm the objects still exist and copy them somewhere outside
-   the ordinary data path before anything else. A lifecycle rule deleting them mid-project
-   ends the ability to re-derive any of this.
+1. ~~**Preserve the inputs first.**~~ **Checked 2026-08-13: they are safe.** 117 chunks
+   remain under `users/Ben_UCPK2/audio/2026-08-11/` in prod, and the ground-truth fixture is
+   in the repo. The bucket's three lifecycle rules cover `transcripts/` (90 d),
+   `pending_downloads/` (7 d) and voice clips — **none reaches `users/`**, which is the
+   deletion mechanism this step existed to get ahead of. So no copy is made: a second copy in
+   the same bucket shares the blast radius anyway, and the risk it would insure against does
+   not exist. Re-check if a lifecycle rule is ever added over `users/`.
 2. Ground truth is checked in (`scripts/fixtures/2026-08-11-blockv-scripts.json`) and
    `scripts/speaker_session_eval.py` already derives per-turn truth from it. Extend it to
    emit the **turn-vs-turn cosine distance matrix** rather than adding a new script.
@@ -42,7 +44,22 @@ tentative-only, `(可能是 …)` **is** the entire visible surface. Showing the
 route to correction data and also puts a name the system does not stand behind in front of a
 human. The viewer work cannot be sequenced without the answer.
 
-**This is the user's call, not a default to be assumed.**
+**Decided 2026-08-13: show them, in the transcript viewer only, with a one-tap confirm.**
+
+The alternative — confirmed-only plus an "unnamed" count — makes step 1 collect nothing.
+Corrections are the calibration input, and a user cannot correct a name they were never shown;
+step 1 would run for weeks and produce no threshold, which is the one thing it exists to do.
+
+The anchoring objection is real and is answered by the affordance rather than by hiding the
+name: `(可能是 …)` next to a **confirm** and a **correct** control asks the reader a question
+instead of asserting an answer, and turns silence — today indistinguishable from agreement —
+into an explicit signal. Two constraints hold it in place: the tentative name never leaves the
+viewer (not minutes, not email, not the responsible party), and a propagated name renders
+visibly differently from one the user asserted.
+
+Reversible: it is what step 1 displays, and step 2 replaces it either way. If the first real
+session shows users accepting plausible wrong names, the fallback is the confirmed-only
+display, and that is a viewer change with no effect on what has been collected.
 
 ## Decisions this plan makes, so they are not made silently later
 
