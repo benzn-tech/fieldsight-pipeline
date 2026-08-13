@@ -152,6 +152,7 @@ from text_normalize import diff_candidates, first_match_span, normalize, occurre
 from keyframe_selection import keyframe_seconds
 from photo_binding import parse_time_range
 import batch_stitch
+import turn_name_overlay
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
 logger = logging.getLogger()
@@ -5347,6 +5348,12 @@ def _read_org_transcripts(date, folder, start_time, end_time):
                     "end": round(abs_end, 1),
                     "time_label": f"{ah:02d}:{am:02d}:{asec_v:02d}",
                     "duration": round(seg_end - seg_start, 1),
+                    # The pair a stored name is keyed by. `start` above is ABSOLUTE clock
+                    # seconds; `speaker_turn_names.turn_ref` is source_filename + the
+                    # in-file offset, so the overlay needs the un-shifted value or it
+                    # matches nothing and every name silently fails to appear.
+                    "source_filename": filename,
+                    "chunk_start": round(seg_start, 3),
                 })
 
             # Word-level filtered text
@@ -5665,6 +5672,40 @@ def get_org_report_history(conn, caller, event):
     return ok(_read_org_report_history(folder_scope, limit))
 
 
+def _apply_speaker_names(conn, caller, payload):
+    """Lay the stored names over the turns this response is already carrying.
+
+    Read-time, never baked in: a correction can be withdrawn, and re-running extraction
+    rewrites the artifact underneath. Gated on the same switch as everything else, so `off`
+    returns exactly what this endpoint returned before the feature existed.
+
+    Two things are reported rather than hidden. `speaker_name` always arrives with its
+    `speaker_state`, because a caller holding a bare name cannot tell tentative from
+    confirmed — and tentative must not leave the transcript viewer. And `unmatchedNames`
+    counts rows that matched no turn: an orphan is a name the user set that is no longer
+    being shown, and silence there reads as "this turn was never named", which is a
+    different and wrong statement.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return payload
+    segs = payload.get("speaker_segments") or []
+    if not segs:
+        return payload
+    bases = {s.get("source_filename") for s in segs if s.get("source_filename")}
+    rows = []
+    for base in sorted(b for b in bases if b):
+        rows.extend(voiceprints.live_turn_names(conn, str(caller["company_id"]), base))
+    index = turn_name_overlay.build(rows)
+    for seg in segs:
+        hit = turn_name_overlay.lookup(index, seg.get("source_filename") or "",
+                                       seg.get("chunk_start", seg.get("start", 0.0)))
+        if hit:
+            seg["speaker_name"] = hit["display_name"]
+            seg["speaker_state"] = hit["state"]
+    payload["unmatchedNames"] = turn_name_overlay.orphans(index)
+    return payload
+
+
 def get_org_transcripts(conn, caller, event):
     """GET /api/org/transcripts?date=&user=&start=&end= -- Aurora-identity
     transcript read (Timeline "Transcript" tab bug fix). scripts/api/
@@ -5691,7 +5732,8 @@ def get_org_transcripts(conn, caller, event):
     folder, err = _resolve_org_media_folder(conn, caller, user, what="transcripts")
     if err is not None:
         return err
-    return ok(_read_org_transcripts(date, folder, p.get("start") or "", p.get("end") or ""))
+    out = _read_org_transcripts(date, folder, p.get("start") or "", p.get("end") or "")
+    return ok(_apply_speaker_names(conn, caller, out))
 
 
 # ----------------------------------------------------------
