@@ -184,14 +184,21 @@ def pending_buckets(rows, now: int, grace_sec: int, window_sec: float = 120.0,
         if table is not None and session_id is not None                 and seal_status(table, session_id, bucket) == "sealed":
             stragglers.extend(idxs)
             continue
-        # Readiness is "nothing can still join", NOT "the cap is reached". Real chunks
-        # arrive 28 s apart, so FIVE fit a 120 s bucket -- treating the cap as readiness
-        # sealed the first four and orphaned the fifth into a straggler redrive, one wasted
-        # per-chunk transcription per bucket, ten of them on the real 153-chunk session.
-        # The cap bounds the request; it says nothing about whether the window is over.
-        if _bucket_is_closed(idxs, times, bucket, window_sec):
-            ready.append((bucket, idxs))
-            continue
+        # ELAPSED QUIET IS THE ONLY SOUND READINESS TEST, and both cheaper-looking ones
+        # have now been measured wrong:
+        #
+        #   * `len(members) >= cap` -- real chunks arrive 28 s apart, so FIVE fit a 120 s
+        #     bucket; sealing at four orphaned the fifth on ten buckets of one real session.
+        #   * "a member of a LATER bucket is visible" -- during a burst a worker sees only
+        #     part of the session, and not merely from eventual consistency: chunk 100's
+        #     event can be processed before chunk 5 has registered at all. A worker holding
+        #     {5, 100} concluded bucket(5) was over and sealed it with one member. The
+        #     acceptance replay turned 153 chunks into 72 singleton bypasses and ZERO
+        #     batches.
+        #
+        # Seeing a later member cannot prove this bucket is complete. Waiting costs
+        # `grace_sec` of latency on every batch; not waiting costs the batching doing
+        # nothing at all under exactly the arrival pattern it was built for.
         newest = max(int(by_index[i].get("registered_at") or 0) for i in idxs)
         if now - newest >= grace_sec:
             ready.append((bucket, idxs))
@@ -204,17 +211,9 @@ def pending_buckets(rows, now: int, grace_sec: int, window_sec: float = 120.0,
     return {"ready": ready, "stragglers": sorted(set(stragglers))}
 
 
-def _bucket_is_closed(idxs, times, bucket, window_sec) -> bool:
-    """True when a member of a LATER bucket has already registered.
-
-    Nothing can still join a bucket whose successor has arrived, so it seals on arrival
-    exactly as the contiguous-window rule did — the common case does not wait for grace.
-    """
-    from batch_stitch import bucket_of
-
-    return any(bucket_of(t, window_sec) > bucket for t in times.values())
-
-
+# `_bucket_is_closed` was removed on 2026-08-13. It judged a bucket complete because a
+# later one was visible, which a partial burst snapshot makes false — and a dead
+# function with a plausible name is how a wrong rule comes back.
 def pending_windows(rows, now: int, grace_sec: int,
                     window_sec: float = 120.0,
                     cap: int = DEFAULT_MAX_BATCH) -> list[list[int]]:

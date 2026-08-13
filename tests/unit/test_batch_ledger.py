@@ -377,7 +377,31 @@ def test_reaching_the_cap_does_not_seal_a_bucket_that_can_still_grow():
     out = bl.pending_buckets(rows, NOW + 10, grace_sec=150, cap=4)
     assert out["ready"] == [], "the bucket can still grow; the cap is not a reason to seal"
 
-    rows += _wrows([(5, 140)], at=NOW)                       # a member of the NEXT bucket
-    out = bl.pending_buckets(rows, NOW + 10, grace_sec=150, cap=4)
-    ready = {k: v for k, v in out["ready"]}
-    assert [0, 1, 2, 3, 4] in ready.values(), f"now it is closed and seals whole: {out}"
+    # A member of the NEXT bucket does NOT make this one ready either -- that rule was
+    # tried and removed the same day: during a burst a worker can see a later chunk before
+    # this bucket's own members have registered, and it sealed them one at a time.
+    rows += _wrows([(5, 140)], at=NOW)
+    assert bl.pending_buckets(rows, NOW + 10, grace_sec=150, cap=4)["ready"] == []
+
+    ready = {k: v for k, v in bl.pending_buckets(rows, NOW + 400, grace_sec=150, cap=4)["ready"]}
+    assert [0, 1, 2, 3, 4] in ready.values(), f"past grace it seals WHOLE, all five: {ready}"
+
+
+def test_a_partial_snapshot_spanning_buckets_does_not_seal_an_incomplete_one():
+    """The acceptance replay failed on exactly this, and it is a defect I introduced.
+
+    153 chunks arrived at once. Each worker sees only part of the session -- not merely
+    because DynamoDB reads are eventually consistent, but because chunk 100's event can be
+    processed before chunk 5 has registered at all. A worker holding {5, 100} concluded that
+    bucket(5) was over, because it could see a LATER bucket, and sealed it with one member.
+    153 chunks became 72 singleton bypasses and ZERO batches.
+
+    Seeing a later member cannot prove this bucket is complete. Only elapsed quiet can.
+    """
+    rows = _wrows([(5, 150)]) + _wrows([(100, 3000)])
+    out = bl.pending_buckets(rows, NOW + 10, grace_sec=150)
+    assert out["ready"] == [], \
+        f"an incomplete bucket must wait, whatever else is visible: {out}"
+
+    out = bl.pending_buckets(rows, NOW + 400, grace_sec=150)
+    assert len(out["ready"]) == 2, "past grace, both seal"
