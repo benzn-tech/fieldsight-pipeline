@@ -47,6 +47,7 @@ import wave
 import numpy as np
 
 import batch_seal
+import transcript_utils
 import batch_stitch
 import turn_name_overlay
 import voiceprint_utils as vp
@@ -159,6 +160,14 @@ def _window_audio(user_folder, date, source_filename, start, end):
     """
     if not batch_stitch.is_batched(source_filename):
         key, audio, sr = _fetch(user_folder, date, source_filename)
+        # The SAME missing term `batch_seal.raw_window_for_member` documents, on the branch
+        # that does not go through it. `_raw_key` strips `_off{T}` to reach the device's
+        # upload, so a position measured inside the VAD unit is short by T once the audio
+        # is the whole chunk. Wrong audio, no error, and every voiceprint number computed
+        # on it looks ordinary.
+        offsets = transcript_utils.extract_vad_offsets_from_filename(source_filename)
+        unit_start = float((offsets or [None])[0] or 0.0)
+        start, end = start + unit_start, end + unit_start
         return key, audio[int(start * sr):int(end * sr)], sr
 
     batch_key = f"audio_segments/{user_folder}/{date}/{source_filename}"
