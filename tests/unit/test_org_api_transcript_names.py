@@ -47,7 +47,8 @@ def wired(monkeypatch):
     monkeypatch.setattr(org, "_resolve_org_media_folder",
                         lambda conn, caller, user, what=None: ("Ada_L", None))
     monkeypatch.setattr(org, "_read_org_transcripts",
-                        lambda date, folder, s, e: json.loads(json.dumps(SEGS)))
+                        # `conn=` is passed since the reader learned to consult the deletion tombstones.
+                        lambda date, folder, s, e, conn=None: json.loads(json.dumps(SEGS)))
     monkeypatch.setattr(org.voiceprints, "live_turn_names", lambda conn, co, base: [
         {"turn_ref": "ben_ucpk2_2026-08-13_11-49-00_sid9db9293e82b94a4d9611572b1233f82d_c0000_bn4_off0.0_to114.0_srcwav.wav@12.5", "display_name": "Ben L",
          "state": "tentative", "source": "correction_propagation",
