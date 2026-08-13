@@ -247,3 +247,36 @@ def test_a_filename_that_declares_no_span_is_not_second_guessed(wired):
     res = org.lambda_handler(_event(dict(BODY, source_filename="x_c0000.wav",
                                          start_sec=900.0, end_sec=905.0)), None)
     assert res["statusCode"] == 202, _body(res)
+
+
+def test_the_artifact_carries_this_session_s_turns_and_no_others(wired, monkeypatch):
+    """The embedder cannot cluster a session it cannot see, and it must not be handed
+    another session's turns: a day holds several, and two sessions routinely have turns
+    starting at the same offset. Mistaking one for the other cost two rounds of debugging."""
+    mine = ("ben_2026-08-13_11-49-00_sid" + "0" * 32 + "_c0000_bn4_off0.0_to114.0_srcwav.json")
+    other = ("ben_2026-08-13_18-10-00_sid" + "1" * 32 + "_c0000_bn4_off0.0_to114.0_srcwav.json")
+    monkeypatch.setattr(org, "_read_org_transcripts", lambda d, f, a, b: {
+        "speaker_segments": [
+            {"source_filename": mine, "chunk_start": 4.88, "duration": 4.0},
+            {"source_filename": mine, "chunk_start": 26.5, "duration": 6.0},
+            {"source_filename": other, "chunk_start": 4.88, "duration": 4.0},
+        ]})
+    ev = _event(BODY)
+    ev["path"] = "/api/org/sessions/ben_2026-08-13_11-49-00_sid" + "0" * 32 + \
+                 "/speaker-corrections"
+    org.lambda_handler(ev, None)
+    doc = json.loads(wired.puts[0]["Body"])
+    assert [t["start_sec"] for t in doc["turns"]] == [4.88, 26.5], (
+        "another session's turn was handed to the clusterer")
+
+
+def test_a_session_with_no_readable_transcript_still_queues_the_correction(wired,
+                                                                           monkeypatch):
+    """The turn the user pointed at is a fact regardless. Losing it because the transcript
+    is not ready would be worse than propagating nothing."""
+    def boom(*a, **k):
+        raise RuntimeError("S3 down")
+    monkeypatch.setattr(org, "_read_org_transcripts", boom)
+    res = org.lambda_handler(_event(BODY), None)
+    assert res["statusCode"] == 202
+    assert json.loads(wired.puts[0]["Body"])["turns"] == []

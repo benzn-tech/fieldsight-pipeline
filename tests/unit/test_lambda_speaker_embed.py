@@ -492,3 +492,107 @@ def test_the_name_the_user_typed_reaches_the_writer(stub_embedder, monkeypatch):
     se.lambda_handler(_s3_event(key), None)
     assert sent["results"][0]["display_name"] == "Ben L", (
         "the name never left the embedder; the row would name nobody")
+
+
+# ---- in-session propagation --------------------------------------------
+#
+# The headline promise: correct one passage and the rest of that person's speech follows.
+# Until now the correction path wrote exactly ONE row -- the turn the user pointed at -- so
+# "propagation: queued" was a claim about a mechanism that existed and was never called.
+#
+# The unit is a VOICE, not a turn: the session is clustered and the correction NAMES A
+# CLUSTER. Two spec revisions died trying to score turns against the corrected window
+# directly, because `decide_name` refuses to confirm on a single candidate.
+
+
+def _prop_request(turns, ref_start=0.0, ref_end=5.0):
+    return {"request_id": "r1", "session_base": "s1", "company_id": "c1",
+            "user_folder": "u", "date": "2026-08-13",
+            "correction": {"source_filename": "x_c0000.wav", "start_sec": ref_start,
+                           "end_sec": ref_end, "display_name": "Ben L"},
+            "turns": turns, "profiles": []}
+
+
+def _two_voice_session(monkeypatch, sent):
+    """Six turns, two voices, alternating. The reference is turn 0, so voice A is Ben."""
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    turns = [{"source_filename": "x_c0000.wav", "start_sec": float(i * 10),
+              "end_sec": float(i * 10 + 5)} for i in range(6)]
+    s3 = FakeS3({key: _json.dumps(_prop_request(turns)).encode(),
+                 "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=70.0)})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    a = np.ones(192, dtype=np.float32)
+    b = np.concatenate([np.ones(96), -np.ones(96)]).astype(np.float32)
+    seq = [a, a, b, a, b, a, b]          # reference embed first, then the six turns
+    calls = {"n": 0}
+
+    def embed(audio, sr):
+        v = seq[min(calls["n"], len(seq) - 1)]
+        calls["n"] += 1
+        return v
+    monkeypatch.setattr(se, "embed_audio", embed)
+    return key
+
+
+def test_one_correction_names_every_turn_of_that_voice(monkeypatch):
+    sent = {}
+    key = _two_voice_session(monkeypatch, sent)
+    se.lambda_handler(_s3_event(key), None)
+    named = [r for r in sent["results"] if r.get("display_name") == "Ben L"]
+    assert len(named) > 1, (
+        "only the corrected turn was named; the propagation the response promises never ran")
+
+
+def test_the_other_voice_is_not_named(monkeypatch):
+    """The failure that matters. Naming the whole session would be worse than naming one
+    turn, because it is a confident wrong answer about somebody who was in the room."""
+    sent = {}
+    key = _two_voice_session(monkeypatch, sent)
+    se.lambda_handler(_s3_event(key), None)
+    # The alternating fixture makes turns at 0/20/40 one voice and 10/30/50 the other.
+    # A named turn from the second set means the two voices were merged.
+    named = {r["turn_ref"] for r in sent["results"]}
+    assert not (named & {"x_c0000.wav@10.0", "x_c0000.wav@30.0", "x_c0000.wav@50.0"}), (
+        f"the second voice was swept up with the first: {sorted(named)}")
+    assert named >= {"x_c0000.wav@20.0", "x_c0000.wav@40.0"}, (
+        f"the first voice was not fully named: {sorted(named)}")
+
+
+def test_the_asserted_turn_is_marked_and_the_rest_are_not(monkeypatch):
+    """Only one of these rows is a claim a person made. The writer refuses a profile id to
+    any row not marked asserted, which is what stops the machine confirming its own
+    profiles."""
+    sent = {}
+    key = _two_voice_session(monkeypatch, sent)
+    se.lambda_handler(_s3_event(key), None)
+    asserted = [r for r in sent["results"] if r.get("asserted")]
+    assert len(asserted) == 1
+    assert asserted[0]["turn_ref"].endswith("@0.0")
+
+
+def test_propagated_rows_are_capped_at_tentative(monkeypatch):
+    """No calibrated margin exists yet — Gate A froze the CLUSTERING threshold, not the one
+    that decides confirmed vs tentative. Until it does, an inferred name is a suggestion."""
+    sent = {}
+    key = _two_voice_session(monkeypatch, sent)
+    se.lambda_handler(_s3_event(key), None)
+    for r in sent["results"]:
+        if not r.get("asserted"):
+            assert r["state"] != "confirmed", "an inferred name was presented as certain"
+
+
+def test_a_session_with_no_turns_still_names_the_corrected_one(stub_embedder,
+                                                              monkeypatch):
+    """The artifact may carry no turn list — an older producer, or a session whose transcript
+    is not ready. That must degrade to today's behaviour, not fail."""
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    s3 = FakeS3({key: _json.dumps(_prop_request([])).encode(),
+                 "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes()})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    se.lambda_handler(_s3_event(key), None)
+    assert len(sent["results"]) == 1 and sent["results"][0]["asserted"]

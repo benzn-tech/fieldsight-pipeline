@@ -1202,6 +1202,32 @@ def session_report_generate(conn, caller, session_id, event):
 _CORRECTION_ROLES = ("admin", "gm", "pm", "site_manager", "platform_admin")
 
 
+def _session_turns(folder, date, session_base):
+    """Every turn of one session, as (file, offset) pairs the embedder can cut audio with.
+
+    Reads the same transcripts the viewer does and keeps only this session — a day can hold
+    several, and two sessions routinely have turns starting at the same offset, so filtering
+    by session id is not optional. (Not filtering cost two rounds of debugging on 08-14, when
+    a turn from another session at the same offset looked like a matching failure.)
+    """
+    try:
+        payload = _read_org_transcripts(date, folder, "", "")
+    except Exception:
+        logger.warning("speaker correction: no transcripts for %s/%s", folder, date)
+        return []
+    out = []
+    for seg in payload.get("speaker_segments") or []:
+        name = seg.get("source_filename") or ""
+        if turn_name_overlay.session_base(name) != session_base:
+            continue
+        start = seg.get("chunk_start")
+        if start is None:
+            continue
+        out.append({"source_filename": name, "start_sec": float(start),
+                    "end_sec": float(start) + float(seg.get("duration") or 0.0)})
+    return out
+
+
 def speaker_corrections(conn, caller, session_base, event):
     """POST /api/org/sessions/{session_base}/speaker-corrections
 
@@ -1296,6 +1322,11 @@ def speaker_corrections(conn, caller, session_base, event):
         "correction": {"source_filename": src, "start_sec": start, "end_sec": end,
                        "display_name": name},
         "profiles": profiles,
+        # The session's own turns, so the embedder can cluster it and let the correction
+        # name a VOICE rather than a single passage. Without them it can only write the one
+        # turn the user pointed at, and "the whole meeting follows" is a claim about a
+        # mechanism that never runs. org-api is the half that can read transcripts.
+        "turns": _session_turns(folder, date_m.group(1), session_base),
     }
     s3().put_object(Bucket=LAKE_BUCKET,
                     Key=f"voiceprint_requests/{company_id}/{session_base}/{request_id}.json",

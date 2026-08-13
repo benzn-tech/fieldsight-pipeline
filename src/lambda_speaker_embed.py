@@ -266,6 +266,78 @@ def invoke_writer(payload):
     return resp
 
 
+MAX_PROPAGATION_TURNS = int(os.environ.get("SPEAKER_PROPAGATION_MAX_TURNS", "300"))
+
+
+def _propagate(folder, date, turns, reference, display_name, asserted_ref):
+    """Correct one passage, name that person's other passages in the same session.
+
+    The unit is a VOICE, not a turn. Two spec revisions died scoring turns against the
+    corrected window directly, because `decide_name` refuses to confirm on a single
+    candidate — deliberately, since confirming on one candidate means confirming on an
+    absolute similarity. Clustering the session and letting the correction NAME A CLUSTER
+    removes that: the reference selects a cluster instead of competing beside it.
+
+    Everything here is capped at `tentative`. Gate A froze the CLUSTERING threshold (0.85,
+    measured); the margin that would justify `confirmed` has never been measured, so an
+    inferred name is a suggestion and says so.
+
+    An empty turn list degrades to naming only the corrected turn — an older producer, or a
+    session whose transcript is not ready, must not fail.
+    """
+    usable = [t for t in turns
+              if float(t.get("end_sec", 0)) - float(t.get("start_sec", 0))
+              >= vp.DEFAULT_MIN_TURN_S][:MAX_PROPAGATION_TURNS]
+    if len(usable) < 2:
+        return []
+
+    vectors, refs = [], []
+    for t in usable:
+        try:
+            _, clip, sr = _window_audio(folder, date, t["source_filename"],
+                                        float(t["start_sec"]), float(t["end_sec"]))
+        except Exception:
+            # One unreadable turn must not lose the whole propagation. It simply goes
+            # unnamed, which is the honest outcome for audio nobody could read.
+            logger.warning("propagation: could not read %s", t.get("source_filename"))
+            continue
+        vectors.append(embed_audio(clip, sr))
+        refs.append(f"{t['source_filename']}@{float(t['start_sec'])}")
+    if len(vectors) < 2:
+        return []
+
+    labels = vp.cluster_turns(vectors)
+    groups = {}
+    for i, lab in enumerate(labels):
+        groups.setdefault(lab, []).append(i)
+    centroids, keys = [], []
+    for lab, idxs in groups.items():
+        keys.append(lab)
+        centroids.append(sum(vectors[i] for i in idxs) / len(idxs))
+
+    which, margin = vp.assign(reference, centroids)
+    if which is None:
+        return []
+    if margin is not None and margin < vp.DEFAULT_MIN_MARGIN:
+        # The corrected window sits between two voices — §2 measured 1 turn in 6 holding
+        # two. Naming a cluster from it would spread one person's name over another's whole
+        # session, so it names nothing and the asserted turn stands alone.
+        logger.warning("propagation refused: reference is between clusters (margin %.3f)",
+                       margin)
+        return []
+
+    out = []
+    for i in groups[keys[which]]:
+        if refs[i] == asserted_ref:
+            continue
+        out.append({"turn_ref": refs[i], "state": "tentative",
+                    "cluster_ref": f"C{keys[which]}", "asserted": False,
+                    "display_name": display_name})
+    logger.info("propagation: %d turns in %d voices, named %d",
+                len(vectors), len(groups), len(out))
+    return out
+
+
 def _from_request_artifact(bucket, key):
     """One correction, start to finish.
 
@@ -296,16 +368,20 @@ def _from_request_artifact(bucket, key):
     # The turn the user asserted. Its name is not an inference and is written as
     # `correction`; the writer refuses to give it a profile id unless it is marked asserted.
     turn_ref = f"{c['source_filename']}@{start}"
+    results = [{"turn_ref": turn_ref, "state": "confirmed",
+                "cluster_ref": None, "asserted": True,
+                "display_name": c.get("display_name"),
+                "score": d.margin}]
+    results.extend(_propagate(folder, date, req.get("turns") or [], v,
+                              c.get("display_name"), turn_ref))
+
     payload = {
         "op": "propagation",
         "company_id": req.get("company_id"),
         "session_base": req.get("session_base"),
         "correction_ref": req.get("request_id"),
         "cluster_threshold": vp.DEFAULT_CLUSTER_TAU,
-        "results": [{"turn_ref": turn_ref, "state": "confirmed",
-                     "cluster_ref": None, "asserted": True,
-                     "display_name": c.get("display_name"),
-                     "score": d.margin}],
+        "results": results,
     }
     invoke_writer(payload)
     logger.info("correction applied: session=%s ref=%s audio=%s",
