@@ -361,8 +361,14 @@ history (`73f70d1`); it was wrong and is not worth preserving inline.
 
 **Design.** Same assembled turns, same prompt, the only difference being
 whether the admission paragraph and its two Bad examples are present — removed
-by string surgery so no other byte differs. `qwen3.7-max`, thinking on. Two
-sessions from **prod**, both from 2026-08-13.
+by string surgery so no other byte differs. Two sessions from **prod**, both
+from 2026-08-13.
+
+Run on `qwen3.7-max` with thinking on, which **is** what production extracts
+with: `fieldsight-prod-extract-session` carries `LLM_PROVIDER=qwen`,
+`QWEN_MODEL=qwen3.7-max`, `QWEN_ENABLE_THINKING=true`. Worth stating, because
+`llm_utils` defaults to the Anthropic path and a reader would otherwise be
+right to ask whether the numbers are off-model.
 
 ### Strategy discussion (`sid15770a…`, 153 files, 1,858 turns, 103,924 chars)
 
@@ -375,9 +381,9 @@ The directions the control invented are the §1 failure verbatim:
 `Identify and leverage internal advocates`, `Evaluate high-billable-hour niches`,
 `Re-evaluate if audio note-taking is the most effective technology`,
 `Define top-down enforcement policy or bottom-up value proposition`. None
-survive with the bar. What does survive is the same two or three real tasks
-every time: the visible-deletion control, the photo-linking bug, the AWS
-summary email.
+survive with the bar. What survives in the three non-empty runs is the same
+small set of real tasks: the visible-deletion control, the photo-linking bug,
+the AWS summary email.
 
 ### Site walk (`sidb6d5d2ab…`, Neil, 17 files, 184 turns, 12,411 chars)
 
@@ -386,18 +392,22 @@ summary email.
 | no bar | 2 | 8, 7 — **7.5/run** | 0 |
 | bar | 2 | 7, 8 — **7.5/run** | 0 |
 
-**This is the result that matters most.** The bar is neutral on real site work:
-same volume, same character. `Ducting -- relocate for 1200mm drilling
-clearance`, `Pipework -- cut and cap 2m from wall`, `Taps -- salvage for reuse`
-all come through. The fear that a stricter rule would suppress genuine tasks is
-not borne out on the session type where suppression would actually cost
-something.
+The bar is inert here: same volume, same character. `Ducting -- relocate for
+1200mm drilling clearance`, `Pipework -- cut and cap 2m from wall`, `Taps --
+salvage for reuse` all come through.
+
+**Read that narrowly.** The control produced *zero* directions on this session,
+so there was nothing for the bar to filter and its discriminator was never
+exercised. What this shows is that the bar does not fire when there is nothing
+to catch — necessary, but not the stronger claim that it never suppresses a
+borderline-genuine task. Two runs, one site walk, one wearer, one day.
 
 ### The failure mode to watch
 
 **One of four bar runs on the strategy session returned zero action items** —
-losing the three genuine ones with the directions. On a discussion-type session
-that is roughly a one-in-four chance of an empty list. The bar is doing its job
+losing the three genuine ones with the directions. One run in four is what was
+observed; it is not a rate, and four runs cannot support one (the interval on
+1-of-4 runs from roughly 1% to 70%). The bar is doing its job
 too enthusiastically at the tail, and the fix is not obvious: the same session
 legitimately contains only two or three tasks, so "empty" and "correct" sit
 very close together. Worth watching in the rollout counters rather than tuned
@@ -405,8 +415,10 @@ blind.
 
 ### Caveats
 
-- Three and four runs per arm. Enough to see a 40 %→0 % shift and a neutral
-  site walk; not enough to put an interval on either.
+- Three and four runs per arm. The per-run means (6.7 against 1.75) carry more
+  precision than n=3 and n=4 with spreads of 5/10/5 and 3/0/2/2 deserve, and the
+  control mean is half-driven by a single 10-item run. **The named direction
+  lists are the evidence; the arithmetic is decoration.**
 - The direction/tickable tally is a regex over verbs and it is crude: it marks
   `Photo linking -- investigate missing photos` a direction, when investigating
   one named bug is plainly tickable. The raw item lists, not the tally, are the
