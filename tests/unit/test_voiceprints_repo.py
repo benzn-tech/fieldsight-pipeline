@@ -152,3 +152,57 @@ def test_confirmations_are_counted_over_distinct_sessions():
     voiceprints.confirmations_count(conn, CO, VP)
     assert "distinct" in conn.calls[0]["sql"].lower()
     assert "session" in conn.calls[0]["sql"].lower()
+
+
+# ----------------------------------------------------------
+# Pool scope. Every turn is scored against every row this returns, and `decide_name` takes
+# the runner-up as the maximum over the rest — so the POOL, not the number of people in the
+# room, is what the margin has to survive. Company-wide is the widest possible pool.
+#
+# The scope argument lands now because `profiles_for_matching` has no callers yet. Once
+# Phase 4 and Phase 5 both call it, changing the signature costs both.
+# ----------------------------------------------------------
+
+
+def test_without_a_site_the_pool_is_the_whole_company_as_before():
+    conn = FakeConn([[]])
+    voiceprints.profiles_for_matching(conn, "c1")
+    sql, params = conn.calls[-1]["sql"], conn.calls[-1]["params"]
+    assert "memberships" not in sql, "company-wide must not pay for a join it does not need"
+    assert params == ("c1",)
+
+
+def test_a_site_scoped_pool_reaches_profiles_through_membership():
+    conn = FakeConn([[]])
+    voiceprints.profiles_for_matching(conn, "c1", site_id="s1")
+    sql, params = conn.calls[-1]["sql"], conn.calls[-1]["params"]
+    assert "memberships" in sql
+    assert "s1" in params
+
+
+def test_a_site_scoped_pool_still_offers_the_unnamed_voices():
+    """`user_id` is nullable BY DESIGN — 0038's comment: a recurring unnamed voice may hold
+    a profile before anyone names it, which is what makes "the same person again" visible.
+
+    Those profiles reach no `memberships` row, so a naive site join drops every one of them
+    and silently kills the feature the nullable column exists for. They are kept in scope
+    instead, and the reason is that they are safe to keep: a profile with no user and no
+    display name cannot produce a NAME. The worst it can do is become the runner-up and push
+    a real match down to `tentative` — a refusal, not a wrong answer.
+    """
+    conn = FakeConn([[]])
+    voiceprints.profiles_for_matching(conn, "c1", site_id="s1")
+    sql = conn.calls[-1]["sql"]
+    assert "p.user_id IS NULL" in sql, (
+        "unnamed profiles must survive site scoping; dropping them is the "
+        "empty-filter-means-no-filter shape this repo has been bitten by")
+
+
+def test_site_scoping_does_not_weaken_consent_or_withdrawal():
+    """The two filters that fail silently must hold under every scope."""
+    for kwargs in ({}, {"site_id": "s1"}):
+        conn = FakeConn([[]])
+        voiceprints.profiles_for_matching(conn, "c1", **kwargs)
+        sql = conn.calls[-1]["sql"]
+        assert "consent_at IS NOT NULL" in sql
+        assert "status <> 'withdrawn'" in sql
