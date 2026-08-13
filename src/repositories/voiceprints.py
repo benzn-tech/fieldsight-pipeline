@@ -62,8 +62,8 @@ def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, windo
     ).fetchone()
 
 
-def profiles_for_matching(conn, company_id) -> list[dict]:
-    """Every profile this company may currently match against.
+def profiles_for_matching(conn, company_id, site_id=None) -> list[dict]:
+    """Every profile this company may currently match against, optionally narrowed to a site.
 
     The two filters are the whole point, and both fail silently if they are missing:
 
@@ -74,18 +74,43 @@ def profiles_for_matching(conn, company_id) -> list[dict]:
 
     `status` comes back with the vector so the caller can cap a tentative profile at
     tentative output rather than promoting it to a confirmed name.
+
+    **Why scope exists.** Every turn is scored against every row returned here, and
+    `decide_name` takes the runner-up as the maximum over the rest — so the size of this
+    result, not the number of people in the room, is what the margin has to survive. A
+    company that accumulates profiles across many sites makes every turn harder to confirm.
+    `site_id=None` keeps the company-wide behaviour and pays for no join.
+
+    **Unnamed profiles stay in scope, and this is the decision worth arguing with.**
+    `speaker_voiceprints.user_id` is nullable by design (0038): a recurring unnamed voice may
+    hold a profile before anyone names it, which is what makes "the same person again"
+    visible. Such a profile reaches no `memberships` row, so a plain site join drops every
+    one of them and silently removes the feature the nullable column exists for — the
+    empty-filter-means-no-filter shape this codebase has been bitten by.
+
+    Keeping them is also the safe direction rather than merely the convenient one: a profile
+    with no user cannot produce a NAME. The worst it can do is become the runner-up and push
+    a real match down to `tentative`, which is a refusal, not a wrong answer — and a wrong
+    confident name is the failure this whole layer is shaped to avoid.
     """
     _require_company(company_id)
+    cols = ("SELECT p.id, p.display_name, p.status, p.user_id, s.id AS sample_id, "
+            "       s.embedding "
+            "FROM speaker_voiceprints p "
+            "JOIN speaker_voiceprint_samples s ON s.voiceprint_id = p.id "
+            "WHERE p.company_id = %s "
+            "  AND p.consent_at IS NOT NULL "
+            "  AND p.status <> 'withdrawn' ")
+    if site_id is None:
+        return conn.cursor(row_factory=dict_row).execute(
+            cols + "ORDER BY p.created_at", (company_id,)).fetchall()
     return conn.cursor(row_factory=dict_row).execute(
-        "SELECT p.id, p.display_name, p.status, p.user_id, s.id AS sample_id, "
-        "       s.embedding "
-        "FROM speaker_voiceprints p "
-        "JOIN speaker_voiceprint_samples s ON s.voiceprint_id = p.id "
-        "WHERE p.company_id = %s "
-        "  AND p.consent_at IS NOT NULL "
-        "  AND p.status <> 'withdrawn' "
-        "ORDER BY p.created_at",
-        (company_id,),
+        cols
+        + "  AND (p.user_id IS NULL OR EXISTS ("
+          "        SELECT 1 FROM memberships m "
+          "         WHERE m.user_id = p.user_id AND m.site_id = %s)) "
+          "ORDER BY p.created_at",
+        (company_id, site_id),
     ).fetchall()
 
 
