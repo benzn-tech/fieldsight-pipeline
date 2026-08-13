@@ -353,11 +353,21 @@ def test_nothing_in_production_asks_for_one_turn_at_a_time():
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except SyntaxError:
             continue
+        # Every name this module is bound to in this file, not just its own. A guard that
+        # only recognises one spelling is the night's own recurring defect wearing a test's
+        # clothes: `import turn_name_overlay as tno` walked straight through the first
+        # version of this.
+        aliases = {"turn_name_overlay"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.name == "turn_name_overlay":
+                        aliases.add(a.asname or a.name)
         for node in ast.walk(tree):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                     and node.func.attr == "lookup"
                     and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "turn_name_overlay"):
+                    and node.func.value.id in aliases):
                 offenders.append(os.path.relpath(path, root))
     assert not offenders, (
         f"{offenders} calls turn_name_overlay.lookup per segment; use resolve(), which pairs "
