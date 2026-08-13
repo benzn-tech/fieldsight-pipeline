@@ -5878,12 +5878,12 @@ def _apply_speaker_names(conn, caller, payload):
     for base in sorted(b for b in bases if b):
         rows.extend(voiceprints.live_turn_names(conn, str(caller["company_id"]), base))
     index = turn_name_overlay.build(rows)
-    for seg in segs:
-        hit = turn_name_overlay.lookup(index, seg.get("source_filename") or "",
-                                       seg.get("chunk_start", seg.get("start", 0.0)))
-        if hit:
-            seg["speaker_name"] = hit["display_name"]
-            seg["speaker_state"] = hit["state"]
+    # One row names one turn. Per-segment lookup let a single assertion produce two
+    # `confirmed` names on TEST, because a neighbouring turn 0.28 s away was inside the
+    # tolerance and claimed the same row.
+    for i, hit in turn_name_overlay.resolve(index, segs).items():
+        segs[i]["speaker_name"] = hit["display_name"]
+        segs[i]["speaker_state"] = hit["state"]
     payload["unmatchedNames"] = turn_name_overlay.orphans(index)
     return payload
 
