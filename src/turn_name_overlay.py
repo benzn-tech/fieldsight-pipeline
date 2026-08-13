@@ -29,10 +29,42 @@ Plan: docs/superpowers/plans/2026-08-13-correction-propagation-implementation.md
 
 # Wide enough to survive a seam dedup, far short of a turn. Phase 0's shortest usable turn is
 # 3 s and the duration floor is 3 s, so half a second cannot reach a neighbouring turn.
+import re
+
 TOLERANCE_SEC = 0.5
 
 # A direct correction is a claim a person made; propagation and matching are inferences.
 _SOURCE_RANK = {"correction": 2, "correction_propagation": 1, "match": 0}
+
+
+def _stem(name):
+    """A turn is named by its RECORDING, not by which artifact you happen to be holding.
+
+    A correction carries the audio (`…_srcwav.wav`); the transcript endpoint holds the
+    transcript (`…_srcwav.json`). Matching on the raw string means the name never appears and
+    nothing anywhere says why — which is exactly what shipped, and what a real correction on
+    TEST exposed.
+    """
+    n = str(name or "")
+    for ext in (".json", ".wav", ".mp4", ".m4a"):
+        if n.endswith(ext):
+            return n[: -len(ext)]
+    return n
+
+
+def session_base(filename):
+    """The session a turn belongs to: everything up to and including `_sid{32hex}`.
+
+    Rows are stored under the session id, and the overlay was looking them up by the segment
+    FILENAME — two different keys, so the query returned nothing every time, and returned it
+    quietly: no rows means no orphans, so `unmatchedNames` read 0 and the failure looked like
+    "this session was never corrected".
+
+    None rather than a guess when there is no session id: a wrong session key reads another
+    session's names onto this one, which is worse than no names.
+    """
+    m = re.match(r"^(.*_sid[0-9a-f]{32})", str(filename or ""))
+    return m.group(1) if m else None
 
 
 def _parse_ref(ref):
@@ -45,7 +77,7 @@ def _parse_ref(ref):
         return None
     name, _, tail = str(ref).rpartition("@")
     try:
-        return name, float(tail)
+        return _stem(name), float(tail)
     except ValueError:
         return None
 
@@ -96,7 +128,7 @@ def lookup(index, source_filename, start_sec):
     a propagated guess sitting beside the correction the user actually made. Distance breaks
     ties only after precedence has.
     """
-    entries = index["by_file"].get(source_filename)
+    entries = index["by_file"].get(_stem(source_filename))
     if not entries:
         return None
     best = None
