@@ -1314,10 +1314,18 @@ def speaker_corrections(conn, caller, session_base, event):
     if not date_m:
         return error("session id must carry its date (…_YYYY-MM-DD_…)", 400)
 
+    # The CANONICAL key, through the same function the reader uses. Storing the URL
+    # spelling and querying the normalised one is how rows land and are never found again —
+    # twice tonight, one layer apart each time. Two spellings of a session are equal as
+    # sessions and not as strings, so only one of them may ever be persisted.
+    session_key = turn_name_overlay.session_base(session_base)
+    if not session_key:
+        return error("session id must carry its sid (…_sid<32 hex>)", 400)
+
     request_id = uuid.uuid4().hex
     artifact = {
         "request_id": request_id,
-        "session_base": session_base,
+        "session_base": session_key,
         "company_id": company_id,
         "user_folder": folder,
         "date": date_m.group(1),

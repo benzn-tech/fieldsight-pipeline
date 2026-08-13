@@ -26,7 +26,9 @@ CALLER = {
     "email": "a@x.nz", "first_name": "Ada", "last_name": "L", "folder_name": "Ada_L",
     "avatar_s3_key": None, "global_role": "admin", "created_at": "2026-08-13",
 }
-SESSION = "Benl1_2026-08-13_11-49-00"
+# A real session id shape: the sid is what identifies a session, and a fixture
+# without one was not a session at all — it just never got asked for the sid.
+SESSION = "Benl1_2026-08-13_11-49-00_sid9db9293e82b94a4d9611572b1233f82d"
 PATH = f"/api/org/sessions/{SESSION}/speaker-corrections"
 
 
@@ -129,7 +131,10 @@ def test_the_window_and_the_name_travel_verbatim(wired):
     assert doc["correction"]["start_sec"] == 12.0
     assert doc["correction"]["end_sec"] == 18.0
     assert doc["correction"]["display_name"] == "Ben L"
-    assert doc["session_base"] == SESSION
+    # The CANONICAL key, not the URL spelling — that is the whole point of the
+    # normalisation, and asserting the URL form here would re-encode the bug.
+    import turn_name_overlay as tno
+    assert doc["session_base"] == tno.session_base(SESSION)
 
 
 def test_the_response_says_which_of_the_two_effects_happened(wired):
@@ -280,3 +285,26 @@ def test_a_session_with_no_readable_transcript_still_queues_the_correction(wired
     res = org.lambda_handler(_event(BODY), None)
     assert res["statusCode"] == 202
     assert json.loads(wired.puts[0]["Body"])["turns"] == []
+
+
+def test_the_stored_session_key_is_the_one_the_reader_will_query_with(wired):
+    """Rows are written by this endpoint and found by the transcript overlay, and each was
+    computing the session key its own way — the writer from the URL, the reader from the
+    filename. Rows landed and were never seen again, twice tonight, one layer apart.
+
+    Only one spelling may ever be persisted, and it is whatever `session_base` returns.
+    """
+    import turn_name_overlay as tno
+    org.lambda_handler(_event(BODY), None)
+    stored = json.loads(wired.puts[0]["Body"])["session_base"]
+    a_filename = SESSION + "_c0000_bn4_off0.0_to114.0_srcwav.json"
+    assert stored == tno.session_base(a_filename), (
+        "the writer stored a key the reader cannot construct from a filename")
+
+
+def test_a_session_without_a_sid_is_refused_rather_than_stored_unfindable(wired):
+    ev = _event(BODY)
+    ev["path"] = "/api/org/sessions/Benl1_2026-03-20_12-18-34/speaker-corrections"
+    res = org.lambda_handler(ev, None)
+    assert res["statusCode"] == 400
+    assert wired.puts == []
