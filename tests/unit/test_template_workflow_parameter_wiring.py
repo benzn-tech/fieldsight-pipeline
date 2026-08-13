@@ -652,3 +652,45 @@ def test_the_batch_dials_are_settable_from_a_repo_variable():
                 f"{env} does not pass {name}, so it can only ever hold its template "
                 f"default -- changing how many chunks make a batch would still need a "
                 f"template edit and a deploy, not a repo variable")
+
+
+# ----------------------------------------------------------
+# The three failure alarms MONITORING.md promises ("you'll receive emails when...") were
+# never created in either account. They are gated on `ShouldCreateAlerts`, which is gated on
+# `AlertEmail`, which NO WORKFLOW PASSED -- so the Parameter held its empty default forever
+# and the condition was permanently false. Verified 2026-08-13: `describe-alarms` returned
+# nothing at all.
+#
+# This is the worst shape a monitoring gap can take, because the documentation says the
+# monitoring exists. Nobody goes looking for an alarm they have been told they have.
+# ----------------------------------------------------------
+
+
+def test_the_failure_alarms_can_actually_be_switched_on():
+    for env, path in WORKFLOWS.items():
+        assert "AlertEmail" in _overrides(path), (
+            f"{env} does not pass AlertEmail, so ShouldCreateAlerts can only ever be false "
+            f"and the three alarms MONITORING.md promises are never created")
+
+
+def test_no_alerts_is_spelled_with_a_sentinel_the_cli_will_carry():
+    """`|| ''` here would repeat the failure that killed the 2026-08-12 prod deploy."""
+    for env, path in WORKFLOWS.items():
+        line = [ln for ln in open(path, encoding="utf-8").read().splitlines()
+                if "AlertEmail=" in ln]
+        assert len(line) == 1
+        assert "|| 'none'" in line[0], (
+            f"{env} must default AlertEmail to the sentinel `none`, not to the empty "
+            f"string -- SAM rejects an empty --parameter-overrides value and fails the "
+            f"entire deploy")
+
+
+def test_both_spellings_of_no_alerts_are_inert():
+    """The sentinel AND the empty string must both mean "no alarms".
+
+    Changing the default without changing the condition would flip it from permanently
+    false to permanently TRUE, and subscribe SNS to the literal address `none`."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    cond = re.search(r"ShouldCreateAlerts:(.*?)(?=\n  \w+:)", text, re.S).group(1)
+    assert "''" in cond, "the empty string must still mean no alarms"
+    assert "'none'" in cond, "the sentinel the workflows send must also mean no alarms"

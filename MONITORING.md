@@ -235,7 +235,19 @@ If a date shows `STALE`, the report is automatically regenerated with the latest
 
 ## 5. Email Alerts (Automatic)
 
-If you provided `AlertEmail` during deployment, you'll receive emails when:
+> **These alarms did not exist in either account until 2026-08-13.** The three resources were
+> in the template all along, gated on `AlertEmail` — which **no workflow passed**, so the
+> Parameter held its empty default forever and the condition was permanently false.
+> `aws cloudwatch describe-alarms` returned *nothing at all* for the account. This section
+> said you would receive emails, which is the reason nobody went looking: an alarm you have
+> been told you have is not one you check.
+>
+> The wiring now exists. **The alarms still do not, until a repo variable is set** —
+> `PROD_ALERT_EMAIL` / `TEST_ALERT_EMAIL`. Unset means the sentinel `none`, which means no
+> alarms, deliberately and visibly.
+
+Once `PROD_ALERT_EMAIL` (or `TEST_ALERT_EMAIL`) is set and the stack redeployed, you'll
+receive emails when:
 
 | Alert | Trigger |
 |-------|---------|
@@ -243,7 +255,16 @@ If you provided `AlertEmail` during deployment, you'll receive emails when:
 | `fieldsight-downloader-errors` | >5 download failures in a day |
 | `fieldsight-report-errors` | Report generator fails |
 
-**First time:** Check your email for the SNS subscription confirmation and click **Confirm subscription**.
+**First time:** Check your email for the SNS subscription confirmation and click **Confirm
+subscription**.
+
+**Verify rather than assume** — the whole point of this entry:
+
+```bash
+aws cloudwatch describe-alarms --query 'MetricAlarms[].AlarmName' --output text
+```
+
+An empty result means no alarms exist, whatever this document or the template says.
 
 Manage alerts:
 ```
