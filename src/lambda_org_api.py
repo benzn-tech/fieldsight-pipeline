@@ -143,7 +143,8 @@ from repositories import (action_items, aliases, classification_feedback, compan
                           programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, rollup, scope,
                           session_group,
-                          sites, threads, topics, users, voice_messages)
+                          sites, threads, topics, users, voice_messages,
+                          voiceprints)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates, first_match_span, normalize, occurrences
 # Keyframe Q7 telemetry derivation (all AWS-free, pure helpers): the deleted
@@ -199,6 +200,12 @@ RECORDING_KINDS = {"video", "audio", "photo"}
 #   enforce  409 when the object is absent; the row stays pending and the
 #            device re-sends inside its own 7-day budget
 UPLOAD_VERIFY_MODE = os.environ.get("UPLOAD_VERIFY_MODE", "off").lower()
+# off | shadow | on. `off` is the deployed default and the rollback: the correction routes
+# 404 and nothing downstream is reachable. Read from the environment rather than a constant
+# because a rollback that needs a code change is not a rollback (the unwired-toggle trap:
+# a switch is only real when repo variable, workflow override and template Parameter all
+# exist -- this repo has shipped a documented rollback that was never wired, twice).
+SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 
 # Voice-timeliness: mis-touch tolerance ("grace") window before a stopped session
 # finalizes + emails. A resume within it cancels the finalize (spec §3.2, §8.4).
@@ -227,6 +234,16 @@ ALLOWED_VOICE_TYPES = {"audio/wav": "wav", "audio/x-wav": "wav",
 
 _s3_client = None
 _cognito_client = None
+
+
+def profiles_for_matching(conn, company_id, site_id=None):
+    """The consent/withdrawn filter, reached through one name.
+
+    Bound here rather than called inline so this module has exactly one place a profile can
+    come from — and so the endpoint's tests can supply rows without a database while still
+    failing if the call disappears.
+    """
+    return voiceprints.profiles_for_matching(conn, company_id, site_id=site_id)
 
 
 def s3():
@@ -584,6 +601,9 @@ def dispatch(conn, event, method, route):
     m_srs = re.match(r"^/sessions/([^/]+)/report/status$", route)
     if m_srs and method == "GET":
         return session_report_status(conn, caller, m_srs.group(1), event)
+    m_sc = re.match(r"^/sessions/([^/]+)/speaker-corrections$", route)
+    if m_sc and method == "POST":
+        return speaker_corrections(conn, caller, m_sc.group(1), event)
     m_srl = re.match(r"^/sessions/([^/]+)/rolling$", route)
     if m_srl and method == "GET":
         return session_rolling(conn, caller, m_srl.group(1), event)
@@ -1173,6 +1193,91 @@ def session_report_generate(conn, caller, session_id, event):
                     ContentType="application/json")
     return ok({"status": "queued", "sessionId": session_id,
                "requestId": request_id, "resultKey": result_key}, 202)
+
+
+# ----------------------------------------------------------
+# Speaker corrections — the only entry to the voiceprint chain.
+# ----------------------------------------------------------
+_CORRECTION_ROLES = ("admin", "gm", "pm", "site_manager", "platform_admin")
+
+
+def speaker_corrections(conn, caller, session_base, event):
+    """POST /api/org/sessions/{session_base}/speaker-corrections
+
+    The user marks a passage as a person. This queues ONE request artifact and returns 202;
+    everything after it happens outside the VPC.
+
+    org-api cannot invoke the embedder directly — it is in-VPC with no NAT, and a
+    `lambda:InvokeFunction` there black-holes until timeout with no log line at all
+    (BUG-36). So the handoff is an S3 artifact, the same shape as
+    `session_report_requests/`, and the trigger on it is wired by hand outside the template
+    (BUG-33).
+
+    **This half owns the profiles.** The embedder has no database and no other way to obtain
+    one, which is what keeps `profiles_for_matching`'s consent and `withdrawn` filters in a
+    single place. Those are the filters whose failure is invisible: a withdrawn profile that
+    still matches keeps naming people and nothing downstream can tell.
+
+    Two effects follow from one gesture and they are reported separately: the name propagates
+    **within this meeting**, and it may become an enrolment sample for **future** ones. The
+    second requires consent from the person whose voice it is (v2 §10) and the first does
+    not, so a single "success" would hide which one the user actually got.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    name = (body.get("display_name") or "").strip()
+    if not name:
+        return error("display_name is required", 400)
+    src = (body.get("source_filename") or "").strip()
+    if not src:
+        return error("source_filename is required", 400)
+    try:
+        start = float(body.get("start_sec"))
+        end = float(body.get("end_sec"))
+    except (TypeError, ValueError):
+        return error("start_sec and end_sec must be numbers", 400)
+    if end <= start:
+        return error("end_sec must be after start_sec", 400)
+
+    # Never from the body: a caller-supplied company would let one tenant queue work
+    # scoped to another's profiles.
+    company_id = str(caller["company_id"])
+    rows = profiles_for_matching(conn, company_id, site_id=body.get("site_id"))
+    profiles = [{"person_key": r["user_id"] or r["id"],
+                 "display_name": r.get("display_name"),
+                 "status": r.get("status"),
+                 "embedding": list(r["embedding"] or [])} for r in rows]
+
+    request_id = uuid.uuid4().hex
+    artifact = {
+        "request_id": request_id,
+        "session_base": session_base,
+        "company_id": company_id,
+        "requested_by": str(caller["id"]),
+        "mode": SPEAKER_IDENTITY_MODE,
+        "correction": {"source_filename": src, "start_sec": start, "end_sec": end,
+                       "display_name": name},
+        "profiles": profiles,
+    }
+    s3().put_object(Bucket=LAKE_BUCKET,
+                    Key=f"voiceprint_requests/{company_id}/{session_base}/{request_id}.json",
+                    Body=json.dumps(artifact, default=str),
+                    ContentType="application/json")
+    logger.info("speaker correction queued: session=%s mode=%s profiles=%d",
+                session_base, SPEAKER_IDENTITY_MODE, len(profiles))
+    return ok({
+        "requestId": request_id,
+        # Named separately because they carry different consent obligations, and because a
+        # user who was told "done" deserves to know which of the two they got.
+        "propagation": "queued",
+        "enrolment": "not_requested",
+    }, 202)
 
 
 def session_report_status(conn, caller, session_id, event):

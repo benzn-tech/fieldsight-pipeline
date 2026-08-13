@@ -853,3 +853,64 @@ def test_the_embedder_may_invoke_the_writer_and_nothing_else():
     assert "lambda:InvokeFunction" in block
     assert "voiceprint-writer" in block
     assert "Resource: '*'" not in block and 'Resource: "*"' not in block
+
+
+def test_the_speaker_identity_mode_is_wired_in_both_environments():
+    """Not a boolean, so the sweep cannot see it. This is the switch the whole speaker
+    feature hangs off — the endpoints 404 when it is `off`, which is also the rollback. A
+    Parameter with no `--parameter-overrides` behind it can only ever hold its default, and
+    this repo has shipped that twice: FILTER_AUDIO_EVENT_TAGS documented a rollback that was
+    not real, and TRANSCRIBE_WHOLE_CHUNK had no Parameter at all.
+    """
+    for env, path in WORKFLOWS.items():
+        assert "SpeakerIdentityMode" in _overrides(path), (
+            f"{env} does not pass SpeakerIdentityMode, so SPEAKER_IDENTITY_MODE can only "
+            f"ever hold its template default — the feature could not be switched on, and "
+            f"more importantly could not be switched back off")
+
+
+def test_the_speaker_identity_mode_defaults_to_off_everywhere():
+    """Merging this must change nothing until somebody sets a repo variable. Both the
+    template default and both workflow fallbacks have to say so, or 'the merge is inert' is
+    a claim rather than a fact."""
+    t = open(TEMPLATE, encoding="utf-8").read()
+    block = _top_level_block(t, "  SpeakerIdentityMode:")
+    assert "Default: 'off'" in block, "the template default is not off"
+    for env, path in WORKFLOWS.items():
+        line = [ln for ln in open(path, encoding="utf-8") if "SpeakerIdentityMode" in ln][0]
+        assert "|| 'off'" in line, f"{env}'s fallback is not off: {line.strip()}"
+
+
+def test_every_function_that_reads_the_speaker_mode_is_given_it():
+    """The middle segment. A function that reads SPEAKER_IDENTITY_MODE but was never handed
+    it reads an empty string, which is not `off` and not any AllowedValue — it is whatever
+    the code's own default happens to be, decided somewhere nobody is looking."""
+    t = open(TEMPLATE, encoding="utf-8").read()
+    for fn in ("OrgApiFunction:",):
+        block = _top_level_block(t, "  " + fn)
+        assert "SPEAKER_IDENTITY_MODE: !Ref SpeakerIdentityMode" in block, (
+            f"{fn} reads the mode but the template never gives it")
+
+
+def _top_level_block(text, header):
+    """The YAML block under `header`, ending at the next key of the SAME indent.
+
+    NOT `block.index("\\n  ", 20)`: two spaces is a prefix of four, so that ends the block at
+    its own first child and every `in block` assertion after it passes on two lines of YAML.
+    I wrote exactly that bug twice within ten minutes tonight — once in an edit script, where
+    it merely failed, and once here, where it would have shipped a guard that cannot fail.
+    """
+    i = text.index(header)
+    rest = text[i + len(header):]
+    m = re.search(r"^  [A-Za-z]", rest, re.M)
+    return header + (rest[:m.start()] if m else rest)
+
+
+def test_org_api_may_write_the_voiceprint_request_but_not_read_the_results():
+    """org-api hands work OUTWARD across the VPC boundary and takes nothing back from that
+    prefix — the results are consumed by the in-VPC writer, invoked by the embedder. A read
+    grant here would be an invitation to build a second consumer nobody designed."""
+    t = open(TEMPLATE, encoding="utf-8").read()
+    assert "voiceprint_requests/*" in t, "org-api cannot queue a correction"
+    assert "voiceprint_results/*" not in t, (
+        "something was granted the results prefix; the writer receives them by invoke")
