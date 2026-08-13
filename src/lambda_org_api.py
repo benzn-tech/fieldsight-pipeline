@@ -4698,6 +4698,25 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
     }
 
 
+def _day_has_deleted_sources(conn, folder, date) -> bool:
+    """Whether anything on this (folder, date) has been deleted by its owner.
+
+    Never raises: a guard that cannot read its input must not take down the timeline. It
+    fails OPEN here deliberately -- refusing to serve a day because the tombstone table was
+    briefly unreachable would break every customer's dashboard to protect a case that may
+    not exist. The SQL-level filters (phase 3) still apply in that window; only the
+    verbatim S3 fallback loses its guard, and that fallback is reached solely when the day
+    has no Aurora topics at all.
+    """
+    if conn is None:
+        return False
+    try:
+        return bool(redactions.deleted_source_prefixes(conn, folder, date))
+    except Exception:
+        logger.exception("deleted-source check failed for %s/%s", folder, date)
+        return False
+
+
 def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     """The single-(user, date) D1 read: Aurora override when extraction
     topics exist AND at least one survives the site ACL filter, else S3
@@ -4749,6 +4768,15 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # verbatim S3 daily_report.json is NOT site-clipped, so serving it would
         # leak the target's out-of-scope content. Nothing safe to show -> 404.
         return ok({"message": f"No in-scope report for {user} on {date}", "date": date}, 404)
+    # A day whose sources were DELETED must not fall through to the pre-rendered doc.
+    #
+    # The comment above says the verbatim contract holds only for a day with no Aurora
+    # topics at all -- and deleting every topic of a day creates exactly that condition. So
+    # the redaction that was supposed to hide the day would instead serve the pre-deletion
+    # `daily_report.json` byte for byte. Filtering SQL and forgetting the artifact rendered
+    # from it is not a deletion.
+    if _day_has_deleted_sources(conn, user, date):
+        return ok({"message": f"No report for {user} on {date}", "date": date}, 404)
     doc = _get_lake_json(f"reports/{date}/{user}/daily_report.json")
     if doc is not None:
         return ok(doc)                              # VERBATIM (byte-identical history)
@@ -4770,7 +4798,10 @@ def admin_disambiguation(conn, caller, date):
     envelope the UI's meeting-picker expects; none is a 404."""
     owner = companies.get_company_by_name(conn, COMPANY_NAME)
     if owner is not None and str(caller["company_id"]) == str(owner["id"]):
-        doc = _get_lake_json(f"reports/{date}/summary_report.json")
+        # Same door, aggregate form: summary_report.json is lake-wide and byte-verbatim,
+        # so a deleted session's words sit inside it whatever the SQL filters say.
+        doc = (None if _day_has_deleted_sources(conn, None, date)
+               else _get_lake_json(f"reports/{date}/summary_report.json"))
         if doc is not None:
             return ok(doc)
     candidates = set()

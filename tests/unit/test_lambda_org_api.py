@@ -7102,3 +7102,60 @@ def test_a_deleted_topic_is_dropped_by_the_renderer_not_flagged(monkeypatch):
     assert held["id"] in ids, "the analysis-scope redaction keeps today's behaviour"
     assert any(t.get("redacted") for t in out), "and it keeps its flag"
     assert keep["id"] in ids
+
+
+def test_the_verbatim_timeline_fallback_is_refused_when_the_day_has_deleted_sources(monkeypatch):
+    """The hole the review predicted, and deleting MAKES it happen.
+
+    The fallback's own comment says it: "Only a day with NO Aurora topics at all keeps the
+    byte-verbatim S3 contract." Deleting every topic of a day creates exactly that
+    condition -- so the redaction that was supposed to hide the day instead serves the
+    pre-deletion `daily_report.json` verbatim, with every word intact.
+
+    A guard that filters SQL and forgets the pre-rendered artifact is not a deletion.
+    """
+    import repositories.redactions as red
+
+    served = {}
+    monkeypatch.setattr(org, "_get_lake_json",
+                        lambda key: served.setdefault("key", key) or
+                        {"executive_summary": "the deleted day, in full"})
+    monkeypatch.setattr(red, "deleted_source_prefixes",
+                        lambda conn, folder=None, date=None: ["extractions/Ada_L/2026-07-14/"])
+    # The timeline asks "does this day have any Aurora topics" first; a deleted day
+    # answers no, which is precisely what opens the verbatim fallback.
+    monkeypatch.setattr(org.topics, "has_topics_for_source_prefix", lambda *a, **k: False)
+    monkeypatch.setattr(org.topics, "list_topics_for_source_prefix", lambda *a, **k: [])
+
+    res = org._render_timeline_for_user(object(), CALLER, "2026-07-14", "Ada_L")
+    body = json.loads(res["body"])
+    assert res["statusCode"] == 404, f"served the pre-deletion doc: {body}"
+    assert "the deleted day, in full" not in str(body)
+
+
+def test_the_admin_summary_verbatim_serve_is_refused_for_a_date_with_deleted_sources(monkeypatch):
+    """Same shape, the aggregate door. `summary_report.json` is lake-wide and served
+    byte-verbatim to the owner company -- a deleted session's content sits inside it."""
+    import repositories.redactions as red
+
+    monkeypatch.setattr(org, "_get_lake_json",
+                        lambda key: {"summary": "everything, including the deleted"})
+    monkeypatch.setattr(red, "deleted_source_prefixes",
+                        lambda conn, folder=None, date=None: ["extractions/Ada_L/2026-07-14/"])
+
+    # The owner-company check runs before the verbatim serve; make the caller the owner so
+    # the branch is actually reached, which is the branch under test.
+    monkeypatch.setattr(org.companies, "get_company_by_name",
+                        lambda conn, name: {"id": CALLER["company_id"]})
+    # Everything after the verbatim branch is irrelevant to this test: if the guard works,
+    # the doc is never fetched. Assert on the FETCH, not on the response shape, so the
+    # test cannot pass because some later step happened to fail.
+    fetched = []
+    monkeypatch.setattr(org, "_get_lake_json",
+                        lambda key: fetched.append(key) or
+                        {"summary": "everything, including the deleted"})
+    try:
+        org.admin_disambiguation(object(), CALLER, "2026-07-14")
+    except Exception:
+        pass                       # the later candidate-listing needs a real conn
+    assert not any("summary_report.json" in k for k in fetched),         f"the pre-deletion aggregate was fetched: {fetched}"
