@@ -431,16 +431,19 @@ def test_a_consumed_member_is_not_placed_in_any_bucket():
 
 def _map3():
     """Three chunks, 30s each, the first with a 1.5s head trim."""
-    ms = [bs.member(0, "users/u/audio/2026-08-13/x_c0000.wav", "2026-08-13T09:00:00", 1.5, 30.0),
-          bs.member(1, "users/u/audio/2026-08-13/x_c0001.wav", "2026-08-13T09:00:30", 0.5, 30.0),
-          bs.member(2, "users/u/audio/2026-08-13/x_c0002.wav", "2026-08-13T09:01:00", 0.25, 30.0)]
+    ms = [bs.member(0, "audio_segments/u/2026-08-13/x_c0000_off0.0_to30.0_srcwav.wav",
+                    "2026-08-13T09:00:00", 1.5, 30.0),
+          bs.member(1, "audio_segments/u/2026-08-13/x_c0001_off0.0_to30.0_srcwav.wav",
+                    "2026-08-13T09:00:30", 0.5, 30.0),
+          bs.member(2, "audio_segments/u/2026-08-13/x_c0002_off0.0_to30.0_srcwav.wav",
+                    "2026-08-13T09:01:00", 0.25, 30.0)]
     return bs.build_map("sid1", ms, sealed_by="session_close")
 
 
 def test_a_window_inside_one_member_maps_to_that_chunk():
     got = bs.locate_in_members(_map3(), 35.0, 40.0)
     assert len(got) == 1
-    assert got[0]["chunk_key"].endswith("x_c0001.wav")
+    assert "x_c0001_off" in got[0]["chunk_key"]
     # 35s into the batch is 5s into member 1's KEPT audio, and its kept audio starts
     # trimmed_head_sec into the chunk itself.
     assert got[0]["start_sec"] == pytest.approx(5.0 + 0.5)
@@ -458,7 +461,7 @@ def test_the_head_trim_is_added_not_ignored():
 
 def test_a_window_spanning_two_members_returns_both_pieces_in_order():
     got = bs.locate_in_members(_map3(), 28.0, 33.0)
-    assert [g["chunk_key"][-9:] for g in got] == ["c0000.wav", "c0001.wav"]
+    assert [g["chunk_key"].split("_off")[0][-5:] for g in got] == ["c0000", "c0001"]
     assert got[0]["start_sec"] == pytest.approx(28.0 + 1.5)
     assert got[0]["end_sec"] == pytest.approx(30.0 + 1.5)      # to the end of its kept audio
     assert got[1]["start_sec"] == pytest.approx(0.0 + 0.5)     # from the start of the next

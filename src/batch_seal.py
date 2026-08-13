@@ -39,6 +39,30 @@ def _wav_bytes(pcm, rate):
     return buf.getvalue()
 
 
+def raw_window_for_member(unit_key, start_in_unit, end_in_unit):
+    """A window inside a batch member, expressed in the device's own upload.
+
+    A batch map's `chunk_key` is the VAD unit under `audio_segments/`, not the raw chunk —
+    found by invoking the deployed function, after unit tests with fabricated maps had
+    agreed with the assumption instead of with what the seal writes.
+
+    Two conversions, and the second is the one that disappears quietly: the unit begins
+    `_off{T}` into its chunk, so a position inside the unit is not a position inside the
+    chunk. Every member in test currently carries `off0.0` because whole-chunk transcription
+    is on, which is exactly what would let the missing term go unnoticed until it was turned
+    off.
+
+    Raises rather than passing the key through: reading the normalised copy gives plausible
+    numbers, not an error, and none of the voiceprint thresholds hold on it.
+    """
+    raw = raw_key_for(unit_key)
+    if not raw:
+        raise ValueError(f"{unit_key!r} is not a VAD unit key; cannot reach the raw upload")
+    offsets = transcript_utils.extract_vad_offsets_from_filename(unit_key.split('/')[-1])
+    unit_start = float((offsets or [None])[0] or 0.0)
+    return raw, start_in_unit + unit_start, end_in_unit + unit_start
+
+
 def raw_key_for(unit_key):
     """The device's own upload for a VAD unit — `users/{user}/audio/{date}/{stem}.wav`.
 

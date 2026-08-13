@@ -237,8 +237,10 @@ def test_an_unknown_op_is_rejected_rather_than_silently_doing_nothing(monkeypatc
 def _batch_map_bytes():
     import json
     import batch_stitch as bs
-    ms = [bs.member(0, "users/u/audio/2026-08-13/x_c0000.wav", "2026-08-13T09:00:00", 1.5, 30.0),
-          bs.member(1, "users/u/audio/2026-08-13/x_c0001.wav", "2026-08-13T09:00:30", 0.5, 30.0)]
+    ms = [bs.member(0, "audio_segments/u/2026-08-13/x_c0000_off0.0_to30.0_srcwav.wav",
+                    "2026-08-13T09:00:00", 1.5, 30.0),
+          bs.member(1, "audio_segments/u/2026-08-13/x_c0001_off0.0_to30.0_srcwav.wav",
+                    "2026-08-13T09:00:30", 0.5, 30.0)]
     return json.dumps(bs.build_map("sid1", ms, sealed_by="session_close")).encode()
 
 

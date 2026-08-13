@@ -46,6 +46,7 @@ import wave
 
 import numpy as np
 
+import batch_seal
 import batch_stitch
 import voiceprint_utils as vp
 
@@ -162,12 +163,18 @@ def _window_audio(user_folder, date, source_filename, start, end):
     batch_key = f"audio_segments/{user_folder}/{date}/{source_filename}"
     doc = json.loads(_get(batch_stitch.map_key_for_audio(batch_key)))
     pieces = batch_stitch.locate_in_members(doc, start, end)
-    parts, rate = [], None
+    parts, rate, first = [], None, None
     for p in pieces:
-        audio, sr = _read_wav(_get(p["chunk_key"]))
+        # A member is a VAD UNIT under audio_segments/, not the device's upload, and the
+        # unit itself begins _off{T} into its chunk. Both conversions live in batch_seal
+        # beside raw_key_for so there is one implementation of each.
+        raw, lo, hi = batch_seal.raw_window_for_member(p["chunk_key"], p["start_sec"],
+                                                       p["end_sec"])
+        audio, sr = _read_wav(_get(raw))
         rate = sr
-        parts.append(audio[int(p["start_sec"] * sr):int(p["end_sec"] * sr)])
-    return pieces[0]["chunk_key"], np.concatenate(parts), rate
+        first = first or raw
+        parts.append(audio[int(lo * sr):int(hi * sr)])
+    return first, np.concatenate(parts), rate
 
 
 def _frames(audio, sr):

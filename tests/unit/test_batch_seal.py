@@ -399,3 +399,38 @@ def test_a_straggler_of_a_sealed_bucket_is_redriven_not_left(s3):
         "the straggler must be consumed, not left to be re-planned forever"
     assert bl.bypass_status(table, SID, 3) == "bypassed"
     assert any(k == keys[3] for k, _ in s3.copies), "and re-driven down the per-chunk path"
+
+
+# ---- a batch member is a VAD unit, not the device's upload ---------------
+#
+# Found by invoking the deployed function, not by a test: the batch map's `chunk_key` points
+# at `audio_segments/…_off{T}_to{E}_srcwav.wav`, the VAD unit — NOT at `users/…`. The unit
+# tests had fabricated maps carrying `users/` keys, so they agreed with the assumption rather
+# than with what the seal actually writes. `map_key_for_audio`'s own docstring records the
+# same shape of accident happening once before.
+#
+# Two conversions, and the second is the one that would have gone unnoticed: the unit itself
+# begins `_off{T}` into the raw chunk, so a position inside the unit is NOT a position inside
+# the chunk. Every member in test currently carries off0.0 (whole-chunk transcription is on),
+# which is exactly why a test using a real-looking zero would have proved nothing.
+
+
+def test_a_position_inside_a_unit_becomes_a_position_inside_the_raw_chunk():
+    key, s, e = batch_seal.raw_window_for_member(
+        "audio_segments/u/2026-08-13/x_c0001_off12.5_to42.5_srcwav.wav", 5.0, 9.0)
+    assert key == "users/u/audio/2026-08-13/x_c0001.wav"
+    assert (s, e) == (17.5, 21.5), "the unit's own offset was dropped"
+
+
+def test_the_zero_offset_case_that_test_currently_produces():
+    key, s, e = batch_seal.raw_window_for_member(
+        "audio_segments/u/2026-08-13/x_c0000_off0.0_to30.0_srcwav.wav", 5.0, 9.0)
+    assert key == "users/u/audio/2026-08-13/x_c0000.wav"
+    assert (s, e) == (5.0, 9.0)
+
+
+def test_a_member_key_that_is_not_a_unit_raises():
+    """Silently returning the key unchanged would read the normalised audio, on which none
+    of the voiceprint thresholds hold — plausible numbers instead of an error."""
+    with pytest.raises(ValueError):
+        batch_seal.raw_window_for_member("nonsense.wav", 0.0, 1.0)
