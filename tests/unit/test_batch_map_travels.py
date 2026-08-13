@@ -240,3 +240,61 @@ def test_every_normalize_transcript_caller_rebases():
         "these resolve absolute times from a transcript without applying its batch map, so "
         "batched turns render early -- by the trimmed overlap, and by the whole of any "
         "VAD-dropped chunk the window bridged: " + ", ".join(offenders))
+
+
+# ---- turns that span a splice are flagged, not eyeballed (phase 6) ----
+
+def test_a_turn_that_spans_the_splice_is_flagged(sealed):
+    """A bridged gap splices audio that is not contiguous in time, and the provider does
+    not know that. It can emit ONE turn whose text runs across the join — fusing utterances
+    up to two minutes apart into a single interval covering time when nobody spoke. Photo
+    binding and claim provenance consume that interval.
+
+    After rebasing, such a turn's own start and end are each individually correct, which is
+    exactly why nothing downstream can notice. So the rebase marks it.
+    """
+    transcript, doc = sealed
+    kept = [m["kept_duration_sec"] for m in doc["members"]]
+    out = bs.rebase_turns_from_embedded_map({"speaker_turns": [
+        {"speaker": "spk_0", "text": "...across the join...",
+         "start_sec": kept[0] - 1.0, "end_sec": kept[0] + 1.0,
+         "abs_start": T0, "abs_end": T0}]}, transcript)
+    assert out["speaker_turns"][0]["crosses_gap"] is True
+
+
+def test_a_turn_crossing_a_merely_adjacent_boundary_is_not_flagged():
+    """Every batch has member boundaries; only the discontinuous ones are suspect. Flagging
+    all of them would make the signal mean "this is a batch", which nothing needs."""
+    doc = bs.build_map(SID, [
+        bs.member(4, "k4", T0.isoformat(), 0.0, 30.0, seam="first"),
+        bs.member(5, "k5", (T0 + timedelta(seconds=30)).isoformat(), 0.0, 30.0,
+                  seam="adjacent"),
+    ], sealed_by="arrival")
+    out = bs.rebase_turns_from_embedded_map({"speaker_turns": [
+        {"speaker": "s", "text": "x", "start_sec": 29.0, "end_sec": 31.0,
+         "abs_start": T0, "abs_end": T0}]}, {bs.EMBEDDED_MAP_KEY: doc})
+    assert out["speaker_turns"][0].get("crosses_gap") is False
+
+
+def test_a_turn_wholly_inside_one_member_is_not_flagged(sealed):
+    transcript, doc = sealed
+    kept = [m["kept_duration_sec"] for m in doc["members"]]
+    out = bs.rebase_turns_from_embedded_map({"speaker_turns": [
+        {"speaker": "s", "text": "x", "start_sec": kept[0] + 2.0, "end_sec": kept[0] + 4.0,
+         "abs_start": T0, "abs_end": T0}]}, transcript)
+    assert out["speaker_turns"][0].get("crosses_gap") is False
+
+
+def test_the_count_is_reported_even_when_it_is_zero(sealed, caplog):
+    """Zero is the positive evidence that the check ran at all.
+
+    Every guard in this feature that only logged on failure became indistinguishable from a
+    guard that was never reached — three times, each behind a missing IAM grant. A count
+    line on every batched transcript is what tells those two apart.
+    """
+    import logging
+    transcript, _ = sealed
+    with caplog.at_level(logging.INFO):
+        bs.rebase_turns_from_embedded_map({"speaker_turns": []}, transcript)
+    assert any("batch_splice_turns=0" in r.getMessage() for r in caplog.records), \
+        f"no count line: {[r.getMessage() for r in caplog.records]}"
