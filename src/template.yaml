@@ -219,8 +219,12 @@ Parameters:
 
   AlertEmail:
     Type: String
-    Description: Email address for failure alerts (leave empty to skip)
-    Default: ''
+    Description: >-
+      Email address for the three failure alarms. `none` means no alarms, and it is a
+      SENTINEL rather than the empty string because SAM rejects an empty
+      --parameter-overrides value outright -- that failed the whole prod deploy on
+      2026-08-12.
+    Default: 'none'
 
   ClaudeApiKey:
     Type: String
@@ -843,7 +847,12 @@ Conditions:
   ShouldEnableNonWorkExpiry: !Equals [!Ref EnableNonWorkExpiry, 'true']
   ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
   ShouldManageBucketPolicy: !And [!Condition ShouldEnableTranscribe, !Equals [!Ref ManageDataBucketPolicy, 'true']]
-  ShouldCreateAlerts: !Not [!Equals [!Ref AlertEmail, '']]
+  # Both spellings of "no alerts": the sentinel the workflows send, and the empty string a
+  # manual `sam deploy` might still pass. Testing only one leaves the other creating an SNS
+  # subscription to a literal address of "none".
+  ShouldCreateAlerts: !And
+    - !Not [!Equals [!Ref AlertEmail, '']]
+    - !Not [!Equals [!Ref AlertEmail, 'none']]
   HasVadLayer: !Not [!Equals [!Ref VadLayerArn, '']]
   HasKeyframeFfmpegLayer: !Not [!Equals [!Ref KeyframeFfmpegLayerArn, '']]
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
