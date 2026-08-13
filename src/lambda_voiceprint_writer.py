@@ -85,7 +85,10 @@ def _propagation(event):
                 correction_ref=correction_ref,
                 cluster_ref=r.get("cluster_ref"),
                 cluster_threshold=tau,
-                voiceprint_id=vp_id if asserted else None,
+                # The asserted row may carry one from the embedder (so a withdrawal can
+                # reach its name when the enrolment was refused); a propagated row never
+                # does, which is what keeps confirmations_count counting humans.
+                voiceprint_id=(r.get("voiceprint_id") or vp_id) if asserted else None,
                 score=r.get("score"),
                 margin=r.get("margin"),
                 label_disagreement=r.get("label_disagreement"),

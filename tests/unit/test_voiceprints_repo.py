@@ -444,3 +444,25 @@ def test_a_named_profile_needs_the_consenter_named_too():
     with pytest.raises(ValueError, match="consented_by"):
         voiceprints.upsert_profile(FakeConn([[]]), CO, display_name="Ben L",
                                    consent_given=True)
+
+
+def test_withdrawal_reaches_names_from_corrections_that_never_enrolled():
+    """The gap a tester hits on their first short window.
+
+    org-api creates the profile BEFORE the embedder runs. If the embedder then refuses the
+    enrolment — window under ten seconds, not homogeneous, or between voices — the turn
+    names are still written, and no sample row exists. Keying the un-naming on the samples'
+    `correction_ref` then finds nothing: 200, `samplesRemoved: 0`, and every name still on
+    the transcript.
+
+    The names carry `voiceprint_id` for exactly this reason now, so both routes are covered:
+    a correction that enrolled is reached through its sample, one that did not through the
+    profile itself.
+    """
+    conn = FakeConn([[], [], [], []])
+    voiceprints.withdraw(conn, CO, VP)
+    upd = next(c for c in conn.calls if "UPDATE speaker_turn_names" in c["sql"])
+    sql = " ".join(upd["sql"].split())
+    assert "correction_ref IN" in sql
+    assert "voiceprint_id = %s" in sql, (
+        "a correction whose enrolment was refused leaves names nothing can reach")

@@ -11,8 +11,9 @@ a file landing):
 Pure compute: **no database, no VPC.** This function runs on python3.12 because that is where
 onnxruntime comes from (the VAD layer is cp312-only) and `PsycopgLayer` is cp311-only — one
 function cannot carry both, and holding a connection here made every invocation raise
-`ModuleNotFoundError` while the deploy stayed green. Profiles arrive in the event from
-org-api, which is in-VPC and already owns the consent/withdrawn filters.
+`ModuleNotFoundError` while the deploy stayed green. Nothing it needs comes from a database:
+the artifact carries the window and the session's turns, and NO voice vectors — carrying them
+was the biometric-residence defect's fifth home.
 
 They fail in opposite directions, and the code is shaped around that asymmetry:
 
@@ -404,7 +405,12 @@ def _from_request_artifact(bucket, key):
     turn_ref = turn_name_overlay.turn_ref(c["source_filename"], start)
     results = [{"turn_ref": turn_ref, "state": "confirmed",
                 "cluster_ref": None, "asserted": True,
-                "display_name": c.get("display_name")}]
+                "display_name": c.get("display_name"),
+                # Carried so a withdrawal can reach this name even when the enrolment was
+                # REFUSED and no sample exists to chain through. Only the asserted row gets
+                # it, and only the writer decides what to do with it — a propagated row with
+                # a profile id would count as an independent human confirmation.
+                "voiceprint_id": (req.get("enrol") or {}).get("voiceprint_id")}]
     why = []
     propagated = _propagate(folder, date, req.get("turns") or [], v,
                             c.get("display_name"), turn_ref, why=why)

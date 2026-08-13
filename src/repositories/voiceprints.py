@@ -3,13 +3,17 @@
 Design: docs/superpowers/specs/2026-08-09-speaker-identity-v2.md §6, §8
 Schema: src/migrations/0038_speaker_voiceprints.sql
 
-Live since 2026-08-14: org-api calls `profiles_for_matching` when a correction is queued,
-the voiceprint writer calls `record_turn_name`, and the transcript endpoint calls
-`live_turn_names` to lay names over the turns it returns. (This paragraph said "nothing calls
-this yet" for a day after that stopped being true.)
+Live since 2026-08-14: the voiceprint writer calls `record_turn_name` and `add_sample`, the
+transcript endpoint calls `live_turn_names`, and `DELETE /api/org/voiceprints/{id}` calls
+`withdraw`.
 
-`add_sample` and `withdraw` are still uncalled — enrolment is Phase 4 and consent is its
-precondition.
+`profiles_for_matching` has NO production caller. It was the correction endpoint's, until
+the voice vectors it returned turned out to be the biometric-residence defect's fifth home —
+propagation names the cluster the corrected turn belongs to and scores against no stored
+profile, so nothing needed them. The consent and withdrawn filters it carries are still the
+ones any future matcher must use; that is why it is kept rather than deleted.
+
+(This paragraph has now been wrong twice in two days, in opposite directions.)
 
 Two of those queries have failure modes that are invisible in production:
 
@@ -227,21 +231,29 @@ def withdraw(conn, company_id, voiceprint_id) -> list:
     # the person's name is a withdrawal in the database and not in the product — TEST showed
     # exactly that: 200 returned, seven rows still naming them.
     #
-    # Reached through `correction_ref`, NOT `voiceprint_id`. Every propagated row carries a
-    # NULL profile id by design — that is what stops the machine confirming its own profiles
-    # — so an UPDATE keyed on the profile would match nothing at all and look like a fix.
-    # The correction is the link the spec named for exactly this, and it is on both.
+    # BOTH routes, because each alone misses rows the other reaches.
+    #
+    # `correction_ref` via the samples finds everything a successful enrolment justified —
+    # keying on `voiceprint_id` alone would match nothing, since every propagated row carries
+    # a NULL profile id by design (that is what stops the machine confirming its own
+    # profiles).
+    #
+    # But the profile is created BEFORE the embedder runs, and the embedder can refuse the
+    # enrolment — a window under ten seconds, or one holding two voices. Then names exist and
+    # no sample does, and the subquery finds nothing: 200, zero removed, every name still on
+    # the transcript. That is the first thing a tester hits with a short window.
     #
     # Superseded, not deleted: the audit of a withdrawal is partly the record of what it
     # removed, and a deleted row cannot say a name was ever shown.
     cur.execute(
         "UPDATE speaker_turn_names SET superseded_at = now() "
         "WHERE company_id = %s AND superseded_at IS NULL "
-        "  AND correction_ref IN ("
-        "        SELECT correction_ref FROM speaker_voiceprint_samples "
-        "         WHERE company_id = %s AND voiceprint_id = %s "
-        "           AND correction_ref IS NOT NULL)",
-        (company_id, company_id, voiceprint_id))
+        "  AND (voiceprint_id = %s"
+        "       OR correction_ref IN ("
+        "            SELECT correction_ref FROM speaker_voiceprint_samples "
+        "             WHERE company_id = %s AND voiceprint_id = %s "
+        "               AND correction_ref IS NOT NULL))",
+        (company_id, voiceprint_id, company_id, voiceprint_id))
     cur.execute(
         "DELETE FROM speaker_voiceprint_samples "
         "WHERE company_id = %s AND voiceprint_id = %s",

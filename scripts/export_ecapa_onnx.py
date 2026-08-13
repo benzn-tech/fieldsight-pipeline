@@ -10,6 +10,13 @@ Runs on a dev box, never in CI:
 Why an export at all: the Lambda cannot carry torch + speechbrain, and a model runtime is
 not something an inference function should pay for. onnxruntime alone is the plan's option A.
 
+**Point `--enrol` at the synthetic fixtures in tests/fixtures/voiceprint_parity/, not at real
+recordings.** This script used to be run against six colleagues' enrolment audio, and the
+result — their voices and their voiceprints — was committed to the repository, where it sat
+outside consent, expiry and withdrawal until 2026-08-14. Parity asserts that the exported
+ONNX answers what SpeechBrain answered, which holds for any audio; there is no reason for a
+person to be in it.
+
 Why reference vectors are committed and the model is not: the model is 84 MB (742 KB graph
 plus an 83 MB external `.data` sidecar) and lives in S3 under `models/`, the same place and
 for the same reason as the Silero VAD model — BUG-02 records that loading that one from a
