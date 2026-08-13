@@ -552,6 +552,34 @@ Parameters:
       the rollback survives a deploy: a switch that exists only in code takes its default
       forever and raises no error.
 
+  TranscribeReservedConcurrency:
+    Type: String
+    Default: '0'
+    Description: >-
+      Maximum concurrent invocations of the transcriber. '0' means NO reservation --
+      not a reservation of zero, which would stop the function dead.
+
+      The provider caps CONCURRENT requests and Lambda does not. Replaying one real
+      71-minute session drove this function to 141 concurrent against an ElevenLabs
+      Creator ceiling of 20; 27 requests came back HTTP 429, each leaving a batch WAV
+      with no transcript and nothing to re-drive it -- about 54 minutes of audio,
+      recovered by hand. Reserved concurrency is the only mechanism that bounds this
+      BEFORE the request is made; everything else reacts to a rejection that has already
+      lost the audio.
+
+      DERIVED, NOT GUESSED. Enumerate every deployed function whose live env carries
+      ELEVENLABS_API_KEY and check whether the stages share a key:
+        aws lambda get-function-configuration --function-name <fn>           --query 'Environment.Variables.ELEVENLABS_API_KEY'
+      As of 2026-08-13 each stage has its OWN key and exactly one consumer
+      (fieldsight-{stage}-transcribe), so the whole ceiling belongs to this function.
+      TEST: plan `creator` = 20 concurrent, reserve 12, margin for in-handler retries.
+      PROD: key is permission-scoped so the plan cannot be read from here, and the
+      observed peak is 54 with zero rate-limit errors -- so the ceiling is higher than
+      Creator's and a guessed number would throttle a working pipeline. Left at '0'
+      until someone reads the plan from the ElevenLabs console.
+
+      Record the pair (provider limit, reserve) together whenever either changes.
+
   BatchWindowSec:
     Type: String
     Default: '120'
@@ -853,6 +881,7 @@ Conditions:
   ShouldCreateAlerts: !And
     - !Not [!Equals [!Ref AlertEmail, '']]
     - !Not [!Equals [!Ref AlertEmail, 'none']]
+  HasTranscribeReserve: !Not [!Equals [!Ref TranscribeReservedConcurrency, '0']]
   HasVadLayer: !Not [!Equals [!Ref VadLayerArn, '']]
   HasKeyframeFfmpegLayer: !Not [!Equals [!Ref KeyframeFfmpegLayerArn, '']]
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
@@ -1014,6 +1043,12 @@ Resources:
       FunctionName: !Sub ["${P}-transcribe", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_transcribe.lambda_handler
+      # '0' omits the property entirely. Reserving zero would stop the function dead, which
+      # is the opposite of the protection intended.
+      ReservedConcurrentExecutions: !If
+        - HasTranscribeReserve
+        - !Ref TranscribeReservedConcurrency
+        - !Ref AWS::NoValue
       Timeout: 300
       MemorySize: 128
       Environment:
