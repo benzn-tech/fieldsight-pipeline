@@ -348,3 +348,39 @@ this is not a small gap: prod holds 532 chunks total, covering 2026-02-09 to
 08-12, with **zero** for 08-13. Task 5 resurfaces the 220 discarded windows,
 which is the cheapest real recall available; a genuine backfill is its own
 piece of work.
+
+---
+
+## 10. The action-item admission bar did NOT reproduce a measurable improvement
+
+Recorded because the commit that added it (`568d25e`) reads as though it fixes
+the failure in §1, and the one run available does not support that.
+
+**What was run.** The same 244 K transcript through the extraction prompt with
+and without the admission bar, same model, thinking on.
+
+| arm | action items | items |
+|---|---|---|
+| no bar (§1's arm B) | 3 | `Product positioning -- market as known IT asset` · `Privacy controls -- implement visible audio deletion` · `Photo linking bug -- investigate missing dashboard photos` |
+| with bar | 3 | `Hardware positioning -- package as company phone` · `Privacy controls -- implement visible deletion features` · `Photo-linking UI -- fix missing image display` |
+
+**The control already produced only tickable tasks.** All three of arm B's
+items name an act someone can finish. The four directions
+(`Target market strategy -- focus high-hourly professionals` and friends) came
+only from **arm A** — the shorter 104 K transcript that prod actually ran. So
+whatever produced them, this run does not show it was the missing bar.
+
+The verbs did firm up (`market as` → `package as`, `investigate` → `fix`), but
+that is one run against one run and is not evidence.
+
+**What the change still stands on.** The prompt taught the failing shape with
+its own first positive example, and naming the criterion — test the verb, not
+the subject — is correct regardless of whether this session happens to exercise
+it. It is a defensible prompt, not a demonstrated fix.
+
+**What would actually establish it.** Several runs per arm on the *arm A*
+input (the 104 K transcript, which is the one that produced the failure), plus
+sessions of both kinds — a site walk, where the bar must not suppress real
+tasks, matters more than the strategy chat. `scripts/extraction_ab.py` on
+PR #404 exists for exactly this and should be the vehicle; do not merge a claim
+of improvement before it has been run.
