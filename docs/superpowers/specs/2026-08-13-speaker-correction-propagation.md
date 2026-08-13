@@ -1,277 +1,329 @@
 # Correcting one turn should name the whole meeting — design
 
-**Status:** spec, revision 2 (revision 1 had three blocking defects; they are recorded below
-rather than deleted, because two of them were wrong in ways worth not repeating)
+**Status:** spec, revision 3
 **Date:** 2026-08-13
-**Extends:** `2026-08-09-speaker-identity-v2.md` (§6 enrolment by correction), phase 4 of
+**Extends:** `2026-08-09-speaker-identity-v2.md` §6, phase 4 of
 `../plans/2026-08-11-speaker-identity-implementation.md`
+
+Two review rounds each found the central mechanism broken. Both are recorded rather than
+deleted, because the second failure was the first one wearing a different costume and that is
+worth being able to recognise a third time.
 
 ## The ask
 
 > 有一句或者数句话现在层面也许是 speaker1，但是我的用户人工更改后比如改成 "Ben L"，
 > 这个 meeting 中所有这个人的内容都会改成 "Ben L"？并且以后也能尽可能 detect？
 
-Two things, separable and worth separating because they ship apart:
-
-* **Backward, this meeting** — one correction names every *other* passage by the same person
-  in the session just corrected.
-* **Forward, future meetings** — the same correction becomes an enrolment sample. Already
-  specified (v2 §6), built (phases 1–3), and gated behind `SPEAKER_IDENTITY_MODE`.
+* **Backward, this meeting** — one correction names every other passage by that person.
+* **Forward, future meetings** — the same correction becomes an enrolment sample (v2 §6,
+  built in phases 1–3, gated by `SPEAKER_IDENTITY_MODE`).
 
 This document is about the first.
 
-## The obvious implementation is the wrong one
+## Rejected: propagate by the provider's speaker label
 
-The transcript carries a provider speaker label per turn (`spk_0`, `spk_1`, …), so the cheap
-propagation is: rename every turn sharing the corrected turn's label. One SQL update, no
-model, no cost.
+The transcript carries `spk_0`, `spk_1`, … so the cheap propagation is to rename every turn
+sharing the corrected turn's label. Phase 0 (2026-08-11 — wearer's device on his chest, two
+other speakers side by side at 5 m) measured what that inherits:
 
-**It inherits every diarization error the provider made, and those are measured to be large.**
-From Phase 0 (2026-08-11 — the wearer had the device on his chest, and two other speakers
-stood side by side at 5 m):
-
-* a three-person passage came back with **two** labels — two people merged under one; and
+* a three-person passage came back with **two** labels — two people merged; and
 * another had the **right number** of labels with the content **swapped between them**.
 
-Under label propagation, one click naming "Ben L" names a second person's speech as Ben,
-everywhere. The user asserted *"this passage is Ben"*; label propagation silently upgrades it
-to *"every passage the provider grouped with it is Ben"* — a claim they never made and cannot
-see the basis of. The failure is quiet: the transcript looks *more* confident.
+The user asserted *"this passage is Ben"*; label propagation silently upgrades that to *"every
+passage the provider grouped with it is Ben"*. The failure is quiet — the transcript looks
+*more* confident. Kept only as a tiebreaker that can cap, never promote.
 
-Rejected as the mechanism. Retained only as a **tiebreaker** (below), where being wrong costs
-an abstention.
+## Rejected twice: score every turn against the corrected window
 
-## The mechanism: propagate by voice, against the room
+**Revision 1** scored each turn against the reference and called `decide_name`. That function
+returns `tentative` unconditionally when there is one candidate, *without looking at the
+score* (`voiceprint_utils.py:122`) — deliberately, because confirming on one candidate means
+confirming on an absolute similarity. One corrected person is one candidate, so no name could
+ever be confirmed, and a stranger at cosine 0.02 still got `(可能是 Ben L)`.
 
-The corrected window becomes a reference vector; every other turn in the session is scored
-against it.
+**Revision 2** tried to supply competition by clustering the session and adding cluster
+centroids as rival candidates. It never excluded the cluster **containing the corrected
+person's own turns**. For every genuine Ben turn, `cos(reference, v_i)` and
+`cos(centroid_Ben, v_i)` are near-equal, the margin collapses to ~0, and nothing confirms —
+the same dead end.
 
-**Revision 1 said this reused `decide_name` unchanged, and that was wrong.** `decide_name`
-(`voiceprint_utils.py:120`) returns `tentative` **unconditionally when there is only one
-candidate**, without looking at the score at all — deliberately, because confirming on a
-single candidate means confirming on an absolute similarity, which the overlapping
-distributions forbid. With one corrected person there is exactly one candidate. So revision 1
-could:
+That failure is documented in the very module the design leans on. `aggregate_scores`
+(`voiceprint_utils.py:76`) exists *only* because ungrouped rows make a person their own
+runner-up: Phase 0's Ben holds two profiles ~0.08 apart, below the 0.15 margin, so he reports
+`tentative` against himself. Revision 2 re-committed a failure the code carries a docstring
+about.
 
-* never produce a confirmed name — the headline effect was arithmetically unreachable; and
-* attach `(可能是 Ben L)` to a stranger's every turn, because at one candidate the cosine is
-  ignored entirely, including a cosine of 0.02.
+## The mechanism: the session is clustered by voice, and a correction names a cluster
 
-The fix is not to weaken the rule. It is to **supply the runner-up the rule needs**, which
-this setting has for free and cross-session matching does not: *the other voices in the same
-room*.
+The unit of propagation is **not** a turn scored against a reference. It is a **voice**.
 
 ```
-corrected window ──embed──► reference v
-all turns in session ──embed──► v_i          (once, per session)
-cluster {v_i} ──► session-local voices C_1..C_k
-   candidates for turn i = { "Ben L": cos(v, v_i) } ∪ { C_j : cos(centroid_j, v_i) }
-   decide_name(candidates, duration)          ← unchanged, now with real competition
+all turns in the session ──embed──► v_1 … v_n        (once per run)
+cluster {v_i} by voice   ──────────► C_1 … C_k
+user corrects a turn t to "Ben L"  ─► the cluster containing t is named "Ben L"
 ```
 
-This is closer to how Phase 0 actually measured its margins than matching against enrolled
-profiles is: those margins are *"best minus closest other speaker"*, and the closest other
-speaker is precisely what a session-local cluster supplies.
+Self-competition cannot arise, because the reference is never a candidate alongside its own
+cluster — it *selects* a cluster. Per-turn confidence is then an ordinary multi-candidate
+question with genuinely different voices competing:
 
-**It is new arithmetic** — clustering the session's own embeddings — and it needs its own
-tests and its own measurement. Revision 1's claim that "nothing new is invented" was false in
-two ways: this, and the deployed embedder's `op: match` only scores against **stored** profiles
-(`load_profiles` → `profiles_for_matching`), with no path for a session-local reference and no
-write of `speaker_turn_names` at all. A new op and a writer are real new surface.
+```
+for turn i in the named cluster:
+    candidates = { C_j : cos(centroid_j, v_i) }   for all j, including its own
+    decide_name(candidates, duration)             ← unchanged, real competition
+```
 
-### An absolute floor, as a refusal only
+A turn sitting comfortably inside its cluster and far from the others confirms. A turn near a
+boundary between two voices degrades to `tentative`. That is the right behaviour and it comes
+out of the existing rule rather than a new one.
 
-Below a floor cosine, the result is `unknown` — no name, not even tentative. This is **not** an
-absolute threshold for confirming; it only stops the mechanism from leaning toward a name when
-the evidence is nothing. Confirming still requires the margin.
+This also reframes what the feature *is*: **the voiceprint re-does the diarization the
+provider got wrong, and the user's correction supplies the name.** Phase 0 measured the
+voiceprint correcting exactly those provider errors. The user is not labelling turns one by
+one; they are labelling a voice.
 
-### Three states, unchanged (v2 §1)
+### The short-window problem disappears
 
-* **confirmed** — margin cleared. Renders as "Ben L".
-* **tentative** — nearest but margin not met. `(可能是 Ben L)` in the transcript viewer
-  **only**; the anonymous label in minutes, email, and action-item responsible party.
-* **unknown** — below the duration floor, below the cosine floor, or no candidate.
+Revision 2 required `window_is_homogeneous` on the corrected window. That check returns `None`
+("cannot tell") below **two frames**, and `FRAME_SECONDS = 5.0`, so **every corrected window
+under 10 seconds propagated nothing** — which is the most natural gesture a user makes, and it
+would have hollowed out the feature while looking like a safety property.
 
-The corrected turn itself is always confirmed: the user said so.
+Under cluster naming the short turn only has to *indicate which cluster*, not carry the
+evidence. The homogeneity requirement moves to where it belongs — the **cluster**, whose
+member turns are checked for coherence, with far more audio than any single turn. A corrected
+turn that sits between two clusters (the 1-in-6 two-voice turn v2 §2 measured) names nothing
+and says so, rather than silently naming the wrong voice.
+
+### Clustering is the new load-bearing threshold, and it is uncalibrated
+
+Pure numpy — `voiceprint_utils` is deliberately dependency-free and the VAD layer carries no
+sklearn — so this is hand-rolled agglomerative clustering on cosine distance with a merge
+threshold. That threshold now decides how many voices the meeting had, and it fails in two
+opposite directions:
+
+* **merged too far** → two people in one cluster → one correction names both, and the
+  runner-up that would have caught it is gone. Over-confirmation.
+* **split too far** → one person in two clusters → the second cluster is unnamed, and its
+  turns compete with the named one at ~0 margin. Under-confirmation.
+
+It has the same no-calibration problem as the margin, and **changing it invalidates every
+calibration row collected before the change**. So it is measured and **frozen before
+collection starts**, using the Phase 0 recordings plus whatever the tentative-only step
+produces, and the frozen value is recorded in the artifact so a row can be attributed to the
+clustering that produced it.
+
+### An absolute floor, stated with its value and its modesty
+
+Below cosine **0.05** to every cluster, a turn is `unknown` rather than tentative. This is not
+a confirming threshold — it only stops the mechanism leaning toward a name when the evidence
+is nothing. Phase 0's distributions box it in: same-person minimum +0.104, different-person
+maximum +0.205, so **any floor above ~0.10 refuses genuine matches** and one low enough to be
+safe does almost nothing. It is there for the cosine-0.02 pathology and is expected to fire
+rarely; if it fires often, something upstream is wrong. `decide_name` has no floor parameter,
+so the floor lives in the caller and is tested there.
 
 ### Label agreement caps, never promotes
 
-Where the provider label agrees with the voice match, nothing changes. Where they
-**disagree**, the disagreement is recorded and the state is capped at `tentative`. Two
-independent sources contradicting each other is where a confident name is least warranted.
+Where the provider label disagrees with the cluster assignment, the disagreement is recorded
+and the state is capped at `tentative`. Two independent sources contradicting each other is
+where a confident name is least warranted.
 
-### The reference window gets the same guard as an enrolment
+## Three states (v2 §1, unchanged)
 
-v2 §2 measured **1 turn in 6 containing two voices**, and says plainly that any mechanism
-treating a turn as one person's voice will sometimes be wrong — *including a user's manual
-correction*. The enrolment path already refuses inhomogeneous windows
-(`lambda_speaker_embed._enrol`). Propagation runs the same `window_is_homogeneous` check on
-the reference; a window that fails, or that is too short to judge, propagates **nothing**. A
-contaminated reference spreading a name across a whole session is the exact failure this
-mechanism exists to prevent.
+* **confirmed** — margin cleared. Renders as "Ben L".
+* **tentative** — `(可能是 Ben L)` in the transcript viewer **only**; the anonymous label in
+  minutes, email, and action-item responsible party.
+* **unknown** — below the duration floor, below the cosine floor, or no cluster.
 
-## Precedence: what happens when corrections disagree
+The corrected turn itself is always confirmed: the user said so.
 
-Revision 1 left this undefined, and 0038 has no uniqueness constraint to fall back on. The
-rule:
+## Corrections are processed together, not one at a time
 
-1. A **direct correction** always beats a propagated name for the same turn.
-2. Among corrections, the **latest** wins.
-3. A new correction **supersedes** every propagated row it contradicts — including rows an
-   earlier correction produced for a different person. Superseded rows are marked, not
-   deleted, so the audit shows what a correction undid.
+Each correction naming a different cluster in the same session is applied in **one run**. This
+is not only a cost decision:
 
-Enforced by a unique index on `(company_id, session_base, turn_ref)` over live rows, so the
-overlay cannot have two answers for one turn regardless of what the writer does.
+* every named cluster becomes a *named* competitor for the others, which is strictly better
+  evidence than competing against an anonymous centroid; and
+* one run means one clustering, so two corrections cannot be resolved against two different
+  partitions of the same meeting.
 
-A correction marks a **window**, which may not align to a turn boundary. The confirmed turn is
-the one with the greatest overlap with the window; ties go to the earlier turn; a window
-spanning several turns confirms all of them it covers by more than half.
+A correction arriving later re-runs the whole session with all corrections known. The run is
+idempotent by construction: same audio, same frozen threshold, same corrections → same rows.
 
-## Schema: this needs migration 0039
+## Precedence, supersession, and withdrawal
 
-Revision 1 said `speaker_turn_names` (0038) already stored what it needed. It does not. 0038
-has `id, company_id, voiceprint_id NOT NULL, session_base, turn_ref, state, score, margin,
-created_at` — **no source, no correction pointer, no disagreement marker**, and a `NOT NULL`
-FK to `speaker_voiceprints` that directly contradicts the consent path below (a correction
-that creates no profile has no id to point at, so every row would violate the FK).
+1. A **direct correction** beats a propagated name for the same turn.
+2. Among corrections, the **latest** wins; ties break on `(created_at, id)` so concurrent
+   writes have a total order.
+3. A run supersedes the rows of the run before it, in **one transaction** — supersede then
+   insert — so an S3-event race (events are unordered, `ReservedConcurrentExecutions` > 1)
+   cannot half-apply or collide on the unique index.
+4. **Withdrawing a correction** supersedes its rows and triggers a re-run from the *surviving*
+   corrections. Earlier superseded rows are **not** resurrected: the overlay is always the
+   output of one clustering over the current correction set, never an accumulation of history.
+   History remains readable, but it never decides anything.
 
-0039 adds: `source text` (`correction` | `correction_propagation` | `match`), `correction_ref
-text`, `label_disagreement boolean`, `superseded_at timestamptz`, makes `voiceprint_id`
-nullable, and adds the unique index over live rows.
+A partial unique index on `(company_id, session_base, turn_ref) WHERE superseded_at IS NULL`
+enforces one live row per turn — **at the string level only**. Since the read join is by
+overlap with tolerance (below), the read-time resolver applies the same precedence rules
+again; the index is a backstop, not the guarantee. Revision 2 claimed the index alone made two
+answers impossible, and with a tolerance join it does not.
+
+## Schema: migration 0040
+
+0038's `speaker_turn_names` has `id, company_id, voiceprint_id NOT NULL, session_base,
+turn_ref, state, score, margin, created_at` — no source, no correction pointer, no
+supersession, and a `NOT NULL` FK that a no-profile correction cannot satisfy.
+
+Added: `source text` (`correction` | `correction_propagation` | `match`), `correction_ref
+text`, `cluster_ref text`, `label_disagreement boolean`, `superseded_at timestamptz`,
+`cluster_threshold double precision`; `voiceprint_id` made nullable; the partial unique index.
+
+**Numbered 0040, not 0039** — 0038's own header reserves 0039 as its revert migration, and
+quietly repurposing that number would remove a recorded rollback path.
 
 ## Where the names live
 
-An **overlay**, resolved at read time. Nothing is rewritten in the transcript artifact:
+An **overlay**, resolved at read time; the transcript artifact is not rewritten. Three reasons:
+withdrawal must reach everything a correction justified (v2 §6), a derived document may have
+exactly one writer (`fieldsight-programme-derived-doc-writers`), and re-running extraction
+rewrites the artifact while an overlay survives it.
 
-1. A correction can be withdrawn, and v2 §6 requires withdrawal to reach "everything it
-   justified" — enumerable only if names are rows.
-2. `fieldsight-programme-derived-doc-writers`: a derived document gets exactly one writer. The
-   transcript artifact has its writer.
-3. Re-running extraction rewrites the artifact; an overlay survives that, baked text does not.
-
-**`turn_ref` stability is the weak point of (3).** It is `source_filename + start_sec`, and the
-live/final two-layer extraction re-assembles turns — a seam dedup can shift `start_sec`, and a
-row whose ref matches nothing makes a name **silently vanish**, which is the same class of
-failure this section claims to avoid. So the join is by **overlap with tolerance**, not string
-equality, and a row matching no turn is surfaced as an orphan count in the response rather
-than dropped.
+**`turn_ref` stability is the weak point.** It is `source_filename + start_sec`, and the
+live/final two-layer extraction re-assembles turns — a seam dedup shifts `start_sec`, and a row
+matching nothing makes a name **silently vanish**. So the join is by **overlap with
+tolerance**, and rows matching no turn are reported as an orphan count rather than dropped.
 
 ## Invocation: org-api cannot invoke this Lambda
 
-Phase 4's plan says the corrections endpoint invokes `SpeakerEmbedFunction` directly, citing
-the Matcher→SuggestionWriter precedent. **That precedent runs the other way.** The matcher is
-*outside* the VPC; org-api is *inside* it, and an in-VPC function has no NAT — a
-`lambda:InvokeFunction` call black-holes until timeout with no logs (BUG-36, and BUG-43 note 4
-records the same rule). So the direct invoke would fail exactly the way this repo has already
-been burned by twice.
+Phase 4's plan has the corrections endpoint invoking `SpeakerEmbedFunction` directly, citing
+the Matcher→SuggestionWriter precedent. **That precedent runs the other way**: the matcher is
+outside the VPC. org-api is inside it with no NAT, so `lambda:InvokeFunction` black-holes until
+timeout with no logs (BUG-36; BUG-43 note 4 states the rule).
 
-The established pattern for an in-VPC function starting outside work is an **S3 request
-artifact** (`extraction_requests/`, `session_finalize_requests/`, `reindex_requests/`). This
-uses the same:
+The established in-VPC→outside handoff is an S3 request artifact:
 
 ```
-org-api (in VPC, has psycopg)
-  ├─ reads the profiles in scope, applies the consent/withdrawn filters
-  └─ writes voiceprint_requests/{id}.json  { session, turns[], reference window, profiles[] }
-        │ S3 event
-        ▼
-  SpeakerEmbedFunction (NOT in VPC — pure compute, no database)
-  ├─ reads raw audio + model from S3
-  └─ writes voiceprint_results/{id}.json   { per-turn state, name, score, margin }
-        │ S3 event
-        ▼
-  an in-VPC writer persists rows into speaker_turn_names
+org-api (in VPC)  ──writes──►  voiceprint_requests/{id}.json
+                                  │ S3 event
+SpeakerEmbedFunction (NOT in VPC, pure compute, no database)
+                   ──writes──►  voiceprint_results/{id}.json
+                                  │ S3 event
+an in-VPC writer  ──persists──►  speaker_turn_names
 ```
 
-### This also resolves a defect found tonight in the deployed function
+**Both S3 triggers must be wired manually outside the template** (BUG-33 — SAM cannot attach
+events to an external bucket; every S3-triggered function here carries a "NO Events: wired
+manually" comment and `scripts/wire-s3-events.sh` does it). Forgetting this **deploys green
+with nothing firing**, which is this repo's canonical trap.
 
-`fieldsight-test-speaker-embed` deployed green and is **100% non-functional**: both of its ops
-raise `ModuleNotFoundError: No module named 'psycopg'`. It carries `fieldsight-vad-layer` for
+The in-VPC writer is a **new function**, not a reuse: it needs `GetObject` on
+`voiceprint_results/*` and `DeleteObject` (below), and the deploy role must be checked for
+every new resource type it introduces — a missing IAM prefix here has twice produced a silent
+success rather than an error.
+
+### This resolves the layer conflict, and a defect found tonight
+
+`fieldsight-test-speaker-embed` deployed green and is **100% non-functional**: both ops raise
+`ModuleNotFoundError: No module named 'psycopg'`. It carries `fieldsight-vad-layer` for
 onnxruntime, which is **cp312-only**, while `PsycopgLayer` is **cp311-only** — one function
-cannot have both, and the unit tests stub `load_profiles`, so nothing ever imported psycopg.
-Found by invoking the deployed function, not by any test.
+cannot have both, and every unit test stubs `load_profiles`, so nothing ever imported it.
+Found by invoking the deployed function.
 
-Making the function **pure compute with no database** removes the conflict rather than working
-around it with a second psycopg layer built for 3.12 (which also needs python3.12 added to
-both deploy workflows). It also removes its `VpcConfig`, which it only ever had in order to
-reach Aurora.
+Pure compute with no database removes the conflict rather than working around it with a second
+psycopg layer for 3.12 (which would also need python3.12 added to both deploy workflows), and
+removes the `VpcConfig` that existed only to reach Aurora.
 
-One thing must survive the move: `profiles_for_matching`'s consent and `withdrawn` filters are
-the queries that fail *invisibly* — a withdrawn profile that still matches is not a
-withdrawal. They stay in the repository, called by org-api, and the request artifact carries
-only what those filters already allowed. A test pins that the embedder has **no** way to
-obtain a profile other than from the artifact.
+`profiles_for_matching`'s consent and `withdrawn` filters stay in the repository, called by
+org-api: a withdrawn profile that still matches is not a withdrawal, and that query fails
+invisibly. A test pins that the embedder has **no** way to obtain a profile except from the
+artifact.
 
-## Cost, stated because it is paid per correction
+## The artifacts are biometric storage, and are treated as such
 
-Revision 1 said "seconds of compute" for ~200 turns. Against the plan's own sizing (~100–400 ms
-per turn at 1769 MB) that is **20–80 s of inference**, plus a per-turn S3 GET and WAV decode
-(`_match` re-fetches per turn with no memoization), plus an 84 MB cold-start model download —
-realistically 40–110 s against a **120 s timeout**, brushing the ceiling on the median case and
-blowing it on a 40-minute session. And a synchronous path through API Gateway dies at 29 s
-regardless.
+Revision 1 proposed caching embeddings and was told the cache was a stored biometric.
+Revision 2 dropped the cache and asserted "retains none" — while routing 192-d vectors through
+S3 objects with no deletion and no lifecycle rule. **The defect moved rather than died.** Both
+reviews caught the same thing in a different place, which is the strongest available signal
+that this is the design's soft spot.
 
-Hence: **asynchronous** (the S3 artifact chain above is inherently so; org-api returns 202),
-**one audio fetch per source file per run** rather than per turn, and an explicit
-`SPEAKER_PROPAGATION_MAX_TURNS` cap whose value is **reported in the result artifact**. Silent
-truncation reads as "covered everything" when it did not.
+So:
 
-**Revision 1 proposed caching turn embeddings across corrections, and that is dropped.** A
-cached ECAPA vector *is* a voiceprint — the same 192-d object `speaker_voiceprint_samples`
-treats as biometric data requiring consent and deletion on withdrawal. Revision 1 justified
-shipping without consent on the grounds that the overlay "carries no stored biometric,
-discarded after the run", and then proposed storing exactly that. The two sentences cannot
-both stand. The cache is dropped and the cost is accepted; a durable cache would have to be
-declared as retained biometric data with a TTL and Phase 6 coverage, which is a bigger
-decision than a speed-up deserves.
+* **Propagation carries no profiles at all.** Its candidates are session-local clusters, so
+  `voiceprint_requests/` for propagation contains audio references and windows — no vectors.
+  This is not a mitigation, it is a consequence of the mechanism.
+* **Enrolment must transit a vector** (the embedder computes it, an in-VPC writer stores it).
+  That artifact is **deleted by the writer after commit**, with an S3 lifecycle rule as the
+  backstop for a writer that dies mid-run, and Phase 6 withdrawal must sweep the prefix —
+  `repositories.voiceprints.withdraw` deletes DB rows only, so a withdrawn person's vector
+  would otherwise survive in a stale artifact.
+* The consent section names these prefixes as **transient biometric storage** rather than
+  claiming they do not exist.
 
 ## Consent
 
-The audio is already lawfully held and already processed. What is new is attaching a **name**
-to a voice pattern — biometric information under the NZ Privacy Act — and consent must come
-from **the person whose voice it is**, not the wearer and not the employer (v2 §10).
+The audio is already lawfully held and processed. What is new is attaching a **name** to a
+voice pattern — biometric information under the NZ Privacy Act — and consent must come from
+**the person whose voice it is**, not the wearer and not the employer (v2 §10).
 
 The product decision on record (2026-08-13) is to ship the mechanism and formalise consent as
-a real-world process. The engineering consequence is that the seam exists now, because
-retrofitting it means finding every profile created before it:
+a real-world process. The engineering seam exists now because retrofitting it means finding
+every profile created before it:
 
-* the **within-session overlay** computes vectors, uses them, and retains none — with the
-  cache dropped, that sentence is now true;
+* the **within-session overlay** stores no vector, and with propagation carrying no profiles
+  that is now structurally true rather than asserted;
 * the **enrolment** — a stored vector attached to a named person, which is what makes future
-  detection possible — still requires `consent_at` (v2 §6, phase 4). Not relaxed here.
+  detection possible — still requires `consent_at` (v2 §6). Not relaxed.
 
-A correction with no consent recorded therefore propagates within the meeting and creates **no
-stored profile**. The API reports which of the two happened; a single "success" would hide it.
+A correction with no consent recorded propagates within the meeting and creates **no stored
+profile**. The API reports which of the two happened; a single "success" would hide it.
 
-## What the user sees
+## Cost and shape
 
-* **Transcript viewer** — names, with `(可能是 …)` for tentative, and a propagated name
-  visibly distinct from a directly corrected one. The user needs to know which they asserted.
+Per-turn embedding is ~100–400 ms at 1769 MB, so a 200-turn session is 20–80 s of inference
+plus a per-source-file audio fetch (`_match` currently re-fetches **per turn** — memoized per
+file) plus an 84 MB cold-start model download. The path is **asynchronous** (the S3 chain
+above; org-api returns 202), so API Gateway's 29 s ceiling does not apply and the **timeout
+goes to 600 s**, matching extract-session. Revision 2 kept 120 s and capped coverage instead,
+which traded user-visible completeness for a number that costs nothing to raise.
+
+`SPEAKER_PROPAGATION_MAX_TURNS` remains as a backstop and its value is **reported in the
+result artifact** — silent truncation reads as "covered everything" when it did not.
+
+## What the user sees, and the confirm affordance
+
+* **Transcript viewer** — names, `(可能是 …)` for tentative, and a propagated name visibly
+  distinct from a directly corrected one.
 * **Minutes, email, action items** — `confirmed` only. The email is what leaves the building.
 * **No extraction re-run.** Phase 5's `on` mode owns whether names re-enter the LLM artifact,
-  with its own budget (`SPEAKER_RERUN_MAX`) and email suppression. Propagation must not
-  quietly acquire that blast radius — in particular it must never cause
-  `session_finalize_requests/{sid}-updated.json` to be written, because that object sends an
-  email.
+  with its own budget and email suppression. Propagation must never cause
+  `session_finalize_requests/{sid}-updated.json` to be written — that object sends an email.
+* **A tap-to-confirm affordance on a tentative name is a requirement, not a nicety.** See
+  calibration.
 
-## Calibration, and what ships before it
+## Calibration, and what ships first
 
-`confirmed` needs a margin threshold, and no calibrated one exists (the plan forbids `on` mode
-until it does). Phase 0's +0.33–0.44 margins cannot supply it: they are same-day,
-channel-matched, n=3–4 per distant speaker, partly cross-session pairs, fitted on their own
-data, and the artifacts were not preserved.
+`confirmed` needs a margin threshold and none is calibrated. Phase 0's +0.33–0.44 cannot
+supply it, and revision 2's claim that session-local centroids are "closer to how Phase 0
+measured" was rhetorical: Phase 0's runner-up was another **enrolled profile** from a clean
+30–45 s read, not a centroid of 3–4 noisy in-session turns at 5 m. Same-session centroids are
+channel-matched, so runner-up scores run higher and margins smaller. The margin distribution
+against centroids is a **new, unmeasured quantity**.
 
 So propagation ships in two steps:
 
-1. **tentative-only** — the mechanism runs, rows land, the viewer shows `(可能是 …)`, and
-   nothing reaches minutes or email. This is usable (the user can correct what it suggests)
-   and it is the calibration collector: propagated rows joined to subsequent corrections are a
-   held-out measurement, on the exact distribution that matters.
-2. **confirmed enabled** — only once step 1 has produced a measured threshold, per condition
-   class, as v2 §9 requires.
+1. **tentative-only** — the mechanism runs, rows land, the viewer shows `(可能是 …)`, nothing
+   reaches minutes or email.
+2. **confirmed enabled** — a threshold change, not a code change, once step 1 has measured one.
 
-Step 1 is the deliverable. Step 2 is a threshold change, not a code change.
+**Step 1's measurement is biased unless the affordance exists.** Corrections only label rows a
+user noticed were wrong; an uncorrected row is "correct *or* unreviewed" and the two are
+indistinguishable, so a naive join measures noticed-false-positives and not accuracy. Worse,
+showing `(可能是 X)` anchors the reader — a plausible wrong name gets accepted — biasing the
+"held-out" set toward confirming. A one-tap confirm turns silence into a signal, and a sampled
+audit covers what is never tapped. Without one of the two, step 1 collects a set that argues
+for a threshold lower than the truth.
 
 ## Rollback
 
@@ -284,13 +336,13 @@ description (`fieldsight-unwired-toggle-trap`).
 * Cross-session propagation (Phase 5, gated on calibration).
 * Renaming inside the LLM artifact (Phase 5 `on`).
 * Identity merging across devices in a multi-device session group.
-* Un-naming on withdrawal (Phase 6) — this spec's contribution is only that the rows exist to
-  make it enumerable.
+* Un-naming on withdrawal (Phase 6) — this spec only ensures the rows make it enumerable.
 
-## Open question for review
+## Open question
 
-Whether a propagated `tentative` name should be shown at all, or whether the viewer should
-show only `confirmed` plus an "unnamed" count. Showing tentative gives the user something to
-correct — the fastest path to more samples — but puts a name the system does not stand behind
-in front of a human, and `(可能是 …)` has never been tested on a real user. Under the
-tentative-only first step this is not a side question: it is the entire visible surface.
+Whether tentative names should be shown at all in step 1, or whether the viewer should show
+only confirmed names plus an "unnamed" count. Showing them is the fastest path to correction
+data; it also puts a name the system does not stand behind in front of a human, and
+`(可能是 …)` has never been tested on a real user. Under the two-step plan this is the entire
+visible surface of step 1, so it is a product decision that has to be made before build, not
+during.
