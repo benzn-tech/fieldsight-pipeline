@@ -32,7 +32,9 @@ import wave
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import speaker_phase0 as sp  # noqa: E402
+import speaker_phase0 as sp
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+import voiceprint_utils as vp  # noqa: E402  # noqa: E402
 
 STOP = set("the a an and or but is are was were be been to of in on at it its that this "
            "i you we they he she him her them my your our their with for from as so if "
@@ -68,6 +70,16 @@ def turns_from_transcript(path):
     return out
 
 
+def _same(a, b) -> bool:
+    """Whether two person keys name the same person.
+
+    Case-insensitive exact match, NOT the three-letter prefix this script used until
+    2026-08-13. That prefix silently scored a distractor called `benny` as the wearer, and
+    a distractor run is exactly when it would have mattered.
+    """
+    return bool(a) and bool(b) and str(a).strip().lower() == str(b).strip().lower()
+
+
 def match_script(text, script):
     """Best script line for this turn, by token overlap. Returns (speaker, score, line_i)."""
     t = set(toks(text))
@@ -92,6 +104,14 @@ def main():
     ap.add_argument("--match-floor", type=float, default=0.30,
                     help="token overlap below which a turn is left UNLABELLED rather than "
                          "assigned — a wrong label is worse than a missing one")
+    ap.add_argument("--person-map", default=None,
+                    help="json: profile stem -> person key. Two enrolments of one person "
+                         "(Ben has English and Chinese) MUST share a key, or they become "
+                         "each other's runner-up and the margin never clears. Absent, "
+                         "every profile is its own person.")
+    ap.add_argument("--distractors", default=None,
+                    help="dir of extra enrolment wavs, treated as people who are NOT in "
+                         "the room. Grows the pool without touching the ground truth.")
     args = ap.parse_args()
     W = args.work
     scripts = json.load(open(args.scripts, encoding="utf-8"))
@@ -102,9 +122,26 @@ def main():
         name = os.path.basename(p)[:-4]
         a, sr = read_wav(p)
         profiles[name] = emb.embed(a, sr)
-    print(f"profiles: {', '.join(profiles)}\n")
+    n_real = len(profiles)
+    if args.distractors:
+        for p in sorted(glob.glob(os.path.join(args.distractors, "*.wav"))):
+            name = "distractor__" + os.path.basename(p)[:-4]
+            a, sr = read_wav(p)
+            profiles[name] = emb.embed(a, sr)
+
+    # profile stem -> person. Ben's two enrolments are one person; without this they are
+    # each other's runner-up at ~0.08 and `decide_name` can never confirm him.
+    person_of = json.load(open(args.person_map, encoding="utf-8")) if args.person_map else {}
+    def person(profile_name):
+        return person_of.get(profile_name, profile_name)
+
+    print(f"profiles: {n_real} real + {len(profiles) - n_real} distractors "
+          f"= {len(profiles)} in the pool, {len({person(n) for n in profiles})} people\n")
 
     all_sims = {}
+    three = {"confirmed": 0, "tentative": 0, "unknown": 0}
+    wrong_confident = []
+    floor_eligible_same = []
     for sid, script_rows in scripts.items():
         script = [(r["speaker"], r["line"]) for r in script_rows]
         print("=" * 78)
@@ -141,21 +178,37 @@ def main():
         print(f"  {'#':>2} {'spk':5} {'s':>5} {'truth':6} " +
               " ".join(f"{n[:5]:>6}" for n in profiles) + "  pred")
         for i, r in enumerate(rows):
-            pred = max(r["scores"], key=r["scores"].get)
-            mark = "" if not r["truth"] else ("  OK" if pred.lower().startswith(r["truth"].lower()[:3]) else "  X")
+            pred = person(max(r["scores"], key=r["scores"].get))
+            mark = "" if not r["truth"] else ("  OK" if _same(pred, r["truth"]) else "  X")
             print(f"  {i:>2} {r['spk']:5} {r['dur']:5.1f} {str(r['truth'])[:6]:6} " +
                   " ".join(f"{r['scores'][n]:+6.3f}" for n in profiles) + f"  {pred}{mark}")
             print(f"      \"{r['text'][:88]}\"")
 
         for r in labelled:
             for n, s in r["scores"].items():
-                key = (r["truth"], "Ben" if n.lower().startswith("ben") else n)
-                all_sims.setdefault(key, []).append(s)
+                all_sims.setdefault((r["truth"], person(n)), []).append(s)
 
         hits = sum(1 for r in labelled
-                   if max(r["scores"], key=r["scores"].get).lower().startswith(r["truth"].lower()[:3]))
+                   if _same(person(max(r["scores"], key=r["scores"].get)), r["truth"]))
         if labelled:
             print(f"\n  nearest-profile accuracy: {hits}/{len(labelled)} = {hits/len(labelled):.0%}")
+
+        # What the shipped rule would actually answer. Nearest-profile and `confirmed` are
+        # different questions: aggregation first (two enrolments of one person are one
+        # candidate), then the margin, which refuses rather than guesses.
+        for r in labelled:
+            agg = vp.aggregate_scores(
+                [{"person_key": person(n), "score": s} for n, s in r["scores"].items()])
+            d = vp.decide_name(agg, duration_s=r["dur"])
+            r["decision"] = d
+            three[d.status] += 1
+            if d.status == "confirmed" and not _same(d.name, r["truth"]):
+                wrong_confident.append((sid[:8], r["truth"], d.name, round(d.margin or 0, 3)))
+            if _same(person(max(r["scores"], key=r["scores"].get)), r["truth"]) \
+                    and r["dur"] >= vp.DEFAULT_MIN_TURN_S:
+                # the number the margin actually has to clear, floor-eligible only
+                floor_eligible_same.append(max(
+                    s for n, s in r["scores"].items() if _same(person(n), r["truth"])))
         print()
 
     print("=" * 78)
@@ -173,6 +226,25 @@ def main():
     if v.best_accuracy is not None:
         print(f"  best fitted cut {v.best_threshold:+.3f} -> {v.best_accuracy:.0%}  (UPPER BOUND)")
     print(f"  verdict: {v.separable}  {v.note}")
+
+    # ---- what the shipped rule would answer, which is not nearest-profile ----
+    total = sum(three.values())
+    print("\nDECISION (decide_name, after per-person aggregation)")
+    if total:
+        for k in ("confirmed", "tentative", "unknown"):
+            print(f"  {k:10} {three[k]:3}  {three[k]/total:5.0%}")
+    print(f"  pool: {len(profiles)} profiles / "
+          f"{len({person(n) for n in profiles})} people")
+    print(f"  WRONG-CONFIDENT: {len(wrong_confident)}"
+          + ("  <-- the number that decides whether the margin is safe"
+             if wrong_confident else "  (none)"))
+    for sid8, truth, got, m in wrong_confident:
+        print(f"      {sid8}  truth={truth}  named={got}  margin={m}")
+    if floor_eligible_same:
+        print(f"  weakest floor-eligible same-person score: {min(floor_eligible_same):+.3f}"
+              f"  (n={len(floor_eligible_same)})")
+        print("      This is the number the margin actually has to clear. The often-quoted"
+              " +0.104 is the 2.1s turn the duration floor now excludes.")
 
     print("\nCOLLAPSE (the question Phase 0 exists for)")
     c = sp.collapse_report(all_sims)
