@@ -249,3 +249,43 @@ T1, T2, T5 are each independently shippable and improve the EXISTING pipeline on
 - **Inferred tasks read as records** — `basis` is preserved end-to-end (T3 artifact, T4 rows if ever stored, T6 passthrough); presentation duty lands on the page, but the backend never drops the field.
 - **Assignee structurally unavailable** — the briefing path never guesses an assignee; unassigned stays unassigned (T3 prompt requirement + no server-side fill).
 - **Corpus-scale page weight** — solved by design here: cross-session search is served by T2/T6 server index, never by embedding turns in the page.
+
+---
+
+## Cross-session coordination (state as of 2026-08-13 ~01:15 NZ)
+
+Read this before starting T1 or T3 — both touch `src/lambda_extract_session.py`,
+and so does an open PR.
+
+**Branches ahead of `origin/develop`:** only two — this one (docs only) and
+`feat/user-deletion-schema`. No source file is touched by both.
+
+**Open PRs:**
+
+- **#459 `feat/user-deletion-schema`** — adds `src/migrations/0041_user_deletion.sql`.
+  This is why T2 moved to `0042`. It is also the only thing in flight that
+  changes prod schema: `develop` is 6 commits ahead of `main` and carries **no
+  migration** (`main` already has 0040), so merging `develop` to `main` tonight
+  runs nothing against the prod database. Merging #459 onward does.
+- **#404 `tool/extraction-harness`** — touches `src/lambda_extract_session.py`.
+  Its entire prompt change is one line:
+
+  > *If no line in the transcript states an observation, do NOT invent one — findings may be an empty array.*
+
+  **That is the same fix this plan argues for, applied to the wrong field.**
+  `findings` was not the field inventing content; `action_items` was. On the
+  measured session, 4 of 6 action items were strategy directions verbed into
+  tasks (`Target market strategy -- focus high-hourly professionals`), diluting
+  the two real ones. The equivalent permission — plus the admission bar, *only
+  what a specific person can finish and tick* — belongs on `action_items` too.
+
+  **Do not duplicate it.** Rebase T1/T3 on #404 once merged, and extend the
+  same sentence to `action_items` rather than writing a competing edit to the
+  same prompt block. If #404's author is still active, the one-line addition
+  is better landed there than here.
+
+**The migration collision is the lesson worth keeping.** `0041` was claimed at
+01:01 and this plan allocated the same number at 01:06. Git would have merged
+both files without complaint — two migrations sharing a number is not a text
+conflict, it is a silent skip at deploy time. Numbers must be checked against
+open PRs, not just against the working tree.
