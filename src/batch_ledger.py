@@ -269,6 +269,23 @@ def mark_members_consumed(table, session_id: str, indices, batch_first_index: in
         table.put_item(Item=item)
 
 
+def seal_status(table, session_id: str, first_index: int):
+    """"sealing" | "sealed" | "bypassed" | None for the batch anchored at this index."""
+    existing = _get_seal(table, session_id, first_index)
+    return existing.get("status") if existing else None
+
+
+def mark_bypassed(table, session_id: str, index: int, now: int) -> None:
+    """A window of one was handed back to the per-chunk path; no artifact exists.
+
+    Recorded with its own status rather than as `sealed`, so a later question of "why is
+    there no `_bn` object for this stretch" has an answer in the ledger instead of looking
+    like the seal that never happened.
+    """
+    table.put_item(Item={"PK": _pk(session_id), "SK": _seal_sk(index),
+                         "status": "bypassed", "bypassed_at": now})
+
+
 def mark_sealed(table, session_id: str, first_index: int, now: int) -> None:
     """The artifacts are written; this batch is finished and must never be re-driven."""
     table.put_item(Item={"PK": _pk(session_id), "SK": _seal_sk(first_index),

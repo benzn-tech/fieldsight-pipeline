@@ -117,6 +117,9 @@ class FakeLedger:
     def mark_sealed(self, table, session_id, first_index, now):
         self.seals[first_index] = {"status": "sealed"}
 
+    def seal_status(self, table, session_id, first_index):
+        return (self.seals.get(first_index) or {}).get("status")
+
 
 @pytest.fixture
 def wired(monkeypatch):
@@ -255,3 +258,26 @@ def test_an_unreadable_raw_upload_does_not_block_the_batch(wired):
     doc = json.loads(s3.puts[[p["Key"] for p in s3.puts].index(maps[0])]["Body"])
     third = doc["members"][2]
     assert third["trimmed_head_sec"] == 0.0 and third["trim_measured"] is False
+
+
+# ---- a bypassed singleton must come back as a transcription, not as a member ----
+
+def test_a_bypassed_member_is_transcribed_when_its_event_comes_back(wired):
+    """The half of the singleton bypass that lives on this side.
+
+    `bypass_singleton` copies the unit onto its own key so a fresh S3 event re-enters this
+    handler. Without a check here the handler registers it, finds it already consumed,
+    plans no window for it, and returns "batched_pending" — so the chunk is neither
+    batched nor transcribed, which is audio gone with no error anywhere. The consumed mark
+    is what makes it silent: it stops the planner, which is exactly what it is for.
+    """
+    monkeypatch, s3, ledger, calls = wired
+    ledger.members[0] = {"chunk_index": 0, "chunk_key": unit_key(0),
+                         "registered_at": 0, "sealed_into": 0}
+    ledger.seals[0] = {"status": "bypassed"}
+
+    results = []
+    handled = mod._maybe_batch("b", unit_key(0), results)
+
+    assert handled is False, "a bypassed member must fall through to transcription"
+    assert results == [], "and must not be reported as batched"

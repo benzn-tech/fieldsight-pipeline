@@ -285,7 +285,8 @@ def map_key_for_transcript(transcript_key: str, audio_prefix: str = 'audio_segme
 
 
 def member(chunk_index: int, chunk_key: str, abs_start: str, trimmed_head_sec: float,
-           kept_duration_sec: float, trim_measured: bool = True) -> dict:
+           kept_duration_sec: float, trim_measured: bool = True,
+           seam: str = "adjacent") -> dict:
     """One member of a batch. `abs_start` is the chunk's own filename clock, ISO-8601."""
     return {
         "chunk_index": chunk_index,
@@ -296,6 +297,10 @@ def member(chunk_index: int, chunk_key: str, abs_start: str, trimmed_head_sec: f
         # False means the seam measured zero unexpectedly: the audio was kept whole and this
         # says so, rather than leaving a 0.0 that reads as "there was no overlap".
         "trim_measured": bool(trim_measured),
+        # "first" | "adjacent" | "gap". A gap seam bridges a chunk VAD dropped: those two
+        # were never adjacent, so zero overlap is the CORRECT answer and must be kept out of
+        # the unmeasured-seam alarm, which exists to catch the byte comparison breaking.
+        "seam": seam,
     }
 
 
