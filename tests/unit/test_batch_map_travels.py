@@ -258,10 +258,13 @@ def test_the_other_shape_of_resolver_is_covered_too():
         os.path.abspath(__file__)))), "src", "lambda_org_api.py")
     tree = ast.parse(open(src, encoding="utf-8").read())
     # The helper's own no-map fallback is the one sanctioned place for the bare form.
-    helper = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-                   and n.name == "_org_segment_abs_sec"), None)
-    assert helper is not None, "the helper this invariant is about has been removed"
-    inside = range(helper.lineno, (helper.end_lineno or helper.lineno) + 1)
+    # Both helpers own the bare form; everywhere else must go through them.
+    names = {"_org_segment_abs_sec", "_org_transcript_file_end_sec"}
+    helpers = [n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name in names]
+    assert len(helpers) == len(names), "a helper this invariant is about has been removed"
+    inside = {ln for h in helpers
+              for ln in range(h.lineno, (h.end_lineno or h.lineno) + 1)}
 
     bare = []
     for node in ast.walk(tree):
@@ -270,7 +273,9 @@ def test_the_other_shape_of_resolver_is_covered_too():
         if node.lineno in inside:
             continue
         left = getattr(node.left, "id", None)
-        if left == "file_time_sec" and getattr(node.right, "id", "").startswith("seg_"):
+        # ANY right-hand side, not just `seg_*`. Naming the variable seen last time is
+        # how this guard missed `file_time_sec + word_start` sitting thirty lines away.
+        if left == "file_time_sec":
             bare.append(node.lineno)
     assert not bare, (
         f"lambda_org_api.py:{bare} adds a segment offset to the file time directly; a "

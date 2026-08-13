@@ -83,3 +83,35 @@ def test_a_segment_before_the_gap_is_unaffected():
 
 def test_without_a_map_the_arithmetic_is_exactly_what_it_was():
     assert mod._org_segment_abs_sec(100.0, 45.0, None) == pytest.approx(145.0)
+
+
+def test_the_word_level_filter_uses_the_map_too():
+    """The render path was wired; the word-level in-range filter was not.
+
+    `filtered_text` and `in_range_count` are built by comparing each word's absolute time
+    against the topic window. On a batched file that arithmetic is early by the bridged gap,
+    so words that belong to the topic are dropped and earlier ones let in — a quietly wrong
+    quote rather than a visibly wrong timestamp.
+
+    It was also invisible to the invariant that forbids bare `file_time_sec + seg_*`: this
+    one adds `word_start`. A guard that names the variable it saw last time only catches
+    the regression that already happened.
+    """
+    import ast
+    import os as _os
+    src = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(
+        _os.path.abspath(__file__)))), "src", "lambda_org_api.py")
+    tree = ast.parse(open(src, encoding="utf-8").read())
+    names = {"_org_segment_abs_sec", "_org_transcript_file_end_sec"}
+    helpers = [n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name in names]
+    assert len(helpers) == len(names)
+    inside = {ln for h in helpers
+              for ln in range(h.lineno, (h.end_lineno or h.lineno) + 1)}
+    bare = [n.lineno for n in ast.walk(tree)
+            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add)
+            and n.lineno not in inside
+            and getattr(n.left, "id", None) == "file_time_sec"]
+    assert not bare, (
+        f"lambda_org_api.py:{bare} adds an offset to the file time directly; every one of "
+        f"them needs _org_segment_abs_sec so a bridged gap is accounted for")

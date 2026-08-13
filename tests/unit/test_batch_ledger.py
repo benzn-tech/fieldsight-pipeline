@@ -281,3 +281,20 @@ def test_an_unplaceable_member_beside_a_placeable_successor_does_not_crash():
             + _wrows([(7, 30)]))
     got = bl.pending_windows(rows, NOW + 400, grace_sec=150, window_sec=120)
     assert sorted(i for w in got for i in w) == [6, 7]
+
+
+def test_a_fresh_bypass_record_is_not_instantly_stale(table):
+    """The retry window has to apply to `bypassed` too, and it did not.
+
+    `claim_seal` may retake a stale `bypassed` record because that means the copy-to-self
+    never completed. It reads staleness from `claimed_at` -- which `mark_bypassed` never
+    wrote, so `now - 0` was always past the window and EVERY bypassed record read as
+    abandoned the instant it existed. A singleton bypass at session close coinciding with a
+    late arrival is exactly the two-sealers race the window exists to bound: the second
+    worker copies again and the chunk is transcribed and paid for twice.
+    """
+    bl.mark_bypassed(table, SID, 4, NOW)
+    assert bl.claim_seal(table, SID, 4, [4], NOW + 400) is None, \
+        "a bypass 400s old is still in flight; the window is 900"
+    assert bl.claim_seal(table, SID, 4, [4], NOW + 1000) is not None, \
+        "past the window it must still be retakeable -- a failed copy has to be recoverable"

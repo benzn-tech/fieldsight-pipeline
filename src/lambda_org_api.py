@@ -5253,7 +5253,7 @@ def _read_org_transcripts(date, folder, start_time, end_time):
                     continue
                 total_words += 1
                 word_start = float(item.get("start_time", 0))
-                abs_ws = file_time_sec + word_start
+                abs_ws = _org_segment_abs_sec(file_time_sec, word_start, batch_map)
                 if start_sec <= abs_ws <= end_sec:
                     in_range_words.append(item.get("alternatives", [{}])[0].get("content", ""))
 
