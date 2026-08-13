@@ -824,3 +824,30 @@ def test_the_embedder_can_read_the_batch_map_but_not_the_audio_beside_it():
         "wrong seconds")
     assert "/audio_segments/*'" not in t and '/audio_segments/*"' not in t, (
         "audio_segments/* is granted wholesale somewhere — the narrowing is the point")
+
+
+def test_the_voiceprint_writer_has_the_layer_the_embedder_cannot_have():
+    """The split, pinned from both sides. The embedder carries VadLayerArn (cp312, for
+    onnxruntime) and the writer carries PsycopgLayer (cp311) — one function cannot have
+    both, and the night this was learned the embedder had a connection and no psycopg,
+    raising ModuleNotFoundError on every invocation behind a green deploy.
+    """
+    t = open(TEMPLATE, encoding="utf-8").read()
+    block = t[t.index("  VoiceprintWriterFunction:"):t.index("  SuggestionWriterFunction:")]
+    assert "!Ref PsycopgLayer" in block, "the writer cannot reach Aurora without psycopg"
+    assert "VadLayerArn" not in block, (
+        "the writer took the cp312 layer as well; the two are mutually exclusive")
+    assert "VpcConfig" in block, "Aurora is only reachable from inside the VPC"
+    assert "Events:" not in block, (
+        "the writer acquired a trigger; it is invoked by the embedder and nothing else")
+
+
+def test_the_embedder_may_invoke_the_writer_and_nothing_else():
+    """Its own work reaches the database only through this invoke — it has no psycopg. A
+    missing grant here fails at runtime with an AccessDenied nobody sees until a real
+    correction is made."""
+    t = open(TEMPLATE, encoding="utf-8").read()
+    block = t[t.index("  SpeakerEmbedFunction:"):t.index("  VoiceprintWriterFunction:")]
+    assert "lambda:InvokeFunction" in block
+    assert "voiceprint-writer" in block
+    assert "Resource: '*'" not in block and 'Resource: "*"' not in block
