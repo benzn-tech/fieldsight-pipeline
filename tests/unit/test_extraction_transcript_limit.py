@@ -222,3 +222,28 @@ def test_the_rolling_summary_keeps_the_end_of_the_meeting():
     assert len(prompt) < lrs.TRANSCRIPT_LIMIT + 2000
     assert "OPENING" in prompt
     assert "DECISION" in prompt, "the email would not mention what was decided"
+
+
+# --- the remaining three callers ------------------------------------------
+#
+# Found by grepping the repo for the same shape after fixing the email path.
+# All three were bare head slices, and all three drop the part their reader
+# opens the document for.
+
+def test_meeting_minutes_keeps_the_decisions_at_the_end():
+    import lambda_meeting_minutes as mm
+    lines = (["OPENING: why we are here"]
+             + ["filler " + "x" * 300 for _ in range(600)]
+             + ["DECISION: we go with option B"])
+    text, _ = mm.elide_middle(lines, 120000, sep="\n\n")
+    assert "OPENING" in text
+    assert "DECISION" in text, "minutes that drop the decisions are not minutes"
+
+
+def test_a_weekly_report_keeps_the_most_recent_days():
+    import lambda_report_generator as rg
+    days = [f"### 2026-08-{d:02d} " + "y" * 900 for d in range(1, 31)]   # > 15000 total
+    text, _ = rg.elide_middle(days, 15000, sep="\n\n")
+    assert "2026-08-01" in text
+    assert "2026-08-30" in text, "a weekly/monthly rollup that drops the recent end is " \
+                                 "the opposite of what it is read for"
