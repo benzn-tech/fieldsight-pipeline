@@ -150,3 +150,40 @@ def test_no_rows_at_all_is_cheap_and_quiet():
     idx = tno.build([])
     assert tno.lookup(idx, "x.wav", 1.0) is None
     assert tno.orphans(idx) == 0
+
+
+# ---- the two keys the halves must agree on ------------------------------
+#
+# Both of these were wrong in the shipped version, and both were invisible because the
+# reader's fixture and the writer's fixture were written by the same hand on the same day.
+# The strings below are copied VERBATIM from TEST, so they cannot agree with an assumption.
+
+REAL_TRANSCRIPT = ("ben_ucpk2_2026-08-13_11-49-00_sid9db9293e82b94a4d9611572b1233f82d"
+                   "_c0000_bn4_off0.0_to114.0_srcwav.json")
+REAL_AUDIO = REAL_TRANSCRIPT[:-5] + ".wav"
+REAL_SESSION = "ben_ucpk2_2026-08-13_11-49-00_sid9db9293e82b94a4d9611572b1233f82d"
+
+
+def test_the_session_is_derived_from_a_real_transcript_filename():
+    """The overlay looked rows up by the SEGMENT FILENAME, while every row is stored under
+    the session id. Two different keys, so the query returned nothing, every time, silently
+    — `unmatchedNames: 0` because there were no rows to orphan."""
+    assert tno.session_base(REAL_TRANSCRIPT) == REAL_SESSION
+
+
+def test_a_per_chunk_filename_yields_the_same_session():
+    plain = ("ben_ucpk2_2026-08-13_11-49-00_sid9db9293e82b94a4d9611572b1233f82d"
+             "_c0000.wav")
+    assert tno.session_base(plain) == REAL_SESSION
+
+
+def test_a_filename_with_no_session_id_yields_nothing_rather_than_a_guess():
+    assert tno.session_base("Benl1_2026-03-20_12-18-34.json") is None
+
+
+def test_the_audio_and_the_transcript_name_the_same_turn():
+    """A correction carries the .wav; the transcript endpoint holds the .json. Matching on
+    the raw string means the name never appears and nothing says why."""
+    idx = tno.build([_row(f"{REAL_AUDIO}@35.0", "Ben L")])
+    assert tno.lookup(idx, REAL_TRANSCRIPT, 35.0)["display_name"] == "Ben L"
+    assert tno.lookup(idx, REAL_AUDIO, 35.0)["display_name"] == "Ben L"

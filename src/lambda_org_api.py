@@ -5705,7 +5705,12 @@ def _apply_speaker_names(conn, caller, payload):
     segs = payload.get("speaker_segments") or []
     if not segs:
         return payload
-    bases = {s.get("source_filename") for s in segs if s.get("source_filename")}
+    # The SESSION, not the segment filename. Rows are stored under the session id, and
+    # looking them up by filename returned nothing every time — quietly, because no rows
+    # also means no orphans, so the count read 0 and it looked like nobody had ever
+    # corrected this session.
+    bases = {turn_name_overlay.session_base(s.get("source_filename"))
+             for s in segs if s.get("source_filename")}
     rows = []
     for base in sorted(b for b in bases if b):
         rows.extend(voiceprints.live_turn_names(conn, str(caller["company_id"]), base))

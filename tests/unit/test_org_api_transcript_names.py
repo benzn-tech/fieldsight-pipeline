@@ -1,5 +1,10 @@
 """Unit: the stored names actually reach the transcript response.
 
+The filenames below are copied VERBATIM from TEST — the transcript side ends `.json`, the
+stored reference ends `.wav`, and the two differ by more than the extension. An earlier
+version of this file invented both sides and they agreed with each other rather than with
+the pipeline, so the read path shipped matching nothing at all.
+
 The resolver is tested in isolation next door. This file exists because that is not enough:
 the endpoint builds its segments in one place and the overlay reads them in another, and the
 two agreeing is a separate fact from either of them working. Tonight already produced one
@@ -19,10 +24,10 @@ CALLER = {"id": "u-1", "cognito_sub": "sub-1", "company_id": "c-1", "email": "a@
 SEGS = {"text": "hello", "segments": [], "speaker_segments": [
     {"speaker": "spk_0", "text": "morning all", "start": 41400.0, "end": 41406.0,
      "time_label": "11:30:00", "duration": 6.0,
-     "source_filename": "ben_2026-08-13_11-49-00_c0000.wav", "chunk_start": 12.5},
+     "source_filename": "ben_ucpk2_2026-08-13_11-49-00_sid9db9293e82b94a4d9611572b1233f82d_c0000_bn4_off0.0_to114.0_srcwav.json", "chunk_start": 12.5},
     {"speaker": "spk_1", "text": "yep", "start": 41410.0, "end": 41413.0,
      "time_label": "11:30:10", "duration": 3.0,
-     "source_filename": "ben_2026-08-13_11-49-00_c0000.wav", "chunk_start": 22.0},
+     "source_filename": "ben_ucpk2_2026-08-13_11-49-00_sid9db9293e82b94a4d9611572b1233f82d_c0000_bn4_off0.0_to114.0_srcwav.json", "chunk_start": 22.0},
 ]}
 
 
@@ -44,7 +49,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(org, "_read_org_transcripts",
                         lambda date, folder, s, e: json.loads(json.dumps(SEGS)))
     monkeypatch.setattr(org.voiceprints, "live_turn_names", lambda conn, co, base: [
-        {"turn_ref": "ben_2026-08-13_11-49-00_c0000.wav@12.5", "display_name": "Ben L",
+        {"turn_ref": "ben_ucpk2_2026-08-13_11-49-00_sid9db9293e82b94a4d9611572b1233f82d_c0000_bn4_off0.0_to114.0_srcwav.wav@12.5", "display_name": "Ben L",
          "state": "tentative", "source": "correction_propagation",
          "created_at": "2026-08-13T01:00:00", "cluster_ref": "C1"},
         {"turn_ref": "vanished.wav@3.0", "display_name": "Zoe", "state": "confirmed",
