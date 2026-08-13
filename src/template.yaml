@@ -819,6 +819,22 @@ Parameters:
       spec §3). False (default) is the pre-Phase-3 binary resolve_scope
       behavior, unchanged in every path, mirroring AuthorityFlip's rollout.
 
+  SpeakerIdentityMode:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['off', 'shadow', 'on']
+    Description: >-
+      The one switch the speaker-naming feature hangs off. off = the correction
+      endpoints 404 and nothing invokes the embedder; prod and test stay byte-identical
+      to before the feature existed, and this is also the rollback. shadow = corrections
+      are accepted and scored, rows land capped at tentative, NO user-visible surface
+      changes -- it is the calibration collector. on = confirmed names may reach the
+      viewer. `on` is PROHIBITED until a calibrated margin exists: Gate A froze the
+      clustering threshold at 0.85 on 2026-08-13, but the margin that decides
+      confirmed-vs-tentative has never been measured.
+      Three states rather than a boolean because shadow is where the evidence for the
+      third state comes from, and a boolean has nowhere to collect it.
+
   UploadVerifyMode:
     Type: String
     Default: 'off'
@@ -1552,6 +1568,9 @@ Resources:
           # Does `complete` verify the bytes arrived before stamping
           # uploaded_at? See the UploadVerifyMode parameter.
           UPLOAD_VERIFY_MODE: !Ref UploadVerifyMode
+          # off -> the correction routes 404. See the SpeakerIdentityMode parameter;
+          # this is the rollback, so it must be a deployed value, not a code constant.
+          SPEAKER_IDENTITY_MODE: !Ref SpeakerIdentityMode
           # Deploy = thaw. See the ServerBuild parameter.
           SERVER_BUILD: !Ref ServerBuild
           # QR passwordless login (2026-07-30) — PROD-ONLY (see IsProdWithOrgApi
@@ -1707,6 +1726,13 @@ Resources:
               # valid if the role can GetObject the key).
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+            # A speaker correction, handed OUTWARD across the VPC boundary the same way.
+            # Write only, and no grant on voiceprint_results/: those go to the in-VPC
+            # writer by direct invoke from the embedder, and a read grant here would be an
+            # invitation to build a second consumer nobody designed.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/voiceprint_requests/*
             - Effect: Allow
               Action: s3:GetObject
               Resource:
