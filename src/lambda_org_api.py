@@ -1255,11 +1255,25 @@ def speaker_corrections(conn, caller, session_base, event):
                  "status": r.get("status"),
                  "embedding": list(r["embedding"] or [])} for r in rows]
 
+    # The producer knows the folder and the date; the consumer must not guess them. A first
+    # version of the embedder derived them from `session_base` and built
+    # `users/{session}/audio//x.wav` — a key that cannot exist, so a missing field would
+    # have surfaced as a NoSuchKey far from its cause.
+    folder, err = _resolve_org_media_folder(conn, caller, body.get("user") or "",
+                                            what="speaker correction")
+    if err is not None:
+        return err
+    date_m = re.search(r"(\d{4}-\d{2}-\d{2})", session_base or "")
+    if not date_m:
+        return error("session id must carry its date (…_YYYY-MM-DD_…)", 400)
+
     request_id = uuid.uuid4().hex
     artifact = {
         "request_id": request_id,
         "session_base": session_base,
         "company_id": company_id,
+        "user_folder": folder,
+        "date": date_m.group(1),
         "requested_by": str(caller["id"]),
         "mode": SPEAKER_IDENTITY_MODE,
         "correction": {"source_filename": src, "start_sec": start, "end_sec": end,

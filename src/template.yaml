@@ -2765,6 +2765,9 @@ Resources:
         Variables:
           S3_BUCKET: !Ref IngestBucketName
           ECAPA_MODEL_S3_KEY: models/ecapa_tdnn.onnx
+          # The in-VPC half. Its name rather than a constant, so the two stacks cannot
+          # cross-invoke each other's writer.
+          VOICEPRINT_WRITER_FUNCTION: !Sub ["${P}-voiceprint-writer", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       Policies:
         - Version: '2012-10-17'
           Statement:

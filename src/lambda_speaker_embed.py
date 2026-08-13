@@ -244,7 +244,87 @@ def _match(event):
     return {"session": event.get("session"), "results": results}
 
 
+WRITER_FUNCTION = os.environ.get("VOICEPRINT_WRITER_FUNCTION", "")
+
+
+def invoke_writer(payload):
+    """Hand the result to the in-VPC half.
+
+    RequestResponse, not Event, and the reason is not latency: under async invocation the
+    192-d vector would sit in Lambda's internal queue and any DLQ — durable biometric
+    storage in a place nobody would think to sweep, which is this design's defect relocating
+    for a fourth time. Synchronous also means a failure surfaces here rather than being
+    retried invisibly by the service.
+    """
+    import boto3
+    resp = boto3.client("lambda").invoke(
+        FunctionName=WRITER_FUNCTION, InvocationType="RequestResponse",
+        Payload=json.dumps(payload).encode())
+    if resp.get("FunctionError"):
+        raise RuntimeError(f"voiceprint writer failed: "
+                           f"{resp['Payload'].read()[:400]!r}")
+    return resp
+
+
+def _from_request_artifact(bucket, key):
+    """One correction, start to finish.
+
+    The artifact is org-api's output: it holds the window the user marked and the profiles
+    that survived the consent and withdrawn filters. This function has no database and no
+    other way to obtain a profile, which is what keeps those filters in one place.
+    """
+    req = json.loads(_get(key))
+    c = req.get("correction") or {}
+    folder, date = req.get("user_folder"), req.get("date")
+    if not folder or not date:
+        # Deliberately not derived from `session_base`. A first version guessed, and the
+        # guess produced `users/s1/audio//x.wav` — a key that cannot exist, which would have
+        # surfaced as a NoSuchKey far from the missing field. The producer knows both; if it
+        # ever stops sending them, this says so.
+        raise ValueError(
+            f"request artifact {key} carries no user_folder/date; the producer has both and "
+            f"guessing them puts the read on a key that cannot exist")
+    start, end = float(c["start_sec"]), float(c["end_sec"])
+    s3_key, clip, sr = _window_audio(folder, date, c["source_filename"], start, end)
+    v = embed_audio(clip, sr)
+
+    profiles = req.get("profiles") or []
+    rows = [{"person_key": p["person_key"], "score": vp.cosine(v, p["embedding"])}
+            for p in profiles]
+    d = vp.decide_name(vp.aggregate_scores(rows), duration_s=end - start)
+
+    # The turn the user asserted. Its name is not an inference and is written as
+    # `correction`; the writer refuses to give it a profile id unless it is marked asserted.
+    turn_ref = f"{c['source_filename']}@{start}"
+    payload = {
+        "op": "propagation",
+        "company_id": req.get("company_id"),
+        "session_base": req.get("session_base"),
+        "correction_ref": req.get("request_id"),
+        "cluster_threshold": vp.DEFAULT_CLUSTER_TAU,
+        "results": [{"turn_ref": turn_ref, "state": "confirmed",
+                     "cluster_ref": None, "asserted": True,
+                     "display_name": c.get("display_name"),
+                     "score": d.margin}],
+    }
+    invoke_writer(payload)
+    logger.info("correction applied: session=%s ref=%s audio=%s",
+                req.get("session_base"), turn_ref, s3_key)
+    return {"status": "applied", "turn_ref": turn_ref}
+
+
 def lambda_handler(event, context):
+    records = (event or {}).get("Records")
+    if records:
+        # An S3 event carries `Records`, not `op`. Without this branch the function dies in
+        # 3 ms with `unknown op None` -- which is exactly what a real correction on TEST did
+        # on 2026-08-14, after the trigger was wired and this entry point was not.
+        out = None
+        for r in records:
+            b = r["s3"]["bucket"]["name"]
+            k = r["s3"]["object"]["key"]
+            out = _from_request_artifact(b, k)
+        return out or {"status": "empty"}
     op = (event or {}).get("op")
     if op == "enrol":
         return _enrol(event)
