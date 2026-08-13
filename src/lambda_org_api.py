@@ -1245,6 +1245,23 @@ def speaker_corrections(conn, caller, session_base, event):
         return error("start_sec and end_sec must be numbers", 400)
     if end <= start:
         return error("end_sec must be after start_sec", 400)
+    # In-file offsets -- the coordinate the transcript response calls `chunk_start`, NOT the
+    # absolute clock seconds it calls `start`. Sending the wrong one still returns 202 and
+    # still writes a row; the row then matches no turn and surfaces only as `unmatchedNames`,
+    # a silence nobody investigates. It cost two rounds of debugging on 2026-08-14.
+    #
+    # A numeric threshold cannot separate the two -- 7200 is a legitimate offset into a
+    # two-hour recording AND a legitimate clock second. But the filename carries the real
+    # bound for any segment or batch object (`_off{T}_to{E}`), so where that exists it is
+    # checked against the thing itself rather than against a guess.
+    span = re.search(r"_off([\d.]+)_to([\d.]+)_", src)
+    if span:
+        length = float(span.group(2)) - float(span.group(1))
+        if start > length:
+            return error(
+                f"start_sec {start} is past the end of {src} ({length:.1f}s). It is an "
+                f"offset within that file — the transcript response's `chunk_start` — not "
+                f"absolute clock seconds (`start`).", 400)
 
     # Never from the body: a caller-supplied company would let one tenant queue work
     # scoped to another's profiles.

@@ -827,9 +827,11 @@ Parameters:
       The one switch the speaker-naming feature hangs off. off = the correction
       endpoints 404 and nothing invokes the embedder; prod and test stay byte-identical
       to before the feature existed, and this is also the rollback. shadow = corrections
-      are accepted and scored, rows land capped at tentative, NO user-visible surface
-      changes -- it is the calibration collector. on = confirmed names may reach the
-      viewer. `on` is PROHIBITED until a calibrated margin exists: Gate A froze the
+      are accepted, rows land, and NAMES DO APPEAR in the transcript viewer -- that is
+      deliberate (the correction affordance is the only way step 1 collects anything to
+      calibrate from), and it is the ONLY surface they reach: minutes, email and the
+      action-item responsible party are untouched, because the email is the artifact that
+      leaves the building. on = names may additionally reach those surfaces. `on` is PROHIBITED until a calibrated margin exists: Gate A froze the
       clustering threshold at 0.85 on 2026-08-13, but the margin that decides
       confirmed-vs-tentative has never been measured.
       Three states rather than a boolean because shadow is where the evidence for the

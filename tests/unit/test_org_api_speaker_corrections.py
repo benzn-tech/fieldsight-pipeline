@@ -214,3 +214,36 @@ def test_the_artifact_names_the_folder_and_the_date_the_consumer_needs(wired):
     doc = json.loads(wired.puts[0]["Body"])
     assert doc["user_folder"] == "Ada_L"
     assert doc["date"] == "2026-08-13"
+
+
+def test_absolute_clock_seconds_are_refused_rather_than_queued(wired):
+    """The transcript response carries both `start` (absolute clock) and `chunk_start`
+    (in-file). Only the second is what a turn_ref is keyed by. Sending the first used to
+    return 202 and write a row that matched no turn — visible only as `unmatchedNames`,
+    which is a silence nobody investigates. It cost me two rounds of debugging tonight."""
+    batch = ("ben_2026-08-13_11-49-00_sid" + "0" * 32 +
+             "_c0000_bn4_off0.0_to114.0_srcwav.wav")
+    res = org.lambda_handler(_event(dict(BODY, source_filename=batch,
+                                         start_sec=41400.0, end_sec=41406.0)), None)
+    assert res["statusCode"] == 400
+    assert "chunk_start" in _body(res)["error"]
+    assert wired.puts == []
+
+
+def test_a_legitimate_offset_inside_the_file_is_accepted(wired):
+    """The bound is the file's own length, not a guess about what a plausible number looks
+    like — 7200 is a legitimate offset into a two-hour recording AND a legitimate clock
+    second, so no threshold could separate them."""
+    batch = ("ben_2026-08-13_11-49-00_sid" + "0" * 32 +
+             "_c0000_bn4_off0.0_to114.0_srcwav.wav")
+    res = org.lambda_handler(_event(dict(BODY, source_filename=batch,
+                                         start_sec=34.92, end_sec=36.9)), None)
+    assert res["statusCode"] == 202, _body(res)
+
+
+def test_a_filename_that_declares_no_span_is_not_second_guessed(wired):
+    """A per-chunk upload carries no `_off…_to…`, so there is nothing to check against and
+    inventing a bound would reject real corrections."""
+    res = org.lambda_handler(_event(dict(BODY, source_filename="x_c0000.wav",
+                                         start_sec=900.0, end_sec=905.0)), None)
+    assert res["statusCode"] == 202, _body(res)

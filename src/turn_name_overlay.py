@@ -107,50 +107,42 @@ def build(rows, confirmed_only=False):
     return {"by_file": by_file, "unmatched": orphaned}
 
 
-def _better(a, b):
-    """Which of two rows a reader should believe.
+def _rank(row, distance):
+    """A total order over the rows that could describe one turn. Higher sorts first.
 
-    A direct correction beats an inference; between two of the same kind the later one wins.
-    `created_at` is compared as text because it is ISO-8601 from Postgres, where lexical and
-    chronological order agree.
+    The order matters more than it looks, and an earlier version got it wrong in a way that
+    tests agreed with: `_better` returned the incumbent on a tie, and `created_at` ties are
+    the NORMAL case, because Postgres `now()` is constant within a transaction and one
+    writer run stamps every row it writes identically. Querying 12.45 against rows at 12.4
+    and 12.9 returned the row at 12.9.
+
+    1. **Source.** A direct correction is a claim a person made; propagation and matching are
+       inferences.
+    2. **Distance.** Distance is what identifies WHICH TURN a row is about. It has to outrank
+       recency: two rows at different offsets are probably about different turns, and the
+       newer one being about a different turn is no reason to prefer it here.
+    3. **Recency.** Only ever a tie-break between rows about the same turn — a re-correction.
     """
-    ra = _SOURCE_RANK.get(a.get("source"), -1)
-    rb = _SOURCE_RANK.get(b.get("source"), -1)
-    if ra != rb:
-        return a if ra > rb else b
-    return a if str(a.get("created_at") or "") >= str(b.get("created_at") or "") else b
+    return (_SOURCE_RANK.get(row.get("source"), -1),
+            -float(distance),
+            str(row.get("created_at") or ""))
 
 
 def lookup(index, source_filename, start_sec):
     """The name for this turn, or None.
 
-    Every row within tolerance is considered, not merely the nearest: the nearest row may be
-    a propagated guess sitting beside the correction the user actually made. Distance breaks
-    ties only after precedence has.
+    Every row within tolerance is considered, not merely the nearest: the nearest may be a
+    propagated guess sitting beside the correction the user actually made.
     """
     entries = index["by_file"].get(_stem(source_filename))
     if not entries:
         return None
-    best = None
-    for at, i, row in entries:
-        d = abs(at - float(start_sec))
-        if d > TOLERANCE_SEC:
-            continue
-        if best is None:
-            best = (d, i, row)
-            continue
-        chosen = _better(row, best[2])
-        if chosen is row and (row is not best[2]):
-            # `_better` returns the incumbent on a tie, so reaching here means this row is
-            # strictly better on precedence — or equal, in which case distance decides.
-            best = (d, i, row)
-        elif chosen is best[2] and _SOURCE_RANK.get(row.get("source"), -1) == \
-                _SOURCE_RANK.get(best[2].get("source"), -1) and d < best[0]:
-            best = (d, i, row)
-    if best is None:
+    candidates = [(at, i, r) for at, i, r in entries
+                  if abs(at - float(start_sec)) <= TOLERANCE_SEC]
+    if not candidates:
         return None
-    index["unmatched"].discard(best[1])
-    row = best[2]
+    at, i, row = max(candidates, key=lambda c: _rank(c[2], abs(c[0] - float(start_sec))))
+    index["unmatched"].discard(i)
     if not row.get("display_name"):
         # An unnamed cluster is a real answer — "someone consistent, not identified" — and
         # `decide_name` hands back the CLUSTER KEY as its name. `C_3` must never render.
