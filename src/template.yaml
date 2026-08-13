@@ -552,6 +552,27 @@ Parameters:
       the rollback survives a deploy: a switch that exists only in code takes its default
       forever and raises no error.
 
+  EnableUserDeletion:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      The customer-facing "delete these recordings" endpoint. TEMPORARY by request.
+
+      This gates the WRITE endpoint only. The read filters are deliberately
+      unconditional: making them follow the flag would mean that turning it off un-hides
+      every recording a customer was told was gone, which is a second incident rather
+      than a rollback.
+
+      Recall lives in the data, not in this switch --
+        SELECT * FROM redactions WHERE scope='deleted' AND reverted_at IS NULL;
+      and one batch is `AND batch_id = :id`. A flag that is turned off leaves no way to
+      find what it did, which is why the marker is a column.
+
+      NOTHING IS DESTROYED when this is on: no S3 object is deleted and no row is
+      dropped. The content stops being readable, and POST /recordings/undelete with the
+      batch id restores exactly what one delete hid.
+
   TranscribeReservedConcurrency:
     Type: String
     Default: '0'
@@ -1569,6 +1590,7 @@ Resources:
           GRADED_ROLES: !Ref GradedRoles
           # Does `complete` verify the bytes arrived before stamping
           # uploaded_at? See the UploadVerifyMode parameter.
+          ENABLE_USER_DELETION: !Ref EnableUserDeletion
           UPLOAD_VERIFY_MODE: !Ref UploadVerifyMode
           # off -> the correction routes 404. See the SpeakerIdentityMode parameter;
           # this is the rollback, so it must be a deployed value, not a code constant.
@@ -1636,6 +1658,20 @@ Resources:
                 - s3:PutObject
                 - s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/voice/*
+            - Effect: Allow
+              # The user-deletion mirror. This function's other grants are all
+              # prefix-scoped, so redactions/* needs its own or the mirror write
+              # 403s. That failure is CAUGHT AND LOGGED by the endpoint (the
+              # database filters already hide the content, so failing the whole
+              # delete would be worse), which means without this statement the
+              # delete reports success while every reader that has no database —
+              # the nightly report generator and Ask — keeps serving the deleted
+              # recording. Read as well as write: the mirror is MERGED, so a
+              # second delete on the same day must see the first one's sessions.
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/redactions/*
             - Effect: Allow
               # GET /api/org/transcripts (Aurora-identity /transcripts fix) —
               # read-only, same transcripts/* objects the legacy fieldsight-api

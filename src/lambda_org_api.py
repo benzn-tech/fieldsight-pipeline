@@ -152,6 +152,7 @@ from text_normalize import diff_candidates, first_match_span, normalize, occurre
 from keyframe_selection import keyframe_seconds
 from photo_binding import parse_time_range
 import batch_stitch
+import deletion_mirror
 import turn_name_overlay
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
@@ -200,6 +201,13 @@ RECORDING_KINDS = {"video", "audio", "photo"}
 #   observe  200 always, but log the verdict enforce would have reached
 #   enforce  409 when the object is absent; the row stays pending and the
 #            device re-sends inside its own 7-day budget
+# A customer-facing delete: the user selects recordings, and everything derived from them
+# stops being visible to anyone. TEMPORARY BY REQUEST — the switch gates the WRITE endpoint
+# only. The read filters are deliberately unconditional: making them follow the flag would
+# mean that turning it off un-hides every recording a customer was told was gone, which is
+# a second incident rather than a rollback. Recall is per-batch and lives in the data:
+#   SELECT * FROM redactions WHERE scope='deleted' AND reverted_at IS NULL;
+ENABLE_USER_DELETION = os.environ.get("ENABLE_USER_DELETION", "false").lower() == "true"
 UPLOAD_VERIFY_MODE = os.environ.get("UPLOAD_VERIFY_MODE", "off").lower()
 # off | shadow | on. `off` is the deployed default and the rollback: the correction routes
 # 404 and nothing downstream is reachable. Read from the environment rather than a constant
@@ -467,6 +475,10 @@ def dispatch(conn, event, method, route):
     if route == "/aliases" and method == "POST":
         return create_alias_endpoint(conn, caller, parse_body(event), event)
 
+    if route == "/recordings/delete" and method == "POST":
+        return delete_recordings_endpoint(conn, caller, parse_body(event))
+    if route == "/recordings/undelete" and method == "POST":
+        return undelete_recordings_endpoint(conn, caller, parse_body(event))
     if route == "/redactions" and method == "POST":
         return create_redaction_endpoint(conn, caller, parse_body(event))
     m_rr = re.match(r"^/redactions/([^/]+)/revert$", route)
@@ -2969,6 +2981,247 @@ def apply_topic_correction(conn, caller, topic_id, body):
                      "occurrences": p["occurrences"]} for p in plan],
         "reindex_enqueued": reindexed,
     })
+
+
+def _source_prefixes_for(rec):
+    """The source prefix one recording's topics live under. One entry, or none.
+
+    Live extraction writes `source_s3_key = extractions/{folder}/{date}/{base}…`, and that
+    prefix is what survives supersession, so it is the tombstone's anchor.
+
+    THERE IS DELIBERATELY NO `reports/` ARM HERE, and the first version of this function
+    had one. Report-sourced topics carry `reports/{date}/{folder}/daily_report.json` -- no
+    session base at all (`lambda_item_writer.py`), so the per-session prefix matched
+    nothing and the docstring claiming it closed "the same day by another door" was simply
+    false. Widening it to the day prefix would be worse: it is a DAY-level rollup, so a
+    permanent day tombstone would hide the other sessions the customer kept, and would keep
+    hiding the CLEAN report that the next nightly run regenerates without the deleted
+    session. The day's stale rollup is handled instead by hiding those topics BY ID in the
+    same batch (see `delete_recordings_endpoint`) -- reversible, and self-healing once the
+    regenerated report lands under a new set of uuids that no tombstone names.
+
+    `sessionBase` is required. Without it the prefix degrades to the whole day, which would
+    hide recordings the customer never selected -- silently, and phrased as success.
+    """
+    folder, date = rec.get("folder"), rec.get("date")
+    base = (rec.get("sessionBase") or "").strip()
+    if not folder or not date or not base:
+        return []
+    return [f"extractions/{folder}/{date}/{base}"]
+
+
+def _can_delete_folder(conn, caller, folder):
+    """May `caller` delete `folder`'s recordings? Plan §0.9.
+
+    Deleting is strictly stronger than viewing, so this is `_can_view_folder` AND an
+    ownership/authority test -- a pm can read a worker's day but must not be able to erase
+    it from everyone's view.
+
+    Own folder, or admin/gm/platform_admin. Nothing else. The tuple's second element is the
+    company the tombstone must be stamped with: the TARGET's company, not the caller's,
+    because `revert_batch` is company-guarded and stamping a cross-company delete with the
+    platform admin's company would leave the affected company unable to undo it.
+    """
+    if not folder:
+        return False, None
+    sc = scope.visible_scope(conn, caller)
+    if folder == sc.get("self_folder"):
+        return True, caller["company_id"]
+    if not _can_view_folder(conn, caller, folder):
+        return False, None
+    if not (sc.get("user_scope") == "ALL" or sc.get("cross_company")):
+        return False, None
+    target = (users.get_by_folder_name_global(conn, folder) if sc.get("cross_company")
+              else users.get_by_folder_name(conn, caller["company_id"], folder))
+    if target is None:
+        return False, None
+    return True, target["company_id"]
+
+
+def delete_recordings_endpoint(conn, caller, body):
+    """Hide everything derived from the selected recordings. Nothing is destroyed.
+
+    Order: tombstones + per-topic redactions -> **commit** -> S3 mirror. The commit is
+    explicit and is NOT the `with conn.transaction()` block: `lambda_handler` opens the
+    connection with `with get_connection() as conn`, and the device heartbeat and the
+    caller lookup have already run statements by the time we get here, so a nested
+    `transaction()` is a SAVEPOINT and commits nothing. An earlier version of this function
+    relied on it and wrote the mirror inside the still-open transaction -- if the request
+    had then failed, S3 would advertise a deletion no database row recorded, with no
+    batch_id to undo it. That is the one direction this feature must never fail in.
+
+    Authorization is per recording, not per request: one unreachable folder is a 403 for
+    that entry, and the rest still go through. `folder` arrives from the request body, so
+    without this check any authenticated account could hide another company's day -- and
+    could not be undone by that company, because `revert_batch` is company-guarded.
+
+    The response carries per-recording counts INCLUDING ZERO. A delete that matched nothing
+    and reported success is the worst outcome available here: the customer is told their
+    recording is gone and it is not.
+    """
+    if not ENABLE_USER_DELETION:
+        return error("recording deletion is not enabled (ENABLE_USER_DELETION)", 403)
+    recs = (body or {}).get("recordings") or []
+    if not recs:
+        return error("no recordings given", 400)
+    reason = ((body or {}).get("reason") or "deleted by the user").strip()
+
+    import uuid as _uuid
+    batch_id = str(_uuid.uuid4())
+    results, days, sessions_by_day = [], set(), {}
+    for rec in recs:
+        prefixes = _source_prefixes_for(rec)
+        if not prefixes:
+            results.append({"recording": rec, "topics_hidden": 0,
+                            "error": "folder, date and sessionBase are all required"})
+            continue
+        allowed, target_company = _can_delete_folder(conn, caller, rec.get("folder"))
+        if not allowed:
+            results.append({"recording": rec, "topics_hidden": 0,
+                            "error": "not permitted to delete this user's recordings"})
+            continue
+        hidden = 0
+        for prefix in prefixes:
+            redactions.create_recording_tombstone(
+                conn, target_company, prefix, reason,
+                caller.get("id"), caller.get("global_role"), batch_id=batch_id)
+            for row in topics.list_topics_for_source_prefix(conn, prefix) or []:
+                if redactions.create_redaction(
+                        conn, target_company, row["id"], reason,
+                        caller.get("id"), caller.get("global_role"),
+                        target_type="topic", scope="deleted", batch_id=batch_id,
+                        skip_if_already_deleted=True):
+                    hidden += 1
+        # The day's report-sourced topics are a rollup that MIXES this session with the
+        # ones the customer kept, so the stale copy has to go -- by id, in this batch, so
+        # the undelete brings it back. Not by source prefix: the next nightly run
+        # regenerates the report WITHOUT the deleted session and re-inserts clean topics
+        # under new uuids, and a prefix tombstone would keep hiding those forever.
+        for row in topics.list_topics_for_source_prefix(
+                conn, f"reports/{rec['date']}/{rec['folder']}/") or []:
+            if redactions.create_redaction(
+                    conn, target_company, row["id"], reason,
+                    caller.get("id"), caller.get("global_role"),
+                    target_type="topic", scope="deleted", batch_id=batch_id,
+                    skip_if_already_deleted=True):
+                hidden += 1
+        results.append({"recording": rec, "topics_hidden": hidden})
+        days.add((rec["folder"], rec["date"]))
+        sessions_by_day.setdefault((rec["folder"], rec["date"]), set()).add(
+            (rec.get("sessionBase") or "").strip())
+
+    conn.commit()
+
+    # The mirror the non-VPC lambdas read. Written AFTER the commit above so it can never
+    # advertise a deletion the database did not keep. MERGED, not overwritten: a second
+    # delete on the same day used to replace the document and thereby un-hide the first
+    # batch from every reader that has no database -- the nightly report and its email.
+    for folder, date in sorted(days):
+        try:
+            existing = deletion_mirror.deleted_sessions_strict(
+                s3(), S3_BUCKET, folder, date)
+            merged = set(existing) | sessions_by_day.get((folder, date), set())
+            deletion_mirror.write_mirror(s3(), S3_BUCKET, folder, date, merged)
+        except deletion_mirror.MirrorUnreadable:
+            # STRICT on purpose: the lenient read returns an empty set, which would turn
+            # this merge into an overwrite and un-hide every earlier deletion for the day.
+            # Not writing leaves the earlier deletions hidden and this one visible to the
+            # database-less readers until a retry — one leak instead of all of them.
+            logger.exception("deletion mirror for %s/%s unreadable — NOT writing, or this "
+                             "batch (%s) would erase the day's earlier deletions",
+                             folder, date, batch_id)
+        except Exception:
+            logger.exception("deletion mirror write failed for %s/%s (batch %s) — the "
+                             "database filters already hide it; retry is idempotent",
+                             folder, date, batch_id)
+
+    logger.info("user deletion: batch=%s recordings=%d topics_hidden=%d refused=%d",
+                batch_id, len(recs), sum(r["topics_hidden"] for r in results),
+                sum(1 for r in results if r.get("error")))
+    return ok({"batch_id": batch_id, "results": results})
+
+
+def undelete_recordings_endpoint(conn, caller, body):
+    """Restore exactly one delete batch. The audit rows survive (`reverted_at`).
+
+    Authorized the same way the delete was, and for the same reason. Gating only on the
+    company (which is all `revert_batch` does) would let any provisioned worker undo an
+    admin's delete of a colleague's recordings, and would let a platform_admin un-delete any
+    company's batch on global_role alone. Delete is per-folder authorized; an undelete that
+    is not is the same hole facing the other way.
+    """
+    if not ENABLE_USER_DELETION:
+        return error("recording deletion is not enabled (ENABLE_USER_DELETION)", 403)
+    batch_id = (body or {}).get("batchId")
+    if not batch_id:
+        return error("batchId is required", 400)
+    cross = is_cross_company(caller["global_role"])
+    existing = redactions.list_batch(
+        conn, batch_id, caller["company_id"], cross_company=cross) or []
+    if not existing:
+        return error("batch not found", 404)
+    folders = {(r.get("target_key") or "").split("/")[1]
+               for r in existing if r.get("target_type") == "recording"
+               and (r.get("target_key") or "").startswith("extractions/")}
+    for folder in sorted(folders):
+        allowed, _ = _can_delete_folder(conn, caller, folder)
+        if not allowed:
+            return error("not permitted to restore this batch", 403)
+
+    rows = redactions.revert_batch(
+        conn, batch_id, caller["company_id"], cross_company=cross) or []
+    # Only THIS batch's sessions come out of the mirror. The first version wrote the day's
+    # document as `[]`, which un-hid every other active batch for that day from the readers
+    # that have no database -- an undelete that restores more than the delete hid.
+    freed = {}
+    for r in rows:
+        if r.get("target_type") != "recording":
+            continue
+        parts = (r.get("target_key") or "").split("/")
+        if len(parts) >= 4 and parts[0] == "extractions":
+            freed.setdefault((parts[1], parts[2]), set()).add(parts[3])
+
+    # The day's stale report rollup is hidden BY TOPIC ID, and `ON CONFLICT DO NOTHING`
+    # means the FIRST batch to touch a day owns those rows. Reverting that batch therefore
+    # republishes a rollup that still contains a second, still-deleted batch's content.
+    # Re-hide them under a batch that is still active, so they remain revertible and die
+    # with the day's last remaining deletion rather than never.
+    reason = "still deleted by another batch"
+    for (folder, date) in sorted(freed):
+        still = redactions.active_batches_for_day(conn, folder, date,
+                                                  exclude_batch=batch_id)
+        if not still:
+            continue
+        company = next((r["company_id"] for r in existing), caller["company_id"])
+        for row in topics.list_topics_for_source_prefix(
+                conn, f"reports/{date}/{folder}/") or []:
+            redactions.create_redaction(
+                conn, company, row["id"], reason, caller.get("id"),
+                caller.get("global_role"), target_type="topic", scope="deleted",
+                batch_id=still[0], skip_if_already_deleted=True)
+        logger.info("undelete %s: %s/%s still deleted by %d other batch(es) — the day's "
+                    "report topics stay hidden under %s",
+                    batch_id, folder, date, len(still), still[0])
+
+    conn.commit()
+    for (folder, date), sessions in sorted(freed.items()):
+        try:
+            remaining = deletion_mirror.deleted_sessions_strict(
+                s3(), S3_BUCKET, folder, date) - sessions
+            deletion_mirror.write_mirror(s3(), S3_BUCKET, folder, date, remaining)
+        except deletion_mirror.MirrorUnreadable:
+            # A lenient read here is worse than anywhere else: `set() - sessions` is empty,
+            # so a blipped GetObject writes an EMPTY document and frees every other active
+            # batch for the day. Leaving the mirror alone keeps this batch's sessions hidden
+            # from the database-less readers a while longer, which is the safe direction.
+            logger.exception("deletion mirror for %s/%s unreadable — NOT rewriting on "
+                             "undelete %s, or it would free the day's other batches",
+                             folder, date, batch_id)
+        except Exception:
+            logger.exception("deletion mirror rewrite failed for %s/%s on undelete %s",
+                             folder, date, batch_id)
+    logger.info("user deletion: undelete batch=%s restored=%d", batch_id, len(rows))
+    return ok({"batch_id": batch_id, "restored": len(rows)})
 
 
 def create_redaction_endpoint(conn, caller, body):

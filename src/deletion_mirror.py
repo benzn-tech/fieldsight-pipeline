@@ -52,7 +52,28 @@ def write_mirror(s3, bucket: str, folder: str, date: str, session_ids) -> str:
     return key
 
 
-def deleted_sessions(s3, bucket: str, folder: str, date: str) -> set:
+class MirrorUnreadable(Exception):
+    """The mirror exists but could not be read.
+
+    Only the read-modify-write callers care. For a READER, "unreadable" and "empty" both
+    end in showing content, so swallowing it is merely the lesser evil. For a WRITER it is
+    the difference between merging and CLOBBERING: an empty read turns the merge into an
+    overwrite that un-hides every earlier deletion for that day, and turns the undelete's
+    subtraction into writing an empty document — which is precisely the "one undelete frees
+    everything" defect the merge was added to fix, reachable any time a GetObject blips.
+    """
+
+
+def deleted_sessions_strict(s3, bucket: str, folder: str, date: str) -> set:
+    """`deleted_sessions`, but a genuine read failure raises instead of reading as empty.
+
+    Absence still returns an empty set — a day with no deletions has no mirror, and that is
+    the common case, not a fault.
+    """
+    return deleted_sessions(s3, bucket, folder, date, strict=True)
+
+
+def deleted_sessions(s3, bucket: str, folder: str, date: str, strict: bool = False) -> set:
     """The deleted session ids for one day, or an empty set.
 
     A missing object is the common case by far — every day without a deletion has no
@@ -63,6 +84,9 @@ def deleted_sessions(s3, bucket: str, folder: str, date: str) -> set:
     like "nothing was deleted", and that indistinguishability is what has cost this project
     three separate silent breakages. It still returns empty rather than raising: taking the
     report generator down would be a worse failure than a delay in hiding one day.
+
+    `strict=True` reverses that trade for the read-modify-write callers, who would otherwise
+    clobber the document they meant to merge into. See `MirrorUnreadable`.
     """
     key = mirror_key(folder, date)
     try:
@@ -72,6 +96,8 @@ def deleted_sessions(s3, bucket: str, folder: str, date: str) -> set:
     except Exception as e:
         if type(e).__name__ in ("NoSuchKey", "404"):
             return set()
+        if strict:
+            raise MirrorUnreadable(key) from e
         logger.warning("deletion mirror %s unreadable (%s) — proceeding as if nothing was "
                        "deleted, which may show content a customer removed",
                        key, type(e).__name__)
