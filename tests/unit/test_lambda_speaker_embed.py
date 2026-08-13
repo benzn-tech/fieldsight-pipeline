@@ -554,9 +554,11 @@ def test_the_other_voice_is_not_named(monkeypatch):
     # The alternating fixture makes turns at 0/20/40 one voice and 10/30/50 the other.
     # A named turn from the second set means the two voices were merged.
     named = {r["turn_ref"] for r in sent["results"]}
-    assert not (named & {"x_c0000.wav@10.0", "x_c0000.wav@30.0", "x_c0000.wav@50.0"}), (
+    # Refs are normalised — the extension is dropped, because a correction carries the .wav
+    # and the transcript carries the .json for the same turn.
+    assert not (named & {"x_c0000@10.0", "x_c0000@30.0", "x_c0000@50.0"}), (
         f"the second voice was swept up with the first: {sorted(named)}")
-    assert named >= {"x_c0000.wav@20.0", "x_c0000.wav@40.0"}, (
+    assert named >= {"x_c0000@20.0", "x_c0000@40.0"}, (
         f"the first voice was not fully named: {sorted(named)}")
 
 
@@ -569,7 +571,7 @@ def test_the_asserted_turn_is_marked_and_the_rest_are_not(monkeypatch):
     se.lambda_handler(_s3_event(key), None)
     asserted = [r for r in sent["results"] if r.get("asserted")]
     assert len(asserted) == 1
-    assert asserted[0]["turn_ref"].endswith("@0.0")
+    assert asserted[0]["turn_ref"] == "x_c0000@0.0"
 
 
 def test_propagated_rows_are_capped_at_tentative(monkeypatch):

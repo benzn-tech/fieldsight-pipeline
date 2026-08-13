@@ -306,3 +306,66 @@ def test_resolve_keeps_precedence_when_both_rows_reach_one_turn():
             _row("x.wav@5.0", "Said", source="correction")]
     out = tno.resolve(tno.build(rows), [_seg("x.json", 5.0)])
     assert out[0]["display_name"] == "Said"
+
+
+# ---- one function builds a turn reference -------------------------------
+#
+# The embedder built refs with two f-strings while the reader normalised with _stem, so a
+# correction carrying `…_srcwav.wav` and a turn list carrying `…_srcwav.json` described the
+# same turn and never compared equal. Propagation refused every real correction with
+# "corrected turn not among the session's turns" — the fourth appearance tonight of two
+# spellings of one thing.
+
+
+def test_a_turn_reference_is_the_same_whichever_artifact_you_hold():
+    assert tno.turn_ref("x_c0000_srcwav.wav", 2.86) == \
+           tno.turn_ref("x_c0000_srcwav.json", 2.86)
+
+
+def test_a_built_reference_parses_back_to_what_built_it():
+    ref = tno.turn_ref("x_c0000_srcwav.wav", 2.86)
+    idx = tno.build([_row(ref, "Ben L")])
+    assert tno.lookup(idx, "x_c0000_srcwav.json", 2.86)["display_name"] == "Ben L"
+
+
+def test_the_offset_survives_as_a_number_not_a_rendering():
+    """2.0 and 2 must not be two different turns."""
+    assert tno.turn_ref("x.wav", 2) == tno.turn_ref("x.wav", 2.0)
+
+
+def test_nothing_in_production_asks_for_one_turn_at_a_time():
+    """`lookup` is kept for exercising the ranking rules and is deliberately not the path
+    the endpoint takes. Asking it per segment lets ONE row be claimed by SEVERAL turns, and
+    on TEST that turned a single assertion into two `confirmed` names.
+
+    A dead public entry point that reintroduces a killed defect is worth a guard rather than
+    a comment — nothing else would notice a future caller.
+    """
+    import ast
+    import os
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2] / "src"
+    offenders = []
+    for path in root.rglob("*.py"):
+        if "__pycache__" in str(path) or path.name == "turn_name_overlay.py":
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "lookup"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "turn_name_overlay"):
+                offenders.append(os.path.relpath(path, root))
+    assert not offenders, (
+        f"{offenders} calls turn_name_overlay.lookup per segment; use resolve(), which pairs "
+        f"rows and turns one-to-one")
+
+
+# A guard asserting "only one place knows the session-id pattern" was written here and then
+# removed. Four unrelated modules legitimately match `_sid[0-9a-f]{32}_c(\d+)` to pull a
+# CHUNK index or a batch number out of a filename — they are not second copies of the session
+# key, and a guard that demands unrelated rewrites is noise rather than protection.
+# `lambda_org_api._session_of`, which really was a second copy, now delegates.
