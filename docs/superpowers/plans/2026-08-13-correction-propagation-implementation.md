@@ -9,6 +9,21 @@ rounds)
 Both are cheap, both can kill or reshape the work, and building before either is answered
 risks discarding it.
 
+### Gate A — **CLOSED 2026-08-13: it separates them, τ = 0.85**
+
+Results: `../specs/2026-08-13-gate-a-clustering-results.md`. Both Phase 0 sessions give k = 3
+at 100% purity across τ ∈ [0.82, 0.88]; frozen at **0.85**, measured with onnxruntime on the
+exported model and with the same `cluster_turns` that ships. In one session the provider had
+returned **two labels for three people** and clustering recovered all three.
+
+**τ′ and the cluster homogeneity check are removed from this plan.** Same-speaker pairs reach
+0.813 against τ = 0.85 — a 0.037 gap, which is noise — so any τ′ tight enough to mean anything
+fires on legitimate clusters. It is dropped rather than tuned, and the `False` → cap-at-
+tentative decision below is withdrawn with it.
+
+The original text follows, unchanged, because the reasoning is what made the answer worth
+having.
+
 ### Gate A — does clustering separate Phase 0's three known speakers?
 
 The spec's kill criterion. Phase 0's numbers are **profile-vs-turn** (same-person +0.104…+0.639,
@@ -63,9 +78,8 @@ display, and that is a viewer change with no effect on what has been collected.
 
 ## Decisions this plan makes, so they are not made silently later
 
-* **`τ′` failure semantics**: a cluster failing the homogeneity bound **caps at `tentative`**,
-  mirroring the k=1 and label-disagreement idioms. Revision 4 defined `None` and left `False`
-  undefined.
+* ~~**`τ′` failure semantics**~~ — **withdrawn**: Gate A measured no room for a second
+  threshold at all. See above.
 * **Ambiguous assignment of the corrected turn** uses the frozen `DEFAULT_MIN_MARGIN` (0.15)
   between the top two cluster distances — the floor was lifted for this one turn, and lifting
   a floor without naming the number replacing it is how the last three defects travelled.
@@ -119,8 +133,10 @@ Each phase is independently revertible and inert until the one after it.
 
 ### P1 — clustering arithmetic in `voiceprint_utils` (inert)
 
-**Tests first.** `cluster_turns(embeddings, tau)` → labels; `leave_one_out_centroid(members,
-i)`; `assign(reference, centroids)` → (index, margin).
+**DONE 2026-08-13.** `cluster_turns(embeddings, tau)` → labels; `leave_one_out_centroid(
+members, i)`; `assign(reference, centroids)` → (index, margin). `scripts/speaker_session_eval.py`
+delegates to these rather than holding a copy, so the frozen τ stays measured against the code
+that ships — re-running Gate A after the move reproduced every number.
 
 Assert: two synthetic clusters separate and one does not split; **a two-member cluster does not
 out-score a ten-member cluster on identical audio** (the leave-one-out guard — without it

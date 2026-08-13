@@ -156,3 +156,103 @@ def window_is_homogeneous(frame_embeddings,
             if 1.0 - cosine(frames[i], frames[j]) > max_spread:
                 return False
     return True
+
+
+# --- clustering a session's own turns -------------------------------------
+#
+# The propagation mechanism's unit is a VOICE, not a turn. Two spec revisions died on the
+# same failure — scoring each turn against the corrected window gives `decide_name` a single
+# candidate, and the single-candidate branch above refuses to confirm on principle. Adding
+# the session's clusters as rivals did not help either, because the corrected person's OWN
+# cluster was among them and he competed with himself at margin ~0.
+#
+# Clustering first and letting the correction NAME a cluster removes the failure structurally:
+# the reference selects a cluster rather than standing beside it, and per-turn confidence
+# becomes an ordinary multi-candidate question between genuinely different voices.
+#
+# tau = 0.85, frozen 2026-08-13 from the two Phase 0 sessions (Gate A): [0.82, 0.88] gives
+# k = 3 at 100% purity in both, and 0.85 is the middle. Measured with THIS code — a threshold
+# measured against a different implementation is not a threshold for this one.
+
+DEFAULT_CLUSTER_TAU = 0.85
+
+
+def cluster_turns(vectors, tau=DEFAULT_CLUSTER_TAU) -> list:
+    """Group a session's turn embeddings into voices. Returns one label per vector.
+
+    Complete linkage on cosine distance: a merge happens only when EVERY pair across the two
+    clusters is within `tau`. Single linkage would chain A→B→C and put two people who sound
+    nothing alike into one cluster — for naming that is the expensive direction, because the
+    runner-up that would have caught the mistake disappears along with them.
+
+    Pure numpy, like everything else here: this ships to a Lambda whose layer carries no
+    scipy and no sklearn, and an implementation that cannot run there would not be the one
+    the threshold was measured against.
+
+    O(n^3) in the worst case, which is fine for the hundreds of turns a session holds and
+    would not be for thousands.
+    """
+    n = len(vectors)
+    if n == 0:
+        return []
+    dist = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist[i][j] = dist[j][i] = 1.0 - cosine(vectors[i], vectors[j])
+    groups = [[i] for i in range(n)]
+    while len(groups) > 1:
+        best = None
+        for a in range(len(groups)):
+            for b in range(a + 1, len(groups)):
+                worst = max(dist[x][y] for x in groups[a] for y in groups[b])
+                if best is None or worst < best[0]:
+                    best = (worst, a, b)
+        if best is None or best[0] > tau:
+            break
+        _, a, b = best
+        groups[a] = groups[a] + groups[b]
+        del groups[b]
+    labels = [0] * n
+    for k, g in enumerate(groups):
+        for i in g:
+            labels[i] = k
+    return labels
+
+
+def leave_one_out_centroid(members, index):
+    """The cluster's centre with `index` taken out of it.
+
+    A turn is part of the centroid it is scored against, which inflates its own similarity —
+    and most in the smallest clusters, where a two-member cluster scores its members highly
+    even when they are barely alike. Margins would then be largest exactly where the evidence
+    is weakest, and the calibration step would freeze that cluster-size dependence into the
+    threshold it produces.
+
+    Raises at n=1 rather than returning a zero vector: zero scores 0.0 against everything and
+    reads as "nobody", when the truth is "cannot say".
+    """
+    import numpy as np
+    if len(members) < 2:
+        raise ValueError(
+            "a singleton cluster has no leave-one-out centroid — it names only the turn the "
+            "user corrected and propagates nothing")
+    arr = np.asarray(members, dtype=np.float64)
+    total = arr.sum(axis=0) - arr[index]
+    return total / (len(members) - 1)
+
+
+def assign(reference, centroids):
+    """Which cluster the corrected window belongs to, and by how much.
+
+    Returns `(index, margin)` where the margin is over the runner-up cluster. The caller
+    refuses below `DEFAULT_MIN_MARGIN`: a corrected turn sitting between two voices is the
+    1-in-6 two-voice turn §2 measured, and naming a cluster from it spreads one person's name
+    across another person's whole session.
+    """
+    if not centroids:
+        return None, None
+    scored = sorted(((cosine(reference, c), i) for i, c in enumerate(centroids)),
+                    reverse=True)
+    if len(scored) == 1:
+        return scored[0][1], None
+    return scored[0][1], scored[0][0] - scored[1][0]

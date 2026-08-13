@@ -115,41 +115,13 @@ class OnnxEmbedder:
 
 
 def agglomerate(vectors, tau):
-    """Complete-linkage agglomerative clustering on cosine distance. Returns labels.
+    """Gate A used `voiceprint_utils.cluster_turns`, and so does anything else.
 
-    Complete linkage, not single: a cluster is only merged when EVERY pair across it is
-    within tau, so "all members within tau" holds by construction. Single linkage would let
-    a chain of near-neighbours join two people who are nothing alike, which for naming is
-    the expensive direction.
-
-    Pure numpy on purpose — voiceprint_utils ships to a Lambda whose layer has no scipy or
-    sklearn, and an implementation measured here that cannot run there is not a measurement
-    of anything.
+    A second implementation here would mean the frozen tau was measured against code that
+    is not the code that ships — the same drift `build_map`'s docstring warns about for
+    batch offsets, in the one place where the number IS the deliverable.
     """
-    n = len(vectors)
-    if n == 0:
-        return []
-    d = np.zeros((n, n))
-    for i in range(n):
-        for j in range(i + 1, n):
-            d[i][j] = d[j][i] = 1.0 - float(vp.cosine(vectors[i], vectors[j]))
-    clusters = [[i] for i in range(n)]
-    while len(clusters) > 1:
-        best, bi, bj = None, -1, -1
-        for a in range(len(clusters)):
-            for b in range(a + 1, len(clusters)):
-                worst = max(d[x][y] for x in clusters[a] for y in clusters[b])
-                if best is None or worst < best:
-                    best, bi, bj = worst, a, b
-        if best is None or best > tau:
-            break
-        clusters[bi] = clusters[bi] + clusters[bj]
-        del clusters[bj]
-    labels = [0] * n
-    for k, c in enumerate(clusters):
-        for i in c:
-            labels[i] = k
-    return labels
+    return vp.cluster_turns(vectors, tau)
 
 
 def report_clustering(rows, taus=(0.30, 0.50, 0.70, 0.80, 0.82, 0.84, 0.85, 0.86,
