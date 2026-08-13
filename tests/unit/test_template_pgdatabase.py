@@ -23,10 +23,15 @@ def test_all_pgdatabase_values_are_guarded_by_the_condition():
     # bare !ImportValue (that would be an un-switched function).
     guarded = len(re.findall(r"PGDATABASE:\s*!If \[HasPgDatabaseOverride", t))
     bare = len(re.findall(r"PGDATABASE:\s*!ImportValue", t))
-    # 17 since life-conversation phase 2 added the in-VPC NonWorkExpiryFunction
-    # (16 with the device ledger's DeviceLedgerFunction; 15 when the chunk-driven
-    # session lifecycle added SessionActivityFunction; 14 when the Tier-0 finalize
-    # plan added FinalizeSweepFunction; 13 before the video-keyframe
-    # KeyframeFunction). Its PGDATABASE is correctly !If-guarded like the rest.
-    assert guarded == 17, f"expected 17 guarded PGDATABASE, found {guarded}"
+    # 18 since speaker identity phase 3 added the in-VPC SpeakerEmbedFunction
+    # (17 with life-conversation phase 2's NonWorkExpiryFunction; 16 with the device
+    # ledger's DeviceLedgerFunction; 15 when the chunk-driven session lifecycle added
+    # SessionActivityFunction; 14 when the Tier-0 finalize plan added
+    # FinalizeSweepFunction; 13 before the video-keyframe KeyframeFunction). Each new
+    # one's PGDATABASE is correctly !If-guarded like the rest.
+    #
+    # The count is the point: a new in-VPC function is meant to make this test fail, so
+    # that whoever adds one has to look at whether they guarded PGDATABASE rather than
+    # discovering months later that test writes went to the prod database.
+    assert guarded == 18, f"expected 18 guarded PGDATABASE, found {guarded}"
     assert bare == 0, f"found {bare} un-switched bare PGDATABASE !ImportValue"
