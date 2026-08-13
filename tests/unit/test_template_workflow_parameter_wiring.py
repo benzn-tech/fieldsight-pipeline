@@ -782,3 +782,28 @@ def test_the_embedder_has_no_event_trigger():
     assert "Events:" not in blk, (
         "SpeakerEmbedFunction must have no Events — it is invoked on demand, and a "
         "trigger would run a model over every file that lands")
+
+
+def test_the_transcriber_can_be_given_a_concurrency_ceiling():
+    """The provider caps CONCURRENT requests; Lambda does not, and 141 met a limit of 20.
+
+    Reserved concurrency is the only mechanism that bounds this before the request is made
+    -- everything else reacts to the rejection, and the rejection loses the audio. It has to
+    be a parameter rather than a constant because the two stages hold different keys on
+    different plans, and the number must be derived from the live consumer list, not guessed.
+    """
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert re.search(r"\n  TranscribeReservedConcurrency:\n", text), "no parameter"
+    assert "ReservedConcurrentExecutions: !Ref TranscribeReservedConcurrency" in text \
+        or "ReservedConcurrentExecutions: !If" in text, "the parameter reaches no function"
+    for env in ("prod", "test"):
+        assert "TranscribeReservedConcurrency" in _overrides(WORKFLOWS[env]), \
+            f"{env} cannot set it, so it holds its default forever"
+
+
+def test_an_unset_ceiling_means_no_reservation_at_all():
+    """`0` must omit the property, not reserve zero -- reserving zero would stop the
+    function dead. Prod's plan is unknown from this repo and its observed peak is 54, so a
+    guessed number there would throttle a working pipeline."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert re.search(r"HasTranscribeReserve:\s*!Not \[!Equals \[!Ref TranscribeReservedConcurrency, '0'\]\]", text)
