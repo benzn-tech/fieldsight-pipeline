@@ -176,7 +176,65 @@ def confirmations_count(conn, company_id, voiceprint_id) -> int:
     _require_company(company_id)
     row = conn.cursor(row_factory=dict_row).execute(
         "SELECT count(DISTINCT n.session_base) AS n FROM speaker_turn_names n "
-        "WHERE n.company_id = %s AND n.voiceprint_id = %s AND n.state = 'confirmed'",
+        "WHERE n.company_id = %s AND n.voiceprint_id = %s AND n.state = 'confirmed' "
+        # Human corrections only. Propagation writes `confirmed` rows too, so without this
+        # the system satisfies its own promotion criterion with its own output -- profiles
+        # confirming themselves overnight, across sessions, with nothing in the schema
+        # showing that the loop exists. The second cut is that propagation rows carry
+        # voiceprint_id NULL, which this equality can never match.
+        "  AND n.source = 'correction'",
         (company_id, voiceprint_id),
     ).fetchone()
     return int((row or {}).get("n") or 0)
+
+
+def record_turn_name(conn, company_id, session_base, turn_ref, state, source,
+                     correction_ref=None, cluster_ref=None, cluster_threshold=None,
+                     voiceprint_id=None, score=None, margin=None,
+                     label_disagreement=None) -> dict | None:
+    """One name for one turn, replacing whatever was live for it.
+
+    Supersede-then-insert, in the CALLER'S transaction. S3 events are unordered and more
+    than one run can be in flight, so without the supersede first the partial unique index
+    turns a race into a write failure rather than a replacement — and a caller that then
+    retries would find the same collision.
+
+    `voiceprint_id` stays None for propagation. A correction that creates no profile has no
+    id to point at, and inventing a named profile to satisfy a foreign key is the consent
+    violation Phase 4 exists to refuse.
+    """
+    _require_company(company_id)
+    cur = conn.cursor(row_factory=dict_row)
+    cur.execute(
+        "UPDATE speaker_turn_names SET superseded_at = now() "
+        "WHERE company_id = %s AND session_base = %s AND turn_ref = %s "
+        "  AND superseded_at IS NULL",
+        (company_id, session_base, turn_ref))
+    return cur.execute(
+        "INSERT INTO speaker_turn_names "
+        "(company_id, voiceprint_id, session_base, turn_ref, state, score, margin, "
+        " source, correction_ref, cluster_ref, cluster_threshold, label_disagreement) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        (company_id, voiceprint_id, session_base, turn_ref, state, score, margin,
+         source, correction_ref, cluster_ref, cluster_threshold, label_disagreement),
+    ).fetchone()
+
+
+def live_turn_names(conn, company_id, session_base) -> list[dict]:
+    """The overlay for one session: one row per turn, superseded rows excluded.
+
+    Precedence is applied AGAIN by the reader. This query returns what the unique index
+    guarantees — one live row per `turn_ref` string — but the read-time join matches turns by
+    overlap with tolerance, because re-extraction shifts `start_sec` and a strict join would
+    make names silently vanish. Two rows whose strings differ slightly can therefore both
+    match one physical turn while satisfying the index.
+    """
+    _require_company(company_id)
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, voiceprint_id, turn_ref, state, score, margin, source, correction_ref, "
+        "       cluster_ref, cluster_threshold, label_disagreement, created_at "
+        "FROM speaker_turn_names "
+        "WHERE company_id = %s AND session_base = %s AND superseded_at IS NULL "
+        "ORDER BY created_at",
+        (company_id, session_base),
+    ).fetchall()

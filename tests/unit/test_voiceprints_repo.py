@@ -244,3 +244,57 @@ def test_profiles_for_matching_returns_numbers_not_text():
     out = vr.profiles_for_matching(conn, CO)
     assert [float(x) for x in out[0]["embedding"]] == [1.0, 2.0, 3.0], (
         "the embedding reached the caller as text; cosine would not have said so")
+
+
+# ---- the loop that would have confirmed profiles from machine output ----
+#
+# `confirmations_count` counts DISTINCT sessions with a `confirmed` turn name as the
+# "N independent confirmations" that promote a profile from tentative (§6). Propagation
+# writes confirmed rows too. Without a source filter the machine satisfies its own promotion
+# criterion with its own output, across sessions, and the profile that then names people was
+# confirmed by nothing.
+#
+# Nothing in the schema shows this: the loop exists only because two features share one
+# table. Two independent cuts, because either alone is one edit from being undone.
+
+
+def test_only_human_corrections_count_towards_promotion():
+    conn = FakeConn([[{"n": 2}]])
+    voiceprints.confirmations_count(conn, CO, VP)
+    sql = conn.calls[0]["sql"]
+    assert "source = 'correction'" in sql, (
+        "propagated rows count as human confirmations — the system promotes profiles with "
+        "its own output")
+
+
+def test_a_propagated_row_carries_no_profile_id():
+    """The second cut. `n.voiceprint_id = %s` can never match NULL, so propagation rows are
+    outside the count even if the source filter is ever removed."""
+    conn = FakeConn([[{"id": "t1"}]])
+    voiceprints.record_turn_name(conn, CO, session_base="s1", turn_ref="f.wav@1.0",
+                                 state="confirmed", source="correction_propagation",
+                                 correction_ref="corr-1", cluster_ref="C1",
+                                 cluster_threshold=0.85)
+    params = conn.calls[-1]["params"]
+    assert None in params, "a propagated row was given a voiceprint_id"
+
+
+def test_a_correction_row_supersedes_the_live_row_for_that_turn_first():
+    """Supersede-then-insert, in the caller's transaction. S3 events are unordered, so two
+    runs can overlap; without the supersede first the partial unique index turns a race into
+    a write failure instead of a replacement."""
+    conn = FakeConn([[], [{"id": "t2"}]])
+    voiceprints.record_turn_name(conn, CO, session_base="s1", turn_ref="f.wav@1.0",
+                                 state="confirmed", source="correction",
+                                 correction_ref="corr-2", voiceprint_id=VP)
+    assert "UPDATE speaker_turn_names" in conn.calls[0]["sql"]
+    assert "superseded_at" in conn.calls[0]["sql"]
+    assert "INSERT INTO speaker_turn_names" in conn.calls[1]["sql"]
+
+
+def test_the_live_overlay_excludes_superseded_rows():
+    conn = FakeConn([[]])
+    voiceprints.live_turn_names(conn, CO, "s1")
+    sql = conn.calls[0]["sql"]
+    assert "superseded_at IS NULL" in sql
+    assert "company_id = %s" in sql
