@@ -65,6 +65,7 @@ from repositories import users as users_repo
 from photo_binding import photos_for_topics as _photos_for_topics
 import thread_match
 from repositories import (companies, findings, meeting_session, recordings,
+                          redactions,
                           session_group, sites, threads, topics)
 # The extraction-key shape lives in session_scope now (the read side needs the
 # SAME parse to derive session_id from topics.source_s3_key -- see that
@@ -666,6 +667,15 @@ def write_extraction_items(date, user_folder, extraction_key):
                 logger.info("%s: resolved %d self-referential responsible -> %r",
                             extraction_key, resolved, recorder)
 
+        # The customer deleted this recording. Write nothing.
+        #
+        # Checked AFTER the advisory lock and BEFORE the idempotent clear, so a delete
+        # racing an extraction cannot end with the old rows cleared and no new ones -- the
+        # clear is what makes this ordering matter, not the insert.
+        if _source_is_deleted(conn, extraction_key):
+            logger.info("%s: source is deleted — writing no topics", extraction_key)
+            return {"skipped": "source_deleted", "key": extraction_key}
+
         # Source-key idempotency (Phase 4a pattern): clear this extraction's
         # prior rows before re-inserting.
         topics.delete_topics_for_source(conn, extraction_key)
@@ -847,6 +857,34 @@ def write_extraction_items(date, user_folder, extraction_key):
 # ----------------------------------------------------------
 # Entry point — S3 event
 # ----------------------------------------------------------
+def _source_is_deleted(conn, source_s3_key) -> bool:
+    """Whether this extraction's source has been deleted by its owner.
+
+    The pipeline is the resurrection path. `lambda_ingest` deletes a day's topics and
+    re-inserts them with NEW uuids when the nightly report supersedes the live extraction,
+    so a tombstone naming a topic uuid stops matching within a day and the deleted content
+    is back on the customer's dashboard the next morning — with no error anywhere, because
+    from the pipeline's point of view nothing went wrong. This is where the write side
+    learns to ask.
+
+    Fails OPEN, and that is the safe direction here: if the tombstone table is unreachable,
+    writing the row loses nothing (the read filters still hide it), whereas refusing to
+    write destroys the only record this audio has.
+
+    Logs either way. A skip nobody can count is indistinguishable from a guard that never
+    ran, which is how three separate missing grants in this codebase each looked like
+    nothing at all.
+    """
+    try:
+        hit = redactions.is_source_deleted(conn, source_s3_key)
+    except Exception:
+        logger.exception("deleted-source check failed for %s — writing anyway; the read "
+                         "filters still apply", source_s3_key)
+        return False
+    logger.info("deleted-source check: key=%s deleted=%s", source_s3_key, hit)
+    return bool(hit)
+
+
 def lambda_handler(event, context):
     event = event or {}
     results = []
