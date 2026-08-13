@@ -5344,7 +5344,53 @@ def _list_media_objects(prefix, what):
         raise
 
 
-def _read_org_transcripts(date, folder, start_time, end_time):
+def _deleted_sessions_for_day(conn, folder, date):
+    """Tombstoned source prefixes for one (folder, date), or an empty set.
+
+    org-api is IN-VPC and holds a connection, so this is the authority rather than the S3
+    mirror the non-VPC lambdas fall back to.
+
+    Fails OPEN like every other guard in this feature: an unreadable tombstone table must
+    not take the media endpoints down. It logs, because "nothing was deleted" and "the
+    check could not run" are otherwise the same answer.
+    """
+    if conn is None:
+        return set()
+    try:
+        raw = redactions.deleted_source_prefixes(conn, folder, date) or []
+    except Exception:
+        logger.exception("media: tombstone lookup failed for %s/%s", folder, date)
+        return set()
+    # Only real prefixes. A repository that hands back anything else -- a fake connection
+    # in a test, a driver returning row objects -- would otherwise be TRUTHY and filter
+    # every file out, which is a silent outage dressed as a privacy feature.
+    return {p for p in raw if isinstance(p, str) and p}
+
+
+def _drop_deleted_media(items, deleted, keyfn, what):
+    """Filter media rows whose session was deleted, and say how many went.
+
+    Zero is logged too: "the list was served" and "the exclusion ran" are otherwise the
+    same observation, which is the shape that hid three separate silent failures here.
+    """
+    if not deleted:
+        logger.info("media %s: tombstoned=0 dropped=0 of %d", what, len(items))
+        return items
+    kept = [it for it in items
+            if not any(_session_of(keyfn(it)) and _session_of(keyfn(it)) in p
+                       for p in deleted)]
+    logger.info("media %s: tombstoned=%d dropped=%d of %d",
+                what, len(deleted), len(items) - len(kept), len(items))
+    return kept
+
+
+def _session_of(key):
+    """The `sid{32hex}` inside a media key, or None."""
+    m = re.search(r"sid[0-9a-f]{32}", key or "")
+    return m.group(0) if m else None
+
+
+def _read_org_transcripts(date, folder, start_time, end_time, conn=None):
     """S3 read + normalize for one (folder, date) window -- mirrors
     lambda_fieldsight_api.get_transcripts's locate/parse/response-shape
     verbatim (same per-file `segments[]` and speaker-turn `speaker_
@@ -5360,6 +5406,21 @@ def _read_org_transcripts(date, folder, start_time, end_time):
     prefix = f"transcripts/{folder}/{date}/"
     transcript_files = [obj["Key"] for obj in _list_media_objects(prefix, "transcripts")
                         if obj["Key"].endswith(".json")]
+
+    # Filtered HERE, at the listing, not at the return: by the time the loop below finishes,
+    # a deleted session's words are already merged into `filtered_full` and there is nothing
+    # left to remove them from.
+    _deleted = _deleted_sessions_for_day(conn, folder, date)
+    if _deleted:
+        _before = len(transcript_files)
+        transcript_files = [k for k in transcript_files
+                            if not any(_session_of(k) and _session_of(k) in p
+                                       for p in _deleted)]
+        logger.info("media transcripts: tombstoned=%d dropped=%d of %d",
+                    len(_deleted), _before - len(transcript_files), _before)
+    else:
+        logger.info("media transcripts: tombstoned=0 dropped=0 of %d",
+                    len(transcript_files))
 
     if not transcript_files:
         return {"text": "", "segments": [], "speaker_segments": [], "message": "No transcripts found"}
@@ -5810,7 +5871,8 @@ def get_org_transcripts(conn, caller, event):
     folder, err = _resolve_org_media_folder(conn, caller, user, what="transcripts")
     if err is not None:
         return err
-    out = _read_org_transcripts(date, folder, p.get("start") or "", p.get("end") or "")
+    out = _read_org_transcripts(date, folder, p.get("start") or "", p.get("end") or "",
+                                conn=conn)
     return ok(_apply_speaker_names(conn, caller, out))
 
 
@@ -5819,7 +5881,7 @@ def get_org_transcripts(conn, caller, event):
 # media reads (P1, 2026-07-23 prod-media-binding plan)
 # ----------------------------------------------------------
 
-def _read_org_audio_segments(date, folder, start_time, end_time):
+def _read_org_audio_segments(date, folder, start_time, end_time, conn=None):
     """S3 list + presign for one (folder, date) window -- mirrors
     lambda_fieldsight_api.get_audio_segments verbatim: same BUG-01-anchored
     regexes, same response fields. Only the folder_name
@@ -5861,6 +5923,8 @@ def _read_org_audio_segments(date, folder, start_time, end_time):
             "time_label": f"{ah:02d}:{am:02d}:{asec:02d}",
         })
     segments.sort(key=lambda seg: seg["absolute_start"])
+    segments = _drop_deleted_media(segments, _deleted_sessions_for_day(conn, folder, date),
+                                   lambda it: it.get("key") or it.get("url") or "", "audio")
     return {"segments": segments, "count": len(segments)}
 
 
@@ -5877,10 +5941,11 @@ def get_org_audio_segments(conn, caller, event):
                                             what="audio")
     if err is not None:
         return err
-    return ok(_read_org_audio_segments(date, folder, p.get("start") or "", p.get("end") or ""))
+    return ok(_read_org_audio_segments(date, folder, p.get("start") or "",
+                                       p.get("end") or "", conn=conn))
 
 
-def _read_org_video_segments(date, folder, start_time, end_time):
+def _read_org_video_segments(date, folder, start_time, end_time, conn=None):
     """Mirrors lambda_fieldsight_api.get_video_segments: web_video/ H264
     previews first, users/{folder}/video/ originals second, an original
     suppressed when a preview shares its base_name, ~10-min assumed file
@@ -5925,6 +5990,8 @@ def _read_org_video_segments(date, folder, start_time, end_time):
                 "codec": "h264" if is_preview else "unknown",
             })
     videos.sort(key=lambda v: v["video_start_sec"])
+    videos = _drop_deleted_media(videos, _deleted_sessions_for_day(conn, folder, date),
+                                 lambda it: it.get("key") or it.get("url") or "", "video")
     return {"videos": videos, "count": len(videos)}
 
 
@@ -5938,7 +6005,8 @@ def get_org_video_segments(conn, caller, event):
                                             what="video")
     if err is not None:
         return err
-    return ok(_read_org_video_segments(date, folder, p.get("start") or "", p.get("end") or ""))
+    return ok(_read_org_video_segments(date, folder, p.get("start") or "",
+                                       p.get("end") or "", conn=conn))
 
 
 _ORG_MEDIA_PRESIGN_PREFIXES = ("users/", "audio_segments/", "transcripts/",
@@ -5992,6 +6060,28 @@ def _authorize_report_object_presign(conn, caller, folder):
     if not self_folder or folder != self_folder:
         return error("you may only access your own reports", 403)
     return None
+
+
+def _presign_target_is_deleted(conn, key) -> bool:
+    """Whether this exact object belongs to a session its owner deleted.
+
+    Matches on the `sid{32hex}` inside the key, which is what a tombstone's source prefix
+    also carries -- the same identity the media listings filter on, so a key that survives
+    one and fails the other cannot exist.
+
+    Fails OPEN and logs, like every guard here: an unreadable tombstone table must not stop
+    every customer from playing their own audio.
+    """
+    if conn is None or not key:
+        return False
+    sid = _session_of(key)
+    if not sid:
+        return False
+    try:
+        return any(sid in p for p in redactions.deleted_source_prefixes(conn) or [])
+    except Exception:
+        logger.exception("media presign: tombstone lookup failed for %s", key)
+        return False
 
 
 def get_org_media_presigned_url(conn, caller, event):
@@ -6052,6 +6142,16 @@ def get_org_media_presigned_url(conn, caller, event):
         _, err = _resolve_org_media_folder(conn, caller, target, what="media")
         if err is not None:
             return err
+    # The most literal door of all: hand over a key, get back a playable link, with no
+    # topic anywhere in the path. Every protection this feature built routes through
+    # topics, so a customer who deleted a recording could still press play on it -- which
+    # is exactly the trust failure the request named.
+    #
+    # The object is NOT deleted; it stays on S3 for analysis. What changes is who may
+    # reach it. 404, not 403: an access-denied would confirm the key exists.
+    if _presign_target_is_deleted(conn, key):
+        logger.info("media presign refused: %s belongs to a deleted session", key)
+        return error("not found", 404)
     url = s3().generate_presigned_url(
         "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
         ExpiresIn=PRESIGNED_URL_EXPIRY)
