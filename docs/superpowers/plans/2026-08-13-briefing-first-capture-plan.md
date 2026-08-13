@@ -17,7 +17,7 @@
 | `src/lambda_ingest.py` + `src/chunking.py` | where `report_chunks` transcript windows are cut today and where topic coupling happens |
 | `src/lambda_ask_agent.py` (`_aggregate_topics`) | BUG-39: where topic-less windows are discarded at READ time |
 | `src/repositories/chunks.py`, `src/repositories/search_sql.py` | repo conventions (dict_row, `%s::vector`) |
-| `src/migrations/` | highest number in use is **0040**; **0039 is RESERVED** by 0038's header — the next free number is **0041** |
+| `src/migrations/` | highest on develop is **0040**; **0039 is RESERVED** by 0038's header; **0041 is TAKEN** by `0041_user_deletion.sql` on `feat/user-deletion-schema` (open PR #459) — the next free number is **0042** |
 | `src/template.yaml` | `ExtractSessionFunction` (~1843, non-VPC, inline S3 policies), `FinalizeSweepFunction` (~2185, in-VPC, writes `extraction_requests/`), `ItemWriterFunction` (~2544, in-VPC Aurora writer), `OrgApiFunction` (~1526) |
 | `CLAUDE.md` | BUG-33 (S3 events wired manually, not via SAM), BUG-36 (in-VPC egress black-holes; S3 request-artifact pattern), BUG-38 (migrations merged to `main` run on prod automatically), BUG-39, BUG-41, BUG-43 (account concurrency = 10; arrival-rate × duration budget; IAM for reading your own output; `simulate-principal-policy`, never guess) |
 
@@ -34,7 +34,7 @@
 
 ```
 T1  turn dedup in the shared assembly        (prerequisite — spec §4: "a prerequisite, not an optimisation")
-T2  migration 0041: FTS + trigram + entities (schema first; additive; nothing reads it yet)
+T2  migration 0042: FTS + trigram + entities (schema first; additive; nothing reads it yet)
 T3  briefing generation lambda + S3 artifact (writes briefings/ + turns sidecar; server-side alias
                                               validation + anchor re-derivation live HERE)
 T4  in-VPC briefing writer → Aurora          (consumes briefings/; fills the T2 tables)
@@ -72,13 +72,13 @@ T1, T2, T5 are each independently shippable and improve the EXISTING pipeline on
 
 **Migrations.** None.
 
----## Task 2 — Migration 0041: Postgres FTS + trigram + entity tables
+---## Task 2 — Migration 0042: Postgres FTS + trigram + entity tables
 
 **Goal.** Give Aurora the literal-keyword instruments the retrieval layer needs (spec §3 measured: zero GIN/tsvector/trigram indexes today, `"Plaud"` → 0) and the entity/alias store, plus a turn-level transcript store that carries **word-level time anchors** natively (today they die when windows are cut to a topic's minute-granularity `time_range`).
 
-**Migration number: `0041`** — 0040 is the highest on develop and 0038's header explicitly reserves 0039. Re-check `src/migrations/` at implementation time in case a concurrent branch lands first; renumber upward, never reuse.
+**Migration number: `0042`** — 0040 is the highest on develop, 0038's header reserves 0039, and **0041 was claimed by `feat/user-deletion-schema` (PR #459) while this plan was being written**. That is exactly the collision to watch for: re-check `src/migrations/` on `origin/develop` AND every open PR immediately before writing the file, and renumber upward. Never reuse a number — two migrations sharing one number means whichever deploys second is silently skipped by the runner.
 
-**What changes — `src/migrations/0041_briefing_search.sql`:**
+**What changes — `src/migrations/0042_briefing_search.sql`:**
 - `CREATE EXTENSION IF NOT EXISTS pg_trgm;` (0001 created `vector` + `pgcrypto` the same way; the migration role can create extensions).
 - **`session_turns`** — the queryable transcript, decoupled from topics by construction:
   - `id uuid PK default gen_random_uuid()`, `company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE`, `site_id uuid REFERENCES sites(id)` (nullable — BUG-43 root-cause 3 showed site can be legitimately unresolvable), `user_id uuid REFERENCES users(id)`, `session_base text NOT NULL`, `report_date date NOT NULL`, `turn_index int NOT NULL`, `speaker text`, `text text NOT NULL`, `abs_start timestamptz`, `abs_end timestamptz`, `source_filename text`, `start_sec double precision` (in-file offset for audio seek — the pair `(source_filename, start_sec)` is what makes an anchor playable), `created_at timestamptz default now()`.
@@ -90,7 +90,7 @@ T1, T2, T5 are each independently shippable and improve the EXISTING pipeline on
 - **`entity_aliases`** — `id uuid PK`, `entity_id uuid NOT NULL REFERENCES session_entities(id) ON DELETE CASCADE`, `alias text NOT NULL`, `status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','rejected'))`, `rejected_reason text` (`'collides_with_canonical'` / `'common_words_phrase'` — the spec's two validation rules, recorded rather than silently dropped), `UNIQUE (entity_id, alias)`. Distinct from migration 0020's `name_aliases` (the human-confirmed correction glossary) — different lifecycle, do not merge them.
 - **FTS over existing chunks:** `CREATE INDEX idx_report_chunks_text_fts ON report_chunks USING gin (to_tsvector('english', chunk_text));` and a trigram GIN on `chunk_text`. Expression index, not a generated column — **zero change to the `report_chunks` row shape or any existing writer**. Table is 532 rows; plain `CREATE INDEX` (no `CONCURRENTLY` — the migration runner is transactional and the table is tiny).
 
-**Files touched.** `src/migrations/0041_briefing_search.sql` only. (Repo modules come in T4/T6.)
+**Files touched.** `src/migrations/0042_briefing_search.sql` only. (Repo modules come in T4/T6.)
 
 **Tested how.** Run the migration against the TEST DB via `lambda_migrate` on a develop deploy; then RDS-Data-API assertions in a rolled-back transaction: insert a turn with `PV Tech`, confirm `tsv @@ plainto_tsquery('english','tech')` hits, `text % 'PB Tech'` (trigram) hits, `UNIQUE` conflicts behave, `ON DELETE CASCADE` from `session_entities` → `entity_aliases` works. Commit the same cases as `tests/integration/test_briefing_search_schema.py` (skips cleanly without `TEST_DATABASE_URL`).
 
@@ -168,7 +168,7 @@ T1, T2, T5 are each independently shippable and improve the EXISTING pipeline on
 
 **New VPC endpoint requirement.** **None** — S3 gateway endpoint exists and is the only AWS service this function touches; Postgres is direct-to-cluster inside the VPC. **Rule check before any future edit: an in-VPC function that grows a call to ANY new AWS service needs that service's VPC endpoint first (BUG-36).**
 
-**Migrations.** Depends on T2 (0041) being applied. No new migration.
+**Migrations.** Depends on T2 (0042) being applied. No new migration.
 
 ---
 
@@ -226,7 +226,7 @@ T1, T2, T5 are each independently shippable and improve the EXISTING pipeline on
 - **Workflow-wiring test:** extend the `test_template_workflow_parameter_wiring.py` family to pin that prod does NOT enable briefing implicitly and TEST does — one repo-variable edit must not be able to silently light it up on prod (the ElevenLabs-key lesson: guarded by a test, not a comment).
 - **Manual wiring checklist** (BUG-33 — none of this is in the template, so it must be written down as prod-cutover steps in `scripts/wire-s3-events.sh` comments): `briefing_requests/` → BriefingFunction; `briefings/` (suffix `.json`) → BriefingWriterFunction; run on the TEST bucket now, on the prod bucket only at enablement.
 - **Monitoring hooks (cheap, artifact-borne — no new infra):** the per-day counts that detect every silent failure named above: sessions closed vs. `briefings/` objects (T3 wiring dead), `briefings/` objects vs. `session_turns` distinct sessions (T4 wiring/identity dead), `anchor_stats.unmatched` ratio (T3 matcher broken), `batch_dedup.turns_dropped` ratio (T1 over/under-dedup). Land them as a short runbook section in `MONITORING.md` with the exact one-line queries/CLI; if a scheduled check is wanted later, it rides the existing sweep, not a new function.
-- **Migration-to-main order:** merge sequence to `main` is 0041 (T2) together with or before T4/T6 code — never code that reads tables prod does not have. Since migrations on `main` auto-run on prod (BUG-38), the merge that carries 0041 IS the prod schema change; it is additive and safe, but it goes in the same release as the dark-switched code, not weeks apart, so no drift window exists.
+- **Migration-to-main order:** merge sequence to `main` is 0042 (T2) together with or before T4/T6 code — never code that reads tables prod does not have. Since migrations on `main` auto-run on prod (BUG-38), the merge that carries 0042 IS the prod schema change; it is additive and safe, but it goes in the same release as the dark-switched code, not weeks apart, so no drift window exists.
 
 **Tested how.** The wiring test above; a TEST full-path smoke: record → close → `briefing_requests/` → `briefings/` → rows → `GET /briefing` + `GET /search/transcript` end to end, checked with the four monitoring queries.
 
