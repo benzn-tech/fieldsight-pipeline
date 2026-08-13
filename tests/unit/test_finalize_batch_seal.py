@@ -138,3 +138,24 @@ def test_the_tail_seal_uses_the_same_window_as_the_transcriber(swept):
     assert window == mod.BATCH_WINDOW_SEC, \
         f"the tail seal grouped by {window}, the transcriber by {mod.BATCH_WINDOW_SEC}"
     assert mod.BATCH_WINDOW_SEC == 120
+
+
+def test_the_sweep_redrives_batches_that_were_never_transcribed(swept, monkeypatch):
+    """Somebody has to come back, and nothing did.
+
+    A batch whose transcription was rejected (27 of them on one replay, all HTTP 429 from
+    the provider's concurrency ceiling) leaves a WAV with no transcript. The per-record
+    `except` recorded `status: error` and returned 200, so S3's async retry never fired;
+    there is no DLQ; and the ledger says `sealed` so no planner looks at it again. About 54
+    minutes of audio, recovered by hand.
+
+    The per-minute sweep already visits every session. This asserts it now looks.
+    """
+    mp, rec = swept
+    seen = []
+    import batch_redrive
+    monkeypatch.setattr(batch_redrive, "redrive_untranscribed",
+                        lambda *a, **k: seen.append(a[2]) or
+                        {"candidates": 0, "redriven": 0, "exhausted": 0})
+    mod.sweep(FakeConn(), grace_seconds=0, infer_idle=False)
+    assert seen, "the sweep never asked whether any sealed batch is missing its transcript"

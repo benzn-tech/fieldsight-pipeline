@@ -585,6 +585,16 @@ def _seal_tail_batches(session_id):
             # path was dead, and a real 6-minute recording lost its last 19 seconds.
             int(time.time()), 0, BATCH_MAX_CHUNKS,
             sealed_by="session_close", window_sec=BATCH_WINDOW_SEC)
+
+        # And come back for anything that was sealed but never transcribed. The rejection
+        # was caught per-record, recorded as `status: error`, and returned 200 -- so S3's
+        # async retry never fired, there is no DLQ, and the ledger says `sealed` so no
+        # planner will look again. 27 batches (~54 minutes of audio) went that way on one
+        # replay and were recovered by hand.
+        import batch_redrive
+        batch_redrive.redrive_untranscribed(
+            boto3.client("s3"), S3_BUCKET, session_id,
+            boto3.resource("dynamodb").Table(TRANSCRIPT_TABLE))
     except Exception:
         logger.exception("batch: could not seal the tail of session %s — the final "
                          "extraction may be missing its last chunks", session_id)
