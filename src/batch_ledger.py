@@ -126,6 +126,90 @@ def _base_times(rows):
     return out
 
 
+def _bypass_sk(index: int) -> str:
+    return f"BYPASS#{index:04d}"
+
+
+def bucket_for_index(row, window_sec: float = 120.0):
+    """The wall-clock bucket a member row belongs to, from its filename."""
+    from batch_stitch import bucket_of
+    from transcript_utils import extract_base_time_from_filename
+
+    base = extract_base_time_from_filename((row.get("chunk_key") or "").rsplit("/", 1)[-1])
+    return None if base is None else bucket_of(base, window_sec)
+
+
+def bypass_status(table, session_id: str, index: int):
+    """Whether THIS member was handed back to the per-chunk path.
+
+    Member-scoped on purpose. The transcriber asks "was this chunk bypassed" to decide
+    whether a copy-to-self event falls through to transcription, and under bucket seal keys
+    a lookup by chunk index against the seal record misses entirely — after which the
+    re-driven audio is neither batched nor transcribed.
+    """
+    resp = table.query(
+        KeyConditionExpression="PK = :pk AND begins_with(SK, :sk)",
+        ExpressionAttributeValues={":pk": _pk(session_id), ":sk": _bypass_sk(index)},
+    )
+    items = resp.get("Items") or []
+    return items[0].get("status") if items else None
+
+
+def pending_buckets(rows, now: int, grace_sec: int, window_sec: float = 120.0,
+                    cap: int = DEFAULT_MAX_BATCH, table=None, session_id=None) -> dict:
+    """`{"ready": [(bucket, [idx…])…], "stragglers": [idx…]}`. Supersedes `pending_windows`.
+
+    The bucket comes from each chunk's own base time, so every worker computes the same key
+    for the same chunk however much of the session it can see. That is what makes the claim
+    able to exclude a rival: under the previous greedy anchor, two workers with different
+    snapshots produced two different keys over the same chunks and neither saw the other —
+    123 batch objects for 153 chunks on a real replay.
+
+    **Stragglers are the other half, and without them this change is worse than the bug it
+    fixes.** A worker that saw 3 of a bucket's 4 chunks seals it; the 4th then plans into a
+    bucket whose claim is already `sealed`, and a sealed claim is never re-driven by design.
+    That member would never be transcribed by anything. It is handed to the per-chunk path
+    instead. Detecting it needs the table, so a caller that passes none simply gets no
+    straggler list — the planning half still works for the pure tests.
+    """
+    from batch_stitch import plan_buckets
+
+    consumed = consumed_indices(rows)
+    times = _base_times(rows)
+    by_index = {int(r["chunk_index"]): r for r in rows}
+    planned = plan_buckets(times, window_sec=window_sec, consumed=consumed)
+
+    ready, stragglers = [], []
+    for bucket, idxs in sorted(planned.items()):
+        if table is not None and session_id is not None                 and seal_status(table, session_id, bucket) == "sealed":
+            stragglers.extend(idxs)
+            continue
+        if len(idxs) >= cap or _bucket_is_closed(idxs, times, bucket, window_sec):
+            ready.append((bucket, idxs))
+            continue
+        newest = max(int(by_index[i].get("registered_at") or 0) for i in idxs)
+        if now - newest >= grace_sec:
+            ready.append((bucket, idxs))
+
+    # Unplaceable members travel alone rather than vanishing, same rule as before.
+    for r in rows:
+        i = int(r["chunk_index"])
+        if i not in times and i not in consumed:
+            stragglers.append(i)
+    return {"ready": ready, "stragglers": sorted(set(stragglers))}
+
+
+def _bucket_is_closed(idxs, times, bucket, window_sec) -> bool:
+    """True when a member of a LATER bucket has already registered.
+
+    Nothing can still join a bucket whose successor has arrived, so it seals on arrival
+    exactly as the contiguous-window rule did — the common case does not wait for grace.
+    """
+    from batch_stitch import bucket_of
+
+    return any(bucket_of(t, window_sec) > bucket for t in times.values())
+
+
 def pending_windows(rows, now: int, grace_sec: int,
                     window_sec: float = 120.0,
                     cap: int = DEFAULT_MAX_BATCH) -> list[list[int]]:
@@ -275,9 +359,12 @@ def mark_bypassed(table, session_id: str, index: int, now: int) -> None:
     # the 900-second window that is supposed to bound the two-sealers race did not exist for
     # bypassed records at all. `bypassed_at` stays because it says WHEN, which `claimed_at`
     # on a bypass record would read as a claim that is still in flight.
-    table.put_item(Item={"PK": _pk(session_id), "SK": _seal_sk(index),
-                         "status": "bypassed", "bypassed_at": now,
-                         "claimed_at": now})
+    item = {"status": "bypassed", "bypassed_at": now, "claimed_at": now}
+    # BOTH keys. The seal-shaped one keeps the existing claim/takeover machinery working;
+    # the member-scoped one is what the transcriber can actually look up when the seal key
+    # is a bucket rather than this chunk's index.
+    table.put_item(Item={"PK": _pk(session_id), "SK": _seal_sk(index), **item})
+    table.put_item(Item={"PK": _pk(session_id), "SK": _bypass_sk(index), **item})
 
 
 def release_claim(table, session_id: str, first_index: int, claimed_at: int) -> bool:

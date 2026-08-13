@@ -298,3 +298,65 @@ def test_a_fresh_bypass_record_is_not_instantly_stale(table):
         "a bypass 400s old is still in flight; the window is 900"
     assert bl.claim_seal(table, SID, 4, [4], NOW + 1000) is not None, \
         "past the window it must still be retakeable -- a failed copy has to be recoverable"
+
+
+# ============================================================
+# Bucket keys and the straggler rule (2026-08-13-burst-arrival-defects)
+# ============================================================
+
+def test_two_workers_with_different_snapshots_contend_for_one_key(table):
+    """Defect A at the ledger layer.
+
+    Under first-index keys, a worker seeing {5,6,7,8} claims SEAL#0005 and a worker seeing
+    {0..8} claims SEAL#0004 -- both granted, both sealing chunks 5,6,7. Under bucket keys
+    they compute the same SK and exactly one wins.
+    """
+    rows = _wrows([(i, i * 30) for i in range(9)])
+    snap_a = [r for r in rows if int(r["chunk_index"]) in (5, 6, 7, 8)]
+    a = bl.pending_buckets(snap_a, NOW + 400, grace_sec=150)
+    b = bl.pending_buckets(rows, NOW + 400, grace_sec=150)
+    key_a = next(k for k, v in a["ready"] if 6 in v)
+    key_b = next(k for k, v in b["ready"] if 6 in v)
+    assert key_a == key_b, "the same chunk must be under the same claim for both workers"
+    assert bl.claim_seal(table, SID, key_a, [6], NOW) is not None
+    assert bl.claim_seal(table, SID, key_b, [6], NOW) is None, "only one may win"
+
+
+def test_a_member_of_a_sealed_bucket_is_redriven_not_orphaned(table):
+    """The trap in the fix. Without this rule the bucket key is WORSE than what it replaces.
+
+    A worker that saw only 3 of a bucket's 4 chunks seals it and marks those consumed. The
+    4th then plans into the same bucket, whose claim is `sealed` -- and `claim_seal` refuses
+    a sealed record forever, by design. That chunk would never be transcribed by anything:
+    duplication traded for silent loss, which is the worse direction.
+    """
+    rows = _wrows([(8, 0), (9, 30), (10, 60), (11, 90)])
+    bucket = next(k for k, v in bl.pending_buckets(rows, NOW + 400, 150)["ready"] if 8 in v)
+    bl.claim_seal(table, SID, bucket, [8, 9, 10], NOW)
+    bl.mark_sealed(table, SID, bucket, NOW)
+    for r in rows[:3]:
+        r["sealed_into"] = bucket
+
+    out = bl.pending_buckets(rows, NOW + 400, grace_sec=150, table=table, session_id=SID)
+    assert out["stragglers"] == [11], f"chunk 11 must be redriven, got {out}"
+    assert not any(11 in v for _, v in out["ready"]), "and never proposed as a claim"
+
+
+def test_a_bypass_record_is_member_scoped_not_bucket_scoped(table):
+    """`_maybe_batch` asks "was THIS chunk bypassed" to decide whether a copy-to-self event
+    falls through to transcription. Under bucket keys a lookup by chunk index misses the
+    claim entirely, and the re-driven audio vanishes -- so the bypass record has to carry
+    the member, not the window."""
+    bl.mark_bypassed(table, SID, 11, NOW)
+    assert bl.bypass_status(table, SID, 11) == "bypassed"
+    assert bl.bypass_status(table, SID, 12) is None
+
+
+def test_a_legacy_first_index_seal_cannot_shadow_a_bucket_claim(table):
+    """Records written before this change use SEAL#0000..SEAL#9999. Bucket numbers are
+    epoch/120 -- about 14.9 million -- so the two ranges cannot collide. Tested, because
+    'cannot collide' is the kind of claim that is wrong once."""
+    bl.claim_seal(table, SID, 5, [5, 6], NOW)           # legacy shape
+    bucket = bl.bucket_for_index(_wrows([(5, 0)])[0])
+    assert bucket > 9999
+    assert bl.claim_seal(table, SID, bucket, [5, 6], NOW) is not None

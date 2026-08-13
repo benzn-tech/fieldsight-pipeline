@@ -153,6 +153,44 @@ def _first_informative_length(pcm: bytes, distinct_needed: int = 8):
 DEFAULT_WINDOW_SEC = 120.0               # two minutes of wall clock — the actual target
 
 
+def bucket_of(base_time, window_sec: float = DEFAULT_WINDOW_SEC) -> int:
+    """Which wall-clock window this chunk belongs to. A pure function of its own base time.
+
+    That purity is the whole point. The seal claim is keyed on the window, so two workers
+    must compute the same window for the same chunk or their claims cannot exclude each
+    other — and a greedy anchor cannot, because it is a function of "who is left", which
+    under concurrency is whatever that worker happened to read. Replaying one real session
+    produced 123 batches for 153 chunks that way.
+
+    `timegm` on the naive value, never `.timestamp()`: the latter interprets a naive
+    datetime in the SERVER's timezone, so the same filename would bucket differently on two
+    machines — the determinism this exists for, quietly undone.
+    """
+    import calendar
+
+    return int(calendar.timegm(base_time.timetuple()) // window_sec)
+
+
+def plan_buckets(members, window_sec: float = DEFAULT_WINDOW_SEC,
+                 consumed=None) -> dict:
+    """{bucket -> [chunk indices]}, computed from base times alone. Supersedes `plan_windows`.
+
+    No anchor, no snapshot, nothing to race. A chunk VAD dropped is still bridged: the
+    bucket simply takes whatever survives inside it.
+
+    The cost, measured and accepted: a conversation straddling a boundary is split where
+    greedy would have kept it whole, and about 2% more requests (480 against 470 over every
+    session in the lake). Determinism under concurrency is worth more than 2%.
+    """
+    consumed = consumed or set()
+    out: dict[int, list[int]] = {}
+    for idx in sorted(members):
+        if idx in consumed:
+            continue
+        out.setdefault(bucket_of(members[idx], window_sec), []).append(idx)
+    return out
+
+
 def plan_windows(members, window_sec: float = DEFAULT_WINDOW_SEC,
                  cap: int = DEFAULT_MAX_BATCH, consumed=None) -> list[list[int]]:
     """Chunk indices grouped into wall-clock windows. Supersedes `plan_batches`.

@@ -284,12 +284,12 @@ def test_a_chunk_at_the_window_boundary_starts_the_next_batch():
     assert got == [[0, 1, 2, 3], [4]]
 
 
-def test_the_window_anchors_on_its_first_member_not_on_a_grid():
-    """A grid aligned to the session start cuts dense stretches at the boundary -- 480
-    requests against 470 for greedy anchoring, and it can split a run of four that a
-    boundary happens to straddle."""
-    got = bs.plan_windows(_at((10, 110), (11, 140), (12, 170)), window_sec=120, cap=4)
-    assert got == [[10, 11, 12]]
+# `test_the_window_anchors_on_its_first_member_not_on_a_grid` was DELETED on 2026-08-13,
+# not edited. It pinned greedy anchoring, chosen hours earlier to save 2% of requests, and
+# a real 71-minute replay then showed greedy producing 123 batches for 153 chunks under
+# concurrent arrival. The reversal is deliberate; its replacement is
+# `test_a_boundary_straddling_run_splits_at_the_bucket_edge`, which asserts the cost the 2%
+# was buying and says why it is now being paid.
 
 
 def test_a_consumed_chunk_is_invisible_to_the_planner():
@@ -334,3 +334,82 @@ def test_the_map_resolves_correctly_across_a_bridged_gap():
         got = bs.resolve_abs_time(doc, t)
         offset = (got - T0).total_seconds()
         assert not (28.0 < offset < 62.0), f"t={t} resolved into the gap at +{offset}"
+
+
+# ============================================================
+# Bucket anchoring (spec 2026-08-13-burst-arrival-defects)
+# ============================================================
+# Replaying one real 71-minute session into TEST produced 123 batch objects for 153 chunks
+# instead of 39, because 153 concurrent workers each planned from a different snapshot of
+# "who is left" and so each computed a different anchor. The seal key is the anchor, so two
+# anchors covering the same chunks held two different keys and neither saw the other.
+#
+# A greedy anchor is a function of the snapshot. Under concurrency that is not a function.
+
+def test_the_bucket_is_a_pure_function_of_the_filename():
+    """Two workers, different snapshots, same chunk -- one answer. This is the property the
+    seal key needs and the greedy anchor cannot provide."""
+    t = datetime(2026, 8, 13, 9, 1, 30)
+    assert bs.bucket_of(t, 120) == bs.bucket_of(t, 120)
+    assert isinstance(bs.bucket_of(t, 120), int)
+
+
+def test_two_snapshots_plan_the_same_bucket_for_every_common_member():
+    """The exact trace from the replay: one worker saw {5,6,7,8}, another saw {0..8}."""
+    members = _at(*[(i, i * 30) for i in range(9)])
+    a = bs.plan_buckets({i: members[i] for i in (5, 6, 7, 8)}, window_sec=120)
+    b = bs.plan_buckets(members, window_sec=120)
+    for idx in (5, 6, 7, 8):
+        ka = next(k for k, v in a.items() if idx in v)
+        kb = next(k for k, v in b.items() if idx in v)
+        assert ka == kb, f"chunk {idx} landed in bucket {ka} for one worker and {kb} for another"
+
+
+def test_naive_base_times_bucket_by_a_fixed_convention_not_the_server_zone(monkeypatch):
+    """`datetime.timestamp()` on a naive value interprets it in the SERVER's zone, so the
+    same filename would bucket differently on two machines -- which is the determinism this
+    whole change exists for, quietly undone."""
+    import importlib
+    import os as _os
+    t = datetime(2026, 8, 13, 9, 1, 30)
+    seen = set()
+    for tz in ("UTC", "Pacific/Auckland", "America/New_York"):
+        monkeypatch.setenv("TZ", tz)
+        try:
+            import time as _time
+            _time.tzset()                      # no-op on Windows; real on the CI runner
+        except AttributeError:
+            pass
+        importlib.reload(bs)
+        seen.add(bs.bucket_of(t, 120))
+    assert len(seen) == 1, f"the bucket moved with the server timezone: {seen}"
+    assert _os.environ  # keep the import meaningful
+
+
+def test_a_boundary_straddling_run_splits_at_the_bucket_edge():
+    """The accepted cost. Greedy would have kept these together; the grid does not, and
+    that is the 2% (480 requests against 470) being paid for determinism.
+
+    This REPLACES test_the_window_anchors_on_its_first_member_not_on_a_grid, deleted by name
+    in the same commit -- the reversal is deliberate and this pair of edits is its record.
+    """
+    T = datetime(2026, 8, 13, 9, 0, 0)
+    base = bs.bucket_of(T, 120)
+    members = {10: T + timedelta(seconds=110), 11: T + timedelta(seconds=140)}
+    out = bs.plan_buckets(members, window_sec=120)
+    assert len(out) == 2 and bs.bucket_of(members[11], 120) == base + 1
+
+
+def test_at_most_cap_base_times_fit_one_bucket_at_thirty_seconds():
+    """The count cap cannot bind while chunks are 30 s, so a bucket is never split by it."""
+    T = datetime(2026, 8, 13, 9, 0, 0)
+    members = {i: T + timedelta(seconds=30 * i) for i in range(40)}
+    for idxs in bs.plan_buckets(members, window_sec=120).values():
+        assert len(idxs) <= 4
+
+
+def test_a_consumed_member_is_not_placed_in_any_bucket():
+    T = datetime(2026, 8, 13, 9, 0, 0)
+    members = {i: T + timedelta(seconds=30 * i) for i in range(4)}
+    out = bs.plan_buckets(members, window_sec=120, consumed={1, 2})
+    assert sorted(i for v in out.values() for i in v) == [0, 3]
