@@ -265,3 +265,19 @@ def test_a_member_whose_filename_cannot_be_read_is_still_planned():
     got = bl.pending_windows(rows, NOW + 400, grace_sec=150, window_sec=120)
     planned = sorted(i for w in got for i in w)
     assert planned == [4, 5, 6], f"chunk 6 disappeared from the plan: {got}"
+
+
+def test_an_unplaceable_member_beside_a_placeable_successor_does_not_crash():
+    """`_cannot_grow` looked up the window's anchor in the base-time table, and an
+    unplaceable window's anchor is not in it.
+
+    The consequence is not one lost chunk: `pending_windows` raises, every arrival for that
+    session errors, and `_seal_tail_batches` swallows the exception -- so the whole
+    session's pending audio is never sealed and never transcribed. The earlier guard test
+    passed only because its fixture happened to have no successor index.
+    """
+    rows = ([{"chunk_index": 6, "chunk_key": "audio_segments/x/not-a-chunk-name.wav",
+              "registered_at": NOW}]
+            + _wrows([(7, 30)]))
+    got = bl.pending_windows(rows, NOW + 400, grace_sec=150, window_sec=120)
+    assert sorted(i for w in got for i in w) == [6, 7]
