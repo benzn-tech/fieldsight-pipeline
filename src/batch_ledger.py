@@ -184,7 +184,12 @@ def pending_buckets(rows, now: int, grace_sec: int, window_sec: float = 120.0,
         if table is not None and session_id is not None                 and seal_status(table, session_id, bucket) == "sealed":
             stragglers.extend(idxs)
             continue
-        if len(idxs) >= cap or _bucket_is_closed(idxs, times, bucket, window_sec):
+        # Readiness is "nothing can still join", NOT "the cap is reached". Real chunks
+        # arrive 28 s apart, so FIVE fit a 120 s bucket -- treating the cap as readiness
+        # sealed the first four and orphaned the fifth into a straggler redrive, one wasted
+        # per-chunk transcription per bucket, ten of them on the real 153-chunk session.
+        # The cap bounds the request; it says nothing about whether the window is over.
+        if _bucket_is_closed(idxs, times, bucket, window_sec):
             ready.append((bucket, idxs))
             continue
         newest = max(int(by_index[i].get("registered_at") or 0) for i in idxs)
