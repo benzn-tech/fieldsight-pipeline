@@ -992,17 +992,43 @@ def generate_word_document(report_data, title):
 # Process User Data
 # ============================================================
 
+def _deleted_sessions_for(bucket, folder, date):
+    """The deleted-session ids for one day, from the S3 mirror."""
+    import deletion_mirror
+
+    return deletion_mirror.deleted_sessions(s3_client, bucket, folder, date)
+
+
+def _transcript_objects_for(bucket, user_name, target_date):
+    """A day's transcript objects, minus anything its owner deleted.
+
+    THIS FUNCTION IS THE ONLY PLACE THE NON-VPC SIDE CAN HONOUR A DELETE. The generator
+    holds no database connection, so the read predicates, the renderer's drop and the
+    write-side guard are all invisible to it — it lists transcripts off S3 and writes a
+    report from whatever it finds, including a recording the customer removed.
+
+    The count is logged including zero: "the report was generated" and "the exclusion ran"
+    are otherwise the same observation.
+    """
+    import deletion_mirror
+
+    prefix = f"transcripts/{user_name}/{target_date}/"
+    objs = list_s3_objects(bucket, prefix)
+    if not objs:
+        objs = [o for o in list_s3_objects(bucket, f"transcripts/{user_name}/")
+                if target_date in o['key']]
+    deleted = _deleted_sessions_for(bucket, user_name, target_date)
+    kept = [o for o in objs
+            if not any(sid in o['key'] for sid in deleted)] if deleted else objs
+    logger.info("deleted-session exclusion: %s %s — %d of %d transcript(s) dropped",
+                user_name, target_date, len(objs) - len(kept), len(objs))
+    return kept
+
+
 def process_user_data(bucket, user_name, target_date, exclude_keys=None):
     logger.info(f"Processing user: {user_name} for {target_date}")
 
-    transcript_prefix = f"transcripts/{user_name}/{target_date}/"
-    transcript_objects = list_s3_objects(bucket, transcript_prefix)
-    if not transcript_objects:
-        transcript_prefix_all = f"transcripts/{user_name}/"
-        transcript_objects = [
-            obj for obj in list_s3_objects(bucket, transcript_prefix_all)
-            if target_date in obj['key']
-        ]
+    transcript_objects = _transcript_objects_for(bucket, user_name, target_date)
 
     transcripts = []
     all_text_parts = []
