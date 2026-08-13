@@ -2633,6 +2633,76 @@ Resources:
   # env verbatim. Gated by HasDb. NO Events (manual/invoke only, like
   # RagSearchFunction below).
   # ----------------------------------------------------------
+  # ----------------------------------------------------------
+  # Speaker identity: the embedder. Two ops, invoked DIRECTLY -- `enrol` (a corrected
+  # passage becomes a voiceprint sample) and `match` (a session's turns get names).
+  # NO Events: nothing here fires because a file landed.
+  #
+  # In VPC because it reads and writes Aurora. That is affordable here and is not for the
+  # transcriber: this function makes no outbound internet call at all -- the model comes
+  # from S3, which has a gateway endpoint (BUG-36).
+  #
+  # Reuses VadLayerArn rather than adding a layer: fieldsight-vad-layer already carries
+  # onnxruntime and numpy for cp312 and no torch, verified by downloading and listing it.
+  # That is also why Runtime is pinned to python3.12 -- the layer is cp312-only and a
+  # mismatch fails at import (BUG-24 class).
+  #
+  # The MODEL is not in the layer and not in the package. It is fetched from S3 at cold
+  # start, like the Silero VAD model and for the recorded reason: BUG-02 is a Layer that
+  # shipped a different model version whose output was silently wrong, and a voiceprint
+  # model that drifts moves every threshold in voiceprint_utils with no error anywhere.
+  # 84 MB (graph + external .data), so MemorySize and Timeout carry a cold start that
+  # downloads it.
+  # ----------------------------------------------------------
+  SpeakerEmbedFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-speaker-embed", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_speaker_embed.lambda_handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 1769
+      ReservedConcurrentExecutions: 5
+      Layers:
+        - !Ref VadLayerArn
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName
+          ECAPA_MODEL_S3_KEY: models/ecapa_tdnn.onnx
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+      Policies:
+        - VPCAccessPolicy: {}
+        - Version: '2012-10-17'
+          Statement:
+            # The raw device uploads -- never audio_segments/. Phase 0's numbers are
+            # raw-audio numbers and do not transfer to the normalised copy.
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/users/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/models/*
+            # Without ListBucket a missing key answers 403, not 404, and "not allowed"
+            # becomes indistinguishable from "not there" inside the function.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - users/*
+                    - models/*
+
   SuggestionWriterFunction:
     Type: AWS::Serverless::Function
     Condition: HasDb
