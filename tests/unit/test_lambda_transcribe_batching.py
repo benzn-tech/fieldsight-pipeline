@@ -464,3 +464,31 @@ def test_the_bypass_check_reads_the_member_record_not_the_seal_key(wired):
                          "registered_at": 0, "sealed_into": 0}
     ledger.bypassed.add(0)
     assert mod._maybe_batch("b", unit_key(0), []) is False
+
+
+def test_a_transcription_failure_emits_a_metric_the_alarm_can_see(wired, capsys):
+    """The Errors alarm I added cannot fire for the incident its own description cites.
+
+    A provider 429 is caught by the per-record `except`, recorded as `status: error`, and
+    the handler returns 200 -- so Lambda's `Errors` metric stays at zero. The 27-batch,
+    54-minute loss would have left that alarm green.
+
+    An EMF line is the fix that needs no new IAM and no new resource type: CloudWatch Logs
+    extracts the metric from the log itself. `logs:PutMetricFilter` is implicitDeny on the
+    deploy role, so a metric filter was not available.
+    """
+    import json as _json
+    monkeypatch, s3, ledger, calls = wired
+    monkeypatch.setattr(mod, "BATCH_TRANSCRIPTION", False)
+    import elevenlabs_utils
+    monkeypatch.setattr(elevenlabs_utils, "transcribe_segment",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 429")))
+
+    mod.lambda_handler(_event(unit_key(0)), None)
+
+    emitted = [ln for ln in capsys.readouterr().out.splitlines() if "_aws" in ln]
+    assert emitted, "no EMF line, so nothing outside the log can count this failure"
+    doc = _json.loads(emitted[-1])
+    names = [m["Name"] for d in doc["_aws"]["CloudWatchMetrics"] for m in d["Metrics"]]
+    assert "TranscriptionFailures" in names
+    assert doc["TranscriptionFailures"] == 1
