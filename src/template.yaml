@@ -1189,7 +1189,17 @@ Resources:
       FunctionName: !Sub ["${P}-report-generator", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_report_generator.lambda_handler
-      Timeout: 300
+      # 900, not 300, because the ceiling was BELOW the work. This function makes one LLM
+      # call per user per day and `llm_utils.HTTP_TIMEOUT` is 150s, so four users can
+      # legitimately need 600s -- and on 2026-08-13 prod burned two full 300s timeouts
+      # before the third (Lambda's own async retry, same RequestId) finished in 76s.
+      # `fieldsight-prod-report-errors` was red for that, not for the NoSuchKey noise it
+      # is easy to mistake for the cause: peak memory was 128 MB of 512, so nothing here
+      # is memory- or compute-bound, only wall-clock.
+      #
+      # This is a ceiling, not a mask. A healthy run still finishes in ~76s; raising it
+      # only stops a slow-but-correct run from being killed and re-run from scratch twice.
+      Timeout: 900
       MemorySize: 512
       Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24) — on 3.11 Word generation silently disables
       Layers: !If
