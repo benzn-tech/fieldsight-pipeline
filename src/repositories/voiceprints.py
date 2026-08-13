@@ -71,6 +71,50 @@ def _require_company(company_id):
     return company_id
 
 
+def upsert_profile(conn, company_id, display_name=None, user_id=None,
+                   consent_given=False, consented_by=None) -> dict | None:
+    """The profile a name attaches to. Existing one if there is one, otherwise a new row.
+
+    **Consent is a precondition, not a checkbox** (§6, §10). A voiceprint is biometric
+    information under the NZ Privacy Act and the consent has to come from the person whose
+    voice it is — not the wearer, not the employer, not whoever is doing the labelling. So a
+    profile carrying a NAME cannot be created without it and this raises.
+
+    A profile with NO name needs none: an unnamed recurring voice links a pattern to nobody.
+    That is also what `speaker_voiceprints.user_id` being nullable is for.
+
+    `consent_at` is stamped by the database, not taken from the caller. A client-supplied
+    timestamp is a claim about when somebody agreed; this is a record of when the system was
+    told — which is the only one of the two this code can honestly make.
+
+    Reuse matters more than it looks: two profiles for one voice make that person his own
+    runner-up, which is exactly the failure `aggregate_scores` was written for. A `withdrawn`
+    profile is never reused — that would resurrect a withdrawal by the back door.
+    """
+    _require_company(company_id)
+    if display_name and not consent_given:
+        raise ValueError(
+            "a named voiceprint cannot be created without consent from the person whose "
+            "voice it is (§6) — an unnamed profile may be created instead")
+    cur = conn.cursor(row_factory=dict_row)
+    if display_name:
+        found = cur.execute(
+            "SELECT id FROM speaker_voiceprints "
+            "WHERE company_id = %s AND display_name = %s AND status <> 'withdrawn' "
+            "ORDER BY created_at LIMIT 1",
+            (company_id, display_name)).fetchone()
+        if found:
+            return found
+    return cur.execute(
+        "INSERT INTO speaker_voiceprints "
+        "(company_id, user_id, display_name, status, consent_at, consented_by) "
+        "VALUES (%s, %s, %s, 'tentative', "
+        "        CASE WHEN %s THEN now() ELSE NULL END, %s) "
+        "RETURNING id",
+        (company_id, user_id, display_name, bool(consent_given), consented_by),
+    ).fetchone()
+
+
 def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, window,
                created_by=None, correction_ref=None) -> dict | None:
     """Record one enrolment contribution.

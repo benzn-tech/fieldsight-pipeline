@@ -185,3 +185,34 @@ def test_an_unnamed_result_stays_unnamed_rather_than_becoming_a_placeholder(call
         "results": [{"turn_ref": "f.wav@1.0", "state": "tentative", "cluster_ref": "C2"}]},
         None)
     assert calls["turns"][0].get("display_name") is None
+
+
+def test_a_propagation_carrying_an_enrolment_stores_the_sample(calls):
+    """One gesture, two effects, one transaction. The turn names land and the profile gains
+    a sample — and a failure in either must not leave half of it applied."""
+    vw.lambda_handler({
+        "op": "propagation", "company_id": CO, "session_base": "s1",
+        "correction_ref": "corr-1",
+        "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed", "cluster_ref": None,
+                     "display_name": "Ben L", "asserted": True}],
+        "enrol": {"voiceprint_id": "vp-1", "embedding": [0.1] * 192,
+                  "s3_key": "users/u/audio/d/x.wav", "window": [0.0, 5.0]}}, None)
+    assert len(calls["samples"]) == 1
+    assert calls["samples"][0]["correction_ref"] == "corr-1", (
+        "the sample cannot be traced back to the correction that justified it, so a "
+        "withdrawal could not enumerate what it produced")
+
+
+def test_a_propagation_without_an_enrolment_stores_no_sample(calls):
+    vw.lambda_handler({
+        "op": "propagation", "company_id": CO, "session_base": "s1",
+        "results": [{"turn_ref": "f.wav@1.0", "state": "tentative", "cluster_ref": "C1"}]},
+        None)
+    assert calls["samples"] == []
+
+
+def test_an_enrolment_with_no_vector_is_refused_rather_than_stored_blank(calls):
+    with pytest.raises((KeyError, ValueError)):
+        vw.lambda_handler({
+            "op": "propagation", "company_id": CO, "session_base": "s1", "results": [],
+            "enrol": {"voiceprint_id": "vp-1"}}, None)

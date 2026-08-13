@@ -717,3 +717,48 @@ def test_a_corrected_turn_sitting_between_two_voices_names_nothing(monkeypatch):
     se.lambda_handler(_s3_event(key), None)
     assert [r for r in sent["results"] if not r.get("asserted")] == [], (
         "a turn sitting between two voices named a whole cluster")
+
+
+def test_an_enrolment_reuses_the_vector_the_correction_already_produced(stub_embedder,
+                                                                        monkeypatch):
+    """The corrected window is embedded once, for the propagation decision. Enrolling the
+    same window is then free — embedding it a second time would pay twice for one answer and
+    invite the two results to differ.
+
+    The vector travels in the invoke payload, never through S3: that is what stopped the
+    biometric-residence defect the reviews chased through two homes.
+    """
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    req = {"request_id": "r1", "session_base": "s1", "company_id": "c1",
+           "user_folder": "u", "date": "2026-08-13",
+           "correction": {"source_filename": "x_c0000.wav", "start_sec": 0.0,
+                          "end_sec": 5.0, "display_name": "Ben L"},
+           "enrol": {"voiceprint_id": "vp-1"}, "turns": [], "profiles": []}
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes()}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    se.lambda_handler(_s3_event(key), None)
+    assert sent["enrol"]["voiceprint_id"] == "vp-1"
+    assert len(sent["enrol"]["embedding"]) == 192
+    assert stub_embedder["n"] == 1, "the window was embedded twice for one answer"
+
+
+def test_no_enrolment_means_no_vector_in_the_payload(stub_embedder, monkeypatch):
+    """Absent consent, nothing biometric leaves this function at all."""
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    req = {"request_id": "r1", "session_base": "s1", "company_id": "c1",
+           "user_folder": "u", "date": "2026-08-13",
+           "correction": {"source_filename": "x_c0000.wav", "start_sec": 0.0,
+                          "end_sec": 5.0, "display_name": "Ben L"},
+           "turns": [], "profiles": []}
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes()}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    se.lambda_handler(_s3_event(key), None)
+    assert not sent.get("enrol")

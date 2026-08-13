@@ -93,8 +93,26 @@ def _propagation(event):
                 # it was dropped here without a word, and the row named nobody.
                 display_name=r.get("display_name"))
             written += 1
-    logger.info("propagation: %d rows for %s (tau=%s)", written, session_base, tau)
-    return {"written": written}
+
+        # One gesture, two effects, ONE transaction. The names describe this meeting; the
+        # sample is what makes the person recognisable in the next one, and §6 requires a
+        # withdrawal to reach "everything it justified" — which is only enumerable because
+        # `correction_ref` travels with the sample.
+        enrol = event.get("enrol")
+        if enrol:
+            if not enrol.get("embedding"):
+                raise ValueError(
+                    "enrolment carries no embedding; storing a blank would create a profile "
+                    "that matches nothing and explains nothing")
+            window = enrol.get("window") or (None, None)
+            add_sample(conn, company_id, enrol["voiceprint_id"], enrol["embedding"],
+                       source="correction", s3_key=enrol.get("s3_key"),
+                       window=(window[0], window[1]),
+                       created_by=enrol.get("created_by"),
+                       correction_ref=correction_ref)
+    logger.info("propagation: %d rows for %s (tau=%s, enrolled=%s)",
+                written, session_base, tau, bool(event.get("enrol")))
+    return {"written": written, "enrolled": bool(event.get("enrol"))}
 
 
 def _enrol(event):

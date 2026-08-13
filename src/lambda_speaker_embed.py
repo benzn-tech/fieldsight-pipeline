@@ -405,6 +405,11 @@ def _from_request_artifact(bucket, key):
     results.extend(_propagate(folder, date, req.get("turns") or [], v,
                               c.get("display_name"), turn_ref))
 
+    # The vector is already computed for the propagation decision, so enrolling the same
+    # window costs nothing more — and embedding it twice would pay twice for one answer and
+    # let the two results differ. It travels in the invoke payload and never through S3,
+    # which is what stopped the biometric-residence defect the reviews chased twice.
+    enrol = req.get("enrol")
     payload = {
         "op": "propagation",
         "company_id": req.get("company_id"),
@@ -412,6 +417,10 @@ def _from_request_artifact(bucket, key):
         "correction_ref": req.get("request_id"),
         "cluster_threshold": vp.DEFAULT_CLUSTER_TAU,
         "results": results,
+        "enrol": ({"voiceprint_id": enrol["voiceprint_id"],
+                   "embedding": [float(x) for x in v],
+                   "s3_key": s3_key, "window": [start, end],
+                   "created_by": req.get("requested_by")} if enrol else None),
     }
     invoke_writer(payload)
     logger.info("correction applied: session=%s ref=%s audio=%s",
