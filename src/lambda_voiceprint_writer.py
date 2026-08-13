@@ -57,8 +57,14 @@ def _propagation(event):
     * propagated rows carry **None**. `confirmations_count` treats a confirmed row as an
       independent *human* confirmation and promotes the profile after N of them; a machine
       row with a profile id would let the system promote profiles from its own output.
-    * the turn the user actually asserted carries the id and `source='correction'`. It is the
-      one row a person vouched for, and it is what the promotion count is supposed to count.
+    * the turn the user actually asserted is written `source='correction'` — the one row a
+      person vouched for, and what the promotion count is supposed to count.
+
+      It carries `voiceprint_id` only when the caller supplies one, and today nothing does:
+      a correction creates no profile (that is Phase 4, and consent is its precondition), so
+      every asserted row has a NULL id and `confirmations_count` is structurally zero. That
+      is the safe direction — promotion can only under-count — but it is two halves waiting
+      to disagree, so it is written down here rather than discovered when Phase 4 lands.
     """
     company_id = _require(event, "company_id")
     session_base = _require(event, "session_base")

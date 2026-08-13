@@ -241,18 +241,9 @@ def leave_one_out_centroid(members, index):
     return total / (len(members) - 1)
 
 
-def assign(reference, centroids):
-    """Which cluster the corrected window belongs to, and by how much.
-
-    Returns `(index, margin)` where the margin is over the runner-up cluster. The caller
-    refuses below `DEFAULT_MIN_MARGIN`: a corrected turn sitting between two voices is the
-    1-in-6 two-voice turn §2 measured, and naming a cluster from it spreads one person's name
-    across another person's whole session.
-    """
-    if not centroids:
-        return None, None
-    scored = sorted(((cosine(reference, c), i) for i, c in enumerate(centroids)),
-                    reverse=True)
-    if len(scored) == 1:
-        return scored[0][1], None
-    return scored[0][1], scored[0][0] - scored[1][0]
+# `assign(reference, centroids)` lived here until 2026-08-14 and is deleted rather than kept.
+# It scored a reference against every centroid, which is precisely the self-comparison
+# `_propagate` stopped doing when it began reading the corrected turn's cluster LABEL — so
+# it had no caller, and its docstring went on describing one ("the caller refuses below
+# DEFAULT_MIN_MARGIN") that no longer existed. Dead code that documents an imaginary caller
+# is the same failure this module keeps producing, one level up.
