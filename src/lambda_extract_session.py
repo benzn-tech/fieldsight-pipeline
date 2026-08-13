@@ -52,6 +52,7 @@ from transcript_utils import (
     extract_base_time_from_filename,
     extract_device_from_filename,
     extract_session_id_from_filename,
+    elide_middle,
     normalize_transcript,
 )
 
@@ -680,59 +681,15 @@ EXTRACTION_SCHEMA = """{
 def render_transcript(turns, limit=None):
     """Render turns for the prompt. Returns (text, stats).
 
-    `stats` is the record of what the model was actually shown — chars, lines,
-    and how many lines were dropped. It exists because the old truncation was a
-    bare slice: a 2-hour session lost its second half and produced an extraction
-    that looked complete, with nothing anywhere saying otherwise. Anything that
-    silently discards input has to leave a number behind.
-
-    When the text exceeds the limit, the head and the tail are kept and the
-    middle is elided on line boundaries, so the reader (and the model) still see
-    where the session started and how it ended.
+    The head-and-tail arithmetic lives in `transcript_utils.elide_middle`, because
+    the same bare-slice defect existed in the rolling summary the stop-recording
+    email is built from. Two implementations of a limit is how one of them gets
+    fixed and the other does not.
     """
     limit = TRANSCRIPT_TEXT_LIMIT if limit is None else limit
     lines = [f"[{t['abs_start_str']}] {t['speaker']}: {t['text']}" for t in turns]
-    text = "\n".join(lines)
-    stats = {
-        'chars': len(text),
-        'lines': len(lines),
-        'lines_omitted': 0,
-        'truncated': False,
-    }
-    if len(text) <= limit:
-        return text, stats
-
-    marker_room = 120  # the elision line itself, plus slack
-    head_budget = int((limit - marker_room) * TRUNCATION_HEAD_SHARE)
-    tail_budget = (limit - marker_room) - head_budget
-
-    head, used = [], 0
-    for line in lines:
-        if used + len(line) + 1 > head_budget:
-            break
-        head.append(line)
-        used += len(line) + 1
-
-    tail, used = [], 0
-    for line in reversed(lines[len(head):]):
-        if used + len(line) + 1 > tail_budget:
-            break
-        tail.append(line)
-        used += len(line) + 1
-    tail.reverse()
-
-    omitted = len(lines) - len(head) - len(tail)
-    stats['truncated'] = True
-    stats['lines_omitted'] = omitted
-    marker = (f"[... {omitted} turn line(s) from the middle of this session were "
-              f"omitted to fit the prompt ...]")
-    rendered = "\n".join(head + [marker] + tail)
-    stats['chars'] = len(rendered)
-    logger.warning(
-        "Transcript truncated: %d chars / %d lines rendered, %d lines omitted "
-        "(limit %d). The extraction below does not cover the whole session.",
-        len(text), len(lines), omitted, limit)
-    return rendered, stats
+    return elide_middle(lines, limit,
+                                head_share=TRUNCATION_HEAD_SHARE)
 
 
 _PROMPT_HEAD = (

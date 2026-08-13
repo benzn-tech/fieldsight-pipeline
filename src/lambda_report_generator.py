@@ -73,6 +73,7 @@ from transcript_utils import (
     extract_device_from_filename as tu_extract_device,
     extract_vad_metadata_from_filename as tu_extract_vad_info,
     read_meeting_manifest,
+    elide_middle,
 )
 
 # Configure logging
@@ -515,7 +516,11 @@ def build_daily_prompt(transcripts_with_photos, user_name, site_name, target_dat
             line += f"\n  Photos taken near this time: {', '.join(photo_names)}"
         transcript_lines.append(line)
 
-    transcripts_text = "\n\n".join(transcript_lines)[:60000]
+    # Head AND tail: a site walk states the site at the start and the defects it found
+    # at the end, and the bare slice dropped the second half of any long day without
+    # saying so. BUG-15 sized this limit; it did not change the shape of the cut.
+    transcripts_text, _ = elide_middle(transcript_lines, 60000,
+                                                        sep="\n\n")
 
     dur_min = int(total_duration // 60)
     dur_sec = int(total_duration % 60)

@@ -936,3 +936,44 @@ def test_someone_who_spoke_once_can_still_be_enrolled(stub_embedder, monkeypatch
     assert sent.get("enrol"), (
         "a person who spoke once could not be enrolled — the most ordinary correction there "
         "is was permanently refused")
+
+
+def test_a_vad_segments_offset_is_added_before_the_audio_is_cut(stub_embedder, monkeypatch):
+    """`_raw_key` strips `_off{T}` to reach the device's upload, so a position measured
+    inside the VAD unit is short by T once the audio is the whole chunk.
+
+    The batched path documents this term and applies it; the non-batched path did not, and
+    the failure is silent — the wrong seconds of audio embed perfectly well.
+    """
+    seen = {}
+
+    def embed(audio, sr):
+        seen.setdefault("first_nonzero", int(np.flatnonzero(audio)[0]) if audio.any() else None)
+        seen["len"] = len(audio)
+        return np.ones(192, dtype=np.float32)
+
+    monkeypatch.setattr(se, "embed_audio", embed)
+
+    sr = 16000
+    import io as _io
+    import wave as _wave
+    samples = np.zeros(120 * sr, dtype="<i2")
+    samples[100 * sr:104 * sr] = 1000       # the only sound is at 100s-104s
+    buf = _io.BytesIO()
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+        w.writeframes(samples.tobytes())
+
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "a" * 32 + "_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: buf.getvalue()}))
+
+    # The unit starts 100s into the chunk; the turn is at 0-4s WITHIN the unit.
+    se.lambda_handler({"op": "match", "session": "s", "user_folder": "Ben_UCPK2",
+                       "date": "2026-08-11",
+                       "turns": [{"source_filename":
+                                  "x_sid" + "a" * 32 + "_c0000_off100.0_to160.0_srcwav.json",
+                                  "start_sec": 0.0, "end_sec": 4.0}]}, None)
+
+    assert seen.get("len") == 4 * sr
+    assert seen.get("first_nonzero") == 0, \
+        "the window was cut at 0s of the whole upload — silence, not the speaker"

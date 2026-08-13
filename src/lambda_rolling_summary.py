@@ -22,9 +22,17 @@ import re
 from datetime import datetime
 from urllib.parse import unquote_plus
 
+import transcript_utils
+
 logger = logging.getLogger()
 
-TRANSCRIPT_LIMIT = 60000   # chars fed to the model — a live meeting-so-far is small
+# The stop-recording email is built from this summary, so a limit that drops the end
+# of the meeting drops the decisions out of the email. "A live meeting-so-far is
+# small" was true of the early ticks and false of the last one, which is the only
+# tick the email ever sees: past ~70 minutes the old bare slice cut the ending off
+# and nothing said so.
+TRANSCRIPT_LIMIT = 60000   # chars fed to the model
+TRANSCRIPT_HEAD_SHARE = 0.5   # a running summary needs the end at least as much
 
 _SYSTEM = (
     "You keep a running summary of an in-progress construction site meeting for a "
@@ -50,7 +58,8 @@ def build_rolling_prompt(turns):
     shape: abs_start_str / speaker / text)."""
     lines = [f"[{t.get('abs_start_str', '')}] {t.get('speaker', '')}: {t.get('text', '')}"
              for t in (turns or [])]
-    transcript = "\n".join(lines)[:TRANSCRIPT_LIMIT]
+    transcript, _ = transcript_utils.elide_middle(
+        lines, TRANSCRIPT_LIMIT, head_share=TRANSCRIPT_HEAD_SHARE)
     return f"{_SYSTEM}\n\n{_INSTRUCTION}\n\nTRANSCRIPT SO FAR:\n{transcript}\n"
 
 
