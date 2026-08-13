@@ -185,3 +185,95 @@ def test_profiles_without_a_user_do_not_collide():
 def test_an_empty_row_set_is_unknown_rather_than_a_crash():
     assert vp.aggregate_scores([]) == {}
     assert vp.decide_name(vp.aggregate_scores([]), duration_s=5.0).status == "unknown"
+
+
+# ---- clustering a session's own turns ------------------------------------
+#
+# The propagation mechanism's unit is a VOICE, not a turn: the session is clustered and the
+# user's correction names a cluster. That removes the self-competition failure two spec
+# revisions died on -- the reference SELECTS a cluster instead of competing beside it.
+#
+# This is the same code that measured Gate A (tau = 0.85 from the two Phase 0 sessions).
+# It has to be, or the frozen threshold was measured against a different implementation.
+
+import numpy as np  # noqa: E402
+
+
+def _v(*xs):
+    return np.array(xs, dtype=np.float64)
+
+
+def test_two_separated_groups_become_two_clusters():
+    a, b = _v(1, 0), _v(0, 1)
+    labels = vp.cluster_turns([a, a * 0.99, b, b * 0.98], tau=0.3)
+    assert len(set(labels)) == 2
+    assert labels[0] == labels[1] and labels[2] == labels[3]
+    assert labels[0] != labels[2]
+
+
+def test_one_group_does_not_split():
+    a = _v(1, 0)
+    labels = vp.cluster_turns([a, a * 0.99, a * 1.01], tau=0.3)
+    assert len(set(labels)) == 1
+
+
+def test_complete_linkage_refuses_the_chain_that_single_linkage_would_join():
+    """Single linkage merges A-B and B-C, and so joins A to C even when A and C are far
+    apart. For naming that is the expensive direction: it puts two people in one cluster,
+    and the runner-up that would have caught it disappears with them."""
+    import math
+    a = _v(1, 0)
+    b = _v(math.cos(0.6), math.sin(0.6))
+    c = _v(math.cos(1.2), math.sin(1.2))
+    tau = 1 - math.cos(0.7)                      # admits A-B and B-C, not A-C
+    labels = vp.cluster_turns([a, b, c], tau=tau)
+    assert labels[0] != labels[2], "A and C were chained together — that is single linkage"
+
+
+def test_an_empty_session_clusters_to_nothing():
+    assert vp.cluster_turns([], tau=0.5) == []
+
+
+def test_the_centroid_excludes_the_turn_being_scored():
+    """Leave-one-out. A turn inflates the centroid it belongs to, and most in the smallest
+    clusters, so margins would be largest exactly where the evidence is weakest -- and step
+    1 would then freeze that cluster-size bias into the threshold."""
+    members = [_v(1, 0), _v(0, 1)]
+    c = vp.leave_one_out_centroid(members, 0)
+    assert vp.cosine(c, members[1]) == pytest.approx(1.0), (
+        "the excluded member still contributed to its own centroid")
+
+
+def test_a_two_member_cluster_does_not_outscore_a_ten_member_one():
+    """The bias, measured the way it would actually show up. Identical audio in both, so any
+    difference in self-similarity is the inflation and nothing else."""
+    a = _v(1, 0)
+    small = [a, a]
+    big = [a] * 10
+    s = vp.cosine(vp.leave_one_out_centroid(small, 0), small[0])
+    b = vp.cosine(vp.leave_one_out_centroid(big, 0), big[0])
+    assert s == pytest.approx(b, abs=1e-9)
+
+
+def test_a_singleton_cluster_has_no_centroid_to_speak_of():
+    """n=1 makes leave-one-out 0/0. It raises rather than returning a zero vector, which
+    would score 0.0 against everything and read as 'nobody' instead of 'cannot say'."""
+    with pytest.raises(ValueError):
+        vp.leave_one_out_centroid([_v(1, 0)], 0)
+
+
+def test_the_reference_selects_the_nearest_cluster_and_reports_its_margin():
+    a, b = _v(1, 0), _v(0, 1)
+    idx, margin = vp.assign(a * 0.97, [a, b])
+    assert idx == 0
+    assert margin > 0.5
+
+
+def test_an_ambiguous_reference_is_reported_as_such_rather_than_picking_one():
+    """A corrected turn that sits between two voices is the 1-in-6 two-voice turn v2 measured.
+    Naming a cluster from it would spread one person's name over another's whole session."""
+    import math
+    a = _v(1, 0)
+    b = _v(math.cos(1.0), math.sin(1.0))
+    idx, margin = vp.assign(_v(math.cos(0.5), math.sin(0.5)), [a, b])
+    assert margin < vp.DEFAULT_MIN_MARGIN, f"margin {margin} — the caller cannot refuse this"
