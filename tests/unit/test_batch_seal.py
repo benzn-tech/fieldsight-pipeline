@@ -224,3 +224,47 @@ def test_the_re_drive_copy_is_one_s3_will_accept(s3):
     assert captured.get("MetadataDirective") == "REPLACE"
     assert captured.get("ContentType") == "audio/wav", \
         "REPLACE drops the existing metadata, so the type must be restated"
+
+
+# ---- the seal must mark its members consumed (the writer half of the §0.2 fix) ----
+
+def test_sealing_a_multi_member_window_marks_every_member_consumed(s3):
+    """The half that was missing.
+
+    `pending_windows` excludes consumed members and its test proved that — by fabricating
+    `sealed_into` on hand-built rows. Nothing checked that the SEALER writes it, and it did
+    not: only the singleton bypass did. So the planner kept re-planning sealed members, and
+    both consequences are live:
+
+      * a late EARLIER chunk shifts the window's first index, claims a seal key nobody
+        holds, and transcribes and bills the whole window a second time;
+      * a late INTERIOR chunk re-plans a window whose key IS held, loses the claim, and is
+        then never transcribed by anything -- including the session-close sweep, forever.
+
+    The reading side never asked the writer. That is the exact shape of
+    `ci-green-over-a-dead-path`.
+    """
+    import batch_ledger as bl
+    table = FakeTable()
+    for i, hms in ((6, "09-01-00"), (7, "09-01-30")):
+        bl.register_chunk(table, SID, i, unit_key(i, hms), 0)
+
+    batch_seal.seal_batch(s3, "b", SID, [6, 7],
+                          _by_index((6, "09-01-00"), (7, "09-01-30")), 0, table)
+
+    assert bl.consumed_indices(bl.list_members(table, SID)) == {6, 7}
+
+
+def test_a_late_earlier_chunk_cannot_rebuild_a_sealed_window(s3):
+    """End to end through the real sealer and the real planner -- the assertion the
+    fabricated-rows test could not make."""
+    import batch_ledger as bl
+    table = FakeTable()
+    for i, hms in ((6, "09-01-00"), (7, "09-01-30")):
+        bl.register_chunk(table, SID, i, unit_key(i, hms), 0)
+    batch_seal.seal_batch(s3, "b", SID, [6, 7],
+                          _by_index((6, "09-01-00"), (7, "09-01-30")), 0, table)
+
+    bl.register_chunk(table, SID, 4, unit_key(4, "09-00-00"), 5000)   # an hour late
+    got = bl.pending_windows(bl.list_members(table, SID), 9000, 150)
+    assert got == [[4]], f"the sealed window must not be re-planned, got {got}"

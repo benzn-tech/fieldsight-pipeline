@@ -181,8 +181,14 @@ def _cannot_grow(window, times, known, window_sec, cap) -> bool:
     if len(window) >= cap:
         return True
     nxt = window[-1] + 1
-    if nxt not in times:
-        return False                       # the successor has not registered
+    if nxt not in times or window[0] not in times:
+        # Either the successor has not registered, or this window's own anchor has no
+        # readable base time (an unplaceable member travelling alone). Subtracting a
+        # missing anchor raised KeyError, which propagated out of `pending_windows` --
+        # so EVERY arrival for that session errored and `_seal_tail_batches` swallowed
+        # it, leaving the whole session's audio sealed by nothing and transcribed by
+        # nothing. Wait for grace instead; it is the safe answer to both.
+        return False
     return (times[nxt] - times[window[0]]).total_seconds() >= window_sec
 
 
@@ -217,7 +223,12 @@ def claim_seal(table, session_id: str, first_index: int, members, now: int,
     existing = _get_seal(table, session_id, first_index)
     if existing is None:
         return None
-    if existing.get("status") != "sealing":
+    # A stale `bypassed` record is retakeable for the same reason a stale `sealing` one
+    # is: it means the copy-to-self never completed. It can only be reached while the
+    # member is still unconsumed -- once consumed, the planner never proposes it again
+    # and nothing calls this -- so there is no path by which a bypass that DID work
+    # gets re-driven and paid for twice.
+    if existing.get("status") not in ("sealing", "bypassed"):
         return None
     if now - int(existing.get("claimed_at") or 0) < retry_after_sec:
         return None
@@ -228,9 +239,10 @@ def claim_seal(table, session_id: str, first_index: int, members, now: int,
 def mark_members_consumed(table, session_id: str, indices, batch_first_index: int) -> None:
     """Record that these members now belong to a sealed batch.
 
-    Written between the map and `mark_sealed`, so a crash leaves members marked for a batch
-    that has no artifact — the conservative direction: that audio is skipped once, whereas
-    the other order would let it be sealed and billed twice.
+    Written after BOTH artifacts and before `mark_sealed`, so a crash before they exist
+    leaves the members unconsumed and the stale claim retakeable — the re-drive window
+    survives. Once the artifacts are on S3 the batch is real, and consuming its members is
+    what stops a late sibling re-planning and re-billing the same audio.
 
     The row is rewritten in full rather than replaced by a marker: `chunk_key` is the only
     record of which object a member was, and losing it makes a sealed batch impossible to

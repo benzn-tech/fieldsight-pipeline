@@ -88,10 +88,20 @@ def bypass_singleton(s3, bucket, session_id, index, unit_key, now, table):
     transcriber directly would pull its client into the sweep's import graph, and the sweep
     runs every minute.
 
-    Consumed is marked FIRST. If the copy then fails the chunk is skipped once; the other
-    order would let every later sweep re-plan it, re-copy it, and pay again.
+    Three writes, and the order of all three is load-bearing:
+
+    1. `bypassed` is recorded BEFORE the copy, because the copy's event can be delivered
+       before the next line runs. An event arriving while the record still said `sealing`
+       would fall through to batching, find the member unplannable, and report
+       `batched_pending` for audio nothing would ever transcribe.
+    2. the copy.
+    3. consumed LAST. A failed copy then leaves the member unconsumed, so the planner
+       proposes it again and `claim_seal` retakes the stale `bypassed` record after its
+       retry window. Marking consumed first — which this did until the review — made a
+       failed copy permanent: never re-planned, never re-copied, never transcribed, and the
+       comment here claimed it was "skipped once".
     """
-    batch_ledger.mark_members_consumed(table, session_id, [index], index)
+    batch_ledger.mark_bypassed(table, session_id, index, now)
     # `MetadataDirective=REPLACE` is not optional: S3 refuses a copy of an object onto its
     # own key when nothing about it changes ("this copy request is illegal because it is
     # trying to copy an object to itself"). REPLACE also drops the existing metadata, so
@@ -99,7 +109,7 @@ def bypass_singleton(s3, bucket, session_id, index, unit_key, now, table):
     s3.copy_object(Bucket=bucket, Key=unit_key,
                    CopySource={'Bucket': bucket, 'Key': unit_key},
                    MetadataDirective='REPLACE', ContentType='audio/wav')
-    batch_ledger.mark_bypassed(table, session_id, index, now)
+    batch_ledger.mark_members_consumed(table, session_id, [index], index)
     logger.info("batch: window of one — chunk %s re-driven per-chunk, no batch written",
                 index)
     return None
@@ -158,8 +168,19 @@ def seal_batch(s3, bucket, session_id, run, by_index, now, table, sealed_by='arr
                   Body=json.dumps(doc), ContentType='application/json')
     s3.put_object(Bucket=bucket, Key=batch_key, Body=_wav_bytes(audio, rate),
                   ContentType='audio/wav')
+    # AFTER both artifacts, BEFORE mark_sealed. This call was missing until the review, and
+    # its absence made the whole consumed-member mechanism decorative on the multi-member
+    # path -- the planner kept re-proposing sealed windows, with two live consequences: a
+    # late EARLIER chunk shifted the first index, claimed a key nobody held and billed the
+    # window twice; a late INTERIOR chunk re-planned a window whose key IS held, lost the
+    # claim, and was then never transcribed by anything, including the close sweep.
+    #
+    # Placed after the WAV so a crash before the artifacts exist leaves the members
+    # unconsumed and the stale `sealing` claim retakeable -- the re-drive window survives.
+    batch_ledger.mark_members_consumed(table, session_id, run, run[0])
     batch_ledger.mark_sealed(table, session_id, run[0], now)
-    logger.info("batch: sealed %s from chunks %s (%s)", batch_key, run, sealed_by)
+    logger.info("batch: sealed %s from chunks %s (%s), members consumed",
+                batch_key, run, sealed_by)
     return batch_key
 
 

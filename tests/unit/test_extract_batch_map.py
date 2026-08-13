@@ -151,8 +151,22 @@ def test_the_reader_looks_where_the_seal_writes(batch_key):
             raise KeyError(Key)          # forces measure_trim's unmeasured path
 
     class FakeTable:
+        """Enough of the table for the seal, which since 2026-08-13 also reads its members
+        back to mark them consumed. A double that only accepts writes made the seal raise
+        `AttributeError` here rather than fail on the property this test is about."""
+
+        def __init__(self):
+            self.items = {}
+
         def put_item(self, Item, ConditionExpression=None):
+            self.items[(Item["PK"], Item["SK"])] = dict(Item)
             return {}
+
+        def query(self, KeyConditionExpression=None, ExpressionAttributeValues=None):
+            pk = ExpressionAttributeValues[":pk"]
+            sk = ExpressionAttributeValues.get(":sk", "")
+            return {"Items": [v for (p, s), v in sorted(self.items.items())
+                              if p == pk and s.startswith(sk)]}
 
     run = [4, 5, 6, 7]
     by_index = {}
