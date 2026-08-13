@@ -5,16 +5,34 @@ point every company-tier read routes through (rollup, RAG embed/reindex)."""
 from psycopg.rows import dict_row
 
 _COLS = ("id, company_id, target_type, target_id, reason, actor_user_id, "
-         "actor_role, scope, created_at, reverted_at")
+         "actor_role, scope, created_at, reverted_at, batch_id, target_key")
 
 
 def create_redaction(conn, company_id, target_id, reason, actor_user_id, actor_role,
-                     *, target_type="topic", scope="analysis"):
+                     *, target_type="topic", scope="analysis",
+                     batch_id=None, target_key=None):
+    """A soft, reversible, audited exclusion.
+
+    `scope='analysis'` hides a topic from company-tier reads only — the
+    life-conversation separation this table was built for. `scope='deleted'` is the
+    customer-facing delete: hidden at EVERY tier.
+
+    `target_key` is the source prefix, and it is what makes a delete survive the
+    pipeline. `lambda_ingest` deletes a day's topics and re-inserts them with new
+    uuids when the nightly report supersedes the live extraction, so a tombstone
+    holding only a topic uuid stops matching within a day and the deleted content
+    returns overnight.
+
+    `batch_id` groups one delete action, so one revert can restore exactly what one
+    delete hid — the only check that proves the feature is reversible.
+    """
     return conn.cursor(row_factory=dict_row).execute(
         f"INSERT INTO redactions (company_id, target_type, target_id, reason, "
-        f"actor_user_id, actor_role, scope) VALUES (%s,%s,%s,%s,%s,%s,%s) "
+        f"actor_user_id, actor_role, scope, batch_id, target_key) "
+        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         f"RETURNING {_COLS}",
-        (company_id, target_type, target_id, reason, actor_user_id, actor_role, scope),
+        (company_id, target_type, target_id, reason, actor_user_id, actor_role, scope,
+         batch_id, target_key),
     ).fetchone()
 
 
