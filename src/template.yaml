@@ -3721,6 +3721,61 @@ Resources:
       AlarmActions:
         - !Ref AlertTopic
 
+  # Added 2026-08-13. The transcriber had no alarm at all, which is why 27 rejected
+  # transcriptions were silent: replaying a real 71-minute session into TEST drove peak
+  # Lambda concurrency to 141 against the provider's 20-concurrent ceiling, and each
+  # HTTP 429 left a batch WAV with no transcript and nothing to re-drive it -- about 54
+  # minutes of audio, recovered only by hand. Every other significant function here has
+  # an alarm; this is the one that spends money and loses words.
+  TranscribeErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlerts
+    Properties:
+      AlarmName: !Sub ["${P}-transcribe-errors", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        Transcription failed for at least one segment. Each failure is audio that has no
+        transcript and that nothing retries -- check for HTTP 429 (provider concurrency)
+        first, then re-drive the affected keys.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TranscribeFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # A throttled ASYNC invocation writes no log line whatsoever. So the moment a concurrency
+  # ceiling is put on this function -- which is the fix for the 429s -- that failure mode
+  # becomes completely invisible unless this metric is watched. The alarm has to exist
+  # BEFORE the ceiling, not after it.
+  TranscribeThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlerts
+    Properties:
+      AlarmName: !Sub ["${P}-transcribe-throttles", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        Transcribe invocations are being throttled. Async events retry with backoff and are
+        then DISCARDED silently past MaximumEventAge, so a sustained throttle is audio loss.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TranscribeFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
   DownloaderErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: ShouldCreateAlerts

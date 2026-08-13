@@ -694,3 +694,42 @@ def test_both_spellings_of_no_alerts_are_inert():
     cond = re.search(r"ShouldCreateAlerts:(.*?)(?=\n  \w+:)", text, re.S).group(1)
     assert "''" in cond, "the empty string must still mean no alarms"
     assert "'none'" in cond, "the sentinel the workflows send must also mean no alarms"
+
+
+# ----------------------------------------------------------
+# Alarms on the function that spends money and can lose audio
+# ----------------------------------------------------------
+
+def test_the_transcriber_has_an_error_alarm():
+    """It had none, and that is why 27 lost batches were silent.
+
+    2026-08-13, replaying a real 71-minute session into TEST: 27 transcription requests
+    were rejected with HTTP 429 (the provider caps concurrent requests at 20; peak Lambda
+    concurrency was 141). Each one left a batch WAV with no transcript and nothing to
+    re-drive it — about 54 minutes of audio gone. The only trace was ERROR lines nobody
+    was watching, because every other significant function has an alarm and this one
+    does not.
+
+    Threshold 1 is deliberate and is not noisy: seven days of prod transcribe logs contain
+    zero `Error processing` lines. An error here means audio is at risk.
+    """
+    text = open(TEMPLATE, encoding="utf-8").read()
+    block = re.search(r"\n  TranscribeErrorAlarm:\n(.*?)(?=\n  \w+:\n)", text, re.S)
+    assert block, "no TranscribeErrorAlarm in the template"
+    body = block.group(1)
+    assert "MetricName: Errors" in body
+    assert "!Ref TranscribeFunction" in body
+    assert "!Ref AlertTopic" in body, "an alarm nobody is told about is not an alarm"
+
+
+def test_the_transcriber_has_a_throttle_alarm():
+    """A throttled async invocation writes NO log line at all.
+
+    So the moment a concurrency ceiling is put on this function — which is the fix for the
+    429s — the failure mode becomes completely invisible unless the Throttles metric is
+    watched. This alarm has to exist BEFORE the ceiling does, not after.
+    """
+    text = open(TEMPLATE, encoding="utf-8").read()
+    block = re.search(r"\n  TranscribeThrottleAlarm:\n(.*?)(?=\n  \w+:\n)", text, re.S)
+    assert block, "no TranscribeThrottleAlarm in the template"
+    assert "MetricName: Throttles" in block.group(1)
