@@ -3761,9 +3761,19 @@ def test_transcripts_non_all_caller_reads_own_folder(presign_wired):
     assert b["speaker_count"] == 2
     assert b["total_speaker_segments"] == 2
     assert b["speakers"] == ["spk_0", "spk_1"]
+    # An exact-shape assertion, and it earned its keep: adding the two keys below made it
+    # fail, which is the only reason anybody looked at whether the WRITER emits them.
+    #
+    # `source_filename` + `chunk_start` are the pair a stored speaker name is keyed by
+    # (`speaker_turn_names.turn_ref`). `start` is ABSOLUTE clock seconds and cannot serve —
+    # the overlay would match nothing and every name would silently fail to appear. This is
+    # the writer side of that contract; the reader side is test_org_api_transcript_names.py,
+    # and both are needed, because a reader tested against a fixture agrees with the fixture
+    # rather than with the writer.
     assert b["speaker_segments"][0] == {
         "speaker": "spk_0", "text": "Hello there.",
         "start": 28800.0, "end": 28802.0, "time_label": "08:00:00", "duration": 2.0,
+        "source_filename": "Ben_UCPK_2026-07-18_08-00-00.json", "chunk_start": 0.0,
     }
     assert b["speaker_segments"][1]["time_label"] == "08:00:02"
     assert b["segments"][0]["filename"] == "Ben_UCPK_2026-07-18_08-00-00.json"

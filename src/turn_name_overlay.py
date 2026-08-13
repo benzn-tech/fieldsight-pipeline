@@ -1,0 +1,137 @@
+"""Resolve stored speaker names onto the turns a reader is holding.
+
+The names live in `speaker_turn_names` and are applied at read time. They are not baked into
+the transcript artifact, for three reasons that have each already cost something here:
+
+  * a correction can be withdrawn, and withdrawal has to reach everything the correction
+    justified — enumerable only if the names are rows;
+  * a derived document may have exactly one writer (`programme.json` records what happens
+    when it gets a second);
+  * re-running extraction rewrites the artifact, and an overlay survives that.
+
+The third reason is also this module's hard problem. A row's `turn_ref` is
+`source_filename + start_sec`, and the live/final two-layer extraction re-assembles turns —
+a seam dedup shifts `start_sec` by a fraction of a second. Under a strict join the row then
+matches nothing and **the name silently disappears**, which is the same class of failure the
+overlay was chosen to avoid. So:
+
+  * the join is by proximity within `TOLERANCE_SEC`, nearest wins;
+  * a row that never matches anything is **counted**, and the caller reports the count.
+
+Precedence has to be applied HERE and not left to the database. The partial unique index
+guarantees one live row per `turn_ref` string; with a tolerance join, two rows whose strings
+differ slightly can both match one physical turn, so the index is a backstop rather than the
+guarantee.
+
+Spec: docs/superpowers/specs/2026-08-13-speaker-correction-propagation.md
+Plan: docs/superpowers/plans/2026-08-13-correction-propagation-implementation.md (P6)
+"""
+
+# Wide enough to survive a seam dedup, far short of a turn. Phase 0's shortest usable turn is
+# 3 s and the duration floor is 3 s, so half a second cannot reach a neighbouring turn.
+TOLERANCE_SEC = 0.5
+
+# A direct correction is a claim a person made; propagation and matching are inferences.
+_SOURCE_RANK = {"correction": 2, "correction_propagation": 1, "match": 0}
+
+
+def _parse_ref(ref):
+    """`{source_filename}@{start_sec}` → (filename, seconds), or None.
+
+    Returns None rather than raising: one malformed row must not take a whole transcript
+    down with it, and an unparseable row is exactly an orphan — a name that cannot be shown.
+    """
+    if not ref or "@" not in str(ref):
+        return None
+    name, _, tail = str(ref).rpartition("@")
+    try:
+        return name, float(tail)
+    except ValueError:
+        return None
+
+
+def build(rows, confirmed_only=False):
+    """An index over live rows, carrying its own orphan bookkeeping.
+
+    `confirmed_only` is the v2 §1 boundary: only confirmed names may reach minutes, email and
+    the action-item responsible party. Tentative names exist for the transcript viewer alone,
+    and the email is the artifact that leaves the building — so the filter is a build-time
+    argument rather than something each caller remembers to apply.
+    """
+    by_file = {}
+    orphaned = set()
+    for i, r in enumerate(rows or []):
+        if confirmed_only and r.get("state") != "confirmed":
+            continue
+        parsed = _parse_ref(r.get("turn_ref"))
+        if parsed is None:
+            orphaned.add(i)
+            continue
+        fname, at = parsed
+        by_file.setdefault(fname, []).append((at, i, r))
+        orphaned.add(i)
+    for entries in by_file.values():
+        entries.sort(key=lambda e: e[0])
+    return {"by_file": by_file, "unmatched": orphaned}
+
+
+def _better(a, b):
+    """Which of two rows a reader should believe.
+
+    A direct correction beats an inference; between two of the same kind the later one wins.
+    `created_at` is compared as text because it is ISO-8601 from Postgres, where lexical and
+    chronological order agree.
+    """
+    ra = _SOURCE_RANK.get(a.get("source"), -1)
+    rb = _SOURCE_RANK.get(b.get("source"), -1)
+    if ra != rb:
+        return a if ra > rb else b
+    return a if str(a.get("created_at") or "") >= str(b.get("created_at") or "") else b
+
+
+def lookup(index, source_filename, start_sec):
+    """The name for this turn, or None.
+
+    Every row within tolerance is considered, not merely the nearest: the nearest row may be
+    a propagated guess sitting beside the correction the user actually made. Distance breaks
+    ties only after precedence has.
+    """
+    entries = index["by_file"].get(source_filename)
+    if not entries:
+        return None
+    best = None
+    for at, i, row in entries:
+        d = abs(at - float(start_sec))
+        if d > TOLERANCE_SEC:
+            continue
+        if best is None:
+            best = (d, i, row)
+            continue
+        chosen = _better(row, best[2])
+        if chosen is row and (row is not best[2]):
+            # `_better` returns the incumbent on a tie, so reaching here means this row is
+            # strictly better on precedence — or equal, in which case distance decides.
+            best = (d, i, row)
+        elif chosen is best[2] and _SOURCE_RANK.get(row.get("source"), -1) == \
+                _SOURCE_RANK.get(best[2].get("source"), -1) and d < best[0]:
+            best = (d, i, row)
+    if best is None:
+        return None
+    index["unmatched"].discard(best[1])
+    row = best[2]
+    if not row.get("display_name"):
+        # An unnamed cluster is a real answer — "someone consistent, not identified" — and
+        # `decide_name` hands back the CLUSTER KEY as its name. `C_3` must never render.
+        return None
+    return {"display_name": row["display_name"], "state": row.get("state"),
+            "source": row.get("source"), "cluster_ref": row.get("cluster_ref")}
+
+
+def orphans(index):
+    """Rows that matched no turn.
+
+    Reported rather than dropped: an orphan is a name the user set that is no longer being
+    shown, and silence there reads as "this turn was never named" — a different and wrong
+    statement.
+    """
+    return len(index["unmatched"])
