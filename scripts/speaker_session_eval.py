@@ -96,6 +96,111 @@ def match_script(text, script):
     return best, bs, bi
 
 
+class OnnxEmbedder:
+    """The exported model, run the way the Lambda runs it.
+
+    Measuring with speechbrain and shipping onnxruntime would leave the gap between them
+    unmeasured; the parity test bounds it at cosine 0.999, but a threshold frozen from one
+    engine and applied by the other is a threshold nobody checked.
+    """
+
+    def __init__(self, path):
+        import onnxruntime as ort
+        self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+
+    def embed(self, audio, sr):
+        out = self.sess.run(None, {"wav": np.asarray(audio, dtype=np.float32)[None, :],
+                                   "wav_lens": np.array([1.0], dtype=np.float32)})
+        return np.asarray(out[0]).ravel()
+
+
+def agglomerate(vectors, tau):
+    """Complete-linkage agglomerative clustering on cosine distance. Returns labels.
+
+    Complete linkage, not single: a cluster is only merged when EVERY pair across it is
+    within tau, so "all members within tau" holds by construction. Single linkage would let
+    a chain of near-neighbours join two people who are nothing alike, which for naming is
+    the expensive direction.
+
+    Pure numpy on purpose — voiceprint_utils ships to a Lambda whose layer has no scipy or
+    sklearn, and an implementation measured here that cannot run there is not a measurement
+    of anything.
+    """
+    n = len(vectors)
+    if n == 0:
+        return []
+    d = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d[i][j] = d[j][i] = 1.0 - float(vp.cosine(vectors[i], vectors[j]))
+    clusters = [[i] for i in range(n)]
+    while len(clusters) > 1:
+        best, bi, bj = None, -1, -1
+        for a in range(len(clusters)):
+            for b in range(a + 1, len(clusters)):
+                worst = max(d[x][y] for x in clusters[a] for y in clusters[b])
+                if best is None or worst < best:
+                    best, bi, bj = worst, a, b
+        if best is None or best > tau:
+            break
+        clusters[bi] = clusters[bi] + clusters[bj]
+        del clusters[bj]
+    labels = [0] * n
+    for k, c in enumerate(clusters):
+        for i in c:
+            labels[i] = k
+    return labels
+
+
+def report_clustering(rows, taus=(0.30, 0.50, 0.70, 0.80, 0.82, 0.84, 0.85, 0.86,
+                                  0.88, 0.90, 0.95)):
+    """Gate A. Does any threshold separate the people we know were in the room?
+
+    Purity alone is not the test: one cluster per turn is perfectly pure and useless, so
+    cluster count is reported beside it. What we need is k == the number of real speakers
+    AND high purity at the same tau.
+    """
+    labelled = [r for r in rows if r.get("truth") and r.get("vec") is not None]
+    if len(labelled) < 2:
+        print("  clustering: too few labelled turns to say anything")
+        return
+    vecs = [r["vec"] for r in labelled]
+    truth = [r["truth"] for r in labelled]
+    people = sorted(set(truth))
+    print(f"\n  --- Gate A: {len(labelled)} labelled turns, {len(people)} real speakers "
+          f"{people} ---")
+
+    # The distribution nobody has measured: turn-vs-turn, not turn-vs-profile.
+    same, diff = [], []
+    for i in range(len(vecs)):
+        for j in range(i + 1, len(vecs)):
+            dist = 1.0 - float(vp.cosine(vecs[i], vecs[j]))
+            (same if truth[i] == truth[j] else diff).append(dist)
+    if same and diff:
+        print(f"  turn-vs-turn cosine DISTANCE  same speaker: "
+              f"min {min(same):.3f} med {sorted(same)[len(same)//2]:.3f} max {max(same):.3f}")
+        print(f"                                 different:    "
+              f"min {min(diff):.3f} med {sorted(diff)[len(diff)//2]:.3f} max {max(diff):.3f}")
+        # NOT the test. max(same) < min(diff) is sufficient for a threshold to exist, not
+        # necessary: complete linkage does not need every same-speaker pair closer than
+        # every different-speaker pair, only a merge ORDER that never crosses people. The
+        # tau sweep below is the real answer; this line is context for how hard it is.
+        print(f"  pairwise bands {'do not overlap' if max(same) < min(diff) else 'OVERLAP'} "
+              f"(by {max(0.0, max(same) - min(diff)):.3f}) — sufficient, not necessary")
+
+    print(f"  {'tau':>5} {'k':>3} {'purity':>7}  {'singletons':>10}")
+    for tau in taus:
+        labels = agglomerate(vecs, tau)
+        k = len(set(labels))
+        hits = 0
+        for c in set(labels):
+            members = [truth[i] for i, l in enumerate(labels) if l == c]
+            hits += max(members.count(x) for x in set(members))
+        singles = sum(1 for c in set(labels) if list(labels).count(c) < 2)
+        flag = "  <-- k == real speakers" if k == len(people) else ""
+        print(f"  {tau:5.2f} {k:>3} {hits/len(labels):>6.0%}  {singles:>10}{flag}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--work", required=True, help="dir holding audio/, tx/, enrol/")
@@ -112,11 +217,20 @@ def main():
     ap.add_argument("--distractors", default=None,
                     help="dir of extra enrolment wavs, treated as people who are NOT in "
                          "the room. Grows the pool without touching the ground truth.")
+    ap.add_argument("--onnx", default=None,
+                    help="path to the exported ECAPA ONNX. Uses onnxruntime instead of "
+                         "speechbrain — the SAME engine the Lambda runs, so a measurement "
+                         "here is a measurement of production rather than of its ancestor. "
+                         "Also avoids a torch install.")
+    ap.add_argument("--cluster", action="store_true",
+                    help="Gate A: cluster each session's turns by voice and report whether "
+                         "any merge threshold separates the known speakers. Needs no "
+                         "enrolments — the whole point is that it uses no stored profiles.")
     args = ap.parse_args()
     W = args.work
     scripts = json.load(open(args.scripts, encoding="utf-8"))
 
-    emb = sp.Embedder(cache_dir=os.path.join(W, "ecapa"))
+    emb = OnnxEmbedder(args.onnx) if args.onnx else sp.Embedder(cache_dir=os.path.join(W, "ecapa"))
     profiles = {}
     for p in sorted(glob.glob(os.path.join(W, "enrol", "*.wav"))):
         name = os.path.basename(p)[:-4]
@@ -169,11 +283,18 @@ def main():
                 scores = {n: sp.cosine(v, pv) for n, pv in profiles.items()}
                 truth, conf, li = match_script(t["text"], script)
                 rows.append({"chunk": ci, "spk": t["spk"], "dur": dur, "text": t["text"],
-                             "truth": truth, "conf": conf, "line": li, "scores": scores})
+                             "truth": truth, "conf": conf, "line": li, "scores": scores,
+                             "vec": v})
 
         labelled = [r for r in rows if r["conf"] >= args.match_floor and r["truth"]]
         print(f"  {len(rows)} turns scored, {len(labelled)} confidently matched to a script line")
         print(f"  diarizer labels seen: {sorted({r['spk'] for r in rows})}")
+        if args.cluster:
+            report_clustering(labelled)
+        if not profiles:
+            # Gate A uses no stored profiles at all — that is the whole claim it tests —
+            # so everything below, which is about matching against them, has nothing to say.
+            continue
         print()
         print(f"  {'#':>2} {'spk':5} {'s':>5} {'truth':6} " +
               " ".join(f"{n[:5]:>6}" for n in profiles) + "  pred")
