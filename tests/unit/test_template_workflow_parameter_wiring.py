@@ -944,3 +944,19 @@ def test_the_voiceprint_prefix_collides_with_no_other_rule():
     for p in others:
         assert not (p.startswith(mine) or mine.startswith(p)), (
             f"{mine} overlaps {p}; S3 will refuse the whole notification config")
+
+
+def test_every_wired_trigger_prefix_is_readable_by_the_function_it_triggers():
+    """A trigger without a matching read grant is a function that gets invoked and then
+    AccessDenied on the object that invoked it. Nothing static compares the two today, and
+    on 2026-08-14 that gap survived a template review, a cfn-lint run and a full suite —
+    it took a real correction on TEST to surface.
+
+    Scoped to the speaker chain, whose trigger this file already knows about.
+    """
+    t = open(TEMPLATE, encoding="utf-8").read()
+    script = open(os.path.join(REPO, "scripts", "wire-s3-events.sh"), encoding="utf-8").read()
+    assert "voiceprint_requests/" in script, "the trigger is gone; this test is stale"
+    block = _top_level_block(t, "  SpeakerEmbedFunction:")
+    assert "/voiceprint_requests/*" in block, (
+        "the embedder is triggered by voiceprint_requests/ and cannot read it")

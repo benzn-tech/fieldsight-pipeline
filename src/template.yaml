@@ -2784,6 +2784,11 @@ Resources:
                 # object; the map is what takes both back to the device's own upload,
                 # which is the audio every voiceprint threshold was measured on.
                 - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*_batch_map.json
+                # Its own input. Wiring the trigger without this grant produces a function
+                # that is invoked and then AccessDenied on the very object that invoked it —
+                # found by a real correction on TEST, because no static check compares the
+                # trigger's prefix against the read grants.
+                - !Sub arn:aws:s3:::${IngestBucketName}/voiceprint_requests/*
             # Without ListBucket a missing key answers 403, not 404, and "not allowed"
             # becomes indistinguishable from "not there" inside the function.
             - Effect: Allow
