@@ -892,7 +892,14 @@ def _instructions_block():
    and if that speaker is never named the array is empty. Those names already have homes:
    action_items.responsible and findings.entity_name. Putting them here says three people were
    in a conversation that one person had.
-   action_items: write each `action` to be read AT A GLANCE and to SURVIVE TRUNCATION -- the UI
+   action_items: FIRST decide whether there is an action at all. An action_item is something a
+   SPECIFIC PERSON COULD FINISH AND TICK OFF. Test the VERB, not the subject: "consult Xiao Han &
+   Benny", "replace the damaged doors", "call the electrician" all name an act that can be
+   completed. "focus on X", "consider Y", "explore Z", "prioritise W" name a DIRECTION -- nobody
+   can ever tick them, and they belong in the topic summary, not here. A discussion that reached no
+   act produces NO action_items; the array is genuinely allowed to be empty, and two real tasks are
+   worth more than six invented ones, because invented ones bury the real ones.
+   Then write each `action` to be read AT A GLANCE and to SURVIVE TRUNCATION -- the UI
    shows only the first few words of the title, so the FIRST 2-4 WORDS must carry the real
    SUBJECT/OUTCOME (what the task is ABOUT), never the activity type or the people. Lead with that
    key subject; the action verb and any names come AFTER it; keep the whole thing to a handful of
@@ -904,6 +911,8 @@ def _instructions_block():
    - Good: "Damaged doors -- replace, floors 1-3, PK building"
    - Bad:  "Consultation with Xiao Han, Benny, and others about go-to-market strategy"  (buries the subject)
    - Bad:  "Identify and complete the unspecified outstanding task"  (vague)
+   - Bad:  "Target market strategy -- focus high-hourly professionals"  (a direction; nothing to tick)
+   - Bad:  "Product strategy -- evaluate fixed sensors vs wearables"  (a direction; leave it in the summary)
 2b. work_class: classify each topic as "work" (site operations: inspections,
     progress, safety, coordination) or "non_work" (personal/off-work talk:
     meals, family, weekend, banter). When UNSURE, choose "work" -- a
