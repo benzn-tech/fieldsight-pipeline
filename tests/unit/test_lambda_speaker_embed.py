@@ -977,3 +977,117 @@ def test_a_vad_segments_offset_is_added_before_the_audio_is_cut(stub_embedder, m
     assert seen.get("len") == 4 * sr
     assert seen.get("first_nonzero") == 0, \
         "the window was cut at 0s of the whole upload — silence, not the speaker"
+
+
+# ---- Phase 5: matching a whole session against stored profiles ------------
+
+
+def _match_artifact(mode="on", turns=None):
+    return json.dumps({
+        "op": "match", "session_base": "sid" + "c" * 32, "company_id": "co-1",
+        "user_folder": "Ben_UCPK2", "date": "2026-08-11", "mode": mode,
+        "turns": turns if turns is not None else [
+            {"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+             "start_sec": 0.0, "end_sec": 5.0}]})
+
+
+def _writer(monkeypatch, profiles, seen):
+    def invoke(payload):
+        seen.append(payload)
+        if payload["op"] == "profiles":
+            return {"profiles": profiles}
+        return {"written": len(payload.get("results") or [])}
+    monkeypatch.setattr(se, "invoke_writer", invoke)
+
+
+def _profile(pid="vp-1", name="Ben L", status="confirmed", vec=None):
+    return {"person_key": pid, "display_name": name, "status": status,
+            "embedding": vec if vec is not None else [1.0] * 192}
+
+
+def test_the_match_artifact_never_carries_vectors_and_fetches_them_instead(
+        stub_embedder, monkeypatch):
+    """The request bucket has a 7-day expiry and nothing else; a voiceprint is biometric
+    data whose storage was consented to in one column. The vectors arrive in the RESULT of a
+    synchronous invoke and exist only in memory."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    s3 = FakeS3({art: _match_artifact(), key: _wav_bytes()})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    seen = []
+    _writer(monkeypatch, [_profile()], seen)
+
+    se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                           "object": {"key": art}}}]}, None)
+    assert seen[0]["op"] == "profiles", "the vectors were not fetched from the in-VPC half"
+    assert "embedding" not in json.dumps(json.loads(s3.objects[art]))
+
+
+def test_shadow_computes_everything_and_writes_no_name(stub_embedder, monkeypatch):
+    """The scores are the point of shadow mode — they are what a threshold is calibrated on
+    — but no name may reach a transcript."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    monkeypatch.setattr(se, "s3",
+                        lambda: FakeS3({art: _match_artifact(mode="shadow"),
+                                        key: _wav_bytes()}))
+    seen = []
+    _writer(monkeypatch, [_profile()], seen)
+
+    out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                                 "object": {"key": art}}}]}, None)
+    assert out["matched"] == 0
+    assert out["wouldMatch"] >= 1, "shadow computed nothing, so it collected nothing"
+    assert not any(p["op"] == "match_names" for p in seen), "shadow wrote a name"
+
+
+def test_on_writes_the_names_it_found(stub_embedder, monkeypatch):
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: _match_artifact(mode="on"),
+                                                  key: _wav_bytes()}))
+    seen = []
+    _writer(monkeypatch, [_profile()], seen)
+
+    out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                                 "object": {"key": art}}}]}, None)
+    write = next(p for p in seen if p["op"] == "match_names")
+    assert out["matched"] == len(write["results"]) >= 1
+    row = write["results"][0]
+    assert row["display_name"] == "Ben L", \
+        "the transcript would show a uuid: decide_name returns the KEY it won on"
+    assert row["person_key"] == "vp-1"
+
+
+def test_a_company_with_no_consented_profile_says_so(stub_embedder, monkeypatch):
+    """'nobody was recognised' and 'there was nobody to recognise' look identical
+    downstream. On TEST the only profile was withdrawn during a withdrawal test, which is
+    exactly how this would be misread as the matcher being broken."""
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: _match_artifact()}))
+    seen = []
+    _writer(monkeypatch, [], seen)
+
+    out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                                 "object": {"key": art}}}]}, None)
+    assert out["profiles"] == 0 and out["matched"] == 0
+    assert not any(p["op"] == "match_names" for p in seen)
+
+
+def test_a_correction_artifact_still_takes_the_correction_path(stub_embedder, monkeypatch):
+    """One prefix, two requests, told apart by `op` inside the object — a second prefix
+    would be a second hand-wired S3 notification (BUG-33)."""
+    art = "voiceprint_requests/co-1/s/r1.json"
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    doc = json.dumps({"session_base": "sid" + "c" * 32, "company_id": "co-1",
+                      "user_folder": "Ben_UCPK2", "date": "2026-08-11", "turns": [],
+                      "correction": {"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                                     "start_sec": 0.0, "end_sec": 5.0,
+                                     "display_name": "Ben L"}})
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: doc, key: _wav_bytes()}))
+    seen = []
+    _writer(monkeypatch, [_profile()], seen)
+    se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                           "object": {"key": art}}}]}, None)
+    assert any(p["op"] == "propagation" for p in seen), \
+        "a correction was routed to the matcher"

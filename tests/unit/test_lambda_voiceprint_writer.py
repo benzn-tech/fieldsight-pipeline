@@ -296,3 +296,50 @@ def test_a_standalone_enrolment_refusal_stores_nothing_and_says_so(calls, monkey
                              "embedding": [0.1] * 192, "s3_key": "k",
                              "window": [0.0, 4.0]}, None)
     assert out["stored"] == 0 and out["reason"] == "closer-to-another-profile"
+
+
+# ---- Phase 5: names with no human behind them ----------------------------
+
+
+def _match_event():
+    return {"op": "match_names", "company_id": CO, "session_base": "s1",
+            "results": [{"turn_ref": "f.wav@1.0", "status": "confirmed",
+                         "person_key": "vp-1", "display_name": "Ben L",
+                         "score": 0.9, "margin": 0.3},
+                        {"turn_ref": "f.wav@9.0", "status": "tentative",
+                         "person_key": "vp-1", "display_name": "Ben L"}]}
+
+
+def test_a_matched_name_is_never_written_as_a_human_correction(calls):
+    """`confirmations_count` counts rows whose source is 'correction' and promotes a profile
+    after enough of them. Writing machine output under that source would let the system
+    promote its own profiles from its own guesses — and the promotion would then justify
+    more confident guesses."""
+    vw.lambda_handler(_match_event(), None)
+    assert calls["turns"], "nothing was written"
+    assert {t["source"] for t in calls["turns"]} == {"voiceprint_match"}
+
+
+def test_a_matched_name_carries_the_profile_so_a_withdrawal_can_find_it(calls):
+    """§6 requires a withdrawal to reach everything the profile justified, and `withdraw`
+    supersedes turn names by exactly this column. A matched name with no id is a name the
+    withdrawal cannot reach — unlike a propagated row, which has no profile to point at."""
+    vw.lambda_handler(_match_event(), None)
+    assert all(t["voiceprint_id"] == "vp-1" for t in calls["turns"])
+
+
+def test_a_refusal_from_the_matcher_writes_no_row(calls):
+    vw.lambda_handler({"op": "match_names", "company_id": CO, "session_base": "s1",
+                       "results": [{"turn_ref": "f.wav@1.0", "status": "unknown",
+                                    "person_key": None}]}, None)
+    assert calls["turns"] == []
+
+
+def test_fetching_profiles_is_company_scoped(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None:
+                        seen.update({"co": company_id}) or [])
+    vw.lambda_handler({"op": "profiles", "company_id": CO}, None)
+    assert seen["co"] == CO, "one company's voice would be matched against another's"

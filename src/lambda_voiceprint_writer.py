@@ -33,7 +33,7 @@ import logging
 
 from db.connection import get_connection
 from repositories.voiceprints import (EnrolmentBelongsToSomebodyElse, add_sample,
-                                     record_turn_name)
+                                      profiles_for_matching, record_turn_name)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -170,10 +170,72 @@ def _enrol(event):
     return {"stored": 1}
 
 
+def _profiles(event):
+    """The company's matchable profiles, handed to the non-VPC embedder.
+
+    **This is the only way voice vectors may reach the matcher.** They travel in the
+    RequestResponse *result* of a synchronous invoke and nowhere else — not through S3, not
+    through an async payload that would sit in Lambda's queue and any DLQ. The same defect
+    has relocated four times already, each time into a store nobody thought to sweep, so the
+    rule is not "avoid S3" but "the vectors are never at rest outside the column that
+    requires consent".
+
+    `profiles_for_matching` stays in this half for the reason its own docstring gives: a
+    withdrawn profile that still matches is not a withdrawal, and that filter must have
+    exactly one home.
+    """
+    company_id = _require(event, "company_id")
+    with get_connection() as conn:
+        rows = profiles_for_matching(conn, company_id, site_id=event.get("site_id"))
+    return {"profiles": [{"person_key": str(r["id"]),
+                          "display_name": r["display_name"],
+                          "status": r["status"],
+                          "embedding": r["embedding"]} for r in rows]}
+
+
+def _match_names(event):
+    """Names a matcher inferred, with no human behind them.
+
+    `source='voiceprint_match'`, never `'correction'`. `confirmations_count` counts rows
+    whose source is `'correction'` and promotes a profile after enough of them — so writing
+    machine output under that source would let the system promote its own profiles from its
+    own guesses, and the promotion would then justify more confident guesses.
+
+    These rows DO carry `voiceprint_id`, unlike propagated ones. §6 requires a withdrawal to
+    reach everything the profile justified, and `withdraw` supersedes turn names by exactly
+    that column. A matched name with no id is a name the withdrawal cannot find.
+    """
+    company_id = _require(event, "company_id")
+    session_base = _require(event, "session_base")
+    written = 0
+    with get_connection() as conn:
+        for r in event.get("results") or []:
+            if r.get("status") not in ("confirmed", "tentative") or not r.get("person_key"):
+                continue
+            record_turn_name(
+                conn, company_id,
+                session_base=session_base,
+                turn_ref=r["turn_ref"],
+                state=r["status"],
+                source="voiceprint_match",
+                voiceprint_id=r["person_key"],
+                display_name=r.get("display_name"),
+                score=r.get("score"),
+                margin=r.get("margin"))
+            written += 1
+    logger.info("match: %d names for %s", written, session_base)
+    return {"written": written}
+
+
 def lambda_handler(event, context):
     op = (event or {}).get("op")
     if op == "propagation":
         return _propagation(event)
     if op == "enrol":
         return _enrol(event)
-    raise ValueError(f"unknown op {op!r} — expected 'propagation' or 'enrol'")
+    if op == "profiles":
+        return _profiles(event)
+    if op == "match_names":
+        return _match_names(event)
+    raise ValueError(f"unknown op {op!r} — expected 'propagation', 'enrol', 'profiles' or "
+                     f"'match_names'")

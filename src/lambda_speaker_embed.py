@@ -479,6 +479,80 @@ def _from_request_artifact(bucket, key):
     return {"status": "applied", "turn_ref": turn_ref}
 
 
+def _from_match_artifact(bucket, key):
+    """Phase 5: name a whole session against the profiles the company already holds.
+
+    Same prefix and same trigger as a correction, told apart by `op` inside the object. A
+    second prefix would be a second hand-wired S3 notification (BUG-33), and the two
+    artifacts differ only in what they ask for.
+
+    The artifact carries **no voice vectors**. It cannot: it sits in a bucket with a 7-day
+    expiry and no other protection, while a voiceprint is biometric data whose storage the
+    subject consented to in one specific column. The vectors are fetched here, synchronously,
+    from the in-VPC writer, and exist only in this function's memory for the length of the
+    run. That is the fifth and last home this defect gets.
+
+    org-api cannot do this itself — it is in-VPC with no NAT, so any outward invoke
+    black-holes (BUG-36). Non-VPC calling in-VPC is the permitted direction.
+    """
+    req = json.loads(_get(key))
+    company_id = req.get("company_id")
+    folder, date = req.get("user_folder"), req.get("date")
+    session = req.get("session_base")
+    if not company_id or not folder or not date or not session:
+        raise ValueError(
+            f"match artifact {key} is missing company_id/user_folder/date/session_base; the "
+            f"producer has all four and guessing any of them reads a key that cannot exist")
+
+    profiles = invoke_writer({"op": "profiles", "company_id": company_id,
+                              "site_id": req.get("site_id")}).get("profiles") or []
+    if not profiles:
+        # Not an error, and worth a line rather than a silent zero: "nobody was recognised"
+        # and "there was nobody to recognise" look identical downstream, and on TEST the
+        # only profile was withdrawn during a withdrawal test, which is exactly how this
+        # would have been misread as the matcher not working.
+        logger.warning("match: no consented profiles for company %s; nothing to match "
+                       "against (session %s)", company_id, session)
+        return {"session": session, "matched": 0, "profiles": 0, "mode": req.get("mode")}
+
+    out = _match({"session": session, "user_folder": folder, "date": date,
+                  "profiles": profiles, "turns": req.get("turns") or []})
+
+    by_key = {p["person_key"]: p for p in profiles}
+    named = []
+    for r in out["results"]:
+        if r.get("status") not in ("confirmed", "tentative") or not r.get("name"):
+            continue
+        turn = r["turn"]
+        named.append({
+            "turn_ref": turn_name_overlay.turn_ref(turn["source_filename"],
+                                                   float(turn["start_sec"])),
+            "status": r["status"],
+            "person_key": r["name"],
+            # `decide_name` returns the KEY it won on, which is the profile id. The name a
+            # reader sees has to come from the profile, or the transcript shows a uuid.
+            "display_name": (by_key.get(r["name"]) or {}).get("display_name"),
+            "margin": r.get("margin"),
+        })
+
+    mode = (req.get("mode") or "").lower()
+    if mode != "on":
+        # `shadow` computes everything and writes nothing. The scores are the point of the
+        # mode — they are what a threshold gets calibrated on — so they go to the log rather
+        # than being discarded, but no name reaches a transcript.
+        logger.info("match(shadow): session=%s would name %d of %d turns: %s",
+                    session, len(named), len(out["results"]),
+                    [(n["display_name"], n["status"], n["margin"]) for n in named])
+        return {"session": session, "matched": 0, "wouldMatch": len(named),
+                "profiles": len(profiles), "mode": mode or "off"}
+
+    written = invoke_writer({"op": "match_names", "company_id": company_id,
+                             "session_base": session, "results": named}).get("written", 0)
+    logger.info("match: session=%s named %d of %d turns against %d profiles",
+                session, written, len(out["results"]), len(profiles))
+    return {"session": session, "matched": written, "profiles": len(profiles), "mode": mode}
+
+
 def lambda_handler(event, context):
     records = (event or {}).get("Records")
     if records:
@@ -489,7 +563,11 @@ def lambda_handler(event, context):
         for r in records:
             b = r["s3"]["bucket"]["name"]
             k = r["s3"]["object"]["key"]
-            out = _from_request_artifact(b, k)
+            doc = json.loads(_get(k))
+            # One prefix, two requests. The op is inside the object rather than in the key
+            # so a new kind of request never needs a new hand-wired S3 notification.
+            out = (_from_match_artifact(b, k) if doc.get("op") == "match"
+                   else _from_request_artifact(b, k))
         return out or {"status": "empty"}
     op = (event or {}).get("op")
     if op == "enrol":

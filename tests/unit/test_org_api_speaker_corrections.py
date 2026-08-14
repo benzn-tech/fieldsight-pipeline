@@ -509,3 +509,81 @@ def test_a_worker_cannot_take_a_name_off(wired, monkeypatch):
 def test_unnaming_404s_when_the_feature_is_off(wired, monkeypatch):
     monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "off")
     assert org.lambda_handler(_unname_event(), None)["statusCode"] == 404
+
+
+# ---- Phase 5: name a session from stored profiles ------------------------
+
+
+SID = "sid" + "b" * 32
+FULL = f"Benl1_2026-08-14_09-00-00_{SID}"
+
+
+def _match_event(session=None, sub="sub-1"):
+    return {"httpMethod": "POST",
+            "path": f"/api/org/sessions/{session or FULL}/speaker-match",
+            "body": json.dumps({"user": "Ben_UCPK2"}),
+            "requestContext": {"authorizer": {"claims": {"sub": sub}}}}
+
+
+def _turns(monkeypatch, n=3):
+    monkeypatch.setattr(org, "_session_turns", lambda *a, **k: [
+        {"source_filename": f"f{i}.json", "start_sec": float(i), "end_sec": float(i) + 5}
+        for i in range(n)])
+
+
+def test_a_match_can_be_asked_for_on_an_existing_session(wired, monkeypatch):
+    """On demand rather than only at finalize: automatic naming helps future meetings, and
+    the reason to want this at all is the archive that already exists."""
+    _turns(monkeypatch)
+    res = org.lambda_handler(_match_event(), None)
+    assert res["statusCode"] == 202
+    assert _body(res)["turnsQueued"] == 3
+
+
+def test_the_queued_artifact_carries_no_voice_vectors(wired, monkeypatch):
+    """The bucket has a 7-day expiry and nothing else. A voiceprint is biometric data whose
+    storage was consented to in one specific column, and this defect has already relocated
+    four times into stores nobody thought to sweep."""
+    _turns(monkeypatch)
+    org.lambda_handler(_match_event(), None)
+    doc = json.loads(wired.puts[-1]["Body"])
+    assert doc["op"] == "match"
+    assert "profiles" not in doc and "embedding" not in json.dumps(doc)
+
+
+def test_the_mode_travels_with_the_request(wired, monkeypatch):
+    """The matcher must not read the switch itself: two readers of one switch disagree the
+    moment one of them is deployed and the other is not."""
+    _turns(monkeypatch)
+    org.lambda_handler(_match_event(), None)
+    assert json.loads(wired.puts[-1]["Body"])["mode"] == org.SPEAKER_IDENTITY_MODE
+
+
+def test_the_answer_says_whether_names_will_actually_be_written(wired, monkeypatch):
+    """"It ran and deliberately wrote nothing" and "it ran and found nobody" are different
+    answers that otherwise look identical."""
+    _turns(monkeypatch)
+    monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "shadow")
+    assert _body(org.lambda_handler(_match_event(), None))["willWriteNames"] is False
+    monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "on")
+    assert _body(org.lambda_handler(_match_event(), None))["willWriteNames"] is True
+
+
+def test_a_session_with_no_turns_is_refused_rather_than_queued(wired, monkeypatch):
+    """A 202 would promise work that cannot happen; the usual cause is transcripts that have
+    not been written yet, which is a wait, not a failure."""
+    monkeypatch.setattr(org, "_session_turns", lambda *a, **k: [])
+    assert org.lambda_handler(_match_event(), None)["statusCode"] == 409
+
+
+def test_a_worker_cannot_ask_for_a_match(wired, monkeypatch):
+    _turns(monkeypatch)
+    monkeypatch.setattr(org.users, "get_user_by_sub",
+                        lambda conn, sub: dict(CALLER, global_role="worker"))
+    assert org.lambda_handler(_match_event(), None)["statusCode"] == 403
+
+
+def test_match_404s_when_the_feature_is_off(wired, monkeypatch):
+    _turns(monkeypatch)
+    monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "off")
+    assert org.lambda_handler(_match_event(), None)["statusCode"] == 404
