@@ -1091,3 +1091,45 @@ def test_a_correction_artifact_still_takes_the_correction_path(stub_embedder, mo
                                            "object": {"key": art}}}]}, None)
     assert any(p["op"] == "propagation" for p in seen), \
         "a correction was routed to the matcher"
+
+
+# ---- long audio ----------------------------------------------------------
+#
+# A 108-second turn killed this function with Runtime.OutOfMemory at 1769 MB on
+# the first real enrolment against whole-chunk transcription. ECAPA's convolutions
+# run the full length of the input, and every earlier run — Phase 0, the parity
+# fixtures, yesterday's live verification — used a window of a few seconds.
+
+
+def test_a_long_turn_is_embedded_in_pieces_not_in_one_pass(monkeypatch):
+    lengths = []
+
+    def once(audio):
+        lengths.append(len(audio))
+        return np.ones(192, dtype=np.float32)
+
+    monkeypatch.setattr(se, "_embed_once", once)
+    se.embed_audio(np.zeros(108 * 16000, dtype=np.float32), 16000)
+    assert len(lengths) > 1, "the whole 108 s went to the model in one tensor"
+    assert max(lengths) <= se.MAX_EMBED_SECONDS * 16000
+
+
+def test_short_audio_still_takes_the_single_pass_path(monkeypatch):
+    """The parity fixtures compare against vectors recorded from one pass. Changing the
+    arithmetic under them would make the comparison meaningless while it stayed green."""
+    calls = []
+    monkeypatch.setattr(se, "_embed_once",
+                        lambda a: calls.append(len(a)) or np.ones(192, dtype=np.float32))
+    se.embed_audio(np.zeros(5 * 16000, dtype=np.float32), 16000)
+    assert calls == [5 * 16000]
+
+
+def test_the_pieces_are_normalised_before_they_are_averaged(monkeypatch):
+    """The scores this feeds are cosines, so a loud piece is not more of an opinion about
+    who is speaking. Without normalising, one piece with a large norm decides the vector."""
+    vecs = [np.array([100.0] + [0.0] * 191, dtype=np.float32),
+            np.array([0.0, 1.0] + [0.0] * 190, dtype=np.float32)]
+    seq = iter(vecs)
+    monkeypatch.setattr(se, "_embed_once", lambda a: next(seq))
+    out = se.embed_audio(np.zeros(40 * 16000, dtype=np.float32), 16000)
+    assert abs(out[0] - out[1]) < 1e-6, "the louder piece dominated the average"
