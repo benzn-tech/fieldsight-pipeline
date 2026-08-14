@@ -135,7 +135,7 @@ import sweep_state
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
-from repositories import (action_items, aliases, classification_feedback, companies,
+from repositories import (action_items, aliases, chunks, classification_feedback, companies,
                           compliance_resolutions, content, content_edits, keyframes,
                           meeting_session, memberships, observations, programme,
                           programme_delay_flags, programme_import,
@@ -3175,11 +3175,13 @@ def delete_recordings_endpoint(conn, caller, body):
                             "error": "not permitted to delete this user's recordings"})
             continue
         hidden = 0
+        topic_ids = []
         for prefix in prefixes:
             redactions.create_recording_tombstone(
                 conn, target_company, prefix, reason,
                 caller.get("id"), caller.get("global_role"), batch_id=batch_id)
             for row in topics.list_topics_for_source_prefix(conn, prefix) or []:
+                topic_ids.append(row["id"])
                 if redactions.create_redaction(
                         conn, target_company, row["id"], reason,
                         caller.get("id"), caller.get("global_role"),
@@ -3199,7 +3201,19 @@ def delete_recordings_endpoint(conn, caller, body):
                     target_type="topic", scope="deleted", batch_id=batch_id,
                     skip_if_already_deleted=True):
                 hidden += 1
-        results.append({"recording": rec, "topics_hidden": hidden})
+        # The search index is MOVED, not filtered. The read-time predicate cannot reach
+        # these rows: every chunk is stamped `source_s3_key = reports/…` so the tombstone's
+        # source arm never matches, and the unassigned transcript windows carry
+        # `topic_id = NULL` where the topic arm is trivially true. Both arms miss, and what
+        # they miss is the verbatim speech -- a customer deleted a recording, watched it
+        # disappear, and the sentence stayed searchable. Archived rather than deleted so the
+        # undelete can put it back without re-embedding.
+        archived = chunks.archive_chunks_for_session(
+            conn, (rec.get("sessionBase") or "").strip(), topic_ids, batch_id)
+        logger.info("user deletion: batch=%s session=%s archived %d chunk(s)",
+                    batch_id, rec.get("sessionBase"), archived)
+        results.append({"recording": rec, "topics_hidden": hidden,
+                        "chunks_archived": archived})
         days.add((rec["folder"], rec["date"]))
         sessions_by_day.setdefault((rec["folder"], rec["date"]), set()).add(
             (rec.get("sessionBase") or "").strip())
@@ -3264,6 +3278,13 @@ def undelete_recordings_endpoint(conn, caller, body):
 
     rows = redactions.revert_batch(
         conn, batch_id, caller["company_id"], cross_company=cross) or []
+    # The search index comes back too, out of the archive and keyed on the same batch, so
+    # one undelete restores exactly what one delete removed. Logged including zero: a batch
+    # created before the archive shipped legitimately has none, and that has to be
+    # distinguishable from a restore that silently did nothing.
+    restored_chunks = chunks.restore_chunks_for_batch(conn, batch_id)
+    logger.info("user deletion: undelete batch=%s restored %d chunk(s)",
+                batch_id, restored_chunks)
     # Only THIS batch's sessions come out of the mirror. The first version wrote the day's
     # document as `[]`, which un-hid every other active batch for that day from the readers
     # that have no database -- an undelete that restores more than the delete hid.
@@ -3315,7 +3336,8 @@ def undelete_recordings_endpoint(conn, caller, body):
             logger.exception("deletion mirror rewrite failed for %s/%s on undelete %s",
                              folder, date, batch_id)
     logger.info("user deletion: undelete batch=%s restored=%d", batch_id, len(rows))
-    return ok({"batch_id": batch_id, "restored": len(rows)})
+    return ok({"batch_id": batch_id, "restored": len(rows),
+               "chunks_restored": restored_chunks})
 
 
 def create_redaction_endpoint(conn, caller, body):

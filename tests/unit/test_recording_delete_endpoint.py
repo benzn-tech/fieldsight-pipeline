@@ -115,6 +115,7 @@ def _stub_writes(monkeypatch, topics_found=()):
     monkeypatch.setattr(org.redactions, "create_recording_tombstone",
                         lambda *a, **k: {"id": "r-1"})
     monkeypatch.setattr(org.redactions, "create_redaction", lambda *a, **k: {"id": "r-2"})
+    monkeypatch.setattr(org.chunks, "archive_chunks_for_session", lambda *a, **k: 0)
 
 
 def test_the_flag_is_a_real_gate(monkeypatch):
@@ -298,6 +299,7 @@ def _undelete_stubs(monkeypatch, rows=None, still=()):
     monkeypatch.setattr(org.redactions, "active_batches_for_day",
                         lambda conn, f, d, **kw: list(still))
     monkeypatch.setattr(org.topics, "list_topics_for_source_prefix", lambda *a, **k: [])
+    monkeypatch.setattr(org.chunks, "restore_chunks_for_batch", lambda *a, **k: 0)
 
 
 def test_undelete_restores_exactly_one_batch(monkeypatch):
@@ -419,3 +421,64 @@ def test_an_unreadable_mirror_does_not_free_everything_on_undelete(monkeypatch):
 
     org.undelete_recordings_endpoint(_Conn(), CALLER, {"batchId": "b-1"})
     assert s3.written == {}
+
+
+# ---- the search index is MOVED, not filtered ---------------------------
+
+def test_the_delete_archives_the_sessions_chunks(monkeypatch):
+    """The read-time predicate cannot reach these rows and the feature shipped believing
+    it could. Every chunk is stamped `source_s3_key = reports/…`, so the tombstone's
+    source arm never matches; and the unassigned transcript windows carry
+    `topic_id = NULL`, where the topic arm is trivially true. A customer deleted a
+    recording, watched it disappear, and the sentence stayed searchable."""
+    monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
+    monkeypatch.setattr(org, "_s3_client", _S3())
+    _allow_all(monkeypatch)
+    _stub_writes(monkeypatch, [{"id": "t-1"}, {"id": "t-2"}])
+    seen = {}
+
+    def _archive(conn, session_base, topic_ids, batch_id):
+        seen["base"] = session_base
+        seen["topic_ids"] = list(topic_ids)
+        seen["batch"] = batch_id
+        return 4
+
+    monkeypatch.setattr(org.chunks, "archive_chunks_for_session", _archive)
+
+    res = org.delete_recordings_endpoint(_Conn(), CALLER, {"recordings": [REC]})
+    body = json.loads(res["body"])
+    assert seen["base"] == "sid-a", "the session base is what identifies the chunks"
+    assert "t-1" in seen["topic_ids"], "topic-linked chunks must go too"
+    assert seen["batch"] == body["batch_id"], "or one undelete cannot restore one delete"
+    assert body["results"][0]["chunks_archived"] == 4, \
+        "report the count, including zero — 'archived nothing' and 'never ran' look alike"
+
+
+def test_undelete_restores_the_archived_chunks(monkeypatch):
+    """Archived rather than deleted precisely so this is possible: rebuilding a chunk
+    means re-embedding it, and the vectors live in a sidecar keyed by sha256 of the text
+    that is long gone by the time anyone undeletes."""
+    monkeypatch.setattr(org, "_s3_client", _S3())
+    _undelete_stubs(monkeypatch)
+    monkeypatch.setattr(org.redactions, "revert_batch", lambda conn, b, c, **kw: BATCH_ROWS)
+    restored = {}
+    monkeypatch.setattr(org.chunks, "restore_chunks_for_batch",
+                        lambda conn, b: restored.setdefault("b", b) and 0 or 7)
+
+    res = org.undelete_recordings_endpoint(_Conn(), CALLER, {"batchId": "b-1"})
+    assert restored["b"] == "b-1"
+    assert json.loads(res["body"])["chunks_restored"] == 7
+
+
+def test_the_chunk_predicate_covers_the_unassigned_bucket():
+    """Two arms, and the second is the one that was missing. `chunk_transcripts` buckets
+    turns by `time_range ± 120s`; whatever matches no topic lands with `topic_id = NULL`
+    and that bucket holds verbatim speech. A topic-only rule leaves it searchable."""
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(
+        _os.path.abspath(__file__)))), "src", "repositories"))
+    import chunks as chunks_repo
+    p = chunks_repo.SESSION_CHUNK_PREDICATE
+    assert "topic_id = ANY" in p, "the topic arm is gone"
+    assert "source_files" in p, "the unassigned bucket is unreachable without this arm"
+    assert "%(session_base)s" in p
