@@ -243,3 +243,56 @@ def test_the_names_and_the_sample_land_in_one_transaction(monkeypatch):
                   "s3_key": "k", "window": [0.0, 15.0]}}, None)
     assert len(conns) == 1, f"{len(conns)} connections opened; the two halves can differ"
     assert {c for _, c in seen} == {conns[0]}, "the sample used a different connection"
+
+
+# ---- a refused enrolment is half a gesture, not none of it ----------------
+
+
+def _refuse(monkeypatch):
+    def boom(conn, company_id, *a, **kw):
+        raise vw.EnrolmentBelongsToSomebodyElse(0.42, 0.71, "vp-other")
+    monkeypatch.setattr(vw, "add_sample", boom)
+
+
+def _correction_event():
+    return {"op": "propagation", "company_id": CO, "session_base": "s1",
+            "correction_ref": "corr-1",
+            "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed",
+                         "cluster_ref": None, "display_name": "Ben L", "asserted": True},
+                        {"turn_ref": "f.wav@9.0", "state": "tentative",
+                         "cluster_ref": "c1", "display_name": "Ben L"}],
+            "enrol": {"voiceprint_id": "vp-1", "embedding": [0.1] * 192,
+                      "s3_key": "users/u/audio/d/x.wav", "window": [0.0, 5.0]}}
+
+
+def test_a_refused_enrolment_does_not_take_the_names_with_it(calls, monkeypatch):
+    """The names describe THIS meeting and were earned by the user's own assertion; only
+    the half that stores biometric data needs consent, and only that half is refused.
+
+    Letting the exception escape would roll back the transaction the names are written in,
+    so a user who corrected a speaker would see nothing happen at all — and the API already
+    reports the two effects separately precisely because they can differ."""
+    _refuse(monkeypatch)
+    out = vw.lambda_handler(_correction_event(), None)
+    assert len(calls["turns"]) == 2, "the names were rolled back with the enrolment"
+    assert out["written"] == 2
+    assert out["enrolled"] is False
+    assert out["enrolRefused"]["reason"] == "closer-to-another-profile"
+
+
+def test_a_refused_enrolment_says_which_profile_it_looked_like(calls, monkeypatch):
+    """Refusing without saying what it resembled leaves a person with nothing to act on —
+    and the whole point of comparing an order rather than a threshold is that the runner-up
+    is the evidence."""
+    _refuse(monkeypatch)
+    out = vw.lambda_handler(_correction_event(), None)
+    assert out["enrolRefused"]["nearestOtherId"] == "vp-other"
+    assert out["enrolRefused"]["bestOther"] > out["enrolRefused"]["own"]
+
+
+def test_a_standalone_enrolment_refusal_stores_nothing_and_says_so(calls, monkeypatch):
+    _refuse(monkeypatch)
+    out = vw.lambda_handler({"op": "enrol", "company_id": CO, "voiceprint_id": "vp-1",
+                             "embedding": [0.1] * 192, "s3_key": "k",
+                             "window": [0.0, 4.0]}, None)
+    assert out["stored"] == 0 and out["reason"] == "closer-to-another-profile"

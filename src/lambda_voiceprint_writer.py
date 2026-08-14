@@ -32,7 +32,8 @@ Plan: docs/superpowers/plans/2026-08-13-correction-propagation-implementation.md
 import logging
 
 from db.connection import get_connection
-from repositories.voiceprints import add_sample, record_turn_name
+from repositories.voiceprints import (EnrolmentBelongsToSomebodyElse, add_sample,
+                                     record_turn_name)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -102,20 +103,33 @@ def _propagation(event):
         # withdrawal to reach "everything it justified" — which is only enumerable because
         # `correction_ref` travels with the sample.
         enrol = event.get("enrol")
+        enrol_refusal = None
         if enrol:
             if not enrol.get("embedding"):
                 raise ValueError(
                     "enrolment carries no embedding; storing a blank would create a profile "
                     "that matches nothing and explains nothing")
             window = enrol.get("window") or (None, None)
-            add_sample(conn, company_id, enrol["voiceprint_id"], enrol["embedding"],
-                       source="correction", s3_key=enrol.get("s3_key"),
-                       window=(window[0], window[1]),
-                       created_by=enrol.get("created_by"),
-                       correction_ref=correction_ref)
-    logger.info("propagation: %d rows for %s (tau=%s, enrolled=%s)",
-                written, session_base, tau, bool(event.get("enrol")))
-    return {"written": written, "enrolled": bool(event.get("enrol"))}
+            try:
+                add_sample(conn, company_id, enrol["voiceprint_id"], enrol["embedding"],
+                           source="correction", s3_key=enrol.get("s3_key"),
+                           window=(window[0], window[1]),
+                           created_by=enrol.get("created_by"),
+                           correction_ref=correction_ref)
+            except EnrolmentBelongsToSomebodyElse as exc:
+                # Caught, not propagated: the names describe THIS meeting and were earned by
+                # the user's own assertion. Letting a refused enrolment roll them back would
+                # punish the gesture for the half of it that needs consent, which is the
+                # half the API already reports separately.
+                enrol_refusal = {"reason": "closer-to-another-profile",
+                                 "own": exc.own, "bestOther": exc.best_other,
+                                 "nearestOtherId": str(exc.nearest_other_id)}
+                logger.warning("enrolment refused for %s: %s", enrol["voiceprint_id"], exc)
+    enrolled = bool(event.get("enrol")) and enrol_refusal is None
+    logger.info("propagation: %d rows for %s (tau=%s, enrolled=%s, refused=%s)",
+                written, session_base, tau, enrolled,
+                (enrol_refusal or {}).get("reason"))
+    return {"written": written, "enrolled": enrolled, "enrolRefused": enrol_refusal}
 
 
 def _enrol(event):
@@ -139,11 +153,20 @@ def _enrol(event):
                          "explains nothing")
     window = event.get("window") or (None, None)
     with get_connection() as conn:
-        add_sample(conn, company_id, _require(event, "voiceprint_id"), embedding,
-                   source="correction", s3_key=event.get("s3_key"),
-                   window=(window[0], window[1]),
-                   created_by=event.get("created_by"),
-                   correction_ref=event.get("correction_ref"))
+        try:
+            add_sample(conn, company_id, _require(event, "voiceprint_id"), embedding,
+                       source="correction", s3_key=event.get("s3_key"),
+                       window=(window[0], window[1]),
+                       created_by=event.get("created_by"),
+                       correction_ref=event.get("correction_ref"))
+        except EnrolmentBelongsToSomebodyElse as exc:
+            # Same refusal as the propagation path, and it has to be spelled out twice
+            # because the two paths report different shapes. What must NOT differ is the
+            # decision, which is why the rule itself lives in `add_sample`.
+            logger.warning("enrol refused: %s", exc)
+            return {"stored": 0, "reason": "closer-to-another-profile",
+                    "own": exc.own, "bestOther": exc.best_other,
+                    "nearestOtherId": str(exc.nearest_other_id)}
     return {"stored": 1}
 
 

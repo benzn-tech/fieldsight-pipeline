@@ -137,6 +137,62 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
     ).fetchone()
 
 
+class EnrolmentBelongsToSomebodyElse(Exception):
+    """A sample was about to join a profile it resembles LESS than it resembles another.
+
+    Carries the two scores so the caller can show a person the choice, rather than only
+    telling them it declined.
+    """
+
+    def __init__(self, own, best_other, nearest_other_id):
+        self.own = own
+        self.best_other = best_other
+        self.nearest_other_id = nearest_other_id
+        super().__init__(
+            f"this window is closer to another profile ({best_other:.3f}) than to the one "
+            f"it would join ({own:.3f}); it may be a different person with the same name")
+
+
+def _agreement(conn, company_id, voiceprint_id, embedding):
+    """(own, best_other, nearest_other_id) for a sample about to be stored.
+
+    `own` is against the samples this profile ALREADY has, so a first sample gets None —
+    there is nothing to agree with, and inventing a number would corrupt the dataset the
+    threshold is eventually meant to come from.
+
+    Deliberately NOT a threshold. `upsert_profile` matches an existing profile by NAME, so
+    two people called "Leo" confirmed by the same person land on one profile, and a profile
+    cannot be un-poisoned — only the contributing sample deleted. The obvious guard is a
+    similarity floor and it is not available: Phase 0 measured the same person varying by
+    more than 0.2 across sessions, so any floor drawn today rejects legitimate second
+    samples and was drawn from nothing.
+
+    What IS available is the ORDER of these two numbers. Both are measured on the same
+    audio, so whatever makes a voice score low today lowers both of them together, and the
+    comparison survives the drift that defeats a floor.
+    """
+    import voiceprint_utils as vp
+
+    rows = profiles_for_matching(conn, company_id)
+    own_vecs = [r["embedding"] for r in rows if str(r["id"]) == str(voiceprint_id)]
+    others = [r for r in rows if str(r["id"]) != str(voiceprint_id)]
+
+    own = None
+    if own_vecs:
+        own = max(vp.cosine(v, embedding) for v in own_vecs)
+
+    best_other, nearest_other_id = None, None
+    if others:
+        by_profile = {}
+        for r in others:
+            sc = vp.cosine(r["embedding"], embedding)
+            pid = str(r["id"])
+            if sc > by_profile.get(pid, -2.0):
+                by_profile[pid] = sc
+        nearest_other_id, best_other = max(by_profile.items(), key=lambda kv: kv[1])
+    return own, best_other, nearest_other_id
+
+
 def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, window,
                created_by=None, correction_ref=None) -> dict | None:
     """Record one enrolment contribution.
@@ -147,16 +203,26 @@ def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, windo
     `correction_ref` and `created_by` are what make a bad enrolment traceable to everything
     it justified. They are optional in the signature and should not be: they are only
     optional because a future enrolment path may have no correction behind it.
+
+    The guard lives HERE and not in a caller because there are two enrolment paths — the
+    one folded into a propagation and the standalone one — and a rule that only one of them
+    runs is a rule the other quietly does without. See `_agreement` for why it compares an
+    order rather than testing a threshold.
     """
     _require_company(company_id)
+    own, best_other, nearest_other_id = _agreement(conn, company_id, voiceprint_id,
+                                                   embedding)
+    if own is not None and best_other is not None and best_other > own:
+        raise EnrolmentBelongsToSomebodyElse(own, best_other, nearest_other_id)
     start_s, end_s = (window or (None, None))
     return conn.cursor(row_factory=dict_row).execute(
         "INSERT INTO speaker_voiceprint_samples "
         "(company_id, voiceprint_id, embedding, source, s3_key, window_start_s, "
-        " window_end_s, created_by, correction_ref) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        " window_end_s, created_by, correction_ref, agreement_own, "
+        " agreement_best_other, nearest_other_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (company_id, voiceprint_id, _vector_literal(embedding), source, s3_key,
-         start_s, end_s, created_by, correction_ref),
+         start_s, end_s, created_by, correction_ref, own, best_other, nearest_other_id),
     ).fetchone()
 
 

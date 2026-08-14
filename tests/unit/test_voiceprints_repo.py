@@ -54,12 +54,18 @@ def _emb(n=192):
 
 # ---- add_sample ----
 
+def _insert(conn):
+    """add_sample reads the company's profiles before it writes, so the INSERT is no
+    longer call 0. Find it by what it is rather than by where it sits."""
+    return next(c for c in conn.calls if c["sql"].startswith("INSERT"))
+
+
 def test_the_embedding_crosses_as_a_pgvector_literal():
-    conn = FakeConn([[{"id": "s1"}]])
+    conn = FakeConn([[], [{"id": "s1"}]])
     voiceprints.add_sample(conn, CO, VP, _emb(), source="enrolment",
                            s3_key="users/x.wav", window=(0.0, 30.0),
                            created_by="u1", correction_ref="corr-9")
-    params = conn.calls[0]["params"]
+    params = _insert(conn)["params"]
     vec = next(p for p in params if isinstance(p, str) and p.startswith("["))
     assert vec.startswith("[0.0,") and vec.endswith("]")
 
@@ -68,7 +74,7 @@ def test_a_wrong_length_embedding_is_refused_before_it_reaches_the_database():
     """The column is vector(192). Postgres would reject it too, but only at insert time and
     with an error nobody reads — and by then the audio window has been chosen and the
     consent recorded."""
-    conn = FakeConn([[{"id": "s1"}]])
+    conn = FakeConn([[], [{"id": "s1"}]])
     with pytest.raises(ValueError):
         voiceprints.add_sample(conn, CO, VP, _emb(128), source="enrolment",
                                s3_key="k", window=(0.0, 1.0), created_by="u1",
@@ -76,12 +82,12 @@ def test_a_wrong_length_embedding_is_refused_before_it_reaches_the_database():
 
 
 def test_a_sample_keeps_the_pointer_back_to_the_correction_that_made_it():
-    conn = FakeConn([[{"id": "s1"}]])
+    conn = FakeConn([[], [{"id": "s1"}]])
     voiceprints.add_sample(conn, CO, VP, _emb(), source="correction",
                            s3_key="k", window=(1.0, 4.0), created_by="u1",
                            correction_ref="corr-9")
-    assert "corr-9" in conn.calls[0]["params"]
-    assert "correction_ref" in conn.calls[0]["sql"]
+    assert "corr-9" in _insert(conn)["params"]
+    assert "correction_ref" in _insert(conn)["sql"]
 
 
 # ---- profiles_for_matching: the query whose mistakes are invisible ----
@@ -519,3 +525,96 @@ def test_removing_a_name_does_not_touch_the_voiceprint():
     voiceprints.unname(conn, CO, session_base="s", display_name="Ben L")
     assert len(conn.calls) == 1
     assert "speaker_voiceprint" not in conn.calls[0]["sql"]
+
+
+# ---- the same name is not the same person ---------------------------------
+#
+# `upsert_profile` finds an existing profile by NAME, so two people called "Leo"
+# confirmed by the same person land on one profile — and a profile cannot be
+# un-poisoned, only the contributing sample deleted.
+#
+# The guard compares an ORDER, never a threshold. A cross-session absolute cosine
+# is not a stable quantity here (Phase 0: the same person varying by >0.2 across
+# sessions), so a floor drawn today would reject legitimate second samples and
+# would have been drawn from nothing. Both numbers below are measured on the same
+# audio, so whatever lowers one lowers the other.
+
+OTHER = "33333333-3333-3333-3333-333333333333"
+
+
+def _profile_row(pid, vec):
+    return {"id": pid, "display_name": "x", "status": "active", "user_id": None,
+            "sample_id": "s", "embedding": vec}
+
+
+def _near(v, k):
+    """A vector like v but nudged, so cosine(v, out) falls as k grows."""
+    out = list(v)
+    for i in range(0, k):
+        out[i] = -out[i] - 1.0
+    return out
+
+
+def test_a_sample_closer_to_another_profile_is_refused():
+    me = _emb()
+    conn = FakeConn([[_profile_row(VP, _near(me, 40)),      # my profile: further
+                      _profile_row(OTHER, _near(me, 2))]])  # somebody else: nearer
+    with pytest.raises(voiceprints.EnrolmentBelongsToSomebodyElse) as exc:
+        voiceprints.add_sample(conn, CO, VP, me, source="correction", s3_key="k",
+                               window=(0.0, 4.0))
+    assert exc.value.nearest_other_id == OTHER
+    assert exc.value.best_other > exc.value.own
+    assert not any(c["sql"].startswith("INSERT") for c in conn.calls), \
+        "it was refused and stored anyway"
+
+
+def test_a_sample_nearest_its_own_profile_is_stored():
+    me = _emb()
+    conn = FakeConn([[_profile_row(VP, _near(me, 2)),
+                      _profile_row(OTHER, _near(me, 40))], [{"id": "s1"}]])
+    voiceprints.add_sample(conn, CO, VP, me, source="correction", s3_key="k",
+                           window=(0.0, 4.0))
+    assert _insert(conn)["sql"].startswith("INSERT")
+
+
+def test_the_first_sample_of_a_profile_is_never_refused():
+    """There is nothing to be closer to. Refusing here would make a profile
+    impossible to start."""
+    me = _emb()
+    conn = FakeConn([[_profile_row(OTHER, _near(me, 1))], [{"id": "s1"}]])
+    voiceprints.add_sample(conn, CO, VP, me, source="correction", s3_key="k",
+                           window=(0.0, 4.0))
+    assert _insert(conn)["sql"].startswith("INSERT")
+
+
+def test_both_agreements_are_recorded_on_the_row():
+    """The numbers a threshold would eventually be drawn FROM. Recording them is the
+    whole reason a threshold does not have to be invented today."""
+    me = _emb()
+    conn = FakeConn([[_profile_row(VP, _near(me, 2)),
+                      _profile_row(OTHER, _near(me, 40))], [{"id": "s1"}]])
+    voiceprints.add_sample(conn, CO, VP, me, source="correction", s3_key="k",
+                           window=(0.0, 4.0))
+    call = _insert(conn)
+    assert "agreement_own" in call["sql"] and "agreement_best_other" in call["sql"]
+    nums = [p for p in call["params"] if isinstance(p, float) and -1.0 <= p <= 1.0]
+    assert len(nums) >= 2, "the two agreements did not reach the row"
+
+
+def test_a_lone_profile_records_no_runner_up_rather_than_a_zero():
+    """NULL is the honest answer. A fabricated 0.0 would poison the very dataset the
+    threshold is meant to come from."""
+    me = _emb()
+    conn = FakeConn([[_profile_row(VP, _near(me, 2))], [{"id": "s1"}]])
+    voiceprints.add_sample(conn, CO, VP, me, source="correction", s3_key="k",
+                           window=(0.0, 4.0))
+    params = _insert(conn)["params"]
+    assert params[-1] is None and params[-2] is None, "a zero was invented"
+
+
+def test_the_comparison_is_company_scoped():
+    me = _emb()
+    conn = FakeConn([[], [{"id": "s1"}]])
+    voiceprints.add_sample(conn, CO, VP, me, source="correction", s3_key="k",
+                           window=(0.0, 4.0))
+    assert CO in conn.calls[0]["params"], "profiles were read without a company scope"
