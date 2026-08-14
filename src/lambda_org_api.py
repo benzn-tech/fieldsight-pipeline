@@ -614,6 +614,9 @@ def dispatch(conn, event, method, route):
     m_srs = re.match(r"^/sessions/([^/]+)/report/status$", route)
     if m_srs and method == "GET":
         return session_report_status(conn, caller, m_srs.group(1), event)
+    m_sm = re.match(r"^/sessions/([^/]+)/speaker-match$", route)
+    if m_sm and method == "POST":
+        return speaker_match(conn, caller, m_sm.group(1), event)
     m_un = re.match(r"^/sessions/([^/]+)/speaker-names$", route)
     if m_un and method == "DELETE":
         return unname_speaker(conn, caller, m_un.group(1), event)
@@ -1248,6 +1251,64 @@ def _session_turns(folder, date, session_base):
         out.append({"source_filename": name, "start_sec": float(start),
                     "end_sec": float(start) + float(seg.get("duration") or 0.0)})
     return out
+
+
+def speaker_match(conn, caller, session_base, event):
+    """POST /api/org/sessions/{session}/speaker-match — name a session from stored profiles.
+
+    Phase 5, as a request rather than a schedule. Doing it on demand is what makes it usable
+    on the sessions that ALREADY exist: automatic naming at finalize only ever helps future
+    meetings, and the reason to want this at all is the archive.
+
+    Queues the same artifact shape as a correction, on the same prefix and the same trigger,
+    distinguished by `op`. It carries the session's turns and **no voice vectors** — the
+    matcher fetches those synchronously from the in-VPC writer, so they are never at rest in
+    a bucket. That is the constraint this whole split exists to hold.
+
+    `SPEAKER_IDENTITY_MODE` decides what comes of it: `shadow` computes and logs and writes
+    no name, `on` writes names. The endpoint answers 202 either way and says which, because
+    "it ran and deliberately wrote nothing" and "it ran and found nobody" are different
+    answers that would otherwise look the same.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+
+    body = parse_body(event) or {}
+    company_id = str(caller["company_id"])
+    folder, err = _resolve_org_media_folder(conn, caller, body.get("user") or "",
+                                            what="speaker match")
+    if err is not None:
+        return err
+    date_m = re.search(r"(\d{4}-\d{2}-\d{2})", session_base or "")
+    if not date_m:
+        return error("session id must carry its date (…_YYYY-MM-DD_…)", 400)
+    session_key = turn_name_overlay.session_base(session_base)
+    if not session_key:
+        return error("session id must carry its sid (…_sid<32 hex>)", 400)
+
+    turns = _session_turns(folder, date_m.group(1), session_base)
+    if not turns:
+        # A 202 here would promise work that cannot happen. The usual cause is a session
+        # whose transcripts are not written yet, which is a wait, not a failure.
+        return error("no transcribed turns found for this session yet", 409)
+
+    request_id = uuid.uuid4().hex
+    s3().put_object(
+        Bucket=LAKE_BUCKET,
+        Key=f"voiceprint_requests/{company_id}/{session_base}/match-{request_id}.json",
+        Body=json.dumps({"op": "match", "request_id": request_id,
+                         "session_base": session_key, "company_id": company_id,
+                         "user_folder": folder, "date": date_m.group(1),
+                         "requested_by": str(caller["id"]),
+                         "mode": SPEAKER_IDENTITY_MODE, "turns": turns}, default=str),
+        ContentType="application/json")
+    logger.info("speaker match queued: session=%s mode=%s turns=%d",
+                session_key, SPEAKER_IDENTITY_MODE, len(turns))
+    return ok({"requestId": request_id, "sessionBase": session_key,
+               "turnsQueued": len(turns), "mode": SPEAKER_IDENTITY_MODE,
+               "willWriteNames": SPEAKER_IDENTITY_MODE == "on"}, 202)
 
 
 def unname_speaker(conn, caller, session_base, event):
