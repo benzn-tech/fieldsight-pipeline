@@ -1223,6 +1223,30 @@ def session_report_generate(conn, caller, session_id, event):
 _CORRECTION_ROLES = ("admin", "gm", "pm", "site_manager", "platform_admin")
 
 
+def _may_correct_speakers(conn, caller, folder):
+    """May `caller` put a name on a passage of `folder`'s recording?
+
+    The role list, OR the caller's own folder. The second arm was added 2026-08-14: a
+    `worker` is the tier that means "your own recordings and nobody else's", and it could not
+    name a speaker in its own meeting — which is the ordinary case, because the person who
+    pressed record is the person who knows who was in the room.
+
+    **It compares against the caller's OWN folder, not against whether the read was
+    allowed.** Those are different questions and conflating them hands the write away:
+    `regional_manager` is absent from the role list but has SITE scope, so
+    `_resolve_org_media_folder` returns a colleague's folder for it quite happily. Gating on
+    "the resolve succeeded" would have let it rename speakers in any recording on its sites.
+
+    Visibility is deliberately untouched. This adds one act on your own recording; it does
+    not widen what anyone can see, and `_resolve_org_media_folder` still runs first.
+    """
+    if caller.get("global_role") in _CORRECTION_ROLES:
+        return True
+    if not folder:
+        return False
+    return folder == scope.visible_scope(conn, caller).get("self_folder")
+
+
 def _session_turns(folder, date, session_base):
     """Every turn of one session, as (file, offset) pairs the embedder can cut audio with.
 
@@ -1327,8 +1351,6 @@ def unname_speaker(conn, caller, session_base, event):
     """
     if SPEAKER_IDENTITY_MODE == "off":
         return error("not found", 404)
-    if caller["global_role"] not in _CORRECTION_ROLES:
-        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
     name = ((event.get("queryStringParameters") or {}).get("name") or "").strip()
     if not name:
         return error("name is required (?name=…): removing every name in the session is a "
@@ -1336,6 +1358,25 @@ def unname_speaker(conn, caller, session_base, event):
     key = turn_name_overlay.session_base(session_base)
     if not key:
         return error("session id must carry its sid (…_sid<32 hex>)", 400)
+    # Unlike the POST, this request carries no folder — a session id and a name, nothing
+    # else. So "is this yours?" is answered from the session itself, against `topics`, whose
+    # extraction keys are `extractions/{folder}/{date}/{session_base}.json`.
+    #
+    # Deliberately NOT by parsing the folder out of `session_base`: that string is caller
+    # input, and using caller input to decide whose recording it is undoes the guard it is
+    # supposed to be. The chunk-session filename also carries the folder lower-cased, so a
+    # parse would have had to compare case-insensitively — a second reason to ask the
+    # database instead.
+    #
+    # `!= 1` is a refusal, not a pass. An empty answer is ordinary (extraction may not have
+    # landed yet) and means we could not establish ownership; could-not-establish is never
+    # permission. The role arm short-circuits so managers never depend on this query.
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        owners = topics.folders_for_session_base(conn, str(caller["company_id"]), key)
+        self_folder = scope.visible_scope(conn, caller).get("self_folder")
+        if len(owners) != 1 or not self_folder or owners[0] != self_folder:
+            return error("removing a name needs an admin, gm, pm, site_manager or "
+                         "platform_admin role, or your own recording", 403)
     n = voiceprints.unname(conn, str(caller["company_id"]), session_base=key,
                            display_name=name)
     logger.info("speaker name removed: session=%s name=%s turns=%d", key, name, n)
@@ -1392,12 +1433,28 @@ def speaker_corrections(conn, caller, session_base, event):
     """
     if SPEAKER_IDENTITY_MODE == "off":
         return error("not found", 404)
-    if caller["global_role"] not in _CORRECTION_ROLES:
-        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
 
     body = parse_body(event)
     if body is None:
         return error("malformed JSON body", 400)
+
+    # Authorisation runs BEFORE the field validation below, and needs the folder to do it —
+    # so the resolve moved up here from further down. Ordering it the other way told an
+    # unauthorised caller which of their fields were malformed before telling them they had
+    # no business asking.
+    #
+    # The producer knows the folder and the date; the consumer must not guess them. A first
+    # version of the embedder derived them from `session_base` and built
+    # `users/{session}/audio//x.wav` — a key that cannot exist, so a missing field would
+    # have surfaced as a NoSuchKey far from its cause.
+    folder, err = _resolve_org_media_folder(conn, caller, body.get("user") or "",
+                                            what="speaker correction")
+    if err is not None:
+        return err
+    if not _may_correct_speakers(conn, caller, folder):
+        return error("naming a speaker needs an admin, gm, pm, site_manager or "
+                     "platform_admin role, or your own recording", 403)
+
     name = (body.get("display_name") or "").strip()
     if not name:
         return error("display_name is required", 400)
@@ -1433,14 +1490,6 @@ def speaker_corrections(conn, caller, session_base, event):
     # scoped to another's profiles.
     company_id = str(caller["company_id"])
 
-    # The producer knows the folder and the date; the consumer must not guess them. A first
-    # version of the embedder derived them from `session_base` and built
-    # `users/{session}/audio//x.wav` — a key that cannot exist, so a missing field would
-    # have surfaced as a NoSuchKey far from its cause.
-    folder, err = _resolve_org_media_folder(conn, caller, body.get("user") or "",
-                                            what="speaker correction")
-    if err is not None:
-        return err
     date_m = re.search(r"(\d{4}-\d{2}-\d{2})", session_base or "")
     if not date_m:
         return error("session id must carry its date (…_YYYY-MM-DD_…)", 400)
