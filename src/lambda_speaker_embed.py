@@ -99,7 +99,15 @@ def _ensure_model():
     return _session
 
 
-MAX_EMBED_SECONDS = float(os.environ.get("VOICEPRINT_MAX_EMBED_SECONDS", "20.0"))
+# Measured on the deployed function (1769 MB), embedding one window of each length with
+# the cap disabled:
+#
+#     20 s -> 537 MB      40 s -> 802 MB      60 s -> 1158 MB      80 s -> 1486 MB
+#
+# ~15.8 MB per second of audio over a ~220 MB baseline, which puts the ceiling near 98 s and
+# explains the 108 s window that killed it. 20.0 was a guess made before this was measured;
+# 45 s uses about half the available memory and gives each piece more than twice the context.
+MAX_EMBED_SECONDS = float(os.environ.get("VOICEPRINT_MAX_EMBED_SECONDS", "45.0"))
 
 
 def _embed_once(audio):
