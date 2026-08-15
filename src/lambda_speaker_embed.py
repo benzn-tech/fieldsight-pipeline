@@ -591,8 +591,21 @@ def _from_match_artifact(bucket, key):
 
     by_key = {p["person_key"]: p for p in profiles}
     named = []
+    skipped_no_runner_up = 0
     for r in out["results"]:
         if r.get("status") not in ("confirmed", "tentative") or not r.get("name"):
+            continue
+        if r.get("margin") is None:
+            # No runner-up: `decide_name` returns a name with a null margin when the pool
+            # holds ONE profile, meaning "the closest of the only person I know". Written to
+            # a transcript that reads as an identification, and it would land on every turn
+            # in the meeting including the other speakers' — the one enrolled name spread
+            # over everybody, which is worse than no name at all.
+            #
+            # Matching needs at least two profiles before it can say anything. That is not a
+            # tuning choice: with overlapping score distributions and no usable absolute
+            # threshold, one candidate cannot be told from a stranger.
+            skipped_no_runner_up += 1
             continue
         turn = r["turn"]
         named.append({
@@ -606,6 +619,13 @@ def _from_match_artifact(bucket, key):
             "margin": r.get("margin"),
         })
 
+    if skipped_no_runner_up:
+        # Loud, because the symptom is indistinguishable from "the matcher did nothing".
+        logger.warning(
+            "match: %d turn(s) had a nearest profile but no runner-up to beat — the company "
+            "has %d matchable profile(s) and discrimination needs at least 2",
+            skipped_no_runner_up, len(profiles))
+
     mode = (req.get("mode") or "").lower()
     if mode != "on":
         # `shadow` computes everything and writes nothing. The scores are the point of the
@@ -617,8 +637,13 @@ def _from_match_artifact(bucket, key):
         return {"session": session, "matched": 0, "wouldMatch": len(named),
                 "profiles": len(profiles), "mode": mode or "off"}
 
-    written = invoke_writer({"op": "match_names", "company_id": company_id,
-                             "session_base": session, "results": named}).get("written", 0)
+    # No invoke when there is nothing to write: an empty write is a database round trip
+    # that reports success, and "wrote 0 rows" then looks like "the writer is fine".
+    written = 0
+    if named:
+        written = invoke_writer({"op": "match_names", "company_id": company_id,
+                                 "session_base": session,
+                                 "results": named}).get("written", 0)
     logger.info("match: session=%s named %d of %d turns against %d profiles",
                 session, written, len(out["results"]), len(profiles))
     return {"session": session, "matched": written, "profiles": len(profiles), "mode": mode}
