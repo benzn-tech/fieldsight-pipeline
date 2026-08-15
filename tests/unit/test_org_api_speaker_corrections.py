@@ -68,6 +68,10 @@ def wired(monkeypatch):
     monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: dict(CALLER))
     monkeypatch.setattr(org, "_resolve_org_media_folder",
                         lambda conn, caller, user, what=None: ("Ada_L", None))
+    # The ownership arm of _may_correct_speakers reads this; FakeConn has no cursor, and a
+    # real query here would only be re-testing repositories.scope.
+    monkeypatch.setattr(org.scope, "visible_scope",
+                        lambda conn, caller: {"self_folder": "Ada_L", "user_scope": "ALL"})
     monkeypatch.setattr(org, "profiles_for_matching",
                         lambda conn, company_id, site_id=None: [
                             {"id": "vp-1", "user_id": "u-9", "display_name": "Ben L",
@@ -167,10 +171,21 @@ def test_a_malformed_body_is_refused_before_anything_is_read(wired):
     assert wired.puts == []
 
 
-def test_a_worker_may_not_correct(wired, monkeypatch):
-    """Naming a voice is a claim about a person that follows them into future sessions."""
+def test_a_worker_may_not_correct_someone_elses_recording(wired, monkeypatch):
+    """Was `test_a_worker_may_not_correct`, on the reasoning that "naming a voice is a claim
+    about a person that follows them into future sessions".
+
+    Two things retired that reasoning. It does not follow them into future sessions —
+    matching against stored profiles is backend Phase 5 and has no caller; naming propagates
+    inside ONE meeting. And the rule it produced meant the person who pressed record could
+    not say who was in the room, which is the ordinary case and not an edge one.
+
+    So the restriction narrowed from "not a worker" to "not someone else's recording", which
+    is what it was protecting. Product decision, 2026-08-14."""
     monkeypatch.setattr(org.users, "get_user_by_sub",
                         lambda conn, sub: dict(CALLER, global_role="worker"))
+    monkeypatch.setattr(org, "_resolve_org_media_folder",
+                        lambda conn, caller, user, what=None: ("Someone_Else", None))
     res = org.lambda_handler(_event(BODY), None)
     assert res["statusCode"] == 403
     assert wired.puts == []
@@ -500,10 +515,11 @@ def test_a_missing_name_is_refused(wired):
     assert res["statusCode"] == 400
 
 
-def test_a_worker_cannot_take_a_name_off(wired, monkeypatch):
-    monkeypatch.setattr(org.users, "get_user_by_sub",
-                        lambda conn, sub: dict(CALLER, global_role="worker"))
-    assert org.lambda_handler(_unname_event(), None)["statusCode"] == 403
+# `test_a_worker_cannot_take_a_name_off` was here and is deleted with the behaviour it
+# pinned: a worker may now take a name off their OWN meeting (product decision 2026-08-14 —
+# "每个用户都有权利标记对话的人是谁"). Three tests replaced it, at the bottom of this file,
+# and they are stricter than it was: someone else's meeting is refused, an owner that cannot
+# be established is refused, and the role arm still short-circuits the lookup.
 
 
 def test_unnaming_404s_when_the_feature_is_off(wired, monkeypatch):
@@ -587,3 +603,132 @@ def test_match_404s_when_the_feature_is_off(wired, monkeypatch):
     _turns(monkeypatch)
     monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "off")
     assert org.lambda_handler(_match_event(), None)["statusCode"] == 404
+
+
+# ---- who may name a speaker --------------------------------------------
+#
+# Until 2026-08-14 this was a role list and nothing else, so a `worker` — the tier that
+# means "you can see your own recordings and nobody else's" — could not put a name on a
+# passage of their OWN meeting. That is the ordinary case, not an edge one: the person who
+# pressed record is the person who knows who was in the room.
+#
+# The arm added here is ownership, and ONLY ownership. Visibility is untouched: a worker
+# still cannot see, let alone rename, anyone else's recording.
+
+
+def _as(role, folder="Ada_L"):
+    c = dict(CALLER)
+    c["global_role"] = role
+    c["folder_name"] = folder
+    return c
+
+
+def test_a_worker_may_name_a_speaker_in_their_own_recording(wired, monkeypatch):
+    monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: _as("worker"))
+    monkeypatch.setattr(org.scope, "visible_scope",
+                        lambda conn, caller: {"self_folder": "Ada_L", "user_scope": "SELF"})
+    res = org.lambda_handler(_event(BODY), None)
+    assert res["statusCode"] == 202, _body(res)
+    assert len(wired.puts) == 1
+
+
+def test_a_worker_may_not_name_a_speaker_in_someone_elses_recording(wired, monkeypatch):
+    """The folder the request resolved to is not the caller's own. Refused even though the
+    ACL let the read through — the two questions are different."""
+    monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: _as("worker"))
+    monkeypatch.setattr(org, "_resolve_org_media_folder",
+                        lambda conn, caller, user, what=None: ("Someone_Else", None))
+    monkeypatch.setattr(org.scope, "visible_scope",
+                        lambda conn, caller: {"self_folder": "Ada_L", "user_scope": "SELF"})
+    res = org.lambda_handler(_event(BODY), None)
+    assert res["statusCode"] == 403, _body(res)
+    assert wired.puts == [], "a correction was queued for another person's recording"
+
+
+def test_a_role_that_can_VIEW_another_folder_still_cannot_name_in_it(wired, monkeypatch):
+    """`regional_manager` is NOT in the correction roles, but its scope is SITE — it can
+    view any member of an in-scope site, so `_resolve_org_media_folder` returns their folder
+    happily. Leaning on that resolve succeeding would have handed it the write. The gate
+    compares against the caller's OWN folder, not against whether the read was allowed."""
+    monkeypatch.setattr(org.users, "get_user_by_sub",
+                        lambda conn, sub: _as("regional_manager"))
+    monkeypatch.setattr(org, "_resolve_org_media_folder",
+                        lambda conn, caller, user, what=None: ("Someone_Else", None))
+    monkeypatch.setattr(org.scope, "visible_scope",
+                        lambda conn, caller: {"self_folder": "Ada_L", "user_scope": "SITE"})
+    res = org.lambda_handler(_event(BODY), None)
+    assert res["statusCode"] == 403, _body(res)
+    assert wired.puts == []
+
+
+def test_a_manager_still_names_in_anyone_elses_recording(wired, monkeypatch):
+    """The role arm is unchanged. This is the behaviour that already shipped."""
+    monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: _as("site_manager"))
+    monkeypatch.setattr(org, "_resolve_org_media_folder",
+                        lambda conn, caller, user, what=None: ("Someone_Else", None))
+    monkeypatch.setattr(org.scope, "visible_scope",
+                        lambda conn, caller: {"self_folder": "Ada_L",
+                                              "user_scope": "SELF_WORKERS"})
+    res = org.lambda_handler(_event(BODY), None)
+    assert res["statusCode"] == 202, _body(res)
+    assert len(wired.puts) == 1
+
+
+# ---- taking a name off YOUR OWN meeting ---------------------------------
+#
+# The DELETE carries a session and a name and nothing else — no folder — so "is this yours?"
+# has to be answered from the session itself. It is answered against `topics`, whose
+# extraction keys are `extractions/{folder}/{date}/{session_base}.json`, and NOT by parsing
+# the folder out of the session id: the session id is caller input, and using caller input
+# to decide whose recording it is would be the whole guard undone.
+
+
+def _owned_by(*folders):
+    return lambda conn, company_id, session_base: list(folders)
+
+
+def test_a_worker_can_take_a_name_off_their_own_meeting(wired, monkeypatch):
+    monkeypatch.setattr(org.users, "get_user_by_sub",
+                        lambda conn, sub: dict(CALLER, global_role="worker"))
+    monkeypatch.setattr(org.topics, "folders_for_session_base", _owned_by("Ada_L"))
+    monkeypatch.setattr(org.voiceprints, "unname",
+                        lambda conn, company_id, session_base, display_name: 3)
+    res = org.lambda_handler(_unname_event(), None)
+    assert res["statusCode"] == 200, _body(res)
+    assert _body(res)["turnsUnnamed"] == 3
+
+
+def test_a_worker_cannot_take_a_name_off_someone_elses_meeting(wired, monkeypatch):
+    monkeypatch.setattr(org.users, "get_user_by_sub",
+                        lambda conn, sub: dict(CALLER, global_role="worker"))
+    monkeypatch.setattr(org.topics, "folders_for_session_base", _owned_by("Someone_Else"))
+    called = []
+    monkeypatch.setattr(org.voiceprints, "unname",
+                        lambda *a, **k: called.append(1) or 3)
+    assert org.lambda_handler(_unname_event(), None)["statusCode"] == 403
+    assert called == [], "a name was removed from another crew's meeting"
+
+
+def test_an_unestablished_owner_is_a_refusal_not_a_pass(wired, monkeypatch):
+    """No topics for the session yet — extraction may simply not have landed. Length != 1 is
+    'could not establish', and could-not-establish is never permission."""
+    monkeypatch.setattr(org.users, "get_user_by_sub",
+                        lambda conn, sub: dict(CALLER, global_role="worker"))
+    monkeypatch.setattr(org.topics, "folders_for_session_base", _owned_by())
+    called = []
+    monkeypatch.setattr(org.voiceprints, "unname", lambda *a, **k: called.append(1) or 3)
+    assert org.lambda_handler(_unname_event(), None)["statusCode"] == 403
+    assert called == []
+
+
+def test_a_manager_does_not_pay_for_the_ownership_lookup(wired, monkeypatch):
+    """The role arm short-circuits: managers were already allowed and must not start
+    depending on a query that can legitimately return nothing."""
+    looked = []
+    monkeypatch.setattr(org.topics, "folders_for_session_base",
+                        lambda *a, **k: looked.append(1) or [])
+    monkeypatch.setattr(org.voiceprints, "unname",
+                        lambda conn, company_id, session_base, display_name: 2)
+    res = org.lambda_handler(_unname_event(), None)
+    assert res["statusCode"] == 200, _body(res)
+    assert looked == [], "the ownership query ran for a caller the role arm already allowed"
