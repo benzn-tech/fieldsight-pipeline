@@ -1135,3 +1135,33 @@ def test_the_pieces_are_normalised_before_they_are_averaged(monkeypatch):
     n = int(se.MAX_EMBED_SECONDS * 2 * 16000)
     out = se.embed_audio(np.zeros(n, dtype=np.float32), 16000)
     assert abs(out[0] - out[1]) < 1e-6, "the louder piece dominated the average"
+
+
+def test_the_same_audio_is_not_downloaded_once_per_turn(stub_embedder, monkeypatch):
+    """A session's turns are, by construction, all from the same handful of files. Fetching
+    and decoding each one per turn cost ~176 ms and a few megabytes every time."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    turns = [{"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+              "start_sec": float(i), "end_sec": float(i) + 5} for i in range(6)]
+    s3 = FakeS3({art: _match_artifact(turns=turns), key: _wav_bytes(seconds=30.0)})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    _writer(monkeypatch, [_profile()], [])
+
+    se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                           "object": {"key": art}}}]}, None)
+    assert s3.gets.count(key) == 1, f"downloaded {s3.gets.count(key)} times for 6 turns"
+
+
+def test_one_invocation_never_serves_another_its_audio(stub_embedder, monkeypatch):
+    """A warm container must not carry one session's audio into the next: the cache is a
+    within-run optimisation, and a stale hit would embed the wrong recording."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    s3 = FakeS3({art: _match_artifact(), key: _wav_bytes()})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    _writer(monkeypatch, [_profile()], [])
+    ev = {"Records": [{"s3": {"bucket": {"name": "b"}, "object": {"key": art}}}]}
+    se.lambda_handler(ev, None)
+    se.lambda_handler(ev, None)
+    assert s3.gets.count(key) == 2, "the second invocation reused the first one's audio"

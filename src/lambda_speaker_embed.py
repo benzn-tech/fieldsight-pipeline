@@ -186,9 +186,31 @@ def _get(key):
     return s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
 
 
+# Decoded audio for the invocation in flight, keyed by S3 key. Cleared at the top of every
+# handler call so a warm container never carries one session's audio into the next.
+#
+# Every turn used to re-download and re-parse the same object: a session of 100 turns from
+# one batch fetched the same few chunks 100 times, ~176 ms and a few megabytes each. The
+# turns in a match run are, by construction, all from the same handful of files.
+_AUDIO_CACHE = {}
+_AUDIO_CACHE_MAX = 8   # ~2 MB each as float32; the bound exists so a long session cannot
+                       # accumulate the whole recording in memory beside the model
+
+
+def _read_cached(key):
+    hit = _AUDIO_CACHE.get(key)
+    if hit is not None:
+        return hit
+    value = _read_wav(_get(key))
+    if len(_AUDIO_CACHE) >= _AUDIO_CACHE_MAX:
+        _AUDIO_CACHE.pop(next(iter(_AUDIO_CACHE)))
+    _AUDIO_CACHE[key] = value
+    return value
+
+
 def _fetch(user_folder, date, source_filename):
     key = _raw_key(user_folder, date, source_filename)
-    audio, sr = _read_wav(_get(key))
+    audio, sr = _read_cached(key)
     return key, audio, sr
 
 
@@ -229,7 +251,7 @@ def _window_audio(user_folder, date, source_filename, start, end):
         # beside raw_key_for so there is one implementation of each.
         raw, lo, hi = batch_seal.raw_window_for_member(p["chunk_key"], p["start_sec"],
                                                        p["end_sec"])
-        audio, sr = _read_wav(_get(raw))
+        audio, sr = _read_cached(raw)
         rate = sr
         first = first or raw
         parts.append(audio[int(lo * sr):int(hi * sr)])
@@ -603,6 +625,7 @@ def _from_match_artifact(bucket, key):
 
 
 def lambda_handler(event, context):
+    _AUDIO_CACHE.clear()
     records = (event or {}).get("Records")
     if records:
         # An S3 event carries `Records`, not `op`. Without this branch the function dies in
