@@ -99,13 +99,54 @@ def _ensure_model():
     return _session
 
 
-def embed_audio(audio, sample_rate):
-    """One 192-d vector for this audio. Stubbed in tests; the model's fidelity is pinned by
-    test_voiceprint_onnx_parity against committed reference vectors."""
+MAX_EMBED_SECONDS = float(os.environ.get("VOICEPRINT_MAX_EMBED_SECONDS", "20.0"))
+
+
+def _embed_once(audio):
     sess = _ensure_model()
     out = sess.run(None, {"wav": np.asarray(audio, dtype=np.float32)[None, :],
                           "wav_lens": np.array([1.0], dtype=np.float32)})
     return np.asarray(out[0]).ravel()
+
+
+def embed_audio(audio, sample_rate):
+    """One 192-d vector for this audio. Stubbed in tests; the model's fidelity is pinned by
+    test_voiceprint_onnx_parity against committed reference vectors.
+
+    **Long audio is embedded in pieces and averaged, not in one pass.** ECAPA's convolutions
+    run the full length of the input, so the activations grow with it: a 108-second turn
+    killed this function with `Runtime.OutOfMemory` at 1769 MB after 40 seconds, on the
+    first real enrolment attempted against whole-chunk transcription. Every earlier run —
+    Phase 0, the parity fixtures, yesterday's live verification — used a window of a few
+    seconds, so nothing had ever asked the model for a long one.
+
+    A 108-second turn is not unusual. `TRANSCRIBE_WHOLE_CHUNK` produces turns the length of
+    the chunk, and the matcher embeds EVERY turn in a session, so the ceiling is reached
+    immediately rather than rarely.
+
+    Averaging unit vectors is the ordinary treatment for an utterance longer than the model
+    was trained on, and it is what `window_is_homogeneous` already does with the same
+    frames. Audio at or under the cap takes the single-pass path untouched, so the parity
+    fixtures still compare like with like.
+    """
+    audio = np.asarray(audio, dtype=np.float32)
+    cap = int(MAX_EMBED_SECONDS * sample_rate)
+    if len(audio) <= cap:
+        return _embed_once(audio)
+
+    vecs = []
+    for i in range(0, len(audio) - cap + 1, cap):
+        v = _embed_once(audio[i:i + cap])
+        n = np.linalg.norm(v)
+        if n:
+            # Normalised BEFORE averaging: the scores this feeds are cosines, so a piece
+            # with a larger norm is not more of an opinion about who is speaking.
+            vecs.append(v / n)
+    if not vecs:
+        return _embed_once(audio[:cap])
+    mean = np.mean(vecs, axis=0)
+    n = np.linalg.norm(mean)
+    return mean / n if n else mean
 
 
 def _raw_key(user_folder, date, source_filename):
