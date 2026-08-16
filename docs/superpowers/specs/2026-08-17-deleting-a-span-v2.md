@@ -64,7 +64,7 @@ Before the re-extraction runs, move the session's rows aside, keyed on the delet
 | `topics` | the anchor everything else hangs off |
 | `action_items` | **the check-off is `status`, a column on this row** — plus assignee, deadline, priority |
 | `safety_observations`, `findings`, `topic_photos` | CASCADE from topics |
-| `topic_threads` | confirmed recurring-item links, CASCADE |
+| `topic_thread_suggestions` | the topic's unanswered thread proposals, CASCADE. **Not `topic_threads`** — a confirmed thread survives a topic delete, because `topics.thread_id` is the reverse link and is SET NULL. What a delete costs is membership and pending suggestions |
 | `report_chunks` | already done — `archive_chunks_for_session` ships |
 | `programme_progress_suggestions` | **not an FK problem.** It stores FROZEN COPIES of the text — `topic_title text NOT NULL`, `topic_summary text` — beside a `topic_id` that is SET NULL, so the sentence survives the topic. Filtered at the read instead of archived, both arms; **fixed separately and already shipped**, because the whole-recording delete had the same hole |
 
