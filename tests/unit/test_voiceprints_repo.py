@@ -841,3 +841,24 @@ def test_the_human_sample_check_is_company_scoped():
     conn = FakeConn([[]])
     voiceprints.has_human_sample(conn, CO, "vp-1")
     assert CO in conn.calls[0]["params"]
+
+
+def test_no_parameter_is_used_only_in_an_untyped_null_test():
+    """`CASE WHEN %s IS NULL` gives Postgres nothing to infer a type from, and it refuses the
+    whole statement: `IndeterminateDatatype: could not determine data type of parameter $7`.
+
+    A real correction on TEST returned 500 for exactly this while 3082 unit tests stayed
+    green — the connection double never type-checks, which is what the warning at the top of
+    CLAUDE.md's testing section is about. TWO sessions hit it independently within the hour,
+    which is the argument for a guard rather than a memory.
+
+    So this asserts on the SQL TEXT, the one thing a double can see. A cast (`%s::uuid IS
+    NULL`) is fine — it is the bare form that has no type to infer.
+    """
+    conn = FakeConn([[], [{"id": "vp-1"}]])
+    voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True,
+                               consented_by="u-9", user_id="u-42")
+    ins = next(c for c in conn.calls if c["sql"].startswith("INSERT"))
+    import re as _re
+    bare = _re.search(r"%s\s+IS\s+NULL", ins["sql"])
+    assert not bare, f"untyped parameter in a NULL test: {bare.group(0) if bare else ''}"
