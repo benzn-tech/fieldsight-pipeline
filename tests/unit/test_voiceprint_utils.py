@@ -303,3 +303,48 @@ def test_the_verdict_still_agrees_with_the_number():
     assert vp.window_is_homogeneous([near]) is None
     assert vp.window_is_homogeneous([near, far],
                                     max_spread=vp.frame_spread([near, far]) / 2) is False
+
+
+# ---- every candidate answer, computed once --------------------------------
+#
+# `frame_spread` does not separate one voice from two on real site audio:
+# 13 one-voice windows span 0.429-0.777 and 12 two-voice windows span
+# 0.445-1.022. That is a fact about the statistic, not about the number 0.35,
+# so the alternatives are computed side by side on the same frames and none of
+# them is chosen here.
+
+
+def test_a_single_frame_yields_no_statistics_rather_than_invented_ones():
+    assert vp.frame_statistics([_v(1.0)]) == {}
+    assert vp.frame_statistics([]) == {}
+
+
+def test_the_max_is_hostage_to_one_odd_frame_and_the_median_is_not():
+    """The reason to have both. A max over pairs is decided by whichever frame is most
+    unusual — for any reason, including a cough or a sentence ending — and real windows are
+    full of those."""
+    same = [_v(1.0, 0.0) for _ in range(6)]
+    stats = vp.frame_statistics(same + [_v(0.0, 1.0)])
+    assert stats["pair_max"] > 0.9, "one odd frame did not reach the max"
+    assert stats["pair_median"] < 0.5, "the median moved with a single odd frame"
+
+
+def test_the_centroid_measures_being_pulled_apart_not_one_outlier():
+    """Two voices move the centre between them, so EVERY frame sits off it. One odd frame
+    among many leaves the centre where it was."""
+    two_groups = [_v(1.0, 0.0)] * 4 + [_v(0.0, 1.0)] * 4
+    one_outlier = [_v(1.0, 0.0)] * 7 + [_v(0.0, 1.0)]
+    assert (vp.frame_statistics(two_groups)["centroid_mean"]
+            > vp.frame_statistics(one_outlier)["centroid_mean"])
+
+
+def test_the_cluster_count_answers_the_question_literally():
+    assert vp.frame_statistics([_v(1.0, 0.0)] * 5)["clusters"] == 1
+    assert vp.frame_statistics([_v(1.0, 0.0)] * 3 + [_v(0.0, 1.0)] * 3)["clusters"] == 2
+
+
+def test_the_current_statistic_is_reported_unchanged_for_comparison():
+    """A candidate is only judgeable against what it would replace."""
+    frames = [_v(1.0, 0.0), _v(0.0, 1.0), _v(1.0, 0.0)]
+    assert (vp.frame_statistics(frames)["pair_max"]
+            == pytest.approx(vp.frame_spread(frames), abs=1e-4))

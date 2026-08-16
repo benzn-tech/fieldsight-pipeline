@@ -264,3 +264,52 @@ def leave_one_out_centroid(members, index):
 # it had no caller, and its docstring went on describing one ("the caller refuses below
 # DEFAULT_MIN_MARGIN") that no longer existed. Dead code that documents an imaginary caller
 # is the same failure this module keeps producing, one level up.
+
+
+def frame_statistics(frame_embeddings) -> dict:
+    """Every candidate answer to "does this window hold one voice", from one set of frames.
+
+    `frame_spread` — the max over all pairs — does not separate one voice from two on this
+    audio. Measured on 13 windows of one person and 12 of two people, both from real site
+    recordings: one voice spans 0.429-0.777 and two voices span 0.445-1.022, so the classes
+    overlap across almost the whole of the first. No threshold on that statistic divides them,
+    which is a fact about the STATISTIC and not about the number 0.35.
+
+    The reason it fails is visible in the data: frames of one person, at steady loudness, sit
+    0.66 apart. A frame embedding carries what is being said, how fast, how far from the mic
+    and what else is in the room, and a MAXIMUM over pairs is decided by whichever frame is
+    most unusual for any of those reasons. Speaker identity is in there; it is not what the
+    maximum is measuring.
+
+    So this returns them all, computed once, and nothing here picks a winner. A candidate
+    earns its place by separating the two classes on the same data, or it does not ship.
+
+      pair_max     the current statistic, kept for comparison
+      pair_median  robust to the single odd frame a max is hostage to
+      centroid_max distance from the window's own mean, rather than pair to pair --
+                   two voices pull the centre between them and move every frame
+      centroid_mean the same, averaged
+      clusters     how many voices complete-linkage finds at tau, which is the literal
+                   question rather than a proxy for it
+
+    Returns {} for fewer than two frames: with one frame there is nothing to compare, and an
+    invented number would be worse than an absent one.
+    """
+    frames = [np.asarray(f, dtype=np.float64).ravel() for f in (frame_embeddings or [])]
+    if len(frames) < 2:
+        return {}
+
+    pair = [1.0 - cosine(frames[i], frames[j])
+            for i in range(len(frames)) for j in range(i + 1, len(frames))]
+    centre = np.mean(frames, axis=0)
+    to_centre = [1.0 - cosine(f, centre) for f in frames]
+    labels = cluster_turns(frames)
+
+    return {
+        "frames": len(frames),
+        "pair_max": round(float(max(pair)), 4),
+        "pair_median": round(float(np.median(pair)), 4),
+        "centroid_max": round(float(max(to_centre)), 4),
+        "centroid_mean": round(float(np.mean(to_centre)), 4),
+        "clusters": len(set(labels)),
+    }
