@@ -484,3 +484,64 @@ def test_an_already_named_turn_is_left_alone(monkeypatch):
         {"turn_ref": "f.json@11.0", "display_name": "Ivy", "source": "correction"}])
     assert vw._inherit_labels(None, CO, "s1", _map(("f.json@2.0", "f.json", "spk_0"),
                                                    ("f.json@11.0", "f.json", "spk_0"))) == 0
+
+
+# ---- harvested samples are a separate population --------------------------
+
+
+def _harvest_event(n=2, **over):
+    return dict({
+        "op": "propagation", "company_id": CO, "session_base": "s1",
+        "correction_ref": "corr-1",
+        "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed", "asserted": True}],
+        "enrol": {"voiceprint_id": "vp-1", "embedding": [0.1] * 192,
+                  "s3_key": "k", "window": [0.0, 20.0]},
+        "harvest": [{"voiceprint_id": "vp-1", "embedding": [0.2] * 192,
+                     "s3_key": f"k{i}", "window": [float(i), float(i) + 12],
+                     "created_by": "u-1"} for i in range(n)]}, **over)
+
+
+def test_harvested_samples_are_never_stored_as_human_ones(calls):
+    """The anchor is what a person vouched for; these are what the clustering suggested.
+    Indistinguishable in the database means a bad batch cannot be deleted without deleting
+    somebody's assertion, and `has_human_sample` could never tell them apart."""
+    out = vw.lambda_handler(_harvest_event(), None)
+    assert out["harvested"] == 2
+    sources = [s["source"] for s in calls["samples"]]
+    assert sources.count("correction") == 1, "the anchor is the only human sample"
+    assert sources.count("correction_propagation") == 2
+
+
+def test_every_harvested_sample_points_back_at_the_correction(calls):
+    """Withdrawal enumerates what a correction produced through `correction_ref`. A
+    harvested sample without it is an orphan the withdrawal cannot reach."""
+    vw.lambda_handler(_harvest_event(), None)
+    assert all(s["correction_ref"] == "corr-1" for s in calls["samples"])
+
+
+def test_one_refused_harvest_sample_does_not_discard_the_others(monkeypatch):
+    """They are independent windows; only the refused one is suspect."""
+    stored = []
+
+    def add(conn, company_id, vp_id, emb, **kw):
+        if kw.get("s3_key") == "k0":
+            raise vw.EnrolmentBelongsToSomebodyElse(0.4, 0.8, "vp-other")
+        stored.append(kw)
+        return {"id": "s"}
+
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "record_turn_name", lambda conn, co, **kw: {"id": "t"})
+    monkeypatch.setattr(vw, "add_sample", add)
+    out = vw.lambda_handler(_harvest_event(n=3), None)
+    assert out["harvested"] == 2 and out["harvestRefused"] == 1
+    # `stored` also holds the anchor; only the harvested ones are counted here.
+    assert len([x for x in stored
+                if x["source"] == "correction_propagation"]) == 2, "a refusal stopped the loop"
+
+
+def test_a_harvest_without_an_anchor_stores_nothing(calls):
+    """Harvest exists only as the other half of an enrolment. Without one there is no
+    profile the samples could honestly belong to."""
+    out = vw.lambda_handler(_harvest_event(enrol=None), None)
+    assert out["harvested"] == 0
+    assert calls["samples"] == []

@@ -77,6 +77,8 @@ def _propagation(event):
 
     written = 0
     declined = 0
+    harvested = 0
+    harvest_refused = 0
     with get_connection() as conn:
         for r in event.get("results") or []:
             asserted = bool(r.get("asserted"))
@@ -134,6 +136,30 @@ def _propagation(event):
                                  "own": exc.own, "bestOther": exc.best_other,
                                  "nearestOtherId": str(exc.nearest_other_id)}
                 logger.warning("enrolment refused for %s: %s", enrol["voiceprint_id"], exc)
+        # The cluster's other members, if the anchor survived its own checks. A SEPARATE
+        # source, permanently: the anchor is what a person vouched for, these are what the
+        # clustering suggested, and telling them apart later is the difference between
+        # deleting a bad batch and deleting somebody's assertion.
+        # Only alongside an anchor that survived. Harvest is the other HALF of an
+        # enrolment, not a thing of its own: without one there is no profile these samples
+        # could honestly belong to, and the producer's ordering guarantee would be the only
+        # thing standing between a refused window and six samples stored for it.
+        for h in (event.get("harvest") or []) if enrol and not enrol_refusal else []:
+            if not h.get("embedding"):
+                continue
+            w = h.get("window") or (None, None)
+            try:
+                add_sample(conn, company_id, h["voiceprint_id"], h["embedding"],
+                           source="correction_propagation", s3_key=h.get("s3_key"),
+                           window=(w[0], w[1]), created_by=h.get("created_by"),
+                           correction_ref=correction_ref)
+                harvested += 1
+            except EnrolmentBelongsToSomebodyElse as exc:
+                # PER SAMPLE. One refusal must not discard the rest: they are independent
+                # windows and only the refused one is suspect.
+                logger.warning("harvest sample refused: %s", exc)
+                harvest_refused += 1
+
         inherited = _inherit_labels(conn, company_id, session_base,
                                     event.get("label_map"))
     enrolled = bool(event.get("enrol")) and enrol_refusal is None
@@ -141,7 +167,8 @@ def _propagation(event):
                 written, session_base, tau, enrolled,
                 (enrol_refusal or {}).get("reason"))
     return {"written": written, "declined": declined, "inherited": inherited,
-            "enrolled": enrolled, "enrolRefused": enrol_refusal}
+            "enrolled": enrolled, "enrolRefused": enrol_refusal,
+            "harvested": harvested, "harvestRefused": harvest_refused}
 
 
 def _enrol(event):

@@ -531,3 +531,24 @@ def rejected_names(conn, company_id, session_base) -> set:
         "WHERE company_id = %s AND session_base = %s",
         (company_id, session_base)).fetchall()
     return {r["display_name"] for r in rows if r.get("display_name")}
+
+
+def has_human_sample(conn, company_id, voiceprint_id) -> bool:
+    """Whether any sample on this profile came from a window a person vouched for.
+
+    A profile can now be BUILT entirely from harvest — cluster members the machine selected
+    after one human named one turn. That is worth having: a single corrected window is often
+    under 10 s and makes a weak profile. But a profile assembled from inference must not be
+    able to earn confidence from inference, or the loop agrees with itself and no later
+    evidence can say where it started going wrong.
+
+    So: coverage may come from the machine, confidence only from people. This is the query
+    that keeps those apart, and it is the reason harvested samples carry their own `source`
+    rather than being indistinguishable from the anchor.
+    """
+    _require_company(company_id)
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT 1 FROM speaker_voiceprint_samples "
+        "WHERE company_id = %s AND voiceprint_id = %s AND source = 'correction' LIMIT 1",
+        (company_id, voiceprint_id)).fetchone()
+    return bool(row)

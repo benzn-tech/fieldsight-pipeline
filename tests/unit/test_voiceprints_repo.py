@@ -819,3 +819,25 @@ def test_no_site_asks_for_no_membership_join_at_all():
     conn = FakeConn([[]])
     voiceprints.profiles_for_matching(conn, CO)
     assert "memberships" not in _sql_of(conn)
+
+
+def test_a_profile_built_only_from_harvest_has_no_human_sample():
+    """Coverage may come from the machine; confidence only from people. A profile can now be
+    BUILT entirely from cluster members the machine selected after one human named one turn
+    — worth having, since a single corrected window is often under 10 s — but it must not be
+    able to earn confidence from inference, or the loop agrees with itself and no later
+    evidence can say where it started going wrong."""
+    conn = FakeConn([[]])
+    assert voiceprints.has_human_sample(conn, CO, "vp-1") is False
+    assert "source = 'correction'" in conn.calls[0]["sql"]
+
+
+def test_a_profile_with_one_vouched_window_has_a_human_sample():
+    conn = FakeConn([[{"?column?": 1}]])
+    assert voiceprints.has_human_sample(conn, CO, "vp-1") is True
+
+
+def test_the_human_sample_check_is_company_scoped():
+    conn = FakeConn([[]])
+    voiceprints.has_human_sample(conn, CO, "vp-1")
+    assert CO in conn.calls[0]["params"]

@@ -109,6 +109,18 @@ def _ensure_model():
 # 45 s uses about half the available memory and gives each piece more than twice the context.
 MAX_EMBED_SECONDS = float(os.environ.get("VOICEPRINT_MAX_EMBED_SECONDS", "45.0"))
 
+# Harvest: turning ONE naming gesture into a usable profile.
+#
+# 10 s, not the 3 s matching floor and not the 5 s a first draft picked.
+# `window_is_homogeneous` returns None for fewer than two frames and frames are cut at
+# FRAME_SECONDS = 5.0, so a 5-9.99 s window is UNJUDGEABLE — and "could not check" is
+# refused alongside "no", or the guard becomes decoration. A 5 s floor would have admitted
+# nothing at all, silently. `lambda_org_api` already documented this: "a window under ten
+# seconds cannot be judged homogeneous and is not enrolled".
+ENROL_MIN_TURN_S = float(os.environ.get("VOICEPRINT_ENROL_MIN_TURN_S", "10.0"))
+ENROL_MAX_SAMPLES = int(os.environ.get("VOICEPRINT_ENROL_MAX_SAMPLES", "6"))
+ENROL_MAX_SECONDS = float(os.environ.get("VOICEPRINT_ENROL_MAX_SECONDS", "60.0"))
+
 
 def _embed_once(audio):
     sess = _ensure_model()
@@ -318,6 +330,9 @@ def _match(event):
         d = vp.decide_name(vp.aggregate_scores(rows), duration_s=duration)
         status = d.status
         if status == "confirmed" and by_key.get(d.name, {}).get("status") == "tentative":
+            # (see below) a profile that has not earned confirmation cannot hand one out —
+            # and since harvest can build a profile entirely from inference, `tentative` is
+            # where such a profile stays until a person vouches for one of its windows.
             # A profile that has not earned confirmation cannot hand one out.
             status = "tentative"
         results.append({"turn": turn, "status": status, "name": d.name,
@@ -351,7 +366,7 @@ MAX_PROPAGATION_TURNS = int(os.environ.get("SPEAKER_PROPAGATION_MAX_TURNS", "300
 
 
 def _propagate(folder, date, turns, reference, display_name, asserted_ref,
-               why=None):
+               why=None, harvest=None):
     """Correct one passage, name that person's other passages in the same session.
 
     The unit is a VOICE, not a turn. Two spec revisions died scoring turns against the
@@ -441,6 +456,23 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref,
                 why.append("between-voices")
             return []
 
+    if harvest is not None:
+        # The cluster, ordered by how well each member agrees with the rest of it. This work
+        # is already done and was previously discarded: one correction stored ONE sample —
+        # the window the user pointed at — which is often shorter than 10 s and makes a weak
+        # profile. Selection happens here; whether any of it is STORED is the caller's
+        # decision, taken after the anchor's own refusal checks.
+        by_agreement = sorted(
+            (i for i in members if refs[i] != asserted_ref),
+            key=lambda i: vp.cosine(
+                vp.leave_one_out_centroid([vectors[j] for j in members],
+                                          members.index(i)),
+                vectors[i]),
+            reverse=True)
+        for i in by_agreement:
+            harvest.append({"turn": usable[i], "vector": vectors[i],
+                            "turn_ref": refs[i]})
+
     out = []
     for i in members:
         if refs[i] == asserted_ref:
@@ -451,6 +483,58 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref,
     logger.info("propagation: %d turns in %d voices, named %d",
                 len(vectors), len(groups), len(out))
     return out
+
+
+def _admit_harvest(folder, date, candidates):
+    """Which cluster members may become enrolment samples.
+
+    **This is a machine-fed path and it is labelled as one.** The human vouched for ONE turn;
+    every other member of the cluster was assigned by `cluster_turns`, and `_propagate` caps
+    those at `tentative` on purpose — "the margin that would justify `confirmed` has never
+    been measured, so an inferred name is a suggestion". Storing them as samples promotes a
+    suggestion to permanent biometric ground truth, so the writer records them under a
+    distinct source and a profile built only from them can never be promoted.
+
+    What makes it defensible rather than merely convenient: complete-linkage clustering at
+    tau = 0.85 means every member agrees with EVERY other at or above that threshold,
+    including the anchor the human vouched for — and 0.85 is the one number in this system
+    that was measured and frozen (Gate A, two Phase 0 sessions). It is a real bar. It is
+    simply not a human one.
+
+    Each admitted turn is re-fetched and re-framed: `_propagate` computes one whole-turn
+    embedding and drops the clip, and homogeneity needs FRAMES. Raw audio is cached per
+    invocation so the S3 cost is small; the ONNX cost is not (~98 ms per second of audio,
+    measured), which is what the caps are for.
+    """
+    admitted, seconds = [], 0.0
+    for c in candidates:
+        if len(admitted) >= ENROL_MAX_SAMPLES or seconds >= ENROL_MAX_SECONDS:
+            break
+        t = c["turn"]
+        start, end = float(t["start_sec"]), float(t["end_sec"])
+        duration = end - start
+        if duration < ENROL_MIN_TURN_S:
+            # Redundant with the homogeneity check and kept deliberately: a window under
+            # 10 s yields fewer than two frames, so `window_is_homogeneous` would return
+            # None and refuse it anyway. What this saves is the S3 read and the ONNX pass
+            # (~98 ms per second of audio, measured) for a turn that cannot possibly be
+            # admitted — and it says the rule out loud instead of leaving it as an emergent
+            # property of two constants that could drift apart.
+            continue
+        key, clip, sr = _window_audio(folder, date, t["source_filename"], start, end)
+        verdict = vp.window_is_homogeneous([embed_audio(f, sr) for f in _frames(clip, sr)])
+        if verdict is not True:
+            # None ("could not check") refused alongside False, exactly as the anchor's own
+            # check does. Admitting the unjudgeable is how a guard becomes decoration.
+            logger.info("harvest: %s not admitted (%s)", c["turn_ref"],
+                        "not homogeneous" if verdict is False else "unjudgeable")
+            continue
+        admitted.append({"embedding": [float(x) for x in c["vector"]],
+                         "s3_key": key, "window": [start, end]})
+        seconds += duration
+    logger.info("harvest: %d of %d cluster members admitted (%.1fs)",
+                len(admitted), len(candidates), seconds)
+    return admitted
 
 
 def _from_request_artifact(bucket, key):
@@ -492,8 +576,10 @@ def _from_request_artifact(bucket, key):
                 # a profile id would count as an independent human confirmation.
                 "voiceprint_id": (req.get("enrol") or {}).get("voiceprint_id")}]
     why = []
+    candidates = []
     propagated = _propagate(folder, date, req.get("turns") or [], v,
-                            c.get("display_name"), turn_ref, why=why)
+                            c.get("display_name"), turn_ref, why=why,
+                            harvest=candidates)
     refusal = why[0] if why else None
     results.extend(propagated)
 
@@ -532,6 +618,11 @@ def _from_request_artifact(bucket, key):
             logger.warning("enrolment refused: the corrected window holds more than one "
                            "voice")
             enrol = None
+    # AFTER the anchor's own checks, never before. `_propagate` runs first, so without this
+    # ordering six samples would be stored for a profile whose own corrected window had just
+    # been judged to hold two voices — the exact condition one sample is refused for.
+    harvested = _admit_harvest(folder, date, candidates) if enrol else []
+
     payload = {
         "op": "propagation",
         "company_id": req.get("company_id"),
@@ -543,6 +634,15 @@ def _from_request_artifact(bucket, key):
                    "embedding": [float(x) for x in v],
                    "s3_key": s3_key, "window": [start, end],
                    "created_by": req.get("requested_by")} if enrol else None),
+        # A LIST, and a separate key. Not the same act as the anchor: the anchor is what a
+        # person vouched for, these are what the clustering suggested, and the two
+        # populations must stay separable forever — for audit, for measurement, and so a bad
+        # batch can be deleted without touching what somebody asserted.
+        # No second `if enrol` here. `harvested` is already empty when the anchor was
+        # refused, so a guard in this expression could never change an outcome — and a
+        # guard no test can falsify is one nobody will notice going wrong.
+        "harvest": [dict(h, voiceprint_id=enrol["voiceprint_id"],
+                         created_by=req.get("requested_by")) for h in harvested],
     }
     invoke_writer(payload)
     logger.info("correction applied: session=%s ref=%s audio=%s",
