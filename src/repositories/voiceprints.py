@@ -80,7 +80,8 @@ def _require_company(company_id):
 
 
 def upsert_profile(conn, company_id, display_name=None, user_id=None,
-                   consent_given=False, consented_by=None) -> dict | None:
+                   consent_given=False, consented_by=None,
+                   linked_by=None, linked_on=None) -> dict | None:
     """The profile a name attaches to. Existing one if there is one, otherwise a new row.
 
     **Consent is a precondition, not a checkbox** (§6, §10). A voiceprint is biometric
@@ -130,14 +131,30 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
             "ORDER BY created_at LIMIT 1",
             (company_id, display_name, consented_by)).fetchone()
         if found:
+            # Link an EXISTING profile too, or the whole thing only works for profiles
+            # created after this shipped — and every profile in the database predates it,
+            # so site narrowing would stay a no-op for the entire existing population.
+            # That is the identical silent-inert failure this work exists to remove.
+            #
+            # `AND user_id IS NULL` so a link is never overwritten: a person is not
+            # re-identified by somebody typing the same name again.
+            if user_id:
+                cur.execute(
+                    "UPDATE speaker_voiceprints "
+                    "SET user_id = %s, linked_by = %s, linked_at = now(), linked_on = %s "
+                    "WHERE id = %s AND user_id IS NULL",
+                    (user_id, linked_by, linked_on, found["id"]))
             return found
     return cur.execute(
         "INSERT INTO speaker_voiceprints "
-        "(company_id, user_id, display_name, status, consent_at, consented_by) "
+        "(company_id, user_id, display_name, status, consent_at, consented_by, "
+        " linked_by, linked_at, linked_on) "
         "VALUES (%s, %s, %s, 'tentative', "
-        "        CASE WHEN %s THEN now() ELSE NULL END, %s) "
+        "        CASE WHEN %s THEN now() ELSE NULL END, %s, "
+        "        %s, CASE WHEN %s IS NULL THEN NULL ELSE now() END, %s) "
         "RETURNING id",
-        (company_id, user_id, display_name, bool(consent_given), consented_by),
+        (company_id, user_id, display_name, bool(consent_given), consented_by,
+         linked_by, user_id, linked_on),
     ).fetchone()
 
 
