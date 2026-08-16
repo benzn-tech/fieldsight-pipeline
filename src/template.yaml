@@ -2480,6 +2480,15 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/embeddings/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
+                # The deletion mirror, read by lambda_ingest.py:510 through
+                # deletion_mirror.deleted_sessions so the nightly rebuild does not put a
+                # deleted recording's turns back into the search index. Without this grant
+                # an EXISTING mirror answers 403, the lenient read swallows it into an
+                # empty set, and the filter is silently off — the same defect the archive
+                # was introduced to close, restored by a missing line of IAM. ListBucket is
+                # already granted below, so an ABSENT mirror is a 404 and reads as "nothing
+                # deleted", which is the correct answer.
+                - !Sub arn:aws:s3:::${IngestBucketName}/redactions/*
             - Effect: Allow
               # Task 4: after committing a report's topics, ingest emits a
               # match_requests/ artifact (match_request.emit) for the non-VPC
