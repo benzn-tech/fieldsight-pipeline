@@ -337,6 +337,14 @@ def _presign_key_is_deleted(s3_key):
     add a second wrong answer.
     """
     parts = (s3_key or "").split("/")
+    # reports/{date}/summary_report.json is only THREE segments, so the length check below
+    # skipped it -- and admin/gm skip the ownership check entirely, so that one object
+    # stayed downloadable byte for byte on a day whose sources were deleted. It is the same
+    # lake-wide file get_timeline already refuses to serve; refusing it in one door and
+    # signing it in the other is not a deletion.
+    if len(parts) == 3 and parts[0] == "reports" and re.match(r"^\d{4}-\d{2}-\d{2}$",
+                                                              parts[1] or ""):
+        return _any_folder_deleted_on(parts[1])
     if len(parts) < 4:
         return False
     top = parts[0]
@@ -372,7 +380,17 @@ def _any_folder_deleted_on(date):
         paginator = s3_client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="redactions/"):
             for obj in page.get("Contents", []):
-                if f"/{date}/" in obj["Key"]:
+                key = obj["Key"]
+                if f"/{date}/" not in key:
+                    continue
+                # The KEY existing is not the question -- undelete rewrites the document
+                # with the remaining sessions and writes an EMPTY one when none are left,
+                # rather than removing the object. Answering on key presence alone would
+                # make a fully-reverted day look deleted forever, and the lake-wide
+                # aggregate would never be served again. Ask what is inside.
+                folder = key.split("/")[1] if len(key.split("/")) > 2 else None
+                if folder and deletion_mirror.deleted_sessions(
+                        s3_client, S3_BUCKET, folder, date):
                     return True
     except Exception:
         logger.exception("could not list redactions/ for %s -- serving unfiltered", date)
@@ -593,6 +611,13 @@ def get_dates(params, caller):
             loaded = False
             if user_folders is not None:
                 for uf in user_folders:
+                    # Same rule as the timeline: `daily_report.json` was written BEFORE the
+                    # delete, so the topic and safety COUNTS derived from it still count the
+                    # removed session. The date picker would show a dot with a nonzero
+                    # count for a day the timeline now 404s -- an inconsistency, and a
+                    # small aggregate leak of content the customer removed.
+                    if _deleted_bases(uf, ds):
+                        continue
                     try:
                         obj = s3_client.get_object(Bucket=S3_BUCKET, Key=f"{REPORT_PREFIX}{ds}/{uf}/daily_report.json")
                         report = json.loads(obj['Body'].read().decode('utf-8'))
@@ -604,7 +629,9 @@ def get_dates(params, caller):
                         loaded = True
                     except:
                         pass
-            if not loaded:
+            if not loaded and not _any_folder_deleted_on(ds):
+                # The lake-wide aggregate, same object and same reason as get_timeline's:
+                # no per-folder granularity exists inside it to filter.
                 obj = s3_client.get_object(Bucket=S3_BUCKET, Key=f"{REPORT_PREFIX}{ds}/summary_report.json")
                 report = json.loads(obj['Body'].read().decode('utf-8'))
                 topics = report.get('topics', [])
@@ -1054,6 +1081,10 @@ def get_recording_stats(params, caller):
     if not user:
         return error('Missing user')
     user_folder = user.replace(' ', '_')
+    # Counts, sizes and durations are DERIVED FACTS about a recording: that it existed,
+    # roughly how long it was, how big. A customer told their recording is gone should not
+    # be able to read its shadow off a statistics endpoint.
+    deleted = _deleted_bases(user_folder, date) | _deleted_bases(user, date)
     stats = {'video_count': 0, 'audio_count': 0, 'total_files': 0,
              'total_size_mb': 0, 'estimated_duration_min': 0}
     for media_type in ['video', 'audio']:
@@ -1063,6 +1094,8 @@ def get_recording_stats(params, caller):
                 resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
                 for obj in resp.get('Contents', []):
                     key = obj['Key'].lower()
+                    if deleted and any(b.lower() in key for b in deleted):
+                        continue          # a recording the customer deleted
                     if any(key.endswith(e) for e in ['.mp4','.webm','.mov','.wav','.mp3','.m4a']):
                         if media_type == 'video':
                             stats['video_count'] += 1

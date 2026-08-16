@@ -126,3 +126,59 @@ def test_every_content_endpoint_consults_the_guard():
         assert "_deleted_bases(" in body, f"{fn} never asks about deletions"
     presign = src.split("def get_presigned_url(", 1)[1].split("\ndef ", 1)[0]
     assert "_presign_key_is_deleted(" in presign
+
+
+# ---- the gaps a review found after the first pass ----------------------
+
+def test_a_fully_reverted_day_stops_looking_deleted(monkeypatch):
+    """Undelete rewrites the mirror with the REMAINING sessions and writes an empty
+    document when none are left, rather than removing the object. Answering on key
+    presence alone made a fully-reverted day look deleted forever — the lake-wide
+    aggregate would never be served again, and the presign for it would 404 for good."""
+    class _S3:
+        def get_paginator(self, _n):
+            class P:
+                def paginate(self, Bucket=None, Prefix=None, **kw):
+                    yield {"Contents": [
+                        {"Key": f"redactions/{FOLDER}/{DATE}/deleted_sessions.json"}]}
+            return P()
+
+    monkeypatch.setattr(api, "s3_client", _S3())
+    monkeypatch.setattr(api.deletion_mirror, "deleted_sessions", lambda *a, **k: set())
+    assert api._any_folder_deleted_on(DATE) is False
+
+    monkeypatch.setattr(api.deletion_mirror, "deleted_sessions", lambda *a, **k: {GONE})
+    assert api._any_folder_deleted_on(DATE) is True
+
+
+def test_presign_refuses_the_lake_wide_aggregate_on_a_deleted_day(monkeypatch):
+    """`reports/{date}/summary_report.json` is only THREE segments, so the (folder, date)
+    parser skipped it — and admin/gm skip the ownership check entirely. That one object
+    stayed downloadable byte for byte on a day whose sources were deleted: the same file
+    the timeline already refuses to serve."""
+    monkeypatch.setattr(api, "_any_folder_deleted_on", lambda d: d == DATE)
+    assert api._presign_key_is_deleted(f"reports/{DATE}/summary_report.json") is True
+    assert api._presign_key_is_deleted("reports/2026-01-01/summary_report.json") is False
+
+
+def test_recording_stats_does_not_count_a_deleted_recording(monkeypatch):
+    """Counts, sizes and durations are derived FACTS about a recording — that it existed,
+    roughly how long it was. A customer told their recording is gone should not read its
+    shadow off a statistics endpoint."""
+    class _S3:
+        def list_objects_v2(self, Bucket=None, Prefix=None, **kw):
+            if f"/{DATE}/" not in Prefix:
+                return {}
+            return {"Contents": [
+                {"Key": f"{Prefix}a_{GONE}_c1.wav", "Size": 1024 * 1024},
+                {"Key": f"{Prefix}a_{KEPT}_c1.wav", "Size": 1024 * 1024},
+            ]}
+
+    monkeypatch.setattr(api, "s3_client", _S3())
+    monkeypatch.setattr(api, "resolve_user_display_name", lambda c: FOLDER)
+    res = api.get_recording_stats({"date": DATE, "user": FOLDER},
+                                  {"role": "admin", "sub": "s"})
+    import json as _json
+    body = _json.loads(res["body"])
+    assert body["audio_count"] == 2, "two folder spellings x one kept file"
+    assert all(GONE not in str(v) for v in body.values())
