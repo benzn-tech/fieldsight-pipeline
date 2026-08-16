@@ -1572,6 +1572,7 @@ def speaker_corrections(conn, caller, session_base, event):
     # not the employer, and not whoever is doing the labelling, who is usually a third
     # person again. The two effects are reported separately for that reason.
     enrol = None
+    _linked_person, _linked_on = None, "not-requested"
     if body.get("consent_given"):
         # WHO consented, not just that somebody did. 0042 added the column precisely because
         # a timestamp cannot tell the subject agreeing apart from the wearer clicking a box
@@ -1585,11 +1586,19 @@ def speaker_corrections(conn, caller, session_base, event):
             return error("consented_by is required with consent_given: record whose voice "
                          "this is, not who is doing the labelling", 400)
         try:
+            # Which person in the directory this name refers to. A profile keyed only on
+            # a string cannot be narrowed by site, and two people sharing a name land on one
+            # profile — an identity is the stabler key.
+            person, matched_on = users.resolve_display_name(conn, company_id, name)
             profile = voiceprints.upsert_profile(
                 conn, company_id, display_name=name,
-                consent_given=True, consented_by=body.get("consented_by"))
+                consent_given=True, consented_by=body.get("consented_by"),
+                user_id=str(person["id"]) if person else None,
+                linked_by=str(caller["id"]) if person else None,
+                linked_on=matched_on if person else None)
         except ValueError as exc:
             return error(str(exc), 400)
+        _linked_person, _linked_on = person, matched_on
         enrol = {"voiceprint_id": str(profile["id"])}
 
     session_turns = _session_turns(folder, date_m.group(1), session_base)
@@ -1633,6 +1642,12 @@ def speaker_corrections(conn, caller, session_base, event):
         # The refusals are not errors and not rare, so name them where the caller is already
         # looking rather than leaving a silence for them to interpret.
         "enrolmentMayBeRefused": bool(enrol),
+        # Said out loud, because a silent NULL here is exactly what made the site-scoped
+        # branch of `profiles_for_matching` a no-op for its whole life: the query had an
+        # escape for unlinked profiles and every profile was unlinked.
+        "linkedTo": ({"userId": str(_linked_person["id"]), "matchedOn": _linked_on}
+                     if _linked_person else None),
+        "linkReason": None if _linked_person else _linked_on,
     }, 202)
 
 

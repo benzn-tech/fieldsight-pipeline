@@ -1,3 +1,5 @@
+import re
+
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -225,3 +227,70 @@ def clear_avatar(conn, cognito_sub) -> dict | None:
         f"UPDATE users SET avatar_s3_key=NULL WHERE cognito_sub=%s RETURNING {_COLS}",
         (cognito_sub,),
     ).fetchone()
+
+_UNSAFE_IN_FOLDER = re.compile(r'[<>:"/\\|?*\s]')
+
+
+def safe_folder_name(raw):
+    """The folder spelling of a person's name, in ONE place.
+
+    org-api built this inline in three separate spots, which was survivable while it was only
+    ever used to WRITE. Reading is what makes a second copy dangerous: a resolver that
+    compares a typed name against `folder_name` without applying the same substitution misses
+    every multi-word name, because "Neil Blunden" is stored as "Neil_Blunden" — and it misses
+    them silently, resolving to nobody and looking like "that person is not in the directory".
+    """
+    return _UNSAFE_IN_FOLDER.sub("_", (raw or "").strip())
+
+
+def resolve_display_name(conn, company_id, name):
+    """Which person in this company that name refers to, or an honest refusal.
+
+    Returns `(row, matched_on)` or `(None, reason)` where reason is `ambiguous` or
+    `not-in-directory`.
+
+    **Ambiguity refuses rather than guesses.** Attaching a voiceprint to the wrong identity
+    files one person's voice under another's name, and the site filter then hides it from the
+    site they are on while offering it on one they are not — a wrong answer nobody can see. A
+    profile with no identity still works by display name; a profile with the wrong one does
+    not fail anywhere.
+
+    `concat_ws`, not `first_name || ' ' || last_name`: in Postgres `'Ben' || ' ' || NULL` is
+    NULL and `NULL = 'ben'` is never true, so the second rule would match nobody for every
+    row with no surname — and rows with no surname are ordinary here (the `Ben_UCPK_` folder,
+    trailing underscore and all, comes from exactly that).
+    """
+    wanted = (name or "").strip()
+    if not wanted or not company_id:
+        return None, "not-in-directory"
+    cur = conn.cursor(row_factory=dict_row)
+    folder = safe_folder_name(wanted)
+    rows = cur.execute(
+        f"SELECT {_COLS} FROM users "
+        "WHERE company_id = %s AND archived_at IS NULL AND lower(folder_name) = lower(%s)",
+        (company_id, folder)).fetchall()
+    if len(rows) == 1:
+        return rows[0], "folder_name"
+    if len(rows) > 1:
+        return None, "ambiguous"
+
+    rows = cur.execute(
+        f"SELECT {_COLS} FROM users "
+        "WHERE company_id = %s AND archived_at IS NULL "
+        "  AND lower(concat_ws(' ', first_name, last_name)) = lower(%s)",
+        (company_id, wanted)).fetchall()
+    if len(rows) == 1:
+        return rows[0], "full_name"
+    if len(rows) > 1:
+        return None, "ambiguous"
+
+    rows = cur.execute(
+        f"SELECT {_COLS} FROM users "
+        "WHERE company_id = %s AND archived_at IS NULL AND lower(first_name) = lower(%s)",
+        (company_id, wanted)).fetchall()
+    if len(rows) == 1:
+        return rows[0], "first_name"
+    if len(rows) > 1:
+        return None, "ambiguous"
+    return None, "not-in-directory"
+

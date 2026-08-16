@@ -66,6 +66,11 @@ def wired(monkeypatch):
     monkeypatch.setattr(org, "s3", lambda: s3)
     monkeypatch.setattr(org, "get_connection", lambda *a, **k: FakeConn())
     monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: dict(CALLER))
+    # Default: the typed name is not in the directory. The tests in this file are about
+    # consent and queuing, not about identity resolution, and letting the real resolver
+    # reach the connection double would make them fail for a reason none of them are about.
+    monkeypatch.setattr(org.users, "resolve_display_name",
+                        lambda conn, company_id, name: (None, "not-in-directory"))
     monkeypatch.setattr(org, "_resolve_org_media_folder",
                         lambda conn, caller, user, what=None: ("Ada_L", None))
     # The ownership arm of _may_correct_speakers reads this; FakeConn has no cursor, and a
@@ -785,3 +790,57 @@ def test_removing_a_name_records_who_rejected_it(wired, monkeypatch):
                         rejected_by=None: seen.update({"by": rejected_by}) or 1)
     org.lambda_handler(_unname_event(), None)
     assert seen["by"], "the rejection has no author"
+
+
+# ---- a profile belongs to a person, not to a string ----------------------
+#
+# `profiles_for_matching`'s site branch keeps a profile when `p.user_id IS NULL`
+# — deliberately, so an unnamed recurring voice stays in scope. But nothing has
+# ever written `user_id`, so every profile takes that escape and site narrowing
+# has been a no-op since the day it was written.
+
+
+def _consenting(**over):
+    return dict(BODY, consent_given=True, consented_by="u-9", **over)
+
+
+def test_a_named_correction_links_the_profile_to_the_directory(wired, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(org.users, "resolve_display_name",
+                        lambda conn, company_id, name: ({"id": "u-42"}, "folder_name"))
+    monkeypatch.setattr(org.voiceprints, "upsert_profile",
+                        lambda conn, company_id, **kw: seen.update(kw) or {"id": "vp-1"})
+    b = _body(org.lambda_handler(_event(_consenting()), None))
+    assert seen["user_id"] == "u-42"
+    assert seen["linked_on"] == "folder_name"
+    assert seen["linked_by"], "the link has no author"
+    assert b["linkedTo"] == {"userId": "u-42", "matchedOn": "folder_name"}
+
+
+def test_an_ambiguous_name_links_to_nobody_and_says_why(wired, monkeypatch):
+    """Two people called Ben. Guessing files one person's voice under another's identity,
+    and the site filter then hides it from the site they are on while offering it on one
+    they are not — a wrong answer nobody can see."""
+    seen = {}
+    monkeypatch.setattr(org.users, "resolve_display_name",
+                        lambda conn, company_id, name: (None, "ambiguous"))
+    monkeypatch.setattr(org.voiceprints, "upsert_profile",
+                        lambda conn, company_id, **kw: seen.update(kw) or {"id": "vp-1"})
+    b = _body(org.lambda_handler(_event(_consenting()), None))
+    assert seen["user_id"] is None
+    assert b["linkedTo"] is None
+    assert b["linkReason"] == "ambiguous"
+
+
+def test_a_name_not_in_the_directory_still_makes_a_working_profile(wired, monkeypatch):
+    monkeypatch.setattr(org.voiceprints, "upsert_profile",
+                        lambda conn, company_id, **kw: {"id": "vp-1"})
+    b = _body(org.lambda_handler(_event(_consenting()), None))
+    assert b["enrolment"] == "requested"
+    assert b["linkReason"] == "not-in-directory"
+
+
+def test_a_correction_without_consent_reports_no_link_rather_than_a_false_one(wired):
+    b = _body(org.lambda_handler(_event(BODY), None))
+    assert b["linkedTo"] is None
+    assert b["linkReason"] == "not-requested"

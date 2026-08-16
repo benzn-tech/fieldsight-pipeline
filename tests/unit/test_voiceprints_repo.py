@@ -722,3 +722,47 @@ def test_rejected_names_are_readable_and_company_scoped():
 def test_reading_rejections_without_a_company_raises():
     with pytest.raises(ValueError):
         voiceprints.rejected_names(FakeConn(), "", "s1")
+
+
+# ---- linking an EXISTING profile -----------------------------------------
+
+
+def test_an_existing_profile_gains_the_identity_too():
+    """`upsert_profile` returns early when it finds a profile by name, so passing `user_id`
+    links only at CREATION. Every profile in the database predates this, so without the
+    update the site-scoped branch stays a no-op for the entire existing population — the
+    identical silent-inert failure this work exists to remove."""
+    conn = FakeConn([[{"id": "vp-1"}], []])
+    out = voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True,
+                                     consented_by="u-9", user_id="u-42",
+                                     linked_by="u-1", linked_on="folder_name")
+    assert out == {"id": "vp-1"}
+    upd = next((c for c in conn.calls if c["sql"].startswith("UPDATE")), None)
+    assert upd is not None, "the existing profile was left unlinked"
+    assert "u-42" in upd["params"] and "vp-1" in upd["params"]
+    assert "linked_on" in upd["sql"] and "linked_by" in upd["sql"]
+
+
+def test_an_existing_link_is_never_overwritten():
+    """A person is not re-identified by somebody typing the same name again."""
+    conn = FakeConn([[{"id": "vp-1"}], []])
+    voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True,
+                               consented_by="u-9", user_id="u-42")
+    upd = next(c for c in conn.calls if c["sql"].startswith("UPDATE"))
+    assert "user_id IS NULL" in upd["sql"]
+
+
+def test_an_unresolved_name_runs_no_update_at_all():
+    conn = FakeConn([[{"id": "vp-1"}]])
+    voiceprints.upsert_profile(conn, CO, display_name="Ben L", consent_given=True,
+                               consented_by="u-9", user_id=None)
+    assert not any(c["sql"].startswith("UPDATE") for c in conn.calls)
+
+
+def test_a_new_profile_records_when_it_was_linked():
+    conn = FakeConn([[], [{"id": "vp-2"}]])
+    voiceprints.upsert_profile(conn, CO, display_name="Zoe", consent_given=True,
+                               consented_by="u-9", user_id="u-7", linked_by="u-1",
+                               linked_on="full_name")
+    ins = next(c for c in conn.calls if c["sql"].startswith("INSERT"))
+    assert "linked_at" in ins["sql"] and "u-7" in ins["params"]
