@@ -269,20 +269,32 @@ def leave_one_out_centroid(members, index):
 def frame_statistics(frame_embeddings) -> dict:
     """Every candidate answer to "does this window hold one voice", from one set of frames.
 
-    `frame_spread` — the max over all pairs — does not separate one voice from two on this
-    audio. Measured on 13 windows of one person and 12 of two people, both from real site
-    recordings: one voice spans 0.429-0.777 and two voices span 0.445-1.022, so the classes
-    overlap across almost the whole of the first. No threshold on that statistic divides them,
-    which is a fact about the STATISTIC and not about the number 0.35.
+    `frame_spread` — the max over all pairs — refuses every window of real site audio at the
+    current limit of 0.35, and these are the candidates for replacing it.
 
-    The reason it fails is visible in the data: frames of one person, at steady loudness, sit
-    0.66 apart. A frame embedding carries what is being said, how fast, how far from the mic
-    and what else is in the room, and a MAXIMUM over pairs is decided by whichever frame is
-    most unusual for any of those reasons. Speaker identity is in there; it is not what the
-    maximum is measuring.
+    **No candidate has been shown to be better, and no threshold has been justified.** An
+    analysis on 2026-08-17 measured 23 one-voice and 16 two-voice windows and reported that a
+    line existed. It does not stand, for three reasons worth carrying here because each is
+    easy to repeat:
 
-    So this returns them all, computed once, and nothing here picks a winner. A candidate
-    earns its place by separating the two classes on the same data, or it does not ship.
+    * `clusters` is NOT independent evidence about the others. It comes from `cluster_turns`,
+      which is complete linkage, whose merge criterion IS the max over all pairs — so
+      `clusters == 1` is identical to `pair_max <= DEFAULT_CLUSTER_TAU`. Verified over 500
+      random frame sets with no counter-example. Using it to screen a set being calibrated on
+      `pair_max` is circular.
+    * every one of these statistics except `clusters` depends on the NUMBER of frames, and a
+      max over pairs most of all: 3 frames give 3 pairs and 4 give 6. Two classes sampled at
+      different window lengths cannot be compared on any of them without normalising.
+    * a class labelled by the provider's diarisation is labelled by something this pipeline
+      has recorded getting speaker counts wrong.
+
+    What the measurement does support: 0.35 is very likely far too strict — every one-voice
+    window measured, under every sampling, sat between 0.36 and 0.78 — and `centroid_max` and
+    `centroid_mean` matched `pair_max` window for window, so there is no case for changing
+    which statistic is used, only the number.
+
+    Nothing here picks a winner. A candidate earns its place by separating the two classes on
+    data whose labels do not come from these numbers.
 
       pair_max     the current statistic, kept for comparison
       pair_median  robust to the single odd frame a max is hostage to
