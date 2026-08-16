@@ -379,3 +379,38 @@ def test_nothing_in_production_asks_for_one_turn_at_a_time():
 # CHUNK index or a batch number out of a filename — they are not second copies of the session
 # key, and a guard that demands unrelated rewrites is noise rather than protection.
 # `lambda_org_api._session_of`, which really was a second copy, now delegates.
+
+
+def test_every_source_the_writer_writes_has_a_rank():
+    """The precedence table is keyed on strings, and the strings live in another file.
+
+    It said "match" while the writer stored "voiceprint_match", so matched names took the
+    -1 default and ranked below every source the table did know — including, absurdly, a
+    source it had never heard of. Nothing failed; the wrong row simply won.
+    """
+    import ast
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[2] / "src" / "lambda_voiceprint_writer.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    written = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if fn != "record_turn_name":
+                continue
+            for kw in node.keywords:
+                if kw.arg != "source":
+                    continue
+                for lit in ast.walk(kw.value):
+                    if isinstance(lit, ast.Constant) and isinstance(lit.value, str):
+                        written.add(lit.value)
+    assert written, "found no source= on any record_turn_name call — the scan is broken"
+    missing = written - set(tno._SOURCE_RANK)
+    assert not missing, f"the writer stores {missing}, which the precedence table cannot rank"
+
+
+def test_a_correction_outranks_a_match_and_a_match_outranks_nothing_known():
+    ranks = tno._SOURCE_RANK
+    assert ranks["correction"] > ranks["correction_propagation"] > ranks["voiceprint_match"]
+    assert ranks["voiceprint_match"] > -1, \
+        "a matched name ranks below an unrecognised source, which is how this was found"

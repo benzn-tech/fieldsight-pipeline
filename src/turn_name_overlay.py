@@ -36,7 +36,16 @@ import re
 TOLERANCE_SEC = 0.5
 
 # A direct correction is a claim a person made; propagation and matching are inferences.
-_SOURCE_RANK = {"correction": 2, "correction_propagation": 1, "match": 0}
+# Keyed on the strings the WRITER actually stores, which is the whole difficulty: this table
+# said "match" while `lambda_voiceprint_writer` wrote "voiceprint_match", so every matched
+# name fell to the -1 default and ranked below a source this table has never heard of. A
+# precedence table that does not contain one side of the comparison decides nothing, quietly.
+# `test_every_source_the_writer_writes_has_a_rank` exists so the next new source cannot
+# repeat it.
+#
+# Order: a human's assertion beats an inference anchored to a human's assertion in the same
+# meeting, which beats a match against a stored profile.
+_SOURCE_RANK = {"correction": 3, "correction_propagation": 2, "voiceprint_match": 1}
 
 
 def _stem(name):
