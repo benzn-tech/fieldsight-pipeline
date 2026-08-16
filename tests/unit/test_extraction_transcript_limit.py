@@ -165,3 +165,85 @@ def test_the_extraction_records_what_the_model_was_shown():
     assert "'transcript_stats': transcript_stats" in src, (
         "an extraction covering half a session must be distinguishable from one "
         "covering all of it")
+
+
+# --- the shared helper, and the two other callers of it --------------------
+#
+# The bare slice was fixed in the extraction layer and left in place in the
+# rolling summary, which is the thing the stop-recording email is built from.
+# One implementation is the fix; these pin the callers to it.
+
+import transcript_utils as tu
+import lambda_rolling_summary as lrs
+
+
+def _lines(n, tag):
+    return [f"{tag}{i} " + "x" * 60 for i in range(n)]
+
+
+def test_the_end_of_a_long_meeting_survives():
+    lines = _lines(50, "HEAD") + _lines(900, "MID") + _lines(50, "TAIL")
+    text, stats = tu.elide_middle(lines, 8000)
+    assert "HEAD0" in text, "the opening was dropped"
+    assert "TAIL49" in text, "the ending was dropped — this is the whole defect"
+    assert stats["truncated"] and stats["lines_omitted"] > 0
+
+
+def test_nothing_is_cut_mid_line():
+    text, _ = tu.elide_middle(_lines(500, "L"), 4000)
+    for line in text.split("\n"):
+        assert line.startswith("L") or line.startswith("[..."), line
+
+
+def test_the_number_of_dropped_lines_is_reported_in_the_text():
+    text, stats = tu.elide_middle(_lines(500, "L"), 4000)
+    assert str(stats["lines_omitted"]) in text, \
+        "the model is shown a gap it cannot see the size of"
+
+
+def test_a_short_transcript_is_untouched():
+    text, stats = tu.elide_middle(["a", "b"], 1000)
+    assert text == "a\nb" and not stats["truncated"] and stats["chars"] == 3
+
+
+def test_the_separator_is_respected():
+    text, _ = tu.elide_middle(["a", "b"], 1000, sep="\n\n")
+    assert text == "a\n\nb"
+
+
+def test_the_rolling_summary_keeps_the_end_of_the_meeting():
+    """The stop-recording email reads THIS summary. A meeting over ~70 minutes used
+    to lose its ending here, which is where the decisions are."""
+    turns = ([{"abs_start_str": "09:00", "speaker": "A", "text": "OPENING " + "x" * 200}]
+             + [{"abs_start_str": "09:30", "speaker": "A", "text": "y" * 200}
+                for _ in range(400)]
+             + [{"abs_start_str": "11:00", "speaker": "A", "text": "DECISION " + "z" * 200}])
+    prompt = lrs.build_rolling_prompt(turns)
+    assert len(prompt) < lrs.TRANSCRIPT_LIMIT + 2000
+    assert "OPENING" in prompt
+    assert "DECISION" in prompt, "the email would not mention what was decided"
+
+
+# --- the remaining three callers ------------------------------------------
+#
+# Found by grepping the repo for the same shape after fixing the email path.
+# All three were bare head slices, and all three drop the part their reader
+# opens the document for.
+
+def test_meeting_minutes_keeps_the_decisions_at_the_end():
+    import lambda_meeting_minutes as mm
+    lines = (["OPENING: why we are here"]
+             + ["filler " + "x" * 300 for _ in range(600)]
+             + ["DECISION: we go with option B"])
+    text, _ = mm.elide_middle(lines, 120000, sep="\n\n")
+    assert "OPENING" in text
+    assert "DECISION" in text, "minutes that drop the decisions are not minutes"
+
+
+def test_a_weekly_report_keeps_the_most_recent_days():
+    import lambda_report_generator as rg
+    days = [f"### 2026-08-{d:02d} " + "y" * 900 for d in range(1, 31)]   # > 15000 total
+    text, _ = rg.elide_middle(days, 15000, sep="\n\n")
+    assert "2026-08-01" in text
+    assert "2026-08-30" in text, "a weekly/monthly rollup that drops the recent end is " \
+                                 "the opposite of what it is read for"

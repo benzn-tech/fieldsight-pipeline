@@ -148,14 +148,31 @@ def window_is_homogeneous(frame_embeddings,
     unchecked. "I could not check" and "I checked and it is fine" must not be the same
     answer — that conflation is how a guard becomes decoration.
     """
+    spread = frame_spread(frame_embeddings)
+    if spread is None:
+        return None
+    return spread <= max_spread
+
+
+def frame_spread(frame_embeddings):
+    """The widest disagreement between any two frames, or None for fewer than two.
+
+    Split out from the verdict because a refusal that says only "no" cannot be argued with.
+    Three real windows have now been refused on TEST — two of them today — and in every case
+    the log said the window was not homogeneous and nothing about HOW FAR off it was. A
+    threshold nobody can see the distance to is a threshold nobody can calibrate: 0.35 was
+    measured once, on read speech, and site audio may simply not look like that.
+
+    This does not change the verdict. It makes the verdict answerable.
+    """
     frames = [np.asarray(f, dtype=np.float64).ravel() for f in (frame_embeddings or [])]
     if len(frames) < 2:
         return None
+    worst = 0.0
     for i in range(len(frames)):
         for j in range(i + 1, len(frames)):
-            if 1.0 - cosine(frames[i], frames[j]) > max_spread:
-                return False
-    return True
+            worst = max(worst, 1.0 - cosine(frames[i], frames[j]))
+    return worst
 
 
 # --- clustering a session's own turns -------------------------------------

@@ -135,7 +135,7 @@ import sweep_state
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
-from repositories import (action_items, aliases, classification_feedback, companies,
+from repositories import (action_items, aliases, chunks, classification_feedback, companies,
                           compliance_resolutions, content, content_edits, keyframes,
                           meeting_session, memberships, observations, programme,
                           programme_delay_flags, programme_import,
@@ -614,6 +614,17 @@ def dispatch(conn, event, method, route):
     m_srs = re.match(r"^/sessions/([^/]+)/report/status$", route)
     if m_srs and method == "GET":
         return session_report_status(conn, caller, m_srs.group(1), event)
+    m_sm = re.match(r"^/sessions/([^/]+)/speaker-match$", route)
+    if m_sm and method == "POST":
+        return speaker_match(conn, caller, m_sm.group(1), event)
+    m_un = re.match(r"^/sessions/([^/]+)/speaker-names$", route)
+    if m_un and method == "DELETE":
+        return unname_speaker(conn, caller, m_un.group(1), event)
+    if route == "/voiceprints" and method == "GET":
+        return list_voiceprints(conn, caller)
+    m_vw = re.match(r"^/voiceprints/([^/]+)$", route)
+    if m_vw and method == "DELETE":
+        return withdraw_voiceprint(conn, caller, m_vw.group(1))
     m_sc = re.match(r"^/sessions/([^/]+)/speaker-corrections$", route)
     if m_sc and method == "POST":
         return speaker_corrections(conn, caller, m_sc.group(1), event)
@@ -1214,6 +1225,30 @@ def session_report_generate(conn, caller, session_id, event):
 _CORRECTION_ROLES = ("admin", "gm", "pm", "site_manager", "platform_admin")
 
 
+def _may_correct_speakers(conn, caller, folder):
+    """May `caller` put a name on a passage of `folder`'s recording?
+
+    The role list, OR the caller's own folder. The second arm was added 2026-08-14: a
+    `worker` is the tier that means "your own recordings and nobody else's", and it could not
+    name a speaker in its own meeting — which is the ordinary case, because the person who
+    pressed record is the person who knows who was in the room.
+
+    **It compares against the caller's OWN folder, not against whether the read was
+    allowed.** Those are different questions and conflating them hands the write away:
+    `regional_manager` is absent from the role list but has SITE scope, so
+    `_resolve_org_media_folder` returns a colleague's folder for it quite happily. Gating on
+    "the resolve succeeded" would have let it rename speakers in any recording on its sites.
+
+    Visibility is deliberately untouched. This adds one act on your own recording; it does
+    not widen what anyone can see, and `_resolve_org_media_folder` still runs first.
+    """
+    if caller.get("global_role") in _CORRECTION_ROLES:
+        return True
+    if not folder:
+        return False
+    return folder == scope.visible_scope(conn, caller).get("self_folder")
+
+
 def _session_turns(folder, date, session_base):
     """Every turn of one session, as (file, offset) pairs the embedder can cut audio with.
 
@@ -1240,8 +1275,274 @@ def _session_turns(folder, date, session_base):
         if start is None:
             continue
         out.append({"source_filename": name, "start_sec": float(start),
-                    "end_sec": float(start) + float(seg.get("duration") or 0.0)})
+                    "end_sec": float(start) + float(seg.get("duration") or 0.0),
+                    # The transcriber's own grouping. It says "these turns are one voice"
+                    # about turns too short for any acoustic judgement, and until now that
+                    # statement never reached the layer that declines to judge them.
+                    "speaker_label": seg.get("speaker_label")})
     return out
+
+
+# Measured on the deployed embedder: ~98 ms per second of audio, plus ~176 ms per turn.
+# The function's timeout is 600 s, so a run is budgeted at 360 s of work — 60 %, leaving room
+# for a cold start, the model download and a slow S3 day. That is ~3600 seconds of speech,
+# or about 100 chunks / 50 minutes of recording.
+#
+# A three-hour meeting exceeds it, and the failure would be a timeout at the very end with
+# nothing written, so the work is split instead. The splits are independent: each fetches its
+# own profiles and names its own turns, and no turn's answer depends on another's.
+MATCH_SECONDS_PER_RUN = float(os.environ.get("MATCH_SECONDS_PER_RUN", "3600"))
+MATCH_TURNS_PER_RUN = int(os.environ.get("MATCH_TURNS_PER_RUN", "400"))
+
+
+def _split_for_budget(turns):
+    """Group turns into runs that fit one invocation. Never splits a turn."""
+    runs, current, seconds = [], [], 0.0
+    for t in turns:
+        dur = max(0.0, float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)))
+        if current and (seconds + dur > MATCH_SECONDS_PER_RUN
+                        or len(current) >= MATCH_TURNS_PER_RUN):
+            runs.append(current)
+            current, seconds = [], 0.0
+        current.append(t)
+        seconds += dur
+    if current:
+        runs.append(current)
+    return runs
+
+
+def list_voiceprints(conn, caller):
+    """GET /api/org/voiceprints — every profile this company holds, and why each is as it is.
+
+    There was no read path at all. A profile could be created, have its enrolment refused,
+    and sit empty forever with no way to look at it short of the database — and "empty
+    because the window was refused" and "empty because the embedder died" produce exactly
+    the same row. Both happened on TEST on 2026-08-16 and were indistinguishable.
+
+    `samples` is the number that decides whether a profile does anything: a named profile
+    with zero of them names nobody. `humanSamples` separates what a person vouched for from
+    what the clustering suggested, which is the distinction the harvest design rests on —
+    a profile made only of inference stays tentative.
+
+    No vectors. They are biometric data, nothing in a listing needs them, and the one place
+    they may travel is the synchronous fetch the matcher makes.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    rows = voiceprints.list_profiles(conn, str(caller["company_id"]))
+    return ok({"voiceprints": [{
+        "id": str(r["id"]),
+        "displayName": r.get("display_name"),
+        "status": r.get("status"),
+        "userId": str(r["user_id"]) if r.get("user_id") else None,
+        "linkedOn": r.get("linked_on"),
+        "consentAt": r.get("consent_at"),
+        "samples": int(r.get("samples") or 0),
+        "humanSamples": int(r.get("human_samples") or 0),
+        "lastAttemptAt": r.get("last_attempt_at"),
+        "lastAttemptOutcome": r.get("last_attempt_outcome"),
+        "lastAttemptDetail": r.get("last_attempt_detail"),
+    } for r in rows]})
+
+
+def _site_for_session(conn, company_id, user_folder, date, session_base):
+    """The site a session belongs to, by the authority order this codebase already settled.
+
+    `lambda_item_writer` fixed that order after BUG-41, and it is not arbitrary: the
+    session-exact answer beats the one the device tagged at open, which beats the day's
+    majority. Starting at the day-majority rung — which the first draft of this did — gives
+    somebody who recorded at two sites in one day the wrong site, the pool narrows to the
+    wrong roster, the right person is dropped, and the result is a refusal indistinguishable
+    from "the model got worse".
+
+    `resolve_site`, the writer's last rung, is deliberately absent: it lives in
+    `lambda_ingest`, takes a report document, and org-api does not import that module. Its
+    job here is done by returning None — an unresolved site means no narrowing, which is the
+    behaviour before this feature and the safe direction.
+    """
+    site = recordings.site_for_media(conn, company_id, user_folder, date, session_base)
+    if site:
+        return site
+    sid = turn_name_overlay.session_base(session_base)
+    if sid:
+        row = meeting_session.get(conn, sid[3:] if sid.startswith("sid") else sid)
+        if row and row.get("site_id"):
+            found = sites.get_site(conn, row["site_id"])
+            # Re-checked, because a site from another tenant would narrow this company's
+            # pool against a roster that is not theirs.
+            if found and str(found.get("company_id")) == str(company_id):
+                return found
+    return recordings.site_for_day(conn, company_id, user_folder, date)
+
+
+def _label_map(turns):
+    """(turn_ref, source_filename, speaker_label) for every turn — no audio, no vectors.
+
+    The transcriber's own grouping, in the one form the writer can act on. Sent whole rather
+    than per run because inheritance is the single thing in this chain whose answer for one
+    turn depends on ANOTHER turn — which is exactly the invariant `_split_for_budget` relies
+    on ("no turn's answer depends on another's").
+    """
+    return [{"turn_ref": turn_name_overlay.turn_ref(t["source_filename"],
+                                                    float(t["start_sec"])),
+             "source_filename": t["source_filename"],
+             "speaker_label": t.get("speaker_label")}
+            for t in turns or []]
+
+
+def speaker_match(conn, caller, session_base, event):
+    """POST /api/org/sessions/{session}/speaker-match — name a session from stored profiles.
+
+    Phase 5, as a request rather than a schedule. Doing it on demand is what makes it usable
+    on the sessions that ALREADY exist: automatic naming at finalize only ever helps future
+    meetings, and the reason to want this at all is the archive.
+
+    Queues the same artifact shape as a correction, on the same prefix and the same trigger,
+    distinguished by `op`. It carries the session's turns and **no voice vectors** — the
+    matcher fetches those synchronously from the in-VPC writer, so they are never at rest in
+    a bucket. That is the constraint this whole split exists to hold.
+
+    `SPEAKER_IDENTITY_MODE` decides what comes of it: `shadow` computes and logs and writes
+    no name, `on` writes names. The endpoint answers 202 either way and says which, because
+    "it ran and deliberately wrote nothing" and "it ran and found nobody" are different
+    answers that would otherwise look the same.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+
+    body = parse_body(event) or {}
+    company_id = str(caller["company_id"])
+    folder, err = _resolve_org_media_folder(conn, caller, body.get("user") or "",
+                                            what="speaker match")
+    if err is not None:
+        return err
+    date_m = re.search(r"(\d{4}-\d{2}-\d{2})", session_base or "")
+    if not date_m:
+        return error("session id must carry its date (…_YYYY-MM-DD_…)", 400)
+    session_key = turn_name_overlay.session_base(session_base)
+    if not session_key:
+        return error("session id must carry its sid (…_sid<32 hex>)", 400)
+
+    turns = _session_turns(folder, date_m.group(1), session_base)
+    if not turns:
+        # A 202 here would promise work that cannot happen. The usual cause is a session
+        # whose transcripts are not written yet, which is a wait, not a failure.
+        return error("no transcribed turns found for this session yet", 409)
+
+    label_map = _label_map(turns)
+    site = _site_for_session(conn, company_id, folder, date_m.group(1), session_base)
+    runs = _split_for_budget(turns)
+    request_ids = []
+    for i, group in enumerate(runs):
+        request_id = uuid.uuid4().hex
+        request_ids.append(request_id)
+        s3().put_object(
+            Bucket=LAKE_BUCKET,
+            Key=f"voiceprint_requests/{company_id}/{session_base}/match-{request_id}.json",
+            Body=json.dumps({"op": "match", "request_id": request_id,
+                             "session_base": session_key, "company_id": company_id,
+                             "user_folder": folder, "date": date_m.group(1),
+                             "requested_by": str(caller["id"]), "part": i + 1,
+                             "of": len(runs),
+                             "mode": SPEAKER_IDENTITY_MODE, "turns": group,
+                             # Absent when the site could not be resolved, which the matcher
+                             # reads as "no narrowing" — the behaviour before this feature.
+                             "site_id": str(site["id"]) if site else None,
+                             # WHOLE in every run, not just this run's slice. Label
+                             # inheritance groups turns by the transcriber's own speaker
+                             # label, and `_split_for_budget` chops on cumulative duration
+                             # with no idea that two turns share one — a group's long turn
+                             # can land in run 1 and its short turns in run 2, which then
+                             # inherits nothing and reports no error. The map carries no
+                             # audio and no vectors, so sending it whole is cheap and
+                             # removes the dependence on where the split fell.
+                             "label_map": label_map}, default=str),
+            ContentType="application/json")
+    logger.info("speaker match queued: session=%s mode=%s turns=%d runs=%d",
+                session_key, SPEAKER_IDENTITY_MODE, len(turns), len(runs))
+    return ok({"requestIds": request_ids, "sessionBase": session_key,
+               "siteId": str(site["id"]) if site else None,
+               "turnsQueued": len(turns), "runs": len(runs),
+               "mode": SPEAKER_IDENTITY_MODE,
+               "willWriteNames": SPEAKER_IDENTITY_MODE == "on"}, 202)
+
+
+def unname_speaker(conn, caller, session_base, event):
+    """DELETE /api/org/sessions/{session}/speaker-names?name=… — take a name off a meeting.
+
+    Not the same request as `DELETE /voiceprints/{id}`, and the difference is why this
+    exists. Withdrawal removes a stored voiceprint and everything it justified — but it needs
+    a profile, and a correction made without consent creates none. On TEST that left six of
+    seven named turns with no route to removal at all.
+
+    "That is not me, take it off" is the ordinary request. It needs no profile, and until now
+    there was no way to make it.
+
+    It does not touch the voiceprint: somebody who wants their name off one transcript has
+    not asked for their profile to be destroyed.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    name = ((event.get("queryStringParameters") or {}).get("name") or "").strip()
+    if not name:
+        return error("name is required (?name=…): removing every name in the session is a "
+                     "different request", 400)
+    key = turn_name_overlay.session_base(session_base)
+    if not key:
+        return error("session id must carry its sid (…_sid<32 hex>)", 400)
+    # Unlike the POST, this request carries no folder — a session id and a name, nothing
+    # else. So "is this yours?" is answered from the session itself, against `topics`, whose
+    # extraction keys are `extractions/{folder}/{date}/{session_base}.json`.
+    #
+    # Deliberately NOT by parsing the folder out of `session_base`: that string is caller
+    # input, and using caller input to decide whose recording it is undoes the guard it is
+    # supposed to be. The chunk-session filename also carries the folder lower-cased, so a
+    # parse would have had to compare case-insensitively — a second reason to ask the
+    # database instead.
+    #
+    # `!= 1` is a refusal, not a pass. An empty answer is ordinary (extraction may not have
+    # landed yet) and means we could not establish ownership; could-not-establish is never
+    # permission. The role arm short-circuits so managers never depend on this query.
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        owners = topics.folders_for_session_base(conn, str(caller["company_id"]), key)
+        self_folder = scope.visible_scope(conn, caller).get("self_folder")
+        if len(owners) != 1 or not self_folder or owners[0] != self_folder:
+            return error("removing a name needs an admin, gm, pm, site_manager or "
+                         "platform_admin role, or your own recording", 403)
+    n = voiceprints.unname(conn, str(caller["company_id"]), session_base=key,
+                           display_name=name, rejected_by=str(caller["id"]))
+    logger.info("speaker name removed: session=%s name=%s turns=%d", key, name, n)
+    return ok({"sessionBase": key, "name": name, "turnsUnnamed": n})
+
+
+def withdraw_voiceprint(conn, caller, voiceprint_id):
+    """DELETE /api/org/voiceprints/{id} — honour a withdrawal.
+
+    §6 requires this to exist, and until enrolment landed there was nothing to withdraw, so
+    it did not. A feature that can create biometric data and offers no way to take it back
+    is not a smaller version of the right thing.
+
+    The vectors go; the profile row survives as `withdrawn`, because a record that something
+    existed and was removed is what an audit of a withdrawal consists of — and because a
+    deleted row would be silently re-created by the next correction naming the same person.
+
+    The count of removed samples comes back rather than a bare 200: "we did it" and "there
+    was nothing there" look identical otherwise, and they mean different things to whoever
+    asked.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    # Company from the caller, never the path: a valid uuid from another tenant would
+    # otherwise be a delete button on their data.
+    removed = voiceprints.withdraw(conn, str(caller["company_id"]), voiceprint_id)
+    logger.info("voiceprint withdrawn: %s (%d samples)", voiceprint_id, len(removed))
+    return ok({"voiceprintId": voiceprint_id, "samplesRemoved": len(removed)})
 
 
 def speaker_corrections(conn, caller, session_base, event):
@@ -1268,12 +1569,28 @@ def speaker_corrections(conn, caller, session_base, event):
     """
     if SPEAKER_IDENTITY_MODE == "off":
         return error("not found", 404)
-    if caller["global_role"] not in _CORRECTION_ROLES:
-        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
 
     body = parse_body(event)
     if body is None:
         return error("malformed JSON body", 400)
+
+    # Authorisation runs BEFORE the field validation below, and needs the folder to do it —
+    # so the resolve moved up here from further down. Ordering it the other way told an
+    # unauthorised caller which of their fields were malformed before telling them they had
+    # no business asking.
+    #
+    # The producer knows the folder and the date; the consumer must not guess them. A first
+    # version of the embedder derived them from `session_base` and built
+    # `users/{session}/audio//x.wav` — a key that cannot exist, so a missing field would
+    # have surfaced as a NoSuchKey far from its cause.
+    folder, err = _resolve_org_media_folder(conn, caller, body.get("user") or "",
+                                            what="speaker correction")
+    if err is not None:
+        return err
+    if not _may_correct_speakers(conn, caller, folder):
+        return error("naming a speaker needs an admin, gm, pm, site_manager or "
+                     "platform_admin role, or your own recording", 403)
+
     name = (body.get("display_name") or "").strip()
     if not name:
         return error("display_name is required", 400)
@@ -1308,20 +1625,7 @@ def speaker_corrections(conn, caller, session_base, event):
     # Never from the body: a caller-supplied company would let one tenant queue work
     # scoped to another's profiles.
     company_id = str(caller["company_id"])
-    rows = profiles_for_matching(conn, company_id, site_id=body.get("site_id"))
-    profiles = [{"person_key": r["user_id"] or r["id"],
-                 "display_name": r.get("display_name"),
-                 "status": r.get("status"),
-                 "embedding": list(r["embedding"] or [])} for r in rows]
 
-    # The producer knows the folder and the date; the consumer must not guess them. A first
-    # version of the embedder derived them from `session_base` and built
-    # `users/{session}/audio//x.wav` — a key that cannot exist, so a missing field would
-    # have surfaced as a NoSuchKey far from its cause.
-    folder, err = _resolve_org_media_folder(conn, caller, body.get("user") or "",
-                                            what="speaker correction")
-    if err is not None:
-        return err
     date_m = re.search(r"(\d{4}-\d{2}-\d{2})", session_base or "")
     if not date_m:
         return error("session id must carry its date (…_YYYY-MM-DD_…)", 400)
@@ -1334,6 +1638,43 @@ def speaker_corrections(conn, caller, session_base, event):
     if not session_key:
         return error("session id must carry its sid (…_sid<32 hex>)", 400)
 
+    # Enrolment is the OTHER half, and it is opt-in because it is the half that stores
+    # biometric data. Propagating a name inside one meeting compares audio the company
+    # already holds; enrolling keeps a voice pattern so the person is recognisable in future
+    # meetings, and §10 requires consent from the person whose voice it is — not the wearer,
+    # not the employer, and not whoever is doing the labelling, who is usually a third
+    # person again. The two effects are reported separately for that reason.
+    enrol = None
+    _linked_person, _linked_on = None, "not-requested"
+    if body.get("consent_given"):
+        # WHO consented, not just that somebody did. 0042 added the column precisely because
+        # a timestamp cannot tell the subject agreeing apart from the wearer clicking a box
+        # on their behalf — and leaving it optional meant the column recorded nothing in the
+        # common case, which is the same silence with an extra field.
+        #
+        # This does not make the claim TRUE: the value is still typed by whoever is at the
+        # keyboard, and no code here can verify it. It makes the claim ATTRIBUTED, which is
+        # the most an API can do and the least an audit needs.
+        if not body.get("consented_by"):
+            return error("consented_by is required with consent_given: record whose voice "
+                         "this is, not who is doing the labelling", 400)
+        try:
+            # Which person in the directory this name refers to. A profile keyed only on
+            # a string cannot be narrowed by site, and two people sharing a name land on one
+            # profile — an identity is the stabler key.
+            person, matched_on = users.resolve_display_name(conn, company_id, name)
+            profile = voiceprints.upsert_profile(
+                conn, company_id, display_name=name,
+                consent_given=True, consented_by=body.get("consented_by"),
+                user_id=str(person["id"]) if person else None,
+                linked_by=str(caller["id"]) if person else None,
+                linked_on=matched_on if person else None)
+        except ValueError as exc:
+            return error(str(exc), 400)
+        _linked_person, _linked_on = person, matched_on
+        enrol = {"voiceprint_id": str(profile["id"])}
+
+    session_turns = _session_turns(folder, date_m.group(1), session_base)
     request_id = uuid.uuid4().hex
     artifact = {
         "request_id": request_id,
@@ -1345,25 +1686,41 @@ def speaker_corrections(conn, caller, session_base, event):
         "mode": SPEAKER_IDENTITY_MODE,
         "correction": {"source_filename": src, "start_sec": start, "end_sec": end,
                        "display_name": name},
-        "profiles": profiles,
         # The session's own turns, so the embedder can cluster it and let the correction
         # name a VOICE rather than a single passage. Without them it can only write the one
         # turn the user pointed at, and "the whole meeting follows" is a claim about a
         # mechanism that never runs. org-api is the half that can read transcripts.
-        "turns": _session_turns(folder, date_m.group(1), session_base),
+        "turns": session_turns,
+        "label_map": _label_map(session_turns),
+        "enrol": enrol,
     }
     s3().put_object(Bucket=LAKE_BUCKET,
                     Key=f"voiceprint_requests/{company_id}/{session_base}/{request_id}.json",
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
-    logger.info("speaker correction queued: session=%s mode=%s profiles=%d",
-                session_base, SPEAKER_IDENTITY_MODE, len(profiles))
+    logger.info("speaker correction queued: session=%s mode=%s turns=%d",
+                session_base, SPEAKER_IDENTITY_MODE, len(artifact["turns"]))
     return ok({
         "requestId": request_id,
         # Named separately because they carry different consent obligations, and because a
         # user who was told "done" deserves to know which of the two they got.
         "propagation": "queued",
-        "enrolment": "not_requested",
+        # "requested", not "queued". Everything downstream may still refuse — a window under
+        # ten seconds cannot be judged homogeneous and is not enrolled, and propagation
+        # refusing on the same window refuses the enrolment with it. Saying "queued" told the
+        # user the thing would happen, when all that had happened was that it had been asked
+        # for. Seen on TEST: this endpoint answered `queued` while the embedder logged
+        # `enrolment refused: window too short to check homogeneity`.
+        "enrolment": "requested" if enrol else "not_requested",
+        # The refusals are not errors and not rare, so name them where the caller is already
+        # looking rather than leaving a silence for them to interpret.
+        "enrolmentMayBeRefused": bool(enrol),
+        # Said out loud, because a silent NULL here is exactly what made the site-scoped
+        # branch of `profiles_for_matching` a no-op for its whole life: the query had an
+        # escape for unlinked profiles and every profile was unlinked.
+        "linkedTo": ({"userId": str(_linked_person["id"]), "matchedOn": _linked_on}
+                     if _linked_person else None),
+        "linkReason": None if _linked_person else _linked_on,
     }, 202)
 
 
@@ -3005,6 +3362,12 @@ def _source_prefixes_for(rec):
     """
     folder, date = rec.get("folder"), rec.get("date")
     base = (rec.get("sessionBase") or "").strip()
+    # A session id is a filename stem: `%`, `/` and `\` cannot appear in one. `_` CAN and
+    # does — legacy bases are `{device}_{date}_{time}` — which is why the repository escapes
+    # its bind rather than rejecting the character. Defence in depth, and the two guards
+    # fail differently: this one refuses the request, that one narrows the pattern.
+    if any(c in base for c in "%/\\"):
+        return []
     if not folder or not date or not base:
         return []
     return [f"extractions/{folder}/{date}/{base}"]
@@ -3081,11 +3444,13 @@ def delete_recordings_endpoint(conn, caller, body):
                             "error": "not permitted to delete this user's recordings"})
             continue
         hidden = 0
+        topic_ids = []
         for prefix in prefixes:
             redactions.create_recording_tombstone(
                 conn, target_company, prefix, reason,
                 caller.get("id"), caller.get("global_role"), batch_id=batch_id)
             for row in topics.list_topics_for_source_prefix(conn, prefix) or []:
+                topic_ids.append(row["id"])
                 if redactions.create_redaction(
                         conn, target_company, row["id"], reason,
                         caller.get("id"), caller.get("global_role"),
@@ -3105,7 +3470,23 @@ def delete_recordings_endpoint(conn, caller, body):
                     target_type="topic", scope="deleted", batch_id=batch_id,
                     skip_if_already_deleted=True):
                 hidden += 1
-        results.append({"recording": rec, "topics_hidden": hidden})
+        # The search index is MOVED, not filtered. The read-time predicate cannot reach
+        # these rows: every chunk is stamped `source_s3_key = reports/…` so the tombstone's
+        # source arm never matches, and the unassigned transcript windows carry
+        # `topic_id = NULL` where the topic arm is trivially true. Both arms miss, and what
+        # they miss is the verbatim speech -- a customer deleted a recording, watched it
+        # disappear, and the sentence stayed searchable. Archived rather than deleted so the
+        # undelete can put it back without re-embedding.
+        # The TARGET's company, matching the tombstone above — an admin deleting another
+        # company's recording (platform_admin) must archive that company's chunks, not
+        # their own. Passing the caller's would silently archive nothing.
+        archived = chunks.archive_chunks_for_session(
+            conn, (rec.get("sessionBase") or "").strip(), topic_ids, batch_id,
+            company_id=target_company)
+        logger.info("user deletion: batch=%s session=%s archived %d chunk(s)",
+                    batch_id, rec.get("sessionBase"), archived)
+        results.append({"recording": rec, "topics_hidden": hidden,
+                        "chunks_archived": archived})
         days.add((rec["folder"], rec["date"]))
         sessions_by_day.setdefault((rec["folder"], rec["date"]), set()).add(
             (rec.get("sessionBase") or "").strip())
@@ -3170,6 +3551,13 @@ def undelete_recordings_endpoint(conn, caller, body):
 
     rows = redactions.revert_batch(
         conn, batch_id, caller["company_id"], cross_company=cross) or []
+    # The search index comes back too, out of the archive and keyed on the same batch, so
+    # one undelete restores exactly what one delete removed. Logged including zero: a batch
+    # created before the archive shipped legitimately has none, and that has to be
+    # distinguishable from a restore that silently did nothing.
+    restored_chunks = chunks.restore_chunks_for_batch(conn, batch_id)
+    logger.info("user deletion: undelete batch=%s restored %d chunk(s)",
+                batch_id, restored_chunks)
     # Only THIS batch's sessions come out of the mirror. The first version wrote the day's
     # document as `[]`, which un-hid every other active batch for that day from the readers
     # that have no database -- an undelete that restores more than the delete hid.
@@ -3221,7 +3609,8 @@ def undelete_recordings_endpoint(conn, caller, body):
             logger.exception("deletion mirror rewrite failed for %s/%s on undelete %s",
                              folder, date, batch_id)
     logger.info("user deletion: undelete batch=%s restored=%d", batch_id, len(rows))
-    return ok({"batch_id": batch_id, "restored": len(rows)})
+    return ok({"batch_id": batch_id, "restored": len(rows),
+               "chunks_restored": restored_chunks})
 
 
 def create_redaction_endpoint(conn, caller, body):
@@ -5768,7 +6157,14 @@ def _read_org_transcripts(date, folder, start_time, end_time, conn=None):
                 if abs_end < start_sec or abs_start > end_sec:
                     continue
 
-                speaker = aseg.get("speaker_label", "spk_0")
+                # Two values on purpose. `speaker` is coerced so the viewer always has
+                # something to render; `speaker_label` is the raw one, None when the
+                # provider returned no diarisation at all. Label inheritance must key on
+                # the raw value: a file with no diarisation is otherwise indistinguishable
+                # from one that genuinely is all spk_0, and inheriting on the coerced value
+                # would spread one name across the whole file.
+                raw_label = aseg.get("speaker_label")
+                speaker = raw_label or "spk_0"
                 text = aseg.get("transcript", "")
                 if not text.strip():
                     continue
@@ -5776,6 +6172,7 @@ def _read_org_transcripts(date, folder, start_time, end_time, conn=None):
                 ah, am, asec_v = int(abs_start) // 3600, (int(abs_start) % 3600) // 60, int(abs_start) % 60
                 all_speaker_segs.append({
                     "speaker": speaker,
+                    "speaker_label": raw_label,
                     "text": text,
                     "start": round(abs_start, 1),
                     "end": round(abs_end, 1),

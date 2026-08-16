@@ -73,6 +73,7 @@ from db.connection import get_connection
 from repositories import (chunks, companies, memberships, recordings, redactions,
                           sites, topics, users)
 import batch_stitch
+import deletion_mirror
 from transcript_utils import normalize_transcript
 
 logger = logging.getLogger()
@@ -440,17 +441,88 @@ def _map_safety(flags):
 # ----------------------------------------------------------
 # Transcripts for a (user_folder, date)
 # ----------------------------------------------------------
+def _archive_deleted_chunks(conn, user_folder, date):
+    """Aurora's veto over what the mirror let through. Runs AFTER the chunk inserts.
+
+    `_load_turns` filters on the S3 mirror because `lambda_embed_report` must build the
+    identical chunk set (see its docstring). That leaves one gap: if the mirror write
+    failed, or a delete landed between embed-report and this run, deleted audio gets
+    re-chunked. This is the authority pass that closes it — same archive the delete
+    endpoint uses, so the rows land in the same place and one undelete still restores
+    exactly what one delete removed.
+
+    It runs on EVERY ingest, not only after a delete. A sweep that only runs when someone
+    remembers to trigger it is a sweep that is not running.
+
+    Failures are logged and swallowed: this is a backstop, and taking the nightly report
+    down for every user to protect one deletion is the wrong trade. The count is logged
+    including zero — "nothing to archive" and "never ran" are otherwise identical, which is
+    how the original gap survived a review that asked about search directly.
+    """
+    try:
+        prefixes = redactions.deleted_source_prefixes(conn, user_folder, date) or []
+    except Exception:
+        logger.exception("could not read deletions for %s/%s — deleted audio may have "
+                         "been re-indexed by this run", user_folder, date)
+        return
+    total = 0
+    for prefix in prefixes:
+        base = (prefix or "").rstrip("/").rsplit("/", 1)[-1]
+        if not base:
+            continue
+        try:
+            # Rows, not ids -- `list_deleted_batches_for_prefix` returns dicts of
+            # (batch_id, company_id). Taking the row itself and binding it as a uuid is
+            # the kind of mistake that only shows up at runtime, on the deletion path,
+            # which nobody exercises by accident.
+            batches = redactions.list_deleted_batches_for_prefix(conn, prefix) or []
+            batch_id = batches[0]["batch_id"] if batches else None
+            total += chunks.archive_chunks_for_session(conn, base, [], batch_id)
+        except Exception:
+            logger.exception("could not archive chunks for deleted session %s", base)
+    logger.info("post-ingest deletion sweep for %s/%s: archived %d chunk(s) across %d "
+                "deleted session(s)", user_folder, date, total, len(prefixes))
+
+
 def _load_turns(user_folder, date):
     """List transcripts/{user_folder}/{date}/*.json, normalize each (skip
     unparseable ones), flatten speaker_turns with a caller-added 'src' key
-    (the source transcript filename) for chunk_transcripts."""
+    (the source transcript filename) for chunk_transcripts.
+
+    A deleted recording's transcripts are skipped, because otherwise the nightly re-ingest
+    rebuilds `transcript_window` chunks of exactly the audio a customer deleted -- the
+    content vanishes when they press the button and is searchable again the next morning.
+
+    THE FILTER READS THE S3 MIRROR, NOT THE DATABASE, and that is not the usual
+    authority-vs-cache trade. `lambda_embed_report` calls this same function and it is not
+    in the VPC -- it has no database at all. If the two disagree about which transcripts to
+    include, the WINDOW BOUNDARIES of the surviving turns differ, so `chunk_text` differs,
+    so its sha256 differs, so every vector lookup misses and `embed_from_sidecar` raises:
+    the whole report fails to ingest. The docstring below this one has warned about exactly
+    that since the agent-turn filter was added. Here the requirement is AGREEMENT, and only
+    a source both lambdas can read delivers it.
+
+    Aurora is still the authority, applied one step later: `_archive_deleted_chunks` runs
+    after the inserts and moves anything the database says is deleted. Doing it there
+    rather than here keeps the two chunk builds identical by construction.
+    """
     prefix = f"transcripts/{user_folder}/{date}/"
+    deleted_bases = deletion_mirror.deleted_sessions(s3(), S3_BUCKET, user_folder, date)
+    logger.info("chunking transcripts for %s/%s, skipping %d deleted session(s)",
+                user_folder, date, len(deleted_bases))
     turns = []
+    skipped = 0
     paginator = s3().get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
             if not key.endswith(".json"):
+                continue
+            if any(b in key for b in deleted_bases):
+                # Substring, because the session id sits INSIDE the filename
+                # (`…_sid{32hex}_c0001.json`) rather than being a path component. Same
+                # rule as deletion_mirror.drop_deleted, deliberately.
+                skipped += 1
                 continue
             filename = key.rsplit("/", 1)[-1]
             raw = s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
@@ -661,6 +733,8 @@ def ingest_report(date, user_folder, report_key):
                 metadata=c["metadata"],
             )
             chunks_n += 1
+
+        _archive_deleted_chunks(conn, user_folder, date)
 
     topics_n = len(topic_seq_to_id)
     logger.info("ingested report=%s topics=%d chunks=%d", report_key, topics_n, chunks_n)

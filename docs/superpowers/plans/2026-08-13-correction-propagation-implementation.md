@@ -270,3 +270,15 @@ the same reasoning that holds P5 applies — a change there costs a real feature
 while the item itself is latent and cannot fire under the current configuration. It belongs
 with whoever next changes `TRANSCRIBE_WHOLE_CHUNK`, and the guard to write is a loud refusal
 when a member's `_off` is non-zero.
+
+## Open on prod, 2026-08-14
+
+**`voiceprint_requests/` has no expiry on the prod lake, and the script cannot add it.**
+`wire-bucket-lifecycle.sh` replaces the whole configuration and refuses when it finds rules
+it does not manage — which prod has (`DeleteOldTranscripts`, `CleanupPendingDownloads`). So
+the 7-day rule added on 2026-08-14 is **TEST only**, and saying "the artifacts expire" was
+true of one environment while the sentence sounded like both.
+
+Prod's prefix is empty today because the feature is `off` there. The first prod correction
+writes an artifact that never expires. Add the rule by hand — the script now prints the exact
+commands when it refuses — **before** `PROD_SPEAKER_IDENTITY_MODE` is ever set.

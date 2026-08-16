@@ -28,9 +28,12 @@ Time resolution logic:
     word[last].end_time = 7371.4s → absolute = 14:21:25
 """
 
+import logging
 import os
 import re
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -604,3 +607,68 @@ def speaker_turns_from_items(results):
         if item.get("end_time"):
             current["end_time"] = item["end_time"]
     return [t for t in turns if t["transcript"].strip()]
+
+
+# --- prompt-size truncation -------------------------------------------------
+
+DEFAULT_HEAD_SHARE = 0.6
+
+
+def elide_middle(lines, limit, head_share=DEFAULT_HEAD_SHARE, sep="\n"):
+    """Fit `lines` into `limit` chars by keeping the head AND the tail.
+
+    Returns `(text, stats)` where stats is
+    `{chars, lines, lines_omitted, truncated}` — the record of what the model was
+    actually shown.
+
+    A meeting states its context at the start and lands its decisions and actions at
+    the END. A bare head slice (`text[:limit]`) therefore drops exactly the part that
+    matters most, and it does so silently: the output looks complete and nothing
+    anywhere says otherwise. That is a real defect this codebase shipped twice —
+    once in the extraction layer (fixed, and this function is that fix generalised)
+    and once in the rolling summary that the stop-recording email is built from,
+    where any meeting over ~70 minutes lost its ending.
+
+    Elision is on line boundaries, so a turn is never cut mid-sentence and handed to
+    the model as if the speaker had stopped there.
+
+    Anything that silently discards input has to leave a number behind: `stats` is
+    that number, and the marker in the text is the model's copy of it.
+    """
+    text = sep.join(lines)
+    stats = {"chars": len(text), "lines": len(lines),
+             "lines_omitted": 0, "truncated": False}
+    if len(text) <= limit:
+        return text, stats
+
+    marker_room = 120  # the elision line itself, plus slack
+    head_budget = int((limit - marker_room) * head_share)
+    tail_budget = (limit - marker_room) - head_budget
+    step = len(sep)
+
+    head, used = [], 0
+    for line in lines:
+        if used + len(line) + step > head_budget:
+            break
+        head.append(line)
+        used += len(line) + step
+
+    tail, used = [], 0
+    for line in reversed(lines[len(head):]):
+        if used + len(line) + step > tail_budget:
+            break
+        tail.append(line)
+        used += len(line) + step
+    tail.reverse()
+
+    omitted = len(lines) - len(head) - len(tail)
+    marker = (f"[... {omitted} line(s) from the middle of this transcript were "
+              f"omitted to fit the prompt ...]")
+    rendered = sep.join(head + [marker] + tail)
+    stats.update(truncated=True, lines_omitted=omitted, chars=len(rendered))
+    logger.warning(
+        "Transcript truncated (middle elided): %d chars / %d lines in, %d chars "
+        "rendered, %d lines omitted (limit %d). What follows does not cover the "
+        "whole session.",
+        len(text), len(lines), len(rendered), omitted, limit)
+    return rendered, stats

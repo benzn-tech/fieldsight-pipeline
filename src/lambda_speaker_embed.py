@@ -6,14 +6,14 @@ a file landing):
     {"op": "enrol", "voiceprint_id", "user_folder", "date", "source_filename",
      "start_sec", "end_sec", "correction_ref"?}
     {"op": "match", "session", "user_folder", "date", "company_id",
-     "profiles": [{"person_key", "status", "embedding"}, ...],
      "turns": [{"source_filename", "start_sec", "end_sec"}, ...]}
 
 Pure compute: **no database, no VPC.** This function runs on python3.12 because that is where
 onnxruntime comes from (the VAD layer is cp312-only) and `PsycopgLayer` is cp311-only — one
 function cannot carry both, and holding a connection here made every invocation raise
-`ModuleNotFoundError` while the deploy stayed green. Profiles arrive in the event from
-org-api, which is in-VPC and already owns the consent/withdrawn filters.
+`ModuleNotFoundError` while the deploy stayed green. Nothing it needs comes from a database:
+the artifact carries the window and the session's turns, and NO voice vectors — carrying them
+was the biometric-residence defect's fifth home.
 
 They fail in opposite directions, and the code is shaped around that asymmetry:
 
@@ -47,6 +47,7 @@ import wave
 import numpy as np
 
 import batch_seal
+import transcript_utils
 import batch_stitch
 import turn_name_overlay
 import voiceprint_utils as vp
@@ -98,13 +99,95 @@ def _ensure_model():
     return _session
 
 
-def embed_audio(audio, sample_rate):
-    """One 192-d vector for this audio. Stubbed in tests; the model's fidelity is pinned by
-    test_voiceprint_onnx_parity against committed reference vectors."""
+# Measured on the deployed function (1769 MB), embedding one window of each length with
+# the cap disabled:
+#
+#     20 s -> 537 MB      40 s -> 802 MB      60 s -> 1158 MB      80 s -> 1486 MB
+#
+# ~15.8 MB per second of audio over a ~220 MB baseline, which puts the ceiling near 98 s and
+# explains the 108 s window that killed it. 20.0 was a guess made before this was measured;
+# 45 s uses about half the available memory and gives each piece more than twice the context.
+MAX_EMBED_SECONDS = float(os.environ.get("VOICEPRINT_MAX_EMBED_SECONDS", "45.0"))
+
+# Harvest: turning ONE naming gesture into a usable profile.
+#
+# 10 s, not the 3 s matching floor and not the 5 s a first draft picked.
+# `window_is_homogeneous` returns None for fewer than two frames and frames are cut at
+# FRAME_SECONDS = 5.0, so a 5-9.99 s window is UNJUDGEABLE — and "could not check" is
+# refused alongside "no", or the guard becomes decoration. A 5 s floor would have admitted
+# nothing at all, silently. `lambda_org_api` already documented this: "a window under ten
+# seconds cannot be judged homogeneous and is not enrolled".
+ENROL_MIN_TURN_S = float(os.environ.get("VOICEPRINT_ENROL_MIN_TURN_S", "10.0"))
+ENROL_MAX_SAMPLES = int(os.environ.get("VOICEPRINT_ENROL_MAX_SAMPLES", "6"))
+ENROL_MAX_SECONDS = float(os.environ.get("VOICEPRINT_ENROL_MAX_SECONDS", "60.0"))
+
+
+def sr_floor(sample_rate):
+    """The shortest remainder worth its own forward pass — one second.
+
+    Below this the piece is a scrap: too short to characterise a voice, and averaged in with
+    equal weight it moves the result toward whatever noise it happens to contain.
+    """
+    return int(sample_rate)
+
+
+def _embed_once(audio):
     sess = _ensure_model()
     out = sess.run(None, {"wav": np.asarray(audio, dtype=np.float32)[None, :],
                           "wav_lens": np.array([1.0], dtype=np.float32)})
     return np.asarray(out[0]).ravel()
+
+
+def embed_audio(audio, sample_rate):
+    """One 192-d vector for this audio. Stubbed in tests; the model's fidelity is pinned by
+    test_voiceprint_onnx_parity against committed reference vectors.
+
+    **Long audio is embedded in pieces and averaged, not in one pass.** ECAPA's convolutions
+    run the full length of the input, so the activations grow with it: a 108-second turn
+    killed this function with `Runtime.OutOfMemory` at 1769 MB after 40 seconds, on the
+    first real enrolment attempted against whole-chunk transcription. Every earlier run —
+    Phase 0, the parity fixtures, yesterday's live verification — used a window of a few
+    seconds, so nothing had ever asked the model for a long one.
+
+    A 108-second turn is not unusual. `TRANSCRIBE_WHOLE_CHUNK` produces turns the length of
+    the chunk, and the matcher embeds EVERY turn in a session, so the ceiling is reached
+    immediately rather than rarely.
+
+    Averaging unit vectors is the ordinary treatment for an utterance longer than the model
+    was trained on, and it is what `window_is_homogeneous` already does with the same
+    frames. Audio at or under the cap takes the single-pass path untouched, so the parity
+    fixtures still compare like with like.
+    """
+    audio = np.asarray(audio, dtype=np.float32)
+    cap = int(MAX_EMBED_SECONDS * sample_rate)
+    if len(audio) <= cap:
+        return _embed_once(audio)
+
+    # `range(..., len(audio) - cap + 1, ...)` walks only WHOLE pieces, so everything after
+    # the last full one is discarded: a 113.6 s turn was embedded from its first 90 seconds
+    # and the remaining 23.6 s — 21 % of the person's speech — never entered the vector.
+    # Silently, and the vector looked entirely ordinary.
+    #
+    # The remainder is kept unless it is too short to be worth a forward pass on its own; a
+    # sub-second scrap is noise, not evidence, and would drag the average toward whatever
+    # happened to be in it.
+    starts = list(range(0, max(1, len(audio) - cap + 1), cap))
+    tail = starts[-1] + cap
+    if len(audio) - tail >= sr_floor(sample_rate):
+        starts.append(tail)
+    vecs = []
+    for i in starts:
+        v = _embed_once(audio[i:i + cap])
+        n = np.linalg.norm(v)
+        if n:
+            # Normalised BEFORE averaging: the scores this feeds are cosines, so a piece
+            # with a larger norm is not more of an opinion about who is speaking.
+            vecs.append(v / n)
+    if not vecs:
+        return _embed_once(audio[:cap])
+    mean = np.mean(vecs, axis=0)
+    n = np.linalg.norm(mean)
+    return mean / n if n else mean
 
 
 def _raw_key(user_folder, date, source_filename):
@@ -136,9 +219,31 @@ def _get(key):
     return s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
 
 
+# Decoded audio for the invocation in flight, keyed by S3 key. Cleared at the top of every
+# handler call so a warm container never carries one session's audio into the next.
+#
+# Every turn used to re-download and re-parse the same object: a session of 100 turns from
+# one batch fetched the same few chunks 100 times, ~176 ms and a few megabytes each. The
+# turns in a match run are, by construction, all from the same handful of files.
+_AUDIO_CACHE = {}
+_AUDIO_CACHE_MAX = 8   # ~2 MB each as float32; the bound exists so a long session cannot
+                       # accumulate the whole recording in memory beside the model
+
+
+def _read_cached(key):
+    hit = _AUDIO_CACHE.get(key)
+    if hit is not None:
+        return hit
+    value = _read_wav(_get(key))
+    if len(_AUDIO_CACHE) >= _AUDIO_CACHE_MAX:
+        _AUDIO_CACHE.pop(next(iter(_AUDIO_CACHE)))
+    _AUDIO_CACHE[key] = value
+    return value
+
+
 def _fetch(user_folder, date, source_filename):
     key = _raw_key(user_folder, date, source_filename)
-    audio, sr = _read_wav(_get(key))
+    audio, sr = _read_cached(key)
     return key, audio, sr
 
 
@@ -159,6 +264,14 @@ def _window_audio(user_folder, date, source_filename, start, end):
     """
     if not batch_stitch.is_batched(source_filename):
         key, audio, sr = _fetch(user_folder, date, source_filename)
+        # The SAME missing term `batch_seal.raw_window_for_member` documents, on the branch
+        # that does not go through it. `_raw_key` strips `_off{T}` to reach the device's
+        # upload, so a position measured inside the VAD unit is short by T once the audio
+        # is the whole chunk. Wrong audio, no error, and every voiceprint number computed
+        # on it looks ordinary.
+        offsets = transcript_utils.extract_vad_offsets_from_filename(source_filename)
+        unit_start = float((offsets or [None])[0] or 0.0)
+        start, end = start + unit_start, end + unit_start
         return key, audio[int(start * sr):int(end * sr)], sr
 
     batch_key = f"audio_segments/{user_folder}/{date}/{source_filename}"
@@ -171,16 +284,51 @@ def _window_audio(user_folder, date, source_filename, start, end):
         # beside raw_key_for so there is one implementation of each.
         raw, lo, hi = batch_seal.raw_window_for_member(p["chunk_key"], p["start_sec"],
                                                        p["end_sec"])
-        audio, sr = _read_wav(_get(raw))
+        audio, sr = _read_cached(raw)
         rate = sr
         first = first or raw
         parts.append(audio[int(lo * sr):int(hi * sr)])
     return first, np.concatenate(parts), rate
 
 
+# A frame quieter than this carries no speech worth comparing. The devices record speech at
+# a median of -36 dBFS (measured), and the one window the homogeneity guard has ever accepted
+# sat at -67/-57 — the noise floor, roughly 30 dB below speech. -55 sits between the two with
+# room on both sides, and it is a floor rather than a judgement: it removes frames that
+# cannot be about anybody, not frames that are merely quiet.
+FRAME_MIN_DBFS = float(os.environ.get("VOICEPRINT_FRAME_MIN_DBFS", "-55.0"))
+
+
+def _dbfs(frame):
+    arr = np.asarray(frame, dtype=np.float32)
+    if arr.size == 0:
+        return -120.0
+    rms = float(np.sqrt(np.mean(arr * arr)))
+    return 20.0 * float(np.log10(rms)) if rms > 1e-9 else -120.0
+
+
 def _frames(audio, sr):
+    """Frames with speech in them, for the homogeneity comparison.
+
+    The gate lives HERE and not in any caller, because four call sites build frames
+    independently — `op=enrol`, `_admit_harvest`, `_from_request_artifact` and `op=spread` —
+    and a gate applied at the writing sites only would leave the DIAGNOSTIC ungated. That is
+    the one used to check whether the gate works, so it would report "not gating" while
+    gating everywhere that matters.
+
+    It also cannot live in `voiceprint_utils`: that module is pure numpy by contract, and
+    `window_is_homogeneous` receives embeddings rather than audio, so it could not gate
+    anything even in principle.
+
+    **This does not unblock enrolment and is not meant to.** Dropping frames can only lower a
+    maximum over pairs or leave it alone; the windows currently refused are refused on pairs
+    of speech-bearing frames that no gate removes. What it stops is the failure that cannot
+    be undone: a window of near-silence being judged "one voice" and stored as somebody's
+    voiceprint. Too few surviving frames already means "cannot tell" at every consumer.
+    """
     step = int(FRAME_SECONDS * sr)
-    return [audio[i:i + step] for i in range(0, len(audio) - step + 1, step)]
+    cut = [audio[i:i + step] for i in range(0, len(audio) - step + 1, step)]
+    return [f for f in cut if _dbfs(f) >= FRAME_MIN_DBFS]
 
 
 def _enrol(event):
@@ -238,6 +386,9 @@ def _match(event):
         d = vp.decide_name(vp.aggregate_scores(rows), duration_s=duration)
         status = d.status
         if status == "confirmed" and by_key.get(d.name, {}).get("status") == "tentative":
+            # (see below) a profile that has not earned confirmation cannot hand one out —
+            # and since harvest can build a profile entirely from inference, `tentative` is
+            # where such a profile stays until a person vouches for one of its windows.
             # A profile that has not earned confirmation cannot hand one out.
             status = "tentative"
         results.append({"turn": turn, "status": status, "name": d.name,
@@ -270,7 +421,8 @@ def invoke_writer(payload):
 MAX_PROPAGATION_TURNS = int(os.environ.get("SPEAKER_PROPAGATION_MAX_TURNS", "300"))
 
 
-def _propagate(folder, date, turns, reference, display_name, asserted_ref):
+def _propagate(folder, date, turns, reference, display_name, asserted_ref,
+               why=None, harvest=None):
     """Correct one passage, name that person's other passages in the same session.
 
     The unit is a VOICE, not a turn. Two spec revisions died scoring turns against the
@@ -336,7 +488,9 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref):
     members = groups[own]
     if len(members) < 2:
         # This voice spoke once. There is nothing to propagate, and that is the answer —
-        # not a reason to look for a different cluster to name.
+        # not a reason to look for a different cluster to name, and NOT a reason to refuse
+        # an enrolment: naming somebody who said one thing is the most ordinary correction
+        # there is.
         logger.info("propagation: the corrected voice has only this turn")
         return []
 
@@ -354,7 +508,26 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref):
             # session.
             logger.warning("propagation refused: the corrected turn is between voices "
                            "(margin %.3f)", margin)
+            if why is not None:
+                why.append("between-voices")
             return []
+
+    if harvest is not None:
+        # The cluster, ordered by how well each member agrees with the rest of it. This work
+        # is already done and was previously discarded: one correction stored ONE sample —
+        # the window the user pointed at — which is often shorter than 10 s and makes a weak
+        # profile. Selection happens here; whether any of it is STORED is the caller's
+        # decision, taken after the anchor's own refusal checks.
+        by_agreement = sorted(
+            (i for i in members if refs[i] != asserted_ref),
+            key=lambda i: vp.cosine(
+                vp.leave_one_out_centroid([vectors[j] for j in members],
+                                          members.index(i)),
+                vectors[i]),
+            reverse=True)
+        for i in by_agreement:
+            harvest.append({"turn": usable[i], "vector": vectors[i],
+                            "turn_ref": refs[i]})
 
     out = []
     for i in members:
@@ -368,12 +541,73 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref):
     return out
 
 
+def _admit_harvest(folder, date, candidates):
+    """Which cluster members may become enrolment samples.
+
+    **This is a machine-fed path and it is labelled as one.** The human vouched for ONE turn;
+    every other member of the cluster was assigned by `cluster_turns`, and `_propagate` caps
+    those at `tentative` on purpose — "the margin that would justify `confirmed` has never
+    been measured, so an inferred name is a suggestion". Storing them as samples promotes a
+    suggestion to permanent biometric ground truth, so the writer records them under a
+    distinct source and a profile built only from them can never be promoted.
+
+    What makes it defensible rather than merely convenient: complete-linkage clustering at
+    tau = 0.85 means every member agrees with EVERY other at or above that threshold,
+    including the anchor the human vouched for — and 0.85 is the one number in this system
+    that was measured and frozen (Gate A, two Phase 0 sessions). It is a real bar. It is
+    simply not a human one.
+
+    Each admitted turn is re-fetched and re-framed: `_propagate` computes one whole-turn
+    embedding and drops the clip, and homogeneity needs FRAMES. Raw audio is cached per
+    invocation so the S3 cost is small; the ONNX cost is not (~98 ms per second of audio,
+    measured), which is what the caps are for.
+    """
+    admitted, seconds = [], 0.0
+    for c in candidates:
+        if len(admitted) >= ENROL_MAX_SAMPLES or seconds >= ENROL_MAX_SECONDS:
+            break
+        t = c["turn"]
+        start, end = float(t["start_sec"]), float(t["end_sec"])
+        duration = end - start
+        if duration < ENROL_MIN_TURN_S:
+            # Redundant with the homogeneity check and kept deliberately: a window under
+            # 10 s yields fewer than two frames, so `window_is_homogeneous` would return
+            # None and refuse it anyway. What this saves is the S3 read and the ONNX pass
+            # (~98 ms per second of audio, measured) for a turn that cannot possibly be
+            # admitted — and it says the rule out loud instead of leaving it as an emergent
+            # property of two constants that could drift apart.
+            continue
+        key, clip, sr = _window_audio(folder, date, t["source_filename"], start, end)
+        frames = [embed_audio(f, sr) for f in _frames(clip, sr)]
+        spread = vp.frame_spread(frames)
+        verdict = vp.window_is_homogeneous(frames)
+        if verdict is not True:
+            # None ("could not check") refused alongside False, exactly as the anchor's own
+            # check does. Admitting the unjudgeable is how a guard becomes decoration.
+            logger.info("harvest: %s not admitted (%s, frames=%d spread=%s)",
+                        c["turn_ref"],
+                        "not homogeneous" if verdict is False else "unjudgeable",
+                        len(frames), "n/a" if spread is None else "%.3f" % spread)
+            continue
+        admitted.append({"embedding": [float(x) for x in c["vector"]],
+                         "s3_key": key, "window": [start, end]})
+        seconds += duration
+    logger.info("harvest: %d of %d cluster members admitted (%.1fs)",
+                len(admitted), len(candidates), seconds)
+    return admitted
+
+
 def _from_request_artifact(bucket, key):
     """One correction, start to finish.
 
-    The artifact is org-api's output: it holds the window the user marked and the profiles
-    that survived the consent and withdrawn filters. This function has no database and no
-    other way to obtain a profile, which is what keeps those filters in one place.
+    The artifact is org-api's output: the window the user marked and the session's turns.
+
+    It carries NO voice vectors. It used to carry every consented profile in the company,
+    192 dimensions each, into an S3 object with no lifecycle rule — so a withdrawn person's
+    voiceprint stayed in the bucket after the withdrawal returned 200. They were never
+    needed: propagation names the cluster the corrected turn belongs to and scores against
+    no stored profile. The only thing those vectors produced was a similarity score on the
+    one row whose name the user had typed himself.
     """
     req = json.loads(_get(key))
     c = req.get("correction") or {}
@@ -390,20 +624,82 @@ def _from_request_artifact(bucket, key):
     s3_key, clip, sr = _window_audio(folder, date, c["source_filename"], start, end)
     v = embed_audio(clip, sr)
 
-    profiles = req.get("profiles") or []
-    rows = [{"person_key": p["person_key"], "score": vp.cosine(v, p["embedding"])}
-            for p in profiles]
-    d = vp.decide_name(vp.aggregate_scores(rows), duration_s=end - start)
-
     # The turn the user asserted. Its name is not an inference and is written as
     # `correction`; the writer refuses to give it a profile id unless it is marked asserted.
     turn_ref = turn_name_overlay.turn_ref(c["source_filename"], start)
     results = [{"turn_ref": turn_ref, "state": "confirmed",
                 "cluster_ref": None, "asserted": True,
                 "display_name": c.get("display_name"),
-                "score": d.margin}]
-    results.extend(_propagate(folder, date, req.get("turns") or [], v,
-                              c.get("display_name"), turn_ref))
+                # Carried so a withdrawal can reach this name even when the enrolment was
+                # REFUSED and no sample exists to chain through. Only the asserted row gets
+                # it, and only the writer decides what to do with it — a propagated row with
+                # a profile id would count as an independent human confirmation.
+                "voiceprint_id": (req.get("enrol") or {}).get("voiceprint_id")}]
+    why = []
+    candidates = []
+    propagated = _propagate(folder, date, req.get("turns") or [], v,
+                            c.get("display_name"), turn_ref, why=why,
+                            harvest=candidates)
+    refusal = why[0] if why else None
+    results.extend(propagated)
+
+    # The vector is already computed for the propagation decision, so enrolling the same
+    # window costs nothing more — and embedding it twice would pay twice for one answer and
+    # let the two results differ. It travels in the invoke payload and never through S3,
+    # which is what stopped the biometric-residence defect the reviews chased twice.
+    # Enrolment runs the same guard `op=enrol` has always run, and this module's docstring
+    # has always claimed: a window that may hold two voices, or that is too short to judge,
+    # is not stored. A profile cannot be un-poisoned — only the contributing sample deleted —
+    # and until now the correction-carried path skipped the check entirely.
+    #
+    # It also refuses whenever PROPAGATION refused. `_propagate` returning nothing because
+    # the corrected turn sits between two voices is the system saying it does not believe the
+    # window is one person; storing that same vector as somebody's profile would be
+    # disbelieving it in one direction and acting on it in the other.
+    enrol = req.get("enrol")
+    if enrol:
+        frames = [embed_audio(f, sr) for f in _frames(clip, sr)]
+        spread = vp.frame_spread(frames)
+        verdict = vp.window_is_homogeneous(frames)
+        if verdict is not True:
+            # The DISTANCE, not just the verdict. Three windows have now been refused on
+            # TEST and every log line said only "not homogeneous" — which cannot be argued
+            # with, and cannot tell "this window really holds two people" apart from "0.35
+            # was measured on read speech and site audio does not look like that".
+            logger.warning("enrolment refused: %s (frames=%d spread=%s limit=%.2f)",
+                           "window is not homogeneous" if verdict is False
+                           else "window too short to check homogeneity",
+                           len(frames),
+                           "n/a" if spread is None else "%.3f" % spread,
+                           vp.DEFAULT_MAX_FRAME_SPREAD)
+            # Carried to the writer rather than only logged. The DB half is the only one
+            # that can attach this to the profile, and without it a refusal ends in
+            # CloudWatch while the person who made the correction is told "requested".
+            enrol = {"voiceprint_id": enrol["voiceprint_id"],
+                     "refused": ("this window does not hold one voice"
+                                 if verdict is False
+                                 else "this window has too little speech to judge")}
+        elif refusal == "between-voices":
+            # Propagation judged this window to hold more than one voice. Storing it as
+            # somebody's profile would be disbelieving that in one direction and acting on
+            # it in the other.
+            #
+            # ONLY that verdict. A first version treated every empty propagation as a
+            # refusal, which swept in three benign ones — too few usable turns, the corrected
+            # window not among them, and "this person spoke once". The last is the most
+            # ordinary enrolment there is (a visitor says one thing and you name them), and
+            # it was permanently refused with a log line claiming the window was untrustworthy.
+            logger.warning("enrolment refused: the corrected window holds more than one "
+                           "voice")
+            enrol = {"voiceprint_id": enrol["voiceprint_id"],
+                     "refused": "the corrected passage holds more than one voice"}
+    # AFTER the anchor's own checks, never before. `_propagate` runs first, so without this
+    # ordering six samples would be stored for a profile whose own corrected window had just
+    # been judged to hold two voices — the exact condition one sample is refused for.
+    # A refused anchor is still an `enrol` dict now — it carries the reason — so harvest
+    # must ask whether it was ACCEPTED, not whether it exists.
+    harvested = (_admit_harvest(folder, date, candidates)
+                 if enrol and not enrol.get("refused") else [])
 
     payload = {
         "op": "propagation",
@@ -412,6 +708,26 @@ def _from_request_artifact(bucket, key):
         "correction_ref": req.get("request_id"),
         "cluster_threshold": vp.DEFAULT_CLUSTER_TAU,
         "results": results,
+        # Carried across untouched. org-api writes it into the artifact and the writer reads
+        # it out of the event; this hop is the only thing between them and it did not speak
+        # the key, so `_inherit_labels` got None on every call and returned 0. The feature
+        # and the rejection guard it feeds were unreachable code, and nothing failed — each
+        # end's tests exercised its own half.
+        "label_map": req.get("label_map"),
+        "enrol": (enrol if (enrol or {}).get("refused") else
+                  ({"voiceprint_id": enrol["voiceprint_id"],
+                    "embedding": [float(x) for x in v],
+                    "s3_key": s3_key, "window": [start, end],
+                    "created_by": req.get("requested_by")} if enrol else None)),
+        # A LIST, and a separate key. Not the same act as the anchor: the anchor is what a
+        # person vouched for, these are what the clustering suggested, and the two
+        # populations must stay separable forever — for audit, for measurement, and so a bad
+        # batch can be deleted without touching what somebody asserted.
+        # No second `if enrol` here. `harvested` is already empty when the anchor was
+        # refused, so a guard in this expression could never change an outcome — and a
+        # guard no test can falsify is one nobody will notice going wrong.
+        "harvest": [dict(h, voiceprint_id=enrol["voiceprint_id"],
+                         created_by=req.get("requested_by")) for h in harvested],
     }
     invoke_writer(payload)
     logger.info("correction applied: session=%s ref=%s audio=%s",
@@ -419,7 +735,148 @@ def _from_request_artifact(bucket, key):
     return {"status": "applied", "turn_ref": turn_ref}
 
 
+def _from_match_artifact(bucket, key):
+    """Phase 5: name a whole session against the profiles the company already holds.
+
+    Same prefix and same trigger as a correction, told apart by `op` inside the object. A
+    second prefix would be a second hand-wired S3 notification (BUG-33), and the two
+    artifacts differ only in what they ask for.
+
+    The artifact carries **no voice vectors**. It cannot: it sits in a bucket with a 7-day
+    expiry and no other protection, while a voiceprint is biometric data whose storage the
+    subject consented to in one specific column. The vectors are fetched here, synchronously,
+    from the in-VPC writer, and exist only in this function's memory for the length of the
+    run. That is the fifth and last home this defect gets.
+
+    org-api cannot do this itself — it is in-VPC with no NAT, so any outward invoke
+    black-holes (BUG-36). Non-VPC calling in-VPC is the permitted direction.
+    """
+    req = json.loads(_get(key))
+    company_id = req.get("company_id")
+    folder, date = req.get("user_folder"), req.get("date")
+    session = req.get("session_base")
+    if not company_id or not folder or not date or not session:
+        raise ValueError(
+            f"match artifact {key} is missing company_id/user_folder/date/session_base; the "
+            f"producer has all four and guessing any of them reads a key that cannot exist")
+
+    profiles = invoke_writer({"op": "profiles", "company_id": company_id,
+                              "site_id": req.get("site_id")}).get("profiles") or []
+    if not profiles:
+        # Not an error, and worth a line rather than a silent zero: "nobody was recognised"
+        # and "there was nobody to recognise" look identical downstream, and on TEST the
+        # only profile was withdrawn during a withdrawal test, which is exactly how this
+        # would have been misread as the matcher not working.
+        logger.warning("match: no consented profiles for company %s; nothing to match "
+                       "against (session %s)", company_id, session)
+        return {"session": session, "matched": 0, "profiles": 0, "mode": req.get("mode")}
+
+    out = _match({"session": session, "user_folder": folder, "date": date,
+                  "profiles": profiles, "turns": req.get("turns") or []})
+
+    by_key = {p["person_key"]: p for p in profiles}
+    named = []
+    skipped_no_runner_up = 0
+    for r in out["results"]:
+        if r.get("status") not in ("confirmed", "tentative") or not r.get("name"):
+            continue
+        if r.get("margin") is None:
+            # No runner-up: `decide_name` returns a name with a null margin when the pool
+            # holds ONE profile, meaning "the closest of the only person I know". Written to
+            # a transcript that reads as an identification, and it would land on every turn
+            # in the meeting including the other speakers' — the one enrolled name spread
+            # over everybody, which is worse than no name at all.
+            #
+            # Matching needs at least two profiles before it can say anything. That is not a
+            # tuning choice: with overlapping score distributions and no usable absolute
+            # threshold, one candidate cannot be told from a stranger.
+            skipped_no_runner_up += 1
+            continue
+        turn = r["turn"]
+        named.append({
+            "turn_ref": turn_name_overlay.turn_ref(turn["source_filename"],
+                                                   float(turn["start_sec"])),
+            "status": r["status"],
+            "person_key": r["name"],
+            # `decide_name` returns the KEY it won on, which is the profile id. The name a
+            # reader sees has to come from the profile, or the transcript shows a uuid.
+            "display_name": (by_key.get(r["name"]) or {}).get("display_name"),
+            "margin": r.get("margin"),
+        })
+
+    if skipped_no_runner_up:
+        # Loud, because the symptom is indistinguishable from "the matcher did nothing".
+        logger.warning(
+            "match: %d turn(s) had a nearest profile but no runner-up to beat — the company "
+            "has %d matchable profile(s) and discrimination needs at least 2",
+            skipped_no_runner_up, len(profiles))
+
+    mode = (req.get("mode") or "").lower()
+    if mode != "on":
+        # `shadow` computes everything and writes nothing. The scores are the point of the
+        # mode — they are what a threshold gets calibrated on — so they go to the log rather
+        # than being discarded, but no name reaches a transcript.
+        logger.info("match(shadow): session=%s would name %d of %d turns: %s",
+                    session, len(named), len(out["results"]),
+                    [(n["display_name"], n["status"], n["margin"]) for n in named])
+        return {"session": session, "matched": 0, "wouldMatch": len(named),
+                "profiles": len(profiles), "mode": mode or "off"}
+
+    # No invoke when there is nothing to write: an empty write is a database round trip
+    # that reports success, and "wrote 0 rows" then looks like "the writer is fine".
+    written = 0
+    if named:
+        written = invoke_writer({"op": "match_names", "company_id": company_id,
+                                 "session_base": session,
+                                 # Both artifacts carry it and both writer branches read it;
+                                 # this hop dropped it on the floor in both directions.
+                                 "label_map": req.get("label_map"),
+                                 "results": named}).get("written", 0)
+    logger.info("match: session=%s named %d of %d turns against %d profiles",
+                session, written, len(out["results"]), len(profiles))
+    return {"session": session, "matched": written, "profiles": len(profiles), "mode": mode}
+
+
+def _spread(event):
+    """The frame spread of one window, and nothing else. Read-only.
+
+    Exists because the two ops that CAN produce this number both have side effects: `enrol`
+    stores the sample when the window passes, and `match` never computes frames at all. So
+    measuring the threshold with either meant either writing junk rows or not measuring.
+
+    Whether 0.35 suits site audio is an open question — three enrolments have been refused,
+    one of them a 14.7 s window inside a single chunk, which is the shape enrolment is meant
+    to accept. This is how that question gets data instead of opinions.
+    """
+    start, end = float(event["start_sec"]), float(event["end_sec"])
+    key, clip, sr = _window_audio(event["user_folder"], event["date"],
+                                  event["source_filename"], start, end)
+    raw = _frames(clip, sr)
+    frames = [embed_audio(f, sr) for f in raw]
+    spread = vp.frame_spread(frames)
+    verdict = vp.window_is_homogeneous(frames)
+    # Per-frame loudness, because the leading explanation for a wide spread is that the
+    # frames are not all speech. `_frames` cuts every 5 s blind — there is no VAD anywhere
+    # in this path — so a frame that is mostly silence gets embedded like any other, and a
+    # silence-vs-speech pair is enormously far apart for reasons that have nothing to do
+    # with how many people are in the room. The devices are also known to record quietly
+    # (median -36 dBFS against a normal -20 to -12), which makes the effect likelier here
+    # than the measurement that set 0.35 would have seen.
+    levels = []
+    for f in raw:
+        arr = np.asarray(f, dtype=np.float32)
+        rms = float(np.sqrt(np.mean(arr * arr))) if arr.size else 0.0
+        levels.append(round(20.0 * float(np.log10(rms)), 1) if rms > 1e-9 else -120.0)
+    return {"s3_key": key, "seconds": round(end - start, 2), "frames": len(frames),
+            "spread": None if spread is None else round(float(spread), 4),
+            "limit": vp.DEFAULT_MAX_FRAME_SPREAD,
+            "frame_dbfs": levels,
+            "verdict": "homogeneous" if verdict is True
+                       else ("mixed" if verdict is False else "unjudgeable")}
+
+
 def lambda_handler(event, context):
+    _AUDIO_CACHE.clear()
     records = (event or {}).get("Records")
     if records:
         # An S3 event carries `Records`, not `op`. Without this branch the function dies in
@@ -429,11 +886,17 @@ def lambda_handler(event, context):
         for r in records:
             b = r["s3"]["bucket"]["name"]
             k = r["s3"]["object"]["key"]
-            out = _from_request_artifact(b, k)
+            doc = json.loads(_get(k))
+            # One prefix, two requests. The op is inside the object rather than in the key
+            # so a new kind of request never needs a new hand-wired S3 notification.
+            out = (_from_match_artifact(b, k) if doc.get("op") == "match"
+                   else _from_request_artifact(b, k))
         return out or {"status": "empty"}
     op = (event or {}).get("op")
     if op == "enrol":
         return _enrol(event)
     if op == "match":
         return _match(event)
-    raise ValueError(f"unknown op {op!r} — expected 'enrol' or 'match'")
+    if op == "spread":
+        return _spread(event)
+    raise ValueError(f"unknown op {op!r} — expected 'enrol', 'match' or 'spread'")

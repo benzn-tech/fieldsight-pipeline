@@ -52,6 +52,7 @@ from transcript_utils import (
     extract_base_time_from_filename,
     extract_device_from_filename,
     extract_session_id_from_filename,
+    elide_middle,
     normalize_transcript,
 )
 
@@ -622,6 +623,215 @@ def _dedup_turn_boundaries(turns, max_window=12):
     return out
 
 
+DUP_MAX_GAP_SEC = 3.0     # a person cannot say the same sentence twice this fast
+DUP_MIN_RATIO = 0.85      # SequenceMatcher on the lowercased text
+DUP_MIN_CHARS = 25        # below this, a repeat is speech, not a re-decode
+DUP_LOOKBACK = 6          # turns to compare against; the time gate does the real work
+DUP_OPEN_PROBE = 12       # chars of one opening that must appear in...
+DUP_OPEN_WINDOW = 24      # ...this much of the other's opening
+
+
+def _opens_alike(a, b, probe=DUP_OPEN_PROBE, window=DUP_OPEN_WINDOW):
+    """Do these two turns START on the same words?
+
+    Similarity alone cannot be trusted here, and the counter-example is a site
+    sentence, not a contrived one:
+
+        "The door on level one is damaged and needs replacing."
+        "The window on level three is damaged and needs replacing."
+
+    Those score 0.891 — INSIDE the range measured for real re-decodes of the
+    same audio (0.857 to 0.980), because they share a long tail. No single
+    ratio can separate them, and collapsing them loses a defect report.
+
+    What does separate them: a re-decode of one piece of audio begins on the
+    same words, while two observations begin on their two different subjects.
+    The probe is offset-tolerant (looked for anywhere in the other's opening)
+    so a copy carrying a leading filler — "like, like we're gonna use this"
+    against "You know, like, like we're gonna use this" — still matches.
+
+    Measured cost of this gate on the session it was built from: 61 of 750
+    duplicates go unmerged (33.2% of characters saved instead of 35.7%). That
+    is the right side to err on — a missed duplicate costs tokens, a false one
+    costs a record of something that was said.
+
+    Punctuation is stripped before comparing. Two windows over one utterance
+    disagree about it freely — the four decodes measured at 13:44:45 split on
+    "Oh." against "Oh," alone — and no subject is ever distinguished by a comma.
+    """
+    a, b = _open_key(a), _open_key(b)
+    return bool(a and b) and (a[:probe] in b[:window] or b[:probe] in a[:window])
+
+
+def _open_key(s):
+    return re.sub(r'[^0-9a-z㐀-䶿一-鿿豈-﫿]+', ' ',
+                  (s or '').lower()).strip()
+
+
+_NUMBERY = re.compile(
+    r'[0-9０-９]|[一二三四五六七八九十'
+    r'百千万两]|'
+    r'\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty|thirty|'
+    r'forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|first|second|third|'
+    r'monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
+    r'january|february|march|april|june|july|august|september|october|november|december)\b',
+    re.I)
+
+_MORPH_PREFIX = 4     # "want"/"wanted" share this much; "tiles"/"soffit" share none
+_WORDISH = re.compile(r'[^0-9a-z一-鿿]')
+
+
+def _diff_is_only_noise(a, b):
+    """Are these two texts different only in the ways a RE-DECODE differs?
+
+    The opening-alignment gate stops two statements that BEGIN on different
+    subjects. It does nothing about a difference further in, and that is where
+    this pass was quietly losing real content. Every one of these merged
+    against the live function before this guard existed:
+
+        "Cut the pipe at 2400 and cap it off..."  / "...at 3400..."
+        "Make sure you cut it at two metres..."   / "...at three metres..."
+        "Leave them 1200mm of clearance..."       / "...1500mm..."
+        "...booked for Thursday."                 / "...booked for Tuesday."
+        "Level 2 needs the tiles out by Friday"   / "...the soffit out..."
+        "...把三楼的瓷砖跟天花板全部拆出来"        / "...把四楼的..."
+
+    Four of the six lost the number. Those are measurements, delivery times and
+    floor numbers -- the exact payload the design says must survive. The test
+    suite caught none of it, because every guard case happened to put its
+    differing token inside the 12-character opening probe.
+
+    So: compare word by word and refuse when a REPLACED span carries meaning.
+
+      - a number, ordinal, weekday or month on either side -> refuse. A
+        re-decode of one piece of audio almost never disagrees about a digit,
+        and when it does ("150" against "one hundred and fifty") letting the
+        duplicate through costs tokens, while merging costs the number.
+      - two words of >=4 letters not sharing a 4-letter prefix -> refuse.
+        "want"/"wanted" share one; "tiles"/"soffit", "Thursday"/"Tuesday",
+        "door"/"window" do not.
+
+    INSERTED and DELETED spans are left alone: a window clipping an utterance
+    short, or one copy carrying a leading "You know,", are the ordinary shapes
+    of a re-decode.
+
+    This refuses genuine merges too -- "Why has he got his GM" against "Why is
+    he called his GM" is a real duplicate this now keeps. That is the intended
+    direction: a missed duplicate costs tokens, a false merge costs a record of
+    something that was said.
+    """
+    # Punctuation is stripped BEFORE the word diff, or "friday." against
+    # "friday," reads as a replaced span carrying a weekday and vetoes a
+    # perfectly ordinary truncation merge.
+    wa = [_WORDISH.sub('', w) for w in (a or '').lower().split()]
+    wb = [_WORDISH.sub('', w) for w in (b or '').lower().split()]
+    wa, wb = [w for w in wa if w], [w for w in wb if w]
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, wa, wb).get_opcodes():
+        if tag != 'replace':
+            continue
+        left, right = ' '.join(wa[i1:i2]), ' '.join(wb[j1:j2])
+        if _NUMBERY.search(left) or _NUMBERY.search(right):
+            return False
+        for side, partners in ((wa[i1:i2], wb[j1:j2]), (wb[j1:j2], wa[i1:i2])):
+            for x in side:
+                word = _WORDISH.sub('', x)
+                if len(word) < _MORPH_PREFIX:
+                    continue                      # function words and fillers
+                if not any(_WORDISH.sub('', p)[:_MORPH_PREFIX] == word[:_MORPH_PREFIX]
+                           for p in partners):
+                    return False
+    return True
+
+
+def _dedup_batch_window_repeats(turns, max_gap=DUP_MAX_GAP_SEC,
+                                min_ratio=DUP_MIN_RATIO, min_chars=DUP_MIN_CHARS,
+                                lookback=DUP_LOOKBACK):
+    """Collapse the SAME audio transcribed more than once by overlapping batch
+    windows. Returns (turns, stats).
+
+    `_dedup_turn_boundaries` above already handles the device seam, and it is
+    the right tool there: it trims an exact leading word-run. It cannot help
+    here, for two measured reasons (session sid15770a…, 3,715 turns, after that
+    pass had already run):
+
+      1. The recogniser decodes the same audio DIFFERENTLY in each window —
+         "they want it" / "they wanted it", "Why has he got his GM" / "Why is he
+         called his GM", one copy carrying a leading "You know," the other not.
+         An exact word-run match finds nothing to trim in any of those.
+      2. 201 pairs were BYTE-IDENTICAL, adjacent, and still survived — because
+         that pass is gated on `cur_start < prev_end`, and a batch-rebased turn
+         may carry no usable `abs_end` (`_rebase_batch_turns` only overwrites it
+         when the end offset resolves). So the gate never fires and the exact
+         path is never even reached.
+
+    Hence: no dependence on `abs_end`, and similarity rather than equality.
+
+    The TIME window is the real guard, not the ratio. Two turns from one speaker
+    starting within `max_gap` seconds of each other cannot both be genuine — a
+    person cannot repeat a 25-character sentence in three seconds — so a
+    speaker who really does say something twice is left alone. Measured on that
+    session, the drop count saturates at a 3s gap (751 pairs at 3s, 5s and 8s
+    alike), so widening the window buys nothing and only risks eating real
+    repetition.
+
+    The LONGER text wins: overlapping windows clip the same utterance at
+    different points, and the fuller decode is the one worth keeping. The
+    surviving turn keeps its original position and timestamps.
+
+    A no-op wherever windows do not overlap (legacy whole-file, VAD segments,
+    unbatched chunk sessions): those never produce two same-speaker turns
+    starting within 3s with 85% of their text in common.
+    """
+    kept, dropped, chars_saved = [], 0, 0
+    for t in turns:
+        text = (t.get('text') or '').strip()
+        start = t.get('abs_start')
+        match = None
+        if len(text) >= min_chars and start is not None:
+            for prev in reversed(kept[-lookback:]):
+                p_start = prev.get('abs_start')
+                p_text = (prev.get('text') or '').strip()
+                if p_start is None or prev.get('speaker') != t.get('speaker'):
+                    continue
+                if abs((start - p_start).total_seconds()) > max_gap:
+                    continue
+                if len(p_text) < min_chars:
+                    continue
+                # Compare against what that turn ORIGINALLY said, not the text a
+                # previous merge may have written over it. Without this, A absorbs
+                # B, then C is measured against B's words and gets dropped even
+                # though C never resembled A -- reproduced, and it deleted a
+                # "changes on Monday" correction, leaving the transcript
+                # asserting Friday.
+                p_orig = prev.get('_dedup_orig_text', p_text)
+                if not _opens_alike(p_orig, text):
+                    continue      # different subjects, not one utterance twice
+                if difflib.SequenceMatcher(None, p_orig.lower(),
+                                           text.lower()).ratio() < min_ratio:
+                    continue
+                if not _diff_is_only_noise(p_orig, text):
+                    continue      # the difference carries meaning: keep both
+                match = prev
+                break
+        if match is None:
+            kept.append(t)
+            continue
+        dropped += 1
+        chars_saved += min(len(match.get('text') or ''), len(text))
+        if len(text) > len(match.get('text') or ''):
+            # Replace in place so the surviving turn keeps its position and
+            # timestamps; copy so a caller's turn dict is never mutated. Carry
+            # the original words alongside so later turns are still compared
+            # against what was actually said here (see the loop above).
+            idx = next(k for k, v in enumerate(kept) if v is match)
+            kept[idx] = dict(match, text=text,
+                             _dedup_orig_text=match.get('_dedup_orig_text')
+                             or (match.get('text') or '').strip())
+    out = [{k: v for k, v in t.items() if k != '_dedup_orig_text'} if
+           '_dedup_orig_text' in t else t for t in kept]
+    return out, {'dropped': dropped, 'chars_saved': chars_saved}
+
+
 # ============================================================
 # Prompt construction
 # ============================================================
@@ -680,59 +890,15 @@ EXTRACTION_SCHEMA = """{
 def render_transcript(turns, limit=None):
     """Render turns for the prompt. Returns (text, stats).
 
-    `stats` is the record of what the model was actually shown — chars, lines,
-    and how many lines were dropped. It exists because the old truncation was a
-    bare slice: a 2-hour session lost its second half and produced an extraction
-    that looked complete, with nothing anywhere saying otherwise. Anything that
-    silently discards input has to leave a number behind.
-
-    When the text exceeds the limit, the head and the tail are kept and the
-    middle is elided on line boundaries, so the reader (and the model) still see
-    where the session started and how it ended.
+    The head-and-tail arithmetic lives in `transcript_utils.elide_middle`, because
+    the same bare-slice defect existed in the rolling summary the stop-recording
+    email is built from. Two implementations of a limit is how one of them gets
+    fixed and the other does not.
     """
     limit = TRANSCRIPT_TEXT_LIMIT if limit is None else limit
     lines = [f"[{t['abs_start_str']}] {t['speaker']}: {t['text']}" for t in turns]
-    text = "\n".join(lines)
-    stats = {
-        'chars': len(text),
-        'lines': len(lines),
-        'lines_omitted': 0,
-        'truncated': False,
-    }
-    if len(text) <= limit:
-        return text, stats
-
-    marker_room = 120  # the elision line itself, plus slack
-    head_budget = int((limit - marker_room) * TRUNCATION_HEAD_SHARE)
-    tail_budget = (limit - marker_room) - head_budget
-
-    head, used = [], 0
-    for line in lines:
-        if used + len(line) + 1 > head_budget:
-            break
-        head.append(line)
-        used += len(line) + 1
-
-    tail, used = [], 0
-    for line in reversed(lines[len(head):]):
-        if used + len(line) + 1 > tail_budget:
-            break
-        tail.append(line)
-        used += len(line) + 1
-    tail.reverse()
-
-    omitted = len(lines) - len(head) - len(tail)
-    stats['truncated'] = True
-    stats['lines_omitted'] = omitted
-    marker = (f"[... {omitted} turn line(s) from the middle of this session were "
-              f"omitted to fit the prompt ...]")
-    rendered = "\n".join(head + [marker] + tail)
-    stats['chars'] = len(rendered)
-    logger.warning(
-        "Transcript truncated: %d chars / %d lines rendered, %d lines omitted "
-        "(limit %d). The extraction below does not cover the whole session.",
-        len(text), len(lines), omitted, limit)
-    return rendered, stats
+    return elide_middle(lines, limit,
+                                head_share=TRUNCATION_HEAD_SHARE)
 
 
 _PROMPT_HEAD = (
@@ -776,7 +942,14 @@ def _instructions_block():
    and if that speaker is never named the array is empty. Those names already have homes:
    action_items.responsible and findings.entity_name. Putting them here says three people were
    in a conversation that one person had.
-   action_items: write each `action` to be read AT A GLANCE and to SURVIVE TRUNCATION -- the UI
+   action_items: FIRST decide whether there is an action at all. An action_item is something a
+   SPECIFIC PERSON COULD FINISH AND TICK OFF. Test the VERB, not the subject: "consult Xiao Han &
+   Benny", "replace the damaged doors", "call the electrician" all name an act that can be
+   completed. "focus on X", "consider Y", "explore Z", "prioritise W" name a DIRECTION -- nobody
+   can ever tick them, and they belong in the topic summary, not here. A discussion that reached no
+   act produces NO action_items; the array is genuinely allowed to be empty, and two real tasks are
+   worth more than six invented ones, because invented ones bury the real ones.
+   Then write each `action` to be read AT A GLANCE and to SURVIVE TRUNCATION -- the UI
    shows only the first few words of the title, so the FIRST 2-4 WORDS must carry the real
    SUBJECT/OUTCOME (what the task is ABOUT), never the activity type or the people. Lead with that
    key subject; the action verb and any names come AFTER it; keep the whole thing to a handful of
@@ -788,6 +961,8 @@ def _instructions_block():
    - Good: "Damaged doors -- replace, floors 1-3, PK building"
    - Bad:  "Consultation with Xiao Han, Benny, and others about go-to-market strategy"  (buries the subject)
    - Bad:  "Identify and complete the unspecified outstanding task"  (vague)
+   - Bad:  "Target market strategy -- focus high-hourly professionals"  (a direction; nothing to tick)
+   - Bad:  "Product strategy -- evaluate fixed sensors vs wearables"  (a direction; leave it in the summary)
 2b. work_class: classify each topic as "work" (site operations: inspections,
     progress, safety, coordination) or "non_work" (personal/off-work talk:
     meals, family, weekend, banter). When UNSURE, choose "work" -- a
@@ -1073,6 +1248,16 @@ def assemble_session_turns(bucket, keys):
             turns.append(dict(turn, source_filename=filename))
     turns.sort(key=lambda t: t['abs_start'])
     turns = _dedup_turn_boundaries(turns)   # drop mobile chunk-overlap dup at seams (no-op pre-chunk)
+    turns, repeat_stats = _dedup_batch_window_repeats(turns)  # drop re-decoded audio (no-op pre-batch)
+    if repeat_stats['dropped']:
+        # Logged, not silent: this number IS the batching rollout's health check.
+        # It should be ~0 while BATCH_TRANSCRIPTION is off and jump the moment it
+        # is switched on. A session where it stays 0 under batching means the
+        # windows stopped overlapping; one where it climbs past ~half the turns
+        # means they overlap too far.
+        logger.info("Batch-window repeats collapsed: %d turn(s), %d chars, "
+                    "%d turn(s) remain", repeat_stats['dropped'],
+                    repeat_stats['chars_saved'], len(turns))
     # Tags first: an announcement wearing one ("[background noise] Recording
     # started.") is invisible to the sentence-matching filter below until the
     # tag is gone. See filter_audio_event_tags.

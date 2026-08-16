@@ -960,3 +960,28 @@ def test_every_wired_trigger_prefix_is_readable_by_the_function_it_triggers():
     block = _top_level_block(t, "  SpeakerEmbedFunction:")
     assert "/voiceprint_requests/*" in block, (
         "the embedder is triggered by voiceprint_requests/ and cannot read it")
+
+
+def test_the_correction_requests_expire():
+    """These artifacts are handed across the VPC boundary and consumed within seconds, and
+    the prefix had NO lifecycle rule — so every correction ever made stayed in the bucket
+    indefinitely.
+
+    That mattered more than housekeeping while they carried voice vectors (they no longer
+    do), and it still matters: an artifact records who was named on which passage, which is
+    a claim about a person that nobody asked to keep forever.
+    """
+    import json as _json
+    import re as _re
+    script = open(os.path.join(REPO, "scripts", "wire-bucket-lifecycle.sh"),
+                  encoding="utf-8").read()
+    # Parsed, not grepped: asserting the two strings kept the test green with the rule set
+    # to `Disabled` and 3650 days, which is the same as no rule with extra ceremony.
+    body = _re.search(r"--lifecycle-configuration '(\{.*?\})'", script, _re.S).group(1)
+    rules = {r["ID"]: r for r in _json.loads(body)["Rules"]}
+    rule = rules.get("voiceprint-requests-expiry")
+    assert rule, "the correction artifacts never expire; the prefix is unmanaged"
+    assert rule["Status"] == "Enabled", "the rule exists and does nothing"
+    assert rule["Filter"]["Prefix"] == "voiceprint_requests/"
+    assert 1 <= rule["Expiration"]["Days"] <= 30, (
+        f"{rule['Expiration']['Days']} days is retention, not a handoff window")

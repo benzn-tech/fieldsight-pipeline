@@ -7,8 +7,24 @@ def parse_version(filename: str) -> int:
 
 
 def pending_versions(all_files: list[str], applied: set[str]) -> list[str]:
+    """Pending migrations, in the order they must run.
+
+    The filename is the tie-break, and it is there because two files can share a version
+    number. `schema_migrations` is keyed on the full filename, so a duplicate number does
+    NOT make one of them silently skip — both apply, which is the important half and was
+    already true. What was missing is an ORDER: `sorted` is stable, so among equal versions
+    the sequence was whatever `os.listdir` returned in `apply_migrations`, which is not
+    defined and can differ between environments.
+
+    Two collisions have already shipped (0041_user_deletion / 0041_turn_name_display, then
+    0044_chunk_archive / 0044_speaker_name_rejections; all four are recorded as applied on
+    TEST). They were harmless because each pair touches unrelated tables. The next pair
+    might not be, and that failure would appear on one environment and not another, with
+    nothing in the code to point at.
+
+    The version still decides — the name is only consulted for a tie."""
     todo = [f for f in all_files if f.endswith(".sql") and f not in applied]
-    return sorted(todo, key=parse_version)
+    return sorted(todo, key=lambda f: (parse_version(f), f))
 
 
 def applied_versions(conn) -> set[str]:

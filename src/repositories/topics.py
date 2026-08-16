@@ -171,6 +171,44 @@ def list_contributor_folders_for_site_date(conn, site_id, report_date) -> list[s
     return sorted({r["folder"] for r in rows if r["folder"]})
 
 
+def folders_for_session_base(conn, company_id, session_base) -> list[str]:
+    """Distinct recorder folders whose topics came out of ONE session.
+
+    Answers "whose recording is this?" for a request that carries a session and nothing
+    else — `DELETE /sessions/{ref}/speaker-names` has no folder in it, and the ownership
+    arm of the speaker-correction gate needs one.
+
+    **Unlike `list_extraction_folder_names_for_date`, this DOES gate a write**, so two
+    things matter more here than there. The users JOIN + company_id filter is the whole
+    tenant guard — `source_s3_key` is folder-keyed and carries no company of its own — and
+    the caller must treat a result of length != 1 as "could not establish", never as
+    permission. An empty list is the ordinary answer for a session whose extraction has not
+    landed yet.
+
+    The folder is read out of the key rather than from `user_id`, matching
+    `list_contributor_folders_for_site_date`: G5b attribution resolves the AUTHOR, while
+    the recording lives under the RECORDER's folder, and those differ for a site-tagged
+    recording made by a non-member.
+
+    Deleted topics are excluded, which is the conservative direction and not merely the one
+    the enumeration guard wanted: a recording the customer deleted stops establishing
+    anything, so the answer degrades to "could not establish" and the caller refuses. Nothing
+    is lost — a deleted recording shows no names to take off.
+
+    Literal '%' is doubled for psycopg's %s paramstyle; the caller's session_base is
+    wildcard-escaped because it is caller input."""
+    like = f"extractions/%%/{_escape_like(session_base)}.json"
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT DISTINCT split_part(t.source_s3_key, '/', 2) AS folder "
+        "FROM topics t JOIN users u ON u.id = t.user_id "
+        "WHERE u.company_id=%s AND t.source_s3_key LIKE %s "
+        "AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' "
+        "AND r.target_id = t.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)",
+        (company_id, like),
+    ).fetchall()
+    return sorted({r["folder"] for r in rows if r["folder"]})
+
+
 def get_topic_photos(conn, topic_id) -> list[dict]:
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, s3_key, caption_text, created_at FROM topic_photos "

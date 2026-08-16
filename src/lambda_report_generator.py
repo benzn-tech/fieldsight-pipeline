@@ -73,6 +73,7 @@ from transcript_utils import (
     extract_device_from_filename as tu_extract_device,
     extract_vad_metadata_from_filename as tu_extract_vad_info,
     read_meeting_manifest,
+    elide_middle,
 )
 
 # Configure logging
@@ -515,7 +516,11 @@ def build_daily_prompt(transcripts_with_photos, user_name, site_name, target_dat
             line += f"\n  Photos taken near this time: {', '.join(photo_names)}"
         transcript_lines.append(line)
 
-    transcripts_text = "\n\n".join(transcript_lines)[:60000]
+    # Head AND tail: a site walk states the site at the start and the defects it found
+    # at the end, and the bare slice dropped the second half of any long day without
+    # saying so. BUG-15 sized this limit; it did not change the shape of the cut.
+    transcripts_text, _ = elide_middle(transcript_lines, 60000,
+                                                        sep="\n\n")
 
     dur_min = int(total_duration // 60)
     dur_sec = int(total_duration % 60)
@@ -618,7 +623,9 @@ def build_weekly_prompt(daily_reports, site_name, start_date, end_date,
                 topics_text += f"\n      \u2610 {a.get('action', '')} \u2192 {a.get('responsible', '?')} by {a.get('deadline', '?')}"
         summaries.append(f"### {date} \u2014 {user}\n{exec_sum}{topics_text}")
 
-    all_summaries = "\n\n".join(summaries)
+    # A week's (or month's) summaries are chronological, so a head slice quietly drops the
+    # most recent days — the ones the report is actually read for.
+    all_summaries, _ = elide_middle(summaries, 15000, sep="\n\n")
 
     scope_intros = (_prompt_templates_cache or {}).get('scope_intros', {})
 
@@ -671,7 +678,7 @@ def build_weekly_prompt(daily_reports, site_name, start_date, end_date,
     if template:
         body = template.format(
             scope_intro=scope_intro,
-            all_summaries=all_summaries[:15000],
+            all_summaries=all_summaries,
             extra_instructions=extra_instructions,
             schema=WEEKLY_REPORT_SCHEMA,
         )
@@ -682,7 +689,7 @@ def build_weekly_prompt(daily_reports, site_name, start_date, end_date,
 {scope_intro}
 
 ## Daily Report Summaries
-{all_summaries[:15000]}
+{all_summaries}
 
 ## Instructions
 1. Identify safety TRENDS across the week (recurring issues, improvements, new risks).
@@ -704,18 +711,21 @@ Rules:
 
 def build_monthly_prompt(daily_reports, weekly_reports, site_name, start_date, end_date):
     if weekly_reports:
-        source_text = "\n\n".join([
+        source_parts = [
             f"### Week of {r.get('period', {}).get('start', '?')} to {r.get('period', {}).get('end', '?')}\n"
             f"{r.get('executive_summary', 'No summary')}"
             for r in weekly_reports
-        ])
+        ]
         source_label = "Weekly Report Summaries"
     else:
-        source_text = "\n\n".join([
+        source_parts = [
             f"### {r.get('report_date', '?')}\n{r.get('executive_summary', r.get('summary', 'No summary'))}"
             for r in daily_reports
-        ])
+        ]
         source_label = "Daily Report Summaries"
+    # Same rule as the weekly path: a month is read for what happened recently, so its
+    # recent end must not be the part a head slice drops.
+    source_text, _ = elide_middle(source_parts, 15000, sep="\n\n")
 
     template = get_template('monthly_report', 'prompt')
     system_ctx = get_template('monthly_report', 'system_context') or \
@@ -724,7 +734,7 @@ def build_monthly_prompt(daily_reports, weekly_reports, site_name, start_date, e
     if template:
         body = template.format(
             site_name=site_name, start_date=start_date, end_date=end_date,
-            source_label=source_label, source_text=source_text[:15000],
+            source_label=source_label, source_text=source_text,
             schema=WEEKLY_REPORT_SCHEMA,
         )
         return f"{system_ctx}\n\n{body}"
@@ -734,7 +744,7 @@ def build_monthly_prompt(daily_reports, weekly_reports, site_name, start_date, e
 Summarize the following reports from {start_date} to {end_date} at site "{site_name}" into a MONTHLY overview.
 
 ## {source_label}
-{source_text[:15000]}
+{source_text}
 
 ## Output Format
 Return ONLY valid JSON matching this schema:

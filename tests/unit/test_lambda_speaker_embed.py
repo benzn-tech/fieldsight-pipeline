@@ -50,15 +50,33 @@ class FakeS3:
         return {"Body": B(self.objects[Key])}
 
 
-def _wav_bytes(seconds=5.0, sr=16000):
+def _wav_bytes(seconds=5.0, sr=16000, silent=False):
+    """Audio with SIGNAL in it by default.
+
+    Every fixture here used to be digital zero, which was harmless while nothing looked at
+    loudness. It stops being harmless the moment a speech gate exists: silent fixtures make
+    every gated test fail, and a suite that fails because its fixtures are silent cannot tell
+    you whether the gate works.
+
+    `silent=True` is kept for the tests that are ABOUT silence — the gate needs something to
+    reject, and it must be asked for explicitly rather than inherited.
+    """
     import io
     import wave
+    n = int(seconds * sr)
+    if silent:
+        samples = np.zeros(n, dtype="<i2")
+    else:
+        # A tone, not noise: deterministic, so a test never fails on a lucky draw, and loud
+        # enough to sit well above any plausible speech gate.
+        t = np.arange(n, dtype=np.float64) / sr
+        samples = (np.sin(2 * np.pi * 220.0 * t) * 8000).astype("<i2")
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(sr)
-        w.writeframes((np.zeros(int(seconds * sr), dtype="<i2")).tobytes())
+        w.writeframes(samples.tobytes())
     return buf.getvalue()
 
 
@@ -717,3 +735,762 @@ def test_a_corrected_turn_sitting_between_two_voices_names_nothing(monkeypatch):
     se.lambda_handler(_s3_event(key), None)
     assert [r for r in sent["results"] if not r.get("asserted")] == [], (
         "a turn sitting between two voices named a whole cluster")
+
+
+def test_an_enrolment_reuses_the_vector_the_correction_already_produced(stub_embedder,
+                                                                        monkeypatch):
+    """The corrected window is embedded once, for the propagation decision. Enrolling the
+    same window is then free — embedding it a second time would pay twice for one answer and
+    invite the two results to differ.
+
+    The vector travels in the invoke payload, never through S3: that is what stopped the
+    biometric-residence defect the reviews chased through two homes.
+    """
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    # 15 s, not 5: the homogeneity guard compares 5-second frames and needs at least two,
+    # so a window under 10 s is "cannot tell" and is refused. A five-second fixture here was
+    # not a shorter version of the real thing — it was a case that cannot be enrolled at all.
+    req = {"request_id": "r1", "session_base": "s1", "company_id": "c1",
+           "user_folder": "u", "date": "2026-08-13",
+           "correction": {"source_filename": "x_c0000.wav", "start_sec": 0.0,
+                          "end_sec": 15.0, "display_name": "Ben L"},
+           "enrol": {"voiceprint_id": "vp-1"}, "turns": [], "profiles": []}
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=20.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    se.lambda_handler(_s3_event(key), None)
+    assert sent["enrol"]["voiceprint_id"] == "vp-1"
+    assert len(sent["enrol"]["embedding"]) == 192
+    # The stored vector IS the one the propagation decision used — not a second embedding of
+    # the same window, which would pay twice for one answer and let the two results differ.
+    # (Counting calls no longer works: the homogeneity guard embeds FRAMES of the window,
+    # which is a different and necessary cost.)
+    assert sent["enrol"]["window"] == [0.0, 15.0]
+    assert sent["enrol"]["s3_key"].endswith("x_c0000.wav")
+
+
+def test_no_enrolment_means_no_vector_in_the_payload(stub_embedder, monkeypatch):
+    """Absent consent, nothing biometric leaves this function at all."""
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    req = {"request_id": "r1", "session_base": "s1", "company_id": "c1",
+           "user_folder": "u", "date": "2026-08-13",
+           "correction": {"source_filename": "x_c0000.wav", "start_sec": 0.0,
+                          "end_sec": 5.0, "display_name": "Ben L"},
+           "turns": [], "profiles": []}
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes()}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    se.lambda_handler(_s3_event(key), None)
+    # No enrolment was ASKED FOR here — no consent — which is a different thing from one
+    # asked for and refused. Neither may carry a vector; only the second carries a reason.
+    assert sent.get("enrol") is None
+
+
+# ---- the guard the enrolment path was routing around --------------------
+#
+# `op=enrol` has run `window_is_homogeneous` since it was written, and this module's own
+# docstring says the guard runs "before anything is stored". The enrolment carried by a
+# correction did not run it — so a window holding two voices could be stored as one person's
+# profile, permanently, and a profile cannot be un-poisoned.
+#
+# Worse: `_propagate` already decides the corrected turn sits between two voices and refuses
+# to propagate for exactly that reason, and the enrolment stored the same vector anyway. The
+# system disbelieved itself in one direction and acted in the other.
+
+
+def _enrol_request(turns, ref_start=0.0, ref_end=15.0):
+    r = _prop_request(turns, ref_start=ref_start, ref_end=ref_end)
+    r["enrol"] = {"voiceprint_id": "vp-1"}
+    return r
+
+
+def test_a_window_holding_two_voices_is_not_enrolled(monkeypatch):
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(_enrol_request([])).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=20.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    # Frames pointing opposite ways: the window is not one voice.
+    seq = [np.ones(192, dtype=np.float32), -np.ones(192, dtype=np.float32),
+           np.ones(192, dtype=np.float32)]
+    calls = {"n": 0}
+
+    def embed(audio, sr):
+        v = seq[calls["n"] % len(seq)]
+        calls["n"] += 1
+        return v
+    monkeypatch.setattr(se, "embed_audio", embed)
+    se.lambda_handler(_s3_event(key), None)
+    # A refused enrolment is no longer None: it carries the REASON, so the writer can put
+    # it on the profile. What must never appear is an embedding — that is the thing whose
+    # storage cannot be undone.
+    assert not (sent.get("enrol") or {}).get("embedding"), (
+        "a window that may hold two voices was stored as one person's profile, and a "
+        "profile cannot be un-poisoned")
+
+
+def test_a_window_too_short_to_judge_is_not_enrolled(stub_embedder, monkeypatch):
+    """`window_is_homogeneous` returns None for 'cannot tell', which is not a pass. Treating
+    them alike in the permissive direction is how a guard becomes decoration — the enrol op
+    has said so in a comment since it was written."""
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    req = _enrol_request([], ref_start=0.0, ref_end=4.0)
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=10.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    se.lambda_handler(_s3_event(key), None)
+    assert not (sent.get("enrol") or {}).get("embedding")
+    assert (sent.get("enrol") or {}).get("refused")
+
+
+def test_the_turn_names_still_land_when_the_enrolment_is_refused(stub_embedder,
+                                                                  monkeypatch):
+    """Refusing to STORE a voice pattern is not a reason to lose the name the user typed.
+    The two effects are separate obligations and they fail separately."""
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    req = _enrol_request([], ref_start=0.0, ref_end=4.0)
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=10.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    se.lambda_handler(_s3_event(key), None)
+    assert sent["results"] and sent["results"][0]["asserted"]
+
+
+def test_a_window_propagation_refused_is_not_enrolled_either(monkeypatch):
+    """The system disbelieving itself in one direction and acting in the other.
+
+    `_propagate` refuses when the corrected turn sits between two voices — that IS the
+    system saying it does not believe this window is one person. Storing the same vector as
+    somebody's profile on the strength of it would be incoherent, and permanent: a profile
+    cannot be un-poisoned, only the contributing sample deleted.
+
+    The window here is long enough to pass the homogeneity check, so only the propagation
+    refusal can stop the enrolment — which is what makes this test about that branch.
+    """
+    import json as _json
+    import math
+    key = "voiceprint_requests/c1/s1/r1.json"
+    turns = [{"source_filename": "x_c0000.wav", "start_sec": float(i * 20),
+              "end_sec": float(i * 20 + 15)} for i in range(4)]
+    req = _enrol_request(turns, ref_start=20.0, ref_end=35.0)
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=90.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+
+    def unit(theta):
+        v = np.zeros(192, dtype=np.float32)
+        v[0], v[1] = math.cos(theta), math.sin(theta)
+        return v
+    # reference (0.7) then the four turns; the corrected one sits between two voices, and
+    # every homogeneity frame of the window is the same vector so the guard passes.
+    order = [unit(0.7)] + [unit(0.0), unit(0.7), unit(1.5), unit(1.55)]
+    state = {"i": 0, "frames": 0}
+
+    def embed(audio, sr):
+        # The guard embeds 5-second frames of a 15s window; feed it a constant so it passes.
+        if len(audio) <= 5 * 16000 + 8:
+            state["frames"] += 1
+            return unit(0.7)
+        v = order[min(state["i"], len(order) - 1)]
+        state["i"] += 1
+        return v
+    monkeypatch.setattr(se, "embed_audio", embed)
+    se.lambda_handler(_s3_event(key), None)
+    assert [r for r in sent["results"] if not r.get("asserted")] == [], (
+        "propagation did not refuse; this test is no longer about what it says it is")
+    # A refused enrolment is no longer None: it carries the REASON, so the writer can put
+    # it on the profile. What must never appear is an embedding — that is the thing whose
+    # storage cannot be undone.
+    assert not (sent.get("enrol") or {}).get("embedding"), (
+        "the window propagation would not trust was stored as somebody's voiceprint")
+
+
+def test_someone_who_spoke_once_can_still_be_enrolled(stub_embedder, monkeypatch):
+    """The most ordinary correction there is — a visitor says one thing and you name them.
+
+    A first version refused it: every empty propagation was treated as a refusal, so "this
+    person has only this turn" (which the propagation log calls a normal answer) blocked the
+    enrolment, and the log claimed the window was untrustworthy. Less evidence should not
+    become more suspicion when the evidence is about a different question.
+    """
+    import json as _json
+    key = "voiceprint_requests/c1/s1/r1.json"
+    # Three turns, all one other voice, plus the corrected one — so the corrected speaker's
+    # cluster has a single member and propagation returns nothing.
+    turns = [{"source_filename": "x_c0000.wav", "start_sec": float(i * 20),
+              "end_sec": float(i * 20 + 15)} for i in range(4)]
+    req = _enrol_request(turns, ref_start=0.0, ref_end=15.0)
+    monkeypatch.setattr(se, "s3", lambda: FakeS3(
+        {key: _json.dumps(req).encode(),
+         "users/u/audio/2026-08-13/x_c0000.wav": _wav_bytes(seconds=90.0)}))
+    sent = {}
+    monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
+    import math
+
+    def unit(theta):
+        v = np.zeros(192, dtype=np.float32)
+        v[0], v[1] = math.cos(theta), math.sin(theta)
+        return v
+    order = [unit(0.0), unit(0.0), unit(2.4), unit(2.42), unit(2.44)]
+    st = {"i": 0}
+
+    def embed(audio, sr):
+        if len(audio) <= 5 * 16000 + 8:      # homogeneity frames
+            return unit(0.0)
+        v = order[min(st["i"], len(order) - 1)]
+        st["i"] += 1
+        return v
+    monkeypatch.setattr(se, "embed_audio", embed)
+    se.lambda_handler(_s3_event(key), None)
+    assert [r for r in sent["results"] if not r.get("asserted")] == [], (
+        "propagation named something; this test is no longer about a lone speaker")
+    assert sent.get("enrol"), (
+        "a person who spoke once could not be enrolled — the most ordinary correction there "
+        "is was permanently refused")
+
+
+def test_a_vad_segments_offset_is_added_before_the_audio_is_cut(stub_embedder, monkeypatch):
+    """`_raw_key` strips `_off{T}` to reach the device's upload, so a position measured
+    inside the VAD unit is short by T once the audio is the whole chunk.
+
+    The batched path documents this term and applies it; the non-batched path did not, and
+    the failure is silent — the wrong seconds of audio embed perfectly well.
+    """
+    seen = {}
+
+    def embed(audio, sr):
+        seen.setdefault("first_nonzero", int(np.flatnonzero(audio)[0]) if audio.any() else None)
+        seen["len"] = len(audio)
+        return np.ones(192, dtype=np.float32)
+
+    monkeypatch.setattr(se, "embed_audio", embed)
+
+    sr = 16000
+    import io as _io
+    import wave as _wave
+    samples = np.zeros(120 * sr, dtype="<i2")
+    samples[100 * sr:104 * sr] = 1000       # the only sound is at 100s-104s
+    buf = _io.BytesIO()
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+        w.writeframes(samples.tobytes())
+
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "a" * 32 + "_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: buf.getvalue()}))
+
+    # The unit starts 100s into the chunk; the turn is at 0-4s WITHIN the unit.
+    se.lambda_handler({"op": "match", "session": "s", "user_folder": "Ben_UCPK2",
+                       "date": "2026-08-11",
+                       "turns": [{"source_filename":
+                                  "x_sid" + "a" * 32 + "_c0000_off100.0_to160.0_srcwav.json",
+                                  "start_sec": 0.0, "end_sec": 4.0}]}, None)
+
+    assert seen.get("len") == 4 * sr
+    assert seen.get("first_nonzero") == 0, \
+        "the window was cut at 0s of the whole upload — silence, not the speaker"
+
+
+# ---- Phase 5: matching a whole session against stored profiles ------------
+
+
+def _match_artifact(mode="on", turns=None):
+    return json.dumps({
+        "op": "match", "session_base": "sid" + "c" * 32, "company_id": "co-1",
+        "user_folder": "Ben_UCPK2", "date": "2026-08-11", "mode": mode,
+        "turns": turns if turns is not None else [
+            {"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+             "start_sec": 0.0, "end_sec": 5.0}]})
+
+
+def _writer(monkeypatch, profiles, seen):
+    def invoke(payload):
+        seen.append(payload)
+        if payload["op"] == "profiles":
+            return {"profiles": profiles}
+        return {"written": len(payload.get("results") or [])}
+    monkeypatch.setattr(se, "invoke_writer", invoke)
+
+
+def _profile(pid="vp-1", name="Ben L", status="confirmed", vec=None):
+    return {"person_key": pid, "display_name": name, "status": status,
+            "embedding": vec if vec is not None else [1.0] * 192}
+
+
+def _pool():
+    """Two profiles, far apart. A ONE-profile pool names nobody by design — see
+    test_one_enrolled_profile_names_nobody — so a fixture with one would silently make
+    every other matcher test assert on the same empty result."""
+    return [_profile("vp-1", "Ben L", vec=[1.0] * 192),
+            _profile("vp-2", "Zoe", vec=[1.0] + [-1.0] * 191)]
+
+
+def test_the_match_artifact_never_carries_vectors_and_fetches_them_instead(
+        stub_embedder, monkeypatch):
+    """The request bucket has a 7-day expiry and nothing else; a voiceprint is biometric
+    data whose storage was consented to in one column. The vectors arrive in the RESULT of a
+    synchronous invoke and exist only in memory."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    s3 = FakeS3({art: _match_artifact(), key: _wav_bytes()})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    seen = []
+    _writer(monkeypatch, [_profile()], seen)
+
+    se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                           "object": {"key": art}}}]}, None)
+    assert seen[0]["op"] == "profiles", "the vectors were not fetched from the in-VPC half"
+    assert "embedding" not in json.dumps(json.loads(s3.objects[art]))
+
+
+def test_shadow_computes_everything_and_writes_no_name(stub_embedder, monkeypatch):
+    """The scores are the point of shadow mode — they are what a threshold is calibrated on
+    — but no name may reach a transcript."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    monkeypatch.setattr(se, "s3",
+                        lambda: FakeS3({art: _match_artifact(mode="shadow"),
+                                        key: _wav_bytes()}))
+    seen = []
+    _writer(monkeypatch, _pool(), seen)
+
+    out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                                 "object": {"key": art}}}]}, None)
+    assert out["matched"] == 0
+    assert out["wouldMatch"] >= 1, "shadow computed nothing, so it collected nothing"
+    assert not any(p["op"] == "match_names" for p in seen), "shadow wrote a name"
+
+
+def test_on_writes_the_names_it_found(stub_embedder, monkeypatch):
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: _match_artifact(mode="on"),
+                                                  key: _wav_bytes()}))
+    seen = []
+    _writer(monkeypatch, _pool(), seen)
+
+    out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                                 "object": {"key": art}}}]}, None)
+    write = next(p for p in seen if p["op"] == "match_names")
+    assert out["matched"] == len(write["results"]) >= 1
+    row = write["results"][0]
+    assert row["display_name"] == "Ben L", \
+        "the transcript would show a uuid: decide_name returns the KEY it won on"
+    assert row["person_key"] == "vp-1"
+
+
+def test_a_company_with_no_consented_profile_says_so(stub_embedder, monkeypatch):
+    """'nobody was recognised' and 'there was nobody to recognise' look identical
+    downstream. On TEST the only profile was withdrawn during a withdrawal test, which is
+    exactly how this would be misread as the matcher being broken."""
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: _match_artifact()}))
+    seen = []
+    _writer(monkeypatch, [], seen)
+
+    out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                                 "object": {"key": art}}}]}, None)
+    assert out["profiles"] == 0 and out["matched"] == 0
+    assert not any(p["op"] == "match_names" for p in seen)
+
+
+def test_a_correction_artifact_still_takes_the_correction_path(stub_embedder, monkeypatch):
+    """One prefix, two requests, told apart by `op` inside the object — a second prefix
+    would be a second hand-wired S3 notification (BUG-33)."""
+    art = "voiceprint_requests/co-1/s/r1.json"
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    doc = json.dumps({"session_base": "sid" + "c" * 32, "company_id": "co-1",
+                      "user_folder": "Ben_UCPK2", "date": "2026-08-11", "turns": [],
+                      "correction": {"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                                     "start_sec": 0.0, "end_sec": 5.0,
+                                     "display_name": "Ben L"}})
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: doc, key: _wav_bytes()}))
+    seen = []
+    _writer(monkeypatch, [_profile()], seen)
+    se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                           "object": {"key": art}}}]}, None)
+    assert any(p["op"] == "propagation" for p in seen), \
+        "a correction was routed to the matcher"
+
+
+# ---- long audio ----------------------------------------------------------
+#
+# A 108-second turn killed this function with Runtime.OutOfMemory at 1769 MB on
+# the first real enrolment against whole-chunk transcription. ECAPA's convolutions
+# run the full length of the input, and every earlier run — Phase 0, the parity
+# fixtures, yesterday's live verification — used a window of a few seconds.
+
+
+def test_a_long_turn_is_embedded_in_pieces_not_in_one_pass(monkeypatch):
+    lengths = []
+
+    def once(audio):
+        lengths.append(len(audio))
+        return np.ones(192, dtype=np.float32)
+
+    monkeypatch.setattr(se, "_embed_once", once)
+    se.embed_audio(np.zeros(108 * 16000, dtype=np.float32), 16000)
+    assert len(lengths) > 1, "the whole 108 s went to the model in one tensor"
+    assert max(lengths) <= se.MAX_EMBED_SECONDS * 16000
+
+
+def test_short_audio_still_takes_the_single_pass_path(monkeypatch):
+    """The parity fixtures compare against vectors recorded from one pass. Changing the
+    arithmetic under them would make the comparison meaningless while it stayed green."""
+    calls = []
+    monkeypatch.setattr(se, "_embed_once",
+                        lambda a: calls.append(len(a)) or np.ones(192, dtype=np.float32))
+    se.embed_audio(np.zeros(5 * 16000, dtype=np.float32), 16000)
+    assert calls == [5 * 16000]
+
+
+def test_the_pieces_are_normalised_before_they_are_averaged(monkeypatch):
+    """The scores this feeds are cosines, so a loud piece is not more of an opinion about
+    who is speaking. Without normalising, one piece with a large norm decides the vector."""
+    vecs = [np.array([100.0] + [0.0] * 191, dtype=np.float32),
+            np.array([0.0, 1.0] + [0.0] * 190, dtype=np.float32)]
+    seq = iter(vecs)
+    monkeypatch.setattr(se, "_embed_once", lambda a: next(seq))
+    # Long enough for two pieces at the measured cap, whatever that cap is set to.
+    n = int(se.MAX_EMBED_SECONDS * 2 * 16000)
+    out = se.embed_audio(np.zeros(n, dtype=np.float32), 16000)
+    assert abs(out[0] - out[1]) < 1e-6, "the louder piece dominated the average"
+
+
+def test_the_same_audio_is_not_downloaded_once_per_turn(stub_embedder, monkeypatch):
+    """A session's turns are, by construction, all from the same handful of files. Fetching
+    and decoding each one per turn cost ~176 ms and a few megabytes every time."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    turns = [{"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+              "start_sec": float(i), "end_sec": float(i) + 5} for i in range(6)]
+    s3 = FakeS3({art: _match_artifact(turns=turns), key: _wav_bytes(seconds=30.0)})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    _writer(monkeypatch, [_profile()], [])
+
+    se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                           "object": {"key": art}}}]}, None)
+    assert s3.gets.count(key) == 1, f"downloaded {s3.gets.count(key)} times for 6 turns"
+
+
+def test_one_invocation_never_serves_another_its_audio(stub_embedder, monkeypatch):
+    """A warm container must not carry one session's audio into the next: the cache is a
+    within-run optimisation, and a stale hit would embed the wrong recording."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    s3 = FakeS3({art: _match_artifact(), key: _wav_bytes()})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    _writer(monkeypatch, [_profile()], [])
+    ev = {"Records": [{"s3": {"bucket": {"name": "b"}, "object": {"key": art}}}]}
+    se.lambda_handler(ev, None)
+    se.lambda_handler(ev, None)
+    assert s3.gets.count(key) == 2, "the second invocation reused the first one's audio"
+
+
+def test_one_enrolled_profile_names_nobody(stub_embedder, monkeypatch):
+    """`decide_name` returns a name with a NULL margin when the pool holds one profile —
+    "the closest of the only person I know". Written to a transcript it reads as an
+    identification, and it lands on every turn including the other speakers': one enrolled
+    name spread over everybody, which is worse than no name at all.
+
+    Discrimination needs two profiles. That is not a tuning choice — with overlapping score
+    distributions and no usable absolute threshold, one candidate cannot be told from a
+    stranger."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: _match_artifact(mode="on"),
+                                                  key: _wav_bytes()}))
+    seen = []
+    _writer(monkeypatch, [_profile()], seen)
+    out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                                 "object": {"key": art}}}]}, None)
+    assert out["matched"] == 0
+    assert not any(p["op"] == "match_names" for p in seen)
+
+
+def test_two_profiles_can_produce_a_name(stub_embedder, monkeypatch):
+    """The counterpart: with a runner-up to beat, the same turn is nameable. Without this
+    the test above would pass for a matcher that never names anything."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: _match_artifact(mode="on"),
+                                                  key: _wav_bytes()}))
+    seen = []
+    near = [1.0] * 192
+    far = [1.0] + [-1.0] * 191
+    _writer(monkeypatch, [_profile("vp-1", "Ben L", vec=near),
+                          _profile("vp-2", "Zoe", vec=far)], seen)
+    out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                                 "object": {"key": art}}}]}, None)
+    assert out["matched"] >= 1
+    assert next(p for p in seen if p["op"] == "match_names")["results"][0][
+        "display_name"] == "Ben L"
+
+
+# ---- harvest: one gesture, a usable profile -------------------------------
+#
+# The human vouches for ONE turn. Every other cluster member is machine-assigned,
+# and `_propagate` caps those at `tentative` on purpose. Storing them as samples
+# promotes a suggestion to permanent biometric ground truth — worth doing, and
+# only defensible while it is labelled as such.
+
+
+def _cands(*specs):
+    return [{"turn": {"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                      "start_sec": s, "end_sec": e},
+             "vector": np.ones(192, dtype=np.float32), "turn_ref": f"t@{s}"}
+            for s, e in specs]
+
+
+def _audio(monkeypatch, seconds=120.0):
+    # The per-invocation audio cache is cleared by `lambda_handler`, and these tests call
+    # `_admit_harvest` directly. Without this they read the previous test's audio — a short
+    # clip, from which a long window slices to nothing, and every admission "fails" for a
+    # reason that has nothing to do with the rule under test.
+    se._AUDIO_CACHE.clear()
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=seconds)}))
+
+
+def test_a_turn_under_the_enrolment_floor_is_not_even_fetched(stub_embedder, monkeypatch):
+    """The floor is REDUNDANT with the homogeneity check — a window under 10 s yields fewer
+    than two frames, so `window_is_homogeneous` returns None and refuses it regardless. What
+    the floor buys is not correctness but cost: no S3 read and no ONNX pass (~98 ms per
+    second of audio) for a turn that cannot be admitted.
+
+    Asserting the outcome alone would pass with the floor removed, which is how this was
+    found. So this asserts the SAVING."""
+    se._AUDIO_CACHE.clear()
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    s3 = FakeS3({key: _wav_bytes(seconds=120.0)})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    embeds = []
+    monkeypatch.setattr(se, "embed_audio", lambda a, sr: embeds.append(1) or
+                        np.ones(192, dtype=np.float32))
+
+    out = se._admit_harvest("Ben_UCPK2", "2026-08-11", _cands((0.0, 4.0)))
+    assert out == []
+    assert embeds == [], "a turn that cannot be admitted was embedded anyway"
+    assert s3.gets == [], "a turn that cannot be admitted was fetched anyway"
+
+    out = se._admit_harvest("Ben_UCPK2", "2026-08-11", _cands((10.0, 24.0)))
+    assert len(out) == 1 and embeds, "a long enough turn was not considered"
+
+
+def test_an_unjudgeable_window_is_refused_like_a_bad_one(stub_embedder, monkeypatch):
+    """`None` means "could not check". Admitting it is how a guard becomes decoration —
+    the anchor's own check refuses None too."""
+    _audio(monkeypatch)
+    monkeypatch.setattr(se.vp, "window_is_homogeneous", lambda frames: None)
+    assert se._admit_harvest("Ben_UCPK2", "2026-08-11", _cands((0.0, 20.0))) == []
+
+
+def test_a_window_with_two_voices_is_refused(stub_embedder, monkeypatch):
+    _audio(monkeypatch)
+    monkeypatch.setattr(se.vp, "window_is_homogeneous", lambda frames: False)
+    assert se._admit_harvest("Ben_UCPK2", "2026-08-11", _cands((0.0, 20.0))) == []
+
+
+def test_harvest_stops_at_the_sample_cap(stub_embedder, monkeypatch):
+    _audio(monkeypatch)
+    monkeypatch.setattr(se, "ENROL_MAX_SECONDS", 10_000.0)
+    out = se._admit_harvest("Ben_UCPK2", "2026-08-11",
+                            _cands(*[(float(i * 12), float(i * 12 + 11)) for i in range(9)]))
+    assert len(out) == se.ENROL_MAX_SAMPLES
+
+
+def test_harvest_stops_at_the_seconds_cap(stub_embedder, monkeypatch):
+    _audio(monkeypatch)
+    monkeypatch.setattr(se, "ENROL_MAX_SAMPLES", 100)
+    monkeypatch.setattr(se, "ENROL_MAX_SECONDS", 25.0)
+    out = se._admit_harvest("Ben_UCPK2", "2026-08-11",
+                            _cands((0.0, 11.0), (12.0, 23.0), (24.0, 35.0), (36.0, 47.0)))
+    assert 0 < len(out) <= 3
+
+
+def test_nothing_is_harvested_when_the_anchor_itself_was_refused(stub_embedder,
+                                                                 monkeypatch):
+    """`_propagate` runs BEFORE the anchor's homogeneity and between-voices checks. Without
+    the ordering, six samples get stored for a profile whose own corrected window was just
+    judged to hold two voices — the exact condition one sample is refused for."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/r1.json"
+    doc = json.dumps({"session_base": "sid" + "c" * 32, "company_id": "co-1",
+                      "user_folder": "Ben_UCPK2", "date": "2026-08-11",
+                      # The ANCHOR is 4 s — unjudgeable, so its own enrolment is
+                      # refused — while the cluster it names holds long turns that would
+                      # otherwise be admitted. Refusing everything globally would make this
+                      # test pass with the ordering removed, which is how it was found.
+                      "correction": {"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                                     "start_sec": 0.0, "end_sec": 4.0,
+                                     "display_name": "Ben L"},
+                      "turns": [{"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                                 "start_sec": 0.0, "end_sec": 4.0},
+                                {"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                                 "start_sec": 10.0, "end_sec": 26.0},
+                                {"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                                 "start_sec": 30.0, "end_sec": 46.0}],
+                      "enrol": {"voiceprint_id": "vp-1"}})
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: doc,
+                                                  key: _wav_bytes(seconds=60.0)}))
+    candidates_embedded = []
+    real_frames = se._frames
+    monkeypatch.setattr(se, "_frames",
+                        lambda a, sr: candidates_embedded.append(1) or real_frames(a, sr))
+    seen = []
+    monkeypatch.setattr(se, "invoke_writer", lambda p: seen.append(p) or {"written": 0})
+    se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                           "object": {"key": art}}}]}, None)
+    assert (seen[0]["enrol"] or {}).get("refused"),         "the anchor was not refused; the test proves nothing"
+    assert not (seen[0]["enrol"] or {}).get("embedding")
+    assert seen[0]["harvest"] == []
+    # Two guards stand here on purpose — the admission pass is skipped AND the payload
+    # refuses to carry it — so removing either alone leaves the outcome unchanged. That is
+    # what belt-and-braces means, and it is also how a mutation can look uncaught. The cost
+    # is the observable difference: a refused anchor must not pay for the cluster's audio.
+    assert len(candidates_embedded) == 1, (
+        "the cluster was embedded for a harvest that could never be stored")
+
+
+def test_the_spread_op_writes_nothing(stub_embedder, monkeypatch):
+    """It exists because the two ops that could otherwise produce this number both have side
+    effects: `enrol` stores the sample when the window passes, and `match` never computes
+    frames at all. A diagnostic that writes is not a diagnostic."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    se._AUDIO_CACHE.clear()
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=30.0)}))
+    called = []
+    monkeypatch.setattr(se, "invoke_writer", lambda p: called.append(p) or {})
+    out = se.lambda_handler({"op": "spread", "user_folder": "Ben_UCPK2",
+                             "date": "2026-08-11",
+                             "source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                             "start_sec": 0.0, "end_sec": 20.0}, None)
+    assert called == [], "a read-only probe invoked the writer"
+    assert out["frames"] >= 2 and out["verdict"] == "homogeneous"
+    assert out["spread"] is not None and out["limit"] == se.vp.DEFAULT_MAX_FRAME_SPREAD
+
+
+def test_the_spread_op_reports_unjudgeable_rather_than_guessing(stub_embedder, monkeypatch):
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    se._AUDIO_CACHE.clear()
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=30.0)}))
+    out = se.lambda_handler({"op": "spread", "user_folder": "Ben_UCPK2",
+                             "date": "2026-08-11",
+                             "source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                             "start_sec": 0.0, "end_sec": 4.0}, None)
+    assert out["verdict"] == "unjudgeable" and out["spread"] is None
+
+
+# ---- the tail of a long turn is not thrown away ---------------------------
+
+
+def test_the_last_seconds_of_a_long_turn_reach_the_vector():
+    """`range(..., len(audio) - cap + 1, ...)` walks only WHOLE pieces. A 113.6 s turn was
+    embedded from its first 90 seconds and the remaining 23.6 s — 21 % of that person's
+    speech — never entered the vector, silently, producing an ordinary-looking result.
+
+    Asserted on coverage rather than on the output, because the output of a dropped tail is
+    indistinguishable from the output of a shorter recording."""
+    import lambda_speaker_embed as m
+    seen = []
+
+    class Rec:
+        def run(self, _o, feed):
+            seen.append(feed["wav"].shape[-1])
+            return [np.ones((1, 192), dtype=np.float32)]
+
+    m._session = Rec()
+    try:
+        sr = 16000
+        m.embed_audio(np.zeros(int(113.6 * sr), dtype=np.float32), sr)
+        covered = sum(seen)
+        assert covered >= int(113.0 * sr), (
+            f"covered {covered / sr:.1f}s of 113.6s — the tail was dropped")
+    finally:
+        m._session = None
+
+
+def test_a_scrap_of_a_remainder_is_not_its_own_piece():
+    """Below a second the remainder cannot characterise a voice, and averaged in with equal
+    weight it drags the result toward whatever noise it holds."""
+    import lambda_speaker_embed as m
+    seen = []
+
+    class Rec:
+        def run(self, _o, feed):
+            seen.append(feed["wav"].shape[-1])
+            return [np.ones((1, 192), dtype=np.float32)]
+
+    m._session = Rec()
+    try:
+        sr = 16000
+        m.embed_audio(np.zeros(int(45.3 * sr), dtype=np.float32), sr)
+        assert len(seen) == 1, f"a 0.3s scrap became its own forward pass: {seen}"
+    finally:
+        m._session = None
+
+
+# ---- frames must contain speech before they are evidence ------------------
+#
+# The homogeneity guard's job is to refuse a window holding two people. The only
+# window it has ever ACCEPTED on real audio was the quietest one measured — two
+# frames at -67 and -57 dBFS, the noise floor, about 30 dB below this device's
+# speech. The input it exists to refuse is the input it let through.
+
+
+def test_a_silent_frame_is_not_evidence_about_a_speaker(monkeypatch):
+    sr = 16000
+    loud = np.sin(2 * np.pi * 220.0 * np.arange(5 * sr) / sr).astype(np.float32) * 0.5
+    quiet = np.zeros(5 * sr, dtype=np.float32)
+    assert len(se._frames(np.concatenate([loud, quiet]), sr)) == 1
+
+
+def test_a_window_of_pure_silence_becomes_unjudgeable_not_homogeneous(monkeypatch):
+    """Not merely refused — UNJUDGEABLE. Two frames of noise resemble each other, so an
+    ungated pair scores near zero and reads as "one voice". `None` is refused at all four
+    consumers; `True` is stored."""
+    sr = 16000
+    frames = se._frames(np.zeros(20 * sr, dtype=np.float32), sr)
+    assert frames == []
+    assert se.vp.window_is_homogeneous([se.embed_audio(f, sr) for f in frames]) is None
+
+
+def test_the_gate_is_in_frames_so_the_diagnostic_sees_it_too(stub_embedder, monkeypatch):
+    """Gating at the writing sites only would leave `op: "spread"` ungated — and that is the
+    op used to check whether the gate works, so it would report "not gating" while gating
+    everywhere that matters."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    se._AUDIO_CACHE.clear()
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=30.0,
+                                                                 silent=True)}))
+    out = se.lambda_handler({"op": "spread", "user_folder": "Ben_UCPK2",
+                             "date": "2026-08-11",
+                             "source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                             "start_sec": 0.0, "end_sec": 20.0}, None)
+    assert out["frames"] == 0
+    assert out["verdict"] == "unjudgeable"
+
+
+def test_a_quiet_but_real_frame_is_kept():
+    """A floor, not a judgement: it removes frames that cannot be about anybody, not frames
+    that are merely quiet. These devices already record 15 dB below normal."""
+    sr = 16000
+    # -40 dBFS: well under normal speech, well over the noise floor.
+    quiet_speech = (np.sin(2 * np.pi * 220.0 * np.arange(10 * sr) / sr)
+                    * 0.014).astype(np.float32)
+    assert len(se._frames(quiet_speech, sr)) == 2

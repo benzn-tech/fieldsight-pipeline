@@ -1732,6 +1732,16 @@ Resources:
                     - audio_segments/*
                     - web_video/*
                     - users/*
+                    # The deletion mirror. GetObject alone is not enough: without ListBucket
+                    # on this prefix a MISSING object answers 403 rather than 404, and
+                    # `deleted_sessions_strict` raises MirrorUnreadable on anything that is
+                    # not NoSuchKey. The mirror is missing precisely because it has never
+                    # been written, so the first delete of any day could never create it —
+                    # permanently. Verified: `aws s3 ls .../redactions/` returned zero
+                    # objects and org-api logged the AccessDenied traceback on a real
+                    # delete. The DB half commits regardless, which is why deleting has
+                    # always LOOKED like it worked.
+                    - redactions/*
             - Effect: Allow
               # authority-flip Task 4 — /timeline reads daily_report.json
               # (and summary_report.json) verbatim from the lake bucket.
@@ -2480,6 +2490,19 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/embeddings/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
+                # The deletion mirror, read by lambda_ingest.py:510 through
+                # deletion_mirror.deleted_sessions so the nightly rebuild does not put a
+                # deleted recording's turns back into the search index. Without this grant
+                # an EXISTING mirror answers 403, the lenient read swallows it into an
+                # empty set, and the filter is silently off — the same defect the archive
+                # was introduced to close, restored by a missing line of IAM.
+                #
+                # An earlier version of this comment claimed ListBucket was "already granted
+                # below". It is granted, but CONDITIONED on a prefix list that did not
+                # include this one — reading the Action and stopping before the Condition is
+                # how that claim got made. `redactions/*` is now in that list too; without
+                # it a missing mirror is a 403, not a 404.
+                - !Sub arn:aws:s3:::${IngestBucketName}/redactions/*
             - Effect: Allow
               # Task 4: after committing a report's topics, ingest emits a
               # match_requests/ artifact (match_request.emit) for the non-VPC
@@ -2506,6 +2529,11 @@ Resources:
                     - reports/*
                     - transcripts/*
                     - voice_ask/*
+                    # Same reason as org-api's: ingest READS the mirror in _load_turns to
+                    # keep the nightly rebuild from re-indexing a deleted recording, and a
+                    # missing mirror must read as 404 ("nothing deleted") rather than 403
+                    # ("cannot tell"), which the lenient read swallows into an empty set.
+                    - redactions/*
 
   # ----------------------------------------------------------
   # Lambda 15: Embed Report (Phase 4d) — S3 event on reports/,
