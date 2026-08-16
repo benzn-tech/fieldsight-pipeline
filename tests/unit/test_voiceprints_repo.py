@@ -289,13 +289,16 @@ def test_a_correction_row_supersedes_the_live_row_for_that_turn_first():
     """Supersede-then-insert, in the caller's transaction. S3 events are unordered, so two
     runs can overlap; without the supersede first the partial unique index turns a race into
     a write failure instead of a replacement."""
-    conn = FakeConn([[], [{"id": "t2"}]])
+    conn = FakeConn([[], [], [{"id": "t2"}]])
     voiceprints.record_turn_name(conn, CO, session_base="s1", turn_ref="f.wav@1.0",
                                  state="confirmed", source="correction",
                                  correction_ref="corr-2", voiceprint_id=VP)
-    assert "UPDATE speaker_turn_names" in conn.calls[0]["sql"]
-    assert "superseded_at" in conn.calls[0]["sql"]
-    assert "INSERT INTO speaker_turn_names" in conn.calls[1]["sql"]
+    # The precedence check reads the live row first; what this test is about is that the
+    # supersede still happens BEFORE the insert.
+    order = [c["sql"].split()[0] for c in conn.calls]
+    assert order.index("UPDATE") < order.index("INSERT")
+    assert "superseded_at" in next(c for c in conn.calls
+                                   if c["sql"].startswith("UPDATE"))["sql"]
 
 
 def test_the_live_overlay_excludes_superseded_rows():
@@ -618,3 +621,69 @@ def test_the_comparison_is_company_scoped():
     voiceprints.add_sample(conn, CO, VP, me, source="correction", s3_key="k",
                            window=(0.0, 4.0))
     assert CO in conn.calls[0]["params"], "profiles were read without a company scope"
+
+
+# ---- write-time precedence -----------------------------------------------
+#
+# The supersede has no source predicate and never had one, so a weaker source
+# could bury a human correction simply by arriving later. `_SOURCE_RANK` cannot
+# help: it ranks at READ time, among rows that both survived.
+
+
+def _live(source, state="confirmed"):
+    return [{"id": "t1", "source": source, "state": state}]
+
+
+def test_a_matched_name_does_not_bury_a_human_correction():
+    conn = FakeConn([_live("correction")])
+    out = voiceprints.record_turn_name(conn, CO, session_base="s1", turn_ref="f.wav@1.0",
+                                       state="confirmed", source="voiceprint_match",
+                                       display_name="Ben L")
+    assert out is None, "the weaker write was accepted"
+    assert not any(c["sql"].startswith("UPDATE") for c in conn.calls), \
+        "the human row was superseded anyway"
+    assert not any(c["sql"].startswith("INSERT") for c in conn.calls)
+
+
+def test_a_correction_replaces_a_matched_name():
+    conn = FakeConn([_live("voiceprint_match"), [], [{"id": "t2"}]])
+    out = voiceprints.record_turn_name(conn, CO, session_base="s1", turn_ref="f.wav@1.0",
+                                       state="confirmed", source="correction",
+                                       display_name="Ben L")
+    assert out == {"id": "t2"}
+
+
+def test_an_equal_source_still_replaces():
+    """A newer match superseding an older match is wanted. Only a write that would move a
+    turn DOWN the scale is declined — otherwise re-running a match could never correct
+    itself."""
+    conn = FakeConn([_live("voiceprint_match"), [], [{"id": "t2"}]])
+    out = voiceprints.record_turn_name(conn, CO, session_base="s1", turn_ref="f.wav@1.0",
+                                       state="tentative", source="voiceprint_match",
+                                       display_name="Zoe")
+    assert out == {"id": "t2"}
+
+
+def test_an_unknown_live_source_never_blocks_a_known_one():
+    """An unrecognised source ranks -1. It must not outrank anything, or a stray value in
+    the column would freeze a turn permanently."""
+    conn = FakeConn([_live("something_nobody_wrote"), [], [{"id": "t2"}]])
+    assert voiceprints.record_turn_name(conn, CO, session_base="s1", turn_ref="f.wav@1.0",
+                                        state="tentative", source="voiceprint_match",
+                                        display_name="Zoe") == {"id": "t2"}
+
+
+def test_the_live_row_is_locked_before_the_decision():
+    """Two writers racing on one turn must serialise here rather than at the partial unique
+    index, where the loser gets a write failure instead of a decision."""
+    conn = FakeConn([[], [], [{"id": "t2"}]])
+    voiceprints.record_turn_name(conn, CO, session_base="s1", turn_ref="f.wav@1.0",
+                                 state="confirmed", source="correction")
+    assert "FOR UPDATE" in conn.calls[0]["sql"]
+
+
+def test_the_precedence_read_is_company_scoped():
+    conn = FakeConn([[], [], [{"id": "t2"}]])
+    voiceprints.record_turn_name(conn, CO, session_base="s1", turn_ref="f.wav@1.0",
+                                 state="confirmed", source="correction")
+    assert CO in conn.calls[0]["params"]

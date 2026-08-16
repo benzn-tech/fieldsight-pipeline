@@ -343,3 +343,36 @@ def test_fetching_profiles_is_company_scoped(monkeypatch):
                         seen.update({"co": company_id}) or [])
     vw.lambda_handler({"op": "profiles", "company_id": CO}, None)
     assert seen["co"] == CO, "one company's voice would be matched against another's"
+
+
+# ---- a declined write is not a write --------------------------------------
+
+
+def test_a_declined_turn_is_reported_separately_from_a_written_one(monkeypatch):
+    """`record_turn_name` returns None when a stronger live row holds the turn. Counting
+    that as written would report a propagation covering turns it never touched — and
+    "found nothing" would be indistinguishable from "deferred to a human"."""
+    seen = []
+
+    def maybe(conn, company_id, **kw):
+        seen.append(kw["turn_ref"])
+        return None if kw["turn_ref"] == "f.wav@9.0" else {"id": "t"}
+
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "record_turn_name", maybe)
+    out = vw.lambda_handler({
+        "op": "propagation", "company_id": CO, "session_base": "s1",
+        "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed", "asserted": True},
+                    {"turn_ref": "f.wav@9.0", "state": "tentative"}]}, None)
+    assert out["written"] == 1 and out["declined"] == 1
+    assert len(seen) == 2, "a declined turn stopped the loop"
+
+
+def test_a_match_that_defers_to_a_human_says_so(monkeypatch):
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "record_turn_name", lambda conn, company_id, **kw: None)
+    out = vw.lambda_handler({"op": "match_names", "company_id": CO, "session_base": "s1",
+                             "results": [{"turn_ref": "f.wav@1.0", "status": "confirmed",
+                                          "person_key": "vp-1",
+                                          "display_name": "Ben L"}]}, None)
+    assert out["written"] == 0 and out["declined"] == 1
