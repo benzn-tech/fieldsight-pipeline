@@ -620,6 +620,8 @@ def dispatch(conn, event, method, route):
     m_un = re.match(r"^/sessions/([^/]+)/speaker-names$", route)
     if m_un and method == "DELETE":
         return unname_speaker(conn, caller, m_un.group(1), event)
+    if route == "/voiceprints" and method == "GET":
+        return list_voiceprints(conn, caller)
     m_vw = re.match(r"^/voiceprints/([^/]+)$", route)
     if m_vw and method == "DELETE":
         return withdraw_voiceprint(conn, caller, m_vw.group(1))
@@ -1307,6 +1309,42 @@ def _split_for_budget(turns):
     if current:
         runs.append(current)
     return runs
+
+
+def list_voiceprints(conn, caller):
+    """GET /api/org/voiceprints — every profile this company holds, and why each is as it is.
+
+    There was no read path at all. A profile could be created, have its enrolment refused,
+    and sit empty forever with no way to look at it short of the database — and "empty
+    because the window was refused" and "empty because the embedder died" produce exactly
+    the same row. Both happened on TEST on 2026-08-16 and were indistinguishable.
+
+    `samples` is the number that decides whether a profile does anything: a named profile
+    with zero of them names nobody. `humanSamples` separates what a person vouched for from
+    what the clustering suggested, which is the distinction the harvest design rests on —
+    a profile made only of inference stays tentative.
+
+    No vectors. They are biometric data, nothing in a listing needs them, and the one place
+    they may travel is the synchronous fetch the matcher makes.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    rows = voiceprints.list_profiles(conn, str(caller["company_id"]))
+    return ok({"voiceprints": [{
+        "id": str(r["id"]),
+        "displayName": r.get("display_name"),
+        "status": r.get("status"),
+        "userId": str(r["user_id"]) if r.get("user_id") else None,
+        "linkedOn": r.get("linked_on"),
+        "consentAt": r.get("consent_at"),
+        "samples": int(r.get("samples") or 0),
+        "humanSamples": int(r.get("human_samples") or 0),
+        "lastAttemptAt": r.get("last_attempt_at"),
+        "lastAttemptOutcome": r.get("last_attempt_outcome"),
+        "lastAttemptDetail": r.get("last_attempt_detail"),
+    } for r in rows]})
 
 
 def _site_for_session(conn, company_id, user_folder, date, session_base):

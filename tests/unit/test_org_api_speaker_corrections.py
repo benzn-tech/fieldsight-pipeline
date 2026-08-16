@@ -909,3 +909,58 @@ def test_a_site_from_another_tenant_is_refused(monkeypatch):
     monkeypatch.setattr(org.recordings, "site_for_day", lambda *a, **k: None)
     assert org._site_for_session(None, "co-1", "Ada_L", "2026-08-16",
                                  "x_sid" + "a" * 32) is None
+
+
+# ---- being able to see why a profile is empty ----------------------------
+
+
+def _list_event(sub="sub-1"):
+    return {"httpMethod": "GET", "path": "/api/org/voiceprints", "body": None,
+            "requestContext": {"authorizer": {"claims": {"sub": sub}}}}
+
+
+def test_a_profile_says_what_happened_the_last_time_somebody_tried(wired, monkeypatch):
+    """"Empty because the window was refused" and "empty because the embedder died" produce
+    the same row. Both happened on TEST on 2026-08-16 and nothing distinguished them."""
+    monkeypatch.setattr(org.voiceprints, "list_profiles", lambda conn, co: [
+        {"id": "vp-1", "display_name": "Ben Lin", "status": "tentative", "user_id": "u-1",
+         "linked_on": "folder_name", "consent_at": None, "samples": 0, "human_samples": 0,
+         "last_attempt_at": "2026-08-16T17:00:00Z", "last_attempt_outcome": "refused",
+         "last_attempt_detail": "this window does not hold one voice"}])
+    b = _body(org.lambda_handler(_list_event(), None))
+    row = b["voiceprints"][0]
+    assert row["samples"] == 0
+    assert row["lastAttemptOutcome"] == "refused"
+    assert "one voice" in row["lastAttemptDetail"]
+
+
+def test_the_listing_separates_vouched_samples_from_inferred_ones(wired, monkeypatch):
+    monkeypatch.setattr(org.voiceprints, "list_profiles", lambda conn, co: [
+        {"id": "vp-1", "display_name": "Ben Lin", "status": "tentative", "user_id": None,
+         "linked_on": None, "consent_at": None, "samples": 6, "human_samples": 1,
+         "last_attempt_at": None, "last_attempt_outcome": None,
+         "last_attempt_detail": None}])
+    row = _body(org.lambda_handler(_list_event(), None))["voiceprints"][0]
+    assert row["samples"] == 6 and row["humanSamples"] == 1
+
+
+def test_the_listing_never_carries_a_vector(wired, monkeypatch):
+    """Biometric data. Nothing in a listing needs it, and the one place it may travel is the
+    synchronous fetch the matcher makes."""
+    monkeypatch.setattr(org.voiceprints, "list_profiles", lambda conn, co: [
+        {"id": "vp-1", "display_name": "X", "status": "tentative", "user_id": None,
+         "linked_on": None, "consent_at": None, "samples": 1, "human_samples": 1,
+         "embedding": [0.1] * 192,
+         "last_attempt_at": None, "last_attempt_outcome": None, "last_attempt_detail": None}])
+    assert "embedding" not in json.dumps(_body(org.lambda_handler(_list_event(), None)))
+
+
+def test_a_worker_cannot_list_voiceprints(wired, monkeypatch):
+    monkeypatch.setattr(org.users, "get_user_by_sub",
+                        lambda conn, sub: dict(CALLER, global_role="worker"))
+    assert org.lambda_handler(_list_event(), None)["statusCode"] == 403
+
+
+def test_listing_404s_when_the_feature_is_off(wired, monkeypatch):
+    monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "off")
+    assert org.lambda_handler(_list_event(), None)["statusCode"] == 404

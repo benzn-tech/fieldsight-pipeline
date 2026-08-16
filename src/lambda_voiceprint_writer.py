@@ -34,7 +34,8 @@ import logging
 from db.connection import get_connection
 from repositories.voiceprints import (EnrolmentBelongsToSomebodyElse, add_sample,
                                       live_turn_names, profiles_for_matching,
-                                      record_turn_name, rejected_names)
+                                      record_attempt, record_turn_name,
+                                      rejected_names)
 from turn_name_overlay import _SOURCE_RANK
 
 logger = logging.getLogger()
@@ -116,7 +117,14 @@ def _propagation(event):
         enrol = event.get("enrol")
         enrol_refusal = None
         if enrol:
-            if not enrol.get("embedding"):
+            if enrol.get("refused"):
+                # The embedder declined the window before it ever reached a vector. Recorded
+                # here because this half owns the database and that verdict would otherwise
+                # exist only in a log line nobody correlates with the empty profile.
+                record_attempt(conn, company_id, enrol["voiceprint_id"], "refused",
+                               enrol.get("refused"))
+                enrol = None
+            elif not enrol.get("embedding"):
                 raise ValueError(
                     "enrolment carries no embedding; storing a blank would create a profile "
                     "that matches nothing and explains nothing")
@@ -136,6 +144,10 @@ def _propagation(event):
                                  "own": exc.own, "bestOther": exc.best_other,
                                  "nearestOtherId": str(exc.nearest_other_id)}
                 logger.warning("enrolment refused for %s: %s", enrol["voiceprint_id"], exc)
+                record_attempt(conn, company_id, enrol["voiceprint_id"], "refused",
+                               "this window resembles another profile more than this one")
+            else:
+                record_attempt(conn, company_id, enrol["voiceprint_id"], "stored")
         # The cluster's other members, if the anchor survived its own checks. A SEPARATE
         # source, permanently: the anchor is what a person vouched for, these are what the
         # clustering suggested, and telling them apart later is the difference between
