@@ -1213,3 +1213,127 @@ def test_two_profiles_can_produce_a_name(stub_embedder, monkeypatch):
     assert out["matched"] >= 1
     assert next(p for p in seen if p["op"] == "match_names")["results"][0][
         "display_name"] == "Ben L"
+
+
+# ---- harvest: one gesture, a usable profile -------------------------------
+#
+# The human vouches for ONE turn. Every other cluster member is machine-assigned,
+# and `_propagate` caps those at `tentative` on purpose. Storing them as samples
+# promotes a suggestion to permanent biometric ground truth — worth doing, and
+# only defensible while it is labelled as such.
+
+
+def _cands(*specs):
+    return [{"turn": {"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                      "start_sec": s, "end_sec": e},
+             "vector": np.ones(192, dtype=np.float32), "turn_ref": f"t@{s}"}
+            for s, e in specs]
+
+
+def _audio(monkeypatch, seconds=120.0):
+    # The per-invocation audio cache is cleared by `lambda_handler`, and these tests call
+    # `_admit_harvest` directly. Without this they read the previous test's audio — a short
+    # clip, from which a long window slices to nothing, and every admission "fails" for a
+    # reason that has nothing to do with the rule under test.
+    se._AUDIO_CACHE.clear()
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=seconds)}))
+
+
+def test_a_turn_under_the_enrolment_floor_is_not_even_fetched(stub_embedder, monkeypatch):
+    """The floor is REDUNDANT with the homogeneity check — a window under 10 s yields fewer
+    than two frames, so `window_is_homogeneous` returns None and refuses it regardless. What
+    the floor buys is not correctness but cost: no S3 read and no ONNX pass (~98 ms per
+    second of audio) for a turn that cannot be admitted.
+
+    Asserting the outcome alone would pass with the floor removed, which is how this was
+    found. So this asserts the SAVING."""
+    se._AUDIO_CACHE.clear()
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    s3 = FakeS3({key: _wav_bytes(seconds=120.0)})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    embeds = []
+    monkeypatch.setattr(se, "embed_audio", lambda a, sr: embeds.append(1) or
+                        np.ones(192, dtype=np.float32))
+
+    out = se._admit_harvest("Ben_UCPK2", "2026-08-11", _cands((0.0, 4.0)))
+    assert out == []
+    assert embeds == [], "a turn that cannot be admitted was embedded anyway"
+    assert s3.gets == [], "a turn that cannot be admitted was fetched anyway"
+
+    out = se._admit_harvest("Ben_UCPK2", "2026-08-11", _cands((10.0, 24.0)))
+    assert len(out) == 1 and embeds, "a long enough turn was not considered"
+
+
+def test_an_unjudgeable_window_is_refused_like_a_bad_one(stub_embedder, monkeypatch):
+    """`None` means "could not check". Admitting it is how a guard becomes decoration —
+    the anchor's own check refuses None too."""
+    _audio(monkeypatch)
+    monkeypatch.setattr(se.vp, "window_is_homogeneous", lambda frames: None)
+    assert se._admit_harvest("Ben_UCPK2", "2026-08-11", _cands((0.0, 20.0))) == []
+
+
+def test_a_window_with_two_voices_is_refused(stub_embedder, monkeypatch):
+    _audio(monkeypatch)
+    monkeypatch.setattr(se.vp, "window_is_homogeneous", lambda frames: False)
+    assert se._admit_harvest("Ben_UCPK2", "2026-08-11", _cands((0.0, 20.0))) == []
+
+
+def test_harvest_stops_at_the_sample_cap(stub_embedder, monkeypatch):
+    _audio(monkeypatch)
+    monkeypatch.setattr(se, "ENROL_MAX_SECONDS", 10_000.0)
+    out = se._admit_harvest("Ben_UCPK2", "2026-08-11",
+                            _cands(*[(float(i * 12), float(i * 12 + 11)) for i in range(9)]))
+    assert len(out) == se.ENROL_MAX_SAMPLES
+
+
+def test_harvest_stops_at_the_seconds_cap(stub_embedder, monkeypatch):
+    _audio(monkeypatch)
+    monkeypatch.setattr(se, "ENROL_MAX_SAMPLES", 100)
+    monkeypatch.setattr(se, "ENROL_MAX_SECONDS", 25.0)
+    out = se._admit_harvest("Ben_UCPK2", "2026-08-11",
+                            _cands((0.0, 11.0), (12.0, 23.0), (24.0, 35.0), (36.0, 47.0)))
+    assert 0 < len(out) <= 3
+
+
+def test_nothing_is_harvested_when_the_anchor_itself_was_refused(stub_embedder,
+                                                                 monkeypatch):
+    """`_propagate` runs BEFORE the anchor's homogeneity and between-voices checks. Without
+    the ordering, six samples get stored for a profile whose own corrected window was just
+    judged to hold two voices — the exact condition one sample is refused for."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/r1.json"
+    doc = json.dumps({"session_base": "sid" + "c" * 32, "company_id": "co-1",
+                      "user_folder": "Ben_UCPK2", "date": "2026-08-11",
+                      # The ANCHOR is 4 s — unjudgeable, so its own enrolment is
+                      # refused — while the cluster it names holds long turns that would
+                      # otherwise be admitted. Refusing everything globally would make this
+                      # test pass with the ordering removed, which is how it was found.
+                      "correction": {"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                                     "start_sec": 0.0, "end_sec": 4.0,
+                                     "display_name": "Ben L"},
+                      "turns": [{"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                                 "start_sec": 0.0, "end_sec": 4.0},
+                                {"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                                 "start_sec": 10.0, "end_sec": 26.0},
+                                {"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                                 "start_sec": 30.0, "end_sec": 46.0}],
+                      "enrol": {"voiceprint_id": "vp-1"}})
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: doc,
+                                                  key: _wav_bytes(seconds=60.0)}))
+    candidates_embedded = []
+    real_frames = se._frames
+    monkeypatch.setattr(se, "_frames",
+                        lambda a, sr: candidates_embedded.append(1) or real_frames(a, sr))
+    seen = []
+    monkeypatch.setattr(se, "invoke_writer", lambda p: seen.append(p) or {"written": 0})
+    se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                           "object": {"key": art}}}]}, None)
+    assert seen[0]["enrol"] is None, "the anchor was not refused; the test proves nothing"
+    assert seen[0]["harvest"] == []
+    # Two guards stand here on purpose — the admission pass is skipped AND the payload
+    # refuses to carry it — so removing either alone leaves the outcome unchanged. That is
+    # what belt-and-braces means, and it is also how a mutation can look uncaught. The cost
+    # is the observable difference: a refused anchor must not pay for the cluster's audio.
+    assert len(candidates_embedded) == 1, (
+        "the cluster was embedded for a harvest that could never be stored")
