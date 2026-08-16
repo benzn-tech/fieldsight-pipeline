@@ -66,7 +66,7 @@ Before the re-extraction runs, move the session's rows aside, keyed on the delet
 | `safety_observations`, `findings`, `topic_photos` | CASCADE from topics |
 | `topic_threads` | confirmed recurring-item links, CASCADE |
 | `report_chunks` | already done — `archive_chunks_for_session` ships |
-| `programme_suggestions` | SET NULL, so the row survives with a dangling link; record the link |
+| `programme_progress_suggestions` | **not an FK problem.** It stores FROZEN COPIES of the text — `topic_title text NOT NULL`, `topic_summary text` — beside a `topic_id` that is SET NULL, so the sentence survives the topic. Filtered at the read instead of archived, both arms; **fixed separately and already shipped**, because the whole-recording delete had the same hole |
 
 `report_chunks_archive` (migration 0044) is the pattern: `CREATE TABLE … (LIKE …)` plus
 `batch_id` and `archived_at`, no foreign keys (so nothing CASCADEs into the archive) and no
@@ -90,8 +90,10 @@ the same clock the UI's time blocks are drawn from, so the span the customer dra
 span the backend removes are one coordinate system with no conversion between them.
 
 **Not `chunk_start` + `duration` within a file.** That arithmetic is what the `_off{T}`
-defect gets wrong (`lambda_speaker_embed.py:110`), and a batched turn's `source_filename`
-is the stitched WAV rather than the device upload.
+defect gets wrong (in `lambda_speaker_embed`, around `_raw_key`/the slice that follows —
+re-locate it before relying on it; the line number this spec first carried had already
+drifted), and a batched turn's `source_filename` is the stitched WAV rather than the device
+upload.
 
 ### 2.4 The other four transcript readers
 
@@ -112,12 +114,47 @@ the wrong clock.
 ### 2.5 The mirror
 
 `redactions/{folder}/{date}/ranges.json`, alongside the existing `deleted_sessions.json`,
-with both lessons that one learned the hard way already applied:
+with both lessons that one learned the hard way already applied — **and one ordering rule
+the review added**: the mirror must be written BEFORE the archive transaction commits is
+NOT the rule (that would advertise a deletion the database might roll back). The rule is
+the one the shipped endpoint already follows — commit, then mirror — plus an explicit
+acknowledgement of the window it leaves: `lambda_report_generator` and
+`lambda_meeting_minutes` have no database and read only the mirror, so a pass that runs
+between the commit and the mirror write can still emit prose containing the span. The
+interim state in §3 hides the whole session in the DATABASE; it does not hide it from those
+two until the mirror lands. Either accept a window of seconds and say so, or gate those two
+lambdas on a per-day marker written first — the choice belongs in the plan, not left
+unstated.
 
 * **merge, never overwrite** — a second span-delete on the same day must not free the first;
 * **read strictly** — an unreadable mirror must abort the write rather than clobber it
   (`deletion_mirror.MirrorUnreadable`), because a lenient read turns a merge into an
   overwrite and an undelete's subtraction into an empty document.
+
+### 2.6 Two more things the review found, and what this spec does about them
+
+**`content_edits` history is protected by accident.** `GET /content/{table}/{id}/history`
+gates on company/site reach only; it currently 404s for a deleted topic solely because
+`content.get_content_row` INNER JOINs through `topics` and the row is gone. Under this
+design that stays true while the rows are archived — but only because the archive
+physically removes them. **An implementer who reaches for a soft flag instead (the natural
+shortcut for dodging the FK/CASCADE ordering) resurrects the leak with no test failing.**
+So: archive by MOVING the row, never by marking it, and pin that with a test that asserts
+the history endpoint 404s for an archived topic.
+
+Note also that v1 §6 claimed `content_edits` keeps "who closed this and when" recoverable
+throughout. Under this mechanism that is false while the session is archived and true again
+after restore. Say the weaker, true thing.
+
+**`topics.py` carries only the topic arm.** `_visible()` splices in
+`DELETED_TOPIC_PREDICATE` and the module never imports `DELETED_SOURCE_PREDICATE`, so no
+read in that file has the source arm. In practice `lambda_ingest._restamp_deleted_topics`
+covers the gap by re-tombstoning re-created topics into the same batch inside the ingest
+transaction — but that is a second, independent mechanism, and
+`lambda_item_writer._source_is_deleted` fails open with a comment asserting "the read
+filters still hide it", which is **not true of this file's reads**. Out of scope for the
+span feature and worth its own change: either give `_visible()` both arms, or correct that
+comment so nobody else relies on a backstop that is not there.
 
 ## 3. The interim window
 
