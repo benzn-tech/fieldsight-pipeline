@@ -57,6 +57,30 @@ def upsert_suggestion(conn, *, site_id, task_id, topic_id, topic_title, topic_su
     ).fetchone()
 
 
+# A suggestion carries FROZEN COPIES of the topic's words -- `topic_title text NOT NULL`
+# and `topic_summary text` (0008) -- and its `topic_id` is `ON DELETE SET NULL`. So a
+# customer-facing delete could take the topic away and leave its sentence sitting here,
+# readable through the programme-feedback surface forever. The bar this feature is held to
+# is that a PARAPHRASE surviving in a summary is a failure; a verbatim copy is worse.
+#
+# The SOURCE arm rather than the topic arm, and both:
+#
+#   * `topic_id` covers what is linked right now -- but it is SET NULL, so a suggestion
+#     whose topic was already superseded has nothing to match on;
+#   * `source_s3_key` is NOT NULL on this table and is exactly what the recording tombstone
+#     holds, so it keeps matching after the link is gone.
+#
+# One of the two would pass every test anyone writes today and leak the moment the
+# pipeline supersedes that day.
+VISIBLE = (
+    "NOT EXISTS (SELECT 1 FROM redactions r "
+    "WHERE r.scope = 'deleted' AND r.reverted_at IS NULL AND ("
+    "  (r.target_type = 'topic' AND r.target_id = programme_progress_suggestions.topic_id)"
+    "  OR (r.target_type = 'recording' AND r.target_key IS NOT NULL"
+    "      AND programme_progress_suggestions.source_s3_key LIKE r.target_key || '%%')))"
+)
+
+
 def list_for_site(conn, site_id, state='pending', topic_user_id=None) -> list[dict]:
     """state=None returns all states; otherwise filtered to that state.
     Newest report_date first, then newest created_at within a date.
@@ -76,6 +100,7 @@ def list_for_site(conn, site_id, state='pending', topic_user_id=None) -> list[di
         f"SELECT {_COLS} FROM programme_progress_suggestions "
         f"WHERE site_id=%s AND (%s::text IS NULL OR state=%s) "
         f"AND (%s::uuid IS NULL OR topic_user_id = %s) "
+        f"AND {VISIBLE} "
         f"ORDER BY report_date DESC, created_at DESC",
         (site_id, state, state, topic_user_id, topic_user_id),
     ).fetchall()
@@ -83,7 +108,8 @@ def list_for_site(conn, site_id, state='pending', topic_user_id=None) -> list[di
 
 def get(conn, suggestion_id) -> dict | None:
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_COLS} FROM programme_progress_suggestions WHERE id=%s",
+        f"SELECT {_COLS} FROM programme_progress_suggestions "
+        f"WHERE id=%s AND {VISIBLE}",
         (suggestion_id,),
     ).fetchone()
 
