@@ -149,9 +149,14 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
         "INSERT INTO speaker_voiceprints "
         "(company_id, user_id, display_name, status, consent_at, consented_by, "
         " linked_by, linked_at, linked_on) "
+        # Both CASE parameters are cast. A parameter whose only use is `IS NULL` gives
+        # Postgres nothing to infer a type from, so the statement fails at PREPARE time for
+        # every value — `IndeterminateDatatype: could not determine data type of parameter
+        # $7`, observed on TEST, which made naming any speaker without an existing profile a
+        # deterministic 500. The suite could not see it: FakeConn never prepares SQL.
         "VALUES (%s, %s, %s, 'tentative', "
-        "        CASE WHEN %s THEN now() ELSE NULL END, %s, "
-        "        %s, CASE WHEN %s IS NULL THEN NULL ELSE now() END, %s) "
+        "        CASE WHEN %s::boolean THEN now() ELSE NULL END, %s, "
+        "        %s, CASE WHEN %s::uuid IS NULL THEN NULL ELSE now() END, %s) "
         "RETURNING id",
         (company_id, user_id, display_name, bool(consent_given), consented_by,
          linked_by, user_id, linked_on),
