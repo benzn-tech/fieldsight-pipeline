@@ -289,11 +289,29 @@ def profiles_for_matching(conn, company_id, site_id=None) -> list[dict]:
     if site_id is None:
         return _decode(conn.cursor(row_factory=dict_row).execute(
             cols + "ORDER BY p.created_at", (company_id,)).fetchall())
+    # Three arms, and the middle one is the whole reason this can be turned on.
+    #
+    # `user_id IS NULL` — an unnamed recurring voice, in scope everywhere by design.
+    #
+    # NO MEMBERSHIP AT ALL — `upsert_field_only_user` writes only `users`, so a directory
+    # entry for somebody with no login has no membership row. Without this arm, attaching an
+    # identity would make that person LESS matchable than before: matchable while unlinked,
+    # invisible the moment they are linked. The fix would have introduced the regression.
+    #
+    # A MEMBERSHIP AT THIS SITE — the narrowing itself.
+    #
+    # `archived_at IS NULL` on both, because every other membership query in this repository
+    # has it (repositories/memberships.py:29, 52, 71, …) and without it somebody removed from
+    # a site keeps being matched there: a guard satisfied and ineffective.
     return _decode(conn.cursor(row_factory=dict_row).execute(
         cols
-        + "  AND (p.user_id IS NULL OR EXISTS ("
-          "        SELECT 1 FROM memberships m "
-          "         WHERE m.user_id = p.user_id AND m.site_id = %s)) "
+        + "  AND (p.user_id IS NULL "
+          "       OR NOT EXISTS (SELECT 1 FROM memberships m2 "
+          "                       WHERE m2.user_id = p.user_id "
+          "                         AND m2.archived_at IS NULL) "
+          "       OR EXISTS (SELECT 1 FROM memberships m "
+          "                   WHERE m.user_id = p.user_id AND m.site_id = %s "
+          "                     AND m.archived_at IS NULL)) "
           "ORDER BY p.created_at",
         (company_id, site_id),
     ).fetchall())

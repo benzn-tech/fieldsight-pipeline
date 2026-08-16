@@ -1309,6 +1309,36 @@ def _split_for_budget(turns):
     return runs
 
 
+def _site_for_session(conn, company_id, user_folder, date, session_base):
+    """The site a session belongs to, by the authority order this codebase already settled.
+
+    `lambda_item_writer` fixed that order after BUG-41, and it is not arbitrary: the
+    session-exact answer beats the one the device tagged at open, which beats the day's
+    majority. Starting at the day-majority rung — which the first draft of this did — gives
+    somebody who recorded at two sites in one day the wrong site, the pool narrows to the
+    wrong roster, the right person is dropped, and the result is a refusal indistinguishable
+    from "the model got worse".
+
+    `resolve_site`, the writer's last rung, is deliberately absent: it lives in
+    `lambda_ingest`, takes a report document, and org-api does not import that module. Its
+    job here is done by returning None — an unresolved site means no narrowing, which is the
+    behaviour before this feature and the safe direction.
+    """
+    site = recordings.site_for_media(conn, company_id, user_folder, date, session_base)
+    if site:
+        return site
+    sid = turn_name_overlay.session_base(session_base)
+    if sid:
+        row = meeting_session.get(conn, sid[3:] if sid.startswith("sid") else sid)
+        if row and row.get("site_id"):
+            found = sites.get_site(conn, row["site_id"])
+            # Re-checked, because a site from another tenant would narrow this company's
+            # pool against a roster that is not theirs.
+            if found and str(found.get("company_id")) == str(company_id):
+                return found
+    return recordings.site_for_day(conn, company_id, user_folder, date)
+
+
 def _label_map(turns):
     """(turn_ref, source_filename, speaker_label) for every turn — no audio, no vectors.
 
@@ -1366,6 +1396,7 @@ def speaker_match(conn, caller, session_base, event):
         return error("no transcribed turns found for this session yet", 409)
 
     label_map = _label_map(turns)
+    site = _site_for_session(conn, company_id, folder, date_m.group(1), session_base)
     runs = _split_for_budget(turns)
     request_ids = []
     for i, group in enumerate(runs):
@@ -1380,6 +1411,9 @@ def speaker_match(conn, caller, session_base, event):
                              "requested_by": str(caller["id"]), "part": i + 1,
                              "of": len(runs),
                              "mode": SPEAKER_IDENTITY_MODE, "turns": group,
+                             # Absent when the site could not be resolved, which the matcher
+                             # reads as "no narrowing" — the behaviour before this feature.
+                             "site_id": str(site["id"]) if site else None,
                              # WHOLE in every run, not just this run's slice. Label
                              # inheritance groups turns by the transcriber's own speaker
                              # label, and `_split_for_budget` chops on cumulative duration
@@ -1393,6 +1427,7 @@ def speaker_match(conn, caller, session_base, event):
     logger.info("speaker match queued: session=%s mode=%s turns=%d runs=%d",
                 session_key, SPEAKER_IDENTITY_MODE, len(turns), len(runs))
     return ok({"requestIds": request_ids, "sessionBase": session_key,
+               "siteId": str(site["id"]) if site else None,
                "turnsQueued": len(turns), "runs": len(runs),
                "mode": SPEAKER_IDENTITY_MODE,
                "willWriteNames": SPEAKER_IDENTITY_MODE == "on"}, 202)
