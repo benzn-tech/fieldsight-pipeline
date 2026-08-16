@@ -1,22 +1,33 @@
-"""Which statistic, if any, tells one voice from two on real site audio.
+"""Which statistic tells one voice from two on real site audio, and where the line goes.
 
-`frame_spread` — the max over all frame pairs — does not. Measured on 13 windows of one
-person (TEST, Ben_UCPK2, 2026-08-12, recorded alone) and 12 windows of two people (PROD,
-Ben_UCPK2, 2026-08-11, with Sam Yu): one voice spans 0.429–0.777, two voices span
-0.445–1.022. The classes overlap across almost the whole of the first, so no threshold on
-that statistic divides them. That is a fact about the statistic, not about the number 0.35.
+Measured on windows the user identified: 13 recorded alone (TEST, Ben_UCPK2, 2026-08-12) and
+16 holding two speakers (TEST, 2026-08-13, both a paired conversation and a rapidly
+alternating one).
 
-This runs every candidate over the same two sets and asks one question of each:
+    statistic       one voice           two voices        best single threshold
+    pair_max        0.429/0.576/0.777   0.727/0.932/1.031  t=0.715 -> 3 refused, 0 ACCEPTED
+    centroid_max    0.148/0.222/0.350   0.296/0.477/0.559  t=0.286 -> 2 refused, 0 ACCEPTED
+    centroid_mean   0.117/0.188/0.267   0.225/0.277/0.396  t=0.217 -> 3 refused, 0 ACCEPTED
 
-    is there a line with one class above it and the other below?
+The classes very nearly separate, and every error is in the recoverable direction. The
+current limit of 0.35 on `pair_max` passes 0 of 13 one-voice windows; the same statistic
+admits 11 of 13 with no two-voice window accepted, at roughly twice that number.
 
-It reports the answer whatever it is. A statistic that fails to separate is a result, not a
-setback — the alternative to hearing it is shipping a threshold that looks calibrated.
+**A first run of this said the opposite** — that the classes overlapped so badly no threshold
+divided them, and that the statistic therefore had to be replaced. That conclusion came from a
+two-voice set built out of PROD 2026-08-11 by pairing turns whose provider labels differed,
+and those labels are not reliable enough for it: this pipeline has recorded three people given
+two labels, and label counts that were right while the content was scrambled. The set had a
+minimum of 0.445 where the better-labelled set has 0.727, and the whole conclusion rested on
+that one number. Labelling quality decided the answer, not the statistic.
+
+So the sets used here are the ones whose labels can be checked: a session the user states they
+recorded alone, and sessions where two speakers demonstrably alternate.
 
     MSYS_NO_PATHCONV=1 python scripts/compare_homogeneity_statistics.py --sub <cognito-sub>
 
-Reads only: `op: "spread"` writes nothing, and returns scalars — frame embeddings never
-leave the function that computes them.
+Reads only: `op: "spread"` writes nothing and returns scalars — frame embeddings never leave
+the function that computes them.
 """
 import argparse
 import json
@@ -32,11 +43,14 @@ ONE_VOICE = {
     "bucket": "fieldsight-data-test-509194952652",
     "what": "one voice (recorded alone)",
 }
+# TEST rather than PROD, and 08-13 rather than 08-11, for the reason in the module
+# docstring: the PROD set's two-voice labels were not reliable enough to calibrate against,
+# and calibrating against them produced the opposite conclusion.
 TWO_VOICES = {
-    "fn": "fieldsight-prod-speaker-embed",
-    "api": "fieldsight-prod-org-api",
-    "user": "Ben_UCPK2", "date": "2026-08-11",
-    "what": "two voices (with Sam Yu)",
+    "fn": "fieldsight-test-speaker-embed",
+    "api": "fieldsight-test-org-api",
+    "user": "Ben_UCPK2", "date": "2026-08-13",
+    "what": "two voices (speakers alternate)",
 }
 
 CANDIDATES = ["pair_max", "pair_median", "centroid_max", "centroid_mean", "clusters"]
@@ -103,6 +117,23 @@ def collect(env, windows):
     return rows
 
 
+def by_direction(one, two, key, threshold):
+    """The two error directions, kept apart because their costs are not.
+
+    A window wrongly REFUSED costs a retry. A window wrongly ACCEPTED stores two people as
+    one person's voiceprint, and a poisoned profile cannot be cleaned — only the contributing
+    sample deleted, after somebody notices, which nothing prompts them to do.
+
+    So a summary that reports "2 of 29 wrong" is not enough to choose a threshold. Which two.
+    """
+    refused = [r[key] for r in one if r[key] > threshold]
+    accepted = [r[key] for r in two if r[key] <= threshold]
+    floor = min(r[key] for r in two)
+    return {"wrongly_refused": refused, "wrongly_accepted": accepted,
+            "zero_accept_threshold": floor,
+            "passes_at_zero_accept": sum(1 for r in one if r[key] < floor)}
+
+
 def separation(one, two, key):
     """Is there a line with one class entirely below and the other entirely above?
 
@@ -156,6 +187,22 @@ def main():
         if s["separates"]:
             winners.append((key, s))
 
+    print()
+    print("Error directions at the best single threshold — the summary above cannot choose")
+    print("one, because a wrong refusal costs a retry and a wrong acceptance cannot be undone.")
+    print()
+    for key in CANDIDATES:
+        a = [r[key] for r in one if key in r]
+        b = [r[key] for r in two if key in r]
+        if not a or not b:
+            continue
+        t = min(((sum(1 for x in a if x > c) + sum(1 for x in b if x <= c)), c)
+                for c in sorted(set(a + b)))[1]
+        d = by_direction(one, two, key, t)
+        print(f"  {key:<15} t={t:<7.3f} refused {len(d['wrongly_refused'])}/{len(a)} "
+              f"| ACCEPTED {len(d['wrongly_accepted'])}/{len(b)}")
+        print(f"  {'':<15} a threshold of {d['zero_accept_threshold']:.3f} accepts NO "
+              f"two-voice window and passes {d['passes_at_zero_accept']}/{len(a)} one-voice")
     print()
     if winners:
         for key, s in winners:
