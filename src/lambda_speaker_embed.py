@@ -327,7 +327,18 @@ def _frames(audio, sr):
     voiceprint. Too few surviving frames already means "cannot tell" at every consumer.
     """
     step = int(FRAME_SECONDS * sr)
-    cut = [audio[i:i + step] for i in range(0, len(audio) - step + 1, step)]
+    if len(audio) < step:
+        return []
+    starts = list(range(0, len(audio) - step + 1, step))
+    # The window's END, as a full-length frame anchored backwards. Walking forward in whole
+    # steps leaves everything after the last one unjudged: a 14.7 s window was decided on its
+    # first 10 s and the remaining 4.7 s — a third of it — was never looked at. A partial
+    # frame is not the answer, because a 4.7 s clip and a 5 s clip do not embed comparably
+    # and the difference would read as two voices; overlapping the previous frame keeps every
+    # frame the same length.
+    if starts[-1] + step < len(audio):
+        starts.append(len(audio) - step)
+    cut = [audio[i:i + step] for i in starts]
     return [f for f in cut if _dbfs(f) >= FRAME_MIN_DBFS]
 
 
@@ -868,6 +879,11 @@ def _spread(event):
         rms = float(np.sqrt(np.mean(arr * arr))) if arr.size else 0.0
         levels.append(round(20.0 * float(np.log10(rms)), 1) if rms > 1e-9 else -120.0)
     return {"s3_key": key, "seconds": round(end - start, 2), "frames": len(frames),
+            # Every candidate statistic, computed here where the vectors already are. They
+            # are NOT returned: a frame embedding is biometric data and this is a diagnostic
+            # path, which is exactly the journey this defect has made four times. Scalars
+            # leave; vectors do not.
+            "candidates": vp.frame_statistics(frames),
             "spread": None if spread is None else round(float(spread), 4),
             "limit": vp.DEFAULT_MAX_FRAME_SPREAD,
             "frame_dbfs": levels,

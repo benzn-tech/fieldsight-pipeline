@@ -1494,3 +1494,46 @@ def test_a_quiet_but_real_frame_is_kept():
     quiet_speech = (np.sin(2 * np.pi * 220.0 * np.arange(10 * sr) / sr)
                     * 0.014).astype(np.float32)
     assert len(se._frames(quiet_speech, sr)) == 2
+
+
+# ---- the end of the window is judged too ---------------------------------
+
+
+def _tone(seconds, sr=16000, amp=0.5):
+    t = np.arange(int(seconds * sr), dtype=np.float64) / sr
+    return (np.sin(2 * np.pi * 220.0 * t) * amp).astype(np.float32)
+
+
+def test_the_last_seconds_of_a_window_are_not_left_unjudged():
+    """Walking forward in whole 5 s steps left everything after the last one unlooked-at: a
+    14.7 s window — the shape enrolment is meant to accept — was decided on its first 10 s
+    and a THIRD of it was never examined.
+
+    Asserted on coverage, because a window judged on two thirds of itself produces a verdict
+    that looks exactly like one judged on all of it."""
+    sr = 16000
+    frames = se._frames(_tone(14.7, sr), sr)
+    assert len(frames) == 3
+    assert all(len(f) == int(se.FRAME_SECONDS * sr) for f in frames), \
+        "a short frame does not embed comparably; the difference would read as two voices"
+
+
+def test_a_window_that_divides_evenly_gains_no_extra_frame():
+    sr = 16000
+    assert len(se._frames(_tone(15.0, sr), sr)) == 3
+
+
+def test_a_window_shorter_than_one_frame_yields_nothing():
+    """Not one short frame — nothing. Fewer than two frames already means "cannot tell", and
+    that is the answer a window this short deserves."""
+    sr = 16000
+    assert se._frames(_tone(3.0, sr), sr) == []
+
+
+def test_the_tail_frame_is_still_gated_on_speech():
+    """The end-anchored frame is a frame like any other: if the window ends in silence it
+    must not sneak past the gate on account of where it sits."""
+    sr = 16000
+    audio = np.concatenate([_tone(12.0, sr), np.zeros(int(2.9 * sr), dtype=np.float32)])
+    frames = se._frames(audio, sr)
+    assert all(se._dbfs(f) >= se.FRAME_MIN_DBFS for f in frames)
