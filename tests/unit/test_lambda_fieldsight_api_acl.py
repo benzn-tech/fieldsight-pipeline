@@ -276,7 +276,10 @@ def test_find_any_report_admin_does_not_widen_to_unmapped_folders(monkeypatch):
     res = fapi.find_any_report("2026-07-20", ADMIN_CALLER)
     assert res["statusCode"] == 404
     assert "available_users" not in body_of(res)
-    assert fake.got == []          # no body read attempted, let alone served
+    # `redactions/` excluded: the deletion guard consults the mirror per candidate folder,
+    # which is not a report body and not a widening of the caller's reach.
+    assert [k for k in fake.got
+            if not k.startswith("redactions/")] == []   # no body read, let alone served
 
 
 def test_find_any_report_admin_with_unreadable_mapping_stays_unrestricted(monkeypatch):
@@ -305,7 +308,10 @@ def test_find_any_report_worker_sees_only_own_folder(monkeypatch):
                                    "reports/2026-07-20/Ada_Worker/daily_report.json"])
     res = fapi.find_any_report("2026-07-20", WORKER_CALLER)
     assert res["statusCode"] == 404
-    assert fake.got == []
+    # `redactions/` reads are excluded: the deletion guard consults the mirror for each
+    # candidate folder before serving its report, and that read is not a widening of the
+    # caller's reach -- which is the only thing this assertion is about.
+    assert [k for k in fake.got if not k.startswith("redactions/")] == []
 
 
 # ---------------------------------------------------------------
