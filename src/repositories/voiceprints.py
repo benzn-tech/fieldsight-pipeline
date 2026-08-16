@@ -24,7 +24,11 @@ Two of those queries have failure modes that are invisible in production:
   "nothing", and here that would match one company's voice against another's profiles. A
   missing company id raises.
 """
+import logging
+
 from psycopg.rows import dict_row
+
+logger = logging.getLogger(__name__)
 
 EMBEDDING_DIMS = 192
 
@@ -369,7 +373,32 @@ def record_turn_name(conn, company_id, session_base, turn_ref, state, source,
     violation Phase 4 exists to refuse.
     """
     _require_company(company_id)
+    # The rank table lives in `turn_name_overlay` because the READ path needs it and that
+    # module must stay importable by the embedder, which runs on cp312 with no psycopg. The
+    # dependency therefore points this way, and the import is local for the same reason
+    # `_agreement`'s is.
+    from turn_name_overlay import _SOURCE_RANK
+
     cur = conn.cursor(row_factory=dict_row)
+    incoming = _SOURCE_RANK.get(source, -1)
+    # FOR UPDATE, so two writers racing on one turn serialise here rather than at the partial
+    # unique index — where the loser sees a write failure instead of a decision.
+    live = cur.execute(
+        "SELECT id, source, state FROM speaker_turn_names "
+        "WHERE company_id = %s AND session_base = %s AND turn_ref = %s "
+        "  AND superseded_at IS NULL FOR UPDATE",
+        (company_id, session_base, turn_ref)).fetchone()
+    if live is not None and _SOURCE_RANK.get(live.get("source"), -1) > incoming:
+        # Refused, not lost. The supersede below has no source predicate of its own — it
+        # never had one — so without this a `label_inheritance` or `voiceprint_match` row
+        # would bury a human's `correction` simply by arriving later, and `_SOURCE_RANK`
+        # could not help: it ranks at READ time, among rows that both survived.
+        #
+        # Equal rank still replaces. A newer match superseding an older match is the wanted
+        # behaviour; only a write that would move a turn DOWN the scale is declined.
+        logger.info("turn name declined: %s would not beat live %s on %s",
+                    source, live.get("source"), turn_ref)
+        return None
     cur.execute(
         "UPDATE speaker_turn_names SET superseded_at = now() "
         "WHERE company_id = %s AND session_base = %s AND turn_ref = %s "

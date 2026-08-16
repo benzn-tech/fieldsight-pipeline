@@ -74,10 +74,11 @@ def _propagation(event):
     vp_id = event.get("voiceprint_id")
 
     written = 0
+    declined = 0
     with get_connection() as conn:
         for r in event.get("results") or []:
             asserted = bool(r.get("asserted"))
-            record_turn_name(
+            row = record_turn_name(
                 conn, company_id,
                 session_base=session_base,
                 turn_ref=r["turn_ref"],
@@ -96,7 +97,13 @@ def _propagation(event):
                 # Carried all the way from the correction body. Without a column to land in
                 # it was dropped here without a word, and the row named nobody.
                 display_name=r.get("display_name"))
-            written += 1
+            # None means the write was DECLINED, not that it failed: a live row from a
+            # stronger source holds the turn. Counting it as written would report a
+            # propagation that covered turns it never touched.
+            if row is None:
+                declined += 1
+            else:
+                written += 1
 
         # One gesture, two effects, ONE transaction. The names describe this meeting; the
         # sample is what makes the person recognisable in the next one, and §6 requires a
@@ -129,7 +136,8 @@ def _propagation(event):
     logger.info("propagation: %d rows for %s (tau=%s, enrolled=%s, refused=%s)",
                 written, session_base, tau, enrolled,
                 (enrol_refusal or {}).get("reason"))
-    return {"written": written, "enrolled": enrolled, "enrolRefused": enrol_refusal}
+    return {"written": written, "declined": declined, "enrolled": enrolled,
+            "enrolRefused": enrol_refusal}
 
 
 def _enrol(event):
@@ -208,11 +216,12 @@ def _match_names(event):
     company_id = _require(event, "company_id")
     session_base = _require(event, "session_base")
     written = 0
+    declined = 0
     with get_connection() as conn:
         for r in event.get("results") or []:
             if r.get("status") not in ("confirmed", "tentative") or not r.get("person_key"):
                 continue
-            record_turn_name(
+            row = record_turn_name(
                 conn, company_id,
                 session_base=session_base,
                 turn_ref=r["turn_ref"],
@@ -222,9 +231,16 @@ def _match_names(event):
                 display_name=r.get("display_name"),
                 score=r.get("score"),
                 margin=r.get("margin"))
-            written += 1
-    logger.info("match: %d names for %s", written, session_base)
-    return {"written": written}
+            if row is None:
+                # A human already named this turn. The match is not wrong to have run; it is
+                # wrong to overwrite, and reporting the difference is what keeps "the matcher
+                # found nothing" apart from "the matcher deferred to somebody".
+                declined += 1
+            else:
+                written += 1
+    logger.info("match: %d names for %s (%d declined to a stronger source)",
+                written, session_base, declined)
+    return {"written": written, "declined": declined}
 
 
 def lambda_handler(event, context):
