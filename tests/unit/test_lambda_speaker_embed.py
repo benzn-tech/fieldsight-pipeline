@@ -1366,3 +1366,52 @@ def test_the_spread_op_reports_unjudgeable_rather_than_guessing(stub_embedder, m
                              "source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
                              "start_sec": 0.0, "end_sec": 4.0}, None)
     assert out["verdict"] == "unjudgeable" and out["spread"] is None
+
+
+# ---- the tail of a long turn is not thrown away ---------------------------
+
+
+def test_the_last_seconds_of_a_long_turn_reach_the_vector():
+    """`range(..., len(audio) - cap + 1, ...)` walks only WHOLE pieces. A 113.6 s turn was
+    embedded from its first 90 seconds and the remaining 23.6 s — 21 % of that person's
+    speech — never entered the vector, silently, producing an ordinary-looking result.
+
+    Asserted on coverage rather than on the output, because the output of a dropped tail is
+    indistinguishable from the output of a shorter recording."""
+    import lambda_speaker_embed as m
+    seen = []
+
+    class Rec:
+        def run(self, _o, feed):
+            seen.append(feed["wav"].shape[-1])
+            return [np.ones((1, 192), dtype=np.float32)]
+
+    m._session = Rec()
+    try:
+        sr = 16000
+        m.embed_audio(np.zeros(int(113.6 * sr), dtype=np.float32), sr)
+        covered = sum(seen)
+        assert covered >= int(113.0 * sr), (
+            f"covered {covered / sr:.1f}s of 113.6s — the tail was dropped")
+    finally:
+        m._session = None
+
+
+def test_a_scrap_of_a_remainder_is_not_its_own_piece():
+    """Below a second the remainder cannot characterise a voice, and averaged in with equal
+    weight it drags the result toward whatever noise it holds."""
+    import lambda_speaker_embed as m
+    seen = []
+
+    class Rec:
+        def run(self, _o, feed):
+            seen.append(feed["wav"].shape[-1])
+            return [np.ones((1, 192), dtype=np.float32)]
+
+    m._session = Rec()
+    try:
+        sr = 16000
+        m.embed_audio(np.zeros(int(45.3 * sr), dtype=np.float32), sr)
+        assert len(seen) == 1, f"a 0.3s scrap became its own forward pass: {seen}"
+    finally:
+        m._session = None

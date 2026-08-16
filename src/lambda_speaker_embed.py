@@ -122,6 +122,15 @@ ENROL_MAX_SAMPLES = int(os.environ.get("VOICEPRINT_ENROL_MAX_SAMPLES", "6"))
 ENROL_MAX_SECONDS = float(os.environ.get("VOICEPRINT_ENROL_MAX_SECONDS", "60.0"))
 
 
+def sr_floor(sample_rate):
+    """The shortest remainder worth its own forward pass — one second.
+
+    Below this the piece is a scrap: too short to characterise a voice, and averaged in with
+    equal weight it moves the result toward whatever noise it happens to contain.
+    """
+    return int(sample_rate)
+
+
 def _embed_once(audio):
     sess = _ensure_model()
     out = sess.run(None, {"wav": np.asarray(audio, dtype=np.float32)[None, :],
@@ -154,8 +163,20 @@ def embed_audio(audio, sample_rate):
     if len(audio) <= cap:
         return _embed_once(audio)
 
+    # `range(..., len(audio) - cap + 1, ...)` walks only WHOLE pieces, so everything after
+    # the last full one is discarded: a 113.6 s turn was embedded from its first 90 seconds
+    # and the remaining 23.6 s — 21 % of the person's speech — never entered the vector.
+    # Silently, and the vector looked entirely ordinary.
+    #
+    # The remainder is kept unless it is too short to be worth a forward pass on its own; a
+    # sub-second scrap is noise, not evidence, and would drag the average toward whatever
+    # happened to be in it.
+    starts = list(range(0, max(1, len(audio) - cap + 1), cap))
+    tail = starts[-1] + cap
+    if len(audio) - tail >= sr_floor(sample_rate):
+        starts.append(tail)
     vecs = []
-    for i in range(0, len(audio) - cap + 1, cap):
+    for i in starts:
         v = _embed_once(audio[i:i + cap])
         n = np.linalg.norm(v)
         if n:
