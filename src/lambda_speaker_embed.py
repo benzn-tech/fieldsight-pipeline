@@ -426,7 +426,14 @@ def invoke_writer(payload):
     if resp.get("FunctionError"):
         raise RuntimeError(f"voiceprint writer failed: "
                            f"{resp['Payload'].read()[:400]!r}")
-    return resp
+    # The WRITER'S answer, not boto3's envelope. Returning `resp` meant every caller read a
+    # dict of StatusCode/ExecutedVersion/Payload and found none of the keys it wanted:
+    # `.get("profiles")` was always None, so the matcher's early return fired on every run
+    # and logged "no consented profiles for this company" — which reads as "nobody has
+    # enrolled yet", not as a broken hop. The whole match path was inert in production while
+    # every test passed, because every test stubs this function.
+    body = resp["Payload"].read()
+    return json.loads(body) if body else {}
 
 
 MAX_PROPAGATION_TURNS = int(os.environ.get("SPEAKER_PROPAGATION_MAX_TURNS", "300"))
@@ -455,7 +462,13 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref,
     if len(usable) < 2:
         return []
 
-    vectors, refs = [], []
+    # THREE parallel lists, appended together. `vectors` and `refs` used to skip unreadable
+    # turns while the harvest path indexed `usable` with the same subscript — so after a
+    # single skip, `usable[i]` was a different turn from `vectors[i]`, and harvest ran the
+    # homogeneity guard on one window's audio while storing another window's embedding under
+    # its s3_key. A profile cannot be un-poisoned, and the provenance recorded would have
+    # pointed at audio that never produced the vector.
+    kept, vectors, refs = [], [], []
     for t in usable:
         try:
             _, clip, sr = _window_audio(folder, date, t["source_filename"],
@@ -465,6 +478,7 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref,
             # unnamed, which is the honest outcome for audio nobody could read.
             logger.warning("propagation: could not read %s", t.get("source_filename"))
             continue
+        kept.append(t)
         vectors.append(embed_audio(clip, sr))
         refs.append(turn_name_overlay.turn_ref(t["source_filename"], t["start_sec"]))
     if len(vectors) < 2:
@@ -537,7 +551,7 @@ def _propagate(folder, date, turns, reference, display_name, asserted_ref,
                 vectors[i]),
             reverse=True)
         for i in by_agreement:
-            harvest.append({"turn": usable[i], "vector": vectors[i],
+            harvest.append({"turn": kept[i], "vector": vectors[i],
                             "turn_ref": refs[i]})
 
     out = []
