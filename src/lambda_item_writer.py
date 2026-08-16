@@ -678,6 +678,19 @@ def write_extraction_items(date, user_folder, extraction_key):
 
         # Source-key idempotency (Phase 4a pattern): clear this extraction's
         # prior rows before re-inserting.
+        #
+        # This CASCADEs `action_items`, and the check-off is `action_items.status` -- a
+        # column on the cascaded row. The live and final tiers write to the SAME key
+        # (`extract_session.out_key` is computed once; the tier rides inside the artifact),
+        # so every final pass destroys whatever a person ticked while the meeting was still
+        # running. Nothing carries it across, and re-matching by text is the wrong fix: the
+        # model rewords, merges and splits, and a confident wrong match puts a supervisor's
+        # tick on a DIFFERENT action item where nobody would ever see it.
+        #
+        # So this does not try to save it. It makes the loss VISIBLE, which is the part that
+        # was missing: a silent permanent loss and "nothing was ticked" produced identical
+        # output, and nobody can look for a problem that leaves no trace.
+        _warn_if_discarding_checkoffs(conn, extraction_key)
         topics.delete_topics_for_source(conn, extraction_key)
 
         # A MERGED artifact additionally supersedes each member's own topics.
@@ -857,6 +870,30 @@ def write_extraction_items(date, user_folder, extraction_key):
 # ----------------------------------------------------------
 # Entry point — S3 event
 # ----------------------------------------------------------
+def _warn_if_discarding_checkoffs(conn, extraction_key):
+    """Log when this supersession is about to CASCADE away a ticked action item.
+
+    Counted, not prevented. Preventing it needs a rule for carrying human decisions across
+    a re-extraction, and the only safe rule is to ask a person -- which is a feature, not a
+    line in a writer. What this buys is a number that can be alarmed on and a log line that
+    names the key, so the next person to ask "did we lose ticks?" has an answer.
+
+    Never raises. A count that fails must not stop an extraction from landing.
+    """
+    try:
+        row = conn.execute(
+            "SELECT count(*) FROM action_items a JOIN topics t ON t.id = a.topic_id "
+            "WHERE t.source_s3_key = %s AND a.status <> 'open'",
+            (extraction_key,)).fetchone()
+        n = (row or [0])[0] or 0
+        if n:
+            logger.warning(
+                "supersession discards %d closed action item(s) for %s -- the live tier's "
+                "check-offs are CASCADEd by the final tier writing the same key",
+                n, extraction_key)
+    except Exception:
+        logger.exception("could not count closed action items for %s", extraction_key)
+
 def _source_is_deleted(conn, source_s3_key) -> bool:
     """Whether this extraction's source has been deleted by its owner.
 
