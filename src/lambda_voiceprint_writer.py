@@ -116,15 +116,22 @@ def _propagation(event):
         # `correction_ref` travels with the sample.
         enrol = event.get("enrol")
         enrol_refusal = None
-        if enrol:
-            if enrol.get("refused"):
-                # The embedder declined the window before it ever reached a vector. Recorded
-                # here because this half owns the database and that verdict would otherwise
-                # exist only in a log line nobody correlates with the empty profile.
-                record_attempt(conn, company_id, enrol["voiceprint_id"], "refused",
-                               enrol.get("refused"))
-                enrol = None
-            elif not enrol.get("embedding"):
+        if enrol and enrol.get("refused"):
+            # The embedder declined the window before it ever reached a vector. Recorded here
+            # because this half owns the database, and that verdict would otherwise exist
+            # only in a log line nobody correlates with the empty profile.
+            #
+            # A SEPARATE branch, not a step inside the storing one: the first version set
+            # `enrol = None` and let control fall through to `enrol.get("window")`, which
+            # crashed on every refusal in production while every unit test stayed green —
+            # the embedder's tests assert it SENDS this shape and nothing asserted the writer
+            # could receive it.
+            record_attempt(conn, company_id, enrol["voiceprint_id"], "refused",
+                           enrol.get("refused"))
+            enrol_refusal = {"reason": enrol.get("refused")}
+            enrol = None
+        elif enrol:
+            if not enrol.get("embedding"):
                 raise ValueError(
                     "enrolment carries no embedding; storing a blank would create a profile "
                     "that matches nothing and explains nothing")
@@ -174,7 +181,9 @@ def _propagation(event):
 
         inherited = _inherit_labels(conn, company_id, session_base,
                                     event.get("label_map"))
-    enrolled = bool(event.get("enrol")) and enrol_refusal is None
+    # `enrol` is cleared when the embedder refused, so this asks whether anything was
+    # actually STORED — not whether the event mentioned an enrolment.
+    enrolled = bool(enrol) and enrol_refusal is None
     logger.info("propagation: %d rows for %s (tau=%s, enrolled=%s, refused=%s)",
                 written, session_base, tau, enrolled,
                 (enrol_refusal or {}).get("reason"))
