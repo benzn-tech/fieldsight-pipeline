@@ -33,7 +33,9 @@ import logging
 
 from db.connection import get_connection
 from repositories.voiceprints import (EnrolmentBelongsToSomebodyElse, add_sample,
-                                      profiles_for_matching, record_turn_name)
+                                      live_turn_names, profiles_for_matching,
+                                      record_turn_name, rejected_names)
+from turn_name_overlay import _SOURCE_RANK
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -132,12 +134,14 @@ def _propagation(event):
                                  "own": exc.own, "bestOther": exc.best_other,
                                  "nearestOtherId": str(exc.nearest_other_id)}
                 logger.warning("enrolment refused for %s: %s", enrol["voiceprint_id"], exc)
+        inherited = _inherit_labels(conn, company_id, session_base,
+                                    event.get("label_map"))
     enrolled = bool(event.get("enrol")) and enrol_refusal is None
     logger.info("propagation: %d rows for %s (tau=%s, enrolled=%s, refused=%s)",
                 written, session_base, tau, enrolled,
                 (enrol_refusal or {}).get("reason"))
-    return {"written": written, "declined": declined, "enrolled": enrolled,
-            "enrolRefused": enrol_refusal}
+    return {"written": written, "declined": declined, "inherited": inherited,
+            "enrolled": enrolled, "enrolRefused": enrol_refusal}
 
 
 def _enrol(event):
@@ -238,9 +242,83 @@ def _match_names(event):
                 declined += 1
             else:
                 written += 1
+        inherited = _inherit_labels(conn, company_id, session_base,
+                                    event.get("label_map"))
     logger.info("match: %d names for %s (%d declined to a stronger source)",
                 written, session_base, declined)
-    return {"written": written, "declined": declined}
+    return {"written": written, "declined": declined, "inherited": inherited}
+
+
+def _inherit_labels(conn, company_id, session_base, label_map):
+    """Spread settled names across the transcriber's own speaker groups.
+
+    The transcriber already said "these turns are one voice". For turns under the 3 s floor
+    that is the ONLY evidence there is — an embedding of a short turn is not weak, it is
+    actively misleading (Phase 0's one miss was 2.1 s and scored its own speaker lowest). So
+    this tier carries no duration floor, because the evidence it uses is not acoustic.
+
+    Runs here rather than in the matcher for one reason: `_split_for_budget` chops a long
+    session into independent runs on cumulative duration, with no idea that two turns share a
+    label. A group's one long turn can land in run 1 and its short turns in run 2, which then
+    sees nothing named and inherits nothing, silently. The label map arrives whole in every
+    run, so the outcome does not depend on where the split fell.
+
+    Three things that are not decoration:
+
+    * **provenance travels.** An inherited row carries the `voiceprint_id` / `correction_ref`
+      of the row it came from, or `withdraw` returns 200 while the inherited names stay on
+      the transcript — the exact failure the withdrawal fix was written for, through a new
+      door.
+    * **a rejection is honoured.** A name a person took off this session is never re-derived,
+      or the user deletes it again after every run with nothing logged.
+    * **grouping is on (source_filename, label).** Speaker labels are per transcription call;
+      batching merges namespaces across chunks on purpose, and every segment of a batch
+      carries the batch object's name — so the filename IS the call identity. Grouping on the
+      label alone would merge two calls' `spk_0` into one person.
+    """
+    if not label_map:
+        return 0
+    groups = {}
+    for t in label_map:
+        label = t.get("speaker_label")
+        ref = t.get("turn_ref")
+        # An absent label is not a group. `speaker` is coerced to "spk_0" for display, and
+        # keying on that would make an undiarised file one speaker from end to end.
+        if not label or not ref:
+            continue
+        groups.setdefault((t.get("source_filename"), label), []).append(ref)
+
+    live = {r["turn_ref"]: r for r in live_turn_names(conn, company_id, session_base)}
+    refused = rejected_names(conn, company_id, session_base)
+    written = 0
+    for refs in groups.values():
+        named = [live[r] for r in refs if r in live and live[r].get("display_name")]
+        if not named:
+            continue
+        best = max(named, key=lambda r: _SOURCE_RANK.get(r.get("source"), -1))
+        if best.get("source") == "label_inheritance":
+            # Nothing to spread: the group's only name is one this tier wrote itself.
+            continue
+        name = best["display_name"]
+        if name in refused:
+            logger.info("inheritance: %r was rejected for %s; not re-derived",
+                        name, session_base)
+            continue
+        for ref in refs:
+            if ref in live:
+                continue
+            row = record_turn_name(
+                conn, company_id, session_base=session_base, turn_ref=ref,
+                state="tentative", source="label_inheritance",
+                display_name=name,
+                # Provenance of the row it inherited FROM, so a withdrawal reaches it.
+                voiceprint_id=best.get("voiceprint_id"),
+                correction_ref=best.get("correction_ref"))
+            if row is not None:
+                written += 1
+    logger.info("inheritance: %d turns named from transcriber labels in %s",
+                written, session_base)
+    return written
 
 
 def lambda_handler(event, context):

@@ -486,7 +486,7 @@ def _unname_event(name="Ben L", sub="sub-1", session=None):
 
 def test_a_name_can_be_taken_off_a_meeting(wired, monkeypatch):
     monkeypatch.setattr(org.voiceprints, "unname",
-                        lambda conn, company_id, session_base, display_name: 3)
+                        lambda conn, company_id, session_base, display_name, rejected_by=None: 3)
     res = org.lambda_handler(_unname_event(), None)
     assert res["statusCode"] == 200
     assert _body(res)["turnsUnnamed"] == 3
@@ -498,7 +498,7 @@ def test_it_works_when_there_is_no_voiceprint_to_withdraw(wired, monkeypatch):
     seven named turns unreachable."""
     seen = {}
     monkeypatch.setattr(org.voiceprints, "unname",
-                        lambda conn, company_id, session_base, display_name:
+                        lambda conn, company_id, session_base, display_name, rejected_by=None:
                         seen.update({"co": company_id, "s": session_base,
                                      "n": display_name}) or 6)
     org.lambda_handler(_unname_event(), None)
@@ -692,7 +692,7 @@ def test_a_worker_can_take_a_name_off_their_own_meeting(wired, monkeypatch):
                         lambda conn, sub: dict(CALLER, global_role="worker"))
     monkeypatch.setattr(org.topics, "folders_for_session_base", _owned_by("Ada_L"))
     monkeypatch.setattr(org.voiceprints, "unname",
-                        lambda conn, company_id, session_base, display_name: 3)
+                        lambda conn, company_id, session_base, display_name, rejected_by=None: 3)
     res = org.lambda_handler(_unname_event(), None)
     assert res["statusCode"] == 200, _body(res)
     assert _body(res)["turnsUnnamed"] == 3
@@ -728,7 +728,7 @@ def test_a_manager_does_not_pay_for_the_ownership_lookup(wired, monkeypatch):
     monkeypatch.setattr(org.topics, "folders_for_session_base",
                         lambda *a, **k: looked.append(1) or [])
     monkeypatch.setattr(org.voiceprints, "unname",
-                        lambda conn, company_id, session_base, display_name: 2)
+                        lambda conn, company_id, session_base, display_name, rejected_by=None: 2)
     res = org.lambda_handler(_unname_event(), None)
     assert res["statusCode"] == 200, _body(res)
     assert looked == [], "the ownership query ran for a caller the role arm already allowed"
@@ -774,3 +774,14 @@ def test_each_run_says_which_part_it_is(wired, monkeypatch):
     docs = [json.loads(p["Body"]) for p in wired.puts]
     assert sorted(d["part"] for d in docs) == list(range(1, len(docs) + 1))
     assert {d["of"] for d in docs} == {len(docs)}
+
+
+def test_removing_a_name_records_who_rejected_it(wired, monkeypatch):
+    """The tombstone stops inference re-deriving the name. Who rejected it is the part that
+    makes the record answerable later — the same discipline as `consented_by`."""
+    seen = {}
+    monkeypatch.setattr(org.voiceprints, "unname",
+                        lambda conn, company_id, session_base, display_name,
+                        rejected_by=None: seen.update({"by": rejected_by}) or 1)
+    org.lambda_handler(_unname_event(), None)
+    assert seen["by"], "the rejection has no author"

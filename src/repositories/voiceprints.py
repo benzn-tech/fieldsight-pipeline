@@ -437,7 +437,7 @@ def live_turn_names(conn, company_id, session_base) -> list[dict]:
     ).fetchall()
 
 
-def unname(conn, company_id, session_base, display_name) -> int:
+def unname(conn, company_id, session_base, display_name, rejected_by=None) -> int:
     """Take a name off one session's transcript. Returns how many turns stopped showing it.
 
     Separate from `withdraw` on purpose, because they answer different questions and only one
@@ -461,11 +461,38 @@ def unname(conn, company_id, session_base, display_name) -> int:
     if not display_name:
         raise ValueError("display_name is required — an absent one would clear every name "
                          "in the session, which is a different request")
-    rows = conn.cursor(row_factory=dict_row).execute(
+    cur = conn.cursor(row_factory=dict_row)
+    rows = cur.execute(
         "UPDATE speaker_turn_names SET superseded_at = now() "
         "WHERE company_id = %s AND session_base = %s AND display_name = %s "
         "  AND superseded_at IS NULL "
         "RETURNING id",
         (company_id, session_base, display_name),
     ).fetchall()
+    # A tombstone, because superseding alone records that a name WAS shown, not that it was
+    # REJECTED — and only the second of those should stop a later inference. Without it,
+    # label inheritance re-derives the same name from the same transcriber label on the next
+    # run and the user has to delete it again after every run, with nothing logged.
+    cur.execute(
+        "INSERT INTO speaker_name_rejections "
+        "(company_id, session_base, display_name, rejected_by) "
+        "VALUES (%s, %s, %s, %s) "
+        "ON CONFLICT (company_id, session_base, display_name) "
+        "DO UPDATE SET rejected_at = now(), rejected_by = EXCLUDED.rejected_by",
+        (company_id, session_base, display_name, rejected_by))
     return len(rows)
+
+
+def rejected_names(conn, company_id, session_base) -> set:
+    """Names a person explicitly took off this session.
+
+    Read before any inference writes a name. `live_turn_names` cannot answer this — a
+    superseded row means "this was shown once", which is also true of a name that was merely
+    replaced by a better one.
+    """
+    _require_company(company_id)
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT display_name FROM speaker_name_rejections "
+        "WHERE company_id = %s AND session_base = %s",
+        (company_id, session_base)).fetchall()
+    return {r["display_name"] for r in rows if r.get("display_name")}

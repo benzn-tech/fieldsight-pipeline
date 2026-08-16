@@ -1273,7 +1273,11 @@ def _session_turns(folder, date, session_base):
         if start is None:
             continue
         out.append({"source_filename": name, "start_sec": float(start),
-                    "end_sec": float(start) + float(seg.get("duration") or 0.0)})
+                    "end_sec": float(start) + float(seg.get("duration") or 0.0),
+                    # The transcriber's own grouping. It says "these turns are one voice"
+                    # about turns too short for any acoustic judgement, and until now that
+                    # statement never reached the layer that declines to judge them.
+                    "speaker_label": seg.get("speaker_label")})
     return out
 
 
@@ -1303,6 +1307,21 @@ def _split_for_budget(turns):
     if current:
         runs.append(current)
     return runs
+
+
+def _label_map(turns):
+    """(turn_ref, source_filename, speaker_label) for every turn — no audio, no vectors.
+
+    The transcriber's own grouping, in the one form the writer can act on. Sent whole rather
+    than per run because inheritance is the single thing in this chain whose answer for one
+    turn depends on ANOTHER turn — which is exactly the invariant `_split_for_budget` relies
+    on ("no turn's answer depends on another's").
+    """
+    return [{"turn_ref": turn_name_overlay.turn_ref(t["source_filename"],
+                                                    float(t["start_sec"])),
+             "source_filename": t["source_filename"],
+             "speaker_label": t.get("speaker_label")}
+            for t in turns or []]
 
 
 def speaker_match(conn, caller, session_base, event):
@@ -1346,6 +1365,7 @@ def speaker_match(conn, caller, session_base, event):
         # whose transcripts are not written yet, which is a wait, not a failure.
         return error("no transcribed turns found for this session yet", 409)
 
+    label_map = _label_map(turns)
     runs = _split_for_budget(turns)
     request_ids = []
     for i, group in enumerate(runs):
@@ -1359,7 +1379,16 @@ def speaker_match(conn, caller, session_base, event):
                              "user_folder": folder, "date": date_m.group(1),
                              "requested_by": str(caller["id"]), "part": i + 1,
                              "of": len(runs),
-                             "mode": SPEAKER_IDENTITY_MODE, "turns": group}, default=str),
+                             "mode": SPEAKER_IDENTITY_MODE, "turns": group,
+                             # WHOLE in every run, not just this run's slice. Label
+                             # inheritance groups turns by the transcriber's own speaker
+                             # label, and `_split_for_budget` chops on cumulative duration
+                             # with no idea that two turns share one — a group's long turn
+                             # can land in run 1 and its short turns in run 2, which then
+                             # inherits nothing and reports no error. The map carries no
+                             # audio and no vectors, so sending it whole is cheap and
+                             # removes the dependence on where the split fell.
+                             "label_map": label_map}, default=str),
             ContentType="application/json")
     logger.info("speaker match queued: session=%s mode=%s turns=%d runs=%d",
                 session_key, SPEAKER_IDENTITY_MODE, len(turns), len(runs))
@@ -1412,7 +1441,7 @@ def unname_speaker(conn, caller, session_base, event):
             return error("removing a name needs an admin, gm, pm, site_manager or "
                          "platform_admin role, or your own recording", 403)
     n = voiceprints.unname(conn, str(caller["company_id"]), session_base=key,
-                           display_name=name)
+                           display_name=name, rejected_by=str(caller["id"]))
     logger.info("speaker name removed: session=%s name=%s turns=%d", key, name, n)
     return ok({"sessionBase": key, "name": name, "turnsUnnamed": n})
 
@@ -1563,6 +1592,7 @@ def speaker_corrections(conn, caller, session_base, event):
             return error(str(exc), 400)
         enrol = {"voiceprint_id": str(profile["id"])}
 
+    session_turns = _session_turns(folder, date_m.group(1), session_base)
     request_id = uuid.uuid4().hex
     artifact = {
         "request_id": request_id,
@@ -1578,7 +1608,8 @@ def speaker_corrections(conn, caller, session_base, event):
         # name a VOICE rather than a single passage. Without them it can only write the one
         # turn the user pointed at, and "the whole meeting follows" is a claim about a
         # mechanism that never runs. org-api is the half that can read transcripts.
-        "turns": _session_turns(folder, date_m.group(1), session_base),
+        "turns": session_turns,
+        "label_map": _label_map(session_turns),
         "enrol": enrol,
     }
     s3().put_object(Bucket=LAKE_BUCKET,
@@ -6028,7 +6059,14 @@ def _read_org_transcripts(date, folder, start_time, end_time, conn=None):
                 if abs_end < start_sec or abs_start > end_sec:
                     continue
 
-                speaker = aseg.get("speaker_label", "spk_0")
+                # Two values on purpose. `speaker` is coerced so the viewer always has
+                # something to render; `speaker_label` is the raw one, None when the
+                # provider returned no diarisation at all. Label inheritance must key on
+                # the raw value: a file with no diarisation is otherwise indistinguishable
+                # from one that genuinely is all spk_0, and inheriting on the coerced value
+                # would spread one name across the whole file.
+                raw_label = aseg.get("speaker_label")
+                speaker = raw_label or "spk_0"
                 text = aseg.get("transcript", "")
                 if not text.strip():
                     continue
@@ -6036,6 +6074,7 @@ def _read_org_transcripts(date, folder, start_time, end_time, conn=None):
                 ah, am, asec_v = int(abs_start) // 3600, (int(abs_start) % 3600) // 60, int(abs_start) % 60
                 all_speaker_segs.append({
                     "speaker": speaker,
+                    "speaker_label": raw_label,
                     "text": text,
                     "start": round(abs_start, 1),
                     "end": round(abs_end, 1),

@@ -45,7 +45,8 @@ TOLERANCE_SEC = 0.5
 #
 # Order: a human's assertion beats an inference anchored to a human's assertion in the same
 # meeting, which beats a match against a stored profile.
-_SOURCE_RANK = {"correction": 3, "correction_propagation": 2, "voiceprint_match": 1}
+_SOURCE_RANK = {"correction": 3, "correction_propagation": 2,
+                "voiceprint_match": 1, "label_inheritance": 0}
 
 
 def _stem(name):
