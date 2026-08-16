@@ -784,12 +784,26 @@ def _spread(event):
     start, end = float(event["start_sec"]), float(event["end_sec"])
     key, clip, sr = _window_audio(event["user_folder"], event["date"],
                                   event["source_filename"], start, end)
-    frames = [embed_audio(f, sr) for f in _frames(clip, sr)]
+    raw = _frames(clip, sr)
+    frames = [embed_audio(f, sr) for f in raw]
     spread = vp.frame_spread(frames)
     verdict = vp.window_is_homogeneous(frames)
+    # Per-frame loudness, because the leading explanation for a wide spread is that the
+    # frames are not all speech. `_frames` cuts every 5 s blind — there is no VAD anywhere
+    # in this path — so a frame that is mostly silence gets embedded like any other, and a
+    # silence-vs-speech pair is enormously far apart for reasons that have nothing to do
+    # with how many people are in the room. The devices are also known to record quietly
+    # (median -36 dBFS against a normal -20 to -12), which makes the effect likelier here
+    # than the measurement that set 0.35 would have seen.
+    levels = []
+    for f in raw:
+        arr = np.asarray(f, dtype=np.float32)
+        rms = float(np.sqrt(np.mean(arr * arr))) if arr.size else 0.0
+        levels.append(round(20.0 * float(np.log10(rms)), 1) if rms > 1e-9 else -120.0)
     return {"s3_key": key, "seconds": round(end - start, 2), "frames": len(frames),
             "spread": None if spread is None else round(float(spread), 4),
             "limit": vp.DEFAULT_MAX_FRAME_SPREAD,
+            "frame_dbfs": levels,
             "verdict": "homogeneous" if verdict is True
                        else ("mixed" if verdict is False else "unjudgeable")}
 
