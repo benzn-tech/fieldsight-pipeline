@@ -3772,6 +3772,11 @@ def test_transcripts_non_all_caller_reads_own_folder(presign_wired):
     # rather than with the writer.
     assert b["speaker_segments"][0] == {
         "speaker": "spk_0", "text": "Hello there.",
+        # The RAW label, None when the provider returned no diarisation. `speaker` above is
+        # coerced so the viewer always has something to render, and label inheritance must
+        # not key on the coerced value: an undiarised file would otherwise look like one
+        # that genuinely is all spk_0, and one name would spread across the whole file.
+        "speaker_label": "spk_0",
         "start": 28800.0, "end": 28802.0, "time_label": "08:00:00", "duration": 2.0,
         "source_filename": "Ben_UCPK_2026-07-18_08-00-00.json", "chunk_start": 0.0,
     }

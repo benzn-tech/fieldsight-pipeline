@@ -376,3 +376,111 @@ def test_a_match_that_defers_to_a_human_says_so(monkeypatch):
                                           "person_key": "vp-1",
                                           "display_name": "Ben L"}]}, None)
     assert out["written"] == 0 and out["declined"] == 1
+
+
+# ---- label inheritance ----------------------------------------------------
+#
+# The transcriber already grouped the short turns. For a turn under the 3 s floor
+# that grouping is the ONLY evidence there is: an embedding of short audio is not
+# weak, it is actively misleading (Phase 0's one miss was 2.1 s and scored its own
+# speaker lowest).
+
+
+def _map(*rows):
+    return [{"turn_ref": r[0], "source_filename": r[1], "speaker_label": r[2]}
+            for r in rows]
+
+
+def _inherit_wired(monkeypatch, live, rejected=()):
+    written = []
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "live_turn_names", lambda conn, co, sb: live)
+    monkeypatch.setattr(vw, "rejected_names", lambda conn, co, sb: set(rejected))
+    monkeypatch.setattr(vw, "record_turn_name",
+                        lambda conn, co, **kw: written.append(kw) or {"id": "t"})
+    return written
+
+
+def test_a_named_turn_spreads_to_its_label_group_with_no_duration_floor(monkeypatch):
+    written = _inherit_wired(monkeypatch, [
+        {"turn_ref": "f.json@2.0", "display_name": "Ivy", "source": "voiceprint_match",
+         "voiceprint_id": "vp-1", "correction_ref": None}])
+    n = vw._inherit_labels(None, CO, "s1", _map(
+        ("f.json@2.0", "f.json", "spk_0"),
+        ("f.json@11.0", "f.json", "spk_0"),   # ~1 s in the real example
+        ("f.json@13.0", "f.json", "spk_0"),
+        ("f.json@11.5", "f.json", "spk_1")))
+    assert n == 2
+    assert {w["turn_ref"] for w in written} == {"f.json@11.0", "f.json@13.0"}
+    assert {w["display_name"] for w in written} == {"Ivy"}
+    assert {w["source"] for w in written} == {"label_inheritance"}
+
+
+def test_an_inherited_row_carries_the_provenance_it_inherited(monkeypatch):
+    """Or `withdraw` returns 200 while the inherited names stay on the transcript — the
+    exact failure the withdrawal fix was written for, through a new door."""
+    written = _inherit_wired(monkeypatch, [
+        {"turn_ref": "f.json@2.0", "display_name": "Ivy", "source": "correction",
+         "voiceprint_id": "vp-9", "correction_ref": "corr-3"}])
+    vw._inherit_labels(None, CO, "s1", _map(("f.json@2.0", "f.json", "spk_0"),
+                                            ("f.json@11.0", "f.json", "spk_0")))
+    assert written[0]["voiceprint_id"] == "vp-9"
+    assert written[0]["correction_ref"] == "corr-3"
+
+
+def test_a_rejected_name_is_never_re_derived(monkeypatch):
+    """A user says "that is not me". Without this the next run re-derives the same name from
+    the same transcriber label and they delete it again, with nothing logged."""
+    written = _inherit_wired(monkeypatch, [
+        {"turn_ref": "f.json@2.0", "display_name": "Ivy", "source": "correction"}],
+        rejected=["Ivy"])
+    assert vw._inherit_labels(None, CO, "s1", _map(("f.json@2.0", "f.json", "spk_0"),
+                                                   ("f.json@11.0", "f.json", "spk_0"))) == 0
+    assert written == []
+
+
+def test_two_calls_labels_are_not_one_person(monkeypatch):
+    """Speaker labels are per transcription call. Batching merges namespaces across chunks
+    on purpose and every segment of a batch carries the batch object's name, so the
+    filename IS the call identity — grouping on the label alone would merge them."""
+    written = _inherit_wired(monkeypatch, [
+        {"turn_ref": "a.json@2.0", "display_name": "Ivy", "source": "correction"}])
+    vw._inherit_labels(None, CO, "s1", _map(("a.json@2.0", "a.json", "spk_0"),
+                                            ("b.json@4.0", "b.json", "spk_0")))
+    assert written == [], "a name crossed into another transcription call"
+
+
+def test_a_turn_with_no_label_is_not_a_group(monkeypatch):
+    """`speaker` is coerced to "spk_0" for display. Keying on the coerced value would make
+    an undiarised file one speaker from end to end."""
+    written = _inherit_wired(monkeypatch, [
+        {"turn_ref": "f.json@2.0", "display_name": "Ivy", "source": "correction"}])
+    vw._inherit_labels(None, CO, "s1", _map(("f.json@2.0", "f.json", None),
+                                            ("f.json@11.0", "f.json", None)))
+    assert written == []
+
+
+def test_inheritance_does_not_feed_on_its_own_output(monkeypatch):
+    written = _inherit_wired(monkeypatch, [
+        {"turn_ref": "f.json@2.0", "display_name": "Ivy", "source": "label_inheritance"}])
+    assert vw._inherit_labels(None, CO, "s1", _map(("f.json@2.0", "f.json", "spk_0"),
+                                                   ("f.json@11.0", "f.json", "spk_0"))) == 0
+    assert written == []
+
+
+def test_the_strongest_name_in_a_group_wins(monkeypatch):
+    written = _inherit_wired(monkeypatch, [
+        {"turn_ref": "f.json@2.0", "display_name": "Zoe", "source": "voiceprint_match"},
+        {"turn_ref": "f.json@6.0", "display_name": "Ivy", "source": "correction"}])
+    vw._inherit_labels(None, CO, "s1", _map(("f.json@2.0", "f.json", "spk_0"),
+                                            ("f.json@6.0", "f.json", "spk_0"),
+                                            ("f.json@11.0", "f.json", "spk_0")))
+    assert [w["display_name"] for w in written] == ["Ivy"]
+
+
+def test_an_already_named_turn_is_left_alone(monkeypatch):
+    written = _inherit_wired(monkeypatch, [
+        {"turn_ref": "f.json@2.0", "display_name": "Ivy", "source": "correction"},
+        {"turn_ref": "f.json@11.0", "display_name": "Ivy", "source": "correction"}])
+    assert vw._inherit_labels(None, CO, "s1", _map(("f.json@2.0", "f.json", "spk_0"),
+                                                   ("f.json@11.0", "f.json", "spk_0"))) == 0

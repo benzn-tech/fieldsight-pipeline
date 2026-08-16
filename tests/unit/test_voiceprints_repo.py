@@ -524,10 +524,10 @@ def test_removing_a_name_does_not_touch_the_voiceprint():
     """Deliberately separate. Somebody who wants their name off one transcript has not asked
     for their profile to be destroyed, and doing both would answer a question they did not
     ask."""
-    conn = FakeConn([[]])
+    conn = FakeConn([[], []])
     voiceprints.unname(conn, CO, session_base="s", display_name="Ben L")
-    assert len(conn.calls) == 1
-    assert "speaker_voiceprint" not in conn.calls[0]["sql"]
+    assert conn.calls, "nothing ran"
+    assert not any("speaker_voiceprint" in c["sql"] for c in conn.calls)
 
 
 # ---- the same name is not the same person ---------------------------------
@@ -687,3 +687,38 @@ def test_the_precedence_read_is_company_scoped():
     voiceprints.record_turn_name(conn, CO, session_base="s1", turn_ref="f.wav@1.0",
                                  state="confirmed", source="correction")
     assert CO in conn.calls[0]["params"]
+
+
+# ---- a rejection is remembered -------------------------------------------
+
+
+def test_removing_a_name_records_that_it_was_rejected():
+    """Superseding alone records that a name WAS shown, which is also true of one merely
+    replaced by a better answer. Only "rejected" should stop a later inference — without
+    this, label inheritance re-derives the same name from the same transcriber label on the
+    next run and the user deletes it again after every run."""
+    conn = FakeConn([[{"id": "t1"}], []])
+    voiceprints.unname(conn, CO, session_base="s", display_name="Ben L",
+                       rejected_by="u-1")
+    sql = " ".join(c["sql"] for c in conn.calls)
+    assert "INSERT INTO speaker_name_rejections" in sql
+    assert "ON CONFLICT" in sql, "a second rejection of the same name would raise"
+
+
+def test_a_rejection_is_scoped_to_one_session():
+    conn = FakeConn([[], []])
+    voiceprints.unname(conn, CO, session_base="s9", display_name="Ben L")
+    ins = next(c for c in conn.calls if c["sql"].startswith("INSERT"))
+    assert "s9" in ins["params"] and CO in ins["params"]
+
+
+def test_rejected_names_are_readable_and_company_scoped():
+    conn = FakeConn([[{"display_name": "Ben L"}, {"display_name": "Zoe"}]])
+    out = voiceprints.rejected_names(conn, CO, "s1")
+    assert out == {"Ben L", "Zoe"}
+    assert CO in conn.calls[0]["params"]
+
+
+def test_reading_rejections_without_a_company_raises():
+    with pytest.raises(ValueError):
+        voiceprints.rejected_names(FakeConn(), "", "s1")
