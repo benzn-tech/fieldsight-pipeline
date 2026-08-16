@@ -291,9 +291,44 @@ def _window_audio(user_folder, date, source_filename, start, end):
     return first, np.concatenate(parts), rate
 
 
+# A frame quieter than this carries no speech worth comparing. The devices record speech at
+# a median of -36 dBFS (measured), and the one window the homogeneity guard has ever accepted
+# sat at -67/-57 — the noise floor, roughly 30 dB below speech. -55 sits between the two with
+# room on both sides, and it is a floor rather than a judgement: it removes frames that
+# cannot be about anybody, not frames that are merely quiet.
+FRAME_MIN_DBFS = float(os.environ.get("VOICEPRINT_FRAME_MIN_DBFS", "-55.0"))
+
+
+def _dbfs(frame):
+    arr = np.asarray(frame, dtype=np.float32)
+    if arr.size == 0:
+        return -120.0
+    rms = float(np.sqrt(np.mean(arr * arr)))
+    return 20.0 * float(np.log10(rms)) if rms > 1e-9 else -120.0
+
+
 def _frames(audio, sr):
+    """Frames with speech in them, for the homogeneity comparison.
+
+    The gate lives HERE and not in any caller, because four call sites build frames
+    independently — `op=enrol`, `_admit_harvest`, `_from_request_artifact` and `op=spread` —
+    and a gate applied at the writing sites only would leave the DIAGNOSTIC ungated. That is
+    the one used to check whether the gate works, so it would report "not gating" while
+    gating everywhere that matters.
+
+    It also cannot live in `voiceprint_utils`: that module is pure numpy by contract, and
+    `window_is_homogeneous` receives embeddings rather than audio, so it could not gate
+    anything even in principle.
+
+    **This does not unblock enrolment and is not meant to.** Dropping frames can only lower a
+    maximum over pairs or leave it alone; the windows currently refused are refused on pairs
+    of speech-bearing frames that no gate removes. What it stops is the failure that cannot
+    be undone: a window of near-silence being judged "one voice" and stored as somebody's
+    voiceprint. Too few surviving frames already means "cannot tell" at every consumer.
+    """
     step = int(FRAME_SECONDS * sr)
-    return [audio[i:i + step] for i in range(0, len(audio) - step + 1, step)]
+    cut = [audio[i:i + step] for i in range(0, len(audio) - step + 1, step)]
+    return [f for f in cut if _dbfs(f) >= FRAME_MIN_DBFS]
 
 
 def _enrol(event):

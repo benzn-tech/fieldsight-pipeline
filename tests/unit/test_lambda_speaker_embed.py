@@ -50,15 +50,33 @@ class FakeS3:
         return {"Body": B(self.objects[Key])}
 
 
-def _wav_bytes(seconds=5.0, sr=16000):
+def _wav_bytes(seconds=5.0, sr=16000, silent=False):
+    """Audio with SIGNAL in it by default.
+
+    Every fixture here used to be digital zero, which was harmless while nothing looked at
+    loudness. It stops being harmless the moment a speech gate exists: silent fixtures make
+    every gated test fail, and a suite that fails because its fixtures are silent cannot tell
+    you whether the gate works.
+
+    `silent=True` is kept for the tests that are ABOUT silence — the gate needs something to
+    reject, and it must be asked for explicitly rather than inherited.
+    """
     import io
     import wave
+    n = int(seconds * sr)
+    if silent:
+        samples = np.zeros(n, dtype="<i2")
+    else:
+        # A tone, not noise: deterministic, so a test never fails on a lucky draw, and loud
+        # enough to sit well above any plausible speech gate.
+        t = np.arange(n, dtype=np.float64) / sr
+        samples = (np.sin(2 * np.pi * 220.0 * t) * 8000).astype("<i2")
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(sr)
-        w.writeframes((np.zeros(int(seconds * sr), dtype="<i2")).tobytes())
+        w.writeframes(samples.tobytes())
     return buf.getvalue()
 
 
@@ -1415,3 +1433,54 @@ def test_a_scrap_of_a_remainder_is_not_its_own_piece():
         assert len(seen) == 1, f"a 0.3s scrap became its own forward pass: {seen}"
     finally:
         m._session = None
+
+
+# ---- frames must contain speech before they are evidence ------------------
+#
+# The homogeneity guard's job is to refuse a window holding two people. The only
+# window it has ever ACCEPTED on real audio was the quietest one measured — two
+# frames at -67 and -57 dBFS, the noise floor, about 30 dB below this device's
+# speech. The input it exists to refuse is the input it let through.
+
+
+def test_a_silent_frame_is_not_evidence_about_a_speaker(monkeypatch):
+    sr = 16000
+    loud = np.sin(2 * np.pi * 220.0 * np.arange(5 * sr) / sr).astype(np.float32) * 0.5
+    quiet = np.zeros(5 * sr, dtype=np.float32)
+    assert len(se._frames(np.concatenate([loud, quiet]), sr)) == 1
+
+
+def test_a_window_of_pure_silence_becomes_unjudgeable_not_homogeneous(monkeypatch):
+    """Not merely refused — UNJUDGEABLE. Two frames of noise resemble each other, so an
+    ungated pair scores near zero and reads as "one voice". `None` is refused at all four
+    consumers; `True` is stored."""
+    sr = 16000
+    frames = se._frames(np.zeros(20 * sr, dtype=np.float32), sr)
+    assert frames == []
+    assert se.vp.window_is_homogeneous([se.embed_audio(f, sr) for f in frames]) is None
+
+
+def test_the_gate_is_in_frames_so_the_diagnostic_sees_it_too(stub_embedder, monkeypatch):
+    """Gating at the writing sites only would leave `op: "spread"` ungated — and that is the
+    op used to check whether the gate works, so it would report "not gating" while gating
+    everywhere that matters."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    se._AUDIO_CACHE.clear()
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=30.0,
+                                                                 silent=True)}))
+    out = se.lambda_handler({"op": "spread", "user_folder": "Ben_UCPK2",
+                             "date": "2026-08-11",
+                             "source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                             "start_sec": 0.0, "end_sec": 20.0}, None)
+    assert out["frames"] == 0
+    assert out["verdict"] == "unjudgeable"
+
+
+def test_a_quiet_but_real_frame_is_kept():
+    """A floor, not a judgement: it removes frames that cannot be about anybody, not frames
+    that are merely quiet. These devices already record 15 dB below normal."""
+    sr = 16000
+    # -40 dBFS: well under normal speech, well over the noise floor.
+    quiet_speech = (np.sin(2 * np.pi * 220.0 * np.arange(10 * sr) / sr)
+                    * 0.014).astype(np.float32)
+    assert len(se._frames(quiet_speech, sr)) == 2
