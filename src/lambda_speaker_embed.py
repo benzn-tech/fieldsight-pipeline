@@ -327,7 +327,18 @@ def _frames(audio, sr):
     voiceprint. Too few surviving frames already means "cannot tell" at every consumer.
     """
     step = int(FRAME_SECONDS * sr)
-    cut = [audio[i:i + step] for i in range(0, len(audio) - step + 1, step)]
+    if len(audio) < step:
+        return []
+    starts = list(range(0, len(audio) - step + 1, step))
+    # The window's END, as a full-length frame anchored backwards. Walking forward in whole
+    # steps leaves everything after the last one unjudged: a 14.7 s window was decided on its
+    # first 10 s and the remaining 4.7 s — a third of it — was never looked at. A partial
+    # frame is not the answer, because a 4.7 s clip and a 5 s clip do not embed comparably
+    # and the difference would read as two voices; overlapping the previous frame keeps every
+    # frame the same length.
+    if starts[-1] + step < len(audio):
+        starts.append(len(audio) - step)
+    cut = [audio[i:i + step] for i in starts]
     return [f for f in cut if _dbfs(f) >= FRAME_MIN_DBFS]
 
 
