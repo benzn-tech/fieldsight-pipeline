@@ -642,6 +642,12 @@ def _from_request_artifact(bucket, key):
         "correction_ref": req.get("request_id"),
         "cluster_threshold": vp.DEFAULT_CLUSTER_TAU,
         "results": results,
+        # Carried across untouched. org-api writes it into the artifact and the writer reads
+        # it out of the event; this hop is the only thing between them and it did not speak
+        # the key, so `_inherit_labels` got None on every call and returned 0. The feature
+        # and the rejection guard it feeds were unreachable code, and nothing failed — each
+        # end's tests exercised its own half.
+        "label_map": req.get("label_map"),
         "enrol": ({"voiceprint_id": enrol["voiceprint_id"],
                    "embedding": [float(x) for x in v],
                    "s3_key": s3_key, "window": [start, end],
@@ -755,6 +761,9 @@ def _from_match_artifact(bucket, key):
     if named:
         written = invoke_writer({"op": "match_names", "company_id": company_id,
                                  "session_base": session,
+                                 # Both artifacts carry it and both writer branches read it;
+                                 # this hop dropped it on the floor in both directions.
+                                 "label_map": req.get("label_map"),
                                  "results": named}).get("written", 0)
     logger.info("match: session=%s named %d of %d turns against %d profiles",
                 session, written, len(out["results"]), len(profiles))
