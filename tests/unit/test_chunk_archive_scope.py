@@ -72,3 +72,28 @@ def test_a_company_is_required():
     """A default of None would silently restore the unscoped behaviour."""
     with pytest.raises((TypeError, ValueError)):
         chunks.archive_chunks_for_session(RecordingConn(), "sid0", [], "b-1")
+
+
+# ---- putting the chunks back after the topics they pointed at are gone ----
+
+
+def test_restore_does_not_carry_a_dangling_topic_id():
+    """`report_chunks.topic_id` is `REFERENCES topics(id) ON DELETE SET NULL`, but the
+    archive table is `LIKE report_chunks`, which deliberately copies no foreign keys. So
+    while a chunk sits in the archive, the nightly ingest can hard-delete the topic it
+    points at — `lambda_ingest` calls `delete_topics_for_source` and its own comment says
+    "always" — and nothing nulls the archived row's copy.
+
+    Re-inserting that row into the live table then violates the FK, which fails the whole
+    undelete transaction, `revert_batch` included. Delete ships tonight; restore breaks one
+    nightly run later, so the reversibility the feature promises expires overnight.
+
+    The restore must resolve `topic_id` through `topics` and yield NULL when it is gone —
+    which is not a workaround but exactly what `ON DELETE SET NULL` would have done had the
+    row never left."""
+    conn = RecordingConn()
+    chunks.restore_chunks_for_batch(conn, "b-1")
+    insert_sql = conn.statements[0][0]
+    assert "FROM topics" in insert_sql, (
+        "the archived topic_id is copied back verbatim; a topic deleted by the nightly "
+        "rebuild makes this INSERT violate the foreign key and roll the undelete back")
