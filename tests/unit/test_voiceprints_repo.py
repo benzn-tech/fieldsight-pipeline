@@ -766,3 +766,56 @@ def test_a_new_profile_records_when_it_was_linked():
                                linked_on="full_name")
     ins = next(c for c in conn.calls if c["sql"].startswith("INSERT"))
     assert "linked_at" in ins["sql"] and "u-7" in ins["params"]
+
+
+# ---- narrowing the pool by site ------------------------------------------
+#
+# `decide_name` takes the runner-up as the maximum over EVERY other candidate, so
+# the size of this result — not the number of people in the room — is what the
+# margin has to survive. A company accumulating profiles across many sites makes
+# every turn harder to confirm, and the failure is refusal, not misidentification:
+# safe, and indistinguishable from the feature being broken.
+
+
+def _sql_of(conn):
+    return " ".join(conn.calls[0]["sql"].split())
+
+
+def test_a_person_who_belongs_to_no_site_stays_in_the_pool():
+    """`upsert_field_only_user` writes only `users` — a directory entry for somebody with no
+    login has no membership row. Without this arm, attaching an identity makes that person
+    LESS matchable than before: matchable while unlinked, invisible once linked. The fix
+    would have introduced the regression."""
+    conn = FakeConn([[]])
+    voiceprints.profiles_for_matching(conn, CO, site_id="st-1")
+    sql = _sql_of(conn)
+    assert "NOT EXISTS" in sql, "a field_only person disappears the moment they are linked"
+
+
+def test_the_membership_check_ignores_archived_memberships():
+    """Every other membership query in this repository filters it
+    (repositories/memberships.py:29, 52, 71, ...). Without it somebody removed from a site
+    keeps being matched there — a guard satisfied and ineffective."""
+    conn = FakeConn([[]])
+    voiceprints.profiles_for_matching(conn, CO, site_id="st-1")
+    sql = _sql_of(conn)
+    assert sql.count("m2.archived_at IS NULL") == 1
+    assert sql.count("m.archived_at IS NULL") == 1
+
+
+def test_an_unnamed_profile_is_never_narrowed_away():
+    conn = FakeConn([[]])
+    voiceprints.profiles_for_matching(conn, CO, site_id="st-1")
+    assert "p.user_id IS NULL" in _sql_of(conn)
+
+
+def test_narrowing_still_asks_for_the_site():
+    conn = FakeConn([[]])
+    voiceprints.profiles_for_matching(conn, CO, site_id="st-1")
+    assert "st-1" in conn.calls[0]["params"]
+
+
+def test_no_site_asks_for_no_membership_join_at_all():
+    conn = FakeConn([[]])
+    voiceprints.profiles_for_matching(conn, CO)
+    assert "memberships" not in _sql_of(conn)

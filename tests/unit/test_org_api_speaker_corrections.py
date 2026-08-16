@@ -71,6 +71,10 @@ def wired(monkeypatch):
     # reach the connection double would make them fail for a reason none of them are about.
     monkeypatch.setattr(org.users, "resolve_display_name",
                         lambda conn, company_id, name: (None, "not-in-directory"))
+    # Default: the site could not be resolved, i.e. no narrowing. The real resolver walks
+    # three repositories and these tests are about queuing, not attribution.
+    monkeypatch.setattr(org, "_site_for_session",
+                        lambda conn, company_id, folder, date, session_base: None)
     monkeypatch.setattr(org, "_resolve_org_media_folder",
                         lambda conn, caller, user, what=None: ("Ada_L", None))
     # The ownership arm of _may_correct_speakers reads this; FakeConn has no cursor, and a
@@ -844,3 +848,64 @@ def test_a_correction_without_consent_reports_no_link_rather_than_a_false_one(wi
     b = _body(org.lambda_handler(_event(BODY), None))
     assert b["linkedTo"] is None
     assert b["linkReason"] == "not-requested"
+
+
+# ---- the site travels with the request -----------------------------------
+#
+# The matcher reads `req.get("site_id")` and the artifact never carried the key,
+# so the site-scoped query was inert for a SECOND, independent reason. Fixing
+# only the query would have moved nothing.
+
+
+def test_the_match_request_carries_the_site(wired, monkeypatch):
+    _turns(monkeypatch)
+    monkeypatch.setattr(org, "_site_for_session",
+                        lambda conn, company_id, folder, date, session_base: {"id": "st-1"})
+    body = _body(org.lambda_handler(_match_event(), None))
+    assert body["siteId"] == "st-1"
+    assert all(json.loads(p["Body"])["site_id"] == "st-1" for p in wired.puts)
+
+
+def test_an_unresolved_site_means_no_narrowing_not_a_failure(wired, monkeypatch):
+    """Before this feature there was no narrowing at all. An unresolved site returns to
+    that, which is the safe direction — narrowing to the WRONG roster drops the right
+    person and presents as a refusal."""
+    _turns(monkeypatch)
+    res = org.lambda_handler(_match_event(), None)
+    assert res["statusCode"] == 202
+    assert json.loads(wired.puts[-1]["Body"])["site_id"] is None
+
+
+def test_every_run_of_a_split_session_carries_the_same_site(wired, monkeypatch):
+    monkeypatch.setattr(org, "_site_for_session",
+                        lambda conn, company_id, folder, date, session_base: {"id": "st-1"})
+    monkeypatch.setattr(org, "_session_turns", lambda *a, **k: [
+        {"source_filename": f"f{i}.json", "start_sec": 0.0, "end_sec": 120.0}
+        for i in range(60)])
+    org.lambda_handler(_match_event(), None)
+    assert {json.loads(p["Body"])["site_id"] for p in wired.puts} == {"st-1"}
+
+
+def test_the_session_exact_site_beats_the_days_majority(monkeypatch):
+    """`lambda_item_writer` settled this order after BUG-41. Starting at the day-majority
+    rung gives somebody who recorded at two sites in one day the wrong site — the pool
+    narrows to the wrong roster and the right person is dropped."""
+    monkeypatch.setattr(org.recordings, "site_for_media",
+                        lambda *a, **k: {"id": "exact"})
+    called = []
+    monkeypatch.setattr(org.recordings, "site_for_day",
+                        lambda *a, **k: called.append(1) or {"id": "majority"})
+    out = org._site_for_session(None, "co-1", "Ada_L", "2026-08-16", "x_sid" + "a" * 32)
+    assert out == {"id": "exact"}
+    assert called == [], "the day-majority rung ran even though the session was known"
+
+
+def test_a_site_from_another_tenant_is_refused(monkeypatch):
+    """It would narrow this company's pool against a roster that is not theirs."""
+    monkeypatch.setattr(org.recordings, "site_for_media", lambda *a, **k: None)
+    monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: {"site_id": "st-9"})
+    monkeypatch.setattr(org.sites, "get_site",
+                        lambda conn, sid: {"id": "st-9", "company_id": "other-co"})
+    monkeypatch.setattr(org.recordings, "site_for_day", lambda *a, **k: None)
+    assert org._site_for_session(None, "co-1", "Ada_L", "2026-08-16",
+                                 "x_sid" + "a" * 32) is None
