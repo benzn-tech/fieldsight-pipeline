@@ -40,6 +40,8 @@ import boto3
 from datetime import datetime, timedelta
 from urllib.parse import unquote_plus
 
+import deletion_mirror
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -278,6 +280,106 @@ def extract_time_seconds_from_filename(filename):
 
 # ── GET /api/timeline ────────────────────────────────────────
 
+# ── Deleted recordings ───────────────────────────────────────
+#
+# This gateway is the LEGACY one and it is still live -- 44 invocations in the 24h before
+# this was written. Every content endpoint below lists S3 objects directly and none of them
+# knew anything about the customer-facing delete, so a recording the customer removed was
+# still readable here: its transcripts, its audio, its video, a presigned URL for any of
+# them, and the pre-deletion daily_report served byte for byte.
+#
+# Nothing had CALLED those endpoints recently -- the live traffic is /api/actions, which
+# returns only check-off state and no content -- so this was reachable rather than actively
+# leaking. Reachable is enough: the promise made to the customer was that it is gone.
+#
+# The mirror, not the database: this lambda has no Aurora connection, exactly like the
+# report generator and the ask agent, and `redactions/{folder}/{date}/deleted_sessions.json`
+# is the copy of the answer written for readers in that position.
+#
+# `search`/`ask` need nothing here -- they PROXY to the ask agent and rag-search, which
+# filter on their own side.
+
+def _deleted_bases(user_folder, date):
+    """Deleted session ids for one (folder, date), or an empty set."""
+    if not user_folder or not date:
+        return set()
+    try:
+        return deletion_mirror.deleted_sessions(s3_client, S3_BUCKET, user_folder, date)
+    except Exception:
+        # Fails OPEN and LOUD, like every guard on this path: an unreadable mirror must not
+        # take the timeline down for everyone. It must not pass silently either -- "nothing
+        # was deleted" and "could not check" are indistinguishable afterwards.
+        logger.exception("deletion mirror unreadable for %s/%s -- serving unfiltered",
+                         user_folder, date)
+        return set()
+
+
+def _drop_deleted_keys(keys, bases):
+    """The subset of `keys` not belonging to a deleted session.
+
+    Substring match, because the session id sits INSIDE the filename
+    (`..._sid{32hex}_c0001.json`) rather than being a path component -- the same rule as
+    deletion_mirror.drop_deleted, deliberately."""
+    if not bases:
+        return list(keys)
+    return [k for k in keys if not any(b in k for b in bases)]
+
+
+def _presign_key_is_deleted(s3_key):
+    """Does this exact object belong to a recording the customer deleted?
+
+    The (folder, date) has to come out of the key itself, because presign takes only a key.
+    Four shapes carry both, and `reports/` puts them the other way round -- getting that
+    order wrong reads the DATE as the folder and every lookup silently misses.
+
+    Unparseable shapes return False: this endpoint already fails closed on ownership just
+    above, so an unknown shape is refused there rather than here, and guessing would only
+    add a second wrong answer.
+    """
+    parts = (s3_key or "").split("/")
+    if len(parts) < 4:
+        return False
+    top = parts[0]
+    if top in ("users", "audio_segments", "transcripts", "web_video"):
+        folder, date = parts[1], parts[2]
+        if top == "users":                       # users/{folder}/{kind}/{date}/...
+            if len(parts) < 5:
+                return False
+            folder, date = parts[1], parts[3]
+    elif top == "reports":                       # reports/{date}/{folder}/...
+        date, folder = parts[1], parts[2]
+    else:
+        return False
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date or ""):
+        return False
+    bases = _deleted_bases(folder, date)
+    return bool(bases) and any(b in s3_key for b in bases)
+
+
+
+def _any_folder_deleted_on(date):
+    """Does ANY folder have a deletion on this date?
+
+    `summary_report.json` is built across every folder at once, so one person's deleted
+    session is inside a document everyone else's admin can read. There is no per-folder
+    granularity to filter, so the aggregate is simply not served on such a day and the
+    caller takes the per-folder path instead.
+
+    Listing `redactions/` is the cheapest possible question -- the prefix exists only for
+    days that HAVE a deletion, so on a normal day this is one empty list call.
+    """
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="redactions/"):
+            for obj in page.get("Contents", []):
+                if f"/{date}/" in obj["Key"]:
+                    return True
+    except Exception:
+        logger.exception("could not list redactions/ for %s -- serving unfiltered", date)
+    return False
+
+
+
 def get_timeline(params, caller):
     date = params.get('date', '')
     user = params.get('user', '')
@@ -303,6 +405,11 @@ def get_timeline(params, caller):
         if role in ('admin', 'gm'):
             key = f"{REPORT_PREFIX}{date}/summary_report.json"
             try:
+                # Same door, aggregate form. This doc is built across every folder, so one
+                # deleted session's words sit inside it -- go the long way round instead,
+                # where each folder is checked on its own.
+                if _any_folder_deleted_on(date):
+                    return find_any_report(date, caller)
                 obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
                 return ok(json.loads(obj['Body'].read().decode('utf-8')))
             except s3_client.exceptions.NoSuchKey:
@@ -314,6 +421,14 @@ def get_timeline(params, caller):
                 return find_any_report(date, caller)
 
     user_folder = user.replace(' ', '_')
+    # A day whose sources were DELETED must not fall through to the pre-rendered doc.
+    # `daily_report.json` was written BEFORE the delete and carries the removed session's
+    # words byte for byte -- filtering the database and then serving the artifact rendered
+    # from it is not a deletion. Same rule, and the same 404, as org-api's timeline.
+    if _deleted_bases(user_folder, date) or _deleted_bases(user, date):
+        logger.info("timeline: %s/%s has deleted recordings -- not serving the stored "
+                    "report", user_folder, date)
+        return ok({'message': f'No report for {user} on {date}', 'date': date}, 404)
     for name_variant in [user_folder, user]:
         key = f"{REPORT_PREFIX}{date}/{name_variant}/daily_report.json"
         try:
@@ -371,6 +486,15 @@ def find_any_report(date, caller=None):
                 parts = key.replace(prefix, '').split('/')
                 if len(parts) >= 2:
                     user_name = parts[0]
+                    # A day whose sources were deleted must not fall through to the
+                    # pre-rendered doc. `daily_report.json` was written BEFORE the delete
+                    # and holds the removed session's words byte for byte -- filtering
+                    # elsewhere and serving the artifact rendered from it is not a
+                    # deletion. Same rule, and the same 404, as the org-api path.
+                    if _deleted_bases(user_name, date):
+                        logger.info("timeline: %s/%s has deleted recordings -- not serving "
+                                    "the stored report", user_name, date)
+                        continue
                     # Filter by permission. Deliberate narrowing: the old
                     # predicate also matched the SPACED display name
                     # (u['name']) against what is always an S3 path
@@ -554,6 +678,12 @@ def get_presigned_url(params, caller=None):
         # caller['role'] and raise.
         if not caller or not can_access_user_data(caller, target_user):
             return error('Access denied to this user\'s media', 403)
+    # A deleted recording's media must not be re-signed, for ANY caller -- including the
+    # admin/gm branch above, which skips the ownership check entirely. 404, not 403: an
+    # access-denied confirms the object exists, and the same choice was made on org-api.
+    if _presign_key_is_deleted(s3_key):
+        logger.info("presign refused: %s belongs to a deleted recording", s3_key)
+        return error('Not found', 404)
     try:
         url = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': s3_key}, ExpiresIn=PRESIGNED_URL_EXPIRY)
         return ok({'url': url, 'expires_in': PRESIGNED_URL_EXPIRY})
@@ -580,6 +710,10 @@ def get_transcripts(params, caller):
         return error('Missing user')
     user_folder = user.replace(' ', '_')
     start_sec, end_sec = media_window(start_time, end_time)
+    # Both folder spellings, because the prefixes below try both and filtering only one
+    # would hide the recording for some users and not others -- indistinguishable from
+    # working.
+    deleted = _deleted_bases(user_folder, date) | _deleted_bases(user, date)
 
     transcript_files = []
     # Try date subfolder first, then flat folder filtered by date
@@ -597,6 +731,8 @@ def get_transcripts(params, caller):
                     key = obj['Key']
                     if not key.endswith('.json'):
                         continue
+                    if deleted and any(b in key for b in deleted):
+                        continue          # a recording the customer deleted
                     # Skip if this is inside a subfolder and we're searching flat
                     parts = key.replace(prefix, '').split('/')
                     if needs_date_filter and len(parts) > 1:
@@ -724,6 +860,7 @@ def get_audio_segments(params, caller):
     start_sec, end_sec = media_window(topic_start, topic_end)
 
     prefix = f"audio_segments/{user_folder}/{date}/"
+    deleted = _deleted_bases(user_folder, date)
     segments = []
     try:
         resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
@@ -731,6 +868,8 @@ def get_audio_segments(params, caller):
             key = obj['Key']
             if not key.endswith('.wav'):
                 continue
+            if deleted and any(b in key for b in deleted):
+                continue              # a recording the customer deleted
             filename = key.split('/')[-1]
             # Base time then offset, matched SEPARATELY -- a chunk-session segment
             # keeps sid/chunk tokens BETWEEN them (..._HH-MM-SS_sid{hex}_c{NNNN}_off...),
@@ -849,6 +988,7 @@ def get_video_segments(params, caller):
     # itself, so it is measured from the unbuffered start.
     seek_from_sec = parse_time_to_seconds(topic_start) if topic_start else 0
 
+    deleted = _deleted_bases(user_folder, date) | _deleted_bases(user, date)
     videos = []
     for name_variant in [user_folder, user]:
         # First check web_video/ (H264 preview)
@@ -860,6 +1000,8 @@ def get_video_segments(params, caller):
                     key = obj['Key']
                     if not any(key.lower().endswith(e) for e in ['.mp4','.webm','.mov']):
                         continue
+                    if deleted and any(b in key for b in deleted):
+                        continue          # a recording the customer deleted
                     filename = key.split('/')[-1]
                     time_match = re.search(r'\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})', filename)
                     if not time_match:
