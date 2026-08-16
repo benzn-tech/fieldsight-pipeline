@@ -1987,8 +1987,26 @@ def get_me(conn, caller):
     # Company name for the profile UI (the caller carries company_id; surface
     # the human name too — tenant-split shows each user their company/Corp).
     company = companies.get_company_by_id(conn, caller["company_id"]) if caller.get("company_id") else None
+    # The caller's authority has TWO dimensions and this endpoint used to report one.
+    #
+    # `global_role` is a column on `users`. The per-site `memberships.role` is a separate
+    # column, and `acl.visible_user_scope` treats it as a FLOOR OVER the global role -- its
+    # own docstring names the case: "a global 'worker' with a pm membership -> SITE". So a
+    # person promoted to site_manager ON A SITE really does gain that authority, while
+    # `/me` kept answering `global_role: worker` and a `scope` computed from the global
+    # role alone. The UI has no other source for this, so it renders "worker" forever and
+    # gates features on a value the backend disagrees with. Reported in prod for UCPK2.
+    #
+    # `effective_scope` is what the read paths ACTUALLY apply. It is None when GRADED_ROLES
+    # is off, because then the membership floor is not applied either and claiming
+    # SELF+WORKERS would be a second wrong answer rather than a fix.
+    site_roles = memberships.caller_site_roles(conn, caller["id"])
+    effective_scope = (scope.visible_scope(conn, caller)["user_scope"]
+                       if GRADED_ROLES else None)
     return ok({**profile, "site_ids": site_ids,
                "scope": resolve_scope(caller["global_role"]),
+               "site_roles": site_roles,
+               "effective_scope": effective_scope,
                "company_name": (company or {}).get("name")})
 
 

@@ -31,6 +31,19 @@ class FakeConn:
         # manager, so the block either runs whole or propagates, like the real one.
         return self
 
+    def execute(self, *a, **k):
+        # /me now reads the caller's per-site membership roles: it used to report
+        # `global_role` alone, so a person promoted to site_manager ON A SITE showed as
+        # "worker" in their profile forever. No rows is the honest answer here — these
+        # tests set up no memberships.
+        class _Cur:
+            def fetchall(self_inner):
+                return []
+
+            def fetchone(self_inner):
+                return None
+        return _Cur()
+
 
 CALLER = {
     "id": "u-uuid-1", "cognito_sub": "sub-1", "company_id": "c-uuid-1",
