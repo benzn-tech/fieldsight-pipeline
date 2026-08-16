@@ -1,0 +1,18 @@
+[
+  {"abs_start_str": "09:02:11", "speaker": "spk_0", "text": "Morning. Let's start with the retaining wall on the north side."},
+  {"abs_start_str": "09:02:19", "speaker": "spk_1", "text": "Sure. It rained yesterday, and the drainage channel over there is a bit blocked."},
+  {"abs_start_str": "09:02:27", "speaker": "spk_0", "text": "Badly blocked? Has any water got through to the foundation?"},
+  {"abs_start_str": "09:02:34", "speaker": "spk_1", "text": "Nothing reached the foundation, just some surface water. A sweep will sort it."},
+  {"abs_start_str": "09:02:45", "speaker": "spk_0", "text": "Then get Ah Qiang to clear the drainage channel this afternoon."},
+  {"abs_start_str": "09:02:52", "speaker": "spk_1", "text": "Will do, I'll tell him. Also the guardrail on the third scaffold lift is loose."},
+  {"abs_start_str": "09:03:04", "speaker": "spk_0", "text": "Loose? Then nobody goes up. Tag it out of service first."},
+  {"abs_start_str": "09:03:12", "speaker": "spk_1", "text": "Already tagged. The scaffold crew comes Monday to re-inspect."},
+  {"abs_start_str": "09:03:25", "speaker": "spk_0", "text": "Is the concrete pour still Thursday as planned?"},
+  {"abs_start_str": "09:03:31", "speaker": "spk_1", "text": "Thursday. Forecast says clear, so it should be fine."},
+  {"abs_start_str": "09:03:40", "speaker": "spk_0", "text": "Has the pump truck been booked?"},
+  {"abs_start_str": "09:03:44", "speaker": "spk_1", "text": "Not yet, I'll call today."},
+  {"abs_start_str": "09:03:52", "speaker": "spk_0", "text": "Do it soon. Last time the pump truck wasn't there and we lost half a day."},
+  {"abs_start_str": "09:04:03", "speaker": "spk_1", "text": "Understood. Also the rebar, we're about thirty metres short for the second floor."},
+  {"abs_start_str": "09:04:15", "speaker": "spk_0", "text": "Thirty metres isn't much. Have the supplier send it with the rest."},
+  {"abs_start_str": "09:04:22", "speaker": "spk_1", "text": "Right. That's everything for today."}
+]
