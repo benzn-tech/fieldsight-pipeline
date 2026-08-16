@@ -437,10 +437,11 @@ def test_the_delete_archives_the_sessions_chunks(monkeypatch):
     _stub_writes(monkeypatch, [{"id": "t-1"}, {"id": "t-2"}])
     seen = {}
 
-    def _archive(conn, session_base, topic_ids, batch_id):
+    def _archive(conn, session_base, topic_ids, batch_id, *, company_id=None):
         seen["base"] = session_base
         seen["topic_ids"] = list(topic_ids)
         seen["batch"] = batch_id
+        seen["company_id"] = company_id
         return 4
 
     monkeypatch.setattr(org.chunks, "archive_chunks_for_session", _archive)
@@ -448,6 +449,11 @@ def test_the_delete_archives_the_sessions_chunks(monkeypatch):
     res = org.delete_recordings_endpoint(_Conn(), CALLER, {"recordings": [REC]})
     body = json.loads(res["body"])
     assert seen["base"] == "sid-a", "the session base is what identifies the chunks"
+    # `report_chunks` is shared by every tenant and the archive statements are an
+    # INSERT…SELECT plus a DELETE over it. Unscoped, a predicate built from the caller's own
+    # request body reaches every customer's rows — and it is the TARGET's company, matching
+    # the tombstone, so a platform_admin deleting across companies archives the right ones.
+    assert seen["company_id"] == "c-1", "the archive was not scoped to a company"
     assert "t-1" in seen["topic_ids"], "topic-linked chunks must go too"
     assert seen["batch"] == body["batch_id"], "or one undelete cannot restore one delete"
     assert body["results"][0]["chunks_archived"] == 4, \

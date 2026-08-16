@@ -3289,6 +3289,12 @@ def _source_prefixes_for(rec):
     """
     folder, date = rec.get("folder"), rec.get("date")
     base = (rec.get("sessionBase") or "").strip()
+    # A session id is a filename stem: `%`, `/` and `\` cannot appear in one. `_` CAN and
+    # does — legacy bases are `{device}_{date}_{time}` — which is why the repository escapes
+    # its bind rather than rejecting the character. Defence in depth, and the two guards
+    # fail differently: this one refuses the request, that one narrows the pattern.
+    if any(c in base for c in "%/\\"):
+        return []
     if not folder or not date or not base:
         return []
     return [f"extractions/{folder}/{date}/{base}"]
@@ -3398,8 +3404,12 @@ def delete_recordings_endpoint(conn, caller, body):
         # they miss is the verbatim speech -- a customer deleted a recording, watched it
         # disappear, and the sentence stayed searchable. Archived rather than deleted so the
         # undelete can put it back without re-embedding.
+        # The TARGET's company, matching the tombstone above — an admin deleting another
+        # company's recording (platform_admin) must archive that company's chunks, not
+        # their own. Passing the caller's would silently archive nothing.
         archived = chunks.archive_chunks_for_session(
-            conn, (rec.get("sessionBase") or "").strip(), topic_ids, batch_id)
+            conn, (rec.get("sessionBase") or "").strip(), topic_ids, batch_id,
+            company_id=target_company)
         logger.info("user deletion: batch=%s session=%s archived %d chunk(s)",
                     batch_id, rec.get("sessionBase"), archived)
         results.append({"recording": rec, "topics_hidden": hidden,

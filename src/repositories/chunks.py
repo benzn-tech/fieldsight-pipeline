@@ -19,11 +19,27 @@ __all__ = ["build_search_sql", "insert_chunk", "search_chunks",
 # window (`chunking.py`), assigned or not. Those are transcript filenames and they carry
 # the session id, so the match is exact rather than inferred -- no time arithmetic, none of
 # the `time_range` guessing the pipeline forbids.
+# The `session_base` bind is a LIKE PATTERN, not a literal: `%` and `_` in it are wildcards.
+# It arrives from the request body, so it must be escaped by `_escape_like` before binding —
+# `sessionBase='%'` made this `LIKE '%%%'`, which is every row in the table.
 SESSION_CHUNK_PREDICATE = (
     "(topic_id = ANY(%(topic_ids)s::uuid[]) OR EXISTS ("
     "  SELECT 1 FROM jsonb_array_elements_text(COALESCE(metadata->'source_files', '[]'::jsonb)) f"
-    "  WHERE f LIKE '%%' || %(session_base)s || '%%'))"
+    "  WHERE f LIKE '%%' || %(session_base)s || '%%' ESCAPE '\\'))"
 )
+
+# `report_chunks` is shared by every tenant and `site_id` is its only route to one:
+# NOT NULL REFERENCES sites(id) (0004_report_chunks.sql:5), and `sites` carries company_id.
+# Without this, a predicate built from caller input reaches every customer's rows.
+COMPANY_SCOPE = " AND site_id IN (SELECT id FROM sites WHERE company_id = %(company_id)s)"
+
+
+def _escape_like(value) -> str:
+    """Escape LIKE wildcards in caller input. Session ids are '_'-joined for legacy
+    recordings, so `_` is literal data here and not a single-character wildcard — the same
+    reasoning as `repositories.topics._escape_like`, kept local so this module does not
+    import a sibling repository for one helper."""
+    return str(value).replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
 
 
 def insert_chunk(conn, site_id, report_date, chunk_type, chunk_text, embedding, *,
@@ -82,7 +98,8 @@ def delete_chunks_for_topic(conn, topic_id) -> int:
     return cur.rowcount
 
 
-def archive_chunks_for_session(conn, session_base, topic_ids, batch_id) -> int:
+def archive_chunks_for_session(conn, session_base, topic_ids, batch_id, *,
+                               company_id=None) -> int:
     """Move one recording's search index out of `report_chunks`. Returns the row count.
 
     MOVE, not filter. The read-time predicate cannot reach these rows: every chunk is
@@ -100,14 +117,23 @@ def archive_chunks_for_session(conn, session_base, topic_ids, batch_id) -> int:
     otherwise the same observation, which is how this defect survived a review that
     explicitly asked about search.
     """
-    params = {"topic_ids": list(topic_ids or []), "session_base": session_base,
-              "batch_id": batch_id}
+    base = str(session_base or "").strip()
+    if not base:
+        # An empty base makes the LIKE arm `'%' || '' || '%'` — every row with any
+        # source_files entry. The endpoint checks this too; the guard belongs where the
+        # damage would happen, not only where the request arrives.
+        raise ValueError("session_base is required: an empty one selects every chunk")
+    if not company_id:
+        raise ValueError("company_id is required: report_chunks is shared by every tenant")
+
+    params = {"topic_ids": list(topic_ids or []), "session_base": _escape_like(base),
+              "batch_id": batch_id, "company_id": company_id}
     conn.execute(
         f"INSERT INTO report_chunks_archive "
         f"SELECT *, %(batch_id)s::uuid, now() FROM report_chunks "
-        f"WHERE {SESSION_CHUNK_PREDICATE}", params)
+        f"WHERE {SESSION_CHUNK_PREDICATE}{COMPANY_SCOPE}", params)
     cur = conn.execute(
-        f"DELETE FROM report_chunks WHERE {SESSION_CHUNK_PREDICATE}", params)
+        f"DELETE FROM report_chunks WHERE {SESSION_CHUNK_PREDICATE}{COMPANY_SCOPE}", params)
     return cur.rowcount
 
 
