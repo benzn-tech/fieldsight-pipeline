@@ -267,3 +267,39 @@ def test_a_singleton_cluster_has_no_centroid_to_speak_of():
 # the behaviour actually lives: test_lambda_speaker_embed's
 # `test_the_reference_is_never_scored_against_a_centroid_holding_itself` and
 # `test_a_corrected_turn_sitting_between_two_voices_names_nothing`, both mutation-verified.
+
+
+# ---- how far off, not just whether ---------------------------------------
+
+
+def _v(*xs):
+    import numpy as _np
+    return _np.array(list(xs) + [0.0] * (192 - len(xs)), dtype=_np.float64)
+
+
+def test_the_spread_is_the_widest_disagreement_not_the_first_one():
+    """A refusal that says only "no" cannot be argued with. Three real windows have been
+    refused on TEST and every log line said the window was not homogeneous and nothing about
+    HOW FAR off it was — so nobody can tell "this really holds two people" apart from "0.35
+    was measured on read speech and site audio does not look like that"."""
+    near, far = _v(1.0, 0.0), _v(1.0, 0.02)
+    opposite = _v(0.0, 1.0)
+    assert vp.frame_spread([near, far]) < 0.01
+    # The pair that disagrees most decides it, wherever it sits in the list.
+    assert vp.frame_spread([near, far, opposite]) == pytest.approx(1.0, abs=0.01)
+
+
+def test_fewer_than_two_frames_has_no_spread():
+    assert vp.frame_spread([]) is None
+    assert vp.frame_spread([_v(1.0)]) is None
+
+
+def test_the_verdict_still_agrees_with_the_number():
+    """The split must not have changed the decision — only made it answerable."""
+    near, far = _v(1.0, 0.0), _v(1.0, 0.02)
+    opposite = _v(0.0, 1.0)
+    assert vp.window_is_homogeneous([near, far]) is True
+    assert vp.window_is_homogeneous([near, opposite]) is False
+    assert vp.window_is_homogeneous([near]) is None
+    assert vp.window_is_homogeneous([near, far],
+                                    max_spread=vp.frame_spread([near, far]) / 2) is False

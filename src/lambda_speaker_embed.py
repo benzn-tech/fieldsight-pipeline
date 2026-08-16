@@ -522,12 +522,16 @@ def _admit_harvest(folder, date, candidates):
             # property of two constants that could drift apart.
             continue
         key, clip, sr = _window_audio(folder, date, t["source_filename"], start, end)
-        verdict = vp.window_is_homogeneous([embed_audio(f, sr) for f in _frames(clip, sr)])
+        frames = [embed_audio(f, sr) for f in _frames(clip, sr)]
+        spread = vp.frame_spread(frames)
+        verdict = vp.window_is_homogeneous(frames)
         if verdict is not True:
             # None ("could not check") refused alongside False, exactly as the anchor's own
             # check does. Admitting the unjudgeable is how a guard becomes decoration.
-            logger.info("harvest: %s not admitted (%s)", c["turn_ref"],
-                        "not homogeneous" if verdict is False else "unjudgeable")
+            logger.info("harvest: %s not admitted (%s, frames=%d spread=%s)",
+                        c["turn_ref"],
+                        "not homogeneous" if verdict is False else "unjudgeable",
+                        len(frames), "n/a" if spread is None else "%.3f" % spread)
             continue
         admitted.append({"embedding": [float(x) for x in c["vector"]],
                          "s3_key": key, "window": [start, end]})
@@ -598,12 +602,20 @@ def _from_request_artifact(bucket, key):
     # disbelieving it in one direction and acting on it in the other.
     enrol = req.get("enrol")
     if enrol:
-        verdict = vp.window_is_homogeneous(
-            [embed_audio(f, sr) for f in _frames(clip, sr)])
+        frames = [embed_audio(f, sr) for f in _frames(clip, sr)]
+        spread = vp.frame_spread(frames)
+        verdict = vp.window_is_homogeneous(frames)
         if verdict is not True:
-            logger.warning("enrolment refused: %s",
+            # The DISTANCE, not just the verdict. Three windows have now been refused on
+            # TEST and every log line said only "not homogeneous" — which cannot be argued
+            # with, and cannot tell "this window really holds two people" apart from "0.35
+            # was measured on read speech and site audio does not look like that".
+            logger.warning("enrolment refused: %s (frames=%d spread=%s limit=%.2f)",
                            "window is not homogeneous" if verdict is False
-                           else "window too short to check homogeneity")
+                           else "window too short to check homogeneity",
+                           len(frames),
+                           "n/a" if spread is None else "%.3f" % spread,
+                           vp.DEFAULT_MAX_FRAME_SPREAD)
             enrol = None
         elif refusal == "between-voices":
             # Propagation judged this window to hold more than one voice. Storing it as
