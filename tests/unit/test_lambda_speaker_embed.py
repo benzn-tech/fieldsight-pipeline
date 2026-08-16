@@ -1131,5 +1131,7 @@ def test_the_pieces_are_normalised_before_they_are_averaged(monkeypatch):
             np.array([0.0, 1.0] + [0.0] * 190, dtype=np.float32)]
     seq = iter(vecs)
     monkeypatch.setattr(se, "_embed_once", lambda a: next(seq))
-    out = se.embed_audio(np.zeros(40 * 16000, dtype=np.float32), 16000)
+    # Long enough for two pieces at the measured cap, whatever that cap is set to.
+    n = int(se.MAX_EMBED_SECONDS * 2 * 16000)
+    out = se.embed_audio(np.zeros(n, dtype=np.float32), 16000)
     assert abs(out[0] - out[1]) < 1e-6, "the louder piece dominated the average"
