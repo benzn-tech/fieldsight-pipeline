@@ -1277,6 +1277,34 @@ def _session_turns(folder, date, session_base):
     return out
 
 
+# Measured on the deployed embedder: ~98 ms per second of audio, plus ~176 ms per turn.
+# The function's timeout is 600 s, so a run is budgeted at 360 s of work — 60 %, leaving room
+# for a cold start, the model download and a slow S3 day. That is ~3600 seconds of speech,
+# or about 100 chunks / 50 minutes of recording.
+#
+# A three-hour meeting exceeds it, and the failure would be a timeout at the very end with
+# nothing written, so the work is split instead. The splits are independent: each fetches its
+# own profiles and names its own turns, and no turn's answer depends on another's.
+MATCH_SECONDS_PER_RUN = float(os.environ.get("MATCH_SECONDS_PER_RUN", "3600"))
+MATCH_TURNS_PER_RUN = int(os.environ.get("MATCH_TURNS_PER_RUN", "400"))
+
+
+def _split_for_budget(turns):
+    """Group turns into runs that fit one invocation. Never splits a turn."""
+    runs, current, seconds = [], [], 0.0
+    for t in turns:
+        dur = max(0.0, float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)))
+        if current and (seconds + dur > MATCH_SECONDS_PER_RUN
+                        or len(current) >= MATCH_TURNS_PER_RUN):
+            runs.append(current)
+            current, seconds = [], 0.0
+        current.append(t)
+        seconds += dur
+    if current:
+        runs.append(current)
+    return runs
+
+
 def speaker_match(conn, caller, session_base, event):
     """POST /api/org/sessions/{session}/speaker-match — name a session from stored profiles.
 
@@ -1318,20 +1346,26 @@ def speaker_match(conn, caller, session_base, event):
         # whose transcripts are not written yet, which is a wait, not a failure.
         return error("no transcribed turns found for this session yet", 409)
 
-    request_id = uuid.uuid4().hex
-    s3().put_object(
-        Bucket=LAKE_BUCKET,
-        Key=f"voiceprint_requests/{company_id}/{session_base}/match-{request_id}.json",
-        Body=json.dumps({"op": "match", "request_id": request_id,
-                         "session_base": session_key, "company_id": company_id,
-                         "user_folder": folder, "date": date_m.group(1),
-                         "requested_by": str(caller["id"]),
-                         "mode": SPEAKER_IDENTITY_MODE, "turns": turns}, default=str),
-        ContentType="application/json")
-    logger.info("speaker match queued: session=%s mode=%s turns=%d",
-                session_key, SPEAKER_IDENTITY_MODE, len(turns))
-    return ok({"requestId": request_id, "sessionBase": session_key,
-               "turnsQueued": len(turns), "mode": SPEAKER_IDENTITY_MODE,
+    runs = _split_for_budget(turns)
+    request_ids = []
+    for i, group in enumerate(runs):
+        request_id = uuid.uuid4().hex
+        request_ids.append(request_id)
+        s3().put_object(
+            Bucket=LAKE_BUCKET,
+            Key=f"voiceprint_requests/{company_id}/{session_base}/match-{request_id}.json",
+            Body=json.dumps({"op": "match", "request_id": request_id,
+                             "session_base": session_key, "company_id": company_id,
+                             "user_folder": folder, "date": date_m.group(1),
+                             "requested_by": str(caller["id"]), "part": i + 1,
+                             "of": len(runs),
+                             "mode": SPEAKER_IDENTITY_MODE, "turns": group}, default=str),
+            ContentType="application/json")
+    logger.info("speaker match queued: session=%s mode=%s turns=%d runs=%d",
+                session_key, SPEAKER_IDENTITY_MODE, len(turns), len(runs))
+    return ok({"requestIds": request_ids, "sessionBase": session_key,
+               "turnsQueued": len(turns), "runs": len(runs),
+               "mode": SPEAKER_IDENTITY_MODE,
                "willWriteNames": SPEAKER_IDENTITY_MODE == "on"}, 202)
 
 

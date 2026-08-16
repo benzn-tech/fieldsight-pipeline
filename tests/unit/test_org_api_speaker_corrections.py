@@ -732,3 +732,45 @@ def test_a_manager_does_not_pay_for_the_ownership_lookup(wired, monkeypatch):
     res = org.lambda_handler(_unname_event(), None)
     assert res["statusCode"] == 200, _body(res)
     assert looked == [], "the ownership query ran for a caller the role arm already allowed"
+# ---- a long session is split, not timed out ------------------------------
+#
+# Measured on the deployed embedder: ~98 ms per second of audio. A three-hour
+# meeting exceeds the 600 s Lambda timeout, and the failure would arrive at the
+# very end with nothing written.
+
+
+def test_a_long_session_is_split_across_runs(wired, monkeypatch):
+    monkeypatch.setattr(org, "_session_turns", lambda *a, **k: [
+        {"source_filename": f"f{i}.json", "start_sec": 0.0, "end_sec": 120.0}
+        for i in range(60)])   # 7200 s of speech, twice the per-run budget
+    body = _body(org.lambda_handler(_match_event(), None))
+    assert body["runs"] >= 2, "one run would have timed out with nothing written"
+    assert body["turnsQueued"] == 60
+    assert len(wired.puts) == body["runs"]
+
+
+def test_every_turn_lands_in_exactly_one_run(wired, monkeypatch):
+    """Dropping a turn would be invisible: fewer names is what a refusal looks like."""
+    monkeypatch.setattr(org, "_session_turns", lambda *a, **k: [
+        {"source_filename": f"f{i}.json", "start_sec": 0.0, "end_sec": 120.0}
+        for i in range(60)])
+    org.lambda_handler(_match_event(), None)
+    seen = [t["source_filename"]
+            for p in wired.puts for t in json.loads(p["Body"])["turns"]]
+    assert sorted(seen) == sorted(f"f{i}.json" for i in range(60))
+    assert len(seen) == len(set(seen)), "a turn was queued twice"
+
+
+def test_a_short_session_is_still_one_run(wired, monkeypatch):
+    _turns(monkeypatch, 3)
+    assert _body(org.lambda_handler(_match_event(), None))["runs"] == 1
+
+
+def test_each_run_says_which_part_it_is(wired, monkeypatch):
+    monkeypatch.setattr(org, "_session_turns", lambda *a, **k: [
+        {"source_filename": f"f{i}.json", "start_sec": 0.0, "end_sec": 120.0}
+        for i in range(60)])
+    org.lambda_handler(_match_event(), None)
+    docs = [json.loads(p["Body"]) for p in wired.puts]
+    assert sorted(d["part"] for d in docs) == list(range(1, len(docs) + 1))
+    assert {d["of"] for d in docs} == {len(docs)}

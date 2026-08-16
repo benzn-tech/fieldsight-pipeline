@@ -1005,6 +1005,14 @@ def _profile(pid="vp-1", name="Ben L", status="confirmed", vec=None):
             "embedding": vec if vec is not None else [1.0] * 192}
 
 
+def _pool():
+    """Two profiles, far apart. A ONE-profile pool names nobody by design — see
+    test_one_enrolled_profile_names_nobody — so a fixture with one would silently make
+    every other matcher test assert on the same empty result."""
+    return [_profile("vp-1", "Ben L", vec=[1.0] * 192),
+            _profile("vp-2", "Zoe", vec=[1.0] + [-1.0] * 191)]
+
+
 def test_the_match_artifact_never_carries_vectors_and_fetches_them_instead(
         stub_embedder, monkeypatch):
     """The request bucket has a 7-day expiry and nothing else; a voiceprint is biometric
@@ -1032,7 +1040,7 @@ def test_shadow_computes_everything_and_writes_no_name(stub_embedder, monkeypatc
                         lambda: FakeS3({art: _match_artifact(mode="shadow"),
                                         key: _wav_bytes()}))
     seen = []
-    _writer(monkeypatch, [_profile()], seen)
+    _writer(monkeypatch, _pool(), seen)
 
     out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
                                                  "object": {"key": art}}}]}, None)
@@ -1047,7 +1055,7 @@ def test_on_writes_the_names_it_found(stub_embedder, monkeypatch):
     monkeypatch.setattr(se, "s3", lambda: FakeS3({art: _match_artifact(mode="on"),
                                                   key: _wav_bytes()}))
     seen = []
-    _writer(monkeypatch, [_profile()], seen)
+    _writer(monkeypatch, _pool(), seen)
 
     out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
                                                  "object": {"key": art}}}]}, None)
@@ -1135,3 +1143,73 @@ def test_the_pieces_are_normalised_before_they_are_averaged(monkeypatch):
     n = int(se.MAX_EMBED_SECONDS * 2 * 16000)
     out = se.embed_audio(np.zeros(n, dtype=np.float32), 16000)
     assert abs(out[0] - out[1]) < 1e-6, "the louder piece dominated the average"
+
+
+def test_the_same_audio_is_not_downloaded_once_per_turn(stub_embedder, monkeypatch):
+    """A session's turns are, by construction, all from the same handful of files. Fetching
+    and decoding each one per turn cost ~176 ms and a few megabytes every time."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    turns = [{"source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+              "start_sec": float(i), "end_sec": float(i) + 5} for i in range(6)]
+    s3 = FakeS3({art: _match_artifact(turns=turns), key: _wav_bytes(seconds=30.0)})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    _writer(monkeypatch, [_profile()], [])
+
+    se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                           "object": {"key": art}}}]}, None)
+    assert s3.gets.count(key) == 1, f"downloaded {s3.gets.count(key)} times for 6 turns"
+
+
+def test_one_invocation_never_serves_another_its_audio(stub_embedder, monkeypatch):
+    """A warm container must not carry one session's audio into the next: the cache is a
+    within-run optimisation, and a stale hit would embed the wrong recording."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    s3 = FakeS3({art: _match_artifact(), key: _wav_bytes()})
+    monkeypatch.setattr(se, "s3", lambda: s3)
+    _writer(monkeypatch, [_profile()], [])
+    ev = {"Records": [{"s3": {"bucket": {"name": "b"}, "object": {"key": art}}}]}
+    se.lambda_handler(ev, None)
+    se.lambda_handler(ev, None)
+    assert s3.gets.count(key) == 2, "the second invocation reused the first one's audio"
+
+
+def test_one_enrolled_profile_names_nobody(stub_embedder, monkeypatch):
+    """`decide_name` returns a name with a NULL margin when the pool holds one profile —
+    "the closest of the only person I know". Written to a transcript it reads as an
+    identification, and it lands on every turn including the other speakers': one enrolled
+    name spread over everybody, which is worse than no name at all.
+
+    Discrimination needs two profiles. That is not a tuning choice — with overlapping score
+    distributions and no usable absolute threshold, one candidate cannot be told from a
+    stranger."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: _match_artifact(mode="on"),
+                                                  key: _wav_bytes()}))
+    seen = []
+    _writer(monkeypatch, [_profile()], seen)
+    out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                                 "object": {"key": art}}}]}, None)
+    assert out["matched"] == 0
+    assert not any(p["op"] == "match_names" for p in seen)
+
+
+def test_two_profiles_can_produce_a_name(stub_embedder, monkeypatch):
+    """The counterpart: with a runner-up to beat, the same turn is nameable. Without this
+    the test above would pass for a matcher that never names anything."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: _match_artifact(mode="on"),
+                                                  key: _wav_bytes()}))
+    seen = []
+    near = [1.0] * 192
+    far = [1.0] + [-1.0] * 191
+    _writer(monkeypatch, [_profile("vp-1", "Ben L", vec=near),
+                          _profile("vp-2", "Zoe", vec=far)], seen)
+    out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                                 "object": {"key": art}}}]}, None)
+    assert out["matched"] >= 1
+    assert next(p for p in seen if p["op"] == "match_names")["results"][0][
+        "display_name"] == "Ben L"

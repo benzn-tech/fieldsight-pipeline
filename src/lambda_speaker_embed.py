@@ -186,9 +186,31 @@ def _get(key):
     return s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
 
 
+# Decoded audio for the invocation in flight, keyed by S3 key. Cleared at the top of every
+# handler call so a warm container never carries one session's audio into the next.
+#
+# Every turn used to re-download and re-parse the same object: a session of 100 turns from
+# one batch fetched the same few chunks 100 times, ~176 ms and a few megabytes each. The
+# turns in a match run are, by construction, all from the same handful of files.
+_AUDIO_CACHE = {}
+_AUDIO_CACHE_MAX = 8   # ~2 MB each as float32; the bound exists so a long session cannot
+                       # accumulate the whole recording in memory beside the model
+
+
+def _read_cached(key):
+    hit = _AUDIO_CACHE.get(key)
+    if hit is not None:
+        return hit
+    value = _read_wav(_get(key))
+    if len(_AUDIO_CACHE) >= _AUDIO_CACHE_MAX:
+        _AUDIO_CACHE.pop(next(iter(_AUDIO_CACHE)))
+    _AUDIO_CACHE[key] = value
+    return value
+
+
 def _fetch(user_folder, date, source_filename):
     key = _raw_key(user_folder, date, source_filename)
-    audio, sr = _read_wav(_get(key))
+    audio, sr = _read_cached(key)
     return key, audio, sr
 
 
@@ -229,7 +251,7 @@ def _window_audio(user_folder, date, source_filename, start, end):
         # beside raw_key_for so there is one implementation of each.
         raw, lo, hi = batch_seal.raw_window_for_member(p["chunk_key"], p["start_sec"],
                                                        p["end_sec"])
-        audio, sr = _read_wav(_get(raw))
+        audio, sr = _read_cached(raw)
         rate = sr
         first = first or raw
         parts.append(audio[int(lo * sr):int(hi * sr)])
@@ -569,8 +591,21 @@ def _from_match_artifact(bucket, key):
 
     by_key = {p["person_key"]: p for p in profiles}
     named = []
+    skipped_no_runner_up = 0
     for r in out["results"]:
         if r.get("status") not in ("confirmed", "tentative") or not r.get("name"):
+            continue
+        if r.get("margin") is None:
+            # No runner-up: `decide_name` returns a name with a null margin when the pool
+            # holds ONE profile, meaning "the closest of the only person I know". Written to
+            # a transcript that reads as an identification, and it would land on every turn
+            # in the meeting including the other speakers' — the one enrolled name spread
+            # over everybody, which is worse than no name at all.
+            #
+            # Matching needs at least two profiles before it can say anything. That is not a
+            # tuning choice: with overlapping score distributions and no usable absolute
+            # threshold, one candidate cannot be told from a stranger.
+            skipped_no_runner_up += 1
             continue
         turn = r["turn"]
         named.append({
@@ -584,6 +619,13 @@ def _from_match_artifact(bucket, key):
             "margin": r.get("margin"),
         })
 
+    if skipped_no_runner_up:
+        # Loud, because the symptom is indistinguishable from "the matcher did nothing".
+        logger.warning(
+            "match: %d turn(s) had a nearest profile but no runner-up to beat — the company "
+            "has %d matchable profile(s) and discrimination needs at least 2",
+            skipped_no_runner_up, len(profiles))
+
     mode = (req.get("mode") or "").lower()
     if mode != "on":
         # `shadow` computes everything and writes nothing. The scores are the point of the
@@ -595,14 +637,20 @@ def _from_match_artifact(bucket, key):
         return {"session": session, "matched": 0, "wouldMatch": len(named),
                 "profiles": len(profiles), "mode": mode or "off"}
 
-    written = invoke_writer({"op": "match_names", "company_id": company_id,
-                             "session_base": session, "results": named}).get("written", 0)
+    # No invoke when there is nothing to write: an empty write is a database round trip
+    # that reports success, and "wrote 0 rows" then looks like "the writer is fine".
+    written = 0
+    if named:
+        written = invoke_writer({"op": "match_names", "company_id": company_id,
+                                 "session_base": session,
+                                 "results": named}).get("written", 0)
     logger.info("match: session=%s named %d of %d turns against %d profiles",
                 session, written, len(out["results"]), len(profiles))
     return {"session": session, "matched": written, "profiles": len(profiles), "mode": mode}
 
 
 def lambda_handler(event, context):
+    _AUDIO_CACHE.clear()
     records = (event or {}).get("Records")
     if records:
         # An S3 event carries `Records`, not `op`. Without this branch the function dies in
