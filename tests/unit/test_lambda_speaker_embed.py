@@ -1337,3 +1337,32 @@ def test_nothing_is_harvested_when_the_anchor_itself_was_refused(stub_embedder,
     # is the observable difference: a refused anchor must not pay for the cluster's audio.
     assert len(candidates_embedded) == 1, (
         "the cluster was embedded for a harvest that could never be stored")
+
+
+def test_the_spread_op_writes_nothing(stub_embedder, monkeypatch):
+    """It exists because the two ops that could otherwise produce this number both have side
+    effects: `enrol` stores the sample when the window passes, and `match` never computes
+    frames at all. A diagnostic that writes is not a diagnostic."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    se._AUDIO_CACHE.clear()
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=30.0)}))
+    called = []
+    monkeypatch.setattr(se, "invoke_writer", lambda p: called.append(p) or {})
+    out = se.lambda_handler({"op": "spread", "user_folder": "Ben_UCPK2",
+                             "date": "2026-08-11",
+                             "source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                             "start_sec": 0.0, "end_sec": 20.0}, None)
+    assert called == [], "a read-only probe invoked the writer"
+    assert out["frames"] >= 2 and out["verdict"] == "homogeneous"
+    assert out["spread"] is not None and out["limit"] == se.vp.DEFAULT_MAX_FRAME_SPREAD
+
+
+def test_the_spread_op_reports_unjudgeable_rather_than_guessing(stub_embedder, monkeypatch):
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    se._AUDIO_CACHE.clear()
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=30.0)}))
+    out = se.lambda_handler({"op": "spread", "user_folder": "Ben_UCPK2",
+                             "date": "2026-08-11",
+                             "source_filename": "x_sid" + "c" * 32 + "_c0000.wav",
+                             "start_sec": 0.0, "end_sec": 4.0}, None)
+    assert out["verdict"] == "unjudgeable" and out["spread"] is None
