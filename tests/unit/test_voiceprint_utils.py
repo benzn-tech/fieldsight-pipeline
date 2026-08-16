@@ -307,11 +307,15 @@ def test_the_verdict_still_agrees_with_the_number():
 
 # ---- every candidate answer, computed once --------------------------------
 #
-# `frame_spread` does not separate one voice from two on real site audio:
-# 13 one-voice windows span 0.429-0.777 and 12 two-voice windows span
-# 0.445-1.022. That is a fact about the statistic, not about the number 0.35,
-# so the alternatives are computed side by side on the same frames and none of
-# them is chosen here.
+# `frame_spread` refuses every window of real site audio at 0.35, so the
+# alternatives are computed side by side on the same frames. None is chosen here,
+# and none has been shown to be better: the analysis that claimed one was rested
+# on a screen that used `pair_max` under another name, on two classes sampled at
+# different frame counts, and on a one-voice class holding one speaker.
+#
+# The property these tests pin is not which candidate wins. It is that each
+# measures what it claims to, so the next comparison is about the data rather
+# than about the arithmetic.
 
 
 def test_a_single_frame_yields_no_statistics_rather_than_invented_ones():
@@ -348,3 +352,40 @@ def test_the_current_statistic_is_reported_unchanged_for_comparison():
     frames = [_v(1.0, 0.0), _v(0.0, 1.0), _v(1.0, 0.0)]
     assert (vp.frame_statistics(frames)["pair_max"]
             == pytest.approx(vp.frame_spread(frames), abs=1e-4))
+
+
+def test_the_cluster_count_is_pair_max_under_another_name():
+    """`clusters` is NOT independent evidence about `pair_max`, and treating it as such
+    invalidated a whole evening's calibration.
+
+    `cluster_turns` is complete linkage, whose merge criterion IS the max over all pairs, so
+    a set stays one cluster exactly while that max is within tau. Using `clusters` to screen
+    a dataset being calibrated on `pair_max` is therefore circular — it discards the largest
+    values and then reports that the rest are well behaved.
+
+    Pinned rather than written down, because the docstring said "computed side by side" and
+    that reads like independence.
+    """
+    rng = np.random.default_rng(11)
+    for _ in range(200):
+        frames = [rng.normal(size=192) for _ in range(int(rng.integers(2, 7)))]
+        stats = vp.frame_statistics(frames)
+        assert (stats["clusters"] == 1) is (stats["pair_max"] <= vp.DEFAULT_CLUSTER_TAU), (
+            "clusters and pair_max disagreed — if this ever fails the two have become "
+            "genuinely independent and the calibration argument changes")
+
+
+def test_every_candidate_but_the_cluster_count_grows_with_frame_count():
+    """Why two classes sampled at different window lengths cannot be compared directly.
+
+    More frames means more pairs — 3 frames give 3, 4 give 6 — and a maximum over more draws
+    is larger whatever is speaking. A comparison that does not hold the frame count fixed is
+    partly measuring window length, which is how a threshold appeared to exist where none
+    had been shown.
+    """
+    rng = np.random.default_rng(3)
+    pool = [rng.normal(size=192) for _ in range(8)]
+    small = vp.frame_statistics(pool[:3])
+    large = vp.frame_statistics(pool)
+    assert large["pair_max"] >= small["pair_max"]
+    assert large["frames"] > small["frames"]
