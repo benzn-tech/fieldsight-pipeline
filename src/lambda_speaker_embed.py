@@ -761,6 +761,30 @@ def _from_match_artifact(bucket, key):
     return {"session": session, "matched": written, "profiles": len(profiles), "mode": mode}
 
 
+def _spread(event):
+    """The frame spread of one window, and nothing else. Read-only.
+
+    Exists because the two ops that CAN produce this number both have side effects: `enrol`
+    stores the sample when the window passes, and `match` never computes frames at all. So
+    measuring the threshold with either meant either writing junk rows or not measuring.
+
+    Whether 0.35 suits site audio is an open question — three enrolments have been refused,
+    one of them a 14.7 s window inside a single chunk, which is the shape enrolment is meant
+    to accept. This is how that question gets data instead of opinions.
+    """
+    start, end = float(event["start_sec"]), float(event["end_sec"])
+    key, clip, sr = _window_audio(event["user_folder"], event["date"],
+                                  event["source_filename"], start, end)
+    frames = [embed_audio(f, sr) for f in _frames(clip, sr)]
+    spread = vp.frame_spread(frames)
+    verdict = vp.window_is_homogeneous(frames)
+    return {"s3_key": key, "seconds": round(end - start, 2), "frames": len(frames),
+            "spread": None if spread is None else round(float(spread), 4),
+            "limit": vp.DEFAULT_MAX_FRAME_SPREAD,
+            "verdict": "homogeneous" if verdict is True
+                       else ("mixed" if verdict is False else "unjudgeable")}
+
+
 def lambda_handler(event, context):
     _AUDIO_CACHE.clear()
     records = (event or {}).get("Records")
@@ -783,4 +807,6 @@ def lambda_handler(event, context):
         return _enrol(event)
     if op == "match":
         return _match(event)
-    raise ValueError(f"unknown op {op!r} — expected 'enrol' or 'match'")
+    if op == "spread":
+        return _spread(event)
+    raise ValueError(f"unknown op {op!r} — expected 'enrol', 'match' or 'spread'")
