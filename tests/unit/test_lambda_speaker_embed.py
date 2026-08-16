@@ -1537,3 +1537,90 @@ def test_the_tail_frame_is_still_gated_on_speech():
     audio = np.concatenate([_tone(12.0, sr), np.zeros(int(2.9 * sr), dtype=np.float32)])
     frames = se._frames(audio, sr)
     assert all(se._dbfs(f) >= se.FRAME_MIN_DBFS for f in frames)
+
+
+# ---- the one function every other test stubs ------------------------------
+
+
+def test_the_writers_answer_is_returned_not_boto3s_envelope(monkeypatch):
+    """`invoke_writer` returned boto3's response dict — StatusCode, ExecutedVersion,
+    Payload — and every caller read it as the writer's result.
+
+    `.get("profiles")` was therefore always None, so the matcher's "no consented profiles"
+    early return fired on EVERY run and logged a line that reads as "nobody has enrolled
+    yet". The whole match path was inert in production while 3158 tests passed, because
+    every one of them replaces this function with a stub that returns a plain dict.
+    """
+    import io as _io
+
+    class FakeLambda:
+        def invoke(self, **kw):
+            return {"StatusCode": 200, "ExecutedVersion": "$LATEST",
+                    "Payload": _io.BytesIO(json.dumps(
+                        {"profiles": [{"person_key": "vp-1"}], "written": 3}).encode())}
+
+    import boto3
+    monkeypatch.setattr(boto3, "client", lambda *_a, **_k: FakeLambda())
+    out = se.invoke_writer({"op": "profiles", "company_id": "co-1"})
+    assert out.get("profiles") == [{"person_key": "vp-1"}]
+    assert out.get("written") == 3
+
+
+def test_an_empty_writer_response_is_a_dict_not_a_crash(monkeypatch):
+    import io as _io
+
+    class FakeLambda:
+        def invoke(self, **kw):
+            return {"StatusCode": 200, "Payload": _io.BytesIO(b"")}
+
+    import boto3
+    monkeypatch.setattr(boto3, "client", lambda *_a, **_k: FakeLambda())
+    assert se.invoke_writer({"op": "match_names"}) == {}
+
+
+def test_a_writer_failure_still_raises_rather_than_returning_nothing(monkeypatch):
+    import io as _io
+
+    class FakeLambda:
+        def invoke(self, **kw):
+            return {"FunctionError": "Unhandled", "Payload": _io.BytesIO(b'{"err":1}')}
+
+    import boto3
+    monkeypatch.setattr(boto3, "client", lambda *_a, **_k: FakeLambda())
+    with pytest.raises(RuntimeError):
+        se.invoke_writer({"op": "propagation"})
+
+
+# ---- harvest must pair a vector with the turn it came from ----------------
+
+
+def test_an_unreadable_turn_does_not_shift_every_later_pairing(stub_embedder, monkeypatch):
+    """`vectors` and `refs` skipped unreadable turns while harvest indexed `usable` with the
+    same subscript. After ONE skip, `usable[i]` was a different turn from `vectors[i]`, so
+    the homogeneity guard ran on one window's audio while another window's embedding was
+    stored under its s3_key — a profile poisoned with someone else's voice, and provenance
+    pointing at audio that never produced the vector."""
+    import turn_name_overlay as tno
+    sid = "sid" + "c" * 32
+    ok_key = f"users/u/audio/2026-08-13/good_{sid}_c0000.wav"
+    se._AUDIO_CACHE.clear()
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({ok_key: _wav_bytes(seconds=60.0)}))
+
+    turns = [{"source_filename": f"missing_{sid}_c0009.wav",  # no audio -> skipped
+              "start_sec": 0.0, "end_sec": 12.0},
+             {"source_filename": f"good_{sid}_c0000.wav", "start_sec": 0.0, "end_sec": 12.0},
+             {"source_filename": f"good_{sid}_c0000.wav", "start_sec": 20.0, "end_sec": 32.0},
+             {"source_filename": f"good_{sid}_c0000.wav", "start_sec": 40.0, "end_sec": 52.0}]
+    harvest = []
+    se._propagate("u", "2026-08-13", turns, np.ones(192, dtype=np.float32), "Ben L",
+                  tno.turn_ref(f"good_{sid}_c0000.wav", 0.0),
+                  harvest=harvest)
+    assert harvest, "nothing was offered for harvest; the test proves nothing"
+    for h in harvest:
+        expected = tno.turn_ref(h["turn"]["source_filename"],
+                                              h["turn"]["start_sec"])
+        assert h["turn_ref"] == expected, (
+            "the turn and the reference disagree — a vector would be stored against "
+            "another window's audio")
+        assert "missing" not in h["turn"]["source_filename"], \
+            "a turn whose audio could not be read was offered for harvest"
