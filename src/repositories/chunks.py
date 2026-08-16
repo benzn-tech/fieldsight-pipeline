@@ -151,9 +151,24 @@ def restore_chunks_for_batch(conn, batch_id) -> int:
     """
     cols = ("id, site_id, user_id, source_s3_key, topic_id, report_date, "
             "chunk_type, chunk_text, embedding, metadata, created_at")
+    # `topic_id` is resolved through `topics` instead of copied, and the reason is a clock:
+    # `report_chunks.topic_id` is `REFERENCES topics(id) ON DELETE SET NULL`, but the
+    # archive is `LIKE report_chunks`, which copies no foreign keys. While a chunk waits in
+    # the archive the nightly ingest hard-deletes and rebuilds that day's topics
+    # (`delete_topics_for_source`, whose own comment says "always"), and nothing nulls the
+    # archived copy. Re-inserting it then violates the FK and fails the whole undelete —
+    # `revert_batch` with it. Delete works tonight; restore would break one nightly run
+    # later, which is the worst possible schedule for a promise of reversibility.
+    #
+    # The scalar subquery yields NULL for a topic that is gone: not a workaround, but
+    # exactly what ON DELETE SET NULL would have done had the row never left the table.
+    select_cols = ("a.id, a.site_id, a.user_id, a.source_s3_key, "
+                   "(SELECT t.id FROM topics t WHERE t.id = a.topic_id), "
+                   "a.report_date, a.chunk_type, a.chunk_text, a.embedding, "
+                   "a.metadata, a.created_at")
     conn.execute(
         f"INSERT INTO report_chunks ({cols}) "
-        f"SELECT {cols} FROM report_chunks_archive WHERE batch_id=%s "
+        f"SELECT {select_cols} FROM report_chunks_archive a WHERE a.batch_id=%s "
         f"ON CONFLICT (id) DO NOTHING", (batch_id,))
     cur = conn.execute(
         "DELETE FROM report_chunks_archive WHERE batch_id=%s", (batch_id,))
