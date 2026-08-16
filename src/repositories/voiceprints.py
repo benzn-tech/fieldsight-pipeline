@@ -557,3 +557,50 @@ def has_human_sample(conn, company_id, voiceprint_id) -> bool:
         "WHERE company_id = %s AND voiceprint_id = %s AND source = 'correction' LIMIT 1",
         (company_id, voiceprint_id)).fetchone()
     return bool(row)
+
+
+def record_attempt(conn, company_id, voiceprint_id, outcome, detail=None) -> None:
+    """What happened the last time a window was offered to this profile.
+
+    A refusal currently reaches CloudWatch and stops there: the writer returns it, nothing
+    reads the return value, and the person who made the correction was told `enrolment:
+    "requested"`. From outside, a profile with zero samples looks the same whether its
+    enrolment was declined on its merits or the embedder died halfway — both happened on
+    TEST tonight, and both looked identical.
+
+    Written for every attempt, not only failures. "Nothing was ever offered" and "something
+    was offered and refused" are different answers to "why is this profile empty", and only
+    one of them is a bug.
+    """
+    _require_company(company_id)
+    conn.cursor(row_factory=dict_row).execute(
+        "UPDATE speaker_voiceprints "
+        "SET last_attempt_at = now(), last_attempt_outcome = %s, last_attempt_detail = %s "
+        "WHERE company_id = %s AND id = %s",
+        (outcome, detail, company_id, voiceprint_id))
+
+
+def list_profiles(conn, company_id) -> list[dict]:
+    """Every profile this company holds, with enough to explain each one's state.
+
+    There was no read endpoint at all: a profile could be created, refused, and left empty
+    with no way to look at it short of the database. `samples` is the number that matters —
+    a named profile with zero of them names nobody — and `human_samples` separates what a
+    person vouched for from what the clustering suggested, which is the distinction the whole
+    harvest design rests on.
+
+    Vectors are deliberately absent. They are biometric data and nothing in a listing needs
+    them; the one place they may travel is the synchronous fetch the matcher makes.
+    """
+    _require_company(company_id)
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT p.id, p.display_name, p.status, p.user_id, p.consent_at, p.consented_by, "
+        "       p.linked_on, p.linked_at, "
+        "       p.last_attempt_at, p.last_attempt_outcome, p.last_attempt_detail, "
+        "       count(s.id) AS samples, "
+        "       count(s.id) FILTER (WHERE s.source = 'correction') AS human_samples "
+        "FROM speaker_voiceprints p "
+        "LEFT JOIN speaker_voiceprint_samples s ON s.voiceprint_id = p.id "
+        "WHERE p.company_id = %s "
+        "GROUP BY p.id ORDER BY p.created_at DESC",
+        (company_id,)).fetchall()

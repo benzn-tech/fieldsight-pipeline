@@ -787,7 +787,9 @@ def test_no_enrolment_means_no_vector_in_the_payload(stub_embedder, monkeypatch)
     sent = {}
     monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
     se.lambda_handler(_s3_event(key), None)
-    assert not sent.get("enrol")
+    # No enrolment was ASKED FOR here — no consent — which is a different thing from one
+    # asked for and refused. Neither may carry a vector; only the second carries a reason.
+    assert sent.get("enrol") is None
 
 
 # ---- the guard the enrolment path was routing around --------------------
@@ -827,7 +829,10 @@ def test_a_window_holding_two_voices_is_not_enrolled(monkeypatch):
         return v
     monkeypatch.setattr(se, "embed_audio", embed)
     se.lambda_handler(_s3_event(key), None)
-    assert not sent.get("enrol"), (
+    # A refused enrolment is no longer None: it carries the REASON, so the writer can put
+    # it on the profile. What must never appear is an embedding — that is the thing whose
+    # storage cannot be undone.
+    assert not (sent.get("enrol") or {}).get("embedding"), (
         "a window that may hold two voices was stored as one person's profile, and a "
         "profile cannot be un-poisoned")
 
@@ -845,7 +850,8 @@ def test_a_window_too_short_to_judge_is_not_enrolled(stub_embedder, monkeypatch)
     sent = {}
     monkeypatch.setattr(se, "invoke_writer", lambda p: sent.update(p) or {})
     se.lambda_handler(_s3_event(key), None)
-    assert not sent.get("enrol")
+    assert not (sent.get("enrol") or {}).get("embedding")
+    assert (sent.get("enrol") or {}).get("refused")
 
 
 def test_the_turn_names_still_land_when_the_enrolment_is_refused(stub_embedder,
@@ -908,7 +914,10 @@ def test_a_window_propagation_refused_is_not_enrolled_either(monkeypatch):
     se.lambda_handler(_s3_event(key), None)
     assert [r for r in sent["results"] if not r.get("asserted")] == [], (
         "propagation did not refuse; this test is no longer about what it says it is")
-    assert not sent.get("enrol"), (
+    # A refused enrolment is no longer None: it carries the REASON, so the writer can put
+    # it on the profile. What must never appear is an embedding — that is the thing whose
+    # storage cannot be undone.
+    assert not (sent.get("enrol") or {}).get("embedding"), (
         "the window propagation would not trust was stored as somebody's voiceprint")
 
 
@@ -1347,7 +1356,8 @@ def test_nothing_is_harvested_when_the_anchor_itself_was_refused(stub_embedder,
     monkeypatch.setattr(se, "invoke_writer", lambda p: seen.append(p) or {"written": 0})
     se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
                                            "object": {"key": art}}}]}, None)
-    assert seen[0]["enrol"] is None, "the anchor was not refused; the test proves nothing"
+    assert (seen[0]["enrol"] or {}).get("refused"),         "the anchor was not refused; the test proves nothing"
+    assert not (seen[0]["enrol"] or {}).get("embedding")
     assert seen[0]["harvest"] == []
     # Two guards stand here on purpose — the admission pass is skipped AND the payload
     # refuses to carry it — so removing either alone leaves the outcome unchanged. That is

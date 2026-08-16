@@ -672,7 +672,13 @@ def _from_request_artifact(bucket, key):
                            len(frames),
                            "n/a" if spread is None else "%.3f" % spread,
                            vp.DEFAULT_MAX_FRAME_SPREAD)
-            enrol = None
+            # Carried to the writer rather than only logged. The DB half is the only one
+            # that can attach this to the profile, and without it a refusal ends in
+            # CloudWatch while the person who made the correction is told "requested".
+            enrol = {"voiceprint_id": enrol["voiceprint_id"],
+                     "refused": ("this window does not hold one voice"
+                                 if verdict is False
+                                 else "this window has too little speech to judge")}
         elif refusal == "between-voices":
             # Propagation judged this window to hold more than one voice. Storing it as
             # somebody's profile would be disbelieving that in one direction and acting on
@@ -685,11 +691,15 @@ def _from_request_artifact(bucket, key):
             # it was permanently refused with a log line claiming the window was untrustworthy.
             logger.warning("enrolment refused: the corrected window holds more than one "
                            "voice")
-            enrol = None
+            enrol = {"voiceprint_id": enrol["voiceprint_id"],
+                     "refused": "the corrected passage holds more than one voice"}
     # AFTER the anchor's own checks, never before. `_propagate` runs first, so without this
     # ordering six samples would be stored for a profile whose own corrected window had just
     # been judged to hold two voices — the exact condition one sample is refused for.
-    harvested = _admit_harvest(folder, date, candidates) if enrol else []
+    # A refused anchor is still an `enrol` dict now — it carries the reason — so harvest
+    # must ask whether it was ACCEPTED, not whether it exists.
+    harvested = (_admit_harvest(folder, date, candidates)
+                 if enrol and not enrol.get("refused") else [])
 
     payload = {
         "op": "propagation",
@@ -704,10 +714,11 @@ def _from_request_artifact(bucket, key):
         # and the rejection guard it feeds were unreachable code, and nothing failed — each
         # end's tests exercised its own half.
         "label_map": req.get("label_map"),
-        "enrol": ({"voiceprint_id": enrol["voiceprint_id"],
-                   "embedding": [float(x) for x in v],
-                   "s3_key": s3_key, "window": [start, end],
-                   "created_by": req.get("requested_by")} if enrol else None),
+        "enrol": (enrol if (enrol or {}).get("refused") else
+                  ({"voiceprint_id": enrol["voiceprint_id"],
+                    "embedding": [float(x) for x in v],
+                    "s3_key": s3_key, "window": [start, end],
+                    "created_by": req.get("requested_by")} if enrol else None)),
         # A LIST, and a separate key. Not the same act as the anchor: the anchor is what a
         # person vouched for, these are what the clustering suggested, and the two
         # populations must stay separable forever — for audit, for measurement, and so a bad

@@ -35,8 +35,11 @@ class FakeConn:
 
 @pytest.fixture
 def calls(monkeypatch):
-    seen = {"turns": [], "samples": []}
+    seen = {"turns": [], "samples": [], "attempts": []}
     monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "record_attempt",
+                        lambda conn, co, vp, outcome, detail=None:
+                        seen["attempts"].append((outcome, detail)))
     monkeypatch.setattr(vw, "record_turn_name",
                         lambda conn, company_id, **kw: seen["turns"].append(kw) or {"id": "t"})
     monkeypatch.setattr(vw, "add_sample",
@@ -230,6 +233,7 @@ def test_the_names_and_the_sample_land_in_one_transaction(monkeypatch):
             conns.append(self)
             return self
     monkeypatch.setattr(vw, "get_connection", lambda: C())
+    monkeypatch.setattr(vw, "record_attempt", lambda *a, **k: None)
     seen = []
     monkeypatch.setattr(vw, "record_turn_name",
                         lambda conn, company_id, **kw: seen.append(("turn", conn)) or {"id": "t"})
@@ -530,6 +534,7 @@ def test_one_refused_harvest_sample_does_not_discard_the_others(monkeypatch):
         return {"id": "s"}
 
     monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "record_attempt", lambda *a, **k: None)
     monkeypatch.setattr(vw, "record_turn_name", lambda conn, co, **kw: {"id": "t"})
     monkeypatch.setattr(vw, "add_sample", add)
     out = vw.lambda_handler(_harvest_event(n=3), None)
