@@ -550,3 +550,53 @@ def test_a_harvest_without_an_anchor_stores_nothing(calls):
     out = vw.lambda_handler(_harvest_event(enrol=None), None)
     assert out["harvested"] == 0
     assert calls["samples"] == []
+
+
+# ---- the writer must survive every shape the embedder can send ------------
+#
+# A refused enrolment is a NEW event shape: `{"voiceprint_id": ..., "refused":
+# "<reason>"}` with no embedding. The embedder's tests assert it SENDS that shape.
+# Nothing asserted this half could receive it, and the first version crashed on
+# every refusal in production while all 3106 unit tests stayed green.
+
+
+def _refused_event(reason="this window does not hold one voice"):
+    return {"op": "propagation", "company_id": CO, "session_base": "s1",
+            "correction_ref": "corr-1",
+            "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed", "asserted": True}],
+            "enrol": {"voiceprint_id": "vp-1", "refused": reason}}
+
+
+def test_a_refused_enrolment_does_not_crash_the_writer(calls):
+    out = vw.lambda_handler(_refused_event(), None)
+    assert out["written"] == 1
+    assert out["enrolled"] is False
+
+
+def test_a_refused_enrolment_stores_no_sample(calls):
+    vw.lambda_handler(_refused_event(), None)
+    assert calls["samples"] == [], "a window the embedder refused was stored anyway"
+
+
+def test_the_reason_reaches_the_profile(calls):
+    """Otherwise it exists only in a log line nobody correlates with the empty profile."""
+    vw.lambda_handler(_refused_event("this window has too little speech to judge"), None)
+    assert ("refused", "this window has too little speech to judge") in calls["attempts"]
+
+
+def test_a_stored_enrolment_is_recorded_as_stored(calls):
+    vw.lambda_handler({
+        "op": "propagation", "company_id": CO, "session_base": "s1",
+        "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed", "asserted": True}],
+        "enrol": {"voiceprint_id": "vp-1", "embedding": [0.1] * 192,
+                  "s3_key": "k", "window": [0.0, 20.0]}}, None)
+    assert ("stored", None) in calls["attempts"], (
+        "only failures are recorded, so 'nothing was ever offered' and 'something was "
+        "offered and refused' stay indistinguishable")
+
+
+def test_the_names_still_land_when_the_enrolment_was_refused(calls):
+    """The names describe THIS meeting and were earned by the user's own assertion. Only the
+    half that stores biometric data was refused."""
+    vw.lambda_handler(_refused_event(), None)
+    assert len(calls["turns"]) == 1
