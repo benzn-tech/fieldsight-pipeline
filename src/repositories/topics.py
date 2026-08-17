@@ -114,6 +114,22 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
     return topic
 
 
+# A CHILD table's exclusion correlates on the child's OWN `topic_id`, never on a `topics`
+# alias -- `FROM action_items` and `FROM topic_photos` have no such alias in scope, and
+# Postgres resolves that at analysis time: `missing FROM-clause entry for table "t"`, every
+# call, not a weak filter but a crash. Two inlined copies said `t.id` and both were live
+# (`/live-items` and the reindex) until a real database was finally asked.
+#
+# Parameterised on the alias for the same reason `deleted_predicates` exists at all: the
+# eleven inlined copies in this file are what the unused `_visible()` helper was written to
+# prevent, and a copy that names the wrong table is exactly how one drifts.
+CHILD_OF_VISIBLE_TOPIC = (
+    "NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' "
+    "AND r.target_id = {alias}.topic_id AND r.scope = 'deleted' "
+    "AND r.reverted_at IS NULL)"
+)
+
+
 def _visible(sql: str, alias: str = "topics") -> str:
     """Append the deleted-topic exclusion to a SELECT.
 
@@ -412,7 +428,8 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
     action_items_by_topic = {}
     for a in conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, text, responsible, deadline, priority, status, created_at "
-        "FROM action_items WHERE topic_id = ANY(%s) AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = t.id AND r.scope = 'deleted' AND r.reverted_at IS NULL) ORDER BY created_at",
+        "FROM action_items WHERE topic_id = ANY(%s) AND "
+        + CHILD_OF_VISIBLE_TOPIC.format(alias="action_items") + " ORDER BY created_at",
         (topic_ids,),
     ).fetchall():
         action_items_by_topic.setdefault(a["topic_id"], []).append(a)
@@ -653,7 +670,9 @@ def get_topic_full(conn, topic_id) -> dict | None:
     t["findings"] = findings.list_for_topics(conn, tids)
     t["photos"] = conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, s3_key, caption_text FROM topic_photos "
-        "WHERE topic_id = ANY(%s) AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = t.id AND r.scope = 'deleted' AND r.reverted_at IS NULL) ORDER BY created_at", (tids,)).fetchall()
+        "WHERE topic_id = ANY(%s) AND "
+        + CHILD_OF_VISIBLE_TOPIC.format(alias="topic_photos")
+        + " ORDER BY created_at", (tids,)).fetchall()
     return t
 
 
