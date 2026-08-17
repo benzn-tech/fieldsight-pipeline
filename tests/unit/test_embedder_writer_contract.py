@@ -263,3 +263,49 @@ def test_the_admitted_limit_reaches_the_column_it_is_stored_in(monkeypatch):
     # re-examining rather than every row ever written.
     monkeypatch.setattr(se, "MAX_FRAME_SPREAD", se.vp.DEFAULT_MAX_FRAME_SPREAD)
     assert se._admitted_limit() is None
+
+
+def test_no_field_crosses_this_seam_unread_in_either_direction():
+    """The census, kept as a test so it cannot quietly stop being true.
+
+    Three defects tonight were one shape on this one seam: a value computed on one side and
+    discarded on the other. `invoke_writer` returned boto3's envelope, so `profiles` was
+    always None and the match path was inert in production. `inherited` was read as
+    `written`, which is structurally zero on the branch that reads it. And the writer's whole
+    reply was thrown away on the correction path, where the log line is the only production
+    signal because Lambda discards what an event-driven invocation returns.
+
+    Each was found by asking the same question of one more field. This asks it of all of
+    them at once, so the fourth instance fails here instead of in production.
+
+    The four exceptions are deliberate and documented: `score`, `margin`,
+    `label_disagreement` and the top-level `voiceprint_id` fallback are read by the writer
+    and sent by nobody. Their columns exist (0040) and a matcher-driven propagation would
+    fill them. They are listed by name rather than skipped by a pattern, so adding a fifth is
+    a decision somebody makes here rather than an omission.
+    """
+    import re
+
+    emb = open("src/lambda_speaker_embed.py", encoding="utf-8").read()
+    wr = open("src/lambda_voiceprint_writer.py", encoding="utf-8").read()
+
+    # --- embedder -> writer: every key sent must be read -------------------
+    block = emb[emb.index("    payload = {"):]
+    block = block[:block.index("invoke_writer(payload)")]
+    sent = set(re.findall(r'^\s{8}"(\w+)":', block, re.M))
+    assert "label_map" in sent, "the payload block moved; this test reads it by position"
+    for key in sent:
+        read = (re.search(r'\.get\("%s"\)|\["%s"\]|_require\(event, "%s"\)' % (key, key, key),
+                          wr) is not None)
+        assert read, f"the embedder sends {key!r} and the writer never reads it"
+
+    # --- writer -> embedder: every key returned must be read ---------------
+    returned = set()
+    for m in re.finditer(r'return \{("(?:\w+)":[^}]*)\}', wr):
+        returned |= set(re.findall(r'"(\w+)":', m.group(1)))
+    callers = emb + open("src/lambda_org_api.py", encoding="utf-8").read()
+    # `stored` and `reason` belong to the writer's `enrol` op, which has no production
+    # caller — recorded in its own docstring. Reading them would mean wiring that op.
+    for key in returned - {"stored", "reason"}:
+        read = re.search(r'\.get\("%s"|\["%s"\]' % (key, key), callers) is not None
+        assert read, f"the writer returns {key!r} and no caller reads it"

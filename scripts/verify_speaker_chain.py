@@ -26,6 +26,14 @@ distinction rather than a tick:
 * **whether "nothing was named" means "no profiles" or "profiles were not delivered"** —
   the #539 distinction. If profiles exist and the match still names nothing, that is the
   interesting failure and this says so in those words.
+* **whether anything is listening on `voiceprint_requests/`** — that notification is
+  hand-wired outside the template (BUG-33). Lose it and `speaker-match` still answers 202,
+  artifacts pile up, and nothing runs, with no in-band symptom at all: the transcript simply
+  never gains a name, which looks exactly like the matcher receiving no profiles.
+* **the mode, before judging by names** — `shadow` computes every score and writes nothing,
+  by design, and `on` is prohibited until a margin is calibrated. Judging shadow by "did the
+  named count go up" would report the designed behaviour as defect #539 on every permitted
+  configuration.
 * **the asynchronous part, waited out** — match is queued through an S3 artifact and the
   embedder has taken 138 seconds on a real session. Reading the transcript once, straight
   after the POST, and concluding "it did not happen" is a mistake I have actually made here.
@@ -37,7 +45,9 @@ script that implied otherwise would be worse than no script.
 """
 import argparse
 import json
+import os
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -52,15 +62,28 @@ def _aws(args):
     return r.stdout, None
 
 
+def _scratch(name):
+    """A lambda payload/response path OUTSIDE the repository.
+
+    This script used to write `_vsc.json` and `_vsc.json.out` into the repo root, and its
+    response half is the worst of the family: `GET /api/org/voiceprints` returns people's
+    display names, and the transcript read returns their words. Two consequences, and
+    .gitignore only addresses the first: an untracked file one `git add -A` away from being
+    committed, and a file inside a Dropbox-synced directory, which syncs regardless of git.
+    """
+    return os.path.join(tempfile.gettempdir(), name)
+
+
 def _invoke(function, payload, scratch="_vsc.json"):
-    with open(scratch, "w", encoding="utf-8") as fh:
+    path = _scratch(scratch)
+    with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
     out, err = _aws(["lambda", "invoke", "--function-name", function,
                      "--cli-binary-format", "raw-in-base64-out",
-                     "--payload", f"file://{scratch}", scratch + ".out"])
+                     "--payload", "file://" + path, path + ".out"])
     if err:
         return None, err
-    with open(scratch + ".out", encoding="utf-8") as fh:
+    with open(path + ".out", encoding="utf-8") as fh:
         return json.load(fh), None
 
 
@@ -106,6 +129,33 @@ def deployed_settings(env):
     return {"mode": mode,
             "max_frame_spread": embed.get("VOICEPRINT_MAX_FRAME_SPREAD",
                                           "(unset -> 0.35)")}, None
+
+
+def trigger_is_wired(env):
+    """Is anything actually listening on `voiceprint_requests/`?
+
+    This notification is hand-wired outside the template (BUG-33) — `SpeakerEmbedFunction`
+    carries no S3 event of its own. If it is ever lost, `speaker-match` still answers 202,
+    artifacts pile up in the bucket, and nothing runs. There is no in-band symptom: the
+    transcript simply never gains a name, which is indistinguishable from the matcher
+    receiving no profiles, and this script would then send the reader to defect #539 — the
+    wrong bug entirely.
+
+    Checked here because a script whose stated purpose is telling apart indistinguishable
+    failures has no business leaving one of them out.
+    """
+    bucket = ("fieldsight-data-test-509194952652" if env == "test"
+              else "fieldsight-data-509194952652")
+    out, err = _aws(["s3api", "get-bucket-notification-configuration", "--bucket", bucket,
+                     "--output", "json"])
+    if err:
+        return None, err
+    cfg = json.loads(out or "{}") or {}
+    for entry in cfg.get("LambdaFunctionConfigurations") or []:
+        rules = (entry.get("Filter") or {}).get("Key", {}).get("FilterRules") or []
+        if any("voiceprint_requests" in str(r.get("Value", "")) for r in rules):
+            return entry.get("LambdaFunctionArn", "").split(":")[-1] or True, None
+    return False, None
 
 
 def named_turns(env, sub, user, date):
@@ -155,6 +205,18 @@ def main():
         print("  under it are not evidence that the window held one voice; each carries the")
         print("  limit it came in under in speaker_voiceprint_samples.admitted_max_spread.")
 
+    wired, err = trigger_is_wired(args.env)
+    if err:
+        print(f"  S3 trigger on voiceprint_requests/: could not check ({err[:80]})")
+    elif wired:
+        print(f"  S3 trigger on voiceprint_requests/  -> {wired}")
+    else:
+        print("\n  NO S3 NOTIFICATION on voiceprint_requests/. Every request below will be")
+        print("  accepted with a 202, write its artifact, and never be picked up. This")
+        print("  notification is hand-wired outside the template (BUG-33), so it can be lost")
+        print("  by a bucket-level change nobody connected to this feature. Fix it before")
+        print("  reading anything further as evidence about the matcher.")
+
     print("\n== profiles ==")
     got, err = _api(args.env, args.sub, "GET", "/voiceprints")
     if err:
@@ -187,14 +249,32 @@ def main():
         return 0
 
     print(f"\n== queueing a match for {args.session} ==")
+    # `--user`, NOT an empty body. `_resolve_org_media_folder` falls back to the CALLER's own
+    # folder when `user` is absent, so an empty body made a manager verify their own
+    # transcripts: no turns for the requested session, 409, and the script reported "refused"
+    # for the one flow it exists to check. It could never have passed.
     queued, err = _api(args.env, args.sub, "POST",
-                       f"/sessions/{args.session}/speaker-match", body={})
+                       f"/sessions/{args.session}/speaker-match",
+                       body={"user": args.user})
     if err:
         print(f"  refused: {err}")
         return 2
     print(f"  {queued.get('turnsQueued')} turns in {queued.get('runs')} run(s), "
           f"mode={queued.get('mode')}, willWriteNames={queued.get('willWriteNames')}, "
           f"siteId={queued.get('siteId')}")
+
+    # `shadow` computes every score and writes NOTHING — that is the mode's purpose, and
+    # `on` is prohibited until a margin is calibrated, so shadow is the only mode this can
+    # currently run against with the feature enabled. Judging it by "did the named count go
+    # up" would report the designed behaviour as defect #539 on every permitted
+    # configuration: a manufactured alarm pointing at a bug that was already fixed.
+    if not queued.get("willWriteNames"):
+        print()
+        print("  Mode is not `on`, so the matcher writes no names by design. Nothing about")
+        print("  the transcript can change, and waiting for it to would prove nothing. Read")
+        print("  the embedder's log for `match(shadow): ... would name N of M` — that count")
+        print("  is what this mode exists to produce, and it is the number to calibrate on.")
+        return 0
 
     # Waited out, not sampled once. The embedder has taken 138 s on a real session, and
     # reading straight after the POST and calling it "did not happen" is a mistake made here
