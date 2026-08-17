@@ -103,9 +103,14 @@ def test_an_update_with_no_fields_writes_nothing(db):
     pid = db.execute(
         "INSERT INTO programmes (site_id, name) VALUES (%s,'P2') RETURNING id",
         (sid,)).fetchone()[0]
+    # `source_task_id` is not optional for an imported row: 0027 carries a table-level
+    # CHECK pairing origin with it (local => NULL, imported => NOT NULL). My first version
+    # of this fixture omitted it and the INSERT was refused -- by the database, on the
+    # first real run, which is the point of running these here.
     tid = db.execute(
-        "INSERT INTO programme_tasks (programme_id, origin, name, first_seen_version) "
-        "VALUES (%s,'imported','Untouched',1) RETURNING id", (pid,)).fetchone()[0]
+        "INSERT INTO programme_tasks (programme_id, origin, source_task_id, name, "
+        "first_seen_version) VALUES (%s,'imported','T-2','Untouched',1) RETURNING id",
+        (pid,)).fetchone()[0]
 
     out = programme_import.apply_plan(
         db, pid, {"insert": [], "remove": [], "update": [{"id": tid, "fields": {}}]},
