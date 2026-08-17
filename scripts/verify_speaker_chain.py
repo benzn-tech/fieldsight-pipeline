@@ -45,7 +45,9 @@ script that implied otherwise would be worse than no script.
 """
 import argparse
 import json
+import os
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -60,15 +62,28 @@ def _aws(args):
     return r.stdout, None
 
 
+def _scratch(name):
+    """A lambda payload/response path OUTSIDE the repository.
+
+    This script used to write `_vsc.json` and `_vsc.json.out` into the repo root, and its
+    response half is the worst of the family: `GET /api/org/voiceprints` returns people's
+    display names, and the transcript read returns their words. Two consequences, and
+    .gitignore only addresses the first: an untracked file one `git add -A` away from being
+    committed, and a file inside a Dropbox-synced directory, which syncs regardless of git.
+    """
+    return os.path.join(tempfile.gettempdir(), name)
+
+
 def _invoke(function, payload, scratch="_vsc.json"):
-    with open(scratch, "w", encoding="utf-8") as fh:
+    path = _scratch(scratch)
+    with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
     out, err = _aws(["lambda", "invoke", "--function-name", function,
                      "--cli-binary-format", "raw-in-base64-out",
-                     "--payload", f"file://{scratch}", scratch + ".out"])
+                     "--payload", "file://" + path, path + ".out"])
     if err:
         return None, err
-    with open(scratch + ".out", encoding="utf-8") as fh:
+    with open(path + ".out", encoding="utf-8") as fh:
         return json.load(fh), None
 
 
