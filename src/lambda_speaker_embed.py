@@ -856,10 +856,33 @@ def _from_request_artifact(bucket, key):
         "harvest": [dict(h, voiceprint_id=enrol["voiceprint_id"],
                          created_by=req.get("requested_by")) for h in harvested],
     }
-    invoke_writer(payload)
-    logger.info("correction applied: session=%s ref=%s audio=%s",
-                req.get("session_base"), turn_ref, s3_key)
-    return {"status": "applied", "turn_ref": turn_ref}
+    # The writer's reply, said out loud. It was discarded, and this line reported that a
+    # correction had been "applied" without any measure of what was applied — while the
+    # return value goes nowhere, because in production this function is only ever driven by
+    # an S3 event and Lambda discards what an event-driven invocation returns.
+    #
+    # So this line was the only production signal for the whole correction, and it could not
+    # tell "named two turns and stored a sample" apart from "named two turns, refused the
+    # enrolment, and harvested nothing". Both read as `correction applied`. The writer logs
+    # its own counts, but in its own log group, which means correlating two functions to
+    # answer the first question anybody asks.
+    reply = invoke_writer(payload) or {}
+    logger.info("correction applied: session=%s ref=%s audio=%s "
+                "named=%d inherited=%d declined=%d enrolled=%s harvested=%d%s",
+                req.get("session_base"), turn_ref, s3_key,
+                reply.get("written", 0), reply.get("inherited", 0),
+                reply.get("declined", 0),
+                reply.get("enrolled") if reply.get("enrolled") is not None else "n/a",
+                reply.get("harvested", 0),
+                # The refusals last, and named, because "no sample was stored" is the
+                # question this feature gets asked about more than any other.
+                (" enrolRefused=%s" % (reply["enrolRefused"] or {}).get("reason")
+                 if reply.get("enrolRefused") else "")
+                + (" harvestRefused=%d" % reply["harvestRefused"]
+                   if reply.get("harvestRefused") else ""))
+    return dict({"status": "applied", "turn_ref": turn_ref},
+                **{k: reply[k] for k in ("written", "inherited", "enrolled", "harvested")
+                   if k in reply})
 
 
 def _from_match_artifact(bucket, key):
