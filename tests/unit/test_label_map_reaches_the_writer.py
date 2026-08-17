@@ -112,3 +112,32 @@ def test_shadow_mode_never_writes_even_to_inherit(monkeypatch):
         "session_base": "s", "mode": "shadow", "turns": [],
         "label_map": [{"turn_ref": "x_c0000@0.0", "label": "spk_0"}]}, profiles=[])
     assert not [p for p in sent if p.get("op") == "match_names"]
+
+
+def test_the_inherited_count_is_reported_not_discarded(monkeypatch):
+    """The writer returns `written` and `inherited` separately, and only `inherited` moves on
+    the no-profiles branch — `results` is empty there by construction, so `written` is
+    structurally zero.
+
+    Reading `written` therefore reported 0 however many turns inheritance actually named. The
+    feature worked and its own log said it had done nothing, which is the shape that sends the
+    next person looking for a defect in the half that was fine.
+    """
+    import lambda_speaker_embed as se
+    import json as _json
+
+    def _writer(payload):
+        if payload.get("op") == "profiles":
+            return {"profiles": []}
+        return {"written": 0, "declined": 0, "inherited": 22}
+
+    monkeypatch.setattr(se, "invoke_writer", _writer)
+    monkeypatch.setattr(se, "_get", lambda k: _json.dumps({
+        "op": "match", "company_id": "co-1", "user_folder": "u", "date": "2026-08-11",
+        "session_base": "s", "mode": "on", "turns": [],
+        "label_map": [{"turn_ref": "x_c0000@0.0", "label": "spk_0"}]}))
+
+    out = se._from_match_artifact("b", "voiceprint_requests/co-1/s/match-1.json")
+    assert out["inherited"] == 22, (
+        "the writer said 22 turns were inherited and the caller reported %r" % out)
+    assert out["matched"] == 0, "no profile matched anything; that must not read as 22"
