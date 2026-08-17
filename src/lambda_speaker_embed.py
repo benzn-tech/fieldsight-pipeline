@@ -298,6 +298,35 @@ def _window_audio(user_folder, date, source_filename, start, end):
 # cannot be about anybody, not frames that are merely quiet.
 FRAME_MIN_DBFS = float(os.environ.get("VOICEPRINT_FRAME_MIN_DBFS", "-55.0"))
 
+# The homogeneity limit, made settable WITHOUT a redeploy — and deliberately not moved.
+#
+# 0.35 was measured on read speech. On site audio it has refused every window ever tried, so
+# no voiceprint can be created and everything downstream of enrolment — matching, automatic
+# naming, harvest — has never run against real data. An evening of measurement produced a
+# candidate number and then three reasons the measurement could not support it (see
+# docs/superpowers/specs/2026-08-17-homogeneity-threshold-measured.md), so the constant stays
+# where it is until somebody measures it properly.
+#
+# What this variable buys is the ability to unblock the path on TEST and find out whether the
+# rest of it works, without shipping a number nobody can defend. PROD leaves it unset and gets
+# `DEFAULT_MAX_FRAME_SPREAD` exactly as before.
+#
+# A guard that can be loosened from outside must SAY when it has been, or the next person
+# reads a successful enrolment as evidence the audio was clean. `_limit_note()` is appended to
+# every enrolment log line, accepted and refused alike — a guard that only speaks when it
+# refuses leaves "it passed" and "it was switched off" looking identical.
+MAX_FRAME_SPREAD = float(os.environ.get("VOICEPRINT_MAX_FRAME_SPREAD",
+                                        str(vp.DEFAULT_MAX_FRAME_SPREAD)))
+
+
+def _limit_note():
+    """Empty when the guard is at its default, loud when it is not."""
+    if MAX_FRAME_SPREAD == vp.DEFAULT_MAX_FRAME_SPREAD:
+        return ""
+    return (" [HOMOGENEITY LIMIT OVERRIDDEN: %.3f, default %.3f — enrolments admitted under "
+            "this limit are not evidence the window held one voice]"
+            % (MAX_FRAME_SPREAD, vp.DEFAULT_MAX_FRAME_SPREAD))
+
 
 def _dbfs(frame):
     arr = np.asarray(frame, dtype=np.float32)
@@ -347,15 +376,21 @@ def _enrol(event):
     key, clip, sr = _window_audio(event["user_folder"], event["date"],
                                   event["source_filename"], start, end)
 
-    verdict = vp.window_is_homogeneous([embed_audio(f, sr) for f in _frames(clip, sr)])
+    verdict = vp.window_is_homogeneous([embed_audio(f, sr) for f in _frames(clip, sr)],
+                                       MAX_FRAME_SPREAD)
     if verdict is not True:
         # None ("could not check") is refused alongside False. Treating them alike in the
         # permissive direction is how a guard becomes decoration.
         reason = ("window is not homogeneous — it may hold more than one voice"
                   if verdict is False else
                   "window too short to check homogeneity — refusing rather than assuming")
-        logger.warning("enrol refused for %s [%s-%s]: %s", key, start, end, reason)
+        logger.warning("enrol refused for %s [%s-%s]: %s%s", key, start, end, reason,
+                       _limit_note())
         return {"status": "refused", "reason": reason, "s3_key": key}
+
+    # A line on the accepting path too. 1078 uploads once produced zero log lines because
+    # only the failure branch spoke, and "it passed" and "it never ran" looked the same.
+    logger.info("enrol accepted for %s [%s-%s]%s", key, start, end, _limit_note())
 
     # Returned, not stored. The in-VPC writer persists it into the column that already
     # requires consent, so the vector never lands in S3 — the biometric-residence defect
@@ -605,15 +640,19 @@ def _admit_harvest(folder, date, candidates):
         key, clip, sr = _window_audio(folder, date, t["source_filename"], start, end)
         frames = [embed_audio(f, sr) for f in _frames(clip, sr)]
         spread = vp.frame_spread(frames)
-        verdict = vp.window_is_homogeneous(frames)
+        verdict = vp.window_is_homogeneous(frames, MAX_FRAME_SPREAD)
         if verdict is not True:
             # None ("could not check") refused alongside False, exactly as the anchor's own
             # check does. Admitting the unjudgeable is how a guard becomes decoration.
-            logger.info("harvest: %s not admitted (%s, frames=%d spread=%s)",
+            logger.info("harvest: %s not admitted (%s, frames=%d spread=%s)%s",
                         c["turn_ref"],
                         "not homogeneous" if verdict is False else "unjudgeable",
-                        len(frames), "n/a" if spread is None else "%.3f" % spread)
+                        len(frames), "n/a" if spread is None else "%.3f" % spread,
+                        _limit_note())
             continue
+        logger.info("harvest: %s admitted (frames=%d spread=%s)%s", c["turn_ref"],
+                    len(frames), "n/a" if spread is None else "%.3f" % spread,
+                    _limit_note())
         admitted.append({"embedding": [float(x) for x in c["vector"]],
                          "s3_key": key, "window": [start, end]})
         seconds += duration
@@ -685,18 +724,18 @@ def _from_request_artifact(bucket, key):
     if enrol:
         frames = [embed_audio(f, sr) for f in _frames(clip, sr)]
         spread = vp.frame_spread(frames)
-        verdict = vp.window_is_homogeneous(frames)
+        verdict = vp.window_is_homogeneous(frames, MAX_FRAME_SPREAD)
         if verdict is not True:
             # The DISTANCE, not just the verdict. Three windows have now been refused on
             # TEST and every log line said only "not homogeneous" — which cannot be argued
             # with, and cannot tell "this window really holds two people" apart from "0.35
             # was measured on read speech and site audio does not look like that".
-            logger.warning("enrolment refused: %s (frames=%d spread=%s limit=%.2f)",
+            logger.warning("enrolment refused: %s (frames=%d spread=%s limit=%.2f)%s",
                            "window is not homogeneous" if verdict is False
                            else "window too short to check homogeneity",
                            len(frames),
                            "n/a" if spread is None else "%.3f" % spread,
-                           vp.DEFAULT_MAX_FRAME_SPREAD)
+                           MAX_FRAME_SPREAD, _limit_note())
             # Carried to the writer rather than only logged. The DB half is the only one
             # that can attach this to the profile, and without it a refusal ends in
             # CloudWatch while the person who made the correction is told "requested".
@@ -718,6 +757,10 @@ def _from_request_artifact(bucket, key):
                            "voice")
             enrol = {"voiceprint_id": enrol["voiceprint_id"],
                      "refused": "the corrected passage holds more than one voice"}
+        else:
+            logger.info("enrolment accepted (frames=%d spread=%s limit=%.2f)%s", len(frames),
+                        "n/a" if spread is None else "%.3f" % spread, MAX_FRAME_SPREAD,
+                        _limit_note())
     # AFTER the anchor's own checks, never before. `_propagate` runs first, so without this
     # ordering six samples would be stored for a profile whose own corrected window had just
     # been judged to hold two voices — the exact condition one sample is refused for.
@@ -879,7 +922,7 @@ def _spread(event):
     raw = _frames(clip, sr)
     frames = [embed_audio(f, sr) for f in raw]
     spread = vp.frame_spread(frames)
-    verdict = vp.window_is_homogeneous(frames)
+    verdict = vp.window_is_homogeneous(frames, MAX_FRAME_SPREAD)
     # Per-frame loudness, because the leading explanation for a wide spread is that the
     # frames are not all speech. `_frames` cuts every 5 s blind — there is no VAD anywhere
     # in this path — so a frame that is mostly silence gets embedded like any other, and a
@@ -899,7 +942,10 @@ def _spread(event):
             # leave; vectors do not.
             "candidates": vp.frame_statistics(frames),
             "spread": None if spread is None else round(float(spread), 4),
-            "limit": vp.DEFAULT_MAX_FRAME_SPREAD,
+            # The limit IN FORCE, not the compiled-in default. A diagnostic that
+            # reports a limit the function is not using is worse than reporting none.
+            "limit": MAX_FRAME_SPREAD,
+            "default_limit": vp.DEFAULT_MAX_FRAME_SPREAD,
             "frame_dbfs": levels,
             "verdict": "homogeneous" if verdict is True
                        else ("mixed" if verdict is False else "unjudgeable")}

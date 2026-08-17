@@ -220,6 +220,7 @@ jobs:
               "EnableUserDeletion=${{ vars.PROD_ENABLE_USER_DELETION || 'false' }}" \
               "UploadVerifyMode=${{ vars.PROD_UPLOAD_VERIFY_MODE || 'observe' }}" \
               "SpeakerIdentityMode=${{ vars.PROD_SPEAKER_IDENTITY_MODE || 'off' }}" \
+              "VoiceprintMaxFrameSpread=${{ vars.PROD_VOICEPRINT_MAX_FRAME_SPREAD || 'default' }}" \
               "AlertEmail=${{ vars.PROD_ALERT_EMAIL || 'none' }}" \
               "ServerBuild=${{ github.sha }}" \
               "ManageDataBucketPolicy=false" \
