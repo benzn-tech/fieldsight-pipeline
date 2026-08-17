@@ -181,7 +181,12 @@ def test_active_batches_for_day_finds_and_forgets(db):
     redactions.create_recording_tombstone(db, co["id"], prefix, "test", None, "admin",
                                           batch_id=batch)
 
+    # Strings, not UUID objects: `batch_id` is a string everywhere else in this feature,
+    # and a caller comparing the two forms gets False from two values that are the same id.
+    # This assertion caught exactly that on its first real run.
     assert batch in redactions.active_batches_for_day(db, "Folder", DATE)
+    assert all(isinstance(b, str)
+               for b in redactions.active_batches_for_day(db, "Folder", DATE))
     assert redactions.active_batches_for_day(db, "Folder", DATE,
                                              exclude_batch=batch) == []
 
