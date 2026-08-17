@@ -55,3 +55,60 @@ def test_the_writer_reads_a_key_the_embedder_never_sent():
         assert "label_map" in keys, (
             "a payload that reaches _inherit_labels does not carry label_map, so it "
             f"receives None and returns 0 — keys were {sorted(keys)}")
+
+
+def _match_artifact(monkeypatch, doc, profiles):
+    """Drive the real production entry point: an S3 artifact, not the direct op."""
+    import json as _json
+    import lambda_speaker_embed as se
+
+    sent = []
+
+    def _writer(payload):
+        sent.append(payload)
+        return {"profiles": profiles} if payload.get("op") == "profiles" else {"written": 3}
+
+    monkeypatch.setattr(se, "invoke_writer", _writer)
+    monkeypatch.setattr(se, "_get", lambda k: _json.dumps(doc))
+    se._from_match_artifact("b", "voiceprint_requests/co-1/s/match-1.json")
+    return sent
+
+
+def test_inheritance_runs_even_when_the_company_holds_no_profile(monkeypatch):
+    """Label inheritance does not need a voiceprint. It spreads names the session ALREADY
+    holds — from somebody's correction — to the turns too short to embed, and it rides inside
+    the writer's `match_names` op.
+
+    The no-profiles branch returned before invoking that op, so "match this session" did
+    nothing at all for a company with no profiles. That is not a corner: enrolment is refused
+    on real site audio today, so no company HAS a profile, which makes this the only branch
+    that runs.
+    """
+    sent = _match_artifact(monkeypatch, {
+        "op": "match", "company_id": "co-1", "user_folder": "u", "date": "2026-08-11",
+        "session_base": "s", "mode": "on", "turns": [],
+        "label_map": [{"turn_ref": "x_c0000@0.0", "label": "spk_0"}]}, profiles=[])
+    names = [p for p in sent if p.get("op") == "match_names"]
+    assert names, ("the run returned on 'no profiles' without invoking the writer, so "
+                   "inheritance never ran")
+    assert names[0]["label_map"], "invoked without the map inheritance needs"
+    assert names[0]["results"] == [], "no profiles means no matched names to write"
+
+
+def test_no_profiles_and_no_label_map_still_writes_nothing(monkeypatch):
+    """The original intent survives: an empty write is a round trip that reports success,
+    and 'wrote 0 rows' then reads as 'the writer is fine'."""
+    sent = _match_artifact(monkeypatch, {
+        "op": "match", "company_id": "co-1", "user_folder": "u", "date": "2026-08-11",
+        "session_base": "s", "mode": "on", "turns": []}, profiles=[])
+    assert not [p for p in sent if p.get("op") == "match_names"]
+
+
+def test_shadow_mode_never_writes_even_to_inherit(monkeypatch):
+    """`shadow` computes and writes nothing. Inheritance is a write, so it must not sneak
+    past the mode gate through the branch added for the no-profiles case."""
+    sent = _match_artifact(monkeypatch, {
+        "op": "match", "company_id": "co-1", "user_folder": "u", "date": "2026-08-11",
+        "session_base": "s", "mode": "shadow", "turns": [],
+        "label_map": [{"turn_ref": "x_c0000@0.0", "label": "spk_0"}]}, profiles=[])
+    assert not [p for p in sent if p.get("op") == "match_names"]
