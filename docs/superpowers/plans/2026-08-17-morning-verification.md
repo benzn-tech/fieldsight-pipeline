@@ -6,11 +6,21 @@ none of the code paths execute. Testing this means testing the **dev site agains
 
 Two things to know before you start, because both make a working system look broken:
 
-1. **You cannot create a voiceprint yet.** The enrolment guard refuses every window of real
-   site audio, and no number that would fix it survived measurement (see
-   `docs/superpowers/specs/2026-08-17-homogeneity-threshold-measured.md`). Step 0 below
-   loosens it on TEST so the rest of the chain can be exercised at all. Without step 0,
-   "the profile has no samples" is the **expected** outcome, not a fault.
+1. **You cannot create a voiceprint from the dev site at all**, and for two independent
+   reasons — a review of the first draft of this document caught the second one, which had
+   been left out entirely:
+   - **there is no consent surface.** Enrolment only happens when the correction carries
+     `consent_given: true` and `consented_by` (`lambda_org_api.py:1646`), and everything
+     inside that branch — including creating the profile row — is skipped otherwise. The UI
+     ships no such control by design, and enrolment UI is explicitly out of scope in the
+     frontend spec. **So a correction made in the browser creates no profile and attempts no
+     enrolment**, and after it `GET /api/org/voiceprints` shows *nothing new at all* rather
+     than an empty profile.
+   - **the guard refuses site audio.** When enrolment *is* requested, the homogeneity guard
+     has so far refused every window of real audio, and no number that would fix it survived
+     measurement (`docs/superpowers/specs/2026-08-17-homogeneity-threshold-measured.md`).
+
+   Step 0 addresses only the second. Step 3 gives the API call that addresses the first.
 2. **Naming a speaker does not mean they will be recognised next time.** Recognition needs a
    stored voiceprint, and there are none. What a correction does today is name this meeting —
    which is real, and checkable below.
@@ -75,7 +85,7 @@ Rename one speaker on a turn of **at least 3 seconds**.
 | that turn shows the name | `confirmed` | nothing renders → the viewer is not reading `speaker_name` |
 | **other long turns of the same voice** change too | several more turns named, `tentative` | only the one turn → propagation found no cluster; normal if that voice spoke once |
 | **turns under 3 seconds** change too | more turns named, `tentative` | none → label inheritance did not run; this is the thing #557 fixed |
-| the name attaches to a real person | `linkedOn: folder_name` in `GET /api/org/voiceprints` | `userId: null` → no roster match on that name, which is allowed |
+| a profile appears in `GET /api/org/voiceprints` | **nothing new appears** | a profile *does* appear → the UI has grown a consent control since this was written, which changes what step 3 tests |
 
 The example that drove this work named **2 turns directly, 6 by propagation, and 22 by
 inheritance**. If you see the first two and not the third, that is the specific regression to
@@ -85,7 +95,27 @@ report.
 
 ## Step 3 — after step 0, the part that has never worked
 
-Make another correction. Then:
+**Not from the browser.** The dev site sends no consent, so a correction made there creates no
+profile and requests no enrolment; repeating step 2 would prove nothing about this. Enrolment
+has to be asked for explicitly:
+
+```bash
+aws lambda invoke --function-name fieldsight-test-org-api \
+  --cli-binary-format raw-in-base64-out --payload '{
+    "httpMethod": "POST",
+    "path": "/api/org/sessions/{session}/speaker-corrections",
+    "requestContext": {"authorizer": {"claims": {"sub": "{sub}"}}},
+    "body": "{\"display_name\":\"{name}\",\"source_filename\":\"{file}\",\"start_sec\":0.0,\"end_sec\":15.0,\"consent_given\":true,\"consented_by\":\"{who}\"}"
+  }' /tmp/corr.json && cat /tmp/corr.json
+```
+
+Pick a window of **at least 10 seconds** — under that, `window_is_homogeneous` sees fewer than
+two frames, cannot judge, and refuses rather than assuming.
+
+`consented_by` records **whose voice it is**, not who is doing the labelling. No code can
+verify that claim; recording it makes it attributed, which is the most an API can do.
+
+Then:
 
 ```bash
 python scripts/verify_speaker_chain.py --sub {sub} --user {folder} --date {date} --env test
@@ -93,10 +123,15 @@ python scripts/verify_speaker_chain.py --sub {sub} --user {folder} --date {date}
 
 `samples` should now be non-zero for that profile, and `humanSamples` at least 1.
 
-**If it is still 0**, read `lastAttemptDetail`. `"this window does not hold one voice"` means
-the guard still refused at 0.7 — worth reporting, because every window measured sat between
-0.36 and 0.78. `"this window has too little speech to judge"` means the window was under 10
-seconds, which is by design.
+**If it is still 0**, read `lastAttemptDetail`:
+
+- `"this window has too little speech to judge"` — the window was under 10 seconds, or the
+  speech-gate dropped frames below −55 dBFS. By design; pick a longer, louder window.
+- `"this window does not hold one voice"` — the guard refused at 0.7. **This is not
+  automatically a defect.** Of the 23 one-voice windows ever measured, three sat above 0.7
+  (0.715, 0.730, 0.777), so some windows are expected to be refused at this setting. It is
+  worth reporting only if *every* window you try is refused, which would suggest the override
+  did not take — check step 1's second row before concluding anything.
 
 ---
 
@@ -131,5 +166,10 @@ the system is ever in.
 1. `speaker-match` end to end. PR #539 fixed a defect that made it inert in production, and
    **that fix has never been exercised against a live stack.** Step 1 and step 4 are the test.
 2. `verify_speaker_chain.py` itself — written, reviewed, never executed against AWS.
-3. Enrolment succeeding at 0.7. Predicted from measured spreads of 0.36–0.78; not observed,
-   because the guard has refused every window ever tried.
+3. Enrolment succeeding at 0.7. Predicted from measured spreads, and only partially — three
+   of 23 measured one-voice windows are above 0.7 — and never observed, because the guard has
+   refused every window ever tried.
+4. **That anyone has ever exercised the consent-carrying path from outside my own hand-built
+   calls.** The first draft of this document told you to make a correction in the browser and
+   then read `samples`, which cannot work; the omission was caught in review, not by running
+   anything.
