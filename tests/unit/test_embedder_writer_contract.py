@@ -221,3 +221,45 @@ def test_the_writer_rejects_an_op_it_does_not_know(writer_db):
     not be silently ignored. A quiet no-op here is how a dropped key looks like success."""
     with pytest.raises(ValueError):
         vw.lambda_handler({"op": "something_nobody_sends", "company_id": CO}, None)
+
+
+def test_the_admitted_limit_reaches_the_column_it_is_stored_in(monkeypatch):
+    """A new field on this seam, tested AT the seam rather than on either side of it.
+
+    `admitted_max_spread` exists so that a sample stored under a loosened homogeneity guard
+    can be found again later, and it crosses three components to get there: the embedder
+    stamps it, the writer forwards it, the repository writes it. Every one of tonight's five
+    defects was a field that one side sent and the other never read, so the check is that the
+    value arrives in the SQL parameters — not that each half handles it.
+    """
+    import lambda_speaker_embed as se
+    import repositories.voiceprints as vpr
+
+    monkeypatch.setattr(se, "MAX_FRAME_SPREAD", 0.7)
+    assert se._admitted_limit() == 0.7
+
+    captured_sql = {}
+
+    class _Cur:
+        def execute(self, sql, params=None):
+            captured_sql["sql"] = sql
+            captured_sql["params"] = params
+            return self
+
+        def fetchone(self):
+            return {"id": "s-1"}
+
+    class _Conn:
+        def cursor(self, row_factory=None):
+            return _Cur()
+
+    monkeypatch.setattr(vpr, "_agreement", lambda *a, **k: (None, None, None))
+    vpr.add_sample(_Conn(), "co-1", "vp-1", [0.1] * 192, "correction", "k", (0.0, 15.0),
+                   admitted_max_spread=se._admitted_limit())
+    assert "admitted_max_spread" in captured_sql["sql"]
+    assert 0.7 in captured_sql["params"], captured_sql["params"]
+
+    # And the ordinary case stores NULL, so the non-NULL rows are exactly the ones worth
+    # re-examining rather than every row ever written.
+    monkeypatch.setattr(se, "MAX_FRAME_SPREAD", se.vp.DEFAULT_MAX_FRAME_SPREAD)
+    assert se._admitted_limit() is None

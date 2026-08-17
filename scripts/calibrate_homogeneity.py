@@ -95,6 +95,25 @@ def summarise(name, rows, limit):
     return vals
 
 
+
+def _calibration_limit(rows):
+    """The limit to calibrate AGAINST, which is the compiled-in default and never the
+    override.
+
+    `op: "spread"` returns both. Reading `limit` — the one in force — would make this tool
+    tautological the moment TEST sets VOICEPRINT_MAX_FRAME_SPREAD: run it at 0.7 to answer
+    "is 0.35 wrong?" and it answers "0 of 13 windows refused", which is a restatement of the
+    setting, not a measurement.
+    """
+    for r in rows:
+        if r.get("default_limit") is not None:
+            if r.get("limit") is not None and r["limit"] != r["default_limit"]:
+                print(f"  NOTE: the function is running with an OVERRIDDEN limit of "
+                      f"{r['limit']}; calibrating against the default "
+                      f"{r['default_limit']} regardless.")
+            return r["default_limit"]
+    return next((r["limit"] for r in rows if r.get("limit") is not None), 0.35)
+
 def main():
     ap = argparse.ArgumentParser()
     for a in ("user", "date", "sub"):
@@ -132,7 +151,7 @@ def main():
                       f"spread={got['spread']} {got['verdict']}")
         results[name] = rows
     print()
-    limit = next((r["limit"] for rows in results.values() for r in rows), 0.35)
+    limit = _calibration_limit([r for rows in results.values() for r in rows])
     a = summarise("one voice ", results["one voice "], limit)
     b = summarise("two voices", results["two voices"], limit)
     print()
