@@ -862,3 +862,80 @@ def test_no_parameter_is_used_only_in_an_untyped_null_test():
     import re as _re
     bare = _re.search(r"%s\s+IS\s+NULL", ins["sql"])
     assert not bare, f"untyped parameter in a NULL test: {bare.group(0) if bare else ''}"
+
+
+# ---- the two functions added tonight that only ever ran as stubs ----------
+#
+# `record_attempt` and `list_profiles` are monkeypatched in the org-api and
+# writer suites and were called for real nowhere. That is how a SQL defect
+# reached production tonight while 3082 tests passed: the connection double does
+# not type-check, so a query is only checked by asserting on its text.
+
+
+def test_an_attempt_is_recorded_against_one_profile_in_one_company():
+    conn = FakeConn([[]])
+    voiceprints.record_attempt(conn, CO, "vp-1", "refused", "two voices")
+    sql = " ".join(conn.calls[0]["sql"].split())
+    assert sql.startswith("UPDATE speaker_voiceprints")
+    assert "company_id = %s" in sql and "id = %s" in sql
+    assert conn.calls[0]["params"] == ("refused", "two voices", CO, "vp-1")
+
+
+def test_an_attempt_stamps_its_own_time_rather_than_taking_one():
+    """A caller-supplied timestamp is a claim about when something happened; `now()` is a
+    record of when the system was told, which is the only one this code can make."""
+    conn = FakeConn([[]])
+    voiceprints.record_attempt(conn, CO, "vp-1", "stored")
+    assert "now()" in conn.calls[0]["sql"]
+
+
+def test_recording_an_attempt_without_a_company_raises():
+    with pytest.raises(ValueError):
+        voiceprints.record_attempt(FakeConn(), "", "vp-1", "stored")
+
+
+def test_no_parameter_in_the_attempt_update_is_untyped_in_a_null_test():
+    """Same shape as the defect that returned 500 tonight."""
+    conn = FakeConn([[]])
+    voiceprints.record_attempt(conn, CO, "vp-1", "refused", None)
+    import re as _re
+    assert not _re.search(r"%s\s+IS\s+NULL", conn.calls[0]["sql"])
+
+
+def test_the_listing_counts_human_samples_separately_from_harvested_ones():
+    """The distinction the whole harvest design rests on: a profile built only from
+    inference must not read as one somebody vouched for."""
+    conn = FakeConn([[{"id": "vp-1"}]])
+    voiceprints.list_profiles(conn, CO)
+    sql = " ".join(conn.calls[0]["sql"].split())
+    assert "count(s.id) AS samples" in sql
+    assert "FILTER (WHERE s.source = 'correction')" in sql
+
+
+def test_the_listing_is_a_left_join_so_an_empty_profile_still_appears():
+    """A profile with zero samples is exactly the case somebody is looking at when they ask
+    why nothing works. An inner join would hide it."""
+    conn = FakeConn([[]])
+    voiceprints.list_profiles(conn, CO)
+    assert "LEFT JOIN" in conn.calls[0]["sql"]
+
+
+def test_the_listing_never_selects_an_embedding():
+    """Biometric data. A listing does not need it, and the one path it may travel is the
+    synchronous fetch the matcher makes."""
+    conn = FakeConn([[]])
+    voiceprints.list_profiles(conn, CO)
+    sql = conn.calls[0]["sql"]
+    assert "embedding" not in sql.split("FROM")[0]
+
+
+def test_the_listing_is_company_scoped():
+    conn = FakeConn([[]])
+    voiceprints.list_profiles(conn, CO)
+    assert CO in conn.calls[0]["params"]
+    assert "p.company_id = %s" in " ".join(conn.calls[0]["sql"].split())
+
+
+def test_listing_without_a_company_raises():
+    with pytest.raises(ValueError):
+        voiceprints.list_profiles(FakeConn(), "")
