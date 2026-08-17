@@ -900,8 +900,11 @@ def _from_match_artifact(bucket, key):
         # ALREADY holds — from a correction somebody made — to the turns too short to embed,
         # and it rides inside the writer's `match_names` op. Returning here skipped it, so
         # "match a session I have no voiceprints for" silently did nothing at all, in exactly
-        # the state the system is in today: enrolment is refused, so no company has a
-        # profile, so this branch is the ONLY one that runs.
+        # the state the system is in today: no company has a profile, so this branch is the
+        # ONLY one that runs. Two reasons, and it took a review to notice the first: the
+        # product sends no consent, so an ordinary correction never requests enrolment at
+        # all; and when an API call does request it, the homogeneity guard has so far refused
+        # every window of real audio.
         if req.get("label_map") and (req.get("mode") or "").lower() == "on":
             written = invoke_writer({"op": "match_names", "company_id": company_id,
                                      "session_base": session,
