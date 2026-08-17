@@ -198,7 +198,13 @@ def active_batches_for_day(conn, folder, date, exclude_batch=None) -> list:
         params.append(exclude_batch)
     sql += " ORDER BY batch_id"
     rows = conn.cursor(row_factory=dict_row).execute(sql, tuple(params)).fetchall()
-    return [r["batch_id"] for r in rows]
+    # STRINGS, not psycopg's UUID objects. `batch_id` is a string everywhere else in this
+    # feature -- the endpoint mints `str(uuid.uuid4())`, the response carries a string, and
+    # the request body sends one back -- so a caller that compares what this returns
+    # against one of those gets False from two values that are the same id. psycopg adapts
+    # either direction when binding, so the mismatch never surfaces as an error; it
+    # surfaces as a branch quietly not taken.
+    return [str(r["batch_id"]) for r in rows]
 
 
 def revert_batch(conn, batch_id, company_id, *, cross_company=False) -> list:
