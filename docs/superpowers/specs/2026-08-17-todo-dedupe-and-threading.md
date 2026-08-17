@@ -142,21 +142,32 @@ which is the actual product, and which the 136-open-items figure says nobody can
 Escalation (auto-raising priority after N recurrences or M days) is **not** in this spec. It
 needs the thread data to exist and a rule nobody has stated.
 
-## 6. Before any of this is built
+## 6. The question that decided this, and its answer
 
-**One question decides §3's second row.** The 0.821 pair — identical title, two days apart,
-the same scaffolding inspection before the same Monday — was rejected. If that genuinely is
-two separate jobs to this customer, then cross-day threading has no true positives to find
-and only the 0-day collapse should be built. If it was swept out with the noise (13 items
-cleared in 13 minutes, most of them cross-products of the 0-day duplicates), then the queue
-needs the 0-day collapse *first* and re-asking afterwards.
+**Asked 2026-08-17:** the 0.821 pair — identical title, two days apart, the same scaffolding
+inspection before the same Monday — was rejected. Is that two separate jobs, or one?
 
-Either way **the 0-day collapse comes first**, and it is the part that needs no labels, no
-human, and no new storage.
+**Answered by the customer, same day: one job. The rejection was a mistake.**
+
+Three things follow.
+
+* **Cross-day threading has true positives.** §3's second row is worth building. Had the
+  answer gone the other way, only the 0-day collapse would be.
+* **The 0-day collapse still comes first**, and now for a sharper reason than "it needs no
+  labels": the queue that produced the mistake was mostly cross-products of the 0-day
+  duplicates — three Mitre-10 mentions and three scaffolding mentions on one evening pair up
+  nine ways against a later day. Thirteen items were cleared in thirteen minutes and the one
+  real thread went out with them. **Collapsing first is what makes the human judgement
+  affordable**; asking someone to find one true positive in a queue of cross-products is
+  asking them to make exactly this mistake.
+* **The existing 15 rejections contain at least one known-false label.** Anyone later mining
+  `topic_thread_suggestions` for calibration must treat that set as noisy — it is not a
+  clean negative class, and the one row we have checked by hand was wrong. Do not fit
+  anything to it.
 
 ## 7. Verification
 
-1. **Answer §6 before writing code.**
+1. §6 is answered — cross-day threading is worth building. Nothing is gated on it now.
 2. The 0-day collapse, on a TEST day with induced duplicates — **not** by replaying
    2026-08-10, whose artifacts and rows live in the prod bucket and prod DB and are not
    reachable from TEST (`fieldsight_test` + `fieldsight-data-test`, BUG-38/PR #114).
