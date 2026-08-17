@@ -361,6 +361,25 @@ def _read_limit(raw):
 MAX_FRAME_SPREAD = _read_limit(os.environ.get("VOICEPRINT_MAX_FRAME_SPREAD"))
 
 
+def _refusal_detail(refusal):
+    """The refusal, with the numbers that decide what to do about it.
+
+    `closer-to-another-profile` is the one refusal a person can act on, and acting on it needs
+    to know WHICH profile and by how much: 0.62 here against 0.71 there means either the
+    correction named the wrong person, or the two profiles are the same person and should be
+    merged. The writer computes all three — `own`, `bestOther`, `nearestOtherId` — and until
+    now every one of them stopped at the seam, leaving a log line that said only that
+    something was closer to something else.
+    """
+    refusal = refusal or {}
+    out = " enrolRefused=%s" % refusal.get("reason")
+    if refusal.get("nearestOtherId"):
+        out += (" (own=%s bestOther=%s nearest=%s)"
+                % (refusal.get("own"), refusal.get("bestOther"),
+                   refusal.get("nearestOtherId")))
+    return out
+
+
 def _admitted_limit():
     """The limit to STORE against a sample, or None when it was the ordinary one.
 
@@ -876,7 +895,7 @@ def _from_request_artifact(bucket, key):
                 reply.get("harvested", 0),
                 # The refusals last, and named, because "no sample was stored" is the
                 # question this feature gets asked about more than any other.
-                (" enrolRefused=%s" % (reply["enrolRefused"] or {}).get("reason")
+                (_refusal_detail(reply["enrolRefused"])
                  if reply.get("enrolRefused") else "")
                 + (" harvestRefused=%d" % reply["harvestRefused"]
                    if reply.get("harvestRefused") else ""))
