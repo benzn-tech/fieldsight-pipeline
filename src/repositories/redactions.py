@@ -238,7 +238,14 @@ def list_deleted_batches_for_prefix(conn, prefix) -> list:
     the tombstone that hid its predecessor, or one revert stops restoring exactly what one
     delete hid — and that equality is the only check that proves the feature is reversible.
     """
-    return conn.cursor(row_factory=dict_row).execute(
+    rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT DISTINCT batch_id, company_id FROM redactions "
         "WHERE target_type = 'recording' AND scope = 'deleted' AND reverted_at IS NULL "
         "AND target_key IS NOT NULL AND %s LIKE target_key || '%%'", (prefix,)).fetchall()
+    # Same shape as `active_batches_for_day`: strings, not psycopg UUID objects. Two
+    # sibling functions returning different forms of the same id is how the next silent
+    # comparison-against-False happens -- that mismatch cannot raise, so nothing points at
+    # it. `company_id` is left as it comes, because every caller passes it straight back
+    # into a query rather than comparing it.
+    return [{**r, "batch_id": str(r["batch_id"]) if r["batch_id"] is not None else None}
+            for r in rows]
