@@ -104,3 +104,84 @@ def test_source_filename_is_kept_because_the_label_alone_is_not_a_person():
 def test_no_turns_maps_to_no_entries():
     assert org._label_map([]) == []
     assert org._label_map(None) == []
+
+
+# ---- _session_turns -----------------------------------------------------
+#
+# Reads S3 through `_read_org_transcripts`, which is stubbed here — everything below is
+# about what happens to the rows AFTER they arrive, which is where the recorded defect was.
+
+SID_A = "Benl1_2026-04-29_08-14-32_sid" + "a" * 32 + "_c0000_srcwav.json"
+SID_B = "Benl1_2026-04-29_09-20-00_sid" + "b" * 32 + "_c0000_srcwav.json"
+
+
+def _payload(*segs):
+    return {"speaker_segments": list(segs)}
+
+
+def _seg(src, start, duration=5.0, label="spk_0"):
+    return {"source_filename": src, "chunk_start": start, "duration": duration,
+            "speaker_label": label}
+
+
+def test_turns_from_another_session_at_the_same_offset_are_not_included(monkeypatch):
+    """The defect this function's docstring records: a day holds several sessions and two
+    routinely have turns at the same offset, so a turn from the wrong session looked like a
+    matching failure. It cost two rounds of debugging and nothing pinned the fix."""
+    monkeypatch.setattr(org, "_read_org_transcripts",
+                        lambda *a, **k: _payload(_seg(SID_A, 10.0), _seg(SID_B, 10.0)))
+    turns = org._session_turns("Benl1", "2026-04-29", SID_A)
+    assert [t["source_filename"] for t in turns] == [SID_A]
+
+
+def test_the_session_is_matched_as_a_session_not_as_a_string(monkeypatch):
+    """Both sides go through `session_base`. Comparing a normalised filename against the raw
+    URL parameter is how one of these ends up matching nothing — the two spellings of a
+    session are not equal as strings, only as sessions."""
+    monkeypatch.setattr(org, "_read_org_transcripts",
+                        lambda *a, **k: _payload(_seg(SID_A, 3.0)))
+    # The caller passes the session id, not the full filename.
+    assert org._session_turns("Benl1", "2026-04-29",
+                              turn_name_overlay.session_base(SID_A))
+
+
+def test_a_turn_with_no_offset_is_dropped_rather_than_defaulted_to_zero(monkeypatch):
+    """A missing `chunk_start` defaulted to 0.0 would cut audio from the top of the file and
+    hand the embedder somebody else's voice under this turn's reference."""
+    monkeypatch.setattr(org, "_read_org_transcripts", lambda *a, **k: _payload(
+        {"source_filename": SID_A, "duration": 5.0}, _seg(SID_A, 7.0)))
+    assert [t["start_sec"] for t in org._session_turns("Benl1", "2026-04-29", SID_A)] == [7.0]
+
+
+def test_the_end_is_derived_from_the_duration(monkeypatch):
+    monkeypatch.setattr(org, "_read_org_transcripts",
+                        lambda *a, **k: _payload(_seg(SID_A, 12.0, duration=9.5)))
+    t = org._session_turns("Benl1", "2026-04-29", SID_A)[0]
+    assert (t["start_sec"], t["end_sec"]) == (12.0, 21.5)
+
+
+def test_the_transcribers_own_label_is_carried_through(monkeypatch):
+    """It is the whole input to label inheritance, and it says "these turns are one voice"
+    about turns too short for any acoustic judgement."""
+    monkeypatch.setattr(org, "_read_org_transcripts",
+                        lambda *a, **k: _payload(_seg(SID_A, 1.0, label="spk_3")))
+    assert org._session_turns("Benl1", "2026-04-29", SID_A)[0]["speaker_label"] == "spk_3"
+
+
+def test_a_transcript_read_that_fails_yields_no_turns_rather_than_raising(monkeypatch):
+    """A correction on a day whose transcripts cannot be read still names the one turn the
+    user pointed at; it must not take the whole request down."""
+    def _boom(*a, **k):
+        raise RuntimeError("S3 said no")
+    monkeypatch.setattr(org, "_read_org_transcripts", _boom)
+    assert org._session_turns("Benl1", "2026-04-29", SID_A) == []
+
+
+def test_a_session_id_that_normalises_to_nothing_matches_no_turns(monkeypatch):
+    """A legacy RealPTT filename has no sid. `want` is then None, and `not want` must refuse
+    everything — without that guard the comparison would be None == None and every turn in
+    the day would be swept into one 'session'."""
+    monkeypatch.setattr(org, "_read_org_transcripts",
+                        lambda *a, **k: _payload(_seg("Benl1_2026-04-29_off0.5_srcwav.json", 4.0)))
+    assert org._session_turns("Benl1", "2026-04-29",
+                              "Benl1_2026-04-29_off0.5_srcwav.json") == []
