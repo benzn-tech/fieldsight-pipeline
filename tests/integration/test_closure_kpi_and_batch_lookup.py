@@ -26,6 +26,10 @@ pytestmark = pytest.mark.integration
 
 DATE = "2026-08-17"
 TZ = "Pacific/Auckland"
+# Read from the module, not spelled here: the closed state is "done", and a test that
+# hard-codes "closed" agrees with itself while matching nothing. Mine did, on its first
+# real run — which is the test discriminating, exactly as intended.
+CLOSED = content_edits._CLOSED_STATUS
 
 
 def _seed(db):
@@ -42,7 +46,7 @@ def _closed_action(db, co, s, u, *, at=None, text="Order steel"):
     aid = db.execute(
         "SELECT id FROM action_items WHERE topic_id=%s", (t["id"],)).fetchone()[0]
     row = content_edits.append_content_edit(
-        db, co["id"], "action_items", aid, "status", "open", "closed", u["id"], "pm")
+        db, co["id"], "action_items", aid, "status", "open", CLOSED, u["id"], "pm")
     if at is not None:
         db.execute("UPDATE content_edits SET created_at=%s WHERE id=%s", (at, row["id"]))
     return aid
@@ -59,7 +63,7 @@ def test_the_kpi_counts_a_closure_on_its_local_day(db):
 
 
 def test_an_edit_that_is_not_a_closure_is_not_counted(db):
-    """`field='status'` and `after_text='closed'` are both load-bearing: a priority tweak
+    """`field='status'` and the closed value are both load-bearing: a priority tweak
     writes an audit row too, and counting it would inflate the number a manager reads."""
     co, s, u = _seed(db)
     t = topics.upsert_topic(db, s["id"], DATE, "Slab", user_id=u["id"],
@@ -76,17 +80,17 @@ def test_an_edit_that_is_not_a_closure_is_not_counted(db):
 
 
 def test_reopening_and_closing_again_is_one_closure_per_event(db):
-    """`before_text IS DISTINCT FROM 'closed'` — a save that leaves it closed must not
-    count a second time."""
+    """`before_text IS DISTINCT FROM` the closed value — a save that leaves it closed must
+    not count a second time."""
     co, s, u = _seed(db)
     t = topics.upsert_topic(db, s["id"], DATE, "Slab", user_id=u["id"],
                             action_items=[{"text": "Chase delivery"}])
     aid = db.execute(
         "SELECT id FROM action_items WHERE topic_id=%s", (t["id"],)).fetchone()[0]
     content_edits.append_content_edit(
-        db, co["id"], "action_items", aid, "status", "open", "closed", u["id"], "pm")
+        db, co["id"], "action_items", aid, "status", "open", CLOSED, u["id"], "pm")
     content_edits.append_content_edit(
-        db, co["id"], "action_items", aid, "status", "closed", "closed", u["id"], "pm")
+        db, co["id"], "action_items", aid, "status", CLOSED, CLOSED, u["id"], "pm")
 
     counts = content_edits.count_action_closures_by_day(
         db, [s["id"]], DATE, DATE, company_id=co["id"], tz=TZ)
