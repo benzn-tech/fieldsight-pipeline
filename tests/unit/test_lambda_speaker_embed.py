@@ -1296,13 +1296,15 @@ def test_an_unjudgeable_window_is_refused_like_a_bad_one(stub_embedder, monkeypa
     """`None` means "could not check". Admitting it is how a guard becomes decoration —
     the anchor's own check refuses None too."""
     _audio(monkeypatch)
-    monkeypatch.setattr(se.vp, "window_is_homogeneous", lambda frames: None)
+    monkeypatch.setattr(se.vp, "window_is_homogeneous",
+                        lambda frames, limit=None: None)
     assert se._admit_harvest("Ben_UCPK2", "2026-08-11", _cands((0.0, 20.0))) == []
 
 
 def test_a_window_with_two_voices_is_refused(stub_embedder, monkeypatch):
     _audio(monkeypatch)
-    monkeypatch.setattr(se.vp, "window_is_homogeneous", lambda frames: False)
+    monkeypatch.setattr(se.vp, "window_is_homogeneous",
+                        lambda frames, limit=None: False)
     assert se._admit_harvest("Ben_UCPK2", "2026-08-11", _cands((0.0, 20.0))) == []
 
 

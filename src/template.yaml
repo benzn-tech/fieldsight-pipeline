@@ -840,6 +840,41 @@ Parameters:
       spec §3). False (default) is the pre-Phase-3 binary resolve_scope
       behavior, unchanged in every path, mirroring AuthorityFlip's rollout.
 
+  VoiceprintMaxFrameSpread:
+    Type: String
+    Default: 'default'
+    # Constrained for two reasons a review found, both of which fail silently:
+    #
+    #   * ANY non-numeric value raises at import time, and this module also serves match,
+    #     propagation and the S3-triggered correction path -- so a typo in a repo variable
+    #     takes the whole speaker feature down with Runtime.ImportModuleError on every
+    #     invocation, while the deploy stays green and nothing reports it. Note the sentinel
+    #     is matched case-sensitively below, so 'Default' would reach float() too.
+    #   * cosine distance runs to 2.0 and the check is `spread <= limit`, so 2 admits ANY
+    #     window at all -- the guard switched off rather than loosened. 1.0 is the top of
+    #     this range: still far looser than anything measurement has suggested, but it
+    #     cannot become a no-op.
+    AllowedPattern: '^(default|0(\.\d+)?|1(\.0+)?)$'
+    ConstraintDescription: >-
+      Either the literal 'default' or a number from 0 to 1.0.
+    Description: >-
+      The enrolment homogeneity limit, overridable WITHOUT a redeploy. The literal string
+      'default' -- rather than an empty string, which sam deploy rejects as a missing
+      parameter value, and rather than repeating 0.35 here where it would drift from the
+      constant it is meant to mirror --
+      means the compiled-in DEFAULT_MAX_FRAME_SPREAD of 0.35, which is what prod runs and
+      what the guard was measured at -- on read speech. On site audio 0.35 has refused
+      every window ever tried, so no voiceprint exists and nothing downstream of enrolment
+      (matching, automatic naming, harvest) has ever run against real data. An evening of
+      measurement produced a candidate and then three reasons the measurement could not
+      support it, so the constant did not move; see
+      docs/superpowers/specs/2026-08-17-homogeneity-threshold-measured.md.
+      Set this on TEST to find out whether the rest of the chain works. Do NOT set it on
+      prod: a window admitted under a loosened limit may hold two people, and a poisoned
+      profile cannot be cleaned -- only the contributing sample deleted, after somebody
+      notices, which nothing prompts them to do. Every enrolment log line says so when the
+      override is in force.
+
   SpeakerIdentityMode:
     Type: String
     Default: 'off'
@@ -908,6 +943,7 @@ Mappings:
                                     # Cognito UserPoolDomain replacement, which fails (one domain per pool, InvalidRequest).
 
 Conditions:
+  HasVoiceprintSpreadOverride: !Not [!Equals [!Ref VoiceprintMaxFrameSpread, 'default']]
   ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
   ShouldEnableFinalize: !Equals [!Ref EnableFinalize, 'true']
   ShouldEnableSweepPendingGate: !Equals [!Ref EnableSweepPendingGate, 'true']
@@ -2848,6 +2884,12 @@ Resources:
           # The in-VPC half. Its name rather than a constant, so the two stacks cannot
           # cross-invoke each other's writer.
           VOICEPRINT_WRITER_FUNCTION: !Sub ["${P}-voiceprint-writer", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+          # 'default' -> the key is absent and the function falls back to
+          # DEFAULT_MAX_FRAME_SPREAD. Absent rather than present-and-blank: the function
+          # reads this with os.environ.get(..., str(DEFAULT_MAX_FRAME_SPREAD)) and float('')
+          # would raise at import time, which in Lambda means every invocation fails while
+          # the deploy stays green.
+          VOICEPRINT_MAX_FRAME_SPREAD: !If [HasVoiceprintSpreadOverride, !Ref VoiceprintMaxFrameSpread, !Ref 'AWS::NoValue']
       Policies:
         - Version: '2012-10-17'
           Statement:

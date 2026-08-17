@@ -52,6 +52,25 @@ def transcript_turns(sub, user, date):
     return json.loads(out["body"], strict=False).get("speaker_segments") or []
 
 
+
+def _calibration_limit(rows):
+    """The limit to calibrate AGAINST, which is the compiled-in default and never the
+    override.
+
+    `op: "spread"` returns both. Reading `limit` — the one in force — would make this tool
+    tautological the moment TEST sets VOICEPRINT_MAX_FRAME_SPREAD: run it at 0.7 to answer
+    "is 0.35 wrong?" and it answers "0 of 13 windows refused", which is a restatement of the
+    setting, not a measurement.
+    """
+    for r in rows:
+        if r.get("default_limit") is not None:
+            if r.get("limit") is not None and r["limit"] != r["default_limit"]:
+                print(f"  NOTE: the function is running with an OVERRIDDEN limit of "
+                      f"{r['limit']}; calibrating against the default "
+                      f"{r['default_limit']} regardless.")
+            return r["default_limit"]
+    return next((r["limit"] for r in rows if r.get("limit") is not None), 0.35)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--user", required=True)
@@ -89,7 +108,7 @@ def main():
 
     judged = sorted(r["spread"] for r in results if r["spread"] is not None)
     if judged:
-        limit = results[0]["limit"]
+        limit = _calibration_limit(results)
         over = [x for x in judged if x > limit]
         print(f"\n  n={len(judged)}  min={judged[0]:.3f}  "
               f"median={judged[len(judged) // 2]:.3f}  max={judged[-1]:.3f}")

@@ -141,7 +141,8 @@ def _propagation(event):
                            source="correction", s3_key=enrol.get("s3_key"),
                            window=(window[0], window[1]),
                            created_by=enrol.get("created_by"),
-                           correction_ref=correction_ref)
+                           correction_ref=correction_ref,
+                           admitted_max_spread=enrol.get("admitted_max_spread"))
             except EnrolmentBelongsToSomebodyElse as exc:
                 # Caught, not propagated: the names describe THIS meeting and were earned by
                 # the user's own assertion. Letting a refused enrolment roll them back would
@@ -171,7 +172,8 @@ def _propagation(event):
                 add_sample(conn, company_id, h["voiceprint_id"], h["embedding"],
                            source="correction_propagation", s3_key=h.get("s3_key"),
                            window=(w[0], w[1]), created_by=h.get("created_by"),
-                           correction_ref=correction_ref)
+                           correction_ref=correction_ref,
+                           admitted_max_spread=h.get("admitted_max_spread"))
                 harvested += 1
             except EnrolmentBelongsToSomebodyElse as exc:
                 # PER SAMPLE. One refusal must not discard the rest: they are independent
@@ -218,7 +220,8 @@ def _enrol(event):
                        source="correction", s3_key=event.get("s3_key"),
                        window=(window[0], window[1]),
                        created_by=event.get("created_by"),
-                       correction_ref=event.get("correction_ref"))
+                       correction_ref=event.get("correction_ref"),
+                       admitted_max_spread=event.get("admitted_max_spread"))
         except EnrolmentBelongsToSomebodyElse as exc:
             # Same refusal as the propagation path, and it has to be spelled out twice
             # because the two paths report different shapes. What must NOT differ is the
