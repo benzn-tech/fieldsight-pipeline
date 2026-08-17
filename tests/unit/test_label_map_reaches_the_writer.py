@@ -210,3 +210,20 @@ def test_a_refusal_says_which_profile_it_was_closer_to():
     # A refusal with no nearest profile carries no parenthetical to explain.
     assert se._refusal_detail({"reason": "this window does not hold one voice"}) \
         == " enrolRefused=this window does not hold one voice"
+
+
+def test_a_split_session_says_which_part_each_run_is():
+    """`_split_for_budget` turns one long session into several artifacts, each its own
+    invocation, and org-api stamps every one with `part` and `of`. Nothing read them.
+
+    Three runs of one meeting produced three interchangeable log lines, so a run that died —
+    and a 70-minute meeting is exactly where a timeout or an OOM lands — left two lines that
+    look like a complete, smaller job. "Some of this meeting was never matched" and "this
+    meeting had fewer turns than you thought" were the same observation.
+    """
+    import lambda_speaker_embed as se
+    assert se._part_of({"part": 2, "of": 3}) == " (part 2/3)"
+    # A session that was not split says nothing, so the ordinary line stays clean.
+    assert se._part_of({"part": 1, "of": 1}) == ""
+    assert se._part_of({}) == ""
+    assert se._part_of(None) == ""

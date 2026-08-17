@@ -361,6 +361,20 @@ def _read_limit(raw):
 MAX_FRAME_SPREAD = _read_limit(os.environ.get("VOICEPRINT_MAX_FRAME_SPREAD"))
 
 
+def _part_of(req):
+    """" (part 2/3)" when a session was split, empty when it was not.
+
+    `_split_for_budget` chops a long session into several artifacts, each becoming its own
+    invocation, and org-api stamps every one with `part` and `of`. Nothing read them. Three
+    runs of one meeting therefore produced three interchangeable log lines, and a run that
+    died — a 70-minute meeting is exactly where a timeout or an OOM lands — left two lines
+    that look like a complete, smaller job. "Some of this meeting was never matched" and
+    "this meeting had fewer turns than you thought" were the same observation.
+    """
+    part, of = (req or {}).get("part"), (req or {}).get("of")
+    return "" if not of or of == 1 else " (part %s/%s)" % (part, of)
+
+
 def _refusal_detail(refusal):
     """The refusal, with the numbers that decide what to do about it.
 
@@ -936,8 +950,8 @@ def _from_match_artifact(bucket, key):
         # and "there was nobody to recognise" look identical downstream, and on TEST the
         # only profile was withdrawn during a withdrawal test, which is exactly how this
         # would have been misread as the matcher not working.
-        logger.warning("match: no consented profiles for company %s; nothing to match "
-                       "against (session %s)", company_id, session)
+        logger.warning("match%s: no consented profiles for company %s; nothing to match "
+                       "against (session %s)", _part_of(req), company_id, session)
         # But label inheritance does not need a profile. It spreads names this session
         # ALREADY holds — from a correction somebody made — to the turns too short to embed,
         # and it rides inside the writer's `match_names` op. Returning here skipped it, so
@@ -958,8 +972,8 @@ def _from_match_artifact(bucket, key):
                                    "label_map": req.get("label_map"),
                                    "results": []})
             inherited = reply.get("inherited", 0)
-            logger.info("match: no profiles, but inheritance named %d turns in %s",
-                        inherited, session)
+            logger.info("match%s: no profiles, but inheritance named %d turns in %s",
+                        _part_of(req), inherited, session)
             return {"session": session, "matched": 0, "inherited": inherited,
                     "profiles": 0, "inheritedOnly": True, "mode": req.get("mode")}
         return {"session": session, "matched": 0, "profiles": 0, "mode": req.get("mode")}
@@ -1039,11 +1053,13 @@ def _from_match_artifact(bucket, key):
         # would make a session where the voiceprints did nothing and inheritance did
         # everything read as a successful match.
         written, inherited = reply.get("written", 0), reply.get("inherited", 0)
-    logger.info("match: session=%s named %d of %d turns against %d profiles "
+    logger.info("match%s: session=%s named %d of %d turns against %d profiles "
                 "(+%d inherited)",
-                session, written, len(out["results"]), len(profiles), inherited)
+                _part_of(req), session, written, len(out["results"]), len(profiles),
+                inherited)
     return {"session": session, "matched": written, "inherited": inherited,
-            "profiles": len(profiles), "mode": mode}
+            "profiles": len(profiles), "mode": mode,
+            "part": req.get("part"), "of": req.get("of")}
 
 
 def _spread(event):
