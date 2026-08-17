@@ -882,6 +882,21 @@ def _from_match_artifact(bucket, key):
         # would have been misread as the matcher not working.
         logger.warning("match: no consented profiles for company %s; nothing to match "
                        "against (session %s)", company_id, session)
+        # But label inheritance does not need a profile. It spreads names this session
+        # ALREADY holds — from a correction somebody made — to the turns too short to embed,
+        # and it rides inside the writer's `match_names` op. Returning here skipped it, so
+        # "match a session I have no voiceprints for" silently did nothing at all, in exactly
+        # the state the system is in today: enrolment is refused, so no company has a
+        # profile, so this branch is the ONLY one that runs.
+        if req.get("label_map") and (req.get("mode") or "").lower() == "on":
+            written = invoke_writer({"op": "match_names", "company_id": company_id,
+                                     "session_base": session,
+                                     "label_map": req.get("label_map"),
+                                     "results": []}).get("written", 0)
+            logger.info("match: no profiles, but inheritance named %d turns in %s",
+                        written, session)
+            return {"session": session, "matched": written, "profiles": 0,
+                    "inheritedOnly": True, "mode": req.get("mode")}
         return {"session": session, "matched": 0, "profiles": 0, "mode": req.get("mode")}
 
     out = _match({"session": session, "user_folder": folder, "date": date,
@@ -935,10 +950,18 @@ def _from_match_artifact(bucket, key):
         return {"session": session, "matched": 0, "wouldMatch": len(named),
                 "profiles": len(profiles), "mode": mode or "off"}
 
-    # No invoke when there is nothing to write: an empty write is a database round trip
+    # No invoke when there is nothing to do at all: an empty write is a database round trip
     # that reports success, and "wrote 0 rows" then looks like "the writer is fine".
+    #
+    # `label_map` counts as something to do. Label inheritance lives INSIDE the writer's
+    # `match_names` op, so an earlier version of this guard — `if named:` — meant that a run
+    # which matched nothing also inherited nothing, and matching nothing is not unusual: with
+    # a single profile every turn is skipped for having no runner-up, which this function
+    # logs as an ordinary outcome. The session could be holding correction names from a
+    # previous gesture that the label map is entitled to spread to the short turns, and they
+    # were silently left unnamed because a DIFFERENT feature had found no candidates.
     written = 0
-    if named:
+    if named or req.get("label_map"):
         written = invoke_writer({"op": "match_names", "company_id": company_id,
                                  "session_base": session,
                                  # Both artifacts carry it and both writer branches read it;
