@@ -2885,10 +2885,12 @@ Resources:
           # cross-invoke each other's writer.
           VOICEPRINT_WRITER_FUNCTION: !Sub ["${P}-voiceprint-writer", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
           # 'default' -> the key is absent and the function falls back to
-          # DEFAULT_MAX_FRAME_SPREAD. Absent rather than present-and-blank: the function
-          # reads this with os.environ.get(..., str(DEFAULT_MAX_FRAME_SPREAD)) and float('')
-          # would raise at import time, which in Lambda means every invocation fails while
-          # the deploy stays green.
+          # DEFAULT_MAX_FRAME_SPREAD. Absent rather than present-and-blank because absence is
+          # the one case `_read_limit` treats as ordinary rather than as an error worth an
+          # ERROR line: an empty string is a value somebody set and could not have meant.
+          # (`_read_limit` refuses to raise on either -- a bad value here would otherwise be
+          # an import-time failure on EVERY invocation of match, propagation and the
+          # S3-triggered correction path, while the deploy stayed green.)
           VOICEPRINT_MAX_FRAME_SPREAD: !If [HasVoiceprintSpreadOverride, !Ref VoiceprintMaxFrameSpread, !Ref 'AWS::NoValue']
       Policies:
         - Version: '2012-10-17'
