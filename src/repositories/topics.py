@@ -387,7 +387,12 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
     if not site_ids:
         return []
 
-    where = "WHERE t.site_id = ANY(%s) AND t.report_date=%s"
+    # The exclusion belongs on the PARENT query, and it was missing here: this function's
+    # only copy of it sat in the action_items child, which is why the enumeration test --
+    # which reads the function body as text -- was green while a deleted topic came back in
+    # full. Alias `t`, because that is what this statement's FROM declares.
+    where = ("WHERE t.site_id = ANY(%s) AND t.report_date=%s AND "
+             + DELETED_TOPIC_PREDICATE.format(alias="t"))
     params = [list(site_ids), report_date]
     if author_ids is not None:
         where += " AND t.user_id = ANY(%s::uuid[])"
