@@ -220,11 +220,17 @@ def _agreement(conn, company_id, voiceprint_id, embedding):
 
 
 def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, window,
-               created_by=None, correction_ref=None) -> dict | None:
+               created_by=None, correction_ref=None,
+               admitted_max_spread=None) -> dict | None:
     """Record one enrolment contribution.
 
     One row per event rather than an averaged vector per person: §6's withdrawal needs each
     contribution individually removable, and an average cannot be un-poisoned.
+
+    `admitted_max_spread` is the homogeneity limit this window got past, and it is stored
+    only when it was NOT the compiled-in default. NULL therefore means "the ordinary guard",
+    and the non-NULL rows are exactly the ones worth re-examining if the loosened limit turns
+    out to have been too loose — which is the whole reason the limit is settable.
 
     `correction_ref` and `created_by` are what make a bad enrolment traceable to everything
     it justified. They are optional in the signature and should not be: they are only
@@ -245,10 +251,11 @@ def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, windo
         "INSERT INTO speaker_voiceprint_samples "
         "(company_id, voiceprint_id, embedding, source, s3_key, window_start_s, "
         " window_end_s, created_by, correction_ref, agreement_own, "
-        " agreement_best_other, nearest_other_id) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        " agreement_best_other, nearest_other_id, admitted_max_spread) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (company_id, voiceprint_id, _vector_literal(embedding), source, s3_key,
-         start_s, end_s, created_by, correction_ref, own, best_other, nearest_other_id),
+         start_s, end_s, created_by, correction_ref, own, best_other, nearest_other_id,
+         admitted_max_spread),
     ).fetchone()
 
 

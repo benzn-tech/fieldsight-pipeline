@@ -315,8 +315,47 @@ FRAME_MIN_DBFS = float(os.environ.get("VOICEPRINT_FRAME_MIN_DBFS", "-55.0"))
 # reads a successful enrolment as evidence the audio was clean. `_limit_note()` is appended to
 # every enrolment log line, accepted and refused alike — a guard that only speaks when it
 # refuses leaves "it passed" and "it was switched off" looking identical.
-MAX_FRAME_SPREAD = float(os.environ.get("VOICEPRINT_MAX_FRAME_SPREAD",
-                                        str(vp.DEFAULT_MAX_FRAME_SPREAD)))
+def _read_limit(raw):
+    """Parse the override, or fall back to the default LOUDLY rather than dying.
+
+    This module also serves `match`, `propagation` and the S3-triggered correction path, so a
+    bare `float(raw)` at import time turns a typo in one repo variable into
+    Runtime.ImportModuleError on EVERY invocation of the speaker feature — while the deploy
+    stays green and nothing reports it. The template constrains the parameter too; this is the
+    half that survives a console edit or a direct `sam deploy`.
+
+    Out-of-range is refused for the same reason it is refused in the template: cosine distance
+    runs to 2.0 and the check is `spread <= limit`, so a limit of 2 admits any window at all —
+    the guard switched off rather than loosened.
+    """
+    if raw is None:
+        return vp.DEFAULT_MAX_FRAME_SPREAD
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.error("VOICEPRINT_MAX_FRAME_SPREAD=%r is not a number; using the default "
+                     "%.2f", raw, vp.DEFAULT_MAX_FRAME_SPREAD)
+        return vp.DEFAULT_MAX_FRAME_SPREAD
+    if not 0.0 < value <= 1.0:
+        logger.error("VOICEPRINT_MAX_FRAME_SPREAD=%r is outside (0, 1.0]; using the default "
+                     "%.2f. Above 1.0 the guard admits everything.",
+                     raw, vp.DEFAULT_MAX_FRAME_SPREAD)
+        return vp.DEFAULT_MAX_FRAME_SPREAD
+    return value
+
+
+MAX_FRAME_SPREAD = _read_limit(os.environ.get("VOICEPRINT_MAX_FRAME_SPREAD"))
+
+
+def _admitted_limit():
+    """The limit to STORE against a sample, or None when it was the ordinary one.
+
+    None rather than always the number, so that the non-NULL rows in the database are exactly
+    the set worth re-examining. A column that is populated on every row answers "what was the
+    limit" and not the question anybody will actually ask, which is "which of these came in
+    under a guard somebody had loosened".
+    """
+    return None if MAX_FRAME_SPREAD == vp.DEFAULT_MAX_FRAME_SPREAD else MAX_FRAME_SPREAD
 
 
 def _limit_note():
@@ -400,7 +439,8 @@ def _enrol(event):
             "embedding": [float(x) for x in embed_audio(clip, sr)],
             "s3_key": key, "window": [start, end],
             "created_by": event.get("created_by"),
-            "correction_ref": event.get("correction_ref")}
+            "correction_ref": event.get("correction_ref"),
+            "admitted_max_spread": _admitted_limit()}
 
 
 def _match(event):
@@ -654,7 +694,8 @@ def _admit_harvest(folder, date, candidates):
                     len(frames), "n/a" if spread is None else "%.3f" % spread,
                     _limit_note())
         admitted.append({"embedding": [float(x) for x in c["vector"]],
-                         "s3_key": key, "window": [start, end]})
+                         "s3_key": key, "window": [start, end],
+                         "admitted_max_spread": _admitted_limit()})
         seconds += duration
     logger.info("harvest: %d of %d cluster members admitted (%.1fs)",
                 len(admitted), len(candidates), seconds)
@@ -753,8 +794,11 @@ def _from_request_artifact(bucket, key):
             # window not among them, and "this person spoke once". The last is the most
             # ordinary enrolment there is (a visitor says one thing and you name them), and
             # it was permanently refused with a log line claiming the window was untrustworthy.
+            # The note belongs on THIS line most of all: reaching it means the homogeneity
+            # guard passed — possibly only because it was loosened — and propagation then
+            # disagreed. Without it the two disagreeing judgements look equally weighted.
             logger.warning("enrolment refused: the corrected window holds more than one "
-                           "voice")
+                           "voice%s", _limit_note())
             enrol = {"voiceprint_id": enrol["voiceprint_id"],
                      "refused": "the corrected passage holds more than one voice"}
         else:
@@ -786,7 +830,8 @@ def _from_request_artifact(bucket, key):
                   ({"voiceprint_id": enrol["voiceprint_id"],
                     "embedding": [float(x) for x in v],
                     "s3_key": s3_key, "window": [start, end],
-                    "created_by": req.get("requested_by")} if enrol else None)),
+                    "created_by": req.get("requested_by"),
+                    "admitted_max_spread": _admitted_limit()} if enrol else None)),
         # A LIST, and a separate key. Not the same act as the anchor: the anchor is what a
         # person vouched for, these are what the clustering suggested, and the two
         # populations must stay separable forever — for audit, for measurement, and so a bad

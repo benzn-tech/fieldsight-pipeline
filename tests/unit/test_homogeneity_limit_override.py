@@ -96,10 +96,17 @@ def _enrol(monkeypatch, seconds=15.0):
                               "start_sec": 0.0, "end_sec": seconds}, None)
 
 
-def test_a_window_the_default_refuses_is_still_refused_when_nothing_is_set(stub_embedder,
-                                                                          monkeypatch):
+def test_the_default_did_not_move(stub_embedder, monkeypatch):
+    """Named for what it actually guards.
+
+    A review pointed out that this test passes on the pre-change code, so it proves nothing
+    about the override. Kept anyway, under an honest name: the whole premise of this change is
+    that the constant does NOT move, and a later edit that quietly relaxed it would otherwise
+    turn every "the override works" test into a tautology without any of them going red.
+    """
     stub_embedder["vectors"] = _frames_at_distance(0.5)
     monkeypatch.setattr(se, "MAX_FRAME_SPREAD", vp.DEFAULT_MAX_FRAME_SPREAD)
+    assert vp.DEFAULT_MAX_FRAME_SPREAD == 0.35
     assert _enrol(monkeypatch)["status"] == "refused"
 
 
@@ -140,8 +147,14 @@ def test_no_call_site_is_left_on_the_default(monkeypatch):
     # region rather than the single line.
     for i, line in enumerate(src.splitlines()):
         if "vp.window_is_homogeneous(" in line:
-            region = "\n".join(src.splitlines()[i:i + 3])
-            assert "MAX_FRAME_SPREAD" in region, "left on the default: %s" % line.strip()
+            # Whitespace-collapsed, because a wrapped call puts the comma at the end of one
+            # line and the argument at the start of the next.
+            region = " ".join(" ".join(src.splitlines()[i:i + 3]).split())
+            # `, MAX_FRAME_SPREAD` — passed as an ARGUMENT. Bare "MAX_FRAME_SPREAD" is also
+            # satisfied by the substring inside DEFAULT_MAX_FRAME_SPREAD, and this grep is
+            # the only coverage two of the four sites have, so its weakest reading is the
+            # one that matters.
+            assert ", MAX_FRAME_SPREAD" in region, "left on the default: %s" % line.strip()
 
 
 def test_the_note_is_silent_at_the_default_and_loud_otherwise(monkeypatch):
@@ -195,3 +208,62 @@ def test_the_environment_variable_actually_reaches_the_constant():
         capture_output=True, text=True, env=plain)
     assert out.returncode == 0, out.stderr[-800:]
     assert float(out.stdout.strip()) == vp.DEFAULT_MAX_FRAME_SPREAD
+
+
+# ---- the value that arrives is not always a number -----------------------
+
+
+@pytest.mark.parametrize("raw", ["off", "", "true", "Default", "0.35abc", None])
+def test_a_value_that_is_not_a_number_falls_back_instead_of_killing_the_function(raw, caplog):
+    """`float(raw)` at import time is not a bad enrolment — it is Runtime.ImportModuleError
+    on EVERY invocation, including match, propagation and the S3-triggered correction path,
+    while the deploy stays green and nothing reports it.
+
+    'Default' is in the list on purpose: the template's sentinel comparison is
+    case-sensitive, so a repo variable set to 'Default' passes the condition and arrives here
+    as a string to parse.
+    """
+    with caplog.at_level(logging.ERROR):
+        assert se._read_limit(raw) == vp.DEFAULT_MAX_FRAME_SPREAD
+    if raw is not None:
+        assert any("VOICEPRINT_MAX_FRAME_SPREAD" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("raw", ["2", "1.5", "0", "-0.4"])
+def test_a_limit_outside_the_range_is_refused(raw, caplog):
+    """Cosine distance runs to 2.0 and the check is `spread <= limit`, so 2 admits ANY window
+    — the guard switched off rather than loosened, with nothing in the response to say so.
+    Zero and negatives refuse everything, which is the same class of mistake pointing the
+    other way."""
+    with caplog.at_level(logging.ERROR):
+        assert se._read_limit(raw) == vp.DEFAULT_MAX_FRAME_SPREAD
+
+
+def test_a_value_inside_the_range_is_taken_as_given():
+    assert se._read_limit("0.7") == 0.7
+    assert se._read_limit("1.0") == 1.0
+
+
+def test_the_template_pattern_admits_exactly_what_the_code_admits():
+    """Two guards, one rule, written in different languages in different files. A template
+    that accepted a value the code then rejects would deploy a stack whose guard is quietly
+    back at the default — a switch wired at all three segments and disagreeing with itself.
+    """
+    import re
+    text = open("src/template.yaml", encoding="utf-8").read()
+    pattern = re.search(r"AllowedPattern: '(\^\(default[^']+)'", text).group(1)
+    rx = re.compile(pattern)
+    for good in ("default", "0.7", "0.35", "1.0"):
+        assert rx.match(good), good
+    for bad in ("off", "2", "1.5", "Default", ""):
+        assert not rx.match(bad), bad
+
+
+def test_the_between_voices_refusal_says_the_guard_was_loosened_too():
+    """That branch is reached ONLY when the homogeneity guard passed — possibly because it was
+    loosened — and propagation then disagreed. It is the line where the override is most
+    diagnostic, and it was the one line missing the note."""
+    import inspect
+    src = inspect.getsource(se)
+    i = src.index("enrolment refused: the corrected window holds more than one ")
+    assert "_limit_note()" in src[i:i + 260], src[i:i + 260]

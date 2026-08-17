@@ -843,6 +843,20 @@ Parameters:
   VoiceprintMaxFrameSpread:
     Type: String
     Default: 'default'
+    # Constrained for two reasons a review found, both of which fail silently:
+    #
+    #   * ANY non-numeric value raises at import time, and this module also serves match,
+    #     propagation and the S3-triggered correction path -- so a typo in a repo variable
+    #     takes the whole speaker feature down with Runtime.ImportModuleError on every
+    #     invocation, while the deploy stays green and nothing reports it. Note the sentinel
+    #     is matched case-sensitively below, so 'Default' would reach float() too.
+    #   * cosine distance runs to 2.0 and the check is `spread <= limit`, so 2 admits ANY
+    #     window at all -- the guard switched off rather than loosened. 1.0 is the top of
+    #     this range: still far looser than anything measurement has suggested, but it
+    #     cannot become a no-op.
+    AllowedPattern: '^(default|0(\.\d+)?|1(\.0+)?)$'
+    ConstraintDescription: >-
+      Either the literal 'default' or a number from 0 to 1.0.
     Description: >-
       The enrolment homogeneity limit, overridable WITHOUT a redeploy. The literal string
       'default' -- rather than an empty string, which sam deploy rejects as a missing
