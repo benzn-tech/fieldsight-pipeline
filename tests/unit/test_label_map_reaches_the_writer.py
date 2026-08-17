@@ -141,3 +141,53 @@ def test_the_inherited_count_is_reported_not_discarded(monkeypatch):
     assert out["inherited"] == 22, (
         "the writer said 22 turns were inherited and the caller reported %r" % out)
     assert out["matched"] == 0, "no profile matched anything; that must not read as 22"
+
+
+def test_the_correction_log_reports_what_the_writer_actually_did(monkeypatch, caplog):
+    """In production this function is driven only by an S3 event, and Lambda discards what an
+    event-driven invocation returns. So this log line is the ENTIRE production signal for a
+    correction, and it used to say "applied" and nothing else — indistinguishable between
+    "named two turns and stored a sample" and "named two turns, refused the enrolment, and
+    harvested nothing".
+    """
+    import logging
+    import lambda_speaker_embed as se
+    import json as _json
+    import numpy as np
+
+    monkeypatch.setattr(se, "invoke_writer", lambda p: {
+        "written": 6, "declined": 1, "inherited": 22, "enrolled": 0,
+        "enrolRefused": {"reason": "this window does not hold one voice"},
+        "harvested": 0, "harvestRefused": 3})
+    monkeypatch.setattr(se, "embed_audio", lambda a, sr: np.ones(192, dtype=np.float32))
+    monkeypatch.setattr(se, "_propagate", lambda *a, **k: ([], [], None))
+
+    def _wav():
+        import io as _io
+        import wave
+        buf = _io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\x00\x01" * 16000 * 12)
+        return buf.getvalue()
+
+    artifact = _json.dumps({
+        "op": "correction", "company_id": "co-1", "user_folder": "u",
+        "date": "2026-08-11", "session_base": "s", "request_id": "r-1",
+        "correction": {"display_name": "Ivy", "source_filename": "x_c0000.wav",
+                       "start_sec": 0.0, "end_sec": 12.0},
+        "turns": []})
+    # Key-aware: one helper fetches both the artifact (JSON text) and the audio (wav bytes).
+    monkeypatch.setattr(se, "_get", lambda k: _wav() if k.endswith(".wav") else artifact)
+
+    with caplog.at_level(logging.INFO):
+        se._from_request_artifact("b", "voiceprint_requests/co-1/s/r-1.json")
+
+    line = next((r.getMessage() for r in caplog.records
+                 if "correction applied" in r.getMessage()), None)
+    assert line, "the correction produced no log line at all"
+    for fragment in ("named=6", "inherited=22", "harvested=0",
+                     "this window does not hold one voice"):
+        assert fragment in line, f"{fragment!r} missing from: {line}"
