@@ -906,14 +906,20 @@ def _from_match_artifact(bucket, key):
         # all; and when an API call does request it, the homogeneity guard has so far refused
         # every window of real audio.
         if req.get("label_map") and (req.get("mode") or "").lower() == "on":
-            written = invoke_writer({"op": "match_names", "company_id": company_id,
-                                     "session_base": session,
-                                     "label_map": req.get("label_map"),
-                                     "results": []}).get("written", 0)
+            # `inherited`, NOT `written`. The writer counts them separately and `written`
+            # only ever counts MATCHED names — of which there are none here, because
+            # `results` is empty by construction. Reading `written` on this branch reports
+            # zero however many turns inheritance actually named, which is the shape that
+            # makes a working feature look dead in the log.
+            reply = invoke_writer({"op": "match_names", "company_id": company_id,
+                                   "session_base": session,
+                                   "label_map": req.get("label_map"),
+                                   "results": []})
+            inherited = reply.get("inherited", 0)
             logger.info("match: no profiles, but inheritance named %d turns in %s",
-                        written, session)
-            return {"session": session, "matched": written, "profiles": 0,
-                    "inheritedOnly": True, "mode": req.get("mode")}
+                        inherited, session)
+            return {"session": session, "matched": 0, "inherited": inherited,
+                    "profiles": 0, "inheritedOnly": True, "mode": req.get("mode")}
         return {"session": session, "matched": 0, "profiles": 0, "mode": req.get("mode")}
 
     out = _match({"session": session, "user_folder": folder, "date": date,
@@ -977,17 +983,25 @@ def _from_match_artifact(bucket, key):
     # logs as an ordinary outcome. The session could be holding correction names from a
     # previous gesture that the label map is entitled to spread to the short turns, and they
     # were silently left unnamed because a DIFFERENT feature had found no candidates.
-    written = 0
+    written, inherited = 0, 0
     if named or req.get("label_map"):
-        written = invoke_writer({"op": "match_names", "company_id": company_id,
-                                 "session_base": session,
-                                 # Both artifacts carry it and both writer branches read it;
-                                 # this hop dropped it on the floor in both directions.
-                                 "label_map": req.get("label_map"),
-                                 "results": named}).get("written", 0)
-    logger.info("match: session=%s named %d of %d turns against %d profiles",
-                session, written, len(out["results"]), len(profiles))
-    return {"session": session, "matched": written, "profiles": len(profiles), "mode": mode}
+        reply = invoke_writer({"op": "match_names", "company_id": company_id,
+                               "session_base": session,
+                               # Both artifacts carry it and both writer branches read it;
+                               # this hop dropped it on the floor in both directions.
+                               "label_map": req.get("label_map"),
+                               "results": named})
+        # Two counts, kept apart because they answer different questions. `written` is how
+        # many turns a stored VOICE matched; `inherited` is how many were named from the
+        # transcriber's own labels once a stronger source had settled one. Collapsing them
+        # would make a session where the voiceprints did nothing and inheritance did
+        # everything read as a successful match.
+        written, inherited = reply.get("written", 0), reply.get("inherited", 0)
+    logger.info("match: session=%s named %d of %d turns against %d profiles "
+                "(+%d inherited)",
+                session, written, len(out["results"]), len(profiles), inherited)
+    return {"session": session, "matched": written, "inherited": inherited,
+            "profiles": len(profiles), "mode": mode}
 
 
 def _spread(event):
