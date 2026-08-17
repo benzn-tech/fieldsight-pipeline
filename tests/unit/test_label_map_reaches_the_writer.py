@@ -191,3 +191,22 @@ def test_the_correction_log_reports_what_the_writer_actually_did(monkeypatch, ca
     for fragment in ("named=6", "inherited=22", "harvested=0",
                      "this window does not hold one voice"):
         assert fragment in line, f"{fragment!r} missing from: {line}"
+
+
+def test_a_refusal_says_which_profile_it_was_closer_to():
+    """`closer-to-another-profile` is the one refusal somebody can act on, and acting on it
+    needs the numbers: 0.62 here against 0.71 there means either the correction named the
+    wrong person, or two profiles are the same person and should be merged.
+
+    The writer computes `own`, `bestOther` and `nearestOtherId`; all three stopped at the seam
+    and the line said only that something was closer to something else.
+    """
+    import lambda_speaker_embed as se
+    detail = se._refusal_detail({"reason": "closer-to-another-profile",
+                                 "own": 0.62, "bestOther": 0.71, "nearestOtherId": "vp-9"})
+    assert "closer-to-another-profile" in detail
+    for fragment in ("0.62", "0.71", "vp-9"):
+        assert fragment in detail, f"{fragment!r} missing from {detail!r}"
+    # A refusal with no nearest profile carries no parenthetical to explain.
+    assert se._refusal_detail({"reason": "this window does not hold one voice"}) \
+        == " enrolRefused=this window does not hold one voice"
