@@ -854,7 +854,14 @@ Parameters:
     #     window at all -- the guard switched off rather than loosened. 1.0 is the top of
     #     this range: still far looser than anything measurement has suggested, but it
     #     cannot become a no-op.
-    AllowedPattern: '^(default|0(\.\d+)?|1(\.0+)?)$'
+    #
+    # Zero is excluded, which an earlier version of this pattern allowed while `_read_limit`
+    # rejected it: the template would have accepted the deploy and the function would have
+    # silently run at 0.35 instead of the "refuse everything" the operator asked for. The
+    # test that was supposed to prove the two agree compared them over a HAND-WRITTEN list of
+    # values that happened not to contain 0; it now derives the expectation from
+    # `_read_limit` itself, so the two cannot drift again.
+    AllowedPattern: '^(default|0\.0*[1-9]\d*|1(\.0+)?)$'
     ConstraintDescription: >-
       Either the literal 'default' or a number from 0 to 1.0.
     Description: >-
