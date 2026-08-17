@@ -59,6 +59,15 @@ def test_every_topic_read_carries_the_deleted_predicate():
         # The PROPERTY, not the spelling: the exclusion may be inlined SQL or the shared
         # constant. Asserting the constant's NAME would pass on a query that imports it and
         # never uses it, and fail on a correct query that inlines the same condition.
+        #
+        # A CHILD read (action_items, topic_photos) builds it from CHILD_OF_VISIBLE_TOPIC,
+        # which correlates on the child's own topic_id. That form counts too — and note
+        # what this test CANNOT do: two of those inlined copies named an alias that did not
+        # exist in their own statement, so they were `missing FROM-clause entry for table
+        # "t"` on every call, and this assertion was green throughout. Text is not SQL.
+        # tests/integration/test_topic_reads_execute.py executes them instead.
+        if "CHILD_OF_VISIBLE_TOPIC" in body:
+            continue
         if "scope = 'deleted'" in body and "reverted_at IS NULL" in body:
             continue
         offenders.append(name)
