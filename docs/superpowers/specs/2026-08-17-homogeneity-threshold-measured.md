@@ -148,6 +148,56 @@ reporting it is how flaw 2 survived a whole evening of measuring.
 
 ---
 
+## What shipped instead of a number (PR #549)
+
+The constant did not move. What moved is that it is now **settable** —
+`VOICEPRINT_MAX_FRAME_SPREAD`, wired repo variable -> workflow -> template parameter, empty
+by default so prod is byte-identical.
+
+That is not a way of shipping 0.70 quietly. It is a way of separating two questions that were
+stuck together:
+
+1. *what is the right limit?* — still unanswered, still needs the measurement described above;
+2. *does anything downstream of enrolment work?* — unanswerable until now, because the guard
+   refused every window and so matching, automatic naming and harvest have never run against
+   real data even once.
+
+Question 2 is answerable tonight and question 1 is not, so they should not share a blocker.
+
+### Running it on TEST
+
+    gh variable set TEST_VOICEPRINT_MAX_FRAME_SPREAD --body 0.7     # any value in (0, 1.0]
+    gh workflow run "Deploy FieldSight TEST (SAM)" --ref develop
+
+Then correct a speaker name in the transcript viewer and read
+`GET /api/org/voiceprints`: the profile should show samples rather than
+`refused -> "this window does not hold one voice"`.
+
+To put it back, delete the variable and redeploy. `gh variable delete
+TEST_VOICEPRINT_MAX_FRAME_SPREAD`.
+
+### What the results are and are not evidence of
+
+**Not** evidence that the admitted windows held one voice. 0.7 has no measurement behind it;
+every log line for such an enrolment says so, and each sample carries the limit it was
+admitted under in `speaker_voiceprint_samples.admitted_max_spread` (migration 0047, NULL for
+the ordinary guard). Finding them again later is one query.
+
+**Is** evidence about the plumbing: whether a sample reaches the profile, whether a profile
+with samples is offered to the matcher, whether the matcher names a turn in the next session,
+and whether harvest — a path that has never once run — stores what it should.
+
+Two traps this arrangement was reviewed into avoiding:
+
+* the calibration scripts read `default_limit`, never the limit in force. Reading the latter
+  would have made `measure_frame_spread.py` answer "0 of 13 windows refused" on a stack set to
+  0.7 — the setting restated as a measurement.
+* the limit is constrained to (0, 1.0] in two places. Cosine distance runs to 2.0 and the
+  check is `spread <= limit`, so 2 would admit any window at all: the guard switched off
+  rather than loosened, with nothing in the response to say which.
+
+---
+
 ## What I am doing instead
 
 Nothing to the constant. The measurement stands as a record of what was tried and why it does
