@@ -10,10 +10,10 @@ Two things are load-bearing here and both fail silently if they regress:
 
   * **the mode gate** — `SPEAKER_IDENTITY_MODE=off` must 404, because that is the rollback.
     A rollback that only stops *some* of the feature is not a rollback.
-  * **the profile query** — the consent and withdrawn filters live in
-    `profiles_for_matching`, and this endpoint is the one caller. A profile without consent
-    that still gets matched keeps naming people, correctly as far as anything downstream can
-    tell.
+  * ~~**the profile query**~~ — this endpoint is NOT a caller of `profiles_for_matching` and
+    has not been since propagation stopped scoring against stored profiles. The claim
+    survived here as a fixture stub of a function nobody called; the consent and withdrawn
+    filters are covered in test_voiceprints_repo and in the writer's tests, where they run.
 """
 import json
 
@@ -81,10 +81,10 @@ def wired(monkeypatch):
     # real query here would only be re-testing repositories.scope.
     monkeypatch.setattr(org.scope, "visible_scope",
                         lambda conn, caller: {"self_folder": "Ada_L", "user_scope": "ALL"})
-    monkeypatch.setattr(org, "profiles_for_matching",
-                        lambda conn, company_id, site_id=None: [
-                            {"id": "vp-1", "user_id": "u-9", "display_name": "Ben L",
-                             "status": "confirmed", "embedding": [0.1] * 192}])
+    # No `profiles_for_matching` stub. This fixture carried one for months after the
+    # endpoint stopped calling it — a stub of a function nothing invoked, which passed for
+    # coverage of the consent filter while covering nothing. The filter is exercised where it
+    # actually runs, in test_voiceprints_repo and the writer's tests.
     return s3
 
 

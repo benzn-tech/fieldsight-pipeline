@@ -7,11 +7,14 @@ Live since 2026-08-14: the voiceprint writer calls `record_turn_name` and `add_s
 transcript endpoint calls `live_turn_names`, and `DELETE /api/org/voiceprints/{id}` calls
 `withdraw`.
 
-`profiles_for_matching` has NO production caller. It was the correction endpoint's, until
-the voice vectors it returned turned out to be the biometric-residence defect's fifth home —
-propagation names the cluster the corrected turn belongs to and scores against no stored
-profile, so nothing needed them. The consent and withdrawn filters it carries are still the
-ones any future matcher must use; that is why it is kept rather than deleted.
+`profiles_for_matching` is called in production by `lambda_voiceprint_writer` — `_profiles`
+serves the matcher's synchronous fetch, and `_agreement` uses it to refuse a sample that sits
+closer to somebody else. **This paragraph has now claimed the opposite three times**, once
+while the callers existed, and the correction is worth more than the fact: a docstring that
+says "nothing calls this" ages into a licence to change the function freely, and both callers
+depend on its consent and withdrawn filters. It left the correction endpoint when the voice
+vectors it returns turned out to be the biometric-residence defect's fifth home; it did not
+stop being called.
 
 (This paragraph has now been wrong twice in two days, in opposite directions.)
 

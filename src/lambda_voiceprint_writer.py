@@ -26,6 +26,19 @@ Event shapes:
     {"op": "enrol", "company_id", "voiceprint_id", "embedding", "s3_key", "window",
      "correction_ref"?, "created_by"?}                          -> {"stored": 0|1}
 
+Four optional fields above are read here and **emitted by nobody**, so their columns are NULL
+on every row ever written: `score` and `margin` on a propagation result, `label_disagreement`,
+and the top-level `voiceprint_id` fallback. They are kept because the columns exist (migration
+0040) and a future matcher-driven propagation would fill them — but an event shape that
+advertises a field no producer sends is the exact half of tonight's five defects that reads
+as working, so it is said here rather than inferred from a NULL column later.
+
+`op: "enrol"` has no production caller either. The embedder's identically named op returns a
+result that is NOT this input — it carries no `company_id`, which `_require` demands — so
+wiring the two by their shared name would fail loudly. It also never calls `record_attempt`,
+so if it is ever wired, the `last_attempt_*` columns built to explain empty profiles stop
+being maintained on that path.
+
 Spec: docs/superpowers/specs/2026-08-13-speaker-correction-propagation.md
 Plan: docs/superpowers/plans/2026-08-13-correction-propagation-implementation.md (P4)
 """
@@ -64,11 +77,15 @@ def _propagation(event):
     * the turn the user actually asserted is written `source='correction'` — the one row a
       person vouched for, and what the promotion count is supposed to count.
 
-      It carries `voiceprint_id` only when the caller supplies one, and today nothing does:
-      a correction creates no profile (that is Phase 4, and consent is its precondition), so
-      every asserted row has a NULL id and `confirmations_count` is structurally zero. That
-      is the safe direction — promotion can only under-count — but it is two halves waiting
-      to disagree, so it is written down here rather than discovered when Phase 4 lands.
+      It carries `voiceprint_id` when the caller supplies one, and **the caller now does**:
+      org-api creates the profile before queueing, and the embedder puts its id on the
+      asserted row. So consented `correction` rows do feed `confirmations_count`, and the
+      "structurally zero" invariant this paragraph used to record is gone — it was written
+      as "two halves waiting to disagree" and then went on being read after the halves
+      agreed.
+
+      What still holds is the part that was load-bearing: only `source='correction'` counts,
+      so promotion counts human assertions and never the system's own propagated output.
     """
     company_id = _require(event, "company_id")
     session_base = _require(event, "session_base")

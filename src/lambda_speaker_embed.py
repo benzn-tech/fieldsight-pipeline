@@ -1,12 +1,26 @@
 """Turn audio into a voiceprint vector, and turns into names.
 
-Two operations, invoked directly (never by an S3 event — nothing about this is triggered by
-a file landing):
+**In production this function is driven by an S3 event.** org-api is in-VPC with no NAT and
+cannot invoke outward (BUG-36), so it hands work over by writing an artifact under
+`voiceprint_requests/` and a hand-wired notification (BUG-33 — the template carries no S3
+event for this function) brings it here. `Records` in the event means that path;
+`_from_request_artifact` and `_from_match_artifact` read the `op` inside the object.
+
+The header used to say the opposite — "never by an S3 event, nothing about this is triggered
+by a file landing" — which was true until 2026-08-14 and then described the one entry point
+that matters.
+
+Three direct ops remain, used by scripts and tests:
 
     {"op": "enrol", "voiceprint_id", "user_folder", "date", "source_filename",
      "start_sec", "end_sec", "correction_ref"?}
     {"op": "match", "session", "user_folder", "date", "company_id",
      "turns": [{"source_filename", "start_sec", "end_sec"}, ...]}
+    {"op": "spread", "user_folder", "date", "source_filename", "start_sec", "end_sec"}
+
+`op=enrol`'s result is NOT the writer's `op=enrol` input despite the shared name: it carries
+no `company_id`, which the writer requires. Nothing wires the pair, and it would fail loudly
+if anything did.
 
 Pure compute: **no database, no VPC.** This function runs on python3.12 because that is where
 onnxruntime comes from (the VAD layer is cp312-only) and `PsycopgLayer` is cp311-only — one

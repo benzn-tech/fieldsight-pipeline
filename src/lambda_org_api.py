@@ -245,14 +245,12 @@ _s3_client = None
 _cognito_client = None
 
 
-def profiles_for_matching(conn, company_id, site_id=None):
-    """The consent/withdrawn filter, reached through one name.
-
-    Bound here rather than called inline so this module has exactly one place a profile can
-    come from — and so the endpoint's tests can supply rows without a database while still
-    failing if the call disappears.
-    """
-    return voiceprints.profiles_for_matching(conn, company_id, site_id=site_id)
+# `profiles_for_matching` used to be re-exported here, with a docstring saying the binding
+# would fail if the call disappeared. The call disappeared — propagation names the cluster the
+# corrected turn belongs to and scores against no stored profile — and the binding did not
+# fail, because a re-export cannot notice that nobody calls it. The consent and withdrawn
+# filters now live where they are used: `lambda_voiceprint_writer` fetches profiles for the
+# matcher, in-VPC, which is the only half that may hold a vector.
 
 
 def s3():
