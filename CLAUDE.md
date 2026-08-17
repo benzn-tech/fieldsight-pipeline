@@ -494,6 +494,55 @@ Windows path and the call fails in a way that reads like a routing bug.
   guard. It was not harmless — it refused every save, which made the fix
   behind it unreachable.
 
+### A stubbed seam is a seam nobody tested (2026-08-17, five instances in one night)
+
+Five separate defects that night had one shape: two components agreeing on a
+contract neither of them stood on, each side's tests exercising its own half, and
+both green while the join was broken. None was findable from either side alone.
+
+* org-api wrote `label_map`, the writer read it, and the hop between them did not
+  forward the key. Label inheritance was unreachable code that reported success.
+* the embedder began sending a refused enrolment as a new shape and the writer
+  crashed on it — every refusal died, and the field that change existed to record
+  stayed NULL.
+* `_SOURCE_RANK` was keyed on `"match"` while the writer stored
+  `"voiceprint_match"`, so matched names ranked below an unrecognised source.
+* `invoke_writer` returned **boto3's envelope** instead of the callee's decoded
+  payload. `.get("profiles")` was therefore always None, the matcher's "no
+  consented profiles" branch fired on every run, and the whole speaker-match path
+  did nothing in production. **Twenty tests monkeypatched that function; none
+  exercised it.**
+* `record_attempt` and `list_profiles` were stubbed everywhere and called for real
+  nowhere, so their SQL had never run.
+
+The checks that would have caught them, in the order they cost least:
+
+1. **Count the stubs.** `grep -c 'setattr(.*"fn"' tests/` against "does any test
+   call `fn` for real". Twenty to zero is the defect, visible without reading any
+   code.
+2. **Replay the actual defect against the new test.** Not a plausible mutation —
+   the real one. Twice that night a guard was written that hung on the very field
+   the defect removed, so the assertion was skipped and the test passed. Both were
+   found only by putting the original code back.
+3. **Test the seam, not the halves.** `tests/unit/test_embedder_writer_contract.py`
+   drives one component over every path that produces a message and feeds each
+   message to the other's real handler. Adding a field to one side and not the
+   other is red rather than silent.
+4. **Assert on SQL text where a double cannot type-check.** A
+   `CASE WHEN %s IS NULL` returned 500 in production with 3082 tests green;
+   Postgres cannot infer the parameter's type and the double never tries.
+
+### Verifying against a live system
+
+- **A log line is evidence about the log line.** "no consented profiles for this
+  company" is what a broken profile fetch prints AND what an empty database
+  prints. Check the thing itself.
+- **Check the timestamps before concluding.** Twice that night stale CloudWatch
+  entries and a not-yet-finished 138-second invocation were read as current state.
+- **Confirm the deploy carries the change before testing it.** `gh run list`
+  right after a merge returns the run for the PREVIOUS commit; match on
+  `headSha`.
+
 ```bash
 # Test meeting minutes
 aws lambda invoke --function-name fieldsight-meeting-minutes \
