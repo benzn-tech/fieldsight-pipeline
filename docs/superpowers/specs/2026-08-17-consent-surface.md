@@ -29,6 +29,30 @@ is a decision rather than an implementation. Shipping consent on its own produce
 that fills up and is never consulted — which is worth knowing before choosing how much to
 invest in the surface.
 
+### The ordering is forced, and the appealing shortcut does not exist
+
+Step 1 needs a decision that is not mine to make, so the obvious move is to do step 3 first —
+automatic matching is pure backend, needs no privacy decision, and after the 2026-08-17 fix a
+match run does useful work even with **zero** profiles, because label inheritance rides on the
+same call.
+
+**That reasoning is wrong, and I got as far as picking the implementation site before checking
+it.** Inheritance spreads names a session *already holds* to its short turns
+(`_inherit_labels` skips any label group with no named member). A session that has just
+finalized holds no corrections, so there is nothing to spread. Inheritance pays off on the
+session somebody has just corrected — which is the on-demand call that already exists — and
+pays nothing on a fresh one.
+
+So automatic matching delivers exactly nothing until profiles exist, profiles need step 1, and
+step 1 needs a decision. The chain cannot be reordered to avoid the decision, and the useful
+thing to record is that the shortcut looked real enough to start building.
+
+For whoever does eventually build step 3: `lambda_finalize_claim` is the site. It is in-VPC,
+already claims the session and already has folder, date, site and recipient from Aurora — the
+same inputs `speaker_match` gathers. The artifact contract (`turns`, `label_map`, `site_id`)
+would then have two producers, so it needs to move to a shared module rather than be written
+twice, which is the defect shape this feature has produced five times.
+
 ---
 
 ## Step 1, precisely
