@@ -692,6 +692,18 @@ Parameters:
       The longest a group may span before it is refused as stale. A device that
       kept a group overnight presents it again the next day and nothing on the
       device objects -- merging yesterday into today reads perfectly fluently.
+  EnableSessionBrief:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether the finalize re-summary writes a session BRIEF (narrative first,
+      to-dos derived from it) instead of the terse rolling summary. The brief
+      returns the same {summary, open_todos} the confirmation email reads, so
+      the email is unchanged either way; on top of that it stores the full
+      brief under session_brief/ for the reader surfaces. Off everywhere until
+      a real session has been read end to end.
+
   EnableGroupMerge:
     Type: String
     Default: 'false'
@@ -2448,6 +2460,13 @@ Resources:
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
           QWEN_ENABLE_THINKING: 'false'
+          # Which summariser that re-summary uses. Off = the terse rolling one
+          # this has always used. On = session_brief, which writes the narrative
+          # first and derives the to-dos from it. It returns the same
+          # {summary, open_todos}, so the email is identical either way; the
+          # difference is that the full brief is also stored under
+          # session_brief/ for the reader surfaces to pick up.
+          SESSION_BRIEF: !Ref EnableSessionBrief
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -2461,7 +2480,12 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
             - Effect: Allow
               Action: s3:PutObject
-              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
+                # The stored brief. Without this the write fails, _store_brief
+                # logs and swallows, and the flag looks on while nothing lands
+                # (CLAUDE.md: a guard that catches is not a feature that works).
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_brief/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
