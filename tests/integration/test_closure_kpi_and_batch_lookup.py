@@ -39,8 +39,21 @@ def _seed(db):
     return co, s, u
 
 
-def _closed_action(db, co, s, u, *, at=None, text="Order steel"):
-    """One action item plus the audit row that says somebody closed it."""
+# Noon on DATE in TZ (NZ is UTC+12), so the default closure lands in the middle of the local
+# day the tests query — far from both boundaries the timezone test deliberately sits on.
+NOON_ON_DATE = f"{DATE}T00:00:00Z"
+
+
+def _closed_action(db, co, s, u, *, at=NOON_ON_DATE, text="Order steel"):
+    """One action item plus the audit row that says somebody closed it.
+
+    `at` defaults to a timestamp INSIDE `DATE` rather than to now. It used to default to
+    now — `created_at`'s own default — which meant the closure landed on whatever day the
+    suite ran and the query asked about 2026-08-17. Those agreed exactly once, on the day
+    the file was written, and three tests here have failed every day since.
+
+    A fixed date and a floating clock is the shape: neither half looks wrong on its own.
+    """
     t = topics.upsert_topic(db, s["id"], DATE, "Slab", user_id=u["id"],
                             action_items=[{"text": text}])
     aid = db.execute(
