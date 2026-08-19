@@ -424,3 +424,81 @@ blind.
   one named bug is plainly tickable. The raw item lists, not the tally, are the
   evidence.
 - Both sessions are from one day and one company.
+
+---
+
+## 11. How it fuses: the integration point already existed
+
+Written after finding `lambda_session_finalize._complete_summary`, which
+invalidates §4's assumption that this needs a pipeline of its own.
+
+### What is already there
+
+At session close — after the grace window, so every transcript has landed —
+finalize runs a worker that:
+
+- re-gathers the session's segments and calls `assemble_deduped_turns`, which
+  now includes the batch-window dedup;
+- runs in a **non-VPC** lambda, so the LLM is reachable;
+- produces `{summary, open_todos}` and hands it to the confirmation email;
+- takes its summariser as an **injectable parameter**
+  (`_complete_summary(artifact, summarize=None)`).
+
+That is the whole "complete session → LLM → narrative + to-dos" chain, already
+built, already running at exactly the right moment. It is just very thin: two or
+three sentences.
+
+**Plan T3 — a new lambda, a `briefing_requests/` channel, a new S3 prefix and its
+IAM — was written without seeing this and is redundant.** The real change is one
+function swap.
+
+### Three ways to fuse, and the one chosen
+
+**A · Side by side.** The brief is a new artifact; the existing extraction is
+untouched. Two LLM passes over one transcript, producing **two records that will
+disagree** — the same meeting summarised twice, with nothing saying which is
+authoritative. This is what §4 implied and it is wrong.
+
+**B · In series — chosen.** The brief is generated first; the item store is
+extracted **from the brief** rather than from the transcript. One LLM pass, one
+record, no drift. Aurora's tables and every consumer of them — check-off, audit
+history, programme impact, compliance rollups, the Tasks page — are untouched,
+because the shape they read does not change. The density gain propagates: an
+action item derived from a brief that kept the names and numbers inherits them.
+
+**C · Refactor** to §2's principle, with Aurora items as materialised views over
+the transcript. It touches `lambda_item_writer`, org-api, the frontend Tasks and
+Today pages, programme matching and compliance rollups. B delivers most of its
+benefit for a fraction of that, and reversibly. **Not now** — revisit once B has
+run on real data, when there will be evidence about whether the structure layer
+still needs to exist separately.
+
+### B in three stages, each independently stoppable
+
+**Stage 1 — swap the summariser.** `session_brief.brief_from_turns` replaces
+`rolling_summary.summarize_turns` inside `_complete_summary`. It returns the
+brief widened with the same `summary` and `open_todos`, so the email is
+byte-identical; the full brief is stored under `session_brief/`. One module, one
+flag, one IAM statement. No new lambda, no migration.
+
+**Stage 2 — item_writer reads the brief.** Topics and action items are extracted
+from the brief instead of the transcript. **Aurora's schema does not change**, so
+no consumer changes.
+
+Do not cut over blind. The current extractor is *correct* on the sessions that
+matter most — assignee fill was 5/5 on a site walk and 14/14 on a named team
+sync (§1). Run both for a week or two and diff the two item sets per session
+before switching. One A/B of three or four runs is not enough evidence to
+retire a path that works.
+
+**Stage 3 — retrieval (optional).** The entity table, Postgres FTS and
+`/search/transcript`. Independent of 1 and 2, and the only part needing a
+migration and new endpoints. It is also the only part that can answer "where was
+Plaud said", which today returns nothing at all (§3).
+
+### What stage 1 does not do
+
+It does not remove the rolling summary — that still serves the mid-meeting poll,
+which is a different question at a different moment. It does not touch
+extraction. It is off by default, and the first real session read end to end is
+what decides whether it goes on.
