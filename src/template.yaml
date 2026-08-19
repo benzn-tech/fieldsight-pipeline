@@ -2459,6 +2459,12 @@ Resources:
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          # Applies to the rolling summariser only. session_brief passes
+          # enable_thinking=True explicitly, because a brief's density comes
+          # from the reasoning and it is measured at ~100-125s for a 70-minute
+          # session -- a deliberate widening of the finalize budget, not an
+          # oversight. Leaving this to the env would have shipped a
+          # configuration none of the measurements were taken on.
           QWEN_ENABLE_THINKING: 'false'
           # Which summariser that re-summary uses. Off = the terse rolling one
           # this has always used. On = session_brief, which writes the narrative

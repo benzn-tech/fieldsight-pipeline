@@ -285,7 +285,15 @@ def brief_from_turns(turns, call_llm=None):
     if call_llm is None:
         import llm_utils
         call_llm = llm_utils.call_llm
-    raw, _err = call_llm(build_brief_prompt(turns), max_tokens=MAX_TOKENS, force_json=True)
+    # Thinking ON, explicitly, not inherited. SessionFinalizeFunction carries
+    # QWEN_ENABLE_THINKING=false -- set when the summariser here was the terse
+    # rolling one and 54s of reasoning blew a 2-minute budget for two sentences.
+    # A brief is the opposite trade: measured at ~100-125s with thinking on for
+    # a 70-minute session, and that is where its density comes from. Inheriting
+    # the env would mean every number this was designed against was measured on
+    # a configuration that never shipped.
+    raw, _err = call_llm(build_brief_prompt(turns), max_tokens=MAX_TOKENS,
+                         force_json=True, enable_thinking=True)
     brief = parse_brief(raw)
     if not brief:
         return None

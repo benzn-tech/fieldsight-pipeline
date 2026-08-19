@@ -196,3 +196,18 @@ def test_the_transcript_is_elided_rather_than_truncated_when_oversized():
     assert len(rendered) <= 5100
     assert "elided" in rendered
     assert rendered.startswith("[13:00:00]")
+
+
+def test_thinking_is_requested_explicitly_not_inherited_from_the_env():
+    # SessionFinalizeFunction runs with QWEN_ENABLE_THINKING=false, set when the
+    # summariser here was the terse rolling one. Every measurement behind this
+    # brief was taken with thinking ON; inheriting the env would ship a
+    # configuration none of them describe.
+    seen = {}
+
+    def spy(prompt, **kw):
+        seen.update(kw)
+        return (_BRIEF_JSON, None)
+
+    sb.brief_from_turns(_turns(), call_llm=spy)
+    assert seen.get("enable_thinking") is True
