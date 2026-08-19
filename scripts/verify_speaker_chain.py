@@ -52,13 +52,24 @@ import sys
 import time
 
 REGION = "ap-southeast-2"
-PREFIX = {"test": "fieldsight-test", "prod": "fieldsight"}
+# `fieldsight-prod-*`, not `fieldsight-*`. The stack prefixes BOTH stages, and the
+# abbreviated form was a guess that no test could catch and that only shows up as
+# ResourceNotFoundException the first time somebody runs this against prod — which is
+# exactly what happened, 25 invocations in a row, every one of them "not found" and none
+# of them saying which name it had tried.
+PREFIX = {"test": "fieldsight-test", "prod": "fieldsight-prod"}
 
 
 def _aws(args):
     r = subprocess.run(["aws", *args, "--region", REGION], capture_output=True, text=True)
     if r.returncode:
-        return None, (r.stderr or "").strip()[:300]
+        err = (r.stderr or "").strip()[:300]
+        if "ResourceNotFound" in err:
+            # Name the thing that was not found. A bare "ResourceNotFoundException" sends the
+            # reader to look for a broken deploy when the truth is a misspelt prefix here.
+            named = [a for a in args if a.startswith("fieldsight")]
+            err += "  <- looked for: %s" % (named or args)
+        return None, err
     return r.stdout, None
 
 
