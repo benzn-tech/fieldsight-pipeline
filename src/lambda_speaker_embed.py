@@ -125,13 +125,33 @@ MAX_EMBED_SECONDS = float(os.environ.get("VOICEPRINT_MAX_EMBED_SECONDS", "45.0")
 
 # Harvest: turning ONE naming gesture into a usable profile.
 #
-# 10 s, not the 3 s matching floor and not the 5 s a first draft picked.
-# `window_is_homogeneous` returns None for fewer than two frames and frames are cut at
-# FRAME_SECONDS = 5.0, so a 5-9.99 s window is UNJUDGEABLE — and "could not check" is
-# refused alongside "no", or the guard becomes decoration. A 5 s floor would have admitted
-# nothing at all, silently. `lambda_org_api` already documented this: "a window under ten
-# seconds cannot be judged homogeneous and is not enrolled".
-ENROL_MIN_TURN_S = float(os.environ.get("VOICEPRINT_ENROL_MIN_TURN_S", "10.0"))
+# One frame length, not two. Derived rather than written, because the two constants drifting
+# apart is exactly what happened.
+#
+# This was 10.0 on the reasoning that "a 5-9.99 s window is UNJUDGEABLE": frames are cut at
+# FRAME_SECONDS = 5.0, `window_is_homogeneous` needs two of them, and a stride of 5 s over a
+# 7 s window gives one. That was true when it was written and stopped being true when
+# `_frames` gained its end-anchored tail frame — the fix for judging a window on two thirds of
+# itself. Since then a window LONGER than one frame yields two, and the comment preserved the
+# obsolete arithmetic while the floor went on enforcing it.
+#
+# What that cost is not a missed optimisation. Measured over 78 prod windows on 2026-08-19:
+#
+#     3-5 s   : unjudgeable, 14 of 14      (one frame, correctly excluded)
+#     5-10 s  : 83 % homogeneous, pair_median 0.152
+#     10-20 s : 5 %  homogeneous, pair_median 0.452
+#     20-30 s : 0 %  homogeneous, pair_median 0.477
+#
+# The floor admitted only 10-30 s windows, which is the band that almost never passes the
+# guard — so enrolment's entire candidate population was the material least suitable for it,
+# and three nights went into suspecting the threshold instead. `pair_median` does not grow
+# with pair count, so the rise is content and not an artifact of longer windows yielding more
+# frame pairs; that alternative was tested before this change, not after.
+#
+# `<=`, not `<`: at exactly FRAME_SECONDS the tail branch does not fire and there is one
+# frame. The floor exists to skip the S3 read and the ONNX pass for windows that cannot be
+# judged, so the boundary belongs on the excluded side.
+ENROL_MIN_TURN_S = float(os.environ.get("VOICEPRINT_ENROL_MIN_TURN_S", str(FRAME_SECONDS)))
 ENROL_MAX_SAMPLES = int(os.environ.get("VOICEPRINT_ENROL_MAX_SAMPLES", "6"))
 ENROL_MAX_SECONDS = float(os.environ.get("VOICEPRINT_ENROL_MAX_SECONDS", "60.0"))
 
@@ -716,13 +736,14 @@ def _admit_harvest(folder, date, candidates):
         t = c["turn"]
         start, end = float(t["start_sec"]), float(t["end_sec"])
         duration = end - start
-        if duration < ENROL_MIN_TURN_S:
-            # Redundant with the homogeneity check and kept deliberately: a window under
-            # 10 s yields fewer than two frames, so `window_is_homogeneous` would return
-            # None and refuse it anyway. What this saves is the S3 read and the ONNX pass
-            # (~98 ms per second of audio, measured) for a turn that cannot possibly be
-            # admitted — and it says the rule out loud instead of leaving it as an emergent
-            # property of two constants that could drift apart.
+        if duration <= ENROL_MIN_TURN_S:
+            # Redundant with the homogeneity check and kept deliberately: a window at or
+            # under one frame length yields fewer than two frames, so
+            # `window_is_homogeneous` would return None and refuse it anyway. What this
+            # saves is the S3 read and the ONNX pass (~98 ms per second of audio, measured)
+            # for a turn that cannot possibly be admitted — and it says the rule out loud
+            # instead of leaving it as an emergent property of two constants that could
+            # drift apart, which is precisely how this floor came to be twice too high.
             continue
         key, clip, sr = _window_audio(folder, date, t["source_filename"], start, end)
         frames = [embed_audio(f, sr) for f in _frames(clip, sr)]
