@@ -73,28 +73,51 @@ The knob stays; it is wired, tested and documented. Nothing should be set in it.
 
 ---
 
-## The interpretation is not settled, and the alternative is one I have already been caught by
+## The confound was tested and excluded
+
+`pair_median` does not grow with the number of pairs, so it separates content from sampling.
+Measured on the same windows:
+
+| band | frames | `pair_max` median | **`pair_median` median** |
+|---|---|---|---|
+| 5–10 s (n=18) | 2 | 0.152 | **0.152** |
+| 10–20 s (n=14) | 3 | 0.521 | **0.452** |
+| 20–30 s (n=10) | 6 | 0.690 | **0.477** |
+
+**The median rises threefold from the short band to the long ones**, so the rise is about what
+is in the window, not about how many pairs were drawn from it.
+
+Both effects are visible at once, which is the neatest part: the median flattens between
+10–20 s and 20–30 s (0.452 → 0.477) while the max keeps climbing (0.521 → 0.690). That extra
+climb *is* the pair-count inflation — real, and separated from the content signal rather than
+mistaken for it.
+
+**One ambiguity remains and does not affect the decision.** A longer window being acoustically
+wider is consistent with a second speaker and also with the same speaker moving, turning away,
+or being crossed by machinery. Nothing here distinguishes those. For choosing enrolment
+material it does not need to: acoustic tightness is what a voiceprint wants, whatever makes a
+window loose.
+
+## The interpretation that survives, and the alternative it was tested against
 
 **Fact:** the guard's pass rate falls monotonically with window length.
-**Inference:** longer windows hold more speakers.
-**Alternative not yet excluded, and it is not exotic:** `spread` is the **maximum over frame
-pairs**, and the number of pairs grows quadratically with frames. A 6 s window gives 2 frames
-and therefore 1 pair; a 25 s window gives 5 frames and 10 pairs. **A max over ten draws is
-larger than a max over one whatever is speaking.**
+**Inference:** longer windows are acoustically wider, and a second speaker is the likeliest
+reason.
+**The alternative, which was not exotic and had to be tested:** `spread` is the **maximum over
+frame pairs**, and pairs grow quadratically with frames. A 6 s window gives 2 frames and
+therefore 1 pair; a 25 s window gives 5 frames and 10 pairs. **A max over ten draws is larger
+than a max over one whatever is speaking.**
 
 This is flaw 2 of `2026-08-17-homogeneity-threshold-measured.md`, which invalidated that
 document's conclusion, arriving in the same shape one direction over. The observation
 "longer windows score higher" is currently consistent with both explanations and distinguishes
 neither.
 
-**What separates them:** `pair_median` rather than `pair_max`. The median over pairs does not
-grow with the number of pairs. If the median also rises with duration, the rise is about
-speaker content; if only the max rises, it is about frame count. `op: "spread"` already returns
-both in `candidates`, and the comparison is running.
-
-Until that returns, the safe reading of this document is narrow and still useful: **windows of
-5–10 s pass the guard and windows over 10 s do not**, whatever the reason. That alone justifies
-the floor moving, because it says the material the floor excludes is the material that passes.
+That alternative is flaw 2 of `2026-08-17-homogeneity-threshold-measured.md`, which
+invalidated that document's conclusion, arriving in the same shape one direction over. It was
+written down here before the comparison ran rather than after, and then the comparison ran and
+excluded it — which is the only reason this document's conclusion is worth more than that
+one's.
 
 ## What is still not known
 
