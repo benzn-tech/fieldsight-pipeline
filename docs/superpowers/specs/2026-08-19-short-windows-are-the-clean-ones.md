@@ -9,10 +9,15 @@
 
 Sampling real prod segments with `op: "spread"` (read-only, scalars only):
 
-| duration band | verdicts | frame spread min / med / max |
-|---|---|---|
-| 5–10 s (12 sampled of 192) | **10 homogeneous, 2 mixed** | 0.052 / **0.175** / 0.608 |
-| 10–30 s (10 sampled of 71) | **10 mixed, 0 homogeneous** | 0.514 / **0.661** / 0.855 |
+| duration band | n | verdicts | frame spread min / med / max |
+|---|---|---|---|
+| 3–5 s | 14 | **14 unjudgeable** | – |
+| 5–10 s | 30 | **25 homogeneous, 5 mixed** (83 % pass) | 0.004 / **0.152** / 0.608 |
+| 10–20 s | 20 | **1 homogeneous, 19 mixed** (5 % pass) | 0.336 / **0.505** / 0.741 |
+| 20–30 s | 14 | **0 homogeneous, 14 mixed** (0 % pass) | 0.547 / **0.690** / 1.047 |
+
+The pass rate collapses monotonically with duration, and the 3–5 s band cannot be judged at
+all — 14 of 14 — which is what fixes the floor at **five** seconds rather than three.
 
 **Short windows pass the guard comfortably. Long windows fail it, every one.**
 
@@ -67,6 +72,29 @@ two-voice samples, permanently.
 The knob stays; it is wired, tested and documented. Nothing should be set in it.
 
 ---
+
+## The interpretation is not settled, and the alternative is one I have already been caught by
+
+**Fact:** the guard's pass rate falls monotonically with window length.
+**Inference:** longer windows hold more speakers.
+**Alternative not yet excluded, and it is not exotic:** `spread` is the **maximum over frame
+pairs**, and the number of pairs grows quadratically with frames. A 6 s window gives 2 frames
+and therefore 1 pair; a 25 s window gives 5 frames and 10 pairs. **A max over ten draws is
+larger than a max over one whatever is speaking.**
+
+This is flaw 2 of `2026-08-17-homogeneity-threshold-measured.md`, which invalidated that
+document's conclusion, arriving in the same shape one direction over. The observation
+"longer windows score higher" is currently consistent with both explanations and distinguishes
+neither.
+
+**What separates them:** `pair_median` rather than `pair_max`. The median over pairs does not
+grow with the number of pairs. If the median also rises with duration, the rise is about
+speaker content; if only the max rises, it is about frame count. `op: "spread"` already returns
+both in `candidates`, and the comparison is running.
+
+Until that returns, the safe reading of this document is narrow and still useful: **windows of
+5–10 s pass the guard and windows over 10 s do not**, whatever the reason. That alone justifies
+the floor moving, because it says the material the floor excludes is the material that passes.
 
 ## What is still not known
 
