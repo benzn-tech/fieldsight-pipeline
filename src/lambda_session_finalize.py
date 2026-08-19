@@ -24,6 +24,13 @@ from urllib.parse import unquote_plus
 logger = logging.getLogger()
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
+
+# Which summariser the finalize re-summary uses. Off = the terse rolling
+# summariser this has always used. On = session_brief, which writes the
+# narrative first and derives the to-dos from it; it returns the same
+# {summary, open_todos} keys, so the email below is unchanged either way.
+SESSION_BRIEF = os.environ.get("SESSION_BRIEF", "false").lower() == "true"
+BRIEF_PREFIX = "session_brief/"
 FINALIZE_RESULTS_PREFIX = "session_finalize_results/"
 
 
@@ -144,12 +151,40 @@ def _complete_summary(artifact, summarize=None):
         if not turns:
             return None
         if summarize is None:
-            import lambda_rolling_summary as rs
-            summarize = rs.summarize_turns
-        return summarize(turns)
+            if SESSION_BRIEF:
+                import session_brief
+                summarize = session_brief.brief_from_turns
+            else:
+                import lambda_rolling_summary as rs
+                summarize = rs.summarize_turns
+        result = summarize(turns)
+        # A brief is worth more than the two keys the email reads, and this is
+        # the only point in the pipeline where the whole session exists as one
+        # clean turn stream. Store it before handing the caller its two keys.
+        # Best-effort: the email must still go out if the write fails.
+        if result and result.get("sections"):
+            _store_brief(folder, date, sid, result)
+        return result
     except Exception:
         logger.exception("finalize: complete re-summary failed for %s — using rolling summary", sid)
         return None
+
+
+def _store_brief(folder, date, session_id, brief):
+    """Write the session brief to S3, mirroring session_rolling/'s layout so the
+    read path is the one already proven for the rolling summary. Never raises:
+    losing the stored copy must not cost the recorder their email."""
+    try:
+        import boto3
+        key = f"{BRIEF_PREFIX}{folder}/{date}/sid{session_id}/latest.json"
+        boto3.client("s3").put_object(
+            Bucket=S3_BUCKET, Key=key,
+            Body=json.dumps(brief, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json")
+        logger.info("session brief stored at %s", key)
+    except Exception:
+        logger.exception("session brief could not be stored for %s "
+                         "-- the email is unaffected", session_id)
 
 
 def process_finalize_request(artifact, *, send=None, write_result=None, complete_summary=None):

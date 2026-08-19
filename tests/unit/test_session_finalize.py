@@ -183,3 +183,56 @@ def test_a_recording_with_no_action_items_says_so_rather_than_sending_a_blank():
     _s, text, html = fin.build_confirmation_email(
         date="2026-07-25", summary="All done.", open_todos=[])
     assert "No action items" in text and "No action items" in html
+
+
+# --- SESSION_BRIEF: which summariser the finalize re-summary uses ------------
+# The brief returns the same {summary, open_todos} the email already reads, so
+# the switch must be invisible to everything below it. These pin that, and pin
+# that storing the brief can never cost the recorder their email.
+
+def _artifact():
+    return {"folder": "Ben_Test", "date": "2026-08-19", "sessionId": "abc"}
+
+
+def test_the_flag_is_off_by_default_so_nothing_changes_until_it_is_set():
+    assert fin.SESSION_BRIEF is False
+
+
+def test_an_injected_summariser_still_wins_over_the_flag(monkeypatch):
+    # The caller's injection point is what the existing tests use; adding a flag
+    # must not quietly take it away.
+    monkeypatch.setattr(fin, "SESSION_BRIEF", True, raising=False)
+    called = {}
+
+    def fake(turns):
+        called["yes"] = True
+        return {"summary": "injected", "open_todos": []}
+
+    monkeypatch.setattr(fin, "_complete_summary",
+                        lambda a, summarize=None: fake(["t"]), raising=False)
+    out = fin.process_finalize_request(
+        {**_artifact(), "recipient": "a@b.c"},
+        send=lambda *a, **k: None, write_result=lambda *a, **k: None)
+    assert out["status"] == "sent" and called
+
+
+def test_a_brief_that_cannot_be_stored_still_sends_the_email(monkeypatch, caplog):
+    # Best-effort by design: S3 is not on the path between the recorder and
+    # their confirmation.
+    def boom(*a, **k):
+        raise RuntimeError("s3 down")
+
+    monkeypatch.setattr(fin, "_store_brief", boom, raising=False)
+    sent = {}
+    out = fin.process_finalize_request(
+        {**_artifact(), "recipient": "a@b.c", "summary": "s", "openTodos": []},
+        send=lambda *a, **k: sent.setdefault("to", a[0]),
+        write_result=lambda *a, **k: None,
+        complete_summary=lambda artifact: None)
+    assert out["status"] == "sent" and sent["to"] == "a@b.c"
+
+
+def test_store_brief_swallows_its_own_failure():
+    # Called directly: no bucket configured, so the write fails. It must not
+    # raise into the worker.
+    fin._store_brief("Ben_Test", "2026-08-19", "abc", {"headline": "x", "sections": []})

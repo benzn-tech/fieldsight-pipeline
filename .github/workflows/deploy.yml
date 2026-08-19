@@ -204,6 +204,7 @@ jobs:
               "BatchSealDeadlineSec=${{ vars.TEST_BATCH_SEAL_DEADLINE_SEC || '150' }}" \
               "FilterAudioEventTags=${{ vars.TEST_FILTER_AUDIO_EVENT_TAGS || 'true' }}" \
               "EnableGroupMerge=${{ vars.TEST_ENABLE_GROUP_MERGE || 'true' }}" \
+              "EnableSessionBrief=${{ vars.TEST_ENABLE_SESSION_BRIEF || 'false' }}" \
               "GroupMergeCap=${{ vars.TEST_GROUP_MERGE_CAP || '2' }}" \
               "StuckMergeSeconds=${{ vars.TEST_STUCK_MERGE_SECONDS || '1800' }}" \
               "GroupMaxSpanSeconds=${{ vars.TEST_GROUP_MAX_SPAN_SECONDS || '43200' }}" \
