@@ -1,12 +1,26 @@
 """Turn audio into a voiceprint vector, and turns into names.
 
-Two operations, invoked directly (never by an S3 event — nothing about this is triggered by
-a file landing):
+**In production this function is driven by an S3 event.** org-api is in-VPC with no NAT and
+cannot invoke outward (BUG-36), so it hands work over by writing an artifact under
+`voiceprint_requests/` and a hand-wired notification (BUG-33 — the template carries no S3
+event for this function) brings it here. `Records` in the event means that path;
+`_from_request_artifact` and `_from_match_artifact` read the `op` inside the object.
+
+The header used to say the opposite — "never by an S3 event, nothing about this is triggered
+by a file landing" — which was true until 2026-08-14 and then described the one entry point
+that matters.
+
+Three direct ops remain, used by scripts and tests:
 
     {"op": "enrol", "voiceprint_id", "user_folder", "date", "source_filename",
      "start_sec", "end_sec", "correction_ref"?}
     {"op": "match", "session", "user_folder", "date", "company_id",
      "turns": [{"source_filename", "start_sec", "end_sec"}, ...]}
+    {"op": "spread", "user_folder", "date", "source_filename", "start_sec", "end_sec"}
+
+`op=enrol`'s result is NOT the writer's `op=enrol` input despite the shared name: it carries
+no `company_id`, which the writer requires. Nothing wires the pair, and it would fail loudly
+if anything did.
 
 Pure compute: **no database, no VPC.** This function runs on python3.12 because that is where
 onnxruntime comes from (the VAD layer is cp312-only) and `PsycopgLayer` is cp311-only — one
@@ -111,13 +125,33 @@ MAX_EMBED_SECONDS = float(os.environ.get("VOICEPRINT_MAX_EMBED_SECONDS", "45.0")
 
 # Harvest: turning ONE naming gesture into a usable profile.
 #
-# 10 s, not the 3 s matching floor and not the 5 s a first draft picked.
-# `window_is_homogeneous` returns None for fewer than two frames and frames are cut at
-# FRAME_SECONDS = 5.0, so a 5-9.99 s window is UNJUDGEABLE — and "could not check" is
-# refused alongside "no", or the guard becomes decoration. A 5 s floor would have admitted
-# nothing at all, silently. `lambda_org_api` already documented this: "a window under ten
-# seconds cannot be judged homogeneous and is not enrolled".
-ENROL_MIN_TURN_S = float(os.environ.get("VOICEPRINT_ENROL_MIN_TURN_S", "10.0"))
+# One frame length, not two. Derived rather than written, because the two constants drifting
+# apart is exactly what happened.
+#
+# This was 10.0 on the reasoning that "a 5-9.99 s window is UNJUDGEABLE": frames are cut at
+# FRAME_SECONDS = 5.0, `window_is_homogeneous` needs two of them, and a stride of 5 s over a
+# 7 s window gives one. That was true when it was written and stopped being true when
+# `_frames` gained its end-anchored tail frame — the fix for judging a window on two thirds of
+# itself. Since then a window LONGER than one frame yields two, and the comment preserved the
+# obsolete arithmetic while the floor went on enforcing it.
+#
+# What that cost is not a missed optimisation. Measured over 78 prod windows on 2026-08-19:
+#
+#     3-5 s   : unjudgeable, 14 of 14      (one frame, correctly excluded)
+#     5-10 s  : 83 % homogeneous, pair_median 0.152
+#     10-20 s : 5 %  homogeneous, pair_median 0.452
+#     20-30 s : 0 %  homogeneous, pair_median 0.477
+#
+# The floor admitted only 10-30 s windows, which is the band that almost never passes the
+# guard — so enrolment's entire candidate population was the material least suitable for it,
+# and three nights went into suspecting the threshold instead. `pair_median` does not grow
+# with pair count, so the rise is content and not an artifact of longer windows yielding more
+# frame pairs; that alternative was tested before this change, not after.
+#
+# `<=`, not `<`: at exactly FRAME_SECONDS the tail branch does not fire and there is one
+# frame. The floor exists to skip the S3 read and the ONNX pass for windows that cannot be
+# judged, so the boundary belongs on the excluded side.
+ENROL_MIN_TURN_S = float(os.environ.get("VOICEPRINT_ENROL_MIN_TURN_S", str(FRAME_SECONDS)))
 ENROL_MAX_SAMPLES = int(os.environ.get("VOICEPRINT_ENROL_MAX_SAMPLES", "6"))
 ENROL_MAX_SECONDS = float(os.environ.get("VOICEPRINT_ENROL_MAX_SECONDS", "60.0"))
 
@@ -345,6 +379,39 @@ def _read_limit(raw):
 
 
 MAX_FRAME_SPREAD = _read_limit(os.environ.get("VOICEPRINT_MAX_FRAME_SPREAD"))
+
+
+def _part_of(req):
+    """" (part 2/3)" when a session was split, empty when it was not.
+
+    `_split_for_budget` chops a long session into several artifacts, each becoming its own
+    invocation, and org-api stamps every one with `part` and `of`. Nothing read them. Three
+    runs of one meeting therefore produced three interchangeable log lines, and a run that
+    died — a 70-minute meeting is exactly where a timeout or an OOM lands — left two lines
+    that look like a complete, smaller job. "Some of this meeting was never matched" and
+    "this meeting had fewer turns than you thought" were the same observation.
+    """
+    part, of = (req or {}).get("part"), (req or {}).get("of")
+    return "" if not of or of == 1 else " (part %s/%s)" % (part, of)
+
+
+def _refusal_detail(refusal):
+    """The refusal, with the numbers that decide what to do about it.
+
+    `closer-to-another-profile` is the one refusal a person can act on, and acting on it needs
+    to know WHICH profile and by how much: 0.62 here against 0.71 there means either the
+    correction named the wrong person, or the two profiles are the same person and should be
+    merged. The writer computes all three — `own`, `bestOther`, `nearestOtherId` — and until
+    now every one of them stopped at the seam, leaving a log line that said only that
+    something was closer to something else.
+    """
+    refusal = refusal or {}
+    out = " enrolRefused=%s" % refusal.get("reason")
+    if refusal.get("nearestOtherId"):
+        out += (" (own=%s bestOther=%s nearest=%s)"
+                % (refusal.get("own"), refusal.get("bestOther"),
+                   refusal.get("nearestOtherId")))
+    return out
 
 
 def _admitted_limit():
@@ -669,13 +736,14 @@ def _admit_harvest(folder, date, candidates):
         t = c["turn"]
         start, end = float(t["start_sec"]), float(t["end_sec"])
         duration = end - start
-        if duration < ENROL_MIN_TURN_S:
-            # Redundant with the homogeneity check and kept deliberately: a window under
-            # 10 s yields fewer than two frames, so `window_is_homogeneous` would return
-            # None and refuse it anyway. What this saves is the S3 read and the ONNX pass
-            # (~98 ms per second of audio, measured) for a turn that cannot possibly be
-            # admitted — and it says the rule out loud instead of leaving it as an emergent
-            # property of two constants that could drift apart.
+        if duration <= ENROL_MIN_TURN_S:
+            # Redundant with the homogeneity check and kept deliberately: a window at or
+            # under one frame length yields fewer than two frames, so
+            # `window_is_homogeneous` would return None and refuse it anyway. What this
+            # saves is the S3 read and the ONNX pass (~98 ms per second of audio, measured)
+            # for a turn that cannot possibly be admitted — and it says the rule out loud
+            # instead of leaving it as an emergent property of two constants that could
+            # drift apart, which is precisely how this floor came to be twice too high.
             continue
         key, clip, sr = _window_audio(folder, date, t["source_filename"], start, end)
         frames = [embed_audio(f, sr) for f in _frames(clip, sr)]
@@ -842,10 +910,33 @@ def _from_request_artifact(bucket, key):
         "harvest": [dict(h, voiceprint_id=enrol["voiceprint_id"],
                          created_by=req.get("requested_by")) for h in harvested],
     }
-    invoke_writer(payload)
-    logger.info("correction applied: session=%s ref=%s audio=%s",
-                req.get("session_base"), turn_ref, s3_key)
-    return {"status": "applied", "turn_ref": turn_ref}
+    # The writer's reply, said out loud. It was discarded, and this line reported that a
+    # correction had been "applied" without any measure of what was applied — while the
+    # return value goes nowhere, because in production this function is only ever driven by
+    # an S3 event and Lambda discards what an event-driven invocation returns.
+    #
+    # So this line was the only production signal for the whole correction, and it could not
+    # tell "named two turns and stored a sample" apart from "named two turns, refused the
+    # enrolment, and harvested nothing". Both read as `correction applied`. The writer logs
+    # its own counts, but in its own log group, which means correlating two functions to
+    # answer the first question anybody asks.
+    reply = invoke_writer(payload) or {}
+    logger.info("correction applied: session=%s ref=%s audio=%s "
+                "named=%d inherited=%d declined=%d enrolled=%s harvested=%d%s",
+                req.get("session_base"), turn_ref, s3_key,
+                reply.get("written", 0), reply.get("inherited", 0),
+                reply.get("declined", 0),
+                reply.get("enrolled") if reply.get("enrolled") is not None else "n/a",
+                reply.get("harvested", 0),
+                # The refusals last, and named, because "no sample was stored" is the
+                # question this feature gets asked about more than any other.
+                (_refusal_detail(reply["enrolRefused"])
+                 if reply.get("enrolRefused") else "")
+                + (" harvestRefused=%d" % reply["harvestRefused"]
+                   if reply.get("harvestRefused") else ""))
+    return dict({"status": "applied", "turn_ref": turn_ref},
+                **{k: reply[k] for k in ("written", "inherited", "enrolled", "harvested")
+                   if k in reply})
 
 
 def _from_match_artifact(bucket, key):
@@ -880,8 +971,32 @@ def _from_match_artifact(bucket, key):
         # and "there was nobody to recognise" look identical downstream, and on TEST the
         # only profile was withdrawn during a withdrawal test, which is exactly how this
         # would have been misread as the matcher not working.
-        logger.warning("match: no consented profiles for company %s; nothing to match "
-                       "against (session %s)", company_id, session)
+        logger.warning("match%s: no consented profiles for company %s; nothing to match "
+                       "against (session %s)", _part_of(req), company_id, session)
+        # But label inheritance does not need a profile. It spreads names this session
+        # ALREADY holds — from a correction somebody made — to the turns too short to embed,
+        # and it rides inside the writer's `match_names` op. Returning here skipped it, so
+        # "match a session I have no voiceprints for" silently did nothing at all, in exactly
+        # the state the system is in today: no company has a profile, so this branch is the
+        # ONLY one that runs. Two reasons, and it took a review to notice the first: the
+        # product sends no consent, so an ordinary correction never requests enrolment at
+        # all; and when an API call does request it, the homogeneity guard has so far refused
+        # every window of real audio.
+        if req.get("label_map") and (req.get("mode") or "").lower() == "on":
+            # `inherited`, NOT `written`. The writer counts them separately and `written`
+            # only ever counts MATCHED names — of which there are none here, because
+            # `results` is empty by construction. Reading `written` on this branch reports
+            # zero however many turns inheritance actually named, which is the shape that
+            # makes a working feature look dead in the log.
+            reply = invoke_writer({"op": "match_names", "company_id": company_id,
+                                   "session_base": session,
+                                   "label_map": req.get("label_map"),
+                                   "results": []})
+            inherited = reply.get("inherited", 0)
+            logger.info("match%s: no profiles, but inheritance named %d turns in %s",
+                        _part_of(req), inherited, session)
+            return {"session": session, "matched": 0, "inherited": inherited,
+                    "profiles": 0, "inheritedOnly": True, "mode": req.get("mode")}
         return {"session": session, "matched": 0, "profiles": 0, "mode": req.get("mode")}
 
     out = _match({"session": session, "user_folder": folder, "date": date,
@@ -935,19 +1050,37 @@ def _from_match_artifact(bucket, key):
         return {"session": session, "matched": 0, "wouldMatch": len(named),
                 "profiles": len(profiles), "mode": mode or "off"}
 
-    # No invoke when there is nothing to write: an empty write is a database round trip
+    # No invoke when there is nothing to do at all: an empty write is a database round trip
     # that reports success, and "wrote 0 rows" then looks like "the writer is fine".
-    written = 0
-    if named:
-        written = invoke_writer({"op": "match_names", "company_id": company_id,
-                                 "session_base": session,
-                                 # Both artifacts carry it and both writer branches read it;
-                                 # this hop dropped it on the floor in both directions.
-                                 "label_map": req.get("label_map"),
-                                 "results": named}).get("written", 0)
-    logger.info("match: session=%s named %d of %d turns against %d profiles",
-                session, written, len(out["results"]), len(profiles))
-    return {"session": session, "matched": written, "profiles": len(profiles), "mode": mode}
+    #
+    # `label_map` counts as something to do. Label inheritance lives INSIDE the writer's
+    # `match_names` op, so an earlier version of this guard — `if named:` — meant that a run
+    # which matched nothing also inherited nothing, and matching nothing is not unusual: with
+    # a single profile every turn is skipped for having no runner-up, which this function
+    # logs as an ordinary outcome. The session could be holding correction names from a
+    # previous gesture that the label map is entitled to spread to the short turns, and they
+    # were silently left unnamed because a DIFFERENT feature had found no candidates.
+    written, inherited = 0, 0
+    if named or req.get("label_map"):
+        reply = invoke_writer({"op": "match_names", "company_id": company_id,
+                               "session_base": session,
+                               # Both artifacts carry it and both writer branches read it;
+                               # this hop dropped it on the floor in both directions.
+                               "label_map": req.get("label_map"),
+                               "results": named})
+        # Two counts, kept apart because they answer different questions. `written` is how
+        # many turns a stored VOICE matched; `inherited` is how many were named from the
+        # transcriber's own labels once a stronger source had settled one. Collapsing them
+        # would make a session where the voiceprints did nothing and inheritance did
+        # everything read as a successful match.
+        written, inherited = reply.get("written", 0), reply.get("inherited", 0)
+    logger.info("match%s: session=%s named %d of %d turns against %d profiles "
+                "(+%d inherited)",
+                _part_of(req), session, written, len(out["results"]), len(profiles),
+                inherited)
+    return {"session": session, "matched": written, "inherited": inherited,
+            "profiles": len(profiles), "mode": mode,
+            "part": req.get("part"), "of": req.get("of")}
 
 
 def _spread(event):

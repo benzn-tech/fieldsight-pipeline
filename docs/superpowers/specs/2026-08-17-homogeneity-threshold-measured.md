@@ -84,7 +84,37 @@ window holding two people would poison a profile, and a poisoned profile cannot 
 only the contributing sample deleted, after somebody notices, which nothing prompts them to
 do.
 
-The guard currently refuses **every** window of real site audio. No voiceprint can be created.
+The guard currently refuses **every** window of real site audio.
+
+## The guard is the second block, not the only one
+
+Corrected 2026-08-17 after a review of the morning checklist, and worth stating plainly
+because this whole document reads as though the threshold is what stands between the product
+and a voiceprint library. It is not, and fixing it alone would change nothing a user can see.
+
+Enrolment is requested only when the correction carries `consent_given: true` and
+`consented_by` (`lambda_org_api.py:1646`). Everything inside that branch is skipped
+otherwise — **including creating the profile row at all**. The product ships no consent
+control: enrolment UI is out of scope in the frontend spec, and the correction dialog sends
+`consent_given: false` deliberately.
+
+So there are two independent blocks, in this order:
+
+1. **no consent surface** — a correction made in the product requests no enrolment, so the
+   guard is never consulted and no profile exists to be empty;
+2. **the guard** — when enrolment *is* requested, by an API call that carries consent, the
+   homogeneity check has so far refused every window of real audio.
+
+Every enrolment refusal ever observed came from a hand-built call that carried consent
+without the author thinking about it, which is exactly how a document about the second block
+came to be written as though it were the only one. The measurement above is unaffected — it
+used `op: "spread"`, which touches neither gate — but the conclusion "no voiceprint can be
+created" was attributed to the wrong cause.
+
+**What this means for the feature the threshold work exists to serve.** The stated goal is a
+voiceprint library that fills itself from ordinary corrections, with no separate enrolment
+step. That loop cannot close on consent-by-API-call. It needs a surface where the person
+whose voice it is agrees — which is a product decision and a privacy one, not a threshold.
 
 ---
 

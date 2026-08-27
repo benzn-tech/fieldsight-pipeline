@@ -248,15 +248,45 @@ def test_the_template_pattern_admits_exactly_what_the_code_admits():
     """Two guards, one rule, written in different languages in different files. A template
     that accepted a value the code then rejects would deploy a stack whose guard is quietly
     back at the default — a switch wired at all three segments and disagreeing with itself.
+
+    The expectation is DERIVED from `_read_limit`, not written out by hand. The first version
+    of this test compared the two over a hand-written list of good and bad values, and the
+    list happened not to contain `0` — which the pattern accepted and the code rejected. A
+    deploy setting the limit to 0 would have been accepted by CloudFormation and then run at
+    0.35, the opposite of the "refuse everything" the operator asked for. A test that checks
+    agreement against a list only checks the values somebody thought of.
     """
     import re
     text = open("src/template.yaml", encoding="utf-8").read()
     pattern = re.search(r"AllowedPattern: '(\^\(default[^']+)'", text).group(1)
     rx = re.compile(pattern)
-    for good in ("default", "0.7", "0.35", "1.0"):
-        assert rx.match(good), good
-    for bad in ("off", "2", "1.5", "Default", ""):
-        assert not rx.match(bad), bad
+
+    for value in ("default", "0.7", "0.35", "1", "1.0", "0.01", "0.999",
+                  "0", "0.0", "0.00", "2", "2.0", "1.5", "-0.4", "off", "", "Default",
+                  "0.35abc", " 0.7"):
+        allowed = bool(rx.match(value))
+        if value == "default":
+            assert allowed, "the sentinel must survive its own pattern"
+            continue
+        # The code takes a value exactly when it parses and lands in (0, 1.0]. Anything the
+        # pattern lets through that the code then discards is a deploy that succeeds and a
+        # guard that is not what was asked for, with only a log line to say so.
+        try:
+            parsed = float(value)
+        except ValueError:
+            parsed = None
+        # "did the function keep what I gave it", asked without re-implementing its range
+        # rule. Comparing against DEFAULT_MAX_FRAME_SPREAD instead would call an explicit
+        # 0.35 a fallback, which is how the first attempt at this test failed.
+        taken = parsed is not None and se._read_limit(value) == parsed
+        # ONE direction. A template stricter than the code is fine — it is the outer guard,
+        # and it rejecting " 0.7" (which float() would happily accept) costs a clearer error
+        # at deploy time. The direction that hurts is the other one: a value CloudFormation
+        # accepts and the function then discards deploys a stack whose guard is not the one
+        # that was asked for, with a log line as the only trace.
+        if allowed:
+            assert taken, (f"{value!r}: the template allows it and the function discards it "
+                           f"-> the deploy succeeds and the guard is not what was asked for")
 
 
 def test_the_between_voices_refusal_says_the_guard_was_loosened_too():

@@ -17,7 +17,9 @@ stores the sample when the window passes, and `match` never computes frames at a
 """
 import argparse
 import json
+import os
 import subprocess
+import tempfile
 import sys
 
 REGION = "ap-southeast-2"
@@ -25,18 +27,31 @@ ORG_API = "fieldsight-test-org-api"
 EMBEDDER = "fieldsight-test-speaker-embed"
 
 
+
+def _scratch(name):
+    """A lambda payload/response path OUTSIDE the repository.
+
+    These scripts used to write `_x.json` and `_x_out.json` into the repo root. The response
+    half holds whatever the function returned — S3 keys naming a real user's folder and
+    recording, and for the voiceprint listing, people's display names. Two consequences, and
+    .gitignore only addresses the first: an untracked file one `git add -A` away from being
+    committed (which is why this repo already has a standing rule against that command), and
+    a file inside a Dropbox-synced directory, which syncs it whether git tracks it or not.
+    """
+    return os.path.join(tempfile.gettempdir(), name)
+
 def _invoke(function, payload):
-    with open("_probe.json", "w", encoding="utf-8") as fh:
+    with open(_scratch("_probe.json"), "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
     r = subprocess.run(
         ["aws", "lambda", "invoke", "--function-name", function,
-         "--cli-binary-format", "raw-in-base64-out", "--payload", "file://_probe.json",
-         "_probe_out.json", "--region", REGION],
+         "--cli-binary-format", "raw-in-base64-out", "--payload", "file://" + _scratch("_probe.json"),
+         _scratch("_probe_out.json"), "--region", REGION],
         capture_output=True, text=True)
     if r.returncode:
         print("INVOKE FAILED:", r.stderr[:400], file=sys.stderr)
         return None
-    with open("_probe_out.json", encoding="utf-8") as fh:
+    with open(_scratch("_probe_out.json"), encoding="utf-8") as fh:
         return json.load(fh)
 
 
