@@ -43,7 +43,13 @@ def _clean_todos(open_todos):
         if text:
             out.append({"text": text,
                         "responsible": (t.get("responsible") or None),
-                        "due": (t.get("due") or None)})
+                        "due": (t.get("due") or None),
+                        # Absent from the rolling summariser and present in a brief. Kept
+                        # optional rather than required so the same cleaner serves both, and
+                        # so a brief whose model omitted it degrades to today's behaviour
+                        # instead of dropping the item.
+                        "why": (t.get("why") or None),
+                        "at": (t.get("at") or None)})
     return out
 
 
@@ -81,6 +87,13 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
             who = t["responsible"] or "Unassigned"
             due = f" (due {t['due']})" if t["due"] else ""
             lines.append(f"  • {t['text']} — {who}{due}")
+            # The line that makes the list readable a day later. The title is written to
+            # survive truncation, so it identifies the task and cannot also say why it
+            # exists; without this the reader goes back to the timeline and opens the topic.
+            # Indented under its item rather than appended to it, so scanning the titles
+            # still works and the context is there when the eye stops.
+            if t.get("why"):
+                lines.append(f"      {t['why']}")
     else:
         lines += ["", no_todos_note]
     body_text = "\n".join(lines).rstrip() + "\n"
@@ -96,15 +109,25 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
     if meta:
         parts.append("<p>" + "<br>".join(meta) + "</p>")
     if todos:
-        rows = "".join(
-            "<tr>"
-            f'<td style="padding:6px;border-bottom:1px solid #eee">{esc(t["text"])}</td>'
-            f'<td style="padding:6px;border-bottom:1px solid #eee">'
-            f'{esc(t["responsible"]) if t["responsible"] else "—"}</td>'
-            f'<td style="padding:6px;border-bottom:1px solid #eee">'
-            f'{esc(t["due"]) if t["due"] else "—"}</td>'
-            "</tr>"
-            for t in todos)
+        def _row(t):
+            # `why` under the title inside the SAME cell, not a fourth column. A column
+            # would be empty for every to-do the rolling summariser produces and for any
+            # brief whose model omitted it, and an empty column reads as missing data
+            # rather than as an absent explanation.
+            why = (f'<div style="color:#666;font-size:13px;padding-top:2px">'
+                   f'{esc(t["why"])}</div>') if t.get("why") else ""
+            return ("<tr>"
+                    f'<td style="padding:6px;border-bottom:1px solid #eee">'
+                    f'{esc(t["text"])}{why}</td>'
+                    f'<td style="padding:6px;border-bottom:1px solid #eee;'
+                    f'vertical-align:top">'
+                    f'{esc(t["responsible"]) if t["responsible"] else "—"}</td>'
+                    f'<td style="padding:6px;border-bottom:1px solid #eee;'
+                    f'vertical-align:top">'
+                    f'{esc(t["due"]) if t["due"] else "—"}</td>'
+                    "</tr>")
+
+        rows = "".join(_row(t) for t in todos)
         parts.append(
             "<h3>Action items</h3>"
             '<table role="presentation" cellspacing="0" cellpadding="0" '

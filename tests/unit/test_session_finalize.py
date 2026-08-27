@@ -236,3 +236,48 @@ def test_store_brief_swallows_its_own_failure():
     # Called directly: no bucket configured, so the write fails. It must not
     # raise into the worker.
     fin._store_brief("Ben_Test", "2026-08-19", "abc", {"headline": "x", "sections": []})
+
+
+def test_the_reason_a_todo_exists_reaches_both_halves_of_the_email():
+    """`why` crosses three boundaries — the brief's own summary shape, `_clean_todos`, and
+    the two renderers — and it was being dropped at the first two.
+
+    The whole brief reached S3 and only `{text, responsible, due}` reached the surfaces that
+    read it, so the to-do list stayed exactly as unusable for recall as before. The owner's
+    words for the symptom: reading the list did not bring the day back, and the timeline had
+    to be opened topic by topic.
+
+    Asserted in BOTH renderers because they are separate code with separate escaping, and a
+    field that reaches one of them is a field half the readers never see.
+    """
+    import lambda_session_finalize as sf
+
+    _subj, text, html = sf.build_confirmation_email(
+        date="2026-08-27", site_name="Riccarton",
+        summary="Procurement blocks the device.",
+        open_todos=[{"text": "Price the device as a company phone",
+                     "responsible": "Sam", "due": "Friday",
+                     "why": "procurement will not sign off on a per-seat licence",
+                     "at": "13:40:56"}])
+
+    for where, body in (("text", text), ("html", html)):
+        assert "Price the device as a company phone" in body, where
+        assert "procurement will not sign off on a per-seat licence" in body, (
+            f"the {where} email dropped the reason the to-do exists")
+
+
+def test_a_todo_without_a_reason_renders_exactly_as_before():
+    """The rolling summariser produces no `why`, and a brief whose model omitted it produces
+    none either. Neither may gain an empty line, a dash, or an empty table cell — an absent
+    explanation must look absent, not missing."""
+    import lambda_session_finalize as sf
+
+    _, text, html = sf.build_confirmation_email(
+        date="2026-08-27",
+        open_todos=[{"text": "Chase the delivery", "responsible": None, "due": None}])
+
+    assert "Chase the delivery" in text and "Chase the delivery" in html
+    # No stray empty context line under the item in the text half.
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    idx = next(i for i, ln in enumerate(lines) if "Chase the delivery" in ln)
+    assert idx == len(lines) - 1 or not lines[idx + 1].startswith("      "), lines[idx:idx + 2]

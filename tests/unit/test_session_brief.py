@@ -145,6 +145,7 @@ def test_it_returns_the_two_keys_the_email_reads():
     out = sb.brief_from_turns(_turns(), call_llm=_llm(_BRIEF_JSON))
     assert out["summary"] == "Procurement blocks the device; package it as a phone."
     assert out["open_todos"] == [{"text": "Price the device as a company phone",
+                                  "why": "procurement", "at": "13:40:56",
                                   "responsible": "Sam", "due": "Friday"}]
 
 
