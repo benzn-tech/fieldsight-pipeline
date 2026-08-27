@@ -83,8 +83,13 @@ def test_an_edit_that_is_not_a_closure_is_not_counted(db):
                             action_items=[{"text": "Book pump"}])
     aid = db.execute(
         "SELECT id FROM action_items WHERE topic_id=%s", (t["id"],)).fetchone()[0]
-    content_edits.append_content_edit(
+    row = content_edits.append_content_edit(
         db, co["id"], "action_items", aid, "priority", "low", "high", u["id"], "pm")
+    # Pinned even though this test asserts an EMPTY result, and for that exact reason: with
+    # a floating timestamp it passes when the field filter works and also when the row simply
+    # falls outside the queried day. Only one of those is the thing being tested.
+    db.execute("UPDATE content_edits SET created_at=%s WHERE id=%s",
+               (NOON_ON_DATE, row["id"]))
 
     counts = content_edits.count_action_closures_by_day(
         db, [s["id"]], DATE, DATE, company_id=co["id"], tz=TZ)
@@ -100,10 +105,14 @@ def test_reopening_and_closing_again_is_one_closure_per_event(db):
                             action_items=[{"text": "Chase delivery"}])
     aid = db.execute(
         "SELECT id FROM action_items WHERE topic_id=%s", (t["id"],)).fetchone()[0]
-    content_edits.append_content_edit(
-        db, co["id"], "action_items", aid, "status", "open", CLOSED, u["id"], "pm")
-    content_edits.append_content_edit(
-        db, co["id"], "action_items", aid, "status", CLOSED, CLOSED, u["id"], "pm")
+    for before in ("open", CLOSED):
+        row = content_edits.append_content_edit(
+            db, co["id"], "action_items", aid, "status", before, CLOSED, u["id"], "pm")
+        # Pinned here too. This test does not go through `_closed_action`, so the first fix
+        # for the fixed-date/floating-clock problem reached the other two tests and left
+        # this one failing — the same defect, one call site over.
+        db.execute("UPDATE content_edits SET created_at=%s WHERE id=%s",
+                   (NOON_ON_DATE, row["id"]))
 
     counts = content_edits.count_action_closures_by_day(
         db, [s["id"]], DATE, DATE, company_id=co["id"], tz=TZ)
