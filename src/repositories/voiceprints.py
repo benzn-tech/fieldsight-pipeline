@@ -84,7 +84,8 @@ def _require_company(company_id):
 
 def upsert_profile(conn, company_id, display_name=None, user_id=None,
                    consent_given=False, consented_by=None,
-                   linked_by=None, linked_on=None) -> dict | None:
+                   linked_by=None, linked_on=None,
+                   consent_basis=None, asserted_by=None) -> dict | None:
     """The profile a name attaches to. Existing one if there is one, otherwise a new row.
 
     **Consent is a precondition, not a checkbox** (§6, §10). A voiceprint is biometric
@@ -104,7 +105,26 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
     profile is never reused — that would resurrect a withdrawal by the back door.
     """
     _require_company(company_id)
-    if display_name and not consented_by:
+    # `attestation` is a basis this function did not previously have, and it exists because
+    # the one it did have excluded the population the feature is for. `consented_by` is the
+    # SUBJECT's id, so it can only be filled for someone with an account — and the people
+    # most often named on a site are subcontractors without one. The result was a rule that
+    # was never satisfied and a library that stayed empty.
+    #
+    # So attestation records a CLAIM, and records who made it in `asserted_by` rather than
+    # borrowing `consented_by` for it. The distinction is the whole point: one column says
+    # "this person agreed", the other says "this person says they agreed", and collapsing
+    # them makes every existing row ambiguous and every later audit unanswerable.
+    #
+    # What it does NOT do is make the claim true. `consent_basis` travels with the profile
+    # so every reader can see which kind it is, and a later decision to hold attested
+    # profiles to a stricter standard can find them in one query.
+    attested = consent_basis == "attestation"
+    if attested and not asserted_by:
+        raise ValueError(
+            "an attested voiceprint needs asserted_by: who is making the claim. A claim "
+            "with nobody attached to it is not a record of anything")
+    if display_name and not (consented_by or attested):
         # The docstring claimed this was required and the code did not check, so the layer
         # that actually stores the row would accept what the endpoint refuses. A rule
         # enforced in exactly one caller is a rule until somebody adds a second caller.
@@ -112,7 +132,7 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
             "a named voiceprint needs consented_by: whose voice this is, recorded — a "
             "timestamp alone cannot tell the subject agreeing from somebody agreeing on "
             "their behalf (§6)")
-    if display_name and not consent_given:
+    if display_name and not (consent_given or attested):
         raise ValueError(
             "a named voiceprint cannot be created without consent from the person whose "
             "voice it is (§6) — an unnamed profile may be created instead")
@@ -127,12 +147,34 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
         # and the margin declines to confirm — while a merge is a wrong confident answer
         # about somebody's biometric data. `consented_by` is required whenever a name is
         # given, so the anchor exists exactly when it is needed.
-        found = cur.execute(
-            "SELECT id FROM speaker_voiceprints "
-            "WHERE company_id = %s AND display_name = %s AND consented_by = %s "
-            "  AND status <> 'withdrawn' "
-            "ORDER BY created_at LIMIT 1",
-            (company_id, display_name, consented_by)).fetchone()
+        # THREE keys, in order of how stable the identity behind them is.
+        #
+        # `user_id` when the name resolved to somebody in the directory: an identity, so two
+        # people who share a display name stay two profiles and one person named twice stays
+        # one. This is the only key that is right in both directions.
+        #
+        # Otherwise the name resolved to nobody — a subcontractor, a visitor — and there is
+        # no identity to key on. Then it is (name, whoever vouched): duplicates when two
+        # people each name the same worker, never a merge of two different workers who share
+        # a name. That direction is chosen deliberately, by the asymmetry recorded above: a
+        # duplicate degrades into a REFUSAL, because the person becomes his own runner-up and
+        # the margin declines to confirm, while a merge is a wrong confident answer about
+        # somebody's biometric data.
+        if user_id:
+            found = cur.execute(
+                "SELECT id FROM speaker_voiceprints "
+                "WHERE company_id = %s AND user_id = %s AND status <> 'withdrawn' "
+                "ORDER BY created_at LIMIT 1",
+                (company_id, user_id)).fetchone()
+        else:
+            anchor = consented_by or asserted_by
+            found = cur.execute(
+                "SELECT id FROM speaker_voiceprints "
+                "WHERE company_id = %s AND display_name = %s AND user_id IS NULL "
+                "  AND coalesce(consented_by, asserted_by) = %s "
+                "  AND status <> 'withdrawn' "
+                "ORDER BY created_at LIMIT 1",
+                (company_id, display_name, anchor)).fetchone()
         if found:
             # Link an EXISTING profile too, or the whole thing only works for profiles
             # created after this shipped — and every profile in the database predates it,
@@ -151,7 +193,7 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
     return cur.execute(
         "INSERT INTO speaker_voiceprints "
         "(company_id, user_id, display_name, status, consent_at, consented_by, "
-        " linked_by, linked_at, linked_on) "
+        " linked_by, linked_at, linked_on, consent_basis, asserted_by) "
         # Both CASE parameters are cast. A parameter whose only use is `IS NULL` gives
         # Postgres nothing to infer a type from, so the statement fails at PREPARE time for
         # every value — `IndeterminateDatatype: could not determine data type of parameter
@@ -159,10 +201,10 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
         # deterministic 500. The suite could not see it: FakeConn never prepares SQL.
         "VALUES (%s, %s, %s, 'tentative', "
         "        CASE WHEN %s::boolean THEN now() ELSE NULL END, %s, "
-        "        %s, CASE WHEN %s::uuid IS NULL THEN NULL ELSE now() END, %s) "
+        "        %s, CASE WHEN %s::uuid IS NULL THEN NULL ELSE now() END, %s, %s, %s) "
         "RETURNING id",
-        (company_id, user_id, display_name, bool(consent_given), consented_by,
-         linked_by, user_id, linked_on),
+        (company_id, user_id, display_name, bool(consent_given or attested), consented_by,
+         linked_by, user_id, linked_on, consent_basis, asserted_by),
     ).fetchone()
 
 

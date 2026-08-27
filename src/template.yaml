@@ -894,6 +894,19 @@ Parameters:
       notices, which nothing prompts them to do. Every enrolment log line says so when the
       override is in force.
 
+  EnrolOnCorrection:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether naming a speaker is itself taken as the claim that the named person agreed to
+      a voiceprint. False keeps the pre-existing rule -- enrolment only when the caller sends
+      consent_given with the SUBJECT's id -- which is stricter and is why no company holds a
+      single profile: the subject needs an account, and on a site the people most often named
+      do not have one. True records the correction as consent_basis='attestation' with
+      asserted_by naming who made the claim. It records a claim and does not verify one;
+      the basis is stored on every row so a later decision can find exactly that population.
+
   SpeakerIdentityMode:
     Type: String
     Default: 'off'
@@ -1665,6 +1678,7 @@ Resources:
           # off -> the correction routes 404. See the SpeakerIdentityMode parameter;
           # this is the rollback, so it must be a deployed value, not a code constant.
           SPEAKER_IDENTITY_MODE: !Ref SpeakerIdentityMode
+          ENROL_ON_CORRECTION: !Ref EnrolOnCorrection
           # Deploy = thaw. See the ServerBuild parameter.
           SERVER_BUILD: !Ref ServerBuild
           # QR passwordless login (2026-07-30) — PROD-ONLY (see IsProdWithOrgApi

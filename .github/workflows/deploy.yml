@@ -188,6 +188,7 @@ jobs:
               "EnableUserDeletion=${{ vars.TEST_ENABLE_USER_DELETION || 'false' }}" \
               "UploadVerifyMode=${{ vars.TEST_UPLOAD_VERIFY_MODE || 'observe' }}" \
               "SpeakerIdentityMode=${{ vars.TEST_SPEAKER_IDENTITY_MODE || 'off' }}" \
+              "EnrolOnCorrection=${{ vars.TEST_ENROL_ON_CORRECTION || 'false' }}" \
               "VoiceprintMaxFrameSpread=${{ vars.TEST_VOICEPRINT_MAX_FRAME_SPREAD || 'default' }}" \
               "AlertEmail=${{ vars.TEST_ALERT_EMAIL || 'none' }}" \
               "ServerBuild=${{ github.sha }}" \

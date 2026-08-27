@@ -216,6 +216,19 @@ UPLOAD_VERIFY_MODE = os.environ.get("UPLOAD_VERIFY_MODE", "off").lower()
 # exist -- this repo has shipped a documented rollback that was never wired, twice).
 SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 
+# Whether naming a speaker is itself taken as the claim that they agreed to a voiceprint.
+#
+# Off, the endpoint keeps the pre-existing rule: enrolment happens only when the caller sends
+# `consent_given` with the SUBJECT's id. That rule is stricter and it is why no company holds
+# a single profile — the subject needs an account, and on a site the people most often named
+# do not have one.
+#
+# On, a correction also creates the profile, recorded as `consent_basis='attestation'` with
+# `asserted_by` naming who made the claim. It records a claim; it does not verify one, and
+# nothing here can. The basis is on every row so a later decision — a stricter standard, a
+# purge, an opt-out register — can find exactly this population in one query.
+ENROL_ON_CORRECTION = os.environ.get("ENROL_ON_CORRECTION", "false").lower() == "true"
+
 # Voice-timeliness: mis-touch tolerance ("grace") window before a stopped session
 # finalizes + emails. A resume within it cancels the finalize (spec §3.2, §8.4).
 STOP_GRACE_SECONDS = int(os.environ.get("STOP_GRACE_SECONDS", "30"))
@@ -1644,7 +1657,19 @@ def speaker_corrections(conn, caller, session_base, event):
     # person again. The two effects are reported separately for that reason.
     enrol = None
     _linked_person, _linked_on = None, "not-requested"
-    if body.get("consent_given"):
+    # Two ways in, and the second is why the library was empty.
+    #
+    # `consent_given` is the strong one: the caller states the SUBJECT agreed and supplies
+    # their id. It needs the subject to have an account, and the people most often named on a
+    # site are subcontractors who do not, so the strong path excluded exactly the population
+    # the feature exists for. Nothing ever enrolled.
+    #
+    # `ENROL_ON_CORRECTION` is the attested one: naming a speaker is itself taken as the
+    # claim, attributed to the person who made it. It records a claim rather than verifying
+    # one, `consent_basis` says so on every row it creates, and the switch means turning it
+    # off returns the endpoint to the strong path exactly as it was.
+    attest = ENROL_ON_CORRECTION and not body.get("consent_given")
+    if body.get("consent_given") or attest:
         # WHO consented, not just that somebody did. 0042 added the column precisely because
         # a timestamp cannot tell the subject agreeing apart from the wearer clicking a box
         # on their behalf — and leaving it optional meant the column recorded nothing in the
@@ -1653,7 +1678,7 @@ def speaker_corrections(conn, caller, session_base, event):
         # This does not make the claim TRUE: the value is still typed by whoever is at the
         # keyboard, and no code here can verify it. It makes the claim ATTRIBUTED, which is
         # the most an API can do and the least an audit needs.
-        if not body.get("consented_by"):
+        if body.get("consent_given") and not body.get("consented_by"):
             return error("consented_by is required with consent_given: record whose voice "
                          "this is, not who is doing the labelling", 400)
         try:
@@ -1663,7 +1688,14 @@ def speaker_corrections(conn, caller, session_base, event):
             person, matched_on = users.resolve_display_name(conn, company_id, name)
             profile = voiceprints.upsert_profile(
                 conn, company_id, display_name=name,
-                consent_given=True, consented_by=body.get("consented_by"),
+                consent_given=not attest,
+                consented_by=body.get("consented_by"),
+                # The claim and who made it, kept apart from the subject. `asserted_by` is
+                # the caller; `consented_by` stays empty on this path because nobody has
+                # said the subject agreed — putting the caller there would make every row
+                # in the table ambiguous about which of the two it records.
+                consent_basis="attestation" if attest else "confirmed",
+                asserted_by=str(caller["id"]) if attest else None,
                 user_id=str(person["id"]) if person else None,
                 linked_by=str(caller["id"]) if person else None,
                 linked_on=matched_on if person else None)
