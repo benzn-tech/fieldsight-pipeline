@@ -1474,6 +1474,11 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
+          # Under the Lambda Timeout above, or the runtime hard-kills this function
+          # before urllib3 raises and the `except` that exists for a slow LLM never
+          # runs. `llm_utils` defaults it to 150 s and explains the ordering; three
+          # functions here had it inverted, all by leaving it at that default.
+          LLM_HTTP_TIMEOUT: '45'
           S3_BUCKET: !Ref DataBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           HAIKU_MODEL: claude-haiku-4-5-20251001
@@ -2092,6 +2097,11 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
+          # Under the Lambda Timeout above, or the runtime hard-kills this function
+          # before urllib3 raises and the `except` that exists for a slow LLM never
+          # runs. `llm_utils` defaults it to 150 s and explains the ordering; three
+          # functions here had it inverted, all by leaving it at that default.
+          LLM_HTTP_TIMEOUT: '90'
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
@@ -2439,7 +2449,15 @@ Resources:
       FunctionName: !Sub ["${P}-session-finalize", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_session_finalize.lambda_handler
-      Timeout: 120
+      # 300, not 120. This function re-summarises the FULL transcript at finalize, and 120
+      # was sized for the rolling summariser it used to call -- whose input is already
+      # compressed. Measured on a real 26-minute session (316 turns, 17 K chars rendered):
+      # the invocation was hard-killed at exactly 120000 ms, three times, with no email sent.
+      #
+      # Sizing is against the OTHER full-transcript LLM caller rather than a guess:
+      # ExtractSessionFunction gets 600 s for the same class of work. 300 leaves the HTTP
+      # timeout below room to lose its race (see LLM_HTTP_TIMEOUT), which 120 did not.
+      Timeout: 300
       MemorySize: 256
       Environment:
         Variables:
@@ -2447,6 +2465,15 @@ Resources:
           S3_BUCKET: !Ref IngestBucketName
           EMAIL_SENDER: !Ref EmailSender
           SENDER_EMAIL: !Ref SenderEmail
+          # UNDER the Lambda Timeout, which is the whole point of the setting and was
+          # inverted here. `llm_utils` defaults it to 150 s and says why: "so the HTTP
+          # client loses the race against the Lambda's own Timeout and we get a catchable
+          # urllib3 error instead of a runtime hard-kill". At Timeout 120 the client WON
+          # that race, so a slow call produced no exception, no fallback to the rolling
+          # summary, and no confirmation email -- the failure the fallback exists to
+          # prevent. Every other LLM caller here sets it explicitly (180 under 300, 540
+          # under 600); this one did not.
+          LLM_HTTP_TIMEOUT: '240' 
           # LLM env — the worker re-summarises the FULL transcript at finalize (a
           # complete summary; the rolling one can be stale/partial). Thinking OFF:
           # summarisation needs no extended reasoning and thinking dominated latency
