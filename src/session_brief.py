@@ -80,7 +80,7 @@ Return ONLY JSON, no code fence and no commentary:
       "text": "One sentence on what needs doing, written for whoever will do it.",
       "why": "What happened in the meeting that produced this",
       "at": "HH:MM:SS",
-      "assignee": "The name it was given to, or null. Do not guess.",
+      "assignee": "The name it was given to, or null. Do not guess. The speaker labels above (spk_0, Speaker 1) are NOT names -- they say which voice spoke, not who the task is for. If nobody was named, this is null.",
       "due": "When, in the words used, or null",
       "basis": "committed if someone took it on; inferred if you concluded it should be done"
     }}
@@ -258,6 +258,32 @@ def reanchor(brief, turns):
     return {"reanchored": fixed, "unmatched": missed}
 
 
+# spk_0, Speaker 1, SPEAKER_02 — the diarisation label, which is what the transcript hands
+# the model when nobody in the room said a name.
+_SPEAKER_LABEL = re.compile(r"^\s*(spk|speaker)[\s_-]*\d+\s*$", re.I)
+
+
+def _real_name(assignee):
+    """The assignee, or None when it is a speaker label wearing a name's clothes.
+
+    Measured on a real session: every one of the five tasks came back assigned to `spk_0` or
+    `spk_1`. The model was not hallucinating — those strings are literally what the rendered
+    transcript puts in front of it, and the prompt asked who the task was given to.
+
+    A label here is worse than an empty field, because it does not read as one. It travels
+    into the confirmation email's Assignee column and into the to-do list as though somebody
+    had been named, and the reader has no way to tell it apart from a real name they do not
+    recognise. Empty says "nobody was named", which is true and is what the meeting contained.
+
+    Guarded here as well as in the prompt because an instruction cannot be relied on and this
+    can: the prompt now says speaker labels are not names, and this makes it so.
+    """
+    name = (assignee or "").strip()
+    if not name or _SPEAKER_LABEL.match(name):
+        return None
+    return name
+
+
 def to_session_summary(brief):
     """The two keys the confirmation email already reads, derived from the brief.
 
@@ -274,7 +300,7 @@ def to_session_summary(brief):
     # a title tuned to survive truncation identifies the task and cannot also carry why it
     # exists, so reading the list meant going back to the timeline and opening the topic.
     todos = [{"text": (t.get("text") or "").strip(),
-              "responsible": t.get("assignee") or None,
+              "responsible": _real_name(t.get("assignee")),
               "due": t.get("due") or None,
               "why": (t.get("why") or "").strip() or None,
               "at": t.get("at") or None}
