@@ -102,46 +102,53 @@ T1, T2, T5 are each independently shippable and improve the EXISTING pipeline on
 
 ---
 
-## Task 3 — Briefing generation pass: new non-VPC lambda writing a new S3 artifact
+## Task 3 — SUPERSEDED: the summariser swap, not a new lambda
 
-**Goal.** One pass over the full deduped transcript per closed session, producing the spec §4 container (`headline / sections[] / entities[] / tasks[]`, free text in the fields, `basis: committed|inferred` on tasks), written to S3 — with **alias validation and time-anchor re-derivation performed server-side in this lambda before the artifact is written**, never left to a client.
+> **Rewritten 2026-08-19.** The original T3 specified a new non-VPC lambda
+> triggered by a `briefing_requests/` artifact writing to a new S3 prefix with
+> its own IAM. It was written without noticing that
+> `lambda_session_finalize._complete_summary` already does all of that, so it
+> would have built a second copy of a path that already runs.
 
-**Architecture (follows existing conventions exactly).**
-- **New function `BriefingFunction`** (`src/lambda_briefing.py`), **non-VPC** — it calls the LLM over the internet, exactly like `ExtractSessionFunction` and `RollingSummaryFunction` (template comment at ~1837: "NOT in VPC"). It must NOT be in-VPC: BUG-36, an in-VPC lambda's LLM call black-holes until timeout.
-- **Trigger: S3 request artifact**, prefix **`briefing_requests/{device_sid}.json`** — the same channel shape as `extraction_requests/` and for the same reason (BUG-36: the in-VPC finalize sweep cannot invoke a lambda; it CAN write S3 through the gateway endpoint). Body mirrors `parse_final_request`'s contract: `{"userFolder", "date", "sessionBase"}`. A distinct prefix, not a marker inside `extraction_requests/` — that prefix's notification already targets `ExtractSessionFunction` and routing two LLM passes through one function couples their timeout/concurrency budgets.
-- **Writer of the request:** `lambda_finalize_claim` (the finalize sweep) writes `briefing_requests/{sid}.json` right where it writes `extraction_requests/` today, behind a new env switch `ENABLE_BRIEFING` (CFN Parameter, default `false`; TEST turns it on via `deploy.yml` parameter override — the additive path is dark on prod until deliberately enabled).
-- **Outputs (all under existing conventions):**
-  - `briefings/{user_folder}/{date}/{session_base}.json` — the validated briefing artifact (schema below).
-  - `briefings/{user_folder}/{date}/{session_base}.turns.json` — the deduped turn stream the briefing was derived from: `[{turn_index, speaker, text, abs_start, abs_end, source_filename, start_sec}]`. This sidecar is what T4 loads into `session_turns` — the in-VPC writer must not re-assemble turns itself (it can't call the shared assembly's S3 pagination cheaply, and two assemblies would drift; one derivation, written down, consumed twice).
-- **Reuses:** `gather_session_segments` + `assemble_session_turns` from `lambda_extract_session` (import, exactly as `lambda_rolling_summary.process_transcript_key` does), `llm_utils.call_llm(..., force_json=True, enable_thinking=True)`, `transcript_utils` (bundled in the zip per the standing rule).
+**What already exists.** At session close, after the grace window,
+`_complete_summary` re-gathers the segments, calls `assemble_deduped_turns`
+(which now includes the T1 dedup), runs in a non-VPC lambda that can reach the
+LLM, and returns `{summary, open_todos}` for the confirmation email. Its
+summariser is an injectable parameter.
 
-**Server-side post-processing — the two spec rules, implemented here:**
-1. **Alias validation** (`_validate_aliases(entities)`): (a) drop an alias equal (case/whitespace-normalized) to any OTHER entity's canonical `name` (the `Claude`-as-alias-of-`Plaud` failure); (b) drop an alias composed entirely of common English words (the `record include` failure) — ship a small stopword/common-word list as a code constant seeded from a standard frequency list; an alias survives only if at least one token is NOT in the list or it contains a digit. Dropped aliases are kept in the artifact under `entities[].rejected_aliases` with reasons — counted, never silently discarded (T4 stores them as `status='rejected'`).
-2. **Time-anchor re-derivation** (`_snap_anchors(briefing, turns)`): the model's `at` is recollection and measured wrong (spec: `13:33:11` vs actual `14:33:11`). For every bullet and task carrying a quote, find the quote in the real turns (reuse `evidence_match.py` — the fuzzy quote-matching machinery `verify_evidence` already uses — do not write a second matcher); for items without a quote, match on their rarest terms. Replace `at` with the matched turn's `abs_start` and attach `{source_filename, start_sec}`. An unmatched anchor is **counted, not silently kept**: the item keeps the model's `at` but gains `"anchor": "unmatched"`, and the artifact's top level records `anchor_stats: {snapped, corrected, unmatched}` (the spec's 4-corrected/2-unmatched measurement becomes a permanent artifact field).
+**What was built instead** (shipped on `feat/brief-as-session-summary`):
 
-**Artifact schema (top level):** `{schema_version: 1, session_base, user_folder, date, headline, sections[], entities[], tasks[], anchor_stats, dedup_stats, transcript_stats, generated_at}`. Tasks carry `basis` verbatim from the model; **nothing in this pipeline may promote an `inferred` task into anything that reads as a record** (spec §8 — surfacing is T6/frontend's contract, but the field must never be dropped here).
+- `src/session_brief.py` — the brief prompt, a tolerant parser, alias validation
+  and time-anchor re-derivation, plus `brief_from_turns`, a drop-in for
+  `summarize_turns` returning the brief **widened** with the same
+  `summary` / `open_todos`. The email is byte-identical either way.
+- `_complete_summary` picks the summariser on `SESSION_BRIEF`, and stores the
+  full brief at `session_brief/{folder}/{date}/sid{id}/latest.json`
+  (best-effort — S3 is not on the path between a recorder and their email).
+- `EnableSessionBrief` parameter, passed by **both** workflows so the switch is
+  real, and an `s3:PutObject` statement for `session_brief/*` so the write does
+  not fail into a swallowed log line.
 
-**Idempotency / cost controls.** Same-key overwrite (the `extraction_key` collide-on-purpose pattern); a re-request regenerates. Concurrency budget per BUG-43: this adds one ~125s LLM call per session **close** (not per chunk) — arrival rate is session closes, so steady-state occupancy is well under one slot; still, set function `Timeout: 600`, `LLM_HTTP_TIMEOUT: 540` (copy ExtractSession's numbers and reasoning) and a `MIN_REBRIEF_INTERVAL_S` throttle reading the existing artifact's `generated_at` (copy `lambda_rolling_summary`'s read-your-own-output throttle) so a retry storm cannot burn money.
+**No new lambda, no request channel, no migration.**
 
-**Files touched.** `src/lambda_briefing.py` (new), `src/lambda_finalize_claim.py` (write the request artifact, ~5 lines behind the switch), `src/template.yaml` (BriefingFunction + FinalizeSweep policy line + `EnableBriefing` parameter), `scripts/wire-s3-events.sh` (the `briefing_requests/` notification — BUG-33), `.github/workflows/deploy.yml` (TEST parameter override `EnableBriefing=true`), tests.
+**Tested how.** 20 unit tests on the pure halves, driven by the real failures:
+`PV Tech` kept, `Claude`-as-`Plaud` refused, `record include` refused,
+"common" measured per corpus (`ducting` is common on a demolition walk and rare
+in an office), the hour-wrong anchor corrected, an unmatchable anchor kept and
+counted. Plus wiring tests: the flag is off by default, injection still beats
+the flag, and a failed store still sends the email.
 
-**Tested how.**
-- Unit (LLM injected, no network — the `summarize_turns(call_llm=...)` pattern): prompt construction includes full transcript; alias rule 1 and rule 2 each with the spec's own examples (`Claude`/`Plaud`, `record include`); anchor snapping corrects a wrong `at` against synthetic turns and counts an unmatchable one; artifact schema pinned; throttle honored; malformed LLM JSON → no write, logged (never write a malformed contract — M-9's rule).
-- TEST end-to-end: close a real session on TEST, confirm `briefing_requests/` → `briefings/{...}.json` + `.turns.json` appear, spot-check anchors against the audio.
+**How you would know it FAILED in production.** With the flag on and nothing
+under `session_brief/`, the IAM statement is missing — `_store_brief` logs and
+swallows by design, so the absence of objects is the signal, not an error rate.
+If briefs land but the email got shorter or lost its to-dos, `to_session_summary`
+is deriving badly; the email reads exactly `summary` and `open_todos` and
+nothing else. If anchors are wrong, `stats.unmatched` climbs — it is recorded
+per brief for that reason.
 
-**How you'd know it FAILED in production.**
-- Silent-failure signature #1: sessions close but no `briefings/` objects appear → the S3 notification wiring (out-of-band, BUG-33) or the FinalizeSweep PutObject grant is missing. Check: `aws s3 ls briefings/` for the day, then FinalizeSweep logs, then `simulate-principal-policy`.
-- Signature #2: artifacts appear with `anchor_stats.unmatched` climbing toward `snapped` → the quote matcher is broken against real ASR text (every anchor a guess). The stat is in the artifact precisely so this is a one-line query, not an investigation.
-- Signature #3 (BUG-43 shape): CloudWatch `Throttles` > 0 on the account while briefing runs — briefing is eating concurrency slots. It is close-triggered so this should not happen; if it does, the throttle interval and a reserved-concurrency cap are the levers.
-
-**IAM (deploy role + function role) — explicit.**
-- `BriefingFunction` role (inline in template, deploy role already creates these): `s3:GetObject` on `transcripts/*`, `voice_ask/*`, `audio_segments/*` (batch maps — same reason as ExtractSession's grant at template ~1919), `briefing_requests/*`, `briefings/*` (reads its own output for the throttle — **BUG-43 lesson 3: a writer that reads its own output needs the Get grant or the throttle silently dies**); `s3:PutObject` on `briefings/*`; `s3:ListBucket` with prefix condition `transcripts/*`, `briefings/*`, `voice_ask/*` (without ListBucket a missing key answers 403 not 404 — the `read_existing_extraction` UNKNOWN trap, documented at template ~1935).
-- `FinalizeSweepFunction`: add `s3:PutObject` on `briefing_requests/*` beside its existing `extraction_requests/*` line.
-- Deploy role: no new resource TYPES (one more Serverless::Function, inline policies, one Parameter). Run `simulate-principal-policy` for `lambda:CreateFunction`/`iam:PutRolePolicy` against the new names anyway before merging.
-
-**New VPC endpoint requirement.** **None.** BriefingFunction is non-VPC (full egress). FinalizeSweep's new write is S3, which it already reaches via the existing gateway endpoint.
-
-**Migrations.** None.
+**Rollout.** `SESSION_BRIEF=false` everywhere until one real session has been
+read end to end. Turn it on in TEST first; a session with no recordings proves
+nothing, so this waits for actual capture.
 
 ---
 
