@@ -40,6 +40,20 @@ _TRAILING = " \t.,;:!?-–—。，、；：！？…"
 _COLLAPSIBLE_STATUS = "open"
 
 
+def _status(row):
+    """A row with NO status is open.
+
+    Database rows always carry one. The rows that do not are the ones read
+    straight out of an extraction artifact — the shape the stop-recording email
+    builds its list from — and a freshly extracted commitment is open by
+    definition; nothing has had the chance to close it. Reading a missing field
+    as "not open" would have quietly excluded that surface from the collapse
+    while every test on the database side stayed green, which is the shape of
+    half the defects in this repo's own list.
+    """
+    return (row.get("status") or _COLLAPSIBLE_STATUS)
+
+
 def enabled():
     """`ENABLE_TODO_COLLAPSE`, default OFF, read on every call.
 
@@ -110,7 +124,7 @@ def collapse(rows):
     groups = {}
     for row in rows:
         key = normalise(row.get("text"))
-        if not key or row.get("status") != _COLLAPSIBLE_STATUS:
+        if not key or _status(row) != _COLLAPSIBLE_STATUS:
             continue
         groups.setdefault(key, []).append(row)
 
@@ -118,7 +132,7 @@ def collapse(rows):
     seen_keys = set()
     for row in rows:
         key = normalise(row.get("text"))
-        if not key or row.get("status") != _COLLAPSIBLE_STATUS:
+        if not key or _status(row) != _COLLAPSIBLE_STATUS:
             out.append(dict(row))
             continue
         if key in seen_keys:
@@ -140,4 +154,4 @@ def collapsed_count(rows):
     is worse than not collapsing: it tells the reader the feature is broken
     rather than that the work is duplicated.
     """
-    return sum(1 for r in collapse(rows) if r.get("status") == _COLLAPSIBLE_STATUS)
+    return sum(1 for r in collapse(rows) if _status(r) == _COLLAPSIBLE_STATUS)

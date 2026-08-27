@@ -118,3 +118,27 @@ def test_empty_and_blank_text_is_left_alone():
     """Two todos with no text are not evidence of one todo said twice."""
     rows = [item("", id="a"), item("   ", id="b")]
     assert len(tc.collapse(rows)) == 2
+
+
+def test_a_row_with_no_status_is_open():
+    """The rows that carry no status are the ones read straight out of an
+    extraction artifact — the shape the stop-recording email builds its list
+    from. Reading a missing field as "not open" would have quietly excluded that
+    surface while every database-side test stayed green."""
+    rows = [{"text": "Scaffolding -- inspect before Monday", "id": "a"},
+            {"text": "Scaffolding -- inspect before Monday", "id": "b"}]
+    out = tc.collapse(rows)
+    assert [r["id"] for r in out] == ["a"]
+    assert out[0]["mention_count"] == 2
+
+
+def test_the_switch_is_off_unless_it_says_true(monkeypatch):
+    """Unset, misspelled, or dropped from one of the two workflows must all mean
+    the lists stay exactly as they are today."""
+    monkeypatch.delenv("ENABLE_TODO_COLLAPSE", raising=False)
+    rows = [item("Same", id="a"), item("Same", id="b")]
+    assert len(tc.collapse_if_enabled(rows)) == 2
+    for bad in ("", "false", "False", "1", "yes", "TRUE ", " true"):
+        monkeypatch.setenv("ENABLE_TODO_COLLAPSE", bad)
+        expected = 1 if bad.strip().lower() == "true" else 2
+        assert len(tc.collapse_if_enabled(rows)) == expected, bad

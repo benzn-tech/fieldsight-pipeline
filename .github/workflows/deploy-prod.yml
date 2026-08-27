@@ -230,6 +230,7 @@ jobs:
               "DocxLayerArn=${{ vars.PROD_DOCX_LAYER_ARN }}" \
               "EnableKeyframes=${{ vars.PROD_ENABLE_KEYFRAMES || 'false' }}" \
               "RebindSpeakers=${{ vars.PROD_REBIND_SPEAKERS || 'false' }}" \
+              "EnableTodoCollapse=${{ vars.PROD_ENABLE_TODO_COLLAPSE || 'false' }}" \
               "EnableThreadSuggestions=${{ vars.PROD_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
               $KF_LAYER_PARAM \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
