@@ -42,7 +42,22 @@ def candidate_corpus(conn, site_id, before_date, window_days):
     mean nothing. A thread tracks outstanding commitments; a topic with none
     is not one.
 
-    Shaped for thread_match.find_candidates (title / summary / open_items)."""
+    Shaped for thread_match.find_candidates (title / summary / open_items).
+
+    ⚠ `open_items` here and in thread_facts / facts_for_threads is NOT collapsed,
+    deliberately, and that is a precondition of Phase B rather than an oversight.
+    All three counts are inflated by same-day duplicates exactly as the todo
+    lists were before ENABLE_TODO_COLLAPSE.
+
+    Safe to leave today: thread_facts and facts_for_threads describe CONFIRMED
+    threads, of which prod has zero, and the queue that would show them is
+    switched off for customers. candidate_corpus only feeds proposal generation.
+
+    Must be done before Phase B ships: a thread reporting "raised 3 times" when
+    one man said it once per recording on a single evening is the feature lying
+    about the only number it exists to produce — and mention count is ranked
+    ABOVE priority in the ordering. Collapsing per (site, day) first is what
+    makes the human judgement affordable; spec §3."""
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT t.id, t.report_date, t.site_id, t.title, t.summary, t.thread_id, "
         "       count(a.id) FILTER (WHERE a.status='open') AS open_items "

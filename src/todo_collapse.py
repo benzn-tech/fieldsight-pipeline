@@ -22,9 +22,12 @@ recomputing on every read is not a shortcut, it is the only shape that survives.
 none of them, which is the implementation a first reading reaches for. Callers
 must hand this the whole day's items, not one topic's.
 
-Pure module: no psycopg, no boto3, no env — importable from any lambda and
-testable without either.
+Pure apart from one env read (`enabled`), which is deliberately at CALL time:
+this repo's standing failure is a switch whose middle segment goes missing and
+silently takes the default, and a module-import read cannot be monkeypatched by
+the tests that would catch it.
 """
+import os
 
 # Trailing punctuation only, and CJK marks alongside the Latin ones: these
 # recordings are routinely Chinese, and a rule that only knows `.` would treat
@@ -35,6 +38,27 @@ _TRAILING = " \t.,;:!?-–—。，、；：！？…"
 # are NOT the same commitment — one of them was dealt with, and merging them
 # would hide the open one behind a tick.
 _COLLAPSIBLE_STATUS = "open"
+
+
+def enabled():
+    """`ENABLE_TODO_COLLAPSE`, default OFF, read on every call.
+
+    Off is the safe direction and that is the point: a variable that is unset,
+    misspelled, or dropped from one of the two workflows leaves the lists
+    exactly as they are today rather than silently changing what a customer's
+    todo list says.
+    """
+    return os.environ.get("ENABLE_TODO_COLLAPSE", "false").strip().lower() == "true"
+
+
+def collapse_if_enabled(rows):
+    """The only entry point read paths should use.
+
+    Returns a copy either way, so a caller cannot come to depend on the
+    identity of the list it was handed — the switch changing that would be a
+    second, invisible behaviour change.
+    """
+    return collapse(rows) if enabled() else [dict(r) for r in (rows or [])]
 
 
 def normalise(text):
