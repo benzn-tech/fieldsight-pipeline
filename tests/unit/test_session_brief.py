@@ -212,3 +212,35 @@ def test_thinking_is_requested_explicitly_not_inherited_from_the_env():
 
     sb.brief_from_turns(_turns(), call_llm=spy)
     assert seen.get("enable_thinking") is True
+
+
+def test_a_speaker_label_is_not_an_assignee():
+    """Measured on a real session: every one of five tasks came back assigned to `spk_0` or
+    `spk_1`. The model was not hallucinating — those strings are literally what the rendered
+    transcript puts in front of it, and the prompt asked who the task was given to.
+
+    A label is worse than an empty field because it does not read as one. It reaches the
+    confirmation email's Assignee column looking exactly like a name the reader does not
+    recognise, when what the meeting actually contained was nobody being named.
+    """
+    import session_brief as sb
+
+    for label in ("spk_0", "spk_1", "Speaker 1", "SPEAKER_02", "  spk_10  ", "speaker-3"):
+        out = sb.to_session_summary({"headline": "h",
+                                     "tasks": [{"text": "t", "assignee": label}]})
+        assert out["open_todos"][0]["responsible"] is None, label
+
+    # A real name survives, including ones that merely contain a digit or the word speaker.
+    for name in ("Clement", "Deon Jay", "James O'Neill", "Speaker Systems Ltd"):
+        out = sb.to_session_summary({"headline": "h",
+                                     "tasks": [{"text": "t", "assignee": name}]})
+        assert out["open_todos"][0]["responsible"] == name, name
+
+
+def test_the_prompt_tells_the_model_the_same_thing():
+    """Both halves, because neither is sufficient. The prompt is what stops the label being
+    generated; the parser is what makes it not matter when it is generated anyway."""
+    import session_brief as sb
+    prompt = sb.build_brief_prompt([{"abs_start_str": "11:00:00", "speaker": "spk_0",
+                                     "text": "hello"}])
+    assert "spk_0" in prompt and "NOT names" in prompt
