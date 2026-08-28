@@ -36,6 +36,7 @@ def _prompts():
     ex = pytest.importorskip("lambda_extract_session")
     rg = pytest.importorskip("lambda_report_generator")
     mm = pytest.importorskip("lambda_meeting_minutes")
+    sb = pytest.importorskip("session_brief")
     return {
         # build_extraction_prompt returns (prompt, stats) -- taking the tuple whole is how
         # the first version of this check reported a false negative.
@@ -45,6 +46,10 @@ def _prompts():
         "weekly_report": rg.build_weekly_prompt([], "Site", "2026-08-20", "2026-08-28"),
         "monthly_report": rg.build_monthly_prompt([], [], "Site", "2026-08-01", "2026-08-28"),
         "meeting_minutes": mm.build_meeting_prompt([], {}),
+        # Added after the brief shipped without the rule and wrote a customer's
+        # session summary in Chinese. The rule existed, the module was simply not
+        # on this list -- which is the only reason nothing caught it.
+        "session_brief": sb.build_brief_prompt(TURNS),
     }
 
 

@@ -20,6 +20,8 @@ import json
 import logging
 import re
 
+from output_language import OUTPUT_LANGUAGE_RULE
+
 logger = logging.getLogger()
 
 MAX_TOKENS = 8000
@@ -127,7 +129,7 @@ How to write it:
    the side chosen: a missed task is one the recorder still remembers, and a
    surplus one is meant to be dismissed in the UI rather than argued away here.
 
-6. Write in the language the meeting was mostly held in.
+6. {OUTPUT_LANGUAGE_RULE}
 
 ---
 
