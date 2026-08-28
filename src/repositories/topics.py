@@ -752,7 +752,7 @@ def list_expired_non_work(conn, *, older_than, created_since, limit=500) -> list
     tombstones on one topic. A topic the recorder rescued to 'work' inside
     the buffer stops matching on work_class and is never seen here again."""
     return conn.cursor(row_factory=dict_row).execute(
-        "SELECT t.id, t.company_id, t.report_date, u.folder_name "
+        "SELECT t.id, u.company_id, t.report_date, u.folder_name "
         "FROM topics t JOIN users u ON u.id = t.user_id "
         "WHERE t.work_class = 'non_work' "
         "AND t.created_at < %s AND t.created_at >= %s "
