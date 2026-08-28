@@ -1276,26 +1276,44 @@ def _session_turns(folder, date, session_base):
     try:
         payload = _read_org_transcripts(date, folder, "", "")
     except Exception:
-        logger.warning("speaker correction: no transcripts for %s/%s", folder, date)
+        # `except Exception -> []` turns a read failure into "this session has no turns",
+        # and the caller cannot tell those apart: the artifact ships with `turns: []`, the
+        # embedder names the one corrected window and nothing else, and the log line says
+        # the correction was queued. Loud, with the reason attached.
+        logger.exception("speaker correction: transcripts unreadable for %s/%s", folder, date)
         return []
     # Both sides through the same normaliser. Comparing a normalised filename key against
     # the raw URL parameter is how one of these ends up matching nothing — the two spellings
     # of a session are not equal as strings, only as sessions.
     want = turn_name_overlay.session_base(session_base)
     out = []
-    for seg in payload.get("speaker_segments") or []:
+    segments = payload.get("speaker_segments") or []
+    matched = with_offset = 0
+    for seg in segments:
         name = seg.get("source_filename") or ""
         if not want or turn_name_overlay.session_base(name) != want:
             continue
+        matched += 1
         start = seg.get("chunk_start")
         if start is None:
             continue
+        with_offset += 1
         out.append({"source_filename": name, "start_sec": float(start),
                     "end_sec": float(start) + float(seg.get("duration") or 0.0),
                     # The transcriber's own grouping. It says "these turns are one voice"
                     # about turns too short for any acoustic judgement, and until now that
                     # statement never reached the layer that declines to judge them.
                     "speaker_label": seg.get("speaker_label")})
+    # WHY it is empty, when it is. An empty turn list is a legitimate outcome — a session
+    # with nothing transcribed yet — and it is also what a session-id mismatch, a missing
+    # `chunk_start` and an empty read all look like. Four investigations into one enrolment
+    # ended here, each time reading `turns: 0` in the artifact with no way to tell which of
+    # the four it was, and each time listing the bucket by hand to find out.
+    if not out:
+        logger.warning(
+            "speaker correction: 0 turns for session=%s (read %d segments; %d matched the "
+            "session, %d of those had an offset) folder=%s date=%s",
+            want, len(segments), matched, with_offset, folder, date)
     return out
 
 

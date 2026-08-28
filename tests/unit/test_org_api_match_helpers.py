@@ -185,3 +185,57 @@ def test_a_session_id_that_normalises_to_nothing_matches_no_turns(monkeypatch):
                         lambda *a, **k: _payload(_seg("Benl1_2026-04-29_off0.5_srcwav.json", 4.0)))
     assert org._session_turns("Benl1", "2026-04-29",
                               "Benl1_2026-04-29_off0.5_srcwav.json") == []
+
+
+def test_an_empty_turn_list_says_which_kind_of_empty_it_is(monkeypatch, caplog):
+    """`turns: 0` in the artifact has four causes and looked identical for all of them.
+
+    A session with nothing transcribed yet is legitimate. A session-id mismatch, segments
+    with no `chunk_start`, and a read that returned nothing are not — and all four produce
+    the same empty list, the same 202, and the same "correction queued" line. Four rounds of
+    one investigation ended here, each listing the bucket by hand to find out which.
+
+    So the counts go in the log: how many segments were read, how many matched the session,
+    how many of those carried an offset. Each pair of numbers rules out one cause.
+    """
+    import logging
+
+    monkeypatch.setattr(org, "_read_org_transcripts",
+                        lambda *a, **k: _payload(_seg(SID_B, 10.0)))
+    with caplog.at_level(logging.WARNING):
+        assert org._session_turns("Benl1", "2026-04-29", SID_A) == []
+
+    line = next((r.getMessage() for r in caplog.records if "0 turns" in r.getMessage()), None)
+    assert line, "an empty result was returned with nothing said about it"
+    assert "read 1 segments" in line, line
+    assert "0 matched the session" in line, (
+        "the count that distinguishes a session mismatch from an empty read is missing")
+
+
+def test_the_offset_count_separates_a_mismatch_from_a_missing_offset(monkeypatch, caplog):
+    """Matched the session but had no `chunk_start` is a different fault from matched
+    nothing, and the two need different fixes."""
+    import logging
+
+    monkeypatch.setattr(org, "_read_org_transcripts", lambda *a, **k: _payload(
+        {"source_filename": SID_A, "duration": 5.0}))
+    with caplog.at_level(logging.WARNING):
+        assert org._session_turns("Benl1", "2026-04-29", SID_A) == []
+
+    line = next(r.getMessage() for r in caplog.records if "0 turns" in r.getMessage())
+    assert "1 matched the session" in line and "0 of those had an offset" in line, line
+
+
+def test_a_read_failure_is_logged_with_its_traceback(monkeypatch, caplog):
+    """`except Exception -> []` made a read failure indistinguishable from an empty session,
+    and the warning said "no transcripts" — which is the innocent reading of both."""
+    import logging
+
+    def _boom(*a, **k):
+        raise RuntimeError("S3 said no")
+
+    monkeypatch.setattr(org, "_read_org_transcripts", _boom)
+    with caplog.at_level(logging.ERROR):
+        assert org._session_turns("Benl1", "2026-04-29", SID_A) == []
+    assert any(r.exc_info for r in caplog.records), (
+        "the exception was swallowed without a traceback, so the cause is unrecoverable")
