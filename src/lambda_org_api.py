@@ -1433,6 +1433,43 @@ def _label_map(turns):
             for t in turns or []]
 
 
+def _same_company_as_folder(conn, caller, folder, what):
+    """None if `folder` belongs to the caller's company, or a 403 explaining why not.
+
+    The media ACL deliberately does NOT pin a cross-company caller to a company:
+    `_resolve_org_media_folder` calls that branch "the SOLE branch NOT pinned to
+    caller.company_id", and for READING that is right — a platform operator looking at a
+    customer's transcripts is the role working as designed.
+
+    These two routes are not reads. They create biometric data, and the company on the row
+    comes from the CALLER (`company_id = str(caller["company_id"])`, which is itself correct:
+    taking it from the body would let one tenant queue work against another's profiles). Put
+    those two correct rules together and a platform operator naming a speaker in customer B's
+    recording files B's voiceprint under their own company — measured, not hypothetical: TEST
+    carries such a row today.
+
+    Refusing is the answer rather than re-filing under the recording's company. A
+    cross-tenant operator cannot see or set the other company's `voiceprint_consent_basis`,
+    so they cannot know on what grounds that company may hold a voice at all; creating the
+    record anyway would be deciding that question for somebody else.
+
+    An UNKNOWN folder passes, and that is stated rather than hidden: device folders with no
+    `users` row exist and corrections on them are legitimate. It logs, because "same company"
+    and "no company to compare" are different facts.
+    """
+    owner = users.get_by_folder_name_global(conn, folder)
+    if owner is None:
+        logger.warning("%s: folder %s has no user row, so its company cannot be checked "
+                       "against the caller's", what, folder)
+        return None
+    if str(owner.get("company_id")) != str(caller["company_id"]):
+        return error(
+            "this recording belongs to another company. Naming a speaker here would store "
+            "a voiceprint under your company for a voice captured under theirs, on grounds "
+            "only they can establish.", 403)
+    return None
+
+
 def speaker_match(conn, caller, session_base, event):
     """POST /api/org/sessions/{session}/speaker-match — name a session from stored profiles.
 
@@ -1459,6 +1496,9 @@ def speaker_match(conn, caller, session_base, event):
     company_id = str(caller["company_id"])
     folder, err = _resolve_org_media_folder(conn, caller, body.get("user") or "",
                                             what="speaker match")
+    if err is not None:
+        return err
+    err = _same_company_as_folder(conn, caller, folder, "speaker match")
     if err is not None:
         return err
     date_m = re.search(r"(\d{4}-\d{2}-\d{2})", session_base or "")
@@ -1669,6 +1709,10 @@ def speaker_corrections(conn, caller, session_base, event):
     if not _may_correct_speakers(conn, caller, folder):
         return error("naming a speaker needs an admin, gm, pm, site_manager or "
                      "platform_admin role, or your own recording", 403)
+
+    err = _same_company_as_folder(conn, caller, folder, "speaker correction")
+    if err is not None:
+        return err
 
     name = (body.get("display_name") or "").strip()
     if not name:
