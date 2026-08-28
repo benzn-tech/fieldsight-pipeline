@@ -30,3 +30,30 @@ def list_companies(conn) -> list[dict]:
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT id, name, industry, created_at FROM companies ORDER BY name",
     ).fetchall()
+
+
+VOICEPRINT_BASES = ("notice", "attestation", "confirmed")
+
+
+def set_voiceprint_consent_basis(conn, company_id, basis):
+    """On what basis this company may hold a voiceprint. Returns the row it changed.
+
+    A short closed list, not free text. The value decides whether biometric data may be
+    created at all, and a typo that lands outside the list would read as "settled" to the
+    endpoint while meaning nothing — the shape where a guard passes on a value nobody
+    intended. `None` clears it, which is how a company withdraws the basis and returns
+    enrolment to the strict rule.
+
+    No audit row is written here and that is a gap, not a decision: this is a change to the
+    grounds on which a company may hold biometric data, and it should be attributable. It is
+    left to the endpoint for now because that is where the caller's identity is, and recorded
+    here so it is not mistaken for something that was considered and dismissed.
+    """
+    if basis is not None and basis not in VOICEPRINT_BASES:
+        raise ValueError(
+            f"unknown voiceprint consent basis {basis!r}; one of {VOICEPRINT_BASES} or None")
+    return conn.cursor(row_factory=dict_row).execute(
+        "UPDATE companies SET voiceprint_consent_basis=%s WHERE id=%s "
+        "RETURNING id, name, voiceprint_consent_basis",
+        (basis, str(company_id)),
+    ).fetchone()
