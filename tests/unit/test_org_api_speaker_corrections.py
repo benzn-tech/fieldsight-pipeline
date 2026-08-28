@@ -33,11 +33,27 @@ PATH = f"/api/org/sessions/{SESSION}/speaker-corrections"
 
 
 class FakeConn:
+    #: The company that owns the folder under test, as `_same_company_as_folder` reads it.
+    #: Default None = "no users row", the branch that fails OPEN for device folders. Every
+    #: test in this file predates the cross-company guard and none of them is about it, so
+    #: they take that branch — which is a real branch, not a hole punched for the tests.
+    #: `test_voiceprint_stays_in_its_company.py` is where the guard itself is exercised.
+    folder_owner = None
+
     def __enter__(self):
         return self
 
     def __exit__(self, *a):
         return False
+
+    def cursor(self, row_factory=None):
+        return self
+
+    def execute(self, sql, params=None):
+        return self
+
+    def fetchone(self):
+        return self.folder_owner
 
 
 class FakeS3:
