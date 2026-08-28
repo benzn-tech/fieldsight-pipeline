@@ -110,7 +110,9 @@ def test_a_company_that_has_settled_no_basis_enrols_nobody():
     basis must behave exactly as the system did before any of this existed."""
     import lambda_org_api as org
     src = open(os.path.join(ROOT, "src", "lambda_org_api.py"), encoding="utf-8").read()
-    assert "company_basis = companies.voiceprint_consent_basis" in src
+    assert 'company_basis = caller.get("voiceprint_consent_basis")' in src, (
+        "the basis is no longer taken from the caller's company; wherever it comes from "
+        "now, it must still be a COMPANY fact and not something this request supplies")
     assert re.search(r"attest\s*=\s*\(ENROL_ON_CORRECTION and company_basis", src), (
         "the company's basis is not required for the attested path, so a company that "
         "settled nothing would still enrol")

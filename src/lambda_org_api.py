@@ -1672,7 +1672,7 @@ def speaker_corrections(conn, caller, session_base, event):
     # at induction and in the subcontract, before anybody opens the app, and every correction
     # inside that company inherits it. A company that has not settled one gets None, and the
     # endpoint falls back to the strict rule — the subject's own id, or no enrolment.
-    company_basis = companies.voiceprint_consent_basis(conn, company_id)
+    company_basis = caller.get("voiceprint_consent_basis") or None
     attest = (ENROL_ON_CORRECTION and company_basis
               and not body.get("consent_given"))
     if body.get("consent_given") or attest:
