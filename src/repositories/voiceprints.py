@@ -120,7 +120,18 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
     # What it does NOT do is make the claim true. `consent_basis` travels with the profile
     # so every reader can see which kind it is, and a later decision to hold attested
     # profiles to a stricter standard can find them in one query.
-    attested = consent_basis == "attestation"
+    # Any basis that does not require the SUBJECT's own id. `notice` and `attestation` are
+    # both of that kind: one rests on the site induction and the subcontract, the other on
+    # somebody's word. `confirmed` is not — it means the subject themselves agreed, and it
+    # still needs `consented_by` to say who.
+    #
+    # This read `consent_basis == "attestation"` and 0049 then added `notice` as the
+    # company-level value without changing it. The endpoint sent `notice`, this refused it,
+    # and the refusal was the pre-existing strict-rule error — so it looked exactly like a
+    # company that had settled nothing rather than like two halves disagreeing. Found by the
+    # first live enrolment attempt, not by any test, because both halves were tested apart.
+    STANDING_BASES = ("notice", "attestation")
+    attested = consent_basis in STANDING_BASES
     if attested and not asserted_by:
         raise ValueError(
             "an attested voiceprint needs asserted_by: who is making the claim. A claim "
