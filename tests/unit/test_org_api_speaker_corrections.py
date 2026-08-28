@@ -33,11 +33,27 @@ PATH = f"/api/org/sessions/{SESSION}/speaker-corrections"
 
 
 class FakeConn:
+    #: The company that owns the folder under test, as `_same_company_as_folder` reads it.
+    #: Default None = "no users row", the branch that fails OPEN for device folders. Every
+    #: test in this file predates the cross-company guard and none of them is about it, so
+    #: they take that branch — which is a real branch, not a hole punched for the tests.
+    #: `test_voiceprint_stays_in_its_company.py` is where the guard itself is exercised.
+    folder_owner = None
+
     def __enter__(self):
         return self
 
     def __exit__(self, *a):
         return False
+
+    def cursor(self, row_factory=None):
+        return self
+
+    def execute(self, sql, params=None):
+        return self
+
+    def fetchone(self):
+        return self.folder_owner
 
 
 class FakeS3:
@@ -282,7 +298,7 @@ def test_the_artifact_carries_this_session_s_turns_and_no_others(wired, monkeypa
     starting at the same offset. Mistaking one for the other cost two rounds of debugging."""
     mine = ("ben_2026-08-13_11-49-00_sid" + "0" * 32 + "_c0000_bn4_off0.0_to114.0_srcwav.json")
     other = ("ben_2026-08-13_18-10-00_sid" + "1" * 32 + "_c0000_bn4_off0.0_to114.0_srcwav.json")
-    monkeypatch.setattr(org, "_read_org_transcripts", lambda d, f, a, b: {
+    monkeypatch.setattr(org, "_read_org_transcripts", lambda d, f, a, b, conn=None: {
         "speaker_segments": [
             {"source_filename": mine, "chunk_start": 4.88, "duration": 4.0},
             {"source_filename": mine, "chunk_start": 26.5, "duration": 6.0},

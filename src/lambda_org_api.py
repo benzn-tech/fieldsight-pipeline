@@ -1265,16 +1265,23 @@ def _may_correct_speakers(conn, caller, folder):
     return folder == scope.visible_scope(conn, caller).get("self_folder")
 
 
-def _session_turns(folder, date, session_base):
+def _session_turns(conn, folder, date, session_base):
     """Every turn of one session, as (file, offset) pairs the embedder can cut audio with.
 
     Reads the same transcripts the viewer does and keeps only this session — a day can hold
     several, and two sessions routinely have turns starting at the same offset, so filtering
     by session id is not optional. (Not filtering cost two rounds of debugging on 08-14, when
     a turn from another session at the same offset looked like a matching failure.)
+
+    `conn` is not optional and is not decoration. `_read_org_transcripts` drops tombstoned
+    sessions at the listing (`_deleted_sessions_for_day`), and that check returns an empty set
+    when handed no connection — so this function used to read a deleted session's turns and
+    hand them to the embedder, which would name a voice from a recording the customer had
+    deleted. Every other reader of these transcripts passes a connection; this one did not,
+    and the omission is invisible because the result is a slightly longer list.
     """
     try:
-        payload = _read_org_transcripts(date, folder, "", "")
+        payload = _read_org_transcripts(date, folder, "", "", conn=conn)
     except Exception:
         # `except Exception -> []` turns a read failure into "this session has no turns",
         # and the caller cannot tell those apart: the artifact ships with `turns: []`, the
@@ -1426,6 +1433,43 @@ def _label_map(turns):
             for t in turns or []]
 
 
+def _same_company_as_folder(conn, caller, folder, what):
+    """None if `folder` belongs to the caller's company, or a 403 explaining why not.
+
+    The media ACL deliberately does NOT pin a cross-company caller to a company:
+    `_resolve_org_media_folder` calls that branch "the SOLE branch NOT pinned to
+    caller.company_id", and for READING that is right — a platform operator looking at a
+    customer's transcripts is the role working as designed.
+
+    These two routes are not reads. They create biometric data, and the company on the row
+    comes from the CALLER (`company_id = str(caller["company_id"])`, which is itself correct:
+    taking it from the body would let one tenant queue work against another's profiles). Put
+    those two correct rules together and a platform operator naming a speaker in customer B's
+    recording files B's voiceprint under their own company — measured, not hypothetical: TEST
+    carries such a row today.
+
+    Refusing is the answer rather than re-filing under the recording's company. A
+    cross-tenant operator cannot see or set the other company's `voiceprint_consent_basis`,
+    so they cannot know on what grounds that company may hold a voice at all; creating the
+    record anyway would be deciding that question for somebody else.
+
+    An UNKNOWN folder passes, and that is stated rather than hidden: device folders with no
+    `users` row exist and corrections on them are legitimate. It logs, because "same company"
+    and "no company to compare" are different facts.
+    """
+    owner = users.get_by_folder_name_global(conn, folder)
+    if owner is None:
+        logger.warning("%s: folder %s has no user row, so its company cannot be checked "
+                       "against the caller's", what, folder)
+        return None
+    if str(owner.get("company_id")) != str(caller["company_id"]):
+        return error(
+            "this recording belongs to another company. Naming a speaker here would store "
+            "a voiceprint under your company for a voice captured under theirs, on grounds "
+            "only they can establish.", 403)
+    return None
+
+
 def speaker_match(conn, caller, session_base, event):
     """POST /api/org/sessions/{session}/speaker-match — name a session from stored profiles.
 
@@ -1454,6 +1498,9 @@ def speaker_match(conn, caller, session_base, event):
                                             what="speaker match")
     if err is not None:
         return err
+    err = _same_company_as_folder(conn, caller, folder, "speaker match")
+    if err is not None:
+        return err
     date_m = re.search(r"(\d{4}-\d{2}-\d{2})", session_base or "")
     if not date_m:
         return error("session id must carry its date (…_YYYY-MM-DD_…)", 400)
@@ -1461,7 +1508,7 @@ def speaker_match(conn, caller, session_base, event):
     if not session_key:
         return error("session id must carry its sid (…_sid<32 hex>)", 400)
 
-    turns = _session_turns(folder, date_m.group(1), session_base)
+    turns = _session_turns(conn, folder, date_m.group(1), session_base)
     if not turns:
         # A 202 here would promise work that cannot happen. The usual cause is a session
         # whose transcripts are not written yet, which is a wait, not a failure.
@@ -1663,6 +1710,10 @@ def speaker_corrections(conn, caller, session_base, event):
         return error("naming a speaker needs an admin, gm, pm, site_manager or "
                      "platform_admin role, or your own recording", 403)
 
+    err = _same_company_as_folder(conn, caller, folder, "speaker correction")
+    if err is not None:
+        return err
+
     name = (body.get("display_name") or "").strip()
     if not name:
         return error("display_name is required", 400)
@@ -1775,7 +1826,7 @@ def speaker_corrections(conn, caller, session_base, event):
         _linked_person, _linked_on = person, matched_on
         enrol = {"voiceprint_id": str(profile["id"])}
 
-    session_turns = _session_turns(folder, date_m.group(1), session_base)
+    session_turns = _session_turns(conn, folder, date_m.group(1), session_base)
     request_id = uuid.uuid4().hex
     artifact = {
         "request_id": request_id,
