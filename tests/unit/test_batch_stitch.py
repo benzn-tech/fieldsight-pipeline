@@ -493,3 +493,49 @@ def test_a_per_chunk_filename_is_not_batched():
     assert bs.is_batched("x_c0000_bn4_off0.0_to114.0_srcwav.wav") is True
     assert bs.is_batched("x_c0000.wav") is False
     assert bs.is_batched("x_c0000_off1.5_to31.5_srcwav.wav") is False
+
+
+# ---- the key builder and the decimal in the filename ---------------------
+
+
+def test_the_map_key_keeps_the_decimal_in_the_offset():
+    """`rsplit('.', 1)` assumed the last dot separates a suffix. These filenames carry a
+    DECIMAL — `..._off0.0_to114.0_srcwav` — so it ate the `.0` and `_srcwav` with it, and
+    every lookup from the audio side asked for a key that cannot exist.
+
+    Observed on TEST: a correction returned 202, the artifact landed, the embedder raised
+    NoSuchKey, and the profile kept an OLDER refusal — so it read as "the guard rejected your
+    window" when the guard had never run. The same window measures 0.198 against a 0.35 limit.
+    """
+    import batch_stitch
+
+    stem = ("audio_segments/Ben_UCPK2/2026-08-12/"
+            "ben_ucpk2_2026-08-12_16-52-24_sidbe419_c0004_bn4_off0.0_to114.0_srcwav")
+    assert batch_stitch.map_key_for_audio(stem) == stem + "_batch_map.json"
+
+
+def test_the_map_key_is_the_same_with_or_without_the_extension():
+    """The caller sometimes holds `...srcwav` and sometimes `...srcwav.wav`, and the two must
+    reach the same map. That divergence is what the docstring's own warning is about — one
+    function so the writer and the reader cannot drift apart — and it had drifted from itself.
+    """
+    import batch_stitch
+
+    stem = "audio_segments/u/d/x_bn2_off0.0_to58.0_srcwav"
+    assert (batch_stitch.map_key_for_audio(stem)
+            == batch_stitch.map_key_for_audio(stem + ".wav")
+            == batch_stitch.map_key_for_audio(stem + ".json")
+            == stem + "_batch_map.json")
+
+
+def test_the_two_key_builders_agree_on_the_same_batch():
+    """`map_key_for_transcript` swaps a whole `.json` and was never wrong, which is why this
+    only ever failed on the enrolment path — the one caller that reaches a map from the AUDIO
+    key. An assertion between them is the one place the disagreement was visible."""
+    import batch_stitch
+
+    stem = "u/2026-08-12/x_bn4_off0.0_to114.0_srcwav"
+    from_transcript = batch_stitch.map_key_for_transcript(f"transcripts/{stem}.json")
+    from_audio = batch_stitch.map_key_for_audio(f"audio_segments/{stem}.wav")
+    assert from_transcript == from_audio, (
+        f"the two halves disagree: {from_transcript!r} vs {from_audio!r}")
