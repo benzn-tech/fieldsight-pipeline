@@ -502,3 +502,101 @@ It does not remove the rolling summary — that still serves the mid-meeting pol
 which is a different question at a different moment. It does not touch
 extraction. It is off by default, and the first real session read end to end is
 what decides whether it goes on.
+
+---
+
+## 12. What admission rule to use — measured against a participant's judgement
+
+The first real ground truth: a working session (`sid93396a…`, 2026-08-27, 26 min,
+316 turns) whose own participant went through the extracted task list item by
+item and said which were real. Recorded as
+`tests/fixtures/task_admission_ground_truth.json`; scored by
+`scripts/eval_task_admission.py`.
+
+Five real tasks, three that only looked like tasks, one the participant could
+not remember (produced by every run, so more likely real and forgotten than
+invented — left unscored).
+
+### Three rules, three runs each
+
+| rule | tasks/run | real found (of 5) | false found (of 3) |
+|---|---|---|---|
+| v1 — is the VERB tickable | 4.3 | 2.7 | 1.0 |
+| v2 — is it still OUTSTANDING | 6.0 | **3.0** | 2.0 |
+| v3 — did somebody PICK IT UP | 3.7 | 2.0 | **0.3** |
+
+**They land on one curve.** Three rules aimed at genuinely different things, and
+precision and recall traded almost exactly. The gap between rules was smaller
+than one rule's own run-to-run spread — v2 produced 8, 6 and 4 tasks on
+identical input. What was being tuned was not the criterion but its tightness.
+
+**Chosen: v2.** A missed task is one the recorder still remembers; a surplus one
+is dismissed in the UI. That is the trade the surface should carry, not the
+prompt.
+
+### What the failures taught, which is more than the ranking did
+
+**v3's rule works and is worth keeping somewhere.** Reading the *reply* rather
+than the proposal cut false tasks to 0.3. All three non-tasks have their refusal
+in the transcript:
+
+> `spk_1: 要把 Josh 这个人排出去的。`
+> `spk_0: 我知道，但是你没有办法 block 得他。`
+
+"I know" — raised before. "You can't block him" — refused. The model was reading
+the proposal and not the answer. It also marked **every** task `committed` across
+nine runs, which is the same blindness showing up in a field we already have:
+`basis` is meaningless until something checks whether anyone took the work on.
+
+**Two real tasks were missed by every rule.** The Outlook integration and the AI
+knowledge base appeared once in nine runs. In the room they sound like product
+scope — "we want an app that reads ICS files" — not like an assignment. The
+model's reading is defensible; the problem is that `action_items` is being asked
+to hold two different things: work on a product roadmap, and things a person
+does after the meeting. No admission rule separates those, because the
+distinction is not in the sentence.
+
+### Consequence for the surface
+
+No run in nine was both complete and clean. A task list that is generated once
+and trusted does not exist at this quality. The list has to be **dismissible** —
+the batch-select the prototype already has is the right place, relabelled from
+"assign" to include "not a task". That is a UI decision the measurements now
+support rather than a preference.
+
+### Does a newer model help? No — 27 runs say the rule matters more, and variance more than either
+
+Three models, the same three rules, three runs each, same session and same
+ground truth. Scores are (real found of 5, false found of 3):
+
+| model | v1 verb | v2 state | v3 uptake |
+|---|---|---|---|
+| **qwen3.7-max** (in production) | 2.7 / **1.0** | **3.0** / 2.0 | 2.0 / **0.3** |
+| qwen3.8-max | 2.3 / 1.0 | 2.7 / 1.3 | 2.0 / 1.3 |
+| qwen3.8-flash | 2.7 / 1.3 | **3.0** / 2.7 | 2.0 / 1.0 |
+
+**3.8-max loses to 3.7-max in every cell.** Recall drops on v1 and v2, and v3's
+false rate goes from 0.3 to 1.3. **flash matches max on score and is not faster**
+— 88–162 s either way, so the usual reason to reach for it does not apply here.
+
+**Keep `qwen3.7-max`.** It is already deployed and its timeout and latency
+settings are tuned around it; switching is risk without benefit.
+
+**The ordering v1 → v2 → v3 holds on all three models** — recall falls, precision
+rises, every time. The rule moves the result. The model does not.
+
+**And variance moves it more than either.** Same model, same rule, same input:
+
+- `3.8-max v1` → 3 real, 3 real, then **1 real with all 3 false**
+- `3.8-flash v2` → 8 tasks, 8 tasks, then **4**
+- `3.7-max v2` → 8, 6, 4
+
+A third run can look nothing like the first two. That is what makes single-run
+prompt comparison worthless here, and it is the mistake this section exists to
+stop repeating: an earlier version of it declared v2 worse than v1 on one run
+each, and 27 runs later that ranking is the opposite way round.
+
+**No configuration in 27 runs was both complete and clean.** The ceiling for a
+single generation on this task is roughly 2–3 real of 5 with 0–2 false. Chasing
+a better rule or a better model does not reach it; letting the reader dismiss a
+surplus item does.
