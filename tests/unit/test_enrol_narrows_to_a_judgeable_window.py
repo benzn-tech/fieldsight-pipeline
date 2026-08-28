@@ -129,3 +129,45 @@ def test_a_narrowed_enrolment_reports_the_window_it_actually_used(monkeypatch):
     lo, hi = out["window"]
     assert (lo, hi) == pytest.approx((105.0, 115.0)), (
         "the artifact reports the whole turn rather than the ten seconds actually enrolled")
+
+
+def test_both_enrolment_paths_go_through_the_same_narrowing():
+    """The assertion this file was missing, and the reason it was missing is the defect.
+
+    There are two enrolment sites: `op=enrol` and the enrolment carried inside a correction
+    artifact. **A real correction takes the second.** The first version of this narrowing was
+    written into the first, tested there, merged, deployed — and the live run printed the
+    identical `frames=22 spread=0.755` with no narrowing line, because the site that runs was
+    the site that was not touched.
+
+    Every test in this file drives `_enrol`, so all of them passed while the feature did
+    nothing. Only source can say the other caller is wired, which is why this reads it.
+    """
+    import inspect
+
+    src = inspect.getsource(se)
+    body = src[src.index("def _from_request_artifact"):]
+    nxt = body.find("\ndef ", 1)
+    body = body[:nxt] if nxt != -1 else body
+    assert "judged_window(" in body, (
+        "the correction-carried enrolment does not go through judged_window; narrowing is "
+        "unreachable on the only path a real correction takes")
+    assert "vp.window_is_homogeneous(" not in body, (
+        "that path kept its own homogeneity check beside the shared one — two copies of the "
+        "same rule is what let a fix to one of them change nothing")
+
+
+def test_the_narrowed_clip_is_what_gets_embedded(monkeypatch):
+    """The vector on the artifact path is embedded BEFORE the guard runs. If narrowing does
+    not force a re-embed, the stored voiceprint is the wide window the guard just refused,
+    while the row beside it records the ten seconds it accepted — a mismatch nothing would
+    ever surface."""
+    import inspect
+
+    src = inspect.getsource(se)
+    body = src[src.index("def _from_request_artifact"):]
+    i = body.index("judged_window(")
+    after = body[i:i + 900]
+    assert "v = embed_audio(clip, sr)" in after, (
+        "the narrowed clip is not re-embedded, so the stored vector is the window that was "
+        "refused")

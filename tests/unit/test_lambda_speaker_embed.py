@@ -1351,8 +1351,8 @@ def test_nothing_is_harvested_when_the_anchor_itself_was_refused(stub_embedder,
     monkeypatch.setattr(se, "s3", lambda: FakeS3({art: doc,
                                                   key: _wav_bytes(seconds=60.0)}))
     candidates_embedded = []
-    real_frames = se._frames
-    monkeypatch.setattr(se, "_frames",
+    real_frames = se._frames_at
+    monkeypatch.setattr(se, "_frames_at",
                         lambda a, sr: candidates_embedded.append(1) or real_frames(a, sr))
     seen = []
     monkeypatch.setattr(se, "invoke_writer", lambda p: seen.append(p) or {"written": 0})
@@ -1365,6 +1365,9 @@ def test_nothing_is_harvested_when_the_anchor_itself_was_refused(stub_embedder,
     # refuses to carry it — so removing either alone leaves the outcome unchanged. That is
     # what belt-and-braces means, and it is also how a mutation can look uncaught. The cost
     # is the observable difference: a refused anchor must not pay for the cluster's audio.
+    # Counts `_frames_at`, which is the cutter now: `_frames` delegates to it, so patching
+    # the wrapper would count zero and this assertion would pass for the wrong reason —
+    # which is exactly how a narrowing fix landed on a path nothing runs earlier tonight.
     assert len(candidates_embedded) == 1, (
         "the cluster was embedded for a harvest that could never be stored")
 

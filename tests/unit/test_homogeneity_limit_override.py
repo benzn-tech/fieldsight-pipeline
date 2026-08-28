@@ -132,22 +132,26 @@ def test_the_diagnostic_reports_the_limit_in_force_not_the_compiled_in_one(stub_
 
 
 def test_no_call_site_is_left_on_the_default(monkeypatch):
-    """The behavioural tests above reach two of the five sites.
+    """The behavioural tests above reach two of the four sites.
 
     Harvest and the correction-carried enrolment are two more, and a site left on the default
     would loosen the guard for one kind of sample and not the kind stored beside it. This
     reads the source because that is the only check that covers a site no test drives.
 
-    The fifth is the narrowed sub-window: when a whole turn is too wide, enrolment re-tests
-    the tightest 10 s inside it. That re-test MUST use the same limit — narrowing under a
-    looser limit would be a second, quieter way to admit a window the guard rejected, which
-    is exactly the shape a settable limit was already at risk of becoming.
+    The fourth is the narrowed sub-window inside `judged_window`: when a whole turn is too
+    wide, enrolment re-tests the tightest 10 s inside it, and that re-test MUST use the same
+    limit — narrowing under a looser one would be a second, quieter way to admit a window the
+    guard rejected.
+
+    The count went 5 -> 4 when the correction-carried path stopped making its own call and
+    started going through `judged_window`. Fewer sites is the improvement: the two paths had
+    the same check written twice, which is why a fix to one of them changed nothing.
     """
     import inspect
     src = inspect.getsource(se)
     calls = [line for line in src.splitlines() if "vp.window_is_homogeneous(" in line
              and "def " not in line]
-    assert len(calls) == 5, "call sites moved; this test counts them on purpose: %r" % calls
+    assert len(calls) == 4, "call sites moved; this test counts them on purpose: %r" % calls
     # The argument may be on the following line where the call wraps, so check the source
     # region rather than the single line.
     for i, line in enumerate(src.splitlines()):
