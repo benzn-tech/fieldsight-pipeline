@@ -188,6 +188,7 @@ jobs:
               "EnableUserDeletion=${{ vars.TEST_ENABLE_USER_DELETION || 'false' }}" \
               "UploadVerifyMode=${{ vars.TEST_UPLOAD_VERIFY_MODE || 'observe' }}" \
               "SpeakerIdentityMode=${{ vars.TEST_SPEAKER_IDENTITY_MODE || 'off' }}" \
+              "EnrolOnCorrection=${{ vars.TEST_ENROL_ON_CORRECTION || 'false' }}" \
               "VoiceprintMaxFrameSpread=${{ vars.TEST_VOICEPRINT_MAX_FRAME_SPREAD || 'default' }}" \
               "AlertEmail=${{ vars.TEST_ALERT_EMAIL || 'none' }}" \
               "ServerBuild=${{ github.sha }}" \
@@ -204,6 +205,7 @@ jobs:
               "BatchSealDeadlineSec=${{ vars.TEST_BATCH_SEAL_DEADLINE_SEC || '150' }}" \
               "FilterAudioEventTags=${{ vars.TEST_FILTER_AUDIO_EVENT_TAGS || 'true' }}" \
               "EnableGroupMerge=${{ vars.TEST_ENABLE_GROUP_MERGE || 'true' }}" \
+              "EnableSessionBrief=${{ vars.TEST_ENABLE_SESSION_BRIEF || 'false' }}" \
               "GroupMergeCap=${{ vars.TEST_GROUP_MERGE_CAP || '2' }}" \
               "StuckMergeSeconds=${{ vars.TEST_STUCK_MERGE_SECONDS || '1800' }}" \
               "GroupMaxSpanSeconds=${{ vars.TEST_GROUP_MAX_SPAN_SECONDS || '43200' }}" \

@@ -340,8 +340,25 @@ def map_key_for_audio(batch_audio_key: str) -> str:
     under `transcripts/`, so every batched session in test fell back to filename
     arithmetic — and the tests agreed with the reader instead of with the writer,
     which is why nothing failed.
+
+    The extension is stripped only when it IS one. `rsplit('.', 1)` assumed the last dot
+    separates a suffix, and these filenames carry a DECIMAL: `..._off0.0_to114.0_srcwav`
+    became `..._off0.0_to114` — the `.0` eaten and `_srcwav` with it. Every lookup from the
+    audio side then asked for a key that cannot exist.
+
+    It surfaced only on the enrolment path, because that is the only caller that reaches a
+    map from the audio key; `map_key_for_transcript` swaps a whole `.json` and was never
+    wrong. So a correction returned 202, the artifact landed, the embedder raised NoSuchKey,
+    and the profile kept an older refusal — which read as "the guard rejected your window"
+    when the guard had never run. Measured separately, the same window scores 0.198 against
+    a limit of 0.35.
     """
-    return f"{batch_audio_key.rsplit('.', 1)[0]}_batch_map.json"
+    stem = batch_audio_key
+    for ext in (".wav", ".json"):
+        if stem.endswith(ext):
+            stem = stem[: -len(ext)]
+            break
+    return f"{stem}_batch_map.json"
 
 
 def map_key_for_transcript(transcript_key: str, audio_prefix: str = 'audio_segments'):

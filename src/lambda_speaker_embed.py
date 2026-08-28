@@ -249,8 +249,23 @@ def _get(key):
 
     `except ClientError: pass` turned a missing IAM prefix into a 200-with-an-empty-result
     before, and without ListBucket a missing key answers 403 rather than 404, so "not
-    allowed" and "not there" are indistinguishable from inside. Both must be loud."""
-    return s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+    allowed" and "not there" are indistinguishable from inside. Both must be loud.
+
+    Loud is not the same as legible. Raising bare left three separate investigations reading
+    `NoSuchKey: The specified key does not exist` with no way to tell WHICH key — the batch
+    map, the transcript, or the audio, all fetched through here — so each round ended in
+    listing the bucket by hand and comparing strings. The key and the bucket go into the
+    message; that is the whole difference between a stack trace and an answer."""
+    from botocore.exceptions import ClientError
+    try:
+        return s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        raise type(exc)(
+            dict(exc.response,
+                 Error=dict(exc.response.get("Error", {}),
+                            Message=f"{code} reading s3://{S3_BUCKET}/{key}")),
+            exc.operation_name) from exc
 
 
 # Decoded audio for the invocation in flight, keyed by S3 key. Cleared at the top of every

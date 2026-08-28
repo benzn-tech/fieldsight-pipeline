@@ -183,3 +183,101 @@ def test_a_recording_with_no_action_items_says_so_rather_than_sending_a_blank():
     _s, text, html = fin.build_confirmation_email(
         date="2026-07-25", summary="All done.", open_todos=[])
     assert "No action items" in text and "No action items" in html
+
+
+# --- SESSION_BRIEF: which summariser the finalize re-summary uses ------------
+# The brief returns the same {summary, open_todos} the email already reads, so
+# the switch must be invisible to everything below it. These pin that, and pin
+# that storing the brief can never cost the recorder their email.
+
+def _artifact():
+    return {"folder": "Ben_Test", "date": "2026-08-19", "sessionId": "abc"}
+
+
+def test_the_flag_is_off_by_default_so_nothing_changes_until_it_is_set():
+    assert fin.SESSION_BRIEF is False
+
+
+def test_an_injected_summariser_still_wins_over_the_flag(monkeypatch):
+    # The caller's injection point is what the existing tests use; adding a flag
+    # must not quietly take it away.
+    monkeypatch.setattr(fin, "SESSION_BRIEF", True, raising=False)
+    called = {}
+
+    def fake(turns):
+        called["yes"] = True
+        return {"summary": "injected", "open_todos": []}
+
+    monkeypatch.setattr(fin, "_complete_summary",
+                        lambda a, summarize=None: fake(["t"]), raising=False)
+    out = fin.process_finalize_request(
+        {**_artifact(), "recipient": "a@b.c"},
+        send=lambda *a, **k: None, write_result=lambda *a, **k: None)
+    assert out["status"] == "sent" and called
+
+
+def test_a_brief_that_cannot_be_stored_still_sends_the_email(monkeypatch, caplog):
+    # Best-effort by design: S3 is not on the path between the recorder and
+    # their confirmation.
+    def boom(*a, **k):
+        raise RuntimeError("s3 down")
+
+    monkeypatch.setattr(fin, "_store_brief", boom, raising=False)
+    sent = {}
+    out = fin.process_finalize_request(
+        {**_artifact(), "recipient": "a@b.c", "summary": "s", "openTodos": []},
+        send=lambda *a, **k: sent.setdefault("to", a[0]),
+        write_result=lambda *a, **k: None,
+        complete_summary=lambda artifact: None)
+    assert out["status"] == "sent" and sent["to"] == "a@b.c"
+
+
+def test_store_brief_swallows_its_own_failure():
+    # Called directly: no bucket configured, so the write fails. It must not
+    # raise into the worker.
+    fin._store_brief("Ben_Test", "2026-08-19", "abc", {"headline": "x", "sections": []})
+
+
+def test_the_reason_a_todo_exists_reaches_both_halves_of_the_email():
+    """`why` crosses three boundaries — the brief's own summary shape, `_clean_todos`, and
+    the two renderers — and it was being dropped at the first two.
+
+    The whole brief reached S3 and only `{text, responsible, due}` reached the surfaces that
+    read it, so the to-do list stayed exactly as unusable for recall as before. The owner's
+    words for the symptom: reading the list did not bring the day back, and the timeline had
+    to be opened topic by topic.
+
+    Asserted in BOTH renderers because they are separate code with separate escaping, and a
+    field that reaches one of them is a field half the readers never see.
+    """
+    import lambda_session_finalize as sf
+
+    _subj, text, html = sf.build_confirmation_email(
+        date="2026-08-27", site_name="Riccarton",
+        summary="Procurement blocks the device.",
+        open_todos=[{"text": "Price the device as a company phone",
+                     "responsible": "Sam", "due": "Friday",
+                     "why": "procurement will not sign off on a per-seat licence",
+                     "at": "13:40:56"}])
+
+    for where, body in (("text", text), ("html", html)):
+        assert "Price the device as a company phone" in body, where
+        assert "procurement will not sign off on a per-seat licence" in body, (
+            f"the {where} email dropped the reason the to-do exists")
+
+
+def test_a_todo_without_a_reason_renders_exactly_as_before():
+    """The rolling summariser produces no `why`, and a brief whose model omitted it produces
+    none either. Neither may gain an empty line, a dash, or an empty table cell — an absent
+    explanation must look absent, not missing."""
+    import lambda_session_finalize as sf
+
+    _, text, html = sf.build_confirmation_email(
+        date="2026-08-27",
+        open_todos=[{"text": "Chase the delivery", "responsible": None, "due": None}])
+
+    assert "Chase the delivery" in text and "Chase the delivery" in html
+    # No stray empty context line under the item in the text half.
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    idx = next(i for i, ln in enumerate(lines) if "Chase the delivery" in ln)
+    assert idx == len(lines) - 1 or not lines[idx + 1].startswith("      "), lines[idx:idx + 2]

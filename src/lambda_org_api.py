@@ -216,6 +216,19 @@ UPLOAD_VERIFY_MODE = os.environ.get("UPLOAD_VERIFY_MODE", "off").lower()
 # exist -- this repo has shipped a documented rollback that was never wired, twice).
 SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 
+# Whether naming a speaker is itself taken as the claim that they agreed to a voiceprint.
+#
+# Off, the endpoint keeps the pre-existing rule: enrolment happens only when the caller sends
+# `consent_given` with the SUBJECT's id. That rule is stricter and it is why no company holds
+# a single profile — the subject needs an account, and on a site the people most often named
+# do not have one.
+#
+# On, a correction also creates the profile, recorded as `consent_basis='attestation'` with
+# `asserted_by` naming who made the claim. It records a claim; it does not verify one, and
+# nothing here can. The basis is on every row so a later decision — a stricter standard, a
+# purge, an opt-out register — can find exactly this population in one query.
+ENROL_ON_CORRECTION = os.environ.get("ENROL_ON_CORRECTION", "false").lower() == "true"
+
 # Voice-timeliness: mis-touch tolerance ("grace") window before a stopped session
 # finalizes + emails. A resume within it cancels the finalize (spec §3.2, §8.4).
 STOP_GRACE_SECONDS = int(os.environ.get("STOP_GRACE_SECONDS", "30"))
@@ -618,6 +631,8 @@ def dispatch(conn, event, method, route):
     m_un = re.match(r"^/sessions/([^/]+)/speaker-names$", route)
     if m_un and method == "DELETE":
         return unname_speaker(conn, caller, m_un.group(1), event)
+    if route == "/company/voiceprint-basis" and method == "PUT":
+        return company_voiceprint_basis(conn, caller, event)
     if route == "/voiceprints" and method == "GET":
         return list_voiceprints(conn, caller)
     m_vw = re.match(r"^/voiceprints/([^/]+)$", route)
@@ -629,6 +644,9 @@ def dispatch(conn, event, method, route):
     m_srl = re.match(r"^/sessions/([^/]+)/rolling$", route)
     if m_srl and method == "GET":
         return session_rolling(conn, caller, m_srl.group(1), event)
+    m_sbr = re.match(r"^/sessions/([^/]+)/brief$", route)
+    if m_sbr and method == "GET":
+        return session_brief_read(conn, caller, m_sbr.group(1), event)
 
     if route == "/voice/upload-url" and method == "POST":
         return create_voice_upload_url(conn, caller, parse_body(event))
@@ -1543,6 +1561,44 @@ def withdraw_voiceprint(conn, caller, voiceprint_id):
     return ok({"voiceprintId": voiceprint_id, "samplesRemoved": len(removed)})
 
 
+def company_voiceprint_basis(conn, caller, event):
+    """PUT /api/org/company/voiceprint-basis — on what grounds this company may hold voices.
+
+    The column existed with nothing able to write it, which is the half-wired shape this
+    session has spent the night removing: a read path, a fallback for the absent value, and
+    no way to make it present.
+
+    Authorised exactly as `withdraw_voiceprint` beside it — mode gate, then role, then the
+    company taken from the CALLER and never from the request. That last one is not caution
+    for its own sake: a body-supplied company id would be a button that decides on what
+    grounds another tenant may hold biometric data.
+
+    `platform_admin` only, and narrower than the correction roles on purpose. Naming a
+    speaker is an everyday act by whoever is on site; deciding the legal basis for holding
+    voices is not, and the two should not share a permission.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] != "platform_admin":
+        return error("platform_admin role required", 403)
+    body = parse_body(event) or {}
+    basis = body.get("basis")
+    if basis is not None:
+        basis = str(basis).strip().lower() or None
+    try:
+        row = companies.set_voiceprint_consent_basis(conn, caller["company_id"], basis)
+    except ValueError as exc:
+        return error(str(exc), 400)
+    if row is None:
+        return error("company not found", 404)
+    # WHO set it and to what. The basis decides whether biometric data may be created at
+    # all, so "somebody changed it" without a name is the same silence `consented_by` was
+    # added to end.
+    logger.info("voiceprint consent basis for company %s set to %r by %s",
+                caller["company_id"], basis, caller["id"])
+    return ok({"companyId": str(row["id"]), "basis": row["voiceprint_consent_basis"]})
+
+
 def speaker_corrections(conn, caller, session_base, event):
     """POST /api/org/sessions/{session_base}/speaker-corrections
 
@@ -1644,7 +1700,25 @@ def speaker_corrections(conn, caller, session_base, event):
     # person again. The two effects are reported separately for that reason.
     enrol = None
     _linked_person, _linked_on = None, "not-requested"
-    if body.get("consent_given"):
+    # Two ways in, and the second is why the library was empty.
+    #
+    # `consent_given` is the strong one: the caller states the SUBJECT agreed and supplies
+    # their id. It needs the subject to have an account, and the people most often named on a
+    # site are subcontractors who do not, so the strong path excluded exactly the population
+    # the feature exists for. Nothing ever enrolled.
+    #
+    # `ENROL_ON_CORRECTION` is the attested one: naming a speaker is itself taken as the
+    # claim, attributed to the person who made it. It records a claim rather than verifying
+    # one, `consent_basis` says so on every row it creates, and the switch means turning it
+    # off returns the endpoint to the strong path exactly as it was.
+    # The basis comes from the COMPANY, not from this request. On a real site it is settled
+    # at induction and in the subcontract, before anybody opens the app, and every correction
+    # inside that company inherits it. A company that has not settled one gets None, and the
+    # endpoint falls back to the strict rule — the subject's own id, or no enrolment.
+    company_basis = caller.get("voiceprint_consent_basis") or None
+    attest = (ENROL_ON_CORRECTION and company_basis
+              and not body.get("consent_given"))
+    if body.get("consent_given") or attest:
         # WHO consented, not just that somebody did. 0042 added the column precisely because
         # a timestamp cannot tell the subject agreeing apart from the wearer clicking a box
         # on their behalf — and leaving it optional meant the column recorded nothing in the
@@ -1653,7 +1727,7 @@ def speaker_corrections(conn, caller, session_base, event):
         # This does not make the claim TRUE: the value is still typed by whoever is at the
         # keyboard, and no code here can verify it. It makes the claim ATTRIBUTED, which is
         # the most an API can do and the least an audit needs.
-        if not body.get("consented_by"):
+        if body.get("consent_given") and not body.get("consented_by"):
             return error("consented_by is required with consent_given: record whose voice "
                          "this is, not who is doing the labelling", 400)
         try:
@@ -1663,7 +1737,18 @@ def speaker_corrections(conn, caller, session_base, event):
             person, matched_on = users.resolve_display_name(conn, company_id, name)
             profile = voiceprints.upsert_profile(
                 conn, company_id, display_name=name,
-                consent_given=True, consented_by=body.get("consented_by"),
+                consent_given=not attest,
+                consented_by=body.get("consented_by"),
+                # The claim and who made it, kept apart from the subject. `asserted_by` is
+                # the caller; `consented_by` stays empty on this path because nobody has
+                # said the subject agreed — putting the caller there would make every row
+                # in the table ambiguous about which of the two it records.
+                consent_basis=company_basis if attest else "confirmed",
+                # WHO invoked the company's basis on this occasion. Under `notice` the basis
+                # itself is the induction, not this person's word — but the row still records
+                # which account acted, because "the company had a policy" and "somebody
+                # applied it to this recording" are different facts and an audit needs both.
+                asserted_by=str(caller["id"]) if attest else None,
                 user_id=str(person["id"]) if person else None,
                 linked_by=str(caller["id"]) if person else None,
                 linked_on=matched_on if person else None)
@@ -1792,6 +1877,55 @@ def session_rolling(conn, caller, session_id, event):
         "summary": data.get("summary", ""),
         "openTodos": data.get("open_todos", []),
         "updatedAt": data.get("updated_at"),
+    })
+
+
+def session_brief_read(conn, caller, session_id, event):
+    """GET /api/org/sessions/{session_id}/brief?date=&user= — the session brief.
+
+    `lambda_session_finalize` has been writing these since the brief shipped and nothing has
+    ever read one. The whole narrative — sections with timestamps and verbatim quotes, the
+    entities with the spellings the transcriber actually produced, the tasks with the reason
+    each exists — has been going to S3 and stopping there, which is the shape this session
+    has spent its time removing.
+
+    Deliberately the same shape as `session_rolling` beside it: the key is rebuilt
+    server-side so a client cannot read another folder's brief, the ACL is the resolver both
+    already use, and the two states are `pending` and `ready` rather than a 404. A brief that
+    has not been written yet and a brief that does not exist are the same thing to the caller,
+    and neither is an error.
+
+    Returned whole rather than filtered. Every field in it was produced for a reader — the
+    quote is what makes a bullet checkable, `at` is what makes it findable in the transcript,
+    and `why` is the field the to-do list was missing. Trimming here would repeat the mistake
+    that made this endpoint necessary.
+    """
+    p = event.get("queryStringParameters") or {}
+    date, user = p.get("date"), (p.get("user") or "").strip()
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="session brief")
+    if err is not None:
+        return err
+    # `sid` prefixed exactly as the writer stores it. The session id in the path may or may
+    # not carry it depending on the caller, and guessing wrong reads a key that cannot exist
+    # — which surfaces as `pending` and looks like "no brief yet" rather than a mistake.
+    sid = session_id if session_id.startswith("sid") else "sid" + session_id
+    key = f"session_brief/{folder}/{date}/{sid}/latest.json"
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return ok({"status": "pending"})
+        raise
+    data = json.loads(obj["Body"].read().decode("utf-8"))
+    return ok({
+        "status": "ready",
+        "headline": data.get("headline", ""),
+        "sections": data.get("sections", []),
+        "entities": data.get("entities", []),
+        "tasks": data.get("tasks", []),
+        "stats": data.get("stats"),
     })
 
 

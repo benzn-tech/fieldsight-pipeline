@@ -199,6 +199,21 @@ def main():
         print("refusing to queue a match against prod from a verification script.")
         return 2
 
+    # WHICH credentials, before anything else. These scripts inherit the ambient AWS
+    # profile, and the default one on this machine is a root `login_session` that expires
+    # daily while two non-expiring IAM profiles sit beside it in ~/.aws/config. A week of
+    # "AWS is down" was that, and the only symptom was `Your session has expired` with no
+    # hint that another profile would have worked.
+    who, err = _aws(["sts", "get-caller-identity", "--query", "Arn", "--output", "text"])
+    print("== identity ==")
+    if err:
+        print(f"  {err.splitlines()[0] if err else 'unknown'}")
+        print(f"  profile in use: {os.environ.get('AWS_PROFILE', '(default)')}")
+        print("  try: AWS_PROFILE=fieldsight-deployer  (a non-expiring IAM user)")
+        return 2
+    print(f"  {who.strip()}   profile={os.environ.get('AWS_PROFILE', '(default)')}")
+
+    print()
     print("== what the deployed stack is running ==")
     cfg, err = deployed_settings(args.env)
     if err and not cfg:

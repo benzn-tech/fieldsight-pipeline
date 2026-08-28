@@ -692,6 +692,18 @@ Parameters:
       The longest a group may span before it is refused as stale. A device that
       kept a group overnight presents it again the next day and nothing on the
       device objects -- merging yesterday into today reads perfectly fluently.
+  EnableSessionBrief:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether the finalize re-summary writes a session BRIEF (narrative first,
+      to-dos derived from it) instead of the terse rolling summary. The brief
+      returns the same {summary, open_todos} the confirmation email reads, so
+      the email is unchanged either way; on top of that it stores the full
+      brief under session_brief/ for the reader surfaces. Off everywhere until
+      a real session has been read end to end.
+
   EnableGroupMerge:
     Type: String
     Default: 'false'
@@ -881,6 +893,19 @@ Parameters:
       profile cannot be cleaned -- only the contributing sample deleted, after somebody
       notices, which nothing prompts them to do. Every enrolment log line says so when the
       override is in force.
+
+  EnrolOnCorrection:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether naming a speaker is itself taken as the claim that the named person agreed to
+      a voiceprint. False keeps the pre-existing rule -- enrolment only when the caller sends
+      consent_given with the SUBJECT's id -- which is stricter and is why no company holds a
+      single profile: the subject needs an account, and on a site the people most often named
+      do not have one. True records the correction as consent_basis='attestation' with
+      asserted_by naming who made the claim. It records a claim and does not verify one;
+      the basis is stored on every row so a later decision can find exactly that population.
 
   SpeakerIdentityMode:
     Type: String
@@ -1462,6 +1487,11 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
+          # Under the Lambda Timeout above, or the runtime hard-kills this function
+          # before urllib3 raises and the `except` that exists for a slow LLM never
+          # runs. `llm_utils` defaults it to 150 s and explains the ordering; three
+          # functions here had it inverted, all by leaving it at that default.
+          LLM_HTTP_TIMEOUT: '45'
           S3_BUCKET: !Ref DataBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           HAIKU_MODEL: claude-haiku-4-5-20251001
@@ -1648,6 +1678,7 @@ Resources:
           # off -> the correction routes 404. See the SpeakerIdentityMode parameter;
           # this is the rollback, so it must be a deployed value, not a code constant.
           SPEAKER_IDENTITY_MODE: !Ref SpeakerIdentityMode
+          ENROL_ON_CORRECTION: !Ref EnrolOnCorrection
           # Deploy = thaw. See the ServerBuild parameter.
           SERVER_BUILD: !Ref ServerBuild
           # QR passwordless login (2026-07-30) — PROD-ONLY (see IsProdWithOrgApi
@@ -2080,6 +2111,11 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
+          # Under the Lambda Timeout above, or the runtime hard-kills this function
+          # before urllib3 raises and the `except` that exists for a slow LLM never
+          # runs. `llm_utils` defaults it to 150 s and explains the ordering; three
+          # functions here had it inverted, all by leaving it at that default.
+          LLM_HTTP_TIMEOUT: '90'
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
@@ -2427,7 +2463,15 @@ Resources:
       FunctionName: !Sub ["${P}-session-finalize", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_session_finalize.lambda_handler
-      Timeout: 120
+      # 300, not 120. This function re-summarises the FULL transcript at finalize, and 120
+      # was sized for the rolling summariser it used to call -- whose input is already
+      # compressed. Measured on a real 26-minute session (316 turns, 17 K chars rendered):
+      # the invocation was hard-killed at exactly 120000 ms, three times, with no email sent.
+      #
+      # Sizing is against the OTHER full-transcript LLM caller rather than a guess:
+      # ExtractSessionFunction gets 600 s for the same class of work. 300 leaves the HTTP
+      # timeout below room to lose its race (see LLM_HTTP_TIMEOUT), which 120 did not.
+      Timeout: 300
       MemorySize: 256
       Environment:
         Variables:
@@ -2435,6 +2479,15 @@ Resources:
           S3_BUCKET: !Ref IngestBucketName
           EMAIL_SENDER: !Ref EmailSender
           SENDER_EMAIL: !Ref SenderEmail
+          # UNDER the Lambda Timeout, which is the whole point of the setting and was
+          # inverted here. `llm_utils` defaults it to 150 s and says why: "so the HTTP
+          # client loses the race against the Lambda's own Timeout and we get a catchable
+          # urllib3 error instead of a runtime hard-kill". At Timeout 120 the client WON
+          # that race, so a slow call produced no exception, no fallback to the rolling
+          # summary, and no confirmation email -- the failure the fallback exists to
+          # prevent. Every other LLM caller here sets it explicitly (180 under 300, 540
+          # under 600); this one did not.
+          LLM_HTTP_TIMEOUT: '240' 
           # LLM env — the worker re-summarises the FULL transcript at finalize (a
           # complete summary; the rolling one can be stale/partial). Thinking OFF:
           # summarisation needs no extended reasoning and thinking dominated latency
@@ -2447,7 +2500,20 @@ Resources:
           QWEN_API_KEY: !Ref DashScopeApiKey
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          # Applies to the rolling summariser only. session_brief passes
+          # enable_thinking=True explicitly, because a brief's density comes
+          # from the reasoning and it is measured at ~100-125s for a 70-minute
+          # session -- a deliberate widening of the finalize budget, not an
+          # oversight. Leaving this to the env would have shipped a
+          # configuration none of the measurements were taken on.
           QWEN_ENABLE_THINKING: 'false'
+          # Which summariser that re-summary uses. Off = the terse rolling one
+          # this has always used. On = session_brief, which writes the narrative
+          # first and derives the to-dos from it. It returns the same
+          # {summary, open_todos}, so the email is identical either way; the
+          # difference is that the full brief is also stored under
+          # session_brief/ for the reader surfaces to pick up.
+          SESSION_BRIEF: !Ref EnableSessionBrief
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -2461,7 +2527,12 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
             - Effect: Allow
               Action: s3:PutObject
-              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
+                # The stored brief. Without this the write fails, _store_brief
+                # logs and swallows, and the flag looks on while nothing lands
+                # (CLAUDE.md: a guard that catches is not a feature that works).
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_brief/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}

@@ -1,4 +1,8 @@
+import uuid
+
 import pytest
+
+from repositories import companies, users
 
 pytestmark = pytest.mark.integration
 
@@ -145,3 +149,42 @@ def test_portfolio_counts_excludes_non_work_and_redacted(db):
     # only the one 'work', non-redacted topic + its action item are counted
     assert counts["topics_count"] == 1
     assert counts["open_actions"] == 1 and counts["total_actions"] == 1
+
+
+def test_the_caller_lookup_survives_its_join(db):
+    """`get_user_by_sub` gained a LEFT JOIN onto companies, and every column in `_COLS`
+    became ambiguous the moment a second table was in scope.
+
+    Postgres refuses the whole statement at PREPARE time — `AmbiguousColumn: column
+    reference "id" is ambiguous` — so every request that resolves a caller returns a 500.
+    That is every authenticated request in the product.
+
+    3286 unit tests passed over it. They cannot see it: the connection doubles record the SQL
+    string and never parse it, which is the standing reason this repository keeps a
+    database-backed test for anything whose SQL is non-trivial. A join is non-trivial.
+    """
+    co = companies.create_company(db, f"JoinCo-{uuid.uuid4().hex[:6]}")
+    sub = f"sub-{uuid.uuid4().hex[:8]}"
+    users.upsert_user(db, sub, "join@x.nz", company_id=co["id"])
+
+    row = users.get_user_by_sub(db, sub)
+
+    assert row is not None, "the join dropped the row it was supposed to decorate"
+    assert str(row["company_id"]) == str(co["id"])
+    assert row["cognito_sub"] == sub
+    # The point of the join: present, and None until the company settles one.
+    assert "voiceprint_consent_basis" in row
+    assert row["voiceprint_consent_basis"] is None
+
+
+def test_a_caller_whose_company_row_is_missing_still_resolves(db):
+    """LEFT JOIN, not JOIN. A user with no company is a broken state worth seeing as a user
+    with no basis — an inner join would make them vanish, and a caller who cannot be resolved
+    is indistinguishable from a caller who does not exist."""
+    sub = f"sub-{uuid.uuid4().hex[:8]}"
+    users.upsert_user(db, sub, "orphan@x.nz")
+
+    row = users.get_user_by_sub(db, sub)
+
+    assert row is not None, "an inner join would have made this caller disappear"
+    assert row["voiceprint_consent_basis"] is None

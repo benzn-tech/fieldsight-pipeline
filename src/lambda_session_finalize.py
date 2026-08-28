@@ -24,6 +24,13 @@ from urllib.parse import unquote_plus
 logger = logging.getLogger()
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
+
+# Which summariser the finalize re-summary uses. Off = the terse rolling
+# summariser this has always used. On = session_brief, which writes the
+# narrative first and derives the to-dos from it; it returns the same
+# {summary, open_todos} keys, so the email below is unchanged either way.
+SESSION_BRIEF = os.environ.get("SESSION_BRIEF", "false").lower() == "true"
+BRIEF_PREFIX = "session_brief/"
 FINALIZE_RESULTS_PREFIX = "session_finalize_results/"
 
 
@@ -36,7 +43,13 @@ def _clean_todos(open_todos):
         if text:
             out.append({"text": text,
                         "responsible": (t.get("responsible") or None),
-                        "due": (t.get("due") or None)})
+                        "due": (t.get("due") or None),
+                        # Absent from the rolling summariser and present in a brief. Kept
+                        # optional rather than required so the same cleaner serves both, and
+                        # so a brief whose model omitted it degrades to today's behaviour
+                        # instead of dropping the item.
+                        "why": (t.get("why") or None),
+                        "at": (t.get("at") or None)})
     return out
 
 
@@ -74,6 +87,13 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
             who = t["responsible"] or "Unassigned"
             due = f" (due {t['due']})" if t["due"] else ""
             lines.append(f"  • {t['text']} — {who}{due}")
+            # The line that makes the list readable a day later. The title is written to
+            # survive truncation, so it identifies the task and cannot also say why it
+            # exists; without this the reader goes back to the timeline and opens the topic.
+            # Indented under its item rather than appended to it, so scanning the titles
+            # still works and the context is there when the eye stops.
+            if t.get("why"):
+                lines.append(f"      {t['why']}")
     else:
         lines += ["", no_todos_note]
     body_text = "\n".join(lines).rstrip() + "\n"
@@ -89,15 +109,25 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
     if meta:
         parts.append("<p>" + "<br>".join(meta) + "</p>")
     if todos:
-        rows = "".join(
-            "<tr>"
-            f'<td style="padding:6px;border-bottom:1px solid #eee">{esc(t["text"])}</td>'
-            f'<td style="padding:6px;border-bottom:1px solid #eee">'
-            f'{esc(t["responsible"]) if t["responsible"] else "—"}</td>'
-            f'<td style="padding:6px;border-bottom:1px solid #eee">'
-            f'{esc(t["due"]) if t["due"] else "—"}</td>'
-            "</tr>"
-            for t in todos)
+        def _row(t):
+            # `why` under the title inside the SAME cell, not a fourth column. A column
+            # would be empty for every to-do the rolling summariser produces and for any
+            # brief whose model omitted it, and an empty column reads as missing data
+            # rather than as an absent explanation.
+            why = (f'<div style="color:#666;font-size:13px;padding-top:2px">'
+                   f'{esc(t["why"])}</div>') if t.get("why") else ""
+            return ("<tr>"
+                    f'<td style="padding:6px;border-bottom:1px solid #eee">'
+                    f'{esc(t["text"])}{why}</td>'
+                    f'<td style="padding:6px;border-bottom:1px solid #eee;'
+                    f'vertical-align:top">'
+                    f'{esc(t["responsible"]) if t["responsible"] else "—"}</td>'
+                    f'<td style="padding:6px;border-bottom:1px solid #eee;'
+                    f'vertical-align:top">'
+                    f'{esc(t["due"]) if t["due"] else "—"}</td>'
+                    "</tr>")
+
+        rows = "".join(_row(t) for t in todos)
         parts.append(
             "<h3>Action items</h3>"
             '<table role="presentation" cellspacing="0" cellpadding="0" '
@@ -144,12 +174,40 @@ def _complete_summary(artifact, summarize=None):
         if not turns:
             return None
         if summarize is None:
-            import lambda_rolling_summary as rs
-            summarize = rs.summarize_turns
-        return summarize(turns)
+            if SESSION_BRIEF:
+                import session_brief
+                summarize = session_brief.brief_from_turns
+            else:
+                import lambda_rolling_summary as rs
+                summarize = rs.summarize_turns
+        result = summarize(turns)
+        # A brief is worth more than the two keys the email reads, and this is
+        # the only point in the pipeline where the whole session exists as one
+        # clean turn stream. Store it before handing the caller its two keys.
+        # Best-effort: the email must still go out if the write fails.
+        if result and result.get("sections"):
+            _store_brief(folder, date, sid, result)
+        return result
     except Exception:
         logger.exception("finalize: complete re-summary failed for %s — using rolling summary", sid)
         return None
+
+
+def _store_brief(folder, date, session_id, brief):
+    """Write the session brief to S3, mirroring session_rolling/'s layout so the
+    read path is the one already proven for the rolling summary. Never raises:
+    losing the stored copy must not cost the recorder their email."""
+    try:
+        import boto3
+        key = f"{BRIEF_PREFIX}{folder}/{date}/sid{session_id}/latest.json"
+        boto3.client("s3").put_object(
+            Bucket=S3_BUCKET, Key=key,
+            Body=json.dumps(brief, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json")
+        logger.info("session brief stored at %s", key)
+    except Exception:
+        logger.exception("session brief could not be stored for %s "
+                         "-- the email is unaffected", session_id)
 
 
 def process_finalize_request(artifact, *, send=None, write_result=None, complete_summary=None):

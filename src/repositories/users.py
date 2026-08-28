@@ -33,8 +33,28 @@ def upsert_user(conn, cognito_sub, email, company_id=None, first_name=None,
 
 
 def get_user_by_sub(conn, cognito_sub) -> dict | None:
+    """The caller, with their company's voiceprint basis carried alongside.
+
+    The basis is a company fact — settled at induction and in the subcontract — and every
+    request already loads the caller, so it rides along in that query rather than costing a
+    second round trip on a value that changes about once in a company's lifetime.
+
+    LEFT JOIN, not JOIN: a user whose company row is missing is a broken state worth seeing
+    as a user with no basis, not as a user who does not exist. And absent reads as None,
+    which is the strict fallback — enrolment then needs the subject's own id, exactly as it
+    did before any of this. A caller assembled without this field (every test double) gets
+    the same, which is the safe direction for a default nobody chose.
+    """
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_COLS} FROM users WHERE cognito_sub=%s", (cognito_sub,)
+        # `users.*` rather than the bare `_COLS`, which is shared with the un-joined
+        # queries below. The moment a second table is in scope, an unqualified `id` matches
+        # both and Postgres refuses the statement — `AmbiguousColumn`, at PREPARE time, for
+        # every caller. Only a real database says so: the connection doubles in the suite
+        # record the SQL string and never parse it, so 3286 unit tests passed over it.
+        f"SELECT users.{', users.'.join(_COLS.split(', '))}, "
+        f"       c.voiceprint_consent_basis "
+        f"FROM users LEFT JOIN companies c ON c.id = users.company_id "
+        f"WHERE users.cognito_sub=%s", (cognito_sub,)
     ).fetchone()
 
 
