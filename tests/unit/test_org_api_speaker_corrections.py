@@ -282,7 +282,7 @@ def test_the_artifact_carries_this_session_s_turns_and_no_others(wired, monkeypa
     starting at the same offset. Mistaking one for the other cost two rounds of debugging."""
     mine = ("ben_2026-08-13_11-49-00_sid" + "0" * 32 + "_c0000_bn4_off0.0_to114.0_srcwav.json")
     other = ("ben_2026-08-13_18-10-00_sid" + "1" * 32 + "_c0000_bn4_off0.0_to114.0_srcwav.json")
-    monkeypatch.setattr(org, "_read_org_transcripts", lambda d, f, a, b: {
+    monkeypatch.setattr(org, "_read_org_transcripts", lambda d, f, a, b, conn=None: {
         "speaker_segments": [
             {"source_filename": mine, "chunk_start": 4.88, "duration": 4.0},
             {"source_filename": mine, "chunk_start": 26.5, "duration": 6.0},
