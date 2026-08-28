@@ -1668,7 +1668,13 @@ def speaker_corrections(conn, caller, session_base, event):
     # claim, attributed to the person who made it. It records a claim rather than verifying
     # one, `consent_basis` says so on every row it creates, and the switch means turning it
     # off returns the endpoint to the strong path exactly as it was.
-    attest = ENROL_ON_CORRECTION and not body.get("consent_given")
+    # The basis comes from the COMPANY, not from this request. On a real site it is settled
+    # at induction and in the subcontract, before anybody opens the app, and every correction
+    # inside that company inherits it. A company that has not settled one gets None, and the
+    # endpoint falls back to the strict rule — the subject's own id, or no enrolment.
+    company_basis = companies.voiceprint_consent_basis(conn, company_id)
+    attest = (ENROL_ON_CORRECTION and company_basis
+              and not body.get("consent_given"))
     if body.get("consent_given") or attest:
         # WHO consented, not just that somebody did. 0042 added the column precisely because
         # a timestamp cannot tell the subject agreeing apart from the wearer clicking a box
@@ -1694,7 +1700,11 @@ def speaker_corrections(conn, caller, session_base, event):
                 # the caller; `consented_by` stays empty on this path because nobody has
                 # said the subject agreed — putting the caller there would make every row
                 # in the table ambiguous about which of the two it records.
-                consent_basis="attestation" if attest else "confirmed",
+                consent_basis=company_basis if attest else "confirmed",
+                # WHO invoked the company's basis on this occasion. Under `notice` the basis
+                # itself is the induction, not this person's word — but the row still records
+                # which account acted, because "the company had a policy" and "somebody
+                # applied it to this recording" are different facts and an audit needs both.
                 asserted_by=str(caller["id"]) if attest else None,
                 user_id=str(person["id"]) if person else None,
                 linked_by=str(caller["id"]) if person else None,
