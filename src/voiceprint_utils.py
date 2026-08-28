@@ -60,17 +60,9 @@ class Decision:
     reason: str
 
 
-def cosine(a, b) -> float:
-    """Cosine similarity. Loudness-invariant on purpose: across 0–6 m the level moves by
-    ~20 dB, and a score that moved with it would be measuring the microphone rather than
-    the speaker. A zero vector scores 0.0 rather than raising — an empty window is a thing
-    that happens, and it is not an error worth failing an extraction over."""
-    a = np.asarray(a, dtype=np.float64).ravel()
-    b = np.asarray(b, dtype=np.float64).ravel()
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
+# ONE definition, and it lives in the numpy-free module because the in-VPC writer imports it
+# and cannot have numpy. Re-exported here so every existing caller keeps working.
+from vector_math import cosine  # noqa: E402,F401
 
 
 def aggregate_scores(rows) -> dict:

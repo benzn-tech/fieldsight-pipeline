@@ -272,7 +272,11 @@ def _agreement(conn, company_id, voiceprint_id, embedding):
     audio, so whatever makes a voice score low today lowers both of them together, and the
     comparison survives the drift that defeats a floor.
     """
-    import voiceprint_utils as vp
+    # From the numpy-free module, NOT from `voiceprint_utils`: this repository is loaded by
+    # `lambda_voiceprint_writer`, which is in-VPC with the psycopg layer and no numpy. The
+    # import used to be `voiceprint_utils`, and enrolment died here after the guard had
+    # already logged that it accepted the window.
+    import vector_math as vp
 
     rows = profiles_for_matching(conn, company_id)
     own_vecs = [r["embedding"] for r in rows if str(r["id"]) == str(voiceprint_id)]
