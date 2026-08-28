@@ -85,7 +85,8 @@ def _require_company(company_id):
 def upsert_profile(conn, company_id, display_name=None, user_id=None,
                    consent_given=False, consented_by=None,
                    linked_by=None, linked_on=None,
-                   consent_basis=None, asserted_by=None) -> dict | None:
+                   consent_basis=None, asserted_by=None,
+                   external_ref=None, external_source=None) -> dict | None:
     """The profile a name attaches to. Existing one if there is one, otherwise a new row.
 
     **Consent is a precondition, not a checkbox** (§6, §10). A voiceprint is biometric
@@ -160,7 +161,22 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
         # duplicate degrades into a REFUSAL, because the person becomes his own runner-up and
         # the margin declines to confirm, while a merge is a wrong confident answer about
         # somebody's biometric data.
-        if user_id:
+        if external_ref:
+            # The site sign-in identity, and the first key tried because it is the one the
+            # site actually runs on. A subcontractor signs in at company A's sites under the
+            # same id whether or not they will ever hold a FieldSight account, which is the
+            # population display names were failing.
+            #
+            # Company-scoped, and that is the load-bearing part rather than a detail: the
+            # SAME external id under two companies is two independent profiles, because a
+            # voiceprint built under A's induction has no basis under B.
+            found = cur.execute(
+                "SELECT id FROM speaker_voiceprints "
+                "WHERE company_id = %s AND external_source = %s AND external_ref = %s "
+                "  AND status <> 'withdrawn' "
+                "ORDER BY created_at LIMIT 1",
+                (company_id, external_source, external_ref)).fetchone()
+        elif user_id:
             found = cur.execute(
                 "SELECT id FROM speaker_voiceprints "
                 "WHERE company_id = %s AND user_id = %s AND status <> 'withdrawn' "
@@ -193,7 +209,8 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
     return cur.execute(
         "INSERT INTO speaker_voiceprints "
         "(company_id, user_id, display_name, status, consent_at, consented_by, "
-        " linked_by, linked_at, linked_on, consent_basis, asserted_by) "
+        " linked_by, linked_at, linked_on, consent_basis, asserted_by, "
+        " external_ref, external_source) "
         # Both CASE parameters are cast. A parameter whose only use is `IS NULL` gives
         # Postgres nothing to infer a type from, so the statement fails at PREPARE time for
         # every value — `IndeterminateDatatype: could not determine data type of parameter
@@ -201,10 +218,12 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
         # deterministic 500. The suite could not see it: FakeConn never prepares SQL.
         "VALUES (%s, %s, %s, 'tentative', "
         "        CASE WHEN %s::boolean THEN now() ELSE NULL END, %s, "
-        "        %s, CASE WHEN %s::uuid IS NULL THEN NULL ELSE now() END, %s, %s, %s) "
+        "        %s, CASE WHEN %s::uuid IS NULL THEN NULL ELSE now() END, %s, %s, %s, "
+        "        %s, %s) "
         "RETURNING id",
         (company_id, user_id, display_name, bool(consent_given or attested), consented_by,
-         linked_by, user_id, linked_on, consent_basis, asserted_by),
+         linked_by, user_id, linked_on, consent_basis, asserted_by,
+         external_ref, external_source),
     ).fetchone()
 
 
