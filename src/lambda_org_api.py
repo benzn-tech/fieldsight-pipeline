@@ -631,6 +631,8 @@ def dispatch(conn, event, method, route):
     m_un = re.match(r"^/sessions/([^/]+)/speaker-names$", route)
     if m_un and method == "DELETE":
         return unname_speaker(conn, caller, m_un.group(1), event)
+    if route == "/company/voiceprint-basis" and method == "PUT":
+        return company_voiceprint_basis(conn, caller, event)
     if route == "/voiceprints" and method == "GET":
         return list_voiceprints(conn, caller)
     m_vw = re.match(r"^/voiceprints/([^/]+)$", route)
@@ -1554,6 +1556,44 @@ def withdraw_voiceprint(conn, caller, voiceprint_id):
     removed = voiceprints.withdraw(conn, str(caller["company_id"]), voiceprint_id)
     logger.info("voiceprint withdrawn: %s (%d samples)", voiceprint_id, len(removed))
     return ok({"voiceprintId": voiceprint_id, "samplesRemoved": len(removed)})
+
+
+def company_voiceprint_basis(conn, caller, event):
+    """PUT /api/org/company/voiceprint-basis — on what grounds this company may hold voices.
+
+    The column existed with nothing able to write it, which is the half-wired shape this
+    session has spent the night removing: a read path, a fallback for the absent value, and
+    no way to make it present.
+
+    Authorised exactly as `withdraw_voiceprint` beside it — mode gate, then role, then the
+    company taken from the CALLER and never from the request. That last one is not caution
+    for its own sake: a body-supplied company id would be a button that decides on what
+    grounds another tenant may hold biometric data.
+
+    `platform_admin` only, and narrower than the correction roles on purpose. Naming a
+    speaker is an everyday act by whoever is on site; deciding the legal basis for holding
+    voices is not, and the two should not share a permission.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] != "platform_admin":
+        return error("platform_admin role required", 403)
+    body = parse_body(event) or {}
+    basis = body.get("basis")
+    if basis is not None:
+        basis = str(basis).strip().lower() or None
+    try:
+        row = companies.set_voiceprint_consent_basis(conn, caller["company_id"], basis)
+    except ValueError as exc:
+        return error(str(exc), 400)
+    if row is None:
+        return error("company not found", 404)
+    # WHO set it and to what. The basis decides whether biometric data may be created at
+    # all, so "somebody changed it" without a name is the same silence `consented_by` was
+    # added to end.
+    logger.info("voiceprint consent basis for company %s set to %r by %s",
+                caller["company_id"], basis, caller["id"])
+    return ok({"companyId": str(row["id"]), "basis": row["voiceprint_consent_basis"]})
 
 
 def speaker_corrections(conn, caller, session_base, event):
