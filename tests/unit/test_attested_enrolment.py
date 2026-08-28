@@ -134,3 +134,47 @@ def test_an_unresolved_name_duplicates_rather_than_merges():
         "without this, an unresolved name could match a profile that HAS an identity and "
         "attach one person's voice to another person's record")
     assert "coalesce(consented_by, asserted_by)" in select
+
+
+# ---- the two lists that have to agree ------------------------------------
+
+
+def test_every_basis_a_company_may_settle_is_one_enrolment_understands():
+    """Two lists in two files, and they disagreed on their first live run.
+
+    `companies.VOICEPRINT_BASES` says what a company may settle. `upsert_profile` decides
+    which of those are enough to create a profile without the subject's own id. The second
+    read `== "attestation"` while the first had grown `notice`, so setting the basis the
+    owner actually uses produced the *pre-existing strict-rule error* — indistinguishable
+    from a company that had settled nothing.
+
+    Neither half was wrong on its own and both were tested apart. This is the assertion that
+    only exists between them.
+    """
+    import repositories.companies as co
+    import repositories.voiceprints as vp
+
+    for basis in co.VOICEPRINT_BASES:
+        conn = _Conn()
+        if basis == "confirmed":
+            # The one that still needs the subject: it says they agreed themselves.
+            vp.upsert_profile(conn, CO, display_name="Clement",
+                              consent_given=True, consented_by=SUBJECT,
+                              consent_basis=basis)
+        else:
+            # A standing basis: no subject id, and it must NOT raise.
+            vp.upsert_profile(conn, CO, display_name="Clement",
+                              consent_basis=basis, asserted_by=ASSERTER)
+        assert any(s.startswith("INSERT") for s in conn.cur.sql), (
+            f"a company may settle {basis!r} and enrolment refuses it — the two lists have "
+            f"drifted apart again")
+
+
+def test_a_basis_no_company_can_settle_is_still_refused():
+    """The pair must agree in both directions. Accepting a value the company endpoint would
+    reject would make `upsert_profile` the more permissive of the two, and a caller reaching
+    it directly would bypass the closed list entirely."""
+    import repositories.voiceprints as vp
+    with pytest.raises(ValueError):
+        vp.upsert_profile(_Conn(), CO, display_name="Clement",
+                          consent_basis="whatever", asserted_by=ASSERTER)
