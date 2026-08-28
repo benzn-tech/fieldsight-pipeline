@@ -64,6 +64,7 @@ import re
 import boto3
 import urllib3
 import agent_turn_filter
+from output_language import OUTPUT_LANGUAGE_RULE
 import weather
 import llm_utils
 from datetime import datetime, timedelta
@@ -600,7 +601,8 @@ Rules:
 - participants should list names of people involved in each topic
 - action_items, safety_flags, and all arrays can be empty []
 - related_photos should contain filenames from the photo lines above
-- Do NOT include any text outside the JSON object"""
+- Do NOT include any text outside the JSON object
+{OUTPUT_LANGUAGE_RULE}"""
 
 
 def build_weekly_prompt(daily_reports, site_name, start_date, end_date,
@@ -706,7 +708,8 @@ Return ONLY valid JSON matching this exact schema:
 Rules:
 - status MUST be one of the allowed values shown
 - risk_level and priority MUST be one of: high, medium, low
-- Do NOT include any text outside the JSON object"""
+- Do NOT include any text outside the JSON object
+{OUTPUT_LANGUAGE_RULE}"""
 
 
 def build_monthly_prompt(daily_reports, weekly_reports, site_name, start_date, end_date):
@@ -754,7 +757,8 @@ Return ONLY valid JSON matching this schema:
 Additional: Include month-level trends and patterns. "next_week_priorities" should be "next_month_priorities".
 
 Rules:
-- Do NOT include any text outside the JSON object"""
+- Do NOT include any text outside the JSON object
+{OUTPUT_LANGUAGE_RULE}"""
 
 
 # ============================================================

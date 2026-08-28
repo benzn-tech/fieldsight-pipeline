@@ -44,6 +44,7 @@ from urllib.parse import unquote_plus
 import boto3
 
 import agent_turn_filter
+from output_language import OUTPUT_LANGUAGE_RULE
 import evidence_match
 import llm_utils
 import batch_stitch
@@ -1009,7 +1010,8 @@ Rules:
 - participants, action_items, findings, decisions, questions may be empty arrays
 - declared_site.confidence is YOUR OWN confidence (0.0-1.0) that this is truly an explicit
   arrival declaration, not a mention
-- Do NOT include any text outside the JSON object{_evidence_instruction()}"""
+- Do NOT include any text outside the JSON object{_evidence_instruction()}
+{OUTPUT_LANGUAGE_RULE}"""
 
 
 def build_extraction_prompt(user_folder, date, session_base, turns, n_segments):

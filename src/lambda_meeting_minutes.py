@@ -49,6 +49,7 @@ import llm_utils
 from datetime import datetime, timedelta
 from io import BytesIO
 import batch_stitch
+from output_language import OUTPUT_LANGUAGE_RULE
 from transcript_utils import (
     normalize_transcript, format_turns_for_prompt, get_time_bounds,
     extract_device_from_filename, write_meeting_manifest,
@@ -492,7 +493,8 @@ Rules:
 - participants MUST only contain names from the Attendees list — never use device IDs or device owner names
 - Do NOT include any text outside the JSON object
 - Do NOT fabricate decisions or action items not clearly stated in the transcript
-- Preserve the original language of decisions — do not soften or editorialize"""
+- Do not soften or editorialize a decision -- record what was actually decided
+{OUTPUT_LANGUAGE_RULE}"""
 
 
 # ============================================================
