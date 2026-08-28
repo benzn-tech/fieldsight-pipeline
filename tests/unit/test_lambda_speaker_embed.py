@@ -1626,3 +1626,52 @@ def test_an_unreadable_turn_does_not_shift_every_later_pairing(stub_embedder, mo
             "another window's audio")
         assert "missing" not in h["turn"]["source_filename"], \
             "a turn whose audio could not be read was offered for harvest"
+
+
+def test_a_missing_key_says_which_key(monkeypatch):
+    """`NoSuchKey: The specified key does not exist` is loud and illegible.
+
+    Three separate investigations read that line from this function and could not tell WHICH
+    key was missing — the batch map, the transcript and the audio all come through `_get` —
+    so each ended in listing the bucket by hand and comparing strings character by character.
+    Twice the key turned out to be correct and the failure was somewhere else entirely.
+
+    Loud and legible are different properties, and only one of them was there.
+    """
+    from botocore.exceptions import ClientError
+
+    class _S3:
+        def get_object(self, Bucket, Key):
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey",
+                           "Message": "The specified key does not exist."}}, "GetObject")
+
+    monkeypatch.setattr(se, "s3", lambda: _S3())
+    monkeypatch.setattr(se, "S3_BUCKET", "a-bucket")
+
+    with pytest.raises(ClientError) as exc:
+        se._get("audio_segments/u/2026-08-12/x_bn4_off0.0_to114.0_srcwav_batch_map.json")
+
+    msg = exc.value.response["Error"]["Message"]
+    assert "x_bn4_off0.0_to114.0_srcwav_batch_map.json" in msg, msg
+    assert "a-bucket" in msg, msg
+    assert "NoSuchKey" in msg, "the original code must survive the rewrap"
+
+
+def test_a_denial_is_still_raised_and_still_named(monkeypatch):
+    """Without ListBucket a missing key answers 403, so "not allowed" and "not there" are
+    indistinguishable from inside — which is why this function raises rather than returning
+    nothing. The rewrap must not swallow that, and must name the key for it too."""
+    from botocore.exceptions import ClientError
+
+    class _S3:
+        def get_object(self, Bucket, Key):
+            raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+
+    monkeypatch.setattr(se, "s3", lambda: _S3())
+    monkeypatch.setattr(se, "S3_BUCKET", "a-bucket")
+
+    with pytest.raises(ClientError) as exc:
+        se._get("some/key.json")
+    assert "AccessDenied" in exc.value.response["Error"]["Message"]
+    assert "some/key.json" in exc.value.response["Error"]["Message"]
