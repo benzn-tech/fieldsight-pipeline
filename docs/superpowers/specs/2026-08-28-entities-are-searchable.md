@@ -213,6 +213,14 @@ topics leak rather than a new one. It is written here because this repository ha
 a deletion that says "deleted" and means something narrower, and because entities are a new
 surface where the difference becomes visible.
 
+**Inherited, not introduced: a session straddling NZ midnight** puts its transcripts — and so
+its topics — under two date folders, i.e. two extraction keys, while finalize's brief carries
+one date. The entity's `source_s3_key` matches only one of them, so a delete issued from the
+other date's listing does not hide it. Topics already split the same way and the tombstone
+already covers one date, so entities inherit the gap rather than widening it. Noted so the
+next reader does not rediscover it as new — and so that if it is ever fixed, it is fixed for
+both.
+
 ---
 
 ## The ACL, written out rather than described
@@ -330,6 +338,11 @@ That is this file's own green-over-a-dead-path shape for the third time, so both
 pinned: **the entity query does not depend on the chunk side's `site_ids` short-circuit**, and
 **every return path carries an `entities` key**, empty list included. A test drives the
 zero-sites caller and asserts the key is present.
+
+**When a caller scopes to one site, entities use the narrowed set** (`lambda_rag_search.py:96`)
+plus the `site_id IS NULL` arm — not the full accessible set. A site filter is the caller
+saying which site they mean, and answering it with entities from elsewhere would make the
+filter mean something different on one half of the response than on the other.
 
 ---
 
