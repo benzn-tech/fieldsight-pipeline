@@ -46,9 +46,15 @@ def get_user_by_sub(conn, cognito_sub) -> dict | None:
     the same, which is the safe direction for a default nobody chose.
     """
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_COLS}, c.voiceprint_consent_basis "
+        # `users.*` rather than the bare `_COLS`, which is shared with the un-joined
+        # queries below. The moment a second table is in scope, an unqualified `id` matches
+        # both and Postgres refuses the statement — `AmbiguousColumn`, at PREPARE time, for
+        # every caller. Only a real database says so: the connection doubles in the suite
+        # record the SQL string and never parse it, so 3286 unit tests passed over it.
+        f"SELECT users.{', users.'.join(_COLS.split(', '))}, "
+        f"       c.voiceprint_consent_basis "
         f"FROM users LEFT JOIN companies c ON c.id = users.company_id "
-        f"WHERE cognito_sub=%s", (cognito_sub,)
+        f"WHERE users.cognito_sub=%s", (cognito_sub,)
     ).fetchone()
 
 
