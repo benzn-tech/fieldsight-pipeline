@@ -644,6 +644,9 @@ def dispatch(conn, event, method, route):
     m_srl = re.match(r"^/sessions/([^/]+)/rolling$", route)
     if m_srl and method == "GET":
         return session_rolling(conn, caller, m_srl.group(1), event)
+    m_sbr = re.match(r"^/sessions/([^/]+)/brief$", route)
+    if m_sbr and method == "GET":
+        return session_brief_read(conn, caller, m_sbr.group(1), event)
 
     if route == "/voice/upload-url" and method == "POST":
         return create_voice_upload_url(conn, caller, parse_body(event))
@@ -1874,6 +1877,55 @@ def session_rolling(conn, caller, session_id, event):
         "summary": data.get("summary", ""),
         "openTodos": data.get("open_todos", []),
         "updatedAt": data.get("updated_at"),
+    })
+
+
+def session_brief_read(conn, caller, session_id, event):
+    """GET /api/org/sessions/{session_id}/brief?date=&user= — the session brief.
+
+    `lambda_session_finalize` has been writing these since the brief shipped and nothing has
+    ever read one. The whole narrative — sections with timestamps and verbatim quotes, the
+    entities with the spellings the transcriber actually produced, the tasks with the reason
+    each exists — has been going to S3 and stopping there, which is the shape this session
+    has spent its time removing.
+
+    Deliberately the same shape as `session_rolling` beside it: the key is rebuilt
+    server-side so a client cannot read another folder's brief, the ACL is the resolver both
+    already use, and the two states are `pending` and `ready` rather than a 404. A brief that
+    has not been written yet and a brief that does not exist are the same thing to the caller,
+    and neither is an error.
+
+    Returned whole rather than filtered. Every field in it was produced for a reader — the
+    quote is what makes a bullet checkable, `at` is what makes it findable in the transcript,
+    and `why` is the field the to-do list was missing. Trimming here would repeat the mistake
+    that made this endpoint necessary.
+    """
+    p = event.get("queryStringParameters") or {}
+    date, user = p.get("date"), (p.get("user") or "").strip()
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="session brief")
+    if err is not None:
+        return err
+    # `sid` prefixed exactly as the writer stores it. The session id in the path may or may
+    # not carry it depending on the caller, and guessing wrong reads a key that cannot exist
+    # — which surfaces as `pending` and looks like "no brief yet" rather than a mistake.
+    sid = session_id if session_id.startswith("sid") else "sid" + session_id
+    key = f"session_brief/{folder}/{date}/{sid}/latest.json"
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return ok({"status": "pending"})
+        raise
+    data = json.loads(obj["Body"].read().decode("utf-8"))
+    return ok({
+        "status": "ready",
+        "headline": data.get("headline", ""),
+        "sections": data.get("sections", []),
+        "entities": data.get("entities", []),
+        "tasks": data.get("tasks", []),
+        "stats": data.get("stats"),
     })
 
 

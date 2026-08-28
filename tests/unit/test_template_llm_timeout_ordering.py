@@ -67,7 +67,13 @@ def _calls_llm(name):
     if not os.path.exists(path):
         return False
     body = open(path, encoding="utf-8").read()
-    return "call_llm" in body or "llm_utils" in body or "session_brief" in body
+    # A CALL, not a mention. The first version matched the string `session_brief` anywhere,
+    # and org-api gained an endpoint that reads `session_brief/...` from S3 — no model, no
+    # HTTP client, 30 s timeout, and instantly an offender. A test that reports a function
+    # for containing a word is a test that will be silenced rather than fixed.
+    return ("llm_utils.call_llm(" in body
+            or "call_llm(" in body and "import llm_utils" in body
+            or "session_brief.brief_from_turns(" in body)
 
 
 def test_the_http_timeout_always_loses_the_race():
