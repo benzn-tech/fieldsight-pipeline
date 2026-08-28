@@ -100,12 +100,33 @@ How to write it:
    here, including a name said once. Aliases matter -- recognition mangles proper
    nouns constantly, and a literal search for the correct spelling then finds
    nothing.
-5. **tasks: only what a specific person could finish and tick off.** Test the
-   verb. "consult Xiao Han", "replace the damaged doors", "call the electrician"
-   are tasks. "focus on X", "consider Y", "explore Z" are directions -- nobody can
-   ever tick them, and they belong in a bullet. A discussion that reached no act
-   yields NO tasks; an empty array is correct, and two real tasks are worth more
-   than six invented ones, because invented ones bury the real ones.
+5. **tasks: is this still OUTSTANDING when the meeting ends?** That is the test,
+   and it is a test about STATE, not about how concrete the verb sounds.
+
+   Leave it OUT when the meeting says the thing has already happened or was
+   already settled -- "we already applied for that", "we set that up last week",
+   "we covered this before", "that's already agreed". Those are worth a bullet,
+   never a task, no matter how actionable the words look on their own.
+
+   Keep it IN when it is still to happen, EVEN IF the verb is broad. "Build the
+   knowledge base", "develop the calendar integration", "get devices to James"
+   name real outstanding work; do not demote them just because they are large or
+   because no date was given.
+
+   Leave OUT anything with no act in it at all -- "focus on X", "consider Y",
+   "explore Z", or a person's role being discussed rather than a thing being
+   assigned. A discussion that reached no act yields NO tasks, and an empty array
+   is correct.
+
+   This wording is deliberately the loose end of the trade. Measured against a
+   session the user judged item by item, three admission rules landed on one
+   curve -- precision and recall traded almost exactly, and the differences
+   between the rules were smaller than the run-to-run variance of any one of
+   them (see docs/superpowers/specs/2026-08-13-briefing-first-capture-design.md
+   section 12). This one recalls the most and admits the most noise, which is
+   the side chosen: a missed task is one the recorder still remembers, and a
+   surplus one is meant to be dismissed in the UI rather than argued away here.
+
 6. Write in the language the meeting was mostly held in.
 
 ---

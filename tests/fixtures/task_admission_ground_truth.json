@@ -1,0 +1,47 @@
+{
+  "_comment": "Per-item judgement by the meeting's own participant on the extracted task list. This is the only ground truth of its kind we have: someone who was in the room saying which items are real. Nine LLM runs across three admission rules were scored against it (spec section 12).",
+  "session": "sid93396a6ac8434fdf908c25a50cc7e167",
+  "folder": "Ben_UCPK2",
+  "date": "2026-08-27",
+  "judged_by": "the participant, 2026-08-28",
+  "true_tasks": [
+    {"id": "A", "label": "Outlook calendar integration",
+     "match": ["outlook", "ics", "日历", "calendar"],
+     "note": "Judged a real action. Not caught by any rule in 9 runs except once -- it reads as product scope rather than an assignment."},
+    {"id": "B", "label": "AI knowledge base for construction terms",
+     "match": ["knowledge base", "知识库", "术语", "ai.*librar"],
+     "note": "Judged a real action. Same shape as A and missed for the same reason."},
+    {"id": "C", "label": "Recording devices to James (South Island)",
+     "match": ["james", "南岛", "south island"]},
+    {"id": "D", "label": "Downtown proposal review, Friday 2 PM",
+     "match": ["downtown", "proposal review", "星期五", "周五", "friday"],
+     "note": "The least ambiguous item in the meeting -- explicit time, explicit invitation, explicit yes. A rule that drops this is too strict."},
+    {"id": "E", "label": "Two devices to Clement to test the new system",
+     "match": ["clement"],
+     "note": "The existing extractor missed this one entirely; every brief run caught it."}
+  ],
+  "not_tasks": [
+    {"id": "F", "label": "Restrict Josh's website access",
+     "match": ["josh"],
+     "note": "Raised before and pushed back on in the room: 'I know, but you can't block him.' The refusal is IN the transcript -- a rule that reads the reply catches this."},
+    {"id": "G", "label": "Train Deon Jay in reality capture",
+     "match": ["deon"],
+     "note": "The speaker describing their own arrangement. The other party said only 'mm'."},
+    {"id": "H", "label": "AWS credits / independent front end",
+     "match": ["aws"],
+     "note": "Already applied for. The reply describes something already under way rather than taking anything on."}
+  ],
+  "unresolved": [
+    {"id": "I", "label": "Follow up on drone / right-of-way usage",
+     "match": ["无人机", "drone", "right.of.way", "lindis", "camera stick"],
+     "note": "The participant did not remember it. Both the extractor and every brief run produced it, so it is more likely real and forgotten than invented. Left unscored."}
+  ],
+  "measured": {
+    "runs_per_variant": 3,
+    "v1_verb_test":   {"tasks_per_run": 4.3, "true_of_5": 2.7, "false_of_3": 1.0},
+    "v2_state_test":  {"tasks_per_run": 6.0, "true_of_5": 3.0, "false_of_3": 2.0},
+    "v3_uptake_test": {"tasks_per_run": 3.7, "true_of_5": 2.0, "false_of_3": 0.3},
+    "chosen": "v2",
+    "why": "Precision and recall traded almost exactly across three rules aimed at different things, and the spread between rules was smaller than one rule's own run-to-run variance. Recall was chosen: a missed task is one the recorder still remembers; a surplus one is dismissed in the UI."
+  }
+}

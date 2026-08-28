@@ -502,3 +502,64 @@ It does not remove the rolling summary — that still serves the mid-meeting pol
 which is a different question at a different moment. It does not touch
 extraction. It is off by default, and the first real session read end to end is
 what decides whether it goes on.
+
+---
+
+## 12. What admission rule to use — measured against a participant's judgement
+
+The first real ground truth: a working session (`sid93396a…`, 2026-08-27, 26 min,
+316 turns) whose own participant went through the extracted task list item by
+item and said which were real. Recorded as
+`tests/fixtures/task_admission_ground_truth.json`; scored by
+`scripts/eval_task_admission.py`.
+
+Five real tasks, three that only looked like tasks, one the participant could
+not remember (produced by every run, so more likely real and forgotten than
+invented — left unscored).
+
+### Three rules, three runs each
+
+| rule | tasks/run | real found (of 5) | false found (of 3) |
+|---|---|---|---|
+| v1 — is the VERB tickable | 4.3 | 2.7 | 1.0 |
+| v2 — is it still OUTSTANDING | 6.0 | **3.0** | 2.0 |
+| v3 — did somebody PICK IT UP | 3.7 | 2.0 | **0.3** |
+
+**They land on one curve.** Three rules aimed at genuinely different things, and
+precision and recall traded almost exactly. The gap between rules was smaller
+than one rule's own run-to-run spread — v2 produced 8, 6 and 4 tasks on
+identical input. What was being tuned was not the criterion but its tightness.
+
+**Chosen: v2.** A missed task is one the recorder still remembers; a surplus one
+is dismissed in the UI. That is the trade the surface should carry, not the
+prompt.
+
+### What the failures taught, which is more than the ranking did
+
+**v3's rule works and is worth keeping somewhere.** Reading the *reply* rather
+than the proposal cut false tasks to 0.3. All three non-tasks have their refusal
+in the transcript:
+
+> `spk_1: 要把 Josh 这个人排出去的。`
+> `spk_0: 我知道，但是你没有办法 block 得他。`
+
+"I know" — raised before. "You can't block him" — refused. The model was reading
+the proposal and not the answer. It also marked **every** task `committed` across
+nine runs, which is the same blindness showing up in a field we already have:
+`basis` is meaningless until something checks whether anyone took the work on.
+
+**Two real tasks were missed by every rule.** The Outlook integration and the AI
+knowledge base appeared once in nine runs. In the room they sound like product
+scope — "we want an app that reads ICS files" — not like an assignment. The
+model's reading is defensible; the problem is that `action_items` is being asked
+to hold two different things: work on a product roadmap, and things a person
+does after the meeting. No admission rule separates those, because the
+distinction is not in the sentence.
+
+### Consequence for the surface
+
+No run in nine was both complete and clean. A task list that is generated once
+and trusted does not exist at this quality. The list has to be **dismissible** —
+the batch-select the prototype already has is the right place, relabelled from
+"assign" to include "not a task". That is a UI decision the measurements now
+support rather than a preference.
