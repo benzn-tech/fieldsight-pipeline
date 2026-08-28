@@ -112,6 +112,34 @@ def test_no_turns_maps_to_no_entries():
 # about what happens to the rows AFTER they arrive, which is where the recorded defect was.
 
 SID_A = "Benl1_2026-04-29_08-14-32_sid" + "a" * 32 + "_c0000_srcwav.json"
+
+
+class _NoTombstones:
+    """A connection that answers the tombstone lookup with "nothing is deleted".
+
+    `_session_turns` now takes one, and that is the point of the change rather than a
+    signature detail: without a connection the deleted-session filter returns an empty set
+    and a tombstoned session's turns are read as if it still existed. Passing None here would
+    restore exactly the behaviour the change removed, so the double is explicit about what it
+    is claiming — nothing on this day was deleted.
+    """
+
+    class _Cur:
+        def execute(self, sql, params=None):
+            return self
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return None
+
+    def cursor(self, row_factory=None):
+        return self._Cur()
+
+
+_CONN = _NoTombstones()
+
 SID_B = "Benl1_2026-04-29_09-20-00_sid" + "b" * 32 + "_c0000_srcwav.json"
 
 
@@ -130,7 +158,7 @@ def test_turns_from_another_session_at_the_same_offset_are_not_included(monkeypa
     matching failure. It cost two rounds of debugging and nothing pinned the fix."""
     monkeypatch.setattr(org, "_read_org_transcripts",
                         lambda *a, **k: _payload(_seg(SID_A, 10.0), _seg(SID_B, 10.0)))
-    turns = org._session_turns("Benl1", "2026-04-29", SID_A)
+    turns = org._session_turns(_CONN, "Benl1", "2026-04-29", SID_A)
     assert [t["source_filename"] for t in turns] == [SID_A]
 
 
@@ -141,7 +169,7 @@ def test_the_session_is_matched_as_a_session_not_as_a_string(monkeypatch):
     monkeypatch.setattr(org, "_read_org_transcripts",
                         lambda *a, **k: _payload(_seg(SID_A, 3.0)))
     # The caller passes the session id, not the full filename.
-    assert org._session_turns("Benl1", "2026-04-29",
+    assert org._session_turns(_CONN, "Benl1", "2026-04-29",
                               turn_name_overlay.session_base(SID_A))
 
 
@@ -150,13 +178,13 @@ def test_a_turn_with_no_offset_is_dropped_rather_than_defaulted_to_zero(monkeypa
     hand the embedder somebody else's voice under this turn's reference."""
     monkeypatch.setattr(org, "_read_org_transcripts", lambda *a, **k: _payload(
         {"source_filename": SID_A, "duration": 5.0}, _seg(SID_A, 7.0)))
-    assert [t["start_sec"] for t in org._session_turns("Benl1", "2026-04-29", SID_A)] == [7.0]
+    assert [t["start_sec"] for t in org._session_turns(_CONN, "Benl1", "2026-04-29", SID_A)] == [7.0]
 
 
 def test_the_end_is_derived_from_the_duration(monkeypatch):
     monkeypatch.setattr(org, "_read_org_transcripts",
                         lambda *a, **k: _payload(_seg(SID_A, 12.0, duration=9.5)))
-    t = org._session_turns("Benl1", "2026-04-29", SID_A)[0]
+    t = org._session_turns(_CONN, "Benl1", "2026-04-29", SID_A)[0]
     assert (t["start_sec"], t["end_sec"]) == (12.0, 21.5)
 
 
@@ -165,7 +193,7 @@ def test_the_transcribers_own_label_is_carried_through(monkeypatch):
     about turns too short for any acoustic judgement."""
     monkeypatch.setattr(org, "_read_org_transcripts",
                         lambda *a, **k: _payload(_seg(SID_A, 1.0, label="spk_3")))
-    assert org._session_turns("Benl1", "2026-04-29", SID_A)[0]["speaker_label"] == "spk_3"
+    assert org._session_turns(_CONN, "Benl1", "2026-04-29", SID_A)[0]["speaker_label"] == "spk_3"
 
 
 def test_a_transcript_read_that_fails_yields_no_turns_rather_than_raising(monkeypatch):
@@ -174,7 +202,7 @@ def test_a_transcript_read_that_fails_yields_no_turns_rather_than_raising(monkey
     def _boom(*a, **k):
         raise RuntimeError("S3 said no")
     monkeypatch.setattr(org, "_read_org_transcripts", _boom)
-    assert org._session_turns("Benl1", "2026-04-29", SID_A) == []
+    assert org._session_turns(_CONN, "Benl1", "2026-04-29", SID_A) == []
 
 
 def test_a_session_id_that_normalises_to_nothing_matches_no_turns(monkeypatch):
@@ -183,7 +211,7 @@ def test_a_session_id_that_normalises_to_nothing_matches_no_turns(monkeypatch):
     the day would be swept into one 'session'."""
     monkeypatch.setattr(org, "_read_org_transcripts",
                         lambda *a, **k: _payload(_seg("Benl1_2026-04-29_off0.5_srcwav.json", 4.0)))
-    assert org._session_turns("Benl1", "2026-04-29",
+    assert org._session_turns(_CONN, "Benl1", "2026-04-29",
                               "Benl1_2026-04-29_off0.5_srcwav.json") == []
 
 
@@ -203,7 +231,7 @@ def test_an_empty_turn_list_says_which_kind_of_empty_it_is(monkeypatch, caplog):
     monkeypatch.setattr(org, "_read_org_transcripts",
                         lambda *a, **k: _payload(_seg(SID_B, 10.0)))
     with caplog.at_level(logging.WARNING):
-        assert org._session_turns("Benl1", "2026-04-29", SID_A) == []
+        assert org._session_turns(_CONN, "Benl1", "2026-04-29", SID_A) == []
 
     line = next((r.getMessage() for r in caplog.records if "0 turns" in r.getMessage()), None)
     assert line, "an empty result was returned with nothing said about it"
@@ -220,7 +248,7 @@ def test_the_offset_count_separates_a_mismatch_from_a_missing_offset(monkeypatch
     monkeypatch.setattr(org, "_read_org_transcripts", lambda *a, **k: _payload(
         {"source_filename": SID_A, "duration": 5.0}))
     with caplog.at_level(logging.WARNING):
-        assert org._session_turns("Benl1", "2026-04-29", SID_A) == []
+        assert org._session_turns(_CONN, "Benl1", "2026-04-29", SID_A) == []
 
     line = next(r.getMessage() for r in caplog.records if "0 turns" in r.getMessage())
     assert "1 matched the session" in line and "0 of those had an offset" in line, line
@@ -236,6 +264,35 @@ def test_a_read_failure_is_logged_with_its_traceback(monkeypatch, caplog):
 
     monkeypatch.setattr(org, "_read_org_transcripts", _boom)
     with caplog.at_level(logging.ERROR):
-        assert org._session_turns("Benl1", "2026-04-29", SID_A) == []
+        assert org._session_turns(_CONN, "Benl1", "2026-04-29", SID_A) == []
     assert any(r.exc_info for r in caplog.records), (
         "the exception was swallowed without a traceback, so the cause is unrecoverable")
+
+
+def test_the_connection_reaches_the_reader_that_filters_deleted_sessions(monkeypatch):
+    """The seam, asserted, because the failure it prevents is invisible.
+
+    `_read_org_transcripts` drops tombstoned sessions at the listing, and
+    `_deleted_sessions_for_day` returns an empty set when it is handed no connection —
+    fails open, deliberately, so an unreadable tombstone table cannot take the media
+    endpoints down. `_session_turns` used to call it with no connection at all, so the
+    filter was permanently in its fail-open state on this path: a deleted session's turns
+    were read and handed to the embedder, which would name a voice from a recording the
+    customer had deleted.
+
+    Nothing about that is visible in the result. The list is simply a little longer, and
+    every assertion in this file would have passed either way — which is why the seam is
+    asserted rather than the outcome. The outcome belongs to the reader's own tests; what
+    was missing here was the argument.
+    """
+    seen = {}
+
+    def _reader(date, folder, a, b, conn=None):
+        seen["conn"] = conn
+        return {"segments": []}
+
+    monkeypatch.setattr(org, "_read_org_transcripts", _reader)
+    org._session_turns(_CONN, "Benl1", "2026-04-29", SID_A)
+    assert seen["conn"] is _CONN, (
+        "the connection did not reach the reader, so the deleted-session filter runs in its "
+        "fail-open state and a tombstoned session's turns come back")

@@ -1265,16 +1265,23 @@ def _may_correct_speakers(conn, caller, folder):
     return folder == scope.visible_scope(conn, caller).get("self_folder")
 
 
-def _session_turns(folder, date, session_base):
+def _session_turns(conn, folder, date, session_base):
     """Every turn of one session, as (file, offset) pairs the embedder can cut audio with.
 
     Reads the same transcripts the viewer does and keeps only this session — a day can hold
     several, and two sessions routinely have turns starting at the same offset, so filtering
     by session id is not optional. (Not filtering cost two rounds of debugging on 08-14, when
     a turn from another session at the same offset looked like a matching failure.)
+
+    `conn` is not optional and is not decoration. `_read_org_transcripts` drops tombstoned
+    sessions at the listing (`_deleted_sessions_for_day`), and that check returns an empty set
+    when handed no connection — so this function used to read a deleted session's turns and
+    hand them to the embedder, which would name a voice from a recording the customer had
+    deleted. Every other reader of these transcripts passes a connection; this one did not,
+    and the omission is invisible because the result is a slightly longer list.
     """
     try:
-        payload = _read_org_transcripts(date, folder, "", "")
+        payload = _read_org_transcripts(date, folder, "", "", conn=conn)
     except Exception:
         # `except Exception -> []` turns a read failure into "this session has no turns",
         # and the caller cannot tell those apart: the artifact ships with `turns: []`, the
@@ -1461,7 +1468,7 @@ def speaker_match(conn, caller, session_base, event):
     if not session_key:
         return error("session id must carry its sid (…_sid<32 hex>)", 400)
 
-    turns = _session_turns(folder, date_m.group(1), session_base)
+    turns = _session_turns(conn, folder, date_m.group(1), session_base)
     if not turns:
         # A 202 here would promise work that cannot happen. The usual cause is a session
         # whose transcripts are not written yet, which is a wait, not a failure.
@@ -1775,7 +1782,7 @@ def speaker_corrections(conn, caller, session_base, event):
         _linked_person, _linked_on = person, matched_on
         enrol = {"voiceprint_id": str(profile["id"])}
 
-    session_turns = _session_turns(folder, date_m.group(1), session_base)
+    session_turns = _session_turns(conn, folder, date_m.group(1), session_base)
     request_id = uuid.uuid4().hex
     artifact = {
         "request_id": request_id,
