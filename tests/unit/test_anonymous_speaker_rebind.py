@@ -195,3 +195,38 @@ def test_a_row_missing_half_its_key_is_dropped_not_stored():
         {"source_filename": None, "speaker_label": "spk_0", "group_label": "A"},
         {"source_filename": "a.json", "speaker_label": "spk_0", "group_label": "A"}])
     assert n == 1
+
+
+def test_the_artifact_reads_the_key_the_turn_builder_actually_writes():
+    """The defect this test exists for shipped, deployed, and produced nothing.
+
+    `transcript_utils._build_turn` names the field `speaker`. The first version of the
+    extraction artifact read `speaker_label` — so `speaker_turns` came out EMPTY on every
+    session, the producer's pre-check saw zero pairs, and the re-bind never ran. No error
+    anywhere; the field was present and the list was short.
+
+    **Every other test in this file fed dicts written by the same file under test**, so both
+    halves agreed on a key the actual producer of turns has never used. This one asks the
+    real builder what it writes, which is the only question that could have caught it.
+    """
+    import inspect
+
+    import transcript_utils as tu
+
+    built = inspect.getsource(tu._build_turn)
+    assert "'speaker':" in built and "speaker_label" not in built, (
+        "the turn builder changed its field name; whatever it is now, the extraction "
+        "artifact must read THAT")
+
+    ex = inspect.getsource(iw)  # not the producer — the artifact composer lives elsewhere
+    import lambda_extract_session as les
+
+    composer = inspect.getsource(les.extract_session_topics) if hasattr(
+        les, "extract_session_topics") else open(
+            "src/lambda_extract_session.py", encoding="utf-8").read()
+    i = composer.index("'speaker_turns':")
+    window = composer[i:i + 400]
+    assert "t.get('speaker')" in window, (
+        "the artifact still reads a key the turn builder does not write; `speaker_turns` "
+        "will be empty on every session and the re-bind will never run")
+    assert ex is not None
