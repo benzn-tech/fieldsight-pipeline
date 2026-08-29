@@ -176,6 +176,7 @@ jobs:
               "NonWorkExpiryHours=${{ vars.TEST_NONWORK_EXPIRY_HOURS || '24' }}" \
               $NONWORK_SINCE_PARAM \
               "EnableKeyframes=${{ vars.TEST_ENABLE_KEYFRAMES || 'false' }}" \
+              "RebindSpeakers=${{ vars.TEST_REBIND_SPEAKERS || 'false' }}" \
               "EnableThreadSuggestions=${{ vars.TEST_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
               $KF_LAYER_PARAM \
               $VAD_LAYER_PARAM \

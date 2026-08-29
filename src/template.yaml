@@ -120,6 +120,16 @@ Parameters:
       are ever tombstoned. Deliberately empty by default — the policy applies to new
       topics only, and an unbounded sweep would tombstone every historical personal
       topic on its first run. The sweep no-ops while this is empty, even if enabled.
+  RebindSpeakers:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Ask the embedder to group a session's per-call speaker labels into one namespace at
+      the end of extraction. Off by default: it costs ~100 s of ONNX on a concurrency slot
+      shared with corrections and matches, and a session with no groups reads exactly as it
+      read before this existed.
+
   EnableKeyframes:
     Type: String
     Default: 'false'
@@ -2769,6 +2779,7 @@ Resources:
           # video-keyframe plan: emit keyframe_requests/ post-commit only when
           # this stage flag is on (ships inert otherwise).
           EMIT_KEYFRAME_REQUESTS: !Ref EnableKeyframes
+          REBIND_SPEAKERS: !Ref RebindSpeakers
           # recurring-item threading: propose which earlier subject a new
           # topic restates. Writes suggestions only; never links.
           SUGGEST_THREADS: !Ref EnableThreadSuggestions
@@ -2805,6 +2816,12 @@ Resources:
               # Confirmed implicitDeny on the deployed test role before adding.
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_requests/*
+            # The anonymous speaker re-bind rides the prefix whose S3 notification is
+            # ALREADY hand-wired -- BUG-33 makes a new trigger the expensive part, and
+            # this reuses one. A prefix grant, not a new notification.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/voiceprint_requests/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}

@@ -879,6 +879,98 @@ def _admit_harvest(folder, date, candidates):
     return admitted
 
 
+#: Turns shorter than this contribute nothing to a centroid. The same floor `_propagate`
+#: uses, and the one the measurement applied: below three seconds an embedding is not a
+#: reliable description of a voice, and averaging unreliable vectors makes a confident wrong
+#: centroid rather than an uncertain one.
+REBIND_MIN_TURN_S = float(os.environ.get("VOICEPRINT_REBIND_MIN_TURN_S", "3.0"))
+
+REBIND_SIMILARITY = (vp.DEFAULT_REBIND_SIMILARITY
+                     if os.environ.get("VOICEPRINT_REBIND_SIMILARITY", "default") == "default"
+                     else float(os.environ["VOICEPRINT_REBIND_SIMILARITY"]))
+
+
+def _rebind(req):
+    """One session's per-call speaker labels, grouped into one namespace.
+
+    Batching numbers speakers per ASR call, so `spk_0` in call 3 and `spk_0` in call 9 are two
+    different people about half the time (50.2 % purity, measured). This decides which pairs
+    are the same voice.
+
+    **The unit is the (call, label) pair, not the turn**, and that is the whole reason it
+    works: 28 decisions with ~40 s of evidence each, instead of 354 decisions where 226 of the
+    turns are under three seconds. The same audio, judged at a granularity it can support.
+
+    Nothing here identifies anybody: the output is letters within one session.
+    """
+    folder, date = req.get("user_folder"), req.get("date")
+    turns = req.get("turns") or []
+
+    by_label = {}
+    for t in turns:
+        label, src = t.get("speaker_label"), t.get("source_filename")
+        if not label or not src:
+            continue          # undiarised segments have no label and get no group
+        try:
+            start, end = float(t["start_sec"]), float(t["end_sec"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if end - start < REBIND_MIN_TURN_S:
+            continue
+        by_label.setdefault((src, label), []).append((start, end))
+
+    # The pre-check, and it logs what it skipped on. Most sessions are one person across one
+    # call, where the re-bind changes nothing and would still cost ~100 s of ONNX and a
+    # concurrency slot the naming path wants. A skip that says nothing is indistinguishable
+    # from a producer that never ran.
+    calls = {src for src, _ in by_label}
+    if len(by_label) < 2 or len(calls) < 2:
+        logger.info("rebind: nothing to group (%d labels across %d calls, from %d turns)",
+                    len(by_label), len(calls), len(turns))
+        return []
+
+    keys, centroids, spreads = [], [], []
+    for key in sorted(by_label):
+        src, label = key
+        vecs = []
+        for start, end in by_label[key]:
+            try:
+                _k, clip, sr = _window_audio(folder, date, src, start, end)
+            except Exception:
+                # One unreadable window must not lose the whole label. It logs, because a
+                # centroid quietly built from half its evidence is a worse answer that looks
+                # identical to a good one.
+                logger.exception("rebind: could not read %s [%s-%s]", src, start, end)
+                continue
+            v = embed_audio(clip, sr)
+            n = float(np.linalg.norm(v))
+            if n:
+                vecs.append(v / n)
+        if not vecs:
+            continue
+        keys.append(key)
+        m = np.mean(vecs, 0)
+        n = float(np.linalg.norm(m))
+        centroids.append(m / n if n else m)
+        # How much the label's own turns disagreed. Stored beside the group because a group
+        # nobody can audit is a group nobody can withdraw.
+        spreads.append(vp.frame_spread(vecs))
+
+    if len(centroids) < 2:
+        logger.info("rebind: %d centroid(s) built from %d labels — nothing to group",
+                    len(centroids), len(by_label))
+        return []
+
+    assignment = vp.cluster_centroids(centroids, REBIND_SIMILARITY)
+    rows = [{"source_filename": keys[i][0], "speaker_label": keys[i][1],
+             "group_label": chr(ord("A") + assignment[i]),
+             "spread": spreads[i]}
+            for i in range(len(keys))]
+    logger.info("rebind: %d (call,label) pairs -> %d groups at similarity %.2f",
+                len(rows), len(set(assignment)), REBIND_SIMILARITY)
+    return rows
+
+
 def _from_request_artifact(bucket, key):
     """One correction, start to finish.
 
@@ -892,6 +984,19 @@ def _from_request_artifact(bucket, key):
     one row whose name the user had typed himself.
     """
     req = json.loads(_get(key))
+    # The re-bind rides the SAME artifact prefix and therefore the same S3 notification —
+    # the part BUG-33 makes expensive is already wired. It branches here rather than
+    # sharing the correction path, because the two have nothing in common past the trigger:
+    # one names a person, the other groups anonymous labels.
+    if req.get("op") == "rebind":
+        rows = _rebind(req)
+        reply = invoke_writer({"op": "rebind",
+                               "company_id": req.get("company_id"),
+                               "session_base": req.get("session_base"),
+                               "groups": rows}) or {}
+        logger.info("rebind stored: %s", reply.get("written"))
+        return {"op": "rebind", "groups": len(rows), "written": reply.get("written")}
+
     c = req.get("correction") or {}
     folder, date = req.get("user_folder"), req.get("date")
     if not folder or not date:

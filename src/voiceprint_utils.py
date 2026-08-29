@@ -183,6 +183,67 @@ def frame_spread(frame_embeddings):
 # k = 3 at 100% purity in both, and 0.85 is the middle. Measured with THIS code — a threshold
 # measured against a different implementation is not a threshold for this one.
 
+#: Similarity floor for grouping per-call speaker centroids into one session namespace.
+#:
+#: NOT the same number as `DEFAULT_CLUSTER_TAU` and not the same kind of number: that one is a
+#: cosine DISTANCE ceiling for complete linkage over turns; this is a cosine SIMILARITY floor
+#: for average linkage over centroids. Two different questions, and mixing the constants would
+#: silently apply a threshold measured for one to the other.
+#:
+#: 0.45 because the measurement found the SAME three groups at 0.35, 0.40 and 0.45 --
+#: stability across the band, rather than a value tuned until the answer looked right. One
+#: session, three speakers; that is the whole evidence base
+#: (docs/superpowers/specs/2026-08-29-asr-accuracy-measured-findings.md).
+DEFAULT_REBIND_SIMILARITY = 0.45
+
+
+def cluster_centroids(vectors, min_similarity=DEFAULT_REBIND_SIMILARITY) -> list:
+    """Group per-call speaker centroids into one namespace. One group index per vector.
+
+    **Average linkage, not complete**, which is the opposite choice from `cluster_turns` right
+    above — deliberately, and for a reason that is about the inputs rather than taste.
+
+    `cluster_turns` judges TURNS, where a single outlying turn merging two clusters attaches
+    one person's name to another's speech; complete linkage refuses unless every pair agrees,
+    which is the conservative direction for naming. Here each vector is already an average of
+    every long turn a label held in one call -- roughly 40 seconds of evidence -- so the
+    outlier it protects against has been averaged away, and complete linkage would instead
+    refuse to merge a genuine voice whose two calls differ by a single bad centroid.
+
+    It is also the linkage the 55.4 % -> 96.3 % measurement was made with. Substituting the
+    other one would keep the number while changing the thing it measured.
+    """
+    n = len(vectors)
+    if n == 0:
+        return []
+    sim = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            sim[i][j] = sim[j][i] = cosine(vectors[i], vectors[j])
+    groups = [[i] for i in range(n)]
+    while len(groups) > 1:
+        best, bi, bj = None, None, None
+        for a in range(len(groups)):
+            for b in range(a + 1, len(groups)):
+                mean = sum(sim[x][y] for x in groups[a] for y in groups[b]) / (
+                    len(groups[a]) * len(groups[b]))
+                if best is None or mean > best:
+                    best, bi, bj = mean, a, b
+        if best is None or best < min_similarity:
+            break
+        groups[bi] = groups[bi] + groups[bj]
+        groups.pop(bj)
+    # Largest first, so the letters are stable in the only sense they can be: the group with
+    # the most evidence is always 'A'. Ties break on the lowest member index rather than on
+    # dict order, or a re-run could relabel an unchanged session.
+    groups.sort(key=lambda g: (-len(g), min(g)))
+    out = [0] * n
+    for gi, members in enumerate(groups):
+        for m in members:
+            out[m] = gi
+    return out
+
+
 DEFAULT_CLUSTER_TAU = 0.85
 
 

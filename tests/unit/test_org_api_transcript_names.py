@@ -32,11 +32,35 @@ SEGS = {"text": "hello", "segments": [], "speaker_segments": [
 
 
 class FakeConn:
+    #: Rows the speaker-group lookup should return, as `(source_filename, label, group)`.
+    #: Empty by default: these tests are about NAMES, and a session with no groups is the
+    #: state they were all written against.
+    #:
+    #: It needs a cursor at all because `_apply_speaker_names` now also reads the re-bind
+    #: mapping. That read fails OPEN and logs — so without this the tests would pass through
+    #: the exception path, which is passing for the wrong reason: the name overlay would be
+    #: exercised while the code under test never ran its normal branch.
+    groups = ()
+
     def __enter__(self):
         return self
 
     def __exit__(self, *a):
         return False
+
+    def cursor(self, row_factory=None):
+        return self
+
+    def execute(self, sql, params=None):
+        self._rows = [{"source_filename": f, "speaker_label": l, "group_label": g}
+                      for f, l, g in self.groups]
+        return self
+
+    def fetchall(self):
+        return getattr(self, "_rows", [])
+
+    def fetchone(self):
+        return None
 
 
 @pytest.fixture
