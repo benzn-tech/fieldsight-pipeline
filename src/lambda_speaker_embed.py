@@ -929,10 +929,10 @@ def _rebind(req):
                     len(by_label), len(calls), len(turns))
         return []
 
-    keys, centroids, spreads = [], [], []
+    keys, centroids, spreads, evidence = [], [], [], []
     for key in sorted(by_label):
         src, label = key
-        vecs = []
+        vecs, secs = [], 0.0
         for start, end in by_label[key]:
             try:
                 _k, clip, sr = _window_audio(folder, date, src, start, end)
@@ -946,9 +946,19 @@ def _rebind(req):
             n = float(np.linalg.norm(v))
             if n:
                 vecs.append(v / n)
+                # Accumulated HERE, beside the vector it belongs to. Deriving it afterwards
+                # from the first `len(vecs)` windows assumes the failures were all at the end
+                # — and a read can fail anywhere, which one real session has already shown.
+                # The seconds would then describe windows that contributed nothing.
+                secs += end - start
         if not vecs:
             continue
         keys.append(key)
+        # How much this centroid is built on. `spread` only answers "did the evidence
+        # disagree", and it is NULL whenever a label contributed one turn -- which measured
+        # 9 of the first 12 real rows. These two are always answerable, and they are what a
+        # human asks when a group looks wrong.
+        evidence.append((len(vecs), round(secs, 1)))
         m = np.mean(vecs, 0)
         n = float(np.linalg.norm(m))
         centroids.append(m / n if n else m)
@@ -964,7 +974,8 @@ def _rebind(req):
     assignment = vp.cluster_centroids(centroids, REBIND_SIMILARITY)
     rows = [{"source_filename": keys[i][0], "speaker_label": keys[i][1],
              "group_label": chr(ord("A") + assignment[i]),
-             "spread": spreads[i]}
+             "spread": spreads[i],
+             "turns": evidence[i][0], "seconds": evidence[i][1]}
             for i in range(len(keys))]
     logger.info("rebind: %d (call,label) pairs -> %d groups at similarity %.2f",
                 len(rows), len(set(assignment)), REBIND_SIMILARITY)

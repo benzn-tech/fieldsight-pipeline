@@ -50,10 +50,11 @@ def replace_for_session(conn, company_id, session_base, rows) -> int:
             continue
         cur.execute(
             "INSERT INTO speaker_label_groups "
-            "(company_id, session_base, source_filename, speaker_label, group_label, spread) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+            "(company_id, session_base, source_filename, speaker_label, group_label, "
+            " spread, turns, seconds) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
             (company_id, session_base, r["source_filename"], r["speaker_label"],
-             r["group_label"], r.get("spread")))
+             r["group_label"], r.get("spread"), r.get("turns"), r.get("seconds")))
         written += 1
     return written
 
