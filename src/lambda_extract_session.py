@@ -1841,11 +1841,19 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         # Only what the re-bind needs. Not the text: it is not looked at, and an artifact
         # that carries a session's words twice is a second copy to keep in step with the
         # first.
+        # `speaker`, not `speaker_label`. `transcript_utils._build_turn` names it `speaker`,
+        # and the first version of this read `speaker_label` -- so the list came out EMPTY on
+        # every session, silently, and the re-bind downstream simply never ran. The unit
+        # tests could not see it: they fed dicts this file wrote, so both halves agreed on a
+        # key the producer of the turns has never used.
+        #
+        # Renamed on the way out because that IS the downstream contract: everything past
+        # this point speaks the transcript's `speaker_label` vocabulary.
         'speaker_turns': ([{'source_filename': t.get('source_filename'),
-                            'speaker_label': t.get('speaker_label'),
+                            'speaker_label': t.get('speaker'),
                             'start_sec': t.get('start_sec'),
                             'end_sec': t.get('end_sec')}
-                           for t in turns if t.get('speaker_label')] if final else []),
+                           for t in turns if t.get('speaker')] if final else []),
     }
 
     s3().put_object(
