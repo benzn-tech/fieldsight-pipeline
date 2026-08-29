@@ -6892,6 +6892,15 @@ def _apply_speaker_names(conn, caller, payload):
             g = groups.get((seg.get("source_filename"), seg.get("speaker_label")))
             if g:
                 seg["speaker_group"] = g
+        # What each group stands on, once per session rather than once per segment. Without
+        # this the audit stops at the database and the only person who can ask "how much is
+        # group A built on" is whoever has SQL access — which is not the person reading the
+        # transcript and noticing it looks wrong.
+        try:
+            payload["speakerGroups"] = speaker_label_groups.evidence_for_session(
+                conn, str(caller["company_id"]), sorted(b for b in bases if b)[0])
+        except Exception:
+            logger.exception("speaker group evidence unreadable; the groups still apply")
     return payload
 
 

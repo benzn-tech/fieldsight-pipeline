@@ -195,6 +195,34 @@ inconsistent `Speaker 1`. That is why the linkage threshold is not loosened to "
 merging", and why the spread that produced each group is stored beside it — a group nobody can
 audit is a group nobody can withdraw.
 
+## Measured after shipping: do NOT require a minimum of evidence to merge
+
+The first multi-speaker run raised an obvious worry. Group A joined a centroid built on **one
+turn of 3.6 seconds** to one built on two turns of 6.5 s — a thin claim, and exactly the
+"confidently wrong group" this spec warns about. The obvious guard is to refuse a merge when a
+centroid carries too little evidence.
+
+**Measured on that session, that guard would have destroyed the feature.**
+
+| group | members | turns | seconds | thinnest member |
+|---|---|---|---|---|
+| A | 2 | 3 | 10.1 | **1 turn** |
+| B | 2 | 3 | 17.4 | **1 turn** |
+| C | 1 | 4 | 21.3 | 4 turns |
+
+**Both cross-call merges contain a one-turn member**, and the centroid that stands alone is the
+one with the most evidence. A minimum-evidence rule would have refused both merges and left the
+session exactly as unusable as before.
+
+That is not a coincidence, and it is the thing to remember rather than the numbers: **a label
+with one turn in a call is precisely the case where the per-call namespace tells you nothing.**
+Thin centroids are not the merges to be suspicious of — they are the merges the feature exists
+to make. The evidence columns are there so a human can see that A is a thinner claim than C,
+not so the code can refuse it.
+
+What remains true is the other direction: the SIMILARITY floor still refuses, and that is the
+guard doing the work. Nothing here loosens it.
+
 ## What this does not do
 
 - **No names.** Groups are letters. Naming is Task 2's endpoint and is unchanged.
