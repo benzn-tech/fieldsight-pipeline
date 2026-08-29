@@ -86,7 +86,9 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
                    consent_given=False, consented_by=None,
                    linked_by=None, linked_on=None,
                    consent_basis=None, asserted_by=None,
-                   external_ref=None, external_source=None) -> dict | None:
+                   external_ref=None, external_source=None,
+                   employer_name=None, employer_source=None,
+                   employer_set_by=None) -> dict | None:
     """The profile a name attaches to. Existing one if there is one, otherwise a new row.
 
     **Consent is a precondition, not a checkbox** (§6, §10). A voiceprint is biometric
@@ -130,6 +132,24 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
     # and the refusal was the pre-existing strict-rule error — so it looked exactly like a
     # company that had settled nothing rather than like two halves disagreeing. Found by the
     # first live enrolment attempt, not by any test, because both halves were tested apart.
+    #: How an employer came to be recorded, kept beside the value rather than inferred from
+    #: it. A name somebody typed and a name accepted from a register are different evidence,
+    #: and they need separating later -- when a subcontractor changes, or when a source turns
+    #: out to have been wrong for a month. Mirrored by a CHECK in migration 0050, and a test
+    #: pins the two lists against each other: the last time an enum lived in two places, one
+    #: side sent `notice` while the other understood only `attestation`, and the resulting
+    #: 400 read as a configuration problem for two days.
+    EMPLOYER_SOURCES = ("typed", "suggested", "sign_on_site")
+
+    employer_name = (employer_name or "").strip() or None
+    employer_source = (employer_source or "").strip() or None
+    if (employer_name is None) != (employer_source is None):
+        raise ValueError(
+            "employer_name and employer_source travel together: a name with no source "
+            "cannot be audited, and a source with no name records nothing")
+    if employer_source is not None and employer_source not in EMPLOYER_SOURCES:
+        raise ValueError(f"employer_source must be one of {EMPLOYER_SOURCES}")
+
     STANDING_BASES = ("notice", "attestation")
     attested = consent_basis in STANDING_BASES
     if attested and not asserted_by:
@@ -216,12 +236,25 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
                     "SET user_id = %s, linked_by = %s, linked_at = now(), linked_on = %s "
                     "WHERE id = %s AND user_id IS NULL",
                     (user_id, linked_by, linked_on, found["id"]))
+            # ONLY when one was supplied. `SET employer_name = %s` with a NULL parameter is
+            # the obvious way to write this, and it erases the answer somebody gave last
+            # week: most corrections carry no employer and must leave the stored one alone.
+            # A DIFFERENT employer does overwrite -- people change subcontractors, and
+            # `employer_set_by` / `employer_set_at` exist to record that it happened.
+            if employer_name is not None:
+                cur.execute(
+                    "UPDATE speaker_voiceprints "
+                    "SET employer_name = %s, employer_source = %s, "
+                    "    employer_set_by = %s, employer_set_at = now() "
+                    "WHERE id = %s",
+                    (employer_name, employer_source, employer_set_by, found["id"]))
             return found
     return cur.execute(
         "INSERT INTO speaker_voiceprints "
         "(company_id, user_id, display_name, status, consent_at, consented_by, "
         " linked_by, linked_at, linked_on, consent_basis, asserted_by, "
-        " external_ref, external_source) "
+        " external_ref, external_source, "
+        " employer_name, employer_source, employer_set_by, employer_set_at) "
         # Both CASE parameters are cast. A parameter whose only use is `IS NULL` gives
         # Postgres nothing to infer a type from, so the statement fails at PREPARE time for
         # every value — `IndeterminateDatatype: could not determine data type of parameter
@@ -230,11 +263,15 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
         "VALUES (%s, %s, %s, 'tentative', "
         "        CASE WHEN %s::boolean THEN now() ELSE NULL END, %s, "
         "        %s, CASE WHEN %s::uuid IS NULL THEN NULL ELSE now() END, %s, %s, %s, "
-        "        %s, %s) "
+        "        %s, %s, "
+        # Same cast rule as the two CASEs above: a parameter whose only use is `IS NULL`
+        # gives Postgres nothing to infer from and fails at PREPARE time for every value.
+        "        %s, %s, %s, CASE WHEN %s::text IS NULL THEN NULL ELSE now() END) "
         "RETURNING id",
         (company_id, user_id, display_name, bool(consent_given or attested), consented_by,
          linked_by, user_id, linked_on, consent_basis, asserted_by,
-         external_ref, external_source),
+         external_ref, external_source,
+         employer_name, employer_source, employer_set_by, employer_name),
     ).fetchone()
 
 
