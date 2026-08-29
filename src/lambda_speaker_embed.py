@@ -457,8 +457,8 @@ def _dbfs(frame):
     return 20.0 * float(np.log10(rms)) if rms > 1e-9 else -120.0
 
 
-def _frames(audio, sr):
-    """Frames with speech in them, for the homogeneity comparison.
+def _frames_at(audio, sr):
+    """Frames with speech in them, as `(start_sample, frame)`.
 
     The gate lives HERE and not in any caller, because four call sites build frames
     independently — `op=enrol`, `_admit_harvest`, `_from_request_artifact` and `op=spread` —
@@ -488,8 +488,92 @@ def _frames(audio, sr):
     # frame the same length.
     if starts[-1] + step < len(audio):
         starts.append(len(audio) - step)
-    cut = [audio[i:i + step] for i in starts]
-    return [f for f in cut if _dbfs(f) >= FRAME_MIN_DBFS]
+    cut = [(i, audio[i:i + step]) for i in starts]
+    return [(i, f) for i, f in cut if _dbfs(f) >= FRAME_MIN_DBFS]
+
+
+def _frames(audio, sr):
+    """`_frames_at` without the offsets, for the callers that only compare.
+
+    Delegates rather than repeating the cut. Two frame cutters that drift apart would move
+    every homogeneity number in this feature by an amount no test compares.
+    """
+    return [f for _, f in _frames_at(audio, sr)]
+
+
+def _tightest_pair(frames, embs, sr):
+    """The two ADJACENT frames that disagree least, as `(start_sample, end_sample)`.
+
+    Why a pair and not the whole window: measured over 78 prod windows on 2026-08-19, a
+    5-10 s window is homogeneous 83 % of the time and a 20-30 s window 0 %. Two frames is
+    10 s — the top of the band that works.
+
+    Why this exists at all: a correction names a TURN, and the propagation half needs those
+    exact turn boundaries to match anything. Under batching a turn is a whole chunk, so the
+    same two numbers were being asked to be a 109 s span for one consumer and a 10 s span for
+    the other. Enrolment refused every real correction as a result, and the two live attempts
+    show both halves of it: a hand-picked 10-18 s window enrolled (spread 0.198) and matched
+    no turn; the real turn matched and enrolled nothing (spread 0.755).
+
+    ADJACENT and contiguous, checked rather than assumed: `_frames_at` drops frames below the
+    dBFS floor, so neighbours in the list are not always neighbours in time, and splicing two
+    separated stretches into one "continuous" sample would store audio that never existed.
+
+    **The choice is selected on the statistic the guard then applies**, so a pass here is not
+    evidence the guard works — it is the guard being given the best candidate the window
+    holds. The guard still refuses when even that candidate is too wide, which is the only
+    property this function is allowed to claim.
+    """
+    step = int(FRAME_SECONDS * sr)
+    best, best_spread = None, None
+    for i in range(len(frames) - 1):
+        if frames[i + 1][0] != frames[i][0] + step:
+            continue                      # a silent frame was dropped between them
+        spread = vp.frame_spread([embs[i], embs[i + 1]])
+        if spread is None:
+            continue
+        if best_spread is None or spread < best_spread:
+            best, best_spread = i, spread
+    if best is None:
+        return None, None
+    return (frames[best][0], frames[best + 1][0] + step), best_spread
+
+
+def judged_window(clip, sr, start, key):
+    """The window this audio can actually be judged on, and the verdict for it.
+
+    Returns `(clip, start, end, n_frames, spread, verdict)`. When the whole window is too
+    wide, the tightest contiguous 10 s inside it is re-tested and returned instead.
+
+    **ONE implementation, used by both enrolment paths, and that is the point.** There are
+    two: `op=enrol` (standalone) and the enrolment carried inside a correction artifact. A
+    real correction takes the second. The first version of this narrowing went into the
+    first only, was deployed, and changed nothing — the live log printed the identical
+    `frames=22 spread=0.755` and no narrowing line at all, because the site that runs was
+    the site that was not touched.
+    """
+    frames = _frames_at(clip, sr)
+    embs = [embed_audio(f, sr) for _, f in frames]
+    spread = vp.frame_spread(embs)
+    verdict = vp.window_is_homogeneous(embs, MAX_FRAME_SPREAD)
+    end = start + len(clip) / sr
+    if verdict is True or len(frames) < 2:
+        return clip, start, end, len(embs), spread, verdict
+
+    span, pair_spread = _tightest_pair(frames, embs, sr)
+    if span is None:
+        return clip, start, end, len(embs), spread, verdict
+    lo, hi = span
+    sub = clip[lo:hi]
+    sub_embs = [embed_audio(f, sr) for _, f in _frames_at(sub, sr)]
+    if vp.window_is_homogeneous(sub_embs, MAX_FRAME_SPREAD) is not True:
+        return clip, start, end, len(embs), spread, verdict
+
+    logger.info("enrolment narrowed for %s: %.1fs window refused (spread %s), using "
+                "%.1f-%.1fs (spread %.3f)%s", key, len(clip) / sr,
+                "n/a" if spread is None else "%.3f" % spread,
+                start + lo / sr, start + hi / sr, pair_spread, _limit_note())
+    return sub, start + lo / sr, start + hi / sr, len(sub_embs), pair_spread, True
 
 
 def _enrol(event):
@@ -497,8 +581,8 @@ def _enrol(event):
     key, clip, sr = _window_audio(event["user_folder"], event["date"],
                                   event["source_filename"], start, end)
 
-    verdict = vp.window_is_homogeneous([embed_audio(f, sr) for f in _frames(clip, sr)],
-                                       MAX_FRAME_SPREAD)
+    clip, start, end, _n, _spread, verdict = judged_window(clip, sr, start, key)
+
     if verdict is not True:
         # None ("could not check") is refused alongside False. Treating them alike in the
         # permissive direction is how a guard becomes decoration.
@@ -846,9 +930,16 @@ def _from_request_artifact(bucket, key):
     # disbelieving it in one direction and acting on it in the other.
     enrol = req.get("enrol")
     if enrol:
-        frames = [embed_audio(f, sr) for f in _frames(clip, sr)]
-        spread = vp.frame_spread(frames)
-        verdict = vp.window_is_homogeneous(frames, MAX_FRAME_SPREAD)
+        # Through the SAME helper as `op=enrol`. A correction names a turn, and under
+        # batching a turn is a whole chunk — so this is the site where a 109 s window
+        # arrives, and the site that has to be able to narrow it.
+        clip, start, end, n_frames, spread, verdict = judged_window(clip, sr, start, s3_key)
+        if verdict is True:
+            # The vector was embedded from the window BEFORE narrowing. Re-embed, or the
+            # stored voiceprint is the 109 seconds the guard just refused while the row
+            # beside it records the ten it accepted.
+            v = embed_audio(clip, sr)
+        frames = [None] * n_frames        # only its length is read below
         if verdict is not True:
             # The DISTANCE, not just the verdict. Three windows have now been refused on
             # TEST and every log line said only "not homogeneous" — which cannot be argued
