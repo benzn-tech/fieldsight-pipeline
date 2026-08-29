@@ -1831,6 +1831,21 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         'extracted_at': datetime.utcnow().isoformat() + 'Z',
         'declared_site': process_declared_site(parsed.get('declared_site')),
         'topics': parsed_topics,
+        # Where each speaker label was heard, for the anonymous re-bind. Carried HERE, on the
+        # final pass only, because of who can do what: this function has the turns and no
+        # database, and `lambda_item_writer` -- the consumer of this artifact -- has the
+        # database, the company id and the deletion tombstones, and no way to read
+        # `transcripts/`. Passing them costs one field and saves giving a second lambda a
+        # transcript grant plus a second copy of the turn assembler.
+        #
+        # Only what the re-bind needs. Not the text: it is not looked at, and an artifact
+        # that carries a session's words twice is a second copy to keep in step with the
+        # first.
+        'speaker_turns': ([{'source_filename': t.get('source_filename'),
+                            'speaker_label': t.get('speaker_label'),
+                            'start_sec': t.get('start_sec'),
+                            'end_sec': t.get('end_sec')}
+                           for t in turns if t.get('speaker_label')] if final else []),
     }
 
     s3().put_object(

@@ -136,7 +136,7 @@ from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
 from repositories import (action_items, aliases, chunks, classification_feedback, companies,
-                          findings,
+                          findings, speaker_label_groups,
                           compliance_resolutions, content, content_edits, keyframes,
                           meeting_session, memberships, observations, programme,
                           programme_delay_flags, programme_import,
@@ -6865,6 +6865,33 @@ def _apply_speaker_names(conn, caller, payload):
         segs[i]["speaker_name"] = hit["display_name"]
         segs[i]["speaker_state"] = hit["state"]
     payload["unmatchedNames"] = turn_name_overlay.orphans(index)
+
+    # The anonymous re-bind, applied the same way and for the same reason: a mapping over the
+    # artifact rather than a rewrite of it. `speaker_label` is left EXACTLY as the ASR wrote
+    # it — overwriting it would destroy the only record of what was actually said, and the
+    # mapping could then be checked against nothing.
+    #
+    # Keyed on `(source_filename, speaker_label)`, so a segment with no label (undiarised
+    # files carry None) simply gets no group and the reader falls back, which is the correct
+    # answer rather than an omission.
+    groups = {}
+    try:
+        for base in sorted(b for b in bases if b):
+            groups.update(speaker_label_groups.for_session(
+                conn, str(caller["company_id"]), base))
+    except Exception:
+        # Fails OPEN, like every other guard in this feature: an unreadable mapping must not
+        # take the transcript down, and a session with no groups reads exactly as it read
+        # before this existed. It LOGS, because "this session was never re-bound" and "the
+        # lookup could not run" are otherwise the same silence — and the second one is the
+        # kind that survives for weeks.
+        logger.exception("speaker groups unreadable for %s; transcript falls back to the "
+                         "per-call labels", sorted(b for b in bases if b))
+    if groups:
+        for seg in segs:
+            g = groups.get((seg.get("source_filename"), seg.get("speaker_label")))
+            if g:
+                seg["speaker_group"] = g
     return payload
 
 
