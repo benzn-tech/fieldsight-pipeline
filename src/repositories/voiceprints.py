@@ -280,6 +280,39 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
     ).fetchone()
 
 
+def employer_for_name(conn, company_id, display_name) -> dict | None:
+    """What this company has already recorded about who `display_name` works for, or None.
+
+    **A record, not an inference.** Somebody in this company typed this answer against this
+    name before; offering it back is remembering, not guessing. When nobody has, this returns
+    None and the caller offers an empty field -- which is the whole reason there is no
+    `findings`-derived candidate here. Matching a typed name against `findings.entity_name`
+    returns that person's TRADE ("Zoe | Rebar" means Zoe does rebar, not that she works for a
+    firm called Rebar), and listing the site's entities returns co-occurrence. Either one
+    behind "please confirm" is a guess that the click turns into a record.
+
+    Most recent first: people change subcontractors, and the newest answer is the one somebody
+    stood behind last.
+
+    Exact match, not `ILIKE '%name%'`. "Andy M" must not inherit "Andy Mason"'s employer, and
+    a substring match over display names is how one person's details reach another's row.
+    """
+    _require_company(company_id)
+    name = (display_name or "").strip()
+    if not name:
+        return None
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, display_name, employer_name, employer_source, employer_set_at, "
+        "       (SELECT count(*) FROM speaker_voiceprint_samples s "
+        "         WHERE s.voiceprint_id = v.id) AS samples "
+        "FROM speaker_voiceprints v "
+        "WHERE company_id = %s AND lower(display_name) = lower(%s) "
+        "  AND employer_name IS NOT NULL AND status <> 'withdrawn' "
+        "ORDER BY employer_set_at DESC NULLS LAST LIMIT 1",
+        (company_id, name),
+    ).fetchone()
+
+
 def get_profile(conn, company_id, voiceprint_id) -> dict | None:
     """One profile, by id, within a company.
 

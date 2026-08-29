@@ -99,3 +99,36 @@ def list_for_topics(conn, topic_ids) -> list[dict]:
         f"SELECT {_COLS} FROM findings WHERE topic_id = ANY(%s) ORDER BY created_at",
         (list(topic_ids),),
     ).fetchall()
+
+
+def trade_heard_for(conn, company_id, entity_name, site_id=None) -> str | None:
+    """The trade this name has been heard as on site, for DISPLAY beside an employer field.
+
+    Never the answer to "who employs them". `entity_name` is the entity a FINDING is about,
+    and prod shows what that means: "Jerry / PK Building", "Troy and Jay", "facade subbie",
+    "Zoe | Rebar". People, groups, roles. **"Zoe | Rebar" says Zoe does rebar** -- putting that
+    behind "please confirm Zoe is from Rebar?" would turn a trade into a company with one
+    click, and stamp the result `employer_source: 'suggested'`.
+
+    So this is grey helper text and nothing else. It is returned under its own key, never
+    pre-filled into the field, and the endpoint's contract says so.
+
+    Tenant path is `findings.site_id -> sites.company_id` -- ONE hop, NOT NULL on both sides.
+    `findings` has no user column, so the "reach the tenant through users" rule that `topics`
+    needs does not apply and would also drop every NULL-author row silently. Measured on prod
+    2026-08-30: 0 of 189 findings have a NULL site_id, so the join loses nothing.
+    """
+    name = (entity_name or "").strip()
+    if not name:
+        return None
+    sql = ("SELECT f.entity_trade, count(*) AS n "
+           "FROM findings f JOIN sites s ON s.id = f.site_id "
+           "WHERE s.company_id = %s AND lower(f.entity_name) = lower(%s) "
+           "  AND f.entity_trade IS NOT NULL ")
+    params = [company_id, name]
+    if site_id:
+        sql += "  AND f.site_id = %s "
+        params.append(site_id)
+    sql += "GROUP BY f.entity_trade ORDER BY n DESC, f.entity_trade LIMIT 1"
+    row = conn.cursor(row_factory=dict_row).execute(sql, tuple(params)).fetchone()
+    return row["entity_trade"] if row else None
