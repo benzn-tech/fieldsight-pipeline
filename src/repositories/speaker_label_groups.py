@@ -74,3 +74,37 @@ def for_session(conn, company_id, session_base) -> dict:
         (company_id, session_base),
     ).fetchall()
     return {(r["source_filename"], r["speaker_label"]): r["group_label"] for r in rows}
+
+
+def evidence_for_session(conn, company_id, session_base) -> list:
+    """One row per GROUP: what it was built on. For a reader to show, not for code to gate.
+
+    `for_session` answers "which group is this segment in". This answers "how much is that
+    group standing on", which is the question somebody asks when a grouping looks wrong — and
+    until it reaches the API the only person who can ask it is whoever has SQL access.
+
+    Deliberately not used to refuse anything. Measured on the first multi-speaker session,
+    **both cross-call merges contained a member built on a single turn**, and the centroid
+    that stood alone was the one with the most evidence. A minimum-evidence rule would have
+    refused both merges and left the session as unusable as before: a label with one turn in a
+    call is precisely the case where the per-call namespace tells you nothing.
+    """
+    _require_company(company_id)
+    if not session_base:
+        return []
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT group_label, count(*) AS labels, sum(turns) AS turns, "
+        "       sum(seconds) AS seconds, max(spread) AS worst_spread "
+        "FROM speaker_label_groups WHERE company_id = %s AND session_base = %s "
+        "GROUP BY group_label ORDER BY group_label",
+        (company_id, session_base),
+    ).fetchall()
+    return [{"group": r["group_label"],
+             "labels": int(r["labels"] or 0),
+             # NULL stays None rather than becoming 0. Rows written before 0052 genuinely do
+             # not know, and a zero would claim "no evidence" about groups that had some.
+             "turns": int(r["turns"]) if r["turns"] is not None else None,
+             "seconds": round(float(r["seconds"]), 1) if r["seconds"] is not None else None,
+             "worstSpread": (round(float(r["worst_spread"]), 3)
+                             if r["worst_spread"] is not None else None)}
+            for r in rows]

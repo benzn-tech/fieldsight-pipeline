@@ -273,3 +273,89 @@ def test_seconds_counts_only_the_windows_that_contributed():
     assert "[:len(vecs)]" not in body, (
         "the seconds are derived from a prefix of the windows again; that is only correct if "
         "every failed read was at the end")
+
+
+def test_the_evidence_is_reachable_without_sql():
+    """`for_session` answers "which group is this segment in". This answers "how much is that
+    group standing on" — the question somebody asks when a grouping looks wrong, and until it
+    reaches the API the only person who can ask it is whoever has database access."""
+    import inspect
+
+    body = _code_of(slg.evidence_for_session)
+    assert "group_label" in body and "GROUP BY" in body
+    assert "company_id = %s" in body, "an unscoped read answers with another tenant's groups"
+
+
+def test_a_null_count_stays_null_rather_than_becoming_zero():
+    """Rows written before migration 0052 genuinely do not know how much evidence they had. A
+    zero would claim "no evidence" about groups that had some — the same conflation this
+    feature has been caught by three times.
+
+    Driven, not grepped. The first version of this test looked for the string
+    `is not None else None`, which stayed present on the OTHER two fields when the one under
+    test was changed — a mutation walked straight past it.
+    """
+    class _EvCur:
+        def execute(self, sql, params=None):
+            return self
+
+        def fetchall(self):
+            return [{"group_label": "A", "labels": 2, "turns": None,
+                     "seconds": None, "worst_spread": None}]
+
+    class _EvConn:
+        def cursor(self, row_factory=None):
+            return _EvCur()
+
+    out = slg.evidence_for_session(_EvConn(), CO, SID)
+    assert out == [{"group": "A", "labels": 2, "turns": None,
+                    "seconds": None, "worstSpread": None}], out
+
+
+def test_the_evidence_never_gates_a_merge(monkeypatch):
+    """Measured on the first multi-speaker session: BOTH cross-call merges contained a member
+    built on a single turn, and the centroid that stood alone had the most evidence. A
+    minimum-evidence rule would have refused both merges and left the session as unusable as
+    before — a label with one turn in a call is precisely the case where the per-call
+    namespace tells you nothing.
+
+    **Driven, not grepped.** The first version listed forbidden spellings (`turns <`,
+    `min_turns`, …) and a mutation written as `evidence[i][0] >= 2` walked past every one of
+    them. A test that forbids the words somebody might use is a test that only catches the
+    words somebody might use.
+    """
+    import lambda_speaker_embed as se
+
+    same = np.ones(192, dtype=np.float32)
+    monkeypatch.setattr(se, "_window_audio",
+                        lambda folder, date, src, start, end: ("k", np.zeros(16000), 16000))
+    monkeypatch.setattr(se, "embed_audio", lambda clip, sr: same)
+
+    # Two calls. The second label contributes ONE turn; the first contributes two.
+    rows = se._rebind({"user_folder": "F", "date": "D", "turns": [
+        {"source_filename": "a.json", "speaker_label": "spk_0",
+         "start_sec": 0.0, "end_sec": 10.0},
+        {"source_filename": "a.json", "speaker_label": "spk_0",
+         "start_sec": 20.0, "end_sec": 30.0},
+        {"source_filename": "b.json", "speaker_label": "spk_0",
+         "start_sec": 0.0, "end_sec": 3.6}]})
+
+    assert len(rows) == 2, rows
+    assert rows[0]["group_label"] == rows[1]["group_label"], (
+        "the one-turn centroid was kept out of the group; measured, that refuses exactly the "
+        "merges this feature exists to make")
+    thin = next(r for r in rows if r["source_filename"] == "b.json")
+    assert thin["turns"] == 1, "the thin member was dropped rather than grouped"
+
+
+def _code_of(fn):
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    node = tree.body[0]
+    if (node.body and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)):
+        node.body = node.body[1:]
+    return ast.unparse(node)
