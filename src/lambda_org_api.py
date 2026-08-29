@@ -136,6 +136,7 @@ from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
 from repositories import (action_items, aliases, chunks, classification_feedback, companies,
+                          findings,
                           compliance_resolutions, content, content_edits, keyframes,
                           meeting_session, memberships, observations, programme,
                           programme_delay_flags, programme_import,
@@ -633,6 +634,8 @@ def dispatch(conn, event, method, route):
         return unname_speaker(conn, caller, m_un.group(1), event)
     if route == "/company/voiceprint-basis" and method == "PUT":
         return company_voiceprint_basis(conn, caller, event)
+    if route == "/speakers/known" and method == "GET":
+        return speaker_known(conn, caller, event)
     if route == "/voiceprints" and method == "GET":
         return list_voiceprints(conn, caller)
     m_vw = re.match(r"^/voiceprints/([^/]+)$", route)
@@ -1662,6 +1665,52 @@ def company_voiceprint_basis(conn, caller, event):
     logger.info("voiceprint consent basis for company %s set to %r by %s",
                 caller["company_id"], basis, caller["id"])
     return ok({"companyId": str(row["id"]), "basis": row["voiceprint_consent_basis"]})
+
+
+def speaker_known(conn, caller, event):
+    """GET /api/org/speakers/known?name=&site=&date= — what we already know about this name.
+
+    Answers ONE question: has somebody in this company already said who this person works
+    for. `known` is a record; `null` means nobody has, and the caller offers an empty field.
+
+    **It is deliberately not a suggestion endpoint.** The first draft of the plan had this
+    ranking candidates out of `findings.entity_name`, which would have put a co-occurrence
+    guess behind "please confirm Andy M is from ABC?" — and a click on that turns the guess
+    into a record stamped `employer_source: 'suggested'`. The register (Sign On Site) is the
+    source that can carry that prompt, because it is a record too; it becomes a second key in
+    this response when that adapter ships.
+
+    `trade` is display-only and says so in the contract. It is what the person DOES, not who
+    employs them.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    p = event.get("queryStringParameters") or {}
+    name = (p.get("name") or "").strip()
+    if not name:
+        return error("name required", 400)
+
+    company_id = str(caller["company_id"])
+    site = (p.get("site") or "").strip() or None
+    if site:
+        # Same rule as every other site parameter here: a site id from the query string is
+        # checked against the caller's company before it narrows anything, or it becomes a
+        # way to ask about another tenant's site by guessing a uuid.
+        owning = sites.get_site(conn, site)
+        if not owning or str(owning.get("company_id")) != company_id:
+            # 404 for both, deliberately: "no such site" and "somebody else's site" must not
+            # be distinguishable, or the endpoint becomes an oracle for which uuids exist.
+            return error("site not found in your company", 404)
+
+    row = voiceprints.employer_for_name(conn, company_id, name)
+    known = None
+    if row:
+        known = {"employer": row["employer_name"],
+                 "source": row["employer_source"],
+                 "profileId": str(row["id"]),
+                 "samples": int(row["samples"] or 0)}
+    return ok({"known": known,
+               "trade": findings.trade_heard_for(conn, company_id, name, site)})
 
 
 def _employer_result(name, source, profile):
