@@ -230,3 +230,46 @@ def test_the_artifact_reads_the_key_the_turn_builder_actually_writes():
         "the artifact still reads a key the turn builder does not write; `speaker_turns` "
         "will be empty on every session and the re-bind will never run")
     assert ex is not None
+
+
+# ---- how much evidence a group was built on ------------------------------
+
+
+def test_a_group_records_how_much_evidence_it_has():
+    """`spread` answers "did the evidence disagree with itself" and is NULL whenever a label
+    contributed one turn — measured 9 of the first 12 real rows. So it was empty for three
+    quarters of them, and the claim it was added for ("a group nobody can audit is a group
+    nobody can withdraw") was true of a quarter.
+
+    `turns` and `seconds` are always answerable, and they are what a human asks when a group
+    looks wrong: a group built on one 4-second turn and a group built on six turns totalling
+    90 seconds are different claims.
+    """
+    conn = _Conn()
+    slg.replace_for_session(conn, CO, SID, [
+        {"source_filename": "a.json", "speaker_label": "spk_0", "group_label": "A",
+         "spread": None, "turns": 1, "seconds": 4.2}])
+    ins = next(s for s in conn.cur.sql if s.startswith("INSERT"))
+    assert "turns, seconds" in ins
+    params = conn.cur.params[conn.cur.sql.index(ins)]
+    assert 1 in params and 4.2 in params
+
+
+def test_seconds_counts_only_the_windows_that_contributed():
+    """The bug this test exists for was mine, one commit old and never shipped.
+
+    The first version derived the seconds from the FIRST `len(vecs)` windows, which assumes
+    every read failure was at the end. A read can fail anywhere — one real session on TEST
+    failed on all of them — and the seconds would then describe windows that contributed
+    nothing to the centroid, while looking entirely plausible.
+    """
+    import inspect
+
+    import lambda_speaker_embed as se
+
+    body = inspect.getsource(se._rebind)
+    assert "secs += end - start" in body, (
+        "the seconds are no longer accumulated beside the vector they belong to")
+    assert "[:len(vecs)]" not in body, (
+        "the seconds are derived from a prefix of the windows again; that is only correct if "
+        "every failed read was at the end")
