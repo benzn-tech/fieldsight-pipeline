@@ -36,6 +36,20 @@ logger = logging.getLogger(__name__)
 EMBEDDING_DIMS = 192
 
 
+#: How an employer came to be recorded, kept beside the value rather than inferred from it. A
+#: name somebody typed and a name accepted from a register are different evidence, and they
+#: need separating later -- when a subcontractor changes, or when a source turns out to have
+#: been wrong for a month. Mirrored by a CHECK in migration 0050, and by `lambda_org_api`,
+#: which imports THIS tuple rather than restating it: the last time an enum lived in two
+#: places, one side sent `notice` while the other understood only `attestation`, and the
+#: resulting 400 read as a configuration problem for two days.
+#:
+#: MODULE level, deliberately. `STANDING_BASES` beside it is local to `upsert_profile` because
+#: only that function reads it; this one has two readers in two files, and a constant one of
+#: them cannot import is a constant they will each write down separately.
+EMPLOYER_SOURCES = ("typed", "suggested", "sign_on_site")
+
+
 def _vector_literal(embedding):
     """pgvector's text input form. Built here so the fake in tests only ever sees a string
     and the suite never needs the extension installed."""
@@ -132,15 +146,6 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
     # and the refusal was the pre-existing strict-rule error — so it looked exactly like a
     # company that had settled nothing rather than like two halves disagreeing. Found by the
     # first live enrolment attempt, not by any test, because both halves were tested apart.
-    #: How an employer came to be recorded, kept beside the value rather than inferred from
-    #: it. A name somebody typed and a name accepted from a register are different evidence,
-    #: and they need separating later -- when a subcontractor changes, or when a source turns
-    #: out to have been wrong for a month. Mirrored by a CHECK in migration 0050, and a test
-    #: pins the two lists against each other: the last time an enum lived in two places, one
-    #: side sent `notice` while the other understood only `attestation`, and the resulting
-    #: 400 read as a configuration problem for two days.
-    EMPLOYER_SOURCES = ("typed", "suggested", "sign_on_site")
-
     employer_name = (employer_name or "").strip() or None
     employer_source = (employer_source or "").strip() or None
     if (employer_name is None) != (employer_source is None):
@@ -272,6 +277,27 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
          linked_by, user_id, linked_on, consent_basis, asserted_by,
          external_ref, external_source,
          employer_name, employer_source, employer_set_by, employer_name),
+    ).fetchone()
+
+
+def get_profile(conn, company_id, voiceprint_id) -> dict | None:
+    """One profile, by id, within a company.
+
+    Company-pinned like every other read in this module: an unpinned lookup would answer for
+    another tenant's row given only a uuid, and the failure is silent — the caller gets a
+    plausible profile and never learns it was the wrong one. `test_no_cross_company_voice_
+    identity` asserts the class of that.
+
+    Exists because `upsert_profile` returns the row as it was FOUND, and the employer update
+    runs after that fetch: reading the employer off the returned object would report the
+    previous value, or None on a first write, for a request that had just stored one.
+    """
+    _require_company(company_id)
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, display_name, status, employer_name, employer_source, "
+        "       employer_set_by, employer_set_at "
+        "FROM speaker_voiceprints WHERE id = %s AND company_id = %s",
+        (voiceprint_id, company_id),
     ).fetchone()
 
 
