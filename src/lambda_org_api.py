@@ -1664,6 +1664,34 @@ def company_voiceprint_basis(conn, caller, event):
     return ok({"companyId": str(row["id"]), "basis": row["voiceprint_consent_basis"]})
 
 
+def _employer_result(name, source, profile):
+    """What to tell the caller about the employer they sent, if any.
+
+    Three outcomes and they are genuinely different:
+
+      nothing sent            -> None
+      stored on a profile     -> the values READ BACK from the row
+      sent with no profile    -> stored=false and the reason
+
+    The third is the one worth the code. Naming a speaker enrols only when the subject's own
+    consent is supplied or the company has settled a standing basis; without either there is
+    no `speaker_voiceprints` row, so the employer has nowhere to live. The correction itself
+    still succeeds — an optional field must not be able to fail the thing it decorates — but
+    a caller that sent a value and gets `null` back cannot tell that from "we recorded
+    nothing", and would have no reason to ask again.
+    """
+    if not name:
+        return None
+    if not profile:
+        return {"stored": False,
+                "reason": "no voiceprint profile was created for this correction, so there "
+                          "is nowhere to record an employer: this company has settled no "
+                          "consent basis and the request carried no consent_given"}
+    return {"stored": True,
+            "name": profile.get("employer_name"),
+            "source": profile.get("employer_source")}
+
+
 def speaker_corrections(conn, caller, session_base, event):
     """POST /api/org/sessions/{session_base}/speaker-corrections
 
@@ -1713,6 +1741,23 @@ def speaker_corrections(conn, caller, session_base, event):
     err = _same_company_as_folder(conn, caller, folder, "speaker correction")
     if err is not None:
         return err
+
+    # Who this person WORKS FOR, which is not whose data this is. Optional on purpose: no
+    # register, no employer, and the correction that builds the voiceprint must still work.
+    employer_name = (body.get("employer_name") or "").strip() or None
+    employer_source = (body.get("employer_source") or "").strip() or None
+    if (employer_name is None) != (employer_source is None):
+        return error("employer_name and employer_source travel together: a name with no "
+                     "source cannot be audited, and a source with no name records nothing",
+                     400)
+    if employer_source is not None and employer_source not in voiceprints.EMPLOYER_SOURCES:
+        return error(f"employer_source must be one of {voiceprints.EMPLOYER_SOURCES}", 400)
+    # REFUSED rather than ignored until the Sign On Site adapter exists. A field one side
+    # sends and the other silently drops is this repository's most-repeated failure; the
+    # sender would get a 202 and never learn the value went nowhere.
+    if body.get("employer_ref") is not None:
+        return error("employer_ref is not accepted yet: it is the sign-in register's key and "
+                     "nothing reads it until that adapter ships", 400)
 
     name = (body.get("display_name") or "").strip()
     if not name:
@@ -1768,6 +1813,7 @@ def speaker_corrections(conn, caller, session_base, event):
     # not the employer, and not whoever is doing the labelling, who is usually a third
     # person again. The two effects are reported separately for that reason.
     enrol = None
+    profile_row = None
     _linked_person, _linked_on = None, "not-requested"
     # Two ways in, and the second is why the library was empty.
     #
@@ -1820,11 +1866,17 @@ def speaker_corrections(conn, caller, session_base, event):
                 asserted_by=str(caller["id"]) if attest else None,
                 user_id=str(person["id"]) if person else None,
                 linked_by=str(caller["id"]) if person else None,
-                linked_on=matched_on if person else None)
+                linked_on=matched_on if person else None,
+                employer_name=employer_name, employer_source=employer_source,
+                employer_set_by=str(caller["id"]) if employer_name else None)
         except ValueError as exc:
             return error(str(exc), 400)
         _linked_person, _linked_on = person, matched_on
         enrol = {"voiceprint_id": str(profile["id"])}
+        # Re-read rather than trusting the write. `upsert_profile` returns the EXISTING row
+        # when there was one, and the employer update runs after that row was fetched — so
+        # the object in hand carries the previous employer, not the one just stored.
+        profile_row = voiceprints.get_profile(conn, company_id, str(profile["id"]))
 
     session_turns = _session_turns(conn, folder, date_m.group(1), session_base)
     request_id = uuid.uuid4().hex
@@ -1872,6 +1924,13 @@ def speaker_corrections(conn, caller, session_base, event):
         # escape for unlinked profiles and every profile was unlinked.
         "linkedTo": ({"userId": str(_linked_person["id"]), "matchedOn": _linked_on}
                      if _linked_person else None),
+        # Read back from the row, never echoed from the request. And when there was no row to
+        # write to, said out loud: `upsert_profile` runs only inside the consent branch, so a
+        # company that has settled no basis, correcting without `consent_given`, creates no
+        # profile at all — and today that is the common case, not the edge one. Returning a
+        # bare null for a request that carried an employer would make "we stored it" and
+        # "there was nowhere to put it" the same answer.
+        "employer": _employer_result(employer_name, employer_source, profile_row),
         "linkReason": None if _linked_person else _linked_on,
     }, 202)
 
