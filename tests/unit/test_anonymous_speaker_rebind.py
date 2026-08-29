@@ -359,3 +359,36 @@ def _code_of(fn):
             and isinstance(node.body[0].value, ast.Constant)):
         node.body = node.body[1:]
     return ast.unparse(node)
+
+
+def test_the_evidence_covers_every_session_on_the_day(monkeypatch):
+    """A day holds more than one session, and the two lookups must agree on which.
+
+    The mapping is built by iterating every session base on the page; the evidence took
+    `sorted(bases)[0]`. On the day this was written that picked a session which had never been
+    re-bound, so the payload carried 77 grouped segments beside an EMPTY evidence list — each
+    half internally consistent, and the pair obviously wrong to anybody who looked.
+
+    Driven over two bases, because the single-base case passes either way — which is why the
+    defect shipped.
+    """
+    import lambda_org_api as org
+
+    asked = []
+    monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "on")
+    monkeypatch.setattr(org.voiceprints, "live_turn_names", lambda c, co, b: [])
+    # Non-empty, because the evidence block only runs when something actually mapped — and a
+    # stub that returns no groups would test the branch where neither half runs.
+    monkeypatch.setattr(org.speaker_label_groups, "for_session",
+                        lambda c, co, b: {("x_sid" + "a" * 32 + "_c0000.json", "spk_0"): "A"})
+    monkeypatch.setattr(org.speaker_label_groups, "evidence_for_session",
+                        lambda c, co, b: asked.append(b) or [{"group": "A", "labels": 1,
+                                                              "turns": 2, "seconds": 9.0,
+                                                              "worstSpread": None}])
+    payload = {"speaker_segments": [
+        {"source_filename": "x_sid" + "a" * 32 + "_c0000.json", "speaker_label": "spk_0"},
+        {"source_filename": "y_sid" + "b" * 32 + "_c0000.json", "speaker_label": "spk_0"}]}
+    org._apply_speaker_names(object(), {"id": "u", "company_id": CO}, payload)
+
+    assert len(asked) == 2, f"the evidence was asked for {len(asked)} of 2 sessions: {asked}"
+    assert len(payload["speakerGroups"]) == 2

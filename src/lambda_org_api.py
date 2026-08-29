@@ -6897,8 +6897,16 @@ def _apply_speaker_names(conn, caller, payload):
         # group A built on" is whoever has SQL access — which is not the person reading the
         # transcript and noticing it looks wrong.
         try:
-            payload["speakerGroups"] = speaker_label_groups.evidence_for_session(
-                conn, str(caller["company_id"]), sorted(b for b in bases if b)[0])
+            # EVERY base, the same way the mapping above is built. A day holds more than one
+            # session, and taking the first sorted base returned the evidence for whichever
+            # session happened to sort first — which on the day this was written was a
+            # session that had never been re-bound, so the payload carried 77 grouped
+            # segments and an empty evidence list beside them.
+            ev = []
+            for base in sorted(b for b in bases if b):
+                ev.extend(speaker_label_groups.evidence_for_session(
+                    conn, str(caller["company_id"]), base))
+            payload["speakerGroups"] = ev
         except Exception:
             logger.exception("speaker group evidence unreadable; the groups still apply")
     return payload
