@@ -845,9 +845,12 @@ def _admit_harvest(folder, date, candidates):
             # drift apart, which is precisely how this floor came to be twice too high.
             continue
         key, clip, sr = _window_audio(folder, date, t["source_filename"], start, end)
-        frames = [embed_audio(f, sr) for f in _frames(clip, sr)]
-        spread = vp.frame_spread(frames)
-        verdict = vp.window_is_homogeneous(frames, MAX_FRAME_SPREAD)
+        # Through `judged_window`, the same helper both enrolment paths use. A cluster member
+        # is a whole TURN, so under batching it is a whole chunk — the identical 109-second
+        # window that refused the anchor. Harvest was the third copy of this check and the
+        # last one still judging turns whole, which is why it admitted nothing.
+        clip, start, end, n_frames, spread, verdict = judged_window(clip, sr, start, key)
+        frames = [None] * n_frames        # only its length is read below
         if verdict is not True:
             # None ("could not check") refused alongside False, exactly as the anchor's own
             # check does. Admitting the unjudgeable is how a guard becomes decoration.
@@ -860,10 +863,17 @@ def _admit_harvest(folder, date, candidates):
         logger.info("harvest: %s admitted (frames=%d spread=%s)%s", c["turn_ref"],
                     len(frames), "n/a" if spread is None else "%.3f" % spread,
                     _limit_note())
-        admitted.append({"embedding": [float(x) for x in c["vector"]],
+        # Embedded from the clip that was ACCEPTED, not from `c["vector"]`. That vector is
+        # `_propagate`'s whole-turn embedding, so storing it after narrowing would file the
+        # 109 seconds the guard refused under a row recording the ten it accepted — the same
+        # mismatch the correction path had, and just as invisible, because each half is
+        # internally consistent.
+        admitted.append({"embedding": [float(x) for x in embed_audio(clip, sr)],
                          "s3_key": key, "window": [start, end],
                          "admitted_max_spread": _admitted_limit()})
-        seconds += duration
+        # The budget counts what is STORED, not what was offered. Charging a 60 s allowance
+        # the full turn length would spend it in one member and call the rest a cap.
+        seconds += end - start
     logger.info("harvest: %d of %d cluster members admitted (%.1fs)",
                 len(admitted), len(candidates), seconds)
     return admitted

@@ -132,26 +132,27 @@ def test_the_diagnostic_reports_the_limit_in_force_not_the_compiled_in_one(stub_
 
 
 def test_no_call_site_is_left_on_the_default(monkeypatch):
-    """The behavioural tests above reach two of the four sites.
+    """The behavioural tests above reach two of the three sites.
 
-    Harvest and the correction-carried enrolment are two more, and a site left on the default
-    would loosen the guard for one kind of sample and not the kind stored beside it. This
-    reads the source because that is the only check that covers a site no test drives.
+    A site left on the default would loosen the guard for one kind of sample and not the
+    kind stored beside it. This reads the source because that is the only check that covers a
+    site no test drives.
 
     The fourth is the narrowed sub-window inside `judged_window`: when a whole turn is too
     wide, enrolment re-tests the tightest 10 s inside it, and that re-test MUST use the same
     limit — narrowing under a looser one would be a second, quieter way to admit a window the
     guard rejected.
 
-    The count went 5 -> 4 when the correction-carried path stopped making its own call and
-    started going through `judged_window`. Fewer sites is the improvement: the two paths had
-    the same check written twice, which is why a fix to one of them changed nothing.
+    The count has gone 5 -> 4 -> 3 as the correction-carried path and then harvest stopped
+    making their own calls and went through `judged_window`. **Fewer is the improvement, and
+    this counter should be read that way rather than as a number to preserve.** The same rule
+    was written three times; a fix to one copy changed nothing, twice.
     """
     import inspect
     src = inspect.getsource(se)
     calls = [line for line in src.splitlines() if "vp.window_is_homogeneous(" in line
              and "def " not in line]
-    assert len(calls) == 4, "call sites moved; this test counts them on purpose: %r" % calls
+    assert len(calls) == 3, "call sites moved; this test counts them on purpose: %r" % calls
     # The argument may be on the following line where the call wraps, so check the source
     # region rather than the single line.
     for i, line in enumerate(src.splitlines()):

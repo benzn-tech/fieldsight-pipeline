@@ -171,3 +171,50 @@ def test_the_narrowed_clip_is_what_gets_embedded(monkeypatch):
     assert "v = embed_audio(clip, sr)" in after, (
         "the narrowed clip is not re-embedded, so the stored vector is the window that was "
         "refused")
+
+
+def test_harvest_goes_through_the_same_narrowing_too():
+    """The third copy, and the one the product owner's idea depends on.
+
+    "Rename Speaker One to Anthony, then collect everything he said and enrol it" is
+    `_admit_harvest`, and it already exists. It admitted nothing, for the same reason the
+    anchor was refused: a cluster member is a whole TURN, so under batching it is the same
+    109-second window. The rule was written three times and fixing one copy changed nothing,
+    twice.
+    """
+    import inspect
+
+    src = inspect.getsource(se)
+    body = src[src.index("def _admit_harvest"):]
+    nxt = body.find("\ndef ", 1)
+    body = body[:nxt] if nxt != -1 else body
+    assert "judged_window(" in body, (
+        "harvest still judges whole turns; every cluster member of a batched session is "
+        "refused and the harvest is silently always empty")
+    assert "vp.window_is_homogeneous(" not in body, "harvest kept its own copy of the rule"
+
+
+def test_a_harvested_sample_is_embedded_from_the_window_it_records():
+    """`c["vector"]` is `_propagate`'s WHOLE-turn embedding. Storing it after narrowing files
+    the 109 seconds the guard refused under a row recording the ten it accepted — invisible,
+    because each half is internally consistent."""
+    import inspect
+
+    # Code lines only. The comment above the fix names `c["vector"]` to say what it stopped
+    # doing, and a source scan that cannot tell an explanation from an instruction reports
+    # the explanation.
+    code = [l for l in inspect.getsource(se._admit_harvest).splitlines()
+            if not l.lstrip().startswith("#")]
+    assert not any('c["vector"]' in l for l in code), (
+        "the harvested sample stores the whole-turn vector, not the narrowed window it "
+        "claims in `window`")
+    assert any("embed_audio(clip, sr)" in l for l in code)
+
+
+def test_the_harvest_budget_counts_what_is_stored():
+    """`ENROL_MAX_SECONDS` is an allowance for stored audio. Charging it the full turn length
+    would spend 60 s on one member and call the remaining caps a limit."""
+    import inspect
+
+    body = inspect.getsource(se._admit_harvest)
+    assert "seconds += end - start" in body, "the budget still charges the whole turn"
