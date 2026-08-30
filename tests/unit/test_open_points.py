@@ -33,7 +33,6 @@ import open_points as op
     "from memory it was three weeks",
     "from recollection they were on site Tuesday",
     "我记得这个柱子是 150",
-    "我觉得应该走第八章",
     "记不清了，回头查一下",
     "记不得是哪一版",
     "不确定还有没有库存",
@@ -54,6 +53,10 @@ def test_markers_fire(text):
     "Ben confirmed the re-inspection is booked.",
     "他们周二来换门。",
     "这批货已经到了。",
+    # A STANCE, not an uncertainty -- "I reckon we should use chapter 8". This
+    # was in the positive list until a real meeting was measured; see
+    # test_a_stance_is_not_an_uncertainty below.
+    "我觉得应该走第八章",
     "",
     "   ",
 ])
@@ -329,3 +332,33 @@ def test_thinking_is_sent_explicitly():
 
     op.attach_resolutions([dict(_PTS[0])], call_llm)
     assert seen["enable_thinking"] is False
+
+
+def test_a_marker_with_no_claim_is_not_an_open_point():
+    """An open point is an assertion PLUS an uncertainty. Hedging on its own is
+    the other half missing.
+
+    Measured, not supposed: on a real 71-minute meeting the marker list's only
+    surviving hits included a bare "哦，好像是" -- a marker, no assertion, nothing
+    to resolve. The prompt already says both halves are required; this is the
+    half of that rule the code can enforce."""
+    admitted, stats = op.admit([_candidate(claim="")], TURNS)
+    assert admitted == []
+    assert stats["rejected"] == {"malformed": 1}
+
+    admitted, stats = op.admit([_candidate(claim=None)], TURNS)
+    assert admitted == []
+    assert stats["rejected"] == {"malformed": 1}
+
+
+def test_a_stance_is_not_an_uncertainty():
+    """我觉得 was in the marker list until it was measured. On a real meeting it
+    produced three of five hits and none was an open point: in Chinese it means
+    "in my view" or "what I mean is" far more often than "I am unsure of this",
+    which is what the English "I think" it resembles would suggest. A stance
+    marker admits every opinion in the meeting."""
+    assert op.has_uncertainty_marker("我觉得这个方案更好") is False
+    assert op.has_uncertainty_marker("我觉得你说的是另一件事") is False
+    # The genuine recall markers beside it are unaffected.
+    assert op.has_uncertainty_marker("我记得是 150") is True
+    assert op.has_uncertainty_marker("记不清了") is True

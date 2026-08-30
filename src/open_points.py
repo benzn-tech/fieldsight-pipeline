@@ -48,7 +48,12 @@ _MARKERS = re.compile(
     # Chinese. No subject marker is available -- Chinese drops pronouns freely --
     # so the interrogative particles are excluded instead: 吗/呢 turn 查一下 into
     # a request rather than a note-to-self.
-    r"|我记得|我觉得|记不清|记不得|不确定|不太确定"
+    # 我觉得 is NOT here, and it was, until it was measured. On a real
+    # 71-minute meeting it produced three of the five hits and none was an
+    # open point: in Chinese it overwhelmingly means "in my view" or "what I
+    # mean is" -- a STANCE -- where the English "I think" it looks like leans
+    # uncertain. A stance marker admits every opinion in the meeting.
+    r"|我记得|记不清|记不得|不确定|不太确定"
     r"|回头(查|确认)|回去(查|确认)|再确认"
     r"|大概是|应该是|好像是",
     re.IGNORECASE,
@@ -166,8 +171,16 @@ def admit(candidates, turns, *, check=None):
             continue
         quote = c.get("quote")
         subject = c.get("subject")
+        claim = c.get("claim")
+        # `claim` is required, not decorative. An open point is an assertion PLUS
+        # an uncertainty, and hedging with no assertion is the other half missing.
+        # Measured: on a real 71-minute meeting the gate's only surviving hits
+        # included a bare "哦，好像是" -- a marker, no claim, nothing to resolve.
+        # The prompt already says both halves are required; this is the half of
+        # that rule the code can actually enforce.
         if not (isinstance(quote, str) and quote.strip()
-                and isinstance(subject, str) and subject.strip()):
+                and isinstance(subject, str) and subject.strip()
+                and isinstance(claim, str) and claim.strip()):
             reject("malformed")
             continue
 
@@ -208,7 +221,7 @@ def admit(candidates, turns, *, check=None):
         admitted.append({
             "quote": quote,
             "at": c.get("at"),
-            "claim": c.get("claim") if isinstance(c.get("claim"), str) else "",
+            "claim": claim,
             # An unknown kind falls to the one that promises nothing. Routing a
             # made-up kind to a resolver would answer a question nobody asked,
             # confidently.
