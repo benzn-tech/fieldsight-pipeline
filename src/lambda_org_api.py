@@ -7228,6 +7228,27 @@ def _presign_target_is_deleted(conn, key) -> bool:
     """
     if conn is None or not key:
         return False
+    parts = key.split("/")
+    if parts and parts[0] == "reports" and len(parts) > 3:
+        # reports/{date}/{folder}/... -- note the order is the OTHER WAY ROUND from every
+        # other presignable shape, and reading it as (folder, date) makes every lookup miss
+        # silently.
+        #
+        # A day report is a SYNTHESIS of the day, so its key carries no session base and the
+        # sid match below can never fire for it. Measured on prod 2026-08-31:
+        # reports/2026-08-14/Ben_UCPK2/daily_report.json still names the session deleted on
+        # 2026-08-16 and still presigned, seventeen days later. Its LastModified has not
+        # changed since it was written, so the nightly rebuild does not revisit past days --
+        # the exposure is permanent, not the one-night window it looks like.
+        #
+        # ANY deletion that day hides the whole document. There is no per-session
+        # granularity inside a day report to filter on, and the alternative to refusing it
+        # is serving it. `lambda_ask_agent` already takes exactly this position on exactly
+        # these objects ("has deleted recordings -- not serving a stored report"), and the
+        # legacy gateway takes it on the cross-folder `summary_report.json`. This is the
+        # third copy of one rule, and the two that existed disagreed about the document that
+        # actually holds the words.
+        return bool(_deleted_sessions_for_day(conn, parts[2], parts[1]))
     sid = _session_of(key)
     if not sid:
         return False

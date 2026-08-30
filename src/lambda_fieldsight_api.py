@@ -361,6 +361,21 @@ def _presign_key_is_deleted(s3_key):
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", date or ""):
         return False
     bases = _deleted_bases(folder, date)
+    if top == "reports":
+        # A day report is a SYNTHESIS of the day, so its key carries no session base and the
+        # `base in key` test below can never fire for it -- the check above caught the
+        # cross-folder `summary_report.json` and signed the per-folder `daily_report.json`
+        # that actually holds the words. Measured on prod 2026-08-31:
+        # reports/2026-08-14/Ben_UCPK2/daily_report.json still names the session deleted on
+        # 2026-08-16 and still presigns, seventeen days later. The object's LastModified is
+        # unchanged since it was written, so the nightly rebuild does not revisit past days
+        # and the exposure is permanent rather than the one-night window it looks like.
+        #
+        # ANY deletion that day hides the whole document, which is what `lambda_ask_agent`
+        # already does with the same objects ("has deleted recordings -- not serving a
+        # stored report"). There is no per-session granularity inside a day report to filter
+        # on, and the alternative to refusing it is serving it.
+        return bool(bases)
     return bool(bases) and any(b in s3_key for b in bases)
 
 
