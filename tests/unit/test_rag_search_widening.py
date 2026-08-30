@@ -12,7 +12,7 @@ the ACL; ask-agent would have to be handed a way to ask "what dates exist",
 which is a way to ask about days it cannot read.
 
 What is asserted here is the ROUTING -- when widening runs, when it must not,
-and that the scope reported back is the range really used. Whether the SQL is
+and that the basis reported back is the range really used. Whether the SQL is
 right is a question only a database can answer, and
 tests/integration/test_latest_visible_date.py asks it there.
 """
@@ -91,7 +91,7 @@ def test_a_dated_search_that_hits_does_not_widen(wired):
                                    widen_when_empty=True), None)
 
     assert len(calls) == 1
-    assert out["scope"] == {"from": "2026-08-29", "to": "2026-08-29", "widened": False}
+    assert out["basis"] == {"from": "2026-08-29", "to": "2026-08-29", "widened": False}
 
 
 def test_an_empty_dated_search_retries_on_the_nearest_earlier_day(wired):
@@ -103,7 +103,7 @@ def test_an_empty_dated_search_retries_on_the_nearest_earlier_day(wired):
 
     assert seen["on_or_before"] == "2026-08-29"          # never looks forward
     assert calls[1] == {"date_from": "2026-08-27", "date_to": "2026-08-27"}
-    assert out["chunks"] and out["scope"] == {"from": "2026-08-27", "to": "2026-08-27",
+    assert out["chunks"] and out["basis"] == {"from": "2026-08-27", "to": "2026-08-27",
                                               "widened": True}
 
 
@@ -116,7 +116,7 @@ def test_widening_is_opt_in(wired):
     out = rag.lambda_handler(event(date_from="2026-08-29", date_to="2026-08-29"), None)
 
     assert len(calls) == 1
-    assert out["scope"]["widened"] is False
+    assert out["basis"]["widened"] is False
 
 
 def test_an_undated_search_never_widens(wired):
@@ -132,12 +132,12 @@ def test_an_undated_search_never_widens(wired):
     out = rag.lambda_handler(event(widen_when_empty=True), None)
 
     assert len(calls) == 1
-    assert out["scope"] == {"from": None, "to": None, "widened": False}
+    assert out["basis"] == {"from": None, "to": None, "widened": False}
 
 
 def test_nothing_to_widen_onto_stays_empty_and_says_so(wired):
-    """A caller whose whole corpus is empty gets an empty answer with a scope
-    that shows what was tried -- not a scope claiming a day it never read."""
+    """A caller whose whole corpus is empty gets an empty answer with a basis
+    that shows what was tried -- not a basis claiming a day it never read."""
     calls = wire_search(wired, [[]])
     wire_latest(wired, None)
 
@@ -146,12 +146,12 @@ def test_nothing_to_widen_onto_stays_empty_and_says_so(wired):
 
     assert len(calls) == 1
     assert out["chunks"] == []
-    assert out["scope"] == {"from": "2026-08-29", "to": "2026-08-29", "widened": False}
+    assert out["basis"] == {"from": "2026-08-29", "to": "2026-08-29", "widened": False}
 
 
-def test_every_early_return_carries_a_scope(wired):
-    """`result.get("scope")` coming back None must never be how a caller learns
-    the search failed -- it reads as 'this deploy predates scope' instead, and
+def test_every_early_return_carries_a_basis(wired):
+    """`result.get("basis")` coming back None must never be how a caller learns
+    the search failed -- it reads as 'this deploy predates the field' instead, and
     ask-agent would silently report the range it asked for as the range used.
     """
     for ev, patch in (
@@ -166,4 +166,4 @@ def test_every_early_return_carries_a_scope(wired):
             wired.setattr(rag.scope, "visible_scope",
                           lambda conn, caller: {"site_ids": set(), "author_ids": None})
         out = rag.lambda_handler(ev, None)
-        assert "scope" in out, f"missing scope on {patch or 'guard'} return"
+        assert "basis" in out, f"missing basis on {patch or 'guard'} return"

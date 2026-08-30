@@ -1,6 +1,6 @@
 """
 NOTE on the assertions below: they check the fields under test rather than the
-whole dict. Every return path now also carries `scope` (the date range actually
+whole dict. Every return path now also carries `basis` (the date range actually
 searched, see test_rag_search_widening.py), and an exact-dict assertion here
 would fail on that addition while testing nothing about it -- the same way it
 would fail on the next one.

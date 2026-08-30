@@ -72,14 +72,19 @@ def _search(event, context):
     # widening a filtered LIST would show rows outside the filter they set.
     widen = bool(event.get("widen_when_empty"))
 
-    # Carried on EVERY return below, empty search included. A caller reading
-    # `result.get("scope")` and finding None cannot tell "this search matched
-    # nothing" from "this deploy predates scope", and ask-agent's fallback in
-    # that case is to report the range it ASKED for as the range used.
-    scope_used = {"from": date_from, "to": date_to, "widened": False}
+    # What the answer will be based on. Carried on EVERY return below, empty
+    # search included: a caller reading `result.get("basis")` and finding None
+    # cannot tell "this search matched nothing" from "this deploy predates the
+    # field", and ask-agent's fallback in that case is to report the range it
+    # ASKED for as the range actually used.
+    #
+    # Named `basis` and not `scope` deliberately. `scope` already means two
+    # other things on this path -- the request's report/transcript/both, and
+    # `repositories.scope`, the ACL primitive imported in this very file.
+    basis = {"from": date_from, "to": date_to, "widened": False}
 
     if not sub or not qv:
-        return {"chunks": [], "error": "missing sub or query_embedding", "scope": scope_used}
+        return {"chunks": [], "error": "missing sub or query_embedding", "basis": basis}
 
     # Reuse a module-level connection across warm invokes — reconnecting to
     # Aurora cost ~1-2s per call and dominated search latency. Read-only path,
@@ -88,7 +93,7 @@ def _search(event, context):
     caller = users.get_user_by_sub(conn, sub)
     if caller is None:
         logger.info("rag-search: caller not provisioned for sub=%s", sub)
-        return {"chunks": [], "error": "caller not provisioned", "scope": scope_used}
+        return {"chunks": [], "error": "caller not provisioned", "basis": basis}
 
     # Fail-safe: ALWAYS scope through the dashboard's ACL primitive (per-author
     # graded visibility). No GRADED_ROLES gate here — rag-search is a new
@@ -116,7 +121,7 @@ def _search(event, context):
             site_ids = [s for s in site_ids if str(s) == str(matched_id)]
 
     if not site_ids:
-        return {"chunks": [], "site_count": 0, "scope": scope_used}
+        return {"chunks": [], "site_count": 0, "basis": basis}
 
     rows = chunks.search_chunks(conn, qv, site_ids, k=k, author_ids=author_ids,
                                 date_from=date_from, date_to=date_to)
@@ -139,7 +144,7 @@ def _search(event, context):
         if latest:
             rows = chunks.search_chunks(conn, qv, site_ids, k=k, author_ids=author_ids,
                                         date_from=latest, date_to=latest)
-            scope_used = {"from": latest, "to": latest, "widened": True}
+            basis = {"from": latest, "to": latest, "widened": True}
     # Synthesis-time safety net (spec §4): normalize retrieved chunk text with
     # the company's active aliases, so a chunk not yet re-embedded still reads
     # corrected before the LLM. site_ids here are the caller's accessible sites.
@@ -155,4 +160,4 @@ def _search(event, context):
     # and report_date is datetime.date -- Lambda's JSON marshaller can't
     # serialize either. Coerce to plain strings before returning.
     rows = json.loads(json.dumps(rows, default=str))
-    return {"chunks": rows, "site_count": len(site_ids), "scope": scope_used}
+    return {"chunks": rows, "site_count": len(site_ids), "basis": basis}

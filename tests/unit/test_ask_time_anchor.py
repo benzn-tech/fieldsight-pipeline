@@ -5,7 +5,7 @@ TDD for the two layers:
   * layer 2 -- the caller's zone plus a rules-only slot read narrow the search
     to the days the question names. The payload rag-search receives gains
     date_from/date_to, which its SQL has always accepted and Ask has never sent.
-  * layer 1 -- the response carries a structured `scope`. It is computed from
+  * layer 1 -- the response carries a structured `basis`. It is computed from
     what came back, NOT written by the model: the screen renders it as a pill
     and the voice path as a clause, and a model asked to phrase it would drift
     between the two and would invent the count.
@@ -80,7 +80,7 @@ NOW = "2026-08-30T09:00:00+00:00"     # 21:00 NZST on the 30th -- still the 30th
 # --------------------------------------------------------------------------
 
 def test_a_time_word_and_a_zone_narrow_the_search(monkeypatch):
-    client, _ = wire(monkeypatch, [{"chunks": [CHUNK], "scope": {"from": "2026-08-29",
+    client, _ = wire(monkeypatch, [{"chunks": [CHUNK], "basis": {"from": "2026-08-29",
                                                                 "to": "2026-08-29",
                                                                 "widened": False}}])
 
@@ -127,54 +127,54 @@ def test_a_narrowed_search_asks_rag_search_to_widen_when_it_finds_nothing(monkey
 
 
 # --------------------------------------------------------------------------
-# layer 1 -- scope comes back, and the model did not write it
+# layer 1 -- basis comes back, and the model did not write it
 # --------------------------------------------------------------------------
 
-def test_scope_reports_the_dates_actually_used(monkeypatch):
-    wire(monkeypatch, [{"chunks": [CHUNK], "scope": {"from": "2026-08-27",
+def test_basis_reports_the_dates_actually_used(monkeypatch):
+    wire(monkeypatch, [{"chunks": [CHUNK], "basis": {"from": "2026-08-27",
                                                      "to": "2026-08-27",
                                                      "widened": True}}])
 
     out = ask(question="昨天发生了什么", tz="Pacific/Auckland", now=NOW)
 
-    assert out["scope"]["from"] == "2026-08-27"
-    assert out["scope"]["widened"] is True
-    assert out["scope"]["chunks"] == 1
-    assert out["scope"]["dates"] == ["2026-08-27"]
+    assert out["basis"]["from"] == "2026-08-27"
+    assert out["basis"]["widened"] is True
+    assert out["basis"]["chunks"] == 1
+    assert out["basis"]["dates"] == ["2026-08-27"]
 
 
-def test_scope_is_computed_not_generated(monkeypatch):
+def test_basis_is_computed_not_generated(monkeypatch):
     """The model is handed the excerpts and writes prose. If it claims three
     meetings when one chunk came back, nothing downstream can tell -- so the
     count is never the model's to produce."""
     wire(monkeypatch,
-         [{"chunks": [CHUNK], "scope": {"from": "2026-08-27", "to": "2026-08-27", "widened": True}}],
+         [{"chunks": [CHUNK], "basis": {"from": "2026-08-27", "to": "2026-08-27", "widened": True}}],
          answer="I looked at 3 meetings across all of August.")
 
     out = ask(question="昨天发生了什么", tz="Pacific/Auckland", now=NOW)
 
-    assert out["scope"]["chunks"] == 1
-    assert out["scope"]["dates"] == ["2026-08-27"]
+    assert out["basis"]["chunks"] == 1
+    assert out["basis"]["dates"] == ["2026-08-27"]
 
 
-def test_scope_is_present_even_when_nothing_matched(monkeypatch):
-    """`.get("scope")` returning None must never be how a caller learns the
-    search was empty -- that reads as 'this build has no scope' instead."""
-    wire(monkeypatch, [{"chunks": [], "scope": {"from": "2026-08-29",
+def test_basis_is_present_even_when_nothing_matched(monkeypatch):
+    """`.get("basis")` returning None must never be how a caller learns the
+    search was empty -- that reads as 'this build has no basis field' instead."""
+    wire(monkeypatch, [{"chunks": [], "basis": {"from": "2026-08-29",
                                                 "to": "2026-08-29", "widened": False}}])
 
     out = ask(question="昨天发生了什么", tz="Pacific/Auckland", now=NOW)
 
-    assert out["scope"]["chunks"] == 0
-    assert out["scope"]["dates"] == []
+    assert out["basis"]["chunks"] == 0
+    assert out["basis"]["dates"] == []
 
 
-def test_scope_is_present_on_an_unfiltered_ask(monkeypatch):
+def test_basis_is_present_on_an_unfiltered_ask(monkeypatch):
     wire(monkeypatch, [{"chunks": [CHUNK]}])
     out = ask(question="混凝土的问题", tz="Pacific/Auckland", now=NOW)
-    assert out["scope"]["from"] is None and out["scope"]["to"] is None
-    assert out["scope"]["widened"] is False
-    assert out["scope"]["dates"] == ["2026-08-27"]
+    assert out["basis"]["from"] is None and out["basis"]["to"] is None
+    assert out["basis"]["widened"] is False
+    assert out["basis"]["dates"] == ["2026-08-27"]
 
 
 # --------------------------------------------------------------------------

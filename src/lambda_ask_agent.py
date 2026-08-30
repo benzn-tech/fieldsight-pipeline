@@ -767,8 +767,13 @@ def _parse_now(raw):
         return None
 
 
-def _scope(result, chunks, requested_from, requested_to):
+def _basis(result, chunks, requested_from, requested_to):
     """What the answer was actually built from.
+
+    Named `basis` rather than `scope` because `scope` is already taken twice on
+    this path: the request field meaning report/transcript/both, and the ACL
+    module rag-search imports. Three meanings of one word in one round trip is
+    how the wrong one gets read.
 
     COMPUTED, never generated. The screen renders this as a pill and the voice
     path as a spoken clause, from one dict, so the two cannot drift -- and a
@@ -779,7 +784,7 @@ def _scope(result, chunks, requested_from, requested_to):
     asked for when it widened. `dates` is the distinct set present in what came
     back: exact, and the only honest basis for "based on 8-27".
     """
-    applied = result.get("scope") or {}
+    applied = result.get("basis") or {}
     return {
         "from": applied.get("from", requested_from),
         "to": applied.get("to", requested_to),
@@ -875,7 +880,7 @@ def _rag_answer(body):
             }
         result = json.loads(resp["Payload"].read().decode("utf-8"))
         chunks = result.get("chunks") or []
-        scope = _scope(result, chunks, date_from, date_to)
+        basis = _basis(result, chunks, date_from, date_to)
 
         if result.get("error"):
             # Distinguish "caller not provisioned" / ACL misses from genuine
@@ -888,7 +893,7 @@ def _rag_answer(body):
                 "citations": [],
                 "model": llm_utils.CLAUDE_MODEL,
                 "grounded": True,
-                "scope": scope,
+                "basis": basis,
             }
 
         prompt = build_rag_prompt(question, chunks, mode=body.get("mode"), today=today)
@@ -926,7 +931,7 @@ def _rag_answer(body):
             "citations": citations,
             "model": llm_utils.CLAUDE_MODEL,
             "grounded": True,
-            "scope": scope,
+            "basis": basis,
         }
     except Exception as e:
         logger.error(f"  RAG path failed: {e}")
