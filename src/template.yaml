@@ -1858,7 +1858,26 @@ Resources:
                     # permission failure into "no brief yet" and hide the next
                     # one of these completely. Measured on TEST and PROD on
                     # 2026-08-31, both 500 on the same session.
+                    #
+                    # Then the whole handler was swept rather than the one
+                    # symptom: org-api reads exactly THREE single keys out of
+                    # the lake and treats a missing one as `pending`, and all
+                    # three had GetObject without ListBucket. Confirmed by
+                    # simulate-principal-policy against the live prod role
+                    # (GetObject allowed, ListBucket implicitDeny) and by
+                    # calling both endpoints on prod. Anything added to this
+                    # family later belongs on this list on the day it is
+                    # written, not on the day somebody reads a 500.
                     - session_brief/*
+                    # GET /sessions/{id}/rolling — the mid-meeting poll. 500ed
+                    # on prod for every session with no rolling summary yet,
+                    # which is every session before the summariser first runs.
+                    - session_rolling/*
+                    # GET /sessions/{id}/report/status — the poll a client runs
+                    # right after requesting a report, when by definition the
+                    # worker has not written the result. Every poll before the
+                    # document exists answered 500 instead of `pending`.
+                    - session_report_results/*
             - Effect: Allow
               # Task 20 (content correction reindex chain): after a content
               # edit commits, org-api (in-VPC) writes the per-topic reindex

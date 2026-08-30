@@ -123,3 +123,28 @@ def test_access_denied_is_not_swallowed_as_pending(monkeypatch):
     _wire_error(monkeypatch, "AccessDenied")
     with pytest.raises(ClientError):
         oa.session_brief_read(None, CALLER, SESSION, EVENT)
+
+
+def test_a_field_added_to_the_writer_tomorrow_is_served_without_an_edit_here(monkeypatch):
+    """The structural version of the two tests above, and the reason they were
+    not enough.
+
+    Widening the whitelist by hand fixed `summary` and `open_todos` and left a
+    comment saying the NEXT field added to the writer would be stored forever and
+    served never. `open_points` was added to the writer within the hour and was
+    not added to the list. A rule that must be remembered at every future edit is
+    not a rule, so this asserts the property instead of the field list.
+    """
+    stored = dict(STORED, open_points=[{"quote": "I think it's 150", "kind": "standard"}],
+                  something_invented_next_week={"a": 1})
+    body = _read(monkeypatch, stored)
+
+    missing = [k for k in stored if k not in body]
+    assert not missing, f"the endpoint dropped {missing}"
+
+
+def test_status_is_the_endpoints_own_and_cannot_be_overwritten(monkeypatch):
+    """`status` is the one key this endpoint adds. A brief that happened to carry
+    its own `status` must not be able to tell the caller it is pending."""
+    body = _read(monkeypatch, dict(STORED, status="pending"))
+    assert body["status"] == "ready"

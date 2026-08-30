@@ -2057,6 +2057,14 @@ def session_rolling(conn, caller, session_id, event):
     })
 
 
+# Shape kept stable for a client reading a brief written before a field existed.
+# NOT a whitelist: the stored object is spread OVER these, so a field the writer
+# gains tomorrow reaches the caller with no edit here. That difference is why the
+# five-key projection this replaced kept swallowing new fields.
+_BRIEF_DEFAULTS = {"headline": "", "sections": [], "entities": [], "tasks": [],
+                   "stats": None, "summary": "", "open_todos": [], "open_points": []}
+
+
 def session_brief_read(conn, caller, session_id, event):
     """GET /api/org/sessions/{session_id}/brief?date=&user= — the session brief.
 
@@ -2096,26 +2104,34 @@ def session_brief_read(conn, caller, session_id, event):
             return ok({"status": "pending"})
         raise
     data = json.loads(obj["Body"].read().decode("utf-8"))
-    return ok({
-        "status": "ready",
-        "headline": data.get("headline", ""),
-        "sections": data.get("sections", []),
-        "entities": data.get("entities", []),
-        "tasks": data.get("tasks", []),
-        "stats": data.get("stats"),
-        # The docstring above says "returned whole rather than filtered" and the
-        # code was a five-key whitelist. `summary` and `open_todos` are in every
-        # stored brief and reached nobody: the writer widens the brief with them
-        # (session_brief.to_session_summary), the email reads them from its own
-        # copy, and this endpoint dropped them on the floor.
-        #
-        # A whitelist protects nothing here -- the object is this company's own
-        # brief and the ACL was applied to reach it. All it guarantees is that
-        # the NEXT field added to the writer is stored forever and served never,
-        # which is the shape that has to be built in before it can be found.
-        "summary": data.get("summary", ""),
-        "open_todos": data.get("open_todos", []),
-    })
+    # The brief WHOLE, which is what the docstring above has always claimed and
+    # what the code did not do. It was a five-key whitelist; `summary` and
+    # `open_todos` were in every stored brief and reached nobody.
+    #
+    # Widening it by hand was tried first and lasted about an hour. The comment
+    # left behind said, in as many words, that the whitelist "guarantees the
+    # NEXT field added to the writer is stored forever and served never" -- and
+    # then `open_points` was added to the writer and not to the list. A rule
+    # that has to be remembered at every future edit is not a rule.
+    #
+    # Nothing here needs protecting by omission: the object is this company's
+    # own brief, the ACL was applied to reach it, and its verbatim quotes are
+    # already served inside `sections`. `status` is the only key this endpoint
+    # adds, and it is last so a stored key can never silently overwrite it.
+    # Defaults UNDER the stored object, not a filter over it. The distinction is
+    # the whole point: `_BRIEF_DEFAULTS` exists so a brief written before a field
+    # existed still has a stable shape for a client reading `body["summary"]`,
+    # and a field the writer gains tomorrow passes through without anyone
+    # editing this line. A whitelist would have done the opposite of both.
+    #
+    # `status` is assigned LAST, and by assignment rather than as a kwarg. A
+    # brief carrying its own "status" makes `dict(defaults, **data, status=...)`
+    # raise TypeError -- which is a 500 on a request that should have worked,
+    # and it was written that way for one commit before a test drove it.
+    out = dict(_BRIEF_DEFAULTS)
+    out.update(data)
+    out["status"] = "ready"
+    return ok(out)
 
 
 # ----------------------------------------------------------
