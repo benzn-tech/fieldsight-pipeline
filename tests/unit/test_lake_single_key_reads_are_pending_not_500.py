@@ -61,6 +61,16 @@ def _wire(monkeypatch, code=None, stored=None):
     monkeypatch.setattr(oa, "s3", lambda: _S3())
     monkeypatch.setattr(oa, "_resolve_org_media_folder",
                         lambda conn, caller, user, what=None: ("Ben_UCPK2", None))
+    # The deletion mirror reads CLEAN, always. The brief route now reads it
+    # before the brief itself, and leaving it to the failing `_S3` above made the
+    # mirror raise first -- which shielded the very guard below from ever being
+    # reached. The test stayed green and stopped testing what it says: exactly
+    # the shape it was written to prevent, one layer up. Stubbed separately so a
+    # fault on the BRIEF is the only thing these cases can be measuring.
+    import deletion_mirror
+
+    monkeypatch.setattr(deletion_mirror, "deleted_sessions_strict",
+                        lambda s3, bucket, folder, date: set())
 
 
 # The three handlers, and the query params each needs beyond date/user.

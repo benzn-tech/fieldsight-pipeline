@@ -2096,6 +2096,45 @@ def session_brief_read(conn, caller, session_id, event):
     # not carry it depending on the caller, and guessing wrong reads a key that cannot exist
     # — which surfaces as `pending` and looks like "no brief yet" rather than a mistake.
     sid = session_id if session_id.startswith("sid") else "sid" + session_id
+
+    # A deleted recording's brief must not still answer. `session_brief/` is
+    # nowhere in the deletion machinery -- not in `deletion_mirror`, not in
+    # `deleted_predicates`, not in `redactions` -- so deleting a recording hid
+    # its chunks and its topics while this endpoint kept serving a frozen copy of
+    # the same verbatim quotes. It is checked BEFORE the object is fetched: bytes
+    # we must not serve are bytes not worth reading.
+    #
+    # THE BUCKET IS `S3_BUCKET`, NOT `LAKE_BUCKET`. They hold the same value
+    # today and they are two variables; the mirror is WRITTEN to S3_BUCKET by
+    # `delete_recordings_endpoint`, and reading it from the brief's bucket would
+    # work until the day they diverge and then hide nothing, silently.
+    #
+    # BOTH SPELLINGS. The mirror carries whatever `sessionBase` the delete
+    # endpoint had; this key is always `sid{hex}`. Two spellings of a session are
+    # equal as sessions and not as strings.
+    #
+    # STRICT, and an unreadable mirror RAISES -- the opposite trade to
+    # `lambda_ask_agent`, which reads it leniently. There, an unreadable mirror
+    # must not take the nightly report down for everyone, and the cost is one
+    # day staying visible until a retry. Here the request is one brief on demand:
+    # failing it costs one reader one refresh, and serving it leaks a recording
+    # the customer deleted.
+    #
+    # It raises rather than answering "removed", which a first version did. That
+    # was fail-closed and still wrong: "we checked and it is removed" and "we
+    # could not check" are different facts, and reporting the second as the first
+    # turns a broken grant on `redactions/` into a silent total outage that looks
+    # like normal operation. This endpoint has already shipped one disguise of
+    # exactly that shape (AccessDenied read as `pending`, #627). Loud, and
+    # nothing served, is both safe and visible.
+    removed = deletion_mirror.deleted_sessions_strict(s3(), S3_BUCKET, folder, date)
+    if sid in removed or sid[3:] in removed:
+        logger.info("brief: %s was deleted -- not served", sid)
+        # "removed", not "deleted": the mechanism is reversible masking and the
+        # product copy for it is "removed from the project view". The three words
+        # (trimmed / removed / sealed) are never used interchangeably.
+        return ok({"status": "removed"})
+
     key = f"session_brief/{folder}/{date}/{sid}/latest.json"
     try:
         obj = s3().get_object(Bucket=LAKE_BUCKET, Key=key)
