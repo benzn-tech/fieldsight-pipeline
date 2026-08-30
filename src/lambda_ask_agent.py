@@ -575,15 +575,33 @@ def build_rag_prompt(question, chunks, mode=None, today=None, basis=None):
         # model was obeying the base rule correctly.
         #
         # So the question is RESTATED instead of argued with: for this answer
-        # the subject is the most recent day, and the empty period is a closing
-        # note. Nothing here is a sentence the model can lift as an opening.
+        # the subject is the most recent day. Nothing here is a sentence the
+        # model can lift as an opening.
+        #
+        # WHO SAYS THE PERIOD WAS EMPTY depends on who is reading. On screen the
+        # client states it FIRST, above the answer, from the computed `basis` --
+        # a reader must not learn their period was empty only after three
+        # sentences about a date they did not ask about (user, 2026-08-31). The
+        # model must therefore NOT repeat it there, or the same fact is stated
+        # twice in two voices, one of them exact and one of them prose.
+        #
+        # Voice has no line to put it on, so there the model is the only thing
+        # that can say it, and it says it first for the same reason.
+        say_it_here = mode == "voice"
         parts.append(
             f"## What this answer is about\nAnswer about {widened_to}. The excerpts below "
             f"are from that day and they are what you have of it -- treat them as the "
-            f"subject of this response, not as a failed attempt at another day. Your FIRST "
-            f"sentence must state something that happened on {widened_to}. Save for the "
-            f"LAST sentence, and put nowhere else, one short note that the period the "
-            f"question named has no records."
+            f"subject of this response, not as a failed attempt at another day."
+            + (
+                f" Open with one short sentence saying the period the question named has "
+                f"no records and that this is {widened_to} instead, then answer about "
+                f"{widened_to}."
+                if say_it_here else
+                f" Your FIRST sentence must state something that happened on "
+                f"{widened_to}. Do NOT mention that the period the question named is "
+                f"empty -- the reader has already been told, above your answer, and "
+                f"repeating it costs them the first line of what they asked for."
+            )
         )
     if today:
         parts.append(
