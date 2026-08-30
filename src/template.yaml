@@ -1839,14 +1839,26 @@ Resources:
               # admin_disambiguation's folder listing would itself fail
               # outright (same reasoning as this function's own programmes/*
               # grant above, and MatcherFunction's programmes/* grant).
-              # Scoped to reports/* only, in the IngestBucketName bucket
-              # (the lake), not DataBucketName (org-assets/programmes).
+              # Scoped to the lake prefixes this role reads a SINGLE key from
+              # and must be able to tell "not written yet" from "denied", in
+              # the IngestBucketName bucket (the lake), not DataBucketName
+              # (org-assets/programmes).
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
                 StringLike:
                   s3:prefix:
                     - reports/*
+                    # session_brief/ had GetObject and not this, so
+                    # GET /api/org/sessions/{id}/brief answered 500 for every
+                    # session whose brief has not been written -- which is most
+                    # of them, and the state the handler calls `pending`. Its
+                    # `except ClientError` arm only recognises NoSuchKey/404,
+                    # correctly: swallowing AccessDenied too would turn a real
+                    # permission failure into "no brief yet" and hide the next
+                    # one of these completely. Measured on TEST and PROD on
+                    # 2026-08-31, both 500 on the same session.
+                    - session_brief/*
             - Effect: Allow
               # Task 20 (content correction reindex chain): after a content
               # edit commits, org-api (in-VPC) writes the per-topic reindex
