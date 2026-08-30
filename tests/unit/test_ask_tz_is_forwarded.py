@@ -85,3 +85,28 @@ def test_the_voice_path_carries_the_zone_into_the_rag_answer(monkeypatch):
     laa._voice_answer({"audio": "", "caller_sub": "sub-1", "tz": "Pacific/Auckland"})
 
     assert seen.get("tz") == "Pacific/Auckland"
+
+
+def test_the_voice_response_carries_the_basis_it_was_given(monkeypatch):
+    """_voice_answer builds its response from scratch, so a field the screen path
+    gains stops there unless it is listed. `_basis`'s docstring claimed the voice
+    path rendered it as a spoken clause while the voice path never received it --
+    the same shape as `date` being forwarded, documented, and read by nobody.
+
+    The device does not speak it yet. This asserts it ARRIVES, so that when the
+    app renders it there is nothing to plumb.
+    """
+    monkeypatch.setattr(laa, "_rag_answer", lambda body: {
+        "answer": "On 2026-07-18 the pour moved.", "citations": [],
+        "basis": {"from": "2026-07-18", "to": "2026-07-18", "widened": True,
+                  "chunks": 4, "dates": ["2026-07-18"]}})
+    monkeypatch.setattr(laa, "_invoke_voice_audit", lambda *a, **k: None)
+
+    import dashscope_utils
+    monkeypatch.setattr(dashscope_utils, "stt", lambda *a, **k: "what happened yesterday")
+    monkeypatch.setattr(dashscope_utils, "tts", lambda *a, **k: b"\x00\x01")
+
+    out = laa._voice_answer({"audio": "", "caller_sub": "sub-1", "tz": "Pacific/Auckland"})
+
+    assert out["basis"]["widened"] is True
+    assert out["basis"]["from"] == "2026-07-18"
