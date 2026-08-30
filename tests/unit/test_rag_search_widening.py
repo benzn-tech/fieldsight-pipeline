@@ -167,3 +167,23 @@ def test_every_early_return_carries_a_basis(wired):
                           lambda conn, caller: {"site_ids": set(), "author_ids": None})
         out = rag.lambda_handler(ev, None)
         assert "basis" in out, f"missing basis on {patch or 'guard'} return"
+
+
+def test_widened_is_not_claimed_over_zero_rows(wired):
+    """`widened: true` with an empty result reports "based on 2026-07-18" over a
+    day nothing was read from.
+
+    It cannot happen today only because `build_search_sql` has no distance
+    threshold, so a date that HAS rows always returns rows. The other search path
+    has one (0.55). This asserts the property rather than the accident, so the
+    day a threshold is added here the claim does not quietly start lying.
+    """
+    calls = wire_search(wired, [[], []])          # dated: empty. widened: also empty.
+    wire_latest(wired, "2026-07-18")
+
+    out = rag.lambda_handler(event(date_from="2026-08-29", date_to="2026-08-29",
+                                   widen_when_empty=True), None)
+
+    assert len(calls) == 2, "the retry did not happen"
+    assert out["chunks"] == []
+    assert out["basis"] == {"from": "2026-08-29", "to": "2026-08-29", "widened": False}
