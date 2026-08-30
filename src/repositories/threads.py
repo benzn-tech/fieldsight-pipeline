@@ -9,6 +9,21 @@ thread is a human's call.
 """
 from psycopg.rows import dict_row
 
+from deleted_predicates import visible_topics_predicate
+
+# Every query in this file joins `topics`, and until 2026-08-31 not one of them asked
+# whether the topic still exists. A recording the customer removed kept its titles in the
+# manager review queue, kept counting toward `times_raised` on the card that explains why an
+# item is at the top of someone's list, and -- worst of the three -- stayed in the matcher's
+# candidate corpus, where it could mint BRAND NEW suggestions out of deleted content.
+#
+# `visible_topics_predicate` carries BOTH arms deliberately (see deleted_predicates): the
+# topic arm for the rows that exist now, the source arm for the rows the nightly pipeline
+# re-creates tomorrow with new uuids that no topic-keyed tombstone names. A read path that
+# takes only the first passes every test written today and leaks overnight.
+_VISIBLE_T = visible_topics_predicate("t")
+_VISIBLE_P = visible_topics_predicate("p")
+
 _THREAD_COLS = "id, site_id, title, first_seen, last_raised, created_at, updated_at"
 _SUGG_COLS = ("id, topic_id, thread_id, parent_topic_id, score, gap_days, "
               "status, created_at, resolved_at, resolved_by")
@@ -34,6 +49,10 @@ def candidate_corpus(conn, site_id, before_date, window_days):
         "FROM topics t LEFT JOIN action_items a ON a.topic_id = t.id "
         "WHERE t.site_id = %s AND t.report_date < %s "
         "  AND t.report_date >= (%s::date - %s::int) "
+        # A deleted topic must not be matchable. This is the arm that CREATES rather than
+        # merely shows: without it the matcher keeps proposing threads built out of a
+        # recording the customer removed, and each proposal is a new row carrying its text.
+        f"  AND {_VISIBLE_T} "
         "GROUP BY t.id HAVING count(a.id) FILTER (WHERE a.status='open') > 0",
         (site_id, before_date, before_date, window_days)).fetchall()
 
@@ -82,7 +101,7 @@ def thread_facts(conn, thread_id):
         "       max(t.report_date) AS last_raised, "
         "       count(a.id) FILTER (WHERE a.status='open') AS open_items "
         "FROM topics t LEFT JOIN action_items a ON a.topic_id = t.id "
-        "WHERE t.thread_id = %s", (thread_id,)).fetchone()
+        f"WHERE t.thread_id = %s AND {_VISIBLE_T}", (thread_id,)).fetchone()
 
 
 def facts_for_threads(conn, thread_ids):
@@ -102,7 +121,7 @@ def facts_for_threads(conn, thread_ids):
         "       max(t.report_date) AS last_raised, "
         "       count(a.id) FILTER (WHERE a.status='open') AS open_items "
         "FROM topics t LEFT JOIN action_items a ON a.topic_id = t.id "
-        "WHERE t.thread_id = ANY(%s) GROUP BY t.thread_id",
+        f"WHERE t.thread_id = ANY(%s) AND {_VISIBLE_T} GROUP BY t.thread_id",
         (list(thread_ids),)).fetchall()
     return {str(r["thread_id"]): r for r in rows}
 
@@ -175,9 +194,12 @@ def list_pending(conn, site_ids, limit=50):
         "       th.title AS thread_title "
         "FROM topic_thread_suggestions s "
         "JOIN topics t ON t.id = s.topic_id "
-        "LEFT JOIN topics p ON p.id = s.parent_topic_id "
+        # The parent is filtered in the JOIN, not the WHERE: a suggestion whose PARENT was
+        # deleted is still a real suggestion about a live topic, so it stays in the queue
+        # with its parent columns null, rather than vanishing with it.
+        f"LEFT JOIN topics p ON p.id = s.parent_topic_id AND {_VISIBLE_P} "
         "LEFT JOIN topic_threads th ON th.id = s.thread_id "
-        "WHERE s.status='pending' AND t.site_id = ANY(%s) "
+        f"WHERE s.status='pending' AND t.site_id = ANY(%s) AND {_VISIBLE_T} "
         "ORDER BY s.created_at DESC LIMIT %s",
         (list(site_ids), limit)).fetchall()
 
