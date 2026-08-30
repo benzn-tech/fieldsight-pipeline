@@ -18,10 +18,22 @@ Three things it deliberately does or refuses to do:
   the correction lands.
 * **It does not group by the artifact's site.** `declared_site` is null on every action
   measured; grouping by it groups by null, finds no pairs, and reads like a clean result.
-* **It reports same-day and cross-day pairs separately, and they must stay separate.** A
-  same-day pair is one event extracted twice (live tier and final tier, or a split session).
-  Only a cross-day pair is the restatement a version history exists to show. Summing them
-  reports a feature as viable on evidence that is mostly a de-duplication bug.
+* **It reports same-day and cross-day pairs separately, and they must stay separate.** Only a
+  cross-day pair is the restatement a version history exists to show. Summing them reports a
+  feature as viable on evidence that is mostly duplication.
+
+A same-day pair is NOT the live tier against the final tier: `extraction_key` puts both on one
+S3 key so the final pass supersedes the live one in place (`lambda_extract_session.py`), and
+this script skips pairs sharing a `session_base` anyway. The sources that remain are a split
+session, and group merge — the merged artifact takes its own `grp...` base while the members'
+artifacts stay in S3 even after `_delete_member_topics` removes the members' database rows.
+
+That last one means the artifact corpus can hold pairs that never coexist where a user looks,
+so a duplicate found here is not by itself a customer-visible defect. Checked separately on
+2026-08-30 through the live `GET /api/org/timeline?date=2026-08-10&user=Ben_UCPK2`: the
+database returned 35 actions over 12 sessions with `Scaffolding -- inspect before Monday`
+present **three times**. Same-day duplication is real in the read model — but that cross-check
+is a second measurement, not something this script proves.
 """
 import argparse
 import collections
@@ -114,6 +126,39 @@ def pairs_of(rows):
     return same_day, cross_day
 
 
+def clusters_of(pairs):
+    """Connected components over the pairs — the unit the V2 gate is stated in.
+
+    Pair count is the wrong measure and this function exists to stop it being used: a chain
+    of one subject seen on four days contributes six pairs, so pair count grows with how long
+    a chain runs rather than with how many distinct things there are to learn from. The 12
+    cross-day pairs measured on 2026-08-30 are 4 subjects.
+    """
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    def key(row):
+        return (row["date"], row["session"], row["action"])
+
+    for p in pairs:
+        union(key(p["a"]), key(p["b"]))
+    groups = {}
+    for k in list(parent):
+        groups.setdefault(find(k), []).append(k)
+    return sorted(groups.values(), key=lambda g: (min(x[0] for x in g), len(g)))
+
+
 def same_responsible(pair):
     x = (pair["a"]["responsible"] or "").strip().lower()
     y = (pair["b"]["responsible"] or "").strip().lower()
@@ -144,19 +189,24 @@ def main():
     print("folders:", collections.Counter(r["folder"] for r in rows).most_common(8))
 
     same_day, cross_day = pairs_of(rows)
+    same_clusters, cross_clusters = clusters_of(same_day), clusters_of(cross_day)
     print(f"\nnear-duplicate pairs across sessions of one recorder "
           f"(jaccard>={JACCARD} or ratio>={RATIO}):")
-    print(f"  same day  : {len(same_day):4d}   <- one event extracted twice, NOT a version")
-    print(f"  cross day : {len(cross_day):4d}   <- the only shape a version history is for")
+    print(f"  same day  : {len(same_day):4d} pairs -> {len(same_clusters):3d} clusters"
+          f"   <- one event extracted twice, NOT a version")
+    print(f"  cross day : {len(cross_day):4d} pairs -> {len(cross_clusters):3d} clusters"
+          f"   <- the only shape a version history is for")
     print(f"  same non-empty responsible: same-day {sum(map(same_responsible, same_day))}, "
           f"cross-day {sum(map(same_responsible, cross_day))}")
+    print(f"\n  THE V2 GATE reads the cross-day CLUSTER count above ({len(cross_clusters)}), "
+          f"not the pair count.")
 
-    print("\ncross-day pairs in full (this is the corpus a matcher would be tuned on):")
-    for p in sorted(cross_day, key=lambda p: -(p["jaccard"] + p["ratio"])):
-        for side in ("a", "b"):
-            r = p[side]
-            print(f"  [{r['date']} | {r['responsible']}] {(r['action'] or '')[:72]}")
-        print(f"      jaccard={p['jaccard']} ratio={p['ratio']}")
+    print("\ncross-day clusters in full (this is the corpus a matcher would be tuned on):")
+    for group in cross_clusters:
+        dates = sorted({x[0] for x in group})
+        print(f"  {dates[0]} .. {dates[-1]}  ({len(dates)} days, {len(group)} occurrences)")
+        for _, _, action in sorted(group):
+            print(f"    {(action or '')[:76]}")
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
