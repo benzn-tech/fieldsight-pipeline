@@ -2088,6 +2088,12 @@ Resources:
                 # Agent-answer sidecars, read by the shared agent_turn_filter. Granted
                 # wherever transcripts are, because the code that reads one reads the other.
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
+                # The deletion mirror. `_session_was_deleted` reads it to avoid
+                # mailing a recording the customer removed, and it reads the
+                # mirror LENIENTLY -- so without this grant the check does not
+                # fail, it silently answers "nothing was deleted" behind one
+                # WARNING line. Verified implicitDeny on both stages before this
+                # was added, which is what a guard shipping dead looks like.
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
                 # The close-driven final-pass request written by FinalizeSweepFunction.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
@@ -2572,6 +2578,14 @@ Resources:
                 # Agent-answer sidecars, read by the shared agent_turn_filter. Granted
                 # wherever transcripts are, because the code that reads one reads the other.
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
+                # The deletion mirror. `_session_was_deleted` reads it so a recording
+                # the customer removed is not mailed back to them. That read is
+                # LENIENT, so without this grant the check does not fail -- it
+                # silently answers "nothing was deleted" behind one WARNING line,
+                # which is what a guard shipping dead looks like.
+                # simulate-principal-policy returned implicitDeny on BOTH stages
+                # before this line existed.
+                - !Sub arn:aws:s3:::${IngestBucketName}/redactions/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
@@ -2588,6 +2602,12 @@ Resources:
                   s3:prefix:
                     - transcripts/*
                     - voice_ask/*
+                    # GetObject alone is not enough: without ListBucket on this
+                    # prefix S3 answers AccessDenied rather than NoSuchKey for a
+                    # key that was never written, and a day with NO deletions has
+                    # no mirror -- which is the common case. The lenient reader
+                    # would then log an exception on every finalize forever.
+                    - redactions/*
             - Effect: Allow
               Action:
                 - ses:SendEmail
