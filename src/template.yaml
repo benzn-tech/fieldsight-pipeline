@@ -1462,11 +1462,31 @@ Resources:
                 # the report still generates — with every picture silently
                 # missing and nothing in the result to say why (BUG-43 §3).
                 - !Sub arn:aws:s3:::${IngestBucketName}/users/*/pictures/*
+                # The deletion mirror. `_session_was_deleted` reads it so a session
+                # removed between the enqueue and this run is neither rendered nor
+                # mailed. The read is LENIENT, so a missing grant does not fail --
+                # it answers "nothing was deleted" behind one WARNING line, which
+                # is a guard shipping dead. implicitDeny on both stages before
+                # this line existed.
+                - !Sub arn:aws:s3:::${IngestBucketName}/redactions/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_reports/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_report_results/*
+            - Effect: Allow
+              # This function had no ListBucket statement at all. GetObject alone
+              # is not enough for the mirror: without ListBucket on the prefix S3
+              # answers AccessDenied rather than NoSuchKey for a key that was
+              # never written -- and a day with NO deletions has no mirror, which
+              # is the common case. The lenient reader would then log an exception
+              # on every report generated, forever (#627's family).
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - redactions/*
             - Effect: Allow
               # SES send for the 'email' delivery option — harmless while
               # EMAIL_SENDER=stub (the stub never calls SES). Verified-identity
@@ -2088,12 +2108,6 @@ Resources:
                 # Agent-answer sidecars, read by the shared agent_turn_filter. Granted
                 # wherever transcripts are, because the code that reads one reads the other.
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
-                # The deletion mirror. `_session_was_deleted` reads it to avoid
-                # mailing a recording the customer removed, and it reads the
-                # mirror LENIENTLY -- so without this grant the check does not
-                # fail, it silently answers "nothing was deleted" behind one
-                # WARNING line. Verified implicitDeny on both stages before this
-                # was added, which is what a guard shipping dead looks like.
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
                 # The close-driven final-pass request written by FinalizeSweepFunction.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*

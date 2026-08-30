@@ -50,6 +50,27 @@ MISSING_KEY_IS_NORMAL = [
      "ingest_report skips a report whose vector sidecar was never written"),
     ("IngestFunction", "redactions/*",
      "_load_turns reads the mirror; missing must mean 'nothing deleted'"),
+    # Every remaining reader of the deletion mirror. Six lambdas call
+    # `deletion_mirror.deleted_sessions`, and a day with NO deletions has no mirror -- which
+    # is the common case, not the edge one, so the missing-key branch here is the branch
+    # that runs almost every time.
+    #
+    # These readers are LENIENT by design: an unreadable mirror answers "nothing was
+    # deleted" behind one WARNING rather than failing the report. That makes a missing grant
+    # WORSE here than in the strict readers above, not better -- it does not 500, it ships a
+    # guard that never guards, and the only trace is a log line nobody is reading. #648
+    # found exactly that on SessionReportFunction: implicitDeny on both stages, mailing a
+    # session the customer had removed, with the check in place and inert.
+    #
+    # Swept against the live prod roles on 2026-08-31 rather than read off this file.
+    ("AskAgentFunction", "redactions/*",
+     "_deleted_sessions gates the stored report and the RAG chunks"),
+    ("ReportGeneratorFunction", "redactions/*",
+     "the nightly rebuild must not re-ingest a removed session"),
+    ("SessionFinalizeFunction", "redactions/*",
+     "_session_was_deleted gates the confirmation email"),
+    ("SessionReportFunction", "redactions/*",
+     "_session_was_deleted gates rendering and mailing the on-demand report"),
 ]
 
 
@@ -68,6 +89,22 @@ def _blocks():
         end = starts[i + 1][1] if i + 1 < len(starts) else len(text)
         out[name] = text[pos:end]
     return out
+
+
+def _reads_whole_bucket(block):
+    """A SAM-managed bucket-wide read, which grants ListBucket with no prefix condition.
+
+    Two of the mirror readers carry `S3ReadPolicy` instead of scoped inline statements, so
+    they have no `s3:prefix` list to inspect and yet answer `allowed` to
+    simulate-principal-policy -- confirmed against the live prod roles on 2026-08-31 before
+    this branch was added, because a test that waves a function through on a pattern nobody
+    checked is how a grant goes missing quietly.
+
+    Adding a scoped grant to these would be redundant, and worse than redundant: it would
+    teach the next reader that the scoped form is required when it is not. The sibling test
+    test_agent_turn_filter_wiring takes the same position for the same functions.
+    """
+    return "S3ReadPolicy:" in block or "S3CrudPolicy:" in block
 
 
 def _list_prefixes(block):
@@ -99,6 +136,8 @@ def _list_prefixes(block):
 def test_a_missing_key_can_be_told_apart_from_a_denied_one(fn, prefix, why):
     block = _blocks().get(fn)
     assert block, f"{fn} is not in template.yaml"
+    if _reads_whole_bucket(block):
+        return
     granted = _list_prefixes(block)
     assert prefix in granted, (
         f"{fn} has GetObject but no ListBucket on {prefix} — so {why} raises AccessDenied "
