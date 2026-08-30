@@ -85,3 +85,41 @@ def test_the_response_is_json_serialisable(monkeypatch):
     resp = oa.session_brief_read(None, CALLER, SESSION, EVENT)
     assert resp["statusCode"] == 200
     json.loads(resp["body"])
+
+
+def _wire_error(monkeypatch, code):
+    from botocore.exceptions import ClientError
+
+    class _S3:
+        def get_object(self, **kw):
+            raise ClientError({"Error": {"Code": code, "Message": code}}, "GetObject")
+
+    monkeypatch.setattr(oa, "s3", lambda: _S3())
+    monkeypatch.setattr(oa, "_resolve_org_media_folder",
+                        lambda conn, caller, user, what=None: ("Ben_UCPK2", None))
+
+
+def test_a_brief_not_written_yet_is_pending(monkeypatch):
+    _wire_error(monkeypatch, "NoSuchKey")
+    body = json.loads(oa.session_brief_read(None, CALLER, SESSION, EVENT)["body"])
+    assert body == {"status": "pending"}
+
+
+def test_access_denied_is_not_swallowed_as_pending(monkeypatch):
+    """The fix for the 500 this endpoint answered is a GRANT, not a wider except.
+
+    Without `s3:ListBucket` on `session_brief/*`, S3 answers AccessDenied rather
+    than NoSuchKey for a key that was never written, so every session with no
+    brief 500ed — measured on TEST and PROD, 2026-08-31. The tempting one-line fix
+    is to catch AccessDenied here too. That would report a real permission failure
+    as "no brief yet", which is the same disguise the missing grant already wore,
+    and the next missing grant would then be invisible instead of loud.
+
+    So this asserts the endpoint still RAISES. If someone widens the except, this
+    goes red and the template's prefix list is where to look.
+    """
+    from botocore.exceptions import ClientError
+
+    _wire_error(monkeypatch, "AccessDenied")
+    with pytest.raises(ClientError):
+        oa.session_brief_read(None, CALLER, SESSION, EVENT)
