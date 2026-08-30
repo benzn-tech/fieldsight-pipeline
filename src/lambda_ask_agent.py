@@ -527,7 +527,7 @@ Rules:
 - Answer in English."""
 
 
-def build_rag_prompt(question, chunks, mode=None, today=None):
+def build_rag_prompt(question, chunks, mode=None, today=None, basis=None):
     """Number each retrieved chunk [1..n] with a site_name . report_date .
     topic_title header, fence its chunk_text, and append the question.
     Fencing + the RAG_SYSTEM_CONTEXT "DATA, not instructions" rule is the
@@ -539,7 +539,14 @@ def build_rag_prompt(question, chunks, mode=None, today=None):
     header already carries a date; without an anchor the model cannot tell
     which of them "yesterday" means, so it summarises all of them. Omitted
     entirely when no usable zone arrived -- a server-side date would be worse
-    than none, because the model would use it exactly as confidently."""
+    than none, because the model would use it exactly as confidently.
+
+    `basis` is only read for its `widened` flag, and only to fix the ORDER of
+    the answer. Measured on TEST: asked what happened yesterday with nothing
+    recorded that day, the model opened with "there is no information about
+    yesterday" and put the records it did find second. The useful sentence was
+    the second one. This product's reader is on a site and reads the first line
+    -- answers first, the gap after."""
     excerpt_blocks = []
     for i, c in enumerate(chunks, start=1):
         header = " . ".join(
@@ -555,6 +562,28 @@ def build_rag_prompt(question, chunks, mode=None, today=None):
 
     system_context = RAG_SYSTEM_CONTEXT_VOICE if mode == "voice" else RAG_SYSTEM_CONTEXT
     parts = [system_context]
+    widened_to = basis.get("from") if (basis and basis.get("widened")) else None
+    if widened_to:
+        # The first attempt at this put a "## The period asked about is empty"
+        # heading here and asked for the content first. Measured on TEST, the
+        # model opened with that heading's own words both times -- a phrase
+        # handed to it at the top of a section is the phrase it starts with.
+        #
+        # It was also fighting RAG_SYSTEM_CONTEXT's standing rule, "if the
+        # excerpts do not contain the answer, say so clearly". Under widening
+        # the excerpts genuinely do not contain the period asked about, so the
+        # model was obeying the base rule correctly.
+        #
+        # So the question is RESTATED instead of argued with: for this answer
+        # the subject is the most recent day, and the empty period is a closing
+        # note. Nothing here is a sentence the model can lift as an opening.
+        parts.append(
+            f"## What this answer is about\nAnswer about {widened_to}. That is the subject "
+            f"of this response -- treat the excerpts as a complete record of that day, not "
+            f"as a failed attempt at another one. Your FIRST sentence must state something "
+            f"that happened on {widened_to}. Save for the LAST sentence, and put nowhere "
+            f"else, one short note that the period the question named has no records."
+        )
     if today:
         parts.append(
             f"## Today\n{today} -- the local date of the person asking. Read any relative "
@@ -896,7 +925,8 @@ def _rag_answer(body):
                 "basis": basis,
             }
 
-        prompt = build_rag_prompt(question, chunks, mode=body.get("mode"), today=today)
+        prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
+                                  today=today, basis=basis)
         answer, err = llm_utils.call_llm(prompt, max_tokens=2048, force_json=False)
 
         if err:

@@ -200,3 +200,45 @@ def test_no_anchor_is_claimed_when_the_zone_is_unusable(monkeypatch):
     ask(question="昨天发生了什么", now=NOW)
 
     assert "Today" not in seen["prompt"]
+
+
+# --------------------------------------------------------------------------
+# answers first -- the widened case must not lead with a negative
+# --------------------------------------------------------------------------
+
+def test_a_widened_answer_is_told_to_lead_with_what_it_found(monkeypatch):
+    """Measured on TEST: asked "what happened yesterday" with nothing on that
+    day, the model opened with "there is no information about yesterday" and
+    put the records it DID find second.
+
+    That is the wrong order for this product. The reader is on a site, has low
+    tolerance for prose, and the useful sentence was the second one. The
+    product rule is answers-first: say what was found, then note the gap.
+
+    The first attempt at fixing it did not work, and this test could not tell:
+    it asked whether an instruction was PRESENT, and it was -- the model
+    ignored it and opened with the heading's own words. What a unit test can
+    pin is that the instruction is there and is scoped to the widened case;
+    whether the model obeys is measured against the deployed model, in
+    scripts/measure_widened_answer_order.py.
+
+    Only when it widened. On a normal answer this instruction would be noise.
+    """
+    _, seen = wire(monkeypatch, [{"chunks": [CHUNK], "basis": {"from": "2026-07-18",
+                                                               "to": "2026-07-18",
+                                                               "widened": True}}])
+
+    ask(question="昨天发生了什么", tz="Pacific/Auckland", now=NOW)
+
+    assert "2026-07-18" in seen["prompt"]
+    assert "FIRST sentence" in seen["prompt"]
+
+
+def test_an_unwidened_answer_is_not_given_that_instruction(monkeypatch):
+    _, seen = wire(monkeypatch, [{"chunks": [CHUNK], "basis": {"from": "2026-08-29",
+                                                               "to": "2026-08-29",
+                                                               "widened": False}}])
+
+    ask(question="昨天发生了什么", tz="Pacific/Auckland", now=NOW)
+
+    assert "FIRST sentence" not in seen["prompt"]
