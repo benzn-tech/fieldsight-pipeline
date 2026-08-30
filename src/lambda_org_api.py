@@ -2103,6 +2103,18 @@ def session_brief_read(conn, caller, session_id, event):
         "entities": data.get("entities", []),
         "tasks": data.get("tasks", []),
         "stats": data.get("stats"),
+        # The docstring above says "returned whole rather than filtered" and the
+        # code was a five-key whitelist. `summary` and `open_todos` are in every
+        # stored brief and reached nobody: the writer widens the brief with them
+        # (session_brief.to_session_summary), the email reads them from its own
+        # copy, and this endpoint dropped them on the floor.
+        #
+        # A whitelist protects nothing here -- the object is this company's own
+        # brief and the ACL was applied to reach it. All it guarantees is that
+        # the NEXT field added to the writer is stored forever and served never,
+        # which is the shape that has to be built in before it can be found.
+        "summary": data.get("summary", ""),
+        "open_todos": data.get("open_todos", []),
     })
 
 
