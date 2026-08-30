@@ -535,8 +535,7 @@ def report_date_counts(conn, site_ids, since_date, *, author_ids=None) -> list[d
     # The source arm is not decoration: `lambda_ingest` re-creates a superseded day's
     # topics with new uuids that no topic-keyed tombstone names, so a topic-only filter
     # hides the dot tonight and draws it again after the nightly rebuild.
-    where = ("WHERE t.site_id = ANY(%s::uuid[]) AND t.report_date >= %s "
-             f"AND {visible_topics_predicate('t')}")
+    where = "WHERE t.site_id = ANY(%s::uuid[]) AND t.report_date >= %s"
     params = [list(site_ids), since_date]
     if author_ids is not None:
         where += " AND t.user_id = ANY(%s::uuid[])"
