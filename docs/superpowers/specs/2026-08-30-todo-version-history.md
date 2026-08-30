@@ -185,3 +185,89 @@ with an endpoint that is already live and no new table.
 Hold V2 behind the re-measurement gate in §2. The design above is what it should be built as
 when the gate opens; building it now would be tuning a matcher against four clusters, and
 the rule that fits three of them is the rule that folds the fourth.
+
+---
+
+## 7. Corrections, same day — an adversarial review of §2 and §3
+
+Six things above were wrong or unsupported. They are corrected here rather than edited away,
+because the wrong version was specific and someone will otherwise re-derive it.
+
+### 7.1 `occurred_at` is NULL on every topic ever written. V1 must not use it.
+
+§2 promised the sketch's *"Tue 2:45 pm"* from `topics.occurred_at`. Neither writer passes it:
+`lambda_item_writer` (the extraction path) and `lambda_ingest` (the report path) both call
+`topics.upsert_topic` without the kwarg, and it defaults to `None`. Confirmed independently
+against production — `GET /api/org/timeline?date=2026-07-17` returns topics that do not carry
+the field at all.
+
+`time_range` is not the substitute: `src/session_scope.py` states it is LLM free text that may
+LABEL a session and must never DECIDE one.
+
+**The real source already exists and is already served.** `/api/org/timeline` returns
+`session_id` and `session_kind` per topic, and `/api/org/sessions?date=&user=` returns
+`started_at`, `ended_at` and `title` per session — computed by `build_day_sessions` through
+`session_scope.session_start` with the `meeting_session` fallback for `sid…` bases that carry
+no time in their name.
+
+### 7.2 So V1 needs no new endpoint at all — and that is a better V1 than §2 described
+
+`/api/org/timeline` already returns each action item with its **`id`**, alongside its topic's
+`session_id`, `session_kind` and `time_range`. Composed with `/api/org/sessions` for the start
+time and title, and `GET /api/org/content/action_items/{id}/history` for the edits, every line
+of the sketch is served by endpoints that are live today.
+
+**V1 is therefore a frontend composition over three existing reads, and the backend work for it
+is zero.** §2's claim that "everything it needs already exists" was right for the wrong reason:
+there is no `GET /api/org/action-items/{id}` — the only route on that path is PATCH — but the
+card does not need one, because it is rendered inside a day view that has already fetched the
+data.
+
+If a single-item fetch is ever wanted (a deep link straight to one to-do), it should copy
+`get_content_history`'s READ-tier authorization — tenant pin, 404 for cross-company, 403 for an
+out-of-reach site — and **not** `patch_action_item`'s write tier, whose assignee conjunct would
+hide the card from people entitled to read it.
+
+### 7.3 The gate is in clusters and the harness now counts clusters
+
+§2 states the gate in clusters while `scripts/measure_action_duplicates.py` printed only pairs;
+the cluster numbers were derived by hand. The script now does connected components and prints
+`pairs -> clusters` for both halves, names which number the gate reads, and lists each cross-day
+cluster in full. Re-running it now answers the gate as written.
+
+### 7.4 Same-day duplicates are not the live tier against the final tier
+
+`extraction_key` puts both tiers on one S3 key so the final pass supersedes the live one in
+place, and the harness skips pairs sharing a `session_base` regardless. What remains is a split
+session and **group merge**: the merged artifact takes its own `grp…` base while the members'
+artifacts stay in S3 even after `_delete_member_topics` removes the members' database rows.
+
+### 7.5 …which means the artifact corpus can hold duplicates that never coexist — so it was checked
+
+An S3-only measurement cannot tell a customer-visible duplicate from a superseded copy the
+bucket still holds. Checked through the live read model on 2026-08-30:
+
+```
+GET /api/org/timeline?date=2026-08-10&user=Ben_UCPK2
+  -> 39 topics, 35 action items, 12 sessions
+     "Scaffolding -- inspect before Monday"   x3
+     "Site meeting -- attend tomorrow 8 AM"   x2
+     "Wood and screws -- purchase at Mitre 10" x2
+     "Shelf brackets -- install two additional" x2
+```
+
+So §5's claim survives, now with a source: the duplication is in what the customer sees, not
+only in the bucket. It is still a de-duplication question, not a version chain.
+
+### 7.6 A dead id 404s, it does not render an empty list — and it is not nightly
+
+§3 said a version list keyed on `action_items.id` "silently empties overnight". Two corrections.
+`GET /content/action_items/{id}/history` **404s** for a superseded row, because the row lookup
+fails before the edits are read — so 0019's "the audit outlives the row" is true of the table
+and unreachable through the only endpoint that reads it. And "overnight" overstates it: under
+`AUTHORITY_FLIP` with `_should_defer`, a day that has extractions keeps its extraction topics
+and no uuids regenerate. The instability is real on non-defer days and on a re-triggered
+item-writer event; it is not the nightly norm.
+
+The 18-dates-vs-22-dates comparison in §1 also came from a second measurement, not from the
+harness: `GET /api/org/dates` for the database side, and the artifact listing for the other.
