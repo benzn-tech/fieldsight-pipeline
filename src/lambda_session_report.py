@@ -153,10 +153,64 @@ def _send_email(artifact):
         sender.send(to, subject, body_text)
 
 
+def _session_was_deleted(artifact):
+    """Is this session in the day's deletion mirror? Never raises.
+
+    Sibling of `lambda_session_finalize._session_was_deleted`, and lenient for
+    the same reason: an unreadable mirror must not cost a requester the report
+    they asked for, and this worker RECORDS errors rather than retrying them.
+    The strict counterpart is `lambda_org_api._session_was_removed`, which backs
+    read endpoints where a failed check costs one reader one refresh -- see its
+    docstring for why the two postures are deliberate and must not be merged.
+
+    Both spellings are compared: the mirror carries whatever `sessionBase` the
+    delete endpoint had, and this artifact's `sessionId` is bare hex.
+
+    Logged on failure, because a permission fault here looks exactly like
+    "nothing was deleted".
+    """
+    folder, date = artifact.get("folder"), artifact.get("date")
+    sid = (artifact.get("sessionId") or "").strip()
+    if not (folder and date and sid):
+        return False
+    try:
+        import boto3
+
+        import deletion_mirror
+        deleted = deletion_mirror.deleted_sessions(
+            boto3.client("s3"), S3_BUCKET, folder, date)
+    except Exception:
+        logger.exception("report: deletion mirror unreadable for %s/%s -- proceeding as "
+                         "if nothing was deleted, which may mail a removed recording",
+                         folder, date)
+        return False
+    return sid in deleted or f"sid{sid}" in deleted
+
+
 def process_request(artifact):
     """Render one enqueued request → Word doc (+ optional email) → result JSON."""
     result_key = artifact["resultKey"]
     request_id = artifact.get("requestId")
+
+    # A session deleted before this request is rendered must not become a DOCX in
+    # S3, and must not be emailed.
+    #
+    # `GET /report/status` stops the POLL from serving a removed session, but this
+    # worker is S3-triggered: a delete landing between org-api's enqueue and this
+    # run -- or an event redelivery hours later -- reaches neither guard. It is
+    # the same defect fixed in `lambda_session_finalize` one lambda over, and it
+    # was the last surface in the deletion enumeration still carrying it.
+    #
+    # Checked BEFORE the render, so nothing is produced from content that must
+    # not leave. The outcome is RECORDED because the requester polls `resultKey`;
+    # a silent skip leaves that poll spinning forever, which is a different bug
+    # wearing this fix's clothes.
+    if _session_was_deleted(artifact):
+        logger.info("report: %s was deleted -- not rendering, not sending", request_id)
+        _write_result(result_key, {"status": "skipped", "requestId": request_id,
+                                   "reason": "recording deleted"})
+        return
+
     try:
         minutes, title = _content_to_minutes(artifact)
         buf = generate_word_document(minutes, title)
