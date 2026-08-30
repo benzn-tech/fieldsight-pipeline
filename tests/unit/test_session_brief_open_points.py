@@ -113,3 +113,58 @@ def test_the_pre_existing_stats_survive_the_new_keys():
     brief = sb.brief_from_turns(TURNS, call_llm=_llm([GOOD]))
     for key in ("reanchored", "unmatched", "aliases_rejected"):
         assert key in brief["stats"], f"the open-points block displaced {key!r}"
+
+
+def test_resolution_is_a_second_call_and_its_failure_is_not_fatal():
+    """Two model calls, and only the first may take the brief down."""
+    calls = []
+
+    def call_llm(prompt, **kw):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return (_reply([GOOD]), None)
+        return (None, "resolver timed out")
+
+    brief = sb.brief_from_turns(TURNS, call_llm=call_llm)
+
+    assert len(calls) == 2, "the resolution call did not happen"
+    assert brief["open_points"][0]["resolution"] is None
+    assert brief["stats"]["open_points_resolved"] == 0
+
+
+def test_a_resolved_point_carries_its_cases_and_its_location():
+    def call_llm(prompt, **kw):
+        if "open_points" in prompt:                 # the brief prompt
+            return (_reply([GOOD]), None)
+        return ('{"resolutions": [{"index": 0, "cases": ["by load", "by height"], '
+                '"where": "NZS 3604, foundations"}]}', None)
+
+    brief = sb.brief_from_turns(TURNS, call_llm=call_llm)
+
+    assert brief["open_points"][0]["resolution"]["cases"] == ["by load", "by height"]
+    assert brief["stats"]["open_points_resolved"] == 1
+
+
+def test_no_admitted_points_means_no_second_call():
+    """A meeting that left nothing hanging must not pay for a model call to
+    resolve nothing."""
+    calls = []
+
+    def call_llm(prompt, **kw):
+        calls.append(prompt)
+        return (_reply([]), None)
+
+    sb.brief_from_turns(TURNS, call_llm=call_llm)
+    assert len(calls) == 1
+
+
+def test_a_resolver_that_raises_costs_the_resolutions_not_the_brief(monkeypatch):
+    import open_points
+
+    monkeypatch.setattr(open_points, "attach_resolutions",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    brief = sb.brief_from_turns(TURNS, call_llm=_llm([GOOD]))
+
+    assert brief is not None
+    assert len(brief["open_points"]) == 1
+    assert brief["stats"]["open_points_resolved"] == 0

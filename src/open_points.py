@@ -19,10 +19,14 @@ and must stay pure at import.
 
 Spec: docs/superpowers/specs/2026-08-30-open-questions-pre-resolved-design.md
 """
+import json
 import re
 from datetime import datetime, timedelta
 
-__all__ = ["has_uncertainty_marker", "admit"]
+from output_language import OUTPUT_LANGUAGE_RULE
+
+__all__ = ["has_uncertainty_marker", "admit",
+           "build_resolution_prompt", "attach_resolutions"]
 
 # Deliberately narrow. A marker is a speaker flagging their OWN recall as
 # unreliable -- not politeness, not softening, and not a question put to someone
@@ -213,3 +217,109 @@ def admit(candidates, turns, *, check=None):
         })
 
     return admitted, {"admitted": len(admitted), "rejected": rejected}
+
+
+_RESOLUTION_RULES = """You are answering questions a construction meeting left open about a
+STANDARD or specification. For each numbered item below, say what the answer DEPENDS ON and
+where to look it up.
+
+Rules:
+- Give the CASES the value varies by -- load, ground condition, height, span, exposure,
+  whatever that standard divides on. That is the answer a reader can apply themselves.
+- Say WHERE it is settled: the part, chapter or section. A range is fine.
+- NEVER state a specific value, dimension, or clause number as fact. You do not have the
+  document in front of you, and a number that turns out to be wrong goes into a variation
+  and then into a dispute. A reader who knows which cases exist and where to look has what
+  they need; a reader handed a wrong number has worse than nothing.
+- If you do not know which standard, or which part of it, return no entry for that item.
+  An omission is a correct answer here and is displayed as an open question.
+- Do not quote the standard and do not reproduce a table."""
+
+
+def build_resolution_prompt(points):
+    """The prompt for the `standard` points, or None when there are none.
+
+    ONLY `standard` points are sent, and the exclusions are not squeamishness:
+    a `supply` point is about stock right now, `needs_a_person` is about
+    somebody's judgement, and `in_corpus` is about our own records. None of
+    those facts exists in a model's weights, so asking produces a fabrication
+    carrying exactly the confidence of a real answer. They are displayed
+    unresolved instead, which is the honest state and is visible to the reader.
+    """
+    items = [(i, p) for i, p in enumerate(points or [])
+             if isinstance(p, dict) and p.get("kind") == "standard"]
+    if not items:
+        return None
+    listed = "\n".join(
+        f'{i}. subject: {p.get("subject", "")} | what was said: {p.get("claim", "")}'
+        for i, p in items)
+    return (
+        _RESOLUTION_RULES + "\n" + OUTPUT_LANGUAGE_RULE
+        + "\n\n## Items\n" + listed
+        + '\n\n## Reply\nJSON only, no prose: {"resolutions": [{"index": <the number '
+          'above>, "cases": ["one short phrase per case"], "where": "part / chapter / '
+          'section"}]}. Leave out any item you cannot answer.'
+    )
+
+
+def attach_resolutions(points, call_llm):
+    """Fill `resolution` on the `standard` points in place. Returns stats.
+
+    EVERY point gets the key, resolved or not. Absent-vs-null is how a reader
+    would learn "this build has no resolutions" instead of "we could not answer
+    this one", and those are different facts.
+
+    Never raises: a resolution is an enrichment on top of an enrichment, and the
+    caller's brief must survive both.
+    """
+    for p in points or []:
+        if isinstance(p, dict):
+            p.setdefault("resolution", None)
+
+    stats = {"resolved": 0, "dropped": 0, "error": None}
+    prompt = build_resolution_prompt(points)
+    if prompt is None:
+        return stats
+
+    # enable_thinking is sent EXPLICITLY. It is a per-function env
+    # (QWEN_ENABLE_THINKING) and the brief's own call overrides it to True for
+    # its own reasons; inheriting here would make this call's latency a property
+    # of whichever call ran last. Off: this is a short, tightly-shaped answer,
+    # and thinking measured ~10x on this provider.
+    raw, err = call_llm(prompt, max_tokens=2000, force_json=True,
+                        enable_thinking=False)
+    if err or not raw:
+        stats["error"] = err or "empty reply"
+        return stats
+
+    try:
+        entries = (json.loads(raw) or {}).get("resolutions") or []
+    except Exception:
+        stats["error"] = "unparseable reply"
+        return stats
+
+    for e in entries:
+        if not isinstance(e, dict):
+            stats["dropped"] += 1
+            continue
+        i = e.get("index")
+        # An index the model invented attaches a pile answer to a door question:
+        # worse than no answer, and indistinguishable from one.
+        if not isinstance(i, int) or isinstance(i, bool) or not (0 <= i < len(points)):
+            stats["dropped"] += 1
+            continue
+        target = points[i]
+        if not isinstance(target, dict) or target.get("kind") != "standard":
+            stats["dropped"] += 1
+            continue
+        cases = [c for c in (e.get("cases") or []) if isinstance(c, str) and c.strip()]
+        where = e.get("where") if isinstance(e.get("where"), str) else ""
+        # "I have no idea" arriving as empty fields must not render as a resolved
+        # point with nothing in it.
+        if not cases and not where.strip():
+            stats["dropped"] += 1
+            continue
+        target["resolution"] = {"cases": cases, "where": where}
+        stats["resolved"] += 1
+
+    return stats

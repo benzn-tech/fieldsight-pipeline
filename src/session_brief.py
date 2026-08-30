@@ -400,6 +400,25 @@ def brief_from_turns(turns, call_llm=None):
     logger.info("session_brief: %d open point(s) admitted, %d rejected (%s)",
                 op_stats["admitted"], sum(op_stats["rejected"].values()),
                 op_stats["rejected"] or "none")
+
+    # Resolve the `standard` ones with a SECOND model call, here rather than at
+    # read time. finalize is non-VPC and already holds the LLM env, so this needs
+    # no endpoint, no IAM and no client input -- and the answer lands INSIDE the
+    # brief object, so it inherits the brief's deletion posture instead of
+    # becoming a second frozen copy somewhere else.
+    #
+    # It is a CACHE and not a record (spec section 8): regenerable, never
+    # authoritative, and no row anywhere references it.
+    try:
+        res_stats = open_points.attach_resolutions(admitted, call_llm)
+    except Exception:
+        logger.exception("session_brief: open-point resolution failed -- "
+                         "the points are kept, unresolved")
+        res_stats = {"resolved": 0, "dropped": 0, "error": "exception"}
+    brief["stats"]["open_points_resolved"] = res_stats["resolved"]
+    logger.info("session_brief: %d open point(s) resolved, %d dropped%s",
+                res_stats["resolved"], res_stats["dropped"],
+                f", error={res_stats['error']}" if res_stats["error"] else "")
     logger.info("session_brief: %d section(s), %d bullet(s), %d entit(ies), %d task(s); "
                 "%d anchor(s) corrected, %d unmatched",
                 len(brief.get("sections") or []),

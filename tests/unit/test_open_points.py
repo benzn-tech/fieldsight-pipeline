@@ -210,3 +210,122 @@ def test_the_anchor_crosses_midnight_to_the_nearest_occurrence():
 
     admitted, stats = op.admit([_candidate(at="23:58:00")], turns)
     assert len(admitted) == 1, stats
+
+
+# ==========================================================================
+# resolution -- only the standard ones, and never a value stated as fact
+# ==========================================================================
+
+_PTS = [
+    {"kind": "standard", "claim": "Pile size in 3604", "subject": "3604"},
+    {"kind": "supply", "claim": "CZ LiDAR stock", "subject": "CZ LiDAR"},
+    {"kind": "needs_a_person", "claim": "Engineer sign-off", "subject": "engineer"},
+    {"kind": "in_corpus", "claim": "The date agreed last time", "subject": "date"},
+]
+
+
+def test_only_standard_points_are_sent_to_the_model():
+    """A `supply` point is about stock right now, `needs_a_person` about
+    somebody's judgement, `in_corpus` about our own records. None of those facts
+    is in a model's weights, so asking produces a fabrication carrying exactly
+    the confidence of a real answer."""
+    prompt = op.build_resolution_prompt(_PTS)
+    assert "3604" in prompt
+    assert "CZ LiDAR" not in prompt
+    assert "Engineer sign-off" not in prompt
+    assert "The date agreed last time" not in prompt
+
+
+def test_no_standard_points_means_no_model_call_at_all():
+    assert op.build_resolution_prompt(_PTS[1:]) is None
+    assert op.build_resolution_prompt([]) is None
+    assert op.build_resolution_prompt(None) is None
+
+
+def test_the_prompt_forbids_stating_a_value_as_fact():
+    """The product rule: give the cases and the location, never the number. A
+    reader who knows which cases exist can spot a wrong cell; a reader given a
+    wrong number puts it in a variation."""
+    low = op.build_resolution_prompt(_PTS).lower()
+    assert "never state a specific value" in low
+    assert "cases" in low
+    assert "section" in low or "chapter" in low
+    assert "do not quote" in low
+
+
+def test_a_resolution_lands_on_the_point_it_was_asked_about():
+    pts = [dict(p) for p in _PTS]
+    reply = ('{"resolutions": [{"index": 0, "cases": ["by load", "by ground condition"], '
+             '"where": "NZS 3604, the foundations part"}]}')
+    stats = op.attach_resolutions(pts, lambda *a, **k: (reply, None))
+
+    assert pts[0]["resolution"]["cases"] == ["by load", "by ground condition"]
+    assert pts[0]["resolution"]["where"].startswith("NZS 3604")
+    assert stats["resolved"] == 1
+
+
+def test_every_point_carries_the_key_resolved_or_not():
+    """Absent-vs-null is how a reader would learn "this build has no
+    resolutions" instead of "we could not answer this one"."""
+    pts = [dict(p) for p in _PTS]
+    op.attach_resolutions(pts, lambda *a, **k: ('{"resolutions": []}', None))
+    for p in pts:
+        assert "resolution" in p
+        assert p["resolution"] is None
+
+
+def test_an_index_the_model_invented_is_dropped():
+    """A wrong index attaches a pile answer to a door question, which is worse
+    than no answer and looks exactly like one."""
+    pts = [dict(_PTS[0])]
+    reply = '{"resolutions": [{"index": 7, "cases": ["x"], "where": "y"}]}'
+    stats = op.attach_resolutions(pts, lambda *a, **k: (reply, None))
+    assert pts[0]["resolution"] is None
+    assert stats["dropped"] == 1
+
+
+def test_a_resolution_aimed_at_a_non_standard_point_is_dropped():
+    pts = [dict(p) for p in _PTS]
+    reply = '{"resolutions": [{"index": 1, "cases": ["x"], "where": "y"}]}'
+    stats = op.attach_resolutions(pts, lambda *a, **k: (reply, None))
+    assert pts[1]["resolution"] is None
+    assert stats["dropped"] == 1
+
+
+def test_an_empty_answer_is_not_a_resolution():
+    """"I have no idea" arriving as {cases: [], where: ""} must not render as a
+    resolved point with nothing in it."""
+    pts = [dict(_PTS[0])]
+    reply = '{"resolutions": [{"index": 0, "cases": [], "where": ""}]}'
+    stats = op.attach_resolutions(pts, lambda *a, **k: (reply, None))
+    assert pts[0]["resolution"] is None
+    assert stats["dropped"] == 1
+
+
+def test_an_llm_failure_leaves_everything_unresolved_and_says_so():
+    pts = [dict(_PTS[0])]
+    stats = op.attach_resolutions(pts, lambda *a, **k: (None, "timeout"))
+    assert pts[0]["resolution"] is None
+    assert stats["error"] == "timeout"
+    assert stats["resolved"] == 0
+
+
+def test_an_unparseable_reply_is_not_a_crash():
+    pts = [dict(_PTS[0])]
+    stats = op.attach_resolutions(pts, lambda *a, **k: ("not json at all", None))
+    assert pts[0]["resolution"] is None
+    assert stats["error"]
+
+
+def test_thinking_is_sent_explicitly():
+    """QWEN_ENABLE_THINKING is a per-function env and the brief's own call
+    overrides it to True. Inheriting here would make the resolution's latency a
+    property of whichever call ran last."""
+    seen = {}
+
+    def call_llm(prompt, **kw):
+        seen.update(kw)
+        return ('{"resolutions": []}', None)
+
+    op.attach_resolutions([dict(_PTS[0])], call_llm)
+    assert seen["enable_thinking"] is False
