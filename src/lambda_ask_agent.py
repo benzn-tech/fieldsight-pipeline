@@ -527,7 +527,7 @@ Rules:
 - Answer in English."""
 
 
-def build_rag_prompt(question, chunks, mode=None, today=None):
+def build_rag_prompt(question, chunks, mode=None, today=None, basis=None):
     """Number each retrieved chunk [1..n] with a site_name . report_date .
     topic_title header, fence its chunk_text, and append the question.
     Fencing + the RAG_SYSTEM_CONTEXT "DATA, not instructions" rule is the
@@ -539,7 +539,14 @@ def build_rag_prompt(question, chunks, mode=None, today=None):
     header already carries a date; without an anchor the model cannot tell
     which of them "yesterday" means, so it summarises all of them. Omitted
     entirely when no usable zone arrived -- a server-side date would be worse
-    than none, because the model would use it exactly as confidently."""
+    than none, because the model would use it exactly as confidently.
+
+    `basis` is only read for its `widened` flag, and only to fix the ORDER of
+    the answer. Measured on TEST: asked what happened yesterday with nothing
+    recorded that day, the model opened with "there is no information about
+    yesterday" and put the records it did find second. The useful sentence was
+    the second one. This product's reader is on a site and reads the first line
+    -- answers first, the gap after."""
     excerpt_blocks = []
     for i, c in enumerate(chunks, start=1):
         header = " . ".join(
@@ -555,6 +562,14 @@ def build_rag_prompt(question, chunks, mode=None, today=None):
 
     system_context = RAG_SYSTEM_CONTEXT_VOICE if mode == "voice" else RAG_SYSTEM_CONTEXT
     parts = [system_context]
+    if basis and basis.get("widened"):
+        parts.append(
+            f"## The period asked about is empty\nThere are no records in the period the "
+            f"question names. What follows is from {basis.get('from')}, the most recent day "
+            f"that has any. Lead with what those records say. Then note, in one short "
+            f"sentence, that the period asked about has nothing in it. Do not open with the "
+            f"absence, and do not answer only with it."
+        )
     if today:
         parts.append(
             f"## Today\n{today} -- the local date of the person asking. Read any relative "
@@ -896,7 +911,8 @@ def _rag_answer(body):
                 "basis": basis,
             }
 
-        prompt = build_rag_prompt(question, chunks, mode=body.get("mode"), today=today)
+        prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
+                                  today=today, basis=basis)
         answer, err = llm_utils.call_llm(prompt, max_tokens=2048, force_json=False)
 
         if err:
