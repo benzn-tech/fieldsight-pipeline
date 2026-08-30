@@ -46,7 +46,7 @@ def _seed(db):
 def _topic(db, site_id, user_id, title, date, source_s3_key):
     return topics.upsert_topic(
         db, site_id, date, title, user_id=user_id, source_s3_key=source_s3_key,
-        summary="s", action_items=[{"action": "do it", "status": "open"}])
+        summary="s", action_items=[{"text": "do it", "status": "open"}])
 
 
 def _delete_topic(db, company_id, topic_id, user_id):
