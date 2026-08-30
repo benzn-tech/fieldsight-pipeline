@@ -1,8 +1,9 @@
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
-from repositories.search_sql import build_search_sql  # re-export
+from repositories.search_sql import build_latest_date_sql, build_search_sql  # re-export
 
-__all__ = ["build_search_sql", "insert_chunk", "search_chunks",
+__all__ = ["build_search_sql", "build_latest_date_sql", "insert_chunk", "search_chunks",
+           "latest_visible_date",
            "delete_chunks_for_source", "delete_chunks_for_topic",
            "archive_chunks_for_session", "restore_chunks_for_batch",
            "SESSION_CHUNK_PREDICATE"]
@@ -66,6 +67,24 @@ def search_chunks(conn, query_embedding, accessible_site_ids, k=5,
          "date_from": date_from, "date_to": date_to,
          "author_ids": list(author_ids) if author_ids is not None else None},
     ).fetchall()
+
+
+def latest_visible_date(conn, accessible_site_ids, *, author_ids=None, on_or_before=None):
+    """The most recent report_date this caller can see, or None.
+
+    Used only by Ask's widening step, so that "nothing yesterday" becomes "the
+    27th, and here is what it said" rather than an empty answer. Returns an ISO
+    string: it goes straight back into `search_chunks`'s date params and into
+    the response's scope, and a `date` object would need converting at both.
+    """
+    row = conn.cursor(row_factory=dict_row).execute(
+        build_latest_date_sql(),
+        {"site_ids": list(accessible_site_ids),
+         "author_ids": list(author_ids) if author_ids is not None else None,
+         "on_or_before": on_or_before},
+    ).fetchone()
+    latest = (row or {}).get("latest")
+    return latest.isoformat() if latest is not None else None
 
 
 def delete_chunks_for_source(conn, source_s3_key) -> int:

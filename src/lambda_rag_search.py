@@ -67,9 +67,24 @@ def _search(event, context):
     date_from = event.get("date_from") or None
     date_to = event.get("date_to") or None
     site_filter = event.get("site") or None  # scope search to ONE project (within ACL)
+    # Opt-in, and Ask is the only caller that opts in. Search (mode=search)
+    # sends the dates a person picked in the UI and wants exactly those days --
+    # widening a filtered LIST would show rows outside the filter they set.
+    widen = bool(event.get("widen_when_empty"))
+
+    # What the answer will be based on. Carried on EVERY return below, empty
+    # search included: a caller reading `result.get("basis")` and finding None
+    # cannot tell "this search matched nothing" from "this deploy predates the
+    # field", and ask-agent's fallback in that case is to report the range it
+    # ASKED for as the range actually used.
+    #
+    # Named `basis` and not `scope` deliberately. `scope` already means two
+    # other things on this path -- the request's report/transcript/both, and
+    # `repositories.scope`, the ACL primitive imported in this very file.
+    basis = {"from": date_from, "to": date_to, "widened": False}
 
     if not sub or not qv:
-        return {"chunks": [], "error": "missing sub or query_embedding"}
+        return {"chunks": [], "error": "missing sub or query_embedding", "basis": basis}
 
     # Reuse a module-level connection across warm invokes — reconnecting to
     # Aurora cost ~1-2s per call and dominated search latency. Read-only path,
@@ -78,7 +93,7 @@ def _search(event, context):
     caller = users.get_user_by_sub(conn, sub)
     if caller is None:
         logger.info("rag-search: caller not provisioned for sub=%s", sub)
-        return {"chunks": [], "error": "caller not provisioned"}
+        return {"chunks": [], "error": "caller not provisioned", "basis": basis}
 
     # Fail-safe: ALWAYS scope through the dashboard's ACL primitive (per-author
     # graded visibility). No GRADED_ROLES gate here — rag-search is a new
@@ -106,10 +121,30 @@ def _search(event, context):
             site_ids = [s for s in site_ids if str(s) == str(matched_id)]
 
     if not site_ids:
-        return {"chunks": [], "site_count": 0}
+        return {"chunks": [], "site_count": 0, "basis": basis}
 
     rows = chunks.search_chunks(conn, qv, site_ids, k=k, author_ids=author_ids,
                                 date_from=date_from, date_to=date_to)
+
+    # "Nothing yesterday" must not become an empty answer. Retry on the nearest
+    # day this caller can actually see, at or BEFORE the range they asked
+    # about: widening forward would answer a question about last week with
+    # something recorded after it. The nearest day is found under the search's
+    # own visibility rules -- a deleted recording must not disclose its date by
+    # being the day the answer widens onto.
+    #
+    # Logged either way. "It ran and there was nowhere to widen to" and "it
+    # never ran" are the same observation otherwise, which is how a whole
+    # feature stays broken unnoticed here.
+    if widen and not rows and (date_from or date_to):
+        latest = chunks.latest_visible_date(
+            conn, site_ids, author_ids=author_ids, on_or_before=date_to or date_from)
+        logger.info("rag-search: %s..%s empty; nearest visible day is %s",
+                    date_from, date_to, latest)
+        if latest:
+            rows = chunks.search_chunks(conn, qv, site_ids, k=k, author_ids=author_ids,
+                                        date_from=latest, date_to=latest)
+            basis = {"from": latest, "to": latest, "widened": True}
     # Synthesis-time safety net (spec §4): normalize retrieved chunk text with
     # the company's active aliases, so a chunk not yet re-embedded still reads
     # corrected before the LLM. site_ids here are the caller's accessible sites.
@@ -125,4 +160,4 @@ def _search(event, context):
     # and report_date is datetime.date -- Lambda's JSON marshaller can't
     # serialize either. Coerce to plain strings before returning.
     rows = json.loads(json.dumps(rows, default=str))
-    return {"chunks": rows, "site_count": len(site_ids)}
+    return {"chunks": rows, "site_count": len(site_ids), "basis": basis}

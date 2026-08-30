@@ -1,3 +1,10 @@
+"""
+NOTE on the assertions below: they check the fields under test rather than the
+whole dict. Every return path now also carries `basis` (the date range actually
+searched, see test_rag_search_widening.py), and an exact-dict assertion here
+would fail on that addition while testing nothing about it -- the same way it
+would fail on the next one.
+"""
 import datetime
 import json
 import uuid
@@ -50,18 +57,18 @@ def test_missing_sub_or_vector_returns_empty(monkeypatch):
     monkeypatch.setattr(rag, "get_cached_connection", boom)
 
     res = rag.lambda_handler({"sub": None, "query_embedding": [0.1] * 1024}, None)
-    assert res == {"chunks": [], "error": "missing sub or query_embedding"}
+    assert (res["chunks"], res["error"]) == ([], "missing sub or query_embedding")
 
     res2 = rag.lambda_handler({"sub": "sub-1", "query_embedding": None}, None)
-    assert res2 == {"chunks": [], "error": "missing sub or query_embedding"}
+    assert (res2["chunks"], res2["error"]) == ([], "missing sub or query_embedding")
 
     res3 = rag.lambda_handler({"sub": "sub-1", "query_embedding": []}, None)
-    assert res3 == {"chunks": [], "error": "missing sub or query_embedding"}
+    assert (res3["chunks"], res3["error"]) == ([], "missing sub or query_embedding")
 
 
 def test_caller_not_provisioned_returns_error_not_raise(wired):
     res = rag.lambda_handler(make_event(sub="sub-ghost"), None)
-    assert res == {"chunks": [], "error": "caller not provisioned"}
+    assert (res["chunks"], res["error"]) == ([], "caller not provisioned")
 
 
 def test_admin_uses_company_sites(wired):
@@ -284,7 +291,7 @@ def test_site_filter_inaccessible_denies(wired):
 
     res = rag.lambda_handler(ev, None)
 
-    assert res == {"chunks": [], "site_count": 0}
+    assert (res["chunks"], res["site_count"]) == ([], 0)
 
 
 def test_graded_site_manager_passes_self_workers_author_ids(wired, monkeypatch):
