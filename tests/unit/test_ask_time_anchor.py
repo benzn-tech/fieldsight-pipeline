@@ -215,6 +215,13 @@ def test_a_widened_answer_is_told_to_lead_with_what_it_found(monkeypatch):
     tolerance for prose, and the useful sentence was the second one. The
     product rule is answers-first: say what was found, then note the gap.
 
+    The first attempt at fixing it did not work, and this test could not tell:
+    it asked whether an instruction was PRESENT, and it was -- the model
+    ignored it and opened with the heading's own words. What a unit test can
+    pin is that the instruction is there and is scoped to the widened case;
+    whether the model obeys is measured against the deployed model, in
+    scripts/measure_widened_answer_order.py.
+
     Only when it widened. On a normal answer this instruction would be noise.
     """
     _, seen = wire(monkeypatch, [{"chunks": [CHUNK], "basis": {"from": "2026-07-18",
@@ -224,7 +231,7 @@ def test_a_widened_answer_is_told_to_lead_with_what_it_found(monkeypatch):
     ask(question="昨天发生了什么", tz="Pacific/Auckland", now=NOW)
 
     assert "2026-07-18" in seen["prompt"]
-    assert "Lead with" in seen["prompt"]
+    assert "FIRST sentence" in seen["prompt"]
 
 
 def test_an_unwidened_answer_is_not_given_that_instruction(monkeypatch):
@@ -234,4 +241,4 @@ def test_an_unwidened_answer_is_not_given_that_instruction(monkeypatch):
 
     ask(question="昨天发生了什么", tz="Pacific/Auckland", now=NOW)
 
-    assert "Lead with" not in seen["prompt"]
+    assert "FIRST sentence" not in seen["prompt"]
