@@ -79,11 +79,18 @@ def has_uncertainty_marker(text):
     return bool(_SELF_CHECK.search(text))
 
 
-# The same window, floor and threshold the extraction path verifies its
-# citations with (lambda_extract_session.py:380-382). Matching them is
-# deliberate: two verifiers with different tolerances would call one quote
-# verified on one path and unverified on the other, and the difference would
-# read as a property of the quote rather than of the caller.
+# The extraction path's DEFAULTS (lambda_extract_session.py:268-270). Matching
+# them is deliberate -- two verifiers with different tolerances would call one
+# quote verified on one path and unverified on the other, and the difference
+# would read as a property of the quote rather than of the caller.
+#
+# They are only equal by default, and a first draft of this comment claimed more
+# than that. Over there the three are CloudFormation parameters wired to env
+# (EvidenceWindowSec / EvidenceFloorTokens / EvidenceFuzzyThreshold,
+# template.yaml:750/806/768); here they are literals, because this module is
+# pure and reading env at import is what makes a module untestable in isolation.
+# So: tuning extraction silently un-matches these. If that ever happens, the
+# honest fix is to pass the three in from the caller, which has the env.
 _W_SECONDS = 60.0
 _FLOOR_TOKENS = 5
 _FUZZY = 0.80

@@ -142,9 +142,19 @@ def _search(event, context):
         logger.info("rag-search: %s..%s empty; nearest visible day is %s",
                     date_from, date_to, latest)
         if latest:
-            rows = chunks.search_chunks(conn, qv, site_ids, k=k, author_ids=author_ids,
-                                        date_from=latest, date_to=latest)
-            basis = {"from": latest, "to": latest, "widened": True}
+            widened_rows = chunks.search_chunks(conn, qv, site_ids, k=k,
+                                                author_ids=author_ids,
+                                                date_from=latest, date_to=latest)
+            # Claimed ONLY if the retry actually returned something. Setting it
+            # unconditionally reports "based on 2026-07-18" over zero excerpts --
+            # a statement about a day nothing was read from. It cannot happen
+            # today only because `build_search_sql` has no distance threshold, so
+            # a date with rows always yields rows; the other search path has one
+            # (0.55), and the day this one gains it, an unconditional flag would
+            # start lying with nothing to catch it.
+            if widened_rows:
+                rows = widened_rows
+                basis = {"from": latest, "to": latest, "widened": True}
     # Synthesis-time safety net (spec §4): normalize retrieved chunk text with
     # the company's active aliases, so a chunk not yet re-embedded still reads
     # corrected before the LLM. site_ids here are the caller's accessible sites.

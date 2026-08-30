@@ -242,3 +242,18 @@ def test_an_unwidened_answer_is_not_given_that_instruction(monkeypatch):
     ask(question="昨天发生了什么", tz="Pacific/Auckland", now=NOW)
 
     assert "FIRST sentence" not in seen["prompt"]
+
+
+def test_the_widened_prompt_does_not_call_five_excerpts_a_complete_record(monkeypatch):
+    """Retrieval is top-k, k=5 by default. On a busy day the excerpts are a
+    SAMPLE, and a prompt telling the model they are "a complete record of that
+    day" instructs it to overclaim -- inside a feature whose entire argument is
+    that the answer says honestly what it was built from."""
+    _, seen = wire(monkeypatch, [{"chunks": [CHUNK], "basis": {"from": "2026-07-18",
+                                                               "to": "2026-07-18",
+                                                               "widened": True}}])
+
+    ask(question="昨天发生了什么", tz="Pacific/Auckland", now=NOW)
+
+    assert "complete record" not in seen["prompt"]
+    assert "FIRST sentence" in seen["prompt"]     # the instruction that works stays

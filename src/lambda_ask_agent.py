@@ -578,11 +578,12 @@ def build_rag_prompt(question, chunks, mode=None, today=None, basis=None):
         # the subject is the most recent day, and the empty period is a closing
         # note. Nothing here is a sentence the model can lift as an opening.
         parts.append(
-            f"## What this answer is about\nAnswer about {widened_to}. That is the subject "
-            f"of this response -- treat the excerpts as a complete record of that day, not "
-            f"as a failed attempt at another one. Your FIRST sentence must state something "
-            f"that happened on {widened_to}. Save for the LAST sentence, and put nowhere "
-            f"else, one short note that the period the question named has no records."
+            f"## What this answer is about\nAnswer about {widened_to}. The excerpts below "
+            f"are from that day and they are what you have of it -- treat them as the "
+            f"subject of this response, not as a failed attempt at another day. Your FIRST "
+            f"sentence must state something that happened on {widened_to}. Save for the "
+            f"LAST sentence, and put nowhere else, one short note that the period the "
+            f"question named has no records."
         )
     if today:
         parts.append(
@@ -804,10 +805,18 @@ def _basis(result, chunks, requested_from, requested_to):
     module rag-search imports. Three meanings of one word in one round trip is
     how the wrong one gets read.
 
-    COMPUTED, never generated. The screen renders this as a pill and the voice
-    path as a spoken clause, from one dict, so the two cannot drift -- and a
-    model asked to phrase it would sooner or later say "three meetings" over a
-    single excerpt, which no downstream check could catch.
+    COMPUTED, never generated. A model asked to phrase it would sooner or later
+    say "three meetings" over a single excerpt, and no downstream check could
+    catch that.
+
+    WHAT ACTUALLY RENDERS IT, as of today: the web client, as a pill
+    (`formatAnswerBasis` in fieldsight-ui). The voice response carries the same
+    dict, but the device does not speak it -- an earlier version of this
+    docstring said it did, which was an intention written in the present tense.
+    Until the app renders it, the only thing a spoken widened answer carries is
+    the prompt instruction telling the model to close with the caveat, which is
+    exactly the model-composed mechanism this field exists to avoid. That fix is
+    a mobile change, and the field is already in the response waiting for it.
 
     `from`/`to` are the range rag-search really applied, which is not the range
     asked for when it widened. `dates` is the distinct set present in what came
@@ -1045,6 +1054,11 @@ def _voice_answer(body):
     _invoke_voice_audit(caller_sub, transcript, answer_text)
     return {
         "transcript": transcript,
+        # Carried, not dropped. This function builds its response from scratch,
+        # so anything the screen path gains stops here unless it is listed --
+        # which is how `_basis` came to claim the voice path rendered it while
+        # the voice path never received it. The device does not speak it yet.
+        "basis": rag.get("basis"),
         "answerText": answer_text,
         "audioBase64": _b64.b64encode(audio_out).decode("ascii"),
         "audioFormat": "wav",
