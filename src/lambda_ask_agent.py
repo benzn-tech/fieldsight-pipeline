@@ -562,13 +562,27 @@ def build_rag_prompt(question, chunks, mode=None, today=None, basis=None):
 
     system_context = RAG_SYSTEM_CONTEXT_VOICE if mode == "voice" else RAG_SYSTEM_CONTEXT
     parts = [system_context]
-    if basis and basis.get("widened"):
+    widened_to = basis.get("from") if (basis and basis.get("widened")) else None
+    if widened_to:
+        # The first attempt at this put a "## The period asked about is empty"
+        # heading here and asked for the content first. Measured on TEST, the
+        # model opened with that heading's own words both times -- a phrase
+        # handed to it at the top of a section is the phrase it starts with.
+        #
+        # It was also fighting RAG_SYSTEM_CONTEXT's standing rule, "if the
+        # excerpts do not contain the answer, say so clearly". Under widening
+        # the excerpts genuinely do not contain the period asked about, so the
+        # model was obeying the base rule correctly.
+        #
+        # So the question is RESTATED instead of argued with: for this answer
+        # the subject is the most recent day, and the empty period is a closing
+        # note. Nothing here is a sentence the model can lift as an opening.
         parts.append(
-            f"## The period asked about is empty\nThere are no records in the period the "
-            f"question names. What follows is from {basis.get('from')}, the most recent day "
-            f"that has any. Lead with what those records say. Then note, in one short "
-            f"sentence, that the period asked about has nothing in it. Do not open with the "
-            f"absence, and do not answer only with it."
+            f"## What this answer is about\nAnswer about {widened_to}. That is the subject "
+            f"of this response -- treat the excerpts as a complete record of that day, not "
+            f"as a failed attempt at another one. Your FIRST sentence must state something "
+            f"that happened on {widened_to}. Save for the LAST sentence, and put nowhere "
+            f"else, one short note that the period the question named has no records."
         )
     if today:
         parts.append(
