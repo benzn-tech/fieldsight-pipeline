@@ -1185,9 +1185,16 @@ def ask_question(body, caller):
 
     if not question:
         return error('Missing question')
-    # NOTE: date is intentionally optional — RAG retrieval (rag-search) is
-    # global across the caller's accessible sites, not filtered by date.
-    # date is still forwarded as soft context when the caller supplies it.
+    # `date` is forwarded and the RAG path does not read it -- it branches on
+    # caller_sub before `date` is ever looked at, so a comment here once
+    # claiming it was "soft context" described something that never happened.
+    # It stays for the legacy S3 path, which does read it.
+    #
+    # `tz` is what the RAG path reads: an IANA zone id, not a date. The zone is
+    # sent instead of a computed date because NZ and AU are both on daylight
+    # saving for part of the year and do not switch on the same day, so a date
+    # computed anywhere but in the caller's own zone is wrong for one of them.
+    # Absent stays absent -- '' would be a blank every reader has to special-case.
 
     # REMOVED (BUG-39 WS2): legacy DynamoDB user/role gate. The RAG ACL is
     # enforced downstream by caller_sub -> rag-search (graded scope.visible_scope,
@@ -1207,6 +1214,8 @@ def ask_question(body, caller):
     }
     if date:
         payload['date'] = date
+    if body.get('tz'):
+        payload['tz'] = body['tz']
     if topic_id is not None:
         payload['topic_id'] = topic_id
 
@@ -1268,6 +1277,8 @@ def ask_voice(body, caller):
         'format': body.get('format') or 'm4a',
         'caller_sub': caller['sub'],
     }
+    if body.get('tz'):
+        payload['tz'] = body['tz']   # see ask_question: an IANA zone, not a date
     try:
         resp = lambda_client.invoke(
             FunctionName=ASK_AGENT_FUNCTION,
