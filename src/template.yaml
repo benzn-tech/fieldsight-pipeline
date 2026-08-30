@@ -2695,6 +2695,17 @@ Resources:
                     # missing mirror must read as 404 ("nothing deleted") rather than 403
                     # ("cannot tell"), which the lenient read swallows into an empty set.
                     - redactions/*
+                    # The vector sidecar. `ingest_report` catches NoSuchKey to skip a report
+                    # that has no sidecar -- a zero-chunk report, or the backfill path
+                    # reaching a report before embed-report has run -- and treats it as a
+                    # clean skip rather than a failure. GetObject on embeddings/* is granted
+                    # below and this was not, so a missing sidecar raised AccessDenied, the
+                    # except did not match, and the whole report's ingest failed instead.
+                    # Not observed in prod: 73 log lines in seven days, no AccessDenied and
+                    # no skip either, so the path has simply not been reached. Found by
+                    # sweeping every prod role for GetObject-allowed / ListBucket-denied
+                    # after the same shape was fixed in org-api three times over.
+                    - embeddings/*
 
   # ----------------------------------------------------------
   # Lambda 15: Embed Report (Phase 4d) — S3 event on reports/,
