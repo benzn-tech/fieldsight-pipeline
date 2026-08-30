@@ -52,6 +52,7 @@ def candidate_corpus(conn, site_id, before_date, window_days):
         # A deleted topic must not be matchable. This is the arm that CREATES rather than
         # merely shows: without it the matcher keeps proposing threads built out of a
         # recording the customer removed, and each proposal is a new row carrying its text.
+        f"  AND {_VISIBLE_T} "
         "GROUP BY t.id HAVING count(a.id) FILTER (WHERE a.status='open') > 0",
         (site_id, before_date, before_date, window_days)).fetchall()
 
@@ -100,7 +101,7 @@ def thread_facts(conn, thread_id):
         "       max(t.report_date) AS last_raised, "
         "       count(a.id) FILTER (WHERE a.status='open') AS open_items "
         "FROM topics t LEFT JOIN action_items a ON a.topic_id = t.id "
-        f"WHERE t.thread_id = %s", (thread_id,)).fetchone()
+        f"WHERE t.thread_id = %s AND {_VISIBLE_T}", (thread_id,)).fetchone()
 
 
 def facts_for_threads(conn, thread_ids):
@@ -120,7 +121,7 @@ def facts_for_threads(conn, thread_ids):
         "       max(t.report_date) AS last_raised, "
         "       count(a.id) FILTER (WHERE a.status='open') AS open_items "
         "FROM topics t LEFT JOIN action_items a ON a.topic_id = t.id "
-        f"WHERE t.thread_id = ANY(%s) GROUP BY t.thread_id",
+        f"WHERE t.thread_id = ANY(%s) AND {_VISIBLE_T} GROUP BY t.thread_id",
         (list(thread_ids),)).fetchall()
     return {str(r["thread_id"]): r for r in rows}
 
@@ -196,9 +197,9 @@ def list_pending(conn, site_ids, limit=50):
         # The parent is filtered in the JOIN, not the WHERE: a suggestion whose PARENT was
         # deleted is still a real suggestion about a live topic, so it stays in the queue
         # with its parent columns null, rather than vanishing with it.
-        f"LEFT JOIN topics p ON p.id = s.parent_topic_id "
+        f"LEFT JOIN topics p ON p.id = s.parent_topic_id AND {_VISIBLE_P} "
         "LEFT JOIN topic_threads th ON th.id = s.thread_id "
-        f"WHERE s.status='pending' AND t.site_id = ANY(%s) "
+        f"WHERE s.status='pending' AND t.site_id = ANY(%s) AND {_VISIBLE_T} "
         "ORDER BY s.created_at DESC LIMIT %s",
         (list(site_ids), limit)).fetchall()
 
