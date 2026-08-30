@@ -28,14 +28,18 @@ for _tag in ("!Sub", "!Ref", "!If", "!Not", "!Equals", "!GetAtt", "!FindInMap",
     _Loader.add_constructor(_tag, lambda loader, node: getattr(node, "value", None))
 
 
-def _finalize_policy_statements():
+def _statements(resource):
     doc = yaml.load(io.open("src/template.yaml", encoding="utf-8").read(), Loader=_Loader)
-    fn = doc["Resources"]["SessionFinalizeFunction"]["Properties"]
+    fn = doc["Resources"][resource]["Properties"]
     out = []
     for policy in fn.get("Policies") or []:
         if isinstance(policy, dict):
             out.extend(policy.get("Statement") or [])
     return out
+
+
+def _finalize_policy_statements():
+    return _statements("SessionFinalizeFunction")
 
 
 def _as_list(v):
@@ -48,6 +52,27 @@ def test_finalize_may_read_the_deletion_mirror():
             and any("redactions/" in str(r) for r in _as_list(s.get("Resource")))]
     assert hits, ("SessionFinalizeFunction cannot GetObject redactions/* -- "
                   "_session_was_deleted is inert and mails deleted recordings")
+
+
+@pytest.mark.parametrize("resource", ["SessionFinalizeFunction", "SessionReportFunction"])
+def test_every_lenient_reader_may_read_the_mirror(resource):
+    """Both non-VPC workers that MAIL something read the mirror leniently, so a
+    missing grant on either is invisible: it answers "nothing was deleted" behind
+    one WARNING line. Parameterised rather than duplicated, because the second
+    one was found only after the first shipped."""
+    hits = [s for s in _statements(resource)
+            if "s3:GetObject" in _as_list(s.get("Action"))
+            and any("redactions/" in str(r) for r in _as_list(s.get("Resource")))]
+    assert hits, f"{resource} cannot GetObject redactions/* -- its guard is inert"
+
+    for s in _statements(resource):
+        if "s3:ListBucket" not in _as_list(s.get("Action")):
+            continue
+        prefixes = ((s.get("Condition") or {}).get("StringLike") or {}).get("s3:prefix")
+        if prefixes and any(str(p).startswith("redactions/") for p in _as_list(prefixes)):
+            break
+    else:
+        pytest.fail(f"no ListBucket condition covers redactions/ for {resource}")
 
 
 def test_finalize_may_list_the_mirror_prefix():
