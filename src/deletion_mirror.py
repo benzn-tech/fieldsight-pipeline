@@ -94,7 +94,25 @@ def deleted_sessions(s3, bucket: str, folder: str, date: str, strict: bool = Fal
     except KeyError:
         return set()
     except Exception as e:
-        if type(e).__name__ in ("NoSuchKey", "404"):
+        # Absence is detected two ways because one of them is fragile. The class
+        # NAME works with a real boto3 client, which generates a per-code
+        # exception class -- and with nothing else: any other client shape, and
+        # every test double, raises a plain `ClientError` and lands in the
+        # "unreadable" arm instead. A strict caller then treats a day with no
+        # deletions as a fault, which for a fail-closed reader means hiding
+        # everything.
+        #
+        # The CODE is what the rest of this repo checks
+        # (`lambda_org_api.session_brief_read` does exactly this), so it is
+        # checked here too. Only the two codes that already meant absence are
+        # read from it -- this makes the existing rule reachable, it does not
+        # widen it.
+        code = ""
+        try:
+            code = (getattr(e, "response", None) or {}).get("Error", {}).get("Code", "")
+        except Exception:
+            code = ""
+        if type(e).__name__ in ("NoSuchKey", "404") or code in ("NoSuchKey", "404"):
             return set()
         if strict:
             raise MirrorUnreadable(key) from e
