@@ -200,3 +200,38 @@ def test_no_anchor_is_claimed_when_the_zone_is_unusable(monkeypatch):
     ask(question="昨天发生了什么", now=NOW)
 
     assert "Today" not in seen["prompt"]
+
+
+# --------------------------------------------------------------------------
+# answers first -- the widened case must not lead with a negative
+# --------------------------------------------------------------------------
+
+def test_a_widened_answer_is_told_to_lead_with_what_it_found(monkeypatch):
+    """Measured on TEST: asked "what happened yesterday" with nothing on that
+    day, the model opened with "there is no information about yesterday" and
+    put the records it DID find second.
+
+    That is the wrong order for this product. The reader is on a site, has low
+    tolerance for prose, and the useful sentence was the second one. The
+    product rule is answers-first: say what was found, then note the gap.
+
+    Only when it widened. On a normal answer this instruction would be noise.
+    """
+    _, seen = wire(monkeypatch, [{"chunks": [CHUNK], "basis": {"from": "2026-07-18",
+                                                               "to": "2026-07-18",
+                                                               "widened": True}}])
+
+    ask(question="昨天发生了什么", tz="Pacific/Auckland", now=NOW)
+
+    assert "2026-07-18" in seen["prompt"]
+    assert "Lead with" in seen["prompt"]
+
+
+def test_an_unwidened_answer_is_not_given_that_instruction(monkeypatch):
+    _, seen = wire(monkeypatch, [{"chunks": [CHUNK], "basis": {"from": "2026-08-29",
+                                                               "to": "2026-08-29",
+                                                               "widened": False}}])
+
+    ask(question="昨天发生了什么", tz="Pacific/Auckland", now=NOW)
+
+    assert "Lead with" not in seen["prompt"]
