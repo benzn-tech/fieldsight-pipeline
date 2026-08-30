@@ -16,7 +16,12 @@ for _k, _v in (("AWS_ACCESS_KEY_ID", "testing"),
                ("AWS_SECRET_ACCESS_KEY", "testing"),
                ("AWS_DEFAULT_REGION", "ap-southeast-2"),
                ("S3_BUCKET", "test-bucket"),
-               ("ANTHROPIC_API_KEY", "sk-ant-test-dummy-key")):
+               ("ANTHROPIC_API_KEY", "sk-ant-test-dummy-key"),
+               # lambda_ask_agent reads this at import to decide whether the RAG
+               # branch exists at all. Five modules set it at their own scope, which
+               # only works while one of them imports the lambda first -- the same
+               # alphabetical-order contract the comment above describes.
+               ("RAG_SEARCH_FUNCTION", "fieldsight-test-rag-search")):
     os.environ.setdefault(_k, _v)
 
 TEST_DB_URL = os.environ.get("TEST_DATABASE_URL")

@@ -29,3 +29,29 @@ def build_search_sql() -> str:
         "ORDER BY c.embedding <=> %(q)s::vector "
         "LIMIT %(k)s"
     )
+
+
+def build_latest_date_sql() -> str:
+    """The most recent day this caller can see, at or before a bound.
+
+    Asking "what happened yesterday" on a day with no recording must not answer
+    nothing -- it must answer the nearest day there IS one and say so. That
+    nearest day has to be found under the SAME visibility rules as the search
+    itself, or the widening becomes a way to learn that a deleted recording
+    existed: the chunks stay hidden, but the date it was made on is disclosed
+    by the answer widening onto it.
+
+    So the WHERE clause is deliberately the search's own, minus the vector and
+    the range: same site pinning, same per-author grading, same
+    `visible_chunks_predicate`. `on_or_before` is bounded rather than open
+    because widening FORWARD would answer a question about last week with
+    something recorded after it.
+    """
+    return (
+        "SELECT max(c.report_date) AS latest "
+        "FROM report_chunks c "
+        "WHERE c.site_id = ANY(%(site_ids)s) "
+        "AND (%(author_ids)s::uuid[] IS NULL OR c.user_id = ANY(%(author_ids)s::uuid[])) "
+        "AND (%(on_or_before)s::date IS NULL OR c.report_date <= %(on_or_before)s::date) "
+        "AND " + visible_chunks_predicate("c")
+    )
