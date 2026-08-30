@@ -136,6 +136,7 @@ from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
 from repositories import (action_items, aliases, chunks, classification_feedback, companies,
+                          findings, speaker_label_groups,
                           compliance_resolutions, content, content_edits, keyframes,
                           meeting_session, memberships, observations, programme,
                           programme_delay_flags, programme_import,
@@ -633,6 +634,8 @@ def dispatch(conn, event, method, route):
         return unname_speaker(conn, caller, m_un.group(1), event)
     if route == "/company/voiceprint-basis" and method == "PUT":
         return company_voiceprint_basis(conn, caller, event)
+    if route == "/speakers/known" and method == "GET":
+        return speaker_known(conn, caller, event)
     if route == "/voiceprints" and method == "GET":
         return list_voiceprints(conn, caller)
     m_vw = re.match(r"^/voiceprints/([^/]+)$", route)
@@ -1664,6 +1667,80 @@ def company_voiceprint_basis(conn, caller, event):
     return ok({"companyId": str(row["id"]), "basis": row["voiceprint_consent_basis"]})
 
 
+def speaker_known(conn, caller, event):
+    """GET /api/org/speakers/known?name=&site=&date= — what we already know about this name.
+
+    Answers ONE question: has somebody in this company already said who this person works
+    for. `known` is a record; `null` means nobody has, and the caller offers an empty field.
+
+    **It is deliberately not a suggestion endpoint.** The first draft of the plan had this
+    ranking candidates out of `findings.entity_name`, which would have put a co-occurrence
+    guess behind "please confirm Andy M is from ABC?" — and a click on that turns the guess
+    into a record stamped `employer_source: 'suggested'`. The register (Sign On Site) is the
+    source that can carry that prompt, because it is a record too; it becomes a second key in
+    this response when that adapter ships.
+
+    `trade` is display-only and says so in the contract. It is what the person DOES, not who
+    employs them.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    p = event.get("queryStringParameters") or {}
+    name = (p.get("name") or "").strip()
+    if not name:
+        return error("name required", 400)
+
+    company_id = str(caller["company_id"])
+    site = (p.get("site") or "").strip() or None
+    if site:
+        # Same rule as every other site parameter here: a site id from the query string is
+        # checked against the caller's company before it narrows anything, or it becomes a
+        # way to ask about another tenant's site by guessing a uuid.
+        owning = sites.get_site(conn, site)
+        if not owning or str(owning.get("company_id")) != company_id:
+            # 404 for both, deliberately: "no such site" and "somebody else's site" must not
+            # be distinguishable, or the endpoint becomes an oracle for which uuids exist.
+            return error("site not found in your company", 404)
+
+    row = voiceprints.employer_for_name(conn, company_id, name)
+    known = None
+    if row:
+        known = {"employer": row["employer_name"],
+                 "source": row["employer_source"],
+                 "profileId": str(row["id"]),
+                 "samples": int(row["samples"] or 0)}
+    return ok({"known": known,
+               "trade": findings.trade_heard_for(conn, company_id, name, site)})
+
+
+def _employer_result(name, source, profile):
+    """What to tell the caller about the employer they sent, if any.
+
+    Three outcomes and they are genuinely different:
+
+      nothing sent            -> None
+      stored on a profile     -> the values READ BACK from the row
+      sent with no profile    -> stored=false and the reason
+
+    The third is the one worth the code. Naming a speaker enrols only when the subject's own
+    consent is supplied or the company has settled a standing basis; without either there is
+    no `speaker_voiceprints` row, so the employer has nowhere to live. The correction itself
+    still succeeds — an optional field must not be able to fail the thing it decorates — but
+    a caller that sent a value and gets `null` back cannot tell that from "we recorded
+    nothing", and would have no reason to ask again.
+    """
+    if not name:
+        return None
+    if not profile:
+        return {"stored": False,
+                "reason": "no voiceprint profile was created for this correction, so there "
+                          "is nowhere to record an employer: this company has settled no "
+                          "consent basis and the request carried no consent_given"}
+    return {"stored": True,
+            "name": profile.get("employer_name"),
+            "source": profile.get("employer_source")}
+
+
 def speaker_corrections(conn, caller, session_base, event):
     """POST /api/org/sessions/{session_base}/speaker-corrections
 
@@ -1713,6 +1790,23 @@ def speaker_corrections(conn, caller, session_base, event):
     err = _same_company_as_folder(conn, caller, folder, "speaker correction")
     if err is not None:
         return err
+
+    # Who this person WORKS FOR, which is not whose data this is. Optional on purpose: no
+    # register, no employer, and the correction that builds the voiceprint must still work.
+    employer_name = (body.get("employer_name") or "").strip() or None
+    employer_source = (body.get("employer_source") or "").strip() or None
+    if (employer_name is None) != (employer_source is None):
+        return error("employer_name and employer_source travel together: a name with no "
+                     "source cannot be audited, and a source with no name records nothing",
+                     400)
+    if employer_source is not None and employer_source not in voiceprints.EMPLOYER_SOURCES:
+        return error(f"employer_source must be one of {voiceprints.EMPLOYER_SOURCES}", 400)
+    # REFUSED rather than ignored until the Sign On Site adapter exists. A field one side
+    # sends and the other silently drops is this repository's most-repeated failure; the
+    # sender would get a 202 and never learn the value went nowhere.
+    if body.get("employer_ref") is not None:
+        return error("employer_ref is not accepted yet: it is the sign-in register's key and "
+                     "nothing reads it until that adapter ships", 400)
 
     name = (body.get("display_name") or "").strip()
     if not name:
@@ -1768,6 +1862,7 @@ def speaker_corrections(conn, caller, session_base, event):
     # not the employer, and not whoever is doing the labelling, who is usually a third
     # person again. The two effects are reported separately for that reason.
     enrol = None
+    profile_row = None
     _linked_person, _linked_on = None, "not-requested"
     # Two ways in, and the second is why the library was empty.
     #
@@ -1820,11 +1915,17 @@ def speaker_corrections(conn, caller, session_base, event):
                 asserted_by=str(caller["id"]) if attest else None,
                 user_id=str(person["id"]) if person else None,
                 linked_by=str(caller["id"]) if person else None,
-                linked_on=matched_on if person else None)
+                linked_on=matched_on if person else None,
+                employer_name=employer_name, employer_source=employer_source,
+                employer_set_by=str(caller["id"]) if employer_name else None)
         except ValueError as exc:
             return error(str(exc), 400)
         _linked_person, _linked_on = person, matched_on
         enrol = {"voiceprint_id": str(profile["id"])}
+        # Re-read rather than trusting the write. `upsert_profile` returns the EXISTING row
+        # when there was one, and the employer update runs after that row was fetched — so
+        # the object in hand carries the previous employer, not the one just stored.
+        profile_row = voiceprints.get_profile(conn, company_id, str(profile["id"]))
 
     session_turns = _session_turns(conn, folder, date_m.group(1), session_base)
     request_id = uuid.uuid4().hex
@@ -1872,6 +1973,13 @@ def speaker_corrections(conn, caller, session_base, event):
         # escape for unlinked profiles and every profile was unlinked.
         "linkedTo": ({"userId": str(_linked_person["id"]), "matchedOn": _linked_on}
                      if _linked_person else None),
+        # Read back from the row, never echoed from the request. And when there was no row to
+        # write to, said out loud: `upsert_profile` runs only inside the consent branch, so a
+        # company that has settled no basis, correcting without `consent_given`, creates no
+        # profile at all — and today that is the common case, not the edge one. Returning a
+        # bare null for a request that carried an employer would make "we stored it" and
+        # "there was nowhere to put it" the same answer.
+        "employer": _employer_result(employer_name, employer_source, profile_row),
         "linkReason": None if _linked_person else _linked_on,
     }, 202)
 
@@ -6757,6 +6865,50 @@ def _apply_speaker_names(conn, caller, payload):
         segs[i]["speaker_name"] = hit["display_name"]
         segs[i]["speaker_state"] = hit["state"]
     payload["unmatchedNames"] = turn_name_overlay.orphans(index)
+
+    # The anonymous re-bind, applied the same way and for the same reason: a mapping over the
+    # artifact rather than a rewrite of it. `speaker_label` is left EXACTLY as the ASR wrote
+    # it — overwriting it would destroy the only record of what was actually said, and the
+    # mapping could then be checked against nothing.
+    #
+    # Keyed on `(source_filename, speaker_label)`, so a segment with no label (undiarised
+    # files carry None) simply gets no group and the reader falls back, which is the correct
+    # answer rather than an omission.
+    groups = {}
+    try:
+        for base in sorted(b for b in bases if b):
+            groups.update(speaker_label_groups.for_session(
+                conn, str(caller["company_id"]), base))
+    except Exception:
+        # Fails OPEN, like every other guard in this feature: an unreadable mapping must not
+        # take the transcript down, and a session with no groups reads exactly as it read
+        # before this existed. It LOGS, because "this session was never re-bound" and "the
+        # lookup could not run" are otherwise the same silence — and the second one is the
+        # kind that survives for weeks.
+        logger.exception("speaker groups unreadable for %s; transcript falls back to the "
+                         "per-call labels", sorted(b for b in bases if b))
+    if groups:
+        for seg in segs:
+            g = groups.get((seg.get("source_filename"), seg.get("speaker_label")))
+            if g:
+                seg["speaker_group"] = g
+        # What each group stands on, once per session rather than once per segment. Without
+        # this the audit stops at the database and the only person who can ask "how much is
+        # group A built on" is whoever has SQL access — which is not the person reading the
+        # transcript and noticing it looks wrong.
+        try:
+            # EVERY base, the same way the mapping above is built. A day holds more than one
+            # session, and taking the first sorted base returned the evidence for whichever
+            # session happened to sort first — which on the day this was written was a
+            # session that had never been re-bound, so the payload carried 77 grouped
+            # segments and an empty evidence list beside them.
+            ev = []
+            for base in sorted(b for b in bases if b):
+                ev.extend(speaker_label_groups.evidence_for_session(
+                    conn, str(caller["company_id"]), base))
+            payload["speakerGroups"] = ev
+        except Exception:
+            logger.exception("speaker group evidence unreadable; the groups still apply")
     return payload
 
 

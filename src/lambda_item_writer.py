@@ -86,6 +86,11 @@ COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 # video-keyframe plan: ship the pipeline change inert -- only when
 # EnableKeyframes flips this env true does item-writer emit keyframe_requests/.
 EMIT_KEYFRAME_REQUESTS = os.environ.get("EMIT_KEYFRAME_REQUESTS", "false").lower() == "true"
+
+#: Ask for an anonymous speaker re-bind at the end of a session. Off by default, like every
+#: other switch in this feature: it costs ~100 s of ONNX on a shared concurrency slot, and a
+#: session with no groups reads exactly as it read before this existed.
+REBIND_SPEAKERS = os.environ.get("REBIND_SPEAKERS", "false").lower() == "true"
 # Propose which earlier subject a new topic is a restatement of. Off by
 # default so the write path ships inert: this only ever writes rows to
 # topic_thread_suggestions, which nothing reads yet.
@@ -401,6 +406,51 @@ def _todos_from_topics(artifact):
                             "responsible": item.get("responsible") or None,
                             "due": item.get("deadline") or item.get("due") or None})
     return out
+
+
+def _request_rebind(company_id, session_base, artifact, put=None):
+    """Ask the embedder to group this session's per-call speaker labels. Returns True if asked.
+
+    Written from HERE because of who can do what. `lambda_extract_session` has the turns and
+    no database; this function has the database, the company id and the deletion tombstones,
+    and no way to read `transcripts/`. So the turns ride on the extraction artifact and the
+    request is written on this side.
+
+    It goes to `voiceprint_requests/`, whose S3 notification is ALREADY hand-wired — the part
+    BUG-33 makes expensive. One new IAM prefix, no new trigger.
+
+    Best effort. A re-bind that does not happen leaves the transcript reading exactly as it
+    reads today; a re-bind that takes the item write down with it would trade a working
+    feature for a cosmetic one.
+    """
+    turns = artifact.get("speaker_turns") or []
+    if not turns:
+        return False
+    # The pre-check, and it logs what it skipped on: most sessions are one person across one
+    # call, where the re-bind changes nothing and would still cost ~100 s of ONNX and a
+    # concurrency slot the naming path wants. A skip that says nothing is indistinguishable
+    # from a producer that never ran.
+    pairs = {(t.get("source_filename"), t.get("speaker_label")) for t in turns
+             if t.get("source_filename") and t.get("speaker_label")}
+    calls = {src for src, _ in pairs}
+    if len(pairs) < 2 or len(calls) < 2:
+        logger.info("rebind: not requested for %s — %d label(s) across %d call(s)",
+                    session_base, len(pairs), len(calls))
+        return False
+    put = put or _put_finalize_request
+    try:
+        put(f"voiceprint_requests/{company_id}/{session_base}/rebind.json",
+            {"op": "rebind", "company_id": str(company_id),
+             "session_base": session_base,
+             "user_folder": artifact.get("userFolder") or artifact.get("user_folder"),
+             "date": artifact.get("date"),
+             "turns": turns})
+    except Exception:
+        logger.exception("rebind: could not enqueue for %s", session_base)
+        return False
+    logger.info("rebind: requested for %s (%d pairs across %d calls)",
+                session_base, len(pairs), len(calls))
+    return True
 
 
 def _put_finalize_request(key, body):
@@ -863,6 +913,13 @@ def write_extraction_items(date, user_folder, extraction_key):
     if EMIT_KEYFRAME_REQUESTS and keyframe_topics:
         keyframe_request.emit(s3(), S3_BUCKET, user_folder, date, session_base,
                               extraction_key, keyframe_topics)
+
+    # Post-commit and AFTER the deleted-source gate above, like the two requests beside it. A
+    # session the customer deleted returns long before here, so a re-bind is never asked for
+    # one — which matters because the groups would outlive the deletion in a table the
+    # tombstone does not reach.
+    if REBIND_SPEAKERS:
+        _request_rebind(company["id"], session_base, extraction)
 
     return {"skipped": False, "topics": topics_n}
 

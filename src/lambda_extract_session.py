@@ -1831,6 +1831,29 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         'extracted_at': datetime.utcnow().isoformat() + 'Z',
         'declared_site': process_declared_site(parsed.get('declared_site')),
         'topics': parsed_topics,
+        # Where each speaker label was heard, for the anonymous re-bind. Carried HERE, on the
+        # final pass only, because of who can do what: this function has the turns and no
+        # database, and `lambda_item_writer` -- the consumer of this artifact -- has the
+        # database, the company id and the deletion tombstones, and no way to read
+        # `transcripts/`. Passing them costs one field and saves giving a second lambda a
+        # transcript grant plus a second copy of the turn assembler.
+        #
+        # Only what the re-bind needs. Not the text: it is not looked at, and an artifact
+        # that carries a session's words twice is a second copy to keep in step with the
+        # first.
+        # `speaker`, not `speaker_label`. `transcript_utils._build_turn` names it `speaker`,
+        # and the first version of this read `speaker_label` -- so the list came out EMPTY on
+        # every session, silently, and the re-bind downstream simply never ran. The unit
+        # tests could not see it: they fed dicts this file wrote, so both halves agreed on a
+        # key the producer of the turns has never used.
+        #
+        # Renamed on the way out because that IS the downstream contract: everything past
+        # this point speaks the transcript's `speaker_label` vocabulary.
+        'speaker_turns': ([{'source_filename': t.get('source_filename'),
+                            'speaker_label': t.get('speaker'),
+                            'start_sec': t.get('start_sec'),
+                            'end_sec': t.get('end_sec')}
+                           for t in turns if t.get('speaker')] if final else []),
     }
 
     s3().put_object(

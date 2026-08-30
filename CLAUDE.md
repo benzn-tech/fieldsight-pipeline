@@ -257,6 +257,50 @@ output_key = f"{OUTPUT_PREFIX}{display_name}/{file_date}/{base_name}.json"
 ```
 This applies to all AWS CLI list-type parameters.
 
+#### ASR accuracy: read the measurements before proposing a change
+`docs/superpowers/specs/2026-08-29-asr-accuracy-measured-findings.md` (scripts:
+`tools/asr-eval/`) measured the four levers on one real 26-minute meeting with
+human-confirmed speaker ground truth. Short version, so the same ground is not re-covered:
+
+- **keyterms = the lever that works for proper nouns**, and it is a per-word whitelist with
+  **no spillover** — added terms went 0→9/10/1 hits, the deliberately-omitted control term
+  got *worse*. Keep feeding `config/custom_vocabulary_construction_nz.txt`. Free.
+- **Speaker labels are ~55 % pure across a session** (`spk_0` is a coin flip between two
+  people). The fix is a **local ECAPA re-bind of the 14 per-call namespaces at finalize**
+  → **96.3 %**, zero vendor cost, ~55 s CPU. **Not** a second whole-session ASR pass (that
+  is a second full ASR bill for the same outcome), and **not** per-turn relabelling
+  (226 of 354 turns are under the 3 s floor).
+- **Whole-session ASR is not worth it**: ≈3.8 points of real word difference once the
+  5.6 % noise floor is subtracted, +65 s latency, and it can **silently swallow ~25 s of
+  speech while looking normal**. Keep batching.
+- **VAD discards 2.9 %** here, all of it trailing silence — `speech_ratio` is 1.00 on every
+  other chunk because `whole_chunk` mode has no intermediate state. Leave it alone.
+
+- **Provider: stay on ElevenLabs.** `qwen-audio-3.0-asr-flash-filetrans` is 41 % faster
+  (50.7 s vs 86.7 s) and far more deterministic (99.2 % same-config re-run vs 94.5 %), but
+  it emits **22–26 % less English**, its **hotwords had zero effect in four configurations**
+  (inline dict, `vocabulary_id` w4, w50 "super", and a controlled probe), and Ben's enrolled
+  voiceprint recalls only **62.9 %** of his speech from it vs **99.4 %** from EL. Its one
+  unique lever is that `speaker_count` is actually honoured. Losses are entirely in the
+  English half — **on a monolingual Mandarin session the verdict could invert.**
+
+**Superseded the same day — do not act on the doc's "(b) the homogeneity guard is still too
+strict".** The named voiceprint library was empty for two other reasons, both now fixed and
+both invisible from the guard's side: `lambda_voiceprint_writer` could not import numpy from
+2026-08-14 (the embedder logged `enrolment accepted` and the *storing* lambda then died —
+PR #595), and enrolment was handed the whole 109-second turn because that is what the
+propagation half needs to match on (PRs #601–#603 narrow it to the tightest contiguous 10 s).
+The first real sample landed at spread **0.231** against the **unchanged** 0.35 limit.
+**Do not loosen that number**; it was measured on 78 prod windows and has been re-litigated
+three times. See the correction block inside the findings doc.
+
+**Method rules that generalise:** always run the same config twice before reading any
+difference — 93.5 % of the word-level change attributed to keyterms turned out to be
+run-to-run jitter, and only a fourth run revealed it. And a **control run is what turns
+"no effect" into a finding**: Qwen's zero hotword hits only became conclusive once a
+no-vocabulary baseline and a probe term the model already emits ruled out "these words are
+just unreachable".
+
 ---
 
 ### Report Generation

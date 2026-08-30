@@ -845,9 +845,12 @@ def _admit_harvest(folder, date, candidates):
             # drift apart, which is precisely how this floor came to be twice too high.
             continue
         key, clip, sr = _window_audio(folder, date, t["source_filename"], start, end)
-        frames = [embed_audio(f, sr) for f in _frames(clip, sr)]
-        spread = vp.frame_spread(frames)
-        verdict = vp.window_is_homogeneous(frames, MAX_FRAME_SPREAD)
+        # Through `judged_window`, the same helper both enrolment paths use. A cluster member
+        # is a whole TURN, so under batching it is a whole chunk — the identical 109-second
+        # window that refused the anchor. Harvest was the third copy of this check and the
+        # last one still judging turns whole, which is why it admitted nothing.
+        clip, start, end, n_frames, spread, verdict = judged_window(clip, sr, start, key)
+        frames = [None] * n_frames        # only its length is read below
         if verdict is not True:
             # None ("could not check") refused alongside False, exactly as the anchor's own
             # check does. Admitting the unjudgeable is how a guard becomes decoration.
@@ -860,13 +863,123 @@ def _admit_harvest(folder, date, candidates):
         logger.info("harvest: %s admitted (frames=%d spread=%s)%s", c["turn_ref"],
                     len(frames), "n/a" if spread is None else "%.3f" % spread,
                     _limit_note())
-        admitted.append({"embedding": [float(x) for x in c["vector"]],
+        # Embedded from the clip that was ACCEPTED, not from `c["vector"]`. That vector is
+        # `_propagate`'s whole-turn embedding, so storing it after narrowing would file the
+        # 109 seconds the guard refused under a row recording the ten it accepted — the same
+        # mismatch the correction path had, and just as invisible, because each half is
+        # internally consistent.
+        admitted.append({"embedding": [float(x) for x in embed_audio(clip, sr)],
                          "s3_key": key, "window": [start, end],
                          "admitted_max_spread": _admitted_limit()})
-        seconds += duration
+        # The budget counts what is STORED, not what was offered. Charging a 60 s allowance
+        # the full turn length would spend it in one member and call the rest a cap.
+        seconds += end - start
     logger.info("harvest: %d of %d cluster members admitted (%.1fs)",
                 len(admitted), len(candidates), seconds)
     return admitted
+
+
+#: Turns shorter than this contribute nothing to a centroid. The same floor `_propagate`
+#: uses, and the one the measurement applied: below three seconds an embedding is not a
+#: reliable description of a voice, and averaging unreliable vectors makes a confident wrong
+#: centroid rather than an uncertain one.
+REBIND_MIN_TURN_S = float(os.environ.get("VOICEPRINT_REBIND_MIN_TURN_S", "3.0"))
+
+REBIND_SIMILARITY = (vp.DEFAULT_REBIND_SIMILARITY
+                     if os.environ.get("VOICEPRINT_REBIND_SIMILARITY", "default") == "default"
+                     else float(os.environ["VOICEPRINT_REBIND_SIMILARITY"]))
+
+
+def _rebind(req):
+    """One session's per-call speaker labels, grouped into one namespace.
+
+    Batching numbers speakers per ASR call, so `spk_0` in call 3 and `spk_0` in call 9 are two
+    different people about half the time (50.2 % purity, measured). This decides which pairs
+    are the same voice.
+
+    **The unit is the (call, label) pair, not the turn**, and that is the whole reason it
+    works: 28 decisions with ~40 s of evidence each, instead of 354 decisions where 226 of the
+    turns are under three seconds. The same audio, judged at a granularity it can support.
+
+    Nothing here identifies anybody: the output is letters within one session.
+    """
+    folder, date = req.get("user_folder"), req.get("date")
+    turns = req.get("turns") or []
+
+    by_label = {}
+    for t in turns:
+        label, src = t.get("speaker_label"), t.get("source_filename")
+        if not label or not src:
+            continue          # undiarised segments have no label and get no group
+        try:
+            start, end = float(t["start_sec"]), float(t["end_sec"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if end - start < REBIND_MIN_TURN_S:
+            continue
+        by_label.setdefault((src, label), []).append((start, end))
+
+    # The pre-check, and it logs what it skipped on. Most sessions are one person across one
+    # call, where the re-bind changes nothing and would still cost ~100 s of ONNX and a
+    # concurrency slot the naming path wants. A skip that says nothing is indistinguishable
+    # from a producer that never ran.
+    calls = {src for src, _ in by_label}
+    if len(by_label) < 2 or len(calls) < 2:
+        logger.info("rebind: nothing to group (%d labels across %d calls, from %d turns)",
+                    len(by_label), len(calls), len(turns))
+        return []
+
+    keys, centroids, spreads, evidence = [], [], [], []
+    for key in sorted(by_label):
+        src, label = key
+        vecs, secs = [], 0.0
+        for start, end in by_label[key]:
+            try:
+                _k, clip, sr = _window_audio(folder, date, src, start, end)
+            except Exception:
+                # One unreadable window must not lose the whole label. It logs, because a
+                # centroid quietly built from half its evidence is a worse answer that looks
+                # identical to a good one.
+                logger.exception("rebind: could not read %s [%s-%s]", src, start, end)
+                continue
+            v = embed_audio(clip, sr)
+            n = float(np.linalg.norm(v))
+            if n:
+                vecs.append(v / n)
+                # Accumulated HERE, beside the vector it belongs to. Deriving it afterwards
+                # from the first `len(vecs)` windows assumes the failures were all at the end
+                # — and a read can fail anywhere, which one real session has already shown.
+                # The seconds would then describe windows that contributed nothing.
+                secs += end - start
+        if not vecs:
+            continue
+        keys.append(key)
+        # How much this centroid is built on. `spread` only answers "did the evidence
+        # disagree", and it is NULL whenever a label contributed one turn -- which measured
+        # 9 of the first 12 real rows. These two are always answerable, and they are what a
+        # human asks when a group looks wrong.
+        evidence.append((len(vecs), round(secs, 1)))
+        m = np.mean(vecs, 0)
+        n = float(np.linalg.norm(m))
+        centroids.append(m / n if n else m)
+        # How much the label's own turns disagreed. Stored beside the group because a group
+        # nobody can audit is a group nobody can withdraw.
+        spreads.append(vp.frame_spread(vecs))
+
+    if len(centroids) < 2:
+        logger.info("rebind: %d centroid(s) built from %d labels — nothing to group",
+                    len(centroids), len(by_label))
+        return []
+
+    assignment = vp.cluster_centroids(centroids, REBIND_SIMILARITY)
+    rows = [{"source_filename": keys[i][0], "speaker_label": keys[i][1],
+             "group_label": chr(ord("A") + assignment[i]),
+             "spread": spreads[i],
+             "turns": evidence[i][0], "seconds": evidence[i][1]}
+            for i in range(len(keys))]
+    logger.info("rebind: %d (call,label) pairs -> %d groups at similarity %.2f",
+                len(rows), len(set(assignment)), REBIND_SIMILARITY)
+    return rows
 
 
 def _from_request_artifact(bucket, key):
@@ -882,6 +995,19 @@ def _from_request_artifact(bucket, key):
     one row whose name the user had typed himself.
     """
     req = json.loads(_get(key))
+    # The re-bind rides the SAME artifact prefix and therefore the same S3 notification —
+    # the part BUG-33 makes expensive is already wired. It branches here rather than
+    # sharing the correction path, because the two have nothing in common past the trigger:
+    # one names a person, the other groups anonymous labels.
+    if req.get("op") == "rebind":
+        rows = _rebind(req)
+        reply = invoke_writer({"op": "rebind",
+                               "company_id": req.get("company_id"),
+                               "session_base": req.get("session_base"),
+                               "groups": rows}) or {}
+        logger.info("rebind stored: %s", reply.get("written"))
+        return {"op": "rebind", "groups": len(rows), "written": reply.get("written")}
+
     c = req.get("correction") or {}
     folder, date = req.get("user_folder"), req.get("date")
     if not folder or not date:

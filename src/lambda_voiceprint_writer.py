@@ -45,6 +45,7 @@ Plan: docs/superpowers/plans/2026-08-13-correction-propagation-implementation.md
 import logging
 
 from db.connection import get_connection
+from repositories import speaker_label_groups
 from repositories.voiceprints import (EnrolmentBelongsToSomebodyElse, add_sample,
                                       live_turn_names, profiles_for_matching,
                                       record_attempt, record_turn_name,
@@ -61,6 +62,34 @@ def _require(event, key):
         raise ValueError(f"{key} is required — an absent one would write rows nobody can "
                          f"scope, and this table is read per company")
     return value
+
+
+def _rebind(event):
+    """Store one session's anonymous speaker groups, replacing whatever was there.
+
+    Letters, not names: nothing here identifies anybody and no vector is stored. It lives on
+    this side of the boundary for the ordinary reason — the embedder is non-VPC and cannot
+    reach Aurora, so the same invoke the enrolment path already uses carries the result across.
+
+    One transaction, delete-then-insert. A session can be re-finalized and the letters come
+    from clustering, so a second run may legitimately call the same voice `B` where the first
+    called it `A`; two generations side by side would give one transcript two contradictory
+    groupings with no way to tell which is current.
+    """
+    company_id = event.get("company_id")
+    session_base = event.get("session_base")
+    groups = event.get("groups") or []
+    if not company_id or not session_base:
+        # Loud, not silent. A request missing either half writes nothing and would otherwise
+        # look exactly like a session whose labels did not need grouping.
+        logger.error("rebind: refusing a request with company_id=%r session_base=%r",
+                     company_id, session_base)
+        return {"written": 0, "error": "company_id and session_base are required"}
+    with get_connection() as conn:
+        written = speaker_label_groups.replace_for_session(
+            conn, company_id, session_base, groups)
+    logger.info("rebind: %d group rows for %s", written, session_base)
+    return {"written": written}
 
 
 def _propagation(event):
@@ -391,6 +420,8 @@ def _inherit_labels(conn, company_id, session_base, label_map):
 
 def lambda_handler(event, context):
     op = (event or {}).get("op")
+    if op == "rebind":
+        return _rebind(event)
     if op == "propagation":
         return _propagation(event)
     if op == "enrol":

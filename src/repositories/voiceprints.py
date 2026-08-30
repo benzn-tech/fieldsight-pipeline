@@ -36,6 +36,20 @@ logger = logging.getLogger(__name__)
 EMBEDDING_DIMS = 192
 
 
+#: How an employer came to be recorded, kept beside the value rather than inferred from it. A
+#: name somebody typed and a name accepted from a register are different evidence, and they
+#: need separating later -- when a subcontractor changes, or when a source turns out to have
+#: been wrong for a month. Mirrored by a CHECK in migration 0050, and by `lambda_org_api`,
+#: which imports THIS tuple rather than restating it: the last time an enum lived in two
+#: places, one side sent `notice` while the other understood only `attestation`, and the
+#: resulting 400 read as a configuration problem for two days.
+#:
+#: MODULE level, deliberately. `STANDING_BASES` beside it is local to `upsert_profile` because
+#: only that function reads it; this one has two readers in two files, and a constant one of
+#: them cannot import is a constant they will each write down separately.
+EMPLOYER_SOURCES = ("typed", "suggested", "sign_on_site")
+
+
 def _vector_literal(embedding):
     """pgvector's text input form. Built here so the fake in tests only ever sees a string
     and the suite never needs the extension installed."""
@@ -86,7 +100,9 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
                    consent_given=False, consented_by=None,
                    linked_by=None, linked_on=None,
                    consent_basis=None, asserted_by=None,
-                   external_ref=None, external_source=None) -> dict | None:
+                   external_ref=None, external_source=None,
+                   employer_name=None, employer_source=None,
+                   employer_set_by=None) -> dict | None:
     """The profile a name attaches to. Existing one if there is one, otherwise a new row.
 
     **Consent is a precondition, not a checkbox** (§6, §10). A voiceprint is biometric
@@ -130,6 +146,15 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
     # and the refusal was the pre-existing strict-rule error — so it looked exactly like a
     # company that had settled nothing rather than like two halves disagreeing. Found by the
     # first live enrolment attempt, not by any test, because both halves were tested apart.
+    employer_name = (employer_name or "").strip() or None
+    employer_source = (employer_source or "").strip() or None
+    if (employer_name is None) != (employer_source is None):
+        raise ValueError(
+            "employer_name and employer_source travel together: a name with no source "
+            "cannot be audited, and a source with no name records nothing")
+    if employer_source is not None and employer_source not in EMPLOYER_SOURCES:
+        raise ValueError(f"employer_source must be one of {EMPLOYER_SOURCES}")
+
     STANDING_BASES = ("notice", "attestation")
     attested = consent_basis in STANDING_BASES
     if attested and not asserted_by:
@@ -216,12 +241,25 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
                     "SET user_id = %s, linked_by = %s, linked_at = now(), linked_on = %s "
                     "WHERE id = %s AND user_id IS NULL",
                     (user_id, linked_by, linked_on, found["id"]))
+            # ONLY when one was supplied. `SET employer_name = %s` with a NULL parameter is
+            # the obvious way to write this, and it erases the answer somebody gave last
+            # week: most corrections carry no employer and must leave the stored one alone.
+            # A DIFFERENT employer does overwrite -- people change subcontractors, and
+            # `employer_set_by` / `employer_set_at` exist to record that it happened.
+            if employer_name is not None:
+                cur.execute(
+                    "UPDATE speaker_voiceprints "
+                    "SET employer_name = %s, employer_source = %s, "
+                    "    employer_set_by = %s, employer_set_at = now() "
+                    "WHERE id = %s",
+                    (employer_name, employer_source, employer_set_by, found["id"]))
             return found
     return cur.execute(
         "INSERT INTO speaker_voiceprints "
         "(company_id, user_id, display_name, status, consent_at, consented_by, "
         " linked_by, linked_at, linked_on, consent_basis, asserted_by, "
-        " external_ref, external_source) "
+        " external_ref, external_source, "
+        " employer_name, employer_source, employer_set_by, employer_set_at) "
         # Both CASE parameters are cast. A parameter whose only use is `IS NULL` gives
         # Postgres nothing to infer a type from, so the statement fails at PREPARE time for
         # every value — `IndeterminateDatatype: could not determine data type of parameter
@@ -230,11 +268,69 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
         "VALUES (%s, %s, %s, 'tentative', "
         "        CASE WHEN %s::boolean THEN now() ELSE NULL END, %s, "
         "        %s, CASE WHEN %s::uuid IS NULL THEN NULL ELSE now() END, %s, %s, %s, "
-        "        %s, %s) "
+        "        %s, %s, "
+        # Same cast rule as the two CASEs above: a parameter whose only use is `IS NULL`
+        # gives Postgres nothing to infer from and fails at PREPARE time for every value.
+        "        %s, %s, %s, CASE WHEN %s::text IS NULL THEN NULL ELSE now() END) "
         "RETURNING id",
         (company_id, user_id, display_name, bool(consent_given or attested), consented_by,
          linked_by, user_id, linked_on, consent_basis, asserted_by,
-         external_ref, external_source),
+         external_ref, external_source,
+         employer_name, employer_source, employer_set_by, employer_name),
+    ).fetchone()
+
+
+def employer_for_name(conn, company_id, display_name) -> dict | None:
+    """What this company has already recorded about who `display_name` works for, or None.
+
+    **A record, not an inference.** Somebody in this company typed this answer against this
+    name before; offering it back is remembering, not guessing. When nobody has, this returns
+    None and the caller offers an empty field -- which is the whole reason there is no
+    `findings`-derived candidate here. Matching a typed name against `findings.entity_name`
+    returns that person's TRADE ("Zoe | Rebar" means Zoe does rebar, not that she works for a
+    firm called Rebar), and listing the site's entities returns co-occurrence. Either one
+    behind "please confirm" is a guess that the click turns into a record.
+
+    Most recent first: people change subcontractors, and the newest answer is the one somebody
+    stood behind last.
+
+    Exact match, not `ILIKE '%name%'`. "Andy M" must not inherit "Andy Mason"'s employer, and
+    a substring match over display names is how one person's details reach another's row.
+    """
+    _require_company(company_id)
+    name = (display_name or "").strip()
+    if not name:
+        return None
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, display_name, employer_name, employer_source, employer_set_at, "
+        "       (SELECT count(*) FROM speaker_voiceprint_samples s "
+        "         WHERE s.voiceprint_id = v.id) AS samples "
+        "FROM speaker_voiceprints v "
+        "WHERE company_id = %s AND lower(display_name) = lower(%s) "
+        "  AND employer_name IS NOT NULL AND status <> 'withdrawn' "
+        "ORDER BY employer_set_at DESC NULLS LAST LIMIT 1",
+        (company_id, name),
+    ).fetchone()
+
+
+def get_profile(conn, company_id, voiceprint_id) -> dict | None:
+    """One profile, by id, within a company.
+
+    Company-pinned like every other read in this module: an unpinned lookup would answer for
+    another tenant's row given only a uuid, and the failure is silent — the caller gets a
+    plausible profile and never learns it was the wrong one. `test_no_cross_company_voice_
+    identity` asserts the class of that.
+
+    Exists because `upsert_profile` returns the row as it was FOUND, and the employer update
+    runs after that fetch: reading the employer off the returned object would report the
+    previous value, or None on a first write, for a request that had just stored one.
+    """
+    _require_company(company_id)
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, display_name, status, employer_name, employer_source, "
+        "       employer_set_by, employer_set_at "
+        "FROM speaker_voiceprints WHERE id = %s AND company_id = %s",
+        (voiceprint_id, company_id),
     ).fetchone()
 
 
