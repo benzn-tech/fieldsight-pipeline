@@ -210,6 +210,39 @@ def _store_brief(folder, date, session_id, brief):
                          "-- the email is unaffected", session_id)
 
 
+def _session_was_deleted(artifact):
+    """Is this session in the day's deletion mirror? Never raises.
+
+    The mirror is exactly what this worker is supposed to read: it is the copy of
+    the answer written for the lambdas that hold no database connection, and this
+    one is non-VPC. Both spellings are matched -- the mirror carries whatever
+    `sessionBase` the delete endpoint had, and the artifact's `sessionId` is bare
+    hex -- because two spellings of a session are equal as sessions and not as
+    strings.
+
+    Failure reads as "not deleted", which is the lenient direction and is argued
+    at the call site. It is LOGGED, because a permission fault here looks exactly
+    like "nothing was deleted" and that indistinguishability has cost this
+    project three separate silent breakages.
+    """
+    folder, date = artifact.get("folder"), artifact.get("date")
+    sid = (artifact.get("sessionId") or "").strip()
+    if not (folder and date and sid):
+        return False
+    try:
+        import boto3
+
+        import deletion_mirror
+        deleted = deletion_mirror.deleted_sessions(
+            boto3.client("s3"), S3_BUCKET, folder, date)
+    except Exception:
+        logger.exception("finalize: deletion mirror unreadable for %s/%s -- proceeding "
+                         "as if nothing was deleted, which may mail a removed recording",
+                         folder, date)
+        return False
+    return sid in deleted or f"sid{sid}" in deleted
+
+
 def process_finalize_request(artifact, *, send=None, write_result=None, complete_summary=None):
     """Build + SES-send the recorder's confirmation email from one enqueued finalize
     request (the in-VPC claim step wrote it), then record the outcome to
@@ -224,6 +257,44 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
     if not recipient:
         return {"status": "skipped", "reason": "no recipient"}
     session_id = artifact.get("sessionId")
+
+    # A recording deleted before this request is processed must not be emailed,
+    # and must not have a fresh brief written from its transcripts.
+    #
+    # There was no coordination between the two paths at all: neither this module
+    # nor `lambda_finalize_claim` held a deletion check, and
+    # `delete_recordings_endpoint` does not touch `meeting_session` or the
+    # enqueued request. `_complete_summary` re-gathers through
+    # `gather_session_segments`, which does not filter either -- so the deleted
+    # session would be rebuilt in full and mailed.
+    #
+    # The window is narrow and real: the recordings list is populated at upload,
+    # well before finalize runs, and the sweep re-drives a finalize that failed.
+    #
+    # SEVERITY, so it is neither over- nor under-read: the recipient is the
+    # RECORDER, the person who deleted it. Not a disclosure to a third party --
+    # the product telling someone their recording was removed and then mailing it
+    # back. A promise broken, not a breach.
+    #
+    # LENIENT, unlike the brief endpoint, and the asymmetry is deliberate. There
+    # a failed check costs one reader one refresh. Here it costs a recorder their
+    # only confirmation for a session that was probably never deleted -- and this
+    # worker RECORDS failures rather than retrying them (re-raising would
+    # S3-retry the trigger and risk a double-send), so failing closed would lose
+    # the email permanently. Logged loudly instead.
+    if _session_was_deleted(artifact):
+        logger.info("finalize: %s was deleted -- not sending, not storing a brief",
+                    session_id)
+        outcome = {"status": "skipped", "reason": "recording deleted",
+                   "sessionId": session_id}
+        # RECORDED, not merely returned. The in-VPC sweep reconciles `finalizing`
+        # from this file; a skip that writes nothing leaves the session stuck in
+        # `finalizing` forever, which is a different bug wearing this fix's
+        # clothes.
+        (write_result if write_result is not None else _default_write_result)(
+            session_id, outcome)
+        return outcome
+
     # Prefer a FRESH complete summary re-derived from the full transcript over the
     # enqueued rolling summary (which can be stale/partial — see _complete_summary);
     # fall back to the rolling summary on any failure.
