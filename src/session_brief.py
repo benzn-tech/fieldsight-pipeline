@@ -20,6 +20,7 @@ import json
 import logging
 import re
 
+import open_points
 from output_language import OUTPUT_LANGUAGE_RULE
 
 logger = logging.getLogger()
@@ -86,6 +87,15 @@ Return ONLY JSON, no code fence and no commentary:
       "due": "When, in the words used, or null",
       "basis": "committed if someone took it on; inferred if you concluded it should be done"
     }}
+  ],
+  "open_points": [
+    {{
+      "quote": "The line, copied VERBATIM from the transcript above, in which the speaker states something AND flags that they are not sure of it. Do not rewrite it and do not merge two lines.",
+      "at": "HH:MM:SS",
+      "claim": "The fact they stated, in one short sentence.",
+      "kind": "standard if a code, standard or specification settles it | supply if it is about a supplier's stock, price or lead time | in_corpus if an earlier meeting would settle it | needs_a_person if only a named person can answer",
+      "subject": "The single term a lookup would need, copied EXACTLY as it appears in the quote above -- a standard number, a product, a company. Not a sentence, not a description. If no such term appears in the quote, leave this entry out entirely."
+    }}
   ]
 }}
 
@@ -102,7 +112,14 @@ How to write it:
    here, including a name said once. Aliases matter -- recognition mangles proper
    nouns constantly, and a literal search for the correct spelling then finds
    nothing.
-5. **tasks: is this still OUTSTANDING when the meeting ends?** That is the test,
+5. **open_points: both halves are required.** A speaker must STATE something
+   AND FLAG that they are unsure of it -- "I think it's 150, I'll have to check".
+   Hedging with no claim ("not sure, anyway") is not one. Neither is a question
+   put to somebody else -- "can you check the stock?" is a task, and tasks have
+   their own field. If nobody left anything hanging, return an empty array; a
+   meeting with no open points is the normal case, not a failure to find any.
+
+6. **tasks: is this still OUTSTANDING when the meeting ends?** That is the test,
    and it is a test about STATE, not about how concrete the verb sounds.
 
    Leave it OUT when the meeting says the thing has already happened or was
@@ -129,7 +146,7 @@ How to write it:
    the side chosen: a missed task is one the recorder still remembers, and a
    surplus one is meant to be dismissed in the UI rather than argued away here.
 
-6. {OUTPUT_LANGUAGE_RULE}
+7. {OUTPUT_LANGUAGE_RULE}
 
 ---
 
@@ -364,6 +381,25 @@ def brief_from_turns(turns, call_llm=None):
         logger.info("session_brief: rejected %d alias guess(es): %s",
                     len(rejected), "; ".join(f"{r['name']}<-{r['alias']} ({r['reason']})"
                                              for r in rejected))
+    # Open points, admitted or counted. The whole block is wrapped because it is
+    # an ENRICHMENT: the brief is what the confirmation email and the website
+    # stand on, and losing it to a verifier bug would be a far worse trade than
+    # losing every open point in the session. Same posture as _store_brief.
+    try:
+        admitted, op_stats = open_points.admit(brief.get("open_points"), turns)
+    except Exception:
+        logger.exception("session_brief: open-point admission failed -- "
+                         "the brief is unaffected")
+        admitted, op_stats = [], {"admitted": 0, "rejected": {"admission_error": 1}}
+    brief["open_points"] = admitted
+    brief["stats"]["open_points_admitted"] = op_stats["admitted"]
+    brief["stats"]["open_points_rejected"] = op_stats["rejected"]
+    # Logged at zero too: "it ran and admitted nothing" and "it never ran" are
+    # the same line otherwise, and that is how a whole feature stays broken
+    # without anyone noticing (1078 uploads once produced no log line at all).
+    logger.info("session_brief: %d open point(s) admitted, %d rejected (%s)",
+                op_stats["admitted"], sum(op_stats["rejected"].values()),
+                op_stats["rejected"] or "none")
     logger.info("session_brief: %d section(s), %d bullet(s), %d entit(ies), %d task(s); "
                 "%d anchor(s) corrected, %d unmatched",
                 len(brief.get("sections") or []),
