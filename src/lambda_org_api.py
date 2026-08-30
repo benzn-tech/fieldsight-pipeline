@@ -1984,6 +1984,44 @@ def speaker_corrections(conn, caller, session_base, event):
     }, 202)
 
 
+def _session_was_removed(session_id, folder, date) -> bool:
+    """Has this session's recording been removed by its owner?
+
+    ONE implementation, three callers -- the brief, the rolling summary, and the report
+    status. It arrived as a block inside the brief (#635) and was copied nowhere, which is
+    how the leak it fixed survived in the two endpoints beside it: they serve the same
+    meeting's words, and hiding one while the others answer hides nothing. This repository
+    has already paid for the other version of that (`#603`: one homogeneity rule written
+    three times, two of the copies fixed and nothing changed).
+
+    THE BUCKET IS `S3_BUCKET`, NOT `LAKE_BUCKET`. They hold the same value today and they
+    are two variables; the mirror is WRITTEN to `S3_BUCKET` by `delete_recordings_endpoint`,
+    and reading it from the callers' bucket would work until the day they diverge and then
+    hide nothing, silently.
+
+    BOTH SPELLINGS. The mirror carries whatever `sessionBase` the delete endpoint had; the
+    brief's key is always `sid{hex}` while `/rolling` and `/report/status` take the id as the
+    caller wrote it. Two spellings of a session are equal as sessions and not as strings, so
+    both are compared.
+
+    STRICT, and an unreadable mirror RAISES -- the opposite trade to `lambda_ask_agent`,
+    which reads it leniently. There, an unreadable mirror must not take the nightly report
+    down for everyone, and the cost is one day staying visible until a retry. Here the
+    request is one document on demand: failing it costs one reader one refresh, and serving
+    it leaks a recording the customer deleted.
+
+    It raises rather than returning True, which a first version of the brief's copy did.
+    That was fail-closed and still wrong: "we checked and it is removed" and "we could not
+    check" are different facts, and reporting the second as the first turns a broken grant on
+    `redactions/` into a silent total outage that looks like normal operation. These
+    endpoints have already shipped one disguise of exactly that shape (AccessDenied read as
+    `pending`, #627). Loud, and nothing served, is both safe and visible.
+    """
+    removed = deletion_mirror.deleted_sessions_strict(s3(), S3_BUCKET, folder, date)
+    bare = session_id[3:] if session_id.startswith("sid") else session_id
+    return session_id in removed or bare in removed or ("sid" + bare) in removed
+
+
 def session_report_status(conn, caller, session_id, event):
     """GET /api/org/sessions/{session_id}/report/status?date=&user=&requestId=
     — Tier-2 T3 poll. The worker (lambda_session_report) writes its result to
@@ -2004,6 +2042,14 @@ def session_report_status(conn, caller, session_id, event):
     folder, err = _resolve_org_media_folder(conn, caller, user, what="session report status")
     if err is not None:
         return err
+    # Same guard as the brief (#635), and here it withholds more than a summary: the `done`
+    # arm below hands out a PRESIGNED URL to a generated document of the whole session. A
+    # presign outlives the check that produced it, so refusing after issuing one would be no
+    # refusal at all. Checked before the result is even read.
+    if _session_was_removed(session_id, folder, date):
+        logger.info("report status: %s was deleted -- not served", session_id)
+        return ok({"status": "removed"})
+
     result_key = f"session_report_results/{folder}/{date}/{session_id}/{request_id}.json"
     try:
         obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
@@ -2041,6 +2087,14 @@ def session_rolling(conn, caller, session_id, event):
     folder, err = _resolve_org_media_folder(conn, caller, user, what="rolling summary")
     if err is not None:
         return err
+    # Same guard as the brief (#635). The rolling summary is built from the same turns and
+    # quotes the brief is, so hiding one and serving the other hides nothing -- and this one
+    # is polled every minute or two by the app, which is the more likely place to be looking
+    # when a recording is removed mid-meeting.
+    if _session_was_removed(session_id, folder, date):
+        logger.info("rolling: %s was deleted -- not served", session_id)
+        return ok({"status": "removed"})
+
     key = f"session_rolling/{folder}/{date}/{session_id}/latest.json"
     try:
         obj = s3().get_object(Bucket=LAKE_BUCKET, Key=key)
@@ -2097,42 +2151,8 @@ def session_brief_read(conn, caller, session_id, event):
     # — which surfaces as `pending` and looks like "no brief yet" rather than a mistake.
     sid = session_id if session_id.startswith("sid") else "sid" + session_id
 
-    # A deleted recording's brief must not still answer. `session_brief/` is
-    # nowhere in the deletion machinery -- not in `deletion_mirror`, not in
-    # `deleted_predicates`, not in `redactions` -- so deleting a recording hid
-    # its chunks and its topics while this endpoint kept serving a frozen copy of
-    # the same verbatim quotes. It is checked BEFORE the object is fetched: bytes
-    # we must not serve are bytes not worth reading.
-    #
-    # THE BUCKET IS `S3_BUCKET`, NOT `LAKE_BUCKET`. They hold the same value
-    # today and they are two variables; the mirror is WRITTEN to S3_BUCKET by
-    # `delete_recordings_endpoint`, and reading it from the brief's bucket would
-    # work until the day they diverge and then hide nothing, silently.
-    #
-    # BOTH SPELLINGS. The mirror carries whatever `sessionBase` the delete
-    # endpoint had; this key is always `sid{hex}`. Two spellings of a session are
-    # equal as sessions and not as strings.
-    #
-    # STRICT, and an unreadable mirror RAISES -- the opposite trade to
-    # `lambda_ask_agent`, which reads it leniently. There, an unreadable mirror
-    # must not take the nightly report down for everyone, and the cost is one
-    # day staying visible until a retry. Here the request is one brief on demand:
-    # failing it costs one reader one refresh, and serving it leaks a recording
-    # the customer deleted.
-    #
-    # It raises rather than answering "removed", which a first version did. That
-    # was fail-closed and still wrong: "we checked and it is removed" and "we
-    # could not check" are different facts, and reporting the second as the first
-    # turns a broken grant on `redactions/` into a silent total outage that looks
-    # like normal operation. This endpoint has already shipped one disguise of
-    # exactly that shape (AccessDenied read as `pending`, #627). Loud, and
-    # nothing served, is both safe and visible.
-    removed = deletion_mirror.deleted_sessions_strict(s3(), S3_BUCKET, folder, date)
-    if sid in removed or sid[3:] in removed:
+    if _session_was_removed(sid, folder, date):
         logger.info("brief: %s was deleted -- not served", sid)
-        # "removed", not "deleted": the mechanism is reversible masking and the
-        # product copy for it is "removed from the project view". The three words
-        # (trimmed / removed / sealed) are never used interchangeably.
         return ok({"status": "removed"})
 
     key = f"session_brief/{folder}/{date}/{sid}/latest.json"
