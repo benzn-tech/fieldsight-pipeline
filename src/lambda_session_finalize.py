@@ -213,6 +213,27 @@ def _store_brief(folder, date, session_id, brief):
 def _session_was_deleted(artifact):
     """Is this session in the day's deletion mirror? Never raises.
 
+    THERE ARE TWO OF THESE AND THE DIFFERENCE IS DELIBERATE. `lambda_org_api.
+    _session_was_removed` answers the same question for the three read endpoints
+    (brief, rolling, report status) and RAISES when the mirror is unreadable.
+    This one returns False and proceeds.
+
+    Neither is the mistake, and neither should be "made consistent" with the
+    other:
+
+    * There, a failed check costs one reader one refresh, and answering "removed"
+      when the truth is "could not check" would turn a broken grant on
+      `redactions/` into a silent total outage wearing the costume of normal
+      operation.
+    * Here, it costs a recorder their ONLY confirmation email for a session that
+      was probably never deleted -- and this worker records failures instead of
+      retrying them, so failing closed loses the email permanently.
+
+    They are separate functions rather than one because this lambda is non-VPC
+    and cannot import org-api's module; the shared part is `deletion_mirror`,
+    which both use. If a third caller appears with the strict posture, it belongs
+    in org-api's helper, not here.
+
     The mirror is exactly what this worker is supposed to read: it is the copy of
     the answer written for the lambdas that hold no database connection, and this
     one is non-VPC. Both spellings are matched -- the mirror carries whatever
