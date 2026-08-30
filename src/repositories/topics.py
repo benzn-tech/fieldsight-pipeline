@@ -6,6 +6,8 @@ from repositories.redactions import DELETED_TOPIC_PREDICATE
 
 import psycopg
 from psycopg.rows import dict_row
+
+from deleted_predicates import visible_topics_predicate
 from psycopg.types.json import Jsonb
 
 from repositories import findings
@@ -518,7 +520,23 @@ def report_date_counts(conn, site_ids, since_date, *, author_ids=None) -> list[d
     A topic matching more than one signal is still counted once."""
     if not site_ids:
         return []
-    where = "WHERE t.site_id = ANY(%s::uuid[]) AND t.report_date >= %s"
+    # The exclusion belongs HERE, in the outer WHERE, and it had been spliced into the
+    # `findings` EXISTS instead -- so `COUNT(*) AS topics` counted deleted topics, and the
+    # safety count filtered exactly one of its three arms. The calendar therefore kept
+    # drawing a density dot, and often a safety dot, for a day whose recording the customer
+    # had removed. Not the words -- "something happened here", which is the fact the
+    # customer was asking to take back.
+    #
+    # Its sibling `list_report_dates` has had it in the right clause all along, which is
+    # what makes this a misplacement rather than an omission: one endpoint, two queries,
+    # one of them right, and the wrong one drawing the dots.
+    #
+    # BOTH ARMS, via the shared predicate rather than a twelfth inlined copy in this file.
+    # The source arm is not decoration: `lambda_ingest` re-creates a superseded day's
+    # topics with new uuids that no topic-keyed tombstone names, so a topic-only filter
+    # hides the dot tonight and draws it again after the nightly rebuild.
+    where = ("WHERE t.site_id = ANY(%s::uuid[]) AND t.report_date >= %s "
+             f"AND {visible_topics_predicate('t')}")
     params = [list(site_ids), since_date]
     if author_ids is not None:
         where += " AND t.user_id = ANY(%s::uuid[])"
@@ -530,7 +548,7 @@ def report_date_counts(conn, site_ids, since_date, *, author_ids=None) -> list[d
         f"                          OR EXISTS (SELECT 1 FROM safety_observations so "
         f"                                      WHERE so.topic_id = t.id) "
         f"                          OR EXISTS (SELECT 1 FROM findings f "
-        f"                                      WHERE f.topic_id = t.id  AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = t.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)"
+        f"                                      WHERE f.topic_id = t.id "
         f"                                        AND f.domain = 'safety')) AS safety "
         f"FROM topics t "
         f"{where} "

@@ -70,6 +70,16 @@ def test_every_topic_read_carries_the_deleted_predicate():
             continue
         if "scope = 'deleted'" in body and "reverted_at IS NULL" in body:
             continue
+        # `visible_topics_predicate(...)` INTERPOLATED into the query, which is the third
+        # legitimate spelling and the only one that carries BOTH arms. The objection above
+        # -- that naming a constant would pass on a query that imports it and never uses it
+        # -- is why this looks for the call inside an f-string in the statement, not for the
+        # import at the top of the file. It is still text, and text is still not SQL:
+        # tests/integration/test_topic_reads_execute.py is what proves the query runs, and
+        # the arm this form adds (a re-created topic carrying a tombstoned source_s3_key) is
+        # only observable against a real database.
+        if re.search(r'\{visible_(?:topics|chunks)_predicate\(', body):
+            continue
         offenders.append(name)
     assert not offenders, (
         "these read topics without excluding deleted ones, so a customer who deleted a "
