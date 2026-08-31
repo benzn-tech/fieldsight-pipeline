@@ -19,6 +19,8 @@ Jsonb() convention.
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from deleted_predicates import visible_topics_predicate
+
 _COLS = ("id, topic_id, site_id, observation, domain, severity, entity_name, "
          "entity_trade, recommended_action, programme_task_id, impact_severity, "
          "impact_note, impact_task_name, impact_evidence, impact_matched_at, "
@@ -99,6 +101,95 @@ def list_for_topics(conn, topic_ids) -> list[dict]:
         f"SELECT {_COLS} FROM findings WHERE topic_id = ANY(%s) ORDER BY created_at",
         (list(topic_ids),),
     ).fetchall()
+
+
+def count_by_domain(conn, company_id, domain, date_from, date_to,
+                    site_ids=None, author_ids=None) -> dict:
+    """How many safety- or quality-domain items in a date range.
+
+    FINDINGS FIRST, `safety_observations` SECOND, PER TOPIC -- the same rule the
+    shipped dashboard read already uses, not a third opinion about which table is
+    true. `topics.list_topics_for_date` does exactly this in Python:
+
+        t["safety_observations"] = (_findings_as_safety_rows(t_findings)
+                                    or safety_by_topic.get(t["id"], []))
+
+    and its left-hand side is already filtered to `domain == "safety"`, so the
+    fallback fires when a topic has no findings IN THIS DOMAIN -- not when it has
+    no findings at all. This function reproduces that condition, in SQL.
+
+    The fallback is load-bearing, not defensive. Measured on the live database:
+    139 topics carry findings and no `safety_observations`, 15 carry
+    `safety_observations` and no findings, and ZERO carry both. The two paths are
+    disjoint, so a findings-only count does not under-report by a margin -- it
+    reports nothing at all for the second kind. (Those are the nightly-report
+    topics, which exist only for zero-extraction days, because `AUTHORITY_FLIP`
+    makes a day with extraction topics defer.)
+
+    SAFETY ONLY. There is no legacy quality table, so `quality` never falls back;
+    an arm that reused `n_legacy` for both would report safety rows as quality
+    ones.
+
+    THE TENANT COMES THROUGH `site_id`. `topics.site_id` and `sites.company_id`
+    are both NOT NULL -- one hop that loses nothing. `topics.user_id` is
+    nullable, so reaching the tenant through `users` instead would drop every
+    NULL-author row from EVERY caller's count, including an ALL-scoped admin's,
+    and the number would look like an answer.
+
+    `author_ids` narrows to a set of authors and `null_author` is what that scope
+    cannot see by construction: findings on topics nobody is recorded as having
+    made. It is reported rather than subtracted silently, so a smaller number
+    arrives with its reason. `unlabelled` is findings whose `domain` is NULL --
+    measured 0 of 189 live, so it is almost always zero and the caller does not
+    print a zero.
+
+    Both deletion arms, via `visible_topics_predicate`. The topic arm covers the
+    rows that exist now; the source arm covers the ones tomorrow's re-ingest
+    rebuilds with new uuids that no topic-keyed tombstone names. A count with
+    only the first passes every test and leaks overnight.
+    """
+    row = conn.cursor(row_factory=dict_row).execute(
+        "WITH scoped AS ("
+        "  SELECT t.id AS topic_id, t.user_id"
+        "  FROM topics t JOIN sites s ON s.id = t.site_id"
+        "  WHERE s.company_id = %(company)s"
+        "    AND t.report_date BETWEEN %(from)s AND %(to)s"
+        "    AND (%(site_ids)s::uuid[] IS NULL OR t.site_id = ANY(%(site_ids)s::uuid[]))"
+        "    AND " + visible_topics_predicate("t") +
+        "), per_topic AS ("
+        "  SELECT sc.topic_id, sc.user_id,"
+        "    (SELECT count(*) FROM findings f"
+        "      WHERE f.topic_id = sc.topic_id AND f.domain = %(domain)s) AS n_findings,"
+        "    (SELECT count(*) FROM findings f"
+        "      WHERE f.topic_id = sc.topic_id AND f.domain IS NULL) AS n_unlabelled,"
+        "    (SELECT count(*) FROM safety_observations so"
+        "      WHERE so.topic_id = sc.topic_id) AS n_legacy"
+        "  FROM scoped sc"
+        "), counted AS ("
+        "  SELECT user_id, n_unlabelled,"
+        "    CASE WHEN n_findings > 0 THEN n_findings"
+        "         WHEN %(domain)s = 'safety' THEN n_legacy ELSE 0 END AS n,"
+        "    CASE WHEN n_findings = 0 AND %(domain)s = 'safety' THEN n_legacy"
+        "         ELSE 0 END AS n_fb"
+        "  FROM per_topic"
+        ")"
+        "SELECT"
+        "  COALESCE(SUM(n) FILTER (WHERE %(authors)s::uuid[] IS NULL"
+        "                          OR user_id = ANY(%(authors)s::uuid[])), 0) AS count,"
+        "  COALESCE(SUM(n_unlabelled), 0) AS unlabelled,"
+        "  COALESCE(SUM(n) FILTER (WHERE user_id IS NULL), 0) AS null_author,"
+        "  COALESCE(SUM(n_fb) FILTER (WHERE %(authors)s::uuid[] IS NULL"
+        "                             OR user_id = ANY(%(authors)s::uuid[])), 0) AS from_fallback"
+        " FROM counted",
+        {"company": company_id, "domain": domain, "from": date_from, "to": date_to,
+         "site_ids": list(site_ids) if site_ids is not None else None,
+         "authors": list(author_ids) if author_ids is not None else None},
+    ).fetchone()
+    # SUM() over bigint returns numeric, which psycopg hands back as Decimal, and
+    # json.dumps has no encoder for Decimal. These numbers go straight into an
+    # HTTP response body, so the cast happens here rather than at every caller.
+    return {k: int(row[k] or 0) for k in ("count", "unlabelled", "null_author",
+                                          "from_fallback")}
 
 
 def trade_heard_for(conn, company_id, entity_name, site_id=None) -> str | None:
