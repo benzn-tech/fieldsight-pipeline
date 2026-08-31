@@ -7238,3 +7238,56 @@ def test_the_admin_summary_verbatim_serve_is_refused_for_a_date_with_deleted_sou
     except Exception:
         pass                       # the later candidate-listing needs a real conn
     assert not any("summary_report.json" in k for k in fetched),         f"the pre-deletion aggregate was fetched: {fetched}"
+
+
+def test_render_shape_carries_the_collapse_count_to_the_client():
+    """A collapsed row must arrive with the number of times it was said.
+
+    The 0-day collapse runs in the repository, BELOW this serializer: one
+    commitment said in three recordings reaches `render_report_shape` as a
+    single row carrying `mention_count`, and the two topics it was taken from
+    reach it with an empty `action_items` list.
+
+    This serializer is a fixed allowlist of keys, and it dropped both
+    `mention_count` and `collapsed_ids` on the way out. Every repository test
+    was green -- they assert on what `collapse()` returns, and nothing asserted
+    on the JSON a browser receives. It was found by invoking the deployed
+    TEST function and reading the response.
+
+    The consequence is worse than the collapse simply not working. The rows do
+    not merge visibly, they DISAPPEAR: the reader is shown a list two items
+    shorter than what was said, with nothing on screen accounting for the
+    difference, and no reason to distrust it.
+    """
+    row = _topic_row(action_items=[
+        {"id": "a-1", "text": "Scaffolding -- inspect before Monday",
+         "responsible": None, "deadline": None, "deadline_text": None,
+         "priority": None, "status": "open",
+         "mention_count": 3, "collapsed_ids": ["a-2", "a-3"]},
+    ])
+    emptied = _topic_row(id="t-2", action_items=[])
+
+    shape = org.render_report_shape([row, emptied], None, "2026-09-01", "Ada_L")
+    item = shape["topics"][0]["action_items"][0]
+
+    assert item["mention_count"] == 3
+    assert item["collapsed_ids"] == ["a-2", "a-3"]
+    assert shape["topics"][1]["action_items"] == []
+
+
+def test_an_uncollapsed_row_still_says_it_was_mentioned_once():
+    """Absent is not zero and not missing.
+
+    Every ordinary row carries `mention_count: 1` so the client never has to
+    decide what a missing key means. A row that arrived before the collapse
+    existed, or from a stack with the flag off, reads the same as one that was
+    considered and found unique -- which is the truth in both cases.
+    """
+    row = _topic_row(action_items=[
+        {"id": "a-1", "text": "Order timber", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open"},
+    ])
+    item = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"][0]
+    assert item["mention_count"] == 1
+    assert item["collapsed_ids"] == []
