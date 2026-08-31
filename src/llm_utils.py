@@ -106,6 +106,26 @@ def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
     return _call_anthropic(prompt, max_tokens)
 
 
+def active_model():
+    """The model this deploy actually calls, for reporting to a caller.
+
+    `CLAUDE_MODEL` is the Anthropic branch's model and is set on every function
+    regardless of provider, so reading it directly answers a different question
+    from the one a caller is asking. On prod today `LLM_PROVIDER=qwen`, and every
+    Ask answer was labelled `claude-haiku-4-5-20251001` under the reader's nose
+    while `qwen3.6-flash` wrote it.
+
+    Returns None when the provider is one this function does not know about --
+    a wrong name is worse than no name, because the reader cannot tell it is
+    wrong.
+    """
+    if LLM_PROVIDER == "qwen":
+        return QWEN_MODEL
+    if LLM_PROVIDER == "anthropic":
+        return CLAUDE_MODEL
+    return None
+
+
 def _post_with_retry(url, body, headers):
     """Single POST with exponential backoff on 429/5xx. Returns (resp, error)."""
     http = urllib3.PoolManager()
