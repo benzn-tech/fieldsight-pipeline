@@ -173,6 +173,21 @@ def _metric(event):
             any_rows = got["sessions"] > 0 or got["photos"] > 0
             if any_rows:
                 notes["zero_kind"] = "none_of_that_kind"
+            elif author_ids is not None:
+                # A FOURTH CAUSE, found by asking a real question as a real
+                # site_manager on TEST. The rows for that day exist and belong to
+                # someone outside this caller's author set, so the range looks
+                # empty from here -- and the sentence for the row-level zeros
+                # says "no recording data was registered", which is a claim about
+                # the pipeline made from a fact about the ACL. The same shape as
+                # the photo zero that said the length could not be measured.
+                #
+                # It does NOT say rows exist elsewhere: SELF+WORKERS exists so a
+                # site_manager cannot learn about another site_manager's data,
+                # and "there are recordings but not yours" discloses exactly
+                # that. The wording just stops speaking for the pipeline and
+                # speaks about the caller's own data instead.
+                notes["zero_kind"] = "nothing_of_yours"
             else:
                 notes["zero_kind"] = ("no_rows_for_that_day"
                                       if topics.has_topics_in_range(
