@@ -175,6 +175,14 @@ def deleted_session_bases(conn, company_id, date_from, date_to) -> set:
     across a caller's folders is one GET per folder per day, while this is one
     query for the range.
 
+    `company_id=None` means EVERY COMPANY, and it must be reachable for the same
+    reason `range_stats` accepts it: a cross-company caller counts rows across
+    companies, and handing them only their OWN company's tombstones leaves
+    another company's deleted session in the total. Measured on prod: a
+    platform_admin was answered 12 sessions where 11 are visible, and the twelfth
+    was a deleted one -- a count that includes deleted recordings is a way to
+    observe what was deleted, which is the thing this argument exists to prevent.
+
     Live `target_key` values are `extractions/{folder}/{date}/sid{32hex}` and the
     base is the last segment. The date filter reads the segment rather than
     `created_at`: a tombstone written on Monday can name Sunday's session, and
@@ -183,11 +191,11 @@ def deleted_session_bases(conn, company_id, date_from, date_to) -> set:
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT DISTINCT substring(target_key from '(sid[0-9a-f]{32})$') AS base "
         "FROM redactions "
-        "WHERE company_id = %s AND target_type = 'recording' AND scope = 'deleted' "
+        "WHERE (%s::uuid IS NULL OR company_id = %s) ""AND target_type = 'recording' AND scope = 'deleted' "
         "AND reverted_at IS NULL AND target_key IS NOT NULL "
         "AND substring(target_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') "
         "    BETWEEN %s AND %s",
-        (company_id, date_from, date_to),
+        (company_id, company_id, date_from, date_to),
     ).fetchall()
     return {r["base"] for r in rows if r["base"]}
 

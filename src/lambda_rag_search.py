@@ -160,7 +160,7 @@ def _metric(event):
         # to and which the mirror is a copy OF. rag-search is in the VPC with no
         # egress, so an S3 read here would not fail -- it would black-hole until
         # the function timed out (BUG-36) and look like a slow query.
-        deleted = redactions.deleted_session_bases(conn, caller["company_id"],
+        deleted = redactions.deleted_session_bases(conn, company,
                                                    date_from, date_to)
         got = recordings.range_stats(conn, company, date_from, date_to,
                                      site_ids, author_ids=author_ids,
