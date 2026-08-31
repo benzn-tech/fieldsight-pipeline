@@ -1104,6 +1104,34 @@ def error(message, status=400):
 # MAIN HANDLER
 # ============================================================
 
+def _corroborate(body):
+    """External corroboration of an answer we already gave.
+
+    The module is imported here rather than at file top: this lambda serves
+    /api/ask on every request, and an import error inside a feature that is off
+    by default must not take the answer path down with it.
+    """
+    question = (body.get('question') or '').strip()
+    answer = (body.get('answer') or '').strip()
+    empty = {'corroborations': [], 'dropped': [], 'truncated': False,
+             'timed_out': False}
+    if not question or not answer:
+        return empty
+    try:
+        import corroboration
+    except Exception as e:  # noqa: BLE001 - a missing module must not 500 the route
+        logger.error(f"corroboration module unavailable: {e}")
+        return empty
+    if not corroboration.enabled():
+        logger.info("corroboration: disabled by flag")
+        return empty
+    try:
+        return corroboration.corroborate(question, answer)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"corroboration failed: {e}", exc_info=True)
+        return empty
+
+
 def lambda_handler(event, context):
     """
     POST /api/ask
@@ -1153,6 +1181,13 @@ def lambda_handler(event, context):
     # and never has RAG_SEARCH_FUNCTION -- see fieldsight-two-accounts.)
     if body.get('audio') and os.environ.get('RAG_SEARCH_FUNCTION'):
         return ok(_voice_answer(body))
+
+    # --- Corroboration path: question + answer in, external findings out. It
+    # reads neither the recordings nor the RAG index, so it is deliberately NOT
+    # inside the caller_sub/RAG_SEARCH_FUNCTION branch below -- gating it on RAG
+    # infrastructure would make it inert for a reason unrelated to what it does.
+    if body.get('mode') == 'corroborate':
+        return ok(_corroborate(body))
 
     date = body.get('date', '')
     user = body.get('user', '')
