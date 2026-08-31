@@ -538,3 +538,25 @@ def test_each_metric_names_its_own_noun_in_the_honest_zero(ask):
         assert mr.render("how many", {"metric": metric, "value": 0,
                                       "from": "2026-08-13", "to": "2026-08-13",
                                       "notes": {"zero_kind": "none_of_that_kind"}}) == want
+
+
+def test_a_count_of_one_agrees_with_its_noun(ask):
+    """"1 recordings on 2026-08-13" was the first sentence this route produced on
+    TEST for a real day. A number that cannot agree with its own noun reads as
+    machine output rather than as an answer."""
+    def say(metric, n):
+        return mr.render("how many", {"metric": metric, "value": n,
+                                      "from": "2026-08-13", "to": "2026-08-13",
+                                      "notes": {}})
+    assert say("count_sessions", 1) == "1 recording on 2026-08-13."
+    assert say("count_sessions", 2) == "2 recordings on 2026-08-13."
+    assert say("count_sessions", 0) == "0 recordings on 2026-08-13."
+    assert say("count_photos", 1) == "1 photo on 2026-08-13."
+    assert say("count_findings_safety", 1) == "1 safety issue on 2026-08-13."
+
+
+def test_chinese_has_no_plural_to_agree_with(ask):
+    out = mr.render("昨天录了几次", {"metric": "count_sessions", "value": 1,
+                                     "from": "2026-08-13", "to": "2026-08-13",
+                                     "notes": {}})
+    assert "录音" in out and "recording" not in out
