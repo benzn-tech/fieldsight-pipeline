@@ -144,3 +144,52 @@ def test_an_empty_or_missing_title_never_threads():
     a = topic(id="a", title="")
     b = topic(id="b", report_date="2026-08-01", title=None)
     assert find_candidates(b, corpus(a, b)) == []
+
+
+def test_open_items_is_a_gate_in_find_candidates_not_a_count():
+    """Why `candidate_corpus` must NOT collapse its `open_items`.
+
+    Both reads of the field in find_candidates are boolean: the subject topic is
+    skipped when it has none, and each corpus entry is skipped when it has none.
+    Nothing ranks on the magnitude.
+
+    So collapsing here would take a topic whose only open item restates an
+    earlier topic's from 1 to 0 and drop it out of the corpus, where it can
+    never be proposed as a parent again — losing a candidate to correct a
+    number no consumer reads. The docstring in repositories/threads.py says so;
+    this is the part that fails if someone acts on it anyway.
+    """
+    site = "s-1"
+    base = {"site_id": site, "summary": ""}
+    subject = dict(base, id="t-now", report_date="2026-08-20",
+                   title="Scaffolding inspection north elevation", open_items=1)
+    parent = dict(base, id="t-old", report_date="2026-08-13",
+                  title="Scaffolding inspection north elevation", open_items=1)
+
+    assert find_candidates(subject, [subject, parent]), \
+        "a parent with open items must be reachable"
+
+    # The same corpus, with the parent's count collapsed to zero exactly as a
+    # (site, day) collapse would do to a same-day duplicate.
+    collapsed_parent = dict(parent, open_items=0)
+    assert find_candidates(subject, [subject, collapsed_parent]) == [], \
+        "zeroing open_items removes the topic from the corpus entirely"
+
+
+def test_times_raised_counts_distinct_dates_so_a_busy_evening_is_one_raising():
+    """The claim this pins is about SQL, so it is asserted against the SQL text.
+
+    An earlier version of the threads.py note said a thread would report "raised
+    3 times" for one commitment said once per recording on a single evening.
+    It would not: the aggregate is count(DISTINCT t.report_date). Three topics
+    on one date are one date.
+
+    Asserted on the query string because a connection double cannot evaluate an
+    aggregate, and this repo has shipped SQL that no test ever executed.
+    """
+    import inspect
+    from repositories import threads as threads_repo
+    src = inspect.getsource(threads_repo.thread_facts)
+    assert "count(DISTINCT t.report_date) AS times_raised" in src
+    src_many = inspect.getsource(threads_repo.facts_for_threads)
+    assert "count(DISTINCT t.report_date) AS times_raised" in src_many
