@@ -33,7 +33,8 @@ import json
 import logging
 
 from db.connection import close_cached_connection, get_cached_connection
-from repositories import aliases, chunks, scope, sites, users
+from repositories import (aliases, chunks, findings, recordings, redactions, scope,
+                         sites, topics, users)
 import text_normalize
 
 logger = logging.getLogger()
@@ -56,7 +57,129 @@ def lambda_handler(event, context):
         close_cached_connection()
 
 
+_METRIC_UNITS = {
+    "duration": "seconds",
+    "count_sessions": "sessions",
+    "count_photos": "photos",
+    "count_findings_safety": "items",
+    "count_findings_quality": "items",
+}
+
+
+def _metric(event):
+    """Answer a counting question with a number, from SQL, with no model.
+
+    Ask retrieves text chunks and answers from them. "How long did I record
+    yesterday" has no textual answer anywhere -- nobody says the duration in the
+    meeting, it is a number in a column -- so `metric_slots` routes it here
+    instead, and this path never reaches an LLM. A model asked how long you
+    recorded says "about two hours" with the fluency of a fact.
+
+    The ACL is the SAME primitive the chunk path uses, resolved the same way from
+    the same `sub`, and the caller does not get to name a folder or a site set.
+    `mode` is the only thing the event chooses.
+
+    THREE ZEROS, because "0" has more than one cause and two of them read
+    identically to a person:
+
+      nothing_visible     the caller can reach no sites at all. Not an answer
+                          about recordings -- an answer about the account.
+      no_rows_for_that_day  topics exist for the range and `recordings` rows do
+                          not. The RealPTT path never registers rows, days
+                          before migration 0009 have none, a lake-fed
+                          environment has none; measured at 15.4% of days that
+                          carry topics. Saying "you recorded nothing" here is
+                          the misleading zero `lambda_org_api` was changed to
+                          stop producing.
+      nothing_recorded    topics do not exist either. The honest zero.
+
+    A findings metric has its own third: `no_topics` means nothing happened in
+    range at all, while a zero with topics present means the day had no item of
+    that domain -- "no safety issues" is a real and welcome answer, and it must
+    not be delivered in the same words as "nothing reached the system".
+
+    `notes` carries only what is non-zero, so a clean answer stays clean and a
+    number that is short arrives with the reason attached.
+    """
+    sub = event.get("sub")
+    metric = event.get("metric")
+    date_from = event.get("date_from") or None
+    date_to = event.get("date_to") or date_from
+    out = {"metric": metric, "from": date_from, "to": date_to}
+
+    if metric not in _METRIC_UNITS:
+        # Refused, never guessed. Falling through to the nearest metric would
+        # answer a different question than the one asked, with a number.
+        return dict(out, error="unknown metric")
+    if not sub or not date_from:
+        return dict(out, error="missing sub or date range")
+    out["unit"] = _METRIC_UNITS[metric]
+
+    conn = get_cached_connection()
+    caller = users.get_user_by_sub(conn, sub)
+    if caller is None:
+        logger.info("rag-search metric: caller not provisioned for sub=%s", sub)
+        return dict(out, error="caller not provisioned")
+
+    sc = scope.visible_scope(conn, caller)
+    site_ids = [str(s) for s in sc["site_ids"]]
+    author_ids = ([str(a) for a in sc["author_ids"]]
+                  if sc["author_ids"] is not None else None)
+    out["scope"] = {"sites": len(site_ids),
+                    "authors": len(author_ids) if author_ids is not None else None}
+
+    if not site_ids:
+        return dict(out, value=0, n=0, notes={"zero_kind": "nothing_visible"})
+
+    notes = {}
+    if metric.startswith("count_findings_"):
+        domain = metric.rsplit("_", 1)[1]
+        got = findings.count_by_domain(conn, caller["company_id"], domain,
+                                       date_from, date_to,
+                                       site_ids=site_ids, author_ids=author_ids)
+        value = got["count"]
+        for k in ("unlabelled", "null_author", "from_fallback"):
+            if got[k]:
+                notes[k] = got[k]
+        if value == 0:
+            notes["zero_kind"] = ("none_in_domain"
+                                  if topics.has_topics_in_range(
+                                      conn, site_ids, date_from, date_to,
+                                      author_ids=author_ids)
+                                  else "no_topics")
+    else:
+        # Tombstones come from Aurora, which this function is already connected
+        # to and which the mirror is a copy OF. rag-search is in the VPC with no
+        # egress, so an S3 read here would not fail -- it would black-hole until
+        # the function timed out (BUG-36) and look like a slow query.
+        deleted = redactions.deleted_session_bases(conn, caller["company_id"],
+                                                   date_from, date_to)
+        got = recordings.range_stats(conn, caller["company_id"], date_from, date_to,
+                                     site_ids, author_ids=author_ids,
+                                     deleted_bases=deleted)
+        value = {"duration": got["duration_s"],
+                 "count_sessions": got["sessions"],
+                 "count_photos": got["photos"]}[metric]
+        for k in ("unmeasured", "unattributed"):
+            if got[k]:
+                notes[k] = got[k]
+        if value == 0:
+            notes["zero_kind"] = ("no_rows_for_that_day"
+                                  if topics.has_topics_in_range(
+                                      conn, site_ids, date_from, date_to,
+                                      author_ids=author_ids)
+                                  else "nothing_recorded")
+
+    return dict(out, value=value, n=value, notes=notes)
+
+
 def _search(event, context):
+    # The metric route answers with a number instead of chunks. Placed first
+    # because everything below it is about embeddings, and a metric question
+    # carries none.
+    if event.get("mode") == "metric":
+        return _metric(event)
+
     sub = event.get("sub")
     try:
         k = int(event.get("k", 8))
