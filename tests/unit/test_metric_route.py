@@ -468,3 +468,73 @@ def test_a_range_reads_as_a_range_not_as_a_single_day():
                                         "from": "2026-08-24", "to": "2026-08-30",
                                         "notes": {}})
     assert "between 2026-08-24 and 2026-08-30" in out
+
+
+# ============================================================
+# Found on TEST, by asking the real question
+# ============================================================
+
+def test_no_photos_on_a_day_that_has_recordings_is_an_honest_zero(wired, monkeypatch):
+    """The first run of this route on TEST answered "how many photos did I take
+    yesterday" with "no recording data was registered, so the length cannot be
+    measured" -- on a day that had 1116 seconds of audio.
+
+    Two defects in one sentence: the zero kind was chosen from THIS metric being
+    0 rather than from the range having no rows, and the wording was the duration
+    one. A photo count of 0 on a day with recordings is "you took no photos", and
+    saying otherwise is a claim about the pipeline made from a fact about photos.
+    """
+    monkeypatch.setattr(rag.recordings, "range_stats",
+                        lambda *a, **k: dict(STATS, photos=0))   # sessions=3
+    monkeypatch.setattr(rag.topics, "has_topics_in_range", lambda *a, **k: True)
+
+    out = rag.lambda_handler(ev(metric="count_photos"), None)
+    assert out["value"] == 0
+    assert out["notes"]["zero_kind"] == "none_of_that_kind"
+
+
+def test_the_row_level_zeros_need_the_range_to_have_no_rows_at_all(wired, monkeypatch):
+    """`no_rows_for_that_day` is a statement about the pipeline, so it must only
+    be reachable when the range produced nothing -- not when one metric of
+    several happens to be zero."""
+    monkeypatch.setattr(rag.recordings, "range_stats",
+                        lambda *a, **k: dict(STATS, sessions=0, duration_s=0, photos=0))
+    monkeypatch.setattr(rag.topics, "has_topics_in_range", lambda *a, **k: True)
+    assert rag.lambda_handler(ev(metric="count_photos"),
+                              None)["notes"]["zero_kind"] == "no_rows_for_that_day"
+
+    monkeypatch.setattr(rag.topics, "has_topics_in_range", lambda *a, **k: False)
+    assert rag.lambda_handler(ev(metric="count_photos"),
+                              None)["notes"]["zero_kind"] == "nothing_recorded"
+
+
+def test_photos_present_but_no_audio_is_still_not_a_pipeline_claim(wired, monkeypatch):
+    """The other half of `any_rows`: a day with photos and no audio has rows, so
+    a zero duration is "no recordings", not "nothing was registered"."""
+    monkeypatch.setattr(rag.recordings, "range_stats",
+                        lambda *a, **k: dict(STATS, sessions=0, duration_s=0, photos=4))
+    monkeypatch.setattr(rag.topics, "has_topics_in_range", lambda *a, **k: True)
+    assert rag.lambda_handler(ev(metric="duration"),
+                              None)["notes"]["zero_kind"] == "none_of_that_kind"
+
+
+def test_the_row_level_sentence_says_nothing_about_length(ask):
+    """It is reachable for every recordings metric. A duration-shaped sentence
+    under a photo question is how the TEST run read."""
+    for metric, noun in (("count_photos", "photos"), ("count_sessions", "recordings")):
+        out = mr.render("how many " + noun,
+                        {"metric": metric, "value": 0, "from": "2026-08-13",
+                         "to": "2026-08-13",
+                         "notes": {"zero_kind": "no_rows_for_that_day"}})
+        assert "length" not in out.lower(), out
+
+
+def test_each_metric_names_its_own_noun_in_the_honest_zero(ask):
+    cases = {"count_photos": "No photos on 2026-08-13.",
+             "count_sessions": "No recordings on 2026-08-13.",
+             "count_findings_safety": "No safety issues on 2026-08-13.",
+             "duration": "No recording time on 2026-08-13."}
+    for metric, want in cases.items():
+        assert mr.render("how many", {"metric": metric, "value": 0,
+                                      "from": "2026-08-13", "to": "2026-08-13",
+                                      "notes": {"zero_kind": "none_of_that_kind"}}) == want
