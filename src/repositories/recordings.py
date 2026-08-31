@@ -194,7 +194,23 @@ def range_stats(conn, company_id, date_from, date_to,
         "  SELECT kind, duration_s, started_at, ended_at, site_id,"
         "    COALESCE(substring(s3_key from '_(sid[0-9a-f]{32})_c[0-9]+\\.'), s3_key) AS fold"
         "  FROM recordings"
-        "  WHERE company_id = %(company)s"
+        # SITE FIRST, COMPANY ONLY FOR THE SITE-LESS ROWS. `site_ids` IS the
+        # ACL -- for every ordinary role it comes from memberships or
+        # list_company_sites and is already inside the caller's company, so
+        # this is not a widening. For a cross-company caller it spans
+        # companies, and pinning `company_id` to the caller's OWN company
+        # then contradicted the site set and matched nothing: a
+        # platform_admin reaching 5 sites that recorded all day was told
+        # "no recording data was registered for it". `has_topics_in_range`
+        # scopes by site alone, which is why the topic half of that sentence
+        # was right and the count was zero.
+        #
+        # The company pin survives on the site-less arm only, and it has to:
+        # a NULL-site row is reachable by no site set, so without it a
+        # cross-company caller would fold another company's unattributed
+        # recordings into `unattributed`.
+        "  WHERE (site_id = ANY(%(sites)s::uuid[])"
+        "         OR (site_id IS NULL AND company_id = %(company)s))"
         "    AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/')"
         "        BETWEEN %(from)s AND %(to)s"
         "    AND (%(authors)s::uuid[] IS NULL OR user_id = ANY(%(authors)s::uuid[]))"

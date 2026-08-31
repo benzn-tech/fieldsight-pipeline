@@ -495,3 +495,68 @@ def test_null_author_is_silent_when_every_author_is_in_scope(db):
                                         author_ids=[uid])
     assert filtered["count"] == 0
     assert filtered["null_author"] == 1, "a short number lost its reason"
+
+
+def test_a_cross_company_caller_counts_the_sites_they_reach(db):
+    """A `platform_admin` reaches every site in every company, and their OWN
+    company usually owns none of them -- on TEST the platform company owns zero
+    sites while all the data is in another.
+
+    `company_id` pinned to the caller's own company then contradicted the site
+    set and matched nothing: a platform_admin reaching 5 sites that recorded all
+    day was told "There are notes on 2026-08-13, but no recording data was
+    registered for it." `has_topics_in_range` scopes by site alone, which is why
+    the topic half of that sentence was right and the count was zero.
+
+    `site_ids` IS the ACL, so it is the scope. For every ordinary role it already
+    comes from memberships or list_company_sites and sits inside the caller's own
+    company, so this is not a widening.
+    """
+    co_data, site, uid = _seed(db, "xcodata")
+    co_admin = companies.create_company(db, "Acme-xcoadmin")["id"]
+    _chunk(db, co_data, site, uid, "xcodata", "2026-08-27", "a" * 32, 1)
+
+    out = recordings.range_stats(db, co_admin, "2026-08-27", "2026-08-27", [site])
+    assert out["sessions"] == 1, "a cross-company caller saw none of the site they reach"
+    assert out["duration_s"] == 30
+
+
+def test_another_companys_site_less_recordings_stay_out_of_unattributed(db):
+    """The company pin survives on the site-less arm, and it has to. A NULL-site
+    row is reachable by no site set at all, so without it a cross-company caller
+    would fold another company's unattributed recordings into their own note."""
+    co_a, site_a, uid_a = _seed(db, "xcoa")
+    co_b, site_b, uid_b = _seed(db, "xcob")
+    recordings.insert_pending(
+        db, co_b, uid_b, None, "audio",
+        "users/xcob/audio/2026-08-27/dev_sid" + "b" * 32 + "_c0001.wav",
+        "xb-1", "2026-08-27T10:00:00Z", duration_s=30)
+
+    out = recordings.range_stats(db, co_a, "2026-08-27", "2026-08-27", [site_a, site_b])
+    assert out["unattributed"] == 0, "another company's site-less recording was named"
+
+
+def test_findings_follow_the_same_rule(db):
+    co_data, site, uid = _seed(db, "xcofind")
+    co_admin = companies.create_company(db, "Acme-xcofindadmin")["id"]
+    t = topics.upsert_topic(db, site, "2026-08-27", "T", user_id=uid,
+                            source_s3_key="extractions/x/2026-08-27/s.json")
+    findings.insert_findings(db, t["id"], site, [{"observation": "x", "domain": "safety"}])
+
+    assert findings.count_by_domain(db, co_admin, "safety", "2026-08-27", "2026-08-27",
+                                    site_ids=[site])["count"] == 1
+
+
+def test_without_a_site_set_the_company_is_still_the_scope(db):
+    """The fallback the CASE keeps. `count_by_domain` is callable with no
+    site_ids, and dropping the company pin outright would have made that call
+    count every company."""
+    co_a, site_a, uid_a = _seed(db, "nositea")
+    co_b, site_b, uid_b = _seed(db, "nositeb")
+    for site in (site_a, site_b):
+        t = topics.upsert_topic(db, site, "2026-08-27", "T", user_id=None,
+                                source_s3_key=f"extractions/{site}/2026-08-27/s.json")
+        findings.insert_findings(db, t["id"], site, [{"observation": "x", "domain": "safety"}])
+
+    out = findings.count_by_domain(db, co_a, "safety", "2026-08-27", "2026-08-27")
+    assert out["count"] == 1, "with no site set, the company pin is what scopes it"
