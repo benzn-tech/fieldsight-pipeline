@@ -1019,7 +1019,9 @@ def _rag_answer(body):
                 "answer": "Search service temporarily unavailable. Please try again.",
                 "error": "rag-search unavailable",
                 "citations": [],
-                "model": llm_utils.CLAUDE_MODEL,
+                # No model was called. A name here would attribute a system
+                # message to something that never ran.
+                "model": None,
             }
         result = json.loads(resp["Payload"].read().decode("utf-8"))
         chunks = result.get("chunks") or []
@@ -1034,7 +1036,8 @@ def _rag_answer(body):
             return {
                 "answer": "No relevant records found for this question.",
                 "citations": [],
-                "model": llm_utils.CLAUDE_MODEL,
+                # This return sits ABOVE the call_llm below: no model ran.
+                "model": None,
                 "grounded": True,
                 "basis": basis,
             }
@@ -1049,7 +1052,7 @@ def _rag_answer(body):
                 "answer": "",
                 "error": err,
                 "citations": [],
-                "model": llm_utils.CLAUDE_MODEL,
+                "model": None,
             }
 
         # CONTRACT: citations MUST stay in the same order as the prompt's [n]
@@ -1073,7 +1076,10 @@ def _rag_answer(body):
         return {
             "answer": answer,
             "citations": citations,
-            "model": llm_utils.CLAUDE_MODEL,
+            # The only branch where a model produced the text, so the only one
+            # that names one -- and it names the one that ran, not the constant
+            # for a provider this deploy may not be using.
+            "model": llm_utils.active_model(),
             "grounded": True,
             "basis": basis,
         }
@@ -1083,7 +1089,9 @@ def _rag_answer(body):
             "answer": "",
             "error": str(e),
             "citations": [],
-            "model": llm_utils.CLAUDE_MODEL,
+            # Reachable from either side of the model call, so there is nothing
+            # honest to name.
+            "model": None,
         }
 
 
