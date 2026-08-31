@@ -550,3 +550,44 @@ was one layer below where the draft stopped reading — it verified the repo's
 
 F1–F4 can be built against a hand-written fixture before B1 exists. F5 needs the
 route. Nothing ships to a customer until §10 decision 1 has an answer.
+
+---
+
+## 11. As built (2026-09-01)
+
+The backend shipped inert on `develop` in three PRs: #656 (B5, the gate), #658
+(B3, the client), #659 (B1/B2/B4/B6/B7/B9/B10). `ENABLE_EXTERNAL_CORROBORATION`
+is `false` in `template.yaml` and in both deploy workflows, so §10 decision 1 is
+still the only thing standing between this and a customer seeing it.
+
+Four things the design did not anticipate, each found by running the code rather
+than by reading it:
+
+**`output_config.effort` is a 400 on Haiku 4.5**, and §5.3 puts haiku on steps 1
+and 4. A call site that simply left the client's default in place would have
+produced a well-formed request against a real model that fails only in the
+deployed environment. The client now drops `effort` for models that reject it,
+rather than leaving each call site to remember.
+
+**A `web_search_tool_result` block carries a list on success and a dict on
+error, with HTTP 200 either way.** Iterating the dict yields its keys, the item
+filter drops them, and zero results come back with nothing to say why — which
+step 4 would report as `not_found`, a claim about the world rather than about
+us. `Reply.search_error` exists for that distinction. It was found by mutation
+check: the first version of the test asserted only "zero results" and stayed
+green with the guard deleted.
+
+**Thinking must stay on and `effort` is what gets turned down.** The obvious way
+to protect the 12 s search budget — `thinking: {"type": "disabled"}` — is the one
+change that can break the step outright: with thinking off, Opus 5 sometimes
+writes a tool call into visible text instead of emitting `server_tool_use`. The
+turn succeeds, the search never runs, and the caller reports `not_found`.
+
+**The flag needed a fourth segment, not three.** `test_template_workflow_parameter_wiring`
+already in the repo failed until both workflows passed the parameter: without the
+`--parameter-overrides` line the parameter could only ever hold its template
+default, and the documented "set a repo variable and redeploy" rollback would
+have been a rollback that did nothing.
+
+§9's latency question is unchanged and unanswerable from here — it needs TEST
+traffic with the flag on, which needs decision 1.
