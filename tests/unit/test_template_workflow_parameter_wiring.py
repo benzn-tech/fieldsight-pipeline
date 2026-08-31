@@ -985,3 +985,36 @@ def test_the_correction_requests_expire():
     assert rule["Filter"]["Prefix"] == "voiceprint_requests/"
     assert 1 <= rule["Expiration"]["Days"] <= 30, (
         f"{rule['Expiration']['Days']} days is retention, not a handoff window")
+
+
+def test_todo_collapse_reaches_every_function_that_reads_action_items():
+    """A read-time collapse applied to some readers and not others is worse than
+    no collapse: the list shows one commitment and the counter beside it says
+    three, which reads as a broken product rather than as duplicated work.
+
+    The generic checks above prove the Parameter is passed by both workflows.
+    They cannot prove it reaches the FUNCTIONS, and this collapse has three
+    consumers in different corners of the template — including one whose list is
+    built from an S3 artifact rather than the database, which is exactly the
+    surface a database-shaped fix forgets.
+    """
+    template = open(TEMPLATE, encoding="utf-8").read()
+
+    assert "EnableTodoCollapse:" in template, "the Parameter itself is missing"
+    assert template.count("ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse") == 3, (
+        "ENABLE_TODO_COLLAPSE must be on all THREE functions that read "
+        "action_items: org-api (timeline / live-items / portfolio tiles), "
+        "item-writer (the stop-recording email, built from the S3 artifact) "
+        "and embed-report (RAG chunk text via get_topic_full)")
+
+    # Default false, in the Parameter and in both workflows. An unset variable
+    # has to leave a customer's todo list exactly as it is today.
+    block = template.split("EnableTodoCollapse:", 1)[1].split("Description:", 1)[0]
+    assert "Default: 'false'" in block, "the collapse must default OFF"
+    for wf in ("test", "prod"):
+        text = open(WORKFLOWS[wf], encoding="utf-8").read()
+        line = [ln for ln in text.splitlines() if "EnableTodoCollapse=" in ln]
+        assert line, f"{wf} does not pass EnableTodoCollapse"
+        assert "'false'" in line[0], (
+            f"{wf} must fall back to false, or a missing repo variable turns the "
+            "collapse ON for that stage")

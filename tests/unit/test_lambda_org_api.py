@@ -1979,9 +1979,25 @@ def test_portfolio_counts_merges_four_queries(monkeypatch):
     # Task 4: portfolio_counts now computes company_excluded_topic_ids first;
     # stub it so this test still exercises exactly the 4 aggregate queries.
     monkeypatch.setattr(org.rollup.redactions, "company_excluded_topic_ids", lambda conn, ids: set())
+    # The action-item leg reads ROWS now, not a SQL aggregate, so that the tile
+    # is counted by the same rule the todo list is collapsed by rather than by a
+    # second copy of it written in SQL. Five items: three of them one commitment
+    # said in three recordings on one day (the 2026-08-10 shape), which with the
+    # collapse off must still count as five.
+    _day = _dt.date(2026, 7, 18)
     conn = _RollupFakeConn(results=[
         [{"site_id": "s-1", "open_safety": 2, "open_high_safety": 1}],
-        [{"site_id": "s-1", "open_actions": 3, "total_actions": 5, "overdue_actions": 1}],
+        [{"site_id": "s-1", "id": "a1", "text": "Scaffolding -- inspect before Monday",
+          "status": "open", "deadline": _dt.date(2020, 1, 1), "created_at": 1,
+          "report_date": _day},
+         {"site_id": "s-1", "id": "a2", "text": "Scaffolding -- inspect before Monday",
+          "status": "open", "deadline": None, "created_at": 2, "report_date": _day},
+         {"site_id": "s-1", "id": "a3", "text": "Scaffolding -- inspect before Monday",
+          "status": "open", "deadline": None, "created_at": 3, "report_date": _day},
+         {"site_id": "s-1", "id": "a4", "text": "Fix gate", "status": "closed",
+          "deadline": None, "created_at": 4, "report_date": _day},
+         {"site_id": "s-1", "id": "a5", "text": "Order timber", "status": "closed",
+          "deadline": None, "created_at": 5, "report_date": _day}],
         [{"site_id": "s-1", "topics_count": 7, "participants": 4}],
         [{"site_id": "s-1", "last_activity_at": _dt.date(2026, 7, 18)}],
     ])
@@ -2010,6 +2026,51 @@ def test_portfolio_counts_merges_four_queries(monkeypatch):
         "topics_count": 7, "participants": 4,
         "last_activity_at": "2026-07-18",
     }}
+
+
+def test_portfolio_tile_agrees_with_the_collapsed_list(monkeypatch):
+    """The tile is counted by the same rule the list is collapsed by.
+
+    A list that shows one commitment beside a counter saying three tells the
+    reader the product is broken rather than that the work was said twice —
+    which is why this leg reads rows instead of asking SQL for a count. A second
+    copy of the normalisation written in SQL is how one rule becomes two that
+    drift, and this repo has paid for that more than once.
+    """
+    monkeypatch.setattr(org.rollup.redactions, "company_excluded_topic_ids",
+                        lambda conn, ids: set())
+    monkeypatch.setenv("ENABLE_TODO_COLLAPSE", "true")
+    _day = _dt.date(2026, 7, 18)
+    rows = [{"site_id": "s-1", "id": "a%d" % i,
+             "text": "Scaffolding -- inspect before Monday",
+             "status": "open", "deadline": None, "created_at": i, "report_date": _day}
+            for i in (1, 2, 3)]
+    conn = _RollupFakeConn(results=[[], rows, [], []])
+    counts = org.rollup.portfolio_counts(conn, ["s-1"])
+    assert counts["s-1"]["open_actions"] == 1, "three recordings, one commitment"
+    assert counts["s-1"]["total_actions"] == 1
+
+    # Off is the default, and off must leave the number exactly as it is today.
+    monkeypatch.delenv("ENABLE_TODO_COLLAPSE")
+    conn2 = _RollupFakeConn(results=[[], rows, [], []])
+    assert org.rollup.portfolio_counts(conn2, ["s-1"])["s-1"]["open_actions"] == 3
+
+
+def test_a_different_day_is_a_different_commitment(monkeypatch):
+    """The collapse is same-day only. The same words two days apart are a
+    RECURRENCE — the thing a person is asked to judge — and collapsing them
+    would answer that question automatically and wrongly."""
+    monkeypatch.setattr(org.rollup.redactions, "company_excluded_topic_ids",
+                        lambda conn, ids: set())
+    monkeypatch.setenv("ENABLE_TODO_COLLAPSE", "true")
+    rows = [{"site_id": "s-1", "id": "a1", "text": "Scaffolding -- inspect",
+             "status": "open", "deadline": None, "created_at": 1,
+             "report_date": _dt.date(2026, 8, 10)},
+            {"site_id": "s-1", "id": "a2", "text": "Scaffolding -- inspect",
+             "status": "open", "deadline": None, "created_at": 2,
+             "report_date": _dt.date(2026, 8, 12)}]
+    conn = _RollupFakeConn(results=[[], rows, [], []])
+    assert org.rollup.portfolio_counts(conn, ["s-1"])["s-1"]["open_actions"] == 2
 
 
 def test_zero_count_site_included():

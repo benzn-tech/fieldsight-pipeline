@@ -1,5 +1,6 @@
 import logging
 
+import todo_collapse
 # The deleted-topic predicate lives with the tombstone it reads, so a caller cannot
 # accidentally write a second copy that drifts.
 from repositories.redactions import DELETED_TOPIC_PREDICATE
@@ -433,12 +434,22 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
 
     topic_ids = [t["id"] for t in topic_rows]
     action_items_by_topic = {}
+    _all_items = []
     for a in conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, text, responsible, deadline, priority, status, created_at "
         "FROM action_items WHERE topic_id = ANY(%s) AND "
         + CHILD_OF_VISIBLE_TOPIC.format(alias="action_items") + " ORDER BY created_at",
         (topic_ids,),
     ).fetchall():
+        _all_items.append(a)
+
+    # Collapsed across the WHOLE call, then grouped. The duplicates live in
+    # DIFFERENT topics — three recordings on one evening, three topics, one
+    # commitment — so a per-topic collapse catches none of them, which is the
+    # implementation a first reading reaches for. The survivor keeps its own
+    # topic_id and lands on its own topic; the rows it stands for simply do not
+    # appear. Off unless ENABLE_TODO_COLLAPSE says otherwise.
+    for a in todo_collapse.collapse_if_enabled(_all_items):
         action_items_by_topic.setdefault(a["topic_id"], []).append(a)
 
     safety_by_topic = {}
@@ -603,11 +614,18 @@ def list_topics_for_source_prefix(conn, source_prefix) -> list[dict]:
 
     topic_ids = [t["id"] for t in topic_rows]
     action_items_by_topic = {}
+    _all_items = []
     for a in conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, text, responsible, deadline, deadline_text, priority, "
         "status, created_at FROM action_items WHERE topic_id = ANY(%s) ORDER BY created_at",
         (topic_ids,),
     ).fetchall():
+        _all_items.append(a)
+
+    # Same collapse as list_topics_for_date, and for the same reason: this is
+    # the authority-flip timeline shim, i.e. the read path a prod customer's
+    # Today and Timeline actually go through.
+    for a in todo_collapse.collapse_if_enabled(_all_items):
         action_items_by_topic.setdefault(a["topic_id"], []).append(a)
 
     safety_by_topic = {}
@@ -682,10 +700,15 @@ def get_topic_full(conn, topic_id) -> dict | None:
         return None
     t = rows[0]
     tids = [t["id"]]
-    t["action_items"] = conn.cursor(row_factory=dict_row).execute(
-        "SELECT id, topic_id, text, responsible, deadline, deadline_text, "
-        "priority, status, created_at FROM action_items WHERE topic_id = ANY(%s) "
-        "ORDER BY created_at", (tids,)).fetchall()
+    # This function has exactly one caller — reindex.py, which turns the result
+    # into RAG chunk text — so collapsing here keeps the same commitment from
+    # being embedded several times over. It is NOT a UI detail view, so there is
+    # no screen where this could disagree with an uncollapsed list.
+    t["action_items"] = todo_collapse.collapse_if_enabled(
+        conn.cursor(row_factory=dict_row).execute(
+            "SELECT id, topic_id, text, responsible, deadline, deadline_text, "
+            "priority, status, created_at FROM action_items WHERE topic_id = ANY(%s) "
+            "ORDER BY created_at", (tids,)).fetchall())
     t["safety_observations"] = conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, observation, risk_level, location, status, "
         "created_at FROM safety_observations WHERE topic_id = ANY(%s) "

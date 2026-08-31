@@ -48,6 +48,7 @@ Environment Variables:
     PG*/DATABASE_URL - read by db.connection.get_connection()
 """
 import json
+import todo_collapse
 import logging
 import os
 from urllib.parse import unquote_plus
@@ -405,7 +406,18 @@ def _todos_from_topics(artifact):
                 out.append({"text": text,
                             "responsible": item.get("responsible") or None,
                             "due": item.get("deadline") or item.get("due") or None})
-    return out
+    # The surface that is not in the database at all. A merged group artifact
+    # carries every member session's topics, so one commitment said in three of
+    # them is listed three times in the stop-recording email — and a
+    # database-side collapse does nothing about it, because this list is built
+    # from the S3 artifact and never touches Aurora.
+    #
+    # These rows carry no `status`; a freshly extracted commitment is open by
+    # definition, which is what todo_collapse._status says and why it says it.
+    # The `mention_count` / `collapsed_ids` the collapse adds are ignored by the
+    # renderer, which reads text/responsible/due — harmless, and there if the
+    # email ever wants to say "raised three times".
+    return todo_collapse.collapse_if_enabled(out)
 
 
 def _request_rebind(company_id, session_base, artifact, put=None):
