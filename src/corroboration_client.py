@@ -67,6 +67,17 @@ MIN_USEFUL_TIMEOUT = 2.0
 
 _RETRYABLE = {429, 500, 502, 503, 504, 529}
 
+# `output_config.effort` is a 400 on Haiku 4.5, and the steps that use haiku are
+# the cheap ones where a caller is most likely to leave the default in place.
+# Dropped here rather than left to each call site, because the failure has no
+# local symptom: the request is well-formed, the model is real, and the only
+# evidence is a 400 in prod.
+_NO_EFFORT_PREFIXES = ("claude-haiku",)
+
+
+def _supports_effort(model: str) -> bool:
+    return not str(model or "").startswith(_NO_EFFORT_PREFIXES)
+
 
 class SearchResult:
     """One page the search step saw. `url` is what a card cites."""
@@ -199,8 +210,9 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, tools=None,
     if timeout is None or timeout < MIN_USEFUL_TIMEOUT:
         return Reply(error=f"no time left ({timeout}s)")
 
+    chosen_model = model or DEFAULT_MODEL
     payload = {
-        "model": model or DEFAULT_MODEL,
+        "model": chosen_model,
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
     }
@@ -208,7 +220,7 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, tools=None,
         payload["system"] = system
     if tools:
         payload["tools"] = tools
-    if effort:
+    if effort and _supports_effort(chosen_model):
         payload["output_config"] = {"effort": effort}
 
     body = json.dumps(payload)

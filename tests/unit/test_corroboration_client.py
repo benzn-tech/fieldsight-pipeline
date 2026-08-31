@@ -276,3 +276,18 @@ def test_the_api_key_is_never_returned_in_the_reply(monkeypatch):
     _install(monkeypatch, FakePool(FakeResponse(401, {"error": {"message": "bad key"}})))
     reply = client.call("q", timeout=12)
     assert "test-key" not in repr(reply)
+
+
+def test_effort_is_dropped_for_a_model_that_rejects_it(monkeypatch):
+    """`output_config.effort` is a 400 on Haiku 4.5, and steps 1 and 4 run haiku.
+    The failure has no local symptom -- well-formed request, real model -- so the
+    only evidence would be a 400 in prod."""
+    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body("hi"))))
+    client.call("q", timeout=4, model="claude-haiku-4-5")
+    assert "output_config" not in pool.calls[0]["body"]
+
+
+def test_effort_is_still_sent_for_a_model_that_takes_it(monkeypatch):
+    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body("hi"))))
+    client.call("q", timeout=4, model="claude-opus-5", effort="medium")
+    assert pool.calls[0]["body"]["output_config"] == {"effort": "medium"}
