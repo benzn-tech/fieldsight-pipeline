@@ -1260,6 +1260,57 @@ def ask_question(body, caller):
         return error(f'Ask agent error: {e}', 500)
 
 
+# ── POST /api/ask/corroborate ─────────────────────
+
+# An answer long enough to be a transcript is a transcript. The corroboration
+# steps read the answer, not the recording, and a caller that pastes the wrong
+# thing here would be aiming meeting content at an external search.
+MAX_CORROBORATE_CHARS = 8000
+
+
+def corroborate_answer(body, caller):
+    """Proxy an answer to the Ask Agent for external corroboration.
+
+    Modelled on ask_question, including the FunctionError guard verbatim: that
+    guard exists so an unhandled exception in the agent does not return a stack
+    trace to the client, and this route needs it for exactly the same reason.
+    """
+    question = body.get('question', '').strip()
+    answer = body.get('answer', '').strip()
+
+    if not question:
+        return error('Missing question')
+    if not answer:
+        return error('Missing answer')
+    if len(answer) > MAX_CORROBORATE_CHARS or len(question) > MAX_CORROBORATE_CHARS:
+        return error('Question or answer too long to corroborate')
+
+    payload = {
+        'question': question,
+        'answer': answer,
+        'mode': 'corroborate',
+        'caller_sub': caller.get('sub', ''),
+    }
+
+    try:
+        resp = lambda_client.invoke(
+            FunctionName=ASK_AGENT_FUNCTION,
+            InvocationType='RequestResponse',
+            Payload=json.dumps(payload)
+        )
+        if resp.get('FunctionError'):
+            logger.error(f"Ask agent returned FunctionError: {resp.get('FunctionError')}")
+            return error('Ask agent error', 500)
+
+        result = json.loads(resp['Payload'].read().decode('utf-8'))
+        if 'body' in result:
+            return result
+        return ok(result)
+    except Exception as e:
+        logger.error(f"Corroborate invocation failed: {e}")
+        return error(f'Ask agent error: {e}', 500)
+
+
 # ── POST /api/ask/voice (SP-Ask) ─────────────────────────────
 
 # ~15s of 128kbps AAC ≈ 240KB ≈ 320K base64 chars; 1.5M chars (~1.1MB decoded)
@@ -1450,6 +1501,7 @@ def lambda_handler(event, context):
         elif path == '/api/actions': return get_actions(params, caller)
         elif path == '/api/ask' and method == 'POST': return ask_question(body, caller)
         elif path == '/api/ask/voice' and method == 'POST': return ask_voice(body, caller)
+        elif path == '/api/ask/corroborate' and method == 'POST': return corroborate_answer(body, caller)
         elif path == '/api/search' and method == 'POST': return search_topics(body, caller)
         else: return error(f'Not found: {method} {path}', 404)
     except Exception as e:

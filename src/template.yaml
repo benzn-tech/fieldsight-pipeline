@@ -278,6 +278,15 @@ Parameters:
     NoEcho: true
     Default: ''
 
+  EnableExternalCorroboration:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Turn on /api/ask/corroborate. Off by default on every stack: it is the one
+      path in this system that sends anything derived from a customer's meeting
+      toward a third party, and the answer to whether the pilot contracts permit
+      that is a commercial decision, not a deploy-time default.
   LlmProvider:
     Type: String
     Description: LLM provider for all Claude call sites (anthropic|qwen)
@@ -1565,6 +1574,11 @@ Resources:
           # DASHSCOPE_TTS_* below default inside dashscope_utils.py (model
           # qwen3-tts-flash-realtime, voice Cherry, intl WS url) — no env
           # override needed here; DashScopeLayer (below) provides the SDK.
+          # External corroboration (/api/ask/corroborate). Off on both stacks
+          # until the pilot contracts are confirmed to permit sending entity
+          # names to a third-party search engine; the code reads this at call
+          # time, so the whole feature returns an empty body while it is false.
+          ENABLE_EXTERNAL_CORROBORATION: !Ref EnableExternalCorroboration
       Layers:
         - !Ref DashScopeLayer
       Policies:
