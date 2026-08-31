@@ -184,3 +184,159 @@ def test_an_empty_folder_list_counts_nothing_rather_than_everything(db):
     _chunk(db, co, site, uid, "empty", "2026-08-27", "8" * 32, 1)
 
     assert recordings.range_stats(db, co, [], "2026-08-27", "2026-08-27")["sessions"] == 0
+
+
+from repositories import findings, topics
+
+
+def test_a_report_sourced_topic_is_counted_through_the_fallback(db):
+    """Measured on the live database: 139 topics carry findings and no
+    safety_observations, 15 carry safety_observations and no findings, and ZERO
+    carry both. The two paths are disjoint, so a findings-only count does not
+    under-report by a margin -- it reports nothing at all for those 15."""
+    co, site, uid = _seed(db, "fallback")
+    t_live = topics.upsert_topic(db, site, "2026-08-27", "Live", user_id=uid,
+                                 source_s3_key="extractions/f/2026-08-27/sidx.json")
+    findings.insert_findings(db, t_live["id"], site,
+                             [{"observation": "loose board", "domain": "safety"}])
+    topics.upsert_topic(db, site, "2026-08-27", "Report", user_id=uid,
+                        source_s3_key="reports/2026-08-27/f/daily_report.json",
+                        safety=[{"observation": "no handrail"}])
+
+    out = findings.count_by_domain(db, co, "safety", "2026-08-27", "2026-08-27")
+
+    assert out["count"] == 2, "the report-path topic was not counted"
+    assert out["from_fallback"] == 1
+
+
+def test_a_topic_with_findings_does_not_double_count_its_legacy_rows(db):
+    """The shipped read falls back ONLY when a topic has zero findings IN THIS
+    DOMAIN -- `_findings_as_safety_rows(t_findings) or safety_by_topic[...]` in
+    topics.py, where the left side is already filtered to domain == 'safety'.
+    A topic carrying both must not count twice."""
+    co, site, uid = _seed(db, "both")
+    t = topics.upsert_topic(db, site, "2026-08-27", "Both", user_id=uid,
+                            source_s3_key="extractions/b/2026-08-27/sidy.json",
+                            safety=[{"observation": "legacy row"}])
+    findings.insert_findings(db, t["id"], site,
+                             [{"observation": "current row", "domain": "safety"}])
+
+    out = findings.count_by_domain(db, co, "safety", "2026-08-27", "2026-08-27")
+    assert out["count"] == 1
+    assert out["from_fallback"] == 0
+
+
+def test_a_progress_finding_is_not_a_safety_finding(db):
+    """The live domain values are exactly progress / quality / safety -- 117 /
+    47 / 25. `progress` is the majority, so a query that forgot the domain
+    filter would answer a safety question with mostly progress items."""
+    co, site, uid = _seed(db, "domains")
+    t = topics.upsert_topic(db, site, "2026-08-27", "Mixed", user_id=uid,
+                            source_s3_key="extractions/m/2026-08-27/sidm.json")
+    findings.insert_findings(db, t["id"], site, [
+        {"observation": "slab poured", "domain": "progress"},
+        {"observation": "chipped tile", "domain": "quality"},
+        {"observation": "no handrail", "domain": "safety"},
+    ])
+
+    assert findings.count_by_domain(db, co, "safety", "2026-08-27", "2026-08-27")["count"] == 1
+    assert findings.count_by_domain(db, co, "quality", "2026-08-27", "2026-08-27")["count"] == 1
+
+
+def test_a_quality_question_never_falls_back(db):
+    """There is no legacy quality table. The fallback arm is safety-only, and a
+    quality count that reused it would report safety rows as quality ones."""
+    co, site, uid = _seed(db, "qualnofb")
+    topics.upsert_topic(db, site, "2026-08-27", "Legacy", user_id=uid,
+                        source_s3_key="reports/2026-08-27/q/daily_report.json",
+                        safety=[{"observation": "no handrail"}])
+
+    out = findings.count_by_domain(db, co, "quality", "2026-08-27", "2026-08-27")
+    assert out["count"] == 0
+    assert out["from_fallback"] == 0
+
+
+def test_the_tenant_comes_through_site_id_not_through_users(db):
+    """`topics.site_id` and `sites.company_id` are both NOT NULL -- one hop that
+    loses nothing. Reaching the tenant through `topics.user_id -> users` instead
+    drops every NULL-author row from EVERY caller's count, including an
+    ALL-scoped admin's, because `topics.user_id` IS nullable."""
+    co, site, uid = _seed(db, "tenant")
+    t = topics.upsert_topic(db, site, "2026-08-27", "Unattributed", user_id=None,
+                            source_s3_key="extractions/t/2026-08-27/sidz.json")
+    findings.insert_findings(db, t["id"], site,
+                             [{"observation": "x", "domain": "safety"}])
+
+    out = findings.count_by_domain(db, co, "safety", "2026-08-27", "2026-08-27")
+    assert out["count"] == 1, "a NULL-author finding vanished from an unscoped count"
+    assert out["null_author"] == 1, "and it was not named"
+
+
+def test_a_self_scoped_caller_is_told_what_they_cannot_see(db):
+    """A per-author scope cannot see NULL-author topics by construction. It must
+    say so rather than quietly answer a smaller number."""
+    co, site, uid = _seed(db, "selfscope")
+    mine = topics.upsert_topic(db, site, "2026-08-27", "Mine", user_id=uid,
+                               source_s3_key="extractions/s/2026-08-27/sid1.json")
+    findings.insert_findings(db, mine["id"], site, [{"observation": "a", "domain": "safety"}])
+    orphan = topics.upsert_topic(db, site, "2026-08-27", "Orphan", user_id=None,
+                                 source_s3_key="extractions/s/2026-08-27/sid2.json")
+    findings.insert_findings(db, orphan["id"], site, [{"observation": "b", "domain": "safety"}])
+
+    out = findings.count_by_domain(db, co, "safety", "2026-08-27", "2026-08-27",
+                                   author_ids=[uid])
+    assert out["count"] == 1
+    assert out["null_author"] == 1
+
+
+def test_another_companys_findings_are_never_counted(db):
+    co_a, site_a, uid_a = _seed(db, "findtena")
+    co_b, site_b, uid_b = _seed(db, "findtenb")
+    for site, uid in ((site_a, uid_a), (site_b, uid_b)):
+        t = topics.upsert_topic(db, site, "2026-08-27", "T", user_id=uid,
+                                source_s3_key="extractions/" + str(site) + "/2026-08-27/s.json")
+        findings.insert_findings(db, t["id"], site, [{"observation": "x", "domain": "safety"}])
+
+    assert findings.count_by_domain(db, co_a, "safety", "2026-08-27", "2026-08-27")["count"] == 1
+
+
+def test_a_deleted_topics_findings_are_not_counted(db):
+    """`company_id` and `reason` are NOT NULL on `redactions` with no defaults --
+    a tombstone that omits them raises rather than hides anything, and a raise
+    inside a test that expects zero reads as "the predicate works"."""
+    co, site, uid = _seed(db, "deltopic")
+    t = topics.upsert_topic(db, site, "2026-08-27", "Gone", user_id=uid,
+                            source_s3_key="extractions/d/2026-08-27/sid9.json")
+    findings.insert_findings(db, t["id"], site, [{"observation": "x", "domain": "safety"}])
+    assert findings.count_by_domain(db, co, "safety", "2026-08-27", "2026-08-27")["count"] == 1
+
+    db.execute("INSERT INTO redactions (company_id, target_type, target_id, reason, scope) "
+               "VALUES (%s, 'topic', %s, 'test', 'deleted')", (co, t["id"]))
+
+    assert findings.count_by_domain(db, co, "safety", "2026-08-27", "2026-08-27")["count"] == 0
+
+
+def test_a_deleted_recording_hides_the_topics_the_pipeline_rebuilds(db):
+    """The source arm, which the topic arm cannot cover: tomorrow's re-ingest
+    gives the day new topic uuids that no topic-keyed tombstone names, and they
+    still carry the deleted recording's `source_s3_key`. A count carrying only
+    the topic arm passes every test above and leaks overnight."""
+    co, site, uid = _seed(db, "delsource")
+    db.execute("INSERT INTO redactions (company_id, target_type, target_id, reason, scope, "
+               "target_key) VALUES (%s, 'recording', gen_random_uuid(), 'test', 'deleted', %s)",
+               (co, "extractions/delsource/2026-08-27/sidaaa"))
+    t = topics.upsert_topic(db, site, "2026-08-27", "Rebuilt", user_id=uid,
+                            source_s3_key="extractions/delsource/2026-08-27/sidaaa.json")
+    findings.insert_findings(db, t["id"], site, [{"observation": "x", "domain": "safety"}])
+
+    assert findings.count_by_domain(db, co, "safety", "2026-08-27", "2026-08-27")["count"] == 0
+
+
+def test_the_range_is_inclusive_at_both_ends(db):
+    co, site, uid = _seed(db, "findrange")
+    for d in ("2026-08-24", "2026-08-26", "2026-08-30"):
+        t = topics.upsert_topic(db, site, d, "T", user_id=uid,
+                                source_s3_key="extractions/r/" + d + "/s.json")
+        findings.insert_findings(db, t["id"], site, [{"observation": "x", "domain": "safety"}])
+
+    assert findings.count_by_domain(db, co, "safety", "2026-08-24", "2026-08-26")["count"] == 2
