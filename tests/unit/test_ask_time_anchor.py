@@ -257,3 +257,41 @@ def test_the_widened_prompt_does_not_call_five_excerpts_a_complete_record(monkey
 
     assert "complete record" not in seen["prompt"]
     assert "FIRST sentence" in seen["prompt"]     # the instruction that works stays
+
+
+# --------------------------------------------------------------------------
+# who says the period was empty depends on who is reading
+# --------------------------------------------------------------------------
+
+def test_the_screen_answer_does_not_repeat_what_the_client_states_first(monkeypatch):
+    """The web client now puts the basis line ABOVE the answer, in red, from the
+    computed `basis`. If the model also says it, the same fact arrives twice in
+    two voices -- one exact, one prose -- and the reader loses the first line of
+    what they actually asked for.
+
+    The reader must learn their period was empty BEFORE reading about another
+    day; that is settled. What changed is who says it (user, 2026-08-31).
+    """
+    _, seen = wire(monkeypatch, [{"chunks": [CHUNK], "basis": {"from": "2026-07-18",
+                                                               "to": "2026-07-18",
+                                                               "widened": True}}])
+
+    ask(question="昨天发生了什么", tz="Pacific/Auckland", now=NOW)
+
+    assert "Do NOT mention" in seen["prompt"]
+    assert "FIRST sentence must state something that happened" in seen["prompt"]
+
+
+def test_the_spoken_answer_still_says_it_because_nothing_else_can(monkeypatch):
+    """SP-Ask has no line to put a pill on. The device does not render `basis`
+    (it is carried in the response and unused), so on voice the model is the
+    only thing that can say the period was empty -- and it says it first, for
+    the same reason the pill is first on screen."""
+    _, seen = wire(monkeypatch, [{"chunks": [CHUNK], "basis": {"from": "2026-07-18",
+                                                               "to": "2026-07-18",
+                                                               "widened": True}}])
+
+    ask(question="昨天发生了什么", tz="Pacific/Auckland", now=NOW, mode="voice")
+
+    assert "Open with one short sentence" in seen["prompt"]
+    assert "Do NOT mention" not in seen["prompt"]
