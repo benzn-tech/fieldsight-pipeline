@@ -106,6 +106,16 @@ _NOUN = {
     "duration": ("recording time", "录音时长", "recording time"),
 }
 
+# Chinese counts need a measure word between the number and the noun. Without
+# one, "一共 1 录音" is what TEST produced -- grammatical nonsense from a
+# template that assumed the English shape.
+_MEASURE = {
+    "count_sessions": "段",
+    "count_photos": "张",
+    "count_findings_safety": "个",
+    "count_findings_quality": "个",
+}
+
 
 def _noun(metric, zh, n=0):
     forms = _NOUN.get(metric, ("items", "条目", "item"))
@@ -159,7 +169,7 @@ def render(question, result) -> str:
         head = (f"{when}你一共录了 {phrase}。" if zh
                 else f"You recorded {phrase} {when}.".replace("  ", " ").strip())
     else:
-        head = (f"{when}一共 {value} {noun}。" if zh
+        head = (f"{when}一共 {value} {_MEASURE.get(metric, '个')}{noun}。" if zh
                 else f"{value} {_noun(metric, zh, value)} {when}.".replace("  ", " ").strip())
 
     tail = [

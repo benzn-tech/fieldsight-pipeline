@@ -560,3 +560,24 @@ def test_chinese_has_no_plural_to_agree_with(ask):
                                      "from": "2026-08-13", "to": "2026-08-13",
                                      "notes": {}})
     assert "录音" in out and "recording" not in out
+
+
+def test_chinese_counts_carry_a_measure_word(ask):
+    """"2026-08-13一共 1 录音。" is what TEST produced -- grammatical nonsense
+    from a template that assumed the English shape, where a bare number sits
+    against a bare noun."""
+    def say(metric):
+        return mr.render("多少", {"metric": metric, "value": 1,
+                                  "from": "2026-08-13", "to": "2026-08-13",
+                                  "notes": {}})
+    assert say("count_sessions") == "2026-08-13一共 1 段录音。"
+    assert say("count_photos") == "2026-08-13一共 1 张照片。"
+    assert say("count_findings_safety") == "2026-08-13一共 1 个安全问题。"
+    assert say("count_findings_quality") == "2026-08-13一共 1 个质量问题。"
+
+
+def test_the_chinese_duration_sentence_is_unchanged_by_the_measure_word(ask):
+    """Duration is not a count, so it takes no measure word."""
+    assert mr.render("昨天录了多久",
+                     {"metric": "duration", "value": 1116, "from": "2026-08-13",
+                      "to": "2026-08-13", "notes": {}}) == "2026-08-13你一共录了 18 分钟。"
