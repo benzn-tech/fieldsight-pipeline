@@ -778,3 +778,41 @@ def test_an_ordinary_caller_still_pins_every_query_to_their_company(wired, monke
     rag.lambda_handler(ev(), None)
     assert seen["stats_co"] == "c-1"
     assert seen["deleted_co"] == "c-1"
+
+
+def test_the_voice_path_reaches_the_metric_route(ask, monkeypatch):
+    """The reason this route was asked for in the first place: "我们要复用这套
+    逻辑到语音 ask agent 上" -- the voice answer must be the number, not a
+    summary of the day's topics read aloud.
+
+    The voice body is BUILT, not passed through, so anything the screen path
+    gains is absent here until someone adds it twice. `tz` is the one the metric
+    route depends on: without it `resolve_today` is None, there is no range, and
+    the question falls through to RAG.
+    """
+    seen = {}
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client(DUR, seen))
+
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "s", "mode": "voice",
+                           "tz": "Pacific/Auckland"})
+
+    assert seen["mode"] == "metric"
+    assert out["answer"] == "You recorded 1 hour 17 minutes on 2026-08-30."
+    assert out["citations"] == [], "voice has nowhere to show a citation"
+
+
+def test_a_voice_body_without_a_timezone_falls_through_rather_than_erroring(ask, monkeypatch):
+    """A device that has not been taught to send `tz` must still get an answer.
+    Before the undated-question gate this produced "That count could not be
+    completed. Please try again." -- spoken aloud."""
+    seen = {}
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client({"chunks": []}, seen))
+    import dashscope_utils
+    monkeypatch.setattr(dashscope_utils, "embed", lambda *a, **k: [[0.1] * 1024])
+
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "s", "mode": "voice"})
+
+    assert seen.get("mode") != "metric"
+    assert "could not be completed" not in (out.get("answer") or "")
