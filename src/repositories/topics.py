@@ -400,8 +400,11 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
     # only copy of it sat in the action_items child, which is why the enumeration test --
     # which reads the function body as text -- was green while a deleted topic came back in
     # full. Alias `t`, because that is what this statement's FROM declares.
-    where = ("WHERE t.site_id = ANY(%s) AND t.report_date=%s AND "
-             + DELETED_TOPIC_PREDICATE.format(alias="t"))
+    # NOTE the missing `WHERE`: this is a bare condition and the keyword is added
+    # once, at the end. Carrying the keyword inside a string that later gets
+    # wrapped in parentheses is what produced `... LEFT JOIN users u ... (WHERE
+    # t.site_id ...)` -- invalid SQL, on every call that had merged keys.
+    where = "t.site_id = ANY(%s) AND t.report_date=%s"
     params = [list(site_ids), report_date]
     if author_ids is not None:
         where += " AND t.user_id = ANY(%s::uuid[])"
@@ -422,6 +425,22 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
         # regardless of which of those filters is active.
         where = f"({where}) OR t.source_s3_key = ANY(%s)"
         params.append(list(merged_keys))
+
+    # The deletion exclusion goes OUTSIDE that OR, and both halves of that
+    # sentence were wrong before.
+    #
+    # It used to sit INSIDE the first branch, so the merged branch carried no
+    # deletion filter at all: a merged session's topics came back for every
+    # member of the group the moment it was deleted -- not after the rebuild,
+    # immediately. The comment above justifies the OR bypassing the ACL, which
+    # is deliberate; nothing ever justified it bypassing a delete.
+    #
+    # And it was the topic arm alone, which stops naming a row once
+    # `lambda_ingest` re-inserts the day under new uuids.
+    #
+    # A delete applies to every branch of a read, whatever the ACL is doing in
+    # any of them.
+    where = f"WHERE ({where}) AND {visible_topics_predicate('t')}"
 
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
