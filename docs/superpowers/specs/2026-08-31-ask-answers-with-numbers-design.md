@@ -1,9 +1,14 @@
 # Spec: the questions whose answer is a number
 
-**Status:** proposal, second draft. The first had eight blocking findings and
-they held up against the code — two of its four data sources would have computed
-**wrong numbers**, and its deletion predicate could not match a row.
-**Date:** 2026-08-31.
+**Status:** proposal, third draft.
+
+* The **first** had eight blocking findings and they held up against the code:
+  two of its four data sources would have computed **wrong numbers**, and its
+  deletion predicate could not match a row.
+* The **second** fixed those, and was then falsified by measurement — §4 rested
+  on a risk that does not exist, and on a number this document invented.
+
+**Date:** 2026-08-31, measured 2026-09-01.
 **Repo:** `fieldsight-pipeline`.
 
 > Ask can find what was said. It cannot say how much there was of it. Three
@@ -15,20 +20,32 @@ they held up against the code — two of its four data sources would have comput
 
 ---
 
-## Read this first: the feature may be premature
+## Read this first: measured on prod, 2026-09-01
 
-§8 lists one measurement that must run before any code. It is not a formality.
-The evidence already points at the answer being uncomfortable:
+The first draft ended with a measurement that had to run before any code, and
+warned the answer might kill the feature. It ran, over the RDS Data API against
+the prod database. It did not kill it, and it falsified one of this document's
+own sections.
 
-- `lambda_org_api.py:5785-5795` documents three ways a day has recordings but no
-  `recordings` rows — the RealPTT capture path never registers them, days before
-  migration 0009 have none, and lake-fed environments have none — and the shipped
-  KPI **deliberately emits no zero** in that case, because doing so "would
-  reinstate the exact misleading zero this change exists to remove."
-- Whether `duration_s` is populated at all is unknown from outside the VPC.
+| | measured | consequence |
+|---|---|---|
+| days-with-topics that have `recordings` rows | **33 / 39 = 84.6%** | viable. But 15.4% have none, so the **third kind of zero** (§7) is real, not theoretical |
+| sessions with a usable duration | **286 / 287 = 99.7%** (281 from `duration_s`, 5 from the span, 1 unmeasurable) | `duration` is answerable |
+| chunk rows → sessions | **2823 → 287, a fold of 9.8×** | counting rows would have reported nearly ten times the recordings a person made |
+| | | *(3127 is every `kind`; 2823 is audio+video, which is what a session count is over. The first pass mixed the photos in.)* |
+| `findings.domain` unlabelled | **0 / 189** | **§4's original justification was false — see below** |
+| findings on NULL-author topics | **5 / 189 = 2.6%** | small, real, and named rather than dropped |
+| topics from the nightly report path | **25 / 267 = 9.4%** | the fallback in §3 is not theoretical |
 
-If row coverage is poor, this is a **collection** problem in the mobile client
-and no amount of routing fixes it. Measure, then decide.
+And the one that settles §3 outright — the two paths are **disjoint**:
+
+| topic source | topics | with `findings` | with `safety_observations` |
+|---|---|---|---|
+| live extraction | 242 | 139 | **0** |
+| nightly report | 25 | **0** | 4 |
+
+A findings-only count reports **zero** for every report-path topic, and four of
+them genuinely carry safety items.
 
 ## Why the questions are refused, and why better retrieval would not help
 
@@ -149,7 +166,10 @@ on every day the nightly report path ran**, and three facts make it so:
 
 **So the count mirrors the shipped read semantics per topic — findings first,
 fallback second — rather than inventing a third opinion about which table is
-true.** A dashboard showing safety items beside an Ask answer saying "zero" is
+true.** Measured on prod: extraction topics carry findings and **zero**
+safety_observations; report topics carry safety_observations and **zero**
+findings. The two paths are disjoint, so a findings-only count does not
+under-report by a margin — it reports nothing at all for one of them. A dashboard showing safety items beside an Ask answer saying "zero" is
 the failure this paragraph exists to prevent.
 
 `observations` (0006, `author_sub NOT NULL`, `status open/closed`) stays out: it
@@ -169,35 +189,41 @@ A worker on SELF scope asking "how many safety issues did I have yesterday" must
 not silently lose the NULL-author rows. They are **counted separately and named**,
 under the same rule as §4.
 
-## 4. Every count carries its denominator
+## 4. Every count carries its denominator — for the reasons that are true
 
-A hard requirement, and the reason this is not just "run four queries".
+A hard requirement. But the first draft justified it with a risk that does not
+exist, and the correction matters more than the rule.
 
-`findings.domain` is **nullable**, and its value comes from the extraction model
-cleaned against the enum (`repositories/findings.py`, `_clean_enum` at :31-36).
-So `count(*) WHERE domain='safety'` does not mean *"there were three safety
-issues"*. It means **"the extractor labelled three"**. What it failed to label
-vanishes silently.
+**What the first draft claimed.** `findings.domain` is nullable and
+model-produced, so a safety count would silently omit whatever the extractor
+failed to label; the answer should therefore read *"3 labelled safety, 7
+unclassified"*.
 
-The label-quality problem is measured here already: on the ordering work,
-`priority` came back `high` for 44% of items.
+**What is true.** `domain` is NULL on **0 of 189** findings on prod. The
+extractor labels every one. **The "7 unclassified" was invented** — a number
+written to make the rule look necessary, which is precisely the failure this
+repository has documented at length and which the review of this spec was asked
+to hunt for. The author produced one anyway.
 
-So the answer is rendered as:
+The rule survives, because three things do make a count mean less than it looks:
 
-> **昨天标为 safety 的有 3 条，另有 7 条未分类。**
+1. **The third zero.** 15.4% of days with topics have no `recordings` rows at
+   all (§7). "You recorded nothing yesterday" and "there are no rows for
+   yesterday" are different facts and this route must not merge them.
+2. **`recordings.site_id` is nullable.** A `SITE`-scoped PM filtering on
+   `site_id` silently excludes untagged recordings; a worker on `user_id = self`
+   sees their own untagged rows. **The same question has a different denominator
+   for the two roles** (BUG-43 is why untagged rows exist), and the answer must
+   say which it used.
+3. **NULL-author findings** — 2.6% on prod. A SELF-scoped worker asking about
+   their own safety issues cannot see them through `topics.user_id`, and
+   `repositories/findings.py` already warns that reaching the tenant through
+   `users` "would drop every NULL-author row silently". They are counted and
+   named, not dropped.
 
-The second number is free (`WHERE domain IS NULL`) and turns "this count may be
-incomplete" from something the reader must know into something they can see. Same
-law as `basis`: **the answer says what it is an answer to.**
-
-The same rule applies wherever it bites:
-
-- rows whose `duration_s` is NULL **and** whose `ended_at` is NULL cannot
-  contribute a duration — that state is reachable, both come from optional body
-  fields (`lambda_org_api.py:716-719`). Those **sessions** (not chunk rows) are
-  counted and named, never dropped from a total.
-- `count_photos` states the window it counted over.
-- NULL-author findings are named, per §3.
+Where a denominator is zero, it is not printed. A line reading "and 0
+unclassified" on every answer is noise, and noise is how a caveat stops being
+read.
 
 ## 5. Scope, and the denominators that differ by role
 
