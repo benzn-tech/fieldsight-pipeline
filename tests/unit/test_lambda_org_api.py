@@ -1979,9 +1979,25 @@ def test_portfolio_counts_merges_four_queries(monkeypatch):
     # Task 4: portfolio_counts now computes company_excluded_topic_ids first;
     # stub it so this test still exercises exactly the 4 aggregate queries.
     monkeypatch.setattr(org.rollup.redactions, "company_excluded_topic_ids", lambda conn, ids: set())
+    # The action-item leg reads ROWS now, not a SQL aggregate, so that the tile
+    # is counted by the same rule the todo list is collapsed by rather than by a
+    # second copy of it written in SQL. Five items: three of them one commitment
+    # said in three recordings on one day (the 2026-08-10 shape), which with the
+    # collapse off must still count as five.
+    _day = _dt.date(2026, 7, 18)
     conn = _RollupFakeConn(results=[
         [{"site_id": "s-1", "open_safety": 2, "open_high_safety": 1}],
-        [{"site_id": "s-1", "open_actions": 3, "total_actions": 5, "overdue_actions": 1}],
+        [{"site_id": "s-1", "id": "a1", "text": "Scaffolding -- inspect before Monday",
+          "status": "open", "deadline": _dt.date(2020, 1, 1), "created_at": 1,
+          "report_date": _day},
+         {"site_id": "s-1", "id": "a2", "text": "Scaffolding -- inspect before Monday",
+          "status": "open", "deadline": None, "created_at": 2, "report_date": _day},
+         {"site_id": "s-1", "id": "a3", "text": "Scaffolding -- inspect before Monday",
+          "status": "open", "deadline": None, "created_at": 3, "report_date": _day},
+         {"site_id": "s-1", "id": "a4", "text": "Fix gate", "status": "closed",
+          "deadline": None, "created_at": 4, "report_date": _day},
+         {"site_id": "s-1", "id": "a5", "text": "Order timber", "status": "closed",
+          "deadline": None, "created_at": 5, "report_date": _day}],
         [{"site_id": "s-1", "topics_count": 7, "participants": 4}],
         [{"site_id": "s-1", "last_activity_at": _dt.date(2026, 7, 18)}],
     ])
@@ -2010,6 +2026,51 @@ def test_portfolio_counts_merges_four_queries(monkeypatch):
         "topics_count": 7, "participants": 4,
         "last_activity_at": "2026-07-18",
     }}
+
+
+def test_portfolio_tile_agrees_with_the_collapsed_list(monkeypatch):
+    """The tile is counted by the same rule the list is collapsed by.
+
+    A list that shows one commitment beside a counter saying three tells the
+    reader the product is broken rather than that the work was said twice —
+    which is why this leg reads rows instead of asking SQL for a count. A second
+    copy of the normalisation written in SQL is how one rule becomes two that
+    drift, and this repo has paid for that more than once.
+    """
+    monkeypatch.setattr(org.rollup.redactions, "company_excluded_topic_ids",
+                        lambda conn, ids: set())
+    monkeypatch.setenv("ENABLE_TODO_COLLAPSE", "true")
+    _day = _dt.date(2026, 7, 18)
+    rows = [{"site_id": "s-1", "id": "a%d" % i,
+             "text": "Scaffolding -- inspect before Monday",
+             "status": "open", "deadline": None, "created_at": i, "report_date": _day}
+            for i in (1, 2, 3)]
+    conn = _RollupFakeConn(results=[[], rows, [], []])
+    counts = org.rollup.portfolio_counts(conn, ["s-1"])
+    assert counts["s-1"]["open_actions"] == 1, "three recordings, one commitment"
+    assert counts["s-1"]["total_actions"] == 1
+
+    # Off is the default, and off must leave the number exactly as it is today.
+    monkeypatch.delenv("ENABLE_TODO_COLLAPSE")
+    conn2 = _RollupFakeConn(results=[[], rows, [], []])
+    assert org.rollup.portfolio_counts(conn2, ["s-1"])["s-1"]["open_actions"] == 3
+
+
+def test_a_different_day_is_a_different_commitment(monkeypatch):
+    """The collapse is same-day only. The same words two days apart are a
+    RECURRENCE — the thing a person is asked to judge — and collapsing them
+    would answer that question automatically and wrongly."""
+    monkeypatch.setattr(org.rollup.redactions, "company_excluded_topic_ids",
+                        lambda conn, ids: set())
+    monkeypatch.setenv("ENABLE_TODO_COLLAPSE", "true")
+    rows = [{"site_id": "s-1", "id": "a1", "text": "Scaffolding -- inspect",
+             "status": "open", "deadline": None, "created_at": 1,
+             "report_date": _dt.date(2026, 8, 10)},
+            {"site_id": "s-1", "id": "a2", "text": "Scaffolding -- inspect",
+             "status": "open", "deadline": None, "created_at": 2,
+             "report_date": _dt.date(2026, 8, 12)}]
+    conn = _RollupFakeConn(results=[[], rows, [], []])
+    assert org.rollup.portfolio_counts(conn, ["s-1"])["s-1"]["open_actions"] == 2
 
 
 def test_zero_count_site_included():
@@ -7177,3 +7238,56 @@ def test_the_admin_summary_verbatim_serve_is_refused_for_a_date_with_deleted_sou
     except Exception:
         pass                       # the later candidate-listing needs a real conn
     assert not any("summary_report.json" in k for k in fetched),         f"the pre-deletion aggregate was fetched: {fetched}"
+
+
+def test_render_shape_carries_the_collapse_count_to_the_client():
+    """A collapsed row must arrive with the number of times it was said.
+
+    The 0-day collapse runs in the repository, BELOW this serializer: one
+    commitment said in three recordings reaches `render_report_shape` as a
+    single row carrying `mention_count`, and the two topics it was taken from
+    reach it with an empty `action_items` list.
+
+    This serializer is a fixed allowlist of keys, and it dropped both
+    `mention_count` and `collapsed_ids` on the way out. Every repository test
+    was green -- they assert on what `collapse()` returns, and nothing asserted
+    on the JSON a browser receives. It was found by invoking the deployed
+    TEST function and reading the response.
+
+    The consequence is worse than the collapse simply not working. The rows do
+    not merge visibly, they DISAPPEAR: the reader is shown a list two items
+    shorter than what was said, with nothing on screen accounting for the
+    difference, and no reason to distrust it.
+    """
+    row = _topic_row(action_items=[
+        {"id": "a-1", "text": "Scaffolding -- inspect before Monday",
+         "responsible": None, "deadline": None, "deadline_text": None,
+         "priority": None, "status": "open",
+         "mention_count": 3, "collapsed_ids": ["a-2", "a-3"]},
+    ])
+    emptied = _topic_row(id="t-2", action_items=[])
+
+    shape = org.render_report_shape([row, emptied], None, "2026-09-01", "Ada_L")
+    item = shape["topics"][0]["action_items"][0]
+
+    assert item["mention_count"] == 3
+    assert item["collapsed_ids"] == ["a-2", "a-3"]
+    assert shape["topics"][1]["action_items"] == []
+
+
+def test_an_uncollapsed_row_still_says_it_was_mentioned_once():
+    """Absent is not zero and not missing.
+
+    Every ordinary row carries `mention_count: 1` so the client never has to
+    decide what a missing key means. A row that arrived before the collapse
+    existed, or from a stack with the flag off, reads the same as one that was
+    considered and found unique -- which is the truth in both cases.
+    """
+    row = _topic_row(action_items=[
+        {"id": "a-1", "text": "Order timber", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open"},
+    ])
+    item = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"][0]
+    assert item["mention_count"] == 1
+    assert item["collapsed_ids"] == []

@@ -219,6 +219,7 @@ jobs:
               "AuthorityFlip=${{ vars.PROD_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.PROD_GRADED_ROLES || 'false' }}" \
               "EnableUserDeletion=${{ vars.PROD_ENABLE_USER_DELETION || 'false' }}" \
+              "EnableExternalCorroboration=${{ vars.PROD_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "UploadVerifyMode=${{ vars.PROD_UPLOAD_VERIFY_MODE || 'observe' }}" \
               "SpeakerIdentityMode=${{ vars.PROD_SPEAKER_IDENTITY_MODE || 'off' }}" \
               "EnrolOnCorrection=${{ vars.PROD_ENROL_ON_CORRECTION || 'false' }}" \
@@ -230,6 +231,7 @@ jobs:
               "DocxLayerArn=${{ vars.PROD_DOCX_LAYER_ARN }}" \
               "EnableKeyframes=${{ vars.PROD_ENABLE_KEYFRAMES || 'false' }}" \
               "RebindSpeakers=${{ vars.PROD_REBIND_SPEAKERS || 'false' }}" \
+              "EnableTodoCollapse=${{ vars.PROD_ENABLE_TODO_COLLAPSE || 'false' }}" \
               "EnableThreadSuggestions=${{ vars.PROD_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
               $KF_LAYER_PARAM \
               "RealPTTAccount=$REALPTT_ACCOUNT" \

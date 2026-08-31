@@ -28,6 +28,9 @@ in here would need a slug<->site_id identity bridge — out of scope for
 leg-1 (see Global Constraints); the UI's compliance-aggregator handles
 manual+live merging separately.
 """
+from datetime import date as _date
+
+import todo_collapse
 from psycopg.rows import dict_row
 
 from repositories import redactions
@@ -100,20 +103,43 @@ def portfolio_counts(conn, site_ids) -> dict:
         b["open_safety"] = r["open_safety"]
         b["open_high_safety"] = r["open_high_safety"]
 
+    # Counted from ROWS rather than by a SQL aggregate, because the collapse is
+    # a Python rule and a second copy of it written in SQL is how one definition
+    # becomes two that drift. The tile a customer reads has to agree with the
+    # list on the next screen: a list showing one commitment beside a counter
+    # saying three tells the reader the product is broken rather than that the
+    # work was said twice.
+    #
+    # The collapse is scoped per (site, DAY) — the same day the duplicates were
+    # said in — so the counters sum per-day distinct commitments rather than
+    # deduplicating a whole quarter down to one.
+    #
+    # Cost: this reads the rows instead of counting them in the engine. At
+    # today's volume (a few hundred open items per site) that is nothing; if a
+    # site ever carries tens of thousands of open actions this is the line that
+    # will need a windowed SQL form, and it will need the normalisation to move
+    # with it rather than be re-typed.
     action_rows = conn.cursor(row_factory=dict_row).execute(
-        "SELECT site_id, "
-        "count(*) FILTER (WHERE status='open') AS open_actions, "
-        "count(*) AS total_actions, "
-        "count(*) FILTER (WHERE status='open' AND deadline IS NOT NULL "
-        "AND deadline < CURRENT_DATE) AS overdue_actions "
-        "FROM action_items WHERE site_id = ANY(%s) AND topic_id != ALL(%s::uuid[]) GROUP BY site_id",
+        "SELECT a.site_id, a.text, a.status, a.deadline, a.id, a.created_at, "
+        "       t.report_date "
+        "FROM action_items a JOIN topics t ON t.id = a.topic_id "
+        "WHERE a.site_id = ANY(%s) AND a.topic_id != ALL(%s::uuid[])",
         (ids, excluded),
     ).fetchall()
+
+    by_site_day = {}
     for r in action_rows:
-        b = merged.setdefault(str(r["site_id"]), _zero())
-        b["open_actions"] = r["open_actions"]
-        b["total_actions"] = r["total_actions"]
-        b["overdue_actions"] = r["overdue_actions"]
+        by_site_day.setdefault((str(r["site_id"]), r["report_date"]), []).append(r)
+
+    for (site_key, _day), rows in by_site_day.items():
+        kept = todo_collapse.collapse_if_enabled(rows)
+        b = merged.setdefault(site_key, _zero())
+        b["total_actions"] += len(kept)
+        b["open_actions"] += sum(1 for r in kept if r["status"] == "open")
+        b["overdue_actions"] += sum(
+            1 for r in kept
+            if r["status"] == "open" and r["deadline"] is not None
+            and r["deadline"] < _date.today())
 
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT site_id, "

@@ -139,6 +139,20 @@ Parameters:
       KeyframeFunction itself deploys whenever HasKeyframeStack (HasDb &&
       HasVadLayer); this flag only gates the item-writer emission so the
       pipeline change ships inert until flipped per stage.
+  EnableTodoCollapse:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Show one commitment where it was said in several recordings on the same
+      day. Read-time only -- nothing is written and nothing is deleted, so the
+      switch is reversible with a redeploy and leaves no trace in the data.
+      Default false because an unset, misspelled or dropped variable must leave
+      a customer's todo list exactly as it is today. Must be set for EVERY
+      function that reads action_items or the counters stop agreeing with the
+      lists: org-api (timeline, live-items, portfolio tiles), item-writer (the
+      stop-recording email, built from the S3 artifact rather than the
+      database), and embed-report (RAG chunk text via get_topic_full).
   EnableThreadSuggestions:
     Type: String
     Default: 'false'
@@ -264,6 +278,15 @@ Parameters:
     NoEcho: true
     Default: ''
 
+  EnableExternalCorroboration:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Turn on /api/ask/corroborate. Off by default on every stack: it is the one
+      path in this system that sends anything derived from a customer's meeting
+      toward a third party, and the answer to whether the pilot contracts permit
+      that is a commercial decision, not a deploy-time default.
   LlmProvider:
     Type: String
     Description: LLM provider for all Claude call sites (anthropic|qwen)
@@ -1551,6 +1574,11 @@ Resources:
           # DASHSCOPE_TTS_* below default inside dashscope_utils.py (model
           # qwen3-tts-flash-realtime, voice Cherry, intl WS url) — no env
           # override needed here; DashScopeLayer (below) provides the SDK.
+          # External corroboration (/api/ask/corroborate). Off on both stacks
+          # until the pilot contracts are confirmed to permit sending entity
+          # names to a third-party search engine; the code reads this at call
+          # time, so the whole feature returns an empty body while it is false.
+          ENABLE_EXTERNAL_CORROBORATION: !Ref EnableExternalCorroboration
       Layers:
         - !Ref DashScopeLayer
       Policies:
@@ -1682,6 +1710,7 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -2771,6 +2800,7 @@ Resources:
         - !Ref PsycopgLayer
       Environment:
         Variables:
+          ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
           DASHSCOPE_API_KEY: !Ref DashScopeApiKey
@@ -2841,6 +2871,7 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           GROUP_MERGE_CAP: !Ref GroupMergeCap
           # Deploy-time credential injection — see MigrateFunction notes.
