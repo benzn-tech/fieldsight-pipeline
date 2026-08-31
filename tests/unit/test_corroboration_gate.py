@@ -159,14 +159,32 @@ def test_every_refusal_comes_back_with_a_reason():
 # ------------------------------------------------------------- the property, not a case
 
 def test_the_gate_cannot_reach_a_network_or_a_model():
-    """`deterministic given its input` is the whole argument of §4. It stops being true
-    the moment this module can call something, so the absence is asserted rather than
-    left to review."""
+    """`deterministic given its input` is the whole argument of §4. It stops being
+    true the moment this module can call something, so the absence is asserted
+    rather than left to review.
+
+    This reads the import graph rather than grepping the text, and the change was
+    forced: `_NOT_WORTH_LOOKING_UP` lists brand names, several of which are also
+    the names of forbidden modules, so a substring scan started failing on a
+    denylist entry. Parsing is also strictly stronger than grepping -- a grep for
+    `import boto3` never sees `__import__("boto3")`, which is asserted separately
+    below.
+    """
+    import ast
     import inspect
-    source = inspect.getsource(gate)
-    for forbidden in ("import boto3", "import requests", "urllib", "httpx",
-                      "llm_utils", "dashscope", "anthropic", "openai", "socket"):
-        assert forbidden not in source, f"the gate reached for {forbidden}"
+
+    tree = ast.parse(inspect.getsource(gate))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+        elif isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            assert name not in ("__import__", "import_module", "eval", "exec"),                 f"the gate can import or evaluate at runtime via {name}"
+
+    assert imported <= {"re", "unicodedata", "__future__"},         f"the gate imports more than it needs: {imported}"
 
 
 def test_normalisation_does_not_open_a_hole():
@@ -201,3 +219,75 @@ def test_organisations_shaped_exactly_like_a_name_are_refused_and_that_is_the_co
     leakier.
     """
     assert gate.screen_entity(entity, "company") == "shaped like a person's name"
+
+
+# ------------------------------------- what is real, harmless, and pointless to send
+
+# These are the entries the person-shape rule does NOT catch -- an acronym, a
+# multi-word brand, a generic noun. If the list were deleted they would all pass,
+# so this is where it earns its place. Single-word brands like `Microsoft` are
+# refused by both rules and would keep passing this test with the list gone,
+# which is why they are not the cases used to defend it.
+@pytest.mark.parametrize("entity,kind", [
+    ("AWS", "company"), ("Newstalk ZB", "company"), ("SIM card", "product"),
+    ("Uber Eats", "product"), ("Google Drive", "product"), ("Wi-Fi", "product"),
+    ("New World", "company"), ("Amazon Web Services", "company"),
+    ("GPS", "product"), ("PDF", "product"),
+])
+def test_a_string_nobody_needs_looked_up_is_refused(entity, kind):
+    """Measured on 40 real prod sessions: 22 strings would have left the account
+    and only three were worth looking up. These spend a slot out of three -- the
+    cap bit on 3 of the 11 sessions that produced any entity -- so they crowded
+    out the useful ones while leaving the account for nothing.
+
+    Asking the extraction prompt to skip them was tried first and partly ignored:
+    22 became 18 with `McDonald's`, `iPad` and `Outlook` still coming through and
+    `AWS` newly appearing. A prose instruction to a model is not a filter.
+    """
+    assert gate.screen_entity(entity, kind) == "nothing to learn from looking it up"
+
+
+@pytest.mark.parametrize("entity", [
+    "Apple Construction Ltd",          # `apple` is listed; this is not apple
+    "Google Building Services",        # nor is this google
+    "Platform Construction Limited",
+])
+def test_the_list_matches_whole_strings_and_not_substrings(entity):
+    """A firm whose name contains a listed word is not that brand. Substring
+    matching here would refuse real contractors, which is the expensive
+    direction: a missing card for a real firm is the thing the reader wanted."""
+    assert gate.screen_entity(entity, "company") is None
+
+
+def test_the_list_is_case_and_spacing_insensitive():
+    """Uses a multi-word entry so the person rule cannot supply the refusal."""
+    for spelling in ["NEWSTALK ZB", "newstalk zb", "  Newstalk   ZB  ",
+                     "Ｎewstalk ZB"]:
+        assert gate.screen_entity(spelling, "company") ==             "nothing to learn from looking it up", spelling
+
+# ---------------------------- the hole at one word, found on real sessions
+
+@pytest.mark.parametrize("entity", ["Heidi", "Dave", "Raven", "Tenix", "Sam"])
+def test_a_single_capitalised_word_is_refused_too(entity):
+    """The rule required two name words, so `Naylor Love` was refused and `Heidi`
+    walked through. Found on 40 real prod sessions, where a bare given name
+    reached the allowed list.
+
+    That was backwards. One capitalised word is MORE ambiguous than two: nothing
+    in `Heidi`, `Raven` and `Tenix` says which is a person, which is a job code
+    and which is a firm. They are the same string.
+    """
+    assert gate.screen_entity(entity, "company") == "shaped like a person's name"
+
+
+@pytest.mark.parametrize("entity", ["VXT", "DB", "UCPK", "MBIE", "NZTA"])
+def test_an_acronym_is_not_this_shape_and_still_passes(entity):
+    """No lowercase run, so it never was a name shape. This is what keeps the
+    one-word tightening from refusing every short organisation."""
+    assert gate.screen_entity(entity, "company") is None
+
+
+@pytest.mark.parametrize("entity", ["Fletcher Building", "Platform Construction Limited",
+                                    "University of Otago", "Naylor Love Construction"])
+def test_a_corporate_marker_still_outranks_the_name_shape(entity):
+    assert gate.screen_entity(entity, "company") is None
