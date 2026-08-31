@@ -21,8 +21,11 @@ WHAT EACH ONE DECIDES
    Measured 84.6% on prod 2026-09-01: viable, but the 15.4% is the "third zero"
    the answer must not report as "you recorded nothing".
 2. duration availability — folded to SESSIONS, never rows.
-3. the fold ratio itself — 10.9x on prod. Counting rows would tell a person they
-   made eleven times the recordings they made.
+3. the fold ratio itself — 9.8x on prod (2823 audio+video rows, 287 sessions).
+   Counting rows would tell a person they made nearly ten times the recordings
+   they made. NOT 10.9x: that is 3127/287, and 3127 includes the 304 photos,
+   which a session count is not over. This header carried the wrong one for a
+   commit, in the very file whose job is to stop numbers being remembered.
 4. `findings.domain` NULL rate — 0/189 on prod, which FALSIFIED the spec's
    original argument for reporting a denominator.
 5. NULL-author findings — invisible to a SELF-scoped caller.

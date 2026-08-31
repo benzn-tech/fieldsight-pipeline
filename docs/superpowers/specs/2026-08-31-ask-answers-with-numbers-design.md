@@ -30,12 +30,19 @@ own sections.
 | | measured | consequence |
 |---|---|---|
 | days-with-topics that have `recordings` rows | **33 / 39 = 84.6%** | viable. But 15.4% have none, so the **third kind of zero** (§7) is real, not theoretical |
-| sessions with a usable duration | **286 / 287 = 99.7%** (281 from `duration_s`, 5 from the span, 1 unmeasurable) | `duration` is answerable |
+| sessions with a usable duration | **281 / 287 = 97.9%** from `duration_s` alone; **286 / 287 = 99.7%** if the span fallback is added | `duration` is answerable — but `day_stats` sums `duration_s` ONLY. The span fallback lives in `duration_for_media`, so a verbatim reuse gets 97.9% and the 5 span-only sessions contribute zero |
 | chunk rows → sessions | **2823 → 287, a fold of 9.8×** | counting rows would have reported nearly ten times the recordings a person made |
 | | | *(3127 is every `kind`; 2823 is audio+video, which is what a session count is over. The first pass mixed the photos in.)* |
 | `findings.domain` unlabelled | **0 / 189** | **§4's original justification was false — see below** |
 | findings on NULL-author topics | **5 / 189 = 2.6%** | small, real, and named rather than dropped |
 | topics from the nightly report path | **25 / 267 = 9.4%** | the fallback in §3 is not theoretical |
+
+**Windows, because they differ and the table above hides that.** Coverage and
+the topic-source split are over `report_date >= current_date - 120`; the fold and
+the duration split are all-time; the findings figures are all-time. The 120-day
+window straddles the 2026-07-16 authority-flip cutover, so the 9.4% report-path
+share mixes two regimes and will drift down. The disjointness below is
+structural and does not move with the window.
 
 And the one that settles §3 outright — the two paths are **disjoint**:
 
@@ -98,6 +105,8 @@ A metric question is a **quantity interrogative over a countable noun**:
 | `duration` | how long, how much time, total time | 多长时间, 多久, 录了多久 |
 | `count_photos` | how many photos/pictures | 多少张照片, 几张照片, 拍了几张 |
 | `count_sessions` | how many recordings/sessions | 几段录音, 录了几次 |
+
+**`count_sessions` has no caller.** The three customer questions justify `duration`, `count_photos` and `count_findings`; this one is here because `day_stats` returns it beside the duration and dropping it would cost a line. It is named as free-riding rather than presented as requested — this repository's rule is that a thing which keeps reappearing gets asked who asked for it.
 | `count_findings` | how many safety/quality issues | 多少安全问题, 多少质量问题, 几个 QA 问题 |
 
 The range comes from `query_slots.time_range`, already shipped. A metric question
@@ -156,9 +165,19 @@ on every day the nightly report path ran**, and three facts make it so:
   "frozen legacy" claim is true only of the item_writer path
   (`lambda_item_writer.py:791-801`).
 - `lambda_ingest.py:662` calls `delete_topics_for_source_prefix(extraction_prefix)`
-  — the nightly report supersedes that day's live-extraction topics — and
-  `findings.topic_id` is `ON DELETE CASCADE`. **The day's findings are deleted by
-  the nightly run**, and ingest never writes findings.
+  — the nightly report superseding that day's live-extraction topics, which
+  would cascade the findings away. **On prod today it does not fire.** That call
+  sits in the `else` of `defer_to_extraction = AUTHORITY_FLIP and _should_defer(…)`
+  (`lambda_ingest.py:645`), and prod runs `AUTHORITY_FLIP=true` — verified on the
+  deployed function, not the template. A day WITH extraction topics defers, so
+  nothing is deleted and no report topic is written; a day WITHOUT them has no
+  findings to delete.
+
+  A draft of this spec presented that delete as the operative mechanism and never
+  mentioned the flag. **The disjointness below is real but its cause is
+  different**: report topics now exist only for zero-extraction days — the
+  RealPTT path, lake-fed environments, days before the flip. A plan written from
+  the wrong story would test for an overnight source swap that cannot happen.
 - The shipped read path already knows this. `repositories/topics.py:369-378`
   sources the safety slot from safety-domain findings first and falls back to raw
   `safety_observations` rows **only when a topic has zero of them**, keeping the
@@ -177,17 +196,40 @@ is **filed by a person**, and "how many did we raise" is a different question
 from "how many did the system find". Merging them silently is the error this
 section is about.
 
-### The join the first draft never wrote out
+### The joins, and a docstring an earlier draft quoted backwards
 
-`findings` has **no date and no user**: only `topic_id`. So "yesterday" is
-`topics.report_date` and "I" is `topics.user_id` — **and `topics.user_id` is
-nullable** (migration 0003). `repositories/findings.py:116-119` warns about
-exactly this shape: reaching the tenant through `users` "would also drop every
-NULL-author row silently."
+`findings` carries **`site_id uuid NOT NULL`** (migration 0010) with
+`idx_findings_site_domain (site_id, domain)` — an index built for exactly this
+count. Date and author come through `topics` (`report_date`, `user_id`); **the
+tenant does not.**
 
-A worker on SELF scope asking "how many safety issues did I have yesterday" must
-not silently lose the NULL-author rows. They are **counted separately and named**,
-under the same rule as §4.
+An earlier draft said findings had "no date and no user: only `topic_id`", and
+cited `repositories/findings.py:116-119` as a warning about that shape. **It says
+the opposite**, and the quote was cut off mid-sentence:
+
+> Tenant path is `findings.site_id -> sites.company_id` — ONE hop, NOT NULL on
+> both sides. `findings` has no user column, so the "reach the tenant through
+> users" rule that `topics` needs **does not apply** and would also drop every
+> NULL-author row silently. Measured on prod 2026-08-30: 0 of 189 findings have
+> a NULL site_id, so the join loses nothing.
+
+The trailing clause was quoted as if it described findings. It describes what
+would go wrong if the `topics` rule were applied TO findings — which is what the
+draft's own sketch then told an implementer to do. Scoping the tenant through
+`topics.user_id → users` drops the 5 NULL-author rows from **every** caller's
+count, including the ALL-scoped admin this section promises will see them.
+
+So, concretely:
+
+| what | comes from | null-safe |
+|---|---|---|
+| tenant | `findings.site_id → sites.company_id` | yes — one hop, NOT NULL both sides, 0/189 NULL on prod |
+| site scope | `findings.site_id` directly | yes, and indexed |
+| date | `topics.report_date` | yes |
+| "I" | `topics.user_id` | **no — nullable.** 5 of 189 on prod |
+
+The NULL-author findings are invisible to a per-author scope by construction.
+They are **counted separately and named**, under §4.
 
 ## 4. Every count carries its denominator — for the reasons that are true
 
@@ -210,11 +252,8 @@ The rule survives, because three things do make a count mean less than it looks:
 1. **The third zero.** 15.4% of days with topics have no `recordings` rows at
    all (§7). "You recorded nothing yesterday" and "there are no rows for
    yesterday" are different facts and this route must not merge them.
-2. **`recordings.site_id` is nullable.** A `SITE`-scoped PM filtering on
-   `site_id` silently excludes untagged recordings; a worker on `user_id = self`
-   sees their own untagged rows. **The same question has a different denominator
-   for the two roles** (BUG-43 is why untagged rows exist), and the answer must
-   say which it used.
+2. **`recordings.site_id` is nullable**, so the same question has a different
+   denominator for a PM than for a worker. Stated once, in §5.
 3. **NULL-author findings** — 2.6% on prod. A SELF-scoped worker asking about
    their own safety issues cannot see them through `topics.user_id`, and
    `repositories/findings.py` already warns that reaching the tenant through
