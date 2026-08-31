@@ -41,7 +41,7 @@ def test_a_session_is_one_session_however_many_chunks_it_arrived_in(db):
     for i in range(21):
         _chunk(db, co, site, uid, "fold", "2026-08-27", "a" * 32, i)
 
-    out = recordings.range_stats(db, co, ["fold"], "2026-08-27", "2026-08-27")
+    out = recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site])
 
     assert out["sessions"] == 1
     assert out["duration_s"] == 21 * 30
@@ -56,7 +56,7 @@ def test_a_pre_chunk_recording_is_still_one_session(db):
         "users/legacy/audio/2026-08-27/dev_2026-08-27_10-00-00.wav",
         "L-1", "2026-08-27T10:00:00Z", duration_s=600)
 
-    assert recordings.range_stats(db, co, ["legacy"], "2026-08-27", "2026-08-27")["sessions"] == 1
+    assert recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site])["sessions"] == 1
 
 
 def test_the_range_is_matched_on_the_key_segment_not_started_at(db):
@@ -72,8 +72,8 @@ def test_the_range_is_matched_on_the_key_segment_not_started_at(db):
         "2026-08-27T23:30:00Z",     # 11:30am the NEXT day in UTC+12
         duration_s=60)
 
-    assert recordings.range_stats(db, co, ["clock"], "2026-08-27", "2026-08-27")["sessions"] == 1
-    assert recordings.range_stats(db, co, ["clock"], "2026-08-28", "2026-08-28")["sessions"] == 0
+    assert recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site])["sessions"] == 1
+    assert recordings.range_stats(db, co, "2026-08-28", "2026-08-28", [site])["sessions"] == 0
 
 
 def test_a_range_spans_days(db):
@@ -82,7 +82,7 @@ def test_a_range_spans_days(db):
     _chunk(db, co, site, uid, "range", "2026-08-26", "2" * 32, 1)
     _chunk(db, co, site, uid, "range", "2026-08-30", "3" * 32, 1)
 
-    out = recordings.range_stats(db, co, ["range"], "2026-08-24", "2026-08-27")
+    out = recordings.range_stats(db, co, "2026-08-24", "2026-08-27", [site])
     assert out["sessions"] == 2
 
 
@@ -95,7 +95,7 @@ def test_a_session_with_no_duration_at_all_is_counted_and_named(db):
         "users/nodur/audio/2026-08-27/dev_sid" + "c" * 32 + "_c0001.wav",
         "n-1", "2026-08-27T10:00:00Z", ended_at=None, duration_s=None)
 
-    out = recordings.range_stats(db, co, ["nodur"], "2026-08-27", "2026-08-27")
+    out = recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site])
     assert out["sessions"] == 1
     assert out["duration_s"] == 0
     assert out["unmeasured"] == 1
@@ -112,7 +112,7 @@ def test_the_span_is_the_fallback_when_duration_s_is_absent(db):
         "s-1", "2026-08-27T10:00:00Z",
         ended_at="2026-08-27T10:02:00Z", duration_s=None)
 
-    out = recordings.range_stats(db, co, ["span"], "2026-08-27", "2026-08-27")
+    out = recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site])
     assert out["duration_s"] == 120
     assert out["unmeasured"] == 0
 
@@ -129,7 +129,7 @@ def test_photos_are_their_own_number_and_do_not_join_the_session_fold(db):
             f"users/pix/pictures/2026-08-27/IMG_{i}.jpg",
             f"p-{i}", "2026-08-27T10:00:00Z")
 
-    out = recordings.range_stats(db, co, ["pix"], "2026-08-27", "2026-08-27")
+    out = recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site])
     assert out["sessions"] == 1
     assert out["photos"] == 3
     assert out["duration_s"] == 30
@@ -145,8 +145,8 @@ def test_a_deleted_session_stops_being_counted(db):
     _chunk(db, co, site, uid, "del", "2026-08-27", "f" * 32, 1)
     _chunk(db, co, site, uid, "del", "2026-08-27", "0" * 32, 1)
 
-    before = recordings.range_stats(db, co, ["del"], "2026-08-27", "2026-08-27")
-    after = recordings.range_stats(db, co, ["del"], "2026-08-27", "2026-08-27",
+    before = recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site])
+    after = recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site],
                                    deleted_bases={"sid" + "f" * 32})
 
     assert before["sessions"] == 2
@@ -160,30 +160,83 @@ def test_either_spelling_of_the_deleted_base_works(db):
     co, site, uid = _seed(db, "spell")
     _chunk(db, co, site, uid, "spell", "2026-08-27", "9" * 32, 1)
 
-    bare = recordings.range_stats(db, co, ["spell"], "2026-08-27", "2026-08-27",
+    bare = recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site],
                                   deleted_bases={"9" * 32})
     assert bare["sessions"] == 0
 
 
 def test_another_companys_recordings_are_never_counted(db):
+    """Both the company pin and the site filter are asserted, because either one
+    alone looks like it works: a site belongs to exactly one company here, so
+    dropping the company_id predicate would still pass a site-scoped test."""
     co_a, site_a, uid_a = _seed(db, "tenanta")
     co_b, site_b, uid_b = _seed(db, "tenantb")
     _chunk(db, co_a, site_a, uid_a, "tenanta", "2026-08-27", "1" * 32, 1)
     _chunk(db, co_b, site_b, uid_b, "tenantb", "2026-08-27", "2" * 32, 1)
 
-    out = recordings.range_stats(db, co_a, ["tenanta", "tenantb"],
-                                 "2026-08-27", "2026-08-27")
-    assert out["sessions"] == 1, "a folder name reached across tenants"
+    out = recordings.range_stats(db, co_a, "2026-08-27", "2026-08-27",
+                                 [site_a, site_b])
+    assert out["sessions"] == 1, "a site id reached across tenants"
 
 
-def test_an_empty_folder_list_counts_nothing_rather_than_everything(db):
+def test_an_empty_site_list_counts_nothing_rather_than_everything(db):
     """`= ANY('{}')` matches no rows, which is the correct deny-by-default. An
-    implementation that skipped the filter when the list is empty would count the
-    whole company."""
+    implementation that skipped the filter when the set is empty would count the
+    whole company -- the "empty list means no filter" bug this repo has already
+    shipped once, where a failed identity resolution showed MORE, not less."""
     co, site, uid = _seed(db, "empty")
     _chunk(db, co, site, uid, "empty", "2026-08-27", "8" * 32, 1)
 
-    assert recordings.range_stats(db, co, [], "2026-08-27", "2026-08-27")["sessions"] == 0
+    assert recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [])["sessions"] == 0
+
+
+def test_an_author_filter_narrows_within_the_sites_the_caller_can_reach(db):
+    """`author_ids` is `visible_scope`'s per-author allow-set, and `None` is what
+    it returns for an ALL- or SITE-scoped caller: no filter. An EMPTY set is a
+    filter that matches nobody -- the two must not collapse into each other."""
+    co, site, uid = _seed(db, "authfilter")
+    other = users.upsert_field_only_user(db, co, "authfilter2", "authfilter2", "", "worker")
+    _chunk(db, co, site, uid, "authfilter", "2026-08-27", "3" * 32, 1)
+    recordings.insert_pending(
+        db, co, other["id"], site, "audio",
+        "users/authfilter2/audio/2026-08-27/dev_sid" + "4" * 32 + "_c0001.wav",
+        "o-1", "2026-08-27T10:00:00Z", duration_s=30)
+
+    assert recordings.range_stats(db, co, "2026-08-27", "2026-08-27",
+                                  [site])["sessions"] == 2
+    assert recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site],
+                                  author_ids=[uid])["sessions"] == 1
+    assert recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site],
+                                  author_ids=[])["sessions"] == 0
+
+
+def test_a_recording_with_no_site_is_excluded_but_named(db):
+    """Measured live: 87 of 3127 rows have a NULL `site_id`, and on one real day
+    that is 28 sessions against 0 in-scope ones. Excluding them is right -- a row
+    belonging to no site cannot be shown to someone whose reach IS a set of
+    sites. Excluding them silently is not: without `unattributed` that day
+    answers "you recorded nothing"."""
+    co, site, uid = _seed(db, "nosite")
+    _chunk(db, co, site, uid, "nosite", "2026-08-27", "5" * 32, 1)
+    recordings.insert_pending(
+        db, co, uid, None, "audio",
+        "users/nosite/audio/2026-08-27/dev_sid" + "6" * 32 + "_c0001.wav",
+        "ns-1", "2026-08-27T10:00:00Z", duration_s=30)
+
+    out = recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site])
+    assert out["sessions"] == 1
+    assert out["unattributed"] == 1, "a site-less recording vanished without a word"
+
+
+def test_a_folder_name_is_not_part_of_the_interface(db):
+    """The parameter this function used to take. A folder name arriving from a
+    request is an ACL bypass wearing a parameter -- the caller names whose
+    recordings to count -- and `recordings.user_id` is NOT NULL (0 of 3127 live)
+    and is the same currency `visible_scope` already speaks."""
+    import inspect
+    params = inspect.signature(recordings.range_stats).parameters
+    assert "folders" not in params
+    assert "site_ids" in params and "author_ids" in params
 
 
 from repositories import findings, topics
