@@ -690,3 +690,52 @@ def test_the_deletion_wiring_is_pinned_by_the_import_graph_not_a_substring():
     assert "boto3" not in imported, "an in-VPC lambda gained an AWS client"
     assert "deletion_mirror" not in imported, "the S3 mirror, from inside the VPC"
     assert "redactions" in str(imported) or True  # reached via `repositories`
+
+
+def test_a_graded_callers_empty_day_does_not_blame_the_pipeline(wired, monkeypatch):
+    """Found by asking a real question as a real site_manager on TEST.
+
+    David is site_manager on a site that HAS 18 recording rows for 2026-07-15 —
+    they belong to someone outside his SELF+WORKERS author set. He has topics
+    that day, so the route answered "There are notes on 2026-07-15, but no
+    recording data was registered for it." The rows were registered; they are not
+    his. That is a claim about the pipeline made from a fact about the ACL — the
+    same shape as the photo zero that said the length could not be measured.
+    """
+    monkeypatch.setattr(rag.scope, "visible_scope",
+                        lambda conn, caller: {"site_ids": {"s-1"}, "author_ids": {"u-1"}})
+    monkeypatch.setattr(rag.recordings, "range_stats",
+                        lambda *a, **k: dict(STATS, sessions=0, duration_s=0, photos=0))
+    monkeypatch.setattr(rag.topics, "has_topics_in_range", lambda *a, **k: True)
+
+    out = rag.lambda_handler(ev(), None)
+    assert out["notes"]["zero_kind"] == "nothing_of_yours"
+
+
+def test_an_unfiltered_caller_still_gets_the_pipeline_answer(wired, monkeypatch):
+    """With no author filter there is nobody else the rows could belong to, so
+    "topics but no rows" really is the pipeline — the 15.4% case. Adding the
+    fourth cause must not swallow the third."""
+    monkeypatch.setattr(rag.recordings, "range_stats",
+                        lambda *a, **k: dict(STATS, sessions=0, duration_s=0, photos=0))
+    monkeypatch.setattr(rag.topics, "has_topics_in_range", lambda *a, **k: True)
+    assert rag.lambda_handler(ev(), None)["notes"]["zero_kind"] == "no_rows_for_that_day"
+
+
+def test_the_scoped_zero_never_says_someone_else_recorded(ask):
+    """SELF+WORKERS exists so a site_manager cannot learn about another site
+    manager's data. "There are recordings but not yours" discloses exactly that,
+    so the sentence speaks only about the caller's own."""
+    out = mr.render("how long did I record yesterday",
+                    {"metric": "duration", "value": 0, "from": "2026-07-15",
+                     "to": "2026-07-15", "notes": {"zero_kind": "nothing_of_yours"}})
+    assert out == "You have no recordings on 2026-07-15."
+    for word in ("someone", "else", "other", "registered", "notes"):
+        assert word not in out.lower(), out
+
+
+def test_the_scoped_zero_speaks_chinese_too(ask):
+    assert mr.render("昨天录了多久",
+                     {"metric": "duration", "value": 0, "from": "2026-07-15",
+                      "to": "2026-07-15",
+                      "notes": {"zero_kind": "nothing_of_yours"}}) == "2026-07-15你没有录音。"

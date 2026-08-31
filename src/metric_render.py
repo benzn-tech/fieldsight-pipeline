@@ -85,6 +85,11 @@ _ZERO = {
     "no_rows_for_that_day": (
         "There are notes {when}, but no recording data was registered for it.",
         "{when}有记录内容，但没有登记录音数据。"),
+    # Speaks about the caller's own data, never about the pipeline and never
+    # about whether anyone else recorded.
+    "nothing_of_yours": (
+        "You have no recordings {when}.",
+        "{when}你没有录音。"),
     "none_of_that_kind": (
         "No {noun} {when}.",
         "{when}没有{noun}。"),
