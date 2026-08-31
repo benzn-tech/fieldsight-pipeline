@@ -134,21 +134,46 @@ knowledge -- if the sources do not address a claim, say so plainly for that enti
 For each entity, write a short paragraph beginning with the entity name.
 """
 
-RECONCILE_PROMPT = """For each entity below you are given the claim our answer made \
-about it, and what a web search found. Assign exactly one state per entity.
+# Two questions in a fixed order, not four states in a list.
+#
+# The list form was measured: 48 runs over 16 labelled cases. It never once
+# called a false claim "corroborated" -- but on claims about the customer's own
+# project it answered "not_found" 6 times out of 12, because the search findings
+# sat right there saying the sources did not address it, and a model reading
+# those findings answers the question they suggest. "We searched and found
+# nothing" about a sentence the web could never have held is a quiet slur on
+# something that was only ever internal.
+#
+# So checkability is asked FIRST and separately, and the findings are not to be
+# consulted until it has been answered.
+RECONCILE_PROMPT = """For each entity below, answer two questions in order.
 
-- "corroborated": the claim is checkable AND a source agrees with it
-- "conflicts": the claim is checkable AND a source disagrees with it
-- "not_found": the claim is checkable, the search ran, nothing usable came back
-- "no_checkable_claim": our answer asserts nothing about this entity that could be \
-checked externally -- the entity is merely named
+QUESTION 1 -- is this claim about the ENTITY, or about this customer's own job?
 
-Use "no_checkable_claim" whenever the claim is absent, vague, or about this customer's \
-own project rather than about the entity itself. Confirming that a company exists is \
-NOT corroboration of our answer, and must not be reported as "corroborated".
+A claim about the entity is one a stranger could look up: what a company does,
+where it operates, what a standard covers, what a product is. A claim about the
+customer's own job merely mentions the entity and asserts something only their own
+records could settle -- what was delivered, what was said in a meeting, what was
+scheduled, who is visiting, what sits on a shelf.
 
-Return ONLY a JSON array, no prose:
-[{{"entity": "...", "state": "...", "summary": "one or two sentences"}}]
+If it is about the customer's own job, the state is "no_checkable_claim" and you are
+done with that entity. Do not read the search findings for it. In particular do not
+let findings that say "the sources do not address this" talk you into "not_found":
+nothing was ever there to find, and reporting a search that failed would suggest the
+web declined to back up a sentence the web never had.
+
+QUESTION 2 -- only for claims about the entity itself. Compare the claim with what
+the search found:
+
+- "corroborated": a source agrees with the claim
+- "conflicts": a source disagrees with the claim
+- "not_found": the search ran and nothing usable came back either way
+
+Confirming that a company merely exists is NOT corroboration of a claim about it.
+
+Return ONLY a JSON array, no prose. The summary says WHY in one or two sentences,
+and must never be empty for "corroborated" or "conflicts":
+[{{"entity": "...", "state": "...", "summary": "..."}}]
 
 CLAIMS:
 {claims}
