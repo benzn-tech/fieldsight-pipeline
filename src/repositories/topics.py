@@ -184,7 +184,12 @@ def list_contributor_folders_for_site_date(conn, site_id, report_date) -> list[s
         "  WHEN source_s3_key LIKE 'extractions/%%' THEN split_part(source_s3_key, '/', 2) "
         "  WHEN source_s3_key LIKE 'reports/%%'     THEN split_part(source_s3_key, '/', 3) "
         "END AS folder "
-        "FROM topics WHERE site_id=%s AND report_date=%s AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)",
+        # Both arms. This list is a list of PEOPLE shown for a day: a recorder
+        # whose only topics that day came from a deleted recording must stop
+        # appearing, and the topic arm alone stops recognising them once the
+        # nightly rebuild re-inserts the day under new uuids.
+        f"FROM topics WHERE site_id=%s AND report_date=%s "
+        f"AND {visible_topics_predicate('topics')}",
         (site_id, report_date),
     ).fetchall()
     return sorted({r["folder"] for r in rows if r["folder"]})
@@ -720,7 +725,14 @@ def list_extraction_folder_names_for_date(conn, company_id, report_date) -> list
     needed -- the '%%' is escaped inline for psycopg's %s paramstyle."""
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT DISTINCT u.folder_name FROM topics t JOIN users u ON u.id = t.user_id "
-        "WHERE t.report_date=%s AND u.company_id=%s  AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = t.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)"
+        # Both arms, for the same reason as the contributor list: this builds the
+        # meeting picker's "available_users", so a folder that survives here is a
+        # person's name offered for a day whose content was deleted. The endpoint
+        # above already refuses the lake-wide summary_report.json for such a day
+        # (`_day_has_deleted_sources`) -- the candidate list was the half that
+        # did not ask.
+        f"WHERE t.report_date=%s AND u.company_id=%s "
+        f"AND {visible_topics_predicate('t')} "
         "AND t.source_s3_key LIKE 'extractions/%%' AND u.folder_name IS NOT NULL",
         (report_date, company_id),
     ).fetchall()
