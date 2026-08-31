@@ -131,10 +131,18 @@ def _metric(event):
     if not site_ids:
         return dict(out, value=0, n=0, notes={"zero_kind": "nothing_visible"})
 
+    # None means "no company restriction", and this is the ONLY place allowed to
+    # ask for it. A cross-company caller's reachable sites belong to other
+    # companies, so pinning their own company contradicts the site set and
+    # matches nothing -- a platform_admin reaching five sites that recorded all
+    # day was told nothing was recorded. Every other caller keeps the pin, which
+    # is belt-and-braces over a site set that is already theirs.
+    company = None if sc.get("cross_company") else caller["company_id"]
+
     notes = {}
     if metric.startswith("count_findings_"):
         domain = metric.rsplit("_", 1)[1]
-        got = findings.count_by_domain(conn, caller["company_id"], domain,
+        got = findings.count_by_domain(conn, company, domain,
                                        date_from, date_to,
                                        site_ids=site_ids, author_ids=author_ids)
         value = got["count"]
@@ -154,7 +162,7 @@ def _metric(event):
         # the function timed out (BUG-36) and look like a slow query.
         deleted = redactions.deleted_session_bases(conn, caller["company_id"],
                                                    date_from, date_to)
-        got = recordings.range_stats(conn, caller["company_id"], date_from, date_to,
+        got = recordings.range_stats(conn, company, date_from, date_to,
                                      site_ids, author_ids=author_ids,
                                      deleted_bases=deleted)
         value = {"duration": got["duration_s"],

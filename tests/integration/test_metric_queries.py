@@ -516,7 +516,12 @@ def test_a_cross_company_caller_counts_the_sites_they_reach(db):
     co_admin = companies.create_company(db, "Acme-xcoadmin")["id"]
     _chunk(db, co_data, site, uid, "xcodata", "2026-08-27", "a" * 32, 1)
 
-    out = recordings.range_stats(db, co_admin, "2026-08-27", "2026-08-27", [site])
+    # None is the cross-company signal, and only `_metric` may send it -- passing
+    # ANOTHER company's id must still count nothing, which is what keeps the pin
+    # meaningful for every ordinary caller.
+    assert recordings.range_stats(db, co_admin, "2026-08-27", "2026-08-27",
+                                  [site])["sessions"] == 0
+    out = recordings.range_stats(db, None, "2026-08-27", "2026-08-27", [site])
     assert out["sessions"] == 1, "a cross-company caller saw none of the site they reach"
     assert out["duration_s"] == 30
 
@@ -544,6 +549,8 @@ def test_findings_follow_the_same_rule(db):
     findings.insert_findings(db, t["id"], site, [{"observation": "x", "domain": "safety"}])
 
     assert findings.count_by_domain(db, co_admin, "safety", "2026-08-27", "2026-08-27",
+                                    site_ids=[site])["count"] == 0
+    assert findings.count_by_domain(db, None, "safety", "2026-08-27", "2026-08-27",
                                     site_ids=[site])["count"] == 1
 
 
@@ -560,3 +567,18 @@ def test_without_a_site_set_the_company_is_still_the_scope(db):
 
     out = findings.count_by_domain(db, co_a, "safety", "2026-08-27", "2026-08-27")
     assert out["count"] == 1, "with no site set, the company pin is what scopes it"
+
+
+def test_the_cross_company_signal_still_narrows_to_the_sites_reached(db):
+    """`company_id=None` lifts the company restriction, not the site one. A
+    platform_admin sees every site because `visible_scope` hands them every site
+    — not because the query stopped filtering."""
+    co_a, site_a, uid_a = _seed(db, "xconarrow_a")
+    co_b, site_b, uid_b = _seed(db, "xconarrow_b")
+    _chunk(db, co_a, site_a, uid_a, "xconarrow_a", "2026-08-27", "1" * 32, 1)
+    _chunk(db, co_b, site_b, uid_b, "xconarrow_b", "2026-08-27", "2" * 32, 1)
+
+    both = recordings.range_stats(db, None, "2026-08-27", "2026-08-27", [site_a, site_b])
+    one = recordings.range_stats(db, None, "2026-08-27", "2026-08-27", [site_a])
+    assert both["sessions"] == 2
+    assert one["sessions"] == 1, "the site filter stopped applying"
