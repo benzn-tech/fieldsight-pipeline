@@ -74,10 +74,15 @@ _ZERO = {
     "nothing_visible": (
         "You do not have access to any project data yet, so there is nothing to count.",
         "你还没有任何项目的访问权限，所以没有可统计的内容。"),
+    # Deliberately says nothing about LENGTH: this kind is reachable for every
+    # recordings metric, and "the length cannot be measured" is a duration
+    # sentence that came out under a photo question on the first TEST run.
     "no_rows_for_that_day": (
-        "There are notes {when}, but no recording data was registered, "
-        "so the length cannot be measured.",
-        "{when}有记录内容，但没有登记录音数据，因此无法统计时长。"),
+        "There are notes {when}, but no recording data was registered for it.",
+        "{when}有记录内容，但没有登记录音数据。"),
+    "none_of_that_kind": (
+        "No {noun} {when}.",
+        "{when}没有{noun}。"),
     "nothing_recorded": (
         "Nothing was recorded {when}.",
         "{when}没有录音。"),
