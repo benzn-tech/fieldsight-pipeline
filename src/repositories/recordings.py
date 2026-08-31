@@ -118,6 +118,88 @@ def day_stats(conn, company_id, user_folder, date) -> dict:
             "duration_s": int(row["duration_s"] or 0)}
 
 
+def range_stats(conn, company_id, folders, date_from, date_to, deleted_bases=()) -> dict:
+    """Sessions, seconds and photos for a set of folders over a date RANGE.
+
+    `day_stats`'s two rules widened, plus one it does not have and one it does
+    not need.
+
+    1. SESSIONS, NOT ROWS. Folded on the sid parsed out of the key, with the key
+       itself as the fold value when there is no sid -- so pre-chunk-session
+       recordings are one row each and the fold is the identity for them.
+       Measured on prod: 2823 rows are 287 sessions, a fold of 9.8x. Counting
+       rows would tell a person they made nearly ten times the recordings they
+       made.
+
+    2. THE KEY SEGMENT, NOT `started_at`. That column is timestamptz (UTC) while
+       this range is the caller's local calendar day, which is what
+       `query_slots.time_range` produces and the clock the extraction topics and
+       the s3_key are already on. Filtering by UTC moves an evening recording to
+       the next day -- the BUG-37/finalize-timezone family.
+
+    3. THE SPAN FALLBACK, which `day_stats` lacks. It sums `duration_s` only,
+       which covers 97.9% of sessions on prod; `ended_at - started_at` --
+       `duration_for_media`'s fallback -- takes it to 99.7%. Without it here, 5
+       sessions in 287 contribute zero and the total is quietly short.
+       `unmeasured` counts the sessions that can produce neither, so a short
+       total is visible rather than assumed.
+
+    4. PHOTOS ARE COUNTED SEPARATELY and never join the fold. They are rows in
+       this table with `kind='photo'` -- 304 of the 3127 on prod -- and mixing
+       them into a session count is how the fold ratio was first miscomputed.
+
+    `deleted_bases` are session bases the CALLER has already resolved from the
+    deletion mirror, in either spelling. They cannot be resolved here: the
+    tombstones live in the `extractions/` key space, `recordings` has no
+    `source_s3_key` column at all, and the predicate every other reader uses
+    therefore matches nothing against this table. The translation happens in the
+    caller and the exclusion happens here -- and a count that includes deleted
+    recordings is a way to observe what was deleted.
+
+    An empty `folders` yields `= ANY('{}')`, which matches no rows. That is the
+    correct deny-by-default: skipping the filter would count the whole company.
+    """
+    bases = {b for b in (deleted_bases or ()) if b}
+    bases |= {b[3:] for b in list(bases) if b.startswith("sid")}
+    bases |= {"sid" + b for b in list(bases) if not b.startswith("sid")}
+
+    row = conn.cursor(row_factory=dict_row).execute(
+        "WITH windowed AS ("
+        "  SELECT kind, duration_s, started_at, ended_at,"
+        "    COALESCE(substring(s3_key from '_(sid[0-9a-f]{32})_c[0-9]+\\.'), s3_key) AS fold"
+        "  FROM recordings"
+        "  WHERE company_id = %(company)s"
+        "    AND substring(s3_key from 'users/([^/]+)/') = ANY(%(folders)s)"
+        "    AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/')"
+        "        BETWEEN %(from)s AND %(to)s"
+        "), sess AS ("
+        "  SELECT fold,"
+        "    COALESCE(SUM(duration_s), 0) AS dur,"
+        "    MAX(EXTRACT(EPOCH FROM (ended_at - started_at))) AS span"
+        "  FROM windowed"
+        "  WHERE kind IN ('audio','video') AND NOT (fold = ANY(%(deleted)s))"
+        "  GROUP BY fold"
+        ")"
+        "SELECT"
+        "  (SELECT count(*) FROM sess) AS sessions,"
+        "  (SELECT COALESCE(SUM(CASE WHEN dur > 0 THEN dur"
+        "                            WHEN span > 0 THEN span"
+        "                            ELSE 0 END), 0) FROM sess) AS duration_s,"
+        "  (SELECT count(*) FROM sess"
+        "    WHERE COALESCE(dur, 0) <= 0 AND COALESCE(span, 0) <= 0) AS unmeasured,"
+        "  (SELECT count(*) FROM windowed"
+        "    WHERE kind = 'photo' AND NOT (fold = ANY(%(deleted)s))) AS photos",
+        {"company": company_id, "folders": list(folders),
+         "from": date_from, "to": date_to, "deleted": list(bases)},
+    ).fetchone()
+    if row is None:
+        return {"sessions": 0, "duration_s": 0, "unmeasured": 0, "photos": 0}
+    return {"sessions": int(row["sessions"] or 0),
+            "duration_s": int(row["duration_s"] or 0),
+            "unmeasured": int(row["unmeasured"] or 0),
+            "photos": int(row["photos"] or 0)}
+
+
 def site_for_media(conn, company_id, user_folder, date, session_base) -> dict | None:
     """The app-tagged site (recordings.site_id) for the recording whose media
     file this extraction session came from, or None. Matches recordings.s3_key
