@@ -225,17 +225,26 @@ def test_thinking_is_never_disabled(monkeypatch):
 
 
 def test_effort_is_low_by_default_and_lives_in_output_config(monkeypatch):
+    """Explicit model: the default is haiku, which rejects effort outright, so a
+    call with no model would prove nothing about where effort is placed."""
     pool = _install(monkeypatch, FakePool(FakeResponse(200, _body("hi"))))
-    client.call("q", timeout=12)
+    client.call("q", timeout=12, model="claude-opus-5")
     assert pool.calls[0]["body"]["output_config"] == {"effort": "low"}
 
 
-def test_the_model_is_pinned_to_one_that_supports_the_search_tool():
-    """The tool version and the model default are one decision: the dynamic-
-    filtering search tool needs Opus 4.6+/Sonnet 4.6+, so changing either alone
-    yields a 400 at runtime and nowhere else."""
-    assert client.WEB_SEARCH_TOOL["type"] == "web_search_20260209"
-    assert client.DEFAULT_MODEL.startswith("claude-")
+def test_the_search_pairing_is_the_measured_one():
+    """The tool version and the model default are one decision, and measurement
+    reversed the first version of it.
+
+    The better tool -- `web_search_20260209`, which filters results before they
+    reach the context -- requires Opus 4.6+/Sonnet 4.6+, and that pairing took
+    17 s per entity against a 12 s budget: three runs, three timeouts. Haiku with
+    the basic tool answers the same prompt in 4.2-4.7 s. Upgrading the tool
+    without also raising the budget puts the feature back where it could not
+    finish, so the two are pinned together here.
+    """
+    assert client.WEB_SEARCH_TOOL["type"] == "web_search_20250305"
+    assert client.DEFAULT_MODEL.startswith("claude-haiku")
 
 
 # ------------------------------------------------------ the property, not a case
