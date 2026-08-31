@@ -164,11 +164,21 @@ def _metric(event):
             if got[k]:
                 notes[k] = got[k]
         if value == 0:
-            notes["zero_kind"] = ("no_rows_for_that_day"
-                                  if topics.has_topics_in_range(
-                                      conn, site_ids, date_from, date_to,
-                                      author_ids=author_ids)
-                                  else "nothing_recorded")
+            # WHICH zero. A photo count of 0 on a day that HAS recordings is an
+            # honest "you took no photos", and answering it with "no recording
+            # data was registered" is a claim about the pipeline made from a
+            # fact about photos. So the row-level zeros are only reachable when
+            # the range produced no rows AT ALL -- measured on TEST, where the
+            # first run of this route said exactly the wrong one.
+            any_rows = got["sessions"] > 0 or got["photos"] > 0
+            if any_rows:
+                notes["zero_kind"] = "none_of_that_kind"
+            else:
+                notes["zero_kind"] = ("no_rows_for_that_day"
+                                      if topics.has_topics_in_range(
+                                          conn, site_ids, date_from, date_to,
+                                          author_ids=author_ids)
+                                      else "nothing_recorded")
 
     return dict(out, value=value, n=value, notes=notes)
 
