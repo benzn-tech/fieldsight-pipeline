@@ -243,7 +243,8 @@ def get_topic(conn, topic_id):
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT id, site_id, user_id, report_date, title, summary, category, "
         "       time_range, source_s3_key, thread_id "
-        "FROM topics WHERE id=%s AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)", (topic_id,)).fetchone()
+        f"FROM topics WHERE id=%s AND {visible_topics_predicate('topics')}",
+        (topic_id,)).fetchone()
 
 
 def delete_topics_for_source(conn, source_s3_key) -> int:
