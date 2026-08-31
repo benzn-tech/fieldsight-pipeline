@@ -277,6 +277,16 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
     for a in result.allowed:
         v = by_entity.get(a["entity"].casefold())
         state = (v or {}).get("state")
+        summary = ((v or {}).get("summary") or "").strip()
+        # A card that says the web agrees, or disagrees, and does not say how is
+        # an assertion the reader cannot check and cannot dismiss. Measured on
+        # the real API: haiku returned `conflicts` with an empty summary on a
+        # claim that was in fact correct. The two other states survive an empty
+        # summary -- "nothing usable came back" and "nothing to check" are
+        # complete statements on their own.
+        if state in ("corroborated", "conflicts") and not summary:
+            dropped.append({"entity": a["entity"], "reason": "a verdict with no reason"})
+            continue
         if state not in STATES:
             # No verdict, or one outside the enum. Every repair available here
             # would invent a finding, so the entity is dropped and counted.
@@ -287,7 +297,7 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
             "kind": a["kind"],
             "state": state,
             "claim": a.get("claim"),
-            "summary": (v.get("summary") or "").strip(),
+            "summary": summary,
             # A card whose state is a finding about the web needs the sources
             # that finding came from. `no_checkable_claim` is a judgement about
             # our own answer and cites nothing.

@@ -591,3 +591,53 @@ have been a rollback that did nothing.
 
 §9's latency question is unchanged and unanswerable from here — it needs TEST
 traffic with the flag on, which needs decision 1.
+
+---
+
+## 12. §9 answered: the budget in §5.3 was wrong (2026-09-01)
+
+Measured against the real API on synthetic content -- a question and an answer
+written for the purpose, about companies and standards whose existence is
+public. No recording, transcript or extraction was read.
+
+**The design's model choice could not finish.** Opus 5 with the dynamic-filtering
+search tool takes **17 s for a single entity** against a 12 s budget: three runs,
+three timeouts, `timed_out: true` every time. `max_uses: 1` did not help (19.9 s)
+-- what costs the time is the model, not the number of searches. The same model
+with **no tool at all** still takes 9.3 s. Sonnet 5 is slower still (19.7 s).
+
+| configuration | latency |
+|---|---|
+| Opus 5 + `web_search_20260209` | 16.9 s / 17.2 s |
+| Sonnet 5 + `web_search_20260209` | 19.7 s |
+| Opus 5, no tool | 9.3 s |
+| Sonnet 5 + `web_search_20250305` | 9.7 s |
+| **Haiku 4.5 + `web_search_20250305`** | **4.2 s / 4.7 s** |
+
+So all three steps run haiku with the basic search tool. End to end on five
+cases: **6.3-7.5 s, mean 5.6 s**, against a 24 s hard stop. The cost is stated
+rather than hidden: the basic tool does no dynamic filtering, so raw results
+reach the model's context. That is affordable at one to three entities and would
+not be at thirty.
+
+**Two findings the latency work surfaced, which latency was not looking for:**
+
+*A verdict with no reason is not a card.* Haiku returned `conflicts` with an
+**empty summary** on a claim that was in fact correct. "The web disagrees" with
+nothing after it is an assertion the reader can neither check nor dismiss, so
+`corroborated` and `conflicts` now require a summary and are dropped without one.
+`not_found` and `no_checkable_claim` survive an empty summary -- those two are
+complete statements on their own.
+
+*The gate held against the case it was written for.* Given the answer *"We agreed
+with Naylor Love that the variation would be priced at forty thousand dollars
+before the claim goes in, and John Smith will sign it off"*, the only entity
+extraction proposed was `Naylor Love`, the gate refused it as person-shaped, and
+the run ended in 1.03 s having made **no search call at all**. No price, no
+variation, no claim, no person's name left the account.
+
+**Still open, and not answerable from here:** how often haiku assigns
+`corroborated` to something it should not. The one false positive seen (a correct
+claim initially called `conflicts`) went the safe direction; the dangerous
+direction is the opposite one, and measuring it needs traffic, which needs
+decision 1.
