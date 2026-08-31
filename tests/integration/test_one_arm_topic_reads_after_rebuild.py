@@ -22,7 +22,8 @@ its own comment says "Text is not SQL."
 
 The first run of this file was RED and that was the point: all eight returned
 the topic. The list below is the judgement made afterwards, read by read, with
-the reason each one is or is not a leak. `get_topic` was the one fixed.
+the reason each one is or is not a leak. `get_topic` was the first one fixed; the two folder-name reads that put a
+PERSON'S NAME on a day followed.
 
 Skipped without TEST_DATABASE_URL. A SKIP IS NOT A PASS -- read the CI run.
 """
@@ -80,14 +81,12 @@ def test_which_one_arm_reads_still_return_it(db):
             "lambda_ingest's supersession matcher. Hiding a superseded day's topics "
             "from it makes the nightly report fail to match them, and unmatched "
             "extraction topics are re-created -- filtering here resurrects content.",
-        "list_contributor_folders_for_site_date":
-            "UNJUDGED. Folder names for a site/date (lambda_org_api ~2665). Whether "
-            "hiding a deleted contributor's folder is right depends on what the "
-            "caller does with the list; not decided tonight, so pinned as-is.",
-        "list_extraction_folder_names_for_date":
-            "UNJUDGED, same shape (lambda_org_api ~5944).",
         "folders_for_session_base":
-            "UNJUDGED, same shape (lambda_org_api ~1595).",
+            "an AUTHORIZATION probe, not a display read: `DELETE /sessions/{ref}/"
+            "speaker-names` asks it whether the session is the caller's own. It "
+            "discloses nothing to anyone -- the answer is about the caller's own "
+            "data and both outcomes are act-on-your-own or 403 -- and filtering "
+            "would only make it fail closed more often. Left alone deliberately.",
         "list_site_topics":
             "DEAD: no caller anywhere in src/. Left alone rather than deleted -- "
             "another workstream may be mid-flight on it.",
