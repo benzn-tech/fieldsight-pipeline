@@ -248,3 +248,223 @@ def test_the_chunk_path_is_untouched_by_the_new_branch(wired):
     keep meaning the chunk path."""
     out = rag.lambda_handler({"sub": "sub-1"}, None)
     assert out.get("error") == "missing sub or query_embedding"
+
+
+# ============================================================
+# Task 5: Ask routes to the metric mode and renders it without a model
+# ============================================================
+
+import io as _io
+import json as _json
+
+laa = pytest.importorskip("lambda_ask_agent",
+                          reason="requires psycopg/boto3 (installed in CI)")
+mr = pytest.importorskip("metric_render")
+
+
+def _client(body, seen=None):
+    class C:
+        def invoke(self, FunctionName, InvocationType, Payload):
+            if seen is not None:
+                seen.update(_json.loads(Payload))
+            return {"Payload": _io.BytesIO(_json.dumps(body).encode())}
+    return C()
+
+
+@pytest.fixture
+def ask(monkeypatch):
+    monkeypatch.setattr(laa, "RAG_SEARCH_FUNCTION", "rag-search-test")
+    return monkeypatch
+
+
+def _answer(resp):
+    return _json.loads(resp["body"])["answer"] if "body" in resp else resp["answer"]
+
+
+DUR = {"metric": "duration", "value": 4620, "unit": "seconds",
+       "from": "2026-08-30", "to": "2026-08-30", "n": 3, "notes": {}}
+
+
+def test_a_metric_question_never_reaches_the_model(ask, monkeypatch):
+    """The routing decision, and the rule. If this regresses, Ask answers "how
+    long did I record" with a summary of the day's topics -- which is exactly
+    what it did before this route existed."""
+    import llm_utils
+    called = {"llm": 0}
+    monkeypatch.setattr(llm_utils, "call_llm",
+                        lambda *a, **k: called.__setitem__("llm", 1) or ("x", None))
+    import dashscope_utils
+    monkeypatch.setattr(dashscope_utils, "embed",
+                        lambda *a, **k: pytest.fail("the embedder was called"))
+    seen = {}
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client(DUR, seen))
+
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "sub-1", "tz": "Pacific/Auckland"})
+
+    assert called["llm"] == 0, "a model was asked to produce a number"
+    assert seen["mode"] == "metric"
+    assert seen["metric"] == "duration"
+    assert "1 hour 17 minutes" in out["answer"]
+    assert out["value"] == 4620
+
+
+def test_the_answer_carries_no_citations_and_names_no_model(ask, monkeypatch):
+    """`model` naming a model that was never asked is a false claim in the
+    response body, and the one the UI would print under the answer."""
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client(DUR))
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "s", "tz": "Pacific/Auckland"})
+    assert out["citations"] == []
+    assert out["model"] is None
+    assert out["computed"] is True
+    assert out["grounded"] is True
+
+
+def test_the_basis_is_the_range_asked_about_and_never_widens(ask, monkeypatch):
+    """The chunk path widens an empty day onto the nearest visible one. A count
+    must not: widening would answer a question about Tuesday with Monday's total
+    and label it Tuesday's."""
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client(DUR))
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "s", "tz": "Pacific/Auckland",
+                           "now": "2026-08-31T09:00:00+12:00"})
+    assert out["basis"]["widened"] is False
+    assert out["basis"]["from"] == "2026-08-30"
+
+
+def test_a_retrieval_question_still_goes_to_rag(ask, monkeypatch):
+    """The fall-through, which is the safe direction and the reason the detector
+    is rules rather than a classifier."""
+    seen = {}
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client({"chunks": []}, seen))
+    import dashscope_utils
+    monkeypatch.setattr(dashscope_utils, "embed", lambda *a, **k: [[0.1] * 1024])
+
+    laa._rag_answer({"question": "昨天发生了什么", "caller_sub": "s"})
+    assert seen.get("mode") != "metric"
+    assert "query_embedding" in seen
+
+
+def test_the_language_follows_the_question(ask, monkeypatch):
+    """A person who asks in Chinese and is answered "1 hour 17 minutes" got a
+    worse answer than the RAG path would have produced, where the model follows
+    the question's language for free."""
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client(DUR))
+    out = laa._rag_answer({"question": "昨天我录制了多长时间",
+                           "caller_sub": "s", "tz": "Pacific/Auckland"})
+    assert "小时" in out["answer"]
+    assert "hour" not in out["answer"]
+
+
+def test_the_caveat_is_printed_only_when_it_is_not_zero(ask, monkeypatch):
+    """`unlabelled` is 0 on 189 of 189 findings live. "And 0 unclassified" on
+    every answer forever is noise, and a caveat that always appears stops being
+    read."""
+    body = {"metric": "count_findings_safety", "value": 3, "unit": "items",
+            "from": "2026-08-30", "to": "2026-08-30", "n": 3, "notes": {}}
+    q = {"question": "how many safety issues yesterday", "caller_sub": "s",
+         "tz": "Pacific/Auckland"}
+
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client(body))
+    assert "unclassified" not in laa._rag_answer(q)["answer"]
+
+    monkeypatch.setattr(laa, "_get_lambda_client",
+                        lambda: _client(dict(body, notes={"unlabelled": 7})))
+    loud = laa._rag_answer(q)["answer"]
+    assert "7" in loud and "unclassified" in loud
+
+
+def test_the_third_zero_does_not_say_you_recorded_nothing(ask, monkeypatch):
+    """Topics exist and `recordings` rows do not -- 15.4% of days with topics.
+    "You recorded nothing" is the misleading zero `lambda_org_api` was changed to
+    stop producing."""
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client(
+        dict(DUR, value=0, n=0, notes={"zero_kind": "no_rows_for_that_day"})))
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "s", "tz": "Pacific/Auckland"})["answer"]
+    assert "nothing was recorded" not in out.lower()
+    assert "no recording data was registered" in out.lower()
+
+
+def test_the_honest_zero_still_says_so(ask, monkeypatch):
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client(
+        dict(DUR, value=0, n=0, notes={"zero_kind": "nothing_recorded"})))
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "s", "tz": "Pacific/Auckland"})["answer"]
+    assert "nothing was recorded" in out.lower()
+
+
+def test_a_crashed_rag_search_is_not_rendered_as_a_zero(ask, monkeypatch):
+    """A 200 with FunctionError set. If it reached the renderer it would come out
+    as an honest-looking zero, which is a broken count that reads as a quiet
+    day."""
+    class C:
+        def invoke(self, **k):
+            return {"FunctionError": "Unhandled"}
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: C())
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "s", "tz": "Pacific/Auckland"})
+    assert out["error"] == "rag-search unavailable"
+    assert "0" not in out["answer"]
+
+
+def test_an_error_result_is_not_rendered_as_a_zero_either(ask, monkeypatch):
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client(
+        {"metric": "duration", "error": "caller not provisioned"}))
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "s", "tz": "Pacific/Auckland"})["answer"]
+    assert "could not be completed" in out.lower()
+
+
+def test_the_range_the_question_names_is_what_gets_counted(ask, monkeypatch):
+    """`query_slots.time_range` already resolves "last week" against the caller's
+    own calendar day. The metric route must send that range, not today."""
+    seen = {}
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client(DUR, seen))
+    laa._rag_answer({"question": "how long did I record last week",
+                     "caller_sub": "s", "tz": "Pacific/Auckland",
+                     "now": "2026-08-31T09:00:00+12:00"})
+    assert seen["date_from"] < seen["date_to"], seen
+    assert seen["date_to"] < "2026-08-31"
+
+
+def test_no_rag_search_function_is_refused_not_crashed(ask, monkeypatch):
+    """The legacy hand-built prod deploy has no RAG_SEARCH_FUNCTION. It must not
+    reach a boto3 invoke with an empty name."""
+    monkeypatch.setattr(laa, "RAG_SEARCH_FUNCTION", "")
+    monkeypatch.setattr(laa, "_get_lambda_client",
+                        lambda: pytest.fail("invoked with no function name"))
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "s", "tz": "Pacific/Auckland"})
+    assert out["error"] == "rag-search not configured"
+
+
+# ---- the renderer, on its own ---------------------------------------------
+
+@pytest.mark.parametrize("secs,want", [
+    (4620, "1 hour 17 minutes"),
+    (3600, "1 hour"),
+    (60, "1 minute"),
+    (90, "1 minute"),          # seconds are dropped once there are minutes
+    (45, "45 seconds"),
+    (1, "1 second"),
+    (0, "no time"),
+])
+def test_seconds_are_written_the_way_a_person_says_them(secs, want):
+    """"4620 seconds" is what the column holds and "1.28 hours" is neither what
+    it holds nor what anyone says."""
+    assert mr.duration_phrase(secs) == want
+
+
+def test_a_question_with_no_cjk_is_not_treated_as_chinese():
+    assert mr.is_cjk("how many photos") is False
+    assert mr.is_cjk("昨天拍了多少张照片") is True
+    assert mr.is_cjk(None) is False
+
+
+def test_a_range_reads_as_a_range_not_as_a_single_day():
+    out = mr.render("how many photos", {"metric": "count_photos", "value": 7,
+                                        "from": "2026-08-24", "to": "2026-08-30",
+                                        "notes": {}})
+    assert "between 2026-08-24 and 2026-08-30" in out
