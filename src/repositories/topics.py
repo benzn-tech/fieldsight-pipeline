@@ -525,16 +525,28 @@ def has_topics_in_range(conn, site_ids, date_from, date_to, *, author_ids=None) 
     `lambda_org_api` was changed to stop producing. This function is how the
     metric route tells them apart: topics exist, rows do not.
 
-    Same ACL currency and same deletion arm as `list_report_dates`, and the same
-    empty-`site_ids` short circuit -- no round-trip, and False rather than a
-    filter-free count of the company.
+    Same ACL currency and the same empty-`site_ids` short circuit as
+    `list_report_dates` -- no round-trip, and False rather than a filter-free
+    count of the company.
+
+    **Both deletion arms, not one.** This carried only the topic arm, copied
+    from `list_report_dates`, and the topic arm alone stops working overnight:
+    `redactions.create_redaction`'s own docstring says a tombstone holding only a
+    topic uuid stops matching once `lambda_ingest` re-inserts the day's topics
+    with new uuids when the nightly report supersedes the live extraction. The
+    source arm matches `source_s3_key` against the deleted prefix and survives
+    that.
+
+    The consequence was dated rather than immediate, which is why it reads as
+    working: delete a recording, and the next day the metric route answers
+    *"there are notes on <date>, but no recording data was registered"* -- one
+    sentence asserting that notes still exist for the thing that was deleted, to
+    the person who deleted it.
     """
     if not site_ids:
         return False
     where = ("WHERE site_id = ANY(%s::uuid[]) AND report_date BETWEEN %s AND %s "
-             "AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' "
-             "AND r.target_id = topics.id AND r.scope = 'deleted' "
-             "AND r.reverted_at IS NULL)")
+             f"AND {visible_topics_predicate('topics')}")
     params = [list(site_ids), date_from, date_to]
     if author_ids is not None:
         where += " AND user_id = ANY(%s::uuid[])"
