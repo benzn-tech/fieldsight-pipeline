@@ -44,20 +44,39 @@ def candidate_corpus(conn, site_id, before_date, window_days):
 
     Shaped for thread_match.find_candidates (title / summary / open_items).
 
-    ⚠ `open_items` here and in thread_facts / facts_for_threads is NOT collapsed,
-    deliberately, and that is a precondition of Phase B rather than an oversight.
-    All three counts are inflated by same-day duplicates exactly as the todo
-    lists were before ENABLE_TODO_COLLAPSE.
+    ⚠ `open_items` here and in thread_facts / facts_for_threads is NOT collapsed.
+    A precondition of Phase B, not an oversight — but a NARROWER one than an
+    earlier version of this note claimed, and the difference matters because
+    acting on the wider claim would break something.
 
-    Safe to leave today: thread_facts and facts_for_threads describe CONFIRMED
-    threads, of which prod has zero, and the queue that would show them is
-    switched off for customers. candidate_corpus only feeds proposal generation.
+    **`times_raised` is not affected.** thread_facts counts
+    `DISTINCT t.report_date`, so three topics on one evening are one raising
+    already. The sentence this note used to carry — "a thread reporting 'raised
+    3 times' when one man said it once per recording on a single evening" —
+    describes a defect this query cannot produce. Verified by reading the
+    aggregate, 2026-09-01.
 
-    Must be done before Phase B ships: a thread reporting "raised 3 times" when
-    one man said it once per recording on a single evening is the feature lying
-    about the only number it exists to produce — and mention count is ranked
-    ABOVE priority in the ordering. Collapsing per (site, day) first is what
-    makes the human judgement affordable; spec §3."""
+    **What IS inflated is `open_items`**, and only where it is DISPLAYED:
+    thread_facts and facts_for_threads. One commitment restated in three
+    recordings on one day counts three, and that number sits on a card
+    explaining why an item is at the top of somebody's list. Collapse per
+    (site, day) — never across days, or Monday and Friday become one raising —
+    then sum. `todo_collapse.collapse` groups on normalised text alone and
+    trusts the caller's scope, so the caller must group by date first.
+
+    **Do NOT collapse `open_items` here in candidate_corpus.** It is not a
+    count in this query's consumer: `thread_match.find_candidates` reads it
+    twice and both are boolean gates — `not (topic.get("open_items") or 0)`
+    and the same for each corpus entry. Collapsing would take a topic whose
+    only open item duplicates an earlier topic's from 1 to 0 and drop it out of
+    the corpus entirely, so it could never be proposed as a parent. That loses
+    candidates to fix a number nobody reads.
+
+    Safe to leave today, and measured rather than assumed: prod and test both
+    hold **zero** rows in `topic_threads` and zero topics with a `thread_id`
+    (2026-09-01). Both display functions return nothing to anybody. prod has 21
+    rows in `topic_thread_suggestions`, which is the labelling queue and does
+    not go through here."""
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT t.id, t.report_date, t.site_id, t.title, t.summary, t.thread_id, "
         "       count(a.id) FILTER (WHERE a.status='open') AS open_items "
