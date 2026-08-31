@@ -60,7 +60,17 @@ def enqueue_topic_reindex(s3_client, bucket, conn, topic_id, folder, date):
     # Life-conversation separation (spec §6): a redacted or non_work topic is
     # removed from RAG. Write a DELETE-ONLY request (no topic_chunks) so
     # apply_vectors deletes its existing vectors and inserts nothing.
-    if t.get("work_class") == "non_work" or redactions.is_topic_redacted(conn, topic_id):
+    #
+    # BOTH deletion arms, and the source one is the arm that survives.
+    # `is_topic_redacted` matches a topic uuid, and `lambda_ingest` re-inserts a
+    # superseded day's topics under NEW uuids -- so the day after a delete this
+    # guard stops recognising the topic it was written for. This is the one read
+    # in the system where failing to recognise a deletion does not merely show
+    # the content: it EMBEDS it, putting deleted text back into the index Ask
+    # retrieves from, where it can then be quoted.
+    if (t.get("work_class") == "non_work"
+            or redactions.is_topic_redacted(conn, topic_id)
+            or redactions.is_source_deleted(conn, t.get("source_s3_key"))):
         key = request_key(date, folder, topic_id)
         s3_client.put_object(Bucket=bucket, Key=key, ContentType="application/json",
             Body=json.dumps({
