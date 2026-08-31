@@ -696,3 +696,73 @@ changed.
 to be run deliberately when the prompts or the model change -- not a guard that
 will notice on its own. The unit tests pin the module's refusals; this pins its
 judgement, and only when someone runs it.
+
+---
+
+## 14. §4.1 measured on real recordings (2026-09-01)
+
+Every test of the gate so far used sentences written for the test. §4.1 says the
+gate's input is model-assigned and that this is the residual risk -- and a
+residual risk measured only against invented sentences has not been measured.
+
+`scripts/measure_gate_on_real_answers.py` runs **step 1 and step 2 only** against
+40 real prod extractions and prints the exact strings that would have reached a
+search engine. It cannot call out: the search function is replaced with one that
+raises, so a script that reads real customer content is structurally unable to
+send any of it. That is enforced rather than promised.
+
+**On privacy, the gate held.** Across 40 real sessions: no person's full name, no
+price, no commercial term, no transcript fragment. 31 of the 40 produced no
+external entity at all, which matches §5.2's expectation that most answers assert
+nothing externally checkable.
+
+**On usefulness it did not, and the two point the same way.** Of the 22 strings
+that would have left, three were worth looking up. The rest were the customer's
+own job codes (`UCPK`, `Raven`), our own product name, and brands nobody needs
+corroborated -- `Microsoft`, `iPad`, `UberEats`, `Newstalk ZB`, `Wi-Fi`. Each one
+spends a slot out of three: **the cap bit on 3 of the 11 sessions that produced
+any entity**, so the useless strings were crowding out the useful ones *and*
+leaving the account for nothing.
+
+| | strings out | distinct | cap bit |
+|---|---|---|---|
+| as designed | 22 | 20 | 3 |
+| + extraction asked to skip them | 18 | 16 | 2 |
+| + `_NOT_WORTH_LOOKING_UP` in the gate | 7 | 7 | 0 |
+| + the one-word person rule | **4** | **4** | **0** |
+
+The four survivors are `University of Otago`, `Platform Construction Limited`,
+`VXT`, `DB` -- which is the set a reader would have wanted.
+
+### Three findings, each from the measurement rather than from review
+
+**A prose instruction is not a filter.** Asking extraction to leave ubiquitous
+brands out took 22 to 18 and was partly ignored: `McDonald's`, `iPad` and
+`Outlook` still came through, and `AWS` newly appeared. The reliable place is the
+gate, as code, unit-tested -- the same argument §4 already makes about privacy,
+now applying to noise.
+
+**The person rule had a hole at one word, and it was pointing backwards.** It
+required two capitalised words, so `Naylor Love` was refused while **`Heidi`
+walked straight through** on real data. One capitalised word is *more* ambiguous
+than two: nothing in `Heidi`, `Raven` and `Tenix` says which is a person, which is
+a job code and which is a firm. The bound is now one, and the cost -- one-word
+firms with no corporate marker are refused -- is the trade already accepted for
+`Naylor Love`, in the same direction. Acronyms keep passing: `VXT` and `DB` have
+no lowercase run, so they were never this shape.
+
+**Extraction was building the claim out of the question.** Asked *"who supplied
+the plasterboard"* with an answer stating the firm is a large materials
+manufacturer, it returned `claim: "supplied the plasterboard"` -- the question's
+predicate, which is a fact about the customer's job, so step 4 correctly answered
+`no_checkable_claim` and no card appeared. In production that would have made the
+feature useless for exactly the case it exists for: any *"who did the X"* question
+would produce a claim about our own job and never a card. Caught because the
+precision set dropped from 48/48 to 45/48 after an unrelated change, and the
+regression was investigated rather than written off as variance.
+
+**A project code still cannot be told from a short firm name.** `Raven` is now
+refused, but by the person rule and not because anything identified it as a job
+code -- and a customer's job codes are that customer's, so they cannot be
+enumerated in a shared gate. What can leave in that case is a word with no meaning
+outside the account. Stated, not denied.

@@ -97,24 +97,42 @@ def _loads(text):
             return None
 
 
-EXTRACT_PROMPT = """You are given a question a construction-site worker asked about \
-their own recorded meetings, and the answer our system gave from those recordings.
+# Measured against 40 real prod sessions before this paragraph existed: 22 strings
+# would have left the account, and only three of them were worth looking up.
+# The rest were the customer's own project codes (`UCPK`, `Raven`), our own
+# product name, and ubiquitous brands nobody needs corroborated -- `Microsoft`,
+# `Wi-Fi`, `SIM card`, `iPad`, `UberEats`. Those are not a privacy failure: no
+# person, price or commercial term got through. They are a *usefulness* failure
+# with a privacy cost attached, and the two point the same way. Noise entities
+# spend the three-entity budget -- the cap bit on 3 of the 11 sessions that had
+# any entity at all -- so the useless ones were crowding out the useful ones,
+# and every one of them was also a string leaving the account for nothing.
+#
+# `no_checkable_claim` cannot fix this: it runs in step 4, after the search has
+# already happened and the budget has already been spent.
+EXTRACT_PROMPT = """You are given a question a construction-site worker asked about their own recorded meetings, and the answer our system gave from those recordings.
 
-List the named external entities the ANSWER refers to, and for each one, the claim \
-the answer makes about it.
+List the named external entities the ANSWER refers to, and for each one, the claim the answer makes about it.
 
-An entity is a company, a published standard, a product, a material, a regulator, an \
-authority, or a public role. Do NOT list people, sites, addresses, projects, or \
-anything that only exists inside this customer's own records.
+An entity is a company, a published standard, a product, a material, a regulator, an authority, or a public role. Do NOT list people, sites, addresses, projects, or anything that only exists inside this customer's own records.
 
-The claim is what the answer asserts about that entity, in the answer's own terms. If \
-the answer merely mentions the entity without asserting anything checkable about it, \
-set claim to null.
+Leave out an entity, even a real one, when looking it up could not tell the reader anything they need:
+
+- project codes, site names, job numbers and internal shorthand, even when they look like a company name
+- the software the conversation was recorded or written with, including this product
+- ubiquitous consumer or technology brands mentioned in passing -- a phone, a food delivery app, an operating system, a radio station, a coffee chain
+- generic technology named as a thing rather than a product: wifi, a sim card, a spreadsheet, email
+
+Keep an entity when the answer asserts something substantive about it that a reader would want checked: a contractor, a supplier, a manufacturer, a published standard, a regulator, a specified material or building product.
+
+The claim must be something the ANSWER states about the entity, in the answer's own terms. Never build the claim out of the question: the question describes this customer's job, and a claim taken from it is a claim about their job rather than about the entity. If the question asks "who supplied the plasterboard" and the answer says a firm is a large materials manufacturer, the claim is that it is a large materials manufacturer -- not that it supplied the plasterboard.
+
+If the answer merely names the entity without asserting anything about it, set claim to null.
 
 Return ONLY a JSON array, no prose:
 [{{"entity": "...", "kind": "company|standard|product|material|public_role|regulator|authority", "claim": "..." | null}}]
 
-An empty array is a correct answer when the answer names no external entity.
+An empty array is a correct answer, and the common one -- most answers name no external entity worth looking up.
 
 QUESTION:
 {question}

@@ -27,6 +27,16 @@ by Naylor Love"` yields the query `"Naylor Love"`. That leaks interest in a comp
 not the dispute. Saying which attack fails is more useful than claiming the gate is
 airtight.
 
+**A project code cannot be told from a short company name.** Measured on real
+sessions, `UCPK` and `Raven` -- this customer's own job codes -- passed as
+products, while `Tenix` is a real firm of exactly the same shape: one short word,
+no corporate marker. Nothing in the string separates them, and a rule invented to
+catch one would refuse the other. The extraction prompt is asked to leave job
+codes out and does so unreliably; `_NOT_WORTH_LOOKING_UP` cannot help, because a
+customer's job codes are that customer's and not enumerable here. What leaves in
+that case is a word with no meaning outside the account, which is the mildest
+form of this leak and is stated rather than denied.
+
 **Only the search step is covered here.** Reconcile (spec step 4) sends the answer to
 the LLM provider, and the answer is conversation-derived. That is a different statement
 from "only entities leave", defensible because the same provider already saw the
@@ -88,7 +98,20 @@ _HAS_DIGIT = re.compile(r"\d")
 # lowercase character. Both walked straight through a check written to stop exactly them.
 # The separator is optional here and the capital is not.
 _NAME_WORD = r"[A-Z][a-z'’]{1,20}(?:[-'’]?[A-Z][a-z'’]{1,20})*"
-_PERSON_SHAPE = re.compile(rf"^{_NAME_WORD}(?:\s+{_NAME_WORD}){{1,2}}$")
+# One to three name words, and the lower bound is the correction. The first
+# version required two, which refused `Naylor Love` and let `Heidi` straight
+# through -- found on real sessions, where a bare given name reached the allowed
+# list. That was backwards: one capitalised word is MORE ambiguous than two, not
+# less. Nothing in `Heidi`, `Raven` or `Tenix` says which of them is a person, a
+# job code and a firm; they are the same string shape.
+#
+# The cost is paid by one-word firms with no corporate marker -- `Tenix` is now
+# refused -- and it is the same trade already accepted for `Naylor Love`, in the
+# same direction: a refused firm costs one card the reader could have looked up
+# themselves, and a person's given name sent to a search engine is the thing the
+# customer was promised would not happen. An acronym keeps passing (`VXT`, `DB`):
+# no lowercase run, so it is not this shape at all.
+_PERSON_SHAPE = re.compile(rf"^{_NAME_WORD}(?:\s+{_NAME_WORD}){{0,2}}$")
 
 # What tells a firm from a person when both are two capitalised words. Not a complete
 # list of the world's company suffixes and not meant to be: it only has to catch the
@@ -108,6 +131,46 @@ _CORPORATE = re.compile(
 _PUBLIC_ROLE = re.compile(
     r"(?i)^(ceo|cfo|coo|cto|managing director|director|chair(man|person)?|president"
     r"|founder|owner|general manager|gm|head of [a-z ]{2,20})$")
+
+# Strings that are real, harmless, and pointless to send.
+#
+# Measured on 40 real prod sessions: of the 22 strings that would have left the
+# account, only three were worth looking up. The rest were ubiquitous brands
+# mentioned in passing -- `Microsoft`, `iPad`, `UberEats`, `Newstalk ZB` -- and
+# our own product name. Nobody needs a card confirming that Microsoft exists,
+# and each one spends a slot out of three: the cap bit on 3 of the 11 sessions
+# that produced any entity at all, so the useless strings were crowding out the
+# useful ones AND leaving the account for nothing.
+#
+# Asking the extraction prompt not to list them was tried first and **partly
+# ignored** -- 22 strings became 18, with `McDonald's`, `iPad` and `Outlook` all
+# still coming through and `AWS` newly appearing. A prose instruction to a model
+# is not a filter. This is, and it is unit-tested.
+#
+# It matches the WHOLE normalised string, never a substring: `Platform
+# Construction Limited` must survive a list containing `platform`, and a firm
+# genuinely called `Apple Construction` is not `apple`.
+#
+# It is not a complete list of the world's brands and is not meant to be, exactly
+# as `_CORPORATE` is not a complete list of company suffixes. It holds the shapes
+# a construction meeting actually produces. A brand not in it costs one useless
+# card, which is the cheap direction.
+_NOT_WORTH_LOOKING_UP = frozenset({
+    # our own product, and the recorder in the room
+    "fieldsight", "fieldsight ai", "vizfield", "viz", "plaud",
+    # the software the conversation happened in or around
+    "microsoft", "outlook", "office", "excel", "word", "powerpoint", "teams",
+    "zoom", "slack", "gmail", "google", "google drive", "dropbox", "whatsapp",
+    "aws", "amazon web services", "azure", "youtube", "facebook", "linkedin",
+    "chatgpt", "openai", "anthropic", "claude",
+    # devices and generic technology named as a thing
+    "ipad", "iphone", "android", "apple", "samsung", "wi-fi", "wifi",
+    "sim card", "sim", "bluetooth", "gps", "usb", "pdf", "email",
+    # consumer brands that turn up in a lunch conversation
+    "mcdonald's", "mcdonalds", "ubereats", "uber eats", "uber", "doordash",
+    "starbucks", "countdown", "new world", "pak'nsave", "paknsave",
+    "newstalk zb", "tvnz", "rnz", "stuff", "nz herald",
+})
 
 MAX_ENTITIES = 3
 
@@ -206,6 +269,13 @@ def screen_entity(entity, kind) -> str | None:
     is_standard = kind_label.strip().lower() == "standard"
     if _HAS_DIGIT.search(text) and not is_standard:
         return "carries digits and is not a standard"
+
+    # Before the person check, and deliberately: the two overlap on one-word
+    # brands, and "Microsoft is shaped like a person's name" is a true refusal
+    # with a false reason. Reasons are returned to the caller and written to logs,
+    # so the more specific one goes first.
+    if text.casefold() in _NOT_WORTH_LOOKING_UP:
+        return "nothing to learn from looking it up"
 
     if _looks_like_a_person(text):
         return "shaped like a person's name"
