@@ -641,3 +641,58 @@ variation, no claim, no person's name left the account.
 claim initially called `conflicts`) went the safe direction; the dangerous
 direction is the opposite one, and measuring it needs traffic, which needs
 decision 1.
+
+---
+
+## 13. §5.2 measured, and the precision question answered (2026-09-01)
+
+§5.2 left this to "the first week of TEST data". **That was the wrong
+instrument.** Real traffic has no ground truth: an answer that comes back
+`corroborated` in production looks identical whether the web agreed or the model
+merely thought it did, and nobody is going to hand-adjudicate a week of them.
+Precision is only measurable against cases where the answer is already known,
+which means writing them.
+
+`scripts/measure_corroboration_precision.py` is 16 labelled cases -- four true
+checkable claims, four false ones, four claims that merely name a real entity
+while asserting something only the customer's own records could settle, and four
+that should leave nothing for the gate to pass -- run three times each.
+Read-only, synthetic content, no customer data.
+
+**The error that matters never occurred.** Across 144 runs of both prompt
+versions, a false claim was reported as `corroborated` **zero times**; all four
+false-claim cases came back `conflicts` on every run. That is the failure §1
+exists to prevent, and it is the one the summary counts separately: a run with a
+clean overall score and one such error is a failing run.
+
+**One systematic error did occur, and the list-form prompt caused it.** Claims
+about the customer's own job -- *"Naylor Love said the slab pour would move to
+Thursday"* -- came back `not_found` 6 times out of 12. Not dangerous, but not
+harmless either: "we searched and found nothing" about a sentence the web could
+never have held suggests the web declined to back it up.
+
+The cause was the prompt's shape, not the model's judgement. Four states in a
+list invites one pass over all of them with the findings already in view, and the
+findings sat right there saying *the sources do not address this* -- so the model
+answered the question they suggested. The fix asks **checkability first, as its
+own question, with an explicit instruction not to read the findings until it is
+answered**.
+
+| | list form | two-question form |
+|---|---|---|
+| accepted | 40/48 | **48/48**, twice (96/96) |
+| claims about the customer's own job | 5/12 | **12/12** |
+| false claim called `corroborated` | 0 | 0 |
+| latency, mean | 6.1 s | 6.1 s |
+
+**A false start worth recording.** The first attempt at this comparison
+reported an improvement that had not happened: the edit's anchor did not match,
+the assertion fired, and the run went ahead against the *old* prompt. 41/48
+versus 40/48 was noise between two runs of the same prompt. The number that
+matters is not the score, it is whether the thing you measured is the thing you
+changed.
+
+**Not a CI test.** It needs a key, a network and money, so it is an instrument
+to be run deliberately when the prompts or the model change -- not a guard that
+will notice on its own. The unit tests pin the module's refusals; this pins its
+judgement, and only when someone runs it.
