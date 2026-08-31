@@ -739,3 +739,42 @@ def test_the_scoped_zero_speaks_chinese_too(ask):
                      {"metric": "duration", "value": 0, "from": "2026-07-15",
                       "to": "2026-07-15",
                       "notes": {"zero_kind": "nothing_of_yours"}}) == "2026-07-15你没有录音。"
+
+
+def test_every_scoped_query_gets_the_same_company_decision(wired, monkeypatch):
+    """The company predicate lived in three calls and I changed two of them. prod
+    then answered a platform_admin 12 sessions where 11 are visible -- the
+    twelfth was a deleted one, because the tombstone lookup still pinned the
+    caller's own company and their company owns nothing.
+
+    Not a source scan: this drives the route and watches what each call receives.
+    """
+    seen = {}
+    monkeypatch.setattr(rag.scope, "visible_scope",
+                        lambda conn, caller: {"site_ids": {"s-1"}, "author_ids": None,
+                                              "cross_company": True})
+    monkeypatch.setattr(rag.redactions, "deleted_session_bases",
+                        lambda conn, co, *a, **k: seen.__setitem__("deleted_co", co) or set())
+    monkeypatch.setattr(rag.recordings, "range_stats",
+                        lambda conn, co, *a, **k: seen.__setitem__("stats_co", co) or dict(STATS))
+    monkeypatch.setattr(rag.findings, "count_by_domain",
+                        lambda conn, co, *a, **k: seen.__setitem__("find_co", co) or dict(COUNTS))
+
+    rag.lambda_handler(ev(), None)
+    rag.lambda_handler(ev(metric="count_findings_safety"), None)
+
+    assert seen["stats_co"] is None
+    assert seen["find_co"] is None
+    assert seen["deleted_co"] is None, "the tombstone lookup kept the caller's own company"
+
+
+def test_an_ordinary_caller_still_pins_every_query_to_their_company(wired, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(rag.redactions, "deleted_session_bases",
+                        lambda conn, co, *a, **k: seen.__setitem__("deleted_co", co) or set())
+    monkeypatch.setattr(rag.recordings, "range_stats",
+                        lambda conn, co, *a, **k: seen.__setitem__("stats_co", co) or dict(STATS))
+
+    rag.lambda_handler(ev(), None)
+    assert seen["stats_co"] == "c-1"
+    assert seen["deleted_co"] == "c-1"

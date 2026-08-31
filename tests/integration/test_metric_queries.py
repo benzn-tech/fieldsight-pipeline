@@ -9,7 +9,7 @@ Skipped without TEST_DATABASE_URL. A SKIP IS NOT A PASS — read the CI run.
 """
 import pytest
 
-from repositories import companies, recordings, sites, users
+from repositories import companies, recordings, redactions, sites, users
 
 pytestmark = pytest.mark.integration
 
@@ -582,3 +582,52 @@ def test_the_cross_company_signal_still_narrows_to_the_sites_reached(db):
     one = recordings.range_stats(db, None, "2026-08-27", "2026-08-27", [site_a])
     assert both["sessions"] == 2
     assert one["sessions"] == 1, "the site filter stopped applying"
+
+
+def test_a_cross_company_caller_gets_every_companys_tombstones(db):
+    """Measured on prod, and this is the leak direction.
+
+    `_metric` passed `company=None` to the counts and the caller's OWN
+    `company_id` to the tombstone lookup. A platform_admin's company owns
+    nothing, so the lookup returned an empty set and another company's deleted
+    session stayed in the total: prod answered 12 sessions for a day where 11 are
+    visible, and the twelfth was the deleted one.
+
+    A count that includes deleted recordings is a way to observe what was
+    deleted, which is the thing `deleted_bases` exists to prevent.
+    """
+    co_a, site_a, uid_a = _seed(db, "tombxa")
+    co_b, site_b, uid_b = _seed(db, "tombxb")
+    for co, site, uid, folder, sid in ((co_a, site_a, uid_a, "tombxa", "1" * 32),
+                                       (co_b, site_b, uid_b, "tombxb", "2" * 32)):
+        _chunk(db, co, site, uid, folder, "2026-08-27", sid, 1)
+        db.execute(
+            "INSERT INTO redactions (company_id, target_type, target_id, reason, "
+            "scope, target_key) VALUES (%s,'recording',gen_random_uuid(),'t','deleted',%s)",
+            (co, f"extractions/{folder}/2026-08-27/sid{sid}"))
+
+    own = redactions.deleted_session_bases(db, co_a, "2026-08-27", "2026-08-27")
+    every = redactions.deleted_session_bases(db, None, "2026-08-27", "2026-08-27")
+
+    assert "sid" + "1" * 32 in own
+    assert "sid" + "2" * 32 not in own, "the company pin stopped pinning"
+    assert {"sid" + "1" * 32, "sid" + "2" * 32} <= every
+
+
+def test_the_cross_company_count_excludes_every_companys_deleted_session(db):
+    """The end of the same wire: what the two arguments do together."""
+    co_a, site_a, uid_a = _seed(db, "tombya")
+    co_b, site_b, uid_b = _seed(db, "tombyb")
+    for co, site, uid, folder, sid in ((co_a, site_a, uid_a, "tombya", "3" * 32),
+                                       (co_b, site_b, uid_b, "tombyb", "4" * 32)):
+        _chunk(db, co, site, uid, folder, "2026-08-27", sid, 1)
+        db.execute(
+            "INSERT INTO redactions (company_id, target_type, target_id, reason, "
+            "scope, target_key) VALUES (%s,'recording',gen_random_uuid(),'t','deleted',%s)",
+            (co, f"extractions/{folder}/2026-08-27/sid{sid}"))
+
+    bases = redactions.deleted_session_bases(db, None, "2026-08-27", "2026-08-27")
+    out = recordings.range_stats(db, None, "2026-08-27", "2026-08-27",
+                                 [site_a, site_b], deleted_bases=bases)
+
+    assert out["sessions"] == 0, "a deleted session survived a cross-company count"
