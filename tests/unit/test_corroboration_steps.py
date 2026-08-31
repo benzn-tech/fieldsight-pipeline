@@ -287,3 +287,26 @@ def test_extraction_returning_junk_does_not_raise(monkeypatch):
     for junk in ['{"not": "a list"}', "not json at all", ""]:
         out, _ = _run(monkeypatch, reply(text=junk))
         assert out["corroborations"] == []
+
+def test_a_verdict_with_no_reason_is_not_a_card(monkeypatch):
+    """Measured on the real API: haiku returned `conflicts` with an empty summary
+    on a claim that was in fact correct. "The web disagrees" with nothing after
+    it is an assertion the reader can neither check nor dismiss."""
+    for state in ("corroborated", "conflicts"):
+        out, _ = _run(monkeypatch, extraction(NAYLOR),
+                      reply(text="...", results=SOURCES),
+                      verdicts({"entity": "Naylor Love Construction",
+                                "state": state, "summary": "   "}))
+        assert out["corroborations"] == [], state
+        assert out["dropped"][-1]["reason"] == "a verdict with no reason"
+
+
+@pytest.mark.parametrize("state", ["not_found", "no_checkable_claim"])
+def test_the_other_two_states_survive_an_empty_summary(monkeypatch, state):
+    """"Nothing usable came back" and "nothing to check" are complete statements
+    on their own; requiring prose there would drop honest results."""
+    out, _ = _run(monkeypatch, extraction(NAYLOR),
+                  reply(text="...", results=SOURCES),
+                  verdicts({"entity": "Naylor Love Construction",
+                            "state": state, "summary": ""}))
+    assert out["corroborations"][0]["state"] == state

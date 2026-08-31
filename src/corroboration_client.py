@@ -49,16 +49,27 @@ logger = logging.getLogger()
 API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 
-# Overridable so a latency regression can be answered without a deploy, but the
-# default is deliberate: the search step needs a model that supports the current
-# web-search tool, and TEST and prod must run the same one.
-DEFAULT_MODEL = os.environ.get("CORROBORATION_MODEL", "claude-opus-5")
+# Overridable so a latency regression can be answered without a deploy. The
+# default is haiku because every step measured faster on it than the answer could
+# afford elsewhere (see WEB_SEARCH_TOOL), and because TEST and prod must run the
+# same model or the tests say nothing about what ships.
+DEFAULT_MODEL = os.environ.get("CORROBORATION_MODEL", "claude-haiku-4-5")
 
-# Dynamic filtering: the model filters results before they reach its context.
-# Requires Opus 4.6+ / Sonnet 4.6+ -- pinned together with DEFAULT_MODEL for that
-# reason, and `max_uses` is what stops one question from becoming six searches
-# inside a step that has twelve seconds.
-WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 3}
+# The basic search tool, chosen by measurement rather than by capability.
+#
+# The dynamic-filtering variant (`web_search_20260209`) is the better tool: it
+# filters results before they reach the model's context. It also requires Opus
+# 4.6+ / Sonnet 4.6+, and on the real API that pairing takes **17 seconds** for a
+# single entity -- against a 12-second budget inside a 24-second hard stop. Three
+# runs, three timeouts. `max_uses: 1` did not help (19.9 s), because what costs
+# the time is the model, not the number of searches: the same model with no tool
+# at all still takes 9.3 s.
+#
+# Haiku with this basic tool answers the same prompt in **4.2-4.7 s** with ten
+# results. That is the whole reason for the downgrade. The cost is real and
+# stated: raw results reach the model's context instead of a filtered set, which
+# is affordable at one to three entities and would not be at thirty.
+WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 2}
 
 # Below this there is no time for a request to do anything but time out, and
 # spending the caller's remaining budget on a doomed attempt is worse than

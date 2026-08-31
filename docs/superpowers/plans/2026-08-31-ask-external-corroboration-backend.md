@@ -12,6 +12,32 @@
 
 ---
 
+## Status — most of this shipped while it was being written
+
+A parallel session executed it. As of 2026-08-31 on `develop`:
+
+| | | |
+|---|---|---|
+| **B5** gate | `src/corroboration_gate.py` | PR #656 |
+| **B3** client | `src/corroboration_client.py` | PR #658 |
+| **B1/B2/B4/B6/B7/B9** route, dispatch, extraction, search, reconcile, switch | `src/corroboration.py`, `lambda_fieldsight_api.py:1271`, `template.yaml` | PR #659 |
+
+**Verified against the deployed TEST function**, not against the suite:
+`fieldsight-test-ask-agent` carries `ENABLE_EXTERNAL_CORROBORATION=false`, and
+`fieldsight-prod-ask-agent` carries nothing — the switch reaches the function
+and is off in both. The same read also confirmed two facts §3 rests on:
+`LLM_PROVIDER=qwen` on TEST, `LLM_HTTP_TIMEOUT=45`.
+
+**What is left is Task 6, and only its second half.** The deploy and the
+env-check are done. The measurement is not, and it is deliberately not:
+obtaining it means turning the flag on in TEST, and TEST holds the customer's
+own meetings. Anyone asking a question during that window sends their entities
+outward. That is exactly the decision in spec §10 — it is not something to
+route around with a probe.
+
+Read the tasks below for what the code is supposed to do and why; do not
+re-implement them.
+
 ## Global Constraints
 
 - **Nothing ships to a customer until §10 decision 1 in the spec has an answer.** The flag defaults `'false'` in both workflows.
