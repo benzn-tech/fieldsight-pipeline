@@ -156,7 +156,13 @@ def count_by_domain(conn, company_id, domain, date_from, date_to,
         "WITH scoped AS ("
         "  SELECT t.id AS topic_id, t.user_id"
         "  FROM topics t JOIN sites s ON s.id = t.site_id"
-        "  WHERE s.company_id = %(company)s"
+        # `company_id=None` means no company restriction, asked for only by
+        # `_metric` and only when `visible_scope` says the caller is
+        # cross-company. Everyone else keeps the pin AND the site narrowing.
+        # ANDing the caller's own company onto a cross-company site set matched
+        # nothing, and `has_topics_in_range` scopes by site alone, so the two
+        # disagreed and a platform_admin was told there were notes and no items.
+        "  WHERE (%(company)s::uuid IS NULL OR s.company_id = %(company)s)"
         "    AND t.report_date BETWEEN %(from)s AND %(to)s"
         "    AND (%(site_ids)s::uuid[] IS NULL OR t.site_id = ANY(%(site_ids)s::uuid[]))"
         "    AND " + visible_topics_predicate("t") +

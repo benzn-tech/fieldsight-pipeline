@@ -194,7 +194,28 @@ def range_stats(conn, company_id, date_from, date_to,
         "  SELECT kind, duration_s, started_at, ended_at, site_id,"
         "    COALESCE(substring(s3_key from '_(sid[0-9a-f]{32})_c[0-9]+\\.'), s3_key) AS fold"
         "  FROM recordings"
-        "  WHERE company_id = %(company)s"
+        # `company_id=None` MEANS NO COMPANY RESTRICTION, and only the ACL
+        # primitive may ask for it -- `visible_scope` sets `cross_company` for
+        # platform_admin, and `_metric` passes None only then.
+        #
+        # Everyone else keeps the pin, which is belt-and-braces over a site set
+        # that is already theirs: for an ordinary role `site_ids` comes from
+        # memberships or list_company_sites and cannot span companies. Removing
+        # it outright would make this function trust whatever site list it is
+        # handed, and a test written for exactly that reason went red when I
+        # tried.
+        #
+        # But the pin cannot apply to a cross-company caller, because the sites
+        # they reach belong to OTHER companies: `company_id = <own> AND site_id =
+        # ANY(<their sites>)` matched nothing, and a platform_admin reaching 5
+        # sites that recorded all day was told "no recording data was registered
+        # for it". `has_topics_in_range` scopes by site alone, which is why the
+        # topic half of that sentence was right while the count was zero.
+        "  WHERE (site_id = ANY(%(sites)s::uuid[])"
+        "         OR (site_id IS NULL"
+        "             AND (%(company)s::uuid IS NULL"
+        "                  OR company_id = %(company)s)))"
+        "    AND (%(company)s::uuid IS NULL OR company_id = %(company)s)"
         "    AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/')"
         "        BETWEEN %(from)s AND %(to)s"
         "    AND (%(authors)s::uuid[] IS NULL OR user_id = ANY(%(authors)s::uuid[]))"
