@@ -166,7 +166,10 @@ def test_no_chunks_returns_not_found_empty_citations(monkeypatch):
     assert result["citations"] == []
     assert result["grounded"] is True
     assert "no relevant records" in result["answer"].lower()  # English-only user-facing string
-    assert result["model"] == llm_utils.CLAUDE_MODEL
+    # This test installs `fail_if_called` above, so it has already proved no
+    # model ran -- and then used to assert a model was named. Naming one put a
+    # model's name under a sentence no model wrote, and the UI renders it.
+    assert result["model"] is None
 
 
 def test_prompt_contains_numbered_chunks(monkeypatch):
@@ -352,7 +355,8 @@ def test_embed_failure_returns_graceful_error_not_raise(monkeypatch):
     assert result["answer"] == ""
     assert result["error"] == "dashscope upstream 503"
     assert result["citations"] == []
-    assert result["model"] == llm_utils.CLAUDE_MODEL
+    # Embedding failed, so the question never reached a model.
+    assert result["model"] is None
 
 
 def test_ask_rag_search_function_error_is_service_error_not_no_records(monkeypatch):
