@@ -29,8 +29,8 @@
 ### Task 1: The dedicated client
 
 **Files:**
-- Create: `src/corroborate_client.py`
-- Test: `tests/unit/test_corroborate_client.py`
+- Create: `src/corroboration_client.py`
+- Test: `tests/unit/test_corroboration_client.py`
 
 **Interfaces:**
 - Consumes: nothing.
@@ -52,7 +52,7 @@ the web_search_result blocks the sources have to come from.
 import time
 import pytest
 
-cc = pytest.importorskip("corroborate_client")
+cc = pytest.importorskip("corroboration_client")
 
 
 def test_budget_reports_what_is_left():
@@ -72,8 +72,8 @@ def test_budget_uses_a_monotonic_clock():
     """Wall-clock jumps (NTP, container resume) must not extend or collapse a
     deadline. A step that thinks it has 20 more seconds because the clock moved
     is a step that outlives the proxy."""
-    import corroborate_client
-    assert "monotonic" in corroborate_client.Budget.__init__.__doc__.lower()
+    import corroboration_client
+    assert "monotonic" in corroboration_client.Budget.__init__.__doc__.lower()
 
 
 def test_call_passes_the_timeout_through_to_the_request(monkeypatch):
@@ -155,8 +155,8 @@ def test_a_missing_key_is_an_error_not_an_exception(monkeypatch):
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `python -m pytest tests/unit/test_corroborate_client.py -q`
-Expected: collection skips with "could not import 'corroborate_client'", or FAIL once the file exists but is empty.
+Run: `python -m pytest tests/unit/test_corroboration_client.py -q`
+Expected: collection skips with "could not import 'corroboration_client'", or FAIL once the file exists but is empty.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -267,256 +267,69 @@ def call_anthropic(prompt, *, max_tokens, timeout, tools=None):
 
 - [ ] **Step 4: Run to verify they pass**
 
-Run: `python -m pytest tests/unit/test_corroborate_client.py -q`
+Run: `python -m pytest tests/unit/test_corroboration_client.py -q`
 Expected: 7 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/corroborate_client.py tests/unit/test_corroborate_client.py
+git add src/corroboration_client.py tests/unit/test_corroboration_client.py
 git commit -m "A client a caller can actually bound"
 ```
 
 ---
 
-### Task 2: The privacy gate
+### Task 2: ~~The privacy gate~~ — ALREADY SHIPPED, read it before Task 3
 
-**Files:**
-- Create: `src/corroborate_gate.py`
-- Test: `tests/unit/test_corroborate_gate.py`
+**Nothing to build.** A parallel session implemented this and merged it while
+this plan was being written: PR #656, `src/corroboration_gate.py` +
+`tests/unit/test_corroboration_gate.py`, on `develop` since 2026-08-31.
 
-**Interfaces:**
-- Consumes: nothing.
-- Produces:
-  - `ALLOWED_KINDS: frozenset` = `{"company", "standard", "product", "public_role", "authority"}`
-  - `gate(entities: list[dict], answer: str, cap: int = 3) -> tuple[list[dict], list[dict]]` — returns `(kept, dropped)`. Each dropped item is `{"entity": str, "reason": str}` with `reason` in `{"kind_not_allowed", "commercial_context", "person_shaped", "too_long", "clause_level", "over_cap"}`.
-
-- [ ] **Step 1: Write the failing tests**
+Read it before starting Task 3 — Task 3 consumes it, and its interface is not
+the one an earlier draft of this plan described.
 
 ```python
-"""Unit: what is allowed to leave the account.
-
-Two things this file is careful about, both conceded in spec §4.1.
-
-The gate is deterministic GIVEN ITS INPUT, but its input is a model-assigned
-`kind` label. So it also applies string-shape checks that do not trust that
-label at all -- a person's name labelled "company" has to be caught by the
-shape, not by the word.
-
-And the attack that DOES fail is worth pinning too, so nobody later "hardens"
-against it and calls the job done: "we're being sued by Naylor Love" yields the
-query `Naylor Love`, which leaks interest in a company and not the dispute.
-"""
-import pytest
-
-g = pytest.importorskip("corroborate_gate")
-
-
-def e(entity, kind="company", claim=None):
-    return {"entity": entity, "kind": kind, "claim": claim}
-
-
-def test_an_allowed_kind_passes():
-    kept, dropped = g.gate([e("Naylor Love")], "Naylor Love is the main contractor.")
-    assert [k["entity"] for k in kept] == ["Naylor Love"]
-    assert dropped == []
-
-
-def test_a_kind_outside_the_allowlist_is_dropped():
-    kept, dropped = g.gate([e("the Downtown claim", kind="project")], "…")
-    assert kept == []
-    assert dropped[0]["reason"] == "kind_not_allowed"
-
-
-def test_a_price_beside_the_entity_drops_it():
-    """The entity is permitted; the sentence it sits in is not."""
-    answer = "Naylor Love disputed the $2.4M variation on the Downtown job."
-    kept, dropped = g.gate([e("Naylor Love")], answer)
-    assert kept == []
-    assert dropped[0]["reason"] == "commercial_context"
-
-
-def test_a_person_shaped_string_labelled_company_is_still_dropped():
-    """The kind label comes from haiku. The shape check does not trust it."""
-    kept, dropped = g.gate([e("Ben Lin", kind="company")], "Ben Lin will inspect it.")
-    assert kept == []
-    assert dropped[0]["reason"] == "person_shaped"
-
-
-def test_a_clause_narrowed_standard_is_dropped():
-    """`NZS 3604` is a public document. `NZS 3604 clause 8.3.1 lintel fixings`
-    identifies the specific defect under dispute, and sending it tells the
-    search provider what went wrong on this site."""
-    kept, dropped = g.gate(
-        [e("NZS 3604 clause 8.3.1 lintel fixings", kind="standard")], "…")
-    assert kept == []
-    assert dropped[0]["reason"] == "clause_level"
-    kept2, _ = g.gate([e("NZS 3604", kind="standard")], "…")
-    assert [k["entity"] for k in kept2] == ["NZS 3604"]
-
-
-def test_being_sued_by_a_company_still_only_sends_the_company():
-    """This attack fails, and the test says so rather than leaving it to
-    somebody's judgement later."""
-    answer = "We are being sued by Naylor Love."
-    kept, _ = g.gate([e("Naylor Love")], answer)
-    assert [k["entity"] for k in kept] == ["Naylor Love"]
-
-
-def test_the_cap_is_three_and_the_overflow_is_reported():
-    ents = [e("A Ltd"), e("B Ltd"), e("C Ltd"), e("D Ltd")]
-    kept, dropped = g.gate(ents, "…")
-    assert len(kept) == 3
-    assert [d["reason"] for d in dropped] == ["over_cap"]
-
-
-def test_a_very_long_entity_is_dropped():
-    kept, dropped = g.gate([e("x" * 200)], "…")
-    assert kept == []
-    assert dropped[0]["reason"] == "too_long"
-
-
-def test_a_chinese_company_name_survives():
-    """This codebase has erased CJK three times with `[^a-z0-9]`-shaped
-    normalisation (memory: fieldsight-ascii-norm-erased-chinese). A Chinese
-    company name must reach the search step intact and distinct."""
-    kept, _ = g.gate([e("中建三局"), e("上海建工")], "两家公司都参与了。")
-    assert [k["entity"] for k in kept] == ["中建三局", "上海建工"]
-```
-
-- [ ] **Step 2: Run to verify they fail**
-
-Run: `python -m pytest tests/unit/test_corroborate_gate.py -q`
-Expected: collection error / FAIL.
-
-- [ ] **Step 3: Write the implementation**
-
-```python
-"""The deterministic half of "only entities leave".
-
-Spec §4. This runs AFTER extraction and does not trust extraction's judgement:
-an LLM asked "is this safe to send?" says yes under a plausible enough
-question, so the decision is plain Python and the tests try to defeat it.
-
-What it cannot do is stated rather than hidden: the `kind` label is
-model-assigned, so the shape checks below exist to catch a wrong label, and
-some residual risk is accepted.
-"""
-import re
-
-ALLOWED_KINDS = frozenset({"company", "standard", "product", "public_role", "authority"})
-
+ALLOWED_KINDS = frozenset({"company", "standard", "product", "material",
+                           "public_role", "regulator", "authority"})
 MAX_ENTITY_CHARS = 60
+MAX_ENTITIES = 3
 
-# Money, quantities and dispute vocabulary in the SENTENCE the entity sits in.
-# The entity may be public; what we are doing with it usually is not.
-_COMMERCIAL = re.compile(
-    r"(\$|NZ\$|AUD|USD|\bclaim\b|\bvariation\b|\bdispute\b|\bsuing\b|\blitigat|"
-    r"\bpenalt|\bliquidated\b|\bretention\b|\bmargin\b|\bquote[ds]?\b|\btender\b|"
-    r"\bcontract sum\b|\bback ?charge)",
-    re.IGNORECASE,
-)
+class Rejected:   # .entity  .kind  .reason        (reason is prose, not a code)
+class GateResult: # .allowed .rejected .truncated
 
-# "Firstname Lastname" in Latin script, optionally with a middle initial.
-# Deliberately Latin-only: a Chinese company name is 2-4 CJK characters and
-# would match almost any "short two-token" heuristic, and dropping every
-# Chinese entity is the ASCII-normalisation bug wearing a different hat.
-_PERSON_SHAPED = re.compile(
-    r"^[A-Z][a-z]{1,15}(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]{1,15}$"
-)
-
-# A standard number narrowed to a clause, section or part.
-_CLAUSE_LEVEL = re.compile(
-    r"\b(clause|section|part|table|figure)\b|\b\d+\.\d+\.\d+\b", re.IGNORECASE
-)
-
-
-def _sentence_around(answer, entity):
-    """The sentence the entity appears in, or the whole answer if not found.
-
-    Falling back to the whole answer is the safe direction: it can only make
-    the commercial check MORE likely to fire.
-    """
-    if not entity or not answer:
-        return answer or ""
-    idx = answer.find(entity)
-    if idx < 0:
-        return answer
-    start = max(answer.rfind(".", 0, idx), answer.rfind("\n", 0, idx)) + 1
-    end = min([p for p in (answer.find(".", idx), answer.find("\n", idx))
-               if p != -1] or [len(answer)])
-    return answer[start:end + 1]
-
-
-def gate(entities, answer, cap=3):
-    """Return (kept, dropped). `dropped` carries a reason for every exclusion."""
-    kept, dropped = [], []
-    for ent in entities or []:
-        name = (ent.get("entity") or "").strip()
-        kind = (ent.get("kind") or "").strip().lower()
-
-        if not name:
-            continue
-        if kind not in ALLOWED_KINDS:
-            dropped.append({"entity": name, "reason": "kind_not_allowed"})
-            continue
-        if len(name) > MAX_ENTITY_CHARS:
-            dropped.append({"entity": name, "reason": "too_long"})
-            continue
-        if _PERSON_SHAPED.match(name):
-            dropped.append({"entity": name, "reason": "person_shaped"})
-            continue
-        if _CLAUSE_LEVEL.search(name):
-            dropped.append({"entity": name, "reason": "clause_level"})
-            continue
-        if _COMMERCIAL.search(_sentence_around(answer, name)):
-            dropped.append({"entity": name, "reason": "commercial_context"})
-            continue
-        kept.append(dict(ent, entity=name, kind=kind))
-
-    if len(kept) > cap:
-        for extra in kept[cap:]:
-            dropped.append({"entity": extra["entity"], "reason": "over_cap"})
-        kept = kept[:cap]
-    return kept, dropped
+def screen_entity(entity, kind) -> str | None      # the reason, or None to allow
+def screen(entities, max_entities=MAX_ENTITIES) -> GateResult
 ```
 
-- [ ] **Step 4: Run to verify they pass**
+**One design difference from this plan's earlier draft, and the shipped one is
+right.** `screen()` takes **only the entities** — it does not take the answer,
+and it does not look at the sentence an entity sits in. The earlier draft
+dropped `Naylor Love` when the surrounding sentence mentioned a dispute or a
+price.
 
-Run: `python -m pytest tests/unit/test_corroborate_gate.py -q`
-Expected: 9 passed.
+That was wrong, and wrong in the expensive direction: **the sentence is never
+sent.** The query is assembled from fields and reaches the search provider as
+`Naylor Love` alone, so the surrounding words cannot leak — while dropping the
+entity costs a legitimate corroboration on exactly the meetings that matter
+most. What does leak is interest in a company, and `corroboration_gate.py`'s
+own docstring names that and accepts it rather than pretending otherwise.
 
-- [ ] **Step 5: The revert-check — prove each rule is load-bearing**
+Do not add an `answer` parameter back.
 
-For each of these, make the edit, run the test file, confirm the named test goes RED, then undo the edit:
-
-| edit | expected failure |
-|---|---|
-| `ALLOWED_KINDS` → add `"project"` | `test_a_kind_outside_the_allowlist_is_dropped` |
-| delete the `_PERSON_SHAPED` branch | `test_a_person_shaped_string_labelled_company_is_still_dropped` |
-| delete the `_COMMERCIAL` branch | `test_a_price_beside_the_entity_drops_it` |
-| delete the `_CLAUSE_LEVEL` branch | `test_a_clause_narrowed_standard_is_dropped` |
-| `_PERSON_SHAPED` → `^\S+\s+\S+$` | `test_a_chinese_company_name_survives` |
-
-A gate that passes because its input never reached it is not a gate. Do not skip this step; it is the only evidence the file does anything.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/corroborate_gate.py tests/unit/test_corroborate_gate.py
-git commit -m "What may leave, decided in Python and not by the model"
-```
-
----
+**Also already covered there, so do not duplicate it in Task 3:** commercial
+terms in Chinese as well as English, NFKC normalisation, the digits-without-
+`standard`-kind rule, clause-narrowed standards, person-shaped strings,
+case-insensitive de-duplication before the cap, and a non-list input degrading
+to "no entities" rather than raising.
 
 ### Task 3: Extraction and reconcile
 
 **Files:**
-- Create: `src/corroborate.py`
-- Test: `tests/unit/test_corroborate.py`
+- Create: `src/corroboration.py`
+- Test: `tests/unit/test_corroboration.py`
 
 **Interfaces:**
-- Consumes: `corroborate_client.Budget`, `corroborate_client.call_anthropic`, `corroborate_gate.gate`
+- Consumes: `corroboration_client.Budget`, `corroboration_client.call_anthropic`, `corroboration_gate.gate`
 - Produces:
   - `STATES: frozenset` = `{"corroborated", "conflicts", "not_found", "no_checkable_claim"}`
   - `extract_entities(question: str, answer: str, budget) -> list[dict]`
@@ -644,7 +457,10 @@ def test_run_returns_the_response_shape(monkeypatch):
 
     out = c.run("q", "a")
     assert [r["state"] for r in out["corroborations"]] == ["corroborated"]
-    assert out["dropped"][0]["reason"] == "kind_not_allowed"
+    # The real gate runs here -- kind "project" is not in ALLOWED_KINDS, and the
+    # reason is the gate's own prose, carried through rather than re-coded.
+    assert out["dropped"][0]["entity"] == "the Downtown claim"
+    assert "allowlist" in out["dropped"][0]["reason"]
     assert out["truncated"] is False
     assert out["timed_out"] is False
 
@@ -665,7 +481,7 @@ def test_run_short_circuits_when_the_gate_keeps_nothing(monkeypatch):
     nothing to look up is the cheapest bug to avoid."""
     called = {"search": 0}
     monkeypatch.setattr(c, "extract_entities",
-                        lambda q, a, b: [{"entity": "x", "kind": "project"}])
+                        lambda q, a, b: [{"entity": "x", "kind": "project"}])  # gate refuses
     monkeypatch.setattr(c, "search",
                         lambda *a, **k: called.__setitem__("search", 1) or ("", []))
     out = c.run("q", "a")
@@ -675,7 +491,7 @@ def test_run_short_circuits_when_the_gate_keeps_nothing(monkeypatch):
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `python -m pytest tests/unit/test_corroborate.py -q`
+Run: `python -m pytest tests/unit/test_corroboration.py -q`
 Expected: collection error / FAIL.
 
 - [ ] **Step 3: Write the implementation**
@@ -697,8 +513,8 @@ import datetime
 import json
 import logging
 
-import corroborate_client as client
-import corroborate_gate as gate_mod
+import corroboration_client as client
+import corroboration_gate as gate_mod
 
 logger = logging.getLogger()
 
@@ -745,6 +561,17 @@ Entities and claims:
 What the web said:
 %s
 """
+
+
+def _dropped_json(rejected):
+    """`Rejected` is an object with prose in `.reason`; the client needs JSON.
+
+    The reason is carried through verbatim rather than mapped to a code. The
+    gate authors wrote them to be read in a log line, and a second vocabulary
+    here is a second thing to keep in sync.
+    """
+    return [{"entity": r.entity, "kind": r.kind, "reason": r.reason}
+            for r in (rejected or [])]
 
 
 def _text_of(data):
@@ -847,19 +674,30 @@ def run(question, answer, total_seconds=24.0):
     budget = client.Budget(total_seconds)
     try:
         raw = extract_entities(question, answer, budget)
-        kept, dropped = gate_mod.gate(raw, answer, cap=ENTITY_CAP)
-        if not kept:
+
+        # corroboration_gate.screen takes ONLY the entities -- not the answer.
+        # The sentence an entity sits in is never sent anywhere, so screening on
+        # it would drop legitimate lookups to defend against a leak that cannot
+        # happen. See the module's own docstring and Task 2.
+        result = gate_mod.screen(raw, max_entities=ENTITY_CAP)
+        dropped = _dropped_json(result.rejected)
+
+        if not result.allowed:
             return {"corroborations": [], "dropped": dropped,
-                    "truncated": False, "timed_out": False}
+                    "truncated": result.truncated, "timed_out": False}
         if budget.expired():
             return {"corroborations": [], "dropped": dropped,
-                    "truncated": False, "timed_out": True}
-        web_text, sources = search(kept, budget)
-        results = reconcile(kept, web_text, sources, budget)
+                    "truncated": result.truncated, "timed_out": True}
+
+        web_text, sources = search(result.allowed, budget)
+        results = reconcile(result.allowed, web_text, sources, budget)
         return {
             "corroborations": results,
             "dropped": dropped,
-            "truncated": any(d["reason"] == "over_cap" for d in dropped),
+            # The gate knows this deterministically. Do not re-derive it by
+            # counting reasons: `truncated` (the cap bit) and `timed_out` (a step
+            # ran out) are different facts and must never collapse into one.
+            "truncated": result.truncated,
             "timed_out": budget.expired(),
         }
     except Exception:
@@ -870,13 +708,13 @@ def run(question, answer, total_seconds=24.0):
 
 - [ ] **Step 4: Run to verify they pass**
 
-Run: `python -m pytest tests/unit/test_corroborate.py -q`
+Run: `python -m pytest tests/unit/test_corroboration.py -q`
 Expected: 10 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/corroborate.py tests/unit/test_corroborate.py
+git add src/corroborate.py tests/unit/test_corroboration.py
 git commit -m "Four states, and the two that are easy to lose"
 ```
 
@@ -1248,8 +1086,10 @@ Leave it off until §10 decision 1 has an answer.
 | §5.4 dedicated client, tools, ≤1 retry | 1 |
 | §5.5 the switch, both workflows, revert-check | 5 |
 | §5.6 `/ask` shape untouched | 4 (last test) |
-| §4 privacy gate, string-shape checks, prompt-contents test | 2, 3 |
-| §7 CJK, defeat-it tests, deployed-env check | 2, 6 |
+| §4 privacy gate | **shipped, PR #656** |
+| §4 prompt-contents test (entities only, no answer) | 3 |
+| §7 CJK + defeat-it tests | **shipped with the gate** |
+| §7 deployed-env check | 6 |
 | §9 measure the search latency | 6 |
 
 **Not in this plan, by design:** the frontend (shipping separately on

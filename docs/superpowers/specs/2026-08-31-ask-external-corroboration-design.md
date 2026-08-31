@@ -169,6 +169,12 @@ The query is **assembled from fields** — `"Naylor Love" CEO` — never quoted 
 a transcript. A test pins that the search step's prompt contains the entity
 strings and nothing else.
 
+**Implemented in `src/corroboration_gate.py`** (PR #656). It screens the entity
+STRING only. An earlier draft of this section screened the sentence around the
+entity as well; that was wrong in the expensive direction, because the sentence is
+never sent and dropping the entity costs a corroboration on exactly the meetings
+that matter most.
+
 ### 4.1 Two honest limits on that claim
 
 **The gate is deterministic given its input, but its input is model-assigned.**
@@ -521,7 +527,7 @@ was one layer below where the draft stopped reading — it verified the repo's
 | B2 | `mode == 'corroborate'` branch in `lambda_ask_agent.lambda_handler` |
 | B3 | **The dedicated client** (§5.4): explicit timeout, ≤1 retry, Anthropic-only, `tools` + `web_search_result` parsing |
 | B4 | Entity + claim extraction, with the CJK test |
-| B5 | **Privacy gate** — kind allowlist *and* string-shape checks, cap 3, defeat-it tests, revert-checks, prompt-contents test |
+| ~~B5~~ | **DONE — PR #656**, `src/corroboration_gate.py`. `screen(entities)` takes only the entities, **not** the answer: the sentence an entity sits in is never sent, so screening on it would drop legitimate lookups against a leak that cannot happen. Do not add an `answer` parameter. |
 | B6 | Web-search step; measure the real latency and report it (§9) |
 | B7 | Reconcile → the four-state enum, with `conflicts` and `no_checkable_claim` fixtures |
 | B8 | Budget accounting against `ApiFunction`'s 30 s; `truncated` and `timed_out` set independently |
