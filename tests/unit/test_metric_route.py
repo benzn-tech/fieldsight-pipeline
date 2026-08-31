@@ -538,3 +538,46 @@ def test_each_metric_names_its_own_noun_in_the_honest_zero(ask):
         assert mr.render("how many", {"metric": metric, "value": 0,
                                       "from": "2026-08-13", "to": "2026-08-13",
                                       "notes": {"zero_kind": "none_of_that_kind"}}) == want
+
+
+def test_a_count_of_one_agrees_with_its_noun(ask):
+    """"1 recordings on 2026-08-13" was the first sentence this route produced on
+    TEST for a real day. A number that cannot agree with its own noun reads as
+    machine output rather than as an answer."""
+    def say(metric, n):
+        return mr.render("how many", {"metric": metric, "value": n,
+                                      "from": "2026-08-13", "to": "2026-08-13",
+                                      "notes": {}})
+    assert say("count_sessions", 1) == "1 recording on 2026-08-13."
+    assert say("count_sessions", 2) == "2 recordings on 2026-08-13."
+    assert say("count_sessions", 0) == "0 recordings on 2026-08-13."
+    assert say("count_photos", 1) == "1 photo on 2026-08-13."
+    assert say("count_findings_safety", 1) == "1 safety issue on 2026-08-13."
+
+
+def test_chinese_has_no_plural_to_agree_with(ask):
+    out = mr.render("昨天录了几次", {"metric": "count_sessions", "value": 1,
+                                     "from": "2026-08-13", "to": "2026-08-13",
+                                     "notes": {}})
+    assert "录音" in out and "recording" not in out
+
+
+def test_chinese_counts_carry_a_measure_word(ask):
+    """"2026-08-13一共 1 录音。" is what TEST produced -- grammatical nonsense
+    from a template that assumed the English shape, where a bare number sits
+    against a bare noun."""
+    def say(metric):
+        return mr.render("多少", {"metric": metric, "value": 1,
+                                  "from": "2026-08-13", "to": "2026-08-13",
+                                  "notes": {}})
+    assert say("count_sessions") == "2026-08-13一共 1 段录音。"
+    assert say("count_photos") == "2026-08-13一共 1 张照片。"
+    assert say("count_findings_safety") == "2026-08-13一共 1 个安全问题。"
+    assert say("count_findings_quality") == "2026-08-13一共 1 个质量问题。"
+
+
+def test_the_chinese_duration_sentence_is_unchanged_by_the_measure_word(ask):
+    """Duration is not a count, so it takes no measure word."""
+    assert mr.render("昨天录了多久",
+                     {"metric": "duration", "value": 1116, "from": "2026-08-13",
+                      "to": "2026-08-13", "notes": {}}) == "2026-08-13你一共录了 18 分钟。"

@@ -94,13 +94,34 @@ _ZERO = {
         "{when}没有{noun}。"),
 }
 
+# (plural, chinese, singular). English counts agree with their number -- "1
+# recordings on 2026-08-13" was the first sentence this route produced on TEST
+# for a real day, and a number that cannot agree with its own noun reads as
+# machine output rather than an answer. Chinese has no such agreement.
 _NOUN = {
-    "count_findings_safety": ("safety issues", "安全问题"),
-    "count_findings_quality": ("quality issues", "质量问题"),
-    "count_sessions": ("recordings", "录音"),
-    "count_photos": ("photos", "照片"),
-    "duration": ("recording time", "录音时长"),
+    "count_findings_safety": ("safety issues", "安全问题", "safety issue"),
+    "count_findings_quality": ("quality issues", "质量问题", "quality issue"),
+    "count_sessions": ("recordings", "录音", "recording"),
+    "count_photos": ("photos", "照片", "photo"),
+    "duration": ("recording time", "录音时长", "recording time"),
 }
+
+# Chinese counts need a measure word between the number and the noun. Without
+# one, "一共 1 录音" is what TEST produced -- grammatical nonsense from a
+# template that assumed the English shape.
+_MEASURE = {
+    "count_sessions": "段",
+    "count_photos": "张",
+    "count_findings_safety": "个",
+    "count_findings_quality": "个",
+}
+
+
+def _noun(metric, zh, n=0):
+    forms = _NOUN.get(metric, ("items", "条目", "item"))
+    if zh:
+        return forms[1]
+    return forms[2] if n == 1 else forms[0]
 
 # Written as "the number is short and here is what it is missing", never as a
 # denominator. `from_fallback` is deliberately absent: which table an item came
@@ -130,7 +151,7 @@ def render(question, result) -> str:
     i = 1 if zh else 0
     metric = (result or {}).get("metric")
     when = _when(result.get("from"), result.get("to"), zh)
-    noun = _NOUN.get(metric, ("items", "条目"))[i]
+    noun = _noun(metric, zh)
 
     if result.get("error") or "value" not in result:
         return ("统计没能完成，请再试一次。" if zh
@@ -148,8 +169,8 @@ def render(question, result) -> str:
         head = (f"{when}你一共录了 {phrase}。" if zh
                 else f"You recorded {phrase} {when}.".replace("  ", " ").strip())
     else:
-        head = (f"{when}一共 {value} {noun}。" if zh
-                else f"{value} {noun} {when}.".replace("  ", " ").strip())
+        head = (f"{when}一共 {value} {_MEASURE.get(metric, '个')}{noun}。" if zh
+                else f"{value} {_noun(metric, zh, value)} {when}.".replace("  ", " ").strip())
 
     tail = [
         _NOTE[k][i].format(n=notes[k])
