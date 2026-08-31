@@ -400,7 +400,11 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
     # only copy of it sat in the action_items child, which is why the enumeration test --
     # which reads the function body as text -- was green while a deleted topic came back in
     # full. Alias `t`, because that is what this statement's FROM declares.
-    where = "WHERE t.site_id = ANY(%s) AND t.report_date=%s"
+    # NOTE the missing `WHERE`: this is a bare condition and the keyword is added
+    # once, at the end. Carrying the keyword inside a string that later gets
+    # wrapped in parentheses is what produced `... LEFT JOIN users u ... (WHERE
+    # t.site_id ...)` -- invalid SQL, on every call that had merged keys.
+    where = "t.site_id = ANY(%s) AND t.report_date=%s"
     params = [list(site_ids), report_date]
     if author_ids is not None:
         where += " AND t.user_id = ANY(%s::uuid[])"
@@ -436,7 +440,7 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
     #
     # A delete applies to every branch of a read, whatever the ACL is doing in
     # any of them.
-    where = f"({where}) AND {visible_topics_predicate('t')}"
+    where = f"WHERE ({where}) AND {visible_topics_predicate('t')}"
 
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "

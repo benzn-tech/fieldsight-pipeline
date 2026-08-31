@@ -1,4 +1,18 @@
-"""Integration: a delete applies to every branch of a read.
+"""Integration: the merged branch of the dashboard read, which never ran.
+
+Before anything about deletions: `list_topics_for_date` with a non-empty
+`merged_keys` produced INVALID SQL. `where` carried the `WHERE` keyword inside
+it, and the merge branch wrapped that string in parentheses -- so the statement
+read `... LEFT JOIN users u ON ... (WHERE t.site_id ...) OR ...`, which Postgres
+rejects at parse time. Every dashboard day view for a user who was in a
+multi-device merged meeting that day raised, on every call.
+
+No test had ever executed it. The repo's fake connection records SQL without
+parsing it, and the existing integration test for this function does not pass
+merged keys. `test_a_live_merged_topic_still_reaches_its_group` below is the
+first thing that runs that branch at all.
+
+## And a delete applies to every branch of a read
 
 `list_topics_for_date` backs the dashboard's day view. Its WHERE is built in
 two halves -- an ACL half, and an OR branch naming the merged artifact keys of
