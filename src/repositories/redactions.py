@@ -160,6 +160,38 @@ def deleted_source_prefixes(conn, folder=None, date=None) -> list:
     return [r["target_key"] for r in rows]
 
 
+def deleted_session_bases(conn, company_id, date_from, date_to) -> set:
+    """The `sid{hex}` bases tombstoned in this company over a date range.
+
+    FROM AURORA, NOT FROM THE S3 MIRROR, and the mirror's own docstring says
+    why: "Aurora stays the authority. This is a cache with one job" -- the job
+    being the non-VPC readers that hold no database connection. `lambda_rag_search`
+    holds one. It is also in the VPC with no egress, so an S3 read from there does
+    not fail, it black-holes until the function times out (BUG-36), and the
+    symptom would look like a slow query.
+
+    Reading it here is cheaper as well as more correct: the mirror is keyed
+    `redactions/{folder}/{date}/deleted_sessions.json`, so a seven-day range
+    across a caller's folders is one GET per folder per day, while this is one
+    query for the range.
+
+    Live `target_key` values are `extractions/{folder}/{date}/sid{32hex}` and the
+    base is the last segment. The date filter reads the segment rather than
+    `created_at`: a tombstone written on Monday can name Sunday's session, and
+    `created_at` would answer a question about Sunday with Monday's deletions.
+    """
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT DISTINCT substring(target_key from '(sid[0-9a-f]{32})$') AS base "
+        "FROM redactions "
+        "WHERE company_id = %s AND target_type = 'recording' AND scope = 'deleted' "
+        "AND reverted_at IS NULL AND target_key IS NOT NULL "
+        "AND substring(target_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') "
+        "    BETWEEN %s AND %s",
+        (company_id, date_from, date_to),
+    ).fetchall()
+    return {r["base"] for r in rows if r["base"]}
+
+
 def is_source_deleted(conn, source_s3_key) -> bool:
     """Whether this object's source has been deleted. Prefix match, not equality: one
     tombstone covers a session's whole folder."""

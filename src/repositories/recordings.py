@@ -118,6 +118,114 @@ def day_stats(conn, company_id, user_folder, date) -> dict:
             "duration_s": int(row["duration_s"] or 0)}
 
 
+def range_stats(conn, company_id, date_from, date_to,
+                site_ids, author_ids=None, deleted_bases=()) -> dict:
+    """Sessions, seconds and photos over a date RANGE, in the ACL's own currency.
+
+    Scoped by `site_ids` and `author_ids` -- the two sets `scope.visible_scope`
+    returns -- and NOT by folder name. A folder name arriving in a request is an
+    ACL bypass wearing a parameter: the caller names whose recordings to count.
+    `recordings.user_id` is NOT NULL (0 of 3127 live) and is the same currency as
+    `author_ids`, so there is nothing folder names buy here.
+
+    `day_stats`'s two rules widened, plus two it does not have.
+
+    1. SESSIONS, NOT ROWS. Folded on the sid parsed out of the key, with the key
+       itself as the fold value when there is no sid -- so pre-chunk-session
+       recordings are one row each and the fold is the identity for them.
+       Measured live: one folder on one day is 263 rows and 5 sessions. Counting
+       rows would tell a person they made fifty times the recordings they made.
+
+    2. THE KEY SEGMENT, NOT `started_at`. That column is timestamptz (UTC) while
+       this range is the caller's local calendar day, which is what
+       `query_slots.time_range` produces and the clock the extraction topics and
+       the s3_key are already on. Filtering by UTC moves an evening recording to
+       the next day -- the BUG-37/finalize-timezone family.
+
+    3. THE SPAN FALLBACK, which `day_stats` lacks. It sums `duration_s` only,
+       which covers 97.9% of sessions; `ended_at - started_at` --
+       `duration_for_media`'s fallback -- takes it to 99.7%. Without it here, 5
+       sessions in 287 contribute zero and the total is quietly short.
+       `unmeasured` counts the sessions that can produce neither, so a short
+       total is visible rather than assumed.
+
+    4. `unattributed` NAMES WHAT THE SITE FILTER COST. `recordings.site_id` is
+       nullable and 87 of 3127 rows live have none, so a site-scoped count drops
+       2.8% of the corpus. Dropping them is right -- a row that belongs to no
+       site cannot be shown to someone whose reach IS a set of sites, and
+       widening the filter when the set is empty is the "empty list means no
+       filter" bug this repo has already shipped once. Dropping them SILENTLY is
+       not: `unattributed` is how many sessions the caller's author scope would
+       have allowed but the site filter excluded, so a number that is short
+       arrives with the reason attached.
+
+    Photos are counted separately and never join the fold: they are rows in this
+    table with `kind='photo'` -- 304 of the 3127 -- and mixing them into a
+    session count is how the fold ratio was first miscomputed.
+
+    `deleted_bases` are session bases the CALLER has already resolved from the
+    deletion mirror, in either spelling. They cannot be resolved here: the
+    tombstones live in the `extractions/` key space, `recordings` has no
+    `source_s3_key` column at all, and the predicate every other reader uses
+    therefore matches nothing against this table. The translation happens in the
+    caller and the exclusion happens here -- and a count that includes deleted
+    recordings is a way to observe what was deleted.
+
+    An empty `site_ids` yields `= ANY('{}')`, which matches no rows. That is the
+    correct deny-by-default: skipping the filter would count the whole company.
+    `author_ids=None` means no author filter, which is what `visible_scope`
+    returns for an ALL- or SITE-scoped caller; an empty SET is still a filter
+    that matches nobody.
+    """
+    bases = {b for b in (deleted_bases or ()) if b}
+    bases |= {b[3:] for b in list(bases) if b.startswith("sid")}
+    bases |= {"sid" + b for b in list(bases) if not b.startswith("sid")}
+
+    row = conn.cursor(row_factory=dict_row).execute(
+        "WITH windowed AS ("
+        "  SELECT kind, duration_s, started_at, ended_at, site_id,"
+        "    COALESCE(substring(s3_key from '_(sid[0-9a-f]{32})_c[0-9]+\\.'), s3_key) AS fold"
+        "  FROM recordings"
+        "  WHERE company_id = %(company)s"
+        "    AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/')"
+        "        BETWEEN %(from)s AND %(to)s"
+        "    AND (%(authors)s::uuid[] IS NULL OR user_id = ANY(%(authors)s::uuid[]))"
+        "), sess AS ("
+        "  SELECT fold,"
+        "    bool_or(site_id = ANY(%(sites)s::uuid[])) AS in_scope,"
+        "    bool_or(site_id IS NULL) AS no_site,"
+        "    COALESCE(SUM(duration_s), 0) AS dur,"
+        "    MAX(EXTRACT(EPOCH FROM (ended_at - started_at))) AS span"
+        "  FROM windowed"
+        "  WHERE kind IN ('audio','video') AND NOT (fold = ANY(%(deleted)s))"
+        "  GROUP BY fold"
+        ")"
+        "SELECT"
+        "  (SELECT count(*) FROM sess WHERE in_scope) AS sessions,"
+        "  (SELECT COALESCE(SUM(CASE WHEN dur > 0 THEN dur"
+        "                            WHEN span > 0 THEN span"
+        "                            ELSE 0 END), 0) FROM sess WHERE in_scope) AS duration_s,"
+        "  (SELECT count(*) FROM sess WHERE in_scope"
+        "     AND COALESCE(dur, 0) <= 0 AND COALESCE(span, 0) <= 0) AS unmeasured,"
+        "  (SELECT count(*) FROM sess WHERE NOT COALESCE(in_scope, false)"
+        "     AND COALESCE(no_site, false)) AS unattributed,"
+        "  (SELECT count(*) FROM windowed"
+        "    WHERE kind = 'photo' AND NOT (fold = ANY(%(deleted)s))"
+        "      AND site_id = ANY(%(sites)s::uuid[])) AS photos",
+        {"company": company_id, "from": date_from, "to": date_to,
+         "sites": [str(s) for s in site_ids],
+         "authors": [str(a) for a in author_ids] if author_ids is not None else None,
+         "deleted": list(bases)},
+    ).fetchone()
+    if row is None:
+        return {"sessions": 0, "duration_s": 0, "unmeasured": 0,
+                "unattributed": 0, "photos": 0}
+    # SUM() over bigint is numeric, which psycopg hands back as Decimal, and
+    # json.dumps has no encoder for Decimal. These go into an HTTP body.
+    return {k: int(row[k] or 0) for k in ("sessions", "duration_s", "unmeasured",
+                                          "unattributed", "photos")}
+
+
 def site_for_media(conn, company_id, user_folder, date, session_base) -> dict | None:
     """The app-tagged site (recordings.site_id) for the recording whose media
     file this extraction session came from, or None. Matches recordings.s3_key

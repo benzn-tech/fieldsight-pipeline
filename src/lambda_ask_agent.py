@@ -850,6 +850,67 @@ def _basis(result, chunks, requested_from, requested_to):
     }
 
 
+def _metric_answer(caller_sub, question, metric, date_from, date_to):
+    """A counting question, answered from SQL and written by a template.
+
+    NO MODEL ON THIS PATH, and that is the whole reason it exists. Ask retrieves
+    text chunks and answers from them; "how long did I record yesterday" has no
+    textual answer anywhere, because nobody says the duration in the meeting --
+    it is a number in a column. Before this route, that question got a summary of
+    the day's topics. Handing the number to a model to phrase would not be safer,
+    it would move the fabrication one step later.
+
+    So: no `llm_utils` call, no `citations`, and `model` stays None rather than
+    naming a model that was never asked. `grounded` is True and `computed` is
+    True -- the number came from rows, not from a paraphrase of rows.
+
+    `basis` is carried in the same shape the chunk path returns, because the UI
+    renders it the same way: the range the answer is actually about, printed
+    before the answer. A metric answer never widens -- widening a count would
+    answer a question about Tuesday with Monday's total and call it Tuesday's.
+    """
+    import metric_render
+
+    if not RAG_SEARCH_FUNCTION:
+        return {"answer": "", "error": "rag-search not configured", "citations": []}
+
+    basis = {"from": date_from, "to": date_to, "widened": False}
+    payload = {"mode": "metric", "metric": metric, "sub": caller_sub,
+               "date_from": date_from, "date_to": date_to}
+    resp = _get_lambda_client().invoke(
+        FunctionName=RAG_SEARCH_FUNCTION,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(payload),
+    )
+    # A crashed rag-search returns a 200 with FunctionError set. It must never
+    # reach the renderer, because the renderer's job is to turn a result into a
+    # sentence and "no result" would come out as an honest-looking zero -- a
+    # broken count that reads as a quiet day.
+    if resp.get("FunctionError"):
+        logger.error("  Ask metric FunctionError: %s", resp.get("FunctionError"))
+        return {"answer": "Search service temporarily unavailable. Please try again.",
+                "error": "rag-search unavailable", "citations": [], "basis": basis}
+
+    result = json.loads(resp["Payload"].read().decode("utf-8"))
+    if result.get("error"):
+        logger.warning("  metric route returned error: %s", result["error"])
+
+    logger.info("  metric=%s value=%s notes=%s", metric,
+                result.get("value"), result.get("notes"))
+    return {
+        "answer": metric_render.render(question, result),
+        "citations": [],
+        "model": None,
+        "grounded": True,
+        "computed": True,
+        "metric": metric,
+        "value": result.get("value"),
+        "unit": result.get("unit"),
+        "notes": result.get("notes") or {},
+        "basis": basis,
+    }
+
+
 def _rag_answer(body):
     """RAG path: embed the question, invoke RAG_SEARCH_FUNCTION for grounded
     chunks (ACL-narrowed to caller_sub's accessible sites), then synthesize
@@ -900,6 +961,18 @@ def _rag_answer(body):
     import query_slots
     today = query_slots.resolve_today(body.get("tz"), now=_parse_now(body.get("now")))
     date_from, date_to = query_slots.time_range(question, today)
+
+    # A counting question leaves here and never reaches the embedder or a model.
+    # `metric_slots` is rules, so a MISS returns None and the question falls
+    # through to exactly what it does today -- the miss costs nothing new, while
+    # a misfire would answer a different question with a number. Imported here
+    # for the same reason `query_slots` is: the legacy hand-built prod zips a
+    # fixed file list and carries neither.
+    import metric_slots
+    _metric = metric_slots.detect(question)
+    if _metric:
+        logger.info("  Ask metric route: %s (%s..%s)", _metric, date_from, date_to)
+        return _metric_answer(caller_sub, question, _metric, date_from, date_to)
 
     try:
         query_vec = dashscope_utils.embed([question])[0]

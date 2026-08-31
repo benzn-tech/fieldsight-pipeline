@@ -509,6 +509,40 @@ def list_report_dates(conn, site_ids, since_date, *, author_ids=None) -> list:
     return [r["report_date"] for r in rows]
 
 
+def has_topics_in_range(conn, site_ids, date_from, date_to, *, author_ids=None) -> bool:
+    """Whether anything was extracted at all in this range, for this caller.
+
+    The third zero's discriminator. A metric answer of 0 has more than one
+    cause, and the two that matter read identically to a person:
+
+      * nothing was recorded -- an honest zero;
+      * something WAS recorded but produced no `recordings` rows -- the RealPTT
+        path never registers them, days before migration 0009 have none, and a
+        lake-fed environment has none. Measured at 15.4% of days that carry
+        topics.
+
+    Answering the second with "you recorded nothing" is the misleading zero
+    `lambda_org_api` was changed to stop producing. This function is how the
+    metric route tells them apart: topics exist, rows do not.
+
+    Same ACL currency and same deletion arm as `list_report_dates`, and the same
+    empty-`site_ids` short circuit -- no round-trip, and False rather than a
+    filter-free count of the company.
+    """
+    if not site_ids:
+        return False
+    where = ("WHERE site_id = ANY(%s::uuid[]) AND report_date BETWEEN %s AND %s "
+             "AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' "
+             "AND r.target_id = topics.id AND r.scope = 'deleted' "
+             "AND r.reverted_at IS NULL)")
+    params = [list(site_ids), date_from, date_to]
+    if author_ids is not None:
+        where += " AND user_id = ANY(%s::uuid[])"
+        params.append(list(author_ids))
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT 1 FROM topics {where} LIMIT 1", tuple(params)).fetchone() is not None
+
+
 def report_date_counts(conn, site_ids, since_date, *, author_ids=None) -> list[dict]:
     """Per-date {report_date, topics, safety} for the calendar's density and
     safety dots. Same ACL scoping and windowing as list_report_dates above —
