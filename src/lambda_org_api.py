@@ -5735,9 +5735,26 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             "participants": t["participants"] or [],
             "summary": t["summary"],
             "key_decisions": [],                    # D3: v1, decisions table deferred
+            # `mention_count` and `collapsed_ids` are NOT optional extras.
+            #
+            # The 0-day collapse removes duplicate rows from this list before it
+            # is serialized: one commitment said in three recordings arrives here
+            # as one row, and the other two topics arrive with an EMPTY
+            # action_items list. Without the count, a reader sees a list that is
+            # quietly two items shorter than what was said, with nothing on
+            # screen accounting for the difference -- strictly worse than not
+            # collapsing at all, because the rows do not just merge, they vanish.
+            #
+            # This serializer is a fixed allowlist, so it dropped both fields on
+            # the way out while every repository-level test stayed green. Found
+            # only by invoking the deployed function and reading the JSON. Any
+            # future field the collapse adds has to be added here too.
             "action_items": [{"id": str(a["id"]), "action": a["text"], "responsible": a["responsible"],
                               "deadline": a["deadline_text"] or (str(a["deadline"]) if a["deadline"] else None),
-                              "priority": a["priority"], "status": a["status"]} for a in t["action_items"]],
+                              "priority": a["priority"], "status": a["status"],
+                              "mention_count": a.get("mention_count", 1),
+                              "collapsed_ids": [str(x) for x in (a.get("collapsed_ids") or [])],
+                              } for a in t["action_items"]],
             # The subject this topic belongs to, when a human has confirmed
             # one. FACTS ONLY -- how many days it was raised on, when last,
             # how much is still open. No judgement: the design deliberately
