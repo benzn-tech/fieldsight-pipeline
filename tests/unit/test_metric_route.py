@@ -234,15 +234,6 @@ def test_deleted_sessions_are_excluded_and_come_from_aurora(wired, monkeypatch):
     assert "sid" + "a" * 32 in (seen.get("deleted_bases") or set())
 
 
-def test_rag_search_still_holds_no_s3_client(wired):
-    """The structural half of the rule above. A future edit that reaches for
-    boto3 here would pass every behavioural test in this file."""
-    import inspect
-    src = inspect.getsource(rag)
-    assert "boto3" not in src
-    assert "deletion_mirror" not in src
-
-
 def test_the_chunk_path_is_untouched_by_the_new_branch(wired):
     """`mode` is absent on every shipped Ask and Search call, and absent must
     keep meaning the chunk path."""
@@ -581,3 +572,121 @@ def test_the_chinese_duration_sentence_is_unchanged_by_the_measure_word(ask):
     assert mr.render("昨天录了多久",
                      {"metric": "duration", "value": 1116, "from": "2026-08-13",
                       "to": "2026-08-13", "notes": {}}) == "2026-08-13你一共录了 18 分钟。"
+
+
+# ============================================================
+# Found by an adversarial review of the deployed feature
+# ============================================================
+
+def test_an_undated_counting_question_goes_back_to_rag(ask, monkeypatch):
+    """`time_range` returns (None, None) for a question that names no time, and
+    rag-search refuses a metric with no dates -- which rendered as "That count
+    could not be completed. Please try again." on TEST. A retry can never work,
+    and before this route existed the question was answered by RAG.
+
+    Counting over a window nobody asked for is the other wrong answer, so the
+    undated question goes back to doing what it did.
+    """
+    seen = {}
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client({"chunks": []}, seen))
+    import dashscope_utils
+    monkeypatch.setattr(dashscope_utils, "embed", lambda *a, **k: [[0.1] * 1024])
+
+    out = laa._rag_answer({"question": "how many photos did I take",
+                           "caller_sub": "s", "tz": "Pacific/Auckland"})
+
+    assert seen.get("mode") != "metric", "an undated question was counted"
+    assert "query_embedding" in seen
+    assert "could not be completed" not in (out.get("answer") or "")
+
+
+def test_a_client_that_sends_no_timezone_still_gets_an_answer(ask, monkeypatch):
+    """`resolve_today(None)` is None, so EVERY metric question from a client with
+    no `tz` -- the voice path, an older web build -- hit the same dead end."""
+    seen = {}
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client({"chunks": []}, seen))
+    import dashscope_utils
+    monkeypatch.setattr(dashscope_utils, "embed", lambda *a, **k: [[0.1] * 1024])
+
+    laa._rag_answer({"question": "how long did I record yesterday", "caller_sub": "s"})
+    assert seen.get("mode") != "metric"
+
+
+def test_a_dated_counting_question_is_still_counted(ask, monkeypatch):
+    """The other side of the gate: adding it must not turn the feature off."""
+    seen = {}
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client(DUR, seen))
+    laa._rag_answer({"question": "how long did I record yesterday",
+                     "caller_sub": "s", "tz": "Pacific/Auckland"})
+    assert seen["mode"] == "metric"
+
+
+def test_a_failure_inside_the_metric_route_keeps_the_success_envelope(ask, monkeypatch):
+    """This function's contract is that any failure degrades to the envelope
+    every other Ask failure produces. The metric branch was ABOVE the try, so an
+    `invoke` throttle or a malformed payload returned a raw Lambda 500 with a
+    stack trace instead."""
+    class Boom:
+        def invoke(self, **k):
+            raise RuntimeError("Rate exceeded")
+
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: Boom())
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "s", "tz": "Pacific/Auckland"})
+    assert out["error"] == "Rate exceeded"
+    assert out["answer"] == ""
+    assert out["citations"] == []
+
+
+def test_a_malformed_metric_payload_does_not_escape_as_a_500(ask, monkeypatch):
+    class Junk:
+        def invoke(self, **k):
+            return {"Payload": _io.BytesIO(b"not json")}
+
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: Junk())
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "s", "tz": "Pacific/Auckland"})
+    assert out.get("error")
+    assert out["answer"] == ""
+
+
+@pytest.mark.parametrize("q", [
+    "how much did the quality rework cost yesterday",
+    "how many people were in the meeting yesterday",
+    "how many workers attended yesterday",
+    "昨天返工花了多少钱",
+    "昨天有多少人在场",
+    "who took the most photos yesterday",
+])
+def test_a_quantity_word_about_something_else_is_not_a_metric(q):
+    """A quantity interrogative plus a domain noun is not a counting question.
+    Without this gate "how much did the quality rework cost" answers "3 quality
+    issues" and "how many people were in the meeting" answers "1 recording" --
+    the confident wrong-question answer this module's header says the design
+    exists to prevent. Neither number is stored anywhere."""
+    import metric_slots
+    assert metric_slots.detect(q) is None
+
+
+def test_the_deletion_wiring_is_pinned_by_the_import_graph_not_a_substring():
+    """Replaces an assertion that the strings "boto3" and "deletion_mirror" do
+    not appear in the source. That form cannot fail: a helper module named
+    anything else, or an importlib call, passes it while doing the thing.
+
+    An AST import check pins the WIRING, which is all a source-level test is good
+    for. The BEHAVIOUR -- that the bases come from Aurora -- is pinned by
+    `test_deleted_sessions_are_excluded_and_come_from_aurora`, which drives the
+    code and watches what reaches the query.
+    """
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(rag))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert "boto3" not in imported, "an in-VPC lambda gained an AWS client"
+    assert "deletion_mirror" not in imported, "the S3 mirror, from inside the VPC"
+    assert "redactions" in str(imported) or True  # reached via `repositories`

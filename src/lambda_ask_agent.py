@@ -962,19 +962,33 @@ def _rag_answer(body):
     today = query_slots.resolve_today(body.get("tz"), now=_parse_now(body.get("now")))
     date_from, date_to = query_slots.time_range(question, today)
 
-    # A counting question leaves here and never reaches the embedder or a model.
-    # `metric_slots` is rules, so a MISS returns None and the question falls
-    # through to exactly what it does today -- the miss costs nothing new, while
-    # a misfire would answer a different question with a number. Imported here
-    # for the same reason `query_slots` is: the legacy hand-built prod zips a
-    # fixed file list and carries neither.
-    import metric_slots
-    _metric = metric_slots.detect(question)
-    if _metric:
-        logger.info("  Ask metric route: %s (%s..%s)", _metric, date_from, date_to)
-        return _metric_answer(caller_sub, question, _metric, date_from, date_to)
-
     try:
+        # A counting question leaves here and never reaches the embedder or a
+        # model. `metric_slots` is rules, so a MISS returns None and the question
+        # falls through to exactly what it does today -- the miss costs nothing
+        # new, while a misfire would answer a different question with a number.
+        # Imported here for the same reason `query_slots` is: the legacy
+        # hand-built prod zips a fixed file list and carries neither.
+        #
+        # INSIDE the try, and that is not tidiness. This function's contract is
+        # that any failure degrades to the same success envelope every other Ask
+        # failure produces; a branch above the try returns a raw Lambda 500 with
+        # a stack trace instead, from an `invoke` throttle or a malformed
+        # payload. It was above the try when this shipped.
+        #
+        # AND ONLY WITH A RANGE. `time_range` returns (None, None) for a question
+        # that names no time -- "how many photos did I take" -- and rag-search
+        # refuses a metric with no dates, which rendered as "That count could not
+        # be completed. Please try again." A retry can never work, and before
+        # this route existed the question was answered by RAG. Counting over a
+        # window nobody asked for is the other wrong answer, so an undated
+        # counting question goes back to doing what it did.
+        import metric_slots
+        _metric = metric_slots.detect(question) if date_from else None
+        if _metric:
+            logger.info("  Ask metric route: %s (%s..%s)", _metric, date_from, date_to)
+            return _metric_answer(caller_sub, question, _metric, date_from, date_to)
+
         query_vec = dashscope_utils.embed([question])[0]
 
         payload = {"sub": caller_sub, "query_embedding": query_vec, "k": k}

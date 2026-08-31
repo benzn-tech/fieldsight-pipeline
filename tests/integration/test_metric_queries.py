@@ -393,3 +393,100 @@ def test_the_range_is_inclusive_at_both_ends(db):
         findings.insert_findings(db, t["id"], site, [{"observation": "x", "domain": "safety"}])
 
     assert findings.count_by_domain(db, co, "safety", "2026-08-24", "2026-08-26")["count"] == 2
+
+
+# ============================================================
+# Found by an adversarial review of the deployed feature
+# ============================================================
+
+def test_only_the_rows_on_a_reachable_site_are_summed(db):
+    """A session's site test is per ROW. `in_scope` asks whether ANY row is on a
+    site the caller can reach, and the sums then count only those rows. Summing
+    the whole fold once one row qualified reports seconds recorded on a site the
+    ACL hides everywhere else in the product.
+
+    No session spans two sites in either live database today; multi-device merge
+    groups by session id, which is exactly how one would arrive.
+    """
+    co, site_a, uid = _seed(db, "twosite")
+    site_b = sites.create_site(db, co, "S-twosite-b")["id"]
+    sid = "7" * 32
+    for i, s in ((1, site_a), (2, site_b), (3, site_b)):
+        recordings.insert_pending(
+            db, co, uid, s, "audio",
+            f"users/twosite/audio/2026-08-27/dev_sid{sid}_c{i:04d}.wav",
+            f"ts-{i}", "2026-08-27T10:00:00Z", duration_s=100)
+
+    out = recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site_a])
+
+    assert out["sessions"] == 1, "the session is reachable through its site-A chunk"
+    assert out["duration_s"] == 100, "seconds from a site the caller cannot reach"
+
+
+def test_a_chunked_session_with_no_duration_spans_the_whole_session(db):
+    """`MAX(ended_at - started_at)` is the span of ONE ~30s chunk, so a
+    nine-minute session whose rows carry no `duration_s` reported 30 seconds
+    while `unmeasured` stayed 0 -- short by 94%, with nothing flagging it. Only
+    the one-row legacy case was covered, where the two are equal."""
+    co, site, uid = _seed(db, "spanchunks")
+    sid = "b" * 32
+    for i in range(18):
+        recordings.insert_pending(
+            db, co, uid, site, "audio",
+            f"users/spanchunks/audio/2026-08-27/dev_sid{sid}_c{i:04d}.wav",
+            f"sc-{i}", f"2026-08-27T10:{i:02d}:00Z",
+            ended_at=f"2026-08-27T10:{i:02d}:30Z", duration_s=None)
+
+    out = recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site])
+
+    assert out["sessions"] == 1
+    # 10:00:00 to 10:17:30 -- the session, not the longest chunk in it.
+    assert out["duration_s"] == 1050, "the span was one chunk, not the session"
+    assert out["unmeasured"] == 0
+
+
+def test_a_photo_belonging_to_a_deleted_session_is_still_counted(db):
+    """A DOCUMENTED GAP, pinned so nobody reads its absence as coverage.
+
+    A photo key carries no session id, so its fold is the whole key and no
+    `sid{hex}` base can equal it. The filter that used to sit on the photo count
+    excluded nothing, ever, while reading as a guard. Linking the two is not
+    possible from these keys: the tombstone names
+    `extractions/{folder}/{date}/sid{hex}` and the photo is
+    `users/{folder}/pictures/{date}/IMG_x.jpg`, sharing only a folder and a day.
+
+    If this test ever goes red because a photo IS excluded, that is the gap being
+    closed -- update it, do not restore the no-op.
+    """
+    co, site, uid = _seed(db, "delphoto")
+    _chunk(db, co, site, uid, "delphoto", "2026-08-27", "c" * 32, 1)
+    recordings.insert_pending(
+        db, co, uid, site, "photo",
+        "users/delphoto/pictures/2026-08-27/IMG_1.jpg",
+        "dp-1", "2026-08-27T10:00:00Z")
+
+    out = recordings.range_stats(db, co, "2026-08-27", "2026-08-27", [site],
+                                 deleted_bases={"sid" + "c" * 32})
+
+    assert out["sessions"] == 0, "the audio session IS excluded"
+    assert out["photos"] == 1, "the photo is not, and this is known"
+
+
+def test_null_author_is_silent_when_every_author_is_in_scope(db):
+    """`null_author` is what a per-author scope cannot see. With no author filter
+    those rows are IN the count, and printing "2 items sit on notes with no
+    recorded author" beside a complete number implies it is short when it is
+    not."""
+    co, site, uid = _seed(db, "nullauth")
+    t = topics.upsert_topic(db, site, "2026-08-27", "Orphan", user_id=None,
+                            source_s3_key="extractions/na/2026-08-27/sid1.json")
+    findings.insert_findings(db, t["id"], site, [{"observation": "x", "domain": "safety"}])
+
+    unfiltered = findings.count_by_domain(db, co, "safety", "2026-08-27", "2026-08-27")
+    assert unfiltered["count"] == 1
+    assert unfiltered["null_author"] == 0, "a complete number was given a caveat"
+
+    filtered = findings.count_by_domain(db, co, "safety", "2026-08-27", "2026-08-27",
+                                        author_ids=[uid])
+    assert filtered["count"] == 0
+    assert filtered["null_author"] == 1, "a short number lost its reason"
