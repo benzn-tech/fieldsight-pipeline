@@ -32,9 +32,14 @@ def is_cjk(question) -> bool:
 def duration_phrase(seconds, zh=False) -> str:
     """Seconds as a person says them.
 
-    Rounded to the minute above an hour and to the second below a minute: "1
-    hour 17 minutes" is what someone wants to hear, "4620 seconds" is what the
-    column holds, and "1.28 hours" is neither.
+    TRUNCATED, not rounded, at each unit: 3599 seconds is "59 minutes" and not
+    "1 hour". That is the right direction for a total someone may act on -- it
+    never claims more time than was recorded -- but the docstring said "rounded"
+    while the code did `divmod`, and a stated behaviour the code does not have is
+    how this repo has shipped comments that outlived their code.
+
+    "1 hour 17 minutes" is what someone wants to hear; "4620 seconds" is what the
+    column holds and "1.28 hours" is neither.
     """
     seconds = int(seconds or 0)
     if seconds <= 0:

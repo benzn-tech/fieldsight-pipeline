@@ -139,7 +139,11 @@ def count_by_domain(conn, company_id, domain, date_from, date_to,
     `author_ids` narrows to a set of authors and `null_author` is what that scope
     cannot see by construction: findings on topics nobody is recorded as having
     made. It is reported rather than subtracted silently, so a smaller number
-    arrives with its reason. `unlabelled` is findings whose `domain` is NULL --
+    arrives with its reason -- and ONLY when an author filter is active. With
+    `author_ids=None` those rows are IN the count, and telling an admin "2 items
+    sit on notes with no recorded author" beside a complete number implies it is
+    short when it is not. The docstring said "what that scope cannot see" while
+    the SQL counted them for every caller. `unlabelled` is findings whose `domain` is NULL --
     measured 0 of 189 live, so it is almost always zero and the caller does not
     print a zero.
 
@@ -177,7 +181,7 @@ def count_by_domain(conn, company_id, domain, date_from, date_to,
         "  COALESCE(SUM(n) FILTER (WHERE %(authors)s::uuid[] IS NULL"
         "                          OR user_id = ANY(%(authors)s::uuid[])), 0) AS count,"
         "  COALESCE(SUM(n_unlabelled), 0) AS unlabelled,"
-        "  COALESCE(SUM(n) FILTER (WHERE user_id IS NULL), 0) AS null_author,"
+        "  COALESCE(SUM(n) FILTER (WHERE user_id IS NULL""                          AND %(authors)s::uuid[] IS NOT NULL), 0) AS null_author,"
         "  COALESCE(SUM(n_fb) FILTER (WHERE %(authors)s::uuid[] IS NULL"
         "                             OR user_id = ANY(%(authors)s::uuid[])), 0) AS from_fallback"
         " FROM counted",
