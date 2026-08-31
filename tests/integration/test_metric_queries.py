@@ -322,7 +322,12 @@ def test_the_tenant_comes_through_site_id_not_through_users(db):
 
     out = findings.count_by_domain(db, co, "safety", "2026-08-27", "2026-08-27")
     assert out["count"] == 1, "a NULL-author finding vanished from an unscoped count"
-    assert out["null_author"] == 1, "and it was not named"
+    # NOT `null_author == 1` here, which is what this test asserted when it was
+    # written and what CI caught: with no author filter the row is IN the count,
+    # so naming it implies the number is short when it is complete. The naming
+    # behaviour belongs to a scope that genuinely cannot see the row --
+    # test_null_author_is_silent_when_every_author_is_in_scope covers both sides.
+    assert out["null_author"] == 0
 
 
 def test_a_self_scoped_caller_is_told_what_they_cannot_see(db):
