@@ -163,8 +163,16 @@ def range_stats(conn, company_id, date_from, date_to,
     table with `kind='photo'` -- 304 of the 3127 -- and mixing them into a
     session count is how the fold ratio was first miscomputed.
 
-    `deleted_bases` are session bases the CALLER has already resolved from the
-    deletion mirror, in either spelling. They cannot be resolved here: the
+    `deleted_bases` EXCLUDES SID-KEYED AUDIO AND VIDEO SESSIONS ONLY. A row with
+    no session id in its key -- a pre-chunk-session recording, or any photo --
+    has the whole key as its fold, which no `sid{hex}` base can equal, so it
+    cannot be excluded here and is not claimed to be. The tombstones name
+    `extractions/{folder}/{date}/sid{hex}` and there is nothing in a legacy key
+    or a photo key to match it against; closing that belongs where the tombstone
+    is written, not here.
+
+    Otherwise: session bases the CALLER has already resolved, in either
+    spelling. They cannot be resolved here: the
     tombstones live in the `extractions/` key space, `recordings` has no
     `source_s3_key` column at all, and the predicate every other reader uses
     therefore matches nothing against this table. The translation happens in the
@@ -192,10 +200,26 @@ def range_stats(conn, company_id, date_from, date_to,
         "    AND (%(authors)s::uuid[] IS NULL OR user_id = ANY(%(authors)s::uuid[]))"
         "), sess AS ("
         "  SELECT fold,"
+        # ONE session, and the site test is per ROW, not per session. `in_scope`
+        # asks whether any of this session's rows are on a site the caller can
+        # reach; the sums below then count ONLY those rows. Summing the whole
+        # fold once one row qualified would report seconds recorded on a site the
+        # ACL hides everywhere else in the product -- no session spans two sites
+        # in either live database today, but multi-device merge groups by session
+        # id, which is exactly how one would arrive.
         "    bool_or(site_id = ANY(%(sites)s::uuid[])) AS in_scope,"
         "    bool_or(site_id IS NULL) AS no_site,"
-        "    COALESCE(SUM(duration_s), 0) AS dur,"
-        "    MAX(EXTRACT(EPOCH FROM (ended_at - started_at))) AS span"
+        "    COALESCE(SUM(duration_s) FILTER"
+        "      (WHERE site_id = ANY(%(sites)s::uuid[])), 0) AS dur,"
+        # THE SPAN OF THE SESSION, not the longest chunk in it. `MAX(ended_at -
+        # started_at)` is the span of one ~30s chunk, so a nine-minute session
+        # whose rows carry no `duration_s` reported 30 seconds and `unmeasured`
+        # stayed 0 -- a total short by 94% with nothing flagging it. Only the
+        # one-row legacy case was covered by a test, where the two are equal.
+        "    EXTRACT(EPOCH FROM ("
+        "      MAX(ended_at) FILTER (WHERE site_id = ANY(%(sites)s::uuid[]))"
+        "      - MIN(started_at) FILTER (WHERE site_id = ANY(%(sites)s::uuid[]))"
+        "    )) AS span"
         "  FROM windowed"
         "  WHERE kind IN ('audio','video') AND NOT (fold = ANY(%(deleted)s))"
         "  GROUP BY fold"
@@ -209,9 +233,17 @@ def range_stats(conn, company_id, date_from, date_to,
         "     AND COALESCE(dur, 0) <= 0 AND COALESCE(span, 0) <= 0) AS unmeasured,"
         "  (SELECT count(*) FROM sess WHERE NOT COALESCE(in_scope, false)"
         "     AND COALESCE(no_site, false)) AS unattributed,"
+        # NO DELETION FILTER HERE, AND IT IS NOT AN OVERSIGHT. A photo key
+        # carries no session id, so its `fold` is the whole key and can never
+        # equal a `sid{hex}` base -- the filter that used to sit here read as
+        # protection and excluded nothing, ever. Linking a photo to a deleted
+        # session is not possible from these keys at all: the tombstone names
+        # `extractions/{folder}/{date}/sid{hex}` and the photo is
+        # `users/{folder}/pictures/{date}/IMG_x.jpg`, sharing only a folder and
+        # a day. A documented gap beats a no-op that looks like a guard.
         "  (SELECT count(*) FROM windowed"
-        "    WHERE kind = 'photo' AND NOT (fold = ANY(%(deleted)s))"
-        "      AND site_id = ANY(%(sites)s::uuid[])) AS photos",
+        "    WHERE kind = 'photo' AND site_id = ANY(%(sites)s::uuid[]))"
+        "    AS photos",
         {"company": company_id, "from": date_from, "to": date_to,
          "sites": [str(s) for s in site_ids],
          "authors": [str(a) for a in author_ids] if author_ids is not None else None,

@@ -39,6 +39,20 @@ _QUANTITY = re.compile(
     re.IGNORECASE,
 )
 
+# Gate 2a. A quantity word whose subject is something this module cannot count.
+# "How much did the quality rework COST" is a money question and "how many PEOPLE
+# were in the meeting" is an attendance question; both carry a quantity
+# interrogative and a domain noun, and without this gate the first answers "3
+# quality issues" and the second "1 recording" -- exactly the confident
+# wrong-question answer the header says the design exists to prevent. Neither
+# number is stored anywhere, so there is nothing to route them to.
+_NOT_OURS = re.compile(
+    r"\bcosts?\b|\bprice\b|\bbudget\b|\bspend\b|\bspent\b|\bdollars?\b"
+    r"|\bpeople\b|\bpersons?\b|\battend\w*\b|\bwho\b|\bwhom\b"
+    r"|多少钱|费用|成本|预算|多少人|几个人|几位|几名",
+    re.IGNORECASE,
+)
+
 # Gate 2. Asking for the items as well as the number.
 _ALSO_WANTS_ITEMS = re.compile(
     r"\band what (were|was|are|is)\b"
@@ -80,6 +94,8 @@ def detect(question):
     if not _QUANTITY.search(text):
         return None
     if _ALSO_WANTS_ITEMS.search(text):
+        return None
+    if _NOT_OURS.search(text):
         return None
     for name, pattern in _METRICS:
         if pattern.search(text):
