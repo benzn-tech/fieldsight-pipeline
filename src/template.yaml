@@ -1973,7 +1973,13 @@ Resources:
             - !If
               - IsProdWithOrgApi
               - Effect: Allow
-                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+                # GetItem was missing here until 2026-09-01. redeem reads the
+                # code back before validating it (lambda_org_api.py get_item),
+                # so every prod redeem failed until someone added an inline
+                # `qr-redeem-getitem` policy to the role BY HAND. That patch is
+                # invisible to this template and a stack update can drop it, so
+                # the grant lives here now and the hand patch is redundant.
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:GetItem]
                 Resource: !GetAtt QrLoginCodesTable.Arn
               - !Ref AWS::NoValue
       Events:
