@@ -301,12 +301,12 @@ Parameters:
   QwenModelPlus:
     Type: String
     Description: Qwen model for structured-JSON tasks (report/meeting/extract/matcher)
-    Default: qwen3.7-max
+    Default: qwen3.8-flash
 
   QwenModelFast:
     Type: String
     Description: Qwen model for the latency-bound ask path
-    Default: qwen3.6-flash
+    Default: qwen3.8-flash
 
   AsrProvider:
     Type: String
