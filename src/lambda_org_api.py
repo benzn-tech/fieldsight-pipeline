@@ -4411,6 +4411,19 @@ def _dates_window_start(months) -> "datetime.date":
     return (now_nz - timedelta(days=m * 30)).date()
 
 
+def _dates_today() -> "datetime.date":
+    """Today in NZ, from the SAME clock as _dates_window_start.
+
+    Only used to close the range handed to `deleted_session_bases`. Deriving it
+    from a bare UTC now would drop the current NZ day for thirteen hours every
+    night, so a session deleted this evening would not be excluded from the
+    upload index -- the calendar would keep a dot for a day the customer had
+    just taken back, which is the exact fact they were asking to withdraw.
+    """
+    return (datetime.now(timezone.utc) + timedelta(hours=13)).date()
+
+
+
 def get_org_dates(conn, caller, event):
     """Membership-scoped report-date index for the Timeline dots — the Aurora
     replacement for legacy /api/dates (get_dates), whose missing ?site check
@@ -4433,15 +4446,49 @@ def get_org_dates(conn, caller, event):
     # return neither — so both vanished from the calendar the moment prod's
     # timeline source became Aurora. `hasReport` stays exactly as it was, so a
     # client that only reads that field is unaffected.
-    rows = topics.report_date_counts(conn, site_ids, since,
-                                     author_ids=_author_filter(conn, caller))
-    return ok({"dates": {
+    author_ids = _author_filter(conn, caller)
+    rows = topics.report_date_counts(conn, site_ids, since, author_ids=author_ids)
+    out = {
         str(r["report_date"]): {
             "hasReport": True,
             "topics": r["topics"],
             "safety": r["safety"],
         } for r in rows
-    }})
+    }
+
+    # ?uploads=1 -- OPT-IN, and the opt-in is the point.
+    #
+    # A day is only in this index if extraction produced topics for it, so when
+    # extraction stops the calendar stops. On 2026-09-02 the LLM provider's
+    # account went into arrears and a day holding 53 photos and 5 recordings
+    # became indistinguishable from a day nobody switched the device on. There
+    # was no dot to click, so no later screen could be reached -- which is why
+    # this endpoint, not the day view, is the first thing that has to know.
+    #
+    # It cannot be unconditional. Nine callers read this map; eight filter on
+    # `hasReport` and are unaffected, but today.js's `_fallbackCandidates`
+    # takes Object.keys(...) with NO such filter and probes the newest few for
+    # a report. Adding report-less dates there would spend its probe budget on
+    # days that 404 and hide the most recent real report -- a regression in the
+    # page most likely to be looked at first. So the default response stays
+    # BYTE-IDENTICAL and a client asks for the wider index once it can draw it.
+    if (p.get("uploads") or "").strip() == "1":
+        company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        deleted = redactions.deleted_session_bases(conn, company, since, _dates_today())
+        for u in recordings.upload_date_counts(
+                conn, company, site_ids, since,
+                author_ids=author_ids, deleted_bases=deleted):
+            entry = out.setdefault(u["date"], {"hasReport": False, "topics": 0, "safety": 0})
+            entry["hasUploads"] = True
+            entry["sessions"] = u["sessions"]
+            entry["photos"] = u["photos"]
+        # Absent uploads is a fact too: a report-only day (RealPTT, pre-0009,
+        # lake-fed media) must not read as "uploads unknown" to a client that
+        # just asked about uploads.
+        for entry in out.values():
+            entry.setdefault("hasUploads", False)
+
+    return ok({"dates": out})
 
 
 # ----------------------------------------------------------

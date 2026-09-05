@@ -279,6 +279,90 @@ def range_stats(conn, company_id, date_from, date_to,
                                           "unattributed", "photos")}
 
 
+def upload_date_counts(conn, company_id, site_ids, since_date, *,
+                       author_ids=None, deleted_bases=()) -> list[dict]:
+    """Per-date {date, sessions, photos} from `recordings` ALONE — no topics,
+    no extraction, no LLM.
+
+    Why it exists: every day-level surface in this product is keyed on
+    extraction topics, so when extraction stops the calendar stops too. On
+    2026-09-02 the LLM provider's account went into arrears and stayed there;
+    a day holding 53 photos and 5 recordings became indistinguishable from a
+    day nobody switched the device on, and the customer found it before we did.
+    A date index that survives the LLM is the first thing that has to exist,
+    because nothing downstream is reachable while the calendar is empty.
+
+    THE DATE COMES FROM THE KEY, NOT FROM started_at. `started_at` is
+    timestamptz while every other date in this product -- the extraction
+    topics, the s3_key path, day_stats, range_stats -- is the device's local
+    day. Filtering on the UTC column moves an evening recording to the next
+    day (the BUG-37/finalize family). The key segment is the one clock they
+    all agree on.
+
+    ACL is `range_stats`'s, verbatim and for its reasons: the site set is the
+    caller's, `company_id=None` means no company restriction and only an ACL
+    primitive may ask for it (platform_admin via is_cross_company), and rows
+    with a NULL site fall back to the company pin rather than vanishing.
+
+    Sessions fold by session id so a 9-minute meeting arriving as 21 chunk
+    rows counts once -- the same fold `day_stats`/`range_stats` use.
+
+    DELETED SESSIONS ARE EXCLUDED; DELETED PHOTOS CANNOT BE. `deleted_bases`
+    removes tombstoned audio/video sessions. It cannot do the same for photos,
+    and that is not an oversight here any more than it is in `range_stats`: a
+    photo key carries no session id, so the tombstone
+    (`extractions/{folder}/{date}/sid{hex}`) and the photo
+    (`users/{folder}/pictures/{date}/IMG.jpg`) share only a folder and a day.
+    A day whose only recording was deleted therefore still reports its photos.
+    That is a real gap, documented rather than papered over -- see
+    docs/superpowers/specs/2026-09-05-day-view-without-the-llm. It is also why
+    this function returns COUNTS and the photo LIST is a separate, later
+    change: a count says "something was captured here", which the calendar dot
+    already said before the delete.
+    """
+    if not site_ids:
+        return []
+    bases = {b for b in (deleted_bases or ()) if b}
+    bases |= {b[3:] for b in list(bases) if b.startswith("sid")}
+    bases |= {"sid" + b for b in list(bases) if not b.startswith("sid")}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "WITH windowed AS ("
+        "  SELECT kind, site_id,"
+        "    substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') AS key_date,"
+        "    COALESCE(substring(s3_key from '_(sid[0-9a-f]{32})_c[0-9]+\\.'), s3_key) AS fold"
+        "  FROM recordings"
+        "  WHERE (site_id = ANY(%(sites)s::uuid[])"
+        "         OR (site_id IS NULL"
+        "             AND (%(company)s::uuid IS NULL"
+        "                  OR company_id = %(company)s)))"
+        "    AND (%(company)s::uuid IS NULL OR company_id = %(company)s)"
+        "    AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') >= %(since)s"
+        "    AND (%(authors)s::uuid[] IS NULL OR user_id = ANY(%(authors)s::uuid[]))"
+        "), sess AS ("
+        "  SELECT key_date, count(DISTINCT fold) AS sessions"
+        "  FROM windowed"
+        "  WHERE kind IN ('audio','video') AND NOT (fold = ANY(%(deleted)s))"
+        "  GROUP BY key_date"
+        "), pics AS ("
+        "  SELECT key_date, count(*) AS photos"
+        "  FROM windowed WHERE kind = 'photo' GROUP BY key_date"
+        ")"
+        "SELECT COALESCE(s.key_date, p.key_date) AS date,"
+        "       COALESCE(s.sessions, 0) AS sessions,"
+        "       COALESCE(p.photos, 0) AS photos "
+        "FROM sess s FULL OUTER JOIN pics p ON p.key_date = s.key_date "
+        "WHERE COALESCE(s.key_date, p.key_date) IS NOT NULL "
+        "ORDER BY 1",
+        {"company": str(company_id) if company_id else None,
+         "sites": [str(s) for s in site_ids],
+         "since": str(since_date),
+         "authors": [str(a) for a in author_ids] if author_ids is not None else None,
+         "deleted": list(bases)},
+    ).fetchall()
+    return [{"date": r["date"], "sessions": int(r["sessions"] or 0),
+             "photos": int(r["photos"] or 0)} for r in rows]
+
+
 def site_for_media(conn, company_id, user_folder, date, session_base) -> dict | None:
     """The app-tagged site (recordings.site_id) for the recording whose media
     file this extraction session came from, or None. Matches recordings.s3_key
