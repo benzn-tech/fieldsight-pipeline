@@ -17,7 +17,12 @@ else:
     t=[x for x in n['speaker_turns'] if x.get('abs_start')]
     n_seg=1
 t.sort(key=lambda x:x['abs_start']); t=EX._dedup_turn_boundaries(t)
-prompt=EX.build_extraction_prompt("Ben_UCPK2","2026-08-27","sid93396a6ac8434fdf908c25a50cc7e167",t,n_seg)
+# build_extraction_prompt returns (prompt, transcript_stats) on current main; it used to
+# return the string alone. Accept both, and ASSERT — the tuple form silently produced a
+# 2-character "prompt" that the API then rejected for the wrong-looking reason.
+built=EX.build_extraction_prompt("Ben_UCPK2","2026-08-27","sid93396a6ac8434fdf908c25a50cc7e167",t,n_seg)
+prompt=built[0] if isinstance(built,tuple) else built
+assert isinstance(prompt,str) and len(prompt)>1000, f"prompt is {type(prompt)} len={len(prompt)}"
 open(os.path.join(W,f"prompt_{which}.txt"),"w",encoding="utf-8").write(prompt)
 print(f"{which}: turns={len(t)} prompt_chars={len(prompt)}",flush=True)
 t0=time.time()
