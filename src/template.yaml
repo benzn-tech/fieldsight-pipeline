@@ -1021,6 +1021,12 @@ Conditions:
   ShouldCreateAlerts: !And
     - !Not [!Equals [!Ref AlertEmail, '']]
     - !Not [!Equals [!Ref AlertEmail, 'none']]
+  # An alarm may only reference a resource that exists. ItemWriterFunction is
+  # behind HasDb, so its alarm needs BOTH conditions or the stack fails to
+  # create in a no-database configuration.
+  ShouldAlarmItemWriter: !And
+    - !Condition ShouldCreateAlerts
+    - !Condition HasDb
   HasTranscribeReserve: !Not [!Equals [!Ref TranscribeReservedConcurrency, '0']]
   HasVadLayer: !Not [!Equals [!Ref VadLayerArn, '']]
   HasKeyframeFfmpegLayer: !Not [!Equals [!Ref KeyframeFfmpegLayerArn, '']]
@@ -4372,6 +4378,100 @@ Resources:
       EvaluationPeriods: 1
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # ------------------------------------------------------------------
+  # Added 2026-09-05, after a two-day production outage nobody was told about.
+  #
+  # The LLM provider's account went into arrears on 09-02. Every extraction
+  # failed from then on: 198 rejections that day, 450 the next. No extraction
+  # means no topics, and every day-level read path in the product is built on
+  # topics -- so a day with 53 photos and 5 recordings rendered identically to
+  # a day nobody switched the device on. It was found by a customer asking why
+  # his photos were missing, not by us.
+  #
+  # Two gaps let it run that long, and these alarms close the first:
+  #   1. extract-session had NO alarm. Four of thirty-nine prod functions did.
+  #   2. The alert topic had no subscriber at all (separate fix).
+  #
+  # PERIOD IS 300, NOT 86400. The five pre-existing alarms use a one-day
+  # window, so the earliest they can fire is when that day's datapoint closes
+  # -- a digest, not an alert. An outage that starts at 09:00 should not wait
+  # until midnight to be reported.
+  #
+  # Deliberately only three. Thirty-nine alarms on a channel someone reads is
+  # how that channel stops being read, and an unsubscribe here is permanent:
+  # CloudFormation never re-creates a subscription it already made.
+  # ------------------------------------------------------------------
+  ExtractSessionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlerts
+    Properties:
+      AlarmName: !Sub ["${P}-extract-session-errors", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        Extraction is failing. Downstream this means no topics, no report, and
+        no photos on the day view -- which is indistinguishable from a quiet day.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ExtractSessionFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  ItemWriterErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldAlarmItemWriter
+    Properties:
+      AlarmName: !Sub ["${P}-item-writer-errors", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        The only writer of topics/findings/action_items into Aurora. Its failures
+        lose data that no later stage re-derives.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ItemWriterFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # Gateway-level, NOT Lambda Errors, and the difference is the whole point.
+  # A handler that catches its own exception and returns a 500 is a SUCCESS to
+  # the Lambda Errors metric. This repo has shipped endpoints that were failing
+  # every single call while that metric sat at zero. 5XXError is measured where
+  # the customer's request actually ended.
+  ApiServerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlerts
+    Properties:
+      AlarmName: !Sub ["${P}-api-5xx", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: The customer-facing API is returning server errors.
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref AWS::StackName
+        - Name: Stage
+          Value: prod
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
       AlarmActions:
         - !Ref AlertTopic
 
