@@ -4474,7 +4474,16 @@ def get_org_dates(conn, caller, event):
     # BYTE-IDENTICAL and a client asks for the wider index once it can draw it.
     if (p.get("uploads") or "").strip() == "1":
         company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
-        deleted = redactions.deleted_session_bases(conn, company, since, _dates_today())
+        # ISO STRINGS, NOT date OBJECTS. deleted_session_bases compares
+        # `substring(target_key from '...') BETWEEN $3 AND $4`, and the left
+        # side is text -- Postgres has no `text >= date` operator, so passing
+        # dates makes the whole route 500. Its only other caller happens to
+        # pass strings straight off a JSON body, so the requirement was never
+        # written down and never enforced. Unit tests could not see it: they
+        # patch this function out, and a fake connection records SQL without
+        # executing it, so the types never meet.
+        deleted = redactions.deleted_session_bases(
+            conn, company, since.isoformat(), _dates_today().isoformat())
         for u in recordings.upload_date_counts(
                 conn, company, site_ids, since,
                 author_ids=author_ids, deleted_bases=deleted):

@@ -208,7 +208,30 @@ def test_the_range_end_is_todays_nz_date_not_utc(wired):
     wired.setattr(org.redactions, "deleted_session_bases",
                   lambda conn, company, d_from, d_to: seen.update(to=d_to) or set())
     org.lambda_handler(make_event({"uploads": "1"}), None)
-    assert seen["to"].isoformat() == "2026-09-06"      # NZ, not 2026-09-05
+    assert seen["to"] == "2026-09-06"                  # NZ, not 2026-09-05
+
+
+def test_the_tombstone_range_is_handed_over_as_text(wired):
+    """Both bounds must be ISO strings, not `date` objects.
+
+    `deleted_session_bases` compares `substring(target_key from '...')
+    BETWEEN $3 AND $4`. The left side is text and Postgres has no
+    `text >= date` operator, so passing dates makes the whole route 500. Its
+    only other caller takes them straight off a JSON body, so the requirement
+    was never written down.
+
+    THIS IS A TYPE ASSERTION BECAUSE NOTHING ELSE HERE CAN BE. The unit suite
+    patches that function out, and the fake connection records SQL without
+    executing it, so the argument types never meet a database. Every one of the
+    3901 tests passed while this route returned 500 for every real call — found
+    by invoking the deployed function against prod, not by running the suite.
+    """
+    seen = {}
+    wired.setattr(org.redactions, "deleted_session_bases",
+                  lambda conn, company, d_from, d_to:
+                      seen.update(types=(type(d_from), type(d_to))) or set())
+    org.lambda_handler(make_event({"uploads": "1"}), None)
+    assert seen["types"] == (str, str)
 
 
 def test_cross_company_caller_lifts_the_company_pin(wired):
