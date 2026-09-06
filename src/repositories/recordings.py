@@ -381,6 +381,62 @@ def upload_date_counts(conn, company_id, site_ids, since_date, *,
              "photos": int(r["photos"] or 0)} for r in rows]
 
 
+def session_span(conn, company_id, user_folder, date, session_base):
+    """(start, end) of one recording session, or None when it cannot be known.
+
+    NONE IS A REAL ANSWER, not an error. A session that arrived through a path
+    which never registered `recordings` rows -- RealPTT, days predating
+    migration 0009, lake-fed files -- has no span at all, and every row of a
+    session can carry a NULL `ended_at`. The caller must treat None as "this
+    deletion covers no photos" AND SAY SO: a photo rule that silently covers
+    nothing is indistinguishable from one that never ran.
+
+    Bounds come from `started_at`/`ended_at` (timestamptz) and are compared only
+    against other timestamptz values. The s3_key date segment is used to FIND
+    the rows -- the device's local day, the same clock as every other date in
+    this product -- and never to order them.
+    """
+    sid = session_base[3:] if session_base.startswith("sid") else session_base
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT MIN(started_at) AS lo, "
+        "       MAX(COALESCE(ended_at, started_at)) AS hi "
+        "FROM recordings "
+        "WHERE company_id = %s AND kind IN ('audio','video') "
+        "AND s3_key LIKE %s ESCAPE '\' AND s3_key LIKE %s ESCAPE '\'",
+        (company_id,
+         f"users/{_escape_like(user_folder)}/%/{date}/%",
+         f"%{_escape_like(sid)}%"),
+    ).fetchone()
+    if not row or row["lo"] is None or row["hi"] is None:
+        return None
+    return row["lo"], row["hi"]
+
+
+def photo_keys_in_span(conn, company_id, user_folder, date, lo, hi) -> list:
+    """Photo keys captured inside a session's span, for that folder and day.
+
+    This is the ONLY link that exists between a photo and a session. A photo key
+    carries no session id -- `users/{folder}/pictures/{date}/IMG.jpg` and the
+    session tombstone `extractions/{folder}/{date}/sid{hex}` share a folder and
+    a day and nothing else -- so time is the only available evidence, and it is
+    evidence rather than proof.
+
+    Photos taken BETWEEN sessions are not covered by any session deletion and
+    never can be. They need a per-photo delete, which is exactly what the
+    tombstone this feeds is shaped for.
+    """
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT s3_key FROM recordings "
+        "WHERE company_id = %s AND kind = 'photo' "
+        "AND s3_key LIKE %s ESCAPE '\' "
+        "AND started_at IS NOT NULL AND started_at BETWEEN %s AND %s "
+        "ORDER BY started_at",
+        (company_id, f"users/{_escape_like(user_folder)}/%/{date}/%", lo, hi),
+    ).fetchall()
+    return [r["s3_key"] for r in rows]
+
+
+
 def site_for_media(conn, company_id, user_folder, date, session_base) -> dict | None:
     """The app-tagged site (recordings.site_id) for the recording whose media
     file this extraction session came from, or None. Matches recordings.s3_key

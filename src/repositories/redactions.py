@@ -143,6 +143,58 @@ def create_recording_tombstone(conn, company_id, source_prefix, reason, actor_us
                             skip_if_already_deleted=True)
 
 
+def create_photo_tombstone(conn, company_id, s3_key, reason, actor_user_id,
+                           actor_role, *, batch_id=None):
+    """Tombstone ONE photo, by its exact object key.
+
+    Same shape as `create_recording_tombstone` -- deterministic uuid5 target_id
+    so a retry declines the conflict instead of raising it -- but the key is an
+    object, not a prefix, because that is what a photo is.
+
+    `batch_id` is not optional in spirit. A photo hidden as part of a session
+    deletion must be restored by that deletion's revert, and `revert_batch`
+    works by batch. Writing one outside the batch produces a photo that no
+    revert can bring back, which is the failure this feature must not create
+    while fixing the opposite one.
+    """
+    import uuid as _uuid
+
+    target_id = str(_uuid.uuid5(_uuid.NAMESPACE_URL, s3_key))
+    return create_redaction(conn, company_id, target_id, reason, actor_user_id,
+                            actor_role, target_type="photo", scope="deleted",
+                            batch_id=batch_id, target_key=s3_key,
+                            skip_if_already_deleted=True)
+
+
+def deleted_photo_keys(conn, company_id=None, keys=None) -> set:
+    """Which photo keys are currently tombstoned.
+
+    Pass `keys` to ask about a specific set -- the day view has the candidate
+    list in hand and only needs the intersection, which is one query instead of
+    loading every tombstone the company ever wrote.
+
+    Empty input returns an empty set WITHOUT touching the database: a day with
+    no photos must not pay for a query, and `= ANY('{}')` is a silent false for
+    every row, which reads as "nothing is deleted" rather than "nothing was
+    asked".
+    """
+    if keys is not None and not keys:
+        return set()
+    sql = ("SELECT target_key FROM redactions "
+           "WHERE target_type = 'photo' AND scope = 'deleted' "
+           "AND reverted_at IS NULL AND target_key IS NOT NULL")
+    params = []
+    if company_id is not None:
+        sql += " AND company_id = %s"
+        params.append(company_id)
+    if keys is not None:
+        sql += " AND target_key = ANY(%s)"
+        params.append(list(keys))
+    rows = conn.cursor(row_factory=dict_row).execute(sql, tuple(params)).fetchall()
+    return {r["target_key"] for r in rows}
+
+
+
 def deleted_source_prefixes(conn, folder=None, date=None) -> list:
     """Active deleted source prefixes, optionally narrowed to one folder/date.
 
