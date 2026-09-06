@@ -180,3 +180,27 @@ def test_no_site_reach_means_no_counts(wired):
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: set())
     assert body_of(_render()) == {"message": f"No report for {USER} on {DATE}",
                                   "date": DATE}
+
+
+def test_a_failure_computing_the_extras_still_answers_404(wired, caplog):
+    """The 404 is the answer. The counts are an addition to it.
+
+    This path did not touch `recordings` or S3 before, so a new dependency that
+    can turn a correct 404 into a 500 is a worse bug than the blank screen it
+    set out to fix. Two tests written long before this change went red exactly
+    here, which is how it was found -- not by this file.
+
+    It must still LOG. A degrade nobody can see is the failure mode this repo
+    keeps re-learning.
+    """
+    import logging
+
+    def _boom(*a, **k):
+        raise RuntimeError("aurora is having a day")
+
+    wired.setattr(org.recordings, "range_stats", _boom)
+    with caplog.at_level(logging.ERROR):
+        res = _render()
+    assert res["statusCode"] == 404
+    assert body_of(res) == {"message": f"No report for {USER} on {DATE}", "date": DATE}
+    assert any("upload facts unavailable" in r.message for r in caplog.records)

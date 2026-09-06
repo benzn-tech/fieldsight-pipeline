@@ -6000,29 +6000,41 @@ def _day_upload_facts(conn, caller, user, date):
     Returns None when there is nothing to say, so the 404 body stays exactly
     as it was rather than growing three keys full of zeros.
     """
-    company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
-    site_ids = _allowed_site_ids(conn, caller)
-    if not site_ids:
+    # NEVER RAISES. The 404 is the answer; these numbers are an addition to
+    # it. This path did not touch `recordings` or S3 before, and a new
+    # dependency that can turn an existing correct answer into a 500 is a
+    # worse bug than the blank screen it set out to fix -- two tests written
+    # long before this change went red exactly there, which is how it was
+    # found. Logged at exception level, not swallowed: a guard that only
+    # speaks when someone is watching is indistinguishable from one that
+    # never ran.
+    try:
+        company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        site_ids = _allowed_site_ids(conn, caller)
+        if not site_ids:
+            return None
+        deleted = redactions.deleted_session_bases(conn, company, date, date)
+        stats = recordings.range_stats(conn, company, date, date, site_ids,
+                                       author_ids=_author_filter(conn, caller),
+                                       deleted_bases=deleted)
+        # Transcription does not go through the LLM provider, so on a day the
+        # extraction failed the transcripts are usually sitting there, readable,
+        # through a route (/transcripts) that needs no topics. Counting them is
+        # what separates "the recorder never reached us" from "we have the words
+        # and could not summarise them".
+        n_tx = sum(1 for _ in _list_media_objects(f"transcripts/{user}/{date}/", "transcripts"))
+        if not (stats["sessions"] or stats["photos"] or n_tx):
+            return None
+        return {
+            "uploads": {"sessions": stats["sessions"],
+                        "duration_s": stats["duration_s"],
+                        "photos": stats["photos"]},
+            "transcripts": n_tx,
+            "day_state": "transcribed" if n_tx else "captured",
+        }
+    except Exception:  # noqa: BLE001 - see above
+        logger.exception("upload facts unavailable for %s/%s", user, date)
         return None
-    deleted = redactions.deleted_session_bases(conn, company, date, date)
-    stats = recordings.range_stats(conn, company, date, date, site_ids,
-                                   author_ids=_author_filter(conn, caller),
-                                   deleted_bases=deleted)
-    # Transcription does not go through the LLM provider, so on a day the
-    # extraction failed the transcripts are usually sitting there, readable,
-    # through a route (/transcripts) that needs no topics. Counting them is
-    # what separates "the recorder never reached us" from "we have the words
-    # and could not summarise them".
-    n_tx = sum(1 for _ in _list_media_objects(f"transcripts/{user}/{date}/", "transcripts"))
-    if not (stats["sessions"] or stats["photos"] or n_tx):
-        return None
-    return {
-        "uploads": {"sessions": stats["sessions"],
-                    "duration_s": stats["duration_s"],
-                    "photos": stats["photos"]},
-        "transcripts": n_tx,
-        "day_state": "transcribed" if n_tx else "captured",
-    }
 
 
 
