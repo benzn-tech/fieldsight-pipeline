@@ -6006,8 +6006,42 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # prose (not site-clipped). Topic rows are already site-clipped above.
         doc = None if cross_user_clip else \
             _get_lake_json(f"reports/{date}/{user}/daily_report.json")
-        return render_report_shape(rows, doc, date, user, conn=conn,
-                                   company_id=caller.get("company_id"))
+        shape = render_report_shape(rows, doc, date, user, conn=conn,
+                                    company_id=caller.get("company_id"))
+        # The day's photos, as a property of the DAY rather than of a topic.
+        #
+        # Measured on prod the morning this was written: 71 of 90 photos on days
+        # that DO have a report were unreachable from any screen. 2026-09-02 is
+        # one topic and 53 photos, of which 10 are shown -- PHOTOS_PER_TOPIC_CAP;
+        # the rest of the days lose theirs to binding, because 37% of topic time
+        # windows are a single instant and 76% are narrower than the +/-2 minute
+        # tolerance. A photo taken while nobody was talking binds to nothing.
+        # Raising the cap does not fix the second cause and widening the
+        # tolerance does not fix the first: both follow from a photo being
+        # visible ONLY as a property of a topic. `related_photos` is unchanged
+        # and stays the enrichment it always was.
+        #
+        # GATED ON cross_user_clip, and this is the whole of the review that
+        # produced it. A pm/site_manager viewing SOMEONE ELSE's day reaches this
+        # 200 whenever one topic survives the site ACL -- the loop below tries
+        # the Aurora shapes BEFORE the cross-user 404. For that caller the 200
+        # granted a site-clipped SLICE of the day, not the day; `photo_list_for_
+        # day` is folder+date with no site clip, and a filename carries a name, a
+        # date and a time. Handing it over says "the target was somewhere at
+        # 14:32" about sites they cannot see, which is exactly what CRITICAL-1
+        # withholds one line above.
+        if not cross_user_clip:
+            photos = _day_photo_block(conn, caller, user, date)
+            if photos is not None:
+                names = [ph["s3_key"].rsplit("/", 1)[-1] for ph in photos]
+                shape["photo_filenames"] = names
+                # `photos` ONLY. The 404's `uploads` also carries sessions and
+                # duration from `range_stats` (site-clipped, author-filtered,
+                # tombstoned); this body already reports those from `day_stats`
+                # (folder-wide, unclipped) under `_report_metadata`. Emitting
+                # both would put two disagreeing session counts in one document.
+                shape["uploads"] = {"photos": len(names)}
+        return shape
 
     # D fix (spec §5.1): prefer the Aurora-rendered shape whenever Aurora topics
     # exist for this (user, date) -- extraction-sourced OR report-sourced -- so
@@ -6045,6 +6079,43 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     if facts:
         body.update(facts)
     return ok(body, 404)
+
+
+def _day_photo_block(conn, caller, user, date):
+    """The day's photos, tombstoned ones removed. `None` if it cannot be read.
+
+    ONE definition, because there are now two consumers -- the "no report" 404
+    and the rendered 200 -- and the failure mode of having two is specific and
+    bad: `photo_list_for_day` does NO tombstone filtering of its own (it is one
+    SELECT), so a second caller that reuses it without ALSO calling
+    `deleted_photo_keys` puts deleted photos back on screen. Extracting the
+    whole block is what makes the two paths agree by construction instead of by
+    anyone remembering to.
+
+    The company argument is the three-state one used everywhere in this file:
+    `None` means UNRESTRICTED, and the folder+date predicate does the pinning.
+    Passing `caller["company_id"]` unconditionally is the specific bug that made
+    an admin's day come back empty on prod (#738/#740) -- a platform_admin sits
+    in its own operator company, which matches none of the customer rows.
+
+    NEVER RAISES. Both consumers already have a correct answer without this;
+    turning one of them into a 500 over a photo list would be a worse bug than
+    the blank grid it exists to fix. Logged at exception level rather than
+    swallowed, because a guard that only speaks when someone is watching cannot
+    be told from one that never ran.
+    """
+    try:
+        company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        photos = recordings.photo_list_for_day(conn, company, user, date)
+        hidden = redactions.deleted_photo_keys(
+            conn, company, keys=[p["s3_key"] for p in photos])
+        photos = [p for p in photos if p["s3_key"] not in hidden]
+        if hidden:
+            logger.info("day view: %s/%s hid %d deleted photo(s)", user, date, len(hidden))
+        return photos
+    except Exception:  # noqa: BLE001 - see above
+        logger.exception("photo list unavailable for %s/%s", user, date)
+        return None
 
 
 def _day_upload_facts(conn, caller, user, date):
@@ -6101,12 +6172,7 @@ def _day_upload_facts(conn, caller, user, date):
         # 41, and the missing twelve would be exactly the ones somebody deleted.
         # Deriving both from the same filtered list makes them agree by
         # construction rather than by anyone remembering to.
-        photos = recordings.photo_list_for_day(conn, company, user, date)
-        hidden = redactions.deleted_photo_keys(
-            conn, company, keys=[p["s3_key"] for p in photos])
-        photos = [p for p in photos if p["s3_key"] not in hidden]
-        if hidden:
-            logger.info("day view: %s/%s hid %d deleted photo(s)", user, date, len(hidden))
+        photos = _day_photo_block(conn, caller, user, date) or []
         n_tx = sum(1 for _ in _list_media_objects(f"transcripts/{user}/{date}/", "transcripts"))
         if not (stats["sessions"] or len(photos) or n_tx):
             return None
