@@ -827,11 +827,7 @@ def _rag_search_list(body):
 
     try:
         query_vec = dashscope_utils.embed([question])[0]
-        # With reranking on we fetch candidates, not context: the reranker picks
-        # the `k` that reach the prompt, so the synthesis prompt -- and therefore
-        # the latency the 29s ceiling actually cares about -- is unchanged.
-        fetch_k = RERANK_CANDIDATES if RERANK_ENABLED else k
-        payload = {"sub": caller_sub, "query_embedding": query_vec, "k": fetch_k}
+        payload = {"sub": caller_sub, "query_embedding": query_vec, "k": k}
         if date_from:
             payload["date_from"] = date_from
         if date_to:
@@ -1064,7 +1060,19 @@ def _rag_answer(body):
 
         query_vec = dashscope_utils.embed([question])[0]
 
-        payload = {"sub": caller_sub, "query_embedding": query_vec, "k": k}
+        # WIDEN ONLY WHEN SOMETHING WILL NARROW IT AGAIN. With reranking on we
+        # fetch candidates, not context: the reranker picks the `k` that reach the
+        # prompt, so the synthesis prompt -- and the latency the 29s ceiling
+        # actually cares about -- is unchanged.
+        #
+        # This line and the _rerank_chunks call below MUST live in the same
+        # function. They did not when this shipped: the identical payload literal
+        # appears in _rag_search_list too, the edit landed there, and Ask went on
+        # fetching 5 chunks and then short-circuiting because 5 <= 5. The feature
+        # could not run on the path it was built for, and every test stayed green
+        # because they all drove the helper instead of the route.
+        fetch_k = RERANK_CANDIDATES if RERANK_ENABLED else k
+        payload = {"sub": caller_sub, "query_embedding": query_vec, "k": fetch_k}
         if date_from or date_to:
             # Added ONLY when a range was actually read. rag-search ignores
             # unknown keys and treats absent dates as "no filter", so a caller
