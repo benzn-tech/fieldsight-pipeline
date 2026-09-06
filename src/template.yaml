@@ -4547,6 +4547,91 @@ Resources:
             Schedule: cron(0 16 * * ? *)
             Description: Device ledger sync to Notion.
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+  # ------------------------------------------------------------------
+  # Extraction backlog probe (2026-09-06)
+  #
+  # The error alarm on extract-session cannot see the tail of an outage: once
+  # the retries stop there are no invocations at all, so it reads OK while
+  # extraction is completely broken. That is how 2026-09-02 stayed invisible
+  # for two days.
+  #
+  # This watches the opposite shape -- work that arrived and was never done.
+  # Measured over the whole prod bucket while writing it: 122 requests, 69
+  # fulfilled, 42 with no transcripts at all (VAD found no speech; NOT a
+  # backlog), 11 with transcripts and no extraction. Only two of the eleven
+  # were the outage; the rest go back to 2026-08-06 and nobody knew.
+  #
+  # Non-VPC because there is no CloudWatch or SNS endpoint inside the VPC (S3,
+  # DynamoDB and cognito-idp only), so nothing in there can publish a metric.
+  # This needs S3 and CloudWatch and no database, so it avoids the
+  # in-VPC/out-of-VPC pair the rest of the pipeline needs.
+  # ------------------------------------------------------------------
+  ExtractionBacklogFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ["${P}-extraction-backlog", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_extraction_backlog.lambda_handler
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DataBucketName
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${DataBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - extraction_requests/*
+                    - extractions/*
+                    - transcripts/*
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
+            # PutMetricData takes no resource ARN. Scoped by namespace instead,
+            # so this role cannot overwrite any other namespace's series.
+            - Effect: Allow
+              Action: cloudwatch:PutMetricData
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: FieldSight/Pipeline
+      Events:
+        BacklogSweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Description: Sessions transcribed but never extracted.
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+
+  ExtractionBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlerts
+    Properties:
+      AlarmName: !Sub ["${P}-extraction-backlog", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        A session was transcribed and never summarised. The words exist and the
+        report does not, which no error alarm can see once the retries stop.
+      Namespace: FieldSight/Pipeline
+      MetricName: ExtractionBacklog
+      Statistic: Maximum
+      Period: 3600
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # `breaching`, NOT notBreaching, and that is the point. The metric is
+      # published on every run including the zero, so missing data means the
+      # checker itself stopped -- the same invisible absence this exists to
+      # detect. Two periods so one failed publish is not an alarm.
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+
 
 # ============================================================
 # Outputs
