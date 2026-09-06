@@ -182,6 +182,21 @@ def _call_anthropic(prompt, max_tokens):
     return None, msg
 
 
+def _is_dashscope(base_url):
+    """Whether the configured chat endpoint is DashScope.
+
+    `enable_thinking` is a DashScope extension. It is absent from every other
+    vendor's parameter list, and an unknown field is either rejected outright
+    or -- worse -- silently dropped, which would turn "no thinking" into
+    thinking on the latency-bound Ask path with nothing to show for it.
+
+    Dispatching on the endpoint rather than adding a third LLM_PROVIDER value
+    is deliberate: a new provider branch would duplicate the retry, JSON-mode
+    and error-code handling that already work here.
+    """
+    return "aliyuncs.com" in (base_url or "")
+
+
 def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
     if not QWEN_API_KEY:
         logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
@@ -191,7 +206,22 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
         payload["temperature"] = LLM_TEMPERATURE
     # Per-call override wins; None falls back to the function's env default.
     thinking = QWEN_ENABLE_THINKING if enable_thinking is None else bool(enable_thinking)
-    if thinking:
+
+    if not _is_dashscope(QWEN_BASE_URL):
+        # OpenAI-compatible vendors (OpenRouter today). Reasoning is expressed
+        # with `reasoning`; `enable_thinking` must never be sent.
+        #
+        # The DashScope branch below also DROPS max_tokens and skips
+        # response_format whenever thinking is on. That coupling is a DashScope
+        # workaround -- thinking + json_object there risks non-strict JSON --
+        # and it is deliberately NOT ported: an unbounded completion on a
+        # per-token vendor is a cost incident waiting to happen, and structured
+        # outputs are supported here.
+        payload["reasoning"] = {"enabled": bool(thinking)}
+        payload["max_tokens"] = max_tokens
+        if force_json:
+            payload["response_format"] = {"type": "json_object"}
+    elif thinking:
         # Thinking mode: highest quality for batch tasks. Do NOT force
         # response_format even when force_json (thinking + json_object risks
         # non-strict JSON); the prompt already instructs JSON and extract_json()
@@ -201,7 +231,7 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
     else:
         # Non-thinking. DashScope's Qwen3 models DEFAULT to thinking when
         # enable_thinking is OMITTED, so QWEN_ENABLE_THINKING=false is INERT
-        # unless we send the flag explicitly False — otherwise a "non-thinking"
+        # unless we send the flag explicitly False -- otherwise a "non-thinking"
         # caller silently burns reasoning latency (measured on the summary task:
         # qwen3.7-max 38s omitted vs 4s explicit-False; qwen3.6-flash 19s vs 3s).
         payload["enable_thinking"] = False
@@ -210,6 +240,7 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
             payload["response_format"] = {"type": "json_object"}
         else:
             payload["max_tokens"] = max_tokens
+
     resp, err = _post_with_retry(
         f"{QWEN_BASE_URL}/chat/completions",
         json.dumps(payload),
