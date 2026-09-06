@@ -40,6 +40,7 @@ Environment Variables:
 
 import os
 import json
+import nz_time
 import logging
 import re
 import boto3
@@ -185,8 +186,9 @@ WEEKLY_MEETINGS_SCHEMA = """{
 # ============================================================
 
 def get_nzdt_now():
-    """Get current time in NZDT (UTC+13)"""
-    return datetime.utcnow() + timedelta(hours=13)
+    """Current NZ wall clock. Named for NZDT, but NZ is on NZST (+12) for about
+    half the year -- the literal this replaced was an hour ahead then."""
+    return nz_time.nz_now()
 
 
 def resolve_date(date_str):

@@ -203,7 +203,10 @@ def test_the_range_end_is_todays_nz_date_not_utc(wired):
             # 22:30 UTC on the 5th == 11:30 NZ on the 6th.
             return datetime(2026, 9, 5, 22, 30, tzinfo=timezone.utc)
 
-    wired.setattr(org, "datetime", _FrozenDatetime)
+    # Freeze the UTC clock INSIDE nz_time, not the module's own `datetime`:
+    # the conversion moved there, and patching the caller would leave the real
+    # DST rule unexercised -- the part that was wrong.
+    wired.setattr(org.nz_time, "datetime", _FrozenDatetime)
     seen = {}
     wired.setattr(org.redactions, "deleted_session_bases",
                   lambda conn, company, d_from, d_to: seen.update(to=d_to) or set())
@@ -255,3 +258,23 @@ def test_ordinary_caller_keeps_the_company_pin(wired):
                   deleted_bases=(): seen.update(company=company) or [])
     org.lambda_handler(make_event({"uploads": "1"}), None)
     assert seen["company"] == "c-uuid-1"
+
+def test_the_range_end_follows_nz_daylight_saving_not_a_fixed_offset(wired):
+    """The offset is +12 for about half the year, and the old code assumed +13.
+
+    11:30 UTC on 6 September is 23:30 the SAME day in Auckland (NZST). A fixed
+    +13 makes it 00:30 on the 7th, so the range closed on a day that had not
+    started -- and the previous test cannot see it, because at 22:30 UTC both
+    offsets land on the same NZ date. This is the hour where they differ.
+    """
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 6, 11, 30, tzinfo=timezone.utc)
+
+    wired.setattr(org.nz_time, "datetime", _FrozenDatetime)
+    seen = {}
+    wired.setattr(org.redactions, "deleted_session_bases",
+                  lambda conn, company, d_from, d_to: seen.update(to=d_to) or set())
+    org.lambda_handler(make_event({"uploads": "1"}), None)
+    assert seen["to"] == "2026-09-06"                  # NZST, not 2026-09-07
