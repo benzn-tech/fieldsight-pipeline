@@ -403,6 +403,34 @@ def upload_date_counts(conn, company_id, site_ids, since_date, *,
              "photos": int(r["photos"] or 0)} for r in rows]
 
 
+def folders_with_uploads_for_date(conn, company_id, date) -> set:
+    """Folder names that captured anything on this day, from `recordings`.
+
+    Exists because the admin day view had no way to learn them. Its candidate
+    list is S3 report folders union Aurora extraction folder names, and a day
+    whose extraction never ran has neither -- so once the calendar started
+    offering upload-only days, an admin clicking one got a bare 404 with no
+    picker and no way to guess whose `?user` to ask for. A dot that opens onto
+    nothing is the same failure the day view exists to end, wearing a
+    different hat.
+
+    The folder is the second segment of the key (`users/{folder}/...`), which
+    is the same place every other reader in this file takes it from, and the
+    day is the date segment -- never `started_at`, which is UTC while the key
+    is the device's local day.
+    """
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT DISTINCT split_part(s3_key, '/', 2) AS folder "
+        "FROM recordings "
+        "WHERE company_id = %s "
+        "AND s3_key LIKE %s "
+        "AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') = %s",
+        (company_id, "users/%", str(date)),
+    ).fetchall()
+    return {r["folder"] for r in rows if r["folder"]}
+
+
+
 def photo_list_for_day(conn, company_id, user_folder, date) -> list:
     """Every photo row for one (folder, day): [{s3_key, taken_at}], oldest first.
 
