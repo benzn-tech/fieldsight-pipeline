@@ -1073,6 +1073,22 @@ def session_close(conn, caller, session_id, body):
                    "version": existing["version"], "noop": True})
 
     row = meeting_session.mark_pending_close(conn, session_id, b.get("endedAt"), intent)
+    if row is None:
+        # THE SWEEP WON THE RACE. `existing` was read a few statements ago and
+        # the guard above only rejects `finalizing`/`sent` as they stood THEN;
+        # the UPDATE matches `open`/`pending_close` as they stand NOW. The
+        # finalize sweep runs every minute, so a device closing a session at the
+        # wrong moment lands exactly in that window -- and this line used to
+        # subscript None and answer 500 to the one call that ends a recording.
+        #
+        # It is the same answer the guard above gives, for the same reason: the
+        # session is past the point of no return, so the close is redundant
+        # rather than wrong. Re-read so the status reported is the real one.
+        current = meeting_session.get(conn, session_id) or existing
+        logger.info("session_close: %s already moved to %s -- idempotent no-op",
+                    session_id, current.get("status"))
+        return ok({"sessionId": session_id, "status": current["status"],
+                   "version": current["version"], "noop": True})
     # The sweep now has a session to finalize (Aurora scale-to-zero, spec
     # 2026-08-11). Belt and braces next to the /open write: an `open` session
     # normally holds the flag up by itself, but a session with no activity
