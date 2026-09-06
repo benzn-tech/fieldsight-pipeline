@@ -64,3 +64,38 @@ def test_offset_pushes_across_midnight():
     _, end = orch.compute_query_range(now_utc, 1, NZ_OFFSET_MS)
 
     assert end == '2026-07-16'
+
+
+# --------------------------------------------------------------------------
+# The fixed +13 this module still carries, and why it does not bite
+# --------------------------------------------------------------------------
+
+def test_the_scheduled_hours_avoid_the_hour_where_the_offset_matters():
+    """`time_difference_ms` is a constant +13 and NZ is +12 for half the year.
+
+    The two offsets disagree about the DATE only in UTC [11:00, 12:00): before
+    11:00 both are on the same NZ day, and from 12:00 both have rolled over.
+    The schedules are the 15-minute sweep over UTC hours 17-23 and 0-7 plus the
+    07:00 daily -- none of which is hour 11 -- so every window this function
+    actually computes is the same under either offset.
+
+    This is the fact that justifies leaving the constant alone (it is also on
+    the RealPTT wire, so correcting it is not an internal change). If someone
+    widens the schedule into hour 11, this test is the thing that says no.
+    """
+    NZDT_MS = 46800000            # +13, what ships
+    NZST_MS = 43200000            # +12, the truth for half the year
+    scheduled_hours = sorted({7} | set(range(17, 24)) | set(range(0, 8)))
+    assert 11 not in scheduled_hours
+
+    for hour in scheduled_hours:
+        for minute in (0, 15, 30, 45):
+            now = datetime(2026, 9, 6, hour, minute, tzinfo=timezone.utc)
+            assert (orch.compute_query_range(now, 1, NZDT_MS)
+                    == orch.compute_query_range(now, 1, NZST_MS)), hour
+
+    # And the hour it is NOT scheduled in is genuinely the one that differs --
+    # otherwise the assertion above would pass for an empty reason.
+    hole = datetime(2026, 9, 6, 11, 30, tzinfo=timezone.utc)
+    assert (orch.compute_query_range(hole, 1, NZDT_MS)
+            != orch.compute_query_range(hole, 1, NZST_MS))

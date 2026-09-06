@@ -63,7 +63,17 @@ _user_mapping = None
 # ============================================================
 WEB_BASE = 'https://realptt.com'     # Must use realptt.com, NOT api.realptt.com
 UPLOAD_FILE_LIMIT = 20               # API max per page (higher = empty body)
-TIMEZONE_OFFSET = -780               # NZDT: -780 minutes from GMT
+# NZDT: -780 minutes from GMT. WRONG FOR HALF THE YEAR, and deliberately left
+# that way for now -- see the note on compute_query_range below. NZ is UTC+12
+# (NZST) from the first Sunday of April to the last Sunday of September, so this
+# tells RealPTT the wrong zone for six months; `nz_time` knows the real rule.
+# Changing it is not a local edit: this value goes out on the login call, and
+# the same assumption rides on time_difference_ms into every recording timestamp
+# RealPTT returns -- which become the filenames and dates the whole downstream
+# pipeline keys on. It needs a verified before/after against the live API, on
+# the pipeline that is running the pilot every fifteen minutes. Not a same-night
+# change.
+TIMEZONE_OFFSET = -780
 
 # Download claim lock (Phase 4b): S3 conditional-put marker preventing two
 # orchestrator sweeps from triggering duplicate downloads for the same key.
@@ -80,7 +90,20 @@ def compute_query_range(now_utc, start_days_ago, time_difference_ms):
     be anchored to the NZ calendar day, not UTC. In Lambda datetime.now() is UTC,
     which lagged the window by a day during NZ mornings and hid same-day
     recordings until UTC caught up (~NZ noon). now_utc must be a tz-aware UTC
-    datetime; time_difference_ms is the UTC->NZ offset (config default 46800000)."""
+    datetime; time_difference_ms is the UTC->NZ offset (config default 46800000).
+
+    THE OFFSET IS A CONSTANT AND NZ'S IS NOT. 46800000 ms is +13 (NZDT); for the
+    half of the year on NZST the true offset is +12, and the two disagree about
+    the DATE only between 11:00 and 12:00 UTC. This function's schedules (the
+    15-minute sweep over UTC hours 17-23 and 0-7, and the 07:00 daily) never
+    touch that hour, so the window it computes is right in practice -- measured,
+    and pinned below by
+    test_the_scheduled_hours_avoid_the_hour_where_the_offset_matters.
+
+    Not fixed rather than not broken: the same value is handed to
+    query_video_files/query_audio_files, so it is part of the RealPTT wire
+    contract and not an internal clock. Correcting it belongs with the
+    TIMEZONE_OFFSET change above, verified against the live API."""
     nz_now = now_utc + timedelta(milliseconds=time_difference_ms)
     end = nz_now
     start = end - timedelta(days=start_days_ago)

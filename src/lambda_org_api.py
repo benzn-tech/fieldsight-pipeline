@@ -129,6 +129,7 @@ import chunk_stitch
 import content_hash
 import device_heartbeat
 import device_status
+import nz_time
 import reindex
 import session_scope
 import sweep_state
@@ -3063,10 +3064,12 @@ def create_org_observation(conn, caller, body):
         if not isinstance(report_date, str) or not REPORT_DATE_RE.match(report_date):
             return error("report_date must be YYYY-MM-DD", 400)
     else:
-        # NZ "today" — the codebase-wide UTC+13 display convention (see
-        # BUG-19); this endpoint is the only writer of report_date so the
-        # default lives here, not in the repository layer.
-        report_date = (datetime.utcnow() + timedelta(hours=13)).date().isoformat()
+        # NZ "today" (BUG-19). The offset is DST-dependent -- the old +13
+        # literal here dated a report to tomorrow between 11:00 and 12:00 UTC
+        # for the half of the year NZ is on NZST. This endpoint is the only
+        # writer of report_date so the default lives here, not in the
+        # repository layer.
+        report_date = nz_time.nz_today().isoformat()
     author_name = " ".join(
         p for p in (caller.get("first_name"), caller.get("last_name")) if p
     ) or caller.get("email")
@@ -4464,20 +4467,25 @@ def _dates_window_start(months) -> "datetime.date":
     except (TypeError, ValueError):
         m = 2
     m = max(1, min(m, 24))
-    now_nz = datetime.now(timezone.utc) + timedelta(hours=13)
-    return (now_nz - timedelta(days=m * 30)).date()
+    return (nz_time.nz_now() - timedelta(days=m * 30)).date()
 
 
 def _dates_today() -> "datetime.date":
     """Today in NZ, from the SAME clock as _dates_window_start.
 
     Only used to close the range handed to `deleted_session_bases`. Deriving it
-    from a bare UTC now would drop the current NZ day for thirteen hours every
-    night, so a session deleted this evening would not be excluded from the
-    upload index -- the calendar would keep a dot for a day the customer had
-    just taken back, which is the exact fact they were asking to withdraw.
+    from a bare UTC now would drop the current NZ day for twelve or thirteen
+    hours every night, so a session deleted this evening would not be excluded
+    from the upload index -- the calendar would keep a dot for a day the
+    customer had just taken back, which is the exact fact they were asking to
+    withdraw.
+
+    Which of twelve or thirteen is a DST question, not a constant, so the
+    offset comes from `nz_time` rather than a literal: for the half of the year
+    NZ is on NZST a hardcoded +13 reports tomorrow between 11:00 and 12:00 UTC,
+    closing this range on a day nobody has reached yet.
     """
-    return (datetime.now(timezone.utc) + timedelta(hours=13)).date()
+    return nz_time.nz_today()
 
 
 
@@ -4707,7 +4715,7 @@ def _write_snapshot(conn, site_id, programme_id):
     doc = programme_snapshot.build_snapshot(prog, tasks)
     # NZ "today"/"now" — the codebase-wide UTC+13 display convention (BUG-19
     # / see create_org_observation's report_date default).
-    updated_at = (datetime.utcnow() + timedelta(hours=13)).isoformat()
+    updated_at = nz_time.nz_now().isoformat()
     programme.write_programme(s3(), S3_BUCKET, site_id, doc, updated_at)
 
 

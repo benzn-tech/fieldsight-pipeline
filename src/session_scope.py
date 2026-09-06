@@ -37,10 +37,10 @@ already followed) so there is exactly one definition of the key shape.
 
 Pure module: no boto3, no psycopg, no env — importable from any lambda.
 """
-import calendar
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
+import nz_time
 from transcript_utils import extract_base_time_from_filename
 
 
@@ -50,30 +50,10 @@ def to_nz(dt):
     but the topic times, S3 keys, and the legacy session_start() are all the device's
     NZ wall clock -- so a chunk session's start must be converted to NZ or the picker
     mixes a UTC start with an NZ end (e.g. "06:36 - 18:39" for an 18:36-18:39 meeting).
-    Prefers the IANA tz db (exact); falls back to NZ's fixed rule (NZDT +13 from the
-    last Sunday of September to the first Sunday of April, else NZST +12) so it never
-    crashes if the runtime lacks tzdata."""
-    if not hasattr(dt, "strftime"):
-        return None
-    aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
-    try:
-        from zoneinfo import ZoneInfo
-        return aware.astimezone(ZoneInfo("Pacific/Auckland")).replace(tzinfo=None)
-    except Exception:
-        u = aware.astimezone(timezone.utc).replace(tzinfo=None)
-        y = u.year
-
-        def _last_sun(mo):
-            d = datetime(y, mo, calendar.monthrange(y, mo)[1])
-            return d - timedelta(days=(d.weekday() - 6) % 7)
-
-        def _first_sun(mo):
-            d = datetime(y, mo, 1)
-            return d + timedelta(days=(6 - d.weekday()) % 7)
-
-        dst_start = _last_sun(9) + timedelta(hours=2) - timedelta(hours=12)
-        dst_end = _first_sun(4) + timedelta(hours=3) - timedelta(hours=13)
-        return u + timedelta(hours=13 if (u >= dst_start or u < dst_end) else 12)
+    The rule itself lives in `nz_time`, shared with the org-api calendar and the
+    report generators: it was written out longhand in four places, and one of the
+    copies had quietly decayed into a constant +13."""
+    return nz_time.to_nz(dt)
 
 
 def to_utc(dt):
@@ -96,36 +76,13 @@ def to_utc(dt):
     re-gather read an empty S3 prefix -- the recipient got "No summary was
     generated for this recording."
 
-    Same DST rule and same tzdata-optional fallback as to_nz. During the one
-    ambiguous hour each April the earlier (DST) reading is taken, matching
-    ZoneInfo's fold=0 default -- an hour's error in a rare window, versus the
-    12-hour error this function exists to remove.
+    The rule lives in `nz_time.from_nz`, including the choice made during the
+    one ambiguous hour each April (the earlier, NZDT reading -- ZoneInfo's
+    fold=0 default): an hour's error in a rare window, against the 12-hour
+    error this function exists to remove.
     """
-    if not hasattr(dt, "strftime"):
-        return None
-    if dt.tzinfo is not None:
-        return dt.astimezone(timezone.utc).replace(tzinfo=None)
-    try:
-        from zoneinfo import ZoneInfo
-        return (dt.replace(tzinfo=ZoneInfo("Pacific/Auckland"))
-                  .astimezone(timezone.utc).replace(tzinfo=None))
-    except Exception:
-        y = dt.year
+    return nz_time.from_nz(dt)
 
-        def _last_sun(mo):
-            d = datetime(y, mo, calendar.monthrange(y, mo)[1])
-            return d - timedelta(days=(d.weekday() - 6) % 7)
-
-        def _first_sun(mo):
-            d = datetime(y, mo, 1)
-            return d + timedelta(days=(6 - d.weekday()) % 7)
-
-        # Boundaries expressed in LOCAL time (this input is local): NZDT runs
-        # from 02:00 on the last Sunday of September to 03:00 on the first
-        # Sunday of April.
-        dst_start = _last_sun(9) + timedelta(hours=2)
-        dst_end = _first_sun(4) + timedelta(hours=3)
-        return dt - timedelta(hours=13 if (dt >= dst_start or dt < dst_end) else 12)
 
 # Depth-exact: extractions/{user_folder}/{date}/{session_base}.json — a key
 # nested any deeper (or shallower, or not ending in .json) is not this
