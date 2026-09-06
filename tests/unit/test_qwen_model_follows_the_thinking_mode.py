@@ -300,3 +300,22 @@ def test_both_environments_fall_back_to_the_same_models():
     for param in ("QwenModelPlus", "QwenModelFast", "QwenModelPlusNonThinking"):
         got = _workflow_fallback(param)
         assert len(set(got.values())) == 1, f"{param} differs between workflows: {got}"
+
+
+def test_every_call_leaves_a_line_naming_the_model_that_ran(monkeypatch, caplog):
+    """Which model served a call was unanswerable from anywhere.
+
+    The env says what a deploy CAN reach and one function reaches two; the
+    rolling-summary artifact records turn_count and updated_at and no model. So
+    after a bump nobody could say whether a bad answer came from the new model
+    or the old -- and a silent regression is the failure this whole pairing
+    exists to prevent.
+    """
+    import logging
+    mod = _load(monkeypatch, "thinky", "fasty")
+    _capture(mod, monkeypatch)
+    with caplog.at_level(logging.INFO):
+        mod.call_llm("hi", max_tokens=100, force_json=True, enable_thinking=False)
+    line = " ".join(r.getMessage() for r in caplog.records)
+    assert "fasty" in line, f"the served model is not in the log: {line!r}"
+    assert "thinky" not in line, "logged the model this call did NOT use"

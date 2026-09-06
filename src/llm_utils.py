@@ -290,6 +290,17 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
         else:
             payload["max_tokens"] = max_tokens
 
+    # One line per call, on the way OUT, naming what actually goes on the wire.
+    #
+    # Which model served a call was unanswerable from anywhere: the env says
+    # what a deploy CAN reach, and one function reaches two. The rolling-summary
+    # artifact records turn_count and updated_at and no model, so after a bump
+    # nobody can say whether a bad answer came from the new model or the old --
+    # and a silent regression is exactly the failure this pairing exists to
+    # prevent. A guard that passes still has to leave a line, or "it ran
+    # correctly" and "it never ran" look the same.
+    logger.info("qwen call: model=%s thinking=%s json=%s",
+                payload["model"], thinking, "response_format" in payload)
     resp, err = _post_with_retry(
         f"{QWEN_BASE_URL}/chat/completions",
         json.dumps(payload),
