@@ -6135,8 +6135,24 @@ def admin_disambiguation(conn, caller, date):
     # this the calendar's upload-only days open onto a bare 404 for an admin:
     # neither source above knows a folder whose extraction never ran, so there
     # is no candidate, no picker, and no way to guess whose ?user to ask for.
+    # NO COMPANY PIN FOR A CROSS-COMPANY CALLER. platform_admin sits in its own
+    # operator company (FieldSight-platform), while the recordings belong to the
+    # customer company -- so pinning to the caller's own company matches zero
+    # rows and the admin is told the day is empty while it holds 56 photos.
+    # Same rule the metric route already applies, and the same trap it was
+    # fixed for: a claim about the pipeline made from a fact about the ACL.
+    #
+    # KNOWN, NOT FIXED HERE: the two candidate sources above carry the same
+    # pin -- `users.get_by_folder_name(conn, caller["company_id"], ...)` and
+    # `list_extraction_folder_names_for_date(conn, caller["company_id"], ...)`
+    # -- so the aggregated day view has always been empty for a cross-company
+    # admin, before this feature existed. Widening those changes which reports
+    # a platform_admin can reach and deserves its own change and its own
+    # before/after, not a line in a commit about upload days.
     candidates.update(recordings.folders_with_uploads_for_date(
-        conn, caller["company_id"], date))
+        conn,
+        None if is_cross_company(caller["global_role"]) else caller["company_id"],
+        date))
     if not candidates:
         return ok({"message": f"No reports for {date}", "date": date}, 404)
     if len(candidates) == 1:

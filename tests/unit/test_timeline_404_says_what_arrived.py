@@ -356,3 +356,33 @@ def test_a_truly_empty_day_still_404s_for_an_admin(monkeypatch):
                         lambda conn, cid, date: set())
     res = org.admin_disambiguation(FakeConn(), dict(CALLER), DATE)
     assert res["statusCode"] == 404
+
+
+def test_a_cross_company_admin_is_not_pinned_to_its_own_company(monkeypatch):
+    """platform_admin sits in its own operator company while the recordings
+    belong to the customer's. Pinning to the caller's company matches zero rows
+    and reports an empty day that holds 56 photos -- a claim about the pipeline
+    made from a fact about the ACL, which is the shape the metric route was
+    already fixed for once.
+    """
+    seen = {}
+    monkeypatch.setattr(org, "_list_report_folders", lambda date: [])
+    monkeypatch.setattr(org.topics, "list_extraction_folder_names_for_date",
+                        lambda conn, cid, date: set())
+    monkeypatch.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
+    monkeypatch.setattr(org.recordings, "folders_with_uploads_for_date",
+                        lambda conn, cid, date: seen.update(company=cid) or set())
+    org.admin_disambiguation(FakeConn(), dict(CALLER, global_role="platform_admin"), DATE)
+    assert seen["company"] is None
+
+
+def test_an_ordinary_admin_keeps_the_company_pin(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(org, "_list_report_folders", lambda date: [])
+    monkeypatch.setattr(org.topics, "list_extraction_folder_names_for_date",
+                        lambda conn, cid, date: set())
+    monkeypatch.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
+    monkeypatch.setattr(org.recordings, "folders_with_uploads_for_date",
+                        lambda conn, cid, date: seen.update(company=cid) or set())
+    org.admin_disambiguation(FakeConn(), dict(CALLER), DATE)
+    assert seen["company"] == CALLER["company_id"]
