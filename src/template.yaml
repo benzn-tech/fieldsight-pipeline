@@ -298,6 +298,24 @@ Parameters:
     Description: DashScope OpenAI-compatible base URL for Qwen chat completions
     Default: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 
+  QwenChatApiKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: >-
+      Credential for CHAT ONLY. Empty falls back to DashScopeApiKey, which is
+      exactly today's behaviour, so an unset value changes nothing.
+
+      It exists because chat and embeddings were pinned to one key on seven
+      functions (`QWEN_API_KEY: !Ref DashScopeApiKey`), while `QwenBaseUrl` is a
+      single parameter shared by all of them. Pointing that base URL at another
+      vendor without a separate credential would have sent the DashScope key to
+      that vendor and 401'd all seven in one deploy. `llm_utils` has always had
+      the fallback; the deployment never exercised it.
+
+      Embeddings, rerank, ASR and TTS keep reading DashScopeApiKey and are
+      unaffected by this parameter.
+
   QwenModelPlus:
     Type: String
     Description: Qwen model for structured-JSON tasks (report/meeting/extract/matcher)
@@ -1043,6 +1061,16 @@ Conditions:
   # NOT depend on HasVadLayer: that layer (fieldsight-vad-layer) is cp312-only
   # and feeds VadFunction, not KeyframeFunction.
   HasKeyframeStack: !And [!Condition HasDb, !Condition HasKeyframeFfmpegLayer]
+  # BOTH switches or neither, and the pairing is the safety property.
+  #
+  # A key-only condition is the same footgun mirrored: set the chat key without
+  # moving the base URL and the other vendor's key goes to DashScope, 401ing
+  # the same seven functions this parameter exists to protect. Requiring the
+  # base URL to have moved makes the two changes atomic -- neither alone can
+  # produce a mismatched (endpoint, credential) pair.
+  UsesSeparateChatVendor: !And
+    - !Not [!Equals [!Ref QwenChatApiKey, '']]
+    - !Not [!Equals [!Ref QwenBaseUrl, 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1']]
   # QR passwordless login (2026-07-30): the code table has a FIXED TableName
   # and DynamoDB table names are unique per account+region, but test and prod
   # deploy from the SAME account — gating on HasOrgApi (true in both stacks)
@@ -1320,7 +1348,7 @@ Resources:
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
-          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
           QWEN_ENABLE_THINKING: 'true'
@@ -1436,7 +1464,7 @@ Resources:
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
-          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
           QWEN_ENABLE_THINKING: 'true'
@@ -1574,7 +1602,7 @@ Resources:
           CLAUDE_MODEL: claude-haiku-4-5-20251001
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
-          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelFast
           # DASHSCOPE_TTS_* below default inside dashscope_utils.py (model
@@ -2108,7 +2136,7 @@ Resources:
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
-          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
           LLM_HTTP_TIMEOUT: '540'
@@ -2230,7 +2258,7 @@ Resources:
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
-          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
           # Thinking OFF — the mid-meeting summary should be fast; summarisation
@@ -2605,7 +2633,7 @@ Resources:
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
-          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
           # Applies to the rolling summariser only. session_brief passes
@@ -3287,7 +3315,7 @@ Resources:
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
-          QWEN_API_KEY: !Ref DashScopeApiKey
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
       Policies:

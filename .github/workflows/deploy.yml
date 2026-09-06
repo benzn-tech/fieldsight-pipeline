@@ -74,6 +74,9 @@ jobs:
           REALPTT_PASSWORD: ${{ secrets.REALPTT_PASSWORD }}
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          # Chat only. Empty -> the template falls back to DashScopeApiKey,
+          # i.e. today's behaviour. See QwenChatApiKey in template.yaml.
+          QWEN_CHAT_API_KEY: ${{ secrets.QWEN_CHAT_API_KEY }}
           # TEST's OWN ElevenLabs key, deliberately not prod's. They were the
           # same key until 2026-08-08, which meant every test recording spent
           # prod's allowance -- and a spent allowance presents as transcription
@@ -151,10 +154,22 @@ jobs:
           # onward is comment, the remaining argument lines are then parsed as
           # separate commands, and the step dies with "command not found" AFTER
           # sam deploy has already run — taking the migration step with it.
+          # Same bare-"Key=" guard as NONWORK_SINCE_PARAM and LlmTemperature below.
+          # SAM rejects `QwenChatApiKey=` outright at argument parsing, before
+          # CloudFormation is reached -- which is exactly how this failed the first
+          # TEST deploy after the parameter was added, with the secret not yet set.
+          QWEN_CHAT_KEY_PARAM=""
+          if [ -n "$QWEN_CHAT_API_KEY" ]; then
+            QWEN_CHAT_KEY_PARAM="QwenChatApiKey=$QWEN_CHAT_API_KEY"
+          fi
           NONWORK_SINCE_PARAM=""
           if [ -n "${{ vars.TEST_NONWORK_EXPIRY_SINCE }}" ]; then
             NONWORK_SINCE_PARAM="NonWorkExpirySince=${{ vars.TEST_NONWORK_EXPIRY_SINCE }}"
           fi
+          # QwenBaseUrl / QwenModelPlus / QwenModelFast / QwenChatApiKey were
+          # never passed here, so both stacks ran template defaults and the
+          # "just flip a variable" rollback did not exist. Unset vars keep those
+          # same defaults, so adding them changes nothing until someone sets one.
           sam deploy --config-env test \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -229,6 +244,10 @@ jobs:
               "OrgUserPoolId=ap-southeast-2_q88pd6XXr" \
               "LlmProvider=${{ vars.TEST_LLM_PROVIDER || 'qwen' }}" \
               "AsrProvider=${{ vars.TEST_ASR_PROVIDER || 'elevenlabs' }}" \
+              "QwenBaseUrl=${{ vars.TEST_QWEN_BASE_URL || 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1' }}" \
+              "QwenModelPlus=${{ vars.TEST_QWEN_MODEL_PLUS || 'qwen3.7-max' }}" \
+              "QwenModelFast=${{ vars.TEST_QWEN_MODEL_FAST || 'qwen3.6-flash' }}" \
+              $QWEN_CHAT_KEY_PARAM \
               "ElevenLabsApiKey=$ELEVENLABS_API_KEY" \
               "PgDatabase=fieldsight_test"
 

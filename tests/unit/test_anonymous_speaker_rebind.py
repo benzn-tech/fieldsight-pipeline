@@ -388,7 +388,51 @@ def test_the_evidence_covers_every_session_on_the_day(monkeypatch):
     payload = {"speaker_segments": [
         {"source_filename": "x_sid" + "a" * 32 + "_c0000.json", "speaker_label": "spk_0"},
         {"source_filename": "y_sid" + "b" * 32 + "_c0000.json", "speaker_label": "spk_0"}]}
-    org._apply_speaker_names(object(), {"id": "u", "company_id": CO}, payload)
+    org._apply_speaker_groups(object(), {"id": "u", "company_id": CO}, payload)
 
     assert len(asked) == 2, f"the evidence was asked for {len(asked)} of 2 sessions: {asked}"
     assert len(payload["speakerGroups"]) == 2
+
+
+def test_groups_are_not_behind_the_naming_gate(monkeypatch):
+    """The defect this split exists for, and it was invisible from either half.
+
+    The group block used to sit inside `_apply_speaker_names`, after its first line —
+    `if SPEAKER_IDENTITY_MODE == "off": return payload`. Enabling the re-bind on prod
+    therefore wrote 28 group rows that no reader could see: 318 segments, zero groups.
+
+    The re-bind is anonymous — letters, no vector, nobody identified — and that is the whole
+    argument for shipping it while the NAMED library waits on a consent surface. Gating its
+    display on the naming switch makes that argument false for the only person it matters to.
+
+    Driven with the switch OFF, because that is the state prod is in.
+    """
+    import lambda_org_api as org
+
+    monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "off")
+    monkeypatch.setattr(org.speaker_label_groups, "for_session",
+                        lambda c, co, b: {("x_sid" + "a" * 32 + "_c0000.json", "spk_0"): "A"})
+    monkeypatch.setattr(org.speaker_label_groups, "evidence_for_session",
+                        lambda c, co, b: [{"group": "A", "labels": 1, "turns": 2,
+                                           "seconds": 9.0, "worstSpread": None}])
+    payload = {"speaker_segments": [
+        {"source_filename": "x_sid" + "a" * 32 + "_c0000.json", "speaker_label": "spk_0"}]}
+    org._apply_speaker_groups(object(), {"id": "u", "company_id": CO}, payload)
+
+    assert payload["speaker_segments"][0].get("speaker_group") == "A", (
+        "the anonymous group is still gated on SPEAKER_IDENTITY_MODE; enabling the re-bind "
+        "alone writes rows nobody can read")
+    assert payload.get("speakerGroups")
+
+
+def test_naming_stays_behind_its_own_gate(monkeypatch):
+    """The other half of the split. Names are the part that carries consent, and `off` must
+    still mean the transcript reads exactly as it did before that feature existed."""
+    import lambda_org_api as org
+
+    monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "off")
+    payload = {"speaker_segments": [
+        {"source_filename": "x_sid" + "a" * 32 + "_c0000.json", "speaker_label": "spk_0"}]}
+    out = org._apply_speaker_names(object(), {"id": "u", "company_id": CO}, payload)
+    assert "speaker_name" not in out["speaker_segments"][0]
+    assert "unmatchedNames" not in out
