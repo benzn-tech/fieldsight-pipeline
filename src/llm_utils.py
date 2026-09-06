@@ -117,7 +117,13 @@ def qwen_model_for(thinking):
     """
     if thinking or not QWEN_MODEL_NONTHINKING:
         return QWEN_MODEL
-    if QWEN_MODEL_NONTHINKING == QWEN_MODEL_INHERIT:
+    # Case-folded on COMPARISON only. The value crosses a repo variable, a
+    # shell, a CLI override and CloudFormation and none of them normalise it,
+    # so `Inherit` would otherwise reach DashScope as a literal model name and
+    # fail every non-thinking call in six functions at runtime. Folding the
+    # value itself instead would quietly lowercase a real model name, and not
+    # every vendor's are lowercase.
+    if QWEN_MODEL_NONTHINKING.lower() == QWEN_MODEL_INHERIT:
         return QWEN_MODEL
     return QWEN_MODEL_NONTHINKING
 

@@ -101,7 +101,7 @@ def test_the_env_default_decides_when_the_call_does_not(monkeypatch):
 # Nothing changes for a deploy that does not set it
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("unset", ["", "   ", "inherit"])
+@pytest.mark.parametrize("unset", ["", "   ", "inherit", "Inherit", "INHERIT"])
 @pytest.mark.parametrize("thinking", [True, False])
 def test_unset_means_one_model_for_both_modes(monkeypatch, unset, thinking):
     """The parameter defaults to the `inherit` sentinel, so every existing deploy
@@ -147,20 +147,78 @@ def test_the_reported_model_is_the_one_that_answered(monkeypatch):
 # A new qwen function cannot be added without it
 # --------------------------------------------------------------------------
 
-def test_every_function_with_a_qwen_model_also_carries_the_non_thinking_one():
-    """The env key is what a Lambda actually reads. A function given QWEN_MODEL
-    and not QWEN_MODEL_NONTHINKING silently pins both modes to one model, and
-    nothing at runtime would say so."""
+def _qwen_env_blocks():
+    """(model_ref, non_thinking_ref or None) for every function in the template.
+
+    Parsed rather than substring-matched: a commented-out pairing satisfies
+    `"X" in line` while CloudFormation ignores it, so a broken template would
+    pass. These env blocks are heavily commented, so a fixed +/-1 line window
+    also fails a correct template the moment somebody adds a note between the
+    two keys.
+    """
     import pathlib
     tpl = pathlib.Path(__file__).resolve().parents[2] / "src" / "template.yaml"
-    lines = tpl.read_text(encoding="utf-8").splitlines()
-    have, missing = 0, []
-    for i, line in enumerate(lines):
-        if line.strip().startswith("QWEN_MODEL: !Ref"):
-            have += 1
-            window = lines[max(0, i - 1):i + 2]
-            if not any("QWEN_MODEL_NONTHINKING: !Ref QwenModelNonThinking" in w
-                       for w in window):
-                missing.append(f"line {i + 1}: {line.strip()}")
-    assert have >= 7, f"expected the known qwen functions, found {have}"
-    assert not missing, "QWEN_MODEL without QWEN_MODEL_NONTHINKING:\n" + "\n".join(missing)
+    blocks, cur = [], None
+    for raw in tpl.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line.startswith("#") or not line:
+            continue
+        if line.startswith("QWEN_MODEL: !Ref "):
+            if cur is not None:
+                blocks.append(cur)
+            cur = [line.split("!Ref ", 1)[1].strip(), None]
+        elif line.startswith("QWEN_MODEL_NONTHINKING: !Ref ") and cur is not None:
+            cur[1] = line.split("!Ref ", 1)[1].strip()
+    if cur is not None:
+        blocks.append(cur)
+    return blocks
+
+
+def test_every_plus_function_carries_the_non_thinking_parameter():
+    """The env key is what a Lambda actually reads. A Plus function given
+    QWEN_MODEL and not QWEN_MODEL_NONTHINKING silently pins both modes to one
+    model, and nothing at runtime would say so."""
+    blocks = _qwen_env_blocks()
+    plus = [b for b in blocks if b[0] == "QwenModelPlus"]
+    assert len(plus) >= 6, f"expected the known plus functions, found {len(plus)}"
+    missing = [b for b in plus if b[1] != "QwenModelPlusNonThinking"]
+    assert not missing, f"QwenModelPlus functions without the override: {missing}"
+
+
+def test_the_ask_path_is_deliberately_left_out():
+    """AskAgentFunction is ALWAYS non-thinking, so QwenModelFast is already its
+    non-thinking model. Mirroring the override onto it would make QwenModelFast
+    dead config and move the latency-bound path onto the heavier model the first
+    time somebody set the variable to protect extract-session's live pass --
+    silently, since the answer would still be correct, just slower.
+
+    This pins the ABSENCE, which is the half a reviewer forgets to pin."""
+    fast = [b for b in _qwen_env_blocks() if b[0] == "QwenModelFast"]
+    assert len(fast) == 1, f"expected exactly one Fast function, found {len(fast)}"
+    assert fast[0][1] is None, (
+        "AskAgentFunction must NOT carry QWEN_MODEL_NONTHINKING -- see the "
+        "parameter Description in template.yaml")
+
+
+def test_no_function_hardcodes_a_qwen_model():
+    """A literal `QWEN_MODEL: qwen3.6-flash` would escape both checks above:
+    it is neither a Plus nor a Fast reference, so it is invisible to the pairing
+    rule while still reaching a model."""
+    import pathlib, re
+    tpl = pathlib.Path(__file__).resolve().parents[2] / "src" / "template.yaml"
+    bad = [ln.strip() for ln in tpl.read_text(encoding="utf-8").splitlines()
+           if re.match(r"^\s*QWEN_MODEL:\s*(?!!Ref)\S", ln) and not ln.strip().startswith("#")]
+    assert not bad, f"QWEN_MODEL must be a !Ref so the pairing rule can see it: {bad}"
+
+
+def test_both_workflows_pass_the_parameter():
+    """Without this, deleting either workflow line leaves every other test green
+    and the repo variable silently inert -- the deploy falls back to the CFN
+    default and nobody learns the knob stopped working."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows"
+    for name, prefix in (("deploy.yml", "TEST"), ("deploy-prod.yml", "PROD")):
+        text = (root / name).read_text(encoding="utf-8")
+        assert "QwenModelPlusNonThinking=" in text, f"{name} does not pass the parameter"
+        assert f"{prefix}_QWEN_MODEL_PLUS_NONTHINKING" in text, (
+            f"{name} does not read its own repo variable")
