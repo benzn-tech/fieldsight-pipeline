@@ -326,6 +326,20 @@ Parameters:
     Description: Qwen model for the latency-bound ask path
     Default: qwen3.6-flash
 
+  EnableRerank:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Reorder Ask's retrieved chunks with qwen3-rerank before they reach the
+      prompt. Off by default: it adds a measured ~4s fixed round trip to a
+      synchronous path already capped at 29s by API Gateway, and whether the
+      answers get better is a judgement no test can make -- it needs a fixed
+      question set read by a person, which does not exist yet.
+
+      Every failure path inside falls back to the cosine order, so turning it
+      on cannot make a question unanswerable; it can only make it slower.
+
   AsrProvider:
     Type: String
     Description: Speech-to-text provider (transcribe|elevenlabs)
@@ -1588,6 +1602,9 @@ Resources:
           DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
           DASHSCOPE_EMBED_MODEL: text-embedding-v4
           DASHSCOPE_EMBED_DIM: '1024'
+          # Ask only. rag-search is in-VPC with no egress and could not make
+          # this call at all -- it would hang to the socket timeout.
+          ENABLE_RERANK: !Ref EnableRerank
           # SP-Ask: async audit hop (in-VPC). Same cross-condition Ref shape as
           # RAG_SEARCH_FUNCTION above (VoiceAuditFunction is HasDb, this fn is
           # unconditional) — safe in practice on the test stack; see the W1001
