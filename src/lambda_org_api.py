@@ -606,7 +606,7 @@ def dispatch(conn, event, method, route):
         return acknowledge_delay_flag(conn, caller, m_dr.group(1), state="resolved")
 
     if route == "/recordings/upload-url" and method == "POST":
-        return create_recording_upload_url(conn, caller, parse_body(event))
+        return create_recording_upload_url(conn, caller, parse_body(event), device_ident)
     m_rc = re.match(r"^/recordings/([^/]+)/complete$", route)
     if m_rc and method == "POST":
         return complete_recording(conn, caller, m_rc.group(1), parse_body(event))
@@ -683,7 +683,7 @@ def _recording_s3_key(display_name, kind, started_at, file_name):
     return f"users/{_safe_seg(display_name)}/{folder}/{date_str}/{_safe_seg(file_name)}"
 
 
-def create_recording_upload_url(conn, caller, body):
+def create_recording_upload_url(conn, caller, body, device_ident=None):
     if body is None:
         return error("malformed JSON body", 400)
     kind = body.get("kind")
@@ -712,6 +712,13 @@ def create_recording_upload_url(conn, caller, body):
             f"{caller.get('first_name', '')}_{caller.get('last_name', '')}"
         key = _recording_s3_key(display_name, kind, started_at, file_name)
         try:
+            # Resolved BEFORE the transaction opens, not inside it. `device_id`
+            # swallows its own exceptions -- but a failed query still leaves the
+            # enclosing transaction aborted, so the swallow would turn a telemetry
+            # miss into "current transaction is aborted" on the INSERT and lose the
+            # upload. Which unit recorded this is worth knowing; it is not worth a
+            # recording.
+            recording_device_id = device_heartbeat.device_id(conn, device_ident)
             with conn.transaction():          # savepoint: on failure, roll back to here so conn stays usable
                 row = recordings.insert_pending(
                     conn, company_id=caller["company_id"], user_id=caller["id"], site_id=site_id,
@@ -719,6 +726,7 @@ def create_recording_upload_url(conn, caller, body):
                     ended_at=body.get("endedAt"), duration_s=body.get("durationS"),
                     resolution=body.get("resolution"), codec=body.get("codec"),
                     size_bytes=body.get("sizeBytes"),
+                    device_id=recording_device_id,
                 )
             rec_id = row["id"]
         except UniqueViolation:
