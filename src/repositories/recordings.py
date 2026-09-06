@@ -459,10 +459,17 @@ def photo_list_for_day(conn, company_id, user_folder, date) -> list:
     """
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT s3_key, started_at FROM recordings "
-        "WHERE company_id = %s AND kind = 'photo' "
+        # company_id=None MEANS NO COMPANY RESTRICTION. A cross-company
+        # platform_admin reads a customer's folder while sitting in its own
+        # operator company, so a bare `company_id = %s` binds NULL and matches
+        # nothing -- the day answers "no photos" while holding 56. Same shape
+        # as range_stats, and the same trap the admin path was just fixed for.
+        "WHERE (%s::uuid IS NULL OR company_id = %s) AND kind = 'photo' "
         "AND s3_key LIKE %s ESCAPE '\\' "
         "ORDER BY started_at NULLS LAST, s3_key",
-        (company_id, f"users/{_escape_like(user_folder)}/%/{date}/%"),
+        (str(company_id) if company_id else None,
+         str(company_id) if company_id else None,
+         f"users/{_escape_like(user_folder)}/%/{date}/%"),
     ).fetchall()
     return [{"s3_key": r["s3_key"], "taken_at": r["started_at"]} for r in rows]
 
