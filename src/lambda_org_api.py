@@ -5969,7 +5969,61 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     doc = _get_lake_json(f"reports/{date}/{user}/daily_report.json")
     if doc is not None:
         return ok(doc)                              # VERBATIM (byte-identical history)
-    return ok({"message": f"No report for {user} on {date}", "date": date}, 404)
+    body = {"message": f"No report for {user} on {date}", "date": date}
+    facts = _day_upload_facts(conn, caller, user, date)
+    if facts:
+        body.update(facts)
+    return ok(body, 404)
+
+
+def _day_upload_facts(conn, caller, user, date):
+    """What arrived on a day that produced no report.
+
+    ONLY for the plain "no report" 404. The other two 404s in this function
+    must NOT carry these numbers, and for different reasons:
+
+      * the cross-user-clip 404 withholds a target's content because the caller
+        may not see it -- answering "they recorded 53 photos" discloses the
+        very fact being withheld;
+      * the deleted-sources 404 is a day the customer took back. `range_stats`
+        drops their tombstoned sessions, but a photo key carries no session id
+        and cannot be excluded at all, so the counts would partially undo the
+        deletion.
+
+    `day_state` reports what can be EVIDENCED, never what is likely. An earlier
+    draft returned "pending", which is a claim about the future that this
+    process cannot make: extraction may have run and legitimately produced
+    nothing, or the caller may have deleted every session that day, and
+    "your report is on the way" is the wrong sentence for both. `reported` is
+    absent by construction -- reaching this code means the report is not there.
+
+    Returns None when there is nothing to say, so the 404 body stays exactly
+    as it was rather than growing three keys full of zeros.
+    """
+    company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+    site_ids = _allowed_site_ids(conn, caller)
+    if not site_ids:
+        return None
+    deleted = redactions.deleted_session_bases(conn, company, date, date)
+    stats = recordings.range_stats(conn, company, date, date, site_ids,
+                                   author_ids=_author_filter(conn, caller),
+                                   deleted_bases=deleted)
+    # Transcription does not go through the LLM provider, so on a day the
+    # extraction failed the transcripts are usually sitting there, readable,
+    # through a route (/transcripts) that needs no topics. Counting them is
+    # what separates "the recorder never reached us" from "we have the words
+    # and could not summarise them".
+    n_tx = sum(1 for _ in _list_media_objects(f"transcripts/{user}/{date}/", "transcripts"))
+    if not (stats["sessions"] or stats["photos"] or n_tx):
+        return None
+    return {
+        "uploads": {"sessions": stats["sessions"],
+                    "duration_s": stats["duration_s"],
+                    "photos": stats["photos"]},
+        "transcripts": n_tx,
+        "day_state": "transcribed" if n_tx else "captured",
+    }
+
 
 
 def admin_disambiguation(conn, caller, date):
