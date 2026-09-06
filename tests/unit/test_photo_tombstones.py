@@ -225,3 +225,22 @@ def test_every_like_carries_a_real_escape_character():
                     "NO escape character, so _escape_like's backslash becomes a "
                     "literal and the LIKE matches nothing" % esc)
     assert checked >= 5, f"only {checked} ESCAPE clauses reached -- the sweep missed some"
+
+
+def test_the_photo_list_is_not_pinned_for_a_cross_company_caller():
+    """A platform_admin reads a customer's folder while sitting in its own
+    operator company. A bare `company_id = %s` binds NULL there and matches
+    nothing, so the day answers "no photos" while holding 56 -- the same shape
+    the admin candidate lookup was just fixed for, one function along."""
+    conn = _Conn(rows=[])
+    recordings.photo_list_for_day(conn, None, "Ada_L", "2026-09-02")
+    sql, params = conn.sql[0]
+    assert "IS NULL OR company_id" in sql
+    assert params[0] is None
+
+
+def test_the_photo_list_still_pins_an_ordinary_caller():
+    conn = _Conn(rows=[])
+    recordings.photo_list_for_day(conn, "c-1", "Ada_L", "2026-09-02")
+    _, params = conn.sql[0]
+    assert params[0] == "c-1"
