@@ -4715,11 +4715,19 @@ Resources:
       EvaluationPeriods: 2
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
-      # `breaching`, NOT notBreaching, and that is the point. The metric is
+      # `breaching` where the sweep RUNS, and that is the point: the metric is
       # published on every run including the zero, so missing data means the
       # checker itself stopped -- the same invisible absence this exists to
       # detect. Two periods so one failed publish is not an alarm.
-      TreatMissingData: breaching
+      #
+      # Conditional, because on a stack whose schedules are off NOTHING feeds
+      # this series and `breaching` makes the alarm permanently red. That is not
+      # hypothetical: adding the Stage dimension moved the test alarm off the
+      # shared series that prod's hourly sweep had been keeping alive, and it
+      # flapped into ALARM twice the same day, e-mailing a real inbox. An alarm
+      # that is always red is an alarm nobody reads -- the exact failure this
+      # whole probe was written to avoid, reintroduced by its own alarm.
+      TreatMissingData: !If [ShouldEnableSchedules, breaching, notBreaching]
       AlarmActions:
         - !Ref AlertTopic
 
