@@ -40,6 +40,12 @@ logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 METRIC_NAMESPACE = os.environ.get("BACKLOG_METRIC_NAMESPACE", "FieldSight/Pipeline")
+# Which stack published this. Without it both stacks write the SAME series and
+# the alarm cannot tell them apart -- test's backlog would page prod, and worse,
+# if the PROD probe died while a test publisher lived, `TreatMissingData:
+# breaching` would never trip. That is precisely the "the checker stopped"
+# scenario this function exists to detect, defeated by a missing dimension.
+METRIC_STAGE = os.environ.get("BACKLOG_METRIC_STAGE", "").strip()
 
 # A request younger than this is in flight, not late. Extraction of a long
 # session takes minutes, and finalize re-drives, so anything tighter would
@@ -140,10 +146,12 @@ def lambda_handler(event, context):
     # appears when something is wrong cannot tell "healthy" from "the checker
     # stopped running", and this whole function exists because absence was
     # invisible.
+    datum = {"MetricName": "ExtractionBacklog",
+             "Value": len(recent), "Unit": "Count"}
+    if METRIC_STAGE:
+        datum["Dimensions"] = [{"Name": "Stage", "Value": METRIC_STAGE}]
     boto3.client("cloudwatch").put_metric_data(
-        Namespace=METRIC_NAMESPACE,
-        MetricData=[{"MetricName": "ExtractionBacklog",
-                     "Value": len(recent), "Unit": "Count"}],
+        Namespace=METRIC_NAMESPACE, MetricData=[datum],
     )
     logger.info("backlog: recent=%d total=%d window_days=%d grace_min=%d",
                 len(recent), len(everything), WINDOW_DAYS, GRACE_MINUTES)

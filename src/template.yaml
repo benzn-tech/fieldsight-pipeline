@@ -4649,6 +4649,12 @@ Resources:
       Environment:
         Variables:
           S3_BUCKET: !Ref DataBucketName
+          # Both stacks publish to one namespace. Without a dimension they
+          # write the SAME series: test's backlog would page prod, and if the
+          # PROD probe died while a test publisher lived, TreatMissingData
+          # would never trip -- the exact "checker stopped" case this exists
+          # to catch, defeated by a missing dimension.
+          BACKLOG_METRIC_STAGE: !Ref Stage
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -4690,6 +4696,9 @@ Resources:
         report does not, which no error alarm can see once the retries stop.
       Namespace: FieldSight/Pipeline
       MetricName: ExtractionBacklog
+      Dimensions:
+        - Name: Stage
+          Value: !Ref Stage
       Statistic: Maximum
       Period: 3600
       EvaluationPeriods: 2
