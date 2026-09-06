@@ -3907,8 +3907,41 @@ def delete_recordings_endpoint(conn, caller, body):
             company_id=target_company)
         logger.info("user deletion: batch=%s session=%s archived %d chunk(s)",
                     batch_id, rec.get("sessionBase"), archived)
+        # Photos. A photo key carries no session id, so the only evidence linking
+        # one to this session is the clock: the session's own recordings rows give
+        # a span, and photos captured inside it are tombstoned in THIS batch so the
+        # undelete restores them together.
+        #
+        # Two limits, stated because a silent one is worse than a known one:
+        #   * photos taken BETWEEN sessions are not covered and never can be by any
+        #     rule of this shape. They need a per-photo delete, which is exactly
+        #     what `create_photo_tombstone` is shaped for.
+        #   * a session with no `recordings` rows (RealPTT, pre-0009, lake-fed) has
+        #     no span, so it covers nothing. That case LOGS. A guard that is silent
+        #     when it declines cannot be told from one that never ran.
+        photos_hidden = 0
+        span = recordings.session_span(
+            conn, target_company, rec["folder"], rec["date"],
+            (rec.get("sessionBase") or "").strip())
+        if span is None:
+            logger.warning(
+                "user deletion: batch=%s session=%s has no recordings span -- "
+                "0 photos covered", batch_id, rec.get("sessionBase"))
+        else:
+            for photo_key in recordings.photo_keys_in_span(
+                    conn, target_company, rec["folder"], rec["date"], span[0], span[1]):
+                if redactions.create_photo_tombstone(
+                        conn, target_company, photo_key, reason,
+                        caller.get("id"), caller.get("global_role"), batch_id=batch_id):
+                    photos_hidden += 1
+            # Logged on the SUCCESS path too, including the zero. "Covered nothing"
+            # and "never ran" have to be distinguishable from the outside.
+            logger.info("user deletion: batch=%s session=%s hid %d photo(s) in span",
+                        batch_id, rec.get("sessionBase"), photos_hidden)
+
         results.append({"recording": rec, "topics_hidden": hidden,
-                        "chunks_archived": archived})
+                        "chunks_archived": archived,
+                        "photos_hidden": photos_hidden})
         days.add((rec["folder"], rec["date"]))
         sessions_by_day.setdefault((rec["folder"], rec["date"]), set()).add(
             (rec.get("sessionBase") or "").strip())
