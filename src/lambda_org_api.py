@@ -6063,13 +6063,33 @@ def _day_upload_facts(conn, caller, user, date):
         # through a route (/transcripts) that needs no topics. Counting them is
         # what separates "the recorder never reached us" from "we have the words
         # and could not summarise them".
+        # The photo list, and the count derived FROM it.
+        #
+        # `range_stats` counts photos without consulting the photo tombstones -- it
+        # cannot, they did not exist when it was written. Taking the count from
+        # there and the list from here would put "53 photos" above a grid showing
+        # 41, and the missing twelve would be exactly the ones somebody deleted.
+        # Deriving both from the same filtered list makes them agree by
+        # construction rather than by anyone remembering to.
+        photos = recordings.photo_list_for_day(conn, company, user, date)
+        hidden = redactions.deleted_photo_keys(
+            conn, company, keys=[p["s3_key"] for p in photos])
+        photos = [p for p in photos if p["s3_key"] not in hidden]
+        if hidden:
+            logger.info("day view: %s/%s hid %d deleted photo(s)", user, date, len(hidden))
         n_tx = sum(1 for _ in _list_media_objects(f"transcripts/{user}/{date}/", "transcripts"))
-        if not (stats["sessions"] or stats["photos"] or n_tx):
+        if not (stats["sessions"] or len(photos) or n_tx):
             return None
         return {
             "uploads": {"sessions": stats["sessions"],
                         "duration_s": stats["duration_s"],
-                        "photos": stats["photos"]},
+                        "photos": len(photos)},
+            # Filenames only. The client already builds the key as
+            # users/{folder}/pictures/{date}/{filename} and presigns it -- that
+            # path is verified working for these objects -- so sending whole keys
+            # would hand it a second way to construct the same thing and a second
+            # way for the two to drift.
+            "photo_filenames": [p["s3_key"].rsplit("/", 1)[-1] for p in photos],
             "transcripts": n_tx,
             "day_state": "transcribed" if n_tx else "captured",
         }
