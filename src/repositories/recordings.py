@@ -381,6 +381,38 @@ def upload_date_counts(conn, company_id, site_ids, since_date, *,
              "photos": int(r["photos"] or 0)} for r in rows]
 
 
+def photo_list_for_day(conn, company_id, user_folder, date) -> list:
+    """Every photo row for one (folder, day): [{s3_key, taken_at}], oldest first.
+
+    Found by the s3_key DATE SEGMENT, never by `started_at`. That column is
+    timestamptz while every other date in this product -- the extraction topics,
+    day_stats, range_stats -- is the device's local day, and filtering on UTC
+    moves an evening capture to the next day (the BUG-37 family). `started_at`
+    is still returned, because ordering photos within a day is a question about
+    instants, not days.
+
+    `uploaded_at` IS DELIBERATELY NOT FILTERED. Rows are written at presign and
+    the column is stamped by /complete, which can be lost even when the object
+    arrived -- "a PUT timeout is not the same as nothing uploaded" is already
+    recorded in this repo. Filtering strictly would drop real photos, which is
+    the exact failure this whole feature exists to end; not filtering can at
+    worst show a thumbnail that 404s, which is visible and recoverable.
+
+    Checked before choosing: on prod every photo in S3 has a row -- 53/53,
+    32/32, 56/56 on the days sampled -- so the rows are not ahead of the
+    objects in practice.
+    """
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT s3_key, started_at FROM recordings "
+        "WHERE company_id = %s AND kind = 'photo' "
+        "AND s3_key LIKE %s ESCAPE '\' "
+        "ORDER BY started_at NULLS LAST, s3_key",
+        (company_id, f"users/{_escape_like(user_folder)}/%/{date}/%"),
+    ).fetchall()
+    return [{"s3_key": r["s3_key"], "taken_at": r["started_at"]} for r in rows]
+
+
+
 def session_span(conn, company_id, user_folder, date, session_base):
     """(start, end) of one recording session, or None when it cannot be known.
 
