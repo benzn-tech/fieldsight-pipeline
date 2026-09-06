@@ -238,21 +238,65 @@ def _param_default(param):
     return None
 
 
+def _workflow_fallback(param):
+    """The literal a workflow falls back to -- the value a deploy ACTUALLY gets.
+
+    `"Foo=${{ vars.X || 'lit' }}"` means the template's `Default:` is never
+    consulted: the CLI always passes a value. So the template Default is dead
+    config for both environments, and asserting it proves nothing about any
+    deploy. A first version of this file asserted exactly that and passed while
+    the deployed functions carried the old model -- caught only by reading the
+    env off a deployed Lambda.
+    """
+    import pathlib, re
+    root = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows"
+    out = {}
+    for name in ("deploy.yml", "deploy-prod.yml"):
+        text = (root / name).read_text(encoding="utf-8")
+        m = re.search(r'"' + param + r"=\$\{\{ vars\.\w+ \|\| '([^']+)' \}\}\"", text)
+        out[name] = m.group(1) if m else None
+    return out
+
+
 def test_no_non_thinking_default_is_a_model_measured_to_drop_fields():
-    """The defaults are what a deploy gets when nobody sets a repo variable, so
-    they are what a forgotten variable falls back to -- the safe value has to be
-    the default, not the thing somebody has to remember to set.
+    """The default is what a deploy gets when nobody sets a repo variable, so it
+    is what a forgotten variable falls back to -- the safe value has to be the
+    default, not the thing somebody has to remember to set.
 
     `qwen3.8-flash` put the due date in 0 of 5 runs with thinking off and 4 of 5
-    with it on. That makes it fine as QwenModelPlus, whose functions run thinking
-    on, and wrong for anything reached WITHOUT thinking: QwenModelPlusNonThinking,
-    and QwenModelFast because AskAgentFunction is always non-thinking.
+    with it on. Fine as QwenModelPlus, whose functions run thinking on; wrong for
+    anything reached WITHOUT thinking: QwenModelPlusNonThinking, and
+    QwenModelFast because AskAgentFunction is always non-thinking.
     """
     UNSAFE_WITHOUT_THINKING = {"qwen3.8-flash"}
     for param in ("QwenModelPlusNonThinking", "QwenModelFast"):
-        got = _param_default(param)
-        assert got, f"{param} has no Default in template.yaml"
-        assert got not in UNSAFE_WITHOUT_THINKING, (
-            f"{param} defaults to {got}, measured to drop structured fields "
-            f"when thinking is off -- see docs/superpowers/specs/"
-            f"2026-09-07-qwen38-flash-thinking-dependency.md")
+        for where, got in _workflow_fallback(param).items():
+            assert got, f"{where}: {param} has no || fallback"
+            assert got not in UNSAFE_WITHOUT_THINKING, (
+                f"{where}: {param} falls back to {got}, measured to drop "
+                f"structured fields when thinking is off -- see docs/superpowers/"
+                f"specs/2026-09-07-qwen38-flash-thinking-dependency.md")
+
+
+def test_the_template_default_agrees_with_what_the_workflows_deploy():
+    """Two places state a default and only one of them is ever used.
+
+    Nothing forces them to agree, so the template Default drifts into a
+    plausible-looking lie -- a reader checking the template gets the wrong
+    answer about every environment. Pin them equal so either one can be read.
+    """
+    for param in ("QwenModelPlus", "QwenModelFast", "QwenModelPlusNonThinking"):
+        tpl = _param_default(param)
+        for where, wf in _workflow_fallback(param).items():
+            assert tpl == wf, (
+                f"{param}: template says {tpl!r}, {where} deploys {wf!r}. The "
+                f"workflow wins, so the template is documenting a value no "
+                f"environment uses.")
+
+
+def test_both_environments_fall_back_to_the_same_models():
+    """test and prod diverging by accident is how a bug reproduces on only one
+    of them, and this pair has no reason to differ."""
+    for param in ("QwenModelPlus", "QwenModelFast", "QwenModelPlusNonThinking"):
+        got = _workflow_fallback(param)
+        assert len(set(got.values())) == 1, f"{param} differs between workflows: {got}"
