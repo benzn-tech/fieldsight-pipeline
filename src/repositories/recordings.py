@@ -116,8 +116,30 @@ def day_stats(conn, company_id, user_folder, date) -> dict:
        s3_key path segment is the one date that agrees with the rest of the
        timeline, and it is the same match duration_for_media/site_for_media use.
 
-    Only 'audio' and 'video' count: the KPI reads "Recordings" (capture
-    sessions), and photos have their own surface on the Evidence page.
+    Only 'audio' and 'video' count: the KPI reads "Recordings", i.e. capture
+    sessions.
+
+    THIS PARAGRAPH USED TO SAY photos "have their own surface on the Evidence
+    page". They did not. The Evidence page's own source comment says photos
+    "are filenames inside report topics -- we already have to fetch
+    /api/timeline anyway", and it calls getTimeline. Two authors each
+    believed the other path existed, and between them a photo could only be
+    seen by being bound to a topic. On a day whose extraction never ran,
+    that meant not at all: 296 of 432 photos on prod were unreachable for
+    exactly this reason.
+
+    The day view now lists photos from `photo_list_for_day` (2026-09-07),
+    filtered through the photo tombstones. This function is not the place
+    to count them -- but it is the place the wrong sentence was written, so
+    the correction belongs here too.
+
+    KNOWN GAP, not fixed here: unlike `range_stats` this takes no site set
+    and no author filter, so a caller who can reach one of a folder's sites
+    is counted seconds recorded on all of them. It is reachable only from
+    the report renderer, where the caller has already passed the folder
+    gate; new callers should use `range_stats(date, date)` instead, which
+    carries both. Changing the clip here would move a number the report has
+    been showing, so it wants its own change and its own before/after.
     company_id scopes the read — the multi-tenant invariant is that a folder
     name never reaches across tenants."""
     row = conn.cursor(row_factory=dict_row).execute(
