@@ -326,6 +326,18 @@ Parameters:
     Description: Qwen model for the latency-bound ask path
     Default: qwen3.6-flash
 
+  QwenModelNonThinking:
+    Type: String
+    Description: >-
+      Model to use for calls that run WITHOUT thinking. Empty means "same as the
+      function's QWEN_MODEL", which is what every deploy did before this
+      parameter existed. It exists because a model can be safe with thinking on
+      and lose structured fields with it off, and one function
+      (extract-session) runs both modes, so no per-function model parameter can
+      express it. See
+      docs/superpowers/specs/2026-09-07-qwen38-flash-thinking-dependency.md
+    Default: inherit
+
   EnableRerank:
     Type: String
     Default: 'false'
@@ -1365,6 +1377,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          QWEN_MODEL_NONTHINKING: !Ref QwenModelNonThinking
           QWEN_ENABLE_THINKING: 'true'
           LLM_HTTP_TIMEOUT: '180'
           REPORT_PREFIX: reports/
@@ -1481,6 +1494,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          QWEN_MODEL_NONTHINKING: !Ref QwenModelNonThinking
           QWEN_ENABLE_THINKING: 'true'
           LLM_HTTP_TIMEOUT: '180'
           MINUTES_PREFIX: meeting_minutes/
@@ -1622,6 +1636,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelFast
+          QWEN_MODEL_NONTHINKING: !Ref QwenModelNonThinking
           # DASHSCOPE_TTS_* below default inside dashscope_utils.py (model
           # qwen3-tts-flash-realtime, voice Cherry, intl WS url) — no env
           # override needed here; DashScopeLayer (below) provides the SDK.
@@ -2156,6 +2171,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          QWEN_MODEL_NONTHINKING: !Ref QwenModelNonThinking
           LLM_HTTP_TIMEOUT: '540'
           # INERT for this function — lambda_extract_session passes an explicit
           # enable_thinking on every call (live=False, final=True), so this env
@@ -2278,6 +2294,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          QWEN_MODEL_NONTHINKING: !Ref QwenModelNonThinking
           # Thinking OFF — the mid-meeting summary should be fast; summarisation
           # needs no extended reasoning (same reason as the finalize worker).
           QWEN_ENABLE_THINKING: 'false'
@@ -2653,6 +2670,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          QWEN_MODEL_NONTHINKING: !Ref QwenModelNonThinking
           # Applies to the rolling summariser only. session_brief passes
           # enable_thinking=True explicitly, because a brief's density comes
           # from the reasoning and it is measured at ~100-125s for a 70-minute
@@ -3335,6 +3353,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          QWEN_MODEL_NONTHINKING: !Ref QwenModelNonThinking
       Policies:
         - LambdaInvokePolicy:
             FunctionName: !Ref SuggestionWriterFunction
