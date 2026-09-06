@@ -130,6 +130,9 @@ jobs:
           REALPTT_PASSWORD: ${{ secrets.REALPTT_PASSWORD }}
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          # Chat only. Empty -> the template falls back to DashScopeApiKey,
+          # i.e. today's behaviour. See QwenChatApiKey in template.yaml.
+          QWEN_CHAT_API_KEY: ${{ secrets.QWEN_CHAT_API_KEY }}
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
           FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
@@ -181,6 +184,10 @@ jobs:
           if [ -n "${{ vars.PROD_LLM_TEMPERATURE }}" ]; then
             LLM_TEMP_PARAM="LlmTemperature=${{ vars.PROD_LLM_TEMPERATURE }}"
           fi
+          # QwenBaseUrl / QwenModelPlus / QwenModelFast / QwenChatApiKey were
+          # never passed here, so both stacks ran template defaults and the
+          # "just flip a variable" rollback did not exist. Unset vars keep those
+          # same defaults, so adding them changes nothing until someone sets one.
           sam deploy --config-env prod \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -246,6 +253,10 @@ jobs:
               "OrgUserPoolId=ap-southeast-2_q88pd6XXr" \
               "LlmProvider=${{ vars.PROD_LLM_PROVIDER || 'anthropic' }}" \
               "AsrProvider=${{ vars.PROD_ASR_PROVIDER || 'transcribe' }}" \
+              "QwenBaseUrl=${{ vars.PROD_QWEN_BASE_URL || 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1' }}" \
+              "QwenModelPlus=${{ vars.PROD_QWEN_MODEL_PLUS || 'qwen3.7-max' }}" \
+              "QwenModelFast=${{ vars.PROD_QWEN_MODEL_FAST || 'qwen3.6-flash' }}" \
+              "QwenChatApiKey=$QWEN_CHAT_API_KEY" \
               "EnableNonWorkExpiry=${{ vars.PROD_NONWORK_EXPIRY_ENABLED || 'false' }}" \
               "NonWorkExpiryHours=${{ vars.PROD_NONWORK_EXPIRY_HOURS || '24' }}" \
               $NONWORK_SINCE_PARAM \
