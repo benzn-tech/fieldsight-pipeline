@@ -319,7 +319,7 @@ Parameters:
   QwenModelPlus:
     Type: String
     Description: Qwen model for structured-JSON tasks (report/meeting/extract/matcher)
-    Default: qwen3.7-max
+    Default: qwen3.8-flash
 
   QwenModelFast:
     Type: String
@@ -340,7 +340,12 @@ Parameters:
       mirroring this parameter onto it would make QwenModelFast dead config and
       silently move the latency-bound path onto the heavier model. See
       docs/superpowers/specs/2026-09-07-qwen38-flash-thinking-dependency.md
-    Default: inherit
+      Defaulted to a concrete model rather than "inherit" the moment
+      QwenModelPlus became qwen3.8-flash: inheriting would have handed the
+      non-thinking callers exactly the model measured to drop the field, and
+      the safe outcome would have depended on somebody remembering to set a
+      repo variable. A default nobody sets has to be the safe one.
+    Default: qwen3.6-flash
 
   EnableRerank:
     Type: String

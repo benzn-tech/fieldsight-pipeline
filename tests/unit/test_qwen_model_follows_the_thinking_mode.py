@@ -222,3 +222,37 @@ def test_both_workflows_pass_the_parameter():
         assert "QwenModelPlusNonThinking=" in text, f"{name} does not pass the parameter"
         assert f"{prefix}_QWEN_MODEL_PLUS_NONTHINKING" in text, (
             f"{name} does not read its own repo variable")
+
+
+def _param_default(param):
+    """The `Default:` of one template Parameter, by walking its block."""
+    import pathlib
+    tpl = pathlib.Path(__file__).resolve().parents[2] / "src" / "template.yaml"
+    inside = False
+    for raw in tpl.read_text(encoding="utf-8").splitlines():
+        if raw.startswith("  ") and not raw.startswith("   ") and raw.rstrip().endswith(":"):
+            inside = raw.strip() == param + ":"
+            continue
+        if inside and raw.strip().startswith("Default:"):
+            return raw.split("Default:", 1)[1].strip().strip('"')
+    return None
+
+
+def test_no_non_thinking_default_is_a_model_measured_to_drop_fields():
+    """The defaults are what a deploy gets when nobody sets a repo variable, so
+    they are what a forgotten variable falls back to -- the safe value has to be
+    the default, not the thing somebody has to remember to set.
+
+    `qwen3.8-flash` put the due date in 0 of 5 runs with thinking off and 4 of 5
+    with it on. That makes it fine as QwenModelPlus, whose functions run thinking
+    on, and wrong for anything reached WITHOUT thinking: QwenModelPlusNonThinking,
+    and QwenModelFast because AskAgentFunction is always non-thinking.
+    """
+    UNSAFE_WITHOUT_THINKING = {"qwen3.8-flash"}
+    for param in ("QwenModelPlusNonThinking", "QwenModelFast"):
+        got = _param_default(param)
+        assert got, f"{param} has no Default in template.yaml"
+        assert got not in UNSAFE_WITHOUT_THINKING, (
+            f"{param} defaults to {got}, measured to drop structured fields "
+            f"when thinking is off -- see docs/superpowers/specs/"
+            f"2026-09-07-qwen38-flash-thinking-dependency.md")
