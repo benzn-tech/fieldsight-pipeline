@@ -10,13 +10,31 @@ _COLS = ("id, company_id, user_id, site_id, kind, s3_key, client_uuid, started_a
 
 def insert_pending(conn, company_id, user_id, site_id, kind, s3_key, client_uuid,
                    started_at, ended_at=None, duration_s=None, resolution=None,
-                   codec=None, size_bytes=None) -> dict:
+                   codec=None, size_bytes=None, device_id=None) -> dict:
+    """`device_id` answers "which physical unit recorded this", and until
+    2026-09-06 nothing ever wrote it.
+
+    Migration 0030 added the column and `lambda_device_ledger` joins on it to
+    report each device's most recent site -- a join that could only ever return
+    NULL, because no code path set it. The ledger's `actual_site` column has
+    been structurally empty since the day it shipped.
+
+    It stopped being cosmetic on 2026-09-02, when a device still signed in as
+    one account filed another site's forty-minute meeting into that account's
+    folder. Answering "which device made this recording" took an afternoon of
+    reconstructing identity out of S3 filenames, because the column built for
+    that question was empty.
+
+    NULL stays a legitimate value: the web app carries no device headers and
+    `device_heartbeat.device_id` returns None for an unknown device. A
+    recording whose device cannot be named is still a recording.
+    """
     return conn.cursor(row_factory=dict_row).execute(
         f"INSERT INTO recordings (company_id, user_id, site_id, kind, s3_key, client_uuid, "
-        f"started_at, ended_at, duration_s, resolution, codec, size_bytes) "
-        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
+        f"started_at, ended_at, duration_s, resolution, codec, size_bytes, device_id) "
+        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
         (company_id, user_id, site_id, kind, s3_key, client_uuid,
-         started_at, ended_at, duration_s, resolution, codec, size_bytes),
+         started_at, ended_at, duration_s, resolution, codec, size_bytes, device_id),
     ).fetchone()
 
 
