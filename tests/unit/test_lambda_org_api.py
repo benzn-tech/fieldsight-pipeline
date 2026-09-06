@@ -1044,6 +1044,12 @@ def presign_wired(wired):
     # gate itself override this per-test.
     wired.setattr(org.companies, "get_company_by_name",
                   lambda conn, name: {"id": "c-uuid-1", "name": name})
+    # 2026-09-07: admin_disambiguation also unions the folders that captured
+    # something but produced no report, so an upload-only day opens onto a
+    # picker instead of a bare 404. Defaulted to empty here so every test
+    # above keeps describing what it was written to describe.
+    wired.setattr(org.recordings, "folders_with_uploads_for_date",
+                  lambda conn, cid, date: set())
     return wired, fake
 
 
@@ -2943,8 +2949,10 @@ def test_404_body_matches_prod_shape(presign_wired):
     res = org.lambda_handler(make_event("GET", "/api/org/timeline",
                                         params={"date": "2026-07-14", "user": "Ghost_User"}), None)
     assert res["statusCode"] == 404
+    # `user` is unconditional now -- the folder is identity, and the client
+    # needs it to build a photo key rather than parse the English message.
     assert body_of(res) == {"message": "No report for Ghost_User on 2026-07-14",
-                            "date": "2026-07-14"}
+                            "date": "2026-07-14", "user": "Ghost_User"}
 
 
 def test_non_all_scope_user_mismatch_403(presign_wired):
