@@ -175,3 +175,53 @@ def test_a_photo_with_no_timestamp_is_not_swept_in():
     recordings.photo_keys_in_span(conn, "c", "Ada_L", "2026-09-02", "lo", "hi")
     sql, _ = conn.sql[0]
     assert "started_at IS NOT NULL" in sql
+
+
+# --------------------------------------------------------------------------
+# The escape character, which collapsed to nothing and shipped
+# --------------------------------------------------------------------------
+
+def test_every_like_carries_a_real_escape_character():
+    """`ESCAPE '\'` in Python source is `ESCAPE ''` in SQL -- no escape at all.
+
+    `\'` inside a double-quoted Python string is an escaped QUOTE, so the
+    escape clause collapses to an empty string. Postgres then treats the
+    backslash `_escape_like` inserted as a literal character, the pattern
+    `users/Neil\_Blunden/%` matches no key that exists, and the query returns
+    zero rows. Silently: no error, no log, just an empty day.
+
+    That shipped to production. `photo_list_for_day` returned nothing, the day
+    view's short-circuit read it as "nothing to say", and days that had been
+    reporting 32 and 56 photos went blank -- a regression introduced by the
+    change that was meant to make those photos visible.
+
+    Asserted on the SQL the functions actually pass, not on the file: a source
+    scan for the right spelling would pass while the runtime string is wrong,
+    which is the exact gap that let it through.
+    """
+    import re
+
+    calls = [
+        lambda c: recordings.day_stats(c, "co", "Ada_L", "2026-09-02"),
+        lambda c: recordings.duration_for_media(c, "co", "Ada_L", "2026-09-02", "sidx"),
+        lambda c: recordings.photo_list_for_day(c, "co", "Ada_L", "2026-09-02"),
+        lambda c: recordings.session_span(c, "co", "Ada_L", "2026-09-02", "sidx"),
+        lambda c: recordings.photo_keys_in_span(c, "co", "Ada_L", "2026-09-02", 1, 2),
+        lambda c: recordings.site_for_media(c, "co", "Ada_L", "2026-09-02", "sidx"),
+        lambda c: recordings.site_for_day(c, "co", "Ada_L", "2026-09-02"),
+    ]
+    checked = 0
+    for call in calls:
+        conn = _Conn(rows=[])
+        try:
+            call(conn)
+        except Exception:                      # noqa: BLE001 - shape, not behaviour
+            pass
+        for sql, _ in conn.sql:
+            for esc in re.findall(r"ESCAPE '(.*?)'", sql):
+                checked += 1
+                assert esc == "\\", (
+                    "ESCAPE resolved to %r -- Postgres reads an empty escape as "
+                    "NO escape character, so _escape_like's backslash becomes a "
+                    "literal and the LIKE matches nothing" % esc)
+    assert checked >= 5, f"only {checked} ESCAPE clauses reached -- the sweep missed some"

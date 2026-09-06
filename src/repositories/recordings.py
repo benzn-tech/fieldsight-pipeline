@@ -405,7 +405,7 @@ def photo_list_for_day(conn, company_id, user_folder, date) -> list:
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT s3_key, started_at FROM recordings "
         "WHERE company_id = %s AND kind = 'photo' "
-        "AND s3_key LIKE %s ESCAPE '\' "
+        "AND s3_key LIKE %s ESCAPE '\\' "
         "ORDER BY started_at NULLS LAST, s3_key",
         (company_id, f"users/{_escape_like(user_folder)}/%/{date}/%"),
     ).fetchall()
@@ -434,7 +434,7 @@ def session_span(conn, company_id, user_folder, date, session_base):
         "       MAX(COALESCE(ended_at, started_at)) AS hi "
         "FROM recordings "
         "WHERE company_id = %s AND kind IN ('audio','video') "
-        "AND s3_key LIKE %s ESCAPE '\' AND s3_key LIKE %s ESCAPE '\'",
+        "AND s3_key LIKE %s ESCAPE '\\' AND s3_key LIKE %s ESCAPE '\\'",
         (company_id,
          f"users/{_escape_like(user_folder)}/%/{date}/%",
          f"%{_escape_like(sid)}%"),
@@ -460,7 +460,7 @@ def photo_keys_in_span(conn, company_id, user_folder, date, lo, hi) -> list:
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT s3_key FROM recordings "
         "WHERE company_id = %s AND kind = 'photo' "
-        "AND s3_key LIKE %s ESCAPE '\' "
+        "AND s3_key LIKE %s ESCAPE '\\' "
         "AND started_at IS NOT NULL AND started_at BETWEEN %s AND %s "
         "ORDER BY started_at",
         (company_id, f"users/{_escape_like(user_folder)}/%/{date}/%", lo, hi),
