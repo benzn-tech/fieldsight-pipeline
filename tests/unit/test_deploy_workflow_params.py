@@ -122,6 +122,37 @@ def test_no_override_line_can_emit_an_empty_value():
             f"shell-guard pattern instead: {offenders}")
 
 
+def test_no_override_line_can_emit_an_empty_value_from_a_shell_variable():
+    """The sibling above only looks at `${{ vars.X }}` interpolations.
+
+    A secret reaches the command as a SHELL variable, continued with a
+    backslash, and an unset secret expands to the empty string exactly like a
+    cleared repo variable. SAM then rejects the bare Key= at argument parsing,
+    before CloudFormation is reached, and the whole deploy exits 2.
+
+    That gap is not hypothetical: `QwenChatApiKey=$QWEN_CHAT_API_KEY` was added
+    in this shape, passed the sibling test because it is not a `vars.`
+    interpolation, and failed the first TEST deploy after merge. The shell-guard
+    form (`FOO_PARAM=""; if [ -n "$FOO" ]; then FOO_PARAM="Key=$FOO"; fi`) is
+    the pattern this repo already uses and is what the fix adopted.
+    """
+    pattern = re.compile(r'^\s+"(\w+)=\$(\w+)"', re.MULTILINE)
+
+    # Secrets that are required for any deploy to be meaningful. An absent one
+    # SHOULD fail loudly rather than deploy a stack wired to nothing -- the same
+    # reasoning the sibling test applies to the layer ARNs.
+    REQUIRED = {"ClaudeApiKey", "DashScopeApiKey", "DbSecretArn",
+                "ElevenLabsApiKey", "FargateSubnetIds", "FargateVpcId",
+                "RealPTTAccount", "RealPTTPassword"}
+
+    for env in WORKFLOWS:
+        offenders = [k for k, _ in pattern.findall(_text(env)) if k not in REQUIRED]
+        assert not offenders, (
+            f"{env}: an unset secret makes these emit a bare 'Key=' and SAM "
+            f"exits 2 before CloudFormation runs -- use the shell-guard "
+            f"pattern: {offenders}")
+
+
 def test_no_comment_sits_inside_a_line_continuation():
     """A comment between two backslash-continued lines silently ends the command.
 

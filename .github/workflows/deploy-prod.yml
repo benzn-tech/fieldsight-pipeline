@@ -171,6 +171,14 @@ jobs:
           #     topic on the first run. The sweep refuses to run without it, so a
           #     forgotten value fails closed rather than sweeping everything.
           # Same bare-"Key=" guard as the layer overrides above.
+          # Same bare-"Key=" guard as NONWORK_SINCE_PARAM and LlmTemperature below.
+          # SAM rejects `QwenChatApiKey=` outright at argument parsing, before
+          # CloudFormation is reached -- which is exactly how this failed the first
+          # TEST deploy after the parameter was added, with the secret not yet set.
+          QWEN_CHAT_KEY_PARAM=""
+          if [ -n "$QWEN_CHAT_API_KEY" ]; then
+            QWEN_CHAT_KEY_PARAM="QwenChatApiKey=$QWEN_CHAT_API_KEY"
+          fi
           NONWORK_SINCE_PARAM=""
           if [ -n "${{ vars.PROD_NONWORK_EXPIRY_SINCE }}" ]; then
             NONWORK_SINCE_PARAM="NonWorkExpirySince=${{ vars.PROD_NONWORK_EXPIRY_SINCE }}"
@@ -256,7 +264,7 @@ jobs:
               "QwenBaseUrl=${{ vars.PROD_QWEN_BASE_URL || 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1' }}" \
               "QwenModelPlus=${{ vars.PROD_QWEN_MODEL_PLUS || 'qwen3.7-max' }}" \
               "QwenModelFast=${{ vars.PROD_QWEN_MODEL_FAST || 'qwen3.6-flash' }}" \
-              "QwenChatApiKey=$QWEN_CHAT_API_KEY" \
+              $QWEN_CHAT_KEY_PARAM \
               "EnableNonWorkExpiry=${{ vars.PROD_NONWORK_EXPIRY_ENABLED || 'false' }}" \
               "NonWorkExpiryHours=${{ vars.PROD_NONWORK_EXPIRY_HOURS || '24' }}" \
               $NONWORK_SINCE_PARAM \
