@@ -488,3 +488,96 @@ def test_the_chunk_predicate_covers_the_unassigned_bucket():
     assert "topic_id = ANY" in p, "the topic arm is gone"
     assert "source_files" in p, "the unassigned bucket is unreachable without this arm"
     assert "%(session_base)s" in p
+
+
+# ---- photos, which the delete now covers ----------------------------------
+#
+# This block exists because the coverage shipped with none. An adversarial pass
+# replaced the `session_span` call with `span = None` -- photos never tombstoned
+# on a session delete -- and the WHOLE SUITE stayed green: 3982 passed. The
+# repository helpers were pinned, the endpoint that calls them was not, and the
+# distance between those two is the entire feature.
+
+def _stub_photo_path(monkeypatch, *, span=("lo", "hi"), keys=()):
+    seen = {"tombstoned": []}
+    monkeypatch.setattr(org.recordings, "session_span", lambda *a, **k: span)
+    monkeypatch.setattr(org.recordings, "photo_keys_in_span", lambda *a, **k: list(keys))
+    monkeypatch.setattr(org.redactions, "create_photo_tombstone",
+                        lambda conn, company, key, *a, **k:
+                        seen["tombstoned"].append((company, key, k.get("batch_id"))) or True)
+    return seen
+
+
+def test_deleting_a_session_tombstones_the_photos_taken_during_it(monkeypatch):
+    monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
+    monkeypatch.setattr(org, "_s3_client", _S3())
+    _allow_all(monkeypatch)
+    _stub_writes(monkeypatch)
+    seen = _stub_photo_path(monkeypatch, keys=["users/A/pictures/d/1.jpg",
+                                               "users/A/pictures/d/2.jpg"])
+    res = org.delete_recordings_endpoint(_Conn(), CALLER, {"recordings": [REC]})
+    assert res["statusCode"] == 200
+    assert [k for _, k, _ in seen["tombstoned"]] == ["users/A/pictures/d/1.jpg",
+                                                    "users/A/pictures/d/2.jpg"]
+    assert json.loads(res["body"])["results"][0]["photos_hidden"] == 2
+
+
+def test_the_photo_tombstones_join_the_delete_batch(monkeypatch):
+    """Every photo must carry the SAME batch_id as the session tombstone, or
+    the revert that undoes this delete leaves the photos hidden forever."""
+    monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
+    monkeypatch.setattr(org, "_s3_client", _S3())
+    _allow_all(monkeypatch)
+    batches = []
+    monkeypatch.setattr(org.topics, "list_topics_for_source_prefix", lambda *a, **k: [])
+    monkeypatch.setattr(org.redactions, "create_recording_tombstone",
+                        lambda *a, **k: batches.append(k.get("batch_id")) or {"id": "r-1"})
+    monkeypatch.setattr(org.redactions, "create_redaction", lambda *a, **k: {"id": "r-2"})
+    monkeypatch.setattr(org.chunks, "archive_chunks_for_session", lambda *a, **k: 0)
+    seen = _stub_photo_path(monkeypatch, keys=["users/A/pictures/d/1.jpg"])
+    org.delete_recordings_endpoint(_Conn(), CALLER, {"recordings": [REC]})
+    photo_batch = seen["tombstoned"][0][2]
+    assert photo_batch is not None and photo_batch == batches[0]
+
+
+def test_the_photos_are_stamped_with_the_targets_company(monkeypatch):
+    """A cross-company delete must tombstone the TARGET's photos, not the
+    caller's. Passing the caller's company would silently hide nothing."""
+    monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
+    monkeypatch.setattr(org, "_s3_client", _S3())
+    _allow_all(monkeypatch, company="target-co")
+    _stub_writes(monkeypatch)
+    seen = _stub_photo_path(monkeypatch, keys=["users/A/pictures/d/1.jpg"])
+    org.delete_recordings_endpoint(_Conn(), CALLER, {"recordings": [REC]})
+    assert seen["tombstoned"][0][0] == "target-co"
+
+
+def test_a_session_with_no_span_covers_nothing_and_says_so(monkeypatch, caplog):
+    """RealPTT, pre-migration-0009, lake-fed. No rows means no span means no
+    photos covered -- which must be visible from outside, because a rule that
+    silently covers nothing is indistinguishable from one that never ran."""
+    import logging
+    monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
+    monkeypatch.setattr(org, "_s3_client", _S3())
+    _allow_all(monkeypatch)
+    _stub_writes(monkeypatch)
+    seen = _stub_photo_path(monkeypatch, span=None, keys=["never-reached.jpg"])
+    with caplog.at_level(logging.WARNING):
+        res = org.delete_recordings_endpoint(_Conn(), CALLER, {"recordings": [REC]})
+    assert seen["tombstoned"] == []
+    assert json.loads(res["body"])["results"][0]["photos_hidden"] == 0
+    assert any("no recordings span" in r.message for r in caplog.records)
+
+
+def test_the_success_path_logs_its_zero_too(monkeypatch, caplog):
+    """A span that covers zero photos and a span that was never computed are
+    different facts. Both have to be readable in the log."""
+    import logging
+    monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
+    monkeypatch.setattr(org, "_s3_client", _S3())
+    _allow_all(monkeypatch)
+    _stub_writes(monkeypatch)
+    _stub_photo_path(monkeypatch, keys=[])
+    with caplog.at_level(logging.INFO):
+        org.delete_recordings_endpoint(_Conn(), CALLER, {"recordings": [REC]})
+    assert any("hid 0 photo(s) in span" in r.message for r in caplog.records)
