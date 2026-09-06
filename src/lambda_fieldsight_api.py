@@ -40,7 +40,8 @@ import boto3
 from datetime import datetime, timedelta
 from urllib.parse import unquote_plus
 
-import deletion_mirror
+import deletion_mirror
+import nz_time
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -417,8 +418,10 @@ def get_timeline(params, caller):
     date = params.get('date', '')
     user = params.get('user', '')
     if not date:
-        nzdt = datetime.utcnow() + timedelta(hours=13)
-        date = (nzdt - timedelta(days=1)).strftime('%Y-%m-%d')
+        # Yesterday in NZ. The offset is +12 for half the year, so the +13
+        # literal that was here answered with the wrong day for an hour every
+        # day between April and late September.
+        date = (nz_time.nz_now() - timedelta(days=1)).strftime('%Y-%m-%d')
     if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
         return error('Invalid date')
 
@@ -555,8 +558,7 @@ def find_any_report(date, caller=None):
 def get_dates(params, caller):
     months = int(params.get('months', '2'))
     site = params.get('site', '')
-    nzdt = datetime.utcnow() + timedelta(hours=13)
-    start_date = nzdt - timedelta(days=months * 30)
+    start_date = nz_time.nz_now() - timedelta(days=months * 30)
     
     role = caller['role']
     user_param = params.get('user', '')
@@ -1171,8 +1173,7 @@ def trigger_report_generation(body, caller):
     date = body.get('date', '')
     force = body.get('force', False)
     if not date:
-        nzdt = datetime.utcnow() + timedelta(hours=13)
-        date = (nzdt - timedelta(days=1)).strftime('%Y-%m-%d')
+        date = (nz_time.nz_now() - timedelta(days=1)).strftime('%Y-%m-%d')
     payload = {'report_type': rtype, 'date': date}
     if caller['role'] == 'worker':
         user = resolve_user_display_name(caller)
