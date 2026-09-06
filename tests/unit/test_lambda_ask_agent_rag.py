@@ -385,3 +385,65 @@ def test_ask_rag_search_function_error_is_service_error_not_no_records(monkeypat
     assert "No relevant records" not in result["answer"]
     assert result.get("error")           # a service error is surfaced
     assert result["citations"] == []
+
+
+# ---- reranking rides THIS route, not the search list ----------------------
+
+def _many(n):
+    return [dict(CHUNK_B, id=i, chunk_text="c%d" % i,
+                 source_s3_key="k%d" % i) for i in range(n)]
+
+
+def test_reranking_widens_the_fetch_on_the_ask_route(monkeypatch):
+    """The widening and the rerank call have to be in the SAME function.
+
+    They were not when this shipped. The payload literal
+    `{"sub": ..., "query_embedding": ..., "k": k}` appears in `_rag_search_list`
+    too, the edit landed there, and Ask went on fetching 5 chunks and then
+    short-circuiting because 5 <= 5. The feature could not run on the path it
+    was built for.
+
+    Every test stayed green because they all drove the helper. This one drives
+    the ROUTE -- it asserts what rag-search was actually asked for.
+    """
+    monkeypatch.setattr(laa, "RERANK_ENABLED", True)
+    monkeypatch.setattr(laa, "RERANK_CANDIDATES", 32)
+    client = wire(monkeypatch, chunks=_many(20))
+    monkeypatch.setattr(dashscope_utils, "rerank",
+                        lambda q, docs, n: list(range(len(docs))))
+    invoke(make_event())
+    assert client.calls[0]["Payload"]["k"] == 32
+
+
+def test_the_reranker_actually_sees_the_ask_chunks(monkeypatch):
+    """Not "was the helper callable" -- was it called, on this route, with the
+    chunks rag-search returned."""
+    seen = {}
+    monkeypatch.setattr(laa, "RERANK_ENABLED", True)
+    monkeypatch.setattr(laa, "RERANK_CANDIDATES", 32)
+    wire(monkeypatch, chunks=_many(20))
+    monkeypatch.setattr(dashscope_utils, "rerank",
+                        lambda q, docs, n: seen.update(n=len(docs), keep=n) or [0, 1, 2, 3, 4])
+    invoke(make_event())
+    assert seen["n"] == 20 and seen["keep"] == 5
+
+
+def test_with_the_flag_off_the_route_is_byte_for_byte_what_it_was(monkeypatch):
+    monkeypatch.setattr(laa, "RERANK_ENABLED", False)
+    client = wire(monkeypatch, chunks=_many(20))
+    monkeypatch.setattr(dashscope_utils, "rerank",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("reranked while disabled")))
+    invoke(make_event())
+    assert client.calls[0]["Payload"]["k"] == 5
+
+
+def test_the_search_list_route_still_honours_its_own_k(monkeypatch):
+    """The widening does not belong here. Search asks for 30 by default and a
+    caller's k is the caller's; silently fetching 32 instead would make this
+    route answer a question nobody asked."""
+    client = wire(monkeypatch, chunks=_many(3))
+    monkeypatch.setattr(laa, "RERANK_ENABLED", True)
+    monkeypatch.setattr(laa, "RERANK_CANDIDATES", 32)
+    laa.lambda_handler({"mode": "search", "question": "q", "caller_sub": "sub-1", "k": 7}, None)
+    assert client.calls[0]["Payload"]["k"] == 7
