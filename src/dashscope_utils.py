@@ -165,6 +165,79 @@ def _embed_batch(http, batch, dim):
     raise RuntimeError(f"DashScope embed request failed after {MAX_ATTEMPTS} attempts: {last_error}")
 
 
+DASHSCOPE_RERANK_URL = os.environ.get(
+    "DASHSCOPE_RERANK_URL",
+    "https://dashscope-intl.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+)
+DASHSCOPE_RERANK_MODEL = os.environ.get("DASHSCOPE_RERANK_MODEL", "qwen3-rerank")
+# Deliberately short, deliberately single-attempt -- see rerank().
+DASHSCOPE_RERANK_TIMEOUT = float(os.environ.get("DASHSCOPE_RERANK_TIMEOUT_SECONDS", "3"))
+
+
+def rerank(query, documents, top_n):
+    """Re-order `documents` by relevance to `query`. Returns a list of indices
+    into `documents`, best first, or None if the reranker could not answer.
+
+    NONE IS A NORMAL RETURN, and the caller must fall back to the order it
+    already had. This runs on the synchronous Ask path, which is capped by API
+    Gateway at 29s and already measured ~24s end to end at k=8. Reranking is a
+    quality improvement on an answer that is already correct enough to ship, so
+    it may never be the reason a question fails to be answered.
+
+    That is also why there is NO RETRY and the timeout is 3s, both unlike
+    `embed` above (four attempts, 60s). Embedding is load-bearing -- without it
+    there is no search at all -- and it runs on batch paths where a slow
+    success beats a fast failure. Here the opposite holds: a second attempt
+    would spend the caller's remaining budget to improve an ordering we can
+    live without.
+
+    Measured before choosing these numbers, against the live model with this
+    account's key: 100 documents of 2600 chars is 33,990 request tokens and
+    ~4.6s; 150 is 51,040 tokens. Latency is near-flat in document count
+    (K=16 -> 3.6s, K=100 -> 4.6s), so the cost is a fixed round trip rather
+    than something that grows with candidates. `gte-rerank` -- the model most
+    documentation still names -- was discontinued 2026-05-30 and answers
+    "Model not exist"; this is qwen3-rerank.
+    """
+    if not DASHSCOPE_API_KEY:
+        logger.warning("rerank: no DASHSCOPE_API_KEY -- keeping the original order")
+        return None
+    if not documents:
+        return None
+    body = json.dumps({
+        "model": DASHSCOPE_RERANK_MODEL,
+        "input": {"query": query, "documents": documents},
+        "parameters": {"top_n": min(top_n, len(documents)), "return_documents": False},
+    })
+    headers = {"Content-Type": "application/json",
+               "Authorization": f"Bearer {DASHSCOPE_API_KEY}"}
+    http = urllib3.PoolManager()
+    try:
+        resp = http.request("POST", DASHSCOPE_RERANK_URL, body=body,
+                            headers=headers, timeout=DASHSCOPE_RERANK_TIMEOUT)
+    except Exception as e:                                    # noqa: BLE001
+        # Logged, never raised. A guard that is silent when it declines is
+        # indistinguishable from one that never ran.
+        logger.warning("rerank: request failed (%s) -- keeping the original order", e)
+        return None
+    if resp.status != 200:
+        logger.warning("rerank: HTTP %s -- keeping the original order: %s",
+                       resp.status, resp.data[:200])
+        return None
+    try:
+        results = json.loads(resp.data.decode("utf-8"))["output"]["results"]
+        order = [int(r["index"]) for r in results]
+    except Exception as e:                                    # noqa: BLE001
+        logger.warning("rerank: unexpected response shape (%s)", e)
+        return None
+    # An index the model invented would silently drop or duplicate a chunk.
+    if any(i < 0 or i >= len(documents) for i in order) or len(set(order)) != len(order):
+        logger.warning("rerank: out-of-range or duplicated indices -- keeping the original order")
+        return None
+    logger.info("rerank: %d candidates -> %d", len(documents), len(order))
+    return order
+
+
 def embed(texts, dim=None):
     """Embed a list of texts via DashScope text-embedding-v4, batching in
     groups of <= 10 and returning vectors in the SAME order as `texts`."""

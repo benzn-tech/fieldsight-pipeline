@@ -627,6 +627,63 @@ def build_rag_prompt(question, chunks, mode=None, today=None, basis=None,
     return "\n\n".join(parts)
 
 
+# Reranking (2026-09-07). OFF by default; see docs/… spec-provider-split-and-rerank.
+#
+# WHY IT RUNS HERE and not in rag-search: rag-search is in-VPC and this account
+# has no NAT and only S3 / DynamoDB / cognito-idp endpoints. A DashScope call
+# from there does not fail fast, it hangs to the socket timeout inside a 30s
+# function and surfaces as "search backend failed". ask-agent is non-VPC and
+# already holds the key.
+RERANK_ENABLED = os.environ.get("ENABLE_RERANK", "false").lower() == "true"
+# Candidates fetched for the reranker to choose from. 32 is rag-search's own
+# clamp, so this needs no change there; the reranker itself measured fine at
+# 100+ and going past 32 means raising that clamp, which is a separate change.
+RERANK_CANDIDATES = int(os.environ.get("RERANK_CANDIDATE_K", "32"))
+# Adjacent transcript windows overlap by OVERLAP_TURNS=2 and one session's
+# windows are near-identical, so positions 6..32 of a cosine ranking are
+# dominated by neighbours of the same few sessions. Reranking 32 near-duplicates
+# re-orders duplicates. Capping per session first is what makes the widening
+# mean anything.
+RERANK_PER_SESSION_CAP = int(os.environ.get("RERANK_PER_SESSION_CAP", "4"))
+
+
+def _diversify(chunks, cap):
+    """At most `cap` chunks per source recording, original order preserved."""
+    seen, out = {}, []
+    for c in chunks:
+        key = c.get("source_s3_key") or c.get("topic_id") or id(c)
+        if seen.get(key, 0) >= cap:
+            continue
+        seen[key] = seen.get(key, 0) + 1
+        out.append(c)
+    return out
+
+
+def _rerank_chunks(question, chunks, keep):
+    """Reorder by relevance and keep the best `keep`.
+
+    Every failure path returns the chunks the caller already had, truncated.
+    The reranker improves an answer that is already shippable, so it may never
+    be the reason a question goes unanswered -- `dashscope_utils.rerank`
+    returns None rather than raising, and this returns the cosine order.
+    """
+    if not RERANK_ENABLED or len(chunks) <= keep:
+        return chunks[:keep]
+    # Imported here, not at module scope, for the reason the three other
+    # dashscope_utils call sites in this file give: the legacy hand-built prod
+    # zip ships a fixed file list and does not carry it, so a top-level import
+    # would kill that deploy's paths on the way past.
+    import dashscope_utils
+
+    candidates = _diversify(chunks, RERANK_PER_SESSION_CAP)
+    order = dashscope_utils.rerank(
+        question, [c.get("chunk_text") or "" for c in candidates], keep)
+    if not order:
+        return candidates[:keep]
+    return [candidates[i] for i in order[:keep]]
+
+
+
 _NO_LEX_MAX_DIST = 0.55  # non-lexical topics past this cosine distance are dropped as irrelevant
 
 # Latin/digit runs, and the scripts written without spaces between words (CJK
@@ -770,7 +827,11 @@ def _rag_search_list(body):
 
     try:
         query_vec = dashscope_utils.embed([question])[0]
-        payload = {"sub": caller_sub, "query_embedding": query_vec, "k": k}
+        # With reranking on we fetch candidates, not context: the reranker picks
+        # the `k` that reach the prompt, so the synthesis prompt -- and therefore
+        # the latency the 29s ceiling actually cares about -- is unchanged.
+        fetch_k = RERANK_CANDIDATES if RERANK_ENABLED else k
+        payload = {"sub": caller_sub, "query_embedding": query_vec, "k": fetch_k}
         if date_from:
             payload["date_from"] = date_from
         if date_to:
@@ -1037,6 +1098,10 @@ def _rag_answer(body):
             }
         result = json.loads(resp["Payload"].read().decode("utf-8"))
         chunks = result.get("chunks") or []
+        # Reorder BEFORE _basis and before the empty check: the citation count and
+        # the 'nothing found' branch must both describe what the answer was
+        # actually built from, not the wider set fetched to choose from.
+        chunks = _rerank_chunks(question, chunks, k)
         basis = _basis(result, chunks, date_from, date_to)
 
         if result.get("error"):
