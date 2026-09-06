@@ -264,6 +264,7 @@ jobs:
               "QwenBaseUrl=${{ vars.PROD_QWEN_BASE_URL || 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1' }}" \
               "QwenModelPlus=${{ vars.PROD_QWEN_MODEL_PLUS || 'qwen3.7-max' }}" \
               "QwenModelFast=${{ vars.PROD_QWEN_MODEL_FAST || 'qwen3.6-flash' }}" \
+              "QwenModelPlusNonThinking=${{ vars.PROD_QWEN_MODEL_PLUS_NONTHINKING || 'inherit' }}" \
               "EnableRerank=${{ vars.PROD_ENABLE_RERANK || 'false' }}" \
               $QWEN_CHAT_KEY_PARAM \
               "EnableNonWorkExpiry=${{ vars.PROD_NONWORK_EXPIRY_ENABLED || 'false' }}" \

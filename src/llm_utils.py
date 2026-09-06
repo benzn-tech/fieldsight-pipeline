@@ -64,6 +64,29 @@ QWEN_BASE_URL = os.environ.get(
     "QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 )
 QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen3.7-max")
+# The model to use when a call runs WITHOUT thinking. Empty means "same as
+# QWEN_MODEL", which is what every deploy did before this existed.
+#
+# It exists because a model can be safe in one mode and not the other, and
+# nothing else in this system can express that. The model is a CloudFormation
+# stack parameter; thinking is a per-function env var that one caller
+# (lambda_extract_session's live pass) overrides per call. So a per-function
+# model parameter cannot separate the two modes inside a single function, and
+# no test can go red on the pairing -- the two values never meet until here.
+#
+# Measured 2026-09-07, five runs per configuration, on one site sentence
+# carrying an explicit date ("delayed to Friday"): qwen3.7-max and
+# qwen3.6-flash put Friday in the `due` field 4/5 with thinking off;
+# qwen3.8-flash managed 0/5 with thinking off -- in BOTH output modes, so it is
+# not response_format -- and 4/5 with thinking on. Five of the eight qwen call
+# sites in this repo run non-thinking deliberately, for latency.
+# docs/superpowers/specs/2026-09-07-qwen38-flash-thinking-dependency.md
+QWEN_MODEL_NONTHINKING = os.environ.get("QWEN_MODEL_NONTHINKING", "").strip()
+# Sentinel rather than empty string: an override that resolves to nothing is
+# rendered `"QwenModelNonThinking=" \` and fails the WHOLE deploy the day the
+# repo variable is cleared, which `test_no_override_line_can_emit_an_empty_value`
+# exists to prevent. An explicit word survives the round trip.
+QWEN_MODEL_INHERIT = "inherit"
 # When true, the qwen path runs in thinking mode (enable_thinking) for higher
 # answer quality on batch tasks, and does NOT force response_format — DashScope
 # guidance is that thinking + json_object can yield non-strict JSON, so we let
@@ -80,6 +103,29 @@ BACKOFF_BASE_SECONDS = 1.0
 # LLM_HTTP_TIMEOUT (see template.yaml) because their Lambda Timeout is 300s,
 # not 180s like extract_session/matcher/ask-agent.
 HTTP_TIMEOUT = float(os.environ.get("LLM_HTTP_TIMEOUT", "150"))
+
+
+def qwen_model_for(thinking):
+    """Which qwen model a call in this mode actually reaches.
+
+    One function can need both modes, so this is a property of the CALL, never
+    of the deploy. Inheritance resolves HERE and not at import: a snapshot taken
+    when the module loaded stops following `QWEN_MODEL` the moment anything
+    changes it, and the two would then disagree with no way to see it. Anything reporting a model name to a reader has to ask the
+    same question the caller asked, or it names a model that did not write the
+    answer -- which this repo has already shipped once.
+    """
+    if thinking or not QWEN_MODEL_NONTHINKING:
+        return QWEN_MODEL
+    # Case-folded on COMPARISON only. The value crosses a repo variable, a
+    # shell, a CLI override and CloudFormation and none of them normalise it,
+    # so `Inherit` would otherwise reach DashScope as a literal model name and
+    # fail every non-thinking call in six functions at runtime. Folding the
+    # value itself instead would quietly lowercase a real model name, and not
+    # every vendor's are lowercase.
+    if QWEN_MODEL_NONTHINKING.lower() == QWEN_MODEL_INHERIT:
+        return QWEN_MODEL
+    return QWEN_MODEL_NONTHINKING
 
 
 def api_key_configured():
@@ -106,7 +152,7 @@ def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
     return _call_anthropic(prompt, max_tokens)
 
 
-def active_model():
+def active_model(enable_thinking=None):
     """The model this deploy actually calls, for reporting to a caller.
 
     `CLAUDE_MODEL` is the Anthropic branch's model and is set on every function
@@ -120,7 +166,8 @@ def active_model():
     wrong.
     """
     if LLM_PROVIDER == "qwen":
-        return QWEN_MODEL
+        return qwen_model_for(enable_thinking if enable_thinking is not None
+                              else QWEN_ENABLE_THINKING)
     if LLM_PROVIDER == "anthropic":
         return CLAUDE_MODEL
     return None
@@ -201,11 +248,13 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
     if not QWEN_API_KEY:
         logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
         return None, "QWEN_API_KEY not configured"
-    payload = {"model": QWEN_MODEL, "messages": [{"role": "user", "content": prompt}]}
-    if LLM_TEMPERATURE is not None:
-        payload["temperature"] = LLM_TEMPERATURE
     # Per-call override wins; None falls back to the function's env default.
     thinking = QWEN_ENABLE_THINKING if enable_thinking is None else bool(enable_thinking)
+    # Resolved BEFORE the model, because the model depends on it.
+    payload = {"model": qwen_model_for(thinking),
+               "messages": [{"role": "user", "content": prompt}]}
+    if LLM_TEMPERATURE is not None:
+        payload["temperature"] = LLM_TEMPERATURE
 
     if not _is_dashscope(QWEN_BASE_URL):
         # OpenAI-compatible vendors (OpenRouter today). Reasoning is expressed
