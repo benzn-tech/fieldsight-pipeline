@@ -7063,6 +7063,64 @@ def get_org_report_history(conn, caller, event):
     return ok(_read_org_report_history(folder_scope, limit))
 
 
+def _apply_speaker_groups(conn, caller, payload):
+    """Lay the anonymous re-bind over the turns this response is carrying.
+
+    **Deliberately NOT gated on `SPEAKER_IDENTITY_MODE`, and that is the whole point.**
+    This block used to live inside `_apply_speaker_names`, behind that switch's first line.
+    The consequence was found by calling the endpoint on prod after the re-bind was enabled
+    there: 28 group rows in the database, 318 transcript segments, and **zero** of them
+    carrying a group. The write half worked and nothing could see it.
+
+    The re-bind is anonymous — letters within one session, no vector stored, nobody
+    identified — and that is precisely the argument for shipping it while the NAMED library
+    waits on a consent surface. Gating its display on the switch that governs naming
+    couples it back to the thing it was designed to be independent of, and makes the
+    "enable it on its own" story false in the only way that matters to a reader.
+
+    Fails open and logs, like the rest of this feature: a session with no groups must read
+    exactly as it read before any of this existed.
+    """
+    segs = payload.get("speaker_segments") or []
+    if not segs:
+        return payload
+    bases = {turn_name_overlay.session_base(s.get("source_filename"))
+             for s in segs if s.get("source_filename")}
+    bases = sorted(b for b in bases if b)
+    if not bases:
+        return payload
+
+    groups = {}
+    try:
+        for base in bases:
+            groups.update(speaker_label_groups.for_session(
+                conn, str(caller["company_id"]), base))
+    except Exception:
+        logger.exception("speaker groups unreadable for %s; transcript falls back to the "
+                         "per-call labels", bases)
+        return payload
+    if not groups:
+        return payload
+
+    for seg in segs:
+        g = groups.get((seg.get("source_filename"), seg.get("speaker_label")))
+        if g:
+            seg["speaker_group"] = g
+    # What each group stands on, once per session rather than once per segment. Without this
+    # the audit stops at the database and the only person who can ask "how much is group A
+    # built on" is whoever has SQL access — not the person reading the transcript and
+    # noticing it looks wrong.
+    try:
+        ev = []
+        for base in bases:
+            ev.extend(speaker_label_groups.evidence_for_session(
+                conn, str(caller["company_id"]), base))
+        payload["speakerGroups"] = ev
+    except Exception:
+        logger.exception("speaker group evidence unreadable; the groups still apply")
+    return payload
+
+
 def _apply_speaker_names(conn, caller, payload):
     """Lay the stored names over the turns this response is already carrying.
 
@@ -7108,41 +7166,6 @@ def _apply_speaker_names(conn, caller, payload):
     # Keyed on `(source_filename, speaker_label)`, so a segment with no label (undiarised
     # files carry None) simply gets no group and the reader falls back, which is the correct
     # answer rather than an omission.
-    groups = {}
-    try:
-        for base in sorted(b for b in bases if b):
-            groups.update(speaker_label_groups.for_session(
-                conn, str(caller["company_id"]), base))
-    except Exception:
-        # Fails OPEN, like every other guard in this feature: an unreadable mapping must not
-        # take the transcript down, and a session with no groups reads exactly as it read
-        # before this existed. It LOGS, because "this session was never re-bound" and "the
-        # lookup could not run" are otherwise the same silence — and the second one is the
-        # kind that survives for weeks.
-        logger.exception("speaker groups unreadable for %s; transcript falls back to the "
-                         "per-call labels", sorted(b for b in bases if b))
-    if groups:
-        for seg in segs:
-            g = groups.get((seg.get("source_filename"), seg.get("speaker_label")))
-            if g:
-                seg["speaker_group"] = g
-        # What each group stands on, once per session rather than once per segment. Without
-        # this the audit stops at the database and the only person who can ask "how much is
-        # group A built on" is whoever has SQL access — which is not the person reading the
-        # transcript and noticing it looks wrong.
-        try:
-            # EVERY base, the same way the mapping above is built. A day holds more than one
-            # session, and taking the first sorted base returned the evidence for whichever
-            # session happened to sort first — which on the day this was written was a
-            # session that had never been re-bound, so the payload carried 77 grouped
-            # segments and an empty evidence list beside them.
-            ev = []
-            for base in sorted(b for b in bases if b):
-                ev.extend(speaker_label_groups.evidence_for_session(
-                    conn, str(caller["company_id"]), base))
-            payload["speakerGroups"] = ev
-        except Exception:
-            logger.exception("speaker group evidence unreadable; the groups still apply")
     return payload
 
 
@@ -7174,6 +7197,10 @@ def get_org_transcripts(conn, caller, event):
         return err
     out = _read_org_transcripts(date, folder, p.get("start") or "", p.get("end") or "",
                                 conn=conn)
+    # Groups FIRST and unconditionally: the anonymous re-bind does not depend on the
+    # naming switch, and putting it after would make the order look like a preference
+    # rather than the independence it is.
+    out = _apply_speaker_groups(conn, caller, out)
     return ok(_apply_speaker_names(conn, caller, out))
 
 
