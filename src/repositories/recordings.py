@@ -422,10 +422,15 @@ def folders_with_uploads_for_date(conn, company_id, date) -> set:
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT DISTINCT split_part(s3_key, '/', 2) AS folder "
         "FROM recordings "
-        "WHERE company_id = %s "
+        # company_id=None MEANS NO COMPANY RESTRICTION, and only an ACL
+        # primitive may ask for it -- a cross-company platform_admin reaches
+        # folders that belong to other companies, and pinning to its own
+        # operator company matches nothing at all.
+        "WHERE (%s::uuid IS NULL OR company_id = %s) "
         "AND s3_key LIKE %s "
         "AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') = %s",
-        (company_id, "users/%", str(date)),
+        (str(company_id) if company_id else None,
+         str(company_id) if company_id else None, "users/%", str(date)),
     ).fetchall()
     return {r["folder"] for r in rows if r["folder"]}
 
