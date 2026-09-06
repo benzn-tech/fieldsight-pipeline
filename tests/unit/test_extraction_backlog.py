@@ -151,3 +151,42 @@ def test_the_metric_is_published_even_when_it_is_zero(monkeypatch):
     assert sent["ns"] == "FieldSight/Pipeline"
     assert sent["data"][0] == {"MetricName": "ExtractionBacklog",
                                "Value": 0, "Unit": "Count"}
+
+
+def test_the_metric_carries_the_stage_that_published_it(monkeypatch):
+    """Both stacks publish into one namespace. Without a dimension they write
+    the SAME series, and the failure that creates is not "test pages prod" --
+    it is that a dead PROD probe stops being detectable, because a live test
+    publisher keeps the series populated and `TreatMissingData: breaching`
+    never trips. That is the exact scenario this function exists to catch.
+    """
+    sent = {}
+
+    class _CW:
+        def put_metric_data(self, Namespace=None, MetricData=None):
+            sent["data"] = MetricData
+
+    monkeypatch.setattr(bl, "METRIC_STAGE", "prod")
+    monkeypatch.setattr(bl, "_s3", lambda: _world(extracted=True))
+    monkeypatch.setattr(bl.boto3, "client",
+                        lambda name, *a, **k: _CW() if name == "cloudwatch" else None)
+    bl.lambda_handler({}, None)
+    assert sent["data"][0]["Dimensions"] == [{"Name": "Stage", "Value": "prod"}]
+
+
+def test_an_unset_stage_publishes_no_dimension_rather_than_an_empty_one(monkeypatch):
+    """A dimension whose value is the empty string is a DIFFERENT series from
+    no dimension at all, and from a real stage. Emitting one would quietly
+    orphan the datapoints where no alarm is watching."""
+    sent = {}
+
+    class _CW:
+        def put_metric_data(self, Namespace=None, MetricData=None):
+            sent["data"] = MetricData
+
+    monkeypatch.setattr(bl, "METRIC_STAGE", "")
+    monkeypatch.setattr(bl, "_s3", lambda: _world(extracted=True))
+    monkeypatch.setattr(bl.boto3, "client",
+                        lambda name, *a, **k: _CW() if name == "cloudwatch" else None)
+    bl.lambda_handler({}, None)
+    assert "Dimensions" not in sent["data"][0]
