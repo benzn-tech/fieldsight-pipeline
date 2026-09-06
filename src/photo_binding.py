@@ -107,6 +107,7 @@ def photos_for_topics(photo_objects, topics):
         if parsed is not None:
             windows[i] = parsed
 
+    capped = 0
     for p in photo_objects:
         hhmm = p.get("hhmm")
         if not hhmm:
@@ -127,10 +128,24 @@ def photos_for_topics(photo_objects, topics):
         order = sorted(qualifying, key=lambda i: (_distance(p_minutes, windows[i]), i))
         target = next((i for i in order if len(result[i]) < PHOTOS_PER_TOPIC_CAP), None)
         if target is None:
-            logger.warning("photo %s dropped: every qualifying topic at cap %d",
-                           p.get("key"), PHOTOS_PER_TOPIC_CAP)
+            capped += 1
             continue
         result[target].append(p)
+    # ONE line, not one per photo, and info rather than warning.
+    #
+    # It used to warn per photo, which was right while a capped photo was LOST:
+    # binding was the only way a photo reached a screen. Since the day view
+    # carries the whole day's list, the cap no longer decides whether a photo is
+    # visible -- only how many hang off one paragraph -- and 43 warnings for a
+    # single ordinary day (2026-09-02, measured) is the kind of noise that
+    # teaches people to skip the channel.
+    #
+    # Still logged, and still unconditional in the sense that matters: "nothing
+    # was capped" and "binding never ran" have to stay distinguishable, so the
+    # count is emitted whenever there was anything to place.
+    if capped:
+        logger.info("photo binding: %d photo(s) past the per-topic cap of %d "
+                    "(visible in the day list, not lost)", capped, PHOTOS_PER_TOPIC_CAP)
     return result
 
 
