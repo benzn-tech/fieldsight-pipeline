@@ -2852,6 +2852,17 @@ Resources:
                     # sweeping every prod role for GetObject-allowed / ListBucket-denied
                     # after the same shape was fixed in org-api three times over.
                     - embeddings/*
+                    # And it was observed, on 2026-09-06, one prefix along. P4's
+                    # photo binding lists users/{folder}/pictures/{date}/ from
+                    # _list_report_pictures, which is NOT inside a try -- so the
+                    # AccessDenied aborted the whole S3-triggered ingest and the
+                    # report's topics were never written to Aurora. Three log
+                    # lines (one delivery, two retries) and reports/2026-09-03/
+                    # Ben_UCPK2 silently did not exist as a day. ItemWriter has
+                    # carried `users/*` for exactly this since Task 3; ingest
+                    # grew the same call and not the same grant. List only --
+                    # binding needs the key and the filename, never the bytes.
+                    - users/*
 
   # ----------------------------------------------------------
   # Lambda 15: Embed Report (Phase 4d) — S3 event on reports/,

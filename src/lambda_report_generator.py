@@ -59,6 +59,7 @@ Environment Variables:
 
 import os
 import json
+import nz_time
 import logging
 import re
 import boto3
@@ -236,7 +237,11 @@ WEEKLY_REPORT_SCHEMA = """{
 # ============================================================
 
 def get_nzdt_now():
-    return datetime.utcnow() + timedelta(hours=13)
+    """Current NZ wall clock, DST-aware. The daily/weekly/monthly schedules all
+    fire far from the 11:00-12:00 UTC hour where +13 and +12 disagree about the
+    date, so this corrects the printed time without moving which day a report
+    covers."""
+    return nz_time.nz_now()
 
 def get_yesterday_date():
     return (get_nzdt_now() - timedelta(days=1)).strftime('%Y-%m-%d')

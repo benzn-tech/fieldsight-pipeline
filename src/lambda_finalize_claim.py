@@ -24,6 +24,7 @@ import logging
 import os
 import time
 
+import nz_time
 import sweep_state
 from repositories import meeting_session, users, sites
 import session_scope
@@ -158,34 +159,14 @@ def _to_nz(dt):
     are the device's NZ wall clock. Return `dt` as Pacific/Auckland LOCAL (naive),
     DST-aware, so (a) the email subject shows NZ time and (b) `.date()` matches the
     device-date the transcripts live under (a morning-NZ recording is the PREVIOUS
-    UTC day — using the UTC date gathered the wrong day and produced "No summary").
+    UTC day -- using the UTC date gathered the wrong day and produced "No summary").
 
-    Prefer the IANA tz database (exact to the hour); if the runtime lacks tzdata,
-    fall back to NZ's fixed rule: NZDT (UTC+13) from the last Sunday of September to
-    the first Sunday of April, else NZST (UTC+12)."""
-    from datetime import datetime, timedelta, timezone
-    if not hasattr(dt, "strftime"):
-        return None
-    aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
-    try:
-        from zoneinfo import ZoneInfo
-        return aware.astimezone(ZoneInfo("Pacific/Auckland")).replace(tzinfo=None)
-    except Exception:
-        import calendar
-        u = aware.astimezone(timezone.utc).replace(tzinfo=None)
-        y = u.year
-
-        def _last_sun(mo):
-            d = datetime(y, mo, calendar.monthrange(y, mo)[1])
-            return d - timedelta(days=(d.weekday() - 6) % 7)
-
-        def _first_sun(mo):
-            d = datetime(y, mo, 1)
-            return d + timedelta(days=(6 - d.weekday()) % 7)
-
-        dst_start = _last_sun(9) + timedelta(hours=2) - timedelta(hours=12)   # -> UTC
-        dst_end = _first_sun(4) + timedelta(hours=3) - timedelta(hours=13)    # -> UTC
-        return u + timedelta(hours=13 if (u >= dst_start or u < dst_end) else 12)
+    The rule itself now lives in `nz_time`, shared with the org-api calendar,
+    because two implementations of one rule is how they drift -- and they had:
+    the calendar's copy assumed a constant +13 and was an hour early for half
+    the year while this one was correct.
+    """
+    return nz_time.to_nz(dt)
 
 
 def _time_range(opened_nz, closed_nz, session_id=None):
