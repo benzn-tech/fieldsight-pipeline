@@ -227,3 +227,50 @@ def test_open_still_accepts_an_unknown_lead_without_calling_the_joinable_check(m
 
     res = org.session_open(CONN, CALLER, SID, {"groupId": LEAD})
     assert res["statusCode"] == 200
+
+
+# ---- the sweep winning the race -------------------------------------------
+
+def test_close_is_a_noop_when_the_sweep_claimed_the_session_first(monkeypatch):
+    """A real customer 500, caught by the api-5xx alarm on the day it shipped.
+
+    `existing` is read a few statements before the UPDATE, and the guard above
+    only rejects `finalizing`/`sent` as they stood THEN. The UPDATE matches
+    `open`/`pending_close` as they stand NOW. The finalize sweep runs every
+    minute, so a device closing a session at the wrong moment lands exactly in
+    that window: the UPDATE matches nothing, returns None, and the response
+    line subscripted None -- answering 500 to the one call that ends a
+    recording.
+
+    The right answer is the one the guard already gives for the same situation:
+    the session is past the point of no return, so the close is redundant
+    rather than wrong.
+    """
+    states = [{"user_id": "u-1", "status": "open", "version": 4},          # first read
+              {"user_id": "u-1", "status": "finalizing", "version": 5}]    # re-read
+    monkeypatch.setattr(org.meeting_session, "get",
+                        lambda conn, sid: states.pop(0) if states else states)
+    monkeypatch.setattr(org.meeting_session, "mark_pending_close",
+                        lambda conn, sid, ended_at, intent: None)
+    monkeypatch.setattr(org.meeting_session, "end_group", lambda conn, gid: 0)
+    res = org.session_close(CONN, CALLER, SID, {"intent": "end"})
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["noop"] is True
+    # The status reported is the REAL one, re-read after losing the race --
+    # echoing the stale 'open' would tell the device its recording is still
+    # running when it is already being finalised.
+    assert b["status"] == "finalizing" and b["version"] == 5
+
+
+def test_close_survives_the_session_vanishing_between_the_two_reads(monkeypatch):
+    """The re-read can itself return None. Falling back to the row already in
+    hand keeps this a 200 no-op rather than trading one NoneType for another."""
+    states = [{"user_id": "u-1", "status": "open", "version": 4}, None]
+    monkeypatch.setattr(org.meeting_session, "get",
+                        lambda conn, sid: states.pop(0) if states else None)
+    monkeypatch.setattr(org.meeting_session, "mark_pending_close",
+                        lambda conn, sid, ended_at, intent: None)
+    monkeypatch.setattr(org.meeting_session, "end_group", lambda conn, gid: 0)
+    res = org.session_close(CONN, CALLER, SID, {"intent": "end"})
+    assert res["statusCode"] == 200 and body_of(res)["noop"] is True
