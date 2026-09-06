@@ -5997,7 +5997,8 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # CRITICAL-1: no in-scope Aurora topics for this (target, date). The
         # verbatim S3 daily_report.json is NOT site-clipped, so serving it would
         # leak the target's out-of-scope content. Nothing safe to show -> 404.
-        return ok({"message": f"No in-scope report for {user} on {date}", "date": date}, 404)
+        return ok({"message": f"No in-scope report for {user} on {date}",
+                   "date": date, "user": user}, 404)
     # A day whose sources were DELETED must not fall through to the pre-rendered doc.
     #
     # The comment above says the verbatim contract holds only for a day with no Aurora
@@ -6006,11 +6007,16 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     # `daily_report.json` byte for byte. Filtering SQL and forgetting the artifact rendered
     # from it is not a deletion.
     if _day_has_deleted_sources(conn, user, date):
-        return ok({"message": f"No report for {user} on {date}", "date": date}, 404)
+        return ok({"message": f"No report for {user} on {date}",
+                   "date": date, "user": user}, 404)
     doc = _get_lake_json(f"reports/{date}/{user}/daily_report.json")
     if doc is not None:
         return ok(doc)                              # VERBATIM (byte-identical history)
-    body = {"message": f"No report for {user} on {date}", "date": date}
+    # `user` is the folder as a FIELD. It was only ever in the human-readable
+    # message, and the client needs it to build the photo key -- leaving it
+    # there would have made a UI parse an English sentence for an identifier.
+    body = {"message": f"No report for {user} on {date}", "date": date,
+            "user": user}
     facts = _day_upload_facts(conn, caller, user, date)
     if facts:
         body.update(facts)
@@ -6125,6 +6131,12 @@ def admin_disambiguation(conn, caller, date):
         if users.get_by_folder_name(conn, caller["company_id"], folder) is not None:
             candidates.add(folder)
     candidates.update(topics.list_extraction_folder_names_for_date(conn, caller["company_id"], date))
+    # And the folders that captured something but produced no report. Without
+    # this the calendar's upload-only days open onto a bare 404 for an admin:
+    # neither source above knows a folder whose extraction never ran, so there
+    # is no candidate, no picker, and no way to guess whose ?user to ask for.
+    candidates.update(recordings.folders_with_uploads_for_date(
+        conn, caller["company_id"], date))
     if not candidates:
         return ok({"message": f"No reports for {date}", "date": date}, 404)
     if len(candidates) == 1:
