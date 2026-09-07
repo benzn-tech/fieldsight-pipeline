@@ -326,6 +326,30 @@ Parameters:
     Description: Qwen model for the latency-bound ask path
     Default: qwen3.6-flash
 
+  LlmReasoningEffortPlus:
+    Type: String
+    AllowedValues: ['low', 'medium', 'high', '']
+    Description: >-
+      Reasoning effort for the QwenModelPlus functions on an OpenAI-compatible
+      vendor. Empty says nothing about effort, which is what every deploy did
+      before this parameter existed.
+      This is NOT enable_thinking. DashScope has a boolean; OpenRouter-style
+      vendors take reasoning.effort, and the levels are priced and
+      latency-differentiated. llm_utils sends effort only to non-DashScope
+      endpoints, because an unknown field is either rejected loudly or dropped
+      silently -- and a silently dropped "low" means the latency path quietly
+      pays for full reasoning.
+    Default: high
+
+  LlmReasoningEffortFast:
+    Type: String
+    AllowedValues: ['low', 'medium', 'high', '']
+    Description: >-
+      Reasoning effort for the latency-bound ask path. Low by design: that path
+      was chosen for latency, and it is the one place where a slower better
+      answer is the wrong trade.
+    Default: low
+
   QwenModelPlusNonThinking:
     Type: String
     Description: >-
@@ -1386,6 +1410,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
           LLM_HTTP_TIMEOUT: '180'
@@ -1503,6 +1528,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
           LLM_HTTP_TIMEOUT: '180'
@@ -1645,6 +1671,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelFast
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortFast
           # DASHSCOPE_TTS_* below default inside dashscope_utils.py (model
           # qwen3-tts-flash-realtime, voice Cherry, intl WS url) — no env
           # override needed here; DashScopeLayer (below) provides the SDK.
@@ -2179,6 +2206,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           LLM_HTTP_TIMEOUT: '540'
           # INERT for this function — lambda_extract_session passes an explicit
@@ -2302,6 +2330,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           # Thinking OFF — the mid-meeting summary should be fast; summarisation
           # needs no extended reasoning (same reason as the finalize worker).
@@ -2678,6 +2707,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           # Applies to the rolling summariser only. session_brief passes
           # enable_thinking=True explicitly, because a brief's density comes
@@ -3372,6 +3402,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
       Policies:
         - LambdaInvokePolicy:
