@@ -100,9 +100,9 @@ except ImportError:
 
 MEETING_MINUTES_SCHEMA = """{
   "executive_summary": [
-    "Bullet 1: Meeting purpose and context",
-    "Bullet 2: Key outcome or decision",
-    "Bullet 3: Overall direction agreed or next major milestone"
+    "<meeting purpose and context>",
+    "<key outcome or decision>",
+    "<overall direction agreed, or the next major milestone>"
   ],
   "topics": [
     {
@@ -527,7 +527,7 @@ def save_debug_record(bucket, target_date, meeting_title, prompt, raw_response,
         debug_record = {
             '_description': 'Debug record for meeting minutes prompt tuning.',
             'timestamp': datetime.utcnow().isoformat() + 'Z',
-            'model': CLAUDE_MODEL,
+            'model': llm_utils.active_model(),
             'meeting_title': meeting_title,
             'target_date': target_date,
             'parse_success': parse_success,
@@ -995,7 +995,7 @@ def generate_meeting_minutes(meeting_config):
             'generated_by': meeting_config.get('triggered_by', 'system'),
             'recordings_processed': len(transcripts),
             'total_words': total_words,
-            'model': CLAUDE_MODEL,
+            'model': llm_utils.active_model(),
             'parse_success': parse_success,
         }
     }
