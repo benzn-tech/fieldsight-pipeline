@@ -1146,6 +1146,15 @@ def _rag_answer(body):
         # Logged on both paths. A retry that silently fixes things forever
         # hides the rate this was built to move, and a rate nobody can see is
         # how a leak becomes permanent.
+        # ONE LINE WHETHER OR NOT IT FIRED. The retry below went three days
+        # in production without logging anything, which is the same thing a
+        # retry that is not wired at all would have printed. "It ran and the
+        # answer was clean" and "it never ran" have to be different in the
+        # log, or the only evidence this guard works stays in a unit test.
+        if not err and answer:
+            logger.info("  Ask answer language: policy=%s cjk=%.3f",
+                        answer_language.policy(),
+                        answer_language.cjk_ratio(answer))
         if not err and answer_language.violates(answer):
             logger.warning("  Ask answer language leaked; retrying once")
             retry_prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),

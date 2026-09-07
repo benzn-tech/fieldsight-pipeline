@@ -97,13 +97,37 @@ def test_effort_never_reaches_dashscope(monkeypatch, effort, thinking):
     assert sent["body"]["enable_thinking"] is thinking
 
 
-@pytest.mark.parametrize("thinking", [True, False])
-def test_unset_effort_keeps_the_boolean_every_deploy_had(monkeypatch, thinking):
-    """The parameter is new, so an unset value must change no request."""
+@pytest.mark.parametrize("thinking,expected", [(True, "high"), (False, "low")])
+def test_unset_effort_maps_the_boolean_onto_the_vendors_vocabulary(
+        monkeypatch, thinking, expected):
+    """This used to send `{"enabled": <bool>}` on the theory that a new
+    parameter must change no request. Measured against the endpoint we are
+    actually moving to, that theory is what breaks the deploy:
+
+        {"reasoning": {"enabled": false}}
+        -> HTTP 400 "Reasoning is mandatory for this endpoint
+                     and cannot be disabled."
+
+    So a deploy that merely forgot to set an effort would fail EVERY call
+    rather than fall back to something. The boolean is now mapped onto the
+    vocabulary every reasoning vendor does accept, and `low` is the closest
+    thing to off: same prompt, 516 reasoning tokens and 6.8s at low against
+    606 and 8.0s with nothing specified.
+    """
     mod = _load(monkeypatch, OPENROUTER, effort=None)
     sent = _capture(mod, monkeypatch)
     mod.call_llm("hi", max_tokens=100, enable_thinking=thinking)
-    assert sent["body"]["reasoning"] == {"enabled": thinking}
+    assert sent["body"]["reasoning"] == {"effort": expected}
+
+
+@pytest.mark.parametrize("thinking", [True, False])
+def test_the_field_that_is_a_hard_400_is_never_sent(monkeypatch, thinking):
+    """The specific regression, pinned on its own so it cannot come back
+    through a different route: `enabled` must not appear at all."""
+    mod = _load(monkeypatch, OPENROUTER, effort=None)
+    sent = _capture(mod, monkeypatch)
+    mod.call_llm("hi", max_tokens=100, enable_thinking=thinking)
+    assert "enabled" not in sent["body"]["reasoning"]
 
 
 @pytest.mark.parametrize("bad", ["highest", "none", "0", "true"])
@@ -113,7 +137,7 @@ def test_an_unknown_effort_falls_back_instead_of_travelling(monkeypatch, bad):
     mod = _load(monkeypatch, OPENROUTER, effort=bad)
     sent = _capture(mod, monkeypatch)
     mod.call_llm("hi", max_tokens=100, enable_thinking=True)
-    assert sent["body"]["reasoning"] == {"enabled": True}
+    assert sent["body"]["reasoning"] == {"effort": "high"}
 
 
 @pytest.mark.parametrize("messy", ["LOW", " high ", "Medium"])

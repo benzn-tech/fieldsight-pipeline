@@ -24,7 +24,7 @@ so `violates` must stay measurable on its own.
 import os
 import re
 
-__all__ = ["policy", "tail_rule", "violates", "EN", "QUESTION"]
+__all__ = ["policy", "tail_rule", "violates", "cjk_ratio", "EN", "QUESTION"]
 
 EN = "en"
 QUESTION = "question"
@@ -72,6 +72,20 @@ def tail_rule(insist=False):
             "asked in.")
 
 
+def cjk_ratio(text):
+    """The share of the answer written in CJK. What `violates` decides on.
+
+    Separate from the decision so the caller can LOG the number on the way
+    past. A guard that only speaks when it fires cannot be told apart from a
+    guard that never ran -- this repo has shipped that exact ambiguity, and
+    the language retry went three days in production without a single line
+    either way.
+    """
+    if not text:
+        return 0.0
+    return len(_CJK.findall(text)) / len(text)
+
+
 def violates(text):
     """Whether this answer broke the `en` policy.
 
@@ -81,5 +95,4 @@ def violates(text):
     """
     if policy() != EN or not text:
         return False
-    cjk = len(_CJK.findall(text))
-    return cjk > 0 and (cjk / len(text)) > _RATIO
+    return cjk_ratio(text) > _RATIO
