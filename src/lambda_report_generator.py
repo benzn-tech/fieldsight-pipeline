@@ -904,7 +904,7 @@ def generate_word_document(report_data, title):
 
     doc.add_heading('Executive Summary', level=1)
     exec_summary = report_data.get('executive_summary')
-    if isinstance(exec_summary, list):
+    if isinstance(exec_summary, list) and exec_summary:
         # Same rendering meeting-minutes already uses: bullets stay bullets.
         # Joining them into one paragraph is what the old string-only call did
         # by accident, and it read as one run-on sentence.

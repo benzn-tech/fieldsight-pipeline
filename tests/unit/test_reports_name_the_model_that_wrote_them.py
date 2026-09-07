@@ -163,3 +163,76 @@ def test_the_word_export_keeps_bullets_as_bullets():
     assert "First point" in texts and "Second point" in texts, texts
     assert "First pointSecond point" not in texts
     assert "First point Second point" not in texts
+
+
+# ------------------------------------------ the prompt builders, driven
+
+def _daily(summary):
+    return {"report_date": "2026-09-02", "user_name": "Ben_UCPK2",
+            "executive_summary": summary, "topics": []}
+
+
+def test_the_weekly_prompt_reads_bullets_as_prose_not_as_a_python_list():
+    """The old expression put `['First point', 'Second point']` -- brackets,
+    quotes and all -- into the text handed to the model. It is legible enough
+    that nothing ever failed, which is why it survived six months."""
+    prompt = rg.build_weekly_prompt(
+        [_daily(["First point", "Second point"])],
+        "SB1108", "2026-08-31", "2026-09-06")
+    assert "First point Second point" in prompt
+    assert "['First point'" not in prompt
+
+
+def test_the_monthly_prompt_reads_bullets_the_same_way_from_either_source():
+    """Two branches, weekly-derived and daily-derived, and both interpolated
+    the list."""
+    from_weekly = rg.build_monthly_prompt(
+        [], [{"period": {"start": "2026-08-31", "end": "2026-09-06"},
+              "executive_summary": ["Week point one", "Week point two"]}],
+        "SB1108", "2026-08-01", "2026-08-31")
+    assert "Week point one Week point two" in from_weekly
+    assert "['Week point one'" not in from_weekly
+
+    from_daily = rg.build_monthly_prompt(
+        [_daily(["Day point one", "Day point two"])], [],
+        "SB1108", "2026-08-01", "2026-08-31")
+    assert "Day point one Day point two" in from_daily
+    assert "['Day point one'" not in from_daily
+
+
+# --------------------------------------- an empty array is not a missing one
+
+def test_an_empty_bullet_array_still_says_something_under_the_heading():
+    """`executive_summary: []` is what a failed extraction looks like. Rendering
+    the heading over blank space tells the reader nothing went wrong."""
+    docx = pytest.importorskip("docx", reason="python-docx ships as a Lambda layer")
+    buf = rg.generate_word_document({"executive_summary": []}, "T")
+    buf.seek(0)
+    texts = [p.text for p in docx.Document(buf).paragraphs]
+    assert "No summary available" in texts, texts
+
+
+# ------------------------------------- every label, in every spelling
+
+@pytest.mark.parametrize("path", [
+    "src/lambda_ask_agent.py",
+    "src/lambda_report_generator.py",
+    "src/lambda_meeting_minutes.py",
+])
+def test_a_model_label_is_the_active_model_or_nothing(path):
+    """The previous version of this sweep named ONE constant, `CLAUDE_MODEL`,
+    and `lambda_ask_agent.py`'s legacy S3 path was labelling answers with a
+    second one, `HAIKU_MODEL`, the whole time. Naming the forbidden spellings
+    is a losing game: there is always another constant. State the property
+    instead -- a `model` field is either the model that ran, or None.
+    """
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parents[2]
+    source = (root / path).read_text(encoding="utf-8")
+    labels = re.findall(r"""['"]model['"]\s*:\s*([^,\n]+)""", source)
+    assert labels, "no model labels found -- the pattern stopped matching"
+    for value in labels:
+        assert value.strip() in ("None", "llm_utils.active_model(),", "llm_utils.active_model()"), (
+            "%s labels an answer with %r; use llm_utils.active_model()" % (path, value.strip())
+        )

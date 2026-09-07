@@ -1523,6 +1523,7 @@ def lambda_handler(event, context):
     logger.info("Ask Agent v1.0 - Complete")
     logger.info("=" * 50)
 
+    import llm_utils
     return ok({
         'answer': answer,
         'grounded': True,
@@ -1530,7 +1531,10 @@ def lambda_handler(event, context):
         'user': user,
         'scope': scope,
         'topic_id': topic_id,
-        'model': HAIKU_MODEL,
+        # `call_claude` above dispatches on LLM_PROVIDER, so on a qwen deploy
+        # this answer was NOT written by HAIKU_MODEL. Third site of the same
+        # mislabel; a sweep that named `CLAUDE_MODEL` walked straight past it.
+        'model': llm_utils.active_model(),
         'data_sources': {
             'report': bool(report_text),
             'report_type': report_type,

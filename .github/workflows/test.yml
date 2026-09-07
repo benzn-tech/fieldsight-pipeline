@@ -30,5 +30,10 @@ jobs:
       # numpy is for the scripts/ tools (multichannel_probe), not for any deployed
       # lambda — those get it from the VAD layer. Without it the probe tests fail to
       # IMPORT, which surfaces as a red suite unrelated to the change being tested.
-      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 numpy pytest pytest-cov
+      # python-docx is the same shape of problem one step later: the Word-export
+      # tests open with `importorskip("docx")`, so without it they SKIP and the
+      # suite is green over a path nothing checked. Keep this list identical to
+      # the one in deploy-prod.yml — that one has been short an entry before, and
+      # the miss showed up as `skipped`, not `failed`, so nothing alerted.
+      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 numpy "python-docx>=1.1" pytest pytest-cov
       - run: python -m pytest -v
