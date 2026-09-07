@@ -136,6 +136,7 @@ import sweep_state
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
+from repositories import location_markers
 from repositories import (action_items, aliases, chunks, classification_feedback, companies,
                           findings, speaker_label_groups,
                           compliance_resolutions, content, content_edits, keyframes,
@@ -6038,6 +6039,12 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
             if photos is not None:
                 names = [ph["s3_key"].rsplit("/", 1)[-1] for ph in photos]
                 shape["photo_filenames"] = names
+                # Grouped by location when he said where he was. ADDITIVE:
+                # photo_filenames stays the flat, complete list, so a client
+                # that ignores this renders exactly what it rendered before.
+                groups = _photo_groups(conn, caller, user, date, photos)
+                if groups is not None:
+                    shape["photo_groups"] = groups
                 # `photos` ONLY. The 404's `uploads` also carries sessions and
                 # duration from `range_stats` (site-clipped, author-filtered,
                 # tombstoned); this body already reports those from `day_stats`
@@ -6118,6 +6125,42 @@ def _day_photo_block(conn, caller, user, date):
         return photos
     except Exception:  # noqa: BLE001 - see above
         logger.exception("photo list unavailable for %s/%s", user, date)
+        return None
+
+
+def _photo_groups(conn, caller, user, date, photos):
+    """The day's photos grouped by WHERE HE SAID HE WAS, or None.
+
+    None, not [], when there are no markers: absent means "nobody said where
+    they were", which is the ordinary case for a meeting and must stay
+    distinguishable from "he announced a room and none of the photos fell in
+    it". A client that gets None shows the flat list it already shows.
+
+    A photo with no location is NOT dropped and NOT bucketed under a made-up
+    heading -- it goes in a group whose location is null, because "taken before
+    he said where he was" is a true and useful thing to render, and inventing a
+    room for it would be the failure this whole feature exists to avoid.
+
+    Never raises: the flat list is the answer, this is an improvement on it.
+    """
+    try:
+        company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        markers = location_markers.for_day(conn, company, user, date)
+        if not markers:
+            return None
+        groups, order = {}, []
+        for ph in photos:
+            name = ph["s3_key"].rsplit("/", 1)[-1]
+            taken = extract_base_time_from_filename(name)
+            where = location_markers.locate(
+                markers, taken.strftime("%H:%M") if taken else None)
+            if where not in groups:
+                groups[where] = []
+                order.append(where)
+            groups[where].append(name)
+        return [{"location": w, "filenames": groups[w]} for w in order]
+    except Exception:  # noqa: BLE001 - see above
+        logger.exception("photo groups unavailable for %s/%s", user, date)
         return None
 
 

@@ -65,6 +65,7 @@ from photo_binding import list_pictures as _pb_list_pictures
 from repositories import users as users_repo
 from photo_binding import photos_for_topics as _photos_for_topics
 import thread_match
+from repositories import location_markers
 from repositories import (companies, findings, meeting_session, recordings,
                           redactions,
                           session_group, sites, threads, topics)
@@ -775,6 +776,30 @@ def write_extraction_items(date, user_folder, extraction_key):
         photo_objects = _list_pictures(pictures_prefix)
         extraction_topics = extraction.get("topics", [])
         photos_by_topic = _photos_for_topics(photo_objects, extraction_topics)
+
+        # The day's location markers, written where the READER can reach them.
+        #
+        # This lambda has the database and the company id; org-api, which serves
+        # the day view, has neither the extraction artifact nor -- checked
+        # before choosing this design -- any S3 grant that would let it read
+        # one: ListBucket and GetObject on `extractions/` both simulate as
+        # implicitDeny for its role. Reading the artifact from there would have
+        # meant two new grants of exactly the shape that has silently 403'd
+        # eight times in this repo.
+        #
+        # Replace, never append: a session is re-driven routinely (finalize,
+        # the backlog probe's repairs, a manual invoke) and each run produces
+        # the day's complete set.
+        #
+        # Never fatal. The markers are an addition to a day that already works
+        # without them; a write that can turn a good extraction into a failed
+        # one would be a worse bug than ungrouped photos.
+        try:
+            location_markers.replace_for_day(
+                conn, company["id"], user_folder, date,
+                extraction.get("location_markers") or [])
+        except Exception:  # noqa: BLE001 -- see above
+            logger.exception("location markers not stored for %s/%s", user_folder, date)
 
         topics_n = 0
         collected_topics = []
