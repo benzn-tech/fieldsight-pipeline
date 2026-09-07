@@ -842,18 +842,24 @@ def test_photo_attaches_to_first_matching_topic_only():
     assert result == {0: [photo], 1: []}
 
 
-def test_cap_ten_photos_per_topic():
-    # Was test_cap_five_photos_per_topic: the cap is PHOTOS_PER_TOPIC_CAP=10
-    # (raised from the report-generator's 5). This day has a single topic, so
-    # the 11th photo has nowhere to cascade to and is dropped with a warning.
+def test_the_cap_is_enforced_at_whatever_it_is_set_to():
+    """Was test_cap_ten_photos_per_topic, and before that ..._five_...  The
+    number has moved three times and the assertion had to be rewritten each
+    time, which is a test pinning a setting rather than a behaviour.
+
+    What matters and does not move: the cap is enforced, it takes the FIRST N
+    in input order, and it does not reorder. The value itself is a display
+    limit now -- the day view lists every photo whether or not it binds -- so
+    it is read from the module rather than restated here.
+    """
+    cap = iw.PHOTOS_PER_TOPIC_CAP
     topics_list = [{"time_range": "09:00 – 10:00"}]
-    photos = [_photo(f"p{i:02d}.jpg", f"09:{i:02d}") for i in range(11)]
+    photos = [_photo("p%02d.jpg" % i, "09:%02d" % (i % 60)) for i in range(cap + 1)]
 
     result = iw._photos_for_topics(photos, topics_list)
 
-    assert iw.PHOTOS_PER_TOPIC_CAP == 10
-    assert len(result[0]) == 10
-    assert result[0] == photos[:10]  # first 10, cap does not reorder
+    assert len(result[0]) == cap
+    assert result[0] == photos[:cap]  # first N, cap does not reorder
 
 
 def test_unparseable_time_range_gets_no_photos():
