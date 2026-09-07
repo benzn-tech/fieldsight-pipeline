@@ -109,6 +109,14 @@ QWEN_ENABLE_THINKING = os.environ.get("QWEN_ENABLE_THINKING", "false").lower() =
 LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "").strip().lower()
 VALID_EFFORTS = ("low", "medium", "high")
 
+# Added to the caller's max_tokens on reasoning endpoints, because reasoning
+# tokens are completion tokens and are emitted BEFORE the answer. Sized from
+# measurement rather than taste: the same prompt used 516 reasoning tokens at
+# effort=low, 743 at high, and 1671 in JSON mode -- so a 4k default with no
+# headroom is fine until the day a long transcript makes the model think, which
+# is exactly the day it matters.
+REASONING_HEADROOM_TOKENS = int(os.environ.get("LLM_REASONING_HEADROOM", "8000"))
+
 MAX_ATTEMPTS = 4
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 BACKOFF_BASE_SECONDS = 1.0
@@ -290,8 +298,23 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
             if LLM_REASONING_EFFORT:
                 logger.warning("ignoring unknown LLM_REASONING_EFFORT=%r (want one of %s)",
                                LLM_REASONING_EFFORT, ", ".join(VALID_EFFORTS))
-            payload["reasoning"] = {"enabled": bool(thinking)}
-        payload["max_tokens"] = max_tokens
+            # The boolean mapped onto the vendor's vocabulary, NOT
+            # `{"enabled": False}`. Measured against
+            # meta/muse-spark-1.3-contributor: that field is a hard 400 --
+            # "Reasoning is mandatory for this endpoint and cannot be disabled"
+            # -- so a deploy that merely forgot to set an effort would fail
+            # every call rather than fall back. `low` is the closest thing the
+            # endpoint offers to off, and it is measurably cheaper and faster
+            # than the default (516 reasoning tokens / 6.8s vs 606 / 8.0s on the
+            # same prompt).
+            payload["reasoning"] = {"effort": "high" if thinking else "low"}
+        # Reasoning tokens are COMPLETION tokens: they come out of max_tokens
+        # before the answer does. A caller asking for 4096 "for the answer" gets
+        # an empty answer if the model spends 4096 thinking -- measured, at
+        # max_tokens=1200 this model produced 1197 reasoning tokens and
+        # content=''. So the caller's number stays the ANSWER budget and the
+        # thinking budget is added on top.
+        payload["max_tokens"] = max_tokens + REASONING_HEADROOM_TOKENS
         if force_json:
             payload["response_format"] = {"type": "json_object"}
     elif thinking:
@@ -336,10 +359,32 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
     data = json.loads(resp.data.decode("utf-8"))
     if resp.status == 200:
         try:
-            return data["choices"][0]["message"]["content"], None
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
         except (KeyError, IndexError):
             logger.error(f"Qwen unexpected response shape: {str(data)[:500]}")
             return None, "unexpected Qwen response shape"
+        # HTTP 200 WITH NO ANSWER IS A FAILURE, and on a reasoning model it is
+        # the likeliest one. The tokens are spent inside `reasoning`, `content`
+        # comes back '' or None, and every status field says success -- so a
+        # caller that trusts the 200 writes an empty summary for a real day and
+        # nothing anywhere says why. Measured on
+        # meta/muse-spark-1.3-contributor: max_tokens=1200 -> 1197 reasoning
+        # tokens, content='', finish_reason='length', HTTP 200.
+        #
+        # Returned as an error so the caller's existing failure path runs: a
+        # day with no summary and a loud log beats a day with a blank one.
+        if not (content or "").strip():
+            usage = data.get("usage") or {}
+            detail = (usage.get("completion_tokens_details") or {})
+            logger.error(
+                "Qwen returned an empty answer: finish_reason=%s completion_tokens=%s "
+                "reasoning_tokens=%s max_tokens=%s -- the budget was spent thinking, "
+                "raise max_tokens or lower the reasoning effort",
+                choice.get("finish_reason"), usage.get("completion_tokens"),
+                detail.get("reasoning_tokens"), payload.get("max_tokens"))
+            return None, "empty answer (reasoning consumed the token budget)"
+        return content, None
     err_obj = data.get("error") or {}
     msg = err_obj.get("message", f"HTTP {resp.status}")
     # The CODE, not just the message. These read almost identically in a log
