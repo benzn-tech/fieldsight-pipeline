@@ -248,6 +248,8 @@ jobs:
               "QwenModelPlus=${{ vars.TEST_QWEN_MODEL_PLUS || 'qwen3.8-flash' }}" \
               "QwenModelFast=${{ vars.TEST_QWEN_MODEL_FAST || 'qwen3.6-flash' }}" \
               "QwenModelPlusNonThinking=${{ vars.TEST_QWEN_MODEL_PLUS_NONTHINKING || 'qwen3.6-flash' }}" \
+              "LlmReasoningEffortPlus=${{ vars.TEST_LLM_EFFORT_PLUS || 'high' }}" \
+              "LlmReasoningEffortFast=${{ vars.TEST_LLM_EFFORT_FAST || 'low' }}" \
               "EnableRerank=${{ vars.TEST_ENABLE_RERANK || 'false' }}" \
               $QWEN_CHAT_KEY_PARAM \
               "ElevenLabsApiKey=$ELEVENLABS_API_KEY" \

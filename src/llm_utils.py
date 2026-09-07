@@ -94,6 +94,21 @@ QWEN_MODEL_INHERIT = "inherit"
 # fast/cheap non-thinking path for latency-bound callers (ask-agent).
 QWEN_ENABLE_THINKING = os.environ.get("QWEN_ENABLE_THINKING", "false").lower() == "true"
 
+# How hard a reasoning-capable vendor should think, when the vendor expresses that
+# as a level rather than a boolean.
+#
+# DashScope has `enable_thinking`, which is on or off. OpenAI-compatible vendors
+# (OpenRouter, and the models behind it) take `reasoning: {"effort": ...}`, where
+# the levels are priced and latency-differentiated. Those are not the same knob and
+# must not be conflated: `effort` sent to DashScope is an unknown field, and an
+# unknown field is either rejected loudly or DROPPED SILENTLY -- and if dropped, a
+# caller that asked for `low` on the latency path quietly pays for full reasoning.
+#
+# Empty means "say nothing about effort", which is what every deploy did before this
+# existed, so an unset value changes no request.
+LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "").strip().lower()
+VALID_EFFORTS = ("low", "medium", "high")
+
 MAX_ATTEMPTS = 4
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 BACKOFF_BASE_SECONDS = 1.0
@@ -266,7 +281,16 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
         # and it is deliberately NOT ported: an unbounded completion on a
         # per-token vendor is a cost incident waiting to happen, and structured
         # outputs are supported here.
-        payload["reasoning"] = {"enabled": bool(thinking)}
+        # `effort` when the deploy states one, the boolean otherwise. A value this
+        # vendor does not know would be worse than saying nothing, so anything
+        # outside the known set falls back rather than travelling.
+        if LLM_REASONING_EFFORT in VALID_EFFORTS:
+            payload["reasoning"] = {"effort": LLM_REASONING_EFFORT}
+        else:
+            if LLM_REASONING_EFFORT:
+                logger.warning("ignoring unknown LLM_REASONING_EFFORT=%r (want one of %s)",
+                               LLM_REASONING_EFFORT, ", ".join(VALID_EFFORTS))
+            payload["reasoning"] = {"enabled": bool(thinking)}
         payload["max_tokens"] = max_tokens
         if force_json:
             payload["response_format"] = {"type": "json_object"}

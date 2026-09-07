@@ -265,6 +265,8 @@ jobs:
               "QwenModelPlus=${{ vars.PROD_QWEN_MODEL_PLUS || 'qwen3.8-flash' }}" \
               "QwenModelFast=${{ vars.PROD_QWEN_MODEL_FAST || 'qwen3.6-flash' }}" \
               "QwenModelPlusNonThinking=${{ vars.PROD_QWEN_MODEL_PLUS_NONTHINKING || 'qwen3.6-flash' }}" \
+              "LlmReasoningEffortPlus=${{ vars.PROD_LLM_EFFORT_PLUS || 'high' }}" \
+              "LlmReasoningEffortFast=${{ vars.PROD_LLM_EFFORT_FAST || 'low' }}" \
               "EnableRerank=${{ vars.PROD_ENABLE_RERANK || 'false' }}" \
               $QWEN_CHAT_KEY_PARAM \
               "EnableNonWorkExpiry=${{ vars.PROD_NONWORK_EXPIRY_ENABLED || 'false' }}" \
