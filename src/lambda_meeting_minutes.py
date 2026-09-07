@@ -74,6 +74,8 @@ def _user_and_date_from_key(key):
 
 # Configuration
 S3_BUCKET = os.environ.get('S3_BUCKET', '')
+# Minutes are read for what was DECIDED, which is at the end of the meeting.
+MINUTES_TRANSCRIPT_LIMIT = int(os.environ.get('MINUTES_TRANSCRIPT_LIMIT', '300000'))
 MINUTES_PREFIX = os.environ.get('MINUTES_PREFIX', 'meeting_minutes/')
 REPORT_PREFIX = os.environ.get('REPORT_PREFIX', 'reports/')  # compat output path
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
@@ -440,7 +442,7 @@ def build_meeting_prompt(transcripts, meeting_config):
     # actions at the END, so a bare head slice drops precisely what minutes are for — and
     # drops it silently, producing minutes that read as complete. Same defect and same fix
     # as the extraction layer and the rolling summary the stop-recording email is built on.
-    transcripts_text, _ = elide_middle(transcript_lines, 120000, sep='\n\n')
+    transcripts_text, _ = elide_middle(transcript_lines, MINUTES_TRANSCRIPT_LIMIT, sep='\n\n')
 
     # Use S3 prompt template if loaded, otherwise use inline default
     if prompt_template and prompt_template.get('prompt'):
@@ -926,7 +928,7 @@ def generate_meeting_minutes(meeting_config):
     # Dynamic max_tokens: longer meetings need more output space
     # ~26K token input for 2hr meeting → expect 8-16K token output
     prompt_tokens_est = len(prompt) // 4
-    max_tokens = min(max(8000, prompt_tokens_est // 2), 16000)
+    max_tokens = min(max(16000, prompt_tokens_est // 2), llm_utils.ANSWER_TOKEN_CEILING)
     logger.info(f"  Prompt ~{prompt_tokens_est} tokens → max_tokens={max_tokens}")
 
     # Call Claude

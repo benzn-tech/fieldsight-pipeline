@@ -18,6 +18,7 @@ S3-triggered handler + SAM wiring land separately.
 """
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from urllib.parse import unquote_plus
@@ -31,7 +32,7 @@ logger = logging.getLogger()
 # small" was true of the early ticks and false of the last one, which is the only
 # tick the email ever sees: past ~70 minutes the old bare slice cut the ending off
 # and nothing said so.
-TRANSCRIPT_LIMIT = 60000   # chars fed to the model
+TRANSCRIPT_LIMIT = int(os.environ.get('ROLLING_TRANSCRIPT_LIMIT', '300000'))  # chars fed to the model
 TRANSCRIPT_HEAD_SHARE = 0.5   # a running summary needs the end at least as much
 
 _SYSTEM = (
@@ -97,7 +98,7 @@ def parse_rolling_summary(raw):
     return {"summary": str(data.get("summary") or "").strip(), "open_todos": todos}
 
 
-def summarize_turns(turns, call_llm=None, max_tokens=1200):
+def summarize_turns(turns, call_llm=None, max_tokens=4000):
     """Summarize the session-so-far. Returns {summary, open_todos} or None (empty
     turns / LLM failure / unparseable). `call_llm(prompt, max_tokens=, force_json=)
     -> (raw, error)` is injectable for tests; defaults to llm_utils.call_llm

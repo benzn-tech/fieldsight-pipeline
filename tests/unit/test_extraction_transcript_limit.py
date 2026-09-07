@@ -25,9 +25,12 @@ Three properties are pinned here.
 
 Raising the cap rather than chunking is deliberate; the reasoning lives next to
 the constant. The short version: chunking means map-reduce with cross-chunk
-topic dedup inside the function that livelocked (BUG-43), and output tokens do
-not scale with input on the prod path anyway — `llm_utils` sends no
-`max_tokens` at all under `force_json`.
+topic dedup inside the function that livelocked (BUG-43).
+
+The paragraph that used to end this docstring said output tokens do not scale
+with input because `llm_utils` sends no `max_tokens` under `force_json`. That
+was DashScope-specific and is no longer true: the OpenRouter path always sends
+a cap. `max_tokens_for` is what bounds the output now.
 """
 import os
 

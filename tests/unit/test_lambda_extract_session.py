@@ -201,8 +201,11 @@ def test_prompt_contains_all_segment_turns(monkeypatch):
     assert "UNIQUEWORDALPHA" in captured["prompt"]
     assert "UNIQUEWORDBETA" in captured["prompt"]
     assert "10:00:00" in captured["prompt"]  # abs_start_str of the first turn
-    # BUG-16: max_tokens scales with segment count (2 segments here)
-    assert captured["max_tokens"] == 4096 + 2 * 350
+    # BUG-16: max_tokens scales with segment count (2 segments here). The
+    # per-segment slope and the base both doubled when the budget stopped being
+    # a no-op: on DashScope force_json dropped max_tokens entirely, so the
+    # number never travelled; the OpenRouter path always sends it.
+    assert captured["max_tokens"] == 8192 + 2 * 700
 
 
 def test_extract_session_requests_force_json(monkeypatch):

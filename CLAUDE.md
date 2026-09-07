@@ -307,22 +307,58 @@ just unreachable".
 
 #### BUG-15: Prompt Text Truncation MUST Match Expected Input Size
 **Bug**: `transcripts_text[:20000]` truncated a 2-hour meeting (105K chars) to only 19% — report covered 12:18–12:41 and missed the remaining 80 minutes.  
-**Rule**:
-- Meeting minutes: `[:120000]` (120K chars ≈ 30K tokens, fits in 200K context)
-- Site daily report: `[:60000]` (site walks are shorter but can still be long)
-- Weekly/monthly summaries: `[:15000]` is fine (these summarise already-processed reports, not raw transcripts)
+**Rule**: size the limit against the model actually in front of it, and make it an
+env var so it can move without a code change.
+
+| Path | Env var | Default (2026-09-07) |
+|---|---|---|
+| Extraction | `TRANSCRIPT_TEXT_LIMIT` | 300000 |
+| Site daily report | `DAILY_TRANSCRIPT_LIMIT` | 300000 |
+| Meeting minutes | `MINUTES_TRANSCRIPT_LIMIT` | 300000 |
+| Rolling summary | `ROLLING_TRANSCRIPT_LIMIT` | 300000 |
+| Ask (transcript / report) | `ASK_TRANSCRIPT_CHARS` / `ASK_REPORT_CHARS` | 300000 / 60000 |
+| Weekly/monthly roll-ups | `ROLLUP_SOURCE_LIMIT` | 60000 |
+
+**The old numbers (120K / 60K / 15K) were sized for a 200K-token Claude context
+and outlived it by two vendor changes.** On 2026-09-03 the 60K daily limit elided
+**257 lines out of the middle** of a 505-minute day while the model it was feeding
+accepts 1,048,576 tokens. When a limit stops matching the model, nothing fails —
+the report just quietly describes part of the day.
+
+Truncation is always `transcript_utils.elide_middle` (head AND tail), never
+`text[:N]`: a session's decisions are at its end. Two bare slices survived in the
+ask path until 2026-09-07 for exactly as long as nobody looked.
 
 #### BUG-16: max_tokens Must Scale with Input Length
 **Bug**: `max_tokens=6000` was hardcoded. A 2-hour meeting with 15 topics needs 10K+ output tokens.  
-**Rule**: Calculate dynamically:
+**Rule**: Calculate dynamically, and bound it with the ONE shared ceiling:
 ```python
-# Meeting minutes
-prompt_tokens_est = len(prompt) // 4
-max_tokens = min(max(8000, prompt_tokens_est // 2), 16000)
+# llm_utils.ANSWER_TOKEN_CEILING (env LLM_ANSWER_TOKEN_CEILING, default 32000)
 
-# Site report
-max_tokens = min(4096 + n_transcripts * 350, 16000)
+# Meeting minutes
+max_tokens = min(max(16000, len(prompt) // 8), llm_utils.ANSWER_TOKEN_CEILING)
+
+# Site report / extraction
+max_tokens = min(8192 + n_segments * 700, llm_utils.ANSWER_TOKEN_CEILING)
 ```
+
+**Two things about this number changed on 2026-09-07 and both matter:**
+
+1. **It reaches the model now.** On DashScope, `force_json` made `llm_utils` drop
+   `max_tokens` entirely, so it was a no-op on the prod path and three separate
+   comments said so. The OpenRouter path **always** sends it. A stale low number
+   is a truncated answer, not a harmless constant.
+2. **Reasoning tokens are completion tokens.** They come out of the budget
+   *before* the answer does — measured: `max_tokens=1200` on muse produced 1197
+   reasoning tokens and `content=''` with HTTP 200. `REASONING_HEADROOM_TOKENS`
+   (default 8000) is added on top of the caller's number so the caller's figure
+   stays an *answer* budget.
+
+Ceiling + headroom must clear the smallest model the deploy can reach
+(`gemini-3.8-flash` caps output at 65,536). Pinned by
+`tests/unit/test_the_limit_is_not_the_thing_that_stops.py`. Measured peak on the
+widest real prod report: **3,386 completion tokens** — the budget is not tight,
+it is sized so the cap is never what stops an answer.
 
 #### BUG-17: User-Provided Attendee Names Must Override Device Mapping
 **Bug**: `user_mapping.json` mapped `Benl1 → Jarley Trainor`. When user passed `attendees: ["Ben", "Sam"]`, the report still showed "Jarley Trainor" because speaker labels were resolved through user_mapping before the prompt was built.  
