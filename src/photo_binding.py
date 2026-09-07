@@ -42,8 +42,25 @@ from transcript_utils import extract_base_time_from_filename
 
 logger = logging.getLogger()
 
-PHOTOS_PER_TOPIC_CAP = 10   # was 5 (report-generator parity); raised so the
-                            # cascade rarely engages on real field days
+import os
+
+PHOTOS_PER_TOPIC_CAP = int(os.environ.get("PHOTOS_PER_TOPIC_CAP", "60"))
+# Was 10, and before that 5. Raised because the cap changed meaning on
+# 2026-09-07: while binding was the ONLY way a photo reached a screen, a
+# capped photo was a LOST photo, and 10 was a data-loss threshold wearing a
+# display-limit's clothes. The day view now lists every photo of the day
+# regardless of binding, so the cap only decides how many thumbnails hang off
+# one paragraph.
+#
+# Measured on the day that prompted it: Neil / 2026-09-02 is one topic and 53
+# photos, of which 10 came back. 60 covers every real day in the bucket while
+# still bounding a pathological one.
+
+# How far past a topic's END a photo may still be attributed to it when NOTHING
+# qualifies under PHOTO_TOLERANCE_MIN. See _carry_forward below -- this is the
+# inspection case, and the bound is what separates it from the unbounded
+# nearest-wins rule that was deliberately removed in 2026-07-24.
+PHOTO_CARRY_FORWARD_MIN = int(os.environ.get("PHOTO_CARRY_FORWARD_MIN", "30"))
 PHOTO_TOLERANCE_MIN = 2     # hard cap: a photo overreaching a topic window's
                             # edge by more than this many minutes does not
                             # qualify for that topic at all (enforced in
@@ -54,6 +71,50 @@ PHOTO_TOLERANCE_MIN = 2     # hard cap: a photo overreaching a topic window's
 # the prod failure was the WINDOW, not the dash (verified ascii()==8211), but
 # a one-character prompt drift must not silently strand photos again.
 _TIME_RANGE_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*[–—-]\s*(\d{1,2}):(\d{2})$")
+
+
+def _carry_forward(p_minutes, windows):
+    """The last thing said before this photo, if it was said recently enough.
+
+    THIS RE-OPENS A DOOR THAT WAS DELIBERATELY CLOSED, so the difference
+    matters. On 2026-07-24 the never-orphan fallback was removed by explicit
+    decision: "an unbounded bind is worse than an orphan -- a photo
+    minutes-to-hours from every window should not be silently attributed to the
+    nearest one." That reasoning is still correct, and this is not that rule:
+
+      * it is BOUNDED (PHOTO_CARRY_FORWARD_MIN), not nearest-at-any-distance;
+      * it is DIRECTIONAL -- only a topic that had already STARTED can claim a
+        later photo, because the claim being modelled is "he was still doing
+        the thing he last described", not "this is the closest event";
+      * and the premise changed. In July an unbound photo was INVISIBLE, so a
+        wrong bind and no bind were both failures and the quieter one won.
+        Since 2026-09-07 the day view lists every photo whether or not it
+        binds, so an unbound photo is merely ungrouped. The cost of being
+        wrong went down; the cost of binding nothing did not.
+
+    Why it is needed, measured: 37% of topic time windows are a single instant
+    and 76% are narrower than PHOTO_TOLERANCE_MIN. Neil / 2026-08-18 is one
+    utterance at 14:32 followed by twelve silent minutes of photography -- 25
+    photos, of which 6 bound. The inspection workflow (say where you are, then
+    photograph in silence) produces exactly this shape every time.
+
+    Deterministic on ties, and the ties are real: 2026-08-13 has three topics
+    sharing one time_range, so "the last thing said" is genuinely ambiguous
+    there. Latest end wins, then lowest index. That is a coin-toss dressed as a
+    rule, and it is the reason this is a FALLBACK: the real answer is a
+    location marker (spec 2026-09-07), which does not collide because people
+    announce where they are far less often than they change subject.
+    """
+    best = None
+    for i, (start, end) in windows.items():
+        if start > p_minutes:
+            continue                      # had not been said yet
+        if p_minutes - end > PHOTO_CARRY_FORWARD_MIN:
+            continue                      # too long ago to still be true
+        key = (end, -i)
+        if best is None or key > best[0]:
+            best = (key, i)
+    return [best[1]] if best else []
 
 
 def _hhmm_to_minutes(hhmm):
@@ -108,6 +169,7 @@ def photos_for_topics(photo_objects, topics):
             windows[i] = parsed
 
     capped = 0
+    carried_count = 0
     for p in photo_objects:
         hhmm = p.get("hhmm")
         if not hhmm:
@@ -117,10 +179,19 @@ def photos_for_topics(photo_objects, topics):
         # PHOTO_TOLERANCE_MIN minutes of an edge. Beyond that a topic does
         # not compete at all -- there is no "nearest of everything" fallback.
         qualifying = [i for i in windows if _distance(p_minutes, windows[i]) <= PHOTO_TOLERANCE_MIN]
+        carried = False
         if not qualifying:
-            logger.info("photo %s dropped: no topic window within %d min",
-                        p.get("key"), PHOTO_TOLERANCE_MIN)
+            # Nothing was being said when this was taken. Fall back to what was
+            # last said BEFORE it, bounded -- the inspection case.
+            qualifying = _carry_forward(p_minutes, windows)
+            carried = bool(qualifying)
+        if not qualifying:
+            logger.info("photo %s dropped: no topic window within %d min and "
+                        "nothing said in the %d min before it",
+                        p.get("key"), PHOTO_TOLERANCE_MIN, PHOTO_CARRY_FORWARD_MIN)
             continue
+        if carried:
+            carried_count += 1
         # Nearest window first; ties -> lowest index. The full ordering (not
         # just the winner) is what lets an at-cap topic cascade to the next-
         # nearest QUALIFYING one, so the cap only drops a photo when every
@@ -146,6 +217,14 @@ def photos_for_topics(photo_objects, topics):
     if capped:
         logger.info("photo binding: %d photo(s) past the per-topic cap of %d "
                     "(visible in the day list, not lost)", capped, PHOTOS_PER_TOPIC_CAP)
+    if carried_count:
+        # Counted separately from the ordinary binds, because these are the
+        # weaker claim: they say "nothing was being said, so we attributed this
+        # to the last thing that was". If that ever starts being wrong, the
+        # number that moves is this one.
+        logger.info("photo binding: %d photo(s) attributed to the last topic "
+                    "that started before them (nothing within %d min)",
+                    carried_count, PHOTO_TOLERANCE_MIN)
     return result
 
 
