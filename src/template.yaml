@@ -2323,7 +2323,15 @@ Resources:
       FunctionName: !Sub ["${P}-rolling-summary", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_rolling_summary.lambda_handler
-      Timeout: 120
+      # 120 s was sized when this function was fed 60,000 chars. It is now fed up
+      # to 300,000 (ROLLING_TRANSCRIPT_LIMIT), and it is the LIVE path -- the
+      # stop-recording email is built from its last tick, so a timeout here is a
+      # meeting with no summary rather than a slow one. Measured on the largest
+      # session available (1,432 turns, 41,599 prompt tokens, muse at high
+      # effort): 37.3 s in the model, 47.3 s in the function. That fits inside
+      # 120 -- but a day twice that size does not, and long days are exactly the
+      # ones whose summary matters. The headroom is cheap; the cliff is not.
+      Timeout: 300
       MemorySize: 256
       Environment:
         Variables:
@@ -2331,7 +2339,7 @@ Resources:
           # before urllib3 raises and the `except` that exists for a slow LLM never
           # runs. `llm_utils` defaults it to 150 s and explains the ordering; three
           # functions here had it inverted, all by leaving it at that default.
-          LLM_HTTP_TIMEOUT: '90'
+          LLM_HTTP_TIMEOUT: '240'
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
