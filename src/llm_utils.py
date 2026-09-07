@@ -116,6 +116,16 @@ VALID_EFFORTS = ("low", "medium", "high")
 # is exactly the day it matters.
 REASONING_HEADROOM_TOKENS = int(os.environ.get("LLM_REASONING_HEADROOM", "8000"))
 
+# The most output any caller may ask for. One number, here, because three
+# lambdas were each carrying their own 16000 and a vendor change has to move
+# all of them or none. Sized to the SMALLEST completion cap among the models
+# this deploy can reach -- gemini-3.8-flash caps at 65,536, muse-spark-1.3 at
+# 943,718, qwen3.8-flash at 131,072 -- and REASONING_HEADROOM_TOKENS is added
+# on top before it goes on the wire, so 32000 + 8000 clears the lowest.
+# Measured peak on the widest real prod report was 3,386 tokens; this is not
+# sized to be tight, it is sized so the answer is never the thing that stops.
+ANSWER_TOKEN_CEILING = int(os.environ.get("LLM_ANSWER_TOKEN_CEILING", "32000"))
+
 MAX_ATTEMPTS = 4
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 BACKOFF_BASE_SECONDS = 1.0
@@ -347,11 +357,13 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
     # correctly" and "it never ran" look the same.
     logger.info("qwen call: model=%s thinking=%s json=%s",
                 payload["model"], thinking, "response_format" in payload)
+    started = time.monotonic()
     resp, err = _post_with_retry(
         f"{QWEN_BASE_URL}/chat/completions",
         json.dumps(payload),
         {"Content-Type": "application/json", "Authorization": f"Bearer {QWEN_API_KEY}"},
     )
+    elapsed = time.monotonic() - started
     if resp is None:
         logger.error(f"Qwen API call failed: {err}")
         return None, err
@@ -360,24 +372,11 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
         try:
             choice = data["choices"][0]
             content = choice["message"]["content"]
-            if not (content or "").strip():
-                # A 200 carrying nothing is the worst shape this API has: the
-                # caller sees success, gets an empty string, and writes an empty
-                # extraction. It happens when reasoning consumes the whole token
-                # budget -- billed in full, `finish_reason: length`, no answer.
-                # Name it, because "the model said nothing" and "the model was cut
-                # off mid-thought" are different problems with the same symptom.
-                reason = choice.get("finish_reason")
-                detail = (data.get("usage") or {}).get("completion_tokens_details") or {}
-                logger.error("Qwen returned an empty answer (finish_reason=%s, "
-                             "reasoning_tokens=%s, model=%s) -- raise max_tokens "
-                             "or lower the reasoning effort",
-                             reason, detail.get("reasoning_tokens"), data.get("model"))
-                return None, f"empty answer from model (finish_reason={reason})"
-            return content, None
         except (KeyError, IndexError):
             logger.error(f"Qwen unexpected response shape: {str(data)[:500]}")
             return None, "unexpected Qwen response shape"
+        usage = data.get("usage") or {}
+        detail = usage.get("completion_tokens_details") or {}
         # HTTP 200 WITH NO ANSWER IS A FAILURE, and on a reasoning model it is
         # the likeliest one. The tokens are spent inside `reasoning`, `content`
         # comes back '' or None, and every status field says success -- so a
@@ -387,17 +386,31 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
         # tokens, content='', finish_reason='length', HTTP 200.
         #
         # Returned as an error so the caller's existing failure path runs: a
-        # day with no summary and a loud log beats a day with a blank one.
+        # day with no summary and a loud log beats a day with a blank one. The
+        # error string carries finish_reason because "the model said nothing"
+        # and "the model was cut off mid-thought" want different fixes.
         if not (content or "").strip():
-            usage = data.get("usage") or {}
-            detail = (usage.get("completion_tokens_details") or {})
+            reason = choice.get("finish_reason")
             logger.error(
                 "Qwen returned an empty answer: finish_reason=%s completion_tokens=%s "
-                "reasoning_tokens=%s max_tokens=%s -- the budget was spent thinking, "
-                "raise max_tokens or lower the reasoning effort",
-                choice.get("finish_reason"), usage.get("completion_tokens"),
-                detail.get("reasoning_tokens"), payload.get("max_tokens"))
-            return None, "empty answer (reasoning consumed the token budget)"
+                "reasoning_tokens=%s max_tokens=%s model=%s -- the budget was spent "
+                "thinking, raise max_tokens or lower the reasoning effort",
+                reason, usage.get("completion_tokens"),
+                detail.get("reasoning_tokens"), payload.get("max_tokens"),
+                data.get("model"))
+            return None, f"empty answer from model (finish_reason={reason})"
+        # Throughput is a deploy decision -- muse, gemini and qwen differ by
+        # multiples on the same prompt -- and it was not answerable from any
+        # log: duration lived in the Lambda REPORT line, which counts S3 and
+        # Aurora too, and the token counts were never written down at all. A
+        # call that SUCCEEDS has to leave its numbers behind, or the next model
+        # comparison is guesswork again.
+        completion = usage.get("completion_tokens")
+        logger.info(
+            "qwen done: model=%s %.1fs prompt=%s completion=%s reasoning=%s finish=%s%s",
+            data.get("model"), elapsed, usage.get("prompt_tokens"), completion,
+            detail.get("reasoning_tokens"), choice.get("finish_reason"),
+            (" %.1f tok/s" % (completion / elapsed)) if completion and elapsed > 0 else "")
         return content, None
     err_obj = data.get("error") or {}
     msg = err_obj.get("message", f"HTTP {resp.status}")

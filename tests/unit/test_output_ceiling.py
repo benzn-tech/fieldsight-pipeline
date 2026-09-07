@@ -43,4 +43,12 @@ def test_the_anthropic_ceiling_scales_past_the_old_8000():
 
 
 def test_the_ceiling_is_still_bounded():
-    assert ex.max_tokens_for(n_segments=10_000) <= 16000
+    """Bounded by the SHARED ceiling, not by a copy of its value.
+
+    This assertion used to read `<= 16000`. Three lambdas each held their own
+    16000 and this test held a fourth copy, so raising the budget meant finding
+    all four -- and a test pinning a literal goes red on the correct change and
+    green on a partial one.
+    """
+    import llm_utils
+    assert ex.max_tokens_for(n_segments=10_000) <= llm_utils.ANSWER_TOKEN_CEILING

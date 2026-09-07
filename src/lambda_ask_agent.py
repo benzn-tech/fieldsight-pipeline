@@ -61,7 +61,7 @@ from datetime import datetime, timedelta
 import batch_stitch
 import deletion_mirror
 from transcript_utils import (
-    normalize_transcript, format_turns_for_prompt, get_time_bounds,
+    elide_middle, normalize_transcript, format_turns_for_prompt, get_time_bounds,
 )
 
 # Configure logging
@@ -92,9 +92,9 @@ def _get_lambda_client():
     return _lambda_client
 
 # Limits
-MAX_TRANSCRIPT_CHARS = 80000   # ~20K tokens for Haiku context
-MAX_REPORT_CHARS = 20000       # Report JSON summary
-MAX_ANSWER_TOKENS = 2048
+MAX_TRANSCRIPT_CHARS = int(os.environ.get('ASK_TRANSCRIPT_CHARS', '300000'))
+MAX_REPORT_CHARS = int(os.environ.get('ASK_REPORT_CHARS', '60000'))
+MAX_ANSWER_TOKENS = int(os.environ.get('ASK_ANSWER_TOKENS', '8000'))
 
 
 # ============================================================
@@ -408,8 +408,11 @@ def format_report_for_prompt(report, report_type):
             lines.append(f"[{q.get('status', '?').upper()}] {q.get('item', '')} — "
                          f"{q.get('details', '')}")
 
-    result = '\n'.join(lines)
-    return result[:MAX_REPORT_CHARS]
+    # Head AND tail. A bare slice drops the end of the report -- next steps and
+    # quality items sit there -- and says nothing, so the model answers as if the
+    # report simply stopped. Same defect elide_middle exists to end.
+    text, _ = elide_middle(lines, MAX_REPORT_CHARS)
+    return text
 
 
 # ============================================================
@@ -425,8 +428,10 @@ def format_transcripts_for_prompt(normalized_list):
         lines = format_turns_for_prompt(norm, use_absolute_time=True)
         all_lines.extend(lines)
 
-    result = '\n'.join(all_lines)
-    return result[:MAX_TRANSCRIPT_CHARS]
+    # Head AND tail: a session's decisions land at the END, and a head slice is
+    # how "what did we agree" became unanswerable without a single log line.
+    text, _ = elide_middle(all_lines, MAX_TRANSCRIPT_CHARS)
+    return text
 
 
 # ============================================================
@@ -1129,7 +1134,7 @@ def _rag_answer(body):
 
         prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
                                   today=today, basis=basis)
-        answer, err = llm_utils.call_llm(prompt, max_tokens=2048, force_json=False)
+        answer, err = llm_utils.call_llm(prompt, max_tokens=MAX_ANSWER_TOKENS, force_json=False)
 
         # READ WHAT CAME BACK, do not trust that the rule was followed. The
         # rule existed for months at the top of the system context and still
@@ -1160,7 +1165,7 @@ def _rag_answer(body):
             retry_prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
                                             today=today, basis=basis,
                                             insist_language=True)
-            retried, retry_err = llm_utils.call_llm(retry_prompt, max_tokens=2048,
+            retried, retry_err = llm_utils.call_llm(retry_prompt, max_tokens=MAX_ANSWER_TOKENS,
                                                     force_json=False)
             if not retry_err and retried and not answer_language.violates(retried):
                 logger.info("  Ask answer language recovered on retry")
