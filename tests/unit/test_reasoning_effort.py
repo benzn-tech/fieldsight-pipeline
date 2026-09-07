@@ -202,3 +202,26 @@ def test_the_workflow_literal_agrees_with_the_template_default():
             assert m.group(1) == tpl, (
                 f"{param}: template says {tpl!r}, {name} deploys {m.group(1)!r}. "
                 f"The workflow wins, so the template documents a value nothing uses.")
+
+
+def test_both_workflows_read_the_same_chat_credential():
+    """A GitHub secret that does not exist resolves to the EMPTY STRING, not an
+    error. The deploy step then drops the override and the stack falls back to
+    DashScope -- with no failure anywhere, on a run that reports success.
+
+    That is how this was wired for a while: the workflows read
+    `secrets.QWEN_CHAT_API_KEY` while the secret in the repo was named for the
+    vendor. Pinning both sides to one name does not prove the secret exists, but
+    it does stop test and prod drifting so that only one of them silently falls
+    back -- which is worse, because the two environments then disagree about
+    which vendor answered.
+    """
+    import re
+    root = ROOT / ".github" / "workflows"
+    names = {}
+    for name in ("deploy.yml", "deploy-prod.yml"):
+        text = (root / name).read_text(encoding="utf-8")
+        m = re.search(r"QWEN_CHAT_API_KEY:\s*\$\{\{\s*secrets\.(\w+)\s*\}\}", text)
+        assert m, f"{name}: no chat credential wired"
+        names[name] = m.group(1)
+    assert len(set(names.values())) == 1, f"workflows read different secrets: {names}"
