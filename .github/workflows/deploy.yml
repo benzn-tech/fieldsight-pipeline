@@ -76,7 +76,7 @@ jobs:
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           # Chat only. Empty -> the template falls back to DashScopeApiKey,
           # i.e. today's behaviour. See QwenChatApiKey in template.yaml.
-          QWEN_CHAT_API_KEY: ${{ secrets.QWEN_CHAT_API_KEY }}
+          QWEN_CHAT_API_KEY: ${{ secrets.OPENROUTER_API_KEY || secrets.QWEN_CHAT_API_KEY }}
           # TEST's OWN ElevenLabs key, deliberately not prod's. They were the
           # same key until 2026-08-08, which meant every test recording spent
           # prod's allowance -- and a spent allowance presents as transcription

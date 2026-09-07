@@ -180,3 +180,28 @@ def test_no_comment_sits_inside_a_line_continuation():
         "comment inside a line continuation — ends the command early: "
         f"{offenders}")
 
+
+
+def test_the_chat_key_reads_the_secret_the_key_was_created_under():
+    """The chat vendor moved to OpenRouter by pointing `QwenBaseUrl` at it --
+    the endpoint-dispatch design in `llm_utils._is_dashscope`, not a new
+    provider branch. What that design does NOT decide is which GitHub secret
+    holds the credential, and the key was created as OPENROUTER_API_KEY while
+    the workflows read QWEN_CHAT_API_KEY.
+
+    The failure is the quiet kind this file exists for: an unset
+    QWEN_CHAT_API_KEY makes `UsesSeparateChatVendor` false, so chat silently
+    falls back to the DashScope key and bills the wrong vendor -- or fails, once
+    that account is the one in arrears. Nothing in the deploy says so.
+
+    OPENROUTER_API_KEY takes precedence; QWEN_CHAT_API_KEY stays as the fallback
+    so a repo that set the older name keeps working.
+    """
+    for env, path in WORKFLOWS.items():
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        assert "secrets.OPENROUTER_API_KEY" in src, env
+        line = [l for l in src.splitlines() if "QWEN_CHAT_API_KEY:" in l]
+        assert len(line) == 1, (env, line)
+        assert "secrets.OPENROUTER_API_KEY" in line[0], (env, line[0])
+        assert "secrets.QWEN_CHAT_API_KEY" in line[0], (env, line[0])
