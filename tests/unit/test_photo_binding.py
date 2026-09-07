@@ -47,22 +47,52 @@ def test_photo_at_tolerance_edge_binds():
     assert pb.photos_for_topics([p], topics) == {0: [p]}
 
 
-def test_photo_past_tolerance_edge_binds_to_nothing():
-    # One minute beyond the 2-min cap: no longer qualifies for this topic.
+def test_photo_past_tolerance_edge_carries_forward_to_what_was_last_said():
+    """Was `..._binds_to_nothing`, and the behaviour really did change.
+
+    Three minutes past a topic that has already ENDED is the inspection shape:
+    he said where he was, then went quiet and kept photographing. It no longer
+    binds to nothing -- it binds to the thing he last described, because
+    nothing else was said in between.
+
+    The tolerance rule is untouched; this is the fallback that runs only when
+    the tolerance rule finds no candidate at all.
+    """
     topics = [{"time_range": "10:00 – 10:05"}]
-    p = _photo("a.jpg", "10:08")            # distance == 3
+    p = _photo("a.jpg", "10:08")            # distance == 3, past tolerance
+    assert pb.photos_for_topics([p], topics) == {0: [p]}
+
+
+def test_a_photo_taken_before_anyone_spoke_still_binds_to_nothing():
+    """Carry-forward is DIRECTIONAL. A topic that had not started yet cannot
+    claim a photo -- otherwise "the last thing said" would quietly become
+    "the nearest thing said", which is the unbounded rule removed in
+    2026-07-24 wearing a different name."""
+    topics = [{"time_range": "10:00 – 10:05"}]
+    p = _photo("a.jpg", "09:50")
     assert pb.photos_for_topics([p], topics) == {0: []}
 
 
-def test_photo_beyond_tolerance_binds_to_nothing():
-    # Was test_photo_beyond_tolerance_still_binds_to_nearest (unbounded
-    # nearest-wins). Under the 2026-07-24 rule a photo further than
-    # PHOTO_TOLERANCE_MIN from every window binds to nothing, even though
-    # one topic is still "nearest": 10:45 is 6 min from topic 0's window and
-    # ~87 min from topic 1's -- neither qualifies.
+def test_a_photo_past_the_carry_bound_still_binds_to_nothing():
+    """The bound is the whole difference between this and the rule that was
+    deliberately removed. An hour after the last word is not "still doing that
+    thing"."""
+    topics = [{"time_range": "10:00 – 10:05"}]
+    far = _photo("a.jpg", "11:00")          # 55 min past the end, bound is 30
+    assert pb.photos_for_topics([far], topics) == {0: []}
+
+
+def test_a_later_topic_never_reaches_back_for_an_earlier_photo():
+    """10:45 sits 6 minutes after topic 0 ended and ~87 minutes before topic 1
+    begins. Topic 0 carries forward to it; topic 1 must not reach backwards,
+    which is what "the last thing SAID BEFORE it" means.
+
+    This is the real Ben_UCPK/2026-07-23 shape that started the whole binding
+    story: single-instant windows and photos a few minutes later.
+    """
     topics = [{"time_range": "10:39 – 10:39"}, {"time_range": "12:12 – 12:13"}]
     p = _photo("a.jpg", "10:45")
-    assert pb.photos_for_topics([p], topics) == {0: [], 1: []}
+    assert pb.photos_for_topics([p], topics) == {0: [p], 1: []}
 
 
 def test_far_photo_binds_to_nothing():
@@ -127,19 +157,27 @@ def test_cap_overflow_cascades_to_next_nearest():
     # under the 2-min tolerance for one side. Tie-break sends the first 10
     # (input order) to topic 0; the cap sends the overflow to topic 1, which
     # still qualifies, rather than dropping them.
+    cap = pb.PHOTOS_PER_TOPIC_CAP
     topics = [{"time_range": "09:00 – 10:00"}, {"time_range": "10:00 – 11:00"}]
-    photos = [_photo(f"p{i:02d}.jpg", "10:00") for i in range(12)]
+    photos = [_photo(f"p{i:02d}.jpg", "10:00") for i in range(cap + 2)]
     result = pb.photos_for_topics(photos, topics)
-    assert len(result[0]) == pb.PHOTOS_PER_TOPIC_CAP        # first 10 in input order
-    assert result[0] == photos[:10]
-    assert result[1] == photos[10:]                          # overflow cascades, not dropped
+    # Derived from the cap, not written as a literal: the cap is a display
+    # limit now and is expected to move again. A test that hardcodes it has to
+    # be edited every time and says nothing about the cascade it is here for.
+    assert len(result[0]) == cap
+    assert result[0] == photos[:cap]
+    assert result[1] == photos[cap:]                         # overflow cascades, not dropped
 
 
 def test_all_topics_at_cap_drops_deterministically():
+    """Still deterministic, and still the first N in input order -- but a
+    dropped photo is no longer a lost one: the day view lists every photo
+    whether or not it binds, which is why the cap could be raised at all."""
+    cap = pb.PHOTOS_PER_TOPIC_CAP
     topics = [{"time_range": "09:00 – 10:00"}]
-    photos = [_photo(f"p{i:02d}.jpg", f"09:{i:02d}") for i in range(12)]
+    photos = [_photo(f"p{i:02d}.jpg", "09:%02d" % (i % 60)) for i in range(cap + 2)]
     result = pb.photos_for_topics(photos, topics)
-    assert result[0] == photos[:10]                          # 2 dropped, logged, no crash
+    assert result[0] == photos[:cap]                         # 2 dropped, logged, no crash
 
 
 def test_result_carries_a_key_for_every_topic_index():
@@ -191,3 +229,71 @@ def test_list_pictures_derives_hhmm_and_skips_untimed_names():
 
 def test_list_pictures_empty_prefix_is_noop():
     assert pb.list_pictures(_FakeS3([]), "bucket", "users/Nobody/pictures/2026-07-23/") == []
+
+
+# --------------------------------------------------------------------------
+# The inspection shape, taken from real days
+# --------------------------------------------------------------------------
+
+def test_the_inspection_shape_binds_every_photo():
+    """Neil / 2026-08-18, read off prod: ONE utterance at 14:32, then twelve
+    silent minutes of photography. 25 photos, of which 6 bound under the
+    tolerance rule alone -- the topic's window is a single instant, so anything
+    after 14:34 fell outside it.
+
+    This is not an edge case, it is the whole inspection workflow: say where
+    you are, then photograph in silence. 37% of topic windows in this repo are
+    a single instant and 76% are narrower than PHOTO_TOLERANCE_MIN.
+    """
+    topics = [{"time_range": "14:32 – 14:32"}]
+    photos = [_photo("p%02d.jpg" % i, "14:%02d" % (32 + i)) for i in range(13)]
+    result = pb.photos_for_topics(photos, topics)
+    assert result[0] == photos, "a silent walkthrough must not lose its photos"
+
+
+def test_a_second_announcement_takes_over_from_the_first():
+    """Each announcement owns the time after it -- what makes per-location
+    grouping possible at all.
+
+    KNOWN LIMIT, asserted rather than hidden. The tolerance rule runs FIRST and
+    it reaches FORWARD: a photo one minute before the next announcement is
+    nearer to that one than to the announcement two minutes behind it, so 17:04
+    lands on "level three" even though he was still on level two.
+    Carry-forward never sees it, because something already qualified.
+
+    That is wrong for an inspection and right for a meeting -- someone
+    photographs a thing and then talks about it -- and nothing in the data
+    tells the two apart yet. Widening this into the tolerance rule would change
+    every meeting-shaped day in order to fix a walkthrough, so it is left alone
+    and written down instead. The location markers in
+    AI/spec-location-is-a-state-not-an-event-2026-09-07.md are what resolve it:
+    a marker says where he WAS, independent of which topic is nearest.
+
+    The blast radius is one tolerance-width before each announcement, and no
+    photo is lost either way -- the day view lists them all.
+    """
+    topics = [{"time_range": "17:02 – 17:02"}, {"time_range": "17:05 – 17:05"}]
+    clearly_two = _photo("early.jpg", "17:03")
+    boundary = _photo("boundary.jpg", "17:04")
+    clearly_three = _photo("late.jpg", "17:06")
+    result = pb.photos_for_topics([clearly_two, boundary, clearly_three], topics)
+    assert result[0] == [clearly_two]
+    assert result[1] == [boundary, clearly_three], (
+        "the boundary photo goes to the LATER topic -- see the docstring")
+
+
+def test_the_photos_of_a_whole_real_day_all_land_somewhere():
+    """2026-09-02 end to end: 53 photos across 13 minutes, five announcements.
+    Measured before this change: 10 of 53 reachable. The count is the point --
+    every photo lands, and none lands twice."""
+    topics = [{"time_range": t} for t in
+              ("17:02 – 17:02", "17:05 – 17:05", "17:09 – 17:09",
+               "17:11 – 17:11", "17:14 – 17:14")]
+    photos = []
+    for minute in range(3, 17):
+        for n in range(4):
+            photos.append(_photo("p%02d_%d.jpg" % (minute, n), "17:%02d" % minute))
+    result = pb.photos_for_topics(photos, topics)
+    bound = [p for v in result.values() for p in v]
+    assert len(bound) == len(photos), "every photo of the day binds"
+    assert len({id(p) for p in bound}) == len(photos), "and none binds twice"
