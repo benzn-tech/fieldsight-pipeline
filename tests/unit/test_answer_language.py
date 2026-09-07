@@ -181,3 +181,41 @@ def test_the_response_declares_the_language_it_was_written_in(monkeypatch):
     out = laa._rag_answer({"question": "昨天都发生了什么", "caller_sub": "s",
                            "tz": "Pacific/Auckland"})
     assert out["answer_language"] == "question"
+
+
+# ---- the guard leaves a line either way -----------------------------------
+
+def test_a_clean_answer_still_says_the_check_ran(monkeypatch, caplog):
+    """The retry went three days in production without logging anything, which
+    is exactly what a retry that was never wired would have printed. "It ran and
+    the answer was clean" and "it never ran" have to be different in the log, or
+    the only evidence this guard works lives in a unit test."""
+    import logging
+    calls = _wire(monkeypatch, [EN_ANS])
+    with caplog.at_level(logging.INFO):
+        laa._rag_answer({"question": "what happened yesterday", "caller_sub": "s",
+                         "tz": "Pacific/Auckland"})
+    assert calls["n"] == 1
+    line = [r.getMessage() for r in caplog.records if "answer language" in r.getMessage()]
+    assert line, [r.getMessage() for r in caplog.records]
+    assert "policy=en" in line[0]
+    assert "cjk=0.000" in line[0]
+
+
+def test_the_logged_ratio_is_the_one_the_decision_used(monkeypatch, caplog):
+    """Two computations of the same number drift. The log reports `cjk_ratio`,
+    and `violates` is defined in terms of it."""
+    import logging
+    _wire(monkeypatch, [ZH, EN_ANS])
+    with caplog.at_level(logging.INFO):
+        laa._rag_answer({"question": "昨天都发生了什么", "caller_sub": "s",
+                         "tz": "Pacific/Auckland"})
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("answer language" in m for m in msgs), msgs
+    assert any("leaked" in m for m in msgs), msgs
+    assert any("recovered" in m for m in msgs), msgs
+
+
+def test_the_ratio_is_zero_for_an_empty_or_missing_answer():
+    assert al.cjk_ratio("") == 0.0
+    assert al.cjk_ratio(None) == 0.0
