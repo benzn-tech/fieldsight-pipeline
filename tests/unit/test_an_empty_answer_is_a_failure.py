@@ -18,8 +18,6 @@ between "it produced nothing" and "it was never asked" has to stay visible.
 """
 import importlib
 import json
-import sys
-
 import pytest
 
 OPENROUTER = "https://openrouter.ai/api/v1"
@@ -32,15 +30,25 @@ class _Resp:
 
 
 def _load(monkeypatch, base_url=OPENROUTER):
+    """Reload IN PLACE, never pop-and-reimport.
+
+    `importlib.reload` mutates the same module object, so every module that did
+    `import llm_utils` at its own import time still sees the reloaded one.
+    Replacing sys.modules with a NEW object instead splits the identity:
+    lambda_ask_agent keeps the old module, this test patches the new one, and
+    twelve unrelated ask tests fail -- but only in CI, because the breakage
+    depends on filename order and this file sorts before test_ask_*. That
+    invisible contract has bitten this repo once already.
+    """
     monkeypatch.setenv("LLM_PROVIDER", "qwen")
     monkeypatch.setenv("QWEN_API_KEY", "k")
     monkeypatch.setenv("QWEN_BASE_URL", base_url)
     monkeypatch.setenv("QWEN_MODEL", "meta/muse-spark-1.3-contributor")
-    sys.modules.pop("llm_utils", None)
-    mod = importlib.import_module("llm_utils")
-    monkeypatch.setattr(mod, "_post_with_retry",
+    import llm_utils
+    importlib.reload(llm_utils)
+    monkeypatch.setattr(llm_utils, "_post_with_retry",
                         lambda *a, **k: (_Resp(_load.payload), None))
-    return mod
+    return llm_utils
 
 
 def _answered(content, finish="stop", reasoning=40, completion=60):
@@ -52,12 +60,12 @@ def _answered(content, finish="stop", reasoning=40, completion=60):
 
 
 @pytest.fixture(autouse=True)
-def _restore():
-    """llm_utils is re-imported per test; put the real one back so the modules
-    that imported it earlier in the session keep working."""
+def _restore_the_module():
+    """A module reloaded under monkeypatched env keeps what it read after the
+    patch is undone -- same fixture as test_reasoning_effort.py, same reason."""
     yield
-    sys.modules.pop("llm_utils", None)
-    importlib.import_module("llm_utils")
+    import llm_utils
+    importlib.reload(llm_utils)
 
 
 def test_the_budget_spent_thinking_is_reported_as_an_error(monkeypatch):
