@@ -108,7 +108,6 @@ QWEN_ENABLE_THINKING = os.environ.get("QWEN_ENABLE_THINKING", "false").lower() =
 # existed, so an unset value changes no request.
 LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "").strip().lower()
 VALID_EFFORTS = ("low", "medium", "high")
-
 # Added to the caller's max_tokens on reasoning endpoints, because reasoning
 # tokens are completion tokens and are emitted BEFORE the answer. Sized from
 # measurement rather than taste: the same prompt used 516 reasoning tokens at
@@ -361,6 +360,21 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
         try:
             choice = data["choices"][0]
             content = choice["message"]["content"]
+            if not (content or "").strip():
+                # A 200 carrying nothing is the worst shape this API has: the
+                # caller sees success, gets an empty string, and writes an empty
+                # extraction. It happens when reasoning consumes the whole token
+                # budget -- billed in full, `finish_reason: length`, no answer.
+                # Name it, because "the model said nothing" and "the model was cut
+                # off mid-thought" are different problems with the same symptom.
+                reason = choice.get("finish_reason")
+                detail = (data.get("usage") or {}).get("completion_tokens_details") or {}
+                logger.error("Qwen returned an empty answer (finish_reason=%s, "
+                             "reasoning_tokens=%s, model=%s) -- raise max_tokens "
+                             "or lower the reasoning effort",
+                             reason, detail.get("reasoning_tokens"), data.get("model"))
+                return None, f"empty answer from model (finish_reason={reason})"
+            return content, None
         except (KeyError, IndexError):
             logger.error(f"Qwen unexpected response shape: {str(data)[:500]}")
             return None, "unexpected Qwen response shape"
