@@ -1413,7 +1413,19 @@ Resources:
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
-          LLM_HTTP_TIMEOUT: '180'
+          # 180 was sized against a max_tokens of 16,000. The ceiling is now
+          # 32,000 (llm_utils.ANSWER_TOKEN_CEILING) plus 8,000 of reasoning
+          # headroom, and latency on this vendor tracks OUTPUT, not input:
+          # measured at effort=high, 7,110 prompt tokens -> 6,440 completion
+          # took 50.4s, while 41,599 prompt -> 3,024 completion took 37.3s.
+          # Throughput is ~130 tok/s across all of them, so a call that
+          # actually spends the 40,000-token wire budget needs ~494s at the
+          # SLOWEST measured rate (81 tok/s -- sizing on the average is a clock
+          # that fails half the times it matters) and would
+          # lose the race against 180 -- urllib3 gives up first, so the outer
+          # Lambda Timeout never gets to help and a long day's report FAILS
+          # rather than arriving late.
+          LLM_HTTP_TIMEOUT: '540'
           REPORT_PREFIX: reports/
           SITE_NAME: !Ref SiteName
           ITEMS_TABLE: !Ref ItemsTableName
@@ -1511,7 +1523,7 @@ Resources:
       FunctionName: !Sub ["${P}-meeting-minutes", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_meeting_minutes.lambda_handler
-      Timeout: 300
+      Timeout: 600  # must exceed LLM_HTTP_TIMEOUT below, or the runtime kills this before urllib3 raises
       MemorySize: 512
       Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24) — on 3.11 Word generation silently disables
       Layers: !If
@@ -1531,7 +1543,9 @@ Resources:
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
-          LLM_HTTP_TIMEOUT: '180'
+          # Same arithmetic as the report generator above: the output budget
+          # grew, and on this vendor the output budget is the clock.
+          LLM_HTTP_TIMEOUT: '540'
           MINUTES_PREFIX: meeting_minutes/
           REPORT_PREFIX: reports/
       Policies:
