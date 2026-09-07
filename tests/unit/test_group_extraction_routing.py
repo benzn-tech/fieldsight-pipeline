@@ -70,7 +70,7 @@ def test_a_solo_request_still_parses(monkeypatch):
     solo = {"userFolder": "Ben_UCPK", "date": "2026-08-07", "sessionBase": "sid" + GID}
     monkeypatch.setattr(ex, "s3", lambda: _FakeS3(solo))
     parsed = ex.parse_final_request("bkt", f"extraction_requests/{GID}.json")
-    assert parsed == ("Ben_UCPK", "2026-08-07", "sid" + GID, 0)
+    assert parsed == ("Ben_UCPK", "2026-08-07", "sid" + GID, 0, None)
 
 
 def test_the_handler_routes_a_group_key_to_extract_group(monkeypatch):

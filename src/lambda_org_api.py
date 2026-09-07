@@ -642,6 +642,9 @@ def dispatch(conn, event, method, route):
     m_vw = re.match(r"^/voiceprints/([^/]+)$", route)
     if m_vw and method == "DELETE":
         return withdraw_voiceprint(conn, caller, m_vw.group(1))
+    m_rg = re.match(r"^/sessions/([^/]+)/regenerate$", route)
+    if m_rg and method == "POST":
+        return regenerate_session(conn, caller, m_rg.group(1), event)
     m_sc = re.match(r"^/sessions/([^/]+)/speaker-corrections$", route)
     if m_sc and method == "POST":
         return speaker_corrections(conn, caller, m_sc.group(1), event)
@@ -7338,6 +7341,92 @@ def _apply_speaker_names(conn, caller, payload):
     # files carry None) simply gets no group and the reader falls back, which is the correct
     # answer rather than an omission.
     return payload
+
+
+def regenerate_session(conn, caller, session_base, event):
+    """POST /api/org/sessions/{sessionBase}/regenerate -- redo the extraction with
+    the speaker names a person has confirmed.
+
+    Renaming a speaker does NOT change Overview, Action Items or the draft email,
+    and that is not a synchronisation bug -- they hold different names. The
+    transcript's names say who was TALKING; `action_items.responsible` and
+    `findings.entity_name` hold names people SAID OUT LOUD, which on prod are
+    routinely not speakers at all ("Design team", "IT Support", "Karina and
+    Anton", "Tony or contractor team"). Nothing records which speaker an extracted
+    name came from -- `action_items` has no speaker column -- so a find-and-replace
+    would reassign a task from one Jesse to a different Jesse silently, and would
+    edit a substring of a field naming two people. This endpoint is the sound
+    alternative: hand the model the confirmed names and let it re-reason.
+
+    It is also worth more than a rename. Today the prompt shows `spk_0`, so "I'll
+    chase the supplier" has no owner the model can name. Given the names, it does.
+
+    202, not 200: the extraction runs on another Lambda and takes a thinking-mode
+    round trip. The body says how many names were sent, because regenerating with
+    ZERO confirmed names re-runs the same prompt for the same answer and costs a
+    model call -- the caller needs to be able to say so rather than watch nothing
+    change for the second time.
+    """
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    if not S3_BUCKET:
+        return error("storage is not configured", 500)
+    if not re.fullmatch(r"sid[0-9a-f]{32}", session_base or ""):
+        # The value becomes an S3 key. Anchored rather than sanitised: this shape
+        # is the only one the producers write, and "reject what we do not
+        # recognise" is a smaller claim to defend than "escape it correctly".
+        return error("sessionBase must look like sid<32 hex>", 400)
+
+    body = parse_body(event) or {}
+    date = (body.get("date") or "").strip()
+    if not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, body.get("user") or "",
+                                           what="regenerate")
+    if err is not None:
+        return err
+
+    # Read the session the same way the transcript viewer does, so the names sent
+    # are the names shown. A second path here is a second thing to keep in step.
+    out = _read_org_transcripts(date, folder, "", "", conn=conn)
+    out = _apply_speaker_names(conn, caller, out)
+    segs = out.get("speaker_segments") or []
+
+    # Keyed on (source_filename, speaker_label), never on the label alone: `spk_0`
+    # is scoped to ONE transcript call and the same label later in the session is
+    # usually a different person. That is what the anonymous re-bind exists to
+    # repair, and a session-level map would undo it by putting one person's
+    # confirmed name onto another person's words.
+    rows, seen = [], set()
+    for s in segs:
+        fn, label = s.get("source_filename"), s.get("speaker_label")
+        name = (s.get("speaker_name") or "").strip()
+        # Only what a person asserted. `tentative` is the SYSTEM's guess, and a
+        # guess handed to the model as a confirmed name is a guess that comes back
+        # as a fact in a report.
+        if not (fn and label and name) or s.get("speaker_state") != "confirmed":
+            continue
+        if (fn, label) in seen:
+            continue
+        seen.add((fn, label))
+        rows.append({"source_filename": fn, "speaker_label": label,
+                     "display_name": name})
+
+    request = {"userFolder": folder, "date": date, "sessionBase": session_base}
+    if rows:
+        request["speakerNames"] = rows
+    boto3.client("s3").put_object(
+        Bucket=S3_BUCKET,
+        # Same key the finalize sweep writes, so this rides the trigger that
+        # already exists rather than needing a second S3 notification -- and every
+        # notification on this bucket is hand-wired outside the template (BUG-33).
+        Key=f"extraction_requests/{session_base[3:]}.json",
+        Body=json.dumps(request).encode("utf-8"),
+        ContentType="application/json")
+    logger.info("regenerate requested for %s by %s with %d confirmed name(s)",
+                session_base, caller["id"], len(rows))
+    return ok({"sessionBase": session_base, "namedTurns": len(rows),
+               "willChangeNames": bool(rows)}, 202)
 
 
 def get_org_transcripts(conn, caller, event):

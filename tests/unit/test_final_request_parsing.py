@@ -45,8 +45,12 @@ def _parse(monkeypatch, payload):
 def test_a_complete_request_parses(monkeypatch):
     # The trailing 0 is `generation`: absent on every artifact the finalize
     # sweep writes, which means "first round" (see _rerun_if_the_session_grew).
+    # The trailing None is `speaker_names`: absent on every artifact the finalize
+    # sweep writes, because that path has no confirmed name to give. Absent means
+    # "render the raw spk_N labels", which is what every extraction did before
+    # the regenerate path existed.
     assert _parse(monkeypatch, json.dumps(GOOD).encode()) == (
-        "Ben_UCPK", "2026-08-06", "sid" + "a" * 32, 0)
+        "Ben_UCPK", "2026-08-06", "sid" + "a" * 32, 0, None)
 
 
 @pytest.mark.parametrize("missing", ["userFolder", "date", "sessionBase"])
