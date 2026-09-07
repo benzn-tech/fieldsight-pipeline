@@ -6034,7 +6034,29 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # date and a time. Handing it over says "the target was somewhere at
         # 14:32" about sites they cannot see, which is exactly what CRITICAL-1
         # withholds one line above.
-        if not cross_user_clip:
+        if cross_user_clip:
+            # THE GATE COVERS PHOTOS, NOT ONE FIELD CARRYING THEM.
+            #
+            # Withholding `photo_filenames` while `topics[].related_photos`
+            # hands over the same names is a rule that gives two answers.
+            # Measured on prod: a site-scoped caller reading Neil's 2026-09-02
+            # got no day list and no groups -- and all 53 filenames anyway,
+            # through the topics.
+            #
+            # The reason the day list is withheld applies here unchanged. A
+            # filename is `neil_blunden_2026-09-02_17-03-08.jpg`: who, what day,
+            # what minute. The topics are site-clipped, but the PHOTOS are not
+            # -- binding is by time, so a photo hanging off an in-scope topic
+            # may well have been taken during a session on a site this caller
+            # cannot see. That is exactly what CRITICAL-1 withholds.
+            #
+            # Raising PHOTOS_PER_TOPIC_CAP from 10 to 60 tonight widened this
+            # channel six-fold on a single-topic day, which is how it came to be
+            # looked at; the inconsistency predates that and is the real defect.
+            for topic in shape.get("topics") or []:
+                if topic.get("related_photos"):
+                    topic["related_photos"] = []
+        else:
             photos = _day_photo_block(conn, caller, user, date)
             if photos is not None:
                 names = [ph["s3_key"].rsplit("/", 1)[-1] for ph in photos]
