@@ -834,11 +834,49 @@ def _dedup_batch_window_repeats(turns, max_gap=DUP_MAX_GAP_SEC,
     return out, {'dropped': dropped, 'chars_saved': chars_saved}
 
 
+def clean_location_markers(raw):
+    """The model's location markers, or [] -- never anything in between.
+
+    A marker with no time cannot place a photo, and a marker with no place has
+    nothing to say, so BOTH are required and anything else is dropped. That
+    makes "the model returned no markers" and "the model returned prose where
+    markers go" the same, safe answer: no grouping, flat list, unchanged day.
+
+    Dropping rather than repairing is deliberate. A marker guessed from a
+    half-answer would put a room heading over photos that may have been taken
+    somewhere else, and a wrong location looks like evidence -- which is the
+    failure this whole feature was built to avoid, arriving through its own
+    front door.
+
+    Lengths are capped because these are rendered as headings and stored in a
+    jsonb column; a model that answers with a paragraph should not become a
+    paragraph-sized heading.
+    """
+    out = []
+    for m in (raw or []):
+        if not isinstance(m, dict):
+            continue
+        at, where = m.get('at'), m.get('location')
+        if not at or not where:
+            continue
+        out.append({'at': str(at)[:5],
+                    'location': str(where)[:120],
+                    'quote': str(m.get('quote') or '')[:300]})
+    return out
+
+
 # ============================================================
 # Prompt construction
 # ============================================================
 
 EXTRACTION_SCHEMA = """{
+  "location_markers": [
+    {
+      "at": "HH:MM  (the timestamp of the utterance itself)",
+      "location": "the place named, e.g. Room 101 / Level 5 east",
+      "quote": "the words that established it, verbatim"
+    }
+  ],
   "topics": [
     {
       "topic_title": "Short descriptive title",
@@ -927,6 +965,20 @@ def _instructions_block():
     Two copies would drift, and the drift would surface as "the merged report
     is formatted differently" -- which reads like a model quirk, not a bug."""
     return f"""## Instructions
+0. LOCATION MARKERS, before anything else. Note every moment where the speaker states WHERE HE NOW
+   IS, or which area the following work or photos relate to -- "right, Room 101", "the following
+   photos are level three progress", "moving into 205". These are what let a photo taken in
+   silence be filed under the right room: an inspection is one announcement followed by ten minutes
+   of quiet photography, so the announcement is the ONLY evidence of where those photos were taken.
+   - Do NOT mark a place merely MENTIONED. "We had that problem in 101 last week" and "level three
+     is waiting on the sparkies" are subjects of conversation, not statements of where he is
+     standing. Marking those would relocate a whole stretch of photos to a room nobody visited.
+   - A conversation does not move him. If he announces Room 101 and then discusses a level-three
+     delay with someone who walks past, he is STILL IN ROOM 101 until he says otherwise.
+   - `at` is the timestamp of the utterance itself; `quote` is the words verbatim, so a wrong
+     marker can be diagnosed instead of guessed at.
+   - Most meeting recordings contain NONE of these. An empty array is the normal answer and is
+     strongly preferred over a marker you are unsure about.
 1. Split the transcript into topics BY SUBJECT -- one topic per distinct subject or work item.
    - Start a NEW topic whenever the conversation moves to a genuinely DIFFERENT subject (a
      different work item, trade, location, or concern) -- even if only a minute passes, even if the
@@ -1855,6 +1907,18 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         # through early -- the exact overlap the throttle exists to prevent.
         'extracted_at': datetime.utcnow().isoformat() + 'Z',
         'declared_site': process_declared_site(parsed.get('declared_site')),
+        # Where he SAID he was, carried through to item-writer, which has the
+        # database. A marker is not a topic and must not become one: a topic is
+        # something that was discussed, a marker is where he was standing, and
+        # only another announcement moves him. Folding these into topics would
+        # let a passing conversation relocate a room's worth of photos.
+        #
+        # Filtered here rather than trusted: a model that answers the question
+        # with prose instead of the shape ("none", or a bare string) must not
+        # reach the database as a marker with no time. Anything without both an
+        # `at` and a `location` is dropped, which makes "no markers" and
+        # "markers the shape of nonsense" the same, safe answer.
+        'location_markers': clean_location_markers(parsed.get('location_markers')),
         'topics': parsed_topics,
         # Where each speaker label was heard, for the anonymous re-bind. Carried HERE, on the
         # final pass only, because of who can do what: this function has the turns and no

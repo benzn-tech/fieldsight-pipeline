@@ -199,3 +199,90 @@ def test_render_report_shape_itself_stays_free_of_day_photos():
                                   conn=None, company_id="c-1")
     assert "photo_filenames" not in out
     assert "uploads" not in out
+
+
+# --------------------------------------------------------------------------
+# Grouped by where he said he was
+# --------------------------------------------------------------------------
+
+FIVE_LEVELS = [
+    {"at": "17:02", "location": "level two"},
+    {"at": "17:05", "location": "level three"},
+]
+
+
+def _at(minute):
+    """A photo whose FILENAME carries its clock time -- which is where the day
+    view gets a photo's time from. The name shape is the real one."""
+    return {"s3_key": PREFIX + "neil_blunden_2026-09-02_17-%02d-00.jpg" % minute,
+            "taken_at": None}
+
+
+def test_the_day_groups_its_photos_by_where_he_said_he_was(wired):
+    """Neil / 2026-09-02 is five announcements and 53 silent photos. Grouping is
+    the whole point of the feature: 'level three' is a heading he said out loud,
+    not one we inferred from what was being discussed."""
+    photos = [_at(3), _at(4), _at(6), _at(7)]
+    wired.setattr(org.recordings, "photo_list_for_day",
+                  lambda conn, company, folder, date: list(photos))
+    wired.setattr(org.location_markers, "for_day",
+                  lambda conn, company, folder, date: list(FIVE_LEVELS))
+    body = body_of(_render())
+    assert body["photo_groups"] == [
+        {"location": "level two", "filenames": [
+            "neil_blunden_2026-09-02_17-03-00.jpg",
+            "neil_blunden_2026-09-02_17-04-00.jpg"]},
+        {"location": "level three", "filenames": [
+            "neil_blunden_2026-09-02_17-06-00.jpg",
+            "neil_blunden_2026-09-02_17-07-00.jpg"]},
+    ]
+    # ...and the flat list is untouched, so a client that ignores groups is
+    # unaffected. This is what makes the feature additive.
+    assert len(body["photo_filenames"]) == 4
+
+
+def test_a_day_where_nobody_said_where_they_were_has_no_groups(wired):
+    """Absent, not empty. A meeting produces no markers, and `[]` would read as
+    'he announced somewhere and no photo fell in it' -- a different fact, and
+    one a client would render as an empty heading."""
+    wired.setattr(org.location_markers, "for_day",
+                  lambda conn, company, folder, date: [])
+    assert "photo_groups" not in body_of(_render())
+
+
+def test_a_photo_taken_before_the_first_announcement_keeps_its_own_group(wired):
+    """It is NOT dropped and NOT filed under a room he had not mentioned yet.
+    `location: null` is the honest heading, and inventing one would be exactly
+    the misattribution this feature exists to avoid."""
+    photos = [_at(1), _at(3)]
+    wired.setattr(org.recordings, "photo_list_for_day",
+                  lambda conn, company, folder, date: list(photos))
+    wired.setattr(org.location_markers, "for_day",
+                  lambda conn, company, folder, date: list(FIVE_LEVELS))
+    groups = body_of(_render())["photo_groups"]
+    assert groups[0]["location"] is None
+    assert groups[0]["filenames"] == ["neil_blunden_2026-09-02_17-01-00.jpg"]
+    assert sum(len(g["filenames"]) for g in groups) == 2, "no photo is lost to grouping"
+
+
+def test_a_marker_lookup_failure_leaves_the_flat_list_standing(wired):
+    """The flat list is the answer; grouping is an improvement on it. A new read
+    that can turn a working day view into a 500 would be a worse bug than
+    ungrouped photos -- the same posture as the photo list itself."""
+    def _boom(conn, company, folder, date):
+        raise RuntimeError("relation \"day_location_markers\" does not exist")
+
+    wired.setattr(org.location_markers, "for_day", _boom)
+    body = body_of(_render())
+    assert "photo_groups" not in body
+    assert body["photo_filenames"] == ["a.jpg", "b.jpg", "c.jpg"]
+
+
+def test_a_scoped_caller_gets_no_groups_either(wired):
+    """The gate is on the whole photo block, so it cannot be defeated by a
+    second field arriving later: a graded caller viewing someone else's day sees
+    neither the list nor the grouping."""
+    wired.setattr(org.location_markers, "for_day",
+                  lambda conn, company, folder, date: list(FIVE_LEVELS))
+    body = body_of(_render(cross_user_clip=True))
+    assert "photo_groups" not in body and "photo_filenames" not in body
