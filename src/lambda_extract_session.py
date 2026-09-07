@@ -1468,12 +1468,13 @@ def max_tokens_for(n_segments):
     """Output budget, scaled to input (BUG-16). Extracted so the group path uses
     the same rule as the solo one rather than a second number to keep in sync.
 
-    Reaches qwen on NEITHER branch: with force_json set, llm_utils omits
-    max_tokens in thinking mode and sends response_format instead of it in
-    non-thinking mode. So this governs the anthropic fallback only, and the old
-    8000 was a limit inherited from a much smaller output model. Timeout 600 and
-    LLM_HTTP_TIMEOUT 540 leave room for the larger number."""
-    return min(4096 + n_segments * 350, 16000)
+    This number REACHES the model on the OpenRouter path, which is the prod path
+    today. The older note here said it reached qwen on neither branch; that was
+    true of DashScope only, where force_json drops max_tokens. OpenRouter always
+    sends it (caller budget + REASONING_HEADROOM_TOKENS), so a low number here is
+    a truncated extraction, not a no-op. Timeout 600 and LLM_HTTP_TIMEOUT 540
+    leave room for the larger number."""
+    return min(8192 + n_segments * 700, llm_utils.ANSWER_TOKEN_CEILING)
 
 
 def looks_truncated(raw):

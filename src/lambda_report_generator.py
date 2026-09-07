@@ -89,6 +89,13 @@ dynamodb = boto3.resource('dynamodb')
 # Configuration
 S3_BUCKET = os.environ.get('S3_BUCKET', '')
 REPORT_PREFIX = os.environ.get('REPORT_PREFIX', 'reports/')
+# Chars of transcript the daily prompt may carry. 60000 was sized for a
+# 200K-token Claude context and survived two model changes unexamined: on
+# 2026-09-03 it elided 257 lines out of the middle of a 505-minute day,
+# while the model it was feeding accepts 1,048,576 tokens.
+DAILY_TRANSCRIPT_LIMIT = int(os.environ.get('DAILY_TRANSCRIPT_LIMIT', '300000'))
+# Roll-ups summarise summaries, so their source is already dense.
+ROLLUP_SOURCE_LIMIT = int(os.environ.get('ROLLUP_SOURCE_LIMIT', '60000'))
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6')
 ITEMS_TABLE = os.environ.get('ITEMS_TABLE', 'fieldsight-items')
@@ -525,7 +532,7 @@ def build_daily_prompt(transcripts_with_photos, user_name, site_name, target_dat
     # Head AND tail: a site walk states the site at the start and the defects it found
     # at the end, and the bare slice dropped the second half of any long day without
     # saying so. BUG-15 sized this limit; it did not change the shape of the cut.
-    transcripts_text, _ = elide_middle(transcript_lines, 60000,
+    transcripts_text, _ = elide_middle(transcript_lines, DAILY_TRANSCRIPT_LIMIT,
                                                         sep="\n\n")
 
     dur_min = int(total_duration // 60)
@@ -632,7 +639,7 @@ def build_weekly_prompt(daily_reports, site_name, start_date, end_date,
 
     # A week's (or month's) summaries are chronological, so a head slice quietly drops the
     # most recent days — the ones the report is actually read for.
-    all_summaries, _ = elide_middle(summaries, 15000, sep="\n\n")
+    all_summaries, _ = elide_middle(summaries, ROLLUP_SOURCE_LIMIT, sep="\n\n")
 
     scope_intros = (_prompt_templates_cache or {}).get('scope_intros', {})
 
@@ -733,7 +740,7 @@ def build_monthly_prompt(daily_reports, weekly_reports, site_name, start_date, e
         source_label = "Daily Report Summaries"
     # Same rule as the weekly path: a month is read for what happened recently, so its
     # recent end must not be the part a head slice drops.
-    source_text, _ = elide_middle(source_parts, 15000, sep="\n\n")
+    source_text, _ = elide_middle(source_parts, ROLLUP_SOURCE_LIMIT, sep="\n\n")
 
     template = get_template('monthly_report', 'prompt')
     system_ctx = get_template('monthly_report', 'system_context') or \
@@ -1340,7 +1347,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
             prompt += ("\n\n## Site Weather (for AI correlation)\n"
                        + weather.weather_prompt_block(weather_block))
 
-        max_tokens = min(4096 + n_transcripts * 350, 16000)
+        max_tokens = min(8192 + n_transcripts * 700, llm_utils.ANSWER_TOKEN_CEILING)
         logger.info(f"  {user_name}: {n_transcripts} transcripts \u2192 max_tokens={max_tokens}")
 
         raw_response, error = call_claude_structured(prompt, max_tokens=max_tokens)
@@ -1493,7 +1500,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
                     total_duration=combined_duration,
                     num_photos=len(combined_photos), name_mapping=user_mapping,
                 )
-                max_tokens = min(4096 + len(combined_transcripts) * 350, 16000)
+                max_tokens = min(8192 + len(combined_transcripts) * 700, llm_utils.ANSWER_TOKEN_CEILING)
                 raw_response, error = call_claude_structured(prompt, max_tokens=max_tokens)
 
                 if not error:
