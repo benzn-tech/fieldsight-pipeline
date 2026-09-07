@@ -180,3 +180,40 @@ def test_no_comment_sits_inside_a_line_continuation():
         "comment inside a line continuation — ends the command early: "
         f"{offenders}")
 
+
+
+def test_the_chat_key_reads_the_secret_the_key_exists_under():
+    """The chat vendor moved to OpenRouter by pointing `QwenBaseUrl` at it --
+    the endpoint dispatch in `llm_utils._is_dashscope`, not a new provider
+    branch. What that design does not decide is which GitHub secret holds the
+    credential, and the key was created as OPENROUTER_API_KEY while the
+    workflows read QWEN_CHAT_API_KEY. #765 fixed the name; nothing pinned it.
+
+    The failure is the quiet kind this file exists for. An unset
+    `QwenChatApiKey` makes the template's `UsesSeparateChatVendor` condition
+    FALSE, so chat silently falls back to `DashScopeApiKey` -- the deploy is
+    green, the stack is valid, and every chat call bills a vendor nobody chose.
+    That is also the account that was in arrears for two days, which is what
+    that fallback looks like on a bad week.
+    """
+    for env, path in WORKFLOWS.items():
+        with open(path, encoding="utf-8") as fh:
+            lines = [l for l in fh.read().splitlines()
+                     if "QWEN_CHAT_API_KEY:" in l]
+        assert len(lines) == 1, (env, lines)
+        assert "secrets.OPENROUTER_API_KEY" in lines[0], (env, lines[0])
+
+
+def test_the_chat_vendor_can_be_switched_without_touching_code():
+    """Both halves have to be overridable from a repo variable, or "switch the
+    model" becomes a deploy of source. `QwenBaseUrl` chooses the vendor and
+    decides the wire shape (`_is_dashscope`); the model ids choose what to ask
+    it for. A base url pointed at OpenRouter with DashScope model ids left
+    behind asks a router for models it does not serve."""
+    for env, path in WORKFLOWS.items():
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        for param in ("QwenBaseUrl=", "QwenModelFast=", "QwenModelPlus="):
+            assert param in src, (env, param)
+            line = [l for l in src.splitlines() if param in l][0]
+            assert "vars." in line, (env, line)
