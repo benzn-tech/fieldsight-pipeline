@@ -286,3 +286,44 @@ def test_a_scoped_caller_gets_no_groups_either(wired):
                   lambda conn, company, folder, date: list(FIVE_LEVELS))
     body = body_of(_render(cross_user_clip=True))
     assert "photo_groups" not in body and "photo_filenames" not in body
+
+
+def test_the_gate_covers_every_field_that_carries_a_filename(wired):
+    """One rule, one answer.
+
+    Withholding `photo_filenames` while `topics[].related_photos` hands over the
+    same names is a gate that leaks around itself. Measured on prod before this
+    was fixed: a site-scoped caller reading Neil's 2026-09-02 received no day
+    list, no groups -- and all 53 filenames through the topics.
+
+    The reason the day list is withheld applies unchanged. A filename is
+    `neil_blunden_2026-09-02_17-03-08.jpg`: who, what day, what minute. The
+    topics are site-clipped; the photos are not, because binding is by time, so
+    a photo hanging off an in-scope topic may have been taken during a session
+    on a site this caller cannot see.
+    """
+    wired.setattr(org, "render_report_shape",
+                  lambda rows, doc, date, user, conn=None, company_id=None:
+                  {"report_date": date, "_report_metadata": {},
+                   "topics": [{"topic_id": 0, "related_photos": ["a.jpg", "b.jpg"]},
+                              {"topic_id": 1, "related_photos": ["c.jpg"]}]})
+    body = body_of(_render(cross_user_clip=True))
+    assert "photo_filenames" not in body
+    assert "photo_groups" not in body
+    assert [t["related_photos"] for t in body["topics"]] == [[], []], (
+        "the topics must not carry filenames the day list is withholding")
+    # ...and the topics themselves still come through: this is a gate on the
+    # photos, not a refusal of the day.
+    assert len(body["topics"]) == 2
+
+
+def test_an_own_day_keeps_its_topic_photos(wired):
+    """The gate is for the CROSS-USER view. Stripping photos from a caller's own
+    day would be a different bug wearing the same code."""
+    wired.setattr(org, "render_report_shape",
+                  lambda rows, doc, date, user, conn=None, company_id=None:
+                  {"report_date": date, "_report_metadata": {},
+                   "topics": [{"topic_id": 0, "related_photos": ["a.jpg", "b.jpg"]}]})
+    body = body_of(_render())
+    assert body["topics"][0]["related_photos"] == ["a.jpg", "b.jpg"]
+    assert body["photo_filenames"] == ["a.jpg", "b.jpg", "c.jpg"]
