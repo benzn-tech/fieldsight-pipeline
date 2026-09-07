@@ -80,7 +80,11 @@ def test_enable_thinking_never_leaves_for_another_vendor(monkeypatch, thinking):
     sent = _capture(mod, monkeypatch)
     mod.call_llm("hi", max_tokens=100, enable_thinking=thinking)
     assert "enable_thinking" not in sent["body"]
-    assert sent["body"]["reasoning"] == {"enabled": thinking}
+    # The boolean now travels as an effort level rather than `enabled`: that
+    # field is a hard 400 on meta/muse-spark-1.3-contributor ("Reasoning is
+    # mandatory for this endpoint and cannot be disabled"), so sending it would
+    # fail every call on the vendor this branch exists for.
+    assert sent["body"]["reasoning"] == {"effort": "high" if thinking else "low"}
 
 
 @pytest.mark.parametrize("thinking", [True, False])
@@ -98,11 +102,19 @@ def test_dashscope_still_gets_its_own_field_and_not_reasoning(monkeypatch, think
 def test_the_other_vendor_always_gets_a_token_ceiling(monkeypatch):
     """DashScope drops max_tokens whenever thinking is on, to avoid truncating
     after the reasoning chain. Porting that to a per-token vendor is an
-    unbounded completion, i.e. a cost incident. Not ported."""
+    unbounded completion, i.e. a cost incident. Not ported.
+
+    The ceiling now carries a reasoning allowance on top of what the caller
+    asked for, because reasoning tokens ARE completion tokens and are emitted
+    BEFORE the answer: measured on the target model, max_tokens=1200 produced
+    1197 reasoning tokens and content='' with HTTP 200. The caller's number
+    stays the ANSWER budget; the thinking budget is added.
+    """
     mod = _load(monkeypatch, OPENROUTER)
     sent = _capture(mod, monkeypatch)
     mod.call_llm("hi", max_tokens=1234, enable_thinking=True)
-    assert sent["body"]["max_tokens"] == 1234
+    assert sent["body"]["max_tokens"] == 1234 + mod.REASONING_HEADROOM_TOKENS
+    assert sent["body"]["max_tokens"] > 1234, "the ceiling is still bounded, just higher"
 
 
 def test_dashscope_keeps_dropping_max_tokens_while_thinking(monkeypatch):
