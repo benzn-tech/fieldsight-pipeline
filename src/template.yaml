@@ -2056,6 +2056,17 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/voiceprint_requests/*
+            # A regenerate request, handed outward across the same boundary and onto
+            # the trigger the finalize sweep already writes to -- rather than a second
+            # S3 notification, which on this bucket means another rule hand-wired
+            # outside the template (BUG-33).
+            #
+            # PutObject only. A read grant would invite a future reader to treat this
+            # prefix as state to consult; it is a doorbell, and the extractor owns what
+            # happens after it rings.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
             - Effect: Allow
               Action: s3:GetObject
               Resource:

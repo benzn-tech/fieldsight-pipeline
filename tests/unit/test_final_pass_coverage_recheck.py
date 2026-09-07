@@ -268,7 +268,7 @@ def test_a_request_without_a_generation_is_the_first_round(monkeypatch):
     })
     _setup(monkeypatch, fake_s3)
     parsed = les.parse_final_request(BUCKET, f"{les.FINAL_REQUESTS_PREFIX}x.json")
-    assert parsed == ("Benl1", "2026-07-06", CHUNK_BASE, 0)
+    assert parsed == ("Benl1", "2026-07-06", CHUNK_BASE, 0, None)
 
 
 def test_an_unusable_generation_falls_back_to_zero_loudly(monkeypatch, caplog):
