@@ -132,7 +132,11 @@ jobs:
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           # Chat only. Empty -> the template falls back to DashScopeApiKey,
           # i.e. today's behaviour. See QwenChatApiKey in template.yaml.
-          QWEN_CHAT_API_KEY: ${{ secrets.QWEN_CHAT_API_KEY }}
+          # The chat vendor's own credential. Named for the vendor, not for
+          # "the other key": a secret that does not exist resolves to the empty
+          # string, the guard below drops the override, and the deploy quietly
+          # falls back to DashScope with no error anywhere.
+          QWEN_CHAT_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
           FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
