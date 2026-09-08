@@ -514,9 +514,23 @@ Rules:
 - Format the answer as markdown.
 - Cite the excerpt(s) you used inline as [n] (matching the excerpt numbers below), placed at the point in the answer where each fact is used.
 - If the excerpts do not contain the answer, say so clearly instead of guessing.
+- Be brief. The first sentence must answer the question. After it, at most 5 short bullets carrying the supporting detail, and never more than 150 words in total.
+- No preamble, no restatement of the question, no closing summary. The reader is standing on a site and reads the first line.
 - Answer in English (customer-facing responses are English-only for now)."""
 
 
+# The brevity rule above is the ONLY lever on how long the reader waits.
+# Measured on prod 2026-09-08, four consecutive Ask calls: the model wrote
+# 899-1224 completion tokens at ~103 tok/s, so 9-12s of the 10-13s round trip
+# was generating prose. Retrieval was ~1.2s. `MAX_ANSWER_TOKENS` is 8000 and
+# never binds -- the cap is not what sets the length, the prompt is.
+#
+# Written as a ceiling with a number rather than an adjective, and with no
+# heading or label the model can lift as an opening (a phrase handed to it at
+# the top of a section is the phrase it starts with -- measured twice on this
+# same prompt, once for the widened-basis heading and once when muse-spark
+# copied "Bullet 1:" out of a schema example).
+#
 # Voice variant (SP-Ask): the SAME grounding + injection guard, but spoken:
 # no markdown, no [n] citation markers (citations aren't read aloud), short
 # complete sentences. Selected by build_rag_prompt(mode="voice"); the screen
