@@ -298,6 +298,26 @@ Parameters:
     Description: DashScope OpenAI-compatible base URL for Qwen chat completions
     Default: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 
+  CorroborationApiKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: >-
+      Credential for the external-corroboration web search ONLY, and separate
+      from every other key on AskAgentFunction on purpose.
+
+      That function already carries `QWEN_API_KEY`, which is
+      `!If [UsesSeparateChatVendor, QwenChatApiKey, DashScopeApiKey]` -- so on a
+      stack whose QwenBaseUrl still points at DashScope it resolves to the
+      DashScope key. Sending one vendor's credential to another 401s every
+      request, which is the reason UsesSeparateChatVendor exists at all;
+      borrowing it here would reintroduce exactly that bug on a path whose
+      failure mode is "the web had nothing to say".
+
+      Empty by default. The feature is separately gated by
+      EnableExternalCorroboration, and an empty key keeps a misconfigured stack
+      inert rather than making it look like a vendor outage.
+
   QwenChatApiKey:
     Type: String
     NoEcho: true
@@ -1694,6 +1714,10 @@ Resources:
           # names to a third-party search engine; the code reads this at call
           # time, so the whole feature returns an empty body while it is false.
           ENABLE_EXTERNAL_CORROBORATION: !Ref EnableExternalCorroboration
+          # Its own key, NOT QWEN_API_KEY above -- see the CorroborationApiKey
+          # parameter for why borrowing that one sends the wrong vendor's
+          # credential on any DashScope-pointed stack.
+          CORROBORATION_API_KEY: !Ref CorroborationApiKey
       Layers:
         - !Ref DashScopeLayer
       Policies:
