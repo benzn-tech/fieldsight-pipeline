@@ -135,3 +135,47 @@ def test_a_paragraph_does_not_become_a_paragraph_sized_heading():
     assert got[0]["at"] == "17:02"
     assert len(got[0]["location"]) == 120
     assert len(got[0]["quote"]) == 300
+
+
+# --------------------------------------------------------------------------
+# The announcement is made ON THE WAY, not on arrival
+# --------------------------------------------------------------------------
+
+def test_the_instruction_covers_both_directions_of_the_same_line():
+    """Ben's 2026-09-08 inspection produced ONE surviving location announcement,
+    "Now going to the office", and the extractor did not mark it -- while quoting
+    it verbatim in a topic's evidence, so it had certainly read it.
+
+    Measured against the deployed model on the real 88-character transcript,
+    6 runs per condition:
+
+        want a marker   ("Now going to the office.")            2/6 -> 6/6
+        want NO marker  ("We had that problem in the office     6/6 -> 6/6
+                          last week...")
+
+    So it was never a refusal, it was a coin toss the wording lost. The examples
+    were all arrival-shaped ("right, Room 101", "moving into 205") while people
+    on a walk announce the room they are heading TO.
+
+    THIS TEST CANNOT SEE THAT. CI cannot call the model, so it pins WIRING, not
+    behaviour: that both halves of the rule are still present. They pull in
+    opposite directions -- one admits a place he has not reached, the other
+    refuses a place he only talked about -- and deleting either one is a silent
+    regression that every other test in this file would still pass. Re-measure
+    against the model when changing the wording; the numbers above are the bar.
+    """
+    block = ex._instructions_block()
+    permits_in_transit = "does not have to have ARRIVED" in block
+    still_refuses_mentions = "merely MENTIONED" in block
+    assert permits_in_transit, "the in-transit case lost its instruction"
+    assert still_refuses_mentions, "the mere-mention guard was dropped"
+
+
+def test_a_marker_made_on_the_way_is_kept_by_the_cleaner():
+    """The layer we DO control. Whatever the model decides, a movement-shaped
+    quote must survive cleaning -- otherwise fixing the prompt above would fix
+    nothing, because the marker would be discarded one function later."""
+    got = ex.clean_location_markers([
+        {"at": "10:28", "location": "office", "quote": "Now going to the office."}])
+    assert got == [{"at": "10:28", "location": "office",
+                    "quote": "Now going to the office."}]

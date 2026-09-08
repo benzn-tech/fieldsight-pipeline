@@ -301,7 +301,23 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
         # `effort` when the deploy states one, the boolean otherwise. A value this
         # vendor does not know would be worse than saying nothing, so anything
         # outside the known set falls back rather than travelling.
-        if LLM_REASONING_EFFORT in VALID_EFFORTS:
+        #
+        # A caller that passed enable_thinking=False asked for the FAST path for
+        # THIS call, and that beats the deploy-wide effort. It has to: one Lambda
+        # can need both modes, which is the entire reason the parameter exists.
+        # lambda_extract_session runs a live pass on every 30-second chunk and a
+        # thinking pass when the session closes -- one env value cannot serve both,
+        # and until this branch existed the env silently won. Measured on the
+        # deployed live pass with LLM_REASONING_EFFORT=high: 119.1s and 8,753
+        # reasoning tokens, on a path throttled to run every 90s. The "fast" pass
+        # had become slower than its own trigger interval (BUG-43's shape) while
+        # its log line still read thinking=False.
+        #
+        # enable_thinking=True does NOT override: the caller is saying THINK, and
+        # how hard is the deploy's call, so the env effort still names the level.
+        if enable_thinking is False:
+            payload["reasoning"] = {"effort": "low"}
+        elif LLM_REASONING_EFFORT in VALID_EFFORTS:
             payload["reasoning"] = {"effort": LLM_REASONING_EFFORT}
         else:
             if LLM_REASONING_EFFORT:
@@ -355,8 +371,13 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
     # and a silent regression is exactly the failure this pairing exists to
     # prevent. A guard that passes still has to leave a line, or "it ran
     # correctly" and "it never ran" look the same.
-    logger.info("qwen call: model=%s thinking=%s json=%s",
-                payload["model"], thinking, "response_format" in payload)
+    # `effort` is in here because its absence is what hid the defect above: the
+    # line said thinking=False on a call that was reasoning at high, and nothing
+    # anywhere printed what actually went on the wire.
+    logger.info("qwen call: model=%s thinking=%s effort=%s json=%s",
+                payload["model"], thinking,
+                (payload.get("reasoning") or {}).get("effort", "-"),
+                "response_format" in payload)
     started = time.monotonic()
     resp, err = _post_with_retry(
         f"{QWEN_BASE_URL}/chat/completions",
