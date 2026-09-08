@@ -414,13 +414,19 @@ def dispatch(conn, event, method, route):
         if method == "POST":
             return create_member(conn, caller, parse_body(event))
     if route == "/members/enroll-backfill" and method == "POST":
-        return backfill_member_folders(conn, caller)
+        return backfill_member_folders(conn, caller, parse_body(event))
     m = re.match(r"^/members/([^/]+)/role$", route)
     if m and method == "PATCH":
         return patch_member_role(conn, caller, m.group(1), parse_body(event))
     m_mf = re.match(r"^/members/([^/]+)/folder$", route)
     if m_mf and method == "PATCH":
         return patch_member_folder(conn, caller, m_mf.group(1), parse_body(event))
+    m_mm = re.match(r"^/members/([^/]+)/memberships/([^/]+)$", route)
+    if m_mm and method == "PUT":
+        return put_member_membership(conn, caller, m_mm.group(1), m_mm.group(2),
+                                     parse_body(event))
+    if m_mm and method == "DELETE":
+        return delete_member_membership(conn, caller, m_mm.group(1), m_mm.group(2))
     m_sp = re.match(r"^/sites/([^/]+)$", route)
     if m_sp and method == "PATCH":
         return patch_org_site(conn, caller, m_sp.group(1), parse_body(event))
@@ -2757,7 +2763,7 @@ def patch_member_folder(conn, caller, target_sub, body):
     the display name they see in the app produces the identical S3 folder
     segment. folder_name is globally unique (0012) — collision_guard below
     avoids crashing that unique index with a raw IntegrityError."""
-    if caller["global_role"] != "admin":
+    if caller["global_role"] not in ("admin", "platform_admin"):
         return error("admin role required", 403)
     if body is None:
         return error("malformed JSON body", 400)
@@ -2765,8 +2771,13 @@ def patch_member_folder(conn, caller, target_sub, body):
     if not isinstance(raw, str) or not raw.strip():
         return error("folder_name is required", 400)
     folder = re.sub(r'[<>:"/\\|?*\s]', '_', raw.strip())
+    # A platform_admin reaches across tenants by design (D6); every other role
+    # stays pinned to its own company. Without the widening the operator account
+    # could see a customer's people but not enrol the one field -- folder_name --
+    # that links their login to the folder their recordings are written under.
     target = users.get_user_by_sub(conn, target_sub)
-    if target is None or target["company_id"] != caller["company_id"]:
+    if target is None or (not is_cross_company(caller["global_role"])
+                          and str(target["company_id"]) != str(caller["company_id"])):
         return error("member not found in your company", 404)
     clash = users.get_by_folder_name_global(conn, folder)
     if clash and clash["cognito_sub"] != target_sub:
@@ -2775,7 +2786,84 @@ def patch_member_folder(conn, caller, target_sub, body):
     return ok(users.get_user_by_sub(conn, target_sub))
 
 
-def backfill_member_folders(conn, caller):
+def _resolve_staffing(conn, caller, target_sub, site_id, require_open_site):
+    """Shared guard for the two staffing routes below. Returns
+    ((site, target), None) or (None, error_response).
+
+    The tenant rule these routes must not break: a membership joins a user and
+    a site, so BOTH ends have to sit in the same company. For a company admin
+    that company is their own. A platform_admin operates from an empty operator
+    company (0015), so pinning to the caller's company would 403 every real
+    staffing call -- it adopts the SITE's company instead (same move as
+    create_member and patch_org_site) and the target is then checked against
+    that, which is what keeps cross-company reach from becoming permission to
+    mix two tenants on one project."""
+    if caller["global_role"] not in ("admin", "platform_admin"):
+        return None, error("admin role required", 403)
+    site = sites.get_site(conn, site_id)
+    if site is None:
+        return None, error("site not found in your company", 403)
+    company_id = (site["company_id"] if is_cross_company(caller["global_role"])
+                  else caller["company_id"])
+    if str(site["company_id"]) != str(company_id):
+        return None, error("site not found in your company", 403)
+    if require_open_site and site.get("archived_at"):
+        return None, error("site is archived — unarchive it first", 409)
+    target = users.get_user_by_sub(conn, target_sub)
+    if target is None or str(target.get("company_id")) != str(company_id):
+        return None, error("member not found in your company", 404)
+    return (site, target), None
+
+
+def put_member_membership(conn, caller, target_sub, site_id, body):
+    """Admin-only: put an EXISTING member on a project, or correct the role
+    they hold on one. Idempotent (ensure_membership upserts on the
+    (user_id, site_id) unique index) and it revives a membership archived by
+    DELETE below, so re-staffing somebody restores the same row.
+
+    Before this route the only way into `memberships` was create_member, so an
+    admin adding a person to their second project had to re-invite the email
+    and rely on create_member's UsernameExists fallback as a side effect. The
+    role written here is not cosmetic now that GRADED_ROLES is on in prod:
+    visible_scope reads membership.role per site, so this is the only place a
+    person's authority ON ONE project can be set after the invite --
+    PATCH /members/{sub}/role writes global_role, which is a different thing."""
+    resolved, err = _resolve_staffing(conn, caller, target_sub, site_id,
+                                      require_open_site=True)
+    if err:
+        return err
+    _site, target = resolved
+    if body is None:
+        return error("malformed JSON body", 400)
+    role = body.get("role")
+    if not isinstance(role, str) or role not in ALLOWED_MEMBERSHIP_ROLES:
+        return error(f"role must be one of {sorted(ALLOWED_MEMBERSHIP_ROLES)}", 400)
+    if target.get("archived_at"):
+        return error("member is archived — unarchive them first", 409)
+    row = memberships.ensure_membership(conn, target["id"], site_id, role)
+    return ok({"membership": row})
+
+
+def delete_member_membership(conn, caller, target_sub, site_id):
+    """Admin-only: take a member off ONE project. Soft (archived_at), so the
+    row and anything referencing it survive and a later PUT revives it.
+
+    An archived SITE is allowed here, unlike PUT: closing a project must not
+    freeze its roster. A membership that is not there answers 404 rather than
+    200 -- an admin who reads success would believe somebody had been taken off
+    a project they still sit on."""
+    resolved, err = _resolve_staffing(conn, caller, target_sub, site_id,
+                                      require_open_site=False)
+    if err:
+        return err
+    _site, target = resolved
+    row = memberships.archive_membership(conn, target["id"], site_id)
+    if row is None:
+        return error("no active membership on that site", 404)
+    return ok({"membership": row})
+
+
+def backfill_member_folders(conn, caller, body=None):
     """Admin-only bulk enrollment: links folder_name for every existing
     company login that never got one (e.g. seeded before create_member's
     D4 auto-enroll shipped) — so an admin doesn't have to walk each old
@@ -2783,9 +2871,23 @@ def backfill_member_folders(conn, caller):
     + collision guard as patch_member_folder/create_member's auto-enroll;
     a folder_name collision skips that one user (reason returned) rather
     than 500ing the whole batch on the global unique index (0012)."""
-    if caller["global_role"] != "admin":
+    if caller["global_role"] not in ("admin", "platform_admin"):
         return error("admin role required", 403)
-    rows = users.list_company_logins_unenrolled(conn, caller["company_id"])
+    # Which company to sweep. A platform_admin's OWN company is the empty
+    # operator company (0015), so defaulting to it would answer 200
+    # {"enrolled": []} -- a successful report of work that could not have
+    # happened. It must name the tenant instead; everyone else stays pinned.
+    company_id = caller["company_id"]
+    req_company_id = (body or {}).get("target_company_id")
+    if is_cross_company(caller["global_role"]):
+        if not req_company_id:
+            return error("target_company_id is required for platform_admin", 400)
+        if companies.get_company_by_id(conn, req_company_id) is None:
+            return error("target company not found", 404)
+        company_id = req_company_id
+    elif req_company_id and str(req_company_id) != str(caller["company_id"]):
+        return error("only platform_admin may backfill another company", 403)
+    rows = users.list_company_logins_unenrolled(conn, company_id)
     enrolled, skipped = [], []
     for row in rows:
         sub = row["cognito_sub"]

@@ -3,7 +3,7 @@ from repositories.acl import resolve_scope  # re-export
 
 __all__ = ["resolve_scope", "add_membership", "accessible_site_ids", "ensure_membership", "list_company_memberships",
           "members_for_site", "caller_site_roles", "worker_user_ids_for_sites",
-          "user_ids_for_sites"]
+          "user_ids_for_sites", "archive_membership"]
 
 
 def add_membership(conn, user_id, site_id, role) -> dict:
@@ -40,6 +40,27 @@ def ensure_membership(conn, user_id, site_id, role) -> dict:
         "ON CONFLICT (user_id, site_id) DO UPDATE SET role=EXCLUDED.role, archived_at=NULL "
         "RETURNING id, user_id, site_id, role, created_at",
         (user_id, site_id, role),
+    ).fetchone()
+
+
+def archive_membership(conn, user_id, site_id) -> dict | None:
+    """Take ONE person off ONE project, without touching the person or the
+    project. Soft: `archived_at` is set, so the row (and the history that
+    references it) survives and ensure_membership revives it on re-staffing.
+
+    Returns None when there was no live membership to remove -- the caller
+    turns that into a 404 rather than reporting a removal that never happened.
+    Guarded on archived_at IS NULL so a second call is a no-op that reports
+    itself as one, instead of silently re-stamping the timestamp.
+
+    Until this existed, `memberships.archived_at` was only ever written as
+    collateral by sites.archive_site / users.archive_user, so the only way to
+    unstaff somebody was to archive the whole site or the whole person."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "UPDATE memberships SET archived_at=now() "
+        "WHERE user_id=%s AND site_id=%s AND archived_at IS NULL "
+        "RETURNING id, user_id, site_id, role, created_at, archived_at",
+        (user_id, site_id),
     ).fetchone()
 
 
