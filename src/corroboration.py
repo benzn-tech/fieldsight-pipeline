@@ -258,7 +258,7 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
     """
     started = clock()
     empty = {"corroborations": [], "dropped": [], "truncated": False,
-             "timed_out": False}
+             "timed_out": False, "searched": False}
 
     if not question or not answer:
         return empty
@@ -286,7 +286,7 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
                 len(result.allowed), len(result.rejected), result.truncated)
 
     base = {"corroborations": [], "dropped": dropped,
-            "truncated": result.truncated, "timed_out": False}
+            "truncated": result.truncated, "timed_out": False, "searched": False}
 
     # --- 3. one search covering all of them ---------------------------------
     if left() < client.MIN_USEFUL_TIMEOUT:
@@ -297,8 +297,39 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
         # would read as "we checked these and found nothing".
         logger.warning("corroboration: search failed: %s", search.error)
         return dict(base, timed_out=True)
-    if search.search_error:
-        logger.warning("corroboration: search tool error: %s", search.search_error)
+    # Reconcile may only ever read text the open web actually produced.
+    #
+    # The model's own account of its tool use is not evidence. Measured on
+    # OpenRouter 2026-09-08, three runs: muse-spark returned 200, 1200 tokens,
+    # zero web results, and wrote "I'll search the web to verify... Initial
+    # results support the claim." Passed to reconcile that becomes
+    # `corroborated`, and the card renders a Confirmed chip with no sources
+    # under it, because the renderer omits the source row when `sources` is
+    # empty. A fabricated corroboration shown as verified is the worst output
+    # this system has.
+    #
+    # `searched` has been on `Reply` since this module was written and no caller
+    # read it. This is that read.
+    #
+    # Note what is NOT blocked: a search that ran and found nothing. That is a
+    # finding about the world, `not_found` is the state that says so, and it is
+    # this feature's most common true answer.
+    grounded = search.searched and not (search.search_error
+                                        and not search.search_results)
+    if not grounded:
+        # Deliberately not `timed_out`. The request finished; it just never
+        # consulted anything. `truncated` and `timed_out` are already kept apart
+        # so a reader knows which happened, and this is a third thing.
+        logger.warning(
+            "corroboration: no web results (searched=%s, tool_error=%s) -- "
+            "not reconciling ungrounded text",
+            search.searched, search.search_error)
+        return dict(base, searched=False)
+
+    # Past this line the web was consulted, so every exit below says so --
+    # including the reconcile timeout. A flag that only ever appears on failure
+    # is one the reader cannot tell from absent.
+    base = dict(base, searched=True)
 
     # --- 4. a state per entity ----------------------------------------------
     if left() < client.MIN_USEFUL_TIMEOUT:
@@ -349,4 +380,4 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
         })
 
     return {"corroborations": cards, "dropped": dropped,
-            "truncated": result.truncated, "timed_out": False}
+            "truncated": result.truncated, "timed_out": False, "searched": True}
