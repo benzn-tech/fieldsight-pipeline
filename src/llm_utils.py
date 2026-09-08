@@ -448,23 +448,66 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
     return None, msg
 
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _strip_control_chars(obj):
+    r"""Scrub C0 control characters out of every string in a parsed response.
+
+    2026-09-08, prod. An extraction came back with
+
+        "time_range": "13:37 \x0e2\x0813:37"
+
+    -- SHIFT OUT and BACKSPACE where the en dash belongs. Both `parse_time_range`
+    implementations correctly refused it and returned None, so the topic owned no
+    time window and NOTHING bound to it. No exception, no warning: the guard held
+    and the feature stopped working, which is the most expensive failure shape
+    there is.
+
+    Rare, and total when it lands. Across 123 prod extraction artifacts and 281
+    topics, exactly 2 were unparseable -- and both were in the SAME session, so
+    that session lost photo binding on every topic it had.
+
+    Scrubbed HERE, not in the parsers, because there are TWO of those
+    (photo_binding and chunking) and two copies of one rule is how one of them
+    gets fixed and the other does not -- the same reason `elide_middle` was
+    factored out. This is the choke point every LLM caller already passes
+    through, so no control character reaches any consumer.
+
+    TAB, LF and CR are deliberately kept: summaries legitimately contain them.
+    """
+    if isinstance(obj, str):
+        return _CONTROL_CHARS.sub("", obj)
+    if isinstance(obj, list):
+        return [_strip_control_chars(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _strip_control_chars(v) for k, v in obj.items()}
+    return obj
+
+
 def extract_json(raw_text):
-    """Three-tier fallback: fenced ```json``` block, whole string, brace slice."""
+    """Three-tier fallback: fenced ```json``` block, whole string, brace slice.
+
+    Every tier returns through `_strip_control_chars`: a scrub wired into only
+    the first would pass a naive test and still leak on real output, which
+    usually arrives fenced or with prose around it.
+    """
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
     if match:
         try:
-            return json.loads(match.group(1))
+            return _strip_control_chars(json.loads(match.group(1)))
         except json.JSONDecodeError:
             pass
     try:
-        return json.loads(raw_text.strip())
+        return _strip_control_chars(json.loads(raw_text.strip()))
     except json.JSONDecodeError:
         pass
     first_brace = raw_text.find("{")
     last_brace = raw_text.rfind("}")
     if first_brace != -1 and last_brace != -1:
         try:
-            return json.loads(raw_text[first_brace:last_brace + 1])
+            return _strip_control_chars(
+                json.loads(raw_text[first_brace:last_brace + 1]))
         except json.JSONDecodeError:
             pass
     logger.error(f"Failed to extract JSON from LLM response: {raw_text[:500]}")
