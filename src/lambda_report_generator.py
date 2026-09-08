@@ -462,7 +462,7 @@ def save_debug_record(bucket, target_date, user_name, prompt, raw_response,
         debug_record = {
             '_description': 'Debug record for prompt tuning.',
             'timestamp': datetime.utcnow().isoformat() + 'Z',
-            'model': CLAUDE_MODEL,
+            'model': llm_utils.active_model(),
             'user_name': user_name,
             'target_date': target_date,
             'parse_success': parse_success,
@@ -486,6 +486,27 @@ def save_debug_record(bucket, target_date, user_name, prompt, raw_response,
 # ============================================================
 # Prompt Builders
 # ============================================================
+
+
+def summary_text(report):
+    """`executive_summary` as one readable string, whatever shape it arrived in.
+
+    It is an ARRAY of bullets under `config/prompt_templates.json` v3.0 and a
+    STRING under the in-code fallback schema below, so both shapes are live: a
+    deploy without the S3 config produces the string. Every consumer here that
+    puts the summary into prose -- the Word export and the weekly/monthly prompt
+    builders -- was written against the string and silently mangled the array:
+    `doc.add_paragraph(list)` does not raise, it concatenates with no separator.
+    """
+    value = report.get('executive_summary')
+    if value is None:
+        value = report.get('summary')
+    if isinstance(value, (list, tuple)):
+        parts = [str(v).strip() for v in value if v]
+        return ' '.join(parts) if parts else 'No summary available'
+    text = str(value).strip() if value else ''
+    return text or 'No summary available'
+
 
 def build_weather_block_for_site(site_info, target_date, today_iso,
                                  fetch=weather.fetch_weather):
@@ -623,7 +644,7 @@ def build_weekly_prompt(daily_reports, site_name, start_date, end_date,
     for report in daily_reports:
         date = report.get('report_date', '?')
         user = report.get('user_name', report.get('user', '?'))
-        exec_sum = report.get('executive_summary', report.get('summary', 'No summary'))
+        exec_sum = summary_text(report)
         topics_text = ""
         for t in report.get('topics', []):
             cat = t.get('category', '?')
@@ -728,13 +749,13 @@ def build_monthly_prompt(daily_reports, weekly_reports, site_name, start_date, e
     if weekly_reports:
         source_parts = [
             f"### Week of {r.get('period', {}).get('start', '?')} to {r.get('period', {}).get('end', '?')}\n"
-            f"{r.get('executive_summary', 'No summary')}"
+            f"{summary_text(r)}"
             for r in weekly_reports
         ]
         source_label = "Weekly Report Summaries"
     else:
         source_parts = [
-            f"### {r.get('report_date', '?')}\n{r.get('executive_summary', r.get('summary', 'No summary'))}"
+            f"### {r.get('report_date', '?')}\n{summary_text(r)}"
             for r in daily_reports
         ]
         source_label = "Daily Report Summaries"
@@ -889,7 +910,15 @@ def generate_word_document(report_data, title):
         doc.add_paragraph('')
 
     doc.add_heading('Executive Summary', level=1)
-    doc.add_paragraph(report_data.get('executive_summary', 'No summary available'))
+    exec_summary = report_data.get('executive_summary')
+    if isinstance(exec_summary, list) and exec_summary:
+        # Same rendering meeting-minutes already uses: bullets stay bullets.
+        # Joining them into one paragraph is what the old string-only call did
+        # by accident, and it read as one run-on sentence.
+        for item in exec_summary:
+            doc.add_paragraph(item, style='List Bullet')
+    else:
+        doc.add_paragraph(summary_text(report_data))
 
     quality_items = report_data.get('quality_and_compliance', [])
     if quality_items:
@@ -1440,7 +1469,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
                 'recordings_skipped': 0,
                 'total_words': user_data['total_words'],
                 'total_duration_seconds': round(dur_total, 1),
-                'model': CLAUDE_MODEL,
+                'model': llm_utils.active_model(),
                 'hidden_topic_ids': hidden_topic_ids or [],
                 'parse_success': parse_success,
             }
@@ -1545,7 +1574,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
                                 'recordings_processed': len(combined_transcripts),
                                 'total_words': sum(d['total_words'] for d in all_users_data.values()),
                                 'total_duration_seconds': round(combined_duration, 1),
-                                'model': CLAUDE_MODEL,
+                                'model': llm_utils.active_model(),
                             }
                         }
 
@@ -1673,7 +1702,7 @@ def generate_periodic_report(report_type, start_date, end_date):
             **claude_output,
             '_report_metadata': {
                 'version': 'v3.5', 'generated_at': now_iso, 'generated_by': 'system',
-                'scope': 'user', 'daily_reports_used': len(user_reports), 'model': CLAUDE_MODEL,
+                'scope': 'user', 'daily_reports_used': len(user_reports), 'model': llm_utils.active_model(),
             }
         }
 
@@ -1747,7 +1776,7 @@ def generate_periodic_report(report_type, start_date, end_date):
             **claude_output,
             '_report_metadata': {
                 'version': 'v3.5', 'generated_at': now_iso, 'generated_by': 'system',
-                'scope': 'site', 'daily_reports_used': len(site_reports), 'model': CLAUDE_MODEL,
+                'scope': 'site', 'daily_reports_used': len(site_reports), 'model': llm_utils.active_model(),
             }
         }
 
@@ -1796,7 +1825,7 @@ def generate_periodic_report(report_type, start_date, end_date):
                     **claude_output,
                     '_report_metadata': {
                         'version': 'v3.5', 'generated_at': now_iso, 'generated_by': 'system',
-                        'scope': 'all', 'daily_reports_used': len(all_daily_reports), 'model': CLAUDE_MODEL,
+                        'scope': 'all', 'daily_reports_used': len(all_daily_reports), 'model': llm_utils.active_model(),
                     }
                 }
                 json_key = f"{REPORT_PREFIX}{end_date}/{report_type}_report.json"
