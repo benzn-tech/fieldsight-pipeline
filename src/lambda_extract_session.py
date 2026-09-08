@@ -970,6 +970,12 @@ def _instructions_block():
    photos are level three progress", "moving into 205". These are what let a photo taken in
    silence be filed under the right room: an inspection is one announcement followed by ten minutes
    of quiet photography, so the announcement is the ONLY evidence of where those photos were taken.
+   - He does not have to have ARRIVED. People announce the room they are walking
+     TOWARD, not the one they are standing in -- "now going to the office", "heading
+     up to level four", "next is the carpet area". Mark it, at the time he says it:
+     from that moment on that is where the following photos were taken. Waiting for
+     an arrival announcement he never makes is how a whole inspection ends up with
+     no locations at all.
    - Do NOT mark a place merely MENTIONED. "We had that problem in 101 last week" and "level three
      is waiting on the sparkies" are subjects of conversation, not statements of where he is
      standing. Marking those would relocate a whole stretch of photos to a room nobody visited.
