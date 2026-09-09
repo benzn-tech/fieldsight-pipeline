@@ -242,13 +242,60 @@ def _reconcile(allowed, findings, budget):
     return parsed, None
 
 
+# A hostname and nothing else: labels, dots, and a final label that is alphabetic
+# so "Fletcher Building Ltd." cannot pass as one.
+_HOSTNAME = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?"
+                       r"(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*"
+                       r"\.[a-z]{2,}$")
+
+
+def _domain(url, title):
+    """Who published this, as a host a reader can judge.
+
+    The card puts the domain under every claim because that is the trust
+    carrier -- a reader decides whether to believe a source from the host, not
+    from the URL. Deriving it by parsing the URL worked while the vendor
+    returned real result URLs.
+
+    This one does not. A measured annotation, 2026-09-08:
+
+        url:   https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZ...
+        title: "wikipedia.org"
+
+    The host is in `title` and the URL is an opaque Google redirect, so parsing
+    the URL makes every source under every claim read
+    `vertexaisearch.cloud.google.com`.
+
+    `title` is trusted only when it IS a hostname, so a vendor that puts a
+    headline there falls through to the URL and stays correct. Neither
+    available means None: a reader shown no source is told less, but a reader
+    shown the wrong one is told something false.
+    """
+    candidate = (title or "").strip().lower()
+    if _HOSTNAME.match(candidate):
+        return candidate[4:] if candidate.startswith("www.") else candidate
+
+    host = ""
+    match = re.match(r"^[a-z][a-z0-9+.-]*://([^/?#]+)", (url or "").strip(),
+                     re.IGNORECASE)
+    if match:
+        host = match.group(1).split("@")[-1].split(":")[0].lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host or None
+
+
 def _sources(reply, limit=4):
     seen, out = set(), []
     for r in reply.search_results:
         if not r.url or r.url in seen:
             continue
         seen.add(r.url)
-        out.append({"title": r.title, "url": r.url, "published": r.page_age})
+        # `url` stays exactly what the vendor gave us, redirect and all. It is
+        # the only link we were handed, and building one out of the domain
+        # would fabricate a citation that was never returned.
+        out.append({"title": r.title, "url": r.url, "published": r.page_age,
+                    "domain": _domain(r.url, r.title)})
         if len(out) >= limit:
             break
     return out
