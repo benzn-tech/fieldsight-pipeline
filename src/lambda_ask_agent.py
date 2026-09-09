@@ -1271,7 +1271,17 @@ def _voice_answer(body):
     async audit. Returns the Contract voice shape, or {'error', 'transcript'?}
     on any stage failure. Never raises (lambda_handler wraps with ok())."""
     import base64 as _b64
+    import time as _time
     import dashscope_utils
+
+    # WHERE THE SECONDS GO. Until now this function logged nothing at all on the
+    # success path, so every latency claim about voice was inferred from the
+    # screen path or from Lambda Duration, which is the sum and says nothing
+    # about which stage owns it. One structured line at the end, below.
+    #
+    # It is measurement, not behaviour: nothing here changes what is returned.
+    t0 = _time.perf_counter()
+    marks = {}
 
     caller_sub = body.get("caller_sub")
     fmt = body.get("format") or "m4a"
@@ -1280,11 +1290,13 @@ def _voice_answer(body):
     except Exception:
         return {"error": "Invalid audio encoding"}
 
+    t_stt = _time.perf_counter()
     try:
         transcript = dashscope_utils.stt(audio_bytes, fmt)
     except Exception as e:
         logger.error("  voice STT failed: %s", e)
         return {"error": "Speech recognition failed"}
+    marks["stt"] = _time.perf_counter() - t_stt
     if not transcript or not transcript.strip():
         # STT heard nothing -> device plays its bundled error cue (spec §7).
         return {"error": "Empty transcript", "transcript": ""}
@@ -1293,18 +1305,35 @@ def _voice_answer(body):
     # anything the screen path gains is absent here until someone adds it twice.
     # Voice needs it most -- there is no date picker to fall back on when the
     # question is spoken.
+    t_rag = _time.perf_counter()
     rag = _rag_answer({"question": transcript, "caller_sub": caller_sub,
                        "mode": "voice", "k": body.get("k", 5),
                        "tz": body.get("tz")})
+    marks["rag"] = _time.perf_counter() - t_rag
     answer_text = (rag.get("answer") or "").strip()
     if rag.get("error") or not answer_text:
         return {"error": rag.get("error") or "No answer", "transcript": transcript}
 
+    t_tts = _time.perf_counter()
     try:
         audio_out = dashscope_utils.tts(answer_text)
     except Exception as e:
         logger.error("  voice TTS failed: %s", e)
         return {"error": "Speech synthesis failed", "transcript": transcript}
+    marks["tts"] = _time.perf_counter() - t_tts
+
+    # `rag` is retrieval AND the model. The model's own elapsed time is already
+    # on the `qwen done:` line for the same request id, so subtracting gives
+    # retrieval -- which nothing has ever reported separately. Both are named
+    # here so the next reader does not have to know that.
+    logger.info(
+        "voice ask: stt=%.2fs rag=%.2fs tts=%.2fs total=%.2fs "
+        "clip_bytes=%d transcript_words=%d answer_words=%d answer_chars=%d "
+        "audio_bytes=%d fmt=%s",
+        marks.get("stt", -1), marks.get("rag", -1), marks.get("tts", -1),
+        _time.perf_counter() - t0, len(audio_bytes),
+        len(transcript.split()), len(answer_text.split()), len(answer_text),
+        len(audio_out), fmt)
 
     _invoke_voice_audit(caller_sub, transcript, answer_text)
     return {

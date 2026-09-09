@@ -545,6 +545,15 @@ def tts(text):
         def on_event(self, response):
             event_type = response.get("type")
             if event_type == "response.audio.delta":
+                # THE NUMBER THAT DECIDES WHETHER STREAMING IS WORTH IT. This
+                # vendor already streams -- deltas arrive here in chunks and we
+                # throw the streaming away by buffering until session.finished.
+                # How much of the answer could already be playing depends on
+                # when the FIRST delta lands relative to the total, and nothing
+                # has ever recorded it.
+                if self.first_delta_at is None:
+                    self.first_delta_at = time.perf_counter()
+                self.deltas += 1
                 self.buf += base64.b64decode(response["delta"])
             elif event_type == "session.finished":
                 self.finished.set()
@@ -559,6 +568,9 @@ def tts(text):
                 )
 
     cb = _TtsCallback()
+    cb.first_delta_at = None
+    cb.deltas = 0
+    t_tts0 = time.perf_counter()
     # url=DASHSCOPE_TTS_WS_URL: must match the API key's region, same as
     # DASHSCOPE_AIGC_URL/DASHSCOPE_BASE_URL above (both dashscope-intl).
     # VERIFY AT DEPLOY against live DashScope.
@@ -587,5 +599,16 @@ def tts(text):
         raise RuntimeError(cb.error)
     if not cb.buf:
         raise RuntimeError("DashScope TTS session finished with no audio")
+
+    # PCM_24000HZ_MONO_16BIT -> 48000 bytes per second of speech. Reported so
+    # `first_chunk / audio_seconds` is readable directly: that ratio is how much
+    # of the answer a streaming transport could have been playing before this
+    # function returned anything at all.
+    total = time.perf_counter() - t_tts0
+    first = (cb.first_delta_at - t_tts0) if cb.first_delta_at else -1.0
+    logger.info("tts: first_chunk=%.2fs total=%.2fs deltas=%d bytes=%d "
+                "audio_seconds=%.2f chars=%d",
+                first, total, cb.deltas, len(cb.buf), len(cb.buf) / 48000.0,
+                len(text))
 
     return _pcm_to_wav(bytes(cb.buf))
