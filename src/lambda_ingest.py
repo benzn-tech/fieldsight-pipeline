@@ -94,14 +94,12 @@ ENABLE_GROUP_MERGE = os.environ.get("ENABLE_GROUP_MERGE", "false").lower() == "t
 
 
 def _merged_keys_for(conn, user_id, report_date):
-    """Merged artifact keys for the groups this user was in that day."""
-    from repositories import meeting_session, session_group
-    keys = []
-    for gid in meeting_session.groups_for_user_on_date(conn, user_id, report_date):
-        row = session_group.get(conn, gid)
-        if row and row.get("merged_key"):
-            keys.append(row["merged_key"])
-    return keys
+    """Merged artifact keys for the groups this user was in that day.
+
+    Thin wrapper kept for this module's call sites; the implementation lives in
+    session_group so org-api and ingest cannot drift apart."""
+    from repositories import session_group
+    return session_group.merged_keys_for_user(conn, user_id, report_date)
 
 
 def _should_defer(conn, user_id, user_folder, date):
