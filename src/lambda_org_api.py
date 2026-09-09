@@ -4564,38 +4564,44 @@ def list_live_items(conn, caller, event):
     # Resolved on its own line, not inside the call: an exception raised while
     # evaluating an argument escapes the callee's try, so a failed enrichment
     # would 500 the whole timeline.
-    merged_keys = _merged_keys_for_caller(conn, caller, date)
+    merged_keys = _merged_keys_for(conn, caller["id"], date)
     rows = topics.list_topics_for_date(conn, site_ids, date,
                                        author_ids=_author_filter(conn, caller),
                                        merged_keys=merged_keys)
     return ok({"topics": rows})
 
 
-def _merged_keys_for_caller(conn, caller, date):
-    """The merged-record keys this caller is entitled to see on `date`.
+def _merged_keys_for(conn, user_id, date):
+    """The merged-record keys `user_id` was a member of on `date`, or [].
 
     A multi-device merge writes ONE topic set, owned by the lead's session, and
-    deletes each member's own. Without this a joiner's day goes blank: they were
-    in the meeting and their timeline shows nothing.
+    PHYSICALLY deletes each member's own. Without this a joiner's day goes blank:
+    they were in the meeting and their timeline shows nothing.
 
-    Entitlement is membership in the group, established from the caller's own
-    sessions -- so this widens nothing. It cannot reach a group the caller was
-    not in, and it names individual artifact keys rather than relaxing the site
-    or author filter.
+    Named for a USER and not for "the caller", because two callers ask two
+    different questions and the answers are not interchangeable:
+
+      * an own-day view asks about the caller, and the keys may then be unioned
+        PAST the ACL -- the caller was in that meeting, so the record is theirs.
+        `/live-items` has always done this;
+      * a cross-user view asks about the TARGET, and those keys must stay inside
+        the caller's site clip. A merged meeting spans devices and therefore
+        sites by definition, which is precisely the object CRITICAL-1's
+        cross_user_clip rule exists for.
+
+    A function called `_merged_keys_for_caller` that quietly answered about
+    somebody else would read as safe at every call site. This one cannot.
 
     Returns [] on any failure: a missing merged record is a stale timeline, a
-    broken one is no timeline at all."""
+    broken one is no timeline at all. Resolve it on its own line, never inside a
+    call's argument list -- an exception raised while evaluating an argument
+    escapes the callee's try, which is how a failed enrichment 500s a whole
+    read."""
     try:
-        gids = meeting_session.groups_for_user_on_date(conn, caller["id"], date)
-        keys = []
-        for gid in gids:
-            row = session_group.get(conn, gid)
-            if row and row.get("merged_key"):
-                keys.append(row["merged_key"])
-        return keys
+        return session_group.merged_keys_for_user(conn, user_id, date)
     except Exception:
         logger.exception("could not resolve merged records for %s on %s",
-                         caller.get("id"), date)
+                         user_id, date)
         return []
 
 
@@ -6120,6 +6126,26 @@ def _day_has_deleted_sources(conn, folder, date) -> bool:
         return False
 
 
+def _timeline_target_id(conn, caller, user):
+    """The user whose group membership decides which merged records this view
+    may show: the person whose day is being read, never the person reading it.
+
+    `user` is a FOLDER name, and the caller's own folder is the common case --
+    resolving it through the database on every own-day read would be a query for
+    an answer already in hand. Falls back to the caller on any failure, which is
+    the conservative direction: a caller can only ever lose merged records that
+    way, never gain someone else's.
+    """
+    try:
+        if not user or user == (caller.get("folder_name") or ""):
+            return caller["id"]
+        row = users.get_by_folder_name(conn, caller["company_id"], user)
+        return (row or {}).get("id") or caller["id"]
+    except Exception:
+        logger.exception("could not resolve timeline target for %s", user)
+        return caller["id"]
+
+
 def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     """The single-(user, date) D1 read: Aurora override when extraction
     topics exist AND at least one survives the site ACL filter, else S3
@@ -6141,14 +6167,58 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     in-scope Aurora topics exist there is nothing safe to show (404). Own-
     timeline and ALL-scope (admin/gm/platform_admin) callers pass
     cross_user_clip=False and are UNCHANGED."""
-    def _aurora_shape(prefix):
+    # Multi-device merge: the meeting's ONE topic set is owned by the lead's
+    # session key and every member's own topics were PHYSICALLY deleted, so a
+    # joiner has nothing under their own prefix. Resolved on its own line and
+    # before the gate below -- an exception raised inside an argument list
+    # escapes the callee's try and 500s the whole read.
+    #
+    # WHOSE membership: the target's, always. On an own-day view the target IS
+    # the caller and this is `/live-items` verbatim. On a cross-user view it has
+    # to be the target -- asking about the caller would answer a question nobody
+    # posed and return the caller's own unrelated meetings.
+    merged_keys = _merged_keys_for(conn, _timeline_target_id(conn, caller, user), date)
+
+    def _aurora_shape(prefix, merged=()):
         """Return the id-carrying rendered shape for `prefix` if it has
         Aurora topics inside the caller's site ACL, else None."""
-        if not topics.has_topics_for_source_prefix(conn, prefix):
+        # The gate has to know about the merge too. A joiner's own prefix is
+        # EMPTY -- that is what the merge does -- so testing the prefix alone
+        # returns before any list call and no union downstream can ever run.
+        if not (topics.has_topics_for_source_prefix(conn, prefix) or merged):
             return None
         allowed = _allowed_site_ids(conn, caller)
-        rows = [r for r in topics.list_topics_for_source_prefix(conn, prefix)
-                if str(r["site_id"]) in allowed]
+        # The kwarg is passed ONLY when there is something to union. A day with
+        # no group must reach this repository exactly as it did before -- same
+        # call, same SQL, same params -- so the change cannot alter the ordinary
+        # case, which is almost every case.
+        rows = (topics.list_topics_for_source_prefix(conn, prefix,
+                                                    merged_keys=list(merged))
+                if merged else
+                topics.list_topics_for_source_prefix(conn, prefix))
+        if not cross_user_clip:
+            # Own day (and ALL-scope). The caller was in that meeting, so the
+            # merged record is theirs: it bypasses the site clip exactly as it
+            # does on `/live-items`, and for the same three reasons -- the rows
+            # carry the LEAD's user_id and site_id, so an author filter, a site
+            # filter, or widening author_ids would each fail, the last of them
+            # by leaking the lead's other solo topics.
+            merged_set = set(merged)
+            rows = [r for r in rows
+                    if str(r["site_id"]) in allowed
+                    or r.get("source_s3_key") in merged_set]
+        else:
+            # Someone else's day. A merged meeting spans devices and therefore
+            # sites BY DEFINITION, which is the object cross_user_clip exists
+            # for, so the merged rows stay INSIDE the clip -- the caller sees
+            # the part of that meeting sitting on sites they can already reach.
+            #
+            # Note what this does NOT do: these paths apply no author filter
+            # (the prefix is the author), so a site_manager viewing a worker can
+            # see merged rows authored by a pm lead they could not open directly.
+            # Bounded to a meeting that viewable worker attended on the caller's
+            # own site, and stated here rather than discovered later.
+            rows = [r for r in rows if str(r["site_id"]) in allowed]
         if not rows:
             return None
         # CRITICAL-1: cross-user graded view never merges the target's whole-day
@@ -6224,8 +6294,12 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     # exist for this (user, date) -- extraction-sourced OR report-sourced -- so
     # report-sourced content is editable exactly like extraction-sourced. Only
     # a day with NO Aurora topics at all keeps the byte-verbatim S3 contract.
-    for prefix in (f"extractions/{user}/{date}/", f"reports/{date}/{user}/"):
-        shape = _aurora_shape(prefix)
+    for prefix, merged in ((f"extractions/{user}/{date}/", merged_keys),
+                           (f"reports/{date}/{user}/", ())):
+        # merged keys only widen the EXTRACTIONS prefix. A merged record is an
+        # extraction artifact; unioning it into the report-sourced read would
+        # return the same rows twice under a different provenance.
+        shape = _aurora_shape(prefix, merged)
         if shape is not None:
             return ok(shape)
     if cross_user_clip:
