@@ -411,6 +411,23 @@ Parameters:
     AllowedValues: [transcribe, elevenlabs]
     Default: transcribe
 
+  AskVoiceModel:
+    Type: String
+    Description: >-
+      Model for the SPOKEN answer only; the screen answer keeps the deploy's.
+      Empty (default) means no override and nothing changes. Measured 2026-09-09
+      on the voice-shaped prompt, three runs each: muse-spark 6.53s with 651
+      completion tokens of which 599 were REASONING, against gemini-3.8-flash
+      3.33s with 32 completion and 0 reasoning. Nearly twice as fast because it
+      stops thinking, not because it writes less. The override always forces the
+      fast path -- the same measurement without an explicit effort gave gemini
+      538 reasoning tokens and 7.22s, SLOWER than the incumbent.
+      The sentinel is the word `none`, not an empty string: an override that
+      resolves to nothing renders a bare `AskVoiceModel=` and SAM exits 2 at
+      argument parsing, failing the WHOLE deploy the day the repo variable is
+      cleared. A word survives the round trip.
+    Default: none
+
   AskSttProvider:
     Type: String
     Description: >-
@@ -1711,6 +1728,7 @@ Resources:
           # named without a key RAISES rather than falling back, which is the
           # point -- see ElevenLabsAskApiKey's description.
           ASK_STT_PROVIDER: !Ref AskSttProvider
+          ASK_VOICE_MODEL: !Ref AskVoiceModel
           ELEVENLABS_ASK_API_KEY: !Ref ElevenLabsAskApiKey
           ELEVENLABS_STT_MODEL: !Ref ElevenLabsSttModel
           ELEVENLABS_LANGUAGE: !Ref ElevenLabsLanguage

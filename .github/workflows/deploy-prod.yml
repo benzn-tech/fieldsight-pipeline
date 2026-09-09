@@ -287,6 +287,7 @@ jobs:
               "NonWorkExpiryHours=${{ vars.PROD_NONWORK_EXPIRY_HOURS || '24' }}" \
               $NONWORK_SINCE_PARAM \
               "AskSttProvider=${{ vars.PROD_ASK_STT_PROVIDER || 'dashscope' }}" \
+              "AskVoiceModel=${{ vars.PROD_ASK_VOICE_MODEL || 'none' }}" \
               $EL_ASK_KEY_PARAM \
               "ElevenLabsApiKey=$ELEVENLABS_API_KEY"
 
