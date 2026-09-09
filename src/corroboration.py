@@ -53,7 +53,12 @@ RECONCILE_BUDGET = 6.0
 
 # Steps 1 and 4 are classification, not reasoning, and they are the two that pay
 # for the search step's twelve seconds.
-CHEAP_MODEL = os.environ.get("CORROBORATION_CHEAP_MODEL", "claude-haiku-4-5")
+# Extract and reconcile share the client with the search step, so this id has to
+# belong to the same vendor. Left at an Anthropic id after the swap, every
+# extract fails against a model OpenRouter does not have -- and `corroborate()`
+# reports a failed extraction as `timed_out`, so the user would be told the
+# check ran out of time on 100% of requests, forever, in four seconds.
+CHEAP_MODEL = os.environ.get("CORROBORATION_CHEAP_MODEL", "google/gemini-3.8-flash")
 
 STATES = frozenset({"corroborated", "conflicts", "not_found", "no_checkable_claim"})
 
@@ -219,7 +224,7 @@ def _search(allowed, budget):
         for a in allowed)
     return client.call(SEARCH_PROMPT.format(entities=lines),
                        timeout=budget, max_tokens=2048,
-                       tools=[client.WEB_SEARCH_TOOL], effort="low")
+                       web=True, effort="low")
 
 
 def _reconcile(allowed, findings, budget):

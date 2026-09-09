@@ -1,17 +1,21 @@
 """The client the corroboration steps use.
 
-Spec: docs/superpowers/specs/2026-08-31-ask-external-corroboration-design.md §5.4
+Spec: docs/superpowers/specs/2026-09-08-corroboration-off-anthropic-design.md
+(supersedes the vendor half of the 2026-08-31 design)
 
 The four reasons this module exists instead of `llm_utils` are each asserted
 here, because "we wrote a second client" is only worth the duplication if the
-second one actually behaves differently. Three of the four are silent failures in
-the shared client -- it would return a plausible answer with the search results
-missing -- so a test that only checks the happy path would pass against the code
-this module was written to avoid.
+second one actually behaves differently. Three of the four are silent failures
+in the shared client -- it would return a plausible answer with the search
+results missing -- so a test that only checks the happy path would pass against
+the code this module was written to avoid.
+
+This file was Anthropic-shaped until 2026-09-09. What changed is the vendor and
+the wire format; what did NOT change is every rule about honesty, and those
+tests are carried over deliberately rather than rewritten from scratch, so a
+reader can see the guarantees survived the port.
 """
 import json
-import sys
-import types
 
 import pytest
 
@@ -47,7 +51,7 @@ class FakePool:
 
 @pytest.fixture(autouse=True)
 def _key(monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("CORROBORATION_API_KEY", "test-key")
 
 
 def _install(monkeypatch, pool):
@@ -55,87 +59,85 @@ def _install(monkeypatch, pool):
     return pool
 
 
-def _body(text="", blocks=None, stop_reason="end_turn"):
-    return {"content": blocks if blocks is not None else [{"type": "text", "text": text}],
-            "stop_reason": stop_reason}
+def _body(text="hi", annotations=None, finish_reason="stop"):
+    message = {"content": text}
+    if annotations is not None:
+        message["annotations"] = annotations
+    return {"choices": [{"message": message, "finish_reason": finish_reason}]}
 
 
-SEARCH_BLOCKS = [
-    {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
-     "input": {"query": "Naylor Love Construction"}},
-    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [
-        {"type": "web_search_result", "url": "https://naylorlove.co.nz/about",
-         "title": "About - Naylor Love", "page_age": "2026-01-04"},
-        {"type": "web_search_result", "url": "https://example.com/nz-builders",
-         "title": "NZ builders", "page_age": None},
-    ]},
-    {"type": "text", "text": "Naylor Love is a New Zealand construction company.",
-     "citations": [{"type": "web_search_result_location",
-                    "url": "https://naylorlove.co.nz/about",
-                    "cited_text": "founded in 1910"}]},
+def _cite(url, title):
+    return {"type": "url_citation",
+            "url_citation": {"url": url, "title": title,
+                             "start_index": 0, "end_index": 10}}
+
+
+SEARCH_ANNOTATIONS = [
+    _cite("https://naylorlove.co.nz/about", "naylorlove.co.nz"),
+    _cite("https://example.com/nz-builders", "example.com"),
 ]
 
 
 # ------------------------------------------------ reason 4: results are not dropped
 
 def test_search_results_survive_the_parse():
-    """`llm_utils._call_anthropic` keeps only `type == "text"` blocks, so every
-    result and citation would vanish with the answer still looking fine. That is
-    the failure this whole module exists to prevent, so it is asserted first."""
-    reply = client._parse(_body(blocks=SEARCH_BLOCKS))
-    assert reply.ok
-    assert reply.searched is True
-    assert [r.url for r in reply.search_results] == [
-        "https://naylorlove.co.nz/about", "https://example.com/nz-builders"]
-    assert reply.search_results[0].title == "About - Naylor Love"
-    assert reply.text.startswith("Naylor Love is a New Zealand")
+    """`llm_utils` keeps only the text. Every source would vanish silently and
+    a plausible answer would still come back -- indistinguishable from the web
+    having nothing to say."""
+    reply = client._parse(_body("Naylor Love is a NZ construction company.",
+                                annotations=SEARCH_ANNOTATIONS))
+    assert reply.search_results == [
+        client.SearchResult("https://naylorlove.co.nz/about", "naylorlove.co.nz"),
+        client.SearchResult("https://example.com/nz-builders", "example.com"),
+    ]
+    assert reply.text == "Naylor Love is a NZ construction company."
 
 
 def test_citations_survive_the_parse():
-    """A card without its source is an unsourced claim wearing a card's clothes."""
-    reply = client._parse(_body(blocks=SEARCH_BLOCKS))
-    assert len(reply.citations) == 1
-    assert reply.citations[0]["url"] == "https://naylorlove.co.nz/about"
+    reply = client._parse(_body(annotations=SEARCH_ANNOTATIONS))
+    assert len(reply.citations) == 2
 
 
-def test_a_search_error_is_not_read_as_an_empty_web():
-    """`web_search_tool_result.content` is a LIST on success and a DICT on error,
-    and the HTTP status is 200 either way. Iterating the dict yields its keys and
-    quietly produces zero results -- which the caller would report as
-    `not_found`, i.e. a finding about the world rather than a fault in us."""
-    blocks = [
-        {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}},
-        {"type": "web_search_tool_result", "tool_use_id": "s1",
-         "content": {"type": "web_search_tool_result_error",
-                     "error_code": "max_uses_exceeded"}},
-        {"type": "text", "text": "I could not complete the search."},
-    ]
-    reply = client._parse(_body(blocks=blocks))
+def test_a_search_that_produced_nothing_is_not_a_search(monkeypatch):
+    """The muse-spark shape, and the reason `searched` is derived from results
+    rather than from prose. Measured 2026-09-08: HTTP 200, 1200 tokens, zero
+    annotations, and text reading "I'll search the web to verify... Initial
+    results support the claim." A model's account of its own tool use is not
+    evidence."""
+    reply = client._parse(_body("I'll search the web to verify this. "
+                                "Initial results support the claim."))
+    assert reply.searched is False
     assert reply.search_results == []
-    assert reply.searched is True, "the search ran and failed; that is not 'no search'"
-    # The load-bearing half. Without this the caller cannot tell a failed search
-    # from an empty one: iterating the error dict yields its keys, the item
-    # filter drops them, and zero results come back with nothing to say why.
-    # A first version of this test asserted only the empty list and stayed green
-    # with the guard deleted.
-    assert reply.search_error == "max_uses_exceeded"
 
 
-def test_a_successful_search_carries_no_search_error():
-    assert client._parse(_body(blocks=SEARCH_BLOCKS)).search_error is None
+def test_an_annotation_without_a_url_is_not_counted_as_a_source():
+    """`searched` is what the caller trusts. Padding it with entries that cite
+    nothing would defeat the guard it exists for."""
+    reply = client._parse(_body(annotations=[{"type": "url_citation",
+                                              "url_citation": {"title": "x"}}]))
+    assert reply.searched is False
+    assert reply.search_results == []
+
+
+def test_a_successful_search_says_it_searched():
+    reply = client._parse(_body(annotations=SEARCH_ANNOTATIONS))
+    assert reply.searched is True
+    assert reply.search_error is None
 
 
 def test_a_malformed_body_does_not_raise():
-    """The step must degrade to no cards, never to a 500 on the answer."""
-    for body in [{}, {"content": None}, {"content": ["not a dict", 7]},
-                 {"content": [{"type": "web_search_tool_result", "content": None}]}]:
-        assert client._parse(body).search_results == []
+    """A shape nobody expected must cost the cards, never the answer."""
+    for junk in ({}, {"choices": []}, {"choices": [None]},
+                 {"choices": [{"message": None}]},
+                 {"choices": [{"message": {"annotations": "not a list"}}]}):
+        reply = client._parse(junk)
+        assert reply.search_results == []
 
 
-# --------------------------------------------------- reason 1: the timeout is ours
+# --------------------------------------------- reason 1: the caller owns the clock
 
 def test_the_callers_timeout_reaches_the_request(monkeypatch):
-    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body("hi"))))
+    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body())))
     client.call("q", timeout=11.5)
     assert pool.calls[0]["timeout"] == 11.5, "the module constant won again"
 
@@ -143,7 +145,7 @@ def test_the_callers_timeout_reaches_the_request(monkeypatch):
 def test_a_timeout_too_small_to_use_spends_nothing(monkeypatch):
     """Below the floor there is no time for anything but a timeout, and burning
     the remaining budget on a doomed attempt is worse than saying so."""
-    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body("hi"))))
+    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body())))
     reply = client.call("q", timeout=0.5)
     assert not reply.ok
     assert pool.calls == [], "it made the request anyway"
@@ -155,14 +157,14 @@ def test_no_retry_unless_the_budget_was_stated(monkeypatch):
     """`llm_utils` retries four times. A caller that says nothing about its
     budget gets exactly one attempt here -- silence must not authorise spending
     the deadline twice."""
-    pool = _install(monkeypatch, FakePool(FakeResponse(503, {}), FakeResponse(200, _body("hi"))))
+    pool = _install(monkeypatch, FakePool(FakeResponse(503, {}), FakeResponse(200, _body())))
     reply = client.call("q", timeout=8)
     assert len(pool.calls) == 1
     assert not reply.ok
 
 
 def test_one_retry_when_the_budget_covers_a_whole_second_attempt(monkeypatch):
-    pool = _install(monkeypatch, FakePool(FakeResponse(503, {}), FakeResponse(200, _body("hi"))))
+    pool = _install(monkeypatch, FakePool(FakeResponse(503, {}), FakeResponse(200, _body())))
     reply = client.call("q", timeout=5, retry_budget=20)
     assert len(pool.calls) == 2
     assert reply.ok and reply.text == "hi"
@@ -170,7 +172,7 @@ def test_one_retry_when_the_budget_covers_a_whole_second_attempt(monkeypatch):
 
 def test_the_retry_is_never_a_third_attempt(monkeypatch):
     pool = _install(monkeypatch, FakePool(FakeResponse(503, {}), FakeResponse(503, {}),
-                                          FakeResponse(200, _body("hi"))))
+                                          FakeResponse(200, _body())))
     reply = client.call("q", timeout=5, retry_budget=999)
     assert len(pool.calls) == 2
     assert not reply.ok
@@ -179,17 +181,17 @@ def test_the_retry_is_never_a_third_attempt(monkeypatch):
 def test_a_budget_that_does_not_cover_a_second_attempt_buys_no_retry(monkeypatch):
     """`retry_budget` is what remains AFTER this attempt. 6 seconds does not fit
     another 5-second attempt plus the floor, so the retry must not be taken."""
-    pool = _install(monkeypatch, FakePool(FakeResponse(503, {}), FakeResponse(200, _body("x"))))
+    pool = _install(monkeypatch, FakePool(FakeResponse(503, {}), FakeResponse(200, _body())))
     client.call("q", timeout=5, retry_budget=6)
     assert len(pool.calls) == 1
 
 
 def test_a_client_error_is_not_retried(monkeypatch):
-    pool = _install(monkeypatch, FakePool(FakeResponse(400, {"error": {"message": "bad tool"}}),
-                                          FakeResponse(200, _body("hi"))))
+    pool = _install(monkeypatch, FakePool(FakeResponse(400, {"error": {"message": "bad plugin"}}),
+                                          FakeResponse(200, _body())))
     reply = client.call("q", timeout=5, retry_budget=99)
     assert len(pool.calls) == 1
-    assert reply.error == "bad tool"
+    assert reply.error == "bad plugin"
 
 
 def test_a_connection_failure_is_reported_not_raised(monkeypatch):
@@ -198,105 +200,111 @@ def test_a_connection_failure_is_reported_not_raised(monkeypatch):
     assert not reply.ok and "connection reset" in reply.error
 
 
-# --------------------------------------------------- reason 3: tools can be sent
+# ------------------------------------------ reason 3: it can actually search
 
-def test_the_web_search_tool_is_sent_when_asked(monkeypatch):
-    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body(blocks=SEARCH_BLOCKS))))
-    client.call("q", timeout=12, tools=[client.WEB_SEARCH_TOOL])
-    assert pool.calls[0]["body"]["tools"] == [client.WEB_SEARCH_TOOL]
+def test_the_web_plugin_is_sent_when_asked(monkeypatch):
+    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body(annotations=SEARCH_ANNOTATIONS))))
+    client.call("q", timeout=13, web=True)
+    assert pool.calls[0]["body"]["plugins"] == client.WEB_PLUGIN
 
 
-def test_the_search_tool_is_capped(monkeypatch):
-    """Twelve seconds does not hold six searches. The cap is on the tool, where
-    the model sees it, not on a loop we do not run."""
-    assert client.WEB_SEARCH_TOOL["max_uses"] <= 3
+def test_nothing_searches_unless_it_asked_to(monkeypatch):
+    """A classification step that quietly searched would spend the search step's
+    budget a second time, inside a hard stop that has no room for it."""
+    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body())))
+    client.call("q", timeout=8)
+    assert "plugins" not in pool.calls[0]["body"]
+
+
+def test_the_measured_pairing_is_the_one_that_ships():
+    """Vendor and request form are one decision, and measurement settled both.
+
+    n=3 per configuration, 2026-09-08: the plugin form answered in 10.3-11.4 s
+    with 4-7 sources; the `:online` suffix -- same model, same question -- was
+    over budget on all three runs; muse-spark returned zero sources while
+    asserting it had searched. Changing either half without re-measuring puts
+    the feature back somewhere it was already shown not to work.
+    """
+    assert client.WEB_PLUGIN == [{"id": "web"}]
+    assert client.DEFAULT_MODEL == "google/gemini-3.8-flash"
+    assert "openrouter.ai" in client.API_URL
 
 
 # ---------------------------------------------- the model-behaviour choices, pinned
 
-def test_thinking_is_never_disabled(monkeypatch):
-    """With thinking disabled, Claude Opus 5 sometimes writes a tool call into
-    its visible text instead of emitting `server_tool_use`. The turn succeeds,
-    the search never runs, and the caller reports `not_found`. Latency is bought
-    with effort instead."""
-    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body("hi"))))
-    client.call("q", timeout=12, tools=[client.WEB_SEARCH_TOOL])
-    assert "thinking" not in pool.calls[0]["body"]
+def test_effort_is_low_by_default_and_lives_under_reasoning(monkeypatch):
+    """Measured on the search prompt: effort low spent 0 reasoning tokens in
+    9.4 s, effort high spent 711 in 13.6 s -- past the search budget. The
+    default is latency, not cost."""
+    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body())))
+    client.call("q", timeout=13, web=True)
+    assert pool.calls[0]["body"]["reasoning"] == {"effort": "low"}
 
 
-def test_effort_is_low_by_default_and_lives_in_output_config(monkeypatch):
-    """Explicit model: the default is haiku, which rejects effort outright, so a
-    call with no model would prove nothing about where effort is placed."""
-    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body("hi"))))
-    client.call("q", timeout=12, model="claude-opus-5")
-    assert pool.calls[0]["body"]["output_config"] == {"effort": "low"}
-
-
-def test_the_search_pairing_is_the_measured_one():
-    """The tool version and the model default are one decision, and measurement
-    reversed the first version of it.
-
-    The better tool -- `web_search_20260209`, which filters results before they
-    reach the context -- requires Opus 4.6+/Sonnet 4.6+, and that pairing took
-    17 s per entity against a 12 s budget: three runs, three timeouts. Haiku with
-    the basic tool answers the same prompt in 4.2-4.7 s. Upgrading the tool
-    without also raising the budget puts the feature back where it could not
-    finish, so the two are pinned together here.
-    """
-    assert client.WEB_SEARCH_TOOL["type"] == "web_search_20250305"
-    assert client.DEFAULT_MODEL.startswith("claude-haiku")
+def test_effort_can_be_raised_by_a_caller_that_means_to(monkeypatch):
+    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body())))
+    client.call("q", timeout=13, effort="high")
+    assert pool.calls[0]["body"]["reasoning"] == {"effort": "high"}
 
 
 # ------------------------------------------------------ the property, not a case
 
-def test_the_client_is_anthropic_on_every_stack():
-    """TEST runs `LLM_PROVIDER=qwen`. If this module could route to DashScope,
-    the environment where the feature gets tested would exercise a different
-    model from prod, and the tests would mean nothing about what ships."""
+def test_the_client_is_one_vendor_on_every_stack():
+    """TEST and prod point their shared chat client at different models. If this
+    module could route through that machinery, the environment where the feature
+    gets tested would exercise a different model from prod and the tests would
+    mean nothing about what ships."""
     import inspect
     source = inspect.getsource(client)
-    # The module docstring names every provider it refuses to route to, and that
-    # explanation is the reason the module exists -- scanning it would forbid the
+    # The module docstring names the models it compared, and that comparison is
+    # the reason the module reads as it does -- scanning it would forbid the
     # documentation rather than the behaviour. The code below it is what matters.
     code = source.split('"""', 2)[-1]
-    for forbidden in ("llm_utils", "dashscope", "qwen", "LLM_PROVIDER",
-                      "QWEN_API_KEY", "elevenlabs"):
+    for forbidden in ("llm_utils", "dashscope", "DASHSCOPE", "LLM_PROVIDER",
+                      "QWEN_API_KEY", "anthropic", "elevenlabs"):
         assert forbidden not in code, f"the client can reach {forbidden}"
-    assert "api.anthropic.com" in code
+    assert "openrouter.ai" in code
+
+
+def test_the_key_is_its_own_and_not_the_chat_one(monkeypatch):
+    """`QWEN_API_KEY` on this function resolves to the DashScope key on any
+    stack still pointed there, and one vendor's credential 401s at another."""
+    import inspect
+    code = inspect.getsource(client).split('"""', 2)[-1]
+    assert "CORROBORATION_API_KEY" in code
 
 
 def test_a_missing_key_costs_the_cards_and_not_the_answer(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body("hi"))))
-    reply = client.call("q", timeout=12)
+    monkeypatch.delenv("CORROBORATION_API_KEY", raising=False)
+    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body())))
+    reply = client.call("q", timeout=13)
     assert not reply.ok and pool.calls == []
 
 
-def test_a_refusal_is_an_error_and_not_an_empty_finding(monkeypatch):
-    """HTTP 200, empty content. Read as "the web said nothing" it becomes a
-    claim about the world; it is a claim about our request."""
-    _install(monkeypatch, FakePool(FakeResponse(200, {"content": [], "stop_reason": "refusal"})))
-    reply = client.call("q", timeout=12)
-    assert not reply.ok and reply.error == "refused"
+def test_the_key_is_sent_as_a_bearer_token(monkeypatch):
+    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body())))
+    client.call("q", timeout=13)
+    assert pool.calls[0]["headers"]["Authorization"] == "Bearer test-key"
+
+
+def test_an_empty_completion_is_an_error_and_not_an_empty_finding(monkeypatch):
+    """HTTP 200 with nothing in it. Measured 2026-09-08: this model with no
+    plugin configured returns `completion_tokens: 0` and an empty string. Read
+    as findings that becomes "the web said nothing", which is a claim about the
+    world where the truth is a claim about our configuration."""
+    _install(monkeypatch, FakePool(FakeResponse(200, _body(""))))
+    reply = client.call("q", timeout=13)
+    assert not reply.ok and reply.error == "empty completion"
+
+
+def test_whitespace_is_not_content(monkeypatch):
+    _install(monkeypatch, FakePool(FakeResponse(200, _body("   \n "))))
+    reply = client.call("q", timeout=13)
+    assert not reply.ok
 
 
 def test_the_api_key_is_never_returned_in_the_reply(monkeypatch):
     """`Reply` ends up in logs. `__repr__` is where a secret leaves a process."""
     _install(monkeypatch, FakePool(FakeResponse(401, {"error": {"message": "bad key"}})))
-    reply = client.call("q", timeout=12)
+    reply = client.call("q", timeout=13)
     assert "test-key" not in repr(reply)
-
-
-def test_effort_is_dropped_for_a_model_that_rejects_it(monkeypatch):
-    """`output_config.effort` is a 400 on Haiku 4.5, and steps 1 and 4 run haiku.
-    The failure has no local symptom -- well-formed request, real model -- so the
-    only evidence would be a 400 in prod."""
-    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body("hi"))))
-    client.call("q", timeout=4, model="claude-haiku-4-5")
-    assert "output_config" not in pool.calls[0]["body"]
-
-
-def test_effort_is_still_sent_for_a_model_that_takes_it(monkeypatch):
-    pool = _install(monkeypatch, FakePool(FakeResponse(200, _body("hi"))))
-    client.call("q", timeout=4, model="claude-opus-5", effort="medium")
-    assert pool.calls[0]["body"]["output_config"] == {"effort": "medium"}
