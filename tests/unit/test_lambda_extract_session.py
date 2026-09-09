@@ -713,8 +713,11 @@ def test_no_turns_returns_none_without_claude_call(monkeypatch):
     result = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
 
     assert result is None
-    # No extraction is published -- the only write is the marker below.
-    assert not any(c["Key"].endswith(".json") for c in fake_s3.put_calls)
+    # No extraction is published. The only write is the skip marker, and
+    # naming it exactly is the point -- "nothing ending in .json" would also
+    # pass if this path started writing something else entirely.
+    assert [c["Key"] for c in fake_s3.put_calls] == [
+        les.skip_marker_key("Benl1", "2026-07-06", SESSION_BASE)]
 
 
 def test_a_skipped_session_records_why_it_was_skipped(monkeypatch):
@@ -727,7 +730,15 @@ def test_a_skipped_session_records_why_it_was_skipped(monkeypatch):
     way to tell those from the one session that really was never summarised, so
     it counted all ten and the alarm went red over nothing.
     """
-    fake_s3 = FakeS3({SEG1_KEY: "{not valid json at all"})
+    # A transcript that READS FINE and says nothing -- this is the shape all
+    # nine prod false positives had, 77 to 81 bytes of "[background noise]"
+    # with no items. Driving this test with corrupt JSON instead would pin the
+    # wrong case: a session whose segments cannot be parsed is a fault, not
+    # silence, and marking it "no-usable-turns" is a known limitation of this
+    # path rather than something to enshrine here.
+    silent = json.dumps({"results": {"transcripts": [{"transcript": "[background noise]"}],
+                                     "items": []}})
+    fake_s3 = FakeS3({SEG1_KEY: silent})
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
     monkeypatch.setattr(llm_utils, "call_llm",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM")))

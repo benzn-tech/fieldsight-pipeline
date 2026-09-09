@@ -64,14 +64,16 @@ REQ_KEY = f"extraction_requests/{SID}.json"
 
 
 def _world(*, when=OLD, transcripts=True, extracted=False, body=None,
-           skipped_marker=False):
+           skipped_marker=False, marker_when=None, transcript_when=None):
     objs = {REQ_KEY: when}
     if transcripts:
-        objs[f"transcripts/Neil_Blunden/2026-09-02/x_sid{SID}_c0000.json"] = when
+        objs[f"transcripts/Neil_Blunden/2026-09-02/x_sid{SID}_c0000.json"] = (
+            transcript_when or when)
     if extracted:
         objs[f"extractions/Neil_Blunden/2026-09-02/sid{SID}.json"] = when
     if skipped_marker:
-        objs[f"extractions/Neil_Blunden/2026-09-02/sid{SID}.skipped"] = when
+        objs[f"extractions/Neil_Blunden/2026-09-02/sid{SID}.skipped"] = (
+            marker_when or when)
     return FakeS3(objs, {REQ_KEY: body if body is not None else _req(SID)})
 
 
@@ -240,3 +242,46 @@ def test_backlog_and_extractor_agree_on_the_marker_key():
     les = pytest.importorskip("lambda_extract_session")
     assert les.skip_marker_key("Neil_Blunden", "2026-09-02", f"sid{SID}") == (
         f"extractions/Neil_Blunden/2026-09-02/sid{SID}{bl.SKIP_MARKER_SUFFIX}")
+
+
+# ---------------------------------------------------------------------------
+# A marker only speaks for the transcripts that existed when it was written.
+#
+# extract_session runs on EVERY transcript chunk, and the first chunk of a
+# session is very often just the device saying "Recording started" -- filtered,
+# no usable turns, marker written, all before any LLM call. Speech arrives in a
+# later chunk. If the passes for those chunks then fail (the 2026-09-02 arrears
+# outage is the case this whole probe was built for), no extraction is ever
+# published but the marker is already there.
+#
+# Measured on prod while reviewing this: since 2026-08-20, 2 of 17 sessions
+# have a sub-200-byte first chunk followed by a real-speech chunk. Honouring
+# the marker unconditionally would hide roughly one session in eight, exactly
+# when extraction is broken.
+# ---------------------------------------------------------------------------
+
+def test_a_transcript_newer_than_the_marker_reopens_the_backlog():
+    world = _world(skipped_marker=True,
+                   marker_when=OLD - timedelta(hours=2),
+                   transcript_when=OLD)
+    recent, everything, _ = bl.scan(world, now=NOW)
+    assert len(recent) == 1 and recent[0]["session"] == f"sid{SID}"
+
+
+def test_a_marker_written_after_the_last_transcript_still_silences_it():
+    """The ordinary case: nobody spoke in any chunk, extraction looked at the
+    finished session and passed over it."""
+    world = _world(skipped_marker=True,
+                   transcript_when=OLD - timedelta(hours=2),
+                   marker_when=OLD)
+    recent, everything, _ = bl.scan(world, now=NOW)
+    assert recent == [] and everything == []
+
+
+def test_a_marker_exactly_as_old_as_the_transcript_is_honoured():
+    """Same second is the common case -- the pass that wrote the marker is the
+    one the transcript triggered. A strict > would reopen every silent
+    session and put the alarm right back where it started."""
+    world = _world(skipped_marker=True, marker_when=OLD, transcript_when=OLD)
+    recent, everything, _ = bl.scan(world, now=NOW)
+    assert recent == [] and everything == []

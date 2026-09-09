@@ -103,7 +103,16 @@ def scan(client, now=None):
     cutoff_new = now - timedelta(minutes=GRACE_MINUTES)
     cutoff_old = now - timedelta(days=WINDOW_DAYS)
 
-    done = set(_keys(client, "extractions/"))
+    # One listing, two questions: what was published, and when each skip
+    # marker was written. The marker's age is load-bearing (see below), so
+    # unlike `done` it cannot be a bare set of keys.
+    done, marker_at = set(), {}
+    for obj in _objects(client, "extractions/"):
+        key = obj["Key"]
+        if key.endswith(SKIP_MARKER_SUFFIX):
+            marker_at[key] = obj["LastModified"]
+        else:
+            done.add(key)
     tx_by_day = {}
     recent, everything, skipped = [], [], 0
 
@@ -123,24 +132,35 @@ def scan(client, now=None):
         if f"extractions/{folder}/{date}/{base}.json" in done:
             continue
 
-        # Extraction looked at this session and decided there was nothing in
-        # it. Measured on prod 2026-09-09: ten sessions were being reported
-        # here and nine were this -- transcripts of "[background noise]" or the
-        # device saying "Recording started", 77 to 81 bytes with no items. The
-        # transcripts check below cannot see that, because a transcript FILE is
-        # not evidence that anybody spoke. Reading the extractor's own decision
-        # is the only version of this that cannot drift away from it.
-        if f"extractions/{folder}/{date}/{base}{SKIP_MARKER_SUFFIX}" in done:
-            continue
-
         # THE DISCRIMINATOR. No transcripts means VAD found no speech and there
         # was nothing to summarise -- 42 of 53 unfulfilled requests on prod are
         # this, and counting them would bury the eleven that matter.
         day = (folder, date)
         if day not in tx_by_day:
-            tx_by_day[day] = _keys(client, f"transcripts/{folder}/{date}/")
+            tx_by_day[day] = [(o["Key"], o["LastModified"])
+                              for o in _objects(client, f"transcripts/{folder}/{date}/")]
         sid = base[3:] if base.startswith("sid") else base
-        if not any(sid in k for k in tx_by_day[day]):
+        mine = [when for k, when in tx_by_day[day] if sid in k]
+        if not mine:
+            continue
+
+        # Extraction looked at this session and decided there was nothing in
+        # it. Measured on prod 2026-09-09: ten sessions were being reported
+        # here and nine were this -- transcripts of "[background noise]" or the
+        # device saying "Recording started", 77 to 81 bytes with no items. A
+        # transcript FILE is not evidence that anybody spoke, so the check
+        # above cannot see it; reading the extractor's own decision is the only
+        # version that cannot drift away from what actually runs.
+        #
+        # ONLY for the transcripts it saw. extract_session runs on every chunk,
+        # and a session's first chunk is very often just "Recording started" --
+        # filtered, no usable turns, marker written, all before any LLM call.
+        # Speech lands in a later chunk. If those passes then fail (the arrears
+        # outage this probe exists for), nothing is ever published and a stale
+        # marker would hide it. On prod, 2 of the 17 sessions since 2026-08-20
+        # have that shape.
+        marked = marker_at.get(f"extractions/{folder}/{date}/{base}{SKIP_MARKER_SUFFIX}")
+        if marked is not None and marked >= max(mine):
             continue
 
         item = {"folder": folder, "date": date, "session": base,
