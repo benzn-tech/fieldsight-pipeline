@@ -45,14 +45,32 @@ logger = logging.getLogger()
 # ApiFunction dies at 30 s, and an agent still working at 35 s is answering a
 # proxy that is already gone. The stop is internal and earlier than the target
 # so the caller always gets a shaped body rather than a gateway error.
-HARD_STOP_SECONDS = float(os.environ.get("CORROBORATION_HARD_STOP", "24"))
+# API Gateway terminates the integration at 29s whatever this file says, so the
+# stop stays under it: past that a missed deadline stops being a shaped
+# `timed_out` body and becomes a raw gateway error, which hides the one fact
+# this module exists to report.
+HARD_STOP_SECONDS = float(os.environ.get("CORROBORATION_HARD_STOP", "27"))
 
+# Sized from measurement, 2026-09-09, against the deployed vendor and using the
+# prompts in THIS file -- an earlier attempt measured a paraphrase of them and
+# over-stated extract by more than double, which is how it concluded the whole
+# budget needed rebalancing:
+#
+#     extract    n=8   2.41 ... 2.79   max 2.79
+#     reconcile  n=8   2.16 ... 3.58   max 3.58
+#     search     n=3   10.3 11.3 11.4  max 11.4
+#
+# Only SEARCH was ever near its slice: 11.4s against 12s, half a second of
+# margin on a step whose overrun is charged to reconcile. The other two were
+# comfortable and are unchanged. A single 13.09s extract outlier appeared once
+# and never again in the following sixteen calls; it is why these keep real
+# margin instead of hugging the maximum.
 EXTRACT_BUDGET = 4.0
-SEARCH_BUDGET = 12.0
+SEARCH_BUDGET = 15.0
 RECONCILE_BUDGET = 6.0
 
 # Steps 1 and 4 are classification, not reasoning, and they are the two that pay
-# for the search step's twelve seconds.
+# for the search step.
 # Extract and reconcile share the client with the search step, so this id has to
 # belong to the same vendor. Left at an Anthropic id after the swap, every
 # extract fails against a model OpenRouter does not have -- and `corroborate()`

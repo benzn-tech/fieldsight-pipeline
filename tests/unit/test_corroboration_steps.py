@@ -250,7 +250,12 @@ def test_a_slow_first_step_leaves_the_later_steps_less_not_more(monkeypatch):
                               "state": "not_found", "summary": "x"}))
     monkeypatch.setattr(steps.client, "call", fake)
     steps.corroborate("q", "a", clock=lambda: next(ticks))
-    assert fake.calls[1]["timeout"] <= 4.0, "the search step ignored the elapsed time"
+    # Expressed against the constant, not a literal: the property is "what is
+    # left of the deadline", and a hard-coded number silently becomes an
+    # assertion about the old budget the next time one changes.
+    left = steps.HARD_STOP_SECONDS - 20.0
+    assert fake.calls[1]["timeout"] <= left, "the search step ignored the elapsed time"
+    assert fake.calls[1]["timeout"] < steps.SEARCH_BUDGET, "it took its full slice anyway"
 
 
 def test_the_cheap_steps_never_send_effort(monkeypatch):
@@ -383,3 +388,67 @@ def test_a_vendor_that_gives_no_date_leaves_it_empty_rather_than_inventing_one()
     vendor supplies no page age. Absent is honest; today's date would not be."""
     s = _source_of("https://example.org/a", "example.org")
     assert s["published"] is None
+
+
+# ------------------------------------------- each slice against what was measured
+
+# The existing test above asserts only that the slices SUM under the hard stop.
+# Three wrong numbers satisfy that as easily as three right ones, and an earlier
+# draft of this change proposed exactly that: extract 3 + search 15 + reconcile 4,
+# reasoned from "classification is cheap" and never measured. It would have
+# shipped green.
+#
+# Measured 2026-09-09 against the deployed vendor, USING THE PROMPTS IN THIS FILE
+# rather than a paraphrase of them -- the paraphrase is what made the first
+# attempt wrong, and it over-stated extract by more than double:
+#
+#     extract    n=8   2.41 2.47 2.48 2.50 2.58 2.72 2.76 2.79   max 2.79
+#     reconcile  n=8   2.16 2.38 2.63 2.80 3.10 3.10 3.11 3.58   max 3.58
+#     search     n=3   10.3 11.4 11.3                            max 11.4
+#
+# So of the three, only SEARCH was ever near its slice: 11.4s against 12s. The
+# other two have been comfortable all along, and the budget did not need the
+# rebalance the plan called for.
+#
+# One 13.09s outlier was seen on a single extract call and never reproduced in
+# the following sixteen. It is why the slices keep real margin rather than
+# hugging the maximum, and why nothing here is sized from a median.
+
+MEASURED_WORST = {"extract": 2.79, "search": 11.4, "reconcile": 3.58}
+
+# API Gateway terminates the integration at 29s no matter what this file says.
+# A hard stop past it converts a shaped `timed_out` body into a raw gateway
+# error, which is strictly worse: the module's contract is that a missed
+# deadline is REPORTED, never disguised.
+GATEWAY_CEILING = 29.0
+
+
+@pytest.mark.parametrize("name,budget", [
+    ("extract", "EXTRACT_BUDGET"),
+    ("search", "SEARCH_BUDGET"),
+    ("reconcile", "RECONCILE_BUDGET"),
+])
+def test_every_slice_clears_its_measured_worst_case(name, budget):
+    """Not merely bigger -- bigger with room. A slice that overruns does not
+    fail politely, it spends the NEXT step's budget and the reader is told the
+    check ran out of time."""
+    slice_s = getattr(steps, budget)
+    worst = MEASURED_WORST[name]
+    assert slice_s >= worst * 1.25, (
+        "%s has %.1fs for a step measured at %.2fs; less than 25%% margin"
+        % (name, slice_s, worst))
+
+
+def test_the_hard_stop_still_fits_inside_the_gateway():
+    """The one ceiling this file does not own."""
+    assert steps.HARD_STOP_SECONDS < GATEWAY_CEILING
+
+
+def test_the_slices_fit_inside_the_hard_stop_with_the_floor_to_spare():
+    """Each step also needs MIN_USEFUL_TIMEOUT of slack before it, or the last
+    one is refused for having no time left -- which reads to the caller as a
+    timeout rather than as arithmetic."""
+    total = steps.EXTRACT_BUDGET + steps.SEARCH_BUDGET + steps.RECONCILE_BUDGET
+    assert total + client.MIN_USEFUL_TIMEOUT <= steps.HARD_STOP_SECONDS, (
+        "%.1fs of slices plus the floor does not fit in %.1fs"
+        % (total, steps.HARD_STOP_SECONDS))
