@@ -397,3 +397,33 @@ def test_a_group_request_missing_its_merged_key_is_a_fault_not_a_meeting():
     bad = {"groupId": GROUP_ID, "members": _group_req()["members"]}
     recent, everything, skipped = bl.scan(_group_world(req=bad), now=NOW)
     assert skipped == 1 and recent == [] and everything == []
+
+
+# ---------------------------------------------------------------------------
+# A bad request object must cost one line, not the whole probe.
+#
+# Counting rather than crashing is this module's stated design ("a request
+# whose JSON will not parse ... would otherwise be indistinguishable from a
+# healthy fulfilled request"). A crash is far worse than a miscount here: no
+# metric is published, `TreatMissingData: breaching` fires the alarm, and the
+# real backlog stops being reported until somebody finds and deletes the
+# object by hand. The alarm would be red for the wrong reason and blind at the
+# same time.
+#
+# All three current writers put dicts, so reaching this needs a manual upload
+# or a bug in one of them -- which is exactly when the probe must keep working.
+# ---------------------------------------------------------------------------
+
+# `None` is the helper's "use the default" sentinel, so JSON null is spelled
+# as the bytes the parser would actually receive.
+@pytest.mark.parametrize("body", [b"null", 7, [], "text", {"userFolder": "F"}])
+def test_a_request_that_is_not_a_valid_object_is_counted_not_fatal(body):
+    recent, everything, skipped = bl.scan(_world(body=body), now=NOW)
+    assert skipped == 1 and recent == [] and everything == []
+
+
+@pytest.mark.parametrize("members", ["notalist", [None], [7], []])
+def test_a_group_whose_members_are_not_objects_is_counted_not_fatal(members):
+    bad = dict(_group_req(), members=members)
+    recent, everything, skipped = bl.scan(_group_world(req=bad), now=NOW)
+    assert skipped == 1 and recent == [] and everything == []

@@ -146,15 +146,27 @@ def scan(client, now=None):
             logger.warning("backlog: unreadable request %s", obj["Key"])
             continue
 
+        # Counting rather than crashing is the point of this whole branch, so
+        # the shape checks belong beside the parse and not after it. A probe
+        # that dies on one bad object publishes no metric at all, which under
+        # `TreatMissingData: breaching` fires the alarm AND stops reporting the
+        # real backlog until somebody deletes the object by hand.
+        if not isinstance(req, dict):
+            skipped += 1
+            logger.warning("backlog: unreadable request %s", obj["Key"])
+            continue
+
         is_group = (obj["Key"].startswith(REQUEST_PREFIX + GROUP_REQUEST_MARKER)
                     or "members" in req or "groupId" in req)
         if is_group:
-            if not (req.get("groupId") and req.get("mergedKey") and req.get("members")):
+            members = req.get("members")
+            members = [m for m in members if isinstance(m, dict)] if isinstance(members, list) else []
+            if not (req.get("groupId") and req.get("mergedKey") and members):
                 skipped += 1
                 logger.warning("backlog: group request %s is missing "
                                "groupId/mergedKey/members", obj["Key"])
                 continue
-            groups.append((obj, req))
+            groups.append((obj, dict(req, members=members)))
         elif not (req.get("userFolder") and req.get("date") and req.get("sessionBase")):
             skipped += 1
             logger.warning("backlog: unreadable request %s", obj["Key"])
@@ -192,6 +204,11 @@ def scan(client, now=None):
         return marked is not None and marked >= max(landed)
 
     # Meetings first, so their members can be recognised below.
+    # extract_group merges only the first GROUP_MAX_MEMBERS devices and names
+    # the rest in the artifact's omittedMembers. This map covers ALL of them,
+    # so a fifth device whose own extraction was also lost is silenced here.
+    # Reading omittedMembers is not an option: this role has no GetObject on
+    # `extractions/` at all, only ListBucket. Recorded as a known edge.
     covered = {}
     for obj, req in groups:
         merged = req["mergedKey"]
