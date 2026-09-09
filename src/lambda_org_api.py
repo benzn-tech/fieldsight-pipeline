@@ -7393,15 +7393,38 @@ def _read_org_report_history(folder_scope, limit):
     short-circuited the deny-all (empty set) case before getting here.
 
     Row shape is byte-compatible with the legacy endpoint's
-    ({key, type, date, generated_at, size}) so pages/reports.js needs no
-    reshape. A listing failure degrades to an empty list -- never to an
-    unfiltered one."""
+    ({key, type, date, generated_at, size} plus optional {docx_key, docx_size})
+    so pages/reports.js needs no reshape. A listing failure degrades to an empty
+    list -- never to an unfiltered one.
+
+    THE WORD FILE. The generator has always written `daily_report.docx` beside
+    the JSON -- 181 of them in prod -- and this endpoint listed only the JSON, so
+    the UI's "Download .docx" button presigned the JSON and every download handed
+    the user the wrong file.
+
+    That was fixed on the LEGACY gateway (`lambda_fieldsight_api.get_report_history`)
+    and the fix could not reach anybody: `scripts/api/reports.js` routes history
+    HERE whenever `timelineSource === 'aurora'` and an org base URL is set, which
+    is exactly prod's Amplify config. Two gateways serve `/reports/history`, the
+    one that was repaired is not the one production calls, and the frontend's
+    "fall back to .json when there is no docx_key" then fired on every single row.
+    Fixing one gateway and not the other is this repo's oldest trap and it caught
+    the fix itself.
+
+    Collected in the same listing pass rather than probed per row: a HeadObject
+    each would be a round trip to learn something this listing already carries,
+    and a presigned URL for a key that does not exist answers 403 here rather
+    than 404, so the failure would not even read as "missing"."""
     reports = []
+    docx_sizes = {}
     try:
         paginator = s3().get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=LAKE_BUCKET, Prefix=REPORT_LAKE_PREFIX):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
+                if key.endswith("_report.docx"):
+                    docx_sizes[key] = obj["Size"]
+                    continue
                 if not key.endswith("_report.json") or "_debug" in key:
                     continue
                 if folder_scope is not None:
@@ -7422,6 +7445,18 @@ def _read_org_report_history(folder_scope, limit):
         # S3 problem must not 500 the Reports page, and must not fall back
         # to anything unfiltered either.
         logger.exception("report history listing failed")
+
+    # ABSENT, NOT EMPTY, when there is no Word file. Word generation disables
+    # itself when the python-docx layer is missing or built for another runtime
+    # -- one log line, no error -- and one prod day already has a .json with no
+    # .docx beside it. A client must be able to tell "this report has no Word
+    # file" from "this backend never sends one", and only absence says that.
+    for r in reports:
+        cand = r["key"][:-len(".json")] + ".docx"
+        if cand in docx_sizes:
+            r["docx_key"] = cand
+            r["docx_size"] = docx_sizes[cand]
+
     reports.sort(key=lambda r: r["date"], reverse=True)
     return {"reports": reports[:limit]}
 
