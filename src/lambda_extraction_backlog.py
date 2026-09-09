@@ -159,6 +159,17 @@ def scan(client, now=None):
         # outage this probe exists for), nothing is ever published and a stale
         # marker would hide it. On prod, 2 of the 17 sessions since 2026-08-20
         # have that shape.
+        #
+        # The timestamp is a PROXY for "which transcripts that pass saw", and
+        # it is not exact under concurrency: a speech chunk landing in the
+        # second or two between a silent pass's listing and its put leaves a
+        # marker newer than a transcript it never read. Sequential arrivals are
+        # safe -- gather_session_segments re-reads the whole session, so once
+        # any chunk holds speech no later pass can reach M-6 at all -- but a
+        # reconnect burst is not sequential. It also needs an extraction outage
+        # in the same moment to hide anything. Recorded rather than closed; the
+        # exact fix is for the marker to carry the keys it saw and for this to
+        # compare sets.
         marked = marker_at.get(f"extractions/{folder}/{date}/{base}{SKIP_MARKER_SUFFIX}")
         if marked is not None and marked >= max(mine):
             continue
