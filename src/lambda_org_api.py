@@ -110,6 +110,7 @@ Secrets Manager call from a NAT-less VPC). Cognito calls need the
 cognito-idp VPC interface endpoint (db stack).
 """
 import json
+import site_coords
 import logging
 import os
 import re
@@ -2608,6 +2609,7 @@ def create_org_site(conn, caller, body):
         if not _relocate_asset(icon, final_icon):
             return error("upload expired or missing — please re-upload the image", 400)
         row = sites.set_site_icon(conn, row["id"], final_icon)
+    _publish_site_coords(row)
     return ok(row, 201)
 
 
@@ -2661,7 +2663,48 @@ def patch_org_site(conn, caller, site_id, body):
         row = sites.set_site_icon(conn, site_id, final_icon)
         if old_icon and old_icon != final_icon:
             _delete_asset(old_icon)
+    _publish_site_coords(row)
     return ok(row)
+
+
+def _publish_site_coords(row):
+    """Put this site's coordinate where the report generator can read it.
+
+    WHY IT HAS TO BE PUBLISHED AT ALL. The generator fetches weather, stores it
+    on the report and feeds it to the prompt with a correlation instruction --
+    and has never produced one, because it takes the coordinate from
+    config/user_mapping.json, where every site is null, while the coordinates
+    entered here live in Aurora. The generator has no VpcConfig (deliberately:
+    it needs egress for the model and the weather API), so it cannot read
+    Aurora. S3 is the only place both of them stand.
+
+    NOT user_mapping.json. Nothing in this repository writes that file -- six
+    lambdas read it and people maintain it by hand, alongside the device
+    mapping and the reassignment log. This writes a separate machine-owned
+    object, and the IAM grant names that one key rather than the config/
+    prefix, so a bug here cannot reach the hand-maintained file.
+
+    NEVER RAISES, and that is the whole contract. Saving a project must not
+    fail because a config object could not be refreshed; the cost of a missed
+    publish is a report without weather, which is exactly where we already
+    are. Logged at exception level rather than swallowed -- a guard that only
+    speaks when someone is watching cannot be told from one that never ran.
+    """
+    try:
+        slug = site_coords.slug_for_site(row)
+        if not slug:
+            return
+        doc = _get_lake_json(site_coords.KEY) or {}
+        merged = site_coords.merge_site(doc, row)
+        if merged == doc:
+            return                      # nothing moved; do not rewrite the object
+        s3().put_object(
+            Bucket=LAKE_BUCKET, Key=site_coords.KEY,
+            Body=json.dumps(merged, indent=2, default=str).encode("utf-8"),
+            ContentType="application/json")
+        logger.info("site-coords: published %s (%d site(s) placed)", slug, len(merged))
+    except Exception:  # noqa: BLE001 - see docstring
+        logger.exception("site-coords: publish failed for %s", (row or {}).get("id"))
 
 
 def list_site_members(conn, caller, site_id):
