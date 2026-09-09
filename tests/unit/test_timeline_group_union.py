@@ -94,7 +94,7 @@ def test_a_failed_group_lookup_does_not_500_the_timeline():
         def cursor(self, **kw):
             raise RuntimeError("db down")
 
-    assert org._merged_keys_for_caller(_Boom(), {"id": "u-1"}, "2026-08-07") == []
+    assert org._merged_keys_for(_Boom(), {"id": "u-1"}, "2026-08-07") == []
 
 
 def test_groups_for_user_uses_the_NZ_day():

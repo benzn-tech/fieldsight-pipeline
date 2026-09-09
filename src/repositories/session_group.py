@@ -177,3 +177,38 @@ def rearm(conn, group_id) -> bool:
         (group_id,),
     ).fetchone()
     return row is not None
+
+
+def merged_keys_for_user(conn, user_id, report_date) -> list[str]:
+    """Merged artifact keys for the groups this user was in on that NZ date.
+
+    One implementation because there were two: lambda_ingest._merged_keys_for
+    and lambda_org_api._merged_keys_for_caller were the same six lines, and a
+    rule with two copies is how one of them later learns something the other
+    does not -- the reason elide_middle was factored out of the two transcript
+    limiters.
+
+    The key is READ from session_group, never re-derived. Re-deriving it as
+    group_merged_key(folder, date, gid) looks identical in review and is wrong
+    the moment a meeting straddles NZ midnight: the joiner who opened at 00:05
+    on D2 belongs to a group whose merged record is filed under the LEAD's D1.
+    Reading the stored key survives that; computing one from the viewer's date
+    produces a key for a day that has no rows.
+
+    Groups this user was not in are unreachable by construction, so nothing here
+    widens what a caller may see. Callers are responsible for deciding whether a
+    resolved key may bypass their ACL -- that is a question about the CALLER, not
+    about this lookup, and org-api answers it differently for an own-day view
+    than for someone else's.
+
+    Raises like every other repository here. A caller that must not fail its read
+    wraps it; org-api does, deliberately, because a missing merged record is a
+    stale timeline while a raised one is no timeline at all.
+    """
+    from repositories import meeting_session
+    keys = []
+    for gid in meeting_session.groups_for_user_on_date(conn, user_id, report_date):
+        row = get(conn, gid)
+        if row and row.get("merged_key"):
+            keys.append(row["merged_key"])
+    return keys
