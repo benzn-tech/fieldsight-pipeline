@@ -283,4 +283,103 @@ def stt_short(audio_bytes, filename="clip.wav"):
             last = "HTTP %d" % resp.status
         if attempt == 1:
             time.sleep(1.0)
-    raise RuntimeError("ElevenLabs STT failed after 2 attempts: %s" % last)
+    raise RuntimeError("ElevenLabs STT failed after 2 attempts: %s" % last)
+
+
+# --- TTS for the voice Ask path --------------------------------------------
+#
+# ITS OWN KEY AGAIN, for the reason stt_short states: EL credit is a shared
+# per-key pool and running out looks like the feature simply stopping. Three
+# consumers now want EL -- the recording pipeline's transcription, Ask's STT,
+# and this -- and a shared pool would let any one of them silently stop the
+# other two. No key, no provider.
+ELEVENLABS_TTS_API_KEY = os.environ.get("ELEVENLABS_API_KEY_TTS", "")
+ELEVENLABS_TTS_URL = os.environ.get(
+    "ELEVENLABS_TTS_URL", "https://api.elevenlabs.io/v1/text-to-speech")
+ELEVENLABS_TTS_VOICE = os.environ.get(
+    "ELEVENLABS_TTS_VOICE", "bPkjmCb0W1xUBvyH2Afs")
+# v3 conversational, chosen on measurement rather than the docs. Measured
+# 2026-09-09 on this endpoint, one two-sentence answer:
+#
+#   DashScope (incumbent)      2.07s
+#   eleven_v3_conversational   1.01s   <- twice as fast, and the expressive model
+#   eleven_v3                  2.83s
+#   eleven_flash_v2_5          0.51s   <- fastest, least expressive
+#
+# The vendor documents v3-conversational on the Text-to-Dialogue WebSocket, so
+# the obvious reading is that it needs a second client. It does not: the plain
+# HTTP /stream endpoint accepts it, verified with a 200 and real audio. Flash is
+# half a second quicker and is the fallback if expressiveness stops mattering,
+# but this is a voice a person on a site listens to, and one second is already
+# well inside the wait the rest of the chain imposes.
+ELEVENLABS_TTS_MODEL = os.environ.get(
+    "ELEVENLABS_TTS_MODEL", "eleven_v3_conversational")
+# 1.2 = 20% faster than written, at the owner's request. Verified to take
+# effect rather than be silently accepted: the same sentence rendered 5.36s at
+# default and 5.20s at 1.2 on v3-conversational, 4.64 -> 3.81 on flash. A
+# vendor that ignores an unknown field returns 200 either way, so the audio
+# length is the only proof.
+ELEVENLABS_TTS_SPEED = float(os.environ.get("ELEVENLABS_TTS_SPEED", "1.2"))
+ELEVENLABS_TTS_TIMEOUT_SECONDS = float(
+    os.environ.get("ELEVENLABS_TTS_TIMEOUT_SECONDS", "10"))
+
+
+def tts(text):
+    """Synthesize one spoken answer. Returns raw PCM 24k mono 16-bit.
+
+    Returns PCM rather than WAV so the caller wraps it with the same
+    `_pcm_to_wav` the incumbent uses -- the device is handed an identical
+    container either way and never learns which vendor spoke.
+
+    The incumbent measured 2.07s total for a two-sentence answer: 1.0s of
+    connection and 0.75s of model. Pre-opening its socket during STT+LLM was
+    tested and saved NOTHING (2.07 -> 2.08), because connect() is synchronous.
+    So this is not expected to be dramatically faster; it is here because the
+    owner asked for one voice vendor, and because the incumbent's model carries
+    a vendor retirement note. Measure before switching a stack -- the repo's one
+    EL timing data point on long audio runs the OTHER way (86.7s vs 50.7s).
+
+    ONE retry on 429/5xx only, like stt_short: a permanent 4xx will not become
+    valid on a second try, and spending the user's remaining seconds proving it
+    is how a slow answer becomes no answer against a 29s ceiling."""
+    if not ELEVENLABS_TTS_API_KEY:
+        raise RuntimeError("ELEVENLABS_API_KEY_TTS not set")
+    if not text or not text.strip():
+        return b""
+
+    url = "%s/%s/stream?output_format=pcm_24000" % (
+        ELEVENLABS_TTS_URL.rstrip("/"), ELEVENLABS_TTS_VOICE)
+    payload = {"text": text, "model_id": ELEVENLABS_TTS_MODEL}
+    if ELEVENLABS_TTS_SPEED and ELEVENLABS_TTS_SPEED != 1.0:
+        payload["voice_settings"] = {"speed": ELEVENLABS_TTS_SPEED}
+    body = json.dumps(payload).encode()
+    headers = {"xi-api-key": ELEVENLABS_TTS_API_KEY,
+               "Content-Type": "application/json",
+               "Accept": "audio/pcm"}
+
+    http = urllib3.PoolManager()
+    last = None
+    for attempt in (1, 2):
+        try:
+            resp = http.request("POST", url, body=body, headers=headers,
+                                timeout=ELEVENLABS_TTS_TIMEOUT_SECONDS)
+        except Exception as e:
+            last = "request failed: %r" % (e,)
+        else:
+            if resp.status == 200:
+                audio = resp.data or b""
+                if not audio:
+                    raise RuntimeError("ElevenLabs TTS returned no audio")
+                logger.info("tts: provider=elevenlabs model=%s bytes=%d "
+                            "audio_seconds=%.2f chars=%d voice=%s speed=%.2f",
+                            ELEVENLABS_TTS_MODEL, len(audio),
+                            len(audio) / 48000.0, len(text),
+                            ELEVENLABS_TTS_VOICE, ELEVENLABS_TTS_SPEED)
+                return audio
+            if resp.status != 429 and resp.status < 500:
+                raise RuntimeError("ElevenLabs TTS: HTTP %d %s"
+                                   % (resp.status, resp.data[:200]))
+            last = "HTTP %d" % resp.status
+        if attempt == 1:
+            time.sleep(1.0)
+    raise RuntimeError("ElevenLabs TTS failed after 2 attempts: %s" % last)

@@ -428,6 +428,55 @@ Parameters:
       cleared. A word survives the round trip.
     Default: none
 
+  ElevenLabsTtsVoice:
+    Type: String
+    Description: ElevenLabs voice id for the spoken Ask answer.
+    Default: bPkjmCb0W1xUBvyH2Afs
+
+  ElevenLabsTtsModel:
+    Type: String
+    Description: >-
+      Measured on the plain HTTP /stream endpoint 2026-09-09, one two-sentence
+      answer: DashScope 2.07s, eleven_v3_conversational 1.01s, eleven_v3 2.83s,
+      eleven_flash_v2_5 0.51s. v3-conversational is twice as fast as the
+      incumbent AND the expressive model; the vendor documents it on the
+      Text-to-Dialogue WebSocket, but the plain endpoint accepts it (verified,
+      200 with real audio). Flash remains the fallback if expressiveness stops
+      being worth half a second.
+    Default: eleven_v3_conversational
+
+  ElevenLabsTtsSpeed:
+    Type: String
+    Description: >-
+      Playback speed multiplier, 1.2 = 20% faster than written. Verified to take
+      effect rather than be silently accepted -- the same sentence rendered 5.36s
+      at default and 5.20s at 1.2 -- because a vendor that ignores an unknown
+      field returns 200 either way and audio length is the only proof.
+    Default: '1.2' 
+
+  AskTtsProvider:
+    Type: String
+    Description: >-
+      Which voice speaks the Ask answer (dashscope|elevenlabs). The incumbent
+      measures 2.07s total -- 1.0s connection, 0.75s model -- and pre-opening its
+      socket during STT+LLM was tested and saved nothing, so this is not a
+      latency change. It is here because one voice vendor was asked for and
+      because the incumbent's model carries a vendor retirement note. Both
+      providers return the same WAV container to the device.
+    AllowedValues: [dashscope, elevenlabs]
+    Default: dashscope
+
+  ElevenLabsTtsApiKey:
+    Type: String
+    Description: >-
+      A THIRD separate ElevenLabs key, for TTS. Not shared with the transcription
+      key or the Ask STT key: EL credit is a per-key pool and exhaustion presents
+      as the feature simply stopping, so one pool across three consumers would
+      let any of them silently stop the other two. Empty means the elevenlabs TTS
+      provider REFUSES rather than borrowing another key.
+    Default: ''
+    NoEcho: true
+
   AskSttProvider:
     Type: String
     Description: >-
@@ -1728,6 +1777,11 @@ Resources:
           # named without a key RAISES rather than falling back, which is the
           # point -- see ElevenLabsAskApiKey's description.
           ASK_STT_PROVIDER: !Ref AskSttProvider
+          ASK_TTS_PROVIDER: !Ref AskTtsProvider
+          ELEVENLABS_API_KEY_TTS: !Ref ElevenLabsTtsApiKey
+          ELEVENLABS_TTS_VOICE: !Ref ElevenLabsTtsVoice
+          ELEVENLABS_TTS_MODEL: !Ref ElevenLabsTtsModel
+          ELEVENLABS_TTS_SPEED: !Ref ElevenLabsTtsSpeed
           ASK_VOICE_MODEL: !Ref AskVoiceModel
           ELEVENLABS_ASK_API_KEY: !Ref ElevenLabsAskApiKey
           ELEVENLABS_STT_MODEL: !Ref ElevenLabsSttModel

@@ -1320,6 +1320,28 @@ def _stt(audio_bytes, fmt):
     return dashscope_utils.stt(audio_bytes, fmt)
 
 
+def _tts(text):
+    """Speak the answer with whichever provider is configured.
+
+    Both providers hand the device the SAME container -- EL returns raw PCM and
+    is wrapped with the incumbent's own `_pcm_to_wav`, so `audioFormat` stays
+    "wav" and the device never learns which vendor spoke. That matters: the
+    mobile client decodes a complete file with MediaPlayer and a container change
+    would be a silent playback failure, not an error.
+
+    Default is the incumbent, and a provider named without its own key raises
+    rather than falling back -- three consumers now want ElevenLabs (the
+    recording pipeline's transcription, Ask's STT, and this), and one shared
+    credit pool would let any of them silently stop the other two.
+    """
+    import dashscope_utils
+    provider = os.environ.get("ASK_TTS_PROVIDER", "dashscope").strip().lower()
+    if provider == "elevenlabs":
+        import elevenlabs_utils
+        return dashscope_utils._pcm_to_wav(elevenlabs_utils.tts(text))
+    return dashscope_utils.tts(text)
+
+
 def _voice_answer(body):
     """Chain one hands-free voice ask: base64-decode -> DashScope STT ->
     existing RAG path (mode='voice', caller_sub ACL, Haiku) -> DashScope TTS ->
@@ -1371,7 +1393,7 @@ def _voice_answer(body):
 
     t_tts = _time.perf_counter()
     try:
-        audio_out = dashscope_utils.tts(answer_text)
+        audio_out = _tts(answer_text)
     except Exception as e:
         logger.error("  voice TTS failed: %s", e)
         return {"error": "Speech synthesis failed", "transcript": transcript}
