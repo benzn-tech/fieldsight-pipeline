@@ -313,3 +313,73 @@ def test_the_other_two_states_survive_an_empty_summary(monkeypatch, state):
                   verdicts({"entity": "Naylor Love Construction",
                             "state": state, "summary": ""}))
     assert out["corroborations"][0]["state"] == state
+
+
+# ------------------------------------------ a source has to say where it is from
+
+# The card puts the source domain under every claim, and it is the trust
+# carrier: a reader decides "is this a source I believe" from the host, not from
+# the URL. The UI derived that host by parsing the URL, which worked while the
+# vendor returned real result URLs.
+#
+# This vendor does not. Measured 2026-09-08, a real annotation:
+#
+#   url:   https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFb5s...
+#   title: "wikipedia.org"
+#
+# So the host lives in `title` and the URL is an opaque Google redirect. Parsed
+# naively, EVERY source under EVERY claim reads `vertexaisearch.cloud.google.com`
+# -- which destroys the one thing this feature exists to give the reader, on a
+# path whose whole promise is that external evidence is visibly separate from
+# what the room said.
+
+
+def _source_of(url, title):
+    r = client.Reply(search_results=[client.SearchResult(url, title)])
+    return steps._sources(r)[0]
+
+
+def test_a_redirect_url_does_not_become_the_source_domain():
+    s = _source_of("https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZ",
+                   "wikipedia.org")
+    assert s["domain"] == "wikipedia.org"
+
+
+def test_a_real_url_still_names_its_own_host():
+    """A vendor that returns real URLs puts a headline in `title`, not a host.
+    Falling back to the URL is what keeps this correct for both shapes."""
+    s = _source_of("https://naylorlove.co.nz/about", "About - Naylor Love")
+    assert s["domain"] == "naylorlove.co.nz"
+
+
+def test_www_is_not_part_of_who_published_it():
+    s = _source_of("https://www.standards.govt.nz/nzs3604", "Standards New Zealand")
+    assert s["domain"] == "standards.govt.nz"
+
+
+def test_a_title_that_is_prose_is_never_mistaken_for_a_host():
+    """`title` is only trusted when it IS a hostname. "Fletcher Building Ltd."
+    ends in a dot-word and would pass a lazy check."""
+    s = _source_of("https://fletcherbuilding.com/news", "Fletcher Building Ltd.")
+    assert s["domain"] == "fletcherbuilding.com"
+
+
+def test_a_source_with_no_usable_host_says_nothing_rather_than_guessing():
+    s = _source_of("not a url", None)
+    assert s["domain"] is None
+
+
+def test_the_url_and_title_are_still_carried_unchanged():
+    """The link still has to work, and the redirect is the only URL we were
+    given. Inventing one from the domain would fabricate a citation."""
+    s = _source_of("https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZ",
+                   "wikipedia.org")
+    assert s["url"].startswith("https://vertexaisearch.cloud.google.com/")
+    assert s["title"] == "wikipedia.org"
+
+
+def test_a_vendor_that_gives_no_date_leaves_it_empty_rather_than_inventing_one():
+    """`published` is the second trust carrier next to the domain, and this
+    vendor supplies no page age. Absent is honest; today's date would not be."""
+    s = _source_of("https://example.org/a", "example.org")
+    assert s["published"] is None
