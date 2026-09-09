@@ -266,6 +266,7 @@ jobs:
               "EnableRerank=${{ vars.TEST_ENABLE_RERANK || 'false' }}" \
               $QWEN_CHAT_KEY_PARAM \
               "AskSttProvider=${{ vars.TEST_ASK_STT_PROVIDER || 'dashscope' }}" \
+              "AskVoiceModel=${{ vars.TEST_ASK_VOICE_MODEL || 'none' }}" \
               $EL_ASK_KEY_PARAM \
               "ElevenLabsApiKey=$ELEVENLABS_API_KEY" \
               "PgDatabase=fieldsight_test"
