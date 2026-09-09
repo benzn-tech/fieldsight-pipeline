@@ -60,6 +60,15 @@ WINDOW_DAYS = int(os.environ.get("BACKLOG_WINDOW_DAYS", "3"))
 
 REQUEST_PREFIX = "extraction_requests/"
 
+#: Marker `lambda_extract_session` writes when it deliberately passes over a
+#: session -- no usable speaker turns, so there was nothing to summarise.
+#:
+#: Kept in step with `lambda_extract_session.SKIP_MARKER_SUFFIX` by a test, not
+#: by an import: this function is non-VPC and dependency-free on purpose.
+#: Deliberately NOT ".json" -- item-writer is wired to `extractions/` with that
+#: suffix and would be invoked on every marker.
+SKIP_MARKER_SUFFIX = ".skipped"
+
 
 def _s3():
     return boto3.client("s3")
@@ -112,6 +121,16 @@ def scan(client, now=None):
             continue
 
         if f"extractions/{folder}/{date}/{base}.json" in done:
+            continue
+
+        # Extraction looked at this session and decided there was nothing in
+        # it. Measured on prod 2026-09-09: ten sessions were being reported
+        # here and nine were this -- transcripts of "[background noise]" or the
+        # device saying "Recording started", 77 to 81 bytes with no items. The
+        # transcripts check below cannot see that, because a transcript FILE is
+        # not evidence that anybody spoke. Reading the extractor's own decision
+        # is the only version of this that cannot drift away from it.
+        if f"extractions/{folder}/{date}/{base}{SKIP_MARKER_SUFFIX}" in done:
             continue
 
         # THE DISCRIMINATOR. No transcripts means VAD found no speech and there

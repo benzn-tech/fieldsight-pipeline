@@ -63,12 +63,15 @@ SID = "b5ae5db542724e1b89b48015f882f5e0"
 REQ_KEY = f"extraction_requests/{SID}.json"
 
 
-def _world(*, when=OLD, transcripts=True, extracted=False, body=None):
+def _world(*, when=OLD, transcripts=True, extracted=False, body=None,
+           skipped_marker=False):
     objs = {REQ_KEY: when}
     if transcripts:
         objs[f"transcripts/Neil_Blunden/2026-09-02/x_sid{SID}_c0000.json"] = when
     if extracted:
         objs[f"extractions/Neil_Blunden/2026-09-02/sid{SID}.json"] = when
+    if skipped_marker:
+        objs[f"extractions/Neil_Blunden/2026-09-02/sid{SID}.skipped"] = when
     return FakeS3(objs, {REQ_KEY: body if body is not None else _req(SID)})
 
 
@@ -190,3 +193,50 @@ def test_an_unset_stage_publishes_no_dimension_rather_than_an_empty_one(monkeypa
                         lambda name, *a, **k: _CW() if name == "cloudwatch" else None)
     bl.lambda_handler({}, None)
     assert "Dimensions" not in sent["data"][0]
+
+
+# ---------------------------------------------------------------------------
+# A transcript file is not evidence that anybody spoke.
+#
+# Measured on prod 2026-09-09: ten requests were being reported as backlog and
+# nine of them had transcripts containing only "[background noise]" or the
+# device saying "Recording started" -- 77 to 81 bytes with zero items. The
+# tenth was real and had never been summarised. So the transcripts test, which
+# was the whole point of this probe, still let nine false positives through and
+# the alarm was red for a session where nothing was lost.
+#
+# The fix is not a better guess in here. `extract_session` already decides this
+# -- it filters announcements, finds no usable turns, and skips -- and now
+# records that decision as a marker object. This module reads the decision
+# instead of re-deriving it, so the two can never disagree.
+# ---------------------------------------------------------------------------
+
+def test_a_session_extraction_deliberately_skipped_is_not_a_backlog():
+    recent, everything, skipped = bl.scan(_world(skipped_marker=True), now=NOW)
+    assert recent == [] and everything == [] and skipped == 0
+
+
+def test_the_marker_does_not_excuse_a_different_session():
+    """The marker is keyed on the session, not the day. A skipped session must
+    not silence a real loss recorded beside it."""
+    world = _world()
+    world._objects["extractions/Neil_Blunden/2026-09-02/sid" + "e" * 32 + ".skipped"] = OLD
+    recent, everything, _ = bl.scan(world, now=NOW)
+    assert len(recent) == 1 and recent[0]["session"] == f"sid{SID}"
+
+
+def test_the_marker_suffix_is_not_dot_json():
+    """item-writer is wired to `extractions/` with suffix `.json`. A marker
+    ending in .json would invoke it with a file it cannot parse, on every
+    silent session. The suffix is load-bearing, so it is pinned here."""
+    assert bl.SKIP_MARKER_SUFFIX == ".skipped"
+    assert not bl.SKIP_MARKER_SUFFIX.endswith(".json")
+
+
+def test_backlog_and_extractor_agree_on_the_marker_key():
+    """Two lambdas, two deployment units, one convention. They cannot share a
+    module -- the backlog probe is deliberately dependency-free so it can run
+    outside the VPC -- so this is what stops them drifting apart."""
+    les = pytest.importorskip("lambda_extract_session")
+    assert les.skip_marker_key("Neil_Blunden", "2026-09-02", f"sid{SID}") == (
+        f"extractions/Neil_Blunden/2026-09-02/sid{SID}{bl.SKIP_MARKER_SUFFIX}")

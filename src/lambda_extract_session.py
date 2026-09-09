@@ -1677,6 +1677,30 @@ def extraction_key(user_folder, date, session_base):
     return f"{EXTRACTIONS_PREFIX}{user_folder}/{date}/{session_base}.json"
 
 
+#: Suffix of the marker written when a session is deliberately skipped.
+#:
+#: NOT ".json", and that is the whole point: item-writer is wired to
+#: `extractions/` with suffix `.json`, so a marker ending in .json would invoke
+#: it once per silent session with a file it cannot parse. Mirrored in
+#: lambda_extraction_backlog.SKIP_MARKER_SUFFIX -- the probe runs outside the
+#: VPC and imports nothing from here, so a test asserts the two agree.
+SKIP_MARKER_SUFFIX = ".skipped"
+
+
+def skip_marker_key(user_folder, date, session_base):
+    """Where a session records that there was nothing in it to extract.
+
+    Beside the extraction it would have written, so one listing of
+    `extractions/` answers both "was this summarised" and "was it deliberately
+    passed over". Before this existed the only trace of the decision was a
+    WARNING, and CloudWatch ages those out: on 2026-09-09 the backlog probe
+    reported ten prod sessions as never summarised and nine of them had been
+    skipped here on purpose, their transcripts holding only "[background
+    noise]" or the device saying "Recording started".
+    """
+    return f"{EXTRACTIONS_PREFIX}{user_folder}/{date}/{session_base}{SKIP_MARKER_SUFFIX}"
+
+
 #: read_existing_extraction could not determine what is published. Distinct from
 #: None, which means "nothing is published". Conflating them is what makes a
 #: silent read failure look like permission to overwrite.
@@ -1765,6 +1789,26 @@ def _supersedes(new_sources, prev):
     return True
 
 
+def _record_skip(bucket, user_folder, date, session_base, reason):
+    """Best-effort marker. A failure here must not turn a session with nothing
+    in it into a Lambda error and a retry storm -- the worst case is the probe
+    keeps reporting it, which is exactly where we were before."""
+    try:
+        s3().put_object(
+            Bucket=bucket,
+            Key=skip_marker_key(user_folder, date, session_base),
+            Body=json.dumps({
+                'reason': reason,
+                'sessionBase': session_base,
+                'userFolder': user_folder,
+                'date': date,
+                'skipped_at': datetime.utcnow().isoformat() + 'Z',
+            }),
+            ContentType='application/json')
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not record skip for %s: %s", session_base, exc)
+
+
 def extract_session(bucket, user_folder, date, session_base, final=False,
                     min_interval_s=MIN_REEXTRACT_INTERVAL_S, now=None,
                     generation=0, speaker_names=None):
@@ -1810,6 +1854,10 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
     # no write), same "don't retry-storm a dead end" reasoning as M-5.
     if not turns:
         logger.warning(f"No usable speaker turns for session {session_base} -- skipping")
+        # Say so where it lasts. The log line is the only record this decision
+        # ever left, so the backlog probe could not tell a session nobody spoke
+        # in from one whose words were dropped, and counted both.
+        _record_skip(bucket, user_folder, date, session_base, "no-usable-turns")
         return None
 
     n_segments = len(source_filenames)

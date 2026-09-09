@@ -713,7 +713,42 @@ def test_no_turns_returns_none_without_claude_call(monkeypatch):
     result = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
 
     assert result is None
-    assert fake_s3.put_calls == []
+    # No extraction is published -- the only write is the marker below.
+    assert not any(c["Key"].endswith(".json") for c in fake_s3.put_calls)
+
+
+def test_a_skipped_session_records_why_it_was_skipped(monkeypatch):
+    """The decision has to outlive the log line.
+
+    On 2026-09-09 the prod backlog probe reported ten sessions as lost. Nine of
+    them had been deliberately skipped here for having no usable turns -- the
+    transcripts held "[background noise]" or the device announcing itself --
+    and the only trace was a WARNING that CloudWatch ages out. The probe had no
+    way to tell those from the one session that really was never summarised, so
+    it counted all ten and the alarm went red over nothing.
+    """
+    fake_s3 = FakeS3({SEG1_KEY: "{not valid json at all"})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(llm_utils, "call_llm",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM")))
+
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    assert len(fake_s3.put_calls) == 1
+    put = fake_s3.put_calls[0]
+    assert put["Key"] == les.skip_marker_key("Benl1", "2026-07-06", SESSION_BASE)
+    body = json.loads(put["Body"])
+    assert body["reason"] == "no-usable-turns"
+    assert body["sessionBase"] == SESSION_BASE
+
+
+def test_the_skip_marker_never_ends_in_dot_json():
+    """item-writer is wired to `extractions/` with suffix `.json`. A marker
+    ending in .json would invoke it once per silent session with a file it
+    cannot parse. The suffix is the thing keeping that from happening."""
+    key = les.skip_marker_key("Benl1", "2026-07-06", SESSION_BASE)
+    assert key.startswith("extractions/")
+    assert not key.endswith(".json")
 
 
 # ---------------------------------------------------------------------------
