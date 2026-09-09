@@ -190,3 +190,114 @@ def test_an_unset_stage_publishes_no_dimension_rather_than_an_empty_one(monkeypa
                         lambda name, *a, **k: _CW() if name == "cloudwatch" else None)
     bl.lambda_handler({}, None)
     assert "Dimensions" not in sent["data"][0]
+
+
+# ---------------------------------------------------------------------------
+# Multi-device meetings were invisible to this probe entirely.
+#
+# A group request is `extraction_requests/group-<id>.json` carrying
+# {groupId, mergedKey, members[]} and no top-level userFolder, so
+# `req["userFolder"]` raised KeyError, the meeting was filed as a fault in the
+# enqueuer, and it was never checked at all.
+#
+# That matters more than it would for a solo session, because a meeting cannot
+# be re-driven: extract_group returns None on an LLM failure instead of raising,
+# and the claim has already set merged_at, so nothing retries it. A failed merge
+# is permanent AND was unreportable.
+# ---------------------------------------------------------------------------
+
+GROUP_ID = "0eade7a8d97a4f4e8198b543c5494eac"
+GROUP_KEY = f"extraction_requests/group-{GROUP_ID}.json"
+MERGED_KEY = f"extractions/Ben_UCPK2/2026-09-02/grp{GROUP_ID}.json"
+MEMBER_SID = "b7bff16c1b7c46a7ab27b671f5d1a5fe"
+
+SPOKE = {"results": {"transcripts": [
+    {"transcript": "they don't meet the requirements for the bracing so we go back"}]}}
+SILENT_DOC = {"results": {"transcripts": [{"transcript": "[background noise]"}]}}
+
+
+def _group_req():
+    return {
+        "groupId": GROUP_ID,
+        "leadSessionId": GROUP_ID,
+        "mergedKey": MERGED_KEY,
+        "members": [
+            {"userFolder": "Ben_UCPK2", "date": "2026-09-02", "sessionBase": f"sid{GROUP_ID}"},
+            {"userFolder": "Ben_UCPK", "date": "2026-09-02", "sessionBase": f"sid{MEMBER_SID}"},
+        ],
+    }
+
+
+def _group_world(*, when=OLD, merged=False, spoke=True, solo_member_request=False, req=None):
+    a = f"transcripts/Ben_UCPK2/2026-09-02/a_sid{GROUP_ID}_c0000.json"
+    b = f"transcripts/Ben_UCPK/2026-09-02/b_sid{MEMBER_SID}_c0000.json"
+    objs = {GROUP_KEY: when, a: when, b: when}
+    doc = SPOKE if spoke else SILENT_DOC
+    bodies = {GROUP_KEY: req if req is not None else _group_req(), a: doc, b: doc}
+    if merged:
+        objs[MERGED_KEY] = when
+    if solo_member_request:
+        k = f"extraction_requests/{MEMBER_SID}.json"
+        objs[k] = when
+        bodies[k] = {"userFolder": "Ben_UCPK", "date": "2026-09-02",
+                     "sessionBase": f"sid{MEMBER_SID}"}
+    return FakeS3(objs, bodies)
+
+
+def test_a_merged_meeting_is_not_a_backlog():
+    recent, everything, skipped = bl.scan(_group_world(merged=True), now=NOW)
+    assert recent == [] and everything == [] and skipped == 0
+
+
+def test_a_meeting_that_was_never_merged_is_a_backlog():
+    recent, everything, skipped = bl.scan(_group_world(), now=NOW)
+    assert skipped == 0, "a group request is readable, not a fault in the enqueuer"
+    assert len(recent) == 1
+    assert recent[0]["session"] == f"grp{GROUP_ID}"
+
+
+def test_a_meeting_nobody_spoke_in_is_not_a_backlog():
+    """Same discriminator as a solo session, applied across the members."""
+    recent, everything, _ = bl.scan(_group_world(spoke=False), now=NOW)
+    assert recent == [] and everything == []
+
+
+def test_a_member_of_a_merged_meeting_is_not_its_own_backlog():
+    """The member's words are in the meeting record, under the group's key.
+
+    This was the second false-positive class in the 2026-09-09 alarm: the
+    session it was red for was a member of a group that had already merged.
+    """
+    recent, everything, _ = bl.scan(
+        _group_world(merged=True, solo_member_request=True), now=NOW)
+    assert recent == [] and everything == []
+
+
+def test_a_member_of_a_meeting_that_never_merged_is_still_reported():
+    """A lost merge must not silence its members too -- that would turn one
+    invisible loss into three."""
+    recent, _, _ = bl.scan(_group_world(solo_member_request=True), now=NOW)
+    assert sorted(i["session"] for i in recent) == [f"grp{GROUP_ID}", f"sid{MEMBER_SID}"]
+
+
+def test_a_group_request_missing_its_merged_key_is_a_fault_not_a_meeting():
+    bad = {"groupId": GROUP_ID, "members": _group_req()["members"]}
+    recent, everything, skipped = bl.scan(_group_world(req=bad), now=NOW)
+    assert skipped == 1 and recent == [] and everything == []
+
+
+# A bad request object must cost one line, not the whole probe. A scan that
+# dies publishes no metric, so TreatMissingData:breaching fires the alarm AND
+# the real backlog stops being reported until somebody finds the object by hand.
+
+@pytest.mark.parametrize("body", [b"null", 7, [], "text", {"userFolder": "F"}])
+def test_a_request_that_is_not_a_valid_object_is_counted_not_fatal(body):
+    recent, everything, skipped = bl.scan(_world(body=body), now=NOW)
+    assert skipped == 1 and recent == [] and everything == []
+
+
+@pytest.mark.parametrize("members", ["notalist", [None], [7], []])
+def test_a_group_whose_members_are_not_objects_is_counted_not_fatal(members):
+    bad = dict(_group_req(), members=members)
+    recent, everything, skipped = bl.scan(_group_world(req=bad), now=NOW)
+    assert skipped == 1 and recent == [] and everything == []

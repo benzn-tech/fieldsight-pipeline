@@ -60,6 +60,18 @@ WINDOW_DAYS = int(os.environ.get("BACKLOG_WINDOW_DAYS", "3"))
 
 REQUEST_PREFIX = "extraction_requests/"
 
+#: Multi-device meetings are enqueued as `extraction_requests/group-<id>.json`
+#: carrying {groupId, mergedKey, members[]} and NO top-level userFolder. The
+#: solo parse raised KeyError on them, so every meeting since the feature
+#: shipped was filed as a fault in the enqueuer and never checked.
+#:
+#: That matters more than it would for a solo session, because a meeting is
+#: never re-driven: extract_group returns None on an LLM failure rather than
+#: raising -- deliberately, the members' own reports have already gone out --
+#: and the finalize claim has already set merged_at. A lost merge is permanent
+#: and this probe is the only thing that would ever notice it.
+GROUP_REQUEST_MARKER = "group-"
+
 
 def _s3():
     return boto3.client("s3")
@@ -156,48 +168,102 @@ def scan(client, now=None):
     tx_by_day = {}
     recent, everything, skipped = [], [], 0
 
+    # Read every request BEFORE judging any of them. A solo session cannot be
+    # judged without knowing whether it belongs to a meeting that merged, and
+    # `group-` sorts after the hex-named solo requests.
+    solo, groups = [], []
     for obj in _objects(client, REQUEST_PREFIX):
         if obj["LastModified"] > cutoff_new:
             continue                                   # still in flight
         try:
             body = client.get_object(Bucket=S3_BUCKET, Key=obj["Key"])["Body"].read()
             req = json.loads(body)
-            folder, date = req["userFolder"], req["date"]
-            base = req["sessionBase"]
         except Exception:                              # noqa: BLE001
             skipped += 1
             logger.warning("backlog: unreadable request %s", obj["Key"])
             continue
 
-        if f"extractions/{folder}/{date}/{base}.json" in done:
+        # Shape checks sit beside the parse, not after it: a probe that dies on
+        # one bad object publishes no metric, which under TreatMissingData
+        # breaching fires the alarm AND stops reporting the real backlog until
+        # somebody deletes the object by hand.
+        if not isinstance(req, dict):
+            skipped += 1
+            logger.warning("backlog: unreadable request %s", obj["Key"])
             continue
 
-        # THE DISCRIMINATOR. No transcripts means VAD found no speech and there
-        # was nothing to summarise -- 42 of 53 unfulfilled requests on prod are
-        # this, and counting them would bury the eleven that matter.
+        is_group = (obj["Key"].startswith(REQUEST_PREFIX + GROUP_REQUEST_MARKER)
+                    or "members" in req or "groupId" in req)
+        if is_group:
+            members = req.get("members")
+            members = ([m for m in members if isinstance(m, dict)]
+                       if isinstance(members, list) else [])
+            if not (req.get("groupId") and req.get("mergedKey") and members):
+                skipped += 1
+                logger.warning("backlog: group request %s is missing "
+                               "groupId/mergedKey/members", obj["Key"])
+                continue
+            groups.append((obj, dict(req, members=members)))
+        elif not (req.get("userFolder") and req.get("date") and req.get("sessionBase")):
+            skipped += 1
+            logger.warning("backlog: unreadable request %s", obj["Key"])
+        else:
+            solo.append((obj, req))
+
+    def somebody_spoke(folder, date, base):
+        """Both discriminators, for one session.
+
+        No transcripts at all means VAD found no speech. Transcripts that hold
+        only markers and device announcements mean the recogniser found none --
+        a transcript FILE is not evidence that anybody spoke.
+        """
+        if not (folder and date and base):
+            return False
         day = (folder, date)
         if day not in tx_by_day:
             tx_by_day[day] = _keys(client, f"transcripts/{folder}/{date}/")
         sid = base[3:] if base.startswith("sid") else base
         mine = [k for k in tx_by_day[day] if sid in k]
-        if not mine:
+        return bool(mine) and any(_has_real_speech(client, k) for k in mine)
+
+    # Meetings first, so their members can be recognised below.
+    covered = {}
+    for obj, req in groups:
+        merged = req["mergedKey"]
+        # extract_group merges only the first GROUP_MAX_MEMBERS devices and
+        # names the rest in the artifact's omittedMembers, which this role
+        # cannot read -- it has ListBucket on `extractions/` and no GetObject.
+        # So a fifth device whose own extraction was also lost is silenced here.
+        # Recorded as a known edge rather than guessed at.
+        for m in req["members"]:
+            covered[(m.get("userFolder"), m.get("date"), m.get("sessionBase"))] = merged
+        if merged in done:
+            continue
+        if not any(somebody_spoke(m.get("userFolder"), m.get("date"), m.get("sessionBase"))
+                   for m in req["members"]):
+            continue
+        lead = req["members"][0]
+        item = {"folder": lead.get("userFolder"), "date": lead.get("date"),
+                "session": f"grp{req['groupId']}",
+                "requested_at": obj["LastModified"].isoformat()}
+        everything.append(item)
+        if obj["LastModified"] >= cutoff_old:
+            recent.append(item)
+
+    for obj, req in solo:
+        folder, date, base = req["userFolder"], req["date"], req["sessionBase"]
+
+        if f"extractions/{folder}/{date}/{base}.json" in done:
             continue
 
-        # A TRANSCRIPT FILE IS NOT EVIDENCE THAT ANYBODY SPOKE. The test above
-        # asks whether an object exists; this asks the question that was meant.
-        #
-        # Measured 2026-09-09 on the ten sessions this alarm was reporting:
-        # NINE of them had transcripts holding "[background noise]", "" or
-        # nothing but the device saying "Recording started." Exactly one had a
-        # real conversation -- two speakers, "they don't meet the requirements".
-        # An alarm that is ninety percent noise gets ignored inside a week, and
-        # this codebase has already learned that once: counting the 42 silent
-        # requests alongside the 11 real ones would have parked the number at 42
-        # forever.
-        #
-        # Cost is bounded: only sessions that already failed both cheaper tests
-        # reach here, which on prod is single digits per run.
-        if not any(_has_real_speech(client, k) for k in mine):
+        # The words are in the meeting's record, under the group's key. This was
+        # the second false-positive class in the 2026-09-09 alarm: the session it
+        # was red for was a member of a group that had already merged.
+        merged = covered.get((folder, date, base))
+        if merged and merged in done:
+            continue
+
+        if not somebody_spoke(folder, date, base):
             continue
 
         item = {"folder": folder, "date": date, "session": base,
