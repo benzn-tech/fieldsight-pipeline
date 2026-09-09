@@ -40,7 +40,7 @@ import boto3
 from datetime import datetime, timedelta
 from urllib.parse import unquote_plus
 
-import deletion_mirror
+import deletion_mirror
 import nz_time
 
 logger = logging.getLogger()
@@ -1146,11 +1146,27 @@ def get_report_history(params, caller):
         return ok({'reports': []})
     
     reports = []
+    # THE WORD FILE IS ALREADY IN THIS LISTING, so carrying it costs nothing.
+    # The generator writes daily_report.docx beside daily_report.json and has
+    # done since the python-docx layer landed -- 183 of them in production --
+    # but this endpoint only ever returned the .json key. The UI's button is
+    # labelled "Download .docx" and presigns whatever `key` it was given, so
+    # every one of those downloads has handed the user raw JSON.
+    #
+    # Collected in the same pass rather than probed per report: a HeadObject
+    # per row would be one round trip each to learn something this listing
+    # already contains, and a missing .docx presigns happily and 404s in the
+    # browser (this bucket answers 403 for keys that do not exist, so the
+    # failure would not even read as "not found").
+    docx_sizes = {}
     try:
         paginator = s3_client.get_paginator('list_objects_v2')
         for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=REPORT_PREFIX):
             for obj in page.get('Contents', []):
                 key = obj['Key']
+                if key.endswith('_report.docx'):
+                    docx_sizes[key] = obj['Size']
+                    continue
                 if not key.endswith('_report.json') or '_debug' in key:
                     continue
                 if folder_scope is not None:
@@ -1162,6 +1178,18 @@ def get_report_history(params, caller):
                                 'generated_at': obj['LastModified'].isoformat(), 'size': obj['Size']})
     except Exception as e:
         logger.error(f"Error: {e}")
+
+    # ABSENT, NOT EMPTY, when there is no Word file. Word generation is
+    # disabled when the python-docx layer is missing or incompatible (the
+    # startup log says which), and one production day has a .json with no
+    # .docx beside it. A client that gets no `docx_key` must be able to tell
+    # "this report has no Word file" from "this backend never sends one".
+    for r in reports:
+        cand = r['key'][:-len('.json')] + '.docx'
+        if cand in docx_sizes:
+            r['docx_key'] = cand
+            r['docx_size'] = docx_sizes[cand]
+
     reports.sort(key=lambda r: r['date'], reverse=True)
     return ok({'reports': reports[:limit]})
 
