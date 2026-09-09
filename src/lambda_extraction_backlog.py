@@ -83,6 +83,64 @@ def _objects(client, prefix):
             yield o
 
 
+# Words a transcript can contain while nobody actually said anything. Non-speech
+# markers come from the recogniser; the device announcements come from the
+# device itself and are already stripped one layer down by
+# lambda_extract_session's DEVICE_ANNOUNCEMENT_PATTERNS -- so a session that
+# holds only these produced no extraction *correctly*, and reporting it as lost
+# work is a false alarm.
+_NON_SPEECH = ("[background noise]", "[music]", "[silence]", "[inaudible]",
+               "recording started", "recording stopped")
+# Kept for reference, not used as the test. A length floor was the obvious
+# mechanism and it does not work: one of the nine false cases was "Recording
+# started." three times over -- 55 characters of the device talking to itself,
+# which clears any floor worth setting. What separates them is not how much text
+# there is but whether any of it is SPEECH, so the markers are removed first and
+# the question is asked of what remains.
+_MIN_SPEECH_CHARS = 40
+
+
+def _has_real_speech(client, key):
+    """Did a person actually say something in this transcript?
+
+    Fails OPEN: any error reading or parsing the object counts as speech, so a
+    transient S3 problem produces a false alarm rather than silently hiding a
+    genuinely lost session. The expensive mistake here is under-reporting.
+    """
+    try:
+        raw = client.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+        doc = json.loads(raw)
+    except Exception:                                  # noqa: BLE001
+        logger.warning("backlog: could not read transcript %s -- counting it "
+                       "as speech", key)
+        return True
+    try:
+        text = (doc.get("results", {}).get("transcripts") or [{}])[0].get(
+            "transcript", "")
+    except Exception:                                  # noqa: BLE001
+        return True
+    stripped = (text or "").strip()
+    low = stripped.lower()
+    if not low:
+        return False
+
+    # Remove every non-speech marker FIRST, then ask whether anything is left.
+    # Length alone is not enough: one of the ten real cases was "Recording
+    # started." three times over, which is 55 characters of the device talking
+    # to itself and would clear any sensible length floor.
+    residue = low
+    for marker in _NON_SPEECH:
+        residue = residue.replace(marker, " ")
+    residue = residue.strip(" .,-")
+    if not residue:
+        return False
+
+    # Something survived. Short-but-real is still real: a worker saying "the
+    # slab cracked" is four words, and guessing that brevity means worthless is
+    # how the one true loss in ten would be discarded.
+    return True
+
+
 def scan(client, now=None):
     """(recent_lost, all_lost, skipped) for the current bucket state.
 
@@ -121,7 +179,25 @@ def scan(client, now=None):
         if day not in tx_by_day:
             tx_by_day[day] = _keys(client, f"transcripts/{folder}/{date}/")
         sid = base[3:] if base.startswith("sid") else base
-        if not any(sid in k for k in tx_by_day[day]):
+        mine = [k for k in tx_by_day[day] if sid in k]
+        if not mine:
+            continue
+
+        # A TRANSCRIPT FILE IS NOT EVIDENCE THAT ANYBODY SPOKE. The test above
+        # asks whether an object exists; this asks the question that was meant.
+        #
+        # Measured 2026-09-09 on the ten sessions this alarm was reporting:
+        # NINE of them had transcripts holding "[background noise]", "" or
+        # nothing but the device saying "Recording started." Exactly one had a
+        # real conversation -- two speakers, "they don't meet the requirements".
+        # An alarm that is ninety percent noise gets ignored inside a week, and
+        # this codebase has already learned that once: counting the 42 silent
+        # requests alongside the 11 real ones would have parked the number at 42
+        # forever.
+        #
+        # Cost is bounded: only sessions that already failed both cheaper tests
+        # reach here, which on prod is single digits per run.
+        if not any(_has_real_speech(client, k) for k in mine):
             continue
 
         item = {"folder": folder, "date": date, "session": base,
