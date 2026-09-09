@@ -217,3 +217,49 @@ def test_the_chat_vendor_can_be_switched_without_touching_code():
             assert param in src, (env, param)
             line = [l for l in src.splitlines() if param in l][0]
             assert "vars." in line, (env, line)
+
+
+# ---------------------------------------- corroboration gets its own credential
+
+def test_the_corroboration_key_reaches_both_stacks():
+    """The web search runs on a different vendor from everything else on this
+    function, so it needs a credential of its own. Without the override the
+    parameter defaults to empty and the feature cannot be switched on at all --
+    the shape this whole file exists for."""
+    for env in WORKFLOWS:
+        body = _text(env)
+        assert "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY" in body, (
+            f"{env}: corroboration has no key and could never run")
+
+
+def test_corroboration_does_not_ride_on_the_chat_key():
+    """`QWEN_API_KEY` on this function is
+    `!If [UsesSeparateChatVendor, QwenChatApiKey, DashScopeApiKey]`. On a stack
+    whose QwenBaseUrl still points at DashScope that resolves to the DashScope
+    key, and sending one vendor's credential to another 401s every request --
+    which is the entire reason `UsesSeparateChatVendor` was added in the first
+    place. Reusing it here would reintroduce the bug it was written to fix.
+    """
+    import pathlib
+    template = (pathlib.Path(__file__).resolve().parents[2]
+                / "src" / "template.yaml").read_text(encoding="utf-8")
+    line = [ln for ln in template.splitlines()
+            if "CORROBORATION_API_KEY:" in ln]
+    assert line, "AskAgentFunction has no CORROBORATION_API_KEY"
+    assert "CorroborationApiKey" in line[0], line[0]
+    for wrong in ("QwenChatApiKey", "DashScopeApiKey", "ClaudeApiKey"):
+        assert wrong not in line[0], (
+            "corroboration must not borrow another vendor's key: " + line[0])
+
+
+def test_the_corroboration_key_is_declared_and_defaults_to_empty():
+    """Empty means the feature stays inert rather than half-configured. It is
+    already gated by EnableExternalCorroboration, and a key that defaults to
+    some other parameter would make a misconfiguration look like a vendor
+    outage."""
+    import pathlib
+    template = (pathlib.Path(__file__).resolve().parents[2]
+                / "src" / "template.yaml").read_text(encoding="utf-8")
+    block = template[template.index("  CorroborationApiKey:"):][:400]
+    assert "NoEcho: true" in block, "a credential must not echo into stack events"
+    assert "Default: ''" in block, block

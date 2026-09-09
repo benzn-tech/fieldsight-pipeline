@@ -29,10 +29,15 @@ class FakeCall:
         return self.queue.pop(0)
 
 
-def reply(text="", results=(), error=None, search_error=None):
+def reply(text="", results=(), error=None, search_error=None, searched=None):
+    """`searched` defaults to "there were results", which is the common case.
+    Pass it explicitly for the two that matter on their own: a search that ran
+    and honestly found nothing (searched=True, no results), and a model that
+    wrote about a search it never performed (searched=False, prose present)."""
     return client.Reply(text=text,
                         search_results=[client.SearchResult(u, t) for u, t in results],
-                        error=error, search_error=search_error, searched=bool(results))
+                        error=error, search_error=search_error,
+                        searched=bool(results) if searched is None else searched)
 
 
 def extraction(*items):
@@ -159,18 +164,89 @@ def test_an_answer_naming_nothing_external_is_not_a_timeout(monkeypatch):
     it as a timeout would make the honest case look like a fault."""
     out, _ = _run(monkeypatch, extraction())
     assert out == {"corroborations": [], "dropped": [], "truncated": False,
-                   "timed_out": False}
+                   "timed_out": False, "searched": False}
 
 
-def test_a_search_tool_error_still_reaches_reconcile(monkeypatch):
-    """The request succeeded and the model still wrote something; the tool error
-    is logged, and the verdict it produces is `not_found` on its own terms
-    rather than being upgraded here."""
+# ------------------------------------------- a search that did not happen
+
+# The rule these pin: **reconcile only ever runs on text the open web actually
+# produced.** Until 2026-09-09 it ran on whatever the search step returned, and
+# the test that used to sit here asserted that was fine -- on the reasoning that
+# "the model still wrote something" and would report `not_found` on its own
+# terms. Its fixture said "I could not search.", so the assumption held there.
+#
+# The assumption is false. Measured on OpenRouter 2026-09-08, three runs,
+# meta/muse-spark-1.3-contributor with a web plugin returned HTTP 200, 1200
+# tokens, ZERO web results, and prose that read:
+#
+#     "I'll search the web to verify the NZS 3604 claim.
+#      Initial results support the claim..."
+#
+# Fed to reconcile that becomes `corroborated`, and a card renders a "Confirmed"
+# chip with no sources beneath it, because the renderer omits the source row
+# when `sources` is empty. A fabricated external corroboration shown to a
+# customer as verified is the worst output this system can produce, and it was
+# reachable against the vendor in production, not only the one being evaluated.
+#
+# So the model's account of its own tool use is no longer evidence. The
+# structural fact is: did web results come back.
+
+
+def test_prose_about_a_search_that_never_ran_produces_nothing(monkeypatch):
+    """The muse-spark shape. Confident, plausible, and entirely ungrounded."""
+    out, fake = _run(monkeypatch, extraction(NAYLOR),
+                     reply(text="I'll search the web to verify this. "
+                                "Initial results support the claim.",
+                           searched=False))
+    assert out["corroborations"] == []
+    assert out["searched"] is False
+    assert len(fake.calls) == 2, "reconcile must not have run on ungrounded text"
+
+
+def test_not_searching_is_not_reported_as_running_out_of_time(monkeypatch):
+    """`truncated` and `timed_out` are already kept apart because a reader who
+    sees three cards deserves to know which. "We did not search" is a third
+    thing: the request finished in four seconds. Calling it a timeout is a
+    false statement about our own system."""
     out, _ = _run(monkeypatch, extraction(NAYLOR),
-                  reply(text="I could not search.", search_error="max_uses_exceeded"),
-                  verdicts({"entity": "Naylor Love Construction",
-                            "state": "not_found", "summary": "No sources reached."}))
+                  reply(text="Initial results support the claim.", searched=False))
+    assert out["timed_out"] is False
+    assert out["searched"] is False
+
+
+def test_a_tool_error_with_nothing_to_show_for_it_produces_nothing(monkeypatch):
+    """A `web_search_tool_result` error block with no results is the same
+    situation wearing a different hat: the prose is ungrounded."""
+    out, fake = _run(monkeypatch, extraction(NAYLOR),
+                     reply(text="I could not search.",
+                           search_error="max_uses_exceeded", searched=True))
+    assert out["corroborations"] == []
+    assert out["searched"] is False
+    assert len(fake.calls) == 2
+
+
+def test_a_search_that_ran_and_found_nothing_still_reaches_reconcile(monkeypatch):
+    """The guard must not swallow the honest empty result. A search that ran
+    and returned no results is a finding about the WORLD, and `not_found` is
+    the state that says so. Over-blocking here would delete the feature's most
+    common true answer."""
+    out, fake = _run(monkeypatch, extraction(NAYLOR),
+                     reply(text="No sources discuss this.", searched=True),
+                     verdicts({"entity": "Naylor Love Construction",
+                               "state": "not_found", "summary": "No sources reached."}))
     assert out["corroborations"][0]["state"] == "not_found"
+    assert out["searched"] is True
+    assert len(fake.calls) == 3
+
+
+def test_the_happy_path_says_the_web_was_consulted(monkeypatch):
+    """The flag is what the UI reads to choose its words, so the true case has
+    to carry it too -- a flag only ever set on failure is one the reader cannot
+    distinguish from absent."""
+    out, _ = _run(monkeypatch, extraction(NAYLOR), reply(results=SOURCES),
+                  verdicts({"entity": "Naylor Love Construction",
+                            "state": "corroborated", "summary": "Confirmed."}))
+    assert out["searched"] is True
 
 
 # --------------------------------------------------------------- truncated vs timed_out
@@ -264,14 +340,17 @@ def test_the_cheap_steps_never_send_effort(monkeypatch):
     assert fake.calls[2]["effort"] is None
 
 
-def test_only_the_search_step_gets_the_web_search_tool(monkeypatch):
+def test_only_the_search_step_searches(monkeypatch):
+    """Three steps, one budget. A classification step that quietly searched
+    would spend the search step's slice a second time, inside a hard stop with
+    no room for it -- and the reader would be told the check timed out."""
     _, fake = _run(monkeypatch, extraction(NAYLOR),
                    reply(text="...", results=SOURCES),
                    verdicts({"entity": "Naylor Love Construction",
                              "state": "not_found", "summary": "x"}))
-    assert fake.calls[0].get("tools") is None
-    assert fake.calls[1]["tools"] == [client.WEB_SEARCH_TOOL]
-    assert fake.calls[2].get("tools") is None
+    assert fake.calls[0].get("web") in (None, False)
+    assert fake.calls[1]["web"] is True
+    assert fake.calls[2].get("web") in (None, False)
 
 
 # --------------------------------------------------------------- it never raises
@@ -310,3 +389,73 @@ def test_the_other_two_states_survive_an_empty_summary(monkeypatch, state):
                   verdicts({"entity": "Naylor Love Construction",
                             "state": state, "summary": ""}))
     assert out["corroborations"][0]["state"] == state
+
+
+# ------------------------------------------ a source has to say where it is from
+
+# The card puts the source domain under every claim, and it is the trust
+# carrier: a reader decides "is this a source I believe" from the host, not from
+# the URL. The UI derived that host by parsing the URL, which worked while the
+# vendor returned real result URLs.
+#
+# This vendor does not. Measured 2026-09-08, a real annotation:
+#
+#   url:   https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFb5s...
+#   title: "wikipedia.org"
+#
+# So the host lives in `title` and the URL is an opaque Google redirect. Parsed
+# naively, EVERY source under EVERY claim reads `vertexaisearch.cloud.google.com`
+# -- which destroys the one thing this feature exists to give the reader, on a
+# path whose whole promise is that external evidence is visibly separate from
+# what the room said.
+
+
+def _source_of(url, title):
+    r = client.Reply(search_results=[client.SearchResult(url, title)])
+    return steps._sources(r)[0]
+
+
+def test_a_redirect_url_does_not_become_the_source_domain():
+    s = _source_of("https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZ",
+                   "wikipedia.org")
+    assert s["domain"] == "wikipedia.org"
+
+
+def test_a_real_url_still_names_its_own_host():
+    """A vendor that returns real URLs puts a headline in `title`, not a host.
+    Falling back to the URL is what keeps this correct for both shapes."""
+    s = _source_of("https://naylorlove.co.nz/about", "About - Naylor Love")
+    assert s["domain"] == "naylorlove.co.nz"
+
+
+def test_www_is_not_part_of_who_published_it():
+    s = _source_of("https://www.standards.govt.nz/nzs3604", "Standards New Zealand")
+    assert s["domain"] == "standards.govt.nz"
+
+
+def test_a_title_that_is_prose_is_never_mistaken_for_a_host():
+    """`title` is only trusted when it IS a hostname. "Fletcher Building Ltd."
+    ends in a dot-word and would pass a lazy check."""
+    s = _source_of("https://fletcherbuilding.com/news", "Fletcher Building Ltd.")
+    assert s["domain"] == "fletcherbuilding.com"
+
+
+def test_a_source_with_no_usable_host_says_nothing_rather_than_guessing():
+    s = _source_of("not a url", None)
+    assert s["domain"] is None
+
+
+def test_the_url_and_title_are_still_carried_unchanged():
+    """The link still has to work, and the redirect is the only URL we were
+    given. Inventing one from the domain would fabricate a citation."""
+    s = _source_of("https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZ",
+                   "wikipedia.org")
+    assert s["url"].startswith("https://vertexaisearch.cloud.google.com/")
+    assert s["title"] == "wikipedia.org"
+
+
+def test_a_vendor_that_gives_no_date_leaves_it_empty_rather_than_inventing_one():
+    """`published` is the second trust carrier next to the domain, and this
+    vendor supplies no page age. Absent is honest; today's date would not be."""
+    s = _source_of("https://example.org/a", "example.org")
+    assert s["published"] is None
