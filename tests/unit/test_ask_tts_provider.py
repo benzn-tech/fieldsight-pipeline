@@ -150,3 +150,61 @@ def test_a_200_with_no_audio_is_a_failure(monkeypatch):
     monkeypatch.setattr(el.urllib3, "PoolManager", lambda *a, **k: _Pool())
     with pytest.raises(RuntimeError, match="no audio"):
         el.tts("hello")
+
+
+def test_the_speed_actually_goes_on_the_wire(monkeypatch):
+    """A vendor that ignores an unknown field returns 200 either way, so
+    "we asked for 1.2" is not the same claim as "it was sent". Measured against
+    the real endpoint the audio DID shorten (5.36s -> 5.20s on
+    v3-conversational, 4.64 -> 3.81 on flash), which is the only proof the
+    parameter is real -- this test pins that we keep sending it."""
+    monkeypatch.setattr(el, "ELEVENLABS_TTS_API_KEY", "k")
+    monkeypatch.setattr(el, "ELEVENLABS_TTS_SPEED", 1.2)
+    seen = {}
+
+    class _Resp:
+        status = 200
+        data = b"pcm"
+
+    class _Pool:
+        def request(self, method, url, body=None, headers=None, timeout=None):
+            seen["body"] = body
+            return _Resp()
+
+    monkeypatch.setattr(el.urllib3, "PoolManager", lambda *a, **k: _Pool())
+    el.tts("hello")
+    import json as _j
+    sent = _j.loads(seen["body"])
+    assert sent["voice_settings"]["speed"] == 1.2
+
+
+def test_speed_one_sends_nothing(monkeypatch):
+    """1.0 is "as written", and sending it would be a settings object that says
+    nothing -- which is how a future reader concludes the field is required."""
+    monkeypatch.setattr(el, "ELEVENLABS_TTS_API_KEY", "k")
+    monkeypatch.setattr(el, "ELEVENLABS_TTS_SPEED", 1.0)
+    seen = {}
+
+    class _Resp:
+        status = 200
+        data = b"pcm"
+
+    class _Pool:
+        def request(self, method, url, body=None, headers=None, timeout=None):
+            seen["body"] = body
+            return _Resp()
+
+    monkeypatch.setattr(el.urllib3, "PoolManager", lambda *a, **k: _Pool())
+    el.tts("hello")
+    import json as _j
+    assert "voice_settings" not in _j.loads(seen["body"])
+
+
+def test_the_conversational_model_is_the_default():
+    """Chosen on measurement, not on the docs: the vendor documents
+    v3-conversational on the Text-to-Dialogue WebSocket, and the plain HTTP
+    /stream endpoint was verified to accept it. If someone later "fixes" this
+    back to flash for speed, the trade being made is 0.51s against the
+    expressiveness of a voice a person on a site listens to."""
+    assert el.ELEVENLABS_TTS_MODEL == "eleven_v3_conversational"
+    assert el.ELEVENLABS_TTS_VOICE == "bPkjmCb0W1xUBvyH2Afs"

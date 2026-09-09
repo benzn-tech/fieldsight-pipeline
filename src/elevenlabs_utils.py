@@ -297,10 +297,29 @@ ELEVENLABS_TTS_API_KEY = os.environ.get("ELEVENLABS_API_KEY_TTS", "")
 ELEVENLABS_TTS_URL = os.environ.get(
     "ELEVENLABS_TTS_URL", "https://api.elevenlabs.io/v1/text-to-speech")
 ELEVENLABS_TTS_VOICE = os.environ.get(
-    "ELEVENLABS_TTS_VOICE", "21m00Tcm4TlvDq8ikWAM")
-# Flash, not the quality tiers. This is a sentence read aloud to someone
-# standing on a site, not narration.
-ELEVENLABS_TTS_MODEL = os.environ.get("ELEVENLABS_TTS_MODEL", "eleven_flash_v2_5")
+    "ELEVENLABS_TTS_VOICE", "bPkjmCb0W1xUBvyH2Afs")
+# v3 conversational, chosen on measurement rather than the docs. Measured
+# 2026-09-09 on this endpoint, one two-sentence answer:
+#
+#   DashScope (incumbent)      2.07s
+#   eleven_v3_conversational   1.01s   <- twice as fast, and the expressive model
+#   eleven_v3                  2.83s
+#   eleven_flash_v2_5          0.51s   <- fastest, least expressive
+#
+# The vendor documents v3-conversational on the Text-to-Dialogue WebSocket, so
+# the obvious reading is that it needs a second client. It does not: the plain
+# HTTP /stream endpoint accepts it, verified with a 200 and real audio. Flash is
+# half a second quicker and is the fallback if expressiveness stops mattering,
+# but this is a voice a person on a site listens to, and one second is already
+# well inside the wait the rest of the chain imposes.
+ELEVENLABS_TTS_MODEL = os.environ.get(
+    "ELEVENLABS_TTS_MODEL", "eleven_v3_conversational")
+# 1.2 = 20% faster than written, at the owner's request. Verified to take
+# effect rather than be silently accepted: the same sentence rendered 5.36s at
+# default and 5.20s at 1.2 on v3-conversational, 4.64 -> 3.81 on flash. A
+# vendor that ignores an unknown field returns 200 either way, so the audio
+# length is the only proof.
+ELEVENLABS_TTS_SPEED = float(os.environ.get("ELEVENLABS_TTS_SPEED", "1.2"))
 ELEVENLABS_TTS_TIMEOUT_SECONDS = float(
     os.environ.get("ELEVENLABS_TTS_TIMEOUT_SECONDS", "10"))
 
@@ -330,7 +349,10 @@ def tts(text):
 
     url = "%s/%s/stream?output_format=pcm_24000" % (
         ELEVENLABS_TTS_URL.rstrip("/"), ELEVENLABS_TTS_VOICE)
-    body = json.dumps({"text": text, "model_id": ELEVENLABS_TTS_MODEL}).encode()
+    payload = {"text": text, "model_id": ELEVENLABS_TTS_MODEL}
+    if ELEVENLABS_TTS_SPEED and ELEVENLABS_TTS_SPEED != 1.0:
+        payload["voice_settings"] = {"speed": ELEVENLABS_TTS_SPEED}
+    body = json.dumps(payload).encode()
     headers = {"xi-api-key": ELEVENLABS_TTS_API_KEY,
                "Content-Type": "application/json",
                "Accept": "audio/pcm"}
@@ -348,10 +370,11 @@ def tts(text):
                 audio = resp.data or b""
                 if not audio:
                     raise RuntimeError("ElevenLabs TTS returned no audio")
-                logger.info("tts: provider=elevenlabs bytes=%d audio_seconds=%.2f "
-                            "chars=%d voice=%s",
-                            len(audio), len(audio) / 48000.0, len(text),
-                            ELEVENLABS_TTS_VOICE)
+                logger.info("tts: provider=elevenlabs model=%s bytes=%d "
+                            "audio_seconds=%.2f chars=%d voice=%s speed=%.2f",
+                            ELEVENLABS_TTS_MODEL, len(audio),
+                            len(audio) / 48000.0, len(text),
+                            ELEVENLABS_TTS_VOICE, ELEVENLABS_TTS_SPEED)
                 return audio
             if resp.status != 429 and resp.status < 500:
                 raise RuntimeError("ElevenLabs TTS: HTTP %d %s"

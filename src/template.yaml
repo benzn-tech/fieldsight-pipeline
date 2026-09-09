@@ -431,14 +431,28 @@ Parameters:
   ElevenLabsTtsVoice:
     Type: String
     Description: ElevenLabs voice id for the spoken Ask answer.
-    Default: 21m00Tcm4TlvDq8ikWAM
+    Default: bPkjmCb0W1xUBvyH2Afs
 
   ElevenLabsTtsModel:
     Type: String
     Description: >-
-      Flash, not a quality tier: this is a sentence read to someone standing on
-      a site, not narration.
-    Default: eleven_flash_v2_5
+      Measured on the plain HTTP /stream endpoint 2026-09-09, one two-sentence
+      answer: DashScope 2.07s, eleven_v3_conversational 1.01s, eleven_v3 2.83s,
+      eleven_flash_v2_5 0.51s. v3-conversational is twice as fast as the
+      incumbent AND the expressive model; the vendor documents it on the
+      Text-to-Dialogue WebSocket, but the plain endpoint accepts it (verified,
+      200 with real audio). Flash remains the fallback if expressiveness stops
+      being worth half a second.
+    Default: eleven_v3_conversational
+
+  ElevenLabsTtsSpeed:
+    Type: String
+    Description: >-
+      Playback speed multiplier, 1.2 = 20% faster than written. Verified to take
+      effect rather than be silently accepted -- the same sentence rendered 5.36s
+      at default and 5.20s at 1.2 -- because a vendor that ignores an unknown
+      field returns 200 either way and audio length is the only proof.
+    Default: '1.2' 
 
   AskTtsProvider:
     Type: String
@@ -1767,6 +1781,7 @@ Resources:
           ELEVENLABS_API_KEY_TTS: !Ref ElevenLabsTtsApiKey
           ELEVENLABS_TTS_VOICE: !Ref ElevenLabsTtsVoice
           ELEVENLABS_TTS_MODEL: !Ref ElevenLabsTtsModel
+          ELEVENLABS_TTS_SPEED: !Ref ElevenLabsTtsSpeed
           ASK_VOICE_MODEL: !Ref AskVoiceModel
           ELEVENLABS_ASK_API_KEY: !Ref ElevenLabsAskApiKey
           ELEVENLABS_STT_MODEL: !Ref ElevenLabsSttModel
