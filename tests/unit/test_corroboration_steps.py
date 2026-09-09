@@ -264,14 +264,17 @@ def test_the_cheap_steps_never_send_effort(monkeypatch):
     assert fake.calls[2]["effort"] is None
 
 
-def test_only_the_search_step_gets_the_web_search_tool(monkeypatch):
+def test_only_the_search_step_searches(monkeypatch):
+    """Three steps, one budget. A classification step that quietly searched
+    would spend the search step's slice a second time, inside a hard stop with
+    no room for it -- and the reader would be told the check timed out."""
     _, fake = _run(monkeypatch, extraction(NAYLOR),
                    reply(text="...", results=SOURCES),
                    verdicts({"entity": "Naylor Love Construction",
                              "state": "not_found", "summary": "x"}))
-    assert fake.calls[0].get("tools") is None
-    assert fake.calls[1]["tools"] == [client.WEB_SEARCH_TOOL]
-    assert fake.calls[2].get("tools") is None
+    assert fake.calls[0].get("web") in (None, False)
+    assert fake.calls[1]["web"] is True
+    assert fake.calls[2].get("web") in (None, False)
 
 
 # --------------------------------------------------------------- it never raises
