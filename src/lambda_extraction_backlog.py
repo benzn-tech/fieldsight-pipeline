@@ -69,6 +69,21 @@ REQUEST_PREFIX = "extraction_requests/"
 #: suffix and would be invoked on every marker.
 SKIP_MARKER_SUFFIX = ".skipped"
 
+#: Group requests are named `extraction_requests/group-<groupId>.json` and
+#: carry {groupId, mergedKey, members[]} with no top-level userFolder, so the
+#: solo parse raised KeyError and filed every meeting as a fault in the
+#: enqueuer. Meetings were therefore never checked at all -- and unlike a solo
+#: session a meeting cannot be re-driven: extract_group returns None on an LLM
+#: failure rather than raising, and the claim has already set merged_at.
+GROUP_REQUEST_MARKER = "group-"
+
+
+def marker_for(extraction_key):
+    """The skip marker beside a given extraction. One rule, so a solo session
+    and a merged meeting cannot end up with different conventions."""
+    stem = extraction_key[:-len(".json")] if extraction_key.endswith(".json") else extraction_key
+    return stem + SKIP_MARKER_SUFFIX
+
 
 def _s3():
     return boto3.client("s3")
@@ -116,62 +131,106 @@ def scan(client, now=None):
     tx_by_day = {}
     recent, everything, skipped = [], [], 0
 
+    # Read every request BEFORE judging any of them: a solo session cannot be
+    # judged without knowing whether it belongs to a meeting that was merged,
+    # and the group request that says so sorts after it.
+    solo, groups = [], []
     for obj in _objects(client, REQUEST_PREFIX):
         if obj["LastModified"] > cutoff_new:
             continue                                   # still in flight
         try:
             body = client.get_object(Bucket=S3_BUCKET, Key=obj["Key"])["Body"].read()
             req = json.loads(body)
-            folder, date = req["userFolder"], req["date"]
-            base = req["sessionBase"]
         except Exception:                              # noqa: BLE001
             skipped += 1
             logger.warning("backlog: unreadable request %s", obj["Key"])
             continue
 
-        if f"extractions/{folder}/{date}/{base}.json" in done:
-            continue
+        is_group = (obj["Key"].startswith(REQUEST_PREFIX + GROUP_REQUEST_MARKER)
+                    or "members" in req or "groupId" in req)
+        if is_group:
+            if not (req.get("groupId") and req.get("mergedKey") and req.get("members")):
+                skipped += 1
+                logger.warning("backlog: group request %s is missing "
+                               "groupId/mergedKey/members", obj["Key"])
+                continue
+            groups.append((obj, req))
+        elif not (req.get("userFolder") and req.get("date") and req.get("sessionBase")):
+            skipped += 1
+            logger.warning("backlog: unreadable request %s", obj["Key"])
+        else:
+            solo.append((obj, req))
 
-        # THE DISCRIMINATOR. No transcripts means VAD found no speech and there
-        # was nothing to summarise -- 42 of 53 unfulfilled requests on prod are
-        # this, and counting them would bury the eleven that matter.
+    def transcripts_for(folder, date, base):
+        """When each of this session's transcripts landed. Empty means VAD
+        found no speech and there was nothing to summarise -- 42 of 53
+        unfulfilled requests on prod are this, and counting them would bury the
+        eleven that matter."""
         day = (folder, date)
         if day not in tx_by_day:
-            tx_by_day[day] = [(o["Key"], o["LastModified"])
-                              for o in _objects(client, f"transcripts/{folder}/{date}/")]
+            tx_by_day[day] = [(o["Key"], o["LastModified"]) for o in
+                              _objects(client, f"transcripts/{folder}/{date}/")]
         sid = base[3:] if base.startswith("sid") else base
-        mine = [when for k, when in tx_by_day[day] if sid in k]
-        if not mine:
+        return [when for k, when in tx_by_day[day] if sid in k]
+
+    def settled(extraction, landed):
+        """Published, or deliberately passed over since the last transcript.
+
+        The marker's timestamp is a PROXY for which transcripts the pass saw,
+        and it is not exact under concurrency: a chunk landing between a silent
+        pass's listing and its put leaves a marker newer than a transcript it
+        never read. Sequential arrivals are safe -- gather_session_segments
+        re-reads the whole session, so once any chunk holds speech no later
+        pass can reach the no-turns branch -- but a reconnect burst is not
+        sequential, and it takes an outage in the same moment to hide anything.
+        Recorded rather than closed; the exact fix is for the marker to carry
+        the keys it saw and for this to compare sets.
+        """
+        if extraction in done:
+            return True
+        marked = marker_at.get(marker_for(extraction))
+        return marked is not None and marked >= max(landed)
+
+    # Meetings first, so their members can be recognised below.
+    covered = {}
+    for obj, req in groups:
+        merged = req["mergedKey"]
+        for m in req["members"]:
+            covered[(m.get("userFolder"), m.get("date"), m.get("sessionBase"))] = merged
+        landed = []
+        for m in req["members"]:
+            landed += transcripts_for(m.get("userFolder"), m.get("date"),
+                                      m.get("sessionBase") or "")
+        if not landed or settled(merged, landed):
+            continue
+        lead = req["members"][0]
+        item = {"folder": lead.get("userFolder"), "date": lead.get("date"),
+                "session": f"grp{req['groupId']}",
+                "requested_at": obj["LastModified"].isoformat()}
+        everything.append(item)
+        if obj["LastModified"] >= cutoff_old:
+            recent.append(item)
+
+    for obj, req in solo:
+        folder, date, base = req["userFolder"], req["date"], req["sessionBase"]
+
+        # The words are in the meeting's record, filed under the group's key.
+        # This was the second false-positive class in the 2026-09-09 alarm: the
+        # session it was red for was a member of a group that had merged.
+        merged = covered.get((folder, date, base))
+        if merged and merged in done:
             continue
 
-        # Extraction looked at this session and decided there was nothing in
-        # it. Measured on prod 2026-09-09: ten sessions were being reported
-        # here and nine were this -- transcripts of "[background noise]" or the
-        # device saying "Recording started", 77 to 81 bytes with no items. A
-        # transcript FILE is not evidence that anybody spoke, so the check
-        # above cannot see it; reading the extractor's own decision is the only
-        # version that cannot drift away from what actually runs.
-        #
-        # ONLY for the transcripts it saw. extract_session runs on every chunk,
-        # and a session's first chunk is very often just "Recording started" --
-        # filtered, no usable turns, marker written, all before any LLM call.
-        # Speech lands in a later chunk. If those passes then fail (the arrears
-        # outage this probe exists for), nothing is ever published and a stale
-        # marker would hide it. On prod, 2 of the 17 sessions since 2026-08-20
-        # have that shape.
-        #
-        # The timestamp is a PROXY for "which transcripts that pass saw", and
-        # it is not exact under concurrency: a speech chunk landing in the
-        # second or two between a silent pass's listing and its put leaves a
-        # marker newer than a transcript it never read. Sequential arrivals are
-        # safe -- gather_session_segments re-reads the whole session, so once
-        # any chunk holds speech no later pass can reach M-6 at all -- but a
-        # reconnect burst is not sequential. It also needs an extraction outage
-        # in the same moment to hide anything. Recorded rather than closed; the
-        # exact fix is for the marker to carry the keys it saw and for this to
-        # compare sets.
-        marked = marker_at.get(f"extractions/{folder}/{date}/{base}{SKIP_MARKER_SUFFIX}")
-        if marked is not None and marked >= max(mine):
+        landed = transcripts_for(folder, date, base)
+        if not landed:
+            continue
+
+        # A transcript FILE is not evidence anybody spoke -- nine of the ten
+        # sessions reported on prod held only "[background noise]" or the
+        # device saying "Recording started". extract_session already decides
+        # this and records the decision; reading it is the only version that
+        # cannot drift from what actually runs.
+        if settled(f"extractions/{folder}/{date}/{base}.json", landed):
             continue
 
         item = {"folder": folder, "date": date, "session": base,

@@ -68,10 +68,34 @@ def test_a_merge_writes_one_artifact_naming_every_member(wired):
     assert set(body["memberSessions"]) == {GID, JOINER}
 
 
-def test_no_usable_turns_writes_nothing_and_does_not_raise(monkeypatch, wired):
+def test_no_usable_turns_writes_no_record_and_does_not_raise(monkeypatch, wired):
     monkeypatch.setattr(ex, "assemble_group_turns", lambda b, kbs: ([], []))
     assert ex.extract_group("bkt", _artifact()) is None
-    assert wired.puts == []
+    assert [k for k, _ in wired.puts if k.endswith(".json")] == []
+
+
+def test_a_meeting_with_nothing_in_it_records_that_it_was_passed_over(monkeypatch, wired):
+    """A meeting cannot be re-driven -- extract_group returns None on failure
+    rather than raising, and the claim has already set merged_at -- so the
+    backlog probe is the only thing that would ever notice a lost merge. Left
+    unmarked, every silent meeting would sit in that report forever and the
+    alarm would stop being read, which is the failure the probe exists inside.
+    """
+    monkeypatch.setattr(ex, "assemble_group_turns", lambda b, kbs: ([], []))
+    ex.extract_group("bkt", _artifact())
+    assert len(wired.puts) == 1
+    key, body = wired.puts[0]
+    assert key == f"extractions/Ben_UCPK/2026-08-07/grp{GID}.skipped"
+    assert body["reason"] == "no-usable-turns"
+    assert body["groupId"] == GID
+
+
+def test_the_meeting_marker_never_ends_in_dot_json(monkeypatch, wired):
+    """item-writer is wired to `extractions/` + `.json`; a marker ending there
+    would invoke it on every silent meeting with a file it cannot parse."""
+    monkeypatch.setattr(ex, "assemble_group_turns", lambda b, kbs: ([], []))
+    ex.extract_group("bkt", _artifact())
+    assert not wired.puts[0][0].endswith(".json")
 
 
 def test_an_llm_failure_writes_nothing_and_does_not_raise(monkeypatch, wired):

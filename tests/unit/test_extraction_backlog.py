@@ -238,10 +238,20 @@ def test_the_marker_suffix_is_not_dot_json():
 def test_backlog_and_extractor_agree_on_the_marker_key():
     """Two lambdas, two deployment units, one convention. They cannot share a
     module -- the backlog probe is deliberately dependency-free so it can run
-    outside the VPC -- so this is what stops them drifting apart."""
+    outside the VPC -- so this is what stops them drifting apart.
+
+    Both shapes, because a meeting's marker is derived from its mergedKey
+    rather than from folder/date/session, and that is the one most likely to be
+    changed on one side only.
+    """
     les = pytest.importorskip("lambda_extract_session")
+    solo = f"extractions/Neil_Blunden/2026-09-02/sid{SID}.json"
+    group = f"extractions/Ben_UCPK2/2026-09-02/grp{'c' * 32}.json"
+    for key in (solo, group):
+        assert les.skip_marker_for(key) == bl.marker_for(key)
     assert les.skip_marker_key("Neil_Blunden", "2026-09-02", f"sid{SID}") == (
-        f"extractions/Neil_Blunden/2026-09-02/sid{SID}{bl.SKIP_MARKER_SUFFIX}")
+        bl.marker_for(solo))
+    assert bl.marker_for(solo).endswith(bl.SKIP_MARKER_SUFFIX)
 
 
 # ---------------------------------------------------------------------------
@@ -285,3 +295,105 @@ def test_a_marker_exactly_as_old_as_the_transcript_is_honoured():
     world = _world(skipped_marker=True, marker_when=OLD, transcript_when=OLD)
     recent, everything, _ = bl.scan(world, now=NOW)
     assert recent == [] and everything == []
+
+
+# ---------------------------------------------------------------------------
+# Multi-device meetings were invisible to this probe entirely.
+#
+# A group request is `extraction_requests/group-<id>.json` and carries
+# {groupId, leadSessionId, mergedKey, members[]} -- no top-level userFolder. So
+# `req["userFolder"]` raised KeyError, the request was filed as "unreadable"
+# (a fault in the enqueuer) and the meeting was never checked at all.
+#
+# That matters more than it did for solo sessions, because a group cannot be
+# re-driven: extract_group returns None on an LLM failure instead of raising,
+# and the claim has already set merged_at, so nothing retries it. A failed
+# meeting merge is permanent AND was unreportable.
+# ---------------------------------------------------------------------------
+
+GROUP_ID = "0eade7a8d97a4f4e8198b543c5494eac"
+GROUP_KEY = f"extraction_requests/group-{GROUP_ID}.json"
+MERGED_KEY = f"extractions/Ben_UCPK2/2026-09-02/grp{GROUP_ID}.json"
+MEMBER_SID = "b7bff16c1b7c46a7ab27b671f5d1a5fe"
+
+
+def _group_req():
+    return {
+        "groupId": GROUP_ID,
+        "leadSessionId": GROUP_ID,
+        "mergedKey": MERGED_KEY,
+        "members": [
+            {"userFolder": "Ben_UCPK2", "date": "2026-09-02", "sessionBase": f"sid{GROUP_ID}"},
+            {"userFolder": "Ben_UCPK", "date": "2026-09-02", "sessionBase": f"sid{MEMBER_SID}"},
+        ],
+    }
+
+
+def _group_world(*, when=OLD, merged=False, marker=False, transcripts=True,
+                 solo_member_request=False, req=None):
+    objs = {GROUP_KEY: when}
+    bodies = {GROUP_KEY: req if req is not None else _group_req()}
+    if transcripts:
+        objs[f"transcripts/Ben_UCPK2/2026-09-02/a_sid{GROUP_ID}_c0000.json"] = when
+        objs[f"transcripts/Ben_UCPK/2026-09-02/b_sid{MEMBER_SID}_c0000.json"] = when
+    if merged:
+        objs[MERGED_KEY] = when
+    if marker:
+        objs[MERGED_KEY[:-len(".json")] + bl.SKIP_MARKER_SUFFIX] = when
+    if solo_member_request:
+        k = f"extraction_requests/{MEMBER_SID}.json"
+        objs[k] = when
+        bodies[k] = {"userFolder": "Ben_UCPK", "date": "2026-09-02",
+                     "sessionBase": f"sid{MEMBER_SID}"}
+    return FakeS3(objs, bodies)
+
+
+def test_a_merged_meeting_is_not_a_backlog():
+    recent, everything, skipped = bl.scan(_group_world(merged=True), now=NOW)
+    assert recent == [] and everything == [] and skipped == 0
+
+
+def test_a_meeting_that_was_never_merged_is_a_backlog():
+    recent, everything, skipped = bl.scan(_group_world(), now=NOW)
+    assert skipped == 0, "a group request is readable, not a fault in the enqueuer"
+    assert len(recent) == 1
+    assert recent[0]["session"] == f"grp{GROUP_ID}"
+
+
+def test_a_meeting_with_no_transcripts_from_any_member_is_not_a_backlog():
+    recent, everything, _ = bl.scan(_group_world(transcripts=False), now=NOW)
+    assert recent == [] and everything == []
+
+
+def test_a_meeting_extraction_deliberately_skipped_is_not_a_backlog():
+    """extract_group settles a meeting with nothing usable in it and records
+    that, the same way a solo session does."""
+    recent, everything, _ = bl.scan(_group_world(marker=True), now=NOW)
+    assert recent == [] and everything == []
+
+
+def test_a_member_of_a_merged_meeting_is_not_its_own_backlog():
+    """The member's words are in the meeting record, under the group's key.
+
+    This is the second false-positive class the 2026-09-09 alarm had: the
+    session it was red for was a member of a group whose merged extraction
+    already existed.
+    """
+    world = _group_world(merged=True, solo_member_request=True)
+    recent, everything, _ = bl.scan(world, now=NOW)
+    assert recent == [] and everything == []
+
+
+def test_a_member_of_a_meeting_that_never_merged_is_still_reported():
+    """A group that lost its merge must not silence its members too --
+    that would turn one invisible loss into three."""
+    world = _group_world(solo_member_request=True)
+    recent, everything, _ = bl.scan(world, now=NOW)
+    sessions = sorted(i["session"] for i in recent)
+    assert sessions == [f"grp{GROUP_ID}", f"sid{MEMBER_SID}"]
+
+
+def test_a_group_request_missing_its_merged_key_is_a_fault_not_a_meeting():
+    bad = {"groupId": GROUP_ID, "members": _group_req()["members"]}
+    recent, everything, skipped = bl.scan(_group_world(req=bad), now=NOW)
+    assert skipped == 1 and recent == [] and everything == []

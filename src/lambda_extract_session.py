@@ -1599,6 +1599,13 @@ def extract_group(bucket, artifact):
         # retry -- but it must be visible, not silent.
         logger.warning("group %s: no usable turns from %d members -- not writing",
                        artifact['groupId'], len(members))
+        # A meeting is never re-driven: this returns None rather than raising,
+        # and the claim has already set merged_at. So the backlog probe is the
+        # only thing that would ever notice a lost merge, and without this it
+        # cannot tell a meeting nobody spoke in from one that was dropped.
+        _record_skip_at(bucket, skip_marker_for(artifact['mergedKey']),
+                        "no-usable-turns", groupId=artifact['groupId'],
+                        members=[m.get('sessionBase') for m in members])
         return None
 
     prompt = build_group_prompt(artifact, sources)
@@ -1687,6 +1694,16 @@ def extraction_key(user_folder, date, session_base):
 SKIP_MARKER_SUFFIX = ".skipped"
 
 
+def skip_marker_for(extraction_key_str):
+    """The marker beside a given extraction. ONE rule, so a solo session and a
+    merged meeting cannot drift into different conventions -- and so the
+    backlog probe, which cannot import this module, has a single string shape
+    to mirror (`lambda_extraction_backlog.marker_for`)."""
+    stem = (extraction_key_str[:-len(".json")]
+            if extraction_key_str.endswith(".json") else extraction_key_str)
+    return stem + SKIP_MARKER_SUFFIX
+
+
 def skip_marker_key(user_folder, date, session_base):
     """Where a session records that there was nothing in it to extract.
 
@@ -1698,7 +1715,7 @@ def skip_marker_key(user_folder, date, session_base):
     skipped here on purpose, their transcripts holding only "[background
     noise]" or the device saying "Recording started".
     """
-    return f"{EXTRACTIONS_PREFIX}{user_folder}/{date}/{session_base}{SKIP_MARKER_SUFFIX}"
+    return skip_marker_for(extraction_key(user_folder, date, session_base))
 
 
 #: read_existing_extraction could not determine what is published. Distinct from
@@ -1789,24 +1806,18 @@ def _supersedes(new_sources, prev):
     return True
 
 
-def _record_skip(bucket, user_folder, date, session_base, reason):
+def _record_skip_at(bucket, key, reason, **fields):
     """Best-effort marker. A failure here must not turn a session with nothing
     in it into a Lambda error and a retry storm -- the worst case is the probe
     keeps reporting it, which is exactly where we were before."""
     try:
-        s3().put_object(
-            Bucket=bucket,
-            Key=skip_marker_key(user_folder, date, session_base),
-            Body=json.dumps({
-                'reason': reason,
-                'sessionBase': session_base,
-                'userFolder': user_folder,
-                'date': date,
-                'skipped_at': datetime.utcnow().isoformat() + 'Z',
-            }),
-            ContentType='application/json')
+        body = {'reason': reason,
+                'skipped_at': datetime.utcnow().isoformat() + 'Z'}
+        body.update(fields)
+        s3().put_object(Bucket=bucket, Key=key, Body=json.dumps(body),
+                        ContentType='application/json')
     except Exception as exc:  # noqa: BLE001
-        logger.warning("could not record skip for %s: %s", session_base, exc)
+        logger.warning("could not record skip at %s: %s", key, exc)
 
 
 def extract_session(bucket, user_folder, date, session_base, final=False,
@@ -1857,7 +1868,9 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         # Say so where it lasts. The log line is the only record this decision
         # ever left, so the backlog probe could not tell a session nobody spoke
         # in from one whose words were dropped, and counted both.
-        _record_skip(bucket, user_folder, date, session_base, "no-usable-turns")
+        _record_skip_at(bucket, skip_marker_key(user_folder, date, session_base),
+                        "no-usable-turns", sessionBase=session_base,
+                        userFolder=user_folder, date=date)
         return None
 
     n_segments = len(source_filenames)
