@@ -196,4 +196,91 @@ def transcribe_segment(audio_bytes, filename, num_speakers=5, keyterms=None):
                 )
                 continue
         raise RuntimeError(f"ElevenLabs STT error HTTP {resp.status}: {resp.data[:300]}")
-    raise RuntimeError(f"ElevenLabs STT failed after {MAX_ATTEMPTS} attempts: {last_error}")
+    raise RuntimeError(f"ElevenLabs STT failed after {MAX_ATTEMPTS} attempts: {last_error}")
+
+
+# --- Short-clip STT for the voice Ask path ---------------------------------
+#
+# A SEPARATE KEY, deliberately, and the toggle cannot be switched on without it.
+#
+# EL credit is a shared per-key pool and exhaustion presents as transcription
+# simply STOPPING -- no error, no alarm. Production's recording pipeline already
+# runs on ELEVENLABS_API_KEY. If Ask shared it, an afternoon of voice questions
+# could silently stop the recording pipeline, and a heavy recording day could
+# silently stop Ask. Falling back to the shared key "for now" is exactly how
+# that coupling would ship unnoticed, so there is no fallback: no key, no
+# provider.
+ELEVENLABS_ASK_API_KEY = os.environ.get("ELEVENLABS_ASK_API_KEY", "")
+# 10s, not the 280s the batch path uses. This call sits in front of a user
+# holding a device, inside a chain with a 29s API Gateway ceiling. Measured
+# median is 0.9-1.4s on 3-14s clips, so 10s is already ~7x headroom; anything
+# longer is a hung request pretending to be a slow one.
+ELEVENLABS_ASK_TIMEOUT_SECONDS = float(
+    os.environ.get("ELEVENLABS_ASK_TIMEOUT_SECONDS", "10"))
+
+
+def stt_short(audio_bytes, filename="clip.wav"):
+    """Transcribe one short spoken question. Returns text, "" if nothing heard.
+
+    Measured 2026-09-09 against the same three real site clips as the incumbent,
+    three runs each:
+
+        clip     DashScope    ElevenLabs
+         3s        3.73s        0.88s
+         8s        6.39s        1.01s
+        14s        7.72s        1.36s
+
+    4-6x, and the spread collapses with it (DashScope ran 3.15-6.85 on the 8s
+    clip; EL 0.98-1.16). That is the entire reason this exists.
+
+    NO DIARISATION. The batch path asks for `diarize` because a site recording
+    has several speakers worth separating; a question asked into a push-to-talk
+    key has one. Measured to cost nothing either way (0.78 vs 0.88, 1.02 vs
+    1.01, 1.53 vs 1.36), so this is not a speed decision -- it drops a
+    multi-tenancy exposure for free, since speaker features are the part of this
+    vendor whose scoping we have never verified.
+
+    ONE retry, not four. `transcribe_segment` backs off 1+2+4s because a lost
+    recording is unrecoverable; a lost question is re-askable, and seven seconds
+    of sleeps against a 29s ceiling would turn a slow answer into no answer.
+
+    Raises RuntimeError so the caller's existing `except` maps it to the device's
+    error cue exactly as the incumbent's failures do."""
+    if not ELEVENLABS_ASK_API_KEY:
+        raise RuntimeError("ELEVENLABS_ASK_API_KEY not set")
+    if not audio_bytes:
+        return ""
+
+    fields = [
+        ("model_id", ELEVENLABS_STT_MODEL),
+        ("file", (filename, audio_bytes, "application/octet-stream")),
+    ]
+    if ELEVENLABS_LANGUAGE:
+        fields.append(("language_code", ELEVENLABS_LANGUAGE))
+
+    http = urllib3.PoolManager()
+    last = None
+    for attempt in (1, 2):
+        try:
+            resp = http.request(
+                "POST", ELEVENLABS_STT_URL, fields=fields,
+                headers={"xi-api-key": ELEVENLABS_ASK_API_KEY},
+                timeout=ELEVENLABS_ASK_TIMEOUT_SECONDS)
+        except Exception as e:
+            last = "request failed: %r" % (e,)
+        else:
+            if resp.status == 200:
+                try:
+                    return (json.loads(resp.data).get("text") or "").strip()
+                except Exception as e:
+                    raise RuntimeError("ElevenLabs STT: unreadable 200: %r" % (e,))
+            # 4xx other than 429 is permanent -- a bad key or a rejected file
+            # will not become valid on a second try, and retrying spends the
+            # user's remaining seconds proving it.
+            if resp.status != 429 and resp.status < 500:
+                raise RuntimeError("ElevenLabs STT: HTTP %d %s"
+                                   % (resp.status, resp.data[:200]))
+            last = "HTTP %d" % resp.status
+        if attempt == 1:
+            time.sleep(1.0)
+    raise RuntimeError("ElevenLabs STT failed after 2 attempts: %s" % last)

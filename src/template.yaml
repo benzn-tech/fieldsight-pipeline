@@ -391,6 +391,31 @@ Parameters:
     AllowedValues: [transcribe, elevenlabs]
     Default: transcribe
 
+  AskSttProvider:
+    Type: String
+    Description: >-
+      Which transcriber the spoken Ask question goes to (dashscope|elevenlabs).
+      Measured 2026-09-09 on three real site clips: DashScope 3.73/6.39/7.72s
+      against ElevenLabs 0.88/1.01/1.36s for 3/8/14 second clips. STT is FIRST
+      in the voice chain and nothing starts until it returns, so this is the only
+      place on that path where whole seconds are available. Defaults to the
+      incumbent; an unknown value falls back to it rather than taking voice Ask
+      offline.
+    AllowedValues: [dashscope, elevenlabs]
+    Default: dashscope
+
+  ElevenLabsAskApiKey:
+    Type: String
+    Description: >-
+      A SEPARATE ElevenLabs key for the Ask path. Deliberately not shared with
+      ElevenLabsApiKey: EL credit is a per-key pool and exhaustion presents as
+      transcription simply STOPPING -- no error, no alarm -- so one key would let
+      an afternoon of voice questions silently stop the recording pipeline, and a
+      heavy recording day silently stop Ask. Empty is valid and means the
+      elevenlabs provider REFUSES rather than borrowing the pipeline's key.
+    Default: ''
+    NoEcho: true
+
   ElevenLabsApiKey:
     Type: String
     Description: ElevenLabs xi-api-key for scribe_v2 STT
@@ -1662,6 +1687,13 @@ Resources:
           REPORT_PREFIX: reports/
           RAG_SEARCH_FUNCTION: !Ref RagSearchFunction
           DASHSCOPE_API_KEY: !Ref DashScopeApiKey
+          # Voice STT provider and its OWN key. Both belong here: a provider
+          # named without a key RAISES rather than falling back, which is the
+          # point -- see ElevenLabsAskApiKey's description.
+          ASK_STT_PROVIDER: !Ref AskSttProvider
+          ELEVENLABS_ASK_API_KEY: !Ref ElevenLabsAskApiKey
+          ELEVENLABS_STT_MODEL: !Ref ElevenLabsSttModel
+          ELEVENLABS_LANGUAGE: !Ref ElevenLabsLanguage
           DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
           DASHSCOPE_EMBED_MODEL: text-embedding-v4
           DASHSCOPE_EMBED_DIM: '1024'

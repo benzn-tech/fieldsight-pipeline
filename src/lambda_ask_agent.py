@@ -1265,6 +1265,32 @@ def _invoke_voice_audit(caller_sub, transcript, answer):
         logger.warning("  voice audit invoke failed (non-fatal): %s", e)
 
 
+def _stt(audio_bytes, fmt):
+    """Transcribe the spoken question with whichever provider is configured.
+
+    Measured 2026-09-09 on three real site clips, three runs each: DashScope
+    3.73 / 6.39 / 7.72s against ElevenLabs 0.88 / 1.01 / 1.36s for 3 / 8 / 14
+    second clips. Four to six times, and the spread collapses with it. STT sits
+    FIRST in the chain and nothing else can start until it returns, so this is
+    the only place on the whole path where whole seconds are available.
+
+    Default is the incumbent. A provider named without its own key raises rather
+    than falling back: EL credit is a shared per-key pool whose exhaustion
+    presents as transcription silently STOPPING, and production's recording
+    pipeline already runs on ELEVENLABS_API_KEY. Quietly borrowing that key
+    would let an afternoon of voice questions stop the recording pipeline. The
+    loud failure is the point -- see elevenlabs_utils.stt_short.
+    """
+    provider = os.environ.get("ASK_STT_PROVIDER", "dashscope").strip().lower()
+    if provider == "elevenlabs":
+        import elevenlabs_utils
+        # The clip's own extension, so the vendor sees the container it is
+        # actually given -- the device sends m4a, the probes sent wav.
+        return elevenlabs_utils.stt_short(audio_bytes, "clip.%s" % (fmt or "m4a"))
+    import dashscope_utils
+    return dashscope_utils.stt(audio_bytes, fmt)
+
+
 def _voice_answer(body):
     """Chain one hands-free voice ask: base64-decode -> DashScope STT ->
     existing RAG path (mode='voice', caller_sub ACL, Haiku) -> DashScope TTS ->
@@ -1292,7 +1318,7 @@ def _voice_answer(body):
 
     t_stt = _time.perf_counter()
     try:
-        transcript = dashscope_utils.stt(audio_bytes, fmt)
+        transcript = _stt(audio_bytes, fmt)
     except Exception as e:
         logger.error("  voice STT failed: %s", e)
         return {"error": "Speech recognition failed"}
