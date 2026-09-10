@@ -263,3 +263,14 @@ def test_the_corroboration_key_is_declared_and_defaults_to_empty():
     block = template[template.index("  CorroborationApiKey:"):][:400]
     assert "NoEcho: true" in block, "a credential must not echo into stack events"
     assert "Default: ''" in block, block
+
+
+def test_the_web_answer_flag_reaches_both_stacks_and_defaults_off():
+    """A declared gate no workflow passes cannot be switched on by setting a
+    repo variable, which is the only way anyone would try -- and "no effect"
+    is indistinguishable from "off by default"."""
+    for env, prefix in PREFIX.items():
+        body = _text(env)
+        assert f"EnableWebAnswer=${{{{ vars.{prefix}_ENABLE_WEB_ANSWER" in body, (
+            f"{env}: the web answer cannot be switched on")
+        assert "|| 'false' }}\"" in body

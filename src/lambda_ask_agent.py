@@ -1152,6 +1152,32 @@ def _rag_answer(body):
                 "basis": basis,
             }
 
+        # The records may not answer this. Ask before spending a synthesis on
+        # them, not after: measured worst case, answering first and looking up
+        # second is 33.2s against API Gateway's 29s, while asking first fits
+        # either way (21.3s when it looks up, 16.5s when it does not).
+        #
+        # Screen path only. A worker holding a push-to-talk button cannot be
+        # made to wait for a web search, and the voice prompt forbids the URLs
+        # a sourced answer needs.
+        web = None
+        if body.get("mode") != "voice":
+            import web_answer
+            web = web_answer.answer(question, chunks)
+        if web is not None and web.get("answer"):
+            # Its own block, never merged into the grounded answer. A reader who
+            # cannot tell what came from their meetings from what came off the
+            # internet has no reason to suspect they need to check.
+            return {
+                "answer": web["answer"],
+                "citations": [],
+                "model": llm_utils.active_model(),
+                "grounded": False,
+                "from_web": True,
+                "web": web,
+                "basis": basis,
+            }
+
         prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
                                   today=today, basis=basis)
         # A spoken answer and a screen answer are the same question asked of two
