@@ -1,6 +1,6 @@
 # When the records cannot answer, look it up
 
-Status: spec, fifth draft. Four adversarial reviews; §9 records what each earlier
+Status: spec, sixth draft. Five adversarial reviews; §9 records what each earlier
 draft got wrong, because two of those mistakes shared a shape worth naming.
 
 ## 1. The gap
@@ -138,6 +138,26 @@ raised this as "the feature may never find anything"; it is now a specific
 question with a yes or no, and §10 requires §1's own questions as acceptance
 cases so the answer is visible rather than assumed.
 
+**Subjects carry NO claim, and that is not a detail.** `screen()` inspects the
+entity string; `claim` is forwarded verbatim into the search-enabled call, and a
+test pins that pass-through as a known property. It is safe today only because
+claims are built from the ANSWER. Route question-derived subjects through
+`_search`/`SEARCH_PROMPT` unchanged -- the natural reading of "rules unchanged"
+-- and a question like *"are we liable for the scaffold collapse at Riccarton
+under NZS 3604"* puts "liable", "collapse" and a site name into the prompt that
+composes search queries. That is the leak the gate exists to prevent, through
+the one channel it never looks at.
+
+So: this path's subjects are `{entity, kind}` only, and its search prompt takes
+names. A test in the same family as the existing pass-through pin holds it.
+
+**The subject itself is not yet stable.** Measured 2026-09-11, the same question
+four times returned `New Zealand standard for scaffolding`, `scaffolding`, and
+**nothing at all**. The empty case is the one that matters: the gate says the
+records cannot answer, no subject is produced, no search runs, and the reader
+gets silence. That is not a latency problem and no budget fixes it -- §10 gains
+a stability requirement, not just an accuracy one.
+
 The rejections below stand, and applied to the merged call they apply the same.
 `force_json` on the grounded pass is rejected: the Anthropic branch never
 receives it, the DashScope non-thinking branch silently drops `max_tokens`, the
@@ -205,7 +225,43 @@ findings payload.
                        |-- compose ............ 5.31s .. t=21.30
 
     worst case 21.30s   ceiling 29s   margin 7.70s
-    with ENABLE_RERANK on (+~4s, default false)  25.30s   margin 3.70s
+
+**That was still too kind, in the way this document keeps being too kind.** Two
+corrections, and both come from the same habit of taking a maximum from a sample
+too small to hold a tail:
+
+- **The gate is not 3.23s.** That was a maximum over one question. Run against
+  four questions at different distances from the corpus, the one that actually
+  needs a subject extracted took **6.80s** -- and the file's own budget notes
+  already say n=8 cannot see a 1-in-10 tail, which is how extraction's 4s slice
+  came to be wrong.
+- **The grounded branch can run twice.** `lambda_ask_agent.py:1212` fires a
+  SECOND full synthesis when the answer violates the language policy, at a
+  measured 1-in-13 on Chinese questions. It was in the code and in no draft's
+  arithmetic.
+
+The response waits for both branches, so the worst case is the slower one:
+
+    web branch      1.36 + 6.80 + 11.40 + 5.31        = 24.87s
+    grounded        1.36 + 11.90 + 11.90 (retry)      = 25.16s
+    -------------------------------------------------------------
+    rerank off      25.16s   ceiling 29s   margin  3.84s
+    rerank ON       29.16s   ceiling 29s   margin -0.16s   OVER
+
+**So this feature and `ENABLE_RERANK` cannot both be on.** Rerank defaults to
+false and nothing turns it on today, which is why this fits at all. That is a
+constraint to write down, not a coincidence to rely on: whoever switches rerank
+on later will break this feature and have no reason to connect the two.
+
+The plan therefore needs per-step budgets and an internal hard stop of its own,
+the way corroboration has `HARD_STOP_SECONDS` -- not "compose gets what is left".
+And the language retry must be counted, bounded by the shared deadline, or
+skipped while the web branch is active.
+
+**All of these are warm-path numbers.** Cold adds an init for the proxy, for
+this function, and for rag-search, whose own comment puts an Aurora reconnect at
+1-2s. Lambda's Duration metric excludes init, so "the clock starts at the HTTP
+request" is true of the ceiling and approximate for the first segment.
 
 Draft 4's own arithmetic, recomputed from the request clock and with compose
 measured, was **27.32s — 1.68s of margin, and 31.32s with rerank on, over the
@@ -268,6 +324,11 @@ holds a button for, and the voice prompt forbids URLs and formatting symbols.
 1b. The gate decision: may a category phrase reach a search engine (§4)? Owner's
    call, and it gates everything after it — a "no" means this feature answers
    only questions naming something proper, which §1's own examples do not.
+   It passes today (36 chars, no commercial term, no digits, and lowercase words
+   cannot match the person shape). Note the decision also covers DIGIT-BEARING
+   category phrases: `kind: standard` grants the digit exemption built for bare
+   standard numbers, so "standard for 2-storey timber builds" would pass on a
+   rule written for "NZS 3604".
 2. The merged gate on `corroboration_client`, fail-closed, reading `chunk_text`
    — one call, answering "did these excerpts answer it" and "what should be
    looked up", with its own exclusion list measured against real questions (§3).
@@ -317,6 +378,14 @@ Two hazards survive the margin and would survive any margin:
   thread still reading at the 45s `LLM_HTTP_TIMEOUT` resumes during the NEXT
   invocation, interleaving its log lines into another request's — in a codebase
   that adjudicates defects by log lines.
+
+- **The orphaned invocation one hop up.** The proxy dies at its own 30s timeout
+  and the gateway cuts at 29s, but this function's timeout is 60s. It keeps
+  computing for up to thirty more seconds and then logs a success no user
+  received -- in a codebase that adjudicates defects by log lines.
+- **No module-global scratch shared between the branches.** boto3 clients and
+  urllib3 pools are thread-safe; a frozen thread resuming mid-write into shared
+  state during the next invocation is worse than interleaved logs.
 
 So §8 step 0 is not "no new capability, only what waits for what". It needs a
 stated join-or-abandon policy and a merged failure envelope, and those belong in
