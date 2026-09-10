@@ -472,19 +472,25 @@ result = [u for u in all_users
 
 ## Lambda Deployment
 
-**CRITICAL: Always bundle transcript_utils.py in every Lambda zip.**
+**CRITICAL: bundle the whole of `src/*.py` in every Lambda zip — do not pick modules.**
+
+The two-file `zip -j rg.zip lambda_report_generator.py transcript_utils.py` that
+used to live here was accurate in 2026-03 and silently wrong by 2026-09: those
+handlers now import ~20 further local modules (`output_language`, `nz_time`,
+`weather`, `site_coords`, `deletion_mirror`, `agent_turn_filter`,
+`report_sections`, `batch_stitch`, …). `update-function-code` validates a zip,
+not an import graph, so a bundle missing one of them **deploys successfully** and
+then raises ImportError on the next cold start.
+
+Use the script; it globs `src/*.py` so it cannot fall behind an import again:
 
 ```bash
-# Report generator
-zip -j rg.zip lambda_report_generator.py transcript_utils.py
-aws lambda update-function-code --function-name fieldsight-report-generator --zip-file fileb://rg.zip
-
-# Meeting minutes
-zip -j mm.zip lambda_meeting_minutes.py transcript_utils.py
-aws lambda update-function-code --function-name fieldsight-meeting-minutes --zip-file fileb://mm.zip
+bash scripts/deploy-lambda-code.sh fieldsight ap-southeast-2
 ```
 
-Always `aws lambda wait function-updated --function-name <name>` before invoking.
+It already does `aws lambda wait function-updated` between functions. If you must
+do one by hand, bundle the same way — `zip -j fn.zip src/*.py` — and never a
+hand-picked subset.
 
 ---
 

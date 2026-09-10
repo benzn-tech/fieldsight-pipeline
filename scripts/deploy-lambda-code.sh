@@ -19,7 +19,22 @@ set -euo pipefail
 
 PREFIX="${1:?usage: deploy-lambda-code.sh <prefix> <region>}"
 REGION="${2:?missing region}"
-SHARED=("src/transcript_utils.py" "src/llm_utils.py" "src/elevenlabs_utils.py")   # bundled in every zip (CLAUDE.md rule)
+# Every module in src/ goes in every zip, and this is deliberate.
+#
+# This used to be a hand-kept list of three files. On 2026-09-11 the handlers in
+# MAP below imported 20 further local modules between them -- agent_turn_filter,
+# output_language, nz_time, weather, site_coords, deletion_mirror, batch_stitch,
+# batch_ledger, batch_seal, answer_language, corroboration, metric_render,
+# metric_slots, query_slots, dashscope_utils and more -- none of them listed.
+# Every one of those is an ImportError at cold start on the function this script
+# had just reported as successfully updated, because `update-function-code`
+# checks a zip, not an import graph.
+#
+# A list that must be edited every time an import is added will be wrong again,
+# and it will be wrong the same silent way. The whole of src/ is 664 KB of text
+# next to a 50 MB limit, so there is nothing to buy by choosing.
+SHARED=()
+while IFS= read -r _m; do SHARED+=("$_m"); done < <(ls src/*.py)
 
 # function-name suffix → handler source file (the 9 real-logic lambdas).
 # fieldsight-fargate-trigger is intentionally omitted: it is an inline-code
@@ -36,7 +51,7 @@ declare -A MAP=(
   [api]=lambda_fieldsight_api
 )
 
-for f in "${SHARED[@]}"; do [ -f "$f" ] || { echo "❌ $f not found (run from repo root)"; exit 1; }; done
+[ "${#SHARED[@]}" -gt 1 ] || { echo "❌ no src/*.py found (run from repo root)"; exit 1; }
 WORK="$(mktemp -d)"; FAIL=0
 
 for suffix in "${!MAP[@]}"; do
@@ -44,8 +59,8 @@ for suffix in "${!MAP[@]}"; do
   HANDLER="src/${MAP[$suffix]}.py"
   if [ ! -f "$HANDLER" ]; then echo "⚠️  skip $FN — $HANDLER missing"; continue; fi
   ZIP="${WORK}/${FN}.zip"
-  zip -j -q "$ZIP" "$HANDLER" "${SHARED[@]}"
-  echo "→ update-function-code $FN  ($(basename "$HANDLER") + transcript_utils.py + llm_utils.py)"
+  zip -j -q "$ZIP" "${SHARED[@]}"
+  echo "→ update-function-code $FN  ($(basename "$HANDLER") + ${#SHARED[@]} src modules)"
   if aws lambda update-function-code --function-name "$FN" \
         --zip-file "fileb://${ZIP}" --publish --region "$REGION" \
         --query '{Fn:FunctionName,Ver:Version,Size:CodeSize,Mod:LastModified}' --output table; then
