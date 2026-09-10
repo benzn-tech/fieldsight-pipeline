@@ -1,186 +1,212 @@
 # When the records cannot answer, look it up
 
-Status: spec, second draft. The first draft was reviewed and three of its
-foundational decisions were wrong; §8 records what changed and why, because two
-of them were wrong in ways worth not repeating.
+Status: spec, third draft. Two adversarial reviews; §9 records what each earlier
+draft got wrong, because two of those mistakes shared a shape worth naming.
 
-## 1. The gap, and what was mis-scoped
+## 1. The gap
 
 The differentiator is "the answer must not be limited to what we collected".
-The 2026-09-08 spec claimed that was ~90% built and needed only a vendor swap.
-It was not.
-
-**Corroboration checks claims the answer already made.** When the corpus cannot
-answer, the answer is *"the provided excerpts do not contain information about
-X"* — a sentence with no entities in it. Extraction finds nothing, the gate
-screens nothing, no search runs. It is structurally incapable of firing in
-exactly the case the differentiator names.
+Corroboration does not deliver it and structurally cannot: it checks claims the
+answer already made, and when the corpus cannot answer, the answer is *"the
+provided excerpts do not contain information about X"* — a sentence with no
+entities in it.
 
 Measured on TEST, 2026-09-10, corroboration switched on:
 
     "what is the NZ standard for scaffolding"   chunks 5, searched=false, cards 0
-    "what does NZS 3604 cover"                  chunks 5, searched=false, cards 0
+    "what does NZS 3604 cover"                  same shape, same outcome
 
-Four real site questions produced zero cards. The owner found this by opening
-the TEST front end and asking for something outside the records — the first
-thing anyone would do.
+Four real site questions, zero cards. The owner found it by opening the front
+end and asking for something outside the records.
 
-## 2. What goes out: entities from the QUESTION
+## 2. What crosses which boundary
 
-The red line is in `corroboration_gate`'s own module docstring: **only entities
-go out, never conversation text.** It was bought with a real leak — the gate's
-first version required two capitalised words, which let a bare given name reach
-the allowed list on a real session.
+The red line is `corroboration_gate`'s, and its exact words matter because two
+drafts read them wrong in opposite directions:
 
-The first draft proposed sending a model-paraphrased *lookup query* screened by
-that same gate, and called it reuse. It is not. Every rule in the gate assumes a
-NAME: `MAX_ENTITY_CHARS` is 60, `_COMMERCIAL` refuses `cost|price|contract|
-claim|variation|delay` (which is most of what a construction lookup asks
-about), digits are refused unless the kind is `standard`, and `_PERSON_SHAPE` is
-anchored `^…$` so it only matches when the WHOLE string is 1–3 capitalised
-words. On a sentence the guarantees invert in both directions: legitimate
-queries are refused, and *"scaffold sign-off requirements Neil Christchurch NZ"*
-sails through carrying a person and a place.
+> Only the search step is covered here. Reconcile sends the answer to the LLM
+> provider, and the answer is conversation-derived. That is a different
+> statement from "only entities leave", defensible because **the same provider
+> already saw the transcript during `/ask`** — but no *search engine* ever
+> receives it.
 
-**Decision: extract entities from the QUESTION, not a query from it.**
+So there are two boundaries, not one:
 
-Corroboration extracts `{entity, kind, claim}` from the answer. The same
-extraction, pointed at the question, yields `scaffolding standard` /
-`New Zealand` from the measurement above. Those are names, which is the shape
-the gate was built for and the shape the red line already permits. Nothing new
-leaves the account, no policy moves, and the privacy machinery is used as
-designed rather than borrowed.
+| | who sees it | rule |
+|---|---|---|
+| **search engine** | a third party that has never seen this account | entity names only, gate-screened |
+| **LLM provider** | already receives `chunk_text` on every `/ask` | conversation-derived text is permitted, and already crosses |
 
-The cost is honest and stated: a question with no nameable subject gets no web
-answer. "What did we decide about the slab" names nothing external and will not
-be looked up. That is the same trade the gate already makes everywhere else.
+Draft 1 proposed sending a paraphrased question to the SEARCH ENGINE and called
+it reuse. Wrong boundary. Draft 2 corrected that and then had no step able to
+turn entity findings back into an answer, because the question's intent cannot
+be carried by names alone.
 
-## 3. The trigger: two doors, and neither is a model's prose
+**Decision — three steps, each on the boundary that permits it:**
+
+1. **Name the subjects.** Extract entities from the question. Gate-screened.
+2. **Search them.** Entity names only reach the search engine. Rules unchanged.
+3. **Compose an answer.** Question + web findings → the LLM provider, which
+   already sees far more than this on every ask. **No policy moves.**
+
+Step 3 is what draft 2 was missing, and it is why the answer can address the
+question rather than describing whatever entities happened to be nameable.
+
+**The stated cost:** a question with no nameable subject is not looked up.
+"What did we decide about the slab" names nothing external. That is the same
+trade the gate makes everywhere else — the price of the boundary, not an
+oversight.
+
+## 3. Extraction from a question is new code, not reuse
+
+Draft 2 said "the same extraction, pointed at the question". It is not.
+`EXTRACT_PROMPT` says *"List the named external entities the ANSWER refers
+to"*, and its central rule is *"Never build the claim out of the question"*.
+Pointed at a question it contradicts itself.
+
+So this is a **new prompt**, inheriting none of the calibration the existing one
+earned against 40 real sessions. Two consequences to carry rather than assume
+away:
+
+- its exclusion list (people, sites, project codes, the product itself) has to
+  be re-derived for question text and measured, not copied
+- `New Zealand` — draft 2's own worked example — is a place, which the prompt
+  excludes and `ALLOWED_KINDS` refuses. **The example did not survive the
+  machinery it was written to demonstrate.** A question's subject is often a
+  category ("scaffolding standard") rather than a name, and the kind vocabulary
+  has to say whether that is admissible before any of this works.
+
+## 4. The trigger: two doors
 
 Retrieval returns `chunks: 5` even when nothing is relevant, so "no chunks" is
-not the whole signal — but review found it is not *no* signal either, and the
-first draft got this backwards.
+not the whole signal. Review found it is not *no* signal either.
 
-**Door A — retrieval returned nothing.** `lambda_ask_agent.py:1139` fires on at
-least five real paths in `lambda_rag_search.py`: caller not provisioned (`:252`),
-`site_count == 0` (`:280`), missing embedding (`:243`), a date-filtered question
-with nothing to widen to (`:295`), and a caller whose only content is deleted.
-The most important of these is **a new pilot account with no recordings yet**,
-asking exactly the question in §1. That branch returns a fixed string today and
-never calls a model, so a trigger that depends on the grounded answer would miss
-the flagship case — the same indictment this spec makes of corroboration.
+**Door A — retrieval returned nothing.** `lambda_ask_agent.py:1139` fires on
+four real paths in `lambda_rag_search.py`: caller not provisioned (`:252`),
+`site_count == 0` (`:280`), a date-filtered question with nothing to widen to
+(`:295`), and a caller whose only content is deleted. The flagship case is
+**`site_count == 0` — a provisioned user with no recordings yet**, asking
+exactly the question in §1. That branch returns a fixed string and never calls
+a model, so a trigger keyed only on the grounded answer would miss it.
 
-**Door B — the excerpts did not answer.** A separate, cheap classification call:
-given the question and the excerpt headers, did these answer it? Measured on the
-deployed vendor, this shape of call is 2.4–2.8s (n=8).
+**Door A must branch on `error`.** "Caller not provisioned" also lands here and
+is an identity-resolution failure; serving it a web answer masks a defect behind
+working-looking output. Only the empty-corpus cases open the door.
 
-**What was rejected, and why it matters:**
+*(Draft 2 claimed five paths. The missing-embedding one is unreachable from
+ask-agent — `dashscope_utils.embed` raises, and ask-agent computes the vector
+inside its own try, so that failure becomes the generic error envelope.)*
 
-| | |
-|---|---|
-| string-match the refusal prose | a phrase is not an interface; this repo has shipped seven consumers hanging off the literal `"failed"` |
-| **make the grounded pass return an envelope (`force_json`)** | **rejected on review.** `force_json` is provider-dependent: the Anthropic branch never receives it, the DashScope non-thinking branch silently DROPS `max_tokens`, and the language-retry call site hardcodes `force_json=False` so a CJK-leaked answer's retry would return prose into a caller expecting JSON. It also collides with `answer_language.tail_rule()`, which is deliberately last in the prompt, and JSON mode measured 1671 reasoning tokens against 516 — inflating the very budget §4 depends on |
-| always search | sends every question to a third party and pays the latency on questions the records answer perfectly well |
+**Door B — the excerpts did not answer.** A separate, cheap classification call.
+`force_json` on the grounded pass is rejected: the Anthropic branch never
+receives it, the DashScope non-thinking branch silently drops `max_tokens`, the
+language-retry call sites hardcode `force_json=False`, it collides with the tail
+rule that is deliberately last in the prompt, and JSON mode measured 1671
+reasoning tokens against 516.
 
-A separate call costs one round trip and touches nothing about how the answer
-itself is produced. That is the whole reason to prefer it.
+Door B runs on `corroboration_client`, not `llm_utils`, and **that choice sends
+excerpt text to the corroboration vendor.** Under §2 that is the LLM-provider
+boundary and permitted — but it is a *different* provider from the one that saw
+the transcript during `/ask`, so it is a new recipient, called out here rather
+than buried. Fail closed: an unparseable verdict means no web answer.
 
-## 4. The budget, and where the real risk is
+Chunk *headers* are `topic_title` + date and say nothing about relevance; door B
+needs `chunk_text`.
 
-The first draft framed the risk as the web search overrunning. The code says
-otherwise.
+## 5. The budget, and what tonight measured about it
 
-The web call through `corroboration_client` is properly bounded: per-attempt
-timeout, a floor below which it refuses to start, and a retry only inside a
-stated budget. **The grounded pass is the unbounded one.** It goes through
-`llm_utils._post_with_retry`: up to 4 attempts at 45s each with backoff — the
-four defects `corroboration_client`'s docstring lists as its reasons for
-existing. One slow vendor attempt alone blows the 29s gateway ceiling before a
-web search is even reached, and there is no `left()`-style clock anywhere in
-`_rag_answer`.
+`call_llm` now takes a `deadline` (shipped 2026-09-11), so the grounded pass can
+be bounded at all — which draft 2 assumed and draft 1 did not even name. That
+was the larger blocker and it is gone.
 
-**Decision: the clock comes first.** `_rag_answer` gets a deadline of its own,
-shared by every step on the path, before any web step is added. Without it this
-feature makes an existing unbounded path longer, and the caller sees a raw 504
-and the UI's "Could not reach the agent" — not the honest fallback.
+The smaller one is now binding, and tonight measured it:
 
-Numbers to size it from, and where each came from:
+    grounded pass, prod       9.0 – 10.8 s
+    door B classification     2.4 –  2.8 s
+    web search (3 entities)   up to 11.4 s
+    compose (new, §2 step 3)  unmeasured
+    gateway ceiling          29 s
 
-    grounded pass, TEST      5.7 – 8.8 s
-    grounded pass, prod      9.0 – 10.8 s   (the repo's own recorded range)
-    classification call      2.4 – 2.8 s    (n=8, this vendor)
-    web search              10.3 – 11.4 s   (n=3, this vendor)
-    gateway ceiling         29 s            (not ours to raise)
+Corroboration's own three steps, sized from measured tails plus honest margins,
+already fill a 27s stop exactly — 8% / 23% / 12% of cushion, nothing left to
+give. **This path is longer than that one** and adds a step nobody has timed.
 
-Prod worst case is the one that binds: 10.8 + 2.8 + 11.4 = 25 s before embed,
-rag-search and gate. It does not fit with room. **So the web step runs only
-when the deadline still covers it, and when it does not, the answer is the one
-we have today — "the records do not cover this" — never an error.**
+**So the honest position is that this does not fit behind API Gateway REST**,
+and no rebalancing changes it. Two ways forward; the choice is the owner's:
 
-## 5. Voice is out
+- **accept partial coverage** — run the web step only while the deadline still
+  covers it, else answer as today. Ships inside the current architecture; fires
+  least often when the vendor is slow, which is when a user is least patient.
+- **move the route off API Gateway REST** — a Function URL lifts the ceiling and
+  is the same change streaming needs. Bigger, and it fixes both.
 
-`_voice_answer` calls the same `_rag_answer` and pipes the result straight into
-TTS. A web fallback there adds 10–11s to a path a worker is holding a button
-for, and the voice prompt forbids URLs and formatting symbols, so sources cannot
-be rendered. The voice path opts out by `mode`, explicitly, with a test.
+Evidence this is not theoretical: with corroboration's budgets at their tightest
+honest setting, roughly **one run in six** still exceeds them.
 
 ## 6. Not mixing the two sources
 
-The web answer is its own block under its own heading — the same separation
-corroboration already uses ("From the open web — not from your recordings"). An
-answer that silently blends them is worse than no answer: the reader cannot
-audit it and has no reason to suspect they need to.
+The web answer is its own block under its own heading — the separation
+corroboration already uses. An answer that blends them is worse than none: the
+reader cannot audit it and has no reason to suspect they need to.
 
-`searched` already exists for the other half of this and the same rule applies:
-prose describing a search is not evidence a search happened. Measured on
-muse-spark, a model will narrate a search it never ran and assert its findings.
+`searched` already exists for this and the rule holds: prose describing a search
+is not evidence one happened. Measured on muse-spark, a model will narrate a
+search it never ran and assert its findings.
 
-**One circularity to cut:** the UI fires `/ask/corroborate` on whatever the
-answer contains. If the answer is now sometimes web-derived, that corroborates
-the web against the web. Suppressed explicitly.
+**Two circularities to cut.** The UI fires `/ask/corroborate` on whatever the
+answer contains, so a web-derived answer would be corroborated against the web.
+And suppression cannot be the last thing shipped: the UI has no discriminator
+today, so between the backend returning web answers and the UI learning about
+them, every one gets corroborated in production.
 
-## 7. Scope
+**Decision:** the web fallback is gated on a REQUEST field only the new UI sends
+— the same pattern `externalCorroboration` already uses. An old UI never
+receives an answer it cannot label, and deploy order stops mattering.
 
-In:
-1. A deadline on `_rag_answer`, shared by every step (§4) — first, and shippable
-   alone.
-2. Entity extraction from the question, screened by the existing gate (§2).
-3. A classification call for door B; door A is the existing empty-chunks branch
-   (§3).
-4. The web answer via `corroboration_client.call(web=True)` — client, credential
-   and vendor already exist and are not re-litigated.
-5. Response carries the web answer, sources with `domain`, and a flag saying the
-   web was consulted, separate from the grounded answer.
-6. UI renders it as a distinct block; corroboration suppressed on it.
+## 7. Voice is out
 
-Out: corroboration itself, voice, streaming, the 29s ceiling, and the gate's
-policy — including `_PERSON_SHAPE`, see §8.
+`_voice_answer` calls the same `_rag_answer` with `mode: "voice"`, so the
+opt-out is real and testable. A web fallback there adds 10s+ to a path a worker
+holds a button for, and the voice prompt forbids URLs and formatting symbols.
 
-## 8. What the first draft got wrong
+## 8. Scope, in shippable order
 
-Recorded because two of these were wrong in the same direction — assuming a
-mechanism did what its name suggested.
+1. Door A branches on `error` — small, correct alone, no new capability.
+2. A question-extraction prompt with its own exclusion list, measured (§3).
+3. Door B on `corroboration_client`, fail-closed, reading `chunk_text` (§4).
+4. The request-field gate (§6) — **before** any web answer can be returned.
+5. Compose step and the web answer, deadline derived from what is left.
+6. UI block, corroboration suppressed on it.
 
-- **"`if not chunks:` never fires."** It fires on five paths, and the one that
-  matters most is a new account with no recordings — the flagship case.
-- **"Screened by the existing gate."** Technically callable, materially a
-  different guarantee on sentences than on names, and a policy change dressed as
-  reuse.
-- **"`_looks_like_a_person` matches one word, contradicting its docstring."**
-  The docstring is stale; the code is a deliberate correction. Its comment
-  records that requiring two words "refused `Naylor Love` and let `Heidi`
-  straight through — found on real sessions, where a bare given name reached the
-  allowed list." Stantec and Bluebeam being refused is a known, accepted cost of
-  a rule bought with a real leak. The first draft invited the owner to reconsider
-  it on a false premise; that invitation is withdrawn.
+Out: corroboration itself, voice, streaming, the gate's policy including
+`_PERSON_SHAPE`.
 
-## 9. What must be measured before it ships
+## 9. What the earlier drafts got wrong
 
-1. That door B tracks reality — questions the records DO and do not answer,
-   n≥5 each. Always-false is a feature that never fires; always-true sends every
-   question out.
-2. That a search actually ran before any web answer is shown.
-3. The combined latency against 29s, on prod-shaped numbers, worst case not
-   median.
-4. That the deadline in §4 actually bounds the grounded pass — by driving it,
-   not by reading it.
+Two of these share a shape: **assuming an interface accepted what was being
+handed to it.**
+
+- **"`if not chunks:` never fires."** It fires on four paths, and the flagship
+  is a new account with no recordings.
+- **"Screened by the existing gate."** Callable, but its rules assume a name; on
+  a sentence, legitimate queries are refused (60-char cap, commercial terms,
+  digits) and an embedded person's name passes, because `_PERSON_SHAPE` is
+  anchored to the whole string.
+- **"The same extraction, pointed at the question."** The prompt forbids exactly
+  that, and the worked example did not survive `ALLOWED_KINDS`.
+- **"A deadline on `_rag_answer`, shippable alone."** `call_llm` had no timeout
+  parameter; bounding it required changing a module nine callers share. Done
+  since, as its own change.
+- **"`_looks_like_a_person` contradicts its docstring."** The docstring is
+  stale; the code is a correction bought with a real leak — requiring two words
+  "refused `Naylor Love` and let `Heidi` straight through". Withdrawn.
+
+## 10. What must be measured before it ships
+
+1. Door B against reality — questions the records do and do not answer, n≥5
+   each. Always-false never fires; always-true sends every question out.
+2. The new extraction prompt's exclusion list, against real questions, for the
+   leaks the existing one was calibrated against.
+3. That a search ran before any web answer is shown.
+4. Combined latency against 29s on prod-shaped numbers, worst case not median —
+   including the compose step, which no one has timed.
