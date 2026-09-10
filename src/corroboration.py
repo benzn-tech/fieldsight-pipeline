@@ -65,9 +65,26 @@ HARD_STOP_SECONDS = float(os.environ.get("CORROBORATION_HARD_STOP", "27"))
 # comfortable and are unchanged. A single 13.09s extract outlier appeared once
 # and never again in the following sixteen calls; it is why these keep real
 # margin instead of hugging the maximum.
-EXTRACT_BUDGET = 4.0
-SEARCH_BUDGET = 15.0
-RECONCILE_BUDGET = 6.0
+# Re-cut 2026-09-11 after n=20 made extract's tail visible. The 4.0s it had was
+# sized from n=8 at 2.41-2.79s, which cannot see a 1-in-10 event: 2 of 20 runs
+# exceed it, max 6.45s, and one of those was observed LIVE as a read timeout on
+# the deployed function -- reported to the reader as "the check ran out of
+# time", which was true and useless.
+#
+#     extract    n=20   p50 2.94   p90 4.51   MAX 6.45
+#     search     n=6    p50 6.00              MAX 8.66  (two entities)
+#     reconcile  n=5    p50 2.28              MAX 2.91  (with effort=low)
+#
+# search keeps a slice sized from the THREE-entity measurement (11.4s), not the
+# two-entity one above: sizing from the easier payload is the same mistake as
+# sizing from a paraphrased prompt, which this file has already made once.
+#
+# These sum to 25 and the floor is 2, which exactly fills the 27s stop. There is
+# no slack left to give any of them, and that is the real finding: three steps'
+# tails plus honest margins no longer fit under a gateway we do not own.
+EXTRACT_BUDGET = 7.0
+SEARCH_BUDGET = 14.0
+RECONCILE_BUDGET = 4.0
 
 # Steps 1 and 4 are classification, not reasoning, and they are the two that pay
 # for the search step. They ask for LOW effort rather than none: on this endpoint
