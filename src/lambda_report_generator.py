@@ -882,6 +882,30 @@ def write_audit_entry(site_id, target_date, action, detail, user='System'):
 # Word Document Generation
 # ============================================================
 
+def site_name_for(user_site_info):
+    """This user's site, or "" when it is not known.
+
+    NOT the SITE_NAME environment variable. That default turned "we could not
+    find this user's site" into "this user works at whichever site the variable
+    names", and on TEST on 2026-09-10 a Neil_Blunden report came out filed under
+    `SB1108 Ellesmere College` -- a different customer's site, from deployed
+    code, in a field that is displayed to a customer and read downstream.
+
+    BUG-41 wrote the rule after the same field misdirected RAG attribution:
+    an environment-level default used for multi-tenant attribution is a
+    dangerous design, because it silently converts "not found" into "belongs to
+    this particular customer". The fix then was applied to what ingest
+    consumes; the report kept carrying the name.
+
+    Empty is both honest and safer downstream: `resolve_site` skips the
+    by-name lookup entirely and falls through to membership, which is where the
+    answer actually is.
+    """
+    if not isinstance(user_site_info, dict):
+        return ''
+    return user_site_info.get('name') or ''
+
+
 def render_sections_into(doc, sections):
     """Write the reader's sections into a Word document.
 
@@ -1451,7 +1475,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         user_role = user_roles.get(user_name, '')
         user_site_id = user_primary_site.get(user_name, '')
         user_site_info = sites_info.get(user_site_id, {})
-        user_site_name = user_site_info.get('name', site_name)
+        user_site_name = site_name_for(user_site_info)
 
         weather_block = build_weather_block_for_site(
             user_site_info, target_date, get_nzdt_now().strftime('%Y-%m-%d'))
@@ -1784,7 +1808,7 @@ def generate_periodic_report(report_type, start_date, end_date):
         logger.info(f"  Generating {report_type} report for user: {user_name} ({len(user_reports)} daily reports)")
         user_site_id = user_primary_site.get(user_name, '')
         user_site_info = sites_info.get(user_site_id, {})
-        user_site_name = user_site_info.get('name', site_name)
+        user_site_name = site_name_for(user_site_info)
         user_role = user_roles.get(user_name, '')
 
         if report_type == 'weekly':
