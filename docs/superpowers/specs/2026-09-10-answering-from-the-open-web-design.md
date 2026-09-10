@@ -1,6 +1,6 @@
 # When the records cannot answer, look it up
 
-Status: spec, third draft. Two adversarial reviews; §9 records what each earlier
+Status: spec, fourth draft. Two adversarial reviews; §9 records what each earlier
 draft got wrong, because two of those mistakes shared a shape worth naming.
 
 ## 1. The gap
@@ -89,9 +89,21 @@ four real paths in `lambda_rag_search.py`: caller not provisioned (`:252`),
 exactly the question in §1. That branch returns a fixed string and never calls
 a model, so a trigger keyed only on the grounded answer would miss it.
 
-**Door A must branch on `error`.** "Caller not provisioned" also lands here and
-is an identity-resolution failure; serving it a web answer masks a defect behind
-working-looking output. Only the empty-corpus cases open the door.
+**Door A opens on empty chunks with NO `error` set.** Stated as an exclusion,
+because the inverse reading is the dangerous one and draft 3 left it ambiguous.
+Checked: the empty-corpus paths carry no `error` key at all (`site_count == 0`
+returns `{"chunks": [], "site_count": 0, ...}` at `:280`; widen-empty and
+deleted-only fall through to the normal return), while `error` marks the defect
+paths -- `"missing sub or query_embedding"` (`:243`), `"caller not provisioned"`
+(`:252`). Serving an identity failure a web answer would mask a defect behind
+working-looking output.
+
+Two things this branch does not do, stated because both fail OPEN. It assumes
+empty-without-error means empty corpus, so any future rag-search path returning
+empty without setting `error` silently earns a web answer -- and `:280` already
+shows the contract is not "errors are always set". And `site_count == 0` can
+also mean a `site_filter` that matched nothing (`:270`), unreachable from `/ask`
+only because ask never sends `site`.
 
 *(Draft 2 claimed five paths. The missing-embedding one is unreachable from
 ask-agent — `dashscope_utils.embed` raises, and ask-agent computes the vector
@@ -131,16 +143,45 @@ Corroboration's own three steps, sized from measured tails plus honest margins,
 already fill a 27s stop exactly — 8% / 23% / 12% of cushion, nothing left to
 give. **This path is longer than that one** and adds a step nobody has timed.
 
-**So the honest position is that this does not fit behind API Gateway REST**,
-and no rebalancing changes it. Two ways forward; the choice is the owner's:
+Draft 3 concluded from this that the path "does not fit behind API Gateway REST"
+and offered the owner a choice between partial coverage and an architecture
+move. Review then added the step draft 3 forgot to count -- its own
+question-extraction call, max 6.45s -- and the sequential worst case became
+**31.5s before compose** against a 29s ceiling. Door B looked decorative.
 
-- **accept partial coverage** — run the web step only while the deadline still
-  covers it, else answer as today. Ships inside the current architecture; fires
-  least often when the vendor is slow, which is when a user is least patient.
-- **move the route off API Gateway REST** — a Function URL lifts the ceiling and
-  is the same change streaming needs. Bigger, and it fixes both.
+**That arithmetic assumes the steps queue, and they do not have to.**
 
-Evidence this is not theoretical: with corroboration's budgets at their tightest
+Door B asks "do these excerpts answer the question". Its inputs are the question
+and the chunks. `lambda_ask_agent.py:1133` has the chunks in hand; the grounded
+synthesis call happens after that line. **Door B does not depend on the grounded
+answer, and neither does anything downstream of it.** They are sequential
+because they were written in reading order, not because one needs the other.
+
+Run both from the moment chunks land:
+
+    t=0.0   chunks in hand
+            |-- grounded synthesis ..................... 10.8s -> t=10.8
+            |-- door B ......... 2.8s -> t=2.8
+                                 |-- name the subjects .. 6.5s -> t=9.3
+                                     |-- web search ..... 11.4s -> t=20.7
+                                         |-- compose .... ~3s  -> t=23.7
+
+**About 24s worst case against 29s**, and the grounded answer is ready at 10.8s
+either way. Nothing is wasted: the web branch starts only if door B says the
+excerpts will not answer, and door B has decided by 2.8s.
+
+This is not free, and the costs are engineering rather than a dilemma:
+concurrency inside a Lambda that has none today, a deadline shared across
+threads rather than one `left()`, and a failure mode where one branch dies and
+the other must still return. The previous framing had none of that -- it asked
+the owner to choose between shipping something decorative and rebuilding the
+transport, because the steps had been assumed to queue.
+
+**What survives from draft 3:** the margins are thin, the ceiling is not ours,
+and a Function URL still lifts it and is still the same change streaming needs.
+It is no longer a precondition for this feature.
+
+Evidence the tails are real: with corroboration's own budgets at their tightest
 honest setting, roughly **one run in six** still exceeds them.
 
 ## 6. Not mixing the two sources
@@ -171,7 +212,12 @@ holds a button for, and the voice prompt forbids URLs and formatting symbols.
 
 ## 8. Scope, in shippable order
 
-1. Door A branches on `error` — small, correct alone, no new capability.
+0. Make the two branches concurrent (§5). No new capability, no new recipient:
+   it changes only what waits for what, and it is what makes the rest fit.
+   Shippable alone, with the grounded answer's own timing pinned so a
+   regression is visible.
+1. Door A opens when chunks are empty AND `error` is ABSENT (§4) — small,
+   correct alone, no new capability.
 2. A question-extraction prompt with its own exclusion list, measured (§3).
 3. Door B on `corroboration_client`, fail-closed, reading `chunk_text` (§4).
 4. The request-field gate (§6) — **before** any web answer can be returned.
