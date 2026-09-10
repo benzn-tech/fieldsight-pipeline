@@ -69,6 +69,7 @@ from output_language import OUTPUT_LANGUAGE_RULE
 import weather
 import site_coords
 import llm_utils
+import report_sections
 from datetime import datetime, timedelta
 from io import BytesIO
 from transcript_utils import (
@@ -1488,6 +1489,16 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
                 'parse_success': parse_success,
             }
         }
+
+        # The shape a person reads, alongside the shape the indexer reads.
+        # `topics` stays exactly as it is -- chunking.py splits RAG chunks
+        # straight out of it, so anything that removes or reshapes it empties
+        # the search index without failing. Sections are additional.
+        #
+        # Weekly, monthly and the site summary deliberately do NOT get this yet:
+        # they spread `**claude_output` and carry a different shape, and half a
+        # mapping renders worse than none.
+        report['sections'] = report_sections.build(report)
 
         json_key = f"{REPORT_PREFIX}{target_date}/{user_name}/daily_report.json"
         s3_client.put_object(
