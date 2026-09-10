@@ -291,3 +291,58 @@ def test_an_acronym_is_not_this_shape_and_still_passes(entity):
                                     "University of Otago", "Naylor Love Construction"])
 def test_a_corporate_marker_still_outranks_the_name_shape(entity):
     assert gate.screen_entity(entity, "company") is None
+
+
+# ------------------------------------- what the gate does and does not protect
+
+# The module docstring says "Only ENTITIES go out. Never conversation text." A
+# reader can take that as "nothing conversational leaves this module", and that
+# is false: extraction sends the whole question and the whole answer to the LLM
+# provider, BEFORE the gate has run at all -- the docstring says so itself, two
+# paragraphs later, and the two are easy to read past each other.
+#
+# These pin the actual boundary rather than the sentence, because a docstring
+# rots quietly and this one already has: it justified the LLM-provider hop with
+# "the same provider already saw the transcript during /ask", which was written
+# when that provider was DashScope. Today both hops are OpenRouter on one key,
+# so the claim is true again by coincidence rather than by the mechanism it
+# names.
+
+def test_extraction_sends_the_whole_conversation_to_the_model():
+    """Not a leak -- a fact worth being unable to forget. The gate cannot
+    protect this hop: it runs after it."""
+    import corroboration as steps
+    prompt = steps.EXTRACT_PROMPT.format(
+        question="did Neil sign off the Ellesmere scaffold variation",
+        answer="Neil approved it on Tuesday at SB1108.")
+    assert "did Neil sign off the Ellesmere scaffold variation" in prompt
+    assert "Neil approved it on Tuesday at SB1108." in prompt
+
+
+def test_the_search_step_carries_no_conversation_text():
+    """This is the hop the gate exists for. Only what survived screening may
+    appear, and the answer must not."""
+    import corroboration as steps
+    allowed = [{"entity": "Fletcher Building", "kind": "company",
+                "claim": "a major NZ materials supplier"}]
+    lines = "\n".join(
+        "- %s (%s): %s" % (a["entity"], a["kind"], a.get("claim"))
+        for a in allowed)
+    prompt = steps.SEARCH_PROMPT.format(entities=lines)
+    assert "Fletcher Building" in prompt
+    for conversational in ("Neil", "Ellesmere", "SB1108", "signed off"):
+        assert conversational not in prompt
+
+
+def test_the_claim_reaches_the_search_step_without_being_screened():
+    """`screen()` inspects the entity string and forwards `claim` verbatim.
+
+    Harmless while claims are built from the ANSWER and the extraction prompt
+    forbids building them from the question. It stops being harmless the moment
+    anything extracts from a question instead, because the claim is what the
+    search-enabled call turns into queries -- so this is pinned as a KNOWN
+    property rather than left to be discovered by whoever changes that.
+    """
+    result = gate.screen([{"entity": "Fletcher Building", "kind": "company",
+                           "claim": "anything at all, unexamined"}])
+    assert result.allowed[0]["claim"] == "anything at all, unexamined"
