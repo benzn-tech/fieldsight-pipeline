@@ -45,6 +45,19 @@ KINDS = frozenset({"narrative", "kpi", "list", "table", "photos"})
 
 _PRIORITY = {"high": 0, "medium": 1, "low": 2}
 
+#: An action that is finished is not an action to chase. org-api serves a
+#: `status` on every action item (it is one of five editable columns, and a
+#: person ticking something off on the Today page is what writes it), and this
+#: section dropped the field -- so a report listed a job somebody had already
+#: closed alongside the ones still owed, indistinguishable, and where it had a
+#: past deadline it sorted to the TOP as the most overdue thing on site.
+#:
+#: Closed rows are kept and ranked last rather than removed. "We said we would
+#: do this, and it is done" is the good half of a daily report, and dropping it
+#: would make a report of a productive day shorter than one of an idle day.
+_CLOSED = frozenset({"done", "completed", "complete", "closed", "cancelled",
+                     "canceled", "resolved"})
+
 #: Values that mean "nobody filled this in". `lambda_meeting_minutes` defaults a
 #: missing deadline to the string "?", which is truthy -- ranked as a date it
 #: would put every undated action from a meeting above every genuinely dated
@@ -159,12 +172,20 @@ def _actions(topics, report_date=None):
                     seen[key]["owner"] = (prior + ", " + owner) if prior else owner
                 if not seen[key]["due"]:
                     seen[key]["due"] = _clean(item.get("deadline"))
+                # Two topics naming one action, one closed and one open, means
+                # it was raised again after being closed. Open wins: the report
+                # must not mark something done while a later mention is still
+                # asking for it.
+                later = _clean(item.get("status")).lower() or "open"
+                if later not in _CLOSED:
+                    seen[key]["status"] = later
                 continue
             seen[key] = {
                 "action": text,
                 "owner": _clean(item.get("responsible")),
                 "due": _clean(item.get("deadline")),
                 "priority": _clean(item.get("priority")).lower(),
+                "status": _clean(item.get("status")).lower() or "open",
                 # org-api's 0-day collapse already merged one commitment said in
                 # three recordings into one row and counted it. That count is
                 # authoritative -- it spans recordings, where the text match
@@ -189,7 +210,7 @@ def _actions(topics, report_date=None):
     return {
         "title": "Actions",
         "kind": "table",
-        "fields": ["action", "owner", "due", "priority"],
+        "fields": ["action", "owner", "due", "priority", "status"],
         "rows": rows,
     }
 
@@ -214,9 +235,14 @@ def _rank(row):
     An action with no priority sorts after `low` rather than in the middle:
     absence of a judgement is not a middling judgement, and putting it above a
     labelled item would let a silent field outrank a stated one.
+
+    Anything already closed sorts below all of it, whatever its date said. A
+    finished job with last Tuesday's deadline is not the most overdue thing on
+    site, and before `status` was carried at all it was ranked as exactly that.
     """
     days = row["_days"]
     return (
+        1 if row.get("status", "open") in _CLOSED else 0,
         1 if days is None else 0,
         days if days is not None else 0,
         -row["mentions"],

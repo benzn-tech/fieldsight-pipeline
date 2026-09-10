@@ -23,7 +23,11 @@ actually is.
 """
 import pytest
 
-rg = pytest.importorskip("lambda_report_generator")
+# Plain import, not importorskip. `lambda_report_generator` imports cleanly in
+# this suite -- 40 other test modules import it the same way -- and a skip here
+# would turn "the module stopped being importable" into seven silently green
+# tests guarding a customer-facing attribution field.
+import lambda_report_generator as rg
 
 
 def test_a_known_site_is_used():
