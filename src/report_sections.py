@@ -149,7 +149,7 @@ def _actions(topics, report_date=None):
                 continue
             key = _normalise(text)
             if key in seen:
-                seen[key]["mentions"] += 1
+                seen[key]["mentions"] += _mention_count(item)
                 # A later mention fills a blank -- and where two topics name
                 # DIFFERENT owners for one action, both are named. Keeping only
                 # the first silently reassigns somebody else's job.
@@ -165,7 +165,14 @@ def _actions(topics, report_date=None):
                 "owner": _clean(item.get("responsible")),
                 "due": _clean(item.get("deadline")),
                 "priority": _clean(item.get("priority")).lower(),
-                "mentions": 1,
+                # org-api's 0-day collapse already merged one commitment said in
+                # three recordings into one row and counted it. That count is
+                # authoritative -- it spans recordings, where the text match
+                # below only spans topics inside one report -- so it wins where
+                # it exists. Its own comment reaches the same conclusion this
+                # ranking does, from the same 44% measurement: repetition is
+                # evidence, a priority label mostly is not.
+                "mentions": _mention_count(item),
             }
             order.append(key)
 
@@ -185,6 +192,15 @@ def _actions(topics, report_date=None):
         "fields": ["action", "owner", "due", "priority"],
         "rows": rows,
     }
+
+
+def _mention_count(item):
+    """How many times this was said, as the producer counted it."""
+    try:
+        n = int(item.get("mention_count") or 1)
+    except (TypeError, ValueError):
+        return 1
+    return n if n > 0 else 1
 
 
 def _rank(row):
