@@ -371,6 +371,12 @@ def format_report_for_prompt(report, report_type):
             lines.append(f"Participants: {', '.join(t.get('participants', []))}")
             lines.append(f"Summary: {t.get('summary', '')}")
 
+            for q in (t.get('open_questions') or []) + (t.get('questions') or []):
+                if isinstance(q, dict):
+                    q = q.get('question', '')
+                if q:
+                    lines.append(f"  Open question: {q}")
+
             for d in t.get('key_decisions', []):
                 if isinstance(d, dict):
                     lines.append(f"  Decision: {d.get('decision', d)}")

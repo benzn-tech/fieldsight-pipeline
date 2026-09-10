@@ -1498,7 +1498,16 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         # Weekly, monthly and the site summary deliberately do NOT get this yet:
         # they spread `**claude_output` and carry a different shape, and half a
         # mapping renders worse than none.
-        report['sections'] = report_sections.build(report)
+        try:
+            report['sections'] = report_sections.build(report)
+        except Exception as exc:  # noqa: BLE001
+            # This runs before the S3 write, inside a loop over users with no
+            # per-user guard: an exception here loses the report, the Word
+            # document and the item rows for this user AND every user after
+            # them. A report with no sections is a rendering problem; a report
+            # that was never written is a lost day.
+            logger.exception("sections could not be built for %s: %s", user_name, exc)
+            report['sections'] = []
 
         json_key = f"{REPORT_PREFIX}{target_date}/{user_name}/daily_report.json"
         s3_client.put_object(

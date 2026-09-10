@@ -73,6 +73,16 @@ def _topic_text(t):
             f"Action: {a.get('action', '')} — {a.get('responsible', '?')}"
             + (f", due {a['deadline']}" if a.get("deadline") else "")
         )
+    # Carried, not concatenated. `lambda_meeting_minutes` used to glue these
+    # onto the end of `summary`; when that stopped, the words left the chunk
+    # too, and "追溯的时候再去 query" is the path this whole change is justified
+    # by. An unanswered question is exactly what somebody searches for.
+    for q in t.get("open_questions", []) or []:
+        parts.append("Open question: " + (q if isinstance(q, str)
+                                          else str(q.get("question", "") if isinstance(q, dict) else q)))
+    for q in t.get("questions", []) or []:
+        parts.append("Open question: " + (q if isinstance(q, str)
+                                          else str(q.get("question", "") if isinstance(q, dict) else q)))
     for s in t.get("safety_flags", []):
         parts.append(
             f"Safety ({s.get('risk_level', '?')}): {s.get('observation', '')}"

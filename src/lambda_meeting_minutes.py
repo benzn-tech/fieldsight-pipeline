@@ -885,7 +885,12 @@ def convert_to_daily_report_format(minutes, meeting_config, transcripts):
     }
 
     # What a person reads. `topics` above stays for chunking.py and for query.
-    compat_report['sections'] = report_sections.build(compat_report)
+    try:
+        compat_report['sections'] = report_sections.build(compat_report)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("sections could not be built for %s: %s",
+                         compat_report.get('report_date'), exc)
+        compat_report['sections'] = []
 
     return compat_report, user_for_path
 

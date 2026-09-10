@@ -26,7 +26,18 @@ Sorting by priority alone puts 26 items in one undifferentiated pile, which is
 not an order. So a date ranks first where there is one, and where there is not,
 how many separate times the day returned to a thing ranks above the label a
 model applies to half of everything.
+
+AND A DEADLINE IS NOT A DATE. The prompt asks for `"deadline": "When (e.g.
+'Tomorrow 08:00', 'EOD', '15:00'), or null"`, so it arrives as free text.
+Sorting that as a string ordered it by first character -- `15/09/2026` first
+because "1" < "2", October above September, `EOD` below October, `Tomorrow`
+below `Friday`. `due_dates` turns it into days-from-the-report-date where it
+honestly can and returns None where it cannot, so an unreadable deadline cannot
+outrank a real one merely for containing characters. The text the model wrote is
+still what gets displayed.
 """
+
+import due_dates
 
 #: The Library's section vocabulary (scripts/api/template-store.js). A kind
 #: outside this set has no renderer on the other side.
@@ -59,15 +70,20 @@ def build(report):
     than rendered as a heading over a blank -- a quiet day should read as a
     short report, not a form somebody failed to fill in.
     """
-    report = report or {}
-    topics = report.get("topics") or []
+    report = report if isinstance(report, dict) else {}
+    # A model writes what it likes. Every list below is filtered to the shape its
+    # reader expects, because this runs BEFORE the S3 write inside a loop over
+    # users: one bad shape meant no report for this user and every user after
+    # them. A section that comes out short beats a lost nightly run.
+    topics = [t for t in (report.get("topics") or []) if isinstance(t, dict)]
 
     sections = [
         _summary(report),
         _on_site(report),
-        _actions(topics),
+        _actions(topics, report.get("report_date")),
         _open_questions(topics),
         _decisions(topics),
+        _dates(report),
         _issues(report),
         _safety(report),
         _photos(topics),
@@ -101,7 +117,11 @@ def _on_site(report):
     `per_recording` is a list of S3 filenames and was being rendered; it is
     plumbing and belongs nowhere near a customer.
     """
-    rec = report.get("recording_session") or {}
+    rec = report.get("recording_session")
+    # A meeting's compat report has no recording_session at all, and org-api
+    # spent a whole comment removing exactly this "hard 0 on a real day".
+    if not isinstance(rec, dict) or not rec:
+        return None
     return {
         "title": "On Site",
         "kind": "kpi",
@@ -114,24 +134,31 @@ def _on_site(report):
     }
 
 
-def _actions(topics):
+def _actions(topics, report_date=None):
     """Every action the day produced, once each, most-owed first."""
     seen = {}
     order = []
     for topic in topics:
-        for item in topic.get("action_items") or []:
+        for item in _as_list(topic.get("action_items")):
             if not isinstance(item, dict):
                 continue
-            text = str(item.get("action") or "").strip()
+            # `_clean`, not `strip`: an action whose text is "N/A" or "TBD" is
+            # not an action, and rendering it gives somebody a row to chase.
+            text = _clean(item.get("action"))
             if not text:
                 continue
             key = _normalise(text)
             if key in seen:
                 seen[key]["mentions"] += 1
-                # First mention wins the wording; a later one fills a blank.
-                for src, dst in (("responsible", "owner"), ("deadline", "due")):
-                    if not seen[key][dst]:
-                        seen[key][dst] = _clean(item.get(src))
+                # A later mention fills a blank -- and where two topics name
+                # DIFFERENT owners for one action, both are named. Keeping only
+                # the first silently reassigns somebody else's job.
+                owner = _clean(item.get("responsible"))
+                if owner and owner.lower() not in seen[key]["owner"].lower():
+                    prior = seen[key]["owner"]
+                    seen[key]["owner"] = (prior + ", " + owner) if prior else owner
+                if not seen[key]["due"]:
+                    seen[key]["due"] = _clean(item.get("deadline"))
                 continue
             seen[key] = {
                 "action": text,
@@ -147,9 +174,11 @@ def _actions(topics):
         return None
     for i, row in enumerate(rows):
         row["_seq"] = i
+        row["_days"] = due_dates.days_until(row["due"], report_date)
     rows.sort(key=_rank)
     for row in rows:
         row.pop("_seq", None)
+        row.pop("_days", None)
     return {
         "title": "Actions",
         "kind": "table",
@@ -159,17 +188,21 @@ def _actions(topics):
 
 
 def _rank(row):
-    """Dated first and soonest; then how often the day came back to it; then
-    the label; then the order it was said in.
+    """Readably-dated first and soonest; then how often the day came back to it;
+    then the label; then the order it was said in.
+
+    "Readably" is the point. A deadline that cannot be turned into a day ranks as
+    undated rather than as its own text: a string sorts by its first character,
+    and `EOD` filed below a date in October.
 
     An action with no priority sorts after `low` rather than in the middle:
     absence of a judgement is not a middling judgement, and putting it above a
     labelled item would let a silent field outrank a stated one.
     """
-    dated = 0 if row["due"] else 1
+    days = row["_days"]
     return (
-        dated,
-        row["due"] or "",
+        1 if days is None else 0,
+        days if days is not None else 0,
         -row["mentions"],
         _PRIORITY.get(row["priority"], len(_PRIORITY)),
         row["_seq"],
@@ -185,10 +218,12 @@ def _open_questions(topics):
     """
     items = []
     for topic in topics:
-        for q in topic.get("open_questions") or []:
-            _add(items, q if isinstance(q, str) else (q or {}).get("question"))
-        for q in topic.get("questions") or []:
-            _add(items, q if isinstance(q, str) else (q or {}).get("question"))
+        for q in _as_list(topic.get("open_questions")):
+            _add(items, q if isinstance(q, str)
+                 else (q.get("question") if isinstance(q, dict) else None))
+        for q in _as_list(topic.get("questions")):
+            _add(items, q if isinstance(q, str)
+                 else (q.get("question") if isinstance(q, dict) else None))
     if not items:
         return None
     return {"title": "Open Questions", "kind": "list", "items": items}
@@ -197,11 +232,34 @@ def _open_questions(topics):
 def _decisions(topics):
     items = []
     for topic in topics:
-        for d in topic.get("key_decisions") or []:
-            _add(items, d if isinstance(d, str) else (d or {}).get("decision"))
+        for d in _as_list(topic.get("key_decisions")):
+            _add(items, d if isinstance(d, str)
+                 else (d.get("decision") if isinstance(d, dict) else None))
     if not items:
         return None
     return {"title": "Decisions", "kind": "list", "items": items}
+
+
+def _dates(report):
+    """The block that is literally dates.
+
+    `critical_dates_and_deadlines` is produced by the daily report and rendered
+    in the Word document. For a design whose first ranking key is the date, the
+    one section made of dates should not be the one that vanishes when the UI
+    moves to sections.
+    """
+    items = []
+    for entry in report.get("critical_dates_and_deadlines") or []:
+        if isinstance(entry, str):
+            _add(items, entry)
+        elif isinstance(entry, dict):
+            what = _clean(entry.get("item") or entry.get("description")
+                          or entry.get("event") or entry.get("detail"))
+            when = _clean(entry.get("date") or entry.get("deadline"))
+            _add(items, (what + " \u2014 " + when) if what and when else (what or when))
+    if not items:
+        return None
+    return {"title": "Key Dates", "kind": "list", "items": items}
 
 
 def _issues(report):
@@ -225,7 +283,12 @@ def _issues(report):
 
 def _safety(report):
     items = []
-    for entry in report.get("safety_observations") or []:
+    entries = report.get("safety_observations")
+    # A bare string here was iterated character by character, producing a Safety
+    # section reading ['L', 'o', 'o', 's', 'e'].
+    if isinstance(entries, str):
+        entries = [entries]
+    for entry in entries or []:
         if isinstance(entry, str):
             _add(items, entry)
         elif isinstance(entry, dict):
@@ -238,7 +301,7 @@ def _safety(report):
 def _photos(topics):
     items = []
     for topic in topics:
-        for p in topic.get("related_photos") or []:
+        for p in _as_list(topic.get("related_photos")):
             _add(items, p if isinstance(p, str) else None)
     if not items:
         return None
@@ -249,8 +312,21 @@ def _photos(topics):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _as_list(value):
+    """A list, whatever arrived. A bare string is one item, not its characters."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
 def _add(bucket, value):
     """Append once, keeping the order things were first said in."""
+    if not isinstance(value, (str, int, float)) and value is not None:
+        return
     text = _clean(value)
     if not text:
         return

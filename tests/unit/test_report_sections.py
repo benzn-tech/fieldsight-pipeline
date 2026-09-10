@@ -16,7 +16,10 @@ So the per-topic timeline stops being rendered. It is still in the file.
 """
 import pytest
 
-rs = pytest.importorskip("report_sections")
+# Plain import, not importorskip. `report_sections` is pure -- no boto3, no
+# psycopg -- so there is no legitimate reason for it to be absent, and a skip
+# would mean these 27 tests go green if the module stops being packaged.
+import report_sections as rs
 
 
 def _topic(**kw):
