@@ -334,15 +334,31 @@ def test_a_slow_first_step_leaves_the_later_steps_less_not_more(monkeypatch):
     assert fake.calls[1]["timeout"] < steps.SEARCH_BUDGET, "it took its full slice anyway"
 
 
-def test_the_cheap_steps_never_send_effort(monkeypatch):
-    """`output_config.effort` is a 400 on haiku. The client drops it, and these
-    two call sites are why that guard exists."""
+def test_the_cheap_steps_ask_for_low_effort_rather_than_none(monkeypatch):
+    """`effort=None` was an Anthropic-era guard: `output_config.effort` is a 400
+    on haiku, and these two call sites are why the client used to drop it. That
+    vendor is gone and the guard's cost stayed.
+
+    Measured 2026-09-11 against the deployed vendor, the real RECONCILE_PROMPT,
+    n=5 per configuration, all ten returning a valid list:
+
+        no effort (what shipped)   3.75  7.19  8.72 10.82  16.50 s
+        effort low                 2.06  2.07  2.28  2.72   2.91 s
+
+    RECONCILE_BUDGET is 6 seconds. Half the no-effort runs are over it and the
+    slowest is nearly three times it -- so the step's own client cancels it, the
+    reader is told the check could not be completed, and nothing about that
+    points at an argument left behind by a vendor swap.
+
+    Sending nothing does not mean "no reasoning" on this endpoint. It means the
+    provider picks, and it picks expensively.
+    """
     _, fake = _run(monkeypatch, extraction(NAYLOR),
                    reply(text="...", results=SOURCES),
                    verdicts({"entity": "Naylor Love Construction",
                              "state": "not_found", "summary": "x"}))
-    assert fake.calls[0]["effort"] is None
-    assert fake.calls[2]["effort"] is None
+    assert fake.calls[0]["effort"] == "low"
+    assert fake.calls[2]["effort"] == "low"
 
 
 def test_only_the_search_step_searches(monkeypatch):
