@@ -28,6 +28,7 @@ import pytest
 
 import lambda_org_api as org
 from repositories import topics
+from tests.unit.test_lambda_ingest import wired      # noqa: F401  (fixture)
 
 SITE_ID = "11111111-1111-1111-1111-111111111111"
 
@@ -83,9 +84,33 @@ def test_both_read_column_lists_carry_it():
     assert "t.open_questions" in topics._TOPIC_COLS_JOINED
 
 
-def test_ingest_passes_the_report_key_through():
-    src = open(org.__file__.replace("lambda_org_api", "lambda_ingest"), encoding="utf-8").read()
-    assert "open_questions=t.get(\"open_questions\")" in src
+def test_ingest_passes_the_report_key_through(wired):
+    """Driven, not grepped.
+
+    This started life as `assert 'open_questions=t.get(...)' in source`, which
+    is an assertion about a SPELLING in one file. It cannot tell whether the
+    argument arrives, and it says nothing at all about the other writer -- see
+    test_the_writer_that_runs_on_flip_days_carries_questions, where exactly
+    that blind spot was hiding the same defect one layer in.
+    """
+    import json
+    import lambda_ingest as ing
+    from tests.unit.test_lambda_ingest import FakeS3, REPORT_KEY, make_report
+
+    report = make_report()
+    report["topics"][0]["open_questions"] = ["Is 3604 a 150 or a 200?"]
+    wired.setattr(ing, "_s3_client", FakeS3({REPORT_KEY: json.dumps(report)}))
+    captured = []
+    wired.setattr(
+        ing.topics, "upsert_topic",
+        lambda conn, site_id, report_date, title, **kw:
+            captured.append(kw) or {"id": "topic-uuid-0"},
+    )
+
+    ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert captured, "the report's topics must reach upsert_topic"
+    assert captured[0]["open_questions"] == ["Is 3604 a 150 or a 200?"]
 
 
 @pytest.mark.parametrize("stored,expected", [

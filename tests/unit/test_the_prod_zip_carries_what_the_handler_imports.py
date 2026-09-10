@@ -82,31 +82,50 @@ def test_every_handler_the_script_deploys_is_reachable_by_that_glob():
         assert h in local, "%s is deployed but not a src/ module" % h
 
 
+def _top_level_imports(module):
+    """Every top-level name this module imports, package names included.
+
+    Deliberately NOT filtered to local modules the way `_imports` is: this is
+    the check for a dependency the flat zip cannot carry, and filtering the
+    packages out is precisely how that check would miss them.
+    """
+    tree = ast.parse((SRC / (module + ".py")).read_text(encoding="utf-8"))
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                found.add(a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            found.add(node.module.split(".")[0])
+    return found
+
+
 def test_the_whole_import_closure_lives_in_src():
-    """The glob covers `src/*.py` and nothing deeper. If a handler grows a
-    dependency on a package directory (`repositories/`, `db/`), the flat zip
-    stops being enough and this fails rather than deploying a broken function.
+    """The glob covers `src/*.py` and nothing deeper. If anything reachable
+    from these nine handlers grows a dependency on a package directory
+    (`repositories/`, `db/`), the flat zip stops being enough and this fails
+    rather than deploying a function that imports on nobody's machine.
+
+    Checked across the whole CLOSURE, not just the handlers' own import lines.
+    A handler does not have to import `repositories` itself for the zip to be
+    short of it -- `lambda_x -> helper -> repositories.topics` is the same
+    broken deploy, and a check that only reads the nine top files would call it
+    green. The closure here is 32 modules.
     """
     local = _local_modules()
     handlers = _handlers_the_script_deploys()
     closure = _closure(handlers, local)
+    assert len(closure) > len(handlers), "the closure must be more than the handlers"
     # Every module in the closure is, by construction, a src/*.py file.
     for m in closure:
         assert (SRC / (m + ".py")).exists(), m
-    # And the packages are not reachable from these nine.
     packages = {p.name for p in SRC.iterdir() if p.is_dir() and (p / "__init__.py").exists()}
-    for h in handlers:
-        tree = ast.parse((SRC / (h + ".py")).read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            names = []
-            if isinstance(node, ast.Import):
-                names = [a.name.split(".")[0] for a in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                names = [node.module.split(".")[0]]
-            for n in names:
-                assert n not in packages, (
-                    "%s imports the package %s, which a flat `zip -j src/*.py` "
-                    "does not carry" % (h, n))
+    assert packages, "expected repositories/ and db/ to exist"
+    for m in sorted(closure):
+        offending = _top_level_imports(m) & packages
+        assert not offending, (
+            "%s imports the package(s) %s, which a flat `zip -j src/*.py` does "
+            "not carry" % (m, sorted(offending)))
 
 
 def test_report_sections_is_carried_because_the_report_now_imports_it():
