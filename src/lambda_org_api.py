@@ -132,6 +132,7 @@ import device_heartbeat
 import device_status
 import nz_time
 import reindex
+import report_sections
 import session_scope
 import sweep_state
 from db.connection import get_connection
@@ -1127,7 +1128,34 @@ def session_close(conn, caller, session_id, body):
                "version": row["version"], "graceSeconds": grace})
 
 
-def _assemble_session_report(conn, caller, session_id, event):
+def _selected_topic_row_ids(body):
+    """The topic ids the caller chose, or None for "all of them".
+
+    CHOSEN, never HIDDEN, and the direction is the whole safety argument. A
+    chosen-list that names a row which no longer exists simply loses that row --
+    it fails CLOSED. A hidden-list applied to a set that has changed since the
+    user saw it lets every new row through -- it fails OPEN, and the person who
+    excluded something would never learn that the exclusion stopped applying.
+    Topics are deleted and re-inserted under new uuids on every re-extraction, so
+    "the set has changed" is the ordinary case here, not the edge one.
+
+    Absent means all, and [] is rejected rather than silently meaning all: a
+    client that computed an empty selection asked for nothing, and answering that
+    with everything is the opposite of what it asked."""
+    if "topicRowIds" not in body:
+        return None, None
+    raw = body.get("topicRowIds")
+    if not isinstance(raw, list) or not raw:
+        return None, error("topicRowIds must be a non-empty list of topic ids", 400)
+    if len(raw) > 200:
+        return None, error("topicRowIds: at most 200", 400)
+    ids = {str(x) for x in raw if isinstance(x, (str, int)) and str(x).strip()}
+    if not ids:
+        return None, error("topicRowIds must be a non-empty list of topic ids", 400)
+    return ids, None
+
+
+def _assemble_session_report(conn, caller, session_id, event, selected=None):
     """Re-derive ONE session's scope + assemble its reviewed report content,
     server-side from (folder, date, session_id). The shared core of the T2
     preview and the T3 generate enqueue (session-report-review-export spec §6).
@@ -1157,8 +1185,18 @@ def _assemble_session_report(conn, caller, session_id, event):
         if r["id"] in redacted or r.get("work_class") == "non_work":
             continue
         srows.append(r)
+    if selected is not None:
+        # INTERSECTION, never a lookup. The chosen ids are filtered against rows
+        # that already passed the site ACL, the redaction check and the non_work
+        # exclusion, so a chosen id cannot widen the scope by one row -- naming
+        # somebody else's topic simply matches nothing.
+        srows = [r for r in srows if str(r["id"]) in selected]
+
     if not srows:
-        # unknown session, all-excluded, or wrong folder/date -> nothing to act on
+        # unknown session, all-excluded, wrong folder/date, or a selection that
+        # matched nothing -> nothing to act on. Deliberately the SAME 404 for all
+        # of them: distinguishing "that id is not yours" from "that id does not
+        # exist" would answer a question the caller has no right to ask.
         return None, error("session not found", 404)
 
     site_name = next((r.get("site_name") for r in srows if r.get("site_name")), None)
@@ -1187,8 +1225,15 @@ def session_report_preview(conn, caller, session_id, event):
 
     NOTE: here `session_id` is the extraction *session_base* the #11 picker
     uses (e.g. 'Benl1_2026-07-25_13-00-11'), NOT the 32-hex device session id
-    of /open|/close. Read-only: nothing is persisted, no doc, no send."""
-    content, err = _assemble_session_report(conn, caller, session_id, event)
+    of /open|/close. Read-only: nothing is persisted, no doc, no send.
+
+    Takes the same optional `topicRowIds` the generate route does, so the modal
+    can preview EXACTLY what it is about to produce. A preview that ignored the
+    selection would show the user one document and hand them another."""
+    selected, err = _selected_topic_row_ids(parse_body(event) or {})
+    if err is not None:
+        return err
+    content, err = _assemble_session_report(conn, caller, session_id, event, selected)
     if err is not None:
         return err
     return ok({
@@ -1232,7 +1277,10 @@ def session_report_generate(conn, caller, session_id, event):
     if deliver == "email" and not recipients:
         return error("recipients required when deliver='email'", 400)
 
-    content, err = _assemble_session_report(conn, caller, session_id, event)
+    selected, err = _selected_topic_row_ids(body)
+    if err is not None:
+        return err
+    content, err = _assemble_session_report(conn, caller, session_id, event, selected)
     if err is not None:
         return err
 
@@ -1249,6 +1297,14 @@ def session_report_generate(conn, caller, session_id, event):
         "companyId": str(caller["company_id"]),
         "requestedBy": str(caller["id"]),
         "templateId": body.get("templateId"),
+        # Both, deliberately. `requested` is what the client sent, `selected` is
+        # what survived the ACL, the redaction check and the non_work exclusion.
+        # When they differ, the artifact is the only place that records a chosen
+        # topic silently dropping out -- otherwise the user gets a shorter
+        # document with nothing anywhere saying why.
+        "requestedTopicRowIds": (sorted(selected) if selected else None),
+        "selectedTopicRowIds": [str(t.get("topic_row_id")) for t in content["topics"]
+                                if t.get("topic_row_id")],
         "title": body.get("title") or content["title"],
         "attendees": body.get("attendees") or content["participants"],
         "fields": body.get("fields") or {},
@@ -6011,6 +6067,14 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             "participants": t["participants"] or [],
             "summary": t["summary"],
             "key_decisions": [],                    # D3: v1, decisions table deferred
+            # Questions raised and left unanswered (migration 0055). This
+            # serializer is a fixed allowlist -- the same one that silently
+            # dropped `mention_count` on the way out -- so a column that is not
+            # named here does not exist as far as any reader is concerned.
+            # `report_sections` builds the report's Open Questions section from
+            # this key, and on an authority-flip day this shaped report IS the
+            # report.
+            "open_questions": t.get("open_questions") or [],
             # `mention_count` and `collapsed_ids` are NOT optional extras.
             #
             # The 0-day collapse removes duplicate rows from this list before it
@@ -6090,7 +6154,7 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             meta["recordings_processed"] = stats["sessions"]
         if stats["duration_s"] > 0:
             meta["duration_seconds"] = stats["duration_s"]
-    return {
+    shaped = {
         "report_date": date,
         "site": rows[0]["site_name"],
         # site_id (org UUID) alongside the display name: the compliance-resolution
@@ -6105,6 +6169,23 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
         "_report_metadata": meta,
         "topics": topics_out,
     }
+
+    # The reader's shape, built by the SAME function the lake reports use.
+    #
+    # This is the path most days take under the authority flip, so without it a
+    # frontend written against `sections` would render them on meeting and
+    # lake-only days and get `undefined` on every extraction day -- which is the
+    # majority. Building a second mapping here instead would be two definitions
+    # of one report, free to drift.
+    #
+    # Never fatal: this endpoint serves the dashboard, and a view that cannot be
+    # assembled must not take the day down with it.
+    try:
+        shaped["sections"] = report_sections.build(shaped)
+    except Exception:  # noqa: BLE001
+        logger.exception("sections could not be built for %s %s", folder, date)
+        shaped["sections"] = []
+    return shaped
 
 
 def _day_has_deleted_sources(conn, folder, date) -> bool:

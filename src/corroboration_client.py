@@ -1,39 +1,55 @@
-"""The Anthropic client the corroboration steps use, and only they use.
+"""The client the corroboration steps use, and only they use.
 
-Spec: docs/superpowers/specs/2026-08-31-ask-external-corroboration-design.md §5.4
+Spec: docs/superpowers/specs/2026-09-08-corroboration-off-anthropic-design.md §2
+Supersedes the vendor half of the 2026-08-31 design; its honesty rules stand.
 
 `llm_utils.call_llm` is the repo's shared client and is wrong for this feature in
 four specific ways, none of which are its fault -- it was built for a background
 pipeline where a slow answer is fine:
 
-1. Its timeout is a module constant. A caller that must finish inside a 24-second
-   hard stop cannot say so, and 45 seconds of it lands on a proxy that dies at 30.
-2. It retries up to four times. Four attempts of a step budgeted at 12 seconds is
+1. Its timeout is a module constant. A caller that must finish inside a hard stop
+   cannot say so, and 45 seconds of it lands on a proxy that dies at 30.
+2. It retries up to four times. Four attempts of a step budgeted at 13 seconds is
    not a retry policy, it is a way of guaranteeing the deadline is missed.
-3. It sends no `tools`, so it cannot run a web search at all.
-4. Its Anthropic branch keeps only `type == "text"` blocks. Even if a search ran,
-   every result and every citation would be dropped on the floor -- silently, with
-   a plausible-looking answer still coming back. That failure would look exactly
-   like "the web had nothing to say".
+3. It sends no `plugins`, so it cannot run a web search at all.
+4. It keeps only the text, so every source and citation would be dropped on the
+   floor -- silently, with a plausible-looking answer still coming back. That
+   failure would look exactly like "the web had nothing to say".
 
-And on TEST `LLM_PROVIDER=qwen`, so the shared client would route to DashScope
-there and Anthropic in prod. A feature whose whole output is "what the open web
-says" cannot be exercised against a different model in the environment where it
-gets tested. This client is Anthropic on every stack; `ANTHROPIC_API_KEY` is
-already on `AskAgentFunction` regardless of `LlmProvider`.
+## Why this vendor
 
-## Two model-behaviour choices that are load-bearing, not preferences
+Measured 2026-09-08, one entity and one claim, n=3 per configuration, because
+temperature 0 is not deterministic on this endpoint:
 
-**Thinking stays on, and effort is what gets turned down.** Claude Opus 5 thinks
-by default, and the obvious way to protect a 12-second budget -- send
-`thinking: {"type": "disabled"}` -- is the one change that can break the search
-step outright: with thinking disabled the model sometimes writes a tool call into
-its visible text instead of emitting a `server_tool_use` block. The turn succeeds,
-the search never runs, nothing raises, and the caller sees `not_found`. Low effort
-buys most of the same latency back without that failure mode.
+    gemini-3.8-flash + plugins:[{"id":"web"}]   10.3 / 11.4 / 11.3 s   6/4/7 sources
+    gemini-3.8-flash:online                     12.4 / 13.0 / 12.6 s   over budget
+    muse-spark-1.3-contributor + web plugin     16.1 / 16.5 / 18.2 s   ZERO sources
 
-**`max_tokens` covers thinking as well as the answer.** A ceiling sized for the
-prose alone truncates mid-sentence once the model thinks first.
+The `:online` suffix is the same model on the same question and was over budget
+on every run, so the plugin form is not a style choice.
+
+muse-spark is disqualified for lying rather than for being slow. It returned
+HTTP 200, 1200 tokens, no sources, and prose reading "I'll search the web to
+verify... Initial results support the claim." Nothing raised. A model's account
+of its own tool use is not evidence, which is why `searched` here is derived
+from whether results came back and never from what the text says.
+
+## The 200 that means failure
+
+Measured the same day: this model with NO plugin configured returns
+`completion_tokens: 0` and an empty content string -- a 200 with nothing in it.
+A misconfigured deploy therefore fails as an empty answer rather than as an
+error, so empty content is treated here as a failure. It has to be: the caller's
+next step would otherwise read "" as findings.
+
+## Reasoning effort
+
+`reasoning: {"effort": ...}` is accepted alongside `plugins`. Measured on the
+search prompt: effort low spent 0 reasoning tokens in 9.4 s, effort high spent
+711 in 13.6 s, past the search budget. Low is the default for that reason rather
+than for cost. The Anthropic client had to special-case models that 400 on an
+effort field; nothing measured here does, and re-inventing that guard without a
+model that fails would be guessing.
 """
 from __future__ import annotations
 
@@ -46,30 +62,15 @@ import urllib3
 
 logger = logging.getLogger()
 
-API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_VERSION = "2023-06-01"
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Overridable so a latency regression can be answered without a deploy. The
-# default is haiku because every step measured faster on it than the answer could
-# afford elsewhere (see WEB_SEARCH_TOOL), and because TEST and prod must run the
-# same model or the tests say nothing about what ships.
-DEFAULT_MODEL = os.environ.get("CORROBORATION_MODEL", "claude-haiku-4-5")
+# The search runs on the provider's side and is requested per call, not declared
+# as a tool the model may choose. `_search` is the only caller that asks for it;
+# a test asserts the cheap steps never do, because a classification step that
+# quietly searched would spend the search step's budget a second time.
+WEB_PLUGIN = [{"id": "web"}]
 
-# The basic search tool, chosen by measurement rather than by capability.
-#
-# The dynamic-filtering variant (`web_search_20260209`) is the better tool: it
-# filters results before they reach the model's context. It also requires Opus
-# 4.6+ / Sonnet 4.6+, and on the real API that pairing takes **17 seconds** for a
-# single entity -- against a 12-second budget inside a 24-second hard stop. Three
-# runs, three timeouts. `max_uses: 1` did not help (19.9 s), because what costs
-# the time is the model, not the number of searches: the same model with no tool
-# at all still takes 9.3 s.
-#
-# Haiku with this basic tool answers the same prompt in **4.2-4.7 s** with ten
-# results. That is the whole reason for the downgrade. The cost is real and
-# stated: raw results reach the model's context instead of a filtered set, which
-# is affordable at one to three entities and would not be at thirty.
-WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 2}
+DEFAULT_MODEL = os.environ.get("CORROBORATION_MODEL", "google/gemini-3.8-flash")
 
 # Below this there is no time for a request to do anything but time out, and
 # spending the caller's remaining budget on a doomed attempt is worse than
@@ -77,17 +78,6 @@ WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_use
 MIN_USEFUL_TIMEOUT = 2.0
 
 _RETRYABLE = {429, 500, 502, 503, 504, 529}
-
-# `output_config.effort` is a 400 on Haiku 4.5, and the steps that use haiku are
-# the cheap ones where a caller is most likely to leave the default in place.
-# Dropped here rather than left to each call site, because the failure has no
-# local symptom: the request is well-formed, the model is real, and the only
-# evidence is a 400 in prod.
-_NO_EFFORT_PREFIXES = ("claude-haiku",)
-
-
-def _supports_effort(model: str) -> bool:
-    return not str(model or "").startswith(_NO_EFFORT_PREFIXES)
 
 
 class SearchResult:
@@ -111,17 +101,21 @@ class Reply:
 
     `error` being set and `text` being empty are different facts and both are
     reported. A step that timed out and a step whose model found nothing produce
-    different states in §5.2, and collapsing them would make `not_found` mean
-    "either the web disagreed or our proxy hiccuped" -- which is not a finding a
-    reader can act on.
+    different states, and collapsing them would make `not_found` mean "either the
+    web disagreed or our proxy hiccuped" -- which is not a finding a reader can
+    act on.
+
+    `searched` is the one a caller must not skip. It says the open web was
+    actually consulted, and it is derived from results rather than from prose
+    precisely because a model will describe a search it never ran.
     """
 
     __slots__ = ("text", "search_results", "citations", "stop_reason",
-                 "error", "elapsed", "searched", "search_error")
+                 "error", "elapsed", "searched", "search_error", "timed_out")
 
     def __init__(self, text="", search_results=None, citations=None,
                  stop_reason=None, error=None, elapsed=0.0, searched=False,
-                 search_error=None):
+                 search_error=None, timed_out=False):
         self.text = text
         self.search_results = search_results or []
         self.citations = citations or []
@@ -129,10 +123,16 @@ class Reply:
         self.error = error
         self.elapsed = elapsed
         self.searched = searched
-        # The search itself failed while the request succeeded. Kept apart from
-        # `error` because the caller may still have a usable answer, and apart
-        # from "no results" because that one is a claim about the world.
+        # Kept because `corroborate()` reads it. This vendor signals a failed
+        # search by returning no annotations rather than by an error object, so
+        # `searched` already covers that case; the field stays so a vendor that
+        # does distinguish the two has somewhere to say so.
         self.search_error = search_error
+        # Structural, never inferred from `error`'s wording. The caller has to
+        # tell a deadline from a format failure to say anything true about it,
+        # and matching on an error string would make a phrase into an interface
+        # -- which this repo has paid for before.
+        self.timed_out = timed_out
 
     @property
     def ok(self) -> bool:
@@ -146,105 +146,92 @@ class Reply:
 
 
 def _parse(data) -> Reply:
-    """Pull text, search results and citations out of one response body.
+    """Read one OpenAI-shaped completion.
 
-    A `web_search_tool_result` block carries either a list of results or a single
-    error object, and the two are told apart by shape rather than by a status
-    code. Treating the error object as a result list is how a search failure
-    becomes "the web returned nothing about this company", which reads to a user
-    as a finding rather than a fault.
+    Web results arrive as `annotations` of type `url_citation` on the assistant
+    message. An annotation carrying no URL is not a source and is dropped rather
+    than counted: `searched` is what the caller trusts, so padding it with
+    unusable entries would defeat the guard it exists for.
     """
-    text_parts, results, citations = [], [], []
-    searched = False
-    search_error = None
+    choices = data.get("choices") or []
+    choice = choices[0] if isinstance(choices, list) and choices else {}
+    if not isinstance(choice, dict):
+        choice = {}
+    message = choice.get("message") or {}
+    if not isinstance(message, dict):
+        message = {}
 
-    for block in data.get("content", []) or []:
-        if not isinstance(block, dict):
+    annotations = message.get("annotations") or []
+    if not isinstance(annotations, list):
+        annotations = []
+
+    results = []
+    for ann in annotations:
+        if not isinstance(ann, dict):
             continue
-        btype = block.get("type")
+        cit = ann.get("url_citation") or {}
+        url = cit.get("url") if isinstance(cit, dict) else None
+        if url:
+            results.append(SearchResult(url, cit.get("title")))
 
-        if btype == "text":
-            text_parts.append(block.get("text") or "")
-            for cite in block.get("citations") or []:
-                if isinstance(cite, dict):
-                    citations.append(cite)
-
-        elif btype == "server_tool_use":
-            if block.get("name") == "web_search":
-                searched = True
-
-        elif btype == "web_search_tool_result":
-            searched = True
-            content = block.get("content")
-            if isinstance(content, dict):
-                # The error shape: {"type": "web_search_tool_result_error",
-                #                   "error_code": "max_uses_exceeded"}. It is a
-                # dict where a success is a list, and that is the only signal --
-                # the HTTP status is 200 either way.
-                search_error = content.get("error_code") or "web_search_failed"
-                logger.warning("corroboration: web_search returned an error: %s",
-                               search_error)
-                continue
-            for item in content or []:
-                if isinstance(item, dict) and item.get("type") == "web_search_result":
-                    results.append(SearchResult(item.get("url"),
-                                                item.get("title"),
-                                                item.get("page_age")))
-
-    return Reply(text="\n".join(p for p in text_parts if p),
+    return Reply(text=message.get("content") or "",
                  search_results=results,
-                 citations=citations,
-                 stop_reason=data.get("stop_reason"),
-                 searched=searched,
-                 search_error=search_error)
+                 citations=list(annotations),
+                 stop_reason=choice.get("finish_reason"),
+                 searched=bool(results))
 
 
-def call(prompt, *, timeout, model=None, max_tokens=1024, tools=None,
+def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
          effort="low", system=None, retry_budget=None) -> Reply:
-    """One Anthropic call, bounded by `timeout` seconds, with at most one retry.
+    """One call, bounded by `timeout` seconds, with at most one retry.
 
     `timeout` is per attempt and is not a suggestion: it is the caller's share of
     a hard stop that belongs to a reader waiting on an answer.
+
+    `web` asks the provider to search. It is a boolean rather than a tool
+    definition because the search belongs to the provider, not to the model.
 
     `retry_budget` is the seconds still available *after* this attempt. A retry
     happens only when the failure was retryable AND that number covers another
     full attempt. The default is no retry at all, because a caller that has not
     thought about its budget must not be allowed to spend it twice.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("CORROBORATION_API_KEY")
     if not api_key:
         # Not raising: a missing key must cost the reader the corroboration
         # cards, never the answer they asked for.
-        logger.error("corroboration: ANTHROPIC_API_KEY not set")
-        return Reply(error="ANTHROPIC_API_KEY not configured")
+        logger.error("corroboration: CORROBORATION_API_KEY not set")
+        return Reply(error="CORROBORATION_API_KEY not configured")
 
     if timeout is None or timeout < MIN_USEFUL_TIMEOUT:
-        return Reply(error=f"no time left ({timeout}s)")
+        return Reply(error=f"no time left ({timeout}s)", timed_out=True)
 
-    chosen_model = model or DEFAULT_MODEL
-    payload = {
-        "model": chosen_model,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }
+    messages = []
     if system:
-        payload["system"] = system
-    if tools:
-        payload["tools"] = tools
-    if effort and _supports_effort(chosen_model):
-        payload["output_config"] = {"effort": effort}
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": model or DEFAULT_MODEL,
+        "max_tokens": max_tokens,
+        "messages": messages,
+    }
+    if web:
+        payload["plugins"] = WEB_PLUGIN
+    if effort:
+        payload["reasoning"] = {"effort": effort}
 
     body = json.dumps(payload)
     headers = {
         "Content-Type": "application/json",
-        "x-api-key": api_key,
-        "anthropic-version": ANTHROPIC_VERSION,
+        "Authorization": "Bearer " + api_key,
     }
 
     http = urllib3.PoolManager()
     attempts_left = 2 if (retry_budget or 0) >= timeout + MIN_USEFUL_TIMEOUT else 1
     started = time.time()
     last_error = None
+    last_timed_out = False
 
     for attempt in range(attempts_left):
         attempt_start = time.time()
@@ -253,6 +240,10 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, tools=None,
                                 timeout=timeout)
         except Exception as e:                    # noqa: BLE001 - all of it is a miss
             last_error = f"{type(e).__name__}: {e}"
+            # urllib3 raises its own class for a read/connect deadline; that is
+            # the one exception here that IS our clock rather than the vendor's
+            # health, and the two lead a reader to different places.
+            last_timed_out = isinstance(e, urllib3.exceptions.TimeoutError)
             logger.warning("corroboration: attempt %d failed: %s",
                            attempt + 1, last_error)
             continue
@@ -261,10 +252,13 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, tools=None,
         if resp.status == 200:
             reply = _parse(json.loads(resp.data.decode("utf-8")))
             reply.elapsed = time.time() - started
-            if reply.stop_reason == "refusal":
-                # A 200 whose content is empty. Reported rather than read as
-                # "nothing found", which it is not.
-                reply.error = "refused"
+            if not (reply.text or "").strip():
+                # A 200 carrying nothing. Measured shape: with no plugin
+                # configured this model answers `completion_tokens: 0` and an
+                # empty string. Passed on as findings that reads as "the web
+                # said nothing", which is a claim about the world where the
+                # truth is a claim about our configuration.
+                reply.error = "empty completion"
             return reply
 
         if resp.status in _RETRYABLE and attempt + 1 < attempts_left:
@@ -280,4 +274,5 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, tools=None,
             last_error = f"HTTP {resp.status}"
         break
 
-    return Reply(error=last_error or "no response", elapsed=time.time() - started)
+    return Reply(error=last_error or "no response", elapsed=time.time() - started,
+                 timed_out=last_timed_out)

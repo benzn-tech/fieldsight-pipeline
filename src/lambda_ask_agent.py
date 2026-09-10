@@ -371,6 +371,12 @@ def format_report_for_prompt(report, report_type):
             lines.append(f"Participants: {', '.join(t.get('participants', []))}")
             lines.append(f"Summary: {t.get('summary', '')}")
 
+            for q in (t.get('open_questions') or []) + (t.get('questions') or []):
+                if isinstance(q, dict):
+                    q = q.get('question', '')
+                if q:
+                    lines.append(f"  Open question: {q}")
+
             for d in t.get('key_decisions', []):
                 if isinstance(d, dict):
                     lines.append(f"  Decision: {d.get('decision', d)}")
@@ -1148,7 +1154,36 @@ def _rag_answer(body):
 
         prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
                                   today=today, basis=basis)
-        answer, err = llm_utils.call_llm(prompt, max_tokens=MAX_ANSWER_TOKENS, force_json=False)
+        # A spoken answer and a screen answer are the same question asked of two
+        # different products, so they may reach two different models. Measured
+        # 2026-09-09 on the voice-shaped prompt, three runs each:
+        #
+        #   meta/muse-spark-1.3-contributor  6.53s  651 completion, 599 REASONING
+        #   google/gemini-3.8-flash          3.33s   32 completion,   0 reasoning
+        #
+        # Nearly twice as fast because it stops THINKING, not because it writes
+        # less -- 599 of muse's 651 tokens were never spoken.
+        #
+        # `enable_thinking=False` is not decoration here and must travel WITH the
+        # model: the same measurement run without it gave gemini 538 reasoning
+        # tokens and 7.22s, SLOWER than the incumbent. A model swap that forgets
+        # the effort is a regression wearing an optimisation's name -- the same
+        # shape as DashScope defaulting enable_thinking ON when the field is
+        # omitted, which cost 10x once already.
+        voice = (body.get("mode") == "voice")
+        # `none` is the sentinel, not a model. An empty override renders a bare
+        # `AskVoiceModel=` and SAM exits 2 before CloudFormation runs, so the
+        # deploy passes a word; this is where the word stops being one.
+        voice_model = os.environ.get("ASK_VOICE_MODEL", "").strip()
+        if voice_model.lower() in ("", "none"):
+            voice_model = None
+        if voice and voice_model:
+            answer, err = llm_utils.call_llm(
+                prompt, max_tokens=MAX_ANSWER_TOKENS, force_json=False,
+                enable_thinking=False, model=voice_model)
+        else:
+            answer, err = llm_utils.call_llm(prompt, max_tokens=MAX_ANSWER_TOKENS,
+                                             force_json=False)
 
         # READ WHAT CAME BACK, do not trust that the rule was followed. The
         # rule existed for months at the top of the system context and still
@@ -1265,13 +1300,71 @@ def _invoke_voice_audit(caller_sub, transcript, answer):
         logger.warning("  voice audit invoke failed (non-fatal): %s", e)
 
 
+def _stt(audio_bytes, fmt):
+    """Transcribe the spoken question with whichever provider is configured.
+
+    Measured 2026-09-09 on three real site clips, three runs each: DashScope
+    3.73 / 6.39 / 7.72s against ElevenLabs 0.88 / 1.01 / 1.36s for 3 / 8 / 14
+    second clips. Four to six times, and the spread collapses with it. STT sits
+    FIRST in the chain and nothing else can start until it returns, so this is
+    the only place on the whole path where whole seconds are available.
+
+    Default is the incumbent. A provider named without its own key raises rather
+    than falling back: EL credit is a shared per-key pool whose exhaustion
+    presents as transcription silently STOPPING, and production's recording
+    pipeline already runs on ELEVENLABS_API_KEY. Quietly borrowing that key
+    would let an afternoon of voice questions stop the recording pipeline. The
+    loud failure is the point -- see elevenlabs_utils.stt_short.
+    """
+    provider = os.environ.get("ASK_STT_PROVIDER", "dashscope").strip().lower()
+    if provider == "elevenlabs":
+        import elevenlabs_utils
+        # The clip's own extension, so the vendor sees the container it is
+        # actually given -- the device sends m4a, the probes sent wav.
+        return elevenlabs_utils.stt_short(audio_bytes, "clip.%s" % (fmt or "m4a"))
+    import dashscope_utils
+    return dashscope_utils.stt(audio_bytes, fmt)
+
+
+def _tts(text):
+    """Speak the answer with whichever provider is configured.
+
+    Both providers hand the device the SAME container -- EL returns raw PCM and
+    is wrapped with the incumbent's own `_pcm_to_wav`, so `audioFormat` stays
+    "wav" and the device never learns which vendor spoke. That matters: the
+    mobile client decodes a complete file with MediaPlayer and a container change
+    would be a silent playback failure, not an error.
+
+    Default is the incumbent, and a provider named without its own key raises
+    rather than falling back -- three consumers now want ElevenLabs (the
+    recording pipeline's transcription, Ask's STT, and this), and one shared
+    credit pool would let any of them silently stop the other two.
+    """
+    import dashscope_utils
+    provider = os.environ.get("ASK_TTS_PROVIDER", "dashscope").strip().lower()
+    if provider == "elevenlabs":
+        import elevenlabs_utils
+        return dashscope_utils._pcm_to_wav(elevenlabs_utils.tts(text))
+    return dashscope_utils.tts(text)
+
+
 def _voice_answer(body):
     """Chain one hands-free voice ask: base64-decode -> DashScope STT ->
     existing RAG path (mode='voice', caller_sub ACL, Haiku) -> DashScope TTS ->
     async audit. Returns the Contract voice shape, or {'error', 'transcript'?}
     on any stage failure. Never raises (lambda_handler wraps with ok())."""
     import base64 as _b64
+    import time as _time
     import dashscope_utils
+
+    # WHERE THE SECONDS GO. Until now this function logged nothing at all on the
+    # success path, so every latency claim about voice was inferred from the
+    # screen path or from Lambda Duration, which is the sum and says nothing
+    # about which stage owns it. One structured line at the end, below.
+    #
+    # It is measurement, not behaviour: nothing here changes what is returned.
+    t0 = _time.perf_counter()
+    marks = {}
 
     caller_sub = body.get("caller_sub")
     fmt = body.get("format") or "m4a"
@@ -1280,11 +1373,13 @@ def _voice_answer(body):
     except Exception:
         return {"error": "Invalid audio encoding"}
 
+    t_stt = _time.perf_counter()
     try:
-        transcript = dashscope_utils.stt(audio_bytes, fmt)
+        transcript = _stt(audio_bytes, fmt)
     except Exception as e:
         logger.error("  voice STT failed: %s", e)
         return {"error": "Speech recognition failed"}
+    marks["stt"] = _time.perf_counter() - t_stt
     if not transcript or not transcript.strip():
         # STT heard nothing -> device plays its bundled error cue (spec §7).
         return {"error": "Empty transcript", "transcript": ""}
@@ -1293,18 +1388,35 @@ def _voice_answer(body):
     # anything the screen path gains is absent here until someone adds it twice.
     # Voice needs it most -- there is no date picker to fall back on when the
     # question is spoken.
+    t_rag = _time.perf_counter()
     rag = _rag_answer({"question": transcript, "caller_sub": caller_sub,
                        "mode": "voice", "k": body.get("k", 5),
                        "tz": body.get("tz")})
+    marks["rag"] = _time.perf_counter() - t_rag
     answer_text = (rag.get("answer") or "").strip()
     if rag.get("error") or not answer_text:
         return {"error": rag.get("error") or "No answer", "transcript": transcript}
 
+    t_tts = _time.perf_counter()
     try:
-        audio_out = dashscope_utils.tts(answer_text)
+        audio_out = _tts(answer_text)
     except Exception as e:
         logger.error("  voice TTS failed: %s", e)
         return {"error": "Speech synthesis failed", "transcript": transcript}
+    marks["tts"] = _time.perf_counter() - t_tts
+
+    # `rag` is retrieval AND the model. The model's own elapsed time is already
+    # on the `qwen done:` line for the same request id, so subtracting gives
+    # retrieval -- which nothing has ever reported separately. Both are named
+    # here so the next reader does not have to know that.
+    logger.info(
+        "voice ask: stt=%.2fs rag=%.2fs tts=%.2fs total=%.2fs "
+        "clip_bytes=%d transcript_words=%d answer_words=%d answer_chars=%d "
+        "audio_bytes=%d fmt=%s",
+        marks.get("stt", -1), marks.get("rag", -1), marks.get("tts", -1),
+        _time.perf_counter() - t0, len(audio_bytes),
+        len(transcript.split()), len(answer_text.split()), len(answer_text),
+        len(audio_out), fmt)
 
     _invoke_voice_audit(caller_sub, transcript, answer_text)
     return {

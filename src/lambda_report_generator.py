@@ -69,6 +69,7 @@ from output_language import OUTPUT_LANGUAGE_RULE
 import weather
 import site_coords
 import llm_utils
+import report_sections
 from datetime import datetime, timedelta
 from io import BytesIO
 from transcript_utils import (
@@ -881,6 +882,89 @@ def write_audit_entry(site_id, target_date, action, detail, user='System'):
 # Word Document Generation
 # ============================================================
 
+def site_name_for(user_site_info):
+    """This user's site, or "" when it is not known.
+
+    NOT the SITE_NAME environment variable. That default turned "we could not
+    find this user's site" into "this user works at whichever site the variable
+    names", and on TEST on 2026-09-10 a Neil_Blunden report came out filed under
+    `SB1108 Ellesmere College` -- a different customer's site, from deployed
+    code, in a field that is displayed to a customer and read downstream.
+
+    BUG-41 wrote the rule after the same field misdirected RAG attribution:
+    an environment-level default used for multi-tenant attribution is a
+    dangerous design, because it silently converts "not found" into "belongs to
+    this particular customer". The fix then was applied to what ingest
+    consumes; the report kept carrying the name.
+
+    Empty is both honest and safer downstream: `resolve_site` skips the
+    by-name lookup entirely and falls through to membership, which is where the
+    answer actually is.
+    """
+    if not isinstance(user_site_info, dict):
+        return ''
+    return user_site_info.get('name') or ''
+
+
+def render_sections_into(doc, sections):
+    """Write the reader's sections into a Word document.
+
+    The Word file and the JSON are two renderings of one report, and until this
+    existed they disagreed: the JSON stopped carrying a timeline and the .docx
+    kept one, complete with the `?` placeholders the JSON had dropped. A customer
+    who downloads the document and a customer who opens the dashboard were
+    reading two different accounts of the same day, which is worse than either
+    account being wrong on its own.
+
+    `kpi` is deliberately not rendered: the session table at the top of the
+    document already states recordings, duration and photos, and saying it twice
+    is how a reader starts wondering which one to believe.
+    """
+    for sec in sections or []:
+        kind = sec.get('kind')
+        title = sec.get('title', '')
+        if kind == 'kpi':
+            continue
+        if kind == 'narrative':
+            body = (sec.get('body') or '').strip()
+            if not body:
+                continue
+            doc.add_heading(title, level=1)
+            doc.add_paragraph(body)
+        elif kind == 'list':
+            items = sec.get('items') or []
+            if not items:
+                continue
+            doc.add_heading(title, level=1)
+            for item in items:
+                doc.add_paragraph(str(item), style='List Bullet')
+        elif kind == 'photos':
+            items = sec.get('items') or []
+            if not items:
+                continue
+            doc.add_heading(title, level=1)
+            doc.add_paragraph(', '.join(str(i) for i in items))
+        elif kind == 'table':
+            rows = sec.get('rows') or []
+            if not rows:
+                continue
+            fields = sec.get('fields') or sorted(rows[0].keys())
+            doc.add_heading(title, level=1)
+            table = doc.add_table(rows=1, cols=len(fields))
+            table.style = 'Light List'
+            for i, field in enumerate(fields):
+                cell = table.rows[0].cells[i]
+                cell.text = field.replace('_', ' ').title()
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.bold = True
+            for row in rows:
+                cells = table.add_row().cells
+                for i, field in enumerate(fields):
+                    value = row.get(field, '')
+                    cells[i].text = '' if value is None else str(value)
+
+
 def generate_word_document(report_data, title):
     if not DOCX_AVAILABLE:
         return None
@@ -922,6 +1006,15 @@ def generate_word_document(report_data, title):
                     for run in paragraph.runs:
                         run.bold = True
         doc.add_paragraph('')
+
+    # One definition of what this report is. Where sections exist -- the daily
+    # report and the meeting compat report -- they are what both artifacts show.
+    # Weekly, monthly and the site summary do not carry them and keep the older
+    # rendering below, unchanged.
+    sections = report_data.get('sections')
+    if sections:
+        render_sections_into(doc, sections)
+        return _finish_document(doc, report_data)
 
     doc.add_heading('Executive Summary', level=1)
     exec_summary = report_data.get('executive_summary')
@@ -1053,6 +1146,12 @@ def generate_word_document(report_data, title):
         doc.add_heading('Quality Summary', level=1)
         doc.add_paragraph(quality)
 
+    return _finish_document(doc, report_data)
+
+
+def _finish_document(doc, report_data):
+    """The provenance footer and the bytes. Shared by both renderings, because
+    two copies of a footer is how one of them loses the model name."""
     meta = report_data.get('_report_metadata', {})
     if meta:
         doc.add_paragraph('')
@@ -1376,7 +1475,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         user_role = user_roles.get(user_name, '')
         user_site_id = user_primary_site.get(user_name, '')
         user_site_info = sites_info.get(user_site_id, {})
-        user_site_name = user_site_info.get('name', site_name)
+        user_site_name = site_name_for(user_site_info)
 
         weather_block = build_weather_block_for_site(
             user_site_info, target_date, get_nzdt_now().strftime('%Y-%m-%d'))
@@ -1488,6 +1587,25 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
                 'parse_success': parse_success,
             }
         }
+
+        # The shape a person reads, alongside the shape the indexer reads.
+        # `topics` stays exactly as it is -- chunking.py splits RAG chunks
+        # straight out of it, so anything that removes or reshapes it empties
+        # the search index without failing. Sections are additional.
+        #
+        # Weekly, monthly and the site summary deliberately do NOT get this yet:
+        # they spread `**claude_output` and carry a different shape, and half a
+        # mapping renders worse than none.
+        try:
+            report['sections'] = report_sections.build(report)
+        except Exception as exc:  # noqa: BLE001
+            # This runs before the S3 write, inside a loop over users with no
+            # per-user guard: an exception here loses the report, the Word
+            # document and the item rows for this user AND every user after
+            # them. A report with no sections is a rendering problem; a report
+            # that was never written is a lost day.
+            logger.exception("sections could not be built for %s: %s", user_name, exc)
+            report['sections'] = []
 
         json_key = f"{REPORT_PREFIX}{target_date}/{user_name}/daily_report.json"
         s3_client.put_object(
@@ -1690,7 +1808,7 @@ def generate_periodic_report(report_type, start_date, end_date):
         logger.info(f"  Generating {report_type} report for user: {user_name} ({len(user_reports)} daily reports)")
         user_site_id = user_primary_site.get(user_name, '')
         user_site_info = sites_info.get(user_site_id, {})
-        user_site_name = user_site_info.get('name', site_name)
+        user_site_name = site_name_for(user_site_info)
         user_role = user_roles.get(user_name, '')
 
         if report_type == 'weekly':

@@ -45,15 +45,48 @@ logger = logging.getLogger()
 # ApiFunction dies at 30 s, and an agent still working at 35 s is answering a
 # proxy that is already gone. The stop is internal and earlier than the target
 # so the caller always gets a shaped body rather than a gateway error.
-HARD_STOP_SECONDS = float(os.environ.get("CORROBORATION_HARD_STOP", "24"))
+# API Gateway terminates the integration at 29s whatever this file says, so the
+# stop stays under it: past that a missed deadline stops being a shaped
+# `timed_out` body and becomes a raw gateway error, which hides the one fact
+# this module exists to report.
+HARD_STOP_SECONDS = float(os.environ.get("CORROBORATION_HARD_STOP", "27"))
 
+# Sized from measurement, 2026-09-09, against the deployed vendor and using the
+# prompts in THIS file -- an earlier attempt measured a paraphrase of them and
+# over-stated extract by more than double, which is how it concluded the whole
+# budget needed rebalancing:
+#
+#     extract    n=8   2.41 ... 2.79   max 2.79
+#     reconcile  n=8   2.16 ... 3.58   max 3.58
+#     search     n=3   10.3 11.3 11.4  max 11.4
+#
+# Only SEARCH was ever near its slice: 11.4s against 12s, half a second of
+# margin on a step whose overrun is charged to reconcile. The other two were
+# comfortable and are unchanged. A single 13.09s extract outlier appeared once
+# and never again in the following sixteen calls; it is why these keep real
+# margin instead of hugging the maximum.
 EXTRACT_BUDGET = 4.0
-SEARCH_BUDGET = 12.0
+SEARCH_BUDGET = 15.0
 RECONCILE_BUDGET = 6.0
 
 # Steps 1 and 4 are classification, not reasoning, and they are the two that pay
-# for the search step's twelve seconds.
-CHEAP_MODEL = os.environ.get("CORROBORATION_CHEAP_MODEL", "claude-haiku-4-5")
+# for the search step. They ask for LOW effort rather than none: on this endpoint
+# sending no `reasoning` field does not mean "do not reason", it means the
+# provider chooses, and it chooses expensively. Measured 2026-09-11 on the real
+# reconcile prompt, n=5 each, every run returning valid JSON either way:
+#
+#     no effort   3.75  7.19  8.72  10.82  16.50 s
+#     effort low  2.06  2.07  2.28   2.72   2.91 s
+#
+# against a 6-second slice. `effort=None` was inherited from the Anthropic
+# client, where `output_config.effort` is a 400 on haiku; that vendor is gone
+# and only the cost stayed.
+# Extract and reconcile share the client with the search step, so this id has to
+# belong to the same vendor. Left at an Anthropic id after the swap, every
+# extract fails against a model OpenRouter does not have -- and `corroborate()`
+# reports a failed extraction as `timed_out`, so the user would be told the
+# check ran out of time on 100% of requests, forever, in four seconds.
+CHEAP_MODEL = os.environ.get("CORROBORATION_CHEAP_MODEL", "google/gemini-3.8-flash")
 
 STATES = frozenset({"corroborated", "conflicts", "not_found", "no_checkable_claim"})
 
@@ -202,15 +235,23 @@ WHAT THE SEARCH FOUND:
 
 
 def _extract(question, answer, budget):
+    """Returns (entities, error, timed_out).
+
+    The third value is the whole point: a transport deadline and a model that
+    wrote prose instead of JSON both arrive here as "an error", and only one of
+    them is worth telling a reader to try again later about.
+    """
     reply = client.call(
         EXTRACT_PROMPT.format(question=question, answer=answer),
-        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort=None)
+        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort="low")
     if not reply.ok:
-        return None, reply.error
+        return None, reply.error, reply.timed_out
     parsed = _loads(reply.text)
     if not isinstance(parsed, list):
-        return None, "extraction did not return a list"
-    return parsed, None
+        # The call succeeded and came back in time. Nothing about this is a
+        # deadline.
+        return None, "extraction did not return a list", False
+    return parsed, None, False
 
 
 def _search(allowed, budget):
@@ -219,7 +260,7 @@ def _search(allowed, budget):
         for a in allowed)
     return client.call(SEARCH_PROMPT.format(entities=lines),
                        timeout=budget, max_tokens=2048,
-                       tools=[client.WEB_SEARCH_TOOL], effort="low")
+                       web=True, effort="low")
 
 
 def _reconcile(allowed, findings, budget):
@@ -228,13 +269,56 @@ def _reconcile(allowed, findings, budget):
         for a in allowed)
     reply = client.call(
         RECONCILE_PROMPT.format(claims=claims, findings=findings or "(nothing found)"),
-        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort=None)
+        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort="low")
     if not reply.ok:
-        return None, reply.error
+        return None, reply.error, reply.timed_out
     parsed = _loads(reply.text)
     if not isinstance(parsed, list):
-        return None, "reconcile did not return a list"
-    return parsed, None
+        return None, "reconcile did not return a list", False
+    return parsed, None, False
+
+
+# A hostname and nothing else: labels, dots, and a final label that is alphabetic
+# so "Fletcher Building Ltd." cannot pass as one.
+_HOSTNAME = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?"
+                       r"(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*"
+                       r"\.[a-z]{2,}$")
+
+
+def _domain(url, title):
+    """Who published this, as a host a reader can judge.
+
+    The card puts the domain under every claim because that is the trust
+    carrier -- a reader decides whether to believe a source from the host, not
+    from the URL. Deriving it by parsing the URL worked while the vendor
+    returned real result URLs.
+
+    This one does not. A measured annotation, 2026-09-08:
+
+        url:   https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZ...
+        title: "wikipedia.org"
+
+    The host is in `title` and the URL is an opaque Google redirect, so parsing
+    the URL makes every source under every claim read
+    `vertexaisearch.cloud.google.com`.
+
+    `title` is trusted only when it IS a hostname, so a vendor that puts a
+    headline there falls through to the URL and stays correct. Neither
+    available means None: a reader shown no source is told less, but a reader
+    shown the wrong one is told something false.
+    """
+    candidate = (title or "").strip().lower()
+    if _HOSTNAME.match(candidate):
+        return candidate[4:] if candidate.startswith("www.") else candidate
+
+    host = ""
+    match = re.match(r"^[a-z][a-z0-9+.-]*://([^/?#]+)", (url or "").strip(),
+                     re.IGNORECASE)
+    if match:
+        host = match.group(1).split("@")[-1].split(":")[0].lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host or None
 
 
 def _sources(reply, limit=4):
@@ -243,7 +327,11 @@ def _sources(reply, limit=4):
         if not r.url or r.url in seen:
             continue
         seen.add(r.url)
-        out.append({"title": r.title, "url": r.url, "published": r.page_age})
+        # `url` stays exactly what the vendor gave us, redirect and all. It is
+        # the only link we were handed, and building one out of the domain
+        # would fabricate a citation that was never returned.
+        out.append({"title": r.title, "url": r.url, "published": r.page_age,
+                    "domain": _domain(r.url, r.title)})
         if len(out) >= limit:
             break
     return out
@@ -258,7 +346,7 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
     """
     started = clock()
     empty = {"corroborations": [], "dropped": [], "truncated": False,
-             "timed_out": False}
+             "timed_out": False, "searched": False, "failed": False}
 
     if not question or not answer:
         return empty
@@ -267,10 +355,18 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
         return HARD_STOP_SECONDS - (clock() - started)
 
     # --- 1. what does the answer claim, and about whom -----------------------
-    entities, err = _extract(question, answer, min(EXTRACT_BUDGET, left()))
+    entities, err, late = _extract(question, answer, min(EXTRACT_BUDGET, left()))
     if err:
-        logger.warning("corroboration: extraction failed: %s", err)
-        return dict(empty, timed_out=True)
+        # Only a real deadline says `timed_out`. Measured on TEST 2026-09-10, a
+        # real question returned "extraction did not return a list" -- a format
+        # failure -- and the reader was told the check ran out of time, in ten
+        # seconds against a budget of twenty-seven. A timeout invites "try again
+        # later"; trying again fails identically. Everything that is not the
+        # clock falls through to `searched: false`, which is true and already
+        # has words the reader can act on.
+        logger.warning("corroboration: extraction failed: %s (timed_out=%s)",
+                       err, late)
+        return dict(empty, timed_out=bool(late), failed=not late)
     if not entities:
         return empty
 
@@ -286,7 +382,8 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
                 len(result.allowed), len(result.rejected), result.truncated)
 
     base = {"corroborations": [], "dropped": dropped,
-            "truncated": result.truncated, "timed_out": False}
+            "truncated": result.truncated, "timed_out": False, "searched": False,
+            "failed": False}
 
     # --- 3. one search covering all of them ---------------------------------
     if left() < client.MIN_USEFUL_TIMEOUT:
@@ -295,19 +392,53 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
     if not search.ok:
         # One call, so there is no partial progress to keep. A shorter list here
         # would read as "we checked these and found nothing".
-        logger.warning("corroboration: search failed: %s", search.error)
-        return dict(base, timed_out=True)
-    if search.search_error:
-        logger.warning("corroboration: search tool error: %s", search.search_error)
+        logger.warning("corroboration: search failed: %s (timed_out=%s)",
+                       search.error, search.timed_out)
+        return dict(base, timed_out=bool(search.timed_out),
+                    failed=not search.timed_out)
+    # Reconcile may only ever read text the open web actually produced.
+    #
+    # The model's own account of its tool use is not evidence. Measured on
+    # OpenRouter 2026-09-08, three runs: muse-spark returned 200, 1200 tokens,
+    # zero web results, and wrote "I'll search the web to verify... Initial
+    # results support the claim." Passed to reconcile that becomes
+    # `corroborated`, and the card renders a Confirmed chip with no sources
+    # under it, because the renderer omits the source row when `sources` is
+    # empty. A fabricated corroboration shown as verified is the worst output
+    # this system has.
+    #
+    # `searched` has been on `Reply` since this module was written and no caller
+    # read it. This is that read.
+    #
+    # Note what is NOT blocked: a search that ran and found nothing. That is a
+    # finding about the world, `not_found` is the state that says so, and it is
+    # this feature's most common true answer.
+    grounded = search.searched and not (search.search_error
+                                        and not search.search_results)
+    if not grounded:
+        # Deliberately not `timed_out`. The request finished; it just never
+        # consulted anything. `truncated` and `timed_out` are already kept apart
+        # so a reader knows which happened, and this is a third thing.
+        logger.warning(
+            "corroboration: no web results (searched=%s, tool_error=%s) -- "
+            "not reconciling ungrounded text",
+            search.searched, search.search_error)
+        return dict(base, searched=False)
+
+    # Past this line the web was consulted, so every exit below says so --
+    # including the reconcile timeout. A flag that only ever appears on failure
+    # is one the reader cannot tell from absent.
+    base = dict(base, searched=True)
 
     # --- 4. a state per entity ----------------------------------------------
     if left() < client.MIN_USEFUL_TIMEOUT:
         return dict(base, timed_out=True)
-    verdicts, err = _reconcile(result.allowed, search.text,
-                               min(RECONCILE_BUDGET, left()))
+    verdicts, err, late = _reconcile(result.allowed, search.text,
+                                     min(RECONCILE_BUDGET, left()))
     if err:
-        logger.warning("corroboration: reconcile failed: %s", err)
-        return dict(base, timed_out=True)
+        logger.warning("corroboration: reconcile failed: %s (timed_out=%s)",
+                       err, late)
+        return dict(base, timed_out=bool(late), failed=not late)
 
     by_entity = {}
     for v in verdicts or []:
@@ -349,4 +480,5 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
         })
 
     return {"corroborations": cards, "dropped": dropped,
-            "truncated": result.truncated, "timed_out": False}
+            "truncated": result.truncated, "timed_out": False, "searched": True,
+            "failed": False}

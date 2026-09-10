@@ -130,3 +130,55 @@ def test_the_earlier_date_wins_when_two_are_offered():
     deadline should surface at the earlier one: being early is recoverable,
     being late is the thing this exists to prevent."""
     assert r("Week of 2026-07-23 or 2026-07-27") == "2026-07-23"
+
+
+# ---- phrases that name a day without spelling one --------------------------
+#
+# Added when the report's action ranking needed an order and found this module
+# returning NULL for the most urgent thing a site says. Before it, `deadline`
+# was NULL for every one of these, the Today page could not call them overdue,
+# and a second parser was written elsewhere to fill the gap -- which is how one
+# rule became two that disagreed in both directions.
+
+@pytest.mark.parametrize("text", [
+    "EOD", "eod", "End of day", "COB", "close of business",
+    "tonight", "this morning", "this afternoon",
+])
+def test_a_phrase_that_names_today_resolves_to_today(text):
+    """Unlike "ASAP" above, these name a DAY. An EOD item not done by tomorrow
+    genuinely is overdue, which is the difference."""
+    assert r(text) == WED
+
+
+@pytest.mark.parametrize("text", ["15:00", "08.30", "9am", "9:00 am"])
+def test_a_time_with_no_day_is_today(text):
+    assert r(text) == WED
+
+
+@pytest.mark.parametrize("text", ["end of week", "EOW", "this week",
+                                  "by the end of the week"])
+def test_the_end_of_the_week_is_the_coming_friday(text):
+    # WED is a Wednesday, so the coming Friday is two days on.
+    assert r(text) == "2026-07-24"
+
+
+def test_an_unpadded_iso_date_is_still_a_date():
+    """Models write 2026-9-5 as readily as 2026-09-05."""
+    assert r("2026-9-5") == "2026-09-05"
+
+
+def test_a_slashed_date_is_read_day_first():
+    """15/09/2026 is September. Nothing in this product is US-format, and
+    reading it the other way moves a deadline by six months silently."""
+    assert r("15/09/2026") == "2026-09-15"
+
+
+def test_an_impossible_slashed_date_is_not_a_date():
+    assert r("31/02/2026") is None
+
+
+def test_ongoing_still_beats_the_new_vocabulary():
+    """`_CONTINUOUS` is checked first and must stay first: "ongoing this week"
+    is not due at the end of this week, it is not due."""
+    assert r("ongoing this week") is None
+    assert r("throughout end of day") is None

@@ -167,8 +167,17 @@ def api_key_configured():
     return bool(ANTHROPIC_API_KEY)
 
 
-def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None,
+             model=None, deadline=None):
     """Return (text, None) on success or (None, error_string) on failure.
+
+    `deadline` (seconds from now) bounds the whole retry ladder, and is opt-in
+    because eight of this module's nine callers are background pipelines where a
+    slow answer is fine. Omitted, nothing changes. Given one, no attempt is
+    STARTED that cannot finish inside it and no backoff sleeps past it -- which
+    matters on any path with a proxy in front of it, because the ladder's own
+    ceiling is MAX_ATTEMPTS x HTTP_TIMEOUT plus backoff and outlives every
+    gateway this repo serves through.
 
     enable_thinking (qwen path only; the anthropic path ignores it):
       None  - use the QWEN_ENABLE_THINKING env default (every pre-existing
@@ -178,10 +187,24 @@ def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
     The per-call override exists because one Lambda can need both modes:
     lambda_extract_session runs a fast live pass during recording and a
     thinking-mode final pass once the session closes.
+
+
+    model (qwen path only): use THIS model for this one call instead of the
+    deploy's. One Lambda can need two models for the same reason it can need two
+    thinking modes -- the Ask function answers on a screen, where a slower and
+    more discursive model is fine, and into a speaker, where it is not.
+
+    Measured 2026-09-09 on the same voice-shaped prompt, three runs each:
+
+        meta/muse-spark-1.3-contributor   6.53s   651 completion, 599 REASONING
+        google/gemini-3.8-flash           3.33s    32 completion,   0 reasoning
+
+    Nearly twice as fast because it stops thinking, not because it writes less.
     """
     if LLM_PROVIDER == "qwen":
-        return _call_qwen(prompt, max_tokens, force_json, enable_thinking)
-    return _call_anthropic(prompt, max_tokens)
+        return _call_qwen(prompt, max_tokens, force_json, enable_thinking, model,
+                          deadline=deadline)
+    return _call_anthropic(prompt, max_tokens, deadline=deadline)
 
 
 def active_model(enable_thinking=None):
@@ -205,30 +228,99 @@ def active_model(enable_thinking=None):
     return None
 
 
-def _post_with_retry(url, body, headers):
-    """Single POST with exponential backoff on 429/5xx. Returns (resp, error)."""
+# Below this there is no time for a request to do anything but time out, and
+# spending what is left of a caller's budget on a doomed attempt is worse than
+# reporting that the budget ran out.
+MIN_USEFUL_SECONDS = 2.0
+
+
+def _why_stopped(last_error, remaining):
+    """Both facts, in one string.
+
+    A retry abandoned because the budget ran out reports the LAST attempt's
+    error today -- "HTTP 503" -- which says the vendor was unhealthy and hides
+    that we quit early. The two lead to different fixes: one is the vendor's,
+    one is ours, and a reader given only the first will go and look at the
+    wrong dashboard.
+    """
+    if remaining is not None and remaining < MIN_USEFUL_SECONDS:
+        return f"{last_error}; deadline exceeded" if last_error else "deadline exceeded"
+    return last_error
+
+
+def _may_sleep(remaining, attempt):
+    """Back off, unless that would spend a budget the caller still owns."""
+    wait = BACKOFF_BASE_SECONDS * (2 ** attempt)
+    if remaining is not None and wait >= remaining:
+        return False
+    time.sleep(wait)
+    return True
+
+
+def _post_with_retry(url, body, headers, deadline=None, clock=time.monotonic):
+    """Single POST with exponential backoff on 429/5xx. Returns (resp, error).
+
+    `deadline` is SECONDS FROM NOW, and it is opt-in. Eight of this module's
+    nine callers are background pipelines where a slow answer is fine, and
+    bounding them by default would hand every one of them a behaviour change
+    nobody asked for. Omitted, every line below behaves exactly as it did.
+
+    Given one, the ladder stops being able to outlive its caller. Without it the
+    ceiling is MAX_ATTEMPTS x HTTP_TIMEOUT plus backoff -- about 187s on
+    AskAgentFunction -- while API Gateway terminates that route's integration at
+    29s. The reader waits out the browser's budget, the gateway 504s, the Lambda
+    keeps burning to its own timeout, and the answer that eventually exists is
+    thrown away.
+
+    Three things the deadline has to do, and the middle one is the one that is
+    easy to leave out:
+
+    * refuse to START an attempt that cannot finish inside it. A 45-second
+      request begun with 5 seconds left cannot be recalled.
+    * refuse to SLEEP past it. Backoff spends the budget just as effectively as
+      a slow attempt and is easier to miss, because nothing is on the wire.
+    * shrink the per-request timeout to what is actually left -- and only ever
+      DOWNWARD. HTTP_TIMEOUT exists to lose the race against the Lambda's own
+      timeout, so a generous deadline must not be allowed to extend it.
+    """
     http = urllib3.PoolManager()
     last_error = None
+    started = clock()
+
+    def left():
+        return None if deadline is None else deadline - (clock() - started)
+
     for attempt in range(MAX_ATTEMPTS):
+        remaining = left()
+        if remaining is not None:
+            if remaining < MIN_USEFUL_SECONDS:
+                # Named for what it is. "connection reset" and "we ran out of
+                # budget" need different fixes, and an error that reports the
+                # wrong one sends the reader at the vendor.
+                return None, (last_error + "; deadline exceeded" if last_error
+                              else "deadline exceeded")
+            timeout = min(HTTP_TIMEOUT, remaining)
+        else:
+            timeout = HTTP_TIMEOUT
         try:
             resp = http.request(
-                "POST", url, body=body, headers=headers, timeout=HTTP_TIMEOUT
+                "POST", url, body=body, headers=headers, timeout=timeout
             )
         except Exception as e:  # noqa: BLE001 - network errors are retryable
             last_error = str(e)
-            if attempt < MAX_ATTEMPTS - 1:
-                time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
+            if attempt < MAX_ATTEMPTS - 1 and _may_sleep(left(), attempt):
                 continue
-            return None, last_error
+            return None, _why_stopped(last_error, left())
         if resp.status in RETRYABLE_STATUSES and attempt < MAX_ATTEMPTS - 1:
             last_error = f"HTTP {resp.status}"
-            time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
-            continue
+            if _may_sleep(left(), attempt):
+                continue
+            return None, _why_stopped(last_error, left())
         return resp, None
     return None, last_error
 
 
-def _call_anthropic(prompt, max_tokens):
+def _call_anthropic(prompt, max_tokens, deadline=None):
     if not ANTHROPIC_API_KEY:
         logger.error("ANTHROPIC_API_KEY not set")
         return None, "ANTHROPIC_API_KEY not configured"
@@ -240,6 +332,13 @@ def _call_anthropic(prompt, max_tokens):
     if LLM_TEMPERATURE is not None:
         payload["temperature"] = LLM_TEMPERATURE
     body = json.dumps(payload)
+    # Passed only when there IS one. "Inert by default" has to include the call
+    # SHAPE, not just the behaviour: 65 existing tests stub this helper with the
+    # three-argument signature it has always had, and an unconditional keyword
+    # broke every one of them. That breakage was the useful signal -- eight of
+    # the nine callers never asked for a deadline and nothing about their path,
+    # including how it is spelled, should move.
+    _bound = {"deadline": deadline} if deadline is not None else {}
     resp, err = _post_with_retry(
         "https://api.anthropic.com/v1/messages",
         body,
@@ -248,6 +347,7 @@ def _call_anthropic(prompt, max_tokens):
             "x-api-key": ANTHROPIC_API_KEY,
             "anthropic-version": "2023-06-01",
         },
+        **_bound,
     )
     if resp is None:
         logger.error(f"Claude API call failed: {err}")
@@ -276,14 +376,19 @@ def _is_dashscope(base_url):
     return "aliyuncs.com" in (base_url or "")
 
 
-def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
+def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
+               deadline=None):
     if not QWEN_API_KEY:
         logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
         return None, "QWEN_API_KEY not configured"
     # Per-call override wins; None falls back to the function's env default.
     thinking = QWEN_ENABLE_THINKING if enable_thinking is None else bool(enable_thinking)
     # Resolved BEFORE the model, because the model depends on it.
-    payload = {"model": qwen_model_for(thinking),
+    # An explicit per-call model beats the deploy's, for the same reason the
+    # per-call thinking override does: the choice belongs to the CALL, not to
+    # the function. Falls back to the deploy when unset, so every existing
+    # caller is unchanged.
+    payload = {"model": model or qwen_model_for(thinking),
                "messages": [{"role": "user", "content": prompt}]}
     if LLM_TEMPERATURE is not None:
         payload["temperature"] = LLM_TEMPERATURE
@@ -379,10 +484,12 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
                 (payload.get("reasoning") or {}).get("effort", "-"),
                 "response_format" in payload)
     started = time.monotonic()
+    _bound = {"deadline": deadline} if deadline is not None else {}
     resp, err = _post_with_retry(
         f"{QWEN_BASE_URL}/chat/completions",
         json.dumps(payload),
         {"Content-Type": "application/json", "Authorization": f"Bearer {QWEN_API_KEY}"},
+        **_bound,
     )
     elapsed = time.monotonic() - started
     if resp is None:

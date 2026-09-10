@@ -837,6 +837,19 @@ def write_extraction_items(date, user_folder, extraction_key):
                 # the TABLE stays in place, unread by this writer, for
                 # rollback.
                 time_range=t.get("time_range"), participants=t.get("participants"),
+                # `questions`, not `open_questions`: that is the key
+                # lambda_extract_session's own schema asks the model for, and
+                # the one chunking.py and lambda_ask_agent.py have always read.
+                #
+                # THIS is the writer that matters for open questions, not
+                # lambda_ingest. On an authority-flip day ingest defers and
+                # writes no report topics at all -- every topic in Aurora comes
+                # through here. Wiring the column, the ingest pass-through and
+                # the org-api serializer while leaving this line out would have
+                # produced exactly the same empty section, one layer further in.
+                open_questions=[q.get("question") if isinstance(q, dict) else q
+                                for q in (t.get("questions") or [])
+                                if (q.get("question") if isinstance(q, dict) else q)] or None,
                 work_class=_wc, work_confidence=_wconf, is_mixed=(t.get("is_mixed") is True),
                 evidence=_evidence_payload(t),
                 # video-keyframe plan (Task 4): re-bound synthetic keyframes
