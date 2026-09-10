@@ -298,6 +298,22 @@ Parameters:
     Description: DashScope OpenAI-compatible base URL for Qwen chat completions
     Default: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 
+  EnableWebAnswer:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Answer from the open web when the retrieved excerpts do not answer the
+      question. Off by default on every stack, for the same reason
+      EnableExternalCorroboration is: it sends something derived from a
+      customer's meeting toward a search engine, and whether the pilot contracts
+      permit that is a commercial decision rather than a deploy-time default.
+
+      What actually leaves is narrower than corroboration's: gate-screened entity
+      NAMES taken from the QUESTION, at most three, with no claim text attached.
+      The question itself and the excerpts go only to the LLM provider, which
+      already receives them on every /ask.
+
   CorroborationApiKey:
     Type: String
     NoEcho: true
@@ -1822,6 +1838,9 @@ Resources:
           # parameter for why borrowing that one sends the wrong vendor's
           # credential on any DashScope-pointed stack.
           CORROBORATION_API_KEY: !Ref CorroborationApiKey
+          # Reads the same credential and the same vendor as corroboration; the
+          # separate flag is about the decision, not the plumbing.
+          ENABLE_WEB_ANSWER: !Ref EnableWebAnswer
       Layers:
         - !Ref DashScopeLayer
       Policies:
