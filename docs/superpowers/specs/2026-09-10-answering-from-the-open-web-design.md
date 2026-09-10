@@ -1,6 +1,6 @@
 # When the records cannot answer, look it up
 
-Status: spec, fourth draft. Two adversarial reviews; §9 records what each earlier
+Status: spec, fifth draft. Four adversarial reviews; §9 records what each earlier
 draft got wrong, because two of those mistakes shared a shape worth naming.
 
 ## 1. The gap
@@ -109,7 +109,36 @@ only because ask never sends `site`.
 ask-agent — `dashscope_utils.embed` raises, and ask-agent computes the vector
 inside its own try, so that failure becomes the generic error envelope.)*
 
-**Door B — the excerpts did not answer.** A separate, cheap classification call.
+**Door B — the excerpts did not answer — and naming the subjects, in ONE call.**
+
+Draft 4 had these as two steps, 2.80s + 6.45s. They take the same inputs: door B
+judges from the question and the chunks, subject-extraction reads the question,
+and neither needs the other's output. Measured 2026-09-11, n=8 each, same run,
+alternating, on realistic chunk text:
+
+    door B alone            1.99  2.60  2.64  2.72  2.80  3.13  3.24  MAX 3.30
+    door B + subjects       1.91  2.03  2.17  2.28  2.38  2.46  2.48  MAX 3.23
+
+**The merged call is not slower than door B alone; the 6.45s extraction step
+disappears entirely.** Extraction was expensive because it was a separate call
+re-reading the context. Merged, it reads a question already in the prompt and
+emits one more array. 8 of 8 judged `answered: false` correctly and 8 of 8
+produced a subject.
+
+That is the difference between 1.68s of margin and 7.70s (§5), and it removes a
+round trip and a failure mode rather than trading one for another.
+
+**One question it opens, which is the owner's.** The subject it returns for §1's
+question is `New Zealand standard for scaffolding`, kind `standard` — a
+*category phrase*, not a proper name. Nothing in the gate refuses it today (it
+is under the 60-char cap, carries no commercial term, has no digits), but the
+gate was built to pass NAMES, and whether category phrases may reach a search
+engine is the same kind of boundary judgement as the `Heidi` correction. Round 3
+raised this as "the feature may never find anything"; it is now a specific
+question with a yes or no, and §10 requires §1's own questions as acceptance
+cases so the answer is visible rather than assumed.
+
+The rejections below stand, and applied to the merged call they apply the same.
 `force_json` on the grounded pass is rejected: the Anthropic branch never
 receives it, the DashScope non-thinking branch silently drops `max_tokens`, the
 language-retry call sites hardcode `force_json=False`, it collides with the tail
@@ -157,18 +186,36 @@ synthesis call happens after that line. **Door B does not depend on the grounded
 answer, and neither does anything downstream of it.** They are sequential
 because they were written in reading order, not because one needs the other.
 
-Run both from the moment chunks land:
+**The clock starts at the HTTP request, not at chunks-in-hand.** Draft 4 anchored
+it at `:1133` and planted 9.0–10.8s there — but that figure is the WHOLE `/ask`
+round trip, measured browser-side and quoted in this repo's own frontend comment.
+The 29s ceiling does not exclude what happens before chunks land. Corrected from
+the per-call split measured in prod logs the same night (total Duration minus the
+model call): embed + rag-search is **1.2–1.4s**, and synthesis alone is 8.9–11.9s.
 
-    t=0.0   chunks in hand
-            |-- grounded synthesis ..................... 10.8s -> t=10.8
-            |-- door B ......... 2.8s -> t=2.8
-                                 |-- name the subjects .. 6.5s -> t=9.3
-                                     |-- web search ..... 11.4s -> t=20.7
-                                         |-- compose .... ~3s  -> t=23.7
+Every number below is measured. `compose` was `~3s` in draft 4 — invented for a
+step the same section called unmeasured — and is now 8 runs on a realistic
+findings payload.
 
-**About 24s worst case against 29s**, and the grounded answer is ready at 10.8s
-either way. Nothing is wasted: the web branch starts only if door B says the
-excerpts will not answer, and door B has decided by 2.8s.
+    t=0.00  HTTP request
+      +1.36  embed + rag-search ....................... t= 1.36
+             |-- grounded synthesis ... 11.9s ......... t=13.26
+             |-- gate (answered? + subjects) .. 3.23s .. t= 4.59
+                  |-- web search ............ 11.40s ... t=16.00
+                       |-- compose ............ 5.31s .. t=21.30
+
+    worst case 21.30s   ceiling 29s   margin 7.70s
+    with ENABLE_RERANK on (+~4s, default false)  25.30s   margin 3.70s
+
+Draft 4's own arithmetic, recomputed from the request clock and with compose
+measured, was **27.32s — 1.68s of margin, and 31.32s with rerank on, over the
+ceiling.** The merged gate (§4) is what turned that into room.
+
+Nothing is wasted in wall-clock: the web branch starts only if the gate says the
+excerpts will not answer, and the gate has decided by 3.23s. **It is not free in
+other currencies**, and §4 says so: the gate call ships `chunk_text` to the
+corroboration vendor on every question, including the majority the corpus
+answers.
 
 This is not free, and the costs are engineering rather than a dilemma:
 concurrency inside a Lambda that has none today, a deadline shared across
@@ -218,8 +265,12 @@ holds a button for, and the voice prompt forbids URLs and formatting symbols.
    regression is visible.
 1. Door A opens when chunks are empty AND `error` is ABSENT (§4) — small,
    correct alone, no new capability.
-2. A question-extraction prompt with its own exclusion list, measured (§3).
-3. Door B on `corroboration_client`, fail-closed, reading `chunk_text` (§4).
+1b. The gate decision: may a category phrase reach a search engine (§4)? Owner's
+   call, and it gates everything after it — a "no" means this feature answers
+   only questions naming something proper, which §1's own examples do not.
+2. The merged gate on `corroboration_client`, fail-closed, reading `chunk_text`
+   — one call, answering "did these excerpts answer it" and "what should be
+   looked up", with its own exclusion list measured against real questions (§3).
 4. The request-field gate (§6) — **before** any web answer can be returned.
 5. Compose step and the web answer, deadline derived from what is left.
 6. UI block, corroboration suppressed on it.
@@ -246,6 +297,30 @@ handed to it.**
 - **"`_looks_like_a_person` contradicts its docstring."** The docstring is
   stale; the code is a correction bought with a real leak — requiring two words
   "refused `Naylor Love` and let `Heidi` straight through". Withdrawn.
+- **The step nobody counted, three times.** Draft 3 forgot its own
+  question-extraction call. Draft 4 counted extraction and invented `~3s` for
+  compose. BOTH anchored the clock at chunks-in-hand, so neither ever counted
+  embed + rag-search — and draft 4 additionally planted a whole-round-trip
+  measurement at that anchor. Every figure in §5 is now measured, and the clock
+  starts where the gateway's does. The pattern is worth naming because it
+  survived three reviews: **an arithmetic that always came out just fitting,
+  because the parts that did not fit had not been written down.**
+
+## 9a. What is still not solved, and is not arithmetic
+
+Two hazards survive the margin and would survive any margin:
+
+- **Nothing can cancel an attempt in flight.** The deadline is checked between
+  attempts, and urllib3's timeout is per-read, not total — a slowly trickling
+  response can outlive it.
+- **An abandoned thread outlives the response.** Lambda freezes the sandbox; a
+  thread still reading at the 45s `LLM_HTTP_TIMEOUT` resumes during the NEXT
+  invocation, interleaving its log lines into another request's — in a codebase
+  that adjudicates defects by log lines.
+
+So §8 step 0 is not "no new capability, only what waits for what". It needs a
+stated join-or-abandon policy and a merged failure envelope, and those belong in
+the plan rather than being discovered during it.
 
 ## 10. What must be measured before it ships
 
