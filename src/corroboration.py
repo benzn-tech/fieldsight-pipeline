@@ -70,7 +70,17 @@ SEARCH_BUDGET = 15.0
 RECONCILE_BUDGET = 6.0
 
 # Steps 1 and 4 are classification, not reasoning, and they are the two that pay
-# for the search step.
+# for the search step. They ask for LOW effort rather than none: on this endpoint
+# sending no `reasoning` field does not mean "do not reason", it means the
+# provider chooses, and it chooses expensively. Measured 2026-09-11 on the real
+# reconcile prompt, n=5 each, every run returning valid JSON either way:
+#
+#     no effort   3.75  7.19  8.72  10.82  16.50 s
+#     effort low  2.06  2.07  2.28   2.72   2.91 s
+#
+# against a 6-second slice. `effort=None` was inherited from the Anthropic
+# client, where `output_config.effort` is a 400 on haiku; that vendor is gone
+# and only the cost stayed.
 # Extract and reconcile share the client with the search step, so this id has to
 # belong to the same vendor. Left at an Anthropic id after the swap, every
 # extract fails against a model OpenRouter does not have -- and `corroborate()`
@@ -233,7 +243,7 @@ def _extract(question, answer, budget):
     """
     reply = client.call(
         EXTRACT_PROMPT.format(question=question, answer=answer),
-        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort=None)
+        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort="low")
     if not reply.ok:
         return None, reply.error, reply.timed_out
     parsed = _loads(reply.text)
@@ -259,7 +269,7 @@ def _reconcile(allowed, findings, budget):
         for a in allowed)
     reply = client.call(
         RECONCILE_PROMPT.format(claims=claims, findings=findings or "(nothing found)"),
-        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort=None)
+        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort="low")
     if not reply.ok:
         return None, reply.error, reply.timed_out
     parsed = _loads(reply.text)
