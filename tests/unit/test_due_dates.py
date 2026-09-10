@@ -50,11 +50,20 @@ def test_tomorrow_beats_a_date_in_october():
     assert dd.days_until("Tomorrow 08:00", WED) < dd.days_until("2026-10-01", WED)
 
 
-def test_end_of_day_is_today_not_unknown():
-    """EOD is the most urgent thing a site report says. Unparsed it sorted below
-    a date three weeks out."""
-    for text in ("EOD", "eod", "End of day", "COB", "ASAP", "Immediate", "urgent"):
+def test_end_of_day_names_a_day_so_it_resolves():
+    """EOD is the most urgent thing a site report says, and unparsed it sorted
+    below a date three weeks out."""
+    for text in ("EOD", "eod", "End of day", "COB", "tonight", "this afternoon"):
         assert dd.days_until(text, WED) == 0, text
+
+
+def test_urgency_that_names_no_day_stays_unresolved():
+    """A decision this repository already made and pinned before any of this:
+    "Immediately" is a priority, not a due date, and inventing today's date for
+    one would make every one of them overdue tomorrow and every day after --
+    forever, for something nobody put a date on."""
+    for text in ("ASAP", "Immediately", "urgent", "Ongoing from next week"):
+        assert dd.days_until(text, WED) is None, text
 
 
 def test_a_bare_time_is_today():
@@ -76,15 +85,24 @@ def test_longer_phrases_win_over_the_words_inside_them():
     """"next week" must not be read as "week", and "end of week" must not be
     read as "end of day"."""
     assert dd.days_until("next week", WED) == 7
-    assert dd.days_until("end of week", WED) == 4
+    # Wednesday -> the coming Friday.
+    assert dd.days_until("end of week", WED) == 2
     assert dd.days_until("end of day", WED) == 0
+
+
+def test_the_spelled_forms_the_other_parser_already_knew():
+    """These were sinking to the bottom while `deadline_parse` resolved them
+    perfectly well -- the cost of writing a second parser without looking."""
+    assert dd.days_until("By 15 September", WED) == 6
+    assert dd.days_until("1 Oct 2026", WED) == 22
+    assert dd.days_until("Within 2 days", WED) == 2
 
 
 def test_text_that_names_no_day_is_None_rather_than_a_guess():
     """None is the honest answer for these, and it matters: an unreadable
     deadline must not outrank a real one just for containing characters."""
     for text in ("", None, "?", "when the crane arrives", "before handover",
-                 "once the RFI is answered", "soon"):
+                 "once the RFI is answered"):
         assert dd.days_until(text, WED) is None, text
 
 

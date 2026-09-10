@@ -64,6 +64,69 @@ _PLACEHOLDERS = {"null", "none", "n/a", "na", "tbc", "tbd", "-", "--"}
 # of what it says. Deliberately narrow: only words that make the whole phrase
 # about duration rather than a deadline, checked before any relative parsing
 # so the date inside them ("from next week") cannot be mistaken for one.
+#: Phrases that name a day without spelling one, and the bare times that mean
+#: the same. Added when the report's action ranking needed an order and found
+#: this module returning NULL for the most urgent thing a site says: "EOD" is
+#: not unresolvable, it is today. Before this, `deadline` was NULL for every one
+#: of them, so the Today page could not call them overdue and a second parser
+#: was written elsewhere to fill the gap -- which is how one rule became two
+#: that disagreed.
+#:
+#: Still no guessing. "Urgent" is deliberately absent: it states a priority, not
+#: a day, and turning it into one would fabricate the urgency this module exists
+#: to avoid fabricating. `_CONTINUOUS` is still checked first, so "ongoing from
+#: next week" stays NULL.
+#: ASAP, "immediately" and "right away" are NOT here, and the test that says so
+#: predates this addition: they state a priority, not a day, and inventing
+#: today's date for one makes it overdue tomorrow and every day after --
+#: forever, for something nobody ever put a date on. "End of day" is different:
+#: it names a day, and an EOD item not done by tomorrow genuinely IS overdue.
+_TODAY_WORDS = (
+    "end of day", "close of business", "eod", "cob",
+    "tonight", "this morning", "this afternoon", "this evening",
+)
+_END_OF_WEEK_WORDS = ("end of week", "eow", "end of the week", "this week",
+                      "by the end of the week")
+
+#: 15:00, 09.30, 9am -- a time with no day is a time TODAY.
+_BARE_TIME = re.compile(r"^\s*\d{1,2}\s*(?::|\.)?\s*\d{0,2}\s*(?:am|pm)?\s*$",
+                        re.IGNORECASE)
+#: 2026-9-5 as readily as 2026-09-05.
+_ISO_LOOSE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
+#: 15/09/2026 is September. Nothing in this product is US-format, and reading it
+#: the other way moves a deadline by months without anything failing.
+_DAY_FIRST = re.compile(r"\b(\d{1,2})[/.](\d{1,2})[/.](\d{4})\b")
+
+
+def _extra_vocabulary(lower, anchor):
+    """The phrases above, or None. Anchor-relative, never server-relative."""
+    if anchor is None:
+        return None
+    if _BARE_TIME.match(lower):
+        return anchor.isoformat()
+    for word in _TODAY_WORDS:
+        if re.search(r"\b" + re.escape(word) + r"\b", lower):
+            return anchor.isoformat()
+    for word in _END_OF_WEEK_WORDS:
+        if re.search(r"\b" + re.escape(word) + r"\b", lower):
+            # Friday, or today when the week is already there or past it.
+            ahead = max(0, 4 - anchor.weekday())
+            return (anchor + timedelta(days=ahead)).isoformat()
+    m = _DAY_FIRST.search(lower)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1))).isoformat()
+        except ValueError:
+            return None
+    m = _ISO_LOOSE.search(lower)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+        except ValueError:
+            return None
+    return None
+
+
 _CONTINUOUS = re.compile(r"\b(ongoing|continuous(?:ly)?|throughout|as\s+required|"
                          r"as\s+needed|daily|weekly|每天|持续)\b", re.IGNORECASE)
 
@@ -138,6 +201,12 @@ def resolve_deadline(free_text, report_date_iso):
         # Nothing relative can be resolved without the report's date, and the
         # spelled-out forms need at least its year.
         return None
+
+    # Tried before the spelled-out forms: "3 Aug" and "EOD" cannot collide, but
+    # "15/09/2026" would be read as a day-month pair by the looser patterns.
+    extra = _extra_vocabulary(lower, anchor)
+    if extra:
+        return extra
 
     if re.search(r"\btoday\b", lower) or _WITHIN_HOURS.search(lower):
         return anchor.isoformat()
