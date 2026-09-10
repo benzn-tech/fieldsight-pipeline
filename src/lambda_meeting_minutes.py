@@ -58,6 +58,8 @@ from transcript_utils import (
 )
 
 # Configure logging
+import report_sections
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -796,16 +798,20 @@ def convert_to_daily_report_format(minutes, meeting_config, transcripts):
         for ai in topic.get('action_items', []):
             compat_actions.append({
                 'action': ai.get('action', ''),
-                'responsible': ai.get('owner', ai.get('responsible', '?')),
-                'deadline': ai.get('deadline', '?'),
+                # Blank, not '?'. A placeholder is truthy, and report_sections
+                # ranks a dated action above an undated one -- '?' would put
+                # every action from a meeting above every genuinely dated one.
+                'responsible': ai.get('owner', ai.get('responsible', '')) or '',
+                'deadline': ai.get('deadline', '') or '',
                 'priority': ai.get('priority', 'medium'),
             })
 
-        # Append open questions to summary
+        # Open questions are carried, not concatenated. Glued onto the end of
+        # every summary they buried both: an unanswered question is a different
+        # kind of thing from a narrative, and from an action -- nobody owns one,
+        # because nobody knows the answer. report_sections gives them a section.
         summary = topic.get('summary', '')
-        open_qs = topic.get('open_questions', [])
-        if open_qs:
-            summary += ' Open questions: ' + '; '.join(open_qs)
+        open_qs = list(topic.get('open_questions', []) or [])
 
         compat_topics.append({
             'topic_id': topic.get('topic_id', 0),
@@ -813,6 +819,7 @@ def convert_to_daily_report_format(minutes, meeting_config, transcripts):
             'topic_title': topic.get('topic_title', ''),
             'category': compat_cat,
             'summary': summary,
+            'open_questions': open_qs,
             'participants': topic.get('participants', []),
             'key_decisions': flat_decisions,
             'action_items': compat_actions,
@@ -859,7 +866,13 @@ def convert_to_daily_report_format(minutes, meeting_config, transcripts):
         'report_type': 'daily',
         'user_name': user_for_path,
         'device': device or 'meeting',
-        'site': meeting_title,  # Use meeting title as "site" — shows in UI header
+        # NOT the meeting title. `lambda_ingest.resolve_site` looks a site up by
+        # NAME and trusts what it finds, so a title here becomes a wrong site on
+        # every RAG chunk the day produces -- BUG-41's failure, from a different
+        # direction. Empty lets ingest fall back to `recordings.site_id`, which
+        # is the authoritative source. The title has its own field below.
+        'site': meeting_config.get('site') or '',
+        'meeting_title': meeting_title,
         'executive_summary': minutes.get('executive_summary', ''),
         'topics': compat_topics,
         'safety_observations': [],
@@ -870,6 +883,14 @@ def convert_to_daily_report_format(minutes, meeting_config, transcripts):
             'meeting_type': minutes.get('meeting_type', 'general'),
         }
     }
+
+    # What a person reads. `topics` above stays for chunking.py and for query.
+    try:
+        compat_report['sections'] = report_sections.build(compat_report)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("sections could not be built for %s: %s",
+                         compat_report.get('report_date'), exc)
+        compat_report['sections'] = []
 
     return compat_report, user_for_path
 

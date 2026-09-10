@@ -132,6 +132,7 @@ import device_heartbeat
 import device_status
 import nz_time
 import reindex
+import report_sections
 import session_scope
 import sweep_state
 from db.connection import get_connection
@@ -6145,7 +6146,7 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             meta["recordings_processed"] = stats["sessions"]
         if stats["duration_s"] > 0:
             meta["duration_seconds"] = stats["duration_s"]
-    return {
+    shaped = {
         "report_date": date,
         "site": rows[0]["site_name"],
         # site_id (org UUID) alongside the display name: the compliance-resolution
@@ -6160,6 +6161,23 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
         "_report_metadata": meta,
         "topics": topics_out,
     }
+
+    # The reader's shape, built by the SAME function the lake reports use.
+    #
+    # This is the path most days take under the authority flip, so without it a
+    # frontend written against `sections` would render them on meeting and
+    # lake-only days and get `undefined` on every extraction day -- which is the
+    # majority. Building a second mapping here instead would be two definitions
+    # of one report, free to drift.
+    #
+    # Never fatal: this endpoint serves the dashboard, and a view that cannot be
+    # assembled must not take the day down with it.
+    try:
+        shaped["sections"] = report_sections.build(shaped)
+    except Exception:  # noqa: BLE001
+        logger.exception("sections could not be built for %s %s", folder, date)
+        shaped["sections"] = []
+    return shaped
 
 
 def _day_has_deleted_sources(conn, folder, date) -> bool:
