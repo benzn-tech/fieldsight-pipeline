@@ -29,7 +29,8 @@ class FakeCall:
         return self.queue.pop(0)
 
 
-def reply(text="", results=(), error=None, search_error=None, searched=None):
+def reply(text="", results=(), error=None, search_error=None, searched=None,
+          timed_out=False):
     """`searched` defaults to "there were results", which is the common case.
     Pass it explicitly for the two that matter on their own: a search that ran
     and honestly found nothing (searched=True, no results), and a model that
@@ -37,7 +38,8 @@ def reply(text="", results=(), error=None, search_error=None, searched=None):
     return client.Reply(text=text,
                         search_results=[client.SearchResult(u, t) for u, t in results],
                         error=error, search_error=search_error,
-                        searched=bool(results) if searched is None else searched)
+                        searched=bool(results) if searched is None else searched,
+                        timed_out=timed_out)
 
 
 def extraction(*items):
@@ -130,7 +132,11 @@ def test_reconcile_returning_prose_instead_of_json_costs_the_cards(monkeypatch):
     out, _ = _run(monkeypatch, extraction(NAYLOR),
                   reply(text="...", results=SOURCES),
                   reply(text="Sure! Here is what I found: Naylor Love looks legitimate."))
-    assert out["corroborations"] == [] and out["timed_out"] is True
+    # No cards is the point; the model was chatty rather than late, and saying
+    # "ran out of time" about a call that answered promptly invites a retry
+    # that will fail in exactly the same way.
+    assert out["corroborations"] == []
+    assert out["failed"] is True and out["timed_out"] is False
 
 
 def test_a_fenced_json_reply_is_still_read(monkeypatch):
@@ -148,15 +154,34 @@ def test_a_fenced_json_reply_is_still_read(monkeypatch):
 def test_a_failed_search_yields_no_cards_and_says_so(monkeypatch):
     """Step 3 is one call covering every entity, so there is no per-entity
     progress to keep. A shorter list would read as "we checked and found
-    nothing", which is a claim about the world rather than about us."""
-    out, _ = _run(monkeypatch, extraction(NAYLOR), reply(error="timeout"))
+    nothing", which is a claim about the world rather than about us.
+
+    Which of `timed_out` / `failed` it says is now the client's structural
+    report, not the shape of the error string."""
+    out, _ = _run(monkeypatch, extraction(NAYLOR),
+                  reply(error="timeout", timed_out=True))
     assert out["corroborations"] == []
     assert out["timed_out"] is True
 
 
-def test_a_failed_extraction_is_a_timeout_not_an_empty_answer(monkeypatch):
-    out, _ = _run(monkeypatch, extraction(NAYLOR).__class__(error="timeout"))
-    assert out["timed_out"] is True
+def test_a_failed_extraction_is_never_an_empty_answer(monkeypatch):
+    """The original name said "is a timeout", and the intent behind it is the
+    one that matters: a broken check must not look like a check that found
+    nothing to do. That intent survives; the label got more precise.
+
+    Reporting every step failure as a deadline was measured wrong on TEST
+    (a format failure announced as a timeout in ten seconds), but simply
+    dropping the flag would have made "nothing to check" and "the check broke"
+    identical -- which is what this test was protecting against. Hence a third
+    signal rather than one fewer."""
+    late = _run(monkeypatch, reply(error="timeout", timed_out=True))[0]
+    assert late["timed_out"] is True and late["failed"] is False
+
+    broke = _run(monkeypatch, reply(error="HTTP 502"))[0]
+    assert broke["timed_out"] is False and broke["failed"] is True
+
+    nothing = _run(monkeypatch, extraction())[0]
+    assert nothing["timed_out"] is False and nothing["failed"] is False
 
 
 def test_an_answer_naming_nothing_external_is_not_a_timeout(monkeypatch):
@@ -164,7 +189,7 @@ def test_an_answer_naming_nothing_external_is_not_a_timeout(monkeypatch):
     it as a timeout would make the honest case look like a fault."""
     out, _ = _run(monkeypatch, extraction())
     assert out == {"corroborations": [], "dropped": [], "truncated": False,
-                   "timed_out": False, "searched": False}
+                   "timed_out": False, "searched": False, "failed": False}
 
 
 # ------------------------------------------- a search that did not happen
@@ -528,3 +553,63 @@ def test_the_slices_fit_inside_the_hard_stop_with_the_floor_to_spare():
     assert total + client.MIN_USEFUL_TIMEOUT <= steps.HARD_STOP_SECONDS, (
         "%.1fs of slices plus the floor does not fit in %.1fs"
         % (total, steps.HARD_STOP_SECONDS))
+
+
+# --------------------------------- a step that failed is not a step that ran late
+
+# Measured on TEST, 2026-09-10, a real question against the real corpus:
+#
+#     corroboration: extraction failed: extraction did not return a list
+#     timed_out: true      elapsed 10.7s
+#
+# The model returned something that was not a JSON array. That is a format
+# failure, and the reader was told the check ran out of time -- in ten seconds,
+# against a budget of twenty-seven. Same shape as the `searched` fix one
+# section up: a failure wearing another failure's label sends whoever reads it
+# at the wrong thing, and a timeout invites "try again later" when trying again
+# will fail identically.
+#
+# There is already a truthful place for these. `searched: false` means the open
+# web was not consulted, which is exactly what happened, and the UI renders it
+# as "Couldn't check the web for this answer". No new flag is needed -- what is
+# needed is for `timed_out` to stop claiming cases it does not own.
+
+
+def test_an_unparseable_extraction_is_not_a_timeout(monkeypatch):
+    """The measured case. Ten seconds is not a deadline being missed."""
+    out, _ = _run(monkeypatch, reply(text="I could not find any entities."))
+    assert out["timed_out"] is False, "a format failure was reported as a deadline"
+    assert out["searched"] is False
+    assert out["corroborations"] == []
+
+
+def test_a_search_that_errored_is_not_a_timeout(monkeypatch):
+    """An HTTP error from the vendor is the vendor's fault and ours to report;
+    it is not our clock."""
+    out, _ = _run(monkeypatch, extraction(NAYLOR), reply(error="HTTP 502"))
+    assert out["timed_out"] is False
+    assert out["searched"] is False
+
+
+def test_a_reconcile_that_errored_is_not_a_timeout(monkeypatch):
+    out, _ = _run(monkeypatch, extraction(NAYLOR), reply(results=SOURCES),
+                  reply(text="not json at all"))
+    assert out["timed_out"] is False
+
+
+def test_a_step_that_really_ran_late_still_says_timed_out(monkeypatch):
+    """The guard must not empty the flag of meaning. A client that reports a
+    deadline structurally is still a deadline."""
+    out, _ = _run(monkeypatch, extraction(NAYLOR),
+                  reply(error="no time left (0.4s)", timed_out=True))
+    assert out["timed_out"] is True
+
+
+def test_running_out_of_budget_between_steps_still_says_timed_out(monkeypatch):
+    """`left()` falling under the floor is this module's own clock, and the one
+    case the flag was always right about."""
+    ticks = iter([0.0, 0.0, 99.0, 99.0, 99.0, 99.0])
+    fake = FakeCall(extraction(NAYLOR))
+    monkeypatch.setattr(steps.client, "call", fake)
+    out = steps.corroborate("q", "a", clock=lambda: next(ticks))
+    assert out["timed_out"] is True

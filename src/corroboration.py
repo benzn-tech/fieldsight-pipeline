@@ -225,15 +225,23 @@ WHAT THE SEARCH FOUND:
 
 
 def _extract(question, answer, budget):
+    """Returns (entities, error, timed_out).
+
+    The third value is the whole point: a transport deadline and a model that
+    wrote prose instead of JSON both arrive here as "an error", and only one of
+    them is worth telling a reader to try again later about.
+    """
     reply = client.call(
         EXTRACT_PROMPT.format(question=question, answer=answer),
         timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort=None)
     if not reply.ok:
-        return None, reply.error
+        return None, reply.error, reply.timed_out
     parsed = _loads(reply.text)
     if not isinstance(parsed, list):
-        return None, "extraction did not return a list"
-    return parsed, None
+        # The call succeeded and came back in time. Nothing about this is a
+        # deadline.
+        return None, "extraction did not return a list", False
+    return parsed, None, False
 
 
 def _search(allowed, budget):
@@ -253,11 +261,11 @@ def _reconcile(allowed, findings, budget):
         RECONCILE_PROMPT.format(claims=claims, findings=findings or "(nothing found)"),
         timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort=None)
     if not reply.ok:
-        return None, reply.error
+        return None, reply.error, reply.timed_out
     parsed = _loads(reply.text)
     if not isinstance(parsed, list):
-        return None, "reconcile did not return a list"
-    return parsed, None
+        return None, "reconcile did not return a list", False
+    return parsed, None, False
 
 
 # A hostname and nothing else: labels, dots, and a final label that is alphabetic
@@ -328,7 +336,7 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
     """
     started = clock()
     empty = {"corroborations": [], "dropped": [], "truncated": False,
-             "timed_out": False, "searched": False}
+             "timed_out": False, "searched": False, "failed": False}
 
     if not question or not answer:
         return empty
@@ -337,10 +345,18 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
         return HARD_STOP_SECONDS - (clock() - started)
 
     # --- 1. what does the answer claim, and about whom -----------------------
-    entities, err = _extract(question, answer, min(EXTRACT_BUDGET, left()))
+    entities, err, late = _extract(question, answer, min(EXTRACT_BUDGET, left()))
     if err:
-        logger.warning("corroboration: extraction failed: %s", err)
-        return dict(empty, timed_out=True)
+        # Only a real deadline says `timed_out`. Measured on TEST 2026-09-10, a
+        # real question returned "extraction did not return a list" -- a format
+        # failure -- and the reader was told the check ran out of time, in ten
+        # seconds against a budget of twenty-seven. A timeout invites "try again
+        # later"; trying again fails identically. Everything that is not the
+        # clock falls through to `searched: false`, which is true and already
+        # has words the reader can act on.
+        logger.warning("corroboration: extraction failed: %s (timed_out=%s)",
+                       err, late)
+        return dict(empty, timed_out=bool(late), failed=not late)
     if not entities:
         return empty
 
@@ -356,7 +372,8 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
                 len(result.allowed), len(result.rejected), result.truncated)
 
     base = {"corroborations": [], "dropped": dropped,
-            "truncated": result.truncated, "timed_out": False, "searched": False}
+            "truncated": result.truncated, "timed_out": False, "searched": False,
+            "failed": False}
 
     # --- 3. one search covering all of them ---------------------------------
     if left() < client.MIN_USEFUL_TIMEOUT:
@@ -365,8 +382,10 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
     if not search.ok:
         # One call, so there is no partial progress to keep. A shorter list here
         # would read as "we checked these and found nothing".
-        logger.warning("corroboration: search failed: %s", search.error)
-        return dict(base, timed_out=True)
+        logger.warning("corroboration: search failed: %s (timed_out=%s)",
+                       search.error, search.timed_out)
+        return dict(base, timed_out=bool(search.timed_out),
+                    failed=not search.timed_out)
     # Reconcile may only ever read text the open web actually produced.
     #
     # The model's own account of its tool use is not evidence. Measured on
@@ -404,11 +423,12 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
     # --- 4. a state per entity ----------------------------------------------
     if left() < client.MIN_USEFUL_TIMEOUT:
         return dict(base, timed_out=True)
-    verdicts, err = _reconcile(result.allowed, search.text,
-                               min(RECONCILE_BUDGET, left()))
+    verdicts, err, late = _reconcile(result.allowed, search.text,
+                                     min(RECONCILE_BUDGET, left()))
     if err:
-        logger.warning("corroboration: reconcile failed: %s", err)
-        return dict(base, timed_out=True)
+        logger.warning("corroboration: reconcile failed: %s (timed_out=%s)",
+                       err, late)
+        return dict(base, timed_out=bool(late), failed=not late)
 
     by_entity = {}
     for v in verdicts or []:
@@ -450,4 +470,5 @@ def corroborate(question, answer, *, clock=time.monotonic) -> dict:
         })
 
     return {"corroborations": cards, "dropped": dropped,
-            "truncated": result.truncated, "timed_out": False, "searched": True}
+            "truncated": result.truncated, "timed_out": False, "searched": True,
+            "failed": False}

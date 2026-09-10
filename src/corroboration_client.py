@@ -111,11 +111,11 @@ class Reply:
     """
 
     __slots__ = ("text", "search_results", "citations", "stop_reason",
-                 "error", "elapsed", "searched", "search_error")
+                 "error", "elapsed", "searched", "search_error", "timed_out")
 
     def __init__(self, text="", search_results=None, citations=None,
                  stop_reason=None, error=None, elapsed=0.0, searched=False,
-                 search_error=None):
+                 search_error=None, timed_out=False):
         self.text = text
         self.search_results = search_results or []
         self.citations = citations or []
@@ -128,6 +128,11 @@ class Reply:
         # `searched` already covers that case; the field stays so a vendor that
         # does distinguish the two has somewhere to say so.
         self.search_error = search_error
+        # Structural, never inferred from `error`'s wording. The caller has to
+        # tell a deadline from a format failure to say anything true about it,
+        # and matching on an error string would make a phrase into an interface
+        # -- which this repo has paid for before.
+        self.timed_out = timed_out
 
     @property
     def ok(self) -> bool:
@@ -199,7 +204,7 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
         return Reply(error="CORROBORATION_API_KEY not configured")
 
     if timeout is None or timeout < MIN_USEFUL_TIMEOUT:
-        return Reply(error=f"no time left ({timeout}s)")
+        return Reply(error=f"no time left ({timeout}s)", timed_out=True)
 
     messages = []
     if system:
@@ -226,6 +231,7 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
     attempts_left = 2 if (retry_budget or 0) >= timeout + MIN_USEFUL_TIMEOUT else 1
     started = time.time()
     last_error = None
+    last_timed_out = False
 
     for attempt in range(attempts_left):
         attempt_start = time.time()
@@ -234,6 +240,10 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
                                 timeout=timeout)
         except Exception as e:                    # noqa: BLE001 - all of it is a miss
             last_error = f"{type(e).__name__}: {e}"
+            # urllib3 raises its own class for a read/connect deadline; that is
+            # the one exception here that IS our clock rather than the vendor's
+            # health, and the two lead a reader to different places.
+            last_timed_out = isinstance(e, urllib3.exceptions.TimeoutError)
             logger.warning("corroboration: attempt %d failed: %s",
                            attempt + 1, last_error)
             continue
@@ -264,4 +274,5 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
             last_error = f"HTTP {resp.status}"
         break
 
-    return Reply(error=last_error or "no response", elapsed=time.time() - started)
+    return Reply(error=last_error or "no response", elapsed=time.time() - started,
+                 timed_out=last_timed_out)
