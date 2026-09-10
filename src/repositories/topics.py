@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 _TOPIC_COLS = ("id, site_id, user_id, source_s3_key, report_date, occurred_at, "
                "category, title, summary, time_range, participants, source, created_at, "
-               "work_class, work_confidence, is_mixed, thread_id, evidence")
+               "work_class, work_confidence, is_mixed, thread_id, evidence, open_questions")
 
 # Phase F (D8 retirement, spec §8): severity -> risk_level, for reshaping
 # safety-domain findings into the legacy safety_observations row shape.
@@ -61,7 +61,7 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
                  action_items=None, safety=None, photos=None,
                  time_range=None, participants=None,
                  work_class=None, work_confidence=None, is_mixed=False,
-                 evidence=None) -> dict:
+                 evidence=None, open_questions=None) -> dict:
     """Insert a topic with its children. NOTE: currently insert-only —
     no ON CONFLICT dedup. Dedup is instead handled by callers running
     delete_topics_for_scope() first to clear the (site_id, report_date, user_id)
@@ -80,19 +80,27 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
     evidence (migration 0037) is the extraction's own citations plus the result
     of checking each against the transcript. NULL means the extraction predates
     the feature or ran with EMIT_EVIDENCE off -- which is prod today -- and is
-    NOT the same as the model having cited nothing."""
+    NOT the same as the model having cited nothing.
+
+    open_questions (migration 0055) are the questions a topic raised and left
+    unanswered. They used to arrive concatenated onto `summary`; once the report
+    stopped doing that, this table was where they were lost, because it had a
+    column for everything a topic produces except a question. Same NULL-vs-[]
+    distinction as evidence: absent means never captured, empty means asked and
+    there were none."""
     cur = conn.cursor(row_factory=dict_row)
     topic = cur.execute(
         f"INSERT INTO topics (site_id, user_id, source_s3_key, report_date, occurred_at, "
         f"category, title, summary, time_range, participants, "
-        f"work_class, work_confidence, is_mixed, evidence) "
-        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_TOPIC_COLS}",
+        f"work_class, work_confidence, is_mixed, evidence, open_questions) "
+        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_TOPIC_COLS}",
         (site_id, user_id, source_s3_key, report_date, occurred_at, category, title, summary,
          time_range, Jsonb(participants) if participants is not None else None,
          work_class, work_confidence, is_mixed,
          # NULL, not '[]', when there is nothing: absent means "never measured",
          # an empty array would mean "measured and cited nothing".
-         Jsonb(evidence) if evidence is not None else None),
+         Jsonb(evidence) if evidence is not None else None,
+         Jsonb(open_questions) if open_questions is not None else None),
     ).fetchone()
     tid = topic["id"]
     for a in (action_items or []):
@@ -344,7 +352,7 @@ def list_extraction_topics_for_day(conn, site_id, user_id, report_date) -> list[
 _TOPIC_COLS_JOINED = (
     "t.id, t.site_id, t.user_id, t.source_s3_key, t.report_date, t.occurred_at, "
     "t.category, t.title, t.summary, t.time_range, t.participants, t.source, t.created_at, "
-    "t.work_class, t.work_confidence, t.is_mixed, t.thread_id"
+    "t.work_class, t.work_confidence, t.is_mixed, t.thread_id, t.open_questions"
 )
 
 

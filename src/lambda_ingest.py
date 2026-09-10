@@ -684,6 +684,13 @@ def ingest_report(date, user_folder, report_key):
                     action_items=mapped_action_items,
                     safety=_map_safety(t.get("safety_flags")),
                     time_range=t.get("time_range"), participants=t.get("participants"),
+                    # Carried, not folded into summary. A meeting's unanswered
+                    # questions reach this table only through this argument now
+                    # -- lambda_meeting_minutes stopped appending them to the
+                    # summary text when the report gained its own section for
+                    # them, and without this line the Timeline loses a day's
+                    # questions entirely.
+                    open_questions=t.get("open_questions") or t.get("questions"),
                     photos=[{"s3_key": p["key"], "caption_text": None}
                             for p in photos_by_topic.get(i, [])],
                 )

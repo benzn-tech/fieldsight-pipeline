@@ -6067,6 +6067,14 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             "participants": t["participants"] or [],
             "summary": t["summary"],
             "key_decisions": [],                    # D3: v1, decisions table deferred
+            # Questions raised and left unanswered (migration 0055). This
+            # serializer is a fixed allowlist -- the same one that silently
+            # dropped `mention_count` on the way out -- so a column that is not
+            # named here does not exist as far as any reader is concerned.
+            # `report_sections` builds the report's Open Questions section from
+            # this key, and on an authority-flip day this shaped report IS the
+            # report.
+            "open_questions": t.get("open_questions") or [],
             # `mention_count` and `collapsed_ids` are NOT optional extras.
             #
             # The 0-day collapse removes duplicate rows from this list before it
