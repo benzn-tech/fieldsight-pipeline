@@ -165,7 +165,7 @@ def test_the_action_table_names_its_columns():
     ])])
     sec = _by_title(rs.build(r), "Actions")
     assert sec["kind"] == "table"
-    assert sec["fields"] == ["action", "owner", "due", "priority"]
+    assert sec["fields"] == ["action", "owner", "due", "priority", "status"]
     assert sec["rows"][0]["owner"] == "Ben"
     assert sec["rows"][0]["due"] == "2026-09-12"
 
