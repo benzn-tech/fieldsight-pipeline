@@ -110,6 +110,7 @@ Secrets Manager call from a NAT-less VPC). Cognito calls need the
 cognito-idp VPC interface endpoint (db stack).
 """
 import json
+import site_coords
 import logging
 import os
 import re
@@ -1126,7 +1127,34 @@ def session_close(conn, caller, session_id, body):
                "version": row["version"], "graceSeconds": grace})
 
 
-def _assemble_session_report(conn, caller, session_id, event):
+def _selected_topic_row_ids(body):
+    """The topic ids the caller chose, or None for "all of them".
+
+    CHOSEN, never HIDDEN, and the direction is the whole safety argument. A
+    chosen-list that names a row which no longer exists simply loses that row --
+    it fails CLOSED. A hidden-list applied to a set that has changed since the
+    user saw it lets every new row through -- it fails OPEN, and the person who
+    excluded something would never learn that the exclusion stopped applying.
+    Topics are deleted and re-inserted under new uuids on every re-extraction, so
+    "the set has changed" is the ordinary case here, not the edge one.
+
+    Absent means all, and [] is rejected rather than silently meaning all: a
+    client that computed an empty selection asked for nothing, and answering that
+    with everything is the opposite of what it asked."""
+    if "topicRowIds" not in body:
+        return None, None
+    raw = body.get("topicRowIds")
+    if not isinstance(raw, list) or not raw:
+        return None, error("topicRowIds must be a non-empty list of topic ids", 400)
+    if len(raw) > 200:
+        return None, error("topicRowIds: at most 200", 400)
+    ids = {str(x) for x in raw if isinstance(x, (str, int)) and str(x).strip()}
+    if not ids:
+        return None, error("topicRowIds must be a non-empty list of topic ids", 400)
+    return ids, None
+
+
+def _assemble_session_report(conn, caller, session_id, event, selected=None):
     """Re-derive ONE session's scope + assemble its reviewed report content,
     server-side from (folder, date, session_id). The shared core of the T2
     preview and the T3 generate enqueue (session-report-review-export spec §6).
@@ -1156,8 +1184,18 @@ def _assemble_session_report(conn, caller, session_id, event):
         if r["id"] in redacted or r.get("work_class") == "non_work":
             continue
         srows.append(r)
+    if selected is not None:
+        # INTERSECTION, never a lookup. The chosen ids are filtered against rows
+        # that already passed the site ACL, the redaction check and the non_work
+        # exclusion, so a chosen id cannot widen the scope by one row -- naming
+        # somebody else's topic simply matches nothing.
+        srows = [r for r in srows if str(r["id"]) in selected]
+
     if not srows:
-        # unknown session, all-excluded, or wrong folder/date -> nothing to act on
+        # unknown session, all-excluded, wrong folder/date, or a selection that
+        # matched nothing -> nothing to act on. Deliberately the SAME 404 for all
+        # of them: distinguishing "that id is not yours" from "that id does not
+        # exist" would answer a question the caller has no right to ask.
         return None, error("session not found", 404)
 
     site_name = next((r.get("site_name") for r in srows if r.get("site_name")), None)
@@ -1186,8 +1224,15 @@ def session_report_preview(conn, caller, session_id, event):
 
     NOTE: here `session_id` is the extraction *session_base* the #11 picker
     uses (e.g. 'Benl1_2026-07-25_13-00-11'), NOT the 32-hex device session id
-    of /open|/close. Read-only: nothing is persisted, no doc, no send."""
-    content, err = _assemble_session_report(conn, caller, session_id, event)
+    of /open|/close. Read-only: nothing is persisted, no doc, no send.
+
+    Takes the same optional `topicRowIds` the generate route does, so the modal
+    can preview EXACTLY what it is about to produce. A preview that ignored the
+    selection would show the user one document and hand them another."""
+    selected, err = _selected_topic_row_ids(parse_body(event) or {})
+    if err is not None:
+        return err
+    content, err = _assemble_session_report(conn, caller, session_id, event, selected)
     if err is not None:
         return err
     return ok({
@@ -1231,7 +1276,10 @@ def session_report_generate(conn, caller, session_id, event):
     if deliver == "email" and not recipients:
         return error("recipients required when deliver='email'", 400)
 
-    content, err = _assemble_session_report(conn, caller, session_id, event)
+    selected, err = _selected_topic_row_ids(body)
+    if err is not None:
+        return err
+    content, err = _assemble_session_report(conn, caller, session_id, event, selected)
     if err is not None:
         return err
 
@@ -1248,6 +1296,14 @@ def session_report_generate(conn, caller, session_id, event):
         "companyId": str(caller["company_id"]),
         "requestedBy": str(caller["id"]),
         "templateId": body.get("templateId"),
+        # Both, deliberately. `requested` is what the client sent, `selected` is
+        # what survived the ACL, the redaction check and the non_work exclusion.
+        # When they differ, the artifact is the only place that records a chosen
+        # topic silently dropping out -- otherwise the user gets a shorter
+        # document with nothing anywhere saying why.
+        "requestedTopicRowIds": (sorted(selected) if selected else None),
+        "selectedTopicRowIds": [str(t.get("topic_row_id")) for t in content["topics"]
+                                if t.get("topic_row_id")],
         "title": body.get("title") or content["title"],
         "attendees": body.get("attendees") or content["participants"],
         "fields": body.get("fields") or {},
@@ -2608,6 +2664,7 @@ def create_org_site(conn, caller, body):
         if not _relocate_asset(icon, final_icon):
             return error("upload expired or missing — please re-upload the image", 400)
         row = sites.set_site_icon(conn, row["id"], final_icon)
+    _publish_site_coords(row)
     return ok(row, 201)
 
 
@@ -2661,7 +2718,48 @@ def patch_org_site(conn, caller, site_id, body):
         row = sites.set_site_icon(conn, site_id, final_icon)
         if old_icon and old_icon != final_icon:
             _delete_asset(old_icon)
+    _publish_site_coords(row)
     return ok(row)
+
+
+def _publish_site_coords(row):
+    """Put this site's coordinate where the report generator can read it.
+
+    WHY IT HAS TO BE PUBLISHED AT ALL. The generator fetches weather, stores it
+    on the report and feeds it to the prompt with a correlation instruction --
+    and has never produced one, because it takes the coordinate from
+    config/user_mapping.json, where every site is null, while the coordinates
+    entered here live in Aurora. The generator has no VpcConfig (deliberately:
+    it needs egress for the model and the weather API), so it cannot read
+    Aurora. S3 is the only place both of them stand.
+
+    NOT user_mapping.json. Nothing in this repository writes that file -- six
+    lambdas read it and people maintain it by hand, alongside the device
+    mapping and the reassignment log. This writes a separate machine-owned
+    object, and the IAM grant names that one key rather than the config/
+    prefix, so a bug here cannot reach the hand-maintained file.
+
+    NEVER RAISES, and that is the whole contract. Saving a project must not
+    fail because a config object could not be refreshed; the cost of a missed
+    publish is a report without weather, which is exactly where we already
+    are. Logged at exception level rather than swallowed -- a guard that only
+    speaks when someone is watching cannot be told from one that never ran.
+    """
+    try:
+        slug = site_coords.slug_for_site(row)
+        if not slug:
+            return
+        doc = _get_lake_json(site_coords.KEY) or {}
+        merged = site_coords.merge_site(doc, row)
+        if merged == doc:
+            return                      # nothing moved; do not rewrite the object
+        s3().put_object(
+            Bucket=LAKE_BUCKET, Key=site_coords.KEY,
+            Body=json.dumps(merged, indent=2, default=str).encode("utf-8"),
+            ContentType="application/json")
+        logger.info("site-coords: published %s (%d site(s) placed)", slug, len(merged))
+    except Exception:  # noqa: BLE001 - see docstring
+        logger.exception("site-coords: publish failed for %s", (row or {}).get("id"))
 
 
 def list_site_members(conn, caller, site_id):
@@ -4521,38 +4619,44 @@ def list_live_items(conn, caller, event):
     # Resolved on its own line, not inside the call: an exception raised while
     # evaluating an argument escapes the callee's try, so a failed enrichment
     # would 500 the whole timeline.
-    merged_keys = _merged_keys_for_caller(conn, caller, date)
+    merged_keys = _merged_keys_for(conn, caller["id"], date)
     rows = topics.list_topics_for_date(conn, site_ids, date,
                                        author_ids=_author_filter(conn, caller),
                                        merged_keys=merged_keys)
     return ok({"topics": rows})
 
 
-def _merged_keys_for_caller(conn, caller, date):
-    """The merged-record keys this caller is entitled to see on `date`.
+def _merged_keys_for(conn, user_id, date):
+    """The merged-record keys `user_id` was a member of on `date`, or [].
 
     A multi-device merge writes ONE topic set, owned by the lead's session, and
-    deletes each member's own. Without this a joiner's day goes blank: they were
-    in the meeting and their timeline shows nothing.
+    PHYSICALLY deletes each member's own. Without this a joiner's day goes blank:
+    they were in the meeting and their timeline shows nothing.
 
-    Entitlement is membership in the group, established from the caller's own
-    sessions -- so this widens nothing. It cannot reach a group the caller was
-    not in, and it names individual artifact keys rather than relaxing the site
-    or author filter.
+    Named for a USER and not for "the caller", because two callers ask two
+    different questions and the answers are not interchangeable:
+
+      * an own-day view asks about the caller, and the keys may then be unioned
+        PAST the ACL -- the caller was in that meeting, so the record is theirs.
+        `/live-items` has always done this;
+      * a cross-user view asks about the TARGET, and those keys must stay inside
+        the caller's site clip. A merged meeting spans devices and therefore
+        sites by definition, which is precisely the object CRITICAL-1's
+        cross_user_clip rule exists for.
+
+    A function called `_merged_keys_for_caller` that quietly answered about
+    somebody else would read as safe at every call site. This one cannot.
 
     Returns [] on any failure: a missing merged record is a stale timeline, a
-    broken one is no timeline at all."""
+    broken one is no timeline at all. Resolve it on its own line, never inside a
+    call's argument list -- an exception raised while evaluating an argument
+    escapes the callee's try, which is how a failed enrichment 500s a whole
+    read."""
     try:
-        gids = meeting_session.groups_for_user_on_date(conn, caller["id"], date)
-        keys = []
-        for gid in gids:
-            row = session_group.get(conn, gid)
-            if row and row.get("merged_key"):
-                keys.append(row["merged_key"])
-        return keys
+        return session_group.merged_keys_for_user(conn, user_id, date)
     except Exception:
         logger.exception("could not resolve merged records for %s on %s",
-                         caller.get("id"), date)
+                         user_id, date)
         return []
 
 
@@ -6077,6 +6181,26 @@ def _day_has_deleted_sources(conn, folder, date) -> bool:
         return False
 
 
+def _timeline_target_id(conn, caller, user):
+    """The user whose group membership decides which merged records this view
+    may show: the person whose day is being read, never the person reading it.
+
+    `user` is a FOLDER name, and the caller's own folder is the common case --
+    resolving it through the database on every own-day read would be a query for
+    an answer already in hand. Falls back to the caller on any failure, which is
+    the conservative direction: a caller can only ever lose merged records that
+    way, never gain someone else's.
+    """
+    try:
+        if not user or user == (caller.get("folder_name") or ""):
+            return caller["id"]
+        row = users.get_by_folder_name(conn, caller["company_id"], user)
+        return (row or {}).get("id") or caller["id"]
+    except Exception:
+        logger.exception("could not resolve timeline target for %s", user)
+        return caller["id"]
+
+
 def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     """The single-(user, date) D1 read: Aurora override when extraction
     topics exist AND at least one survives the site ACL filter, else S3
@@ -6098,14 +6222,58 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     in-scope Aurora topics exist there is nothing safe to show (404). Own-
     timeline and ALL-scope (admin/gm/platform_admin) callers pass
     cross_user_clip=False and are UNCHANGED."""
-    def _aurora_shape(prefix):
+    # Multi-device merge: the meeting's ONE topic set is owned by the lead's
+    # session key and every member's own topics were PHYSICALLY deleted, so a
+    # joiner has nothing under their own prefix. Resolved on its own line and
+    # before the gate below -- an exception raised inside an argument list
+    # escapes the callee's try and 500s the whole read.
+    #
+    # WHOSE membership: the target's, always. On an own-day view the target IS
+    # the caller and this is `/live-items` verbatim. On a cross-user view it has
+    # to be the target -- asking about the caller would answer a question nobody
+    # posed and return the caller's own unrelated meetings.
+    merged_keys = _merged_keys_for(conn, _timeline_target_id(conn, caller, user), date)
+
+    def _aurora_shape(prefix, merged=()):
         """Return the id-carrying rendered shape for `prefix` if it has
         Aurora topics inside the caller's site ACL, else None."""
-        if not topics.has_topics_for_source_prefix(conn, prefix):
+        # The gate has to know about the merge too. A joiner's own prefix is
+        # EMPTY -- that is what the merge does -- so testing the prefix alone
+        # returns before any list call and no union downstream can ever run.
+        if not (topics.has_topics_for_source_prefix(conn, prefix) or merged):
             return None
         allowed = _allowed_site_ids(conn, caller)
-        rows = [r for r in topics.list_topics_for_source_prefix(conn, prefix)
-                if str(r["site_id"]) in allowed]
+        # The kwarg is passed ONLY when there is something to union. A day with
+        # no group must reach this repository exactly as it did before -- same
+        # call, same SQL, same params -- so the change cannot alter the ordinary
+        # case, which is almost every case.
+        rows = (topics.list_topics_for_source_prefix(conn, prefix,
+                                                    merged_keys=list(merged))
+                if merged else
+                topics.list_topics_for_source_prefix(conn, prefix))
+        if not cross_user_clip:
+            # Own day (and ALL-scope). The caller was in that meeting, so the
+            # merged record is theirs: it bypasses the site clip exactly as it
+            # does on `/live-items`, and for the same three reasons -- the rows
+            # carry the LEAD's user_id and site_id, so an author filter, a site
+            # filter, or widening author_ids would each fail, the last of them
+            # by leaking the lead's other solo topics.
+            merged_set = set(merged)
+            rows = [r for r in rows
+                    if str(r["site_id"]) in allowed
+                    or r.get("source_s3_key") in merged_set]
+        else:
+            # Someone else's day. A merged meeting spans devices and therefore
+            # sites BY DEFINITION, which is the object cross_user_clip exists
+            # for, so the merged rows stay INSIDE the clip -- the caller sees
+            # the part of that meeting sitting on sites they can already reach.
+            #
+            # Note what this does NOT do: these paths apply no author filter
+            # (the prefix is the author), so a site_manager viewing a worker can
+            # see merged rows authored by a pm lead they could not open directly.
+            # Bounded to a meeting that viewable worker attended on the caller's
+            # own site, and stated here rather than discovered later.
+            rows = [r for r in rows if str(r["site_id"]) in allowed]
         if not rows:
             return None
         # CRITICAL-1: cross-user graded view never merges the target's whole-day
@@ -6181,8 +6349,12 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     # exist for this (user, date) -- extraction-sourced OR report-sourced -- so
     # report-sourced content is editable exactly like extraction-sourced. Only
     # a day with NO Aurora topics at all keeps the byte-verbatim S3 contract.
-    for prefix in (f"extractions/{user}/{date}/", f"reports/{date}/{user}/"):
-        shape = _aurora_shape(prefix)
+    for prefix, merged in ((f"extractions/{user}/{date}/", merged_keys),
+                           (f"reports/{date}/{user}/", ())):
+        # merged keys only widen the EXTRACTIONS prefix. A merged record is an
+        # extraction artifact; unioning it into the report-sourced read would
+        # return the same rows twice under a different provenance.
+        shape = _aurora_shape(prefix, merged)
         if shape is not None:
             return ok(shape)
     if cross_user_clip:
@@ -7350,15 +7522,38 @@ def _read_org_report_history(folder_scope, limit):
     short-circuited the deny-all (empty set) case before getting here.
 
     Row shape is byte-compatible with the legacy endpoint's
-    ({key, type, date, generated_at, size}) so pages/reports.js needs no
-    reshape. A listing failure degrades to an empty list -- never to an
-    unfiltered one."""
+    ({key, type, date, generated_at, size} plus optional {docx_key, docx_size})
+    so pages/reports.js needs no reshape. A listing failure degrades to an empty
+    list -- never to an unfiltered one.
+
+    THE WORD FILE. The generator has always written `daily_report.docx` beside
+    the JSON -- 181 of them in prod -- and this endpoint listed only the JSON, so
+    the UI's "Download .docx" button presigned the JSON and every download handed
+    the user the wrong file.
+
+    That was fixed on the LEGACY gateway (`lambda_fieldsight_api.get_report_history`)
+    and the fix could not reach anybody: `scripts/api/reports.js` routes history
+    HERE whenever `timelineSource === 'aurora'` and an org base URL is set, which
+    is exactly prod's Amplify config. Two gateways serve `/reports/history`, the
+    one that was repaired is not the one production calls, and the frontend's
+    "fall back to .json when there is no docx_key" then fired on every single row.
+    Fixing one gateway and not the other is this repo's oldest trap and it caught
+    the fix itself.
+
+    Collected in the same listing pass rather than probed per row: a HeadObject
+    each would be a round trip to learn something this listing already carries,
+    and a presigned URL for a key that does not exist answers 403 here rather
+    than 404, so the failure would not even read as "missing"."""
     reports = []
+    docx_sizes = {}
     try:
         paginator = s3().get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=LAKE_BUCKET, Prefix=REPORT_LAKE_PREFIX):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
+                if key.endswith("_report.docx"):
+                    docx_sizes[key] = obj["Size"]
+                    continue
                 if not key.endswith("_report.json") or "_debug" in key:
                     continue
                 if folder_scope is not None:
@@ -7379,6 +7574,18 @@ def _read_org_report_history(folder_scope, limit):
         # S3 problem must not 500 the Reports page, and must not fall back
         # to anything unfiltered either.
         logger.exception("report history listing failed")
+
+    # ABSENT, NOT EMPTY, when there is no Word file. Word generation disables
+    # itself when the python-docx layer is missing or built for another runtime
+    # -- one log line, no error -- and one prod day already has a .json with no
+    # .docx beside it. A client must be able to tell "this report has no Word
+    # file" from "this backend never sends one", and only absence says that.
+    for r in reports:
+        cand = r["key"][:-len(".json")] + ".docx"
+        if cand in docx_sizes:
+            r["docx_key"] = cand
+            r["docx_size"] = docx_sizes[cand]
+
     reports.sort(key=lambda r: r["date"], reverse=True)
     return {"reports": reports[:limit]}
 

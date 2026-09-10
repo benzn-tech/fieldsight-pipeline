@@ -167,7 +167,8 @@ def api_key_configured():
     return bool(ANTHROPIC_API_KEY)
 
 
-def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None,
+             model=None):
     """Return (text, None) on success or (None, error_string) on failure.
 
     enable_thinking (qwen path only; the anthropic path ignores it):
@@ -178,9 +179,22 @@ def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
     The per-call override exists because one Lambda can need both modes:
     lambda_extract_session runs a fast live pass during recording and a
     thinking-mode final pass once the session closes.
+
+
+    model (qwen path only): use THIS model for this one call instead of the
+    deploy's. One Lambda can need two models for the same reason it can need two
+    thinking modes -- the Ask function answers on a screen, where a slower and
+    more discursive model is fine, and into a speaker, where it is not.
+
+    Measured 2026-09-09 on the same voice-shaped prompt, three runs each:
+
+        meta/muse-spark-1.3-contributor   6.53s   651 completion, 599 REASONING
+        google/gemini-3.8-flash           3.33s    32 completion,   0 reasoning
+
+    Nearly twice as fast because it stops thinking, not because it writes less.
     """
     if LLM_PROVIDER == "qwen":
-        return _call_qwen(prompt, max_tokens, force_json, enable_thinking)
+        return _call_qwen(prompt, max_tokens, force_json, enable_thinking, model)
     return _call_anthropic(prompt, max_tokens)
 
 
@@ -276,14 +290,18 @@ def _is_dashscope(base_url):
     return "aliyuncs.com" in (base_url or "")
 
 
-def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
+def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None):
     if not QWEN_API_KEY:
         logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
         return None, "QWEN_API_KEY not configured"
     # Per-call override wins; None falls back to the function's env default.
     thinking = QWEN_ENABLE_THINKING if enable_thinking is None else bool(enable_thinking)
     # Resolved BEFORE the model, because the model depends on it.
-    payload = {"model": qwen_model_for(thinking),
+    # An explicit per-call model beats the deploy's, for the same reason the
+    # per-call thinking override does: the choice belongs to the CALL, not to
+    # the function. Falls back to the deploy when unset, so every existing
+    # caller is unchanged.
+    payload = {"model": model or qwen_model_for(thinking),
                "messages": [{"role": "user", "content": prompt}]}
     if LLM_TEMPERATURE is not None:
         payload["temperature"] = LLM_TEMPERATURE

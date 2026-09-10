@@ -89,6 +89,8 @@ jobs:
           # silent fallback would restore the shared-quota behaviour invisibly,
           # which is the one outcome worse than a deploy that fails loudly.
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY_TEST }}
+          ELEVENLABS_ASK_API_KEY: ${{ secrets.ELEVENLABS_ASK_API_KEY_TEST }}
+          ELEVENLABS_API_KEY_TTS: ${{ secrets.ELEVENLABS_API_KEY_TTS }}
           FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
           FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
         run: |
@@ -124,6 +126,20 @@ jobs:
           # prod's 200 intact. (Comments cannot live inside the --parameter-overrides
           # continuation below: a '#' after a line-continuation backslash comments out
           # the REST of the command.)
+          # Optional by design: an Ask key that is not set means the elevenlabs
+          # STT provider REFUSES rather than borrowing the pipeline's key, so an
+          # empty secret must not become a bare `ElevenLabsAskApiKey=` and exit 2
+          # at SAM argument parsing -- which is exactly what QwenChatApiKey did.
+          # Same reasoning as EL_ASK_KEY_PARAM: optional by design, so an unset
+          # secret must not become a bare `ElevenLabsTtsApiKey=` and exit 2.
+          EL_TTS_KEY_PARAM=""
+          if [ -n "$ELEVENLABS_API_KEY_TTS" ]; then
+            EL_TTS_KEY_PARAM="ElevenLabsTtsApiKey=$ELEVENLABS_API_KEY_TTS"
+          fi
+          EL_ASK_KEY_PARAM=""
+          if [ -n "$ELEVENLABS_ASK_API_KEY" ]; then
+            EL_ASK_KEY_PARAM="ElevenLabsAskApiKey=$ELEVENLABS_ASK_API_KEY"
+          fi
           KF_LAYER_PARAM=""
           if [ -n "${{ vars.TEST_KEYFRAME_FFMPEG_LAYER_ARN }}" ]; then
             KF_LAYER_PARAM="KeyframeFfmpegLayerArn=${{ vars.TEST_KEYFRAME_FFMPEG_LAYER_ARN }}"
@@ -257,6 +273,11 @@ jobs:
               "LlmReasoningEffortFast=${{ vars.TEST_LLM_EFFORT_FAST || 'low' }}" \
               "EnableRerank=${{ vars.TEST_ENABLE_RERANK || 'false' }}" \
               $QWEN_CHAT_KEY_PARAM \
+              "AskSttProvider=${{ vars.TEST_ASK_STT_PROVIDER || 'dashscope' }}" \
+              "AskTtsProvider=${{ vars.TEST_ASK_TTS_PROVIDER || 'dashscope' }}" \
+              $EL_TTS_KEY_PARAM \
+              "AskVoiceModel=${{ vars.TEST_ASK_VOICE_MODEL || 'none' }}" \
+              $EL_ASK_KEY_PARAM \
               "ElevenLabsApiKey=$ELEVENLABS_API_KEY" \
               "PgDatabase=fieldsight_test"
 

@@ -29,10 +29,15 @@ class FakeCall:
         return self.queue.pop(0)
 
 
-def reply(text="", results=(), error=None, search_error=None):
+def reply(text="", results=(), error=None, search_error=None, searched=None):
+    """`searched` defaults to "there were results", which is the common case.
+    Pass it explicitly for the two that matter on their own: a search that ran
+    and honestly found nothing (searched=True, no results), and a model that
+    wrote about a search it never performed (searched=False, prose present)."""
     return client.Reply(text=text,
                         search_results=[client.SearchResult(u, t) for u, t in results],
-                        error=error, search_error=search_error, searched=bool(results))
+                        error=error, search_error=search_error,
+                        searched=bool(results) if searched is None else searched)
 
 
 def extraction(*items):
@@ -159,18 +164,89 @@ def test_an_answer_naming_nothing_external_is_not_a_timeout(monkeypatch):
     it as a timeout would make the honest case look like a fault."""
     out, _ = _run(monkeypatch, extraction())
     assert out == {"corroborations": [], "dropped": [], "truncated": False,
-                   "timed_out": False}
+                   "timed_out": False, "searched": False}
 
 
-def test_a_search_tool_error_still_reaches_reconcile(monkeypatch):
-    """The request succeeded and the model still wrote something; the tool error
-    is logged, and the verdict it produces is `not_found` on its own terms
-    rather than being upgraded here."""
+# ------------------------------------------- a search that did not happen
+
+# The rule these pin: **reconcile only ever runs on text the open web actually
+# produced.** Until 2026-09-09 it ran on whatever the search step returned, and
+# the test that used to sit here asserted that was fine -- on the reasoning that
+# "the model still wrote something" and would report `not_found` on its own
+# terms. Its fixture said "I could not search.", so the assumption held there.
+#
+# The assumption is false. Measured on OpenRouter 2026-09-08, three runs,
+# meta/muse-spark-1.3-contributor with a web plugin returned HTTP 200, 1200
+# tokens, ZERO web results, and prose that read:
+#
+#     "I'll search the web to verify the NZS 3604 claim.
+#      Initial results support the claim..."
+#
+# Fed to reconcile that becomes `corroborated`, and a card renders a "Confirmed"
+# chip with no sources beneath it, because the renderer omits the source row
+# when `sources` is empty. A fabricated external corroboration shown to a
+# customer as verified is the worst output this system can produce, and it was
+# reachable against the vendor in production, not only the one being evaluated.
+#
+# So the model's account of its own tool use is no longer evidence. The
+# structural fact is: did web results come back.
+
+
+def test_prose_about_a_search_that_never_ran_produces_nothing(monkeypatch):
+    """The muse-spark shape. Confident, plausible, and entirely ungrounded."""
+    out, fake = _run(monkeypatch, extraction(NAYLOR),
+                     reply(text="I'll search the web to verify this. "
+                                "Initial results support the claim.",
+                           searched=False))
+    assert out["corroborations"] == []
+    assert out["searched"] is False
+    assert len(fake.calls) == 2, "reconcile must not have run on ungrounded text"
+
+
+def test_not_searching_is_not_reported_as_running_out_of_time(monkeypatch):
+    """`truncated` and `timed_out` are already kept apart because a reader who
+    sees three cards deserves to know which. "We did not search" is a third
+    thing: the request finished in four seconds. Calling it a timeout is a
+    false statement about our own system."""
     out, _ = _run(monkeypatch, extraction(NAYLOR),
-                  reply(text="I could not search.", search_error="max_uses_exceeded"),
-                  verdicts({"entity": "Naylor Love Construction",
-                            "state": "not_found", "summary": "No sources reached."}))
+                  reply(text="Initial results support the claim.", searched=False))
+    assert out["timed_out"] is False
+    assert out["searched"] is False
+
+
+def test_a_tool_error_with_nothing_to_show_for_it_produces_nothing(monkeypatch):
+    """A `web_search_tool_result` error block with no results is the same
+    situation wearing a different hat: the prose is ungrounded."""
+    out, fake = _run(monkeypatch, extraction(NAYLOR),
+                     reply(text="I could not search.",
+                           search_error="max_uses_exceeded", searched=True))
+    assert out["corroborations"] == []
+    assert out["searched"] is False
+    assert len(fake.calls) == 2
+
+
+def test_a_search_that_ran_and_found_nothing_still_reaches_reconcile(monkeypatch):
+    """The guard must not swallow the honest empty result. A search that ran
+    and returned no results is a finding about the WORLD, and `not_found` is
+    the state that says so. Over-blocking here would delete the feature's most
+    common true answer."""
+    out, fake = _run(monkeypatch, extraction(NAYLOR),
+                     reply(text="No sources discuss this.", searched=True),
+                     verdicts({"entity": "Naylor Love Construction",
+                               "state": "not_found", "summary": "No sources reached."}))
     assert out["corroborations"][0]["state"] == "not_found"
+    assert out["searched"] is True
+    assert len(fake.calls) == 3
+
+
+def test_the_happy_path_says_the_web_was_consulted(monkeypatch):
+    """The flag is what the UI reads to choose its words, so the true case has
+    to carry it too -- a flag only ever set on failure is one the reader cannot
+    distinguish from absent."""
+    out, _ = _run(monkeypatch, extraction(NAYLOR), reply(results=SOURCES),
+                  verdicts({"entity": "Naylor Love Construction",
+                            "state": "corroborated", "summary": "Confirmed."}))
+    assert out["searched"] is True
 
 
 # --------------------------------------------------------------- truncated vs timed_out

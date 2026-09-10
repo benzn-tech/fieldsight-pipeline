@@ -640,7 +640,32 @@ def report_date_counts(conn, site_ids, since_date, *, author_ids=None) -> list[d
     ).fetchall()
 
 
-def list_topics_for_source_prefix(conn, source_prefix) -> list[dict]:
+def _prefix_or_merged(merged_keys):
+    """The prefix condition, widened by exact merged keys when there are any.
+
+    UNION ONLY. No deletion predicate is added here, and that is deliberate
+    rather than an oversight: this function has never carried one -- the
+    NOT EXISTS (... redactions ...) text lives in its DOCSTRING, not its SQL --
+    and its callers drop deleted topics in Python afterwards.
+
+    Adding the predicate here would break the delete endpoint. delete_recordings
+    and undelete enumerate topics THROUGH this function in order to tombstone or
+    re-hide them; a predicate makes a second delete batch enumerate nothing and
+    hands the re-hide logic an empty list.
+
+    A merged record's rows are reached by EXACT key, never by the lead's
+    identity: a graded member has author_ids active and the merged rows carry
+    the lead's user_id, a member off the lead's site is cut by the site filter,
+    and adding the lead to author_ids would leak that lead's OTHER solo topics.
+    The key names the merged rows and nothing else.
+    """
+    cond = "t.source_s3_key LIKE %s ESCAPE '\\'"
+    if merged_keys:
+        cond += " OR t.source_s3_key = ANY(%s)"
+    return cond
+
+
+def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None) -> list[dict]:
     """org-api timeline shim read (authority-flip Task 4): all topics whose
     source_s3_key starts with source_prefix (typically
     f"extractions/{user_folder}/{date}/"), so the shim can render the
@@ -675,9 +700,9 @@ def list_topics_for_source_prefix(conn, source_prefix) -> list[dict]:
         f"FROM topics t "
         f"LEFT JOIN sites s ON s.id = t.site_id "
         f"LEFT JOIN users u ON u.id = t.user_id "
-        f"WHERE t.source_s3_key LIKE %s ESCAPE '\\' "
+        f"WHERE ({_prefix_or_merged(merged_keys)}) "
         f"ORDER BY t.time_range NULLS LAST, t.created_at, t.id",
-        (escaped + '%',),
+        tuple([escaped + '%'] + ([list(merged_keys)] if merged_keys else [])),
     ).fetchall()
 
     if not topic_rows:

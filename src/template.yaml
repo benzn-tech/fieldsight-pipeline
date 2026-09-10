@@ -411,6 +411,97 @@ Parameters:
     AllowedValues: [transcribe, elevenlabs]
     Default: transcribe
 
+  AskVoiceModel:
+    Type: String
+    Description: >-
+      Model for the SPOKEN answer only; the screen answer keeps the deploy's.
+      Empty (default) means no override and nothing changes. Measured 2026-09-09
+      on the voice-shaped prompt, three runs each: muse-spark 6.53s with 651
+      completion tokens of which 599 were REASONING, against gemini-3.8-flash
+      3.33s with 32 completion and 0 reasoning. Nearly twice as fast because it
+      stops thinking, not because it writes less. The override always forces the
+      fast path -- the same measurement without an explicit effort gave gemini
+      538 reasoning tokens and 7.22s, SLOWER than the incumbent.
+      The sentinel is the word `none`, not an empty string: an override that
+      resolves to nothing renders a bare `AskVoiceModel=` and SAM exits 2 at
+      argument parsing, failing the WHOLE deploy the day the repo variable is
+      cleared. A word survives the round trip.
+    Default: none
+
+  ElevenLabsTtsVoice:
+    Type: String
+    Description: ElevenLabs voice id for the spoken Ask answer.
+    Default: bPkjmCb0W1xUBvyH2Afs
+
+  ElevenLabsTtsModel:
+    Type: String
+    Description: >-
+      Measured on the plain HTTP /stream endpoint 2026-09-09, one two-sentence
+      answer: DashScope 2.07s, eleven_v3_conversational 1.01s, eleven_v3 2.83s,
+      eleven_flash_v2_5 0.51s. v3-conversational is twice as fast as the
+      incumbent AND the expressive model; the vendor documents it on the
+      Text-to-Dialogue WebSocket, but the plain endpoint accepts it (verified,
+      200 with real audio). Flash remains the fallback if expressiveness stops
+      being worth half a second.
+    Default: eleven_v3_conversational
+
+  ElevenLabsTtsSpeed:
+    Type: String
+    Description: >-
+      Playback speed multiplier, 1.2 = 20% faster than written. Verified to take
+      effect rather than be silently accepted -- the same sentence rendered 5.36s
+      at default and 5.20s at 1.2 -- because a vendor that ignores an unknown
+      field returns 200 either way and audio length is the only proof.
+    Default: '1.2' 
+
+  AskTtsProvider:
+    Type: String
+    Description: >-
+      Which voice speaks the Ask answer (dashscope|elevenlabs). The incumbent
+      measures 2.07s total -- 1.0s connection, 0.75s model -- and pre-opening its
+      socket during STT+LLM was tested and saved nothing, so this is not a
+      latency change. It is here because one voice vendor was asked for and
+      because the incumbent's model carries a vendor retirement note. Both
+      providers return the same WAV container to the device.
+    AllowedValues: [dashscope, elevenlabs]
+    Default: dashscope
+
+  ElevenLabsTtsApiKey:
+    Type: String
+    Description: >-
+      A THIRD separate ElevenLabs key, for TTS. Not shared with the transcription
+      key or the Ask STT key: EL credit is a per-key pool and exhaustion presents
+      as the feature simply stopping, so one pool across three consumers would
+      let any of them silently stop the other two. Empty means the elevenlabs TTS
+      provider REFUSES rather than borrowing another key.
+    Default: ''
+    NoEcho: true
+
+  AskSttProvider:
+    Type: String
+    Description: >-
+      Which transcriber the spoken Ask question goes to (dashscope|elevenlabs).
+      Measured 2026-09-09 on three real site clips: DashScope 3.73/6.39/7.72s
+      against ElevenLabs 0.88/1.01/1.36s for 3/8/14 second clips. STT is FIRST
+      in the voice chain and nothing starts until it returns, so this is the only
+      place on that path where whole seconds are available. Defaults to the
+      incumbent; an unknown value falls back to it rather than taking voice Ask
+      offline.
+    AllowedValues: [dashscope, elevenlabs]
+    Default: dashscope
+
+  ElevenLabsAskApiKey:
+    Type: String
+    Description: >-
+      A SEPARATE ElevenLabs key for the Ask path. Deliberately not shared with
+      ElevenLabsApiKey: EL credit is a per-key pool and exhaustion presents as
+      transcription simply STOPPING -- no error, no alarm -- so one key would let
+      an afternoon of voice questions silently stop the recording pipeline, and a
+      heavy recording day silently stop Ask. Empty is valid and means the
+      elevenlabs provider REFUSES rather than borrowing the pipeline's key.
+    Default: ''
+    NoEcho: true
+
   ElevenLabsApiKey:
     Type: String
     Description: ElevenLabs xi-api-key for scribe_v2 STT
@@ -1682,6 +1773,19 @@ Resources:
           REPORT_PREFIX: reports/
           RAG_SEARCH_FUNCTION: !Ref RagSearchFunction
           DASHSCOPE_API_KEY: !Ref DashScopeApiKey
+          # Voice STT provider and its OWN key. Both belong here: a provider
+          # named without a key RAISES rather than falling back, which is the
+          # point -- see ElevenLabsAskApiKey's description.
+          ASK_STT_PROVIDER: !Ref AskSttProvider
+          ASK_TTS_PROVIDER: !Ref AskTtsProvider
+          ELEVENLABS_API_KEY_TTS: !Ref ElevenLabsTtsApiKey
+          ELEVENLABS_TTS_VOICE: !Ref ElevenLabsTtsVoice
+          ELEVENLABS_TTS_MODEL: !Ref ElevenLabsTtsModel
+          ELEVENLABS_TTS_SPEED: !Ref ElevenLabsTtsSpeed
+          ASK_VOICE_MODEL: !Ref AskVoiceModel
+          ELEVENLABS_ASK_API_KEY: !Ref ElevenLabsAskApiKey
+          ELEVENLABS_STT_MODEL: !Ref ElevenLabsSttModel
+          ELEVENLABS_LANGUAGE: !Ref ElevenLabsLanguage
           DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
           DASHSCOPE_EMBED_MODEL: text-embedding-v4
           DASHSCOPE_EMBED_DIM: '1024'
@@ -1912,6 +2016,19 @@ Resources:
                 - s3:PutObject
                 - s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/programmes/*
+            - Effect: Allow
+              # Site coordinates, published for the report generator.
+              #
+              # ONE KEY, NOT THE `config/` PREFIX, and the narrowness is the
+              # point. `config/user_mapping.json` sits in that prefix, is
+              # maintained by hand, carries the device mapping and the
+              # reassignment log, and is read by six lambdas. Granting
+              # `config/*` would put it one bug away from being overwritten by
+              # a request handler. This grant cannot reach it.
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/config/site-coords.json
             - Effect: Allow
               # Recordings upload: the org API issues presigned PUTs into
               # users/{name}/{video|audio|pictures}/{date}/ for the mobile app

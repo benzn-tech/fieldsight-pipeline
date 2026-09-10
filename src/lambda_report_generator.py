@@ -67,6 +67,7 @@ import urllib3
 import agent_turn_filter
 from output_language import OUTPUT_LANGUAGE_RULE
 import weather
+import site_coords
 import llm_utils
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -364,7 +365,20 @@ def load_user_mapping_full(bucket):
 def get_user_site_mapping(bucket):
     full = load_user_mapping_full(bucket)
     raw_mapping = full.get('mapping', {})
-    sites_info = full.get('sites', {})
+    # WHERE THE COORDINATES ACTUALLY COME FROM.
+    #
+    # The `sites` block of user_mapping.json has null lat/lng for every site
+    # and always has, so `build_weather_block_for_site` returned None every
+    # time and not one report in production carries a weather block -- while
+    # the coordinates people enter in the web UI sit in the Aurora `sites`
+    # table, which this Lambda cannot reach (no VpcConfig, by design: it needs
+    # egress for the model and the weather API).
+    #
+    # org-api publishes them to a small machine-owned object instead. Absent or
+    # unreadable, this is a no-op and the old behaviour stands.
+    sites_info = site_coords.overlay_sites_info(
+        full.get('sites', {}),
+        download_json_from_s3(bucket, site_coords.KEY) or {})
     user_primary_site = {}
     user_all_sites = {}
     user_roles = {}
