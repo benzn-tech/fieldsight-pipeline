@@ -595,13 +595,30 @@ def lambda_handler(event, context):
                 'error': str(e)
             })
     
-    # Summary statistics
+    # Summary statistics.
+    #
+    # EVERY STATUS A RESULT CAN CARRY HAS TO BE COUNTED HERE. `batched_pending` was
+    # not, and it is the ordinary outcome whenever batching is on — so a healthy
+    # batching run logged `{"total": 1, "started": 0, "skipped": 0, "exists": 0,
+    # "errors": 0}`, four zeros that are indistinguishable from a lambda that
+    # decided nothing at all. On 2026-09-11 that cost an hour of reading logs to
+    # establish that the pipeline was, in fact, working.
+    #
+    # `other` is the backstop and is deliberately not a list of known names: a
+    # status added later and forgotten here surfaces as a non-zero `other` instead
+    # of silently vanishing into the gap between `total` and the rest.
+    counted = ('started', 'skipped', 'exists', 'error', 'batched_pending',
+               'transcribing', 'completed')
     summary = {
         'total': len(results),
         'started': sum(1 for r in results if r.get('status') == 'started'),
         'skipped': sum(1 for r in results if r.get('status') == 'skipped'),
         'exists': sum(1 for r in results if r.get('status') == 'exists'),
         'errors': sum(1 for r in results if r.get('status') == 'error'),
+        'batched_pending': sum(1 for r in results if r.get('status') == 'batched_pending'),
+        'transcribing': sum(1 for r in results if r.get('status') == 'transcribing'),
+        'completed': sum(1 for r in results if r.get('status') == 'completed'),
+        'other': sum(1 for r in results if r.get('status') not in counted),
     }
     
     logger.info(f"Processing complete: {json.dumps(summary)}")
