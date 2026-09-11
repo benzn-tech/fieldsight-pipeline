@@ -229,14 +229,18 @@ def test_decisions_from_every_topic_land_in_one_list():
     assert len(items) == 2
 
 
-def test_on_site_carries_the_numbers_not_the_filenames():
-    """`per_recording` is a list of S3 filenames. It is plumbing, and it was
-    being rendered."""
-    sec = _by_title(rs.build(_report()), "On Site")
-    assert sec["kind"] == "kpi"
-    blob = str(sec)
-    assert ".wav" not in blob and ".mp4" not in blob
-
+def test_the_recording_counts_are_not_a_section():
+    """They were, and they restated `recording_session` -- which the viewer
+    already renders as header facts -- so the same three numbers were on one
+    screen twice and disagreed about zero. The report's owner then asked for
+    the counts to go entirely: a day is described by what was decided and what
+    is owed, not by how many files it took to record it."""
+    r = _report(recording_session={"recordings": 3, "total_duration_display": "2m",
+                                   "photos": 6, "total_words": 150537})
+    titles = _titles(rs.build(r))
+    assert "On Site" not in titles
+    for s_ in rs.build(r):
+        assert s_["kind"] != "kpi", "no section restates the session counts"
 
 def test_an_empty_section_is_dropped_rather_than_shown_empty():
     """A report for a quiet day should not be five headings over nothing."""
@@ -249,8 +253,8 @@ def test_an_empty_section_is_dropped_rather_than_shown_empty():
 def test_safety_survives_when_there_is_something_to_say():
     r = _report(safety_observations=[{"observation": "Loose cable on level 2"}])
     sec = _by_title(rs.build(r), "Safety")
-    assert sec["kind"] == "table"
-    assert sec["rows"][0]["observation"] == "Loose cable on level 2"
+    assert sec["kind"] == "entries"
+    assert sec["items"][0]["title"] == "Loose cable on level 2"
 
 
 def test_safety_says_what_to_do_about_it():
@@ -265,10 +269,27 @@ def test_safety_says_what_to_do_about_it():
         "recommended_action": "Start a joint coordination group",
         "who_raised": "Ben",
     }])
-    row = _by_title(rs.build(r), "Safety")["rows"][0]
-    assert row["action"] == "Start a joint coordination group"
-    assert row["risk"] == "high"
-    assert row["location"] == "Cook Brothers adjoining site"
+    item = _by_title(rs.build(r), "Safety")["items"][0]
+    assert item["status"] == "high"
+    assert "Start a joint coordination group" in item["note"]
+    assert "Cook Brothers adjoining site" in item["note"]
+
+
+def test_safety_and_quality_are_the_same_shape():
+    """Asked for directly: "我不关心你是用列表还是表格，我希望和上面统一". Two
+    sections that both describe an observation, its state and one line about it
+    must not be rendered by two different mechanisms."""
+    r = _report(
+        safety_observations=[{"observation": "Loose cable", "risk_level": "low",
+                              "recommended_action": "Tape it"}],
+        quality_and_compliance=[{"item": "PS4 outstanding", "status": "concern",
+                                 "details": "Chase the engineer"}],
+    )
+    built = rs.build(r)
+    safety = _by_title(built, "Safety")
+    quality = _by_title(built, "Issues & Quality")
+    assert safety["kind"] == quality["kind"] == "entries"
+    assert set(safety["items"][0]) == set(quality["items"][0]) == {"title", "status", "note"}
 
 
 def test_section_order_is_fixed():
@@ -281,7 +302,7 @@ def test_section_order_is_fixed():
         safety_observations=[{"observation": "Cable"}],
     )
     assert _titles(rs.build(r)) == [
-        "Summary", "On Site", "Actions", "Open Questions",
+        "Summary", "Actions", "Open Questions",
         "Decisions", "Issues & Quality", "Safety",
     ]
 

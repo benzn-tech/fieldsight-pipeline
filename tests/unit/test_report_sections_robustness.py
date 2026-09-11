@@ -66,7 +66,7 @@ def test_a_report_that_is_not_a_report_still_returns_sections(report):
 
 def test_a_bare_string_of_safety_is_one_observation_not_nine_letters():
     sec = _by_title(rs.build(_report(safety_observations="Loose cable")), "Safety")
-    assert [r["observation"] for r in sec["rows"]] == ["Loose cable"]
+    assert [r["title"] for r in sec["items"]] == ["Loose cable"]
 
 
 # ---------------------------------------------------------------------------
@@ -205,3 +205,46 @@ def test_key_dates_are_in_date_order():
     ])
     rows = _by_title(rs.build(r), "Key Dates")["rows"]
     assert [x["what"] for x in rows] == ["Sooner thing", "Later thing", "Unreadable"]
+
+
+# ---------------------------------------------------------------------------
+# Photos: a filename is not something you can fetch
+# ---------------------------------------------------------------------------
+
+def test_a_photo_carries_a_key_not_only_a_name():
+    """`related_photos` holds BARE FILENAMES -- both writers store
+    `s3_key.rsplit("/", 1)[-1]`. A filename cannot be presigned and cannot be
+    read out of S3, so the viewer could only print the name of a photograph it
+    was standing next to, and the Word document wrote a comma-separated run of
+    them. Asked why photos are not in the report, that was the whole answer."""
+    r = _report(user_name="Ben_UCPK2", report_date="2026-09-03",
+                topics=[{"topic_title": "T", "related_photos": ["ben_20260903_101500.jpg"]}])
+    items = _by_title(rs.build(r), "Photos")["items"]
+    assert items == [{"name": "ben_20260903_101500.jpg",
+                      "key": "users/Ben_UCPK2/pictures/2026-09-03/ben_20260903_101500.jpg"}]
+
+
+def test_a_photo_that_already_has_a_path_is_not_prefixed_twice():
+    """A future writer storing full keys must not produce
+    users/X/pictures/D/users/X/pictures/D/f.jpg."""
+    key = "users/Ben_UCPK2/pictures/2026-09-03/a.jpg"
+    r = _report(user_name="Ben_UCPK2", report_date="2026-09-03",
+                topics=[{"topic_title": "T", "related_photos": [key]}])
+    assert _by_title(rs.build(r), "Photos")["items"][0]["key"] == key
+
+
+def test_the_same_photo_twice_is_one_photo():
+    """Two topics inside one minute bind the same shutter."""
+    r = _report(user_name="Ben_UCPK2", report_date="2026-09-03", topics=[
+        {"topic_title": "T", "related_photos": ["a.jpg"]},
+        {"topic_title": "U", "related_photos": ["a.jpg", "b.jpg"]},
+    ])
+    assert [i["name"] for i in _by_title(rs.build(r), "Photos")["items"]] == ["a.jpg", "b.jpg"]
+
+
+def test_a_photo_with_no_user_or_date_keeps_the_name_and_an_empty_key():
+    """Absent is better than a key that resolves to somebody else's folder."""
+    r = _report(user_name="", report_date="", topics=[{"topic_title": "T", "related_photos": ["a.jpg"]}])
+    r.pop("date", None)
+    items = _by_title(rs.build(r), "Photos")["items"]
+    assert items[0]["name"] == "a.jpg" and items[0]["key"] == ""

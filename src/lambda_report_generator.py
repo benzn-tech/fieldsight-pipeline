@@ -906,6 +906,62 @@ def site_name_for(user_site_info):
     return user_site_info.get('name') or ''
 
 
+def _add_photos_to_document(doc, items, max_photos=None):
+    """The photographs themselves, not a list of their filenames.
+
+    This wrote `', '.join(filenames)` -- a comma-separated run of
+    `ben_ucpk2_20260903_101500.jpg` in a customer's report, which tells a
+    reader that a photograph exists and nothing else. Asked why photos are not
+    in the report, that was the answer.
+
+    Every failure here degrades to the filename rather than losing the entry:
+    a missing object, a permission the role does not have, an image python-docx
+    cannot decode. A report with one photo it could not fetch is still a
+    report; an exception inside document generation is no report at all, and
+    Word generation already disables itself silently often enough (BUG-24).
+
+    `max_photos` is a ceiling, not a preference. Each embedded image is held in
+    memory while the document is assembled, and a day with two hundred site
+    photographs would rebuild the OOM that BUG-04 fixed elsewhere.
+    """
+    try:
+        limit = int(os.environ.get('REPORT_MAX_EMBEDDED_PHOTOS', '40'))
+    except ValueError:
+        limit = 40
+    if max_photos is not None:
+        limit = max_photos
+
+    shown = 0
+    for item in items:
+        if isinstance(item, dict):
+            name = str(item.get('name') or '').strip()
+            key = str(item.get('key') or '').strip()
+        else:
+            name, key = str(item).strip(), ''
+        if not (name or key):
+            continue
+        if shown >= limit or not key:
+            doc.add_paragraph(name or key, style='List Bullet')
+            continue
+        try:
+            obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+            stream = BytesIO(obj['Body'].read())
+            doc.add_picture(stream, width=Inches(5.5))
+            caption = doc.add_paragraph(name)
+            caption.style = doc.styles['Caption'] if 'Caption' in [
+                st.name for st in doc.styles] else caption.style
+            shown += 1
+        except Exception as exc:                      # noqa: BLE001 - see above
+            logger.warning("photo not embedded, listing name instead: %s (%s)",
+                           key, exc)
+            doc.add_paragraph(name or key, style='List Bullet')
+
+    remaining = len(items) - shown
+    if shown and remaining > 0:
+        doc.add_paragraph("%d further photo%s listed above by name."
+                          % (remaining, "" if remaining == 1 else "s"))
+
+
 def render_sections_into(doc, sections):
     """Write the reader's sections into a Word document.
 
@@ -938,12 +994,33 @@ def render_sections_into(doc, sections):
             doc.add_heading(title, level=1)
             for item in items:
                 doc.add_paragraph(str(item), style='List Bullet')
+        elif kind == 'entries':
+            # A thing, its state, and one line about it. Not a table: four
+            # columns of prose read as a spreadsheet of paragraphs, and the
+            # columns do not line up anyway because `note` is a sentence and
+            # `status` is a word.
+            items = [i for i in (sec.get('items') or []) if isinstance(i, dict)]
+            if not items:
+                continue
+            doc.add_heading(title, level=1)
+            for item in items:
+                head = str(item.get('title') or '').strip()
+                if not head:
+                    continue
+                para = doc.add_paragraph()
+                para.add_run(head).bold = True
+                state = str(item.get('status') or '').strip()
+                if state:
+                    para.add_run('   ' + state.replace('_', ' '))
+                note = str(item.get('note') or '').strip()
+                if note:
+                    doc.add_paragraph(note)
         elif kind == 'photos':
             items = sec.get('items') or []
             if not items:
                 continue
             doc.add_heading(title, level=1)
-            doc.add_paragraph(', '.join(str(i) for i in items))
+            _add_photos_to_document(doc, items)
         elif kind == 'table':
             rows = sec.get('rows') or []
             if not rows:
