@@ -1143,6 +1143,28 @@ def _rag_answer(body):
             logger.warning(f"  rag-search returned error: {result['error']}")
 
         if not chunks:
+            # Retrieval found nothing, which is already the verdict -- so this
+            # is the ONE place the web fallback matters most, and the first
+            # build had its hook below this return and never reached it. The
+            # owner hit it on the first question they tried.
+            #
+            # `error` marks the DEFECT paths (caller not provisioned, missing
+            # embedding); the empty-corpus paths carry no error key at all.
+            # Serving an identity failure a web answer would hide a defect
+            # behind working-looking output.
+            if body.get("mode") != "voice" and not result.get("error"):
+                import web_answer
+                empty_web = web_answer.answer(question, [])
+                if empty_web is not None and empty_web.get("answer"):
+                    return {
+                        "answer": empty_web["answer"],
+                        "citations": [],
+                        "model": llm_utils.active_model(),
+                        "grounded": False,
+                        "from_web": True,
+                        "web": empty_web,
+                        "basis": basis,
+                    }
             return {
                 "answer": "No relevant records found for this question.",
                 "citations": [],

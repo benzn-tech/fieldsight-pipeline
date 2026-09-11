@@ -9,39 +9,38 @@ It exists so the feature can be judged from use rather than from a document --
 five review rounds produced a design and no working path, and a design nobody has
 felt is a design nobody can correct.
 
-## Why the gate runs BEFORE the grounded answer
+## The breakdown this replaced, and why
 
-The obvious shape is "answer from records, notice it declined, then look it up".
-It does not fit. Measured, worst case, from the HTTP request:
+The first build broke the question into gate-screened entity NAMES, searched
+those, and composed an answer from the findings -- three model calls, so nothing
+but names would reach a search engine.
 
-    retrieval 1.36 + synthesis 11.9 + gate 3.23 + search 11.4 + compose 5.31
-      = 33.2s, against API Gateway's 29s
+It failed on the most ordinary question there is. Asked *"Which New Zealand
+standard covers timber design?"*, subject extraction returned NOTHING on three
+runs out of four: the question contains no standard number, because **the number
+is the thing the asker does not know, which is why they are asking.**
 
-Running the gate first turns it into a router, and both branches fit:
+So the question goes out whole, and `question_admission` decides whether it may
+-- same protection, admission instead of dissection. Two calls instead of four.
 
-    records cannot answer   1.36 + 3.23 + 11.40 + 5.31 = 21.30s
-    records can answer      1.36 + 3.23 + 11.90         = 16.49s
+## Why the verdict runs BEFORE the grounded answer
 
-The cost is 3.23s on every question, including the majority the corpus answers.
-That is the price of the small version; the plan's concurrent shape removes it
-and is the next step, not this one.
+Answering from records first and looking up second does not fit. Measured worst
+case from the HTTP request: retrieval 1.36 + synthesis 11.9 + verdict 3.2 +
+lookup 11.4 = 27.9s against API Gateway's 29s, before anything goes wrong.
+Asking first turns the verdict into a router and both branches fit.
+
+The cost is the verdict call on every question, including the majority the
+corpus answers. The plan's concurrent shape removes it; this is the small
+version.
 
 ## What crosses which boundary
 
-Two boundaries, and they are not the same one (see corroboration_gate's own
-docstring, corrected 2026-09-11):
-
-  * the SEARCH ENGINE receives gate-screened entity NAMES and nothing else --
-    no claim field, no question text, no excerpt text
+  * the SEARCH ENGINE receives the QUESTION, once `question_admission` has
+    passed it -- never the excerpts, never a paragraph of context
   * the LLM PROVIDER receives the question and the excerpts, which it already
     receives on every `/ask`
 
-The claim field is deliberately absent from what this module builds. `screen()`
-inspects the entity string and forwards `claim` verbatim into the search-enabled
-call; that is safe only while claims come from an ANSWER. Subjects here come from
-a QUESTION, so a claim built from one would put the user's own words one model
-hop from a search engine -- the threat the gate exists for, through the one
-channel it never looks at.
 """
 from __future__ import annotations
 
@@ -52,34 +51,22 @@ import re
 import time
 
 import corroboration_client as client
-import corroboration_gate as gate
+import question_admission
 
 logger = logging.getLogger()
 
-# Sized from the measurements in the module docstring, each over the worst case
-# actually observed rather than over a median -- and they have to SUM under the
-# stop with the floor to spare, or the last step is refused for having no time
-# left and the reader is told it timed out when the truth is arithmetic.
-#
-#     gate      MAX 6.80s (four questions; one question alone said 3.23)
-#     search    MAX 11.40s (three entities; two entities alone said 8.66)
-#     compose   MAX  5.31s (n=8)
-#
-# 7 + 12 + 6 = 25, plus the 2s floor, exactly fills 27. Every one of those
-# maxima came from a sample this repo has already been burned for trusting, so
-# they are ceilings to re-measure rather than facts to build on.
-GATE_BUDGET = 7.0
-SEARCH_BUDGET = 12.0
-COMPOSE_BUDGET = 6.0
+# Measured against the deployed vendor: the verdict is a classification
+# (2.4-3.3s over four questions, 6.8s once) and the lookup is a search plus an
+# answer (10.3-11.4s). 8 + 14 = 22 plus the 2s floor fits the 27s stop, which
+# fits API Gateway's 29s.
+VERDICT_BUDGET = 8.0
+WEB_BUDGET = 14.0
 HARD_STOP_SECONDS = float(os.environ.get("WEB_ANSWER_HARD_STOP", "27"))
 
 CHEAP_MODEL = os.environ.get("CORROBORATION_CHEAP_MODEL", "google/gemini-3.8-flash")
 
-# At most this many subjects reach a search engine. The corroboration gate caps
-# entities at three for the same reason and this path is no more entitled.
-MAX_SUBJECTS = 3
-
 _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
+
 
 
 def enabled():
@@ -88,22 +75,12 @@ def enabled():
     return os.environ.get("ENABLE_WEB_ANSWER", "false").lower() == "true"
 
 
-GATE_PROMPT = """Two questions about the excerpts below, answered together in one JSON object.
+VERDICT_PROMPT = """Do the excerpts below answer the question?
 
-1. Do the excerpts answer the question? `answered` is true only if a reader would
-   get what they asked for from these excerpts alone.
-2. If they do NOT, what external subjects would have to be looked up to answer it?
-   A subject is a company, a published standard, a product, a material, a
-   regulator or an authority. NOT people, sites, addresses, project codes, or
-   anything that only exists inside this customer's own records. Take them from
-   the QUESTION, not from the excerpts.
+Answer true only if a reader would get what they asked for from these excerpts
+alone. Excerpts merely about the same site or the same day are not an answer.
 
-Return only JSON, no prose:
-{{"answered": true|false,
-  "subjects": [{{"entity": "...", "kind": "company|standard|product|material|regulator|authority"}}]}}
-
-`subjects` is empty when `answered` is true, and may be empty when it is false --
-a question naming nothing external cannot be looked up.
+Return only JSON, no prose: {{"answered": true|false}}
 
 ## Question
 {question}
@@ -112,32 +89,17 @@ a question naming nothing external cannot be looked up.
 {excerpts}
 """
 
-SEARCH_PROMPT = """Search the open web for each subject below and report what public
-sources say about it, in the context of New Zealand construction.
+WEB_PROMPT = """Search the open web and answer this question, for a reader working
+on a New Zealand construction site.
 
-Report only what the sources say. Do not speculate, and do not fill a gap with
-general knowledge -- if the sources do not cover a subject, say so plainly for
-that subject.
+Report only what public sources say. Do not speculate, and do not fill a gap with
+general knowledge -- if the sources do not answer the question, say so plainly
+rather than guessing.
 
-{subjects}
-
-For each subject, write a short paragraph beginning with the subject name.
-"""
-
-COMPOSE_PROMPT = """A user asked a question that their own recorded meetings do not
-answer. Below is what public web sources say about the subjects of that question.
-
-Answer the question from these findings only. Report what the sources say. Do not
-speculate and do not fill a gap with general knowledge -- if the findings do not
-answer the question, say so plainly.
-
-Name the source of each fact you use. Be brief: the reader is on a construction site.
+Name the source of each fact you use. Be brief.
 
 ## Question
 {question}
-
-## What public sources say
-{findings}
 """
 
 
@@ -161,39 +123,20 @@ def _excerpt_block(chunks, limit=5):
     return "\n".join(out)
 
 
-def _screened_subjects(raw):
-    """Gate-screened names, and NOTHING else.
-
-    `screen()` wants `{entity, kind, claim}` and forwards `claim` untouched into
-    the search call. Every subject is given `claim: None` here so there is
-    nothing to forward -- see the module docstring for why that is the whole
-    point rather than a detail.
-    """
-    candidates = []
-    for item in (raw or [])[:MAX_SUBJECTS * 2]:
-        if not isinstance(item, dict):
-            continue
-        entity = item.get("entity")
-        if isinstance(entity, str) and entity.strip():
-            candidates.append({"entity": entity.strip(),
-                               "kind": item.get("kind"),
-                               "claim": None})
-    if not candidates:
-        return [], []
-    result = gate.screen(candidates, max_entities=MAX_SUBJECTS)
-    dropped = [{"entity": r.entity, "reason": r.reason} for r in result.rejected]
-    return result.allowed, dropped
-
-
 def answer(question, chunks, *, clock=time.monotonic):
-    """Return a web-answer block, or None to leave the grounded path alone.
+    """A web-answer block, or None to leave the grounded path alone.
 
-    Never raises. Every failure -- flag off, gate said the records answer it, no
-    nameable subject, a step that broke, a deadline missed -- returns either None
-    or a body whose flags say which, because "we found nothing" and "we did not
-    look" are different sentences and only one of them is about the world.
+    `chunks` may be empty: retrieval returning nothing IS the verdict, so that
+    case skips straight to the lookup rather than asking a model whether an
+    empty set answered anything. That is the case the first build missed
+    entirely -- it returned a fixed "no relevant records" string above this hook
+    and never reached it.
+
+    Never raises. Every failure returns either None or a body whose flags say
+    which -- "we found nothing", "we may not ask" and "we did not look" are
+    three different sentences and only one of them is about the world.
     """
-    if not enabled() or not question or not chunks:
+    if not enabled() or not question:
         return None
 
     started = clock()
@@ -201,87 +144,73 @@ def answer(question, chunks, *, clock=time.monotonic):
     def left():
         return HARD_STOP_SECONDS - (clock() - started)
 
-    verdict, err = _gate(question, chunks, min(GATE_BUDGET, left()))
-    if err or verdict is None:
-        logger.warning("web answer: gate failed: %s", err)
-        return None
-    if verdict.get("answered") is True:
-        # The records answered it. Nothing to look up, and saying so out loud
-        # keeps the "we never fired" case distinguishable from "we broke".
-        logger.info("web answer: records answered it; no lookup")
-        return None
+    if chunks:
+        verdict, err = _verdict(question, chunks, min(VERDICT_BUDGET, left()))
+        if err or verdict is None:
+            # Fail closed. An unreadable verdict is not permission to search.
+            logger.warning("web answer: verdict failed: %s", err)
+            return None
+        if verdict.get("answered") is True:
+            logger.info("web answer: the records answer it; no lookup")
+            return None
+    else:
+        logger.info("web answer: nothing retrieved; the records cannot answer it")
 
-    subjects, dropped = _screened_subjects(verdict.get("subjects"))
-    if not subjects:
-        logger.info("web answer: nothing nameable to look up (dropped=%d)",
-                    len(dropped))
-        return {"answer": None, "sources": [], "subjects": [],
-                "dropped": dropped, "searched": False, "timed_out": False,
-                "failed": False}
-
-    names = [a["entity"] for a in subjects]
-    logger.info("web answer: looking up %s", names)
+    refused = question_admission.screen(question, chunks)
+    if refused:
+        # Loud, and returned rather than swallowed: a refusal nobody can see
+        # cannot be measured.
+        logger.info("web answer: question not sent -- %s", refused)
+        return _spent(refused=refused)
 
     if left() < client.MIN_USEFUL_TIMEOUT:
-        return _spent(names, dropped, timed_out=True)
-    found = _search(names, min(SEARCH_BUDGET, left()))
+        return _spent(timed_out=True)
+
+    found = _ask_the_web(question, min(WEB_BUDGET, left()))
     if not found.ok:
-        logger.warning("web answer: search failed: %s (timed_out=%s)",
+        logger.warning("web answer: lookup failed: %s (timed_out=%s)",
                        found.error, found.timed_out)
-        return _spent(names, dropped, timed_out=bool(found.timed_out),
+        return _spent(timed_out=bool(found.timed_out),
                       failed=not found.timed_out)
     if not found.searched:
         # Prose describing a search is not evidence one happened. Measured on a
-        # second vendor: 200 OK, no results, and a paragraph asserting findings.
+        # second vendor: 200 OK, no results, a paragraph asserting findings.
         logger.warning("web answer: no web results came back")
-        return _spent(names, dropped)
+        return _spent()
 
-    if left() < client.MIN_USEFUL_TIMEOUT:
-        return _spent(names, dropped, timed_out=True, sources=_sources(found))
-    text, err = _compose(question, found.text, min(COMPOSE_BUDGET, left()))
-    if err or not text:
-        logger.warning("web answer: compose failed: %s", err)
-        return _spent(names, dropped, failed=True, sources=_sources(found))
-
-    return {"answer": text, "sources": _sources(found), "subjects": names,
-            "dropped": dropped, "searched": True, "timed_out": False,
-            "failed": False}
+    logger.info("web answer: answered from %d sources", len(found.search_results))
+    return {"answer": (found.text or "").strip(),
+            "sources": _sources(found),
+            "searched": True, "timed_out": False, "failed": False,
+            "refused": None}
 
 
-def _spent(names, dropped, *, timed_out=False, failed=False, sources=None):
+def _spent(*, timed_out=False, failed=False, refused=None):
     """A body that says what happened, never an empty one that reads as
-    'the web had nothing to say'."""
-    return {"answer": None, "sources": sources or [], "subjects": names,
-            "dropped": dropped, "searched": False,
-            "timed_out": timed_out, "failed": failed}
+    'the web had nothing to say'. Four states, because they lead four different
+    places: we may not ask, we did not look, we ran out of time, it broke."""
+    return {"answer": None, "sources": [], "searched": False,
+            "timed_out": timed_out, "failed": failed, "refused": refused}
 
 
-def _gate(question, chunks, budget):
+def _verdict(question, chunks, budget):
     reply = client.call(
-        GATE_PROMPT.format(question=question, excerpts=_excerpt_block(chunks)),
-        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort="low")
+        VERDICT_PROMPT.format(question=question, excerpts=_excerpt_block(chunks)),
+        timeout=budget, model=CHEAP_MODEL, max_tokens=512, effort="low")
     if not reply.ok:
         return None, reply.error
     parsed = _loads(reply.text)
     if not isinstance(parsed, dict) or "answered" not in parsed:
-        # Fail closed: an unreadable verdict is not permission to search.
-        return None, "gate did not return a verdict"
+        return None, "verdict was not a verdict"
     return parsed, None
 
 
-def _search(names, budget):
-    lines = "\n".join("- %s" % n for n in names)
-    return client.call(SEARCH_PROMPT.format(subjects=lines),
+def _ask_the_web(question, budget):
+    """One call: the question, the web plugin, an answer. The provider composes
+    its own queries from the question, which is why `question_admission` runs
+    before this and not after."""
+    return client.call(WEB_PROMPT.format(question=question),
                        timeout=budget, max_tokens=2048, web=True, effort="low")
-
-
-def _compose(question, findings, budget):
-    reply = client.call(
-        COMPOSE_PROMPT.format(question=question, findings=findings),
-        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort="low")
-    if not reply.ok:
-        return None, reply.error
-    return (reply.text or "").strip() or None, None
 
 
 def _sources(reply, limit=4):
