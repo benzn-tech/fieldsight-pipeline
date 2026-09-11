@@ -56,8 +56,8 @@ def test_actions_reach_the_reader_through_this_path_too():
     shape = org.render_report_shape(rows, None, "2026-07-14", "Ada_L")
     actions = _sections(shape).get("Actions")
     assert actions, "an action item on a topic must become an Actions row"
-    assert actions["rows"][0]["action"] == "Chase the steel delivery"
-    assert actions["rows"][0]["due"] == "2026-07-16"
+    assert actions["items"][0]["title"] == "Chase the steel delivery"
+    assert "2026-07-16" in actions["items"][0]["note"]
 
 
 def test_no_on_site_panel_of_zeros_on_this_path():
@@ -89,6 +89,9 @@ def test_the_collapse_count_is_what_ranks_it_not_a_recount():
          "status": "open", "mention_count": 1},
     ])]
     rows_out = _sections(org.render_report_shape(
-        rows, None, "2026-07-14", "Ada_L"))["Actions"]["rows"]
-    assert rows_out[0]["action"] == "Order the brackets"
-    assert rows_out[0]["mentions"] == 3
+        rows, None, "2026-07-14", "Ada_L"))["Actions"]["items"]
+    # The count is no longer rendered -- an entry carries the thing, its
+    # priority and one detail line -- but it still RANKS: "Order the brackets"
+    # is `low` priority and outranks a `high` one on repetition alone.
+    assert rows_out[0]["title"] == "Order the brackets"
+    assert rows_out[0]["status"] == "low", "the low-priority item is genuinely first"

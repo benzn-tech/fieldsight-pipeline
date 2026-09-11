@@ -114,7 +114,6 @@ def build(report):
         _open_questions(topics),
         _decisions(topics),
         _dates(report),
-        _issues(report),
         _safety(report),
         _photos(topics, report),
     ]
@@ -128,17 +127,26 @@ def build(report):
 def _summary(report):
     """One narrative for the day.
 
-    `executive_summary` arrives as a string from some paths and a list of
-    sentences from others; both become one readable paragraph rather than
-    bullets, because this is the part somebody reads instead of the timeline
-    that used to be underneath it.
+    BULLETS, NOT A PARAGRAPH. The prompt asks for "a list of 4-8 bullet points,
+    each a concise actionable statement", and this glued them back into one
+    block of prose -- undoing the only structure the model was asked to
+    provide, and turning eight separate facts into a wall a reader has to
+    unpick. Asked for directly: "Summary做成bullets".
+
+    A string still arrives from some paths (older reports, the meeting compat
+    shape). One sentence is one bullet; it is not split, because splitting
+    prose on full stops invents boundaries the writer did not put there.
     """
     value = report.get("executive_summary")
+    items = []
     if isinstance(value, (list, tuple)):
-        body = " ".join(str(v).strip() for v in value if str(v).strip())
+        for v in value:
+            _add(items, v if isinstance(v, str) else None)
     else:
-        body = str(value or "").strip()
-    return {"title": "Summary", "kind": "narrative", "body": body}
+        _add(items, str(value or ""))
+    if not items:
+        return None
+    return {"title": "Summary", "kind": "list", "items": items}
 
 
 # `_on_site` is gone. It restated `recording_session` -- recordings, duration,
@@ -358,12 +366,27 @@ def _actions(topics, report_date=None):
     for row in rows:
         row.pop("_seq", None)
         row.pop("_days", None)
-    return {
-        "title": "Actions",
-        "kind": "table",
-        "fields": ["action", "owner", "due", "priority", "status"],
-        "rows": rows,
-    }
+    # ONE SHAPE FOR ACTIONS AND SAFETY. Asked for directly: "统一action和safety
+    # 的表达格式" and "trim简单点". A five-column table beside a two-line entry
+    # made two lists of obligations look like two different kinds of thing, and
+    # the table's own columns were mostly short words padded to a full column
+    # each. What a reader needs from an action is the same as from a safety
+    # observation: what it is, how urgent, and the detail underneath.
+    #
+    # The ORDER still carries the ranking -- date, then how often the day came
+    # back to it, then priority -- so nothing is lost by dropping the columns;
+    # the sort is just no longer visible as a sortable grid.
+    items = []
+    for row in rows:
+        note = _join(row.get("owner"),
+                     ("due " + row["due"]) if row.get("due") else "",
+                     row["status"] if row.get("status") in _CLOSED else "")
+        items.append({
+            "title": row["action"],
+            "status": row.get("priority", ""),
+            "note": note,
+        })
+    return {"title": "Actions", "kind": "entries", "items": items}
 
 
 def _mention_count(item):
@@ -497,23 +520,11 @@ def _dates(report):
             "fields": ["when", "what", "who"], "rows": rows}
 
 
-def _issues(report):
-    rows = []
-    for entry in report.get("quality_and_compliance") or []:
-        if not isinstance(entry, dict):
-            continue
-        item = _clean(entry.get("item"))
-        if not item:
-            continue
-        rows.append({
-            "title": item,
-            "status": _clean(entry.get("status")),
-            "note": _clean(entry.get("details")) or _clean(entry.get("detail")),
-        })
-    if not rows:
-        return None
-    return {"title": "Issues & Quality", "kind": "entries", "items": rows}
-
+# `_issues` is gone. "Issues & Quality" was a third list of obligations beside
+# Actions and Safety, built from `quality_and_compliance`, and the report's
+# owner asked for it to go: "quality删掉". The field is still in the report and
+# still indexed -- this removes a section from what a person reads, not a fact
+# from what a query can reach.
 
 def _safety(report):
     rows = []

@@ -110,8 +110,8 @@ def test_a_dated_action_outranks_an_undated_one_whatever_its_priority():
         {"action": "Undated but urgent", "priority": "high"},
         {"action": "Due Tuesday", "priority": "low", "deadline": "2026-09-15"},
     ])])
-    rows = _by_title(rs.build(r), "Actions")["rows"]
-    assert rows[0]["action"] == "Due Tuesday"
+    rows = _by_title(rs.build(r), "Actions")["items"]
+    assert rows[0]["title"] == "Due Tuesday"
 
 
 def test_earlier_deadlines_come_first():
@@ -119,8 +119,8 @@ def test_earlier_deadlines_come_first():
         {"action": "Later", "deadline": "2026-10-01"},
         {"action": "Sooner", "deadline": "2026-09-12"},
     ])])
-    rows = _by_title(rs.build(r), "Actions")["rows"]
-    assert [x["action"] for x in rows] == ["Sooner", "Later"]
+    rows = _by_title(rs.build(r), "Actions")["items"]
+    assert [x["title"] for x in rows] == ["Sooner", "Later"]
 
 
 def test_something_raised_twice_outranks_something_raised_once():
@@ -134,9 +134,8 @@ def test_something_raised_twice_outranks_something_raised_once():
             {"action": "Order the brackets", "priority": "high"},
         ]),
     ])
-    rows = _by_title(rs.build(r), "Actions")["rows"]
-    assert rows[0]["action"] == "Tidy the IT room"
-    assert rows[0]["mentions"] == 2
+    rows = _by_title(rs.build(r), "Actions")["items"]
+    assert rows[0]["title"] == "Tidy the IT room"
 
 
 def test_the_same_action_appears_once():
@@ -145,9 +144,8 @@ def test_the_same_action_appears_once():
         _topic(action_items=[{"action": "Prepare pitch deck"}]),
         _topic(action_items=[{"action": "prepare pitch deck."}]),
     ])
-    rows = _by_title(rs.build(r), "Actions")["rows"]
+    rows = _by_title(rs.build(r), "Actions")["items"]
     assert len(rows) == 1
-    assert rows[0]["mentions"] == 2
 
 
 def test_priority_still_breaks_a_tie():
@@ -155,27 +153,32 @@ def test_priority_still_breaks_a_tie():
         {"action": "Medium thing", "priority": "medium"},
         {"action": "High thing", "priority": "high"},
     ])])
-    rows = _by_title(rs.build(r), "Actions")["rows"]
-    assert [x["action"] for x in rows] == ["High thing", "Medium thing"]
+    rows = _by_title(rs.build(r), "Actions")["items"]
+    assert [x["title"] for x in rows] == ["High thing", "Medium thing"]
 
 
-def test_the_action_table_names_its_columns():
+def test_an_action_carries_its_owner_and_its_date_on_one_line():
+    """Actions used to be a five-column table. It is an entry now, so that it
+    and Safety read alike -- asked for directly: "统一action和safety的表达格式",
+    and "trim简单点". Nothing is dropped: the owner and the date move from
+    columns to the detail line, and the ranking still lives in the order."""
     r = _report(topics=[_topic(action_items=[
         {"action": "Do it", "responsible": "Ben", "deadline": "2026-09-12", "priority": "high"},
     ])])
     sec = _by_title(rs.build(r), "Actions")
-    assert sec["kind"] == "table"
-    assert sec["fields"] == ["action", "owner", "due", "priority", "status"]
-    assert sec["rows"][0]["owner"] == "Ben"
-    assert sec["rows"][0]["due"] == "2026-09-12"
+    assert sec["kind"] == "entries"
+    item = sec["items"][0]
+    assert item["title"] == "Do it"
+    assert item["status"] == "high"
+    assert "Ben" in item["note"] and "2026-09-12" in item["note"]
 
 
 def test_an_action_with_no_text_is_dropped_not_rendered_blank():
     r = _report(topics=[_topic(action_items=[
         {"action": "", "priority": "high"}, {"responsible": "Ben"}, {"action": "Real one"},
     ])])
-    rows = _by_title(rs.build(r), "Actions")["rows"]
-    assert [x["action"] for x in rows] == ["Real one"]
+    rows = _by_title(rs.build(r), "Actions")["items"]
+    assert [x["title"] for x in rows] == ["Real one"]
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +215,22 @@ def test_a_question_asked_twice_is_listed_once():
 # The rest
 # ---------------------------------------------------------------------------
 
-def test_the_summary_is_one_narrative_not_a_list_of_fragments():
-    r = _report(executive_summary=["First thing happened.", "Then another."])
+def test_the_summary_is_the_bullets_the_model_was_asked_for():
+    """The prompt asks for "a list of 4-8 bullet points, each a concise
+    actionable statement". Gluing them back into a paragraph undid the only
+    structure the model was asked to provide. Asked for directly:
+    "Summary做成bullets"."""
+    r = _report(executive_summary=["Vehicle controls enforced.", "Tanking pushed to Monday."])
     sec = _by_title(rs.build(r), "Summary")
-    assert sec["kind"] == "narrative"
-    assert isinstance(sec["body"], str)
-    assert "First thing happened." in sec["body"] and "Then another." in sec["body"]
+    assert sec["kind"] == "list"
+    assert sec["items"] == ["Vehicle controls enforced.", "Tanking pushed to Monday."]
+
+
+def test_a_summary_that_arrives_as_prose_is_one_bullet():
+    """Older reports and the meeting compat shape send a string. It is not
+    split on full stops: that invents boundaries the writer did not put in."""
+    r = _report(executive_summary="A single sentence. And a second one.")
+    assert _by_title(rs.build(r), "Summary")["items"] ==         ["A single sentence. And a second one."]
 
 
 def test_decisions_from_every_topic_land_in_one_list():
@@ -275,21 +288,28 @@ def test_safety_says_what_to_do_about_it():
     assert "Cook Brothers adjoining site" in item["note"]
 
 
-def test_safety_and_quality_are_the_same_shape():
-    """Asked for directly: "我不关心你是用列表还是表格，我希望和上面统一". Two
-    sections that both describe an observation, its state and one line about it
-    must not be rendered by two different mechanisms."""
+def test_actions_and_safety_are_the_same_shape():
+    """"统一action和safety的表达格式". Two lists of things somebody owes must not
+    look like two different kinds of thing. (Issues & Quality was the third and
+    was removed outright: "quality删掉".)"""
     r = _report(
         safety_observations=[{"observation": "Loose cable", "risk_level": "low",
                               "recommended_action": "Tape it"}],
-        quality_and_compliance=[{"item": "PS4 outstanding", "status": "concern",
-                                 "details": "Chase the engineer"}],
+        topics=[_topic(action_items=[{"action": "Chase the steel", "priority": "high",
+                                      "responsible": "Ada"}])],
     )
     built = rs.build(r)
     safety = _by_title(built, "Safety")
-    quality = _by_title(built, "Issues & Quality")
-    assert safety["kind"] == quality["kind"] == "entries"
-    assert set(safety["items"][0]) == set(quality["items"][0]) == {"title", "status", "note"}
+    actions = _by_title(built, "Actions")
+    assert safety["kind"] == actions["kind"] == "entries"
+    assert set(safety["items"][0]) == set(actions["items"][0]) == {"title", "status", "note"}
+
+
+def test_quality_is_not_a_section_any_more():
+    """The field is still in the report and still indexed -- this removed a
+    section from what a person reads, not a fact from what a query reaches."""
+    r = _report(quality_and_compliance=[{"item": "PS4 outstanding", "status": "concern"}])
+    assert "Issues & Quality" not in _titles(rs.build(r))
 
 
 def test_section_order_is_fixed():
@@ -303,7 +323,7 @@ def test_section_order_is_fixed():
     )
     assert _titles(rs.build(r)) == [
         "Summary", "Actions", "Open Questions",
-        "Decisions", "Issues & Quality", "Safety",
+        "Decisions", "Safety",
     ]
 
 
@@ -320,11 +340,12 @@ def test_a_placeholder_deadline_does_not_count_as_a_date(placeholder):
         {"action": "Has no date really", "deadline": placeholder, "priority": "low"},
         {"action": "Genuinely due", "deadline": "2026-09-15", "priority": "low"},
     ])])
-    rows = _by_title(rs.build(r), "Actions")["rows"]
-    assert rows[0]["action"] == "Genuinely due"
-    assert rows[1]["due"] == "", f"{placeholder!r} should not survive as a date"
+    rows = _by_title(rs.build(r), "Actions")["items"]
+    assert rows[0]["title"] == "Genuinely due"
+    assert placeholder not in rows[1]["note"], (
+        f"{placeholder!r} should not survive as a date")
 
 
 def test_a_placeholder_owner_is_shown_as_no_owner():
     r = _report(topics=[_topic(action_items=[{"action": "Do it", "responsible": "?"}])])
-    assert _by_title(rs.build(r), "Actions")["rows"][0]["owner"] == ""
+    assert "?" not in _by_title(rs.build(r), "Actions")["items"][0]["note"]

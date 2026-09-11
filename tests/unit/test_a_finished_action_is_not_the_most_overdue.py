@@ -41,26 +41,42 @@ def _actions(report):
 
 
 def _rows(*topics):
-    return _actions({"date": DATE, "topics": list(topics)})["rows"]
+    """The Actions section's entries.
+
+    Actions used to be a table of five columns and is now an entry -- what it
+    is, how urgent, and the detail underneath -- so that it and Safety read
+    alike. The RANKING is unchanged and is what these tests are about: the
+    order of this list still carries date, then repetition, then priority, and
+    a closed item still sorts below everything owed.
+    """
+    return _actions({"date": DATE, "topics": list(topics)})["items"]
+
+
+def _closed(row):
+    """Whether the row reads as finished. The chip now carries priority, so a
+    closed action says so on its detail line instead."""
+    return any(w in (row.get("note") or "").lower() for w in
+               ("done", "complete", "closed", "cancel", "resolved"))
 
 
 def test_status_reaches_the_row():
     rows = _rows(_topic(_act("Order the steel", status="done")))
-    assert rows[0]["status"] == "done"
+    assert _closed(rows[0])
 
 
-def test_an_item_with_no_status_is_open_not_blank():
+def test_an_item_with_no_status_does_not_read_as_finished():
     """The daily report generator's own extraction has no status field at all --
-    everything it writes is newly said and therefore open. A blank would rank
-    as neither open nor closed and read as an unknown state on the page."""
+    everything it writes is newly said and therefore open."""
     rows = _rows(_topic(_act("Order the steel")))
-    assert rows[0]["status"] == "open"
+    assert not _closed(rows[0])
 
 
-def test_status_is_a_declared_field_so_a_renderer_can_find_it():
-    """`sections` is consumed by field name; a value on the row that is not in
-    `fields` is invisible to the table renderer on the other side."""
-    assert "status" in _actions({"date": DATE, "topics": [_topic(_act("x"))]})["fields"]
+def test_an_action_and_a_safety_observation_are_the_same_shape():
+    """Asked for directly: "统一action和safety的表达格式". Two lists of things
+    somebody owes must not look like two different kinds of thing."""
+    sec = _actions({"date": DATE, "topics": [_topic(_act("x"))]})
+    assert sec["kind"] == "entries"
+    assert set(sec["items"][0]) == {"title", "status", "note"}
 
 
 def test_a_finished_item_with_a_past_deadline_does_not_lead_the_list():
@@ -69,7 +85,7 @@ def test_a_finished_item_with_a_past_deadline_does_not_lead_the_list():
         _act("Fix the handrail", deadline="2026-09-04", status="done"),
         _act("Chase the RFI", deadline="2026-09-12"),
     ))
-    assert [r["action"] for r in rows] == ["Chase the RFI", "Fix the handrail"]
+    assert [r["title"] for r in rows] == ["Chase the RFI", "Fix the handrail"]
 
 
 def test_closed_sorts_below_even_an_undated_open_item():
@@ -78,7 +94,7 @@ def test_closed_sorts_below_even_an_undated_open_item():
         _act("Sign off the pour", deadline="2026-09-01", status="completed"),
         _act("Someone should look at the gate"),
     ))
-    assert [r["status"] for r in rows] == ["open", "completed"]
+    assert [_closed(r) for r in rows] == [False, True]
 
 
 def test_the_closed_vocabulary_covers_what_the_column_actually_holds():
@@ -88,7 +104,7 @@ def test_the_closed_vocabulary_covers_what_the_column_actually_holds():
             _act("Closed thing", deadline="2026-09-01", status=word),
             _act("Open thing"),
         ))
-        assert rows[0]["action"] == "Open thing", word
+        assert rows[0]["title"] == "Open thing", word
 
 
 def test_an_unrecognised_status_is_treated_as_open():
@@ -99,7 +115,7 @@ def test_an_unrecognised_status_is_treated_as_open():
             _act("Live thing", status=word),
             _act("Really done", deadline="2026-09-01", status="done"),
         ))
-        assert rows[0]["action"] == "Live thing", word
+        assert rows[0]["title"] == "Live thing", word
 
 
 def test_raised_again_after_being_closed_is_open():
@@ -111,7 +127,7 @@ def test_raised_again_after_being_closed_is_open():
         _topic(_act("Replace the barrier")),
     )
     assert len(rows) == 1
-    assert rows[0]["status"] == "open"
+    assert not _closed(rows[0])
 
 
 def test_closed_in_every_mention_stays_closed():
@@ -120,4 +136,4 @@ def test_closed_in_every_mention_stays_closed():
         _topic(_act("Replace the barrier", status="closed")),
     )
     assert len(rows) == 1
-    assert rows[0]["status"] in ("done", "closed")
+    assert _closed(rows[0])

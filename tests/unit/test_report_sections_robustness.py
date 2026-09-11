@@ -75,7 +75,7 @@ def test_a_bare_string_of_safety_is_one_observation_not_nine_letters():
 
 def _rows(items, report_date="2026-09-09"):
     r = _report(report_date=report_date, topics=[{"action_items": items}])
-    return _by_title(rs.build(r), "Actions")["rows"]
+    return _by_title(rs.build(r), "Actions")["items"]
 
 
 def test_tomorrow_outranks_a_date_in_october():
@@ -84,7 +84,7 @@ def test_tomorrow_outranks_a_date_in_october():
         {"action": "October thing", "deadline": "2026-10-01"},
         {"action": "Tomorrow thing", "deadline": "Tomorrow 08:00"},
     ])
-    assert [x["action"] for x in rows] == ["Tomorrow thing", "October thing"]
+    assert [x["title"] for x in rows] == ["Tomorrow thing", "October thing"]
 
 
 def test_end_of_day_outranks_everything_dated_later():
@@ -92,7 +92,7 @@ def test_end_of_day_outranks_everything_dated_later():
         {"action": "Next week", "deadline": "2026-09-16"},
         {"action": "Right now", "deadline": "EOD"},
     ])
-    assert rows[0]["action"] == "Right now"
+    assert rows[0]["title"] == "Right now"
 
 
 def test_a_deadline_nobody_can_read_ranks_as_undated():
@@ -102,14 +102,14 @@ def test_a_deadline_nobody_can_read_ranks_as_undated():
         {"action": "Vague", "deadline": "when the crane arrives", "priority": "low"},
         {"action": "Real", "deadline": "2026-12-25", "priority": "low"},
     ])
-    assert rows[0]["action"] == "Real"
+    assert rows[0]["title"] == "Real"
 
 
 def test_an_unreadable_deadline_is_still_shown():
     """Ranked as undated, displayed as written -- the model's words are what the
     site manager needs to see, even when we cannot sort on them."""
     rows = _rows([{"action": "Vague", "deadline": "when the crane arrives"}])
-    assert rows[0]["due"] == "when the crane arrives"
+    assert "when the crane arrives" in rows[0]["note"]
 
 
 def test_an_overdue_action_comes_first():
@@ -117,7 +117,7 @@ def test_an_overdue_action_comes_first():
         {"action": "Upcoming", "deadline": "2026-09-20"},
         {"action": "Overdue", "deadline": "2026-09-01"},
     ], report_date="2026-09-09")
-    assert rows[0]["action"] == "Overdue"
+    assert rows[0]["title"] == "Overdue"
 
 
 def test_with_no_report_date_nothing_pretends_to_be_dated():
@@ -126,8 +126,8 @@ def test_with_no_report_date_nothing_pretends_to_be_dated():
         {"action": "A", "deadline": "Tomorrow"},
         {"action": "B", "deadline": "EOD", "priority": "high"},
     ]}]}
-    rows = _by_title(rs.build(r), "Actions")["rows"]
-    assert rows[0]["action"] == "B", "falls back to priority, not to alphabet"
+    rows = _by_title(rs.build(r), "Actions")["items"]
+    assert rows[0]["title"] == "B", "falls back to priority, not to alphabet"
 
 
 # ---------------------------------------------------------------------------
@@ -140,13 +140,13 @@ def test_two_owners_for_one_action_are_both_named():
         {"action_items": [{"action": "Order the brackets", "responsible": "Ben"}]},
         {"action_items": [{"action": "Order the brackets", "responsible": "James"}]},
     ])
-    row = _by_title(rs.build(r), "Actions")["rows"][0]
-    assert "Ben" in row["owner"] and "James" in row["owner"]
+    row = _by_title(rs.build(r), "Actions")["items"][0]
+    assert "Ben" in row["note"] and "James" in row["note"]
 
 
 def test_an_action_whose_text_is_a_placeholder_is_not_an_action():
     rows = _rows([{"action": "N/A"}, {"action": "TBD"}, {"action": "Real work"}])
-    assert [x["action"] for x in rows] == ["Real work"]
+    assert [x["title"] for x in rows] == ["Real work"]
 
 
 # ---------------------------------------------------------------------------
