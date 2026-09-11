@@ -155,6 +155,9 @@ except ImportError:
 # ============================================================
 DAILY_REPORT_SCHEMA = """{
   "executive_summary": "2-3 sentence overview of key activities and outcomes",
+  "work_completed": [
+    "One thing that was physically DONE on site today, in one line. Work, not talk: a pour, a lift, an inspection passed, an area backfilled. Omit anything that was only discussed, planned or promised -- those are actions and decisions and have their own sections. Empty array if the day was meetings only."
+  ],
   "quality_and_compliance": [
     {
       "item": "Testing or compliance matter",

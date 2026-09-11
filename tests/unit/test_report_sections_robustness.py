@@ -248,3 +248,128 @@ def test_a_photo_with_no_user_or_date_keeps_the_name_and_an_empty_key():
     r.pop("date", None)
     items = _by_title(rs.build(r), "Photos")["items"]
     assert items[0]["name"] == "a.jpg" and items[0]["key"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Weather, and how much it could have got in the way
+# ---------------------------------------------------------------------------
+
+def _weather(**kw):
+    base = {"condition_label": "Slight rain", "temp_min_c": 11.2,
+            "temp_max_c": 13.5, "precip_mm": 5.9, "windspeed_kmh": 22.2}
+    base.update(kw)
+    return _report(weather=base)
+
+
+def test_weather_reads_as_the_lines_a_person_asked_for():
+    items = _by_title(rs.build(_weather()), "Weather")["items"]
+    assert [i["title"] for i in items] == [
+        "Slight rain",
+        "Temperature: 11.2°C – 13.5°C",
+        "Rainfall: 5.9mm",
+        "Maximum wind speed: 22.2 km/h",
+    ]
+
+
+def test_the_impact_level_names_what_drove_it():
+    """A colour with no reason beside it is a mood ring: the reader cannot tell
+    whether to move the pour or the crew."""
+    head = _by_title(rs.build(_weather()), "Weather")["items"][0]
+    assert head["status"] == "moderate"
+    assert "rain" in head["note"]
+
+
+@pytest.mark.parametrize("mm,level", [
+    (0.0, ""), (0.4, "low"), (6.0, "moderate"), (18.0, "high"), (44.0, "severe"),
+])
+def test_rain_drives_the_level(mm, level):
+    head = _by_title(rs.build(_weather(precip_mm=mm, windspeed_kmh=5,
+                                       temp_min_c=14, temp_max_c=20)),
+                     "Weather")["items"][0]
+    assert head["status"] == level, mm
+
+
+@pytest.mark.parametrize("kmh,level", [
+    (10.0, ""), (28.0, "low"), (40.0, "moderate"), (55.0, "high"), (80.0, "severe"),
+])
+def test_wind_drives_the_level(kmh, level):
+    head = _by_title(rs.build(_weather(precip_mm=0, windspeed_kmh=kmh,
+                                       temp_min_c=14, temp_max_c=20)),
+                     "Weather")["items"][0]
+    assert head["status"] == level, kmh
+
+
+def test_cold_and_heat_are_both_an_impact():
+    cold = _by_title(rs.build(_weather(precip_mm=0, windspeed_kmh=5,
+                                       temp_min_c=3, temp_max_c=9)),
+                     "Weather")["items"][0]
+    assert cold["status"] == "moderate" and "concrete" in cold["note"]
+    hot = _by_title(rs.build(_weather(precip_mm=0, windspeed_kmh=5,
+                                      temp_min_c=22, temp_max_c=36)),
+                    "Weather")["items"][0]
+    assert hot["status"] == "high" and "crew" in hot["note"]
+
+
+def test_the_worst_factor_sets_the_level_and_every_reason_is_named():
+    head = _by_title(rs.build(_weather(precip_mm=40, windspeed_kmh=40,
+                                       temp_min_c=2, temp_max_c=9)),
+                     "Weather")["items"][0]
+    assert head["status"] == "severe"
+    for word in ("rain", "wind", "concrete"):
+        assert word in head["note"], word
+
+
+def test_a_missing_number_does_not_invent_a_level():
+    """Absent stays absent. A level derived from a number nobody measured is a
+    claim about a day this system did not observe."""
+    head = _by_title(rs.build(_weather(precip_mm=None, windspeed_kmh=None,
+                                       temp_min_c=None, temp_max_c=None)),
+                     "Weather")["items"][0]
+    assert head["status"] == ""
+
+
+def test_a_whole_number_is_not_rendered_with_a_trailing_zero():
+    items = _by_title(rs.build(_weather(precip_mm=12.0)), "Weather")["items"]
+    assert "Rainfall: 12mm" in [i["title"] for i in items]
+
+
+def test_no_weather_means_no_section():
+    """Null on every production report so far, and not because the fetch
+    failed: the generator reads the site coordinate from user_mapping.json,
+    where the sites have null lat/lng, while the coordinates people type into
+    the web UI live in Aurora. An empty "Weather" heading would read as a claim
+    that the day was unremarkable."""
+    for value in (None, {}, "sunny", 7):
+        assert "Weather" not in _titles(rs.build(_report(weather=value))), value
+
+
+# ---------------------------------------------------------------------------
+# What was done, apart from what was said
+# ---------------------------------------------------------------------------
+
+def test_work_completed_is_its_own_section():
+    """"这样把完成的内容分离". Until now the only account of a day's work was the
+    executive summary, which mixes what happened with what was agreed and what
+    is still owed."""
+    r = _report(work_completed=["Continued groundworks despite slight rain",
+                                "Progressed with foundation preparations"])
+    sec = _by_title(rs.build(r), "Work Completed")
+    assert sec["kind"] == "list"
+    assert sec["items"] == ["Continued groundworks despite slight rain",
+                            "Progressed with foundation preparations"]
+
+
+def test_work_completed_is_absent_on_a_day_of_meetings():
+    for value in (None, [], ["", "  ", "N/A"]):
+        assert "Work Completed" not in _titles(rs.build(_report(work_completed=value)))
+
+
+def test_the_prompt_asks_for_work_not_talk():
+    """The section is only as good as the field, and the field is only as good
+    as the instruction. A topic's summary describes a CONVERSATION, and a
+    conversation about backfilling is not backfilling."""
+    import lambda_report_generator as rg
+    schema = rg.DAILY_REPORT_SCHEMA
+    assert '"work_completed"' in schema
+    assert "physically DONE" in schema
+    assert "only discussed" in schema

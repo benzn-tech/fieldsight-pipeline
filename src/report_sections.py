@@ -108,6 +108,8 @@ def build(report):
 
     sections = [
         _summary(report),
+        _weather(report),
+        _work_completed(report),
         _actions(topics, report.get("report_date")),
         _open_questions(topics),
         _decisions(topics),
@@ -145,6 +147,156 @@ def _summary(report):
 # owner then asked for the counts to go entirely: "多少分钟。多少个字啊？多少，
 # 这些都不要了". A day is described by what was decided and what is owed, not by
 # how many files it took to record it.
+
+#: How much a day's weather could get in the way, and how sure we are that it
+#: did. These are THIS PRODUCT'S defaults, not a cited standard -- a site that
+#: pours concrete all winter and one that flies steel have different lines, and
+#: the numbers are here to be argued with rather than to be believed.
+#:
+#: The reasoning behind each, stated so a disagreement can be specific:
+#:   rain  -- earthworks and pours are the first things a wet day stops, and
+#:            5 mm is roughly where a NZ site starts covering up rather than
+#:            working through it.
+#:   wind  -- lifting is the exposure. Care from about 35 km/h, and most crews
+#:            stop craning well before the gust limits printed on the machine.
+#:   cold  -- concrete placed below 5 degrees needs protection or it does not
+#:            gain strength on schedule.
+#:   heat  -- above 30 the constraint is the people, not the material.
+#:
+#: A level is never invented from a missing number: absent stays absent.
+_WEATHER_SCALE = ("low", "moderate", "high", "severe")
+
+_RAIN_MM = ((30.0, "severe"), (15.0, "high"), (5.0, "moderate"), (0.2, "low"))
+_WIND_KMH = ((70.0, "severe"), (50.0, "high"), (35.0, "moderate"), (25.0, "low"))
+_COLD_C = ((0.0, "high"), (5.0, "moderate"))
+_HEAT_C = ((35.0, "high"), (30.0, "moderate"))
+
+
+def _num(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _at_or_above(value, table):
+    for threshold, level in table:
+        if value >= threshold:
+            return level
+    return None
+
+
+def _at_or_below(value, table):
+    for threshold, level in table:
+        if value <= threshold:
+            return level
+    return None
+
+
+def _worst(levels):
+    found = [l for l in levels if l in _WEATHER_SCALE]
+    if not found:
+        return ""
+    return max(found, key=_WEATHER_SCALE.index)
+
+
+def _weather(report):
+    """The day's weather, and how much it could have got in the way.
+
+    ABSENT IS COMMON AND HAS A CAUSE. `weather` is null on every production
+    report so far, and not because the fetch failed: the generator reads the
+    site coordinate from `config/user_mapping.json`, where the sites have null
+    lat/lng, while the coordinates people type into the web UI live in the
+    Aurora `sites` table and are published to `config/site-coords.json` only
+    when somebody saves them. A site nobody has placed on a map has no weather,
+    and this section is absent rather than empty -- an empty "Weather" heading
+    reads as a claim that the day was unremarkable.
+    """
+    w = report.get("weather")
+    if not isinstance(w, dict) or not w:
+        return None
+
+    items = []
+    condition = _clean(w.get("condition_label") or w.get("condition"))
+
+    rain = _num(w.get("precip_mm"))
+    wind = _num(w.get("windspeed_kmh"))
+    tmin = _num(w.get("temp_min_c"))
+    tmax = _num(w.get("temp_max_c"))
+
+    level = _worst([
+        _at_or_above(rain, _RAIN_MM) if rain is not None else None,
+        _at_or_above(wind, _WIND_KMH) if wind is not None else None,
+        _at_or_below(tmin, _COLD_C) if tmin is not None else None,
+        _at_or_above(tmax, _HEAT_C) if tmax is not None else None,
+    ])
+
+    # What drove the level, named. A colour with no reason beside it is a mood
+    # ring: the reader cannot tell whether to move the pour or the crew.
+    because = []
+    if rain is not None and _at_or_above(rain, _RAIN_MM):
+        because.append("rain affects earthworks and pours")
+    if wind is not None and _at_or_above(wind, _WIND_KMH):
+        because.append("wind affects lifting")
+    if tmin is not None and _at_or_below(tmin, _COLD_C):
+        because.append("cold affects concrete curing")
+    if tmax is not None and _at_or_above(tmax, _HEAT_C):
+        because.append("heat affects the crew")
+
+    if condition:
+        items.append({"title": condition, "status": level,
+                      "note": "; ".join(because)})
+    elif level:
+        items.append({"title": "Conditions on site", "status": level,
+                      "note": "; ".join(because)})
+
+    if tmin is not None and tmax is not None:
+        items.append({"title": "Temperature: %s\u00b0C \u2013 %s\u00b0C"
+                               % (_trim(tmin), _trim(tmax)),
+                      "status": "", "note": ""})
+    if rain is not None:
+        items.append({"title": "Rainfall: %smm" % _trim(rain),
+                      "status": "", "note": ""})
+    if wind is not None:
+        items.append({"title": "Maximum wind speed: %s km/h" % _trim(wind),
+                      "status": "", "note": ""})
+
+    if not items:
+        return None
+    return {"title": "Weather", "kind": "entries", "items": items}
+
+
+def _trim(value):
+    """11.2 stays 11.2; 12.0 becomes 12. The measurement is rendered as
+    recorded -- rounding it in one of the two renderings is how the Word file
+    and the dashboard start disagreeing about the same day."""
+    text = ("%f" % value).rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _work_completed(report):
+    """What was physically DONE, separated from what was discussed.
+
+    Asked for directly: "这样把完成的内容分离". Until now the only account of a
+    day's work was the executive summary, which mixes what happened with what
+    was agreed and what is still owed -- so a reader could not answer "what did
+    we actually get done" without reading all of it.
+
+    This is a field the model produces, not a derivation from the topics: a
+    topic's summary describes a CONVERSATION, and a conversation about
+    backfilling is not backfilling.
+    """
+    items = []
+    for entry in _as_list(report.get("work_completed")):
+        if isinstance(entry, str):
+            _add(items, entry)
+        elif isinstance(entry, dict):
+            _add(items, entry.get("item") or entry.get("work")
+                 or entry.get("description"))
+    if not items:
+        return None
+    return {"title": "Work Completed", "kind": "list", "items": items}
+
 
 def _actions(topics, report_date=None):
     """Every action the day produced, once each, most-owed first."""
