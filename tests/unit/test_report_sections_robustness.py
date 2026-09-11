@@ -373,3 +373,30 @@ def test_the_prompt_asks_for_work_not_talk():
     assert '"work_completed"' in schema
     assert "physically DONE" in schema
     assert "only discussed" in schema
+
+
+def test_the_report_carries_every_field_it_asks_for():
+    """THE ALLOWLIST AND THE SCHEMA MUST NOT DRIFT.
+
+    `lambda_report_generator` builds the report dict from a fixed list of
+    `claude_output.get(...)` calls. Every key the schema asks the model for has
+    to appear there too, or the field is requested, produced, paid for and
+    thrown away -- silently, because nothing downstream knows to miss it.
+
+    That is exactly what happened to `work_completed`: the prompt asked for it,
+    the debug record shows the model returned it, and the report did not carry
+    it, for one missing line. org-api has the same shape of serializer and lost
+    `mention_count` the same way.
+    """
+    import re
+    import lambda_report_generator as rg
+    src = open(rg.__file__, encoding="utf-8").read()
+    copied = set(re.findall(r"claude_output\.get\('([a-z_]+)'", src))
+    asked = set(re.findall(r'"([a-z_]+)":', rg.DAILY_REPORT_SCHEMA))
+    # Only the TOP-LEVEL keys of the schema; nested item fields travel inside
+    # their parent and are not copied one by one.
+    top = {"executive_summary", "work_completed", "quality_and_compliance",
+           "safety_observations", "critical_dates_and_deadlines", "topics"}
+    assert top <= asked, "the schema stopped asking for %s" % (top - asked)
+    missing = top - copied
+    assert not missing, "asked for but never copied into the report: %s" % sorted(missing)

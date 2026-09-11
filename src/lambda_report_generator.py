@@ -1650,6 +1650,14 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
             },
             'weather': weather_block,
             'executive_summary': claude_output.get('executive_summary', ''),
+            # A FIXED ALLOWLIST. Every key the schema asks the model for has to
+            # be named here too, or the field is requested, produced, paid for
+            # and thrown away -- silently, because nothing downstream knows to
+            # miss it. `work_completed` was asked for, arrived in the response,
+            # and did not reach the report for exactly one missing line.
+            # `test_the_report_carries_every_field_it_asks_for` now fails when
+            # the schema and this list drift apart.
+            'work_completed': claude_output.get('work_completed', []),
             'quality_and_compliance': claude_output.get('quality_and_compliance', []),
             'safety_observations': claude_output.get('safety_observations', []),
             'critical_dates_and_deadlines': claude_output.get('critical_dates_and_deadlines', []),
@@ -1775,6 +1783,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
                                 'photos': len(combined_photos),
                             },
                             'executive_summary': claude_output.get('executive_summary', ''),
+                            'work_completed': claude_output.get('work_completed', []),
                             'quality_and_compliance': claude_output.get('quality_and_compliance', []),
                             'safety_observations': claude_output.get('safety_observations', []),
                             'critical_dates_and_deadlines': claude_output.get('critical_dates_and_deadlines', []),
