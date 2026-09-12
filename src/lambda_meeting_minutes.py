@@ -19,9 +19,17 @@ This Lambda function:
 5. Writes minutes JSON + Word doc to S3
 
 Trigger:
-  - API Gateway (on-demand)  → {"date": "2026-03-20"}
-  - API Gateway (with config) → {"date": "2026-03-20", "meeting_title": "...", "attendees": [...]}
-  - EventBridge (scheduled)   → {"date": "yesterday"}
+  NOTHING INVOKES THIS YET. The claim that API Gateway and EventBridge trigger it
+  was in this docstring for months and was never true: the function has no
+  `Events:` block in template.yaml, no caller anywhere in the repo, and zero
+  invocations on prod over 30 days. It is deployed, it works, and it has never
+  run. Wiring it to session close is the next step; until then every invocation
+  is manual.
+
+  Accepted event shapes, all manual today:
+  - {"date": "2026-03-20"}                              one whole day
+  - {"date": "2026-03-20", "session_id": "<32 hex>"}    ONE recording session
+  - plus meeting_title / meeting_type / attendees / user / transcript_prefix
 
 Event payload options:
   date              — Target date (YYYY-MM-DD) or "yesterday" or "today"
@@ -29,6 +37,11 @@ Event payload options:
   meeting_type      — Optional: strategy | standup | brainstorm | review | bd | general
   attendees         — Optional: list of attendee names
   user              — Optional: specific device/user folder to process (default: all)
+  session_id        — Optional: ONE recording session, which is the meeting
+                      boundary the owner settled on (record-start to record-stop).
+                      Absent means the whole day, which merges two meetings into
+                      one document; present also puts the id in the output key,
+                      without which the day's second meeting overwrites its first.
   transcript_prefix — Optional: custom S3 prefix for transcripts (e.g. "meetings/2026-03-20/")
 
 Environment Variables:
@@ -282,15 +295,85 @@ def load_user_mapping(bucket):
 # Collect Transcripts for a Date
 # ============================================================
 
-def collect_transcripts(bucket, target_date, user_filter=None, custom_prefix=None):
+# A recording session id as it appears in a transcript filename:
+# `..._sid<id>_c0008_...`. Anchored and character-limited because this value
+# becomes a key filter -- a separator or a wildcard in it must match nothing
+# rather than reach outside the keys the caller was already allowed to list.
+_SESSION_ID = re.compile(r"^[0-9a-zA-Z]{1,64}$")
+
+
+def _session_token(session_id):
+    """The `sid<id>_` token to require in a key, or None for "no scoping".
+
+    Returns None for a blank/absent id (an empty parameter is an absent one) and
+    raises for a malformed one, so that a hostile value cannot silently degrade
+    into collecting the whole day.
+    """
+    if session_id is None:
+        return None
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    sid = session_id.strip()
+    if not _SESSION_ID.match(sid):
+        raise ValueError("malformed session_id")
+    return "sid%s_" % sid
+
+
+def _output_stem(meeting_title, session_id=None):
+    """The filename stem for one set of minutes.
+
+    The session id is part of it whenever there is one, because the default
+    title is `Meeting - <date>` for every session and the key is
+    `meeting_minutes/<date>/<stem>.json`. Without the id, the second meeting of
+    a day silently OVERWRITES the first -- and since both documents look
+    complete, the loss is invisible until someone goes looking for a decision
+    that was minuted and is now gone.
+
+    Eight characters, because the id is already unique within a date and a key
+    is read by people. Titles keep their own slug so a named meeting is still
+    recognisable in a listing.
+    """
+    stem = re.sub(r'[^a-zA-Z0-9_-]', '_', meeting_title or '')[:50]
+    try:
+        token = _session_token(session_id)
+    except ValueError:
+        token = None
+    if token:
+        # token is `sid<id>_`; keep a readable prefix of the id itself.
+        stem = "%s__%s" % (stem, token[3:-1][:8])
+    return stem
+
+
+def collect_transcripts(bucket, target_date, user_filter=None, custom_prefix=None,
+                        session_id=None):
     """
     Collect all transcripts for a given date, normalized via transcript_utils.
 
     Each entry in the returned list is the output of normalize_transcript(),
     with an additional 'key' field for the S3 object path.
 
+    `session_id` narrows to ONE recording session, which is the meeting boundary
+    the owner settled on: a meeting starts when recording starts and ends when it
+    stops. Without it this function collects a whole DATE, so two meetings in one
+    day merge into a single document with one title, one attendee list and
+    decisions from two rooms -- wrong in a way the output cannot show.
+
+    The id is matched as the token `sid<id>_`, never as a substring: device-
+    generated ids are not guaranteed to differ in their first bytes, and a
+    substring match would put one session's chunks in another's minutes with no
+    error anywhere. It composes WITH the date filter rather than replacing it,
+    and an id that matches nothing yields nothing -- the caller can distinguish
+    "nothing to report" from "here is someone else's meeting" only if this fails
+    closed.
+
     Returns: list of normalized transcript dicts sorted by segment_base_time
     """
+    try:
+        session_token = _session_token(session_id)
+    except ValueError:
+        logger.warning("meeting minutes: ignoring a malformed session_id; "
+                       "collecting nothing rather than the whole day")
+        return []
     user_mapping = load_user_mapping(bucket)
     transcripts = []
 
@@ -319,8 +402,15 @@ def collect_transcripts(bucket, target_date, user_filter=None, custom_prefix=Non
 
     if custom_prefix:
         for obj in list_s3_objects(bucket, custom_prefix):
-            if obj['key'].endswith('.json'):
-                _process_object(obj['key'])
+            if not obj['key'].endswith('.json'):
+                continue
+            # The custom-prefix path is gated too. A caller that passes both a
+            # prefix and a session means the intersection, and leaving one path
+            # ungated is how this repo's fixes have twice reached only half of
+            # the callers.
+            if session_token and session_token not in obj['key']:
+                continue
+            _process_object(obj['key'])
     else:
         # Discover users from transcripts/ folder
         users = set()
@@ -351,10 +441,13 @@ def collect_transcripts(bucket, target_date, user_filter=None, custom_prefix=Non
                     continue
                 if target_date not in key:
                     continue
+                if session_token and session_token not in key:
+                    continue
                 _process_object(key)
 
     transcripts.sort(key=lambda x: x.get('segment_base_time') or datetime.min)
-    logger.info(f"Collected {len(transcripts)} transcripts for {target_date}")
+    logger.info("Collected %d transcripts for %s%s", len(transcripts), target_date,
+                (" session %s" % session_id) if session_token else " (whole day)")
     return transcripts
 
 
@@ -522,10 +615,16 @@ def extract_json_from_response(raw_text):
 # ============================================================
 
 def save_debug_record(bucket, target_date, meeting_title, prompt, raw_response,
-                      parsed_json, parse_success, input_stats):
-    """Save debug record for prompt tuning."""
+                      parsed_json, parse_success, input_stats, session_id=None):
+    """Save debug record for prompt tuning.
+
+    `session_id` is a parameter rather than read from an enclosing config,
+    because this whole body is inside a try/except that logs and continues: a
+    NameError here would be swallowed and the debug record would simply stop
+    appearing, which is the kind of silence this codebase has paid for before.
+    """
     try:
-        safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', meeting_title)[:50]
+        safe_title = _output_stem(meeting_title, session_id)
         debug_key = f"{MINUTES_PREFIX}{target_date}/{safe_title}_debug.json"
 
         debug_record = {
@@ -920,6 +1019,7 @@ def generate_meeting_minutes(meeting_config):
         S3_BUCKET, target_date,
         user_filter=meeting_config.get('user'),
         custom_prefix=meeting_config.get('transcript_prefix'),
+        session_id=meeting_config.get('session_id'),
     )
 
     if not transcripts:
@@ -964,7 +1064,8 @@ def generate_meeting_minutes(meeting_config):
                 'transcripts_count': len(transcripts),
                 'total_words': total_words,
                 'error': error,
-            }
+            },
+            session_id=meeting_config.get('session_id'),
         )
         return {
             'status': 'error',
@@ -995,12 +1096,13 @@ def generate_meeting_minutes(meeting_config):
             'transcripts_count': len(transcripts),
             'total_words': total_words,
             'attendees': attendees,
-        }
+        },
+        session_id=meeting_config.get('session_id'),
     )
 
     # Build final minutes document
     now_iso = datetime.utcnow().isoformat() + 'Z'
-    safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', meeting_title)[:50]
+    safe_title = _output_stem(meeting_title, meeting_config.get('session_id'))
 
     minutes = {
         'meeting_date': target_date,
@@ -1154,6 +1256,7 @@ def lambda_handler(event, context):
         'attendees': event.get('attendees', []),
         'user': event.get('user', None),
         'transcript_prefix': event.get('transcript_prefix', None),
+        'session_id': event.get('session_id', None),
         'triggered_by': event.get('triggered_by', 'system'),
     }
 
