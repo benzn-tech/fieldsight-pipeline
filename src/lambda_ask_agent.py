@@ -1416,6 +1416,12 @@ def _voice_answer(body):
 
     caller_sub = body.get("caller_sub")
     fmt = body.get("format") or "m4a"
+    # Counted here rather than at the log line so an early return -- a silent
+    # clip, a retrieval failure -- still knows the turn count was present. The
+    # gateway has already capped and sanitised it; this side trusts nothing and
+    # only counts.
+    _h = body.get("history")
+    history_turns = len(_h) if isinstance(_h, list) else 0
     try:
         audio_bytes = _b64.b64decode(body.get("audio") or "", validate=True)
     except Exception:
@@ -1457,14 +1463,19 @@ def _voice_answer(body):
     # on the `qwen done:` line for the same request id, so subtracting gives
     # retrieval -- which nothing has ever reported separately. Both are named
     # here so the next reader does not have to know that.
+    # `history_turns` is RECEIVED, not used: step 2 of the continuity spec
+    # forwards the turns and retrieves with nothing, so this number is the only
+    # evidence of whether any real device sends them. Without it, "the device
+    # half shipped" and "the device half shipped and is silently sending
+    # nothing" look identical for as long as nobody looks.
     logger.info(
         "voice ask: stt=%.2fs rag=%.2fs tts=%.2fs total=%.2fs "
         "clip_bytes=%d transcript_words=%d answer_words=%d answer_chars=%d "
-        "audio_bytes=%d fmt=%s",
+        "audio_bytes=%d fmt=%s history_turns=%d",
         marks.get("stt", -1), marks.get("rag", -1), marks.get("tts", -1),
         _time.perf_counter() - t0, len(audio_bytes),
         len(transcript.split()), len(answer_text.split()), len(answer_text),
-        len(audio_out), fmt)
+        len(audio_out), fmt, history_turns)
 
     _invoke_voice_audit(caller_sub, transcript, answer_text)
     return {
