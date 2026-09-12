@@ -256,6 +256,7 @@ jobs:
               "EnableUserDeletion=${{ vars.PROD_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.PROD_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \
+              "EnableWebAnswer=${{ vars.PROD_ENABLE_WEB_ANSWER || 'false' }}" \
               "UploadVerifyMode=${{ vars.PROD_UPLOAD_VERIFY_MODE || 'observe' }}" \
               "SpeakerIdentityMode=${{ vars.PROD_SPEAKER_IDENTITY_MODE || 'off' }}" \
               "EnrolOnCorrection=${{ vars.PROD_ENROL_ON_CORRECTION || 'false' }}" \

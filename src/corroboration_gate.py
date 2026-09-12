@@ -2,10 +2,16 @@
 
 Spec: docs/superpowers/specs/2026-08-31-ask-external-corroboration-design.md §4
 
-Only ENTITIES go out. Never conversation text. Construction meeting content is
-commercially confidential -- a claim dispute, a subcontractor's pricing, a defect
-allocation -- and sending any of it to a third-party search engine is a contractual
-problem regardless of how good the answer would be.
+Only ENTITIES reach a SEARCH ENGINE. Never conversation text. Construction meeting
+content is commercially confidential -- a claim dispute, a subcontractor's pricing, a
+defect allocation -- and sending any of it to a third-party search engine is a
+contractual problem regardless of how good the answer would be.
+
+Read that sentence exactly. It is about the search engine, and it is NOT the
+statement "nothing conversational leaves this module": extraction sends the whole
+question and the whole answer to the LLM provider, before this gate has run at
+all. That hop is covered below; the two are easy to read past each other and one
+test pins each.
 
 PURE PYTHON, NO I/O, NO MODEL. This is the whole point of the module existing
 separately. An LLM asked "is this safe to send?" says yes under pressure from a
@@ -16,7 +22,9 @@ extraction returned.
 ## The two limits this gate does not pretend to hold (spec §4.1)
 
 **Its input is model-assigned.** Extraction returns `[{entity, kind, claim}]` and the
-kind allowlist filters on `kind` -- a label only as good as haiku's classification. A
+kind allowlist filters on `kind` -- a label only as good as the extraction model's
+classification (haiku when this was written; `CORROBORATION_CHEAP_MODEL` now, which
+is a Gemini model on OpenRouter). A
 person's name labelled `company`, a firm literally named "Ben Smith Contracting", and a
 project codename shaped like a company all pass the label check. So every entity also
 goes through **string-shape checks that do not consult the label at all**. The residual
@@ -37,11 +45,27 @@ customer's job codes are that customer's and not enumerable here. What leaves in
 that case is a word with no meaning outside the account, which is the mildest
 form of this leak and is stated rather than denied.
 
-**Only the search step is covered here.** Reconcile (spec step 4) sends the answer to
-the LLM provider, and the answer is conversation-derived. That is a different statement
-from "only entities leave", defensible because the same provider already saw the
-transcript during `/ask` -- but no *search engine* ever receives it, and this module is
-the thing that makes that true.
+**Only the search step is covered here.** Extraction sends the question AND the answer,
+and reconcile sends the answer, to the LLM provider. Both are conversation-derived, and
+neither passes through this module -- extraction happens before it, by construction.
+That is a different statement from "only entities leave", and it is defensible only
+because that provider already receives `chunk_text` on every `/ask`. No *search engine*
+ever receives any of it, and this module is the thing that makes that true.
+
+**That justification has already gone stale once, and quietly.** It was written when
+`/ask` ran DashScope and corroboration ran Anthropic -- two different providers, and
+the sentence was wrong the moment the second one was introduced. Today both hops are
+OpenRouter under one key, so it is true again, by coincidence rather than by the
+mechanism it names. Anyone moving either side to a different vendor breaks it without
+touching this file: **check the two API keys, not this paragraph.**
+
+**The `claim` field is forwarded unscreened.** `screen()` inspects the entity string;
+`claim` goes through untouched and into the search-enabled call, where the model turns
+it into queries. Safe while claims are built from the ANSWER and `EXTRACT_PROMPT`
+forbids building them from the question. Anything that extracts from a QUESTION instead
+puts the user's own words one model-hop from a search engine, which is the threat named
+at the top of this docstring. A test pins the property so that change cannot be made
+without meeting it.
 
 ## Why a rejection is returned rather than dropped
 
