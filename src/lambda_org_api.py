@@ -1155,6 +1155,51 @@ def _selected_topic_row_ids(body):
     return ids, None
 
 
+def _day_report_rows(conn, caller, folder, date):
+    """One (folder, date)'s extraction topic rows as the meeting picker and the
+    session report must see them -- including a multi-device meeting.
+
+    A merge writes ONE topic set under the LEAD's folder
+    (`extractions/{lead}/{date}/grp{id}.json`) and deletes each member's own.
+    Listing only `extractions/{folder}/{date}/` therefore hid the meeting from
+    every joiner: their picker was empty and its report was a 404, while the
+    lead worked by coincidence. `/timeline` and `/live-items` already union the
+    merged keys; this is the same rule for the two routes that did not.
+
+    The clip is `_render_timeline_for_user`'s, not a new one:
+
+      * own day -- a merged row may pass the site clip. The caller was in that
+        meeting, so the record is theirs even when the lead recorded on a site
+        they are not a member of;
+      * someone else's day -- merged rows stay inside the caller's site clip. A
+        merged meeting spans devices and therefore sites by definition, which is
+        the object the cross-user clip exists for.
+
+    "Own" is decided on the resolved folder, so an ALL-scope caller reading a
+    colleague's day gets the stricter side. The timeline lets that caller skip
+    the clip; here it can only ever lose a merged row, never gain one.
+
+    Membership is resolved for the person whose day this is, never the caller
+    (`_timeline_target_id`), and on its own line: `_merged_keys_for` returns []
+    on failure, and a lookup that raised inside an argument list would escape
+    that and 500 the read. With no merged keys the list call is exactly the one
+    both routes always made.
+    """
+    allowed = _allowed_site_ids(conn, caller)
+    merged = _merged_keys_for(conn, _timeline_target_id(conn, caller, folder), date)
+    prefix = f"extractions/{folder}/{date}/"
+    if merged:
+        rows = topics.list_topics_for_source_prefix(conn, prefix, merged_keys=list(merged))
+    else:
+        rows = topics.list_topics_for_source_prefix(conn, prefix)
+    own_day = bool(folder) and folder == (caller.get("folder_name") or "")
+    if own_day and merged:
+        merged_set = set(merged)
+        return [r for r in rows
+                if str(r["site_id"]) in allowed or r.get("source_s3_key") in merged_set]
+    return [r for r in rows if str(r["site_id"]) in allowed]
+
+
 def _assemble_session_report(conn, caller, session_id, event, selected=None):
     """Re-derive ONE session's scope + assemble its reviewed report content,
     server-side from (folder, date, session_id). The shared core of the T2
@@ -1173,9 +1218,7 @@ def _assemble_session_report(conn, caller, session_id, event, selected=None):
     if err is not None:
         return None, err
 
-    allowed = _allowed_site_ids(conn, caller)
-    rows = [r for r in topics.list_topics_for_source_prefix(conn, f"extractions/{folder}/{date}/")
-            if str(r["site_id"]) in allowed]
+    rows = _day_report_rows(conn, caller, folder, date)
     redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if rows else {}
     srows = []
     for r in rows:
@@ -6966,9 +7009,7 @@ def get_org_sessions(conn, caller, event):
     if err is not None:
         return err
 
-    allowed = _allowed_site_ids(conn, caller)
-    rows = [r for r in topics.list_topics_for_source_prefix(conn, f"extractions/{folder}/{date}/")
-            if str(r["site_id"]) in allowed]
+    rows = _day_report_rows(conn, caller, folder, date)
     sessions, excluded = build_day_sessions(conn, caller, folder, date, rows)
     return ok({
         "date": date,
