@@ -1138,14 +1138,38 @@ def generate_meeting_minutes(meeting_config):
     device = transcripts[0].get('device') if transcripts else None
     user_for_path = meeting_config.get('user') or device or 'meeting'
 
+    # ONE SESSION IS NOT THE DAY. Everything under reports/<date>/<user>/ below
+    # is a DAY-level object: the compat daily_report.json (the nightly report's
+    # own key, and embed-report's trigger), the manifest that removes transcripts
+    # from that report (and replaces rather than merges), and meeting_minutes.json
+    # which Ask and the timeline find by fixed name. For whole-day minutes that
+    # is the design -- the day was a meeting. For one session it overwrote the
+    # day's report, released another session's claim, and let two sessions
+    # overwrite each other; observed on TEST 2026-09-13. Renaming the keys per
+    # session would hide them from both readers, so a session-scoped run writes
+    # only its archive under meeting_minutes/, whose key already carries the id.
+    try:
+        session_scoped = _session_token(meeting_config.get('session_id')) is not None
+    except ValueError:
+        # Unreachable -- collection already refused this id -- and if it were
+        # reached, leaving the day alone is the safe side.
+        session_scoped = True
+    if session_scoped:
+        # A skipped write and a write that never ran must not look the same.
+        logger.info("Session-scoped minutes (%s): archive only; the day's "
+                    "daily_report.json, manifest and reports/ minutes are untouched",
+                    meeting_config.get('session_id'))
+
     # --- Save meeting_minutes.json to reports/ path (alongside daily_report) ---
-    report_json_key = f"{REPORT_PREFIX}{target_date}/{user_for_path}/meeting_minutes.json"
-    s3_client.put_object(
-        Bucket=S3_BUCKET, Key=report_json_key,
-        Body=json.dumps(minutes, ensure_ascii=False, indent=2, default=str),
-        ContentType='application/json'
-    )
-    logger.info(f"Saved: {report_json_key}")
+    report_json_key = None
+    if not session_scoped:
+        report_json_key = f"{REPORT_PREFIX}{target_date}/{user_for_path}/meeting_minutes.json"
+        s3_client.put_object(
+            Bucket=S3_BUCKET, Key=report_json_key,
+            Body=json.dumps(minutes, ensure_ascii=False, indent=2, default=str),
+            ContentType='application/json'
+        )
+        logger.info(f"Saved: {report_json_key}")
 
     # --- Save Word doc to both paths ---
     try:
@@ -1160,45 +1184,48 @@ def generate_meeting_minutes(meeting_config):
                 Body=word_buffer.getvalue(),
                 ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
             )
-            # Reports/ path copy
-            word_buffer.seek(0)
-            report_word_key = f"{REPORT_PREFIX}{target_date}/{user_for_path}/meeting_minutes.docx"
-            s3_client.put_object(
-                Bucket=S3_BUCKET, Key=report_word_key,
-                Body=word_buffer.getvalue(),
-                ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-            )
-            logger.info(f"Saved: {report_word_key}")
+            # Reports/ path copy -- a day-level object, see session_scoped above
+            if not session_scoped:
+                word_buffer.seek(0)
+                report_word_key = f"{REPORT_PREFIX}{target_date}/{user_for_path}/meeting_minutes.docx"
+                s3_client.put_object(
+                    Bucket=S3_BUCKET, Key=report_word_key,
+                    Body=word_buffer.getvalue(),
+                    ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                )
+                logger.info(f"Saved: {report_word_key}")
     except Exception as e:
         logger.error(f"Word generation failed: {e}")
 
     # --- Compat: write daily_report.json format for frontend backward compat ---
     compat_key = None
-    try:
-        compat_report, _ = convert_to_daily_report_format(
-            minutes, meeting_config, transcripts
-        )
-        compat_key = f"{REPORT_PREFIX}{target_date}/{user_for_path}/daily_report.json"
-        s3_client.put_object(
-            Bucket=S3_BUCKET, Key=compat_key,
-            Body=json.dumps(compat_report, ensure_ascii=False, indent=2, default=str),
-            ContentType='application/json'
-        )
-        logger.info(f"Saved compat report: {compat_key}")
-    except Exception as e:
-        logger.error(f"Compat report save failed: {e}")
+    if not session_scoped:
+        try:
+            compat_report, _ = convert_to_daily_report_format(
+                minutes, meeting_config, transcripts
+            )
+            compat_key = f"{REPORT_PREFIX}{target_date}/{user_for_path}/daily_report.json"
+            s3_client.put_object(
+                Bucket=S3_BUCKET, Key=compat_key,
+                Body=json.dumps(compat_report, ensure_ascii=False, indent=2, default=str),
+                ContentType='application/json'
+            )
+            logger.info(f"Saved compat report: {compat_key}")
+        except Exception as e:
+            logger.error(f"Compat report save failed: {e}")
 
     # --- Write meeting manifest (marks transcripts as consumed) ---
     manifest_key = None
-    try:
-        consumed_keys = [t.get('key', '') for t in transcripts if t.get('key')]
-        manifest_key = write_meeting_manifest(
-            s3_client, S3_BUCKET, REPORT_PREFIX, target_date,
-            user_for_path, consumed_keys, meeting_title=meeting_title,
-        )
-        logger.info(f"Saved manifest: {manifest_key} ({len(consumed_keys)} keys)")
-    except Exception as e:
-        logger.error(f"Manifest write failed: {e}")
+    if not session_scoped:
+        try:
+            consumed_keys = [t.get('key', '') for t in transcripts if t.get('key')]
+            manifest_key = write_meeting_manifest(
+                s3_client, S3_BUCKET, REPORT_PREFIX, target_date,
+                user_for_path, consumed_keys, meeting_title=meeting_title,
+            )
+            logger.info(f"Saved manifest: {manifest_key} ({len(consumed_keys)} keys)")
+        except Exception as e:
+            logger.error(f"Manifest write failed: {e}")
 
     return {
         'status': 'success',
