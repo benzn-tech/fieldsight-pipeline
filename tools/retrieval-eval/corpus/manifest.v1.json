@@ -1,18 +1,14 @@
 {
  "version": "v1",
- "description": "Frozen source transcripts for the retrieval evaluation. Hashes are of the exact bytes prod stored.",
+ "description": "Source transcripts the v1 questions were written against, pinned by the exact bytes prod stored. Read in place; no copy is kept.",
  "owner_folder": "Ben_UCPK2",
  "source_bucket": "fieldsight-data-509194952652",
- "lifecycle_warning": "Bucket rule DeleteOldTranscripts expires transcripts/ 90 days after creation. The frozen copy must live outside that prefix.",
- "frozen_copy": null,
  "days": [
   {
    "date": "2026-09-02",
    "file_count": 46,
    "bytes": 2249313,
    "corpus_sha256": "d875ade9d3275d268924be3d889c4cc170c5a3934649107020546e4463623419",
-   "source_expires_from": "2026-11-30",
-   "source_expires_by": "2026-12-01",
    "files": [
     {
      "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_10-55-18_sid81a64d850bb34d8bbf01ec11fd2af02f_c0001_off0.0_to5.0_srcwav.json",
@@ -297,8 +293,6 @@
    "file_count": 229,
    "bytes": 10449139,
    "corpus_sha256": "9691febc912f350ea04c2ea0159b125bdb915fc0a66f93f4ad2c2fed89ec3697",
-   "source_expires_from": "2026-12-08",
-   "source_expires_by": "2026-12-09",
    "files": [
     {
      "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-19-01_sidd22615c636eb472d92759eb00938e2e6_c0000_bn2_off0.0_to58.0_srcwav.json",
@@ -1676,5 +1670,6 @@
     }
    ]
   }
- ]
+ ],
+ "retention": "Prod bucket lifecycle rule DeleteOldTranscripts (90-day expiry on transcripts/) was removed on 2026-09-15; these files no longer expire."
 }

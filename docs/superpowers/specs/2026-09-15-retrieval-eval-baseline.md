@@ -87,11 +87,12 @@ loss caused by retrieval.
 
 ## Open decisions
 
-1. **Where the frozen corpus lives.** It must sit outside `transcripts/` before 2026-11-30.
-   The bucket has versioning enabled and no object lock.
-2. **How it honours deletion.** The corpus is real site speech, including people other than
-   the device owner. A frozen copy must not survive a customer's deletion request, so it
-   either registers with the deletion flow or is covered by explicit consent.
+1. ~~Where the frozen corpus lives.~~ Resolved 2026-09-15 without a copy: the owner
+   removed the prod bucket's hand-made `DeleteOldTranscripts` rule (90-day expiry on
+   `transcripts/`, found in no template or script, first deletions due ~2026-09-22). The
+   corpus is the original files, pinned by the manifest's sha256.
+2. ~~How a copy honours deletion.~~ No copy exists, so there is nothing extra to delete;
+   the originals follow the product's deletion behaviour like any other transcript.
 3. ~~Who confirms the gold set.~~ Confirmed by the owner on 2026-09-15 and published as
    `gold/v1.jsonl` (45 items). Result files dated earlier that day name
    `gold/v1.draft.jsonl` when it held 20, 40 or 45 items; every item in them is the

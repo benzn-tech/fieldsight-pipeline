@@ -70,7 +70,12 @@ aggregation step, not by retrieval. That distinction is the point of reporting a
 
 ## The corpus
 
-The source transcripts sit under `transcripts/`, which a bucket lifecycle rule deletes
-90 days after creation. `manifest.v1.json` records each file's expiry window. The frozen
-copy it describes is not made yet — where it lives, and how it honours a customer's
-deletion request, is an open decision recorded in the spec.
+The source transcripts stay where the pipeline wrote them, under `transcripts/`.
+`manifest.v1.json` records each file's size and sha256, so a later run can prove it read
+the same words. No separate copy is kept.
+
+That rests on one bucket setting: until 2026-09-15 the prod bucket carried a hand-made
+lifecycle rule, `DeleteOldTranscripts`, that expired `transcripts/` after 90 days. The
+owner had it removed that day. If a rule like that ever comes back, this corpus — and
+every re-index of older days — starts disappearing without an error; check
+`aws s3api get-bucket-lifecycle-configuration` before trusting a run on old dates.
