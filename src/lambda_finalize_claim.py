@@ -113,6 +113,14 @@ def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_
     if row is None:
         return {"status": "noop", "sessionId": session_id}
     ctx = resolve_context(conn, row) or {}
+    if not ctx.get("folder"):
+        # Without a folder there is no final extraction and no rolling summary to
+        # read -- the session's content never reaches the website. This was
+        # silent, and 18 prod sessions lost their final pass to it (a login with
+        # no folder_name, 2026-09-11..15).
+        logger.warning("finalize: session %s has no recording folder (user %s has no "
+                       "folder_name) -- no final extraction requested",
+                       session_id, row.get("user_id"))
 
     # Requested BEFORE the recipient check on purpose: the final extraction is
     # what puts this session's content on the WEBSITE, which a recorder with no
@@ -702,6 +710,19 @@ def reconcile(conn, read_result):
         elif status == "error":
             meeting_session.mark_failed(conn, sid)
             out.append((sid, "failed"))
+        elif status == "skipped":
+            # The worker decided there is nothing to send -- today, a recording
+            # deleted before its email went out. It writes a result precisely so
+            # this pass can settle the session, but only sent/error were mapped,
+            # so the session sat in `finalizing` for good: never re-driven, never
+            # closed, and counted as in-flight by the group-merge quiet check.
+            # Settled as `sent` rather than `failed` because nothing failed and
+            # nothing should be retried; the reason is logged, since the status
+            # alone can no longer tell the two apart.
+            meeting_session.mark_sent(conn, sid)
+            logger.info("finalize: %s settled without an email (%s)",
+                        sid, res.get("reason") or "skipped")
+            out.append((sid, "skipped"))
     return out
 
 
