@@ -943,6 +943,120 @@ def _basis(result, chunks, requested_from, requested_to):
     }
 
 
+# ------------------------------------------------------------------
+# Scoped Ask (spec docs/superpowers/specs/2026-09-15-scoped-ask-design.md §4.2)
+# ------------------------------------------------------------------
+
+_SCOPE_AUTHOR_MAX = 200
+
+
+def _validate_scope(body):
+    """Validate the client's scope REQUEST. Pure; never raises.
+
+    Nothing malformed may reach rag-search: a non-uuid through `WHERE id=%s` or a
+    non-ISO date through `%(date_from)s::date` raises in Postgres, and a
+    rag-search raise surfaces as "Search service temporarily unavailable". A
+    malformed field is dropped as `invalid` and the request continues without it.
+    Absent (None or '') is not a request and is neither kept nor dropped.
+    """
+    import uuid as _uuid
+    from datetime import date as _date
+
+    req, dropped = {}, []
+    for field in ("topic_row_id", "site_id"):
+        raw = body.get(field)
+        if raw is None or raw == "":
+            continue
+        try:
+            if not isinstance(raw, str):
+                raise ValueError(field)
+            req[field] = str(_uuid.UUID(raw))
+        except (ValueError, TypeError, AttributeError):
+            dropped.append({"field": field, "reason": "invalid"})
+
+    raw = body.get("date")
+    if raw is not None and raw != "":
+        ok = (isinstance(raw, str) and len(raw) == 10 and raw[4] == "-" and raw[7] == "-")
+        if ok:
+            try:
+                _date.fromisoformat(raw)
+            except ValueError:
+                ok = False
+        if ok:
+            req["date"] = raw
+        else:
+            dropped.append({"field": "date", "reason": "invalid"})
+
+    raw = body.get("author_folder")
+    if raw is not None and raw != "":
+        folder = raw.strip() if isinstance(raw, str) else ""
+        if folder and len(folder) <= _SCOPE_AUTHOR_MAX:
+            req["author_folder"] = folder
+        else:
+            dropped.append({"field": "author_folder", "reason": "invalid"})
+    return req, dropped
+
+
+def _scope_range(scope_req, q_from, q_to):
+    """The range rag-search is sent, per the spec §4.2 precedence table.
+
+    A requested topic sends the body `date..date` when there is one, and otherwise
+    no range. rag-search replaces it with the topic's own day when the topic is
+    visible, and keeps it when it is not (no retry). Widening is only ever for a
+    range the QUESTION named: a day someone picked, or a topic's day, is exactly
+    that day.
+    """
+    has_q = bool(q_from or q_to)
+    body_date = scope_req.get("date")
+    dropped = []
+    if "topic_row_id" in scope_req:
+        if has_q:
+            dropped.append({"field": "question_range", "reason": "overridden_by_topic"})
+        if body_date:
+            return {"from": body_date, "to": body_date, "widen": False,
+                    "dropped": dropped, "body_date_sent": True}
+        return {"from": None, "to": None, "widen": False,
+                "dropped": dropped, "body_date_sent": False}
+    if has_q:
+        if body_date:
+            dropped.append({"field": "date", "reason": "overridden_by_question"})
+        return {"from": q_from, "to": q_to, "widen": True,
+                "dropped": dropped, "body_date_sent": False}
+    if body_date:
+        return {"from": body_date, "to": body_date, "widen": False,
+                "dropped": dropped, "body_date_sent": True}
+    return {"from": None, "to": None, "widen": False, "dropped": dropped,
+            "body_date_sent": False}
+
+
+def _applied_scope(result, scope_req, plan, scope_dropped):
+    """What the answer was really scoped to: rag-search's `applied` plus this
+    hop's own drops. Only enforced fields appear as keys. COMPUTED, never phrased
+    by a model, for the same reason `basis` is. A rag-search that predates
+    `applied` yields no site/author/topic keys, so the UI shows "not scoped"
+    instead of echoing the request.
+    """
+    result = result or {}
+    applied = result.get("applied") or {}
+    out = {}
+    for key in ("site_id", "author_folder", "topic_row_id", "topic_title"):
+        if applied.get(key):
+            out[key] = applied[key]
+    dropped = list(scope_dropped)
+    pinned = result.get("pinned_topic")
+    if pinned and pinned.get("report_date"):
+        out["date"] = str(pinned["report_date"])
+        if scope_req.get("date") and scope_req["date"] != out["date"]:
+            dropped.append({"field": "date", "reason": "overridden_by_topic"})
+    elif plan.get("body_date_sent"):
+        out["date"] = scope_req["date"]
+    for d in applied.get("dropped") or []:
+        if d not in dropped:
+            dropped.append(d)
+    out["dropped"] = dropped
+    return out
+
+
 def _metric_answer(caller_sub, question, metric, date_from, date_to):
     """A counting question, answered from SQL and written by a template.
 
