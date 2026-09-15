@@ -5,7 +5,7 @@ through the same scope core as a meeting report. Spec 2026-09-15 §5.1, §5.2.
 """
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -207,10 +207,10 @@ def test_a_chunk_session_orders_by_its_db_start_not_insertion_order(day):
     mp.setattr(org.meeting_session, "get", lambda conn, sid: {
         # 2026-07-25T00:30 UTC -> 12:30 NZ (July = NZST, UTC+12) -- BEFORE the
         # legacy S1300 session's parsed 13:00:11 start. `_chunk_session_start`
-        # reads this real column shape: a naive/aware datetime (psycopg
-        # timestamptz), not a string, and converts UTC -> NZ itself.
-        "opened_at": datetime(2026, 7, 25, 0, 30),
-        "closed_at": datetime(2026, 7, 25, 0, 45),
+        # reads this real column shape: psycopg returns timestamptz as an
+        # AWARE datetime, not a string, and converts UTC -> NZ itself.
+        "opened_at": datetime(2026, 7, 25, 0, 30, tzinfo=timezone.utc),
+        "closed_at": datetime(2026, 7, 25, 0, 45, tzinfo=timezone.utc),
     })
     rows = ROWS + [_row(id="t-chunk", source_s3_key=KEY_CHUNK,
                         title="Chunk session topic", time_range="12:30 – 12:45")]
