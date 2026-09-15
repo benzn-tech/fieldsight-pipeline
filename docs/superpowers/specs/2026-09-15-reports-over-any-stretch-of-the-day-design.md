@@ -419,22 +419,27 @@ Designed now, not built until the schema-constraint testing has a result.
 
 ## 9. Order
 
-Starts from predecessor §8.10.
+Revised after the §11 review. Each step names the findings it absorbs.
 
 1. ~~Joiners find and report on their meeting; shared `_day_report_rows`~~ — done, #836.
-2. Worker and status learn `scope` / `sessionIds`; keys under `day/`; deletion
-   check over every id. **Must land before any day generate route.**
-3. `_assemble_report` core; day preview/generate/status routes with title,
-   sites and ordering rules.
-4. Frontend `scope`; "All day" opens the modal; `worker` gets `report:create:self`.
-5. Generation step: transcripts IAM, model env, built-in template, clipping,
-   fingerprint, empty-content handling; timeout measured on a worn day.
-6. Recording blocks: migration, function, EventBridge rule, the two parameters
-   and their guard test, `recording_blocks` in `GET /sessions`, two-level picker.
-7. (Later phase) Template storage and versioning, §6.
+2. **Session routes refuse an id that is not a session base** (F2). Must land before
+   anything writes under a `day/` key segment, or the existing status route serves day
+   results with no per-session deletion check.
+3. Worker and status learn `scope` / `sessionIds`; keys under `day/`; deletion check over
+   every id and over the mirror of **every folder present in the rows**, not only the
+   requester's (F7). Day status refuses `done` when any member is tombstoned.
+4. `_assemble_report` core and day preview/generate/status routes, applying **both**
+   deletion arms — topic-id tombstones and source-prefix tombstones — for every folder the
+   rows come from (§11.2).
+5. Frontend `scope`; "All day" opens the modal; `worker` gets `report:create:self`, with the
+   two `/reports` gates scoped to `crew` in the same change (F5).
+6. Generation step (§5.3 as amended by F3; footer renderer change, F8).
+7. Recording blocks (§5.4 as amended by F1, F4, F9).
+8. (Later phase) Template storage and versioning, §6.
 
-Steps 2–4 change no output a customer sees until 4 ships. Step 5 is the first
-that produces new text and should go to TEST behind its own flag.
+Steps 2–5 are implementation plan 1
+(`docs/superpowers/plans/2026-09-15-day-scoped-reports-foundation.md`). Steps 6 and 7 get
+their own plans once step 5 is on TEST.
 
 ## 10. Open questions
 
@@ -446,3 +451,47 @@ that produces new text and should go to TEST behind its own flag.
   another user and another device type before treating them as settled.
 - When a day counts as "done" for blocks: currently never — each new transcript
   recomputes. Acceptable while computation is one LIST; revisit if it is not.
+
+---
+
+## 11. Review — Fable, 2026-09-15 (adopted)
+
+Reviewed against `fieldsight-pipeline` `origin/develop` 06a9837, `fieldsight-ui` `origin/dev`
+9a720e7 and prod (read-only). Verdict: pass with changes. The owner reviewed the findings
+and asked for planning to start. Every finding below is adopted; where a finding changes an
+earlier section, **this section wins**.
+
+### 11.1 Findings and dispositions
+
+| ID | Severity | Finding | Disposition |
+|---|---|---|---|
+| F1 | MAJOR | Blocks derived from S3 names re-advertise deleted recordings and wholly-personal sessions in the picker | §5.4: the row stores each block's member session ids; `GET /sessions` filters at **read** time against tombstones and the all-excluded rule of `build_day_sessions` |
+| F2 | MAJOR | `GET /sessions/day/report/status` resolves to the day result key; the route validates no id shape and checks removal only for the literal `day` | New §9 step 2: every `/sessions/{id}/…` route refuses an id that is not a session base. Verified in code during planning: the route regexes are `([^/]+)` and the result key is built from the path segment |
+| F3 | MAJOR | `time_range` is minute-precision; batched transcript objects need the embedded batch map to place a turn; a merged (`grp`) topic's clock is another device's | §5.3: clip with the media readers' `MEDIA_WINDOW_BUFFER_SEC` widening (over-clip); place turns with `assemble_session_turns`, never filename arithmetic; any excluded topic in a `grp` session makes that session unplaceable |
+| F4 | MAJOR | "Skip if computed < 90 s ago" loses the last transcripts of every day; read-then-write races | §5.4: debounce — mark the day dirty and recompute on a trailing pass; upsert monotonic on source object count; set `ReservedConcurrentExecutions` |
+| F5 | MINOR | `report:create:self` for workers also unlocks the `/reports` Generate/Regenerate controls (`reports.js`, two unscoped gates) | §9 step 5 scopes both gates to `crew`. Verified: `scripts/roles.js` is loaded by no page; `fs-globals.js` is authoritative. Live role mapping is `me.global_role` passed through unchanged, which closes the first §10 question |
+| F6 | MINOR | Session ordering converts starts to NZ time, so "no timezone conversion anywhere" is untrue | §5.1 reads: no conversion of topic or window times; session ordering uses NZ-converted starts, consistent while every device runs in Pacific/Auckland |
+| F7 | MINOR | Generated `.docx` survives a later delete; a joiner's merged rows are tombstoned in the lead's mirror, not the requester's | §9 step 3: check every folder's mirror; day status refuses `done` when a member is tombstoned. The surviving `.docx` is recorded in §7 as an existing hole this widens |
+| F8 | MINOR | Stale counts; deploy-role simulation must pass resource ARNs; the footer needs a renderer change | §3.3 counts below; §5.4 and §7 read "`simulate-principal-policy` **with resource ARNs**"; §5.6 footer is a `generate_word_document` change |
+| F9 | MINOR | Changing a threshold never reaches a finished day | §5.4/§5.5: the row stores **segments**, not blocks; org-api merges at read with the configured thresholds. org-api becomes the single reader of both parameters |
+| F10 | MINOR | A whole-block window includes audio no topic covers, and that audio has no work/non-work class | Open question for the generation plan (§10). Not decided here: excluding it drops exactly the untopic'd audio §4.1 wanted covered |
+
+### 11.2 Found while planning
+
+The session route today applies only the **topic** arm of deletion (`redactions.list_active_for_topics`).
+`deleted_predicates.py` states both arms are required: the nightly ingest re-creates a day's
+topics with new uuids that no topic tombstone names, so a topic-only filter lets deleted
+content back in the next morning. Day assembly (§9 step 4) applies both arms, taking source
+prefixes from `redactions.deleted_source_prefixes` for every folder parsed out of the rows'
+`source_s3_key` (the lead's folder included). Prod recording tombstones have the shape
+`extractions/{folder}/{date}/sid{32hex}` and match by prefix.
+
+### 11.3 Corrected facts
+
+- §3.3: prod now has 475 topics — 393 parseable `time_range`, 80 empty, 2 corrupted;
+  `occurred_at` NULL on all 475. **All 80 empty rows are `reports/`-sourced** and never reach
+  a session picker. **0 of 45 non_work and 0 of 28 active topic redactions are
+  unplaceable**, so §5.3's fail-closed drop currently triggers on no prod session.
+- §3.5: over the 30 days to 2026-09-15, 26 of 57 closed sessions were idle-closed, and 30 of
+  57 ended `failed` — unrelated to this design, noted for whoever measures email latency.
+
