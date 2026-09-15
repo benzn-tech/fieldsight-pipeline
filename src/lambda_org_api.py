@@ -375,6 +375,36 @@ def lambda_handler(event, context):
         return error("internal error", 500)
 
 
+def get_app_latest():
+    """GET /api/org/app/latest -- the newest published app build for this stage (in-app updates).
+
+    Signed-in, provisioned callers only: dispatched after the caller guard, by the owner's choice
+    that a download link is never handed to a device nobody has signed in on.
+
+    No manifest yet is an ordinary answer, `{available: false}`. Any OTHER failure to read it --
+    AccessDenied included -- is a 503 and an ERROR log, never "no update": swallowed, it would tell
+    every device it is up to date, silently and indefinitely. This repo has shipped that exact shape
+    before (`except ClientError: pass` turning a 403 into an empty 200).
+    """
+    import app_release
+    try:
+        raw = s3().get_object(Bucket=S3_BUCKET, Key=app_release.MANIFEST_KEY)["Body"].read()
+    except ClientError as e:
+        code = (e.response.get("Error") or {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return ok({"available": False})
+        logger.error("app-release manifest unreadable (%s) at s3://%s/%s: %s",
+                     code, S3_BUCKET, app_release.MANIFEST_KEY, e)
+        return error("update manifest unreadable", 503)
+    manifest = app_release.parse_manifest(raw)
+    return ok(app_release.response_for(
+        manifest,
+        lambda key: s3().generate_presigned_url(
+            "get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=PRESIGNED_URL_EXPIRY),
+        PRESIGNED_URL_EXPIRY,
+    ))
+
+
 def dispatch(conn, event, method, route):
     claims = (event.get("requestContext", {}) or {}).get("authorizer", {}).get("claims", {})
     sub = claims.get("sub", "")
@@ -397,6 +427,10 @@ def dispatch(conn, event, method, route):
         return error("caller has no company", 403)
     if caller.get("archived_at") is not None and not (route == "/me" and method == "GET"):
         return error("account archived", 403)
+
+    # In-app updates. After the caller guard on purpose -- signed-in, provisioned devices only.
+    if route == "/app/latest" and method == "GET":
+        return get_app_latest()
 
     if route == "/me":
         if method == "GET":
@@ -6205,12 +6239,19 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             # This serializer is a fixed allowlist, so it dropped both fields on
             # the way out while every repository-level test stayed green. Found
             # only by invoking the deployed function and reading the JSON. Any
-            # future field the collapse adds has to be added here too.
+            # future field the collapse or the day reads add (edit_count -> version)
+            # has to be added here too.
             "action_items": [{"id": str(a["id"]), "action": a["text"], "responsible": a["responsible"],
                               "deadline": a["deadline_text"] or (str(a["deadline"]) if a["deadline"] else None),
                               "priority": a["priority"], "status": a["status"],
                               "mention_count": a.get("mention_count", 1),
                               "collapsed_ids": [str(x) for x in (a.get("collapsed_ids") or [])],
+                              # 1 + content_edits rows for this item (todo-card spec 3.4).
+                              # edit_count is stamped by the two day reads in
+                              # repositories/topics.py; get_topic_full (reindex) does not
+                              # count, so its rows are v1. The session-report preview reads
+                              # through list_topics_for_source_prefix and carries the count.
+                              "version": 1 + int(a.get("edit_count") or 0),
                               } for a in t["action_items"]],
             # The subject this topic belongs to, when a human has confirmed
             # one. FACTS ONLY -- how many days it was raised on, when last,
@@ -7687,6 +7728,7 @@ def _read_org_report_history(folder_scope, limit):
     than 404, so the failure would not even read as "missing"."""
     reports = []
     docx_sizes = {}
+    docx_times = {}
     try:
         paginator = s3().get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=LAKE_BUCKET, Prefix=REPORT_LAKE_PREFIX):
@@ -7694,6 +7736,7 @@ def _read_org_report_history(folder_scope, limit):
                 key = obj["Key"]
                 if key.endswith("_report.docx"):
                     docx_sizes[key] = obj["Size"]
+                    docx_times[key] = obj["LastModified"].isoformat()
                     continue
                 if not key.endswith("_report.json") or "_debug" in key:
                     continue
@@ -7726,6 +7769,12 @@ def _read_org_report_history(folder_scope, limit):
         if cand in docx_sizes:
             r["docx_key"] = cand
             r["docx_size"] = docx_sizes[cand]
+            # When the Word file itself was written. The generator saves the JSON
+            # first and the .docx after it, so a client following a regenerate
+            # that looks only at generated_at can stop between the two and show
+            # a new report beside the previous Word file. Same listing pass, no
+            # extra request.
+            r["docx_generated_at"] = docx_times[cand]
 
     reports.sort(key=lambda r: r["date"], reverse=True)
     return {"reports": reports[:limit]}

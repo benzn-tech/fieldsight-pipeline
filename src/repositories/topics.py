@@ -356,6 +356,32 @@ _TOPIC_COLS_JOINED = (
 )
 
 
+# One count per day read, over the action items that survived the collapse.
+# `version = 1 + edit_count` is what Today's to-do chip shows (todo-card spec
+# §3.4), and it has to agree with GET /content/action_items/{id}/history, which
+# lists content_edits by row_id -- so collapsed_ids are NOT counted, and there is
+# no company predicate: every writer stamps the row's own company and history
+# filters on the row's company, so the unscoped count is the same number.
+# `::uuid[]` is required: the ids are passed as str, and uuid = text has no
+# operator. Served by idx_content_edits_row (migration 0019).
+_EDIT_COUNT_SQL = (
+    "SELECT row_id, count(*) AS n FROM content_edits "
+    "WHERE table_name = 'action_items' AND row_id = ANY(%s::uuid[]) "
+    "GROUP BY row_id"
+)
+
+
+def _stamp_edit_counts(conn, items):
+    if not items:
+        return items
+    ids = [str(a["id"]) for a in items]
+    counts = {str(r["row_id"]): int(r["n"]) for r in conn.cursor(row_factory=dict_row)
+              .execute(_EDIT_COUNT_SQL, (ids,)).fetchall()}
+    for a in items:
+        a["edit_count"] = counts.get(str(a["id"]), 0)
+    return items
+
+
 def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
                          merged_keys=None) -> list[dict]:
     """Dashboard multi-site read for one report_date: topics scoped to
@@ -482,7 +508,7 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
     # implementation a first reading reaches for. The survivor keeps its own
     # topic_id and lands on its own topic; the rows it stands for simply do not
     # appear. Off unless ENABLE_TODO_COLLAPSE says otherwise.
-    for a in todo_collapse.collapse_if_enabled(_all_items):
+    for a in _stamp_edit_counts(conn, todo_collapse.collapse_if_enabled(_all_items)):
         action_items_by_topic.setdefault(a["topic_id"], []).append(a)
 
     safety_by_topic = {}
@@ -729,7 +755,7 @@ def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None) -> l
     # Same collapse as list_topics_for_date, and for the same reason: this is
     # the authority-flip timeline shim, i.e. the read path a prod customer's
     # Today and Timeline actually go through.
-    for a in todo_collapse.collapse_if_enabled(_all_items):
+    for a in _stamp_edit_counts(conn, todo_collapse.collapse_if_enabled(_all_items)):
         action_items_by_topic.setdefault(a["topic_id"], []).append(a)
 
     safety_by_topic = {}
