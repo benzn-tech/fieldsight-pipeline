@@ -132,13 +132,14 @@ import device_heartbeat
 import device_status
 import nz_time
 import reindex
+import recording_blocks
 import report_sections
 import session_scope
 import sweep_state
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
-from repositories import location_markers
+from repositories import day_recording_segments, location_markers
 from repositories import (action_items, aliases, chunks, classification_feedback, companies,
                           findings, speaker_label_groups,
                           compliance_resolutions, content, content_edits, keyframes,
@@ -7102,6 +7103,77 @@ def build_day_sessions(conn, caller, folder, date, rows):
     return sessions, excluded
 
 
+def _block_thresholds():
+    """(gap_seconds, long_block_seconds) for recording blocks.
+
+    Read per request rather than at import: org-api is the single reader of both
+    (design 2026-09-15 §5.5 as amended by F9). The defaults must equal the template's,
+    which test_template_workflow_parameter_wiring pins.
+    """
+    return (float(os.environ.get("REPORT_BLOCK_GAP_SECONDS", "600")),
+            float(os.environ.get("REPORT_LONG_BLOCK_SECONDS", "5400")))
+
+
+def _recording_blocks_entry(conn, folder, date, rows, sessions):
+    """{"recording_blocks": [...]} for the sessions envelope, or {} when there is no answer.
+
+    {} -- so the key is ABSENT, not empty -- when the folder has no users row or the day
+    has never been computed. The UI renders sessions then and never waits.
+
+    The owner is resolved with users.get_by_folder_name_global, the same lookup the
+    writer (lambda_recording_segments) keys the row with, so the two always agree. The
+    folder is already authorised by _resolve_org_media_folder before this runs.
+    _timeline_target_id is NOT used: it falls back to the CALLER on a miss, which here
+    would serve the caller's own blocks under someone else's day.
+
+    F1, applied at read time on the stored segments:
+      * a session that has topic rows but none survived build_day_sessions (all
+        redacted or non_work) is not advertised. A session with audio and no topic rows
+        at all -- extraction pending, or nothing extracted -- is kept: that untopic'd
+        audio is what a whole-block window exists to cover (design §4.1);
+      * a recording tombstoned by source prefix is not advertised;
+      * every device session of a deleted MERGED meeting is not advertised. That delete
+        writes one tombstone, `extractions/{lead_folder}/{date}/grp{lead_sid}`, which names
+        none of the device sids stored here and, for a member, not even this folder, so
+        the folder-narrowed prefix arm can never see it. It is expanded to the member
+        sessions it covers (day_recording_segments.deleted_group_session_ids).
+    topic_row_ids only name topics that survived build_day_sessions.
+
+    Any failure logs and returns {}: blocks are an enhancement to a picker that works
+    without them, and must never 500 the sessions read.
+    """
+    try:
+        owner = users.get_by_folder_name_global(conn, folder)
+        if owner is None:
+            return {}
+        stored = day_recording_segments.get(conn, owner["id"], date)
+        if stored is None:
+            return {}
+        listed = {session_scope.device_session_id(s["session_id"]) for s in sessions}
+        with_topics = set()
+        for r in rows:
+            base, kind = session_scope.session_ref(r.get("source_s3_key"))
+            if kind == session_scope.KIND_EXTRACTION:
+                with_topics.add(session_scope.device_session_id(base))
+        excluded = (with_topics - listed) - {None}
+        excluded |= day_recording_segments.deleted_group_session_ids(
+            conn, [s.get("session_id") for s in stored["segments"]])
+        kept = recording_blocks.filter_segments(
+            stored["segments"], excluded,
+            redactions.deleted_source_prefixes(conn, folder, date))
+        gap_seconds, long_block_seconds = _block_thresholds()
+        visible_ids = {tid for s in sessions for tid in s["topic_row_ids"]}
+        topic_rows = [r for r in rows if str(r["id"]) in visible_ids]
+        blocks = recording_blocks.merge_segments(kept, gap_seconds, long_block_seconds)
+        for block in blocks:
+            block["topic_row_ids"] = recording_blocks.topic_ids_in_block(block, topic_rows)
+        return {"recording_blocks": blocks}
+    except Exception:
+        logger.exception("recording blocks unavailable for %s %s; serving sessions without them",
+                         folder, date)
+        return {}
+
+
 def get_org_sessions(conn, caller, event):
     """GET /api/org/sessions?date=YYYY-MM-DD[&user={folder}]
 
@@ -7141,6 +7213,7 @@ def get_org_sessions(conn, caller, event):
         "gap_minutes": session_scope.SESSION_GAP_MINUTES,
         "sessions": sessions,
         "excluded": excluded,
+        **_recording_blocks_entry(conn, folder, date, rows, sessions),
     })
 
 

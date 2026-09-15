@@ -1071,3 +1071,17 @@ def test_recording_blocks_default_off_on_prod_and_on_on_test():
         assert len(line) == 1, f"{env_name}: expected one line, found {len(line)}"
         assert fallback in line[0], (
             f"{env_name} must fall back to {fallback} for EnableRecordingBlocks")
+
+
+def test_the_block_code_defaults_match_the_template_defaults():
+    """When they disagree the environment wins silently, and the number in the source
+    reads like the one in force -- the same hazard as the evidence tunables above."""
+    tpl = open(TEMPLATE, encoding="utf-8").read()
+    src = open(os.path.join(REPO, "src", "lambda_org_api.py"), encoding="utf-8").read()
+    for env, (param, _) in _BLOCK_TUNABLES.items():
+        block = re.search(rf"\n  {param}:\n(.*?)(?=\n  \w+:\n)", tpl, re.S).group(1)
+        tpl_default = re.search(r"Default:\s*'([^']+)'", block).group(1)
+        code_default = re.search(
+            rf"os\.environ\.get\([\"']{env}[\"'],\s*[\"']([^\"']+)[\"']\)", src).group(1)
+        assert float(tpl_default) == float(code_default), (
+            f"{env}: template default {tpl_default!r} != code default {code_default!r}")
