@@ -170,11 +170,97 @@ def test_an_invisible_topic_is_dropped_and_search_keeps_the_other_narrowing(wire
 
 
 def test_hidden_and_unknown_topics_produce_the_same_response(wired):
+    """Proves the HANDLER does not branch on the id -- both cases are stubbed to
+    the same None from get_topic_visible, so this can only show the two inputs
+    are routed identically here, not that a hidden and an unknown topic are
+    actually indistinguishable in the real query. That equality is proved on a
+    real DB by tests/integration/test_get_topic_visible.py."""
     wire_search(wired, rows=[ROW])
     wire_topic(wired, None)
     hidden = rag.lambda_handler(event(topic_row_id=TOPIC_ID), None)
     unknown = rag.lambda_handler(event(topic_row_id="00000000-0000-4000-8000-000000000000"), None)
     assert hidden == unknown
+
+
+# -- spec §5 tests 4-6: author narrowing --------------------------------------
+
+def test_an_author_outside_the_callers_company_matches_nothing(wired):
+    seen = {}
+
+    def lookup(conn, company_id, folder):
+        seen["company"], seen["folder"] = company_id, folder
+        return None
+
+    wired.setattr(rag.users, "get_by_folder_name", lookup)
+    wired.setattr(rag.users, "get_by_folder_name_global", boom)
+    wired.setattr(rag.chunks, "search_chunks", boom)            # never the full set
+
+    out = rag.lambda_handler(event(author="Other_Co_Worker"), None)
+
+    assert seen == {"company": "c-1", "folder": "Other_Co_Worker"}
+    assert out["chunks"] == []
+    assert out["applied"]["dropped"] == [{"field": "author_folder", "reason": "not_visible"}]
+    assert "author_folder" not in out["applied"]
+
+
+def test_an_unrestricted_caller_is_narrowed_to_the_named_author(wired):
+    set_scope(wired, sites={"s-1"}, authors=None)
+    wired.setattr(rag.users, "get_by_folder_name", lambda conn, cid, folder: {"id": "u-9"})
+    calls = wire_search(wired, rows=[ROW])
+
+    out = rag.lambda_handler(event(author="Ben_UCPK2"), None)
+
+    assert calls[0]["author_ids"] == ["u-9"]
+    assert out["applied"] == {"author_folder": "Ben_UCPK2", "dropped": []}
+
+
+def test_an_author_outside_the_callers_author_set_matches_nothing(wired):
+    """A site_manager (SELF+WORKERS) naming a pm must get nothing, not the pm."""
+    set_scope(wired, sites={"s-1"}, authors={"u-1", "u-2"})
+    wired.setattr(rag.users, "get_by_folder_name", lambda conn, cid, folder: {"id": "u-9"})
+    wired.setattr(rag.chunks, "search_chunks", boom)
+
+    out = rag.lambda_handler(event(author="The_PM"), None)
+
+    assert out["chunks"] == []
+    assert out["applied"]["dropped"] == [{"field": "author_folder", "reason": "not_visible"}]
+
+
+def test_an_author_inside_the_author_set_is_narrowed_to(wired):
+    set_scope(wired, sites={"s-1"}, authors={"u-1", "u-9"})
+    wired.setattr(rag.users, "get_by_folder_name", lambda conn, cid, folder: {"id": "u-9"})
+    calls = wire_search(wired, rows=[ROW])
+
+    rag.lambda_handler(event(author="A_Worker"), None)
+
+    assert calls[0]["author_ids"] == ["u-9"]
+
+
+def test_a_cross_company_caller_resolves_the_folder_globally(wired):
+    set_scope(wired, sites={"s-1"}, authors=None, cross_company=True)
+    wired.setattr(rag.users, "get_by_folder_name", boom)
+    wired.setattr(rag.users, "get_by_folder_name_global", lambda conn, folder: {"id": "u-9"})
+    calls = wire_search(wired, rows=[ROW])
+
+    rag.lambda_handler(event(author="Ben_UCPK2"), None)
+
+    assert calls[0]["author_ids"] == ["u-9"]
+
+
+# -- site ----------------------------------------------------------------------
+
+def test_a_site_in_reach_is_reported_as_applied(wired):
+    calls = wire_search(wired, rows=[ROW])
+    out = rag.lambda_handler(event(site="s-1"), None)
+    assert calls[0]["site_ids"] == ["s-1"]
+    assert out["applied"] == {"site_id": "s-1", "dropped": []}
+
+
+def test_a_site_out_of_reach_is_not_visible_and_matches_nothing(wired):
+    wired.setattr(rag.chunks, "search_chunks", boom)
+    out = rag.lambda_handler(event(site="5c0e8d7a-1111-4222-8333-444455556666"), None)
+    assert out["chunks"] == []
+    assert out["applied"]["dropped"] == [{"field": "site_id", "reason": "not_visible"}]
 
 
 def test_every_return_carries_applied(wired):

@@ -298,6 +298,7 @@ def _search(event, context):
                             "site_id": site_ids[0], "date": date_from})
         else:
             applied["dropped"].append({"field": "topic_row_id", "reason": "not_visible"})
+            logger.info("rag-search: topic_row_id not visible to caller")
 
     # Project-scoped search: `site_filter` is normally the site UUID (what the
     # UI's top-bar selector actually sends), so check it against the caller's
@@ -314,6 +315,28 @@ def _search(event, context):
             matched = sites.get_company_site_by_slug(conn, caller["company_id"], site_filter)
             matched_id = matched["id"] if matched else None
             site_ids = [s for s in site_ids if str(s) == str(matched_id)]
+
+        if site_ids:
+            applied["site_id"] = str(site_ids[0])
+        else:
+            applied["dropped"].append({"field": "site_id", "reason": "not_visible"})
+
+    # A named author narrows INSIDE the ACL and never falls back to the
+    # unnarrowed set: unresolved, or outside author_ids, means no rows. Company-
+    # pinned lookup unless the caller is cross-company (users.py:69-82).
+    if author_filter:
+        if sc.get("cross_company"):
+            target = users.get_by_folder_name_global(conn, author_filter)
+        else:
+            target = users.get_by_folder_name(conn, caller["company_id"], author_filter)
+        target_id = str(target["id"]) if target else None
+        if target_id and (author_ids is None or target_id in author_ids):
+            author_ids = [target_id]
+            applied["author_folder"] = author_filter
+        else:
+            applied["dropped"].append({"field": "author_folder", "reason": "not_visible"})
+            return {"chunks": [], "site_count": len(site_ids), "basis": basis,
+                    "applied": applied}
 
     if not site_ids:
         return {"chunks": [], "site_count": 0, "basis": basis, "applied": applied}
