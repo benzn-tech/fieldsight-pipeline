@@ -81,6 +81,8 @@ def wired(monkeypatch):
     monkeypatch.setattr(org.users, "get_by_folder_name",
                         lambda conn, cid, folder: {"id": "u-2", "folder_name": folder})
     monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {})
+    monkeypatch.setattr(org.redactions, "deleted_source_prefixes",
+                        lambda conn, folder=None, date=None: [])
     monkeypatch.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
     # No recordings row by default -> the RealPTT/worker-device common case,
     # where `ended_at` can only come from the LLM's time_range (design §3.2).
@@ -306,6 +308,20 @@ def test_preview_excludes_redacted_and_non_work(wired):
                   lambda conn, ids: {"t-removed": {"id": "r-1"}})
     b = body_of(_preview(SESSION_1300, PREVIEW_PARAMS))
     assert {t["topic_title"] for t in b["topics"]} == {"Work topic"}
+
+
+def test_preview_excludes_a_session_whose_recording_was_deleted(wired):
+    """The overnight case: ingest re-created the topics under new uuids, so no topic
+    tombstone names them -- only the recording tombstone on the source key does."""
+    _wire_rows(wired, [
+        _row(id="t-recreated-1", source_s3_key=KEY_1300, title="Recreated one"),
+        _row(id="t-recreated-2", source_s3_key=KEY_1300, title="Recreated two"),
+    ])
+    wired.setattr(org.redactions, "deleted_source_prefixes",
+                  lambda conn, folder=None, date=None:
+                  ["extractions/Ada_L/2026-07-25/Benl1_2026-07-25_13-00-11"]
+                  if folder == "Ada_L" else [])
+    assert _preview(SESSION_1300, PREVIEW_PARAMS)["statusCode"] == 404
 
 
 def test_preview_unknown_session_is_404(wired):

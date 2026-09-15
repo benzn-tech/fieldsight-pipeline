@@ -678,6 +678,17 @@ def dispatch(conn, event, method, route):
     m_srs = re.match(r"^/sessions/([^/]+)/report/status$", route)
     if m_srs and method == "GET":
         return session_report_status(conn, caller, m_srs.group(1), event)
+
+    m_drp = re.match(r"^/days/([^/]+)/report/preview$", route)
+    if m_drp and method == "POST":
+        return day_report_preview(conn, caller, m_drp.group(1), event)
+    m_drg = re.match(r"^/days/([^/]+)/report$", route)
+    if m_drg and method == "POST":
+        return day_report_generate(conn, caller, m_drg.group(1), event)
+    m_drs = re.match(r"^/days/([^/]+)/report/status$", route)
+    if m_drs and method == "GET":
+        return day_report_status(conn, caller, m_drs.group(1), event)
+
     m_sm = re.match(r"^/sessions/([^/]+)/speaker-match$", route)
     if m_sm and method == "POST":
         return speaker_match(conn, caller, m_sm.group(1), event)
@@ -1242,6 +1253,55 @@ def _day_report_rows(conn, caller, folder, date):
     return [r for r in rows if str(r["site_id"]) in allowed]
 
 
+def _deleted_prefixes_for_rows(conn, rows, date):
+    """Recording tombstones (source arm) for every folder these rows come from.
+
+    Every folder, not only the requester's: a multi-device meeting's rows are written
+    under the LEAD's folder, and so is its tombstone. STRICT -- a failed lookup raises,
+    because this feeds a document; producing one that includes a deleted recording is
+    worse than producing none (the same trade `_session_was_removed` makes)."""
+    folders = sorted({parsed[0] for parsed in
+                      (session_scope.parse_extraction_key(r.get("source_s3_key")) for r in rows)
+                      if parsed})
+    prefixes = set()
+    for folder in folders:
+        for p in redactions.deleted_source_prefixes(conn, folder, date) or []:
+            if isinstance(p, str) and p:
+                prefixes.add(p)
+    return prefixes
+
+
+def _report_rows_in_scope(conn, caller, folder, date, session_id=None, selected=None):
+    """The topic rows a report may contain, for one session or (session_id=None) the day.
+
+    Scope integrity: rows come from `_day_report_rows` (ACL, site clip, joiners), then
+    lose extraction-less rows, non_work, both deletion arms (topic tombstones AND
+    recording tombstones on the source key -- `deleted_predicates.py`: both arms or
+    neither), and finally intersect with the caller's chosen ids. A selection can only
+    narrow."""
+    rows = _day_report_rows(conn, caller, folder, date)
+    if not rows:
+        return []
+    redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows])
+    deleted = _deleted_prefixes_for_rows(conn, rows, date)
+    kept = []
+    for r in rows:
+        sid, kind = session_scope.session_ref(r.get("source_s3_key"))
+        if kind != session_scope.KIND_EXTRACTION:
+            continue
+        if session_id is not None and sid != session_id:
+            continue
+        if r["id"] in redacted or r.get("work_class") == "non_work":
+            continue
+        key = r.get("source_s3_key") or ""
+        if any(key.startswith(p) for p in deleted):
+            continue
+        kept.append(r)
+    if selected is not None:
+        kept = [r for r in kept if str(r["id"]) in selected]
+    return kept
+
+
 def _assemble_session_report(conn, caller, session_id, event, selected=None):
     """Re-derive ONE session's scope + assemble its reviewed report content,
     server-side from (folder, date, session_id). The shared core of the T2
@@ -1260,22 +1320,8 @@ def _assemble_session_report(conn, caller, session_id, event, selected=None):
     if err is not None:
         return None, err
 
-    rows = _day_report_rows(conn, caller, folder, date)
-    redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if rows else {}
-    srows = []
-    for r in rows:
-        sid, kind = session_scope.session_ref(r.get("source_s3_key"))
-        if kind != session_scope.KIND_EXTRACTION or sid != session_id:
-            continue
-        if r["id"] in redacted or r.get("work_class") == "non_work":
-            continue
-        srows.append(r)
-    if selected is not None:
-        # INTERSECTION, never a lookup. The chosen ids are filtered against rows
-        # that already passed the site ACL, the redaction check and the non_work
-        # exclusion, so a chosen id cannot widen the scope by one row -- naming
-        # somebody else's topic simply matches nothing.
-        srows = [r for r in srows if str(r["id"]) in selected]
+    srows = _report_rows_in_scope(conn, caller, folder, date,
+                                  session_id=session_id, selected=selected)
 
     if not srows:
         # unknown session, all-excluded, wrong folder/date, or a selection that
@@ -1413,6 +1459,17 @@ def regenerate_own_report(conn, caller, body):
                "report_type": report_type, "folder": folder}, 202)
 
 
+def _delivery_from_body(body):
+    """(deliver, recipients, None) or (None, None, error) -- shared by both generate routes."""
+    deliver = body.get("deliver", "download")
+    if deliver not in ("download", "email"):
+        return None, None, error("deliver must be 'download' or 'email'", 400)
+    recipients = body.get("recipients") or []
+    if deliver == "email" and not recipients:
+        return None, None, error("recipients required when deliver='email'", 400)
+    return deliver, recipients, None
+
+
 def session_report_generate(conn, caller, session_id, event):
     """POST /api/org/sessions/{session_id}/report — Tier-2 T3
     (session-report-review-export spec §6). ENQUEUES an async generate job.
@@ -1427,12 +1484,9 @@ def session_report_generate(conn, caller, session_id, event):
     body = parse_body(event)
     if body is None:
         return error("malformed JSON body", 400)
-    deliver = body.get("deliver", "download")
-    if deliver not in ("download", "email"):
-        return error("deliver must be 'download' or 'email'", 400)
-    recipients = body.get("recipients") or []
-    if deliver == "email" and not recipients:
-        return error("recipients required when deliver='email'", 400)
+    deliver, recipients, err = _delivery_from_body(body)
+    if err is not None:
+        return err
 
     selected, err = _selected_topic_row_ids(body)
     if err is not None:
@@ -1484,6 +1538,141 @@ def session_report_generate(conn, caller, session_id, event):
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
     return ok({"status": "queued", "sessionId": session_id,
+               "requestId": request_id, "resultKey": result_key}, 202)
+
+
+def _assemble_day_report(conn, caller, date, event, selected=None):
+    """Every reportable topic of one (folder, date), across meetings. (content, None) or
+    (None, error). Scope comes from `_report_rows_in_scope` with no session, so every
+    exclusion a meeting report applies, a day report applies (spec 2026-09-15 §5.2)."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return None, error("date required (YYYY-MM-DD)", 400)
+    p = event.get("queryStringParameters") or {}
+    user = (p.get("user") or "").strip()
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="day report")
+    if err is not None:
+        return None, err
+    rows = _report_rows_in_scope(conn, caller, folder, date, session_id=None, selected=selected)
+    if not rows:
+        return None, error("nothing to report for that day", 404)
+
+    # Meetings in their authoritative start order (build_day_sessions), then topics by the
+    # parsed start of their time_range, unparseable last -- never the lexical sort of the
+    # free text, never created_at (spec §8.4 of the superseded draft).
+    sessions, _excluded = build_day_sessions(conn, caller, folder, date, rows)
+    rank = {}
+    for i, s in enumerate(sessions):
+        for tid in s.get("topic_row_ids") or []:
+            rank.setdefault(tid, i)
+
+    def order(r):
+        rng = parse_time_range(r.get("time_range"))
+        return (rank.get(str(r["id"]), len(sessions)), rng is None, rng[0] if rng else 0, str(r["id"]))
+
+    rows = sorted(rows, key=order)
+    session_ids = []
+    for r in rows:
+        sid = session_scope.session_id_from_source_key(r.get("source_s3_key"))
+        if sid and sid not in session_ids:
+            session_ids.append(sid)
+    mirror_folders = sorted({parsed[0] for parsed in
+                             (session_scope.parse_extraction_key(r.get("source_s3_key")) for r in rows)
+                             if parsed})
+    site_names = sorted({r["site_name"] for r in rows if r.get("site_name")})
+    starts = [s["started_at"] for s in sessions if s.get("started_at")]
+    shaped = render_report_shape(rows, {}, date, folder, conn)
+    position = {str(r["id"]): i for i, r in enumerate(rows)}
+    topics_out = sorted(shaped["topics"],
+                        key=lambda t: position.get(str(t.get("topic_row_id")), len(position)))
+    return {
+        "scope": "day",
+        "date": date,
+        "folder": folder,
+        "title": f"{date} · {', '.join(site_names)}" if site_names else date,
+        "siteNames": site_names,
+        "startedAt": min(starts) if starts else None,
+        "participants": _session_participants(rows),
+        "topics": topics_out,
+        "sessionIds": session_ids,
+        "mirrorFolders": mirror_folders,
+        "topic_row_ids": [str(r["id"]) for r in rows],
+    }, None
+
+
+def day_report_preview(conn, caller, date, event):
+    """POST /api/org/days/{date}/report/preview?user= — a whole day, read-only."""
+    selected, err = _selected_topic_row_ids(parse_body(event) or {})
+    if err is not None:
+        return err
+    content, err = _assemble_day_report(conn, caller, date, event, selected)
+    if err is not None:
+        return err
+    return ok({
+        "scope": "day",
+        "date": content["date"],
+        "title": content["title"],
+        "siteNames": content["siteNames"],
+        "startedAt": content["startedAt"],
+        "participants": content["participants"],
+        "topics": content["topics"],
+        "sessionIds": content["sessionIds"],
+        "fieldDefaults": {
+            "title": content["title"],
+            "attendees": content["participants"],
+            "date": content["date"],
+            "site": ", ".join(content["siteNames"]),
+        },
+    })
+
+
+def day_report_generate(conn, caller, date, event):
+    """POST /api/org/days/{date}/report?user= — enqueue a day report for the worker.
+
+    Same hand-off as the meeting report (in-VPC org-api writes an S3 request artifact,
+    the non-VPC worker renders it), under a `day/` key segment. The artifact names every
+    session and every folder in scope so the worker can check each against its deletion
+    mirror (Task 2)."""
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    deliver, recipients, err = _delivery_from_body(body)
+    if err is not None:
+        return err
+    selected, err = _selected_topic_row_ids(body)
+    if err is not None:
+        return err
+    content, err = _assemble_day_report(conn, caller, date, event, selected)
+    if err is not None:
+        return err
+
+    request_id = uuid.uuid4().hex
+    folder = content["folder"]
+    result_key = f"session_report_results/{folder}/{date}/day/{request_id}.json"
+    request_key = f"session_report_requests/{folder}/{date}/day/{request_id}.json"
+    artifact = {
+        "scope": "day",
+        "requestId": request_id,
+        "date": date,
+        "folder": folder,
+        "companyId": str(caller["company_id"]),
+        "requestedBy": str(caller["id"]),
+        "templateId": body.get("templateId"),
+        "requestedTopicRowIds": (sorted(selected) if selected else None),
+        "selectedTopicRowIds": content["topic_row_ids"],
+        "sessionIds": content["sessionIds"],
+        "mirrorFolders": content["mirrorFolders"],
+        "title": body.get("title") or content["title"],
+        "attendees": body.get("attendees") or content["participants"],
+        "fields": body.get("fields") or {},
+        "deliver": deliver,
+        "recipients": recipients,
+        "content": content,
+        "resultKey": result_key,
+    }
+    s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
+                    Body=json.dumps(artifact, default=str),
+                    ContentType="application/json")
+    return ok({"status": "queued", "scope": "day", "date": date,
                "requestId": request_id, "resultKey": result_key}, 202)
 
 
@@ -2233,6 +2422,12 @@ def speaker_corrections(conn, caller, session_base, event):
     }, 202)
 
 
+def _is_removed_spelling(session_id, removed):
+    """Both spellings: the mirror holds whatever base the delete endpoint had."""
+    bare = session_id[3:] if session_id.startswith("sid") else session_id
+    return session_id in removed or bare in removed or ("sid" + bare) in removed
+
+
 def _session_was_removed(session_id, folder, date) -> bool:
     """Has this session's recording been removed by its owner?
 
@@ -2267,8 +2462,7 @@ def _session_was_removed(session_id, folder, date) -> bool:
     `pending`, #627). Loud, and nothing served, is both safe and visible.
     """
     removed = deletion_mirror.deleted_sessions_strict(s3(), S3_BUCKET, folder, date)
-    bare = session_id[3:] if session_id.startswith("sid") else session_id
-    return session_id in removed or bare in removed or ("sid" + bare) in removed
+    return _is_removed_spelling(session_id, removed)
 
 
 def session_report_status(conn, caller, session_id, event):
@@ -2309,6 +2503,59 @@ def session_report_status(conn, caller, session_id, event):
     result = json.loads(obj["Body"].read().decode("utf-8"))
     status = result.get("status")
     if status == "done" and result.get("docKey"):
+        url = s3().generate_presigned_url(
+            "get_object", Params={"Bucket": LAKE_BUCKET, "Key": result["docKey"]},
+            ExpiresIn=PRESIGNED_URL_EXPIRY)
+        return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed"))})
+    if status == "error":
+        return ok({"status": "error", "error": result.get("error")})
+    return ok({"status": status or "pending"})
+
+
+def _any_session_removed(session_ids, folders, date):
+    """STRICT, like `_session_was_removed`: an unreadable mirror raises."""
+    for folder in folders:
+        removed = deletion_mirror.deleted_sessions_strict(s3(), S3_BUCKET, folder, date)
+        if any(_is_removed_spelling(sid, removed) for sid in session_ids):
+            return True
+    return False
+
+
+def day_report_status(conn, caller, date, event):
+    """GET /api/org/days/{date}/report/status?user=&requestId= — poll a day report.
+
+    The result names every session and folder in scope (Task 2). Each is re-checked
+    against the deletion mirrors before a URL is presigned, because a presign outlives
+    the check that produced it."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    p = event.get("queryStringParameters") or {}
+    user = (p.get("user") or "").strip()
+    request_id = (p.get("requestId") or "").strip()
+    if not _REQUEST_ID_RE.match(request_id):
+        return error("requestId required", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="day report status")
+    if err is not None:
+        return err
+
+    result_key = f"session_report_results/{folder}/{date}/day/{request_id}.json"
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return ok({"status": "pending"})
+        raise
+    result = json.loads(obj["Body"].read().decode("utf-8"))
+    status = result.get("status")
+    if status == "done" and result.get("docKey"):
+        session_ids = [s for s in (result.get("sessionIds") or []) if s]
+        folders = [f for f in (result.get("mirrorFolders") or []) if f] or [folder]
+        if not session_ids:
+            logger.error("day report %s: result names no sessions -- not served", request_id)
+            return ok({"status": "error", "error": "report result is incomplete"})
+        if _any_session_removed(session_ids, folders, date):
+            logger.info("day report %s: a session in it was deleted -- not served", request_id)
+            return ok({"status": "removed"})
         url = s3().generate_presigned_url(
             "get_object", Params={"Bucket": LAKE_BUCKET, "Key": result["docKey"]},
             ExpiresIn=PRESIGNED_URL_EXPIRY)
@@ -3384,6 +3631,9 @@ def get_asset_url(event):
 REPORT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # The same date, matched ANYWHERE in an S3 key (report-history rows).
 REPORT_DATE_IN_KEY_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+# The worker's request ids are uuid4().hex.
+_REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 # The /sessions/{id}/… routes that build an S3 key or a scope from {id}.
 _SESSION_KEYED_ROUTE_RE = re.compile(
