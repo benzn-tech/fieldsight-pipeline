@@ -158,7 +158,9 @@ After `site_ids`/`author_ids` are resolved (`:258-261`), before `search_chunks` 
    * Found → `site_ids = [site_id]`; `author_ids = [user_id]` **only if `user_id` is not NULL**
      (a NULL would make `= ANY(ARRAY[NULL])` match nothing — leave `author_ids` as resolved);
      `date_from = date_to = report_date`; **`widen = False`** regardless of the request; any
-     requested `site`/`author` is ignored (the topic defines them); return `pinned_topic`.
+     requested `site`/`author` is not applied (the topic defines them) and each is reported in
+     `applied.dropped` as `{field: "site_id" | "author_folder", reason: "overridden_by_topic"}`;
+     return `pinned_topic`.
    * Not found for any reason → no `pinned_topic`, `applied.dropped` gets
      `topic_row_id: not_visible`, and search continues with the other requested narrowing.
      Response shape is identical for unknown, hidden and out-of-reach ids; timing differs
