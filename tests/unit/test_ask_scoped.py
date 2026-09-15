@@ -464,6 +464,19 @@ def test_empty_unscoped_search_still_falls_back_to_the_web(monkeypatch):
     assert out["answer"] == "From the web."
 
 
+def test_an_invalid_site_id_never_scopes_the_request_so_the_web_fallback_still_fires(monkeypatch):
+    """An INVALID site_id (never survives _validate_scope into scope_req) must
+    not be treated as `narrowed`, or an otherwise-unscoped question with empty
+    retrieval would wrongly take the no-records path instead of the web."""
+    client, _ = wire(monkeypatch, responses=[{"chunks": [], "applied": {"dropped": []}}],
+                     web={"answer": "From the web."})
+    out = ask(question="concrete issues", site_id="123")
+    assert "site" not in client.calls[0]
+    assert out.get("from_web") is True
+    assert out["answer"] == "From the web."
+    assert drops(out["applied_scope"]["dropped"]) == {("site_id", "invalid")}
+
+
 def test_topic_with_question_range_and_no_body_date_sends_no_range(monkeypatch):
     client, _ = wire(monkeypatch)
     out = ask(question="what did we say yesterday", topic_row_id=TOPIC_ID)

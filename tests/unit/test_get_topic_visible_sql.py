@@ -78,12 +78,19 @@ def test_action_items_use_the_visible_child_rule():
         topics._TOPIC_VISIBLE_ACTION_ITEMS_SQL
 
 
+def test_action_items_select_deadline_text_like_the_other_readers():
+    """topics.py ~723/~820 select both deadline and deadline_text; this
+    statement must too, so a text-only deadline is not silently dropped."""
+    assert "deadline_text" in topics._TOPIC_VISIBLE_ACTION_ITEMS_SQL
+
+
 def test_params_and_row_are_json_safe():
     row = {"id": uuid.UUID(TOPIC_ID), "title": "Scaffold handover", "summary": "Signed off.",
            "report_date": datetime.date(2026, 9, 3), "site_id": uuid.UUID(SITE_ID),
            "site_name": "UC PK", "user_id": uuid.UUID(USER_ID), "time_range": "09:10–09:40"}
     items = [{"text": "Send tag photos", "responsible": "Ben",
-              "deadline": datetime.date(2026, 9, 5), "status": "open"}]
+              "deadline": datetime.date(2026, 9, 5), "deadline_text": "next week",
+              "status": "open"}]
     conn = FakeConn(row=row, items=items)
 
     got = topics.get_topic_visible(conn, TOPIC_ID.upper(), [SITE_ID], [USER_ID])
@@ -96,6 +103,17 @@ def test_params_and_row_are_json_safe():
                    "user_id": USER_ID, "time_range": "09:10–09:40",
                    "action_items": [{"text": "Send tag photos", "responsible": "Ben",
                                      "deadline": "2026-09-05", "status": "open"}]}
+
+
+def test_an_action_item_with_no_deadline_date_falls_back_to_deadline_text():
+    row = {"id": uuid.UUID(TOPIC_ID), "title": "t", "summary": None,
+           "report_date": datetime.date(2026, 9, 3), "site_id": uuid.UUID(SITE_ID),
+           "site_name": None, "user_id": None, "time_range": None}
+    items = [{"text": "Send tag photos", "responsible": "Ben",
+              "deadline": None, "deadline_text": "next week", "status": "open"}]
+    got = topics.get_topic_visible(FakeConn(row=row, items=items), TOPIC_ID, [SITE_ID], None)
+    assert got["action_items"] == [{"text": "Send tag photos", "responsible": "Ben",
+                                    "deadline": "next week", "status": "open"}]
 
 
 def test_a_null_author_stays_none():

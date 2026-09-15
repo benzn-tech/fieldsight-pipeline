@@ -238,7 +238,12 @@ topic, a NULL-`user_id` topic, and a deleted-recording topic.
 ## 7. Rollout
 
 Backend first (`develop` → TEST; `main` → prod through the `deploy-prod.yml` approval). The new
-fields are additive: the current UI sends none and is unaffected. `api/ask.js` routes `/ask` via
-`orgBaseUrl`, so dev hits the TEST gateway and main the prod gateway; the UI change merges to
-`dev` only after the backend is on TEST, and to `main` only after the prod deploy is approved and
-live. An early UI deploy renders "Searched all your projects" rather than a false scope.
+fields are additive, but not inert against the current UI: §0 records that the Timeline day chat
+and topic tabs already send `date` today, and this backend enforces `date` as a real narrowing
+(§4.2) rather than the no-op it is now. So once this deploy lands, those existing Asks narrow to
+the selected day — no widening, no web fallback — before the new UI ships the scope labels that
+would explain that narrowing to the user. `api/ask.js` routes `/ask` via `orgBaseUrl`, so dev hits
+the TEST gateway and main the prod gateway; the UI change merges to `dev` only after the backend
+is on TEST, and to `main` only after the prod deploy is approved and live. This rollout gap (real
+scoping live before its UI label) is a pending product decision, not resolved by this doc —
+recorded in the PR for sign-off, not decided here.

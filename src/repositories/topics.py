@@ -857,7 +857,7 @@ _TOPIC_VISIBLE_SQL = (
 )
 
 _TOPIC_VISIBLE_ACTION_ITEMS_SQL = (
-    "SELECT text, responsible, deadline, status FROM action_items "
+    "SELECT text, responsible, deadline, deadline_text, status FROM action_items "
     "WHERE topic_id = %s AND "
     + CHILD_OF_VISIBLE_TOPIC.format(alias="action_items")
     + " ORDER BY created_at"
@@ -902,7 +902,8 @@ def get_topic_visible(conn, topic_id, site_ids, author_ids) -> dict | None:
         "time_range": str(row["time_range"]) if row["time_range"] is not None else None,
         "action_items": [
             {"text": a["text"], "responsible": a["responsible"],
-             "deadline": str(a["deadline"]) if a["deadline"] is not None else None,
+             "deadline": (str(a["deadline"]) if a["deadline"] is not None
+                          else a.get("deadline_text")),
              "status": a["status"]}
             for a in items
         ],

@@ -42,6 +42,22 @@ def test_a_work_topic_in_reach_comes_back_with_its_action_items(db):
                                     "deadline": None, "status": "open"}]
 
 
+def test_an_action_item_with_no_deadline_date_falls_back_to_deadline_text(db):
+    """topics.py ~723/~820 select both deadline and deadline_text; get_topic_visible
+    used to select only deadline, so a text-only deadline (e.g. "next week") was
+    silently dropped from the Ask prompt."""
+    _, s1, _, user = _world(db, "deadlinetext")
+    t = topics.upsert_topic(db, s1["id"], DAY, "Scaffold handover", user_id=user["id"],
+                            work_class="work",
+                            action_items=[{"text": "Send tag photos", "responsible": "Ben",
+                                          "deadline_text": "next week"}])
+
+    got = topics.get_topic_visible(db, str(t["id"]), _sid(s1), None)
+
+    assert got["action_items"] == [{"text": "Send tag photos", "responsible": "Ben",
+                                    "deadline": "next week", "status": "open"}]
+
+
 def test_an_unclassified_topic_is_visible(db):
     """`IS DISTINCT FROM`, not `<>`: work_class NULL must not be excluded."""
     _, s1, _, user = _world(db, "nullclass")

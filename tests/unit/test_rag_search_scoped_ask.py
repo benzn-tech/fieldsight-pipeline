@@ -247,6 +247,36 @@ def test_a_cross_company_caller_resolves_the_folder_globally(wired):
     assert calls[0]["author_ids"] == ["u-9"]
 
 
+def test_a_uuid_object_author_id_is_normalised_to_str_before_narrowing(wired):
+    """get_by_folder_name can return {"id": uuid.UUID(...)} (a real row, not a
+    string) -- str(target["id"]) must match the scope's already-stringified
+    author_ids or a real author narrows to nothing."""
+    import uuid as _uuid
+    uid = _uuid.UUID("00000000-0000-4000-8000-0000000000a1")
+    set_scope(wired, sites={"s-1"}, authors={str(uid)})
+    wired.setattr(rag.users, "get_by_folder_name", lambda conn, cid, folder: {"id": uid})
+    calls = wire_search(wired, rows=[ROW])
+
+    out = rag.lambda_handler(event(author="Ben_UCPK2"), None)
+
+    assert calls[0]["author_ids"] == [str(uid)]
+    assert out["applied"] == {"author_folder": "Ben_UCPK2", "dropped": []}
+
+
+def test_a_cross_company_author_excluded_by_scope_matches_nothing_and_never_searches(wired):
+    """cross_company=True with a non-None author set that excludes the
+    globally-resolved id: not_visible, no chunks, search_chunks never called."""
+    set_scope(wired, sites={"s-1"}, authors={"u-1", "u-2"}, cross_company=True)
+    wired.setattr(rag.users, "get_by_folder_name", boom)
+    wired.setattr(rag.users, "get_by_folder_name_global", lambda conn, folder: {"id": "u-9"})
+    wired.setattr(rag.chunks, "search_chunks", boom)
+
+    out = rag.lambda_handler(event(author="Someone_Else"), None)
+
+    assert out["chunks"] == []
+    assert out["applied"]["dropped"] == [{"field": "author_folder", "reason": "not_visible"}]
+
+
 # -- site ----------------------------------------------------------------------
 
 def test_a_site_in_reach_is_reported_as_applied(wired):
