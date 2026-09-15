@@ -684,6 +684,9 @@ def dispatch(conn, event, method, route):
     m_drg = re.match(r"^/days/([^/]+)/report$", route)
     if m_drg and method == "POST":
         return day_report_generate(conn, caller, m_drg.group(1), event)
+    m_drs = re.match(r"^/days/([^/]+)/report/status$", route)
+    if m_drs and method == "GET":
+        return day_report_status(conn, caller, m_drs.group(1), event)
 
     m_sm = re.match(r"^/sessions/([^/]+)/speaker-match$", route)
     if m_sm and method == "POST":
@@ -2418,6 +2421,12 @@ def speaker_corrections(conn, caller, session_base, event):
     }, 202)
 
 
+def _is_removed_spelling(session_id, removed):
+    """Both spellings: the mirror holds whatever base the delete endpoint had."""
+    bare = session_id[3:] if session_id.startswith("sid") else session_id
+    return session_id in removed or bare in removed or ("sid" + bare) in removed
+
+
 def _session_was_removed(session_id, folder, date) -> bool:
     """Has this session's recording been removed by its owner?
 
@@ -2452,8 +2461,7 @@ def _session_was_removed(session_id, folder, date) -> bool:
     `pending`, #627). Loud, and nothing served, is both safe and visible.
     """
     removed = deletion_mirror.deleted_sessions_strict(s3(), S3_BUCKET, folder, date)
-    bare = session_id[3:] if session_id.startswith("sid") else session_id
-    return session_id in removed or bare in removed or ("sid" + bare) in removed
+    return _is_removed_spelling(session_id, removed)
 
 
 def session_report_status(conn, caller, session_id, event):
@@ -2494,6 +2502,59 @@ def session_report_status(conn, caller, session_id, event):
     result = json.loads(obj["Body"].read().decode("utf-8"))
     status = result.get("status")
     if status == "done" and result.get("docKey"):
+        url = s3().generate_presigned_url(
+            "get_object", Params={"Bucket": LAKE_BUCKET, "Key": result["docKey"]},
+            ExpiresIn=PRESIGNED_URL_EXPIRY)
+        return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed"))})
+    if status == "error":
+        return ok({"status": "error", "error": result.get("error")})
+    return ok({"status": status or "pending"})
+
+
+def _any_session_removed(session_ids, folders, date):
+    """STRICT, like `_session_was_removed`: an unreadable mirror raises."""
+    for folder in folders:
+        removed = deletion_mirror.deleted_sessions_strict(s3(), S3_BUCKET, folder, date)
+        if any(_is_removed_spelling(sid, removed) for sid in session_ids):
+            return True
+    return False
+
+
+def day_report_status(conn, caller, date, event):
+    """GET /api/org/days/{date}/report/status?user=&requestId= — poll a day report.
+
+    The result names every session and folder in scope (Task 2). Each is re-checked
+    against the deletion mirrors before a URL is presigned, because a presign outlives
+    the check that produced it."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    p = event.get("queryStringParameters") or {}
+    user = (p.get("user") or "").strip()
+    request_id = (p.get("requestId") or "").strip()
+    if not _REQUEST_ID_RE.match(request_id):
+        return error("requestId required", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="day report status")
+    if err is not None:
+        return err
+
+    result_key = f"session_report_results/{folder}/{date}/day/{request_id}.json"
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return ok({"status": "pending"})
+        raise
+    result = json.loads(obj["Body"].read().decode("utf-8"))
+    status = result.get("status")
+    if status == "done" and result.get("docKey"):
+        session_ids = [s for s in (result.get("sessionIds") or []) if s]
+        folders = [f for f in (result.get("mirrorFolders") or []) if f] or [folder]
+        if not session_ids:
+            logger.error("day report %s: result names no sessions -- not served", request_id)
+            return ok({"status": "error", "error": "report result is incomplete"})
+        if _any_session_removed(session_ids, folders, date):
+            logger.info("day report %s: a session in it was deleted -- not served", request_id)
+            return ok({"status": "removed"})
         url = s3().generate_presigned_url(
             "get_object", Params={"Bucket": LAKE_BUCKET, "Key": result["docKey"]},
             ExpiresIn=PRESIGNED_URL_EXPIRY)
@@ -3569,6 +3630,9 @@ def get_asset_url(event):
 REPORT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # The same date, matched ANYWHERE in an S3 key (report-history rows).
 REPORT_DATE_IN_KEY_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+# The worker's request ids are uuid4().hex.
+_REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 # The /sessions/{id}/… routes that build an S3 key or a scope from {id}.
 _SESSION_KEYED_ROUTE_RE = re.compile(
