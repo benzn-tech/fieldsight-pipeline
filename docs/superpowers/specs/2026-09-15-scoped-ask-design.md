@@ -55,7 +55,8 @@ caller may see.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `date` | `YYYY-MM-DD` | restrict to this `report_date` (field already exists; now read on the RAG path) |
+| `scoped` | boolean | gate for `date`: body `date` is read on the RAG path **only when `scoped` is JSON `true`**; any other value (absent, `"true"`, `1`) leaves `date` ignored exactly as before this change — not validated, not in `applied_scope`, no `dropped` entry. The deployed UI already sends `date`, so without this gate old clients would silently start narrowing. `site_id`, `author_folder`, `topic_row_id` are not gated (no old client sends them) |
+| `date` | `YYYY-MM-DD` | restrict to this `report_date` (field already exists; read on the RAG path only with `scoped: true`) |
 | `site_id` | uuid | restrict to this site |
 | `author_folder` | string | restrict to chunks authored by this folder's user |
 | `topic_row_id` | uuid | pin this topic; implies its own date and site (and author when non-NULL) |
@@ -89,7 +90,7 @@ visibly "not scoped" instead of silently wrong.
 ### 4.1 Proxy — `lambda_fieldsight_api.ask_question`
 
 Forward `site_id`, `author_folder`, `topic_row_id` exactly as `date`/`tz`/`topic_id` are
-forwarded (omit when absent — never `''`). No validation here.
+forwarded (omit when absent — never `''`). Forward `scoped` when truthy. No validation here.
 
 ### 4.2 Ask Agent — `lambda_ask_agent._rag_answer`
 
@@ -110,6 +111,10 @@ In order, before the rag-search invoke:
    | no | yes | no | question range | true | — |
    | no | no | yes | `date..date` | **false** | — |
    | no | no | no | none | false (as today) | — |
+
+   "body `date`" in this table means a `date` sent **with `scoped: true`** (§3). Without the
+   gate a body `date` counts as "no" in every row, and does not count as scoped for the
+   no-records-vs-web-fallback decision in step 7.
 
    If the topic turns out not visible (rag-search returns no `pinned_topic`), the Ask Agent does
    **not** retry: that answer used the request's other narrowing, and `topic_row_id: not_visible`
@@ -238,12 +243,13 @@ topic, a NULL-`user_id` topic, and a deleted-recording topic.
 ## 7. Rollout
 
 Backend first (`develop` → TEST; `main` → prod through the `deploy-prod.yml` approval). The new
-fields are additive, but not inert against the current UI: §0 records that the Timeline day chat
-and topic tabs already send `date` today, and this backend enforces `date` as a real narrowing
-(§4.2) rather than the no-op it is now. So once this deploy lands, those existing Asks narrow to
-the selected day — no widening, no web fallback — before the new UI ships the scope labels that
-would explain that narrowing to the user. `api/ask.js` routes `/ask` via `orgBaseUrl`, so dev hits
-the TEST gateway and main the prod gateway; the UI change merges to `dev` only after the backend
-is on TEST, and to `main` only after the prod deploy is approved and live. This rollout gap (real
-scoping live before its UI label) is a pending product decision, not resolved by this doc —
-recorded in the PR for sign-off, not decided here.
+fields are additive and inert against the current UI: §0 records that the Timeline day chat and
+topic tabs already send `date` today, but this backend honours `date` only when the body also
+carries `scoped: true` (§3), which no current client sends. So once this deploy lands, those
+existing Asks behave exactly as before — the rag-search payload for a `date` + `topic_id` +
+`scope` request is key-for-key identical to one without `date` (pinned by
+`tests/unit/test_ask_scoped.py`). Day narrowing starts only when the new UI, which sends
+`scoped: true` alongside the scope labels that explain it, ships. `api/ask.js` routes `/ask` via
+`orgBaseUrl`, so dev hits the TEST gateway and main the prod gateway; the UI change merges to
+`dev` only after the backend is on TEST, and to `main` only after the prod deploy is approved and
+live. (User decision 2026-09-16: gate it, rather than let real scoping go live before its label.)

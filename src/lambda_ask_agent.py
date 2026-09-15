@@ -991,6 +991,16 @@ def _validate_scope(body):
     rag-search raise surfaces as "Search service temporarily unavailable". A
     malformed field is dropped as `invalid` and the request continues without it.
     Absent (None or '') is not a request and is neither kept nor dropped.
+
+    Body `date` is GATED on `scoped is True` (JSON true only). The deployed web
+    UI already sends `date` from the Timeline day chat and topic tabs, and
+    before scoped Ask the RAG path ignored it. Without the gate this backend
+    would silently start narrowing those old clients to one day with no
+    widening and no web fallback. So an ungated `date` is exactly as before:
+    not validated, not kept, not dropped -- it never reaches the range plan,
+    `applied_scope`, the metric-route decision or the web-fallback decision.
+    `site_id`, `author_folder`, `topic_row_id` are not gated: no old client
+    sends them.
     """
     import uuid as _uuid
     from datetime import date as _date
@@ -1007,7 +1017,7 @@ def _validate_scope(body):
         except (ValueError, TypeError, AttributeError):
             dropped.append({"field": field, "reason": "invalid"})
 
-    raw = body.get("date")
+    raw = body.get("date") if body.get("scoped") is True else None
     if raw is not None and raw != "":
         ok = (isinstance(raw, str) and raw.isascii() and len(raw) == 10
               and raw[4] == "-" and raw[7] == "-")

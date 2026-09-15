@@ -134,7 +134,8 @@ def test_full_scope_with_a_visible_topic_crosses_the_real_seam(monkeypatch):
     client, seen = wire_ask(monkeypatch)
 
     out = ask(question="Who is responsible for follow-ups?", topic_row_id=TOPIC_ID,
-              site_id=OTHER_SITE_ID, author_folder="Someone_Else", date="2026-08-01")
+              site_id=OTHER_SITE_ID, author_folder="Someone_Else", date="2026-08-01",
+              scoped=True)
 
     sent = client.calls[0]
     assert sent["topic_row_id"] == TOPIC_ID
@@ -164,7 +165,7 @@ def test_site_and_author_scope_with_no_topic_crosses_the_real_seam(monkeypatch):
     client, seen = wire_ask(monkeypatch)
 
     out = ask(question="concrete issues", site_id=SITE_ID, author_folder="Ben_UCPK2",
-              date="2026-09-03")
+              date="2026-09-03", scoped=True)
 
     sent = client.calls[0]
     assert sent["site"] == SITE_ID

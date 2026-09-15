@@ -55,3 +55,23 @@ def test_absent_or_blank_scope_fields_are_not_sent(monkeypatch, value):
 
     for f in FIELDS:
         assert f not in rec.sent[0]
+
+
+def test_scoped_is_forwarded_when_true(monkeypatch):
+    rec = Recorder()
+    monkeypatch.setattr(fsapi, "lambda_client", rec)
+    fsapi.ask_question({"question": "open actions?", "date": "2026-09-03",
+                        "scoped": True}, CALLER)
+    assert rec.sent[0]["scoped"] is True
+    assert rec.sent[0]["date"] == "2026-09-03"
+
+
+@pytest.mark.parametrize("value", [None, False, ""])
+def test_scoped_is_not_sent_when_absent_or_falsy(monkeypatch, value):
+    rec = Recorder()
+    monkeypatch.setattr(fsapi, "lambda_client", rec)
+    body = {"question": "open actions?", "date": "2026-09-03"}
+    if value is not None:
+        body["scoped"] = value
+    fsapi.ask_question(body, CALLER)
+    assert "scoped" not in rec.sent[0]

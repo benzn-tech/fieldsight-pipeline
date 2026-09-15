@@ -32,7 +32,8 @@ def drops(items):
 
 def test_well_formed_fields_survive_and_are_canonical():
     req, dropped = laa._validate_scope({"topic_row_id": TOPIC_ID.upper(), "site_id": SITE_ID,
-                                        "date": "2026-09-03", "author_folder": " Ben_UCPK2 "})
+                                        "date": "2026-09-03", "author_folder": " Ben_UCPK2 ",
+                                        "scoped": True})
     assert req == {"topic_row_id": TOPIC_ID, "site_id": SITE_ID,
                    "date": "2026-09-03", "author_folder": "Ben_UCPK2"}
     assert dropped == []
@@ -45,7 +46,7 @@ def test_well_formed_fields_survive_and_are_canonical():
     ("author_folder", "x" * 201), ("author_folder", 42), ("author_folder", "   "),
 ])
 def test_malformed_fields_are_dropped_invalid_and_never_raise(field, value):
-    req, dropped = laa._validate_scope({field: value})
+    req, dropped = laa._validate_scope({field: value, "scoped": True})
     assert field not in req
     assert dropped == [{"field": field, "reason": "invalid"}]
 
@@ -53,6 +54,7 @@ def test_malformed_fields_are_dropped_invalid_and_never_raise(field, value):
 @pytest.mark.parametrize("value", [None, ""])
 def test_absent_fields_are_neither_kept_nor_dropped(value):
     body = {f: value for f in ("topic_row_id", "site_id", "date", "author_folder")}
+    body["scoped"] = True
     assert laa._validate_scope(body) == ({}, [])
 
 
@@ -201,7 +203,8 @@ def test_topic_with_question_range_and_other_day_sends_the_body_date_and_reports
         "applied": {"topic_row_id": TOPIC_ID, "topic_title": "Scaffold handover",
                     "site_id": SITE_ID, "date": "2026-09-03", "dropped": []}}])
 
-    out = ask(question="what did we say yesterday", topic_row_id=TOPIC_ID, date="2026-09-01")
+    out = ask(question="what did we say yesterday", topic_row_id=TOPIC_ID, date="2026-09-01",
+              scoped=True)
 
     p = client.calls[0]
     assert (p["date_from"], p["date_to"]) == ("2026-09-01", "2026-09-01")
@@ -218,7 +221,7 @@ def test_topic_not_visible_with_body_date_still_narrows_to_that_day(monkeypatch)
         "chunks": [CHUNK],
         "applied": {"dropped": [{"field": "topic_row_id", "reason": "not_visible"}]}}])
 
-    out = ask(question="concrete issues", topic_row_id=TOPIC_ID, date="2026-09-01")
+    out = ask(question="concrete issues", topic_row_id=TOPIC_ID, date="2026-09-01", scoped=True)
 
     assert (client.calls[0]["date_from"], client.calls[0]["date_to"]) == ("2026-09-01", "2026-09-01")
     assert len(client.calls) == 1                                # no retry
@@ -234,7 +237,7 @@ def test_topic_alone_sends_no_range(monkeypatch):
 
 def test_question_range_beats_body_date_without_a_topic(monkeypatch):
     client, _ = wire(monkeypatch)
-    out = ask(question="what happened yesterday", date="2026-09-01")
+    out = ask(question="what happened yesterday", date="2026-09-01", scoped=True)
     p = client.calls[0]
     assert (p["date_from"], p["date_to"]) == ("2026-08-29", "2026-08-29")
     assert p["widen_when_empty"] is True
@@ -251,7 +254,7 @@ def test_question_range_alone_widens_as_today(monkeypatch):
 
 def test_body_date_alone_narrows_and_never_widens(monkeypatch):
     client, _ = wire(monkeypatch)
-    out = ask(question="concrete issues", date="2026-09-01")
+    out = ask(question="concrete issues", date="2026-09-01", scoped=True)
     p = client.calls[0]
     assert (p["date_from"], p["date_to"]) == ("2026-09-01", "2026-09-01")
     assert "widen_when_empty" not in p
@@ -280,7 +283,7 @@ def test_malformed_values_are_dropped_and_the_answer_still_comes_back(monkeypatc
     client, _ = wire(monkeypatch)
 
     out = ask(question="concrete issues", topic_row_id="not-a-uuid", site_id="123",
-              date="2026-02-30", author_folder="x" * 201)
+              date="2026-02-30", author_folder="x" * 201, scoped=True)
 
     p = client.calls[0]
     for key in ("topic_row_id", "site", "author", "date_from", "date_to"):
@@ -323,7 +326,7 @@ def _assert_scoped(out):
 
 def test_rag_return_function_error(monkeypatch):
     wire(monkeypatch, function_error="Unhandled")
-    out = ask(question="concrete issues", date="bad")
+    out = ask(question="concrete issues", date="bad", scoped=True)
     assert out["error"] == "rag-search unavailable"
     _assert_scoped(out)
     assert drops(out["applied_scope"]["dropped"]) == {("date", "invalid")}
@@ -338,7 +341,7 @@ def test_rag_return_empty_with_web_answer(monkeypatch):
 
 def test_rag_return_empty_no_answer(monkeypatch):
     wire(monkeypatch, responses=[{"chunks": [], "applied": {"dropped": []}}])
-    out = ask(question="concrete issues", date="2026-09-01")
+    out = ask(question="concrete issues", date="2026-09-01", scoped=True)
     assert out["answer"] == "No relevant records found for this question."
     assert out["applied_scope"] == {"date": "2026-09-01", "dropped": []}
 
@@ -382,7 +385,7 @@ METRIC_Q = "how long did I record yesterday"
 def test_metric_return_not_configured(monkeypatch):
     wire(monkeypatch)
     monkeypatch.setattr(laa, "RAG_SEARCH_FUNCTION", "")
-    out = ask(question=METRIC_Q, date="2026-08-20")
+    out = ask(question=METRIC_Q, date="2026-08-20", scoped=True)
     assert out["error"] == "rag-search not configured"
     assert out["applied_scope"] == {"dropped": [{"field": "date", "reason": "overridden_by_question"}]}
 
@@ -407,7 +410,7 @@ def test_metric_return_success(monkeypatch):
 # --------------------------------------------------------------------------
 
 def test_a_full_width_date_is_dropped_invalid():
-    req, dropped = laa._validate_scope({"date": "\uff12\uff10\uff12\uff16-\uff10\uff19-\uff10\uff13"})
+    req, dropped = laa._validate_scope({"date": "\uff12\uff10\uff12\uff16-\uff10\uff19-\uff10\uff13", "scoped": True})
     assert "date" not in req
     assert dropped == [{"field": "date", "reason": "invalid"}]
 
@@ -418,7 +421,7 @@ def test_pinned_topic_on_the_body_date_reports_no_date_override(monkeypatch):
         "applied": {"topic_row_id": TOPIC_ID, "topic_title": "Scaffold handover",
                     "site_id": SITE_ID, "date": "2026-09-03", "dropped": []}}])
 
-    out = ask(question="concrete issues", topic_row_id=TOPIC_ID, date="2026-09-03")
+    out = ask(question="concrete issues", topic_row_id=TOPIC_ID, date="2026-09-03", scoped=True)
 
     assert out["applied_scope"]["date"] == "2026-09-03"
     assert ("date", "overridden_by_topic") not in drops(out["applied_scope"]["dropped"])
@@ -442,7 +445,7 @@ NO_RECORDS = "No relevant records found for this question."
 def test_empty_day_scoped_search_takes_the_no_records_path_not_the_web(monkeypatch):
     wire(monkeypatch, responses=[{"chunks": [], "applied": {"dropped": []}}],
          web={"answer": "From the web."})
-    out = ask(question="concrete issues", date="2026-09-01")
+    out = ask(question="concrete issues", date="2026-09-01", scoped=True)
     assert out["answer"] == NO_RECORDS
     assert "from_web" not in out
     assert out["applied_scope"]["date"] == "2026-09-01"
@@ -542,3 +545,63 @@ def test_empty_retrieval_with_scope_but_no_topic_takes_the_no_answer_path(monkey
     assert out["answer"] == "No relevant records found for this question."
     assert seen["llm_calls"] == 0
     assert out["applied_scope"] == {"site_id": SITE_ID, "dropped": []}
+
+
+# --------------------------------------------------------------------------
+# The `scoped` gate: body `date` is honoured only with `scoped is True`.
+# The deployed UI already sends `date` + `topic_id` + `scope`; before scoped
+# Ask the RAG path ignored `date`, and an old client must see no change.
+# --------------------------------------------------------------------------
+
+LEGACY = {"topic_id": 3, "scope": "both"}
+
+
+def _legacy_pair(monkeypatch, question, responses=({"chunks": [CHUNK]},), web=None):
+    """Run the same legacy request with and without `date`; return both
+    (payload, response) pairs."""
+    out = []
+    for extra in ({"date": "2026-09-01"}, {}):
+        client, _ = wire(monkeypatch, responses=list(responses), web=web)
+        res = ask(question=question, **LEGACY, **extra)
+        out.append((client.calls[0], res))
+    return out
+
+
+@pytest.mark.parametrize("question", ["concrete issues", "what happened yesterday",
+                                      "how long did I record yesterday"])
+def test_a_legacy_date_leaves_the_rag_search_payload_key_for_key_identical(monkeypatch, question):
+    (with_date, res_a), (without, res_b) = _legacy_pair(monkeypatch, question)
+    assert with_date == without
+    assert res_a["applied_scope"] == res_b["applied_scope"]
+    assert "date" not in res_a["applied_scope"]
+    assert "date" not in {d["field"] for d in res_a["applied_scope"]["dropped"]}
+
+
+def test_a_legacy_date_with_empty_retrieval_still_falls_back_to_the_web(monkeypatch):
+    (_, res_a), (_, res_b) = _legacy_pair(monkeypatch, "concrete issues",
+                                          responses=[{"chunks": []}],
+                                          web={"answer": "From the web."})
+    assert res_a.get("from_web") is True and res_a["answer"] == "From the web."
+    assert res_a["applied_scope"] == res_b["applied_scope"] == {"dropped": []}
+
+
+def test_an_invalid_legacy_date_is_not_reported_dropped(monkeypatch):
+    wire(monkeypatch)
+    out = ask(question="concrete issues", date="bad", **LEGACY)
+    assert out["applied_scope"] == {"dropped": []}
+
+
+@pytest.mark.parametrize("value", ["true", 1, "yes", False, None, {"x": 1}])
+def test_only_json_true_opens_the_gate(value):
+    assert laa._validate_scope({"date": "2026-09-03", "scoped": value}) == ({}, [])
+
+
+def test_json_true_opens_the_gate():
+    assert laa._validate_scope({"date": "2026-09-03", "scoped": True}) == (
+        {"date": "2026-09-03"}, [])
+
+
+def test_the_non_date_fields_are_not_gated():
+    req, _ = laa._validate_scope({"site_id": SITE_ID, "author_folder": "Ben_UCPK2",
+                                  "topic_row_id": TOPIC_ID})
+    assert req == {"site_id": SITE_ID, "author_folder": "Ben_UCPK2", "topic_row_id": TOPIC_ID}
