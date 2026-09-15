@@ -77,31 +77,44 @@ class FakeConn:
 
 def _dirty_row(date, count=1):
     return {"user_id": "u-ben", "report_date": date, "folder_name": "Ben_UCPK2",
-            "segments": [], "source_object_count": count, "dirty": True, "computed_at": NOW}
+            "segments": [], "source_object_count": count, "dirty": True,
+            "dirty_since": None, "computed_at": NOW}
 
 
 @pytest.fixture
 def store(monkeypatch):
     """In-memory day_recording_segments with the same monotonic rule as the SQL, plus a
     recording stand-in for the sweep_state flag. `events` records flag calls and dirty
-    listings in order."""
+    listings in order.
+
+    `dirty_since` mirrors the migration 0056 column (I1): mark_dirty stamps it with the
+    module's own clock (rs._utcnow(), the same one compute_day reads `listed_at` from) the
+    first time a day is marked, and upsert_monotonic only clears dirty/dirty_since when
+    that mark predates the LIST it is writing -- otherwise the write lands but the mark
+    survives, exactly like the real `WHERE`/`CASE` in the repository's SQL.
+    """
     state = {"rows": {}, "upserts": [], "dirty_marks": [], "events": [], "pending": True}
 
     def get(conn, user_id, report_date):
         return state["rows"].get((user_id, str(report_date)))
 
-    def upsert_monotonic(conn, user_id, report_date, folder_name, segments, count):
+    def upsert_monotonic(conn, user_id, report_date, folder_name, segments, count, listed_at):
         state["upserts"].append({"user_id": user_id, "report_date": str(report_date),
                                  "folder_name": folder_name, "segments": segments,
-                                 "source_object_count": count})
+                                 "source_object_count": count, "listed_at": listed_at})
         key = (user_id, str(report_date))
         old = state["rows"].get(key)
         if old is not None and count < old["source_object_count"]:
             return False
+        old_dirty_since = old.get("dirty_since") if old else None
+        if old_dirty_since is None or old_dirty_since <= listed_at:
+            new_dirty, new_dirty_since = False, None
+        else:
+            new_dirty, new_dirty_since = old.get("dirty", False), old_dirty_since
         state["rows"][key] = {"user_id": user_id, "report_date": str(report_date),
                               "folder_name": folder_name, "segments": segments,
-                              "source_object_count": count, "dirty": False,
-                              "computed_at": NOW}
+                              "source_object_count": count, "dirty": new_dirty,
+                              "dirty_since": new_dirty_since, "computed_at": NOW}
         return True
 
     def mark_dirty(conn, user_id, report_date):
@@ -110,6 +123,8 @@ def store(monkeypatch):
         if row is None:
             return False
         row["dirty"] = True
+        if row.get("dirty_since") is None:
+            row["dirty_since"] = rs._utcnow()
         return True
 
     def list_dirty(conn, limit=50):
@@ -268,6 +283,68 @@ def test_the_debounce_constant_is_thirty_seconds():
     assert rs.DEBOUNCE_SECONDS == 30
 
 
+def test_a_debounce_mark_that_finds_no_row_logs_truthfully_not_debounced_dirty(store, monkeypatch, caplog):
+    # M5: mark_dirty's return value was ignored -- a race where the row disappeared
+    # between get() and mark_dirty() still logged "debounced-dirty" as if the mark
+    # landed. The outcome returned to the caller is unchanged; only the log must tell
+    # the truth about what happened underneath it.
+    caplog.set_level(logging.INFO)
+    row = _dirty_row("2026-09-02", count=3)
+    row.update(dirty=False, computed_at=NOW - timedelta(seconds=rs.DEBOUNCE_SECONDS - 1))
+    store["rows"][("u-ben", "2026-09-02")] = row
+    monkeypatch.setattr(rs.day_recording_segments, "mark_dirty", lambda conn, uid, date: False)
+    assert rs.handle_object_key(FakeConn(), FakeS3(DAY_KEYS), "bkt", REAL_KEY, NOW) == "debounced-dirty"
+    assert "debounce mark found no row" in caplog.text
+    assert "recording_segments: debounced-dirty folder=Ben_UCPK2 date=2026-09-02" not in caplog.text
+
+
+def test_two_concurrent_computes_do_not_clear_a_mark_raised_between_them(store, monkeypatch, caplog):
+    """I1: A and B both LIST an old day concurrently; B writes first. While A is still
+    in flight, transcript Y lands and invocation C finds B's now-fresh row, so it only
+    marks the day dirty (and raises the sweep flag) instead of recomputing. A then
+    writes -- its listing started (and so its `listed_at`) BEFORE C's mark, so its
+    write must not clear the mark C just raised, or Y is lost with the row reading
+    clean and no sweep ever revisits it.
+
+    Before the dirty_since fix this failed: the old rule cleared dirty on any write
+    whose object count was >= the stored count, with no notion of when the LIST that
+    produced it started relative to the mark.
+    """
+    caplog.set_level(logging.INFO)
+    row = _dirty_row("2026-09-02", count=1)
+    row.update(dirty=False, dirty_since=None,
+              computed_at=NOW - timedelta(seconds=rs.DEBOUNCE_SECONDS))
+    store["rows"][("u-ben", "2026-09-02")] = row
+
+    ticks = iter([
+        NOW - timedelta(seconds=5),   # B's listed_at (B starts, finishes first)
+        NOW - timedelta(seconds=2),   # C's dirty_since (Y lands while A is in flight)
+        NOW - timedelta(seconds=4),   # A's listed_at (A started before C, finishes last)
+    ])
+    monkeypatch.setattr(rs, "_utcnow", lambda: next(ticks))
+
+    conn, s3 = FakeConn(), FakeS3(DAY_KEYS)
+
+    # B: the row is old enough to recompute (not debounced).
+    assert rs.handle_object_key(conn, s3, "bkt", REAL_KEY, NOW) == "computed"
+    assert store["rows"][("u-ben", "2026-09-02")]["dirty"] is False
+
+    # C: Y lands. B's write just set computed_at = NOW, so this reads as fresh and is
+    # only marked dirty, not recomputed.
+    assert rs.handle_object_key(conn, s3, "bkt", REAL_KEY, NOW) == "debounced-dirty"
+    marked = store["rows"][("u-ben", "2026-09-02")]
+    assert marked["dirty"] is True
+    dirty_since = marked["dirty_since"]
+    assert dirty_since == NOW - timedelta(seconds=2)
+
+    # A finishes last, writing from a LIST that started before C's mark.
+    result = rs.compute_day(conn, s3, "bkt", "u-ben", "Ben_UCPK2", "2026-09-02")
+    assert result["written"] is True
+    row_after = store["rows"][("u-ben", "2026-09-02")]
+    assert row_after["dirty"] is True, "A's late write must not clear a mark raised after its LIST began"
+    assert row_after["dirty_since"] == dirty_since
+
+
 # ---- sweep_dirty ---------------------------------------------------------------
 
 def test_the_trailing_pass_recomputes_every_dirty_day_and_clears_it(store, caplog):
@@ -305,6 +382,23 @@ def test_a_refused_smaller_listing_is_logged_by_the_trailing_pass(store, caplog)
     assert rs.sweep_dirty(FakeConn(), FakeS3(DAY_KEYS), "bkt") == 1
     assert "sweep kept the larger stored row folder=Ben_UCPK2" in caplog.text
     assert store["rows"][("u-ben", "2026-09-02")]["dirty"] is True
+
+
+def test_reaching_the_sweep_limit_re_raises_the_flag_for_the_next_tick(store, caplog):
+    # M4: list_dirty is capped at `limit`, so a day left over past that cap is
+    # invisible to this tick. Without re-raising the flag, an idle tick right after
+    # would see "not pending" and skip, stranding whatever did not fit.
+    caplog.set_level(logging.INFO)
+    store["rows"][("u-ben", "2026-09-02")] = _dirty_row("2026-09-02")
+    assert rs.sweep_dirty(FakeConn(), FakeS3(DAY_KEYS), "bkt", limit=1) == 1
+    assert store["events"][-1] == ("mark", rs.FLAG_KEY)
+    assert "sweep limit" in caplog.text and "re-flagged" in caplog.text
+
+
+def test_a_sweep_that_does_not_reach_the_limit_does_not_re_raise_the_flag(store):
+    store["rows"][("u-ben", "2026-09-02")] = _dirty_row("2026-09-02")
+    assert rs.sweep_dirty(FakeConn(), FakeS3(DAY_KEYS), "bkt", limit=50) == 1
+    assert ("mark", rs.FLAG_KEY) not in store["events"]
 
 
 # ---- lambda_handler --------------------------------------------------------------
@@ -380,6 +474,20 @@ def test_an_event_with_no_key_says_so_and_does_not_connect(wired_handler, caplog
     assert rs.lambda_handler({"source": "aws.s3", "detail": {}}, None) == {"outcomes": []}
     assert wired_handler["connections"] == []
     assert "no object key in event; nothing to do" in caplog.text
+
+
+def test_a_failed_connection_on_the_schedule_leaves_the_flag_pending(wired_handler, store, monkeypatch):
+    # I2: clear_pending used to run before get_connection. A connect failure (Aurora
+    # still resuming) or any exception before listing must not tell the next
+    # EventBridge retry that there is nothing pending.
+    def boom(*a, **k):
+        raise RuntimeError("connect failed")
+
+    monkeypatch.setattr("db.connection.get_connection", boom)
+    store["rows"][("u-ben", "2026-09-02")] = _dirty_row("2026-09-02")
+    with pytest.raises(RuntimeError):
+        rs.lambda_handler(SCHEDULE, None)
+    assert store["events"] == []
 
 
 # ---- seam: what the writer stores is what the reader merges ----------------------

@@ -32,6 +32,7 @@ def test_it_stores_segments_and_the_debounce_state_not_blocks():
     for column in ("folder_name text NOT NULL", "segments jsonb NOT NULL",
                    "source_object_count int NOT NULL",
                    "dirty boolean NOT NULL DEFAULT false",
+                   "dirty_since timestamptz",
                    "computed_at timestamptz NOT NULL DEFAULT now()"):
         assert column in sql, column
     assert "gap_seconds" not in sql and "blocks jsonb" not in sql

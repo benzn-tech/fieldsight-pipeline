@@ -25,6 +25,18 @@
 -- day had just been computed marks the row, and the five-minute trailing pass
 -- recomputes it, so the last transcripts of a day are never lost to the debounce.
 --
+-- dirty_since (fix for a race found in review round 1, I1): two concurrent computes
+-- can both LIST an old day before either writes. If the one that started EARLIER
+-- (and so missed a transcript that landed mid-flight) writes LAST, a dirty/count-only
+-- rule would let its write clear a mark raised in between, and the late transcript is
+-- lost with the row reading clean. dirty_since records when the CURRENT mark was
+-- raised (the earliest of any marks since the row was last clean); upsert_monotonic
+-- only clears dirty when the write's own `listed_at` (captured before that LIST
+-- began) is at or after dirty_since -- i.e. the write's view could have seen whatever
+-- caused the mark. A write whose LIST started before the mark leaves dirty/dirty_since
+-- untouched, so the day stays flagged for the trailing pass. NULL means "not marked
+-- since the last clean write".
+--
 -- Keyed by user rather than folder because users.folder_name can be changed and the
 -- person cannot; folder_name is carried so the trailing pass can LIST without a join.
 CREATE TABLE IF NOT EXISTS day_recording_segments (
@@ -34,6 +46,7 @@ CREATE TABLE IF NOT EXISTS day_recording_segments (
     segments            jsonb       NOT NULL,
     source_object_count int         NOT NULL,
     dirty               boolean     NOT NULL DEFAULT false,
+    dirty_since         timestamptz,
     computed_at         timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (user_id, report_date)
 );

@@ -35,40 +35,89 @@ def _user(db, folder):
         (cid, f"{folder.lower()}@example.test", folder)).fetchone()[0]
 
 
+def _now():
+    """A `listed_at` taken from the app's own clock, not the transaction-frozen SQL
+    now() the repository stamps `dirty_since`/`computed_at` with (see the comment on
+    test_list_dirty_returns_only_dirty_rows_least_recently_computed_first below)."""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
 def test_a_first_write_round_trips_segments_as_a_list(db):
     uid = _user(db, "Blocks_T")
-    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 5) is True
+    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 5, _now()) is True
     row = drs.get(db, uid, DAY)
     assert row["segments"] == SEGS
     assert row["source_object_count"] == 5
     assert row["dirty"] is False
+    assert row["dirty_since"] is None
     assert row["report_date"] == DAY and row["folder_name"] == "Blocks_T"
     assert row["computed_at"] is not None
 
 
 def test_a_listing_with_fewer_objects_does_not_shrink_the_day(db):
     uid = _user(db, "Blocks_T")
-    drs.upsert_monotonic(db, uid, DAY, "Blocks_T", NEWER, 5)
-    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 4) is False
+    drs.upsert_monotonic(db, uid, DAY, "Blocks_T", NEWER, 5, _now())
+    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 4, _now()) is False
     row = drs.get(db, uid, DAY)
     assert row["segments"] == NEWER and row["source_object_count"] == 5
 
 
 def test_an_equal_or_larger_listing_replaces_the_day_and_clears_dirty(db):
     uid = _user(db, "Blocks_T")
-    drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 5)
+    drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 5, _now())
     assert drs.mark_dirty(db, uid, DAY) is True
-    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", NEWER, 5) is True
+    # now() is constant inside the test transaction (see the comment further down), so
+    # this mark and every `_now()` above/below it share one SQL timestamp; the app-side
+    # `_now()` taken here is real wall-clock time and so is always later than it.
+    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", NEWER, 5, _now()) is True
     row = drs.get(db, uid, DAY)
     assert row["segments"] == NEWER and row["dirty"] is False
+    assert row["dirty_since"] is None
 
 
 def test_a_refused_write_leaves_the_dirty_mark_in_place(db):
     uid = _user(db, "Blocks_T")
-    drs.upsert_monotonic(db, uid, DAY, "Blocks_T", NEWER, 5)
+    drs.upsert_monotonic(db, uid, DAY, "Blocks_T", NEWER, 5, _now())
     drs.mark_dirty(db, uid, DAY)
-    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 4) is False
+    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 4, _now()) is False
     assert drs.get(db, uid, DAY)["dirty"] is True
+
+
+# ---- I1: a write's LIST relative to when the mark it might be racing was raised ----
+
+def test_a_mark_raised_after_the_writes_list_began_survives_the_write(db):
+    """Reproduces the review round-1 race directly against SQL: a write whose LIST
+    started before a mark was raised must not clear that mark, even though the count
+    rule alone would allow the write to land."""
+    uid = _user(db, "Blocks_T")
+    listed_at = _now()
+    drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 5, listed_at)
+    assert drs.mark_dirty(db, uid, DAY) is True
+    # now() is frozen at transaction start for the whole test, so this mark's
+    # dirty_since cannot naturally land after `listed_at` (captured mid-test, on the
+    # real clock) inside one transaction. Push it forward explicitly to simulate a
+    # mark genuinely raised after this write's LIST began.
+    db.execute("UPDATE day_recording_segments SET dirty_since = %s WHERE user_id = %s",
+              (listed_at + datetime.timedelta(seconds=1), uid))
+    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", NEWER, 5, listed_at) is True
+    row = drs.get(db, uid, DAY)
+    assert row["segments"] == NEWER            # the write itself still lands
+    assert row["dirty"] is True                # but the mark it raced survives
+    assert row["dirty_since"] is not None
+
+
+def test_a_mark_raised_before_the_writes_list_began_is_cleared(db):
+    """The trailing pass's own recompute, whose LIST starts after the mark, is exactly
+    the write meant to clear it."""
+    uid = _user(db, "Blocks_T")
+    drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 5, _now())
+    assert drs.mark_dirty(db, uid, DAY) is True
+    listed_at = _now()          # this LIST starts after the mark above
+    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", NEWER, 5, listed_at) is True
+    row = drs.get(db, uid, DAY)
+    assert row["segments"] == NEWER
+    assert row["dirty"] is False
+    assert row["dirty_since"] is None
 
 
 def test_mark_dirty_without_a_row_creates_nothing(db):
@@ -82,7 +131,7 @@ def test_list_dirty_returns_only_dirty_rows_least_recently_computed_first(db):
     newer = _user(db, "Blocks_New")
     clean = _user(db, "Blocks_Clean")
     for uid, folder in ((older, "Blocks_Old"), (newer, "Blocks_New"), (clean, "Blocks_Clean")):
-        drs.upsert_monotonic(db, uid, DAY, folder, SEGS, 1)
+        drs.upsert_monotonic(db, uid, DAY, folder, SEGS, 1, _now())
     drs.mark_dirty(db, older, DAY)
     drs.mark_dirty(db, newer, DAY)
     # now() is constant inside the test transaction, so order is set explicitly.
@@ -96,7 +145,7 @@ def test_list_dirty_returns_only_dirty_rows_least_recently_computed_first(db):
 
 def test_a_row_cannot_name_a_user_that_does_not_exist(db):
     with pytest.raises(psycopg.errors.ForeignKeyViolation):
-        drs.upsert_monotonic(db, uuid.uuid4(), DAY, "Nobody", SEGS, 1)
+        drs.upsert_monotonic(db, uuid.uuid4(), DAY, "Nobody", SEGS, 1, _now())
 
 
 # ---- deleted merged meetings -------------------------------------------------------

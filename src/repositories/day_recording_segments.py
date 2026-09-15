@@ -7,7 +7,8 @@ import json
 
 from psycopg.rows import dict_row
 
-_COLS = "user_id, report_date, folder_name, segments, source_object_count, dirty, computed_at"
+_COLS = ("user_id, report_date, folder_name, segments, source_object_count, "
+        "dirty, dirty_since, computed_at")
 
 
 def get(conn, user_id, report_date) -> dict | None:
@@ -24,35 +25,57 @@ def get(conn, user_id, report_date) -> dict | None:
 
 
 def upsert_monotonic(conn, user_id, report_date, folder_name, segments,
-                     source_object_count) -> bool:
+                     source_object_count, listed_at) -> bool:
     """Write the day's segments unless the stored row was computed from MORE objects.
 
-    Returns True when the row was written (and `dirty` cleared), False when an older,
-    smaller listing was refused. A refused write leaves `dirty` as it was on purpose:
-    clearing it would drop the mark a newer transcript left.
+    `listed_at` is an aware datetime taken immediately BEFORE the S3 LIST that produced
+    `segments` started. The count rule is unchanged: a listing with fewer objects than
+    the stored one is refused outright (see below). A write that is NOT refused clears
+    `dirty`/`dirty_since` only when the mark predates that LIST (dirty_since IS NULL, or
+    dirty_since <= listed_at) -- i.e. this LIST could have seen whatever raised the
+    mark. Otherwise the segments/count/computed_at still land, but dirty/dirty_since are
+    left exactly as stored: the mark was raised by something this LIST could not have
+    observed, so the trailing pass must still revisit the day (I1 -- two concurrent
+    computes racing a debounce mark).
+
+    Returns True when the row was written, False when an older, smaller listing was
+    refused. A refused write leaves dirty/dirty_since as they were on purpose: clearing
+    them would drop the mark a newer transcript left.
     """
     row = conn.cursor(row_factory=dict_row).execute(
         "INSERT INTO day_recording_segments "
-        "(user_id, report_date, folder_name, segments, source_object_count, dirty, computed_at) "
-        "VALUES (%s, %s, %s, %s::jsonb, %s, false, now()) "
+        "(user_id, report_date, folder_name, segments, source_object_count, "
+        "dirty, dirty_since, computed_at) "
+        "VALUES (%s, %s, %s, %s::jsonb, %s, false, NULL, now()) "
         "ON CONFLICT (user_id, report_date) DO UPDATE SET "
         "folder_name = EXCLUDED.folder_name, "
         "segments = EXCLUDED.segments, "
         "source_object_count = EXCLUDED.source_object_count, "
-        "dirty = false, "
+        "dirty = CASE WHEN day_recording_segments.dirty_since IS NULL "
+        "             OR day_recording_segments.dirty_since <= %s "
+        "             THEN false ELSE day_recording_segments.dirty END, "
+        "dirty_since = CASE WHEN day_recording_segments.dirty_since IS NULL "
+        "             OR day_recording_segments.dirty_since <= %s "
+        "             THEN NULL ELSE day_recording_segments.dirty_since END, "
         "computed_at = now() "
         "WHERE EXCLUDED.source_object_count >= day_recording_segments.source_object_count "
         "RETURNING user_id",
         (str(user_id), report_date, folder_name, json.dumps(segments),
-         int(source_object_count)),
+         int(source_object_count), listed_at, listed_at),
     ).fetchone()
     return row is not None
 
 
 def mark_dirty(conn, user_id, report_date) -> bool:
-    """Flag an existing row for the trailing pass. False when there is no row to flag."""
+    """Flag an existing row for the trailing pass. False when there is no row to flag.
+
+    dirty_since keeps the EARLIEST mark since the row was last clean (COALESCE), so a
+    second mark before the trailing pass catches up does not push the timestamp later
+    and does not make a stale write look like it could have seen the mark.
+    """
     row = conn.cursor(row_factory=dict_row).execute(
-        "UPDATE day_recording_segments SET dirty = true "
+        "UPDATE day_recording_segments SET dirty = true, "
+        "dirty_since = COALESCE(dirty_since, now()) "
         "WHERE user_id = %s AND report_date = %s RETURNING user_id",
         (str(user_id), report_date),
     ).fetchone()

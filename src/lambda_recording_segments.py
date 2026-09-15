@@ -135,7 +135,14 @@ def list_day_keys(s3, bucket, folder, date):
 
 
 def compute_day(conn, s3, bucket, user_id, folder, date):
-    """LIST the day, derive segments, write monotonically. Returns a summary dict."""
+    """LIST the day, derive segments, write monotonically. Returns a summary dict.
+
+    `listed_at` is taken right before the LIST starts (not after, and not at the top
+    of handle_object_key) so it marks the earliest moment this call's view of the day
+    could be stale -- what upsert_monotonic compares against dirty_since to decide
+    whether this write's LIST could have seen whatever raised the mark (I1).
+    """
+    listed_at = _utcnow()
     keys = list_day_keys(s3, bucket, folder, date)
     segments = []
     skipped = 0
@@ -150,7 +157,7 @@ def compute_day(conn, s3, bucket, user_id, folder, date):
                     folder, date, skipped)
     segments.sort(key=lambda s: (s["start"], s["key"]))
     written = day_recording_segments.upsert_monotonic(
-        conn, user_id, date, folder, segments, len(keys))
+        conn, user_id, date, folder, segments, len(keys), listed_at)
     return {"objects": len(keys), "segments": len(segments),
             "skipped": skipped, "written": written}
 
@@ -171,11 +178,18 @@ def handle_object_key(conn, s3, bucket, key, now):
         return "skipped-unresolved"
     row = day_recording_segments.get(conn, user["id"], date)
     if row is not None and (now - row["computed_at"]).total_seconds() < DEBOUNCE_SECONDS:
-        day_recording_segments.mark_dirty(conn, user["id"], date)
+        marked = day_recording_segments.mark_dirty(conn, user["id"], date)
         # AFTER the row is marked (autocommit), so a sweep that reads the flag always
         # finds the row it was raised for.
         sweep_state.mark_pending(FLAG_KEY)
-        logger.info("recording_segments: debounced-dirty folder=%s date=%s", folder, date)
+        if marked:
+            logger.info("recording_segments: debounced-dirty folder=%s date=%s", folder, date)
+        else:
+            # M5: mark_dirty's return value was silently ignored -- a race where the
+            # row was gone by the time the UPDATE ran (e.g. between get() and here)
+            # still logged "debounced-dirty" as though the mark had landed.
+            logger.warning("recording_segments: debounce mark found no row folder=%s date=%s "
+                           "(row gone between get() and mark_dirty())", folder, date)
         return "debounced-dirty"
     result = compute_day(conn, s3, bucket, user["id"], folder, date)
     logger.info("recording_segments: computed folder=%s date=%s objects=%d segments=%d "
@@ -201,6 +215,13 @@ def sweep_dirty(conn, s3, bucket, limit=SWEEP_LIMIT):
             logger.exception("recording_segments: sweep failed folder=%s date=%s",
                              row["folder_name"], row["report_date"])
     logger.info("recording_segments: swept %d of %d dirty day(s)", done, len(rows))
+    if len(rows) >= limit:
+        # M4: list_dirty is capped at `limit`, so a day left over past that cap was
+        # never seen this tick. Without re-raising the flag, an idle tick right after
+        # would read "not pending" and skip, stranding whatever did not fit.
+        sweep_state.mark_pending(FLAG_KEY)
+        logger.info("recording_segments: sweep limit (%d) reached; re-flagged for next tick",
+                    limit)
     return done
 
 
@@ -216,10 +237,15 @@ def lambda_handler(event, context):
             # Must be logged: without this line the skip path is unverifiable.
             logger.info("recording_segments: sweep skipped (no dirty days flagged)")
             return {"swept": 0, "skipped": "no-pending"}
-        # Cleared BEFORE listing: a day marked while this pass runs raises the flag
-        # again and is picked up next tick, instead of being cleared away unseen.
-        sweep_state.clear_pending(FLAG_KEY)
         with get_connection(autocommit=True) as conn:
+            # Cleared only once the connection is open, immediately before listing
+            # (I2): clearing it earlier meant a connect failure -- likely while Aurora
+            # is still resuming -- or any exception before this point left the flag
+            # cleared with nothing swept, and the next EventBridge retry would read
+            # "not pending" and skip. Also BEFORE listing within this block: a day
+            # marked while this pass runs raises the flag again and is picked up next
+            # tick, instead of being cleared away unseen.
+            sweep_state.clear_pending(FLAG_KEY)
             return {"swept": sweep_dirty(conn, s3, S3_BUCKET)}
     keys = keys_from_event(event)
     if not keys:
