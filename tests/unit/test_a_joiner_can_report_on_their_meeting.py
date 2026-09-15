@@ -39,7 +39,7 @@ from tests.unit.test_org_api_sessions import (  # noqa: E402
 )
 
 DATE = "2026-07-25"
-GROUP = "AAA111"
+GROUP = "a" * 32  # a real groupId is always 32 hex chars (see lambda_org_api._SID_RE)
 SESSION = f"grp{GROUP}"
 MERGED_KEY = f"extractions/Lead_Folder/{DATE}/{SESSION}.json"
 OWN = {"date": DATE, "user": "Ada_L"}            # CALLER's own folder
