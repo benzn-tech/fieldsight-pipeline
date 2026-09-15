@@ -116,16 +116,29 @@ DEVICE_ANNOUNCEMENT_MAX_CHARS = int(
 # engines and runs, and because the app can change its wording without telling
 # the backend — which is also why the artifact reports what was removed.
 #
-# These are the app's four voice lines as of GrandTime PR #13 (merged
+# The app's voice lines. The first four shipped in GrandTime PR #13 (merged
 # 2026-08-07, wired and verified in the release apk — an earlier version of this
-# comment said they were staged but unwired, which was wrong):
+# comment said they were staged but unwired, which was wrong) and are still what
+# every device older than 0.7.12 says:
 #
 #   recording_started : "Recording started."
 #   recording_stopped : "Recording stopped."
 #   meeting_prompt    : "Recording stopped. Has the meeting ended? Check the screen."
 #   meeting_ended     : "Meeting ended. Recording stopped."
 #
-# Two of those are MULTI-SENTENCE, which is why matching is done per sentence
+# GrandTime 0.7.12 (branch feat/notification-sounds, 2026-09-15) replaced the
+# first two with a recorded set, one clip per event. Wording as supplied with
+# the clips; none of these matched the patterns before this change, because the
+# match is a whole sentence and "video"/"audio" in front of "recording" was
+# enough to miss:
+#
+#   video_started / video_paused / video_stopped : "Video recording started." / "... paused." / "... stopped."
+#   audio_started / audio_paused / audio_stopped : "Audio recording started." / "... paused." / "... stopped."
+#   photo_captured : "Photo captured"
+#   low_battery    : "Low battery, recording will stop soon."
+#   ask_agent      : "Ready, go ahead."
+#
+# Several lines are MULTI-SENTENCE, which is why matching is done per sentence
 # rather than over the whole turn: a whole-turn match caught only the first two.
 # Per-sentence also covers the likelier field case — the prompts have audible
 # pauses between sentences, so a transcriber may well emit them as separate
@@ -135,7 +148,7 @@ _DEFAULT_ANNOUNCEMENT_PATTERNS = [
     # "stopping". Without it "Stopped recording." walks straight through, which
     # is what the tests caught.
     r"(please\s+)?(start|stopp?|end)(ed|ing)?\s+(the\s+)?record(ing)?",
-    r"(the\s+)?record(ing)?\s+(has\s+|is\s+)?(start|stopp?|end)(ed|ing)?",
+    r"(the\s+)?((video|audio)\s+)?record(ing)?\s+(has\s+|is\s+)?(start|stopp?|end|paus)(ed|ing)?",
     r"(the\s+)?meeting\s+(has\s+)?(start|stopp?|end)(ed|ing)?",
     r"(start|end)\s+of\s+(the\s+)?meeting",
     r"record(ing)?\s+(started|stopped|ended)",
@@ -144,11 +157,23 @@ _DEFAULT_ANNOUNCEMENT_PATTERNS = [
     # recording vocabulary to distinguish it. It is only ever dropped as part of
     # a turn whose other sentences are announcements.
     r"has\s+the\s+meeting\s+ended",
+    # From the 0.7.12 recorded set.
+    r"photo\s+captured",
+    r"(low\s+battery\s+)?recording\s+will\s+stop\s+soon",
+    # The Ask start cue. Only ever as ONE sentence: split at the comma into
+    # "Ready." and "Go ahead.", each is something a person says on site all
+    # day, so neither is a pattern or a companion, and that rendering is
+    # deliberately left unfiltered. The owner accepted that a person saying
+    # exactly "Ready, go ahead." as a whole turn loses it (2026-09-15).
+    r"ready\s+go\s+ahead",
 ]
 # Sentences that are not announcements by themselves, but are recognisable as
 # prompt text when they arrive attached to one.
 _ANNOUNCEMENT_COMPANIONS = [
     r"check\s+the\s+screen",
+    # From low_battery, when the transcriber splits it at the comma. On its own
+    # it is a person talking about a tool.
+    r"low\s+battery",
 ]
 
 
