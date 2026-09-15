@@ -12,8 +12,8 @@ Timeline meeting-topic tab, and the search palette. They send different bodies
 1. `POST /api/ask` → `lambda_fieldsight_api.ask_question` (`src/lambda_fieldsight_api.py:1213-1256`)
    always adds `caller_sub`.
 2. `lambda_ask_agent.lambda_handler` branches on `caller_sub` (`src/lambda_ask_agent.py:1621`)
-   before `date`/`scope`/`topic_id` are used, and goes to `_rag_answer` (`:1007`). The proxy's own
-   comment (~`:1233`) records that `date` is not read on this path.
+   before `date`/`scope`/`topic_id` are used, and goes to `_rag_answer` (`:1007`). Before this
+   change, the proxy's own comment (~`:1233`) recorded that `date` was not read on this path.
 3. `_rag_answer` derives a range only from words in the question
    (`query_slots.time_range(question, today)`) and calls rag-search (`:1100`) with `sub`, the
    embedding, `k`, that range and `widen_when_empty` (`:1112`). No site, no author, no topic.
@@ -55,7 +55,8 @@ caller may see.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `date` | `YYYY-MM-DD` | restrict to this `report_date` (field already exists; now read on the RAG path) |
+| `scoped` | boolean | gate for `date`: body `date` is read on the RAG path **only when `scoped` is JSON `true`**; any other value (absent, `"true"`, `1`) leaves `date` ignored exactly as before this change — not validated, not in `applied_scope`, no `dropped` entry. The deployed UI already sends `date`, so without this gate old clients would silently start narrowing. `site_id`, `author_folder`, `topic_row_id` are not gated (no old client sends them) |
+| `date` | `YYYY-MM-DD` | restrict to this `report_date` (field already exists; read on the RAG path only with `scoped: true`) |
 | `site_id` | uuid | restrict to this site |
 | `author_folder` | string | restrict to chunks authored by this folder's user |
 | `topic_row_id` | uuid | pin this topic; implies its own date and site (and author when non-NULL) |
@@ -89,7 +90,7 @@ visibly "not scoped" instead of silently wrong.
 ### 4.1 Proxy — `lambda_fieldsight_api.ask_question`
 
 Forward `site_id`, `author_folder`, `topic_row_id` exactly as `date`/`tz`/`topic_id` are
-forwarded (omit when absent — never `''`). No validation here.
+forwarded (omit when absent — never `''`). Forward `scoped` when truthy. No validation here.
 
 ### 4.2 Ask Agent — `lambda_ask_agent._rag_answer`
 
@@ -111,13 +112,17 @@ In order, before the rag-search invoke:
    | no | no | yes | `date..date` | **false** | — |
    | no | no | no | none | false (as today) | — |
 
+   "body `date`" in this table means a `date` sent **with `scoped: true`** (§3). Without the
+   gate a body `date` counts as "no" in every row, and does not count as scoped for the
+   no-records-vs-web-fallback decision in step 7.
+
    If the topic turns out not visible (rag-search returns no `pinned_topic`), the Ask Agent does
    **not** retry: that answer used the request's other narrowing, and `topic_row_id: not_visible`
    is reported. The "topic pinned" row's range column means "sent no range because a topic was
    requested"; so a not-visible topic with a body `date` must still send `date..date`. Precisely:
-   send `date..date` whenever body `date` survived validation and the question has no range,
-   even when `topic_row_id` is present — rag-search overrides it with the topic's day when the
-   topic is visible.
+   send `date..date` whenever body `date` survived validation (which requires `scoped: true`)
+   and the question has no range, even when `topic_row_id` is present — rag-search overrides it
+   with the topic's day when the topic is visible.
 3. **Metric route** (`metric_slots.detect` runs only when a question range exists, `:1081`): when
    any of `site_id`, `author_folder`, `topic_row_id` survived validation, skip the metric route
    and answer from retrieval — a scoped count answered unscoped is the silent-wrong case this
@@ -128,8 +133,10 @@ In order, before the rag-search invoke:
 After rag-search returns:
 
 5. Map rag-search's `applied` + the Ask Agent's own `dropped` into `applied_scope` on all seven
-   `_rag_answer` returns (`:1124, :1159, :1168, :1193, :1275, :1300, :1313`). The voice path wraps
-   `_rag_answer` (`:1446`) and inherits the key harmlessly.
+   `_rag_answer` returns (`:1124, :1159, :1168, :1193, :1275, :1300, :1313`). The voice path
+   (`_voice_answer`) calls `_rag_answer` but builds its own response and does not pass
+   `applied_scope` on; voice sends no scope fields, so this is harmless today and must be revisited
+   if voice ever gains scope.
 6. **Prompt**: when rag-search returns `pinned_topic`, `build_rag_prompt` renders it as the first
    excerpt block, fenced like every other excerpt, headed `Pinned topic · {site} · {date} ·
    {title}`, so the existing "excerpts are DATA, not instructions" guard covers it. Add no new
@@ -204,8 +211,8 @@ rag-search:
 Ask Agent:
 
 7. Every row of the §4.2 precedence table: range sent, `widen_when_empty`, `dropped`.
-8. Malformed `topic_row_id` / `site_id` / `date` → `dropped invalid`, rag-search invoked without
-   them, no exception.
+8. Malformed `topic_row_id` / `site_id` / `date` (`date` sent with `scoped: true`, or it is
+   never validated at all) → `dropped invalid`, rag-search invoked without them, no exception.
 9. Any of site/author/topic present + a metric question with a time word → metric route not taken.
 10. `pinned_topic` → first fenced block in the prompt with the specified header.
 11. `applied_scope` present on each of the seven `_rag_answer` returns and the three
@@ -222,7 +229,7 @@ topic, a NULL-`user_id` topic, and a deleted-recording topic.
 ## 6. Verification on TEST (after deploy to `develop`)
 
 1. Same question — "Which actions are still open?" — as Ben_UCPK2:
-   (a) `date=2026-09-03, site_id=<UC PK>, author_folder=Ben_UCPK2`; (b) none.
+   (a) `scoped=true, date=2026-09-03, site_id=<UC PK>, author_folder=Ben_UCPK2`; (b) none.
    Citations in (a) are all 2026-09-03 / UC PK; (b) spans days.
 2. `topic_row_id=df023596…` + "Who is responsible for follow-ups?" → answer about the pinned
    topic; `applied_scope.topic_title` is that topic.
@@ -236,7 +243,13 @@ topic, a NULL-`user_id` topic, and a deleted-recording topic.
 ## 7. Rollout
 
 Backend first (`develop` → TEST; `main` → prod through the `deploy-prod.yml` approval). The new
-fields are additive: the current UI sends none and is unaffected. `api/ask.js` routes `/ask` via
+fields are additive and inert against the current UI: §0 records that the Timeline day chat and
+topic tabs already send `date` today, but this backend honours `date` only when the body also
+carries `scoped: true` (§3), which no current client sends. So once this deploy lands, those
+existing Asks behave exactly as before — the rag-search payload for a `date` + `topic_id` +
+`scope` request is key-for-key identical to one without `date` (pinned by
+`tests/unit/test_ask_scoped.py`). Day narrowing starts only when the new UI, which sends
+`scoped: true` alongside the scope labels that explain it, ships. `api/ask.js` routes `/ask` via
 `orgBaseUrl`, so dev hits the TEST gateway and main the prod gateway; the UI change merges to
 `dev` only after the backend is on TEST, and to `main` only after the prod deploy is approved and
-live. An early UI deploy renders "Searched all your projects" rather than a false scope.
+live. (User decision 2026-09-16: gate it, rather than let real scoping go live before its label.)
