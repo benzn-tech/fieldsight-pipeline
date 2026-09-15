@@ -1333,6 +1333,11 @@ def _rag_answer(body):
         # actually built from, not the wider set fetched to choose from.
         chunks = _rerank_chunks(question, chunks, k)
         basis = _basis(result, chunks, date_from, date_to)
+        # A scoped ask (day/site/author/topic) never consults the web: the web
+        # cannot know that site or day (spec 2026-09-15 §4.2 step 7). Computed
+        # once so the empty-retrieval branch and the pre-synthesis check below
+        # cannot drift apart.
+        scoped = narrowed or plan["body_date_sent"]
 
         if result.get("error"):
             # Distinguish "caller not provisioned" / ACL misses from genuine
@@ -1354,7 +1359,6 @@ def _rag_answer(body):
             # no-records path (spec 2026-09-15 §4.2 step 7): the web cannot know
             # that site or day, and the UI's "Ask across everything" offer
             # depends on the no-answer result.
-            scoped = narrowed or plan["body_date_sent"]
             if body.get("mode") != "voice" and not result.get("error") and not scoped:
                 import web_answer
                 empty_web = web_answer.answer(question, [])
@@ -1391,7 +1395,12 @@ def _rag_answer(body):
         # With no chunks this can only be a pinned topic, which is the reader's
         # own record; asking the web whether records answer it would judge an
         # empty list.
-        if body.get("mode") != "voice" and chunks:
+        #
+        # Nor on a scoped ask, or whenever a topic is pinned. This check sees
+        # only `chunks`, never the pinned block, so on TEST it judged a pinned
+        # topic's records unable to answer "What are the next steps?" and
+        # returned a web block with no citations instead of the topic.
+        if body.get("mode") != "voice" and chunks and not scoped and not pinned_topic:
             import web_answer
             web = web_answer.answer(question, chunks)
         if web is not None and web.get("answer"):

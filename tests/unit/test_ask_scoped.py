@@ -628,3 +628,75 @@ def test_a_legacy_topic_with_a_different_body_date_reports_no_override(monkeypat
     assert "date_from" not in with_date and "date_to" not in with_date
     assert res_a["applied_scope"] == res_b["applied_scope"]
     assert {"field": "date", "reason": "overridden_by_topic"} not in res_a["applied_scope"]["dropped"]
+
+
+# --------------------------------------------------------------------------
+# TEST verification defect: the pre-synthesis web check ran on scoped asks.
+# It judges only `chunks`, never the pinned block, so a pinned topic asked
+# "What are the next steps?" came back as a web block with no citations.
+# The stub RETURNS an answer, so a check that wrongly runs is visible twice:
+# in the call count and in `from_web`.
+# --------------------------------------------------------------------------
+
+WEB = {"answer": "Public sources cannot answer this question."}
+
+
+def _count_web(monkeypatch):
+    calls = []
+
+    def fake_web(question, chunks, **k):
+        calls.append(list(chunks))
+        return WEB
+
+    monkeypatch.setattr(web_answer, "answer", fake_web)
+    return calls
+
+
+def test_a_pinned_topic_with_chunks_never_runs_the_web_check(monkeypatch):
+    _, seen = wire(monkeypatch, responses=[{
+        "chunks": [CHUNK], "pinned_topic": PINNED,
+        "applied": {"topic_row_id": TOPIC_ID, "topic_title": "Scaffold handover",
+                    "site_id": SITE_ID, "date": "2026-09-03", "dropped": []}}])
+    calls = _count_web(monkeypatch)
+
+    out = ask(question="What are the next steps?", scoped=True, date="2026-09-03",
+              site_id=SITE_ID, author_folder="Ben_UCPK2", topic_row_id=TOPIC_ID)
+
+    assert calls == []
+    assert "from_web" not in out
+    assert seen["llm_calls"] == 1 and HEADER in seen["prompt"]
+    assert out["answer"] == "Grounded answer [1]."
+
+
+def test_a_scoped_day_with_chunks_never_runs_the_web_check(monkeypatch):
+    wire(monkeypatch, responses=[{"chunks": [CHUNK], "applied": {"dropped": []}}])
+    calls = _count_web(monkeypatch)
+    out = ask(question="What are the next steps?", scoped=True, date="2026-09-03")
+    assert calls == []
+    assert "from_web" not in out and out["grounded"] is True
+
+
+def test_a_site_only_scope_with_chunks_never_runs_the_web_check(monkeypatch):
+    wire(monkeypatch, responses=[{"chunks": [CHUNK],
+                                  "applied": {"site_id": SITE_ID, "dropped": []}}])
+    calls = _count_web(monkeypatch)
+    out = ask(question="What are the next steps?", site_id=SITE_ID)
+    assert calls == []
+    assert "from_web" not in out and out["grounded"] is True
+
+
+def test_an_unscoped_ask_with_chunks_still_runs_the_web_check(monkeypatch):
+    _, seen = wire(monkeypatch)
+    calls = _count_web(monkeypatch)
+    out = ask(question="What are the next steps?")
+    assert calls == [[CHUNK]]
+    assert out.get("from_web") is True and out["answer"] == WEB["answer"]
+    assert seen["llm_calls"] == 0
+
+
+def test_a_legacy_date_without_the_gate_still_runs_the_web_check(monkeypatch):
+    wire(monkeypatch)
+    calls = _count_web(monkeypatch)
+    out = ask(question="What are the next steps?", date="2026-09-03", **LEGACY)
+    assert len(calls) == 1
+    assert out.get("from_web") is True and out["answer"] == WEB["answer"]
