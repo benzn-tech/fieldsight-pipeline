@@ -7137,7 +7137,30 @@ def _recording_blocks_entry(conn, folder, date, rows, sessions):
         none of the device sids stored here and, for a member, not even this folder, so
         the folder-narrowed prefix arm can never see it. It is expanded to the member
         sessions it covers (day_recording_segments.deleted_group_session_ids).
+
+    F1 fix round 1 (I1): the exclusion set above is computed on RAW session bases
+    (session_scope.session_ref), not on session_scope.device_session_id -- that helper
+    only matches a chunk session's `sid{32hex}` base and maps a `grp{lead_sid}` base OR
+    a legacy whole-file base to None, which used to make both un-excludable (they landed
+    in both "has topics" and "listed", cancelling out). Excluded bases are now
+    reclassified:
+      * `sid{32hex}`     -> the 32-hex id, added straight to the excluded session ids;
+      * `grp{lead_sid}`  -> the lead id is expanded via
+        day_recording_segments.group_member_session_ids to the lead AND every member
+        device session, all added to the excluded ids (mirrors the deleted-meeting
+        expansion above, but for exclusion rather than deletion);
+      * anything else (a legacy whole-file base) -> `extractions/{folder}/{date}/{base}`
+        is added to the prefixes passed to recording_blocks.filter_segments; a
+        session_id-less legacy segment's own tombstone candidates already include that
+        exact key (recording_blocks._tombstone_candidates), so the prefix arm alone
+        hides it without any change to recording_blocks.py.
     topic_row_ids only name topics that survived build_day_sessions.
+
+    M1: blocks are NOT clipped to _allowed_site_ids -- stored segments carry no site_id
+    at all, only session/topic identity, so there is nothing here to clip against. This
+    is the same folder-gated (not site-gated) exposure /audio-segments already has for a
+    single recording; a later export task must not treat a block's `session_ids` as
+    site-authorised on its own.
 
     Any failure logs and returns {}: blocks are an enhancement to a picker that works
     without them, and must never 500 the sessions read.
@@ -7149,18 +7172,34 @@ def _recording_blocks_entry(conn, folder, date, rows, sessions):
         stored = day_recording_segments.get(conn, owner["id"], date)
         if stored is None:
             return {}
-        listed = {session_scope.device_session_id(s["session_id"]) for s in sessions}
-        with_topics = set()
+        listed_bases = {s["session_id"] for s in sessions}
+        with_topic_bases = set()
         for r in rows:
             base, kind = session_scope.session_ref(r.get("source_s3_key"))
             if kind == session_scope.KIND_EXTRACTION:
-                with_topics.add(session_scope.device_session_id(base))
-        excluded = (with_topics - listed) - {None}
-        excluded |= day_recording_segments.deleted_group_session_ids(
+                with_topic_bases.add(base)
+        excluded_bases = (with_topic_bases - listed_bases) - {None}
+
+        excluded_ids = set()
+        excluded_lead_sids = []
+        extra_prefixes = []
+        for base in excluded_bases:
+            hexid = session_scope.device_session_id(base)
+            grp_match = re.match(r"^grp([0-9a-f]{32})$", base) if hexid is None else None
+            if hexid is not None:
+                excluded_ids.add(hexid)
+            elif grp_match is not None:
+                excluded_lead_sids.append(grp_match.group(1))
+            else:
+                extra_prefixes.append(f"extractions/{folder}/{date}/{base}")
+        if excluded_lead_sids:
+            excluded_ids |= day_recording_segments.group_member_session_ids(
+                conn, excluded_lead_sids)
+
+        excluded_ids |= day_recording_segments.deleted_group_session_ids(
             conn, [s.get("session_id") for s in stored["segments"]])
-        kept = recording_blocks.filter_segments(
-            stored["segments"], excluded,
-            redactions.deleted_source_prefixes(conn, folder, date))
+        prefixes = redactions.deleted_source_prefixes(conn, folder, date) + extra_prefixes
+        kept = recording_blocks.filter_segments(stored["segments"], excluded_ids, prefixes)
         gap_seconds, long_block_seconds = _block_thresholds()
         visible_ids = {tid for s in sessions for tid in s["topic_row_ids"]}
         topic_rows = [r for r in rows if str(r["id"]) in visible_ids]

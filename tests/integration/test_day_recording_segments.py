@@ -215,3 +215,31 @@ def test_a_solo_sid_tombstone_is_not_read_as_a_group(db):
 def test_no_candidates_asks_nothing(db):
     assert drs.deleted_group_session_ids(db, []) == set()
     assert drs.deleted_group_session_ids(db, [None, ""]) == set()
+
+
+# ---- group_member_session_ids: exclusion (not deletion) fan-out ---------------------
+#
+# Companion to deleted_group_session_ids, used when a `grp{lead_sid}` extraction base
+# itself (not a tombstone) needs expanding to every device session it covers -- e.g. all
+# of its topics were redacted/non_work (recording_blocks §5.4 fix round 1, I1).
+
+def test_a_lead_with_members_expands_to_the_lead_and_every_member(db):
+    _cid, _lead_user, _redactions = _group(db)
+    assert drs.group_member_session_ids(db, [LEAD]) == {LEAD, MEMBER, OTHER_MEMBER}
+
+
+def test_a_lead_with_no_members_expands_to_only_itself(db):
+    from repositories import meeting_session
+
+    cid = db.execute("INSERT INTO companies (name) VALUES ('GS') RETURNING id").fetchone()[0]
+    lone_lead = "e" * 32
+    lone_user = db.execute(
+        "INSERT INTO users (company_id, email, global_role, folder_name) "
+        "VALUES (%s, 'lone@example.test', 'worker', 'Lone_Lead') RETURNING id", (cid,)).fetchone()[0]
+    meeting_session.ensure_open(db, lone_lead, cid, lone_user, None, "audio", None)
+    assert drs.group_member_session_ids(db, [lone_lead]) == {lone_lead}
+
+
+def test_empty_input_expands_to_nothing(db):
+    assert drs.group_member_session_ids(db, []) == set()
+    assert drs.group_member_session_ids(db, [None, ""]) == set()

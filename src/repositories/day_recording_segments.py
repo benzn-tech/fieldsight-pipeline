@@ -125,3 +125,24 @@ def deleted_group_session_ids(conn, session_ids) -> set[str]:
         (ids,),
     ).fetchall()
     return {r["sid"] for r in rows}
+
+
+def group_member_session_ids(conn, lead_sids) -> set[str]:
+    """The lead ids themselves plus every device session_id merged under one of them.
+
+    Companion to `deleted_group_session_ids`, but for EXCLUSION rather than deletion:
+    a merged meeting's `grp{lead_sid}` extraction base names no device session directly
+    (recording_blocks §5.4 fix round 1, I1) -- a caller that has decided a `grp{lead_sid}`
+    base should be hidden (e.g. every one of its topics was redacted/non_work) still needs
+    every device session id it covers, lead included, to exclude the right segments. No
+    tombstone condition here on purpose -- this is not about what was deleted, only about
+    what group membership IS, right now.
+    """
+    leads = sorted({s for s in (lead_sids or []) if s})
+    if not leads:
+        return set()
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT session_id FROM meeting_session WHERE group_id = ANY(%s)",
+        (leads,),
+    ).fetchall()
+    return set(leads) | {r["session_id"] for r in rows}

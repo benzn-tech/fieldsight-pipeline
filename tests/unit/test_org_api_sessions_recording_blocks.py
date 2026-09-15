@@ -86,6 +86,10 @@ def _key(sid):
     return f"extractions/Ada_L/{DATE}/sid{sid}.json"
 
 
+def _grp_key(sid):
+    return f"extractions/Ada_L/{DATE}/grp{sid}.json"
+
+
 ROWS = [
     _row(id="t-a1", source_s3_key=_key(SID_A), time_range="10:56 – 11:10"),
     _row(id="t-a2", source_s3_key=_key(SID_A), time_range="11:30 – 11:36"),
@@ -97,7 +101,8 @@ ROWS = [
 @pytest.fixture
 def wired(monkeypatch):
     """Caller resolved, no redactions, ALL-scope site reach, no stored segments yet."""
-    calls = {"owner_lookups": [], "segment_reads": [], "prefix_reads": [], "group_lookups": []}
+    calls = {"owner_lookups": [], "segment_reads": [], "prefix_reads": [], "group_lookups": [],
+             "group_member_lookups": []}
     # groups: {lead_sid: {member sids}}; grp_tombstones: [(target_key, reverted)]
     state = {"stored": None, "prefixes": [], "redacted": {}, "groups": {}, "grp_tombstones": []}
 
@@ -110,7 +115,20 @@ def wired(monkeypatch):
         return {sid for sid in session_ids if sid and any(
             sid == gid or sid in state["groups"].get(gid, ()) for gid in dead)}
 
+    def group_members(conn, lead_sids):
+        """Stands in for the SQL in repositories.day_recording_segments (run for real in
+        tests/integration): every lead id plus every member merged under it, tombstone
+        status irrelevant -- this is exclusion, not deletion."""
+        leads = sorted({s for s in lead_sids if s})
+        calls["group_member_lookups"].append(leads)
+        out = set()
+        for lead in leads:
+            out.add(lead)
+            out |= set(state["groups"].get(lead, ()))
+        return out
+
     monkeypatch.setattr(org.day_recording_segments, "deleted_group_session_ids", deleted_groups)
+    monkeypatch.setattr(org.day_recording_segments, "group_member_session_ids", group_members)
     monkeypatch.setattr(org, "get_connection", lambda *a, **k: FakeConn())
     monkeypatch.setattr(org.users, "get_user_by_sub",
                         lambda conn, sub: dict(CALLER) if sub == "sub-1" else None)
@@ -307,6 +325,67 @@ def test_a_reverted_group_tombstone_hides_nothing(wired):
     wired["state"]["grp_tombstones"] = [(f"extractions/Ada_L/{DATE}/grp{SID_B}", True)]
     body = body_of(_get(DAY))
     assert _spans(body) == [("10:55", "11:35"), ("17:14", "17:47"), ("17:57", "18:15")]
+
+
+# ---- fix round 1 (I1): a grp/legacy base excluded by non_work/redacted must still hide --
+#
+# device_session_id only matches a chunk session's `sid{32hex}` base -- a `grp{lead_sid}`
+# base (a merged meeting) or a legacy whole-file base both map to None, and used to cancel
+# out of both "has topics" and "listed" instead of being excluded (I1).
+
+def test_a_merged_meetings_block_is_hidden_on_the_leads_day_when_all_its_topics_are_non_work(wired):
+    rows = [r if r["id"] != "t-b1" else dict(r, source_s3_key=_grp_key(SID_B), work_class="non_work")
+            for r in ROWS]
+    _wire_rows(wired, rows)
+    _store(wired)
+    wired["state"]["groups"] = {SID_B: {MEMBER_B}}
+    body = body_of(_get(DAY))
+    assert _spans(body) == [("10:55", "11:35"), ("17:57", "18:15")]
+    assert wired["calls"]["group_member_lookups"] == [[SID_B]]
+
+
+def test_a_merged_meetings_block_is_hidden_on_a_members_day_when_all_its_topics_are_non_work(wired):
+    rows = [r if r["id"] != "t-b1" else dict(r, source_s3_key=_grp_key(SID_B), work_class="non_work")
+            for r in ROWS]
+    _wire_rows(wired, rows)
+    _store(wired, _segments_for("Bob_K", {SID_B: MEMBER_B}))
+    wired["state"]["groups"] = {SID_B: {MEMBER_B}}
+    body = body_of(_get({"date": DATE, "user": "Bob_K"}))
+    assert _spans(body) == [("10:55", "11:35"), ("17:57", "18:15")]
+
+
+def test_a_merged_meetings_block_is_hidden_when_all_its_topics_are_redacted(wired):
+    rows = [r if r["id"] != "t-b1" else dict(r, source_s3_key=_grp_key(SID_B)) for r in ROWS]
+    _wire_rows(wired, rows)
+    _store(wired)
+    wired["state"]["groups"] = {SID_B: {MEMBER_B}}
+    wired["state"]["redacted"] = {"t-b1": {"scope": "redacted"}}
+    body = body_of(_get(DAY))
+    assert _spans(body) == [("10:55", "11:35"), ("17:57", "18:15")]
+
+
+def test_a_legacy_whole_file_sessions_block_is_hidden_when_all_its_topics_are_excluded(wired):
+    legacy_base = f"ada_l_{DATE}_19-26-40"
+    legacy_row = _row(id="t-legacy", source_s3_key=f"extractions/Ada_L/{DATE}/{legacy_base}.json",
+                      time_range="19:26 – 19:27", work_class="non_work")
+    legacy_segment = {
+        "start": 70000.0, "end": 70030.0, "session_id": None,
+        "key": f"transcripts/Ada_L/{DATE}/{legacy_base}_off0.0_to30.0_srcwav.json",
+    }
+    _wire_rows(wired, ROWS + [legacy_row])
+    _store(wired, SEGMENTS + [legacy_segment])
+    body = body_of(_get(DAY))
+    assert _spans(body) == [("10:55", "11:35"), ("17:14", "17:47"), ("17:57", "18:15")]
+
+
+def test_a_merged_meeting_with_one_surviving_topic_still_shows_its_block(wired):
+    rows = [r if r["id"] != "t-b1" else dict(r, source_s3_key=_grp_key(SID_B)) for r in ROWS]
+    _wire_rows(wired, rows)
+    _store(wired)
+    wired["state"]["groups"] = {SID_B: {MEMBER_B}}
+    body = body_of(_get(DAY))
+    assert _spans(body) == [("10:55", "11:35"), ("17:14", "17:47"), ("17:57", "18:15")]
+    assert body["recording_blocks"][1]["topic_row_ids"] == ["t-b1"]
 
 
 def test_a_failing_blocks_read_still_serves_the_sessions(wired):
