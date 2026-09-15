@@ -1040,6 +1040,37 @@ Parameters:
       script (CJK at ~2 chars per token) so a fully specific Chinese quote is
       not capped at `weak` for having no spaces in it.
 
+  EnableRecordingBlocks:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether RecordingSegmentsFunction keeps day_recording_segments current: its
+      transcripts/ Object Created rule and its rate(5 minutes) trailing pass both
+      take their State from this. Off means both rules are DISABLED, no row is
+      ever written, and GET /api/org/sessions carries no recording_blocks key, so
+      the picker renders sessions exactly as before. Never on the finalize/email
+      path (design D5): the only coupling to email latency is account
+      concurrency, which the function caps at 2.
+
+  ReportBlockGapSeconds:
+    Type: String
+    Default: '600'
+    Description: >-
+      Silence, in seconds, that splits a day's recorded segments into separate
+      recording blocks in the report picker (design D2). Read by org-api only,
+      per request, against the raw segments stored per day, so a change reaches
+      every day including finished ones (review finding F9). Separate from
+      session_scope.SESSION_GAP_MINUTES, which this does not touch (D4).
+
+  ReportLongBlockSeconds:
+    Type: String
+    Default: '5400'
+    Description: >-
+      A recording block longer than this many seconds is not selectable as a
+      whole; its topics are the unit instead (design D1/D2, 90 minutes). Read by
+      org-api only, for the same single-reader reason as ReportBlockGapSeconds.
+
   DeviceAnnouncementPatterns:
     Type: String
     Default: ''
@@ -1215,6 +1246,7 @@ Conditions:
   HasVoiceprintSpreadOverride: !Not [!Equals [!Ref VoiceprintMaxFrameSpread, 'default']]
   ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
   ShouldEnableFinalize: !Equals [!Ref EnableFinalize, 'true']
+  ShouldEnableRecordingBlocks: !Equals [!Ref EnableRecordingBlocks, 'true']
   ShouldEnableSweepPendingGate: !Equals [!Ref EnableSweepPendingGate, 'true']
   ShouldEnableNonWorkExpiry: !Equals [!Ref EnableNonWorkExpiry, 'true']
   ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
@@ -1229,6 +1261,10 @@ Conditions:
   # behind HasDb, so its alarm needs BOTH conditions or the stack fails to
   # create in a no-database configuration.
   ShouldAlarmItemWriter: !And
+    - !Condition ShouldCreateAlerts
+    - !Condition HasDb
+  # Same reason as ShouldAlarmItemWriter: RecordingSegmentsFunction is behind HasDb.
+  ShouldAlarmRecordingSegments: !And
     - !Condition ShouldCreateAlerts
     - !Condition HasDb
   HasTranscribeReserve: !Not [!Equals [!Ref TranscribeReservedConcurrency, '0']]
@@ -1992,6 +2028,10 @@ Resources:
           # AUTHORITY_FLIP (IngestFunction, above): Parameter default 'false',
           # driven per-environment by a repo variable in the deploy workflows.
           GRADED_ROLES: !Ref GradedRoles
+          # Recording-block thresholds (design 2026-09-15 §5.5 as amended by F9). org-api
+          # is the ONLY function given these: it merges stored segments at read time.
+          REPORT_BLOCK_GAP_SECONDS: !Ref ReportBlockGapSeconds
+          REPORT_LONG_BLOCK_SECONDS: !Ref ReportLongBlockSeconds
           # Does `complete` verify the bytes arrived before stamping
           # uploaded_at? See the UploadVerifyMode parameter.
           ENABLE_USER_DELETION: !Ref EnableUserDeletion
@@ -2674,6 +2714,97 @@ Resources:
                 object:
                   key:
                     - suffix: _vad_metadata.json
+
+  # ----------------------------------------------------------
+  # Recording blocks (design 2026-09-15 §5.4, review F1/F4/F8/F9). Keeps
+  # day_recording_segments current from the transcript stream so the report
+  # picker can offer "10:55-11:35" as one stretch. In-VPC for Aurora; its other
+  # calls are S3 ListObjectsV2 and one DynamoDB flag, both through the VPC's
+  # existing gateway endpoints (BUG-36: nothing else is reachable from here).
+  # Deliberately NOT folded into SessionActivityFunction above: that function
+  # feeds finalize, and this one must never sit on the email path (D5).
+  # ----------------------------------------------------------
+  RecordingSegmentsFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-recording-segments", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_recording_segments.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      # Every transcript landing invokes this, and account concurrency is shared with
+      # finalize. 2 bounds what a burst can take. A throttled async invocation is queued
+      # and retried by Lambda and logs NOTHING while it waits -- the Throttles metric is
+      # the only signal. The rate(5 minutes) pass below heals any day left dirty.
+      ReservedConcurrentExecutions: 2
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          S3_BUCKET: !Ref IngestBucketName
+          # The trailing pass's "any dirty day?" flag -- its own item in the items table
+          # (sweep_state key RECORDING_BLOCKS#{stage}), so an idle tick skips Aurora and
+          # the cluster can still auto-pause (test_sweep_cadence_vs_autopause).
+          SWEEP_STATE_TABLE: !Ref ItemsTableName
+          STAGE: !Ref Stage
+          # No REPORT_BLOCK_* here, on purpose: this function stores raw segments and
+          # org-api is the single reader of both thresholds (F9).
+      Policies:
+        - VPCAccessPolicy: {}
+        # In-VPC, but DynamoDB is reachable through the existing gateway endpoint
+        # (vpce-01233d5b756ffefcb) -- no NAT, no new paid endpoint. The same grant
+        # SessionActivityFunction carries for the finalize flag.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTableName
+        # Names only. Without ListBucket a missing key answers 403, not 404; this function
+        # never GETs, so it is granted nothing else under transcripts/.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - transcripts/*
+      Events:
+        # Template-declared EventBridge rule, the SessionActivityFunction pattern -- not
+        # a bucket notification (BUG-33: SAM cannot attach S3 events to an external bucket).
+        TranscriptLanded:
+          Type: EventBridgeRule
+          Properties:
+            State: !If [ShouldEnableRecordingBlocks, ENABLED, DISABLED]
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - Object Created
+              detail:
+                bucket:
+                  name:
+                    - !Ref IngestBucketName
+                object:
+                  key:
+                    - prefix: transcripts/
+        # The trailing pass (F4): recomputes every day the debounce marked dirty. Connects
+        # to Aurora only when its flag is set, plus one hourly safety tick.
+        DirtyDaySweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Recording blocks trailing pass - recomputes days the debounce marked dirty.
+            State: !If [ShouldEnableRecordingBlocks, ENABLED, DISABLED]
 
   # ----------------------------------------------------------
   # Tier-0 finalize — grace SWEEP (in-VPC) + send WORKER (non-VPC).
@@ -4663,6 +4794,41 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: !Ref TranscribeFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # Recording blocks (design 2026-09-15 §7). RecordingSegmentsFunction runs with
+  # ReservedConcurrentExecutions 2, and a throttled ASYNC invocation writes no log line at
+  # all: Lambda retries it and, past MaximumEventAge, discards it silently, so a day's
+  # blocks stop updating with nothing in the logs. This metric is the only signal.
+  #
+  # TreatMissingData: notBreaching, unconditionally -- deliberately NOT tied to
+  # ShouldEnableRecordingBlocks the way ExtractionBacklogAlarm ties its policy to its sweep.
+  # That pattern is for a series the function publishes on EVERY run, where absence means
+  # the publisher died. Throttles has no datapoint in a period with no throttle, on every
+  # stack and with the switch on or off, so absence is never a fault here; a real throttle
+  # is a datapoint >= 1, which notBreaching cannot hide. `breaching` would page every quiet
+  # period.
+  RecordingSegmentsThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldAlarmRecordingSegments
+    Properties:
+      AlarmName: !Sub ["${P}-recording-segments-throttles", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        RecordingSegmentsFunction invocations are being throttled (reserved concurrency 2).
+        Throttled events write no log and are discarded past MaximumEventAge, so report-picker
+        recording blocks can go stale silently. Check dirty rows in day_recording_segments.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RecordingSegmentsFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1

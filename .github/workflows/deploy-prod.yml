@@ -250,6 +250,9 @@ jobs:
               "EvidenceWindowSec=${{ vars.PROD_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.PROD_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
               "EvidenceFloorTokens=${{ vars.PROD_EVIDENCE_FLOOR_TOKENS || '5' }}" \
+              "EnableRecordingBlocks=${{ vars.PROD_ENABLE_RECORDING_BLOCKS || 'false' }}" \
+              "ReportBlockGapSeconds=${{ vars.PROD_REPORT_BLOCK_GAP_SECONDS || '600' }}" \
+              "ReportLongBlockSeconds=${{ vars.PROD_REPORT_LONG_BLOCK_SECONDS || '5400' }}" \
               $LLM_TEMP_PARAM \
               "AuthorityFlip=${{ vars.PROD_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.PROD_GRADED_ROLES || 'false' }}" \

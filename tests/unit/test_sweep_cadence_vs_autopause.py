@@ -30,7 +30,9 @@ DB_TEMPLATE = os.path.join(HERE, "..", "..", "infra", "db-template.yaml")
 SWEEP_SRC = os.path.join(HERE, "..", "..", "src", "lambda_finalize_claim.py")
 
 # Allowed to run faster than the threshold *because* it gates internally.
-GATED_EXCEPTIONS = {"FinalizeSweepFunction"}
+# RecordingSegmentsFunction: its rate(5 minutes) trailing pass reads its own sweep_state
+# flag before connecting, with an hourly safety window (design 2026-09-15 §5.4, F4).
+GATED_EXCEPTIONS = {"FinalizeSweepFunction", "RecordingSegmentsFunction"}
 
 # AWS's own default when MinCapacity is 0 and the field is omitted.
 AWS_DEFAULT_SECONDS_UNTIL_AUTO_PAUSE = 300
@@ -146,6 +148,16 @@ def test_the_exception_actually_gates_its_connection():
     src = _read(SWEEP_SRC)
     assert "SWEEP_REQUIRE_PENDING" in src
     assert "sweep_state.is_pending" in src
+    assert "no-pending" in src, "the skip path must be observable in logs"
+
+
+def test_the_recording_blocks_exception_actually_gates_its_connection():
+    """RecordingSegmentsFunction is exempt on the same terms as the finalize sweep: its
+    tick reads its own flag before connecting, and connects unconditionally only in an
+    hourly safety window. If either goes, the exemption is a lie."""
+    src = _read(os.path.join(HERE, "..", "..", "src", "lambda_recording_segments.py"))
+    assert "sweep_state.is_pending(FLAG_KEY)" in src
+    assert "is_safety_tick(now)" in src
     assert "no-pending" in src, "the skip path must be observable in logs"
 
 

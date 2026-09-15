@@ -253,6 +253,9 @@ jobs:
               "EvidenceWindowSec=${{ vars.TEST_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.TEST_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
               "EvidenceFloorTokens=${{ vars.TEST_EVIDENCE_FLOOR_TOKENS || '5' }}" \
+              "EnableRecordingBlocks=${{ vars.TEST_ENABLE_RECORDING_BLOCKS || 'true' }}" \
+              "ReportBlockGapSeconds=${{ vars.TEST_REPORT_BLOCK_GAP_SECONDS || '600' }}" \
+              "ReportLongBlockSeconds=${{ vars.TEST_REPORT_LONG_BLOCK_SECONDS || '5400' }}" \
               "LlmTemperature=${{ vars.TEST_LLM_TEMPERATURE || '0' }}" \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
