@@ -2223,6 +2223,13 @@ Resources:
               # valid if the role can GetObject the key).
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+            - Effect: Allow
+              # POST /api/org/reports/regenerate: the caller's own report, handed to
+              # the non-VPC ReportGeneratorFunction as report_requests/<folder>/<rid>.json
+              # (BUG-36), wired by hand in scripts/wire-s3-events.sh (BUG-33). Write
+              # only: the generator reads the request, org-api never does.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/report_requests/*
             # A speaker correction, handed OUTWARD across the VPC boundary the same way.
             # Write only, and no grant on voiceprint_results/: those go to the in-VPC
             # writer by direct invoke from the embedder, and a read grant here would be an

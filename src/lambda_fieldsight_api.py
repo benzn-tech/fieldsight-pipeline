@@ -1197,23 +1197,15 @@ def get_report_history(params, caller):
 # ── POST /api/reports/generate ───────────────────────────────
 
 def trigger_report_generation(body, caller):
-    rtype = body.get('report_type', 'daily')
-    date = body.get('date', '')
-    force = body.get('force', False)
-    if not date:
-        date = (nz_time.nz_now() - timedelta(days=1)).strftime('%Y-%m-%d')
-    payload = {'report_type': rtype, 'date': date}
-    if caller['role'] == 'worker':
-        user = resolve_user_display_name(caller)
-        if user:
-            payload['users_filter'] = [user.replace('_', ' ')]
-    if force:
-        payload['force'] = True
-    try:
-        lambda_client.invoke(FunctionName=REPORT_FUNCTION, InvocationType='Event', Payload=json.dumps(payload))
-        return ok({'message': f'Report triggered for {date}', 'status': 'pending'}, 202)
-    except Exception as e:
-        return error(f'Failed: {e}', 500)
+    # CLOSED 2026-09-15. Its only caller was the frontend. It regenerated a whole day
+    # for every user -- the worker-only filter was sent as `users_filter`, a key the
+    # generator never reads, in a "First Last" form that matches no folder -- plus a
+    # seven-day backfill, and on 2026-09-14 one click rewrote four prod reports across
+    # two people. Owner rule: each person regenerates only their own reports, which is
+    # POST /api/org/reports/regenerate. The nightly schedule invokes the generator
+    # directly and never came through here.
+    return error('Gone: use POST /api/org/reports/regenerate, which regenerates '
+                 'only your own report', 410)
 
 
 # ── POST /api/ask ───────────────────────────────────────────
