@@ -10,7 +10,7 @@ against the same questions every time, instead of against whoever last tried a q
 
 | Path | What it is | Changes how |
 |---|---|---|
-| `gold/v1.draft.jsonl` | Questions, each anchored to the words that answer it | Append a new version; never edit a published one |
+| `gold/v1.jsonl` | 45 questions (39 answerable, 6 controls), each anchored to the words that answer it; confirmed by the owner 2026-09-15 | Never edited; corrections become `v2.jsonl` |
 | `corpus/manifest.v1.json` | The exact transcript files the questions were written against, with sha256 | Never edited; a new corpus is `manifest.v2.json` |
 | `run.py` | Scores the production search path against a gold file | Code |
 | `results/` | One JSON per run, carrying the configuration it measured | Appended by `run.py` |
@@ -21,7 +21,7 @@ against the same questions every time, instead of against whoever last tried a q
 export AWS_PROFILE=fieldsight-deployer AWS_DEFAULT_REGION=ap-southeast-2
 export DASHSCOPE_API_KEY=...        # only the query embedding is called
 python tools/retrieval-eval/run.py \
-  --gold tools/retrieval-eval/gold/v1.draft.jsonl --label baseline --repeat 2
+  --gold tools/retrieval-eval/gold/v1.jsonl --label baseline --repeat 2
 ```
 
 Read-only: it queries the database through the RDS Data API and calls DashScope for the

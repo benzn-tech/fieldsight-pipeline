@@ -55,7 +55,7 @@ USAGE
 -----
     export AWS_PROFILE=fieldsight-deployer AWS_DEFAULT_REGION=ap-southeast-2
     export DASHSCOPE_API_KEY=...
-    python tools/retrieval-eval/run.py --gold tools/retrieval-eval/gold/v1.draft.jsonl \
+    python tools/retrieval-eval/run.py --gold tools/retrieval-eval/gold/v1.jsonl \
         --label baseline --repeat 2
 """
 import argparse

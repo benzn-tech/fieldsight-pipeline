@@ -92,8 +92,10 @@ loss caused by retrieval.
 2. **How it honours deletion.** The corpus is real site speech, including people other than
    the device owner. A frozen copy must not survive a customer's deletion request, so it
    either registers with the deletion flow or is covered by explicit consent.
-3. **Who confirms the gold set.** The v1 items were drafted from the transcripts; they are
-   not confirmed until the owner has reviewed them.
+3. ~~Who confirms the gold set.~~ Confirmed by the owner on 2026-09-15 and published as
+   `gold/v1.jsonl` (45 items). Result files dated earlier that day name
+   `gold/v1.draft.jsonl` when it held 20, 40 or 45 items; every item in them is the
+   same item in v1, apart from `status`.
 
 ## First results (2026-09-15, draft gold set, 45 items)
 
