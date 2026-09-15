@@ -1306,7 +1306,12 @@ def _rag_answer(body):
             # embedding); the empty-corpus paths carry no error key at all.
             # Serving an identity failure a web answer would hide a defect
             # behind working-looking output.
-            if body.get("mode") != "voice" and not result.get("error"):
+            # A scoped search (day/site/author/topic) that found nothing takes the
+            # no-records path (spec 2026-09-15 §4.2 step 7): the web cannot know
+            # that site or day, and the UI's "Ask across everything" offer
+            # depends on the no-answer result.
+            scoped = narrowed or plan["body_date_sent"]
+            if body.get("mode") != "voice" and not result.get("error") and not scoped:
                 import web_answer
                 empty_web = web_answer.answer(question, [])
                 if empty_web is not None and empty_web.get("answer"):

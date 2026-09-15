@@ -430,3 +430,45 @@ def test_applied_scope_deduplicates_a_drop_reported_by_both_hops():
     same = {"field": "site_id", "reason": "not_visible"}
     out = laa._applied_scope({"applied": {"dropped": [dict(same)]}}, req, plan, [dict(same)])
     assert out["dropped"] == [same]
+
+
+# --------------------------------------------------------------------------
+# Task 6 review: I-1 (spec §4.2 step 7) and M-1
+# --------------------------------------------------------------------------
+
+NO_RECORDS = "No relevant records found for this question."
+
+
+def test_empty_day_scoped_search_takes_the_no_records_path_not_the_web(monkeypatch):
+    wire(monkeypatch, responses=[{"chunks": [], "applied": {"dropped": []}}],
+         web={"answer": "From the web."})
+    out = ask(question="concrete issues", date="2026-09-01")
+    assert out["answer"] == NO_RECORDS
+    assert "from_web" not in out
+    assert out["applied_scope"]["date"] == "2026-09-01"
+
+
+def test_empty_site_scoped_search_takes_the_no_records_path_not_the_web(monkeypatch):
+    wire(monkeypatch, responses=[{"chunks": [], "applied": {"site_id": SITE_ID, "dropped": []}}],
+         web={"answer": "From the web."})
+    out = ask(question="concrete issues", site_id=SITE_ID)
+    assert out["answer"] == NO_RECORDS
+    assert "from_web" not in out
+    assert out["applied_scope"]["site_id"] == SITE_ID
+
+
+def test_empty_unscoped_search_still_falls_back_to_the_web(monkeypatch):
+    wire(monkeypatch, responses=[{"chunks": []}], web={"answer": "From the web."})
+    out = ask(question="concrete issues")
+    assert out.get("from_web") is True
+    assert out["answer"] == "From the web."
+
+
+def test_topic_with_question_range_and_no_body_date_sends_no_range(monkeypatch):
+    client, _ = wire(monkeypatch)
+    out = ask(question="what did we say yesterday", topic_row_id=TOPIC_ID)
+    p = client.calls[0]
+    for key in ("date_from", "date_to", "widen_when_empty"):
+        assert key not in p
+    assert p["topic_row_id"] == TOPIC_ID
+    assert ("question_range", "overridden_by_topic") in drops(out["applied_scope"]["dropped"])
