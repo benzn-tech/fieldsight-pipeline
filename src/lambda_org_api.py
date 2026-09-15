@@ -375,6 +375,36 @@ def lambda_handler(event, context):
         return error("internal error", 500)
 
 
+def get_app_latest():
+    """GET /api/org/app/latest -- the newest published app build for this stage (in-app updates).
+
+    Signed-in, provisioned callers only: dispatched after the caller guard, by the owner's choice
+    that a download link is never handed to a device nobody has signed in on.
+
+    No manifest yet is an ordinary answer, `{available: false}`. Any OTHER failure to read it --
+    AccessDenied included -- is a 503 and an ERROR log, never "no update": swallowed, it would tell
+    every device it is up to date, silently and indefinitely. This repo has shipped that exact shape
+    before (`except ClientError: pass` turning a 403 into an empty 200).
+    """
+    import app_release
+    try:
+        raw = s3().get_object(Bucket=S3_BUCKET, Key=app_release.MANIFEST_KEY)["Body"].read()
+    except ClientError as e:
+        code = (e.response.get("Error") or {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return ok({"available": False})
+        logger.error("app-release manifest unreadable (%s) at s3://%s/%s: %s",
+                     code, S3_BUCKET, app_release.MANIFEST_KEY, e)
+        return error("update manifest unreadable", 503)
+    manifest = app_release.parse_manifest(raw)
+    return ok(app_release.response_for(
+        manifest,
+        lambda key: s3().generate_presigned_url(
+            "get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=PRESIGNED_URL_EXPIRY),
+        PRESIGNED_URL_EXPIRY,
+    ))
+
+
 def dispatch(conn, event, method, route):
     claims = (event.get("requestContext", {}) or {}).get("authorizer", {}).get("claims", {})
     sub = claims.get("sub", "")
@@ -397,6 +427,10 @@ def dispatch(conn, event, method, route):
         return error("caller has no company", 403)
     if caller.get("archived_at") is not None and not (route == "/me" and method == "GET"):
         return error("account archived", 403)
+
+    # In-app updates. After the caller guard on purpose -- signed-in, provisioned devices only.
+    if route == "/app/latest" and method == "GET":
+        return get_app_latest()
 
     if route == "/me":
         if method == "GET":
