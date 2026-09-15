@@ -137,13 +137,14 @@ def test_list_topics_for_date_joins_and_children_and_is_live():
     conn = FakeConn(results=[
         [topic_report, topic_live],   # main topics query
         [action_row],                 # action_items children
+        [],                           # content_edits counts (survivors only)
         [safety_row],                 # safety_observations children
         [],                           # findings children
     ])
 
     rows = topics.list_topics_for_date(conn, ["site-1", "site-2"], "2026-07-06")
 
-    assert len(conn.calls) == 4
+    assert len(conn.calls) == 5
     main_sql, main_params = conn.calls[0]["sql"], conn.calls[0]["params"]
     assert "site_id = ANY(%s)" in main_sql
     assert "report_date=%s" in main_sql
@@ -151,16 +152,17 @@ def test_list_topics_for_date_joins_and_children_and_is_live():
     assert "LEFT JOIN users" in main_sql
     assert main_params == (["site-1", "site-2"], "2026-07-06")
 
-    # all three children queries scoped to the topic ids the main query returned
     assert conn.calls[1]["params"] == (["t-1", "t-2"],)
-    assert conn.calls[2]["params"] == (["t-1", "t-2"],)
+    assert conn.calls[2]["params"] == (["a-1"],)
     assert conn.calls[3]["params"] == (["t-1", "t-2"],)
+    assert conn.calls[4]["params"] == (["t-1", "t-2"],)
     assert "action_items" in conn.calls[1]["sql"]
-    assert "safety_observations" in conn.calls[2]["sql"]
-    assert "findings" in conn.calls[3]["sql"]
+    assert "content_edits" in conn.calls[2]["sql"]
+    assert "safety_observations" in conn.calls[3]["sql"]
+    assert "findings" in conn.calls[4]["sql"]
 
     by_id = {r["id"]: r for r in rows}
-    assert by_id["t-2"]["action_items"] == [action_row]
+    assert by_id["t-2"]["action_items"] == [{**action_row, "edit_count": 0}]
     assert by_id["t-2"]["safety_observations"] == []
     assert by_id["t-1"]["safety_observations"] == [safety_row]
     assert by_id["t-1"]["action_items"] == []
@@ -402,6 +404,7 @@ def test_list_for_source_prefix_orders_by_time_range_and_batches_four_children()
     conn = FakeConn(results=[
         [topic_a, topic_b],   # main topics query
         [action_row],         # action_items children
+        [],                   # content_edits counts
         [safety_row],         # safety_observations children
         [finding_row],        # findings children
         [photo_row],          # photos children -- the fourth batched child
@@ -410,23 +413,25 @@ def test_list_for_source_prefix_orders_by_time_range_and_batches_four_children()
     rows = topics.list_topics_for_source_prefix(
         conn, "extractions/Jarley_Trainor/2026-07-06/")
 
-    assert len(conn.calls) == 5  # main + 4 batched children, never N+1
+    assert len(conn.calls) == 6
     main_sql, main_params = conn.calls[0]["sql"], conn.calls[0]["params"]
     assert "source_s3_key LIKE %s" in main_sql
     assert "ESCAPE '\\'" in main_sql
     assert "ORDER BY t.time_range NULLS LAST, t.created_at, t.id" in main_sql
     assert main_params == (r"extractions/Jarley\_Trainor/2026-07-06/%",)
 
-    for i in (1, 2, 3, 4):
+    for i in (1, 3, 4, 5):
         assert conn.calls[i]["params"] == (["t-1", "t-2"],)
+    assert conn.calls[2]["params"] == (["a-1"],)
     assert "action_items" in conn.calls[1]["sql"]
     assert "deadline_text" in conn.calls[1]["sql"]
-    assert "safety_observations" in conn.calls[2]["sql"]
-    assert "findings" in conn.calls[3]["sql"]
-    assert "topic_photos" in conn.calls[4]["sql"]
+    assert "content_edits" in conn.calls[2]["sql"]
+    assert "safety_observations" in conn.calls[3]["sql"]
+    assert "findings" in conn.calls[4]["sql"]
+    assert "topic_photos" in conn.calls[5]["sql"]
 
     by_id = {r["id"]: r for r in rows}
-    assert by_id["t-1"]["action_items"] == [action_row]
+    assert by_id["t-1"]["action_items"] == [{**action_row, "edit_count": 0}]
     assert by_id["t-2"]["action_items"] == []
     assert by_id["t-2"]["safety_observations"] == [safety_row]
     assert by_id["t-1"]["safety_observations"] == []
