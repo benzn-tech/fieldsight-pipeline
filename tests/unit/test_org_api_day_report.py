@@ -5,6 +5,7 @@ through the same scope core as a meeting report. Spec 2026-09-15 §5.1, §5.2.
 """
 import json
 import re
+from datetime import datetime
 
 import pytest
 
@@ -74,6 +75,18 @@ ROWS = [
     _row(id="t-early", source_s3_key=KEY_1300, title="Early in first meeting", time_range="13:05 – 13:10"),
     _row(id="t-personal", source_s3_key=KEY_1300, title="Personal", work_class="non_work"),
 ]
+
+# A real F2SP chunk session: base is the bare `sid{32hex}` token (no timestamp
+# to parse), and a multi-device merge: base is `grp{32hex}`, written under the
+# LEAD's folder but pulled into a joiner's own day by exact key (a mirror).
+CHUNK_HEX = "a" * 32
+CHUNK_SID = f"sid{CHUNK_HEX}"
+KEY_CHUNK = f"extractions/Ada_L/{DATE}/{CHUNK_SID}.json"
+
+GRP_HEX = "b" * 32
+GRP_SID = f"grp{GRP_HEX}"
+KEY_GRP_ADA = f"extractions/Ada_L/{DATE}/{GRP_SID}.json"
+KEY_GRP_BEN = f"extractions/Ben_UCPK/{DATE}/{GRP_SID}.json"
 
 
 def _preview(params=None, body=None):
@@ -177,3 +190,88 @@ def test_the_folder_gate_is_the_media_one(day):
     mp.setattr(org, "_resolve_org_media_folder", gate)
     assert _generate({"deliver": "download"})["statusCode"] == 403
     assert seen["what"] == "day report" and puts == []
+
+
+# ----------------------------------------------------------
+# Real F2SP recordings are chunk sessions (`sid{32hex}`) and merged meetings
+# (`grp{32hex}`), never the legacy whole-file base every test above used.
+# `build_day_sessions` takes a different path for those --
+# `_chunk_session_start`/`_chunk_session_close` -> `meeting_session.get` --
+# that no day-report test reached before this one, so an ordering/type
+# mismatch between the DB-derived start and the legacy parsed start would
+# ship silently.
+# ----------------------------------------------------------
+
+def test_a_chunk_session_orders_by_its_db_start_not_insertion_order(day):
+    mp, puts = day
+    mp.setattr(org.meeting_session, "get", lambda conn, sid: {
+        # 2026-07-25T00:30 UTC -> 12:30 NZ (July = NZST, UTC+12) -- BEFORE the
+        # legacy S1300 session's parsed 13:00:11 start. `_chunk_session_start`
+        # reads this real column shape: a naive/aware datetime (psycopg
+        # timestamptz), not a string, and converts UTC -> NZ itself.
+        "opened_at": datetime(2026, 7, 25, 0, 30),
+        "closed_at": datetime(2026, 7, 25, 0, 45),
+    })
+    rows = ROWS + [_row(id="t-chunk", source_s3_key=KEY_CHUNK,
+                        title="Chunk session topic", time_range="12:30 – 12:45")]
+    _rows(mp, rows)
+
+    res = _preview()
+    assert res["statusCode"] == 200
+    b = json.loads(res["body"])
+    # True time order across sessions, not the order ROWS/dict-insertion put
+    # them in: the chunk session (12:30) sorts before the legacy one (13:00).
+    assert [t["topic_title"] for t in b["topics"]] == [
+        "Chunk session topic", "Early in first meeting",
+        "Late in first meeting", "Second meeting"]
+    assert b["sessionIds"] == [CHUNK_SID, S1300, S1405]
+
+    gen = _generate({"deliver": "download"})
+    assert gen["statusCode"] == 202
+    art = json.loads(puts[0]["Body"])
+    assert art["sessionIds"] == [CHUNK_SID, S1300, S1405]
+
+
+def test_a_chunk_session_with_no_db_row_sorts_last_not_crashes(day):
+    """`meeting_session.get` returning None (unknown/expired session) must not
+    raise -- `_chunk_session_start` declines to None and the session sorts
+    after every dated one, same as an unparseable legacy base."""
+    mp, puts = day
+    mp.setattr(org.meeting_session, "get", lambda conn, sid: None)
+    rows = ROWS + [_row(id="t-chunk", source_s3_key=KEY_CHUNK,
+                        title="Chunk session topic", time_range="? – ?")]
+    _rows(mp, rows)
+    res = _preview()
+    assert res["statusCode"] == 200
+    b = json.loads(res["body"])
+    assert [t["topic_title"] for t in b["topics"]] == [
+        "Early in first meeting", "Late in first meeting",
+        "Second meeting", "Chunk session topic"]
+
+
+def test_a_merged_meeting_mirrored_under_two_folders_counts_once(day):
+    """A multi-device merge writes one topic set under the LEAD's folder, but
+    a joiner's own day pulls those rows in by exact key alongside rows that
+    live under their own folder (`_day_report_rows`) -- two different
+    `parse_extraction_key` folders for the SAME `grp` session. `session_ref`
+    keys purely on the session_base, so it must still collapse to one entry
+    in `sessionIds`, and `mirrorFolders` must name both folders it drew rows
+    from (the artifact's per-folder deletion-mirror check)."""
+    mp, puts = day
+    rows = [
+        _row(id="t-grp-a", source_s3_key=KEY_GRP_ADA, title="Grp early", time_range="09:00 – 09:10"),
+        _row(id="t-grp-b", source_s3_key=KEY_GRP_BEN, title="Grp late", time_range="09:10 – 09:20"),
+    ]
+    _rows(mp, rows)
+
+    res = _preview()
+    assert res["statusCode"] == 200
+    b = json.loads(res["body"])
+    assert [t["topic_title"] for t in b["topics"]] == ["Grp early", "Grp late"]
+    assert b["sessionIds"] == [GRP_SID]
+
+    gen = _generate({"deliver": "download"})
+    assert gen["statusCode"] == 202
+    art = json.loads(puts[0]["Body"])
+    assert art["sessionIds"] == [GRP_SID]
+    assert art["mirrorFolders"] == ["Ada_L", "Ben_UCPK"]
