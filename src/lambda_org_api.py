@@ -539,6 +539,8 @@ def dispatch(conn, event, method, route):
         return delete_keyframe_endpoint(conn, caller, parse_body(event))
     if route == "/reports/history" and method == "GET":
         return get_org_report_history(conn, caller, event)
+    if route == "/reports/regenerate" and method == "POST":
+        return regenerate_own_report(conn, caller, parse_body(event))
 
     if route == "/rollup/portfolio" and method == "GET":
         return list_portfolio_rollup(conn, caller, event)
@@ -1297,6 +1299,78 @@ def session_report_preview(conn, caller, session_id, event):
             "site": content["siteName"],
         },
     })
+
+
+_REGENERABLE_TYPES = ("daily", "weekly", "monthly")
+
+
+def regenerate_own_report(conn, caller, body):
+    """POST /api/org/reports/regenerate {report_type, date} -- queue the CALLER's
+    own report, and only it.
+
+    Owner rule (2026-09-15): each person regenerates only their own reports; no
+    role may regenerate another person's; nobody regenerates a summary by hand.
+    So the folder is caller.folder_name and nothing else. There is no scope field
+    in the body to trust or to reject, and anything that looks like one
+    (user/folder/users_filter) is simply never read.
+
+    org-api is in-VPC and cannot invoke the generator (BUG-36). It writes one
+    request artifact to report_requests/<folder>/<rid>.json; the non-VPC generator
+    is S3-triggered on that prefix and regenerates exactly that report or nothing.
+
+    `date` is the day for a daily and the END of the period for weekly/monthly:
+    history rows carry only the end date, so the period is derived here --
+    weekly = the seven days ending on it, monthly = the month up to it.
+    """
+    if not isinstance(body, dict):
+        return error("malformed JSON body", 400)
+    report_type = body.get("report_type")
+    if not isinstance(report_type, str) or report_type not in _REGENERABLE_TYPES:
+        return error("report_type must be daily, weekly or monthly", 400)
+    date = body.get("date")
+    if not isinstance(date, str) or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    try:
+        end = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        return error("date required (YYYY-MM-DD)", 400)
+
+    folder = (caller.get("folder_name") or "").strip()
+    if not folder:
+        return error("your account has no recording folder, so it has no reports "
+                     "to regenerate -- ask an admin to enrol it", 403)
+
+    if report_type == "daily":
+        # A day with nothing recorded would run the generator, write nothing, and
+        # leave the person waiting on a report that can never arrive.
+        listed = s3().list_objects_v2(Bucket=S3_BUCKET, Prefix=f"transcripts/{folder}/{date}/",
+                                      MaxKeys=1)
+        if not listed.get("KeyCount"):
+            return error("no recordings for that date", 404)
+
+    request_id = uuid.uuid4().hex
+    artifact = {
+        "requestId": request_id,
+        "report_type": report_type,
+        "user": folder,
+        "triggered_by": caller.get("email") or str(caller.get("id")),
+        "requestedBy": str(caller.get("id")),
+    }
+    if report_type == "daily":
+        artifact["date"] = date
+    elif report_type == "weekly":
+        artifact["start_date"] = (end - timedelta(days=6)).isoformat()
+        artifact["end_date"] = date
+    else:
+        artifact["start_date"] = end.replace(day=1).isoformat()
+        artifact["end_date"] = date
+
+    request_key = f"report_requests/{folder}/{request_id}.json"
+    s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
+                    Body=json.dumps(artifact, default=str),
+                    ContentType="application/json")
+    return ok({"status": "queued", "requestId": request_id,
+               "report_type": report_type, "folder": folder}, 202)
 
 
 def session_report_generate(conn, caller, session_id, event):
