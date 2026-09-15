@@ -104,7 +104,8 @@ DATABASE = os.environ.get("EVAL_DB_NAME", "fieldsight")
 ASK_K = 5            # lambda_ask_agent: body.get("k", 5)
 LIST_K = 30          # lambda_ask_agent._rag_search_list: body.get("k", 30)
 PROD_RERANK_BUDGET_MS = 3000
-SYSTEMS = ["prod", "rerank", "link", "link-rollup", "link-rollup+rerank", "link-rollup@0.65"]
+SYSTEMS = ["prod", "rerank", "link", "link-rollup", "link-rollup+rerank", "link-rollup@0.65",
+           "link-blockrollup"]
 
 REWRITES = [
     ("%(q)s::vector", "CAST(:q AS vector)"),
@@ -166,6 +167,7 @@ class Searcher:
         self.sql = data_api_sql()
         self.rds = boto3.client("rds-data")
         self.topics = self._load_topics()
+        self.blocks = recording_blocks(HERE / "corpus" / "manifest.v1.json")
 
     def _query(self, sql, params):
         resp = self.rds.execute_statement(resourceArn=CLUSTER, secretArn=SECRET, database=DATABASE,
@@ -210,10 +212,58 @@ class Searcher:
 
 # --- proposed systems ---------------------------------------------------------
 
-def link_windows(rows, topics_by_date, rollup):
+_SEGMENT_KEY = re.compile(r"_\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})_.*_off([\d.]+)_to([\d.]+)_src")
+
+
+def recording_blocks(manifest_path, gap_seconds=600):
+    """{date: [(start_s, end_s), ...]} -- the design's recording blocks (PR #838
+    §5.4): transcript segments placed by filename base time + VAD offset, merged
+    where the silence between them is at most `gap_seconds`."""
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    out = {}
+    for day in manifest["days"]:
+        segs = []
+        for f in day["files"]:
+            m = _SEGMENT_KEY.search(f["key"])
+            if m:
+                base = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+                segs.append((base + float(m.group(4)), base + float(m.group(5))))
+        blocks = []
+        for s, e in sorted(segs):
+            if blocks and s - blocks[-1][1] <= gap_seconds:
+                blocks[-1][1] = max(blocks[-1][1], e)
+            else:
+                blocks.append([s, e])
+        out[day["date"]] = [(int(s), int(e)) for s, e in blocks]
+    return out
+
+
+def _hhmm(sec):
+    return "%02d:%02d" % (sec // 3600, (sec % 3600) // 60)
+
+
+def rollup_title(start, date, mode, blocks_by_date, long_block_seconds=5400):
+    """The parent row an unlinked window is shown under. `hour`: its clock hour.
+    `block`: its recording block when that block is short enough to be one
+    selectable unit, else the clock hour inside it -- the design's rule that
+    long blocks are not a unit."""
+    hour = start // 3600
+    by_hour = "Recordings %02d:00–%02d:00" % (hour, hour + 1)
+    if mode != "block":
+        return by_hour
+    for bs, be in blocks_by_date.get(date, []):
+        if bs - 60 <= start <= be + 60:
+            if be - bs <= long_block_seconds:
+                return "Recording %s–%s" % (_hhmm(bs), _hhmm(be))
+            return by_hour
+    return by_hour
+
+
+def link_windows(rows, topics_by_date, rollup, blocks_by_date=None):
     """Copies of `rows` where topic-less transcript windows carry the Aurora topic
-    they overlap most in time. With `rollup`, windows that overlap nothing become
-    a one-hour time-block row rather than being dropped by the aggregator."""
+    they overlap most in time. With `rollup` ("hour" or "block"; True means
+    "hour"), windows that overlap nothing are shown under a parent row rather
+    than being dropped by the aggregator."""
     out = []
     for r in rows:
         r = dict(r)
@@ -229,9 +279,10 @@ def link_windows(rows, topics_by_date, rollup):
             if best:
                 r["topic_id"], r["topic_title"] = best[1], best[2]
             elif rollup and span:
-                hour = span[0] // 3600
+                mode = "block" if rollup == "block" else "hour"
                 r["chunk_type"] = "topic"
-                r["metadata"] = dict(md, title="Recordings %02d:00–%02d:00" % (hour, hour + 1))
+                r["metadata"] = dict(md, title=rollup_title(
+                    span[0], str(r.get("report_date")), mode, blocks_by_date or {}))
         out.append(r)
     return out
 
@@ -308,6 +359,8 @@ def score_question(searcher, item, today):
     list_link, n_link = list_rank(linked, item["question"], item)
     list_roll, n_roll = list_rank(rolled, item["question"], item)
     list_roll65, n_roll65 = list_rank(rolled, item["question"], item, max_dist=0.65)
+    blocked = link_windows(top30, searcher.topics, rollup="block", blocks_by_date=searcher.blocks)
+    list_block, n_block = list_rank(blocked, item["question"], item)
 
     systems = {
         "prod": {"ask": ask_prod, "list": list_prod, "list_rows": n_prod},
@@ -316,6 +369,7 @@ def score_question(searcher, item, today):
         "link-rollup": {"ask": ask_prod, "list": list_roll, "list_rows": n_roll},
         "link-rollup+rerank": {"ask": ask_rr, "list": list_roll, "list_rows": n_roll},
         "link-rollup@0.65": {"ask": ask_prod, "list": list_roll65, "list_rows": n_roll65},
+        "link-blockrollup": {"ask": ask_prod, "list": list_block, "list_rows": n_block},
     }
     return {"id": item["id"], "lang": item.get("lang"), "expect": item.get("expect"),
             "category": item.get("category"), "style": item.get("style"),
