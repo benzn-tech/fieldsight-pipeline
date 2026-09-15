@@ -762,8 +762,7 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
     if existing is not None:
         rec_id, key = existing["id"], existing["s3_key"]
     else:
-        display_name = caller.get("folder_name") or \
-            f"{caller.get('first_name', '')}_{caller.get('last_name', '')}"
+        display_name = caller.get("folder_name") or _enrol_folder_on_upload(conn, caller)
         key = _recording_s3_key(display_name, kind, started_at, file_name)
         try:
             # Resolved BEFORE the transaction opens, not inside it. `device_id`
@@ -3008,6 +3007,59 @@ def patch_member_role(conn, caller, target_sub, body):
     return ok(row)
 
 
+def _free_folder_name(conn, name, sub, user_id=None):
+    """A recording folder for `name` that no OTHER user holds, or None.
+
+    folder_name is globally unique (0012), and two people with the same first
+    and last name in one company -- different logins, different emails -- are an
+    ordinary thing. The first keeps `Ben_Lin`; the second used to be left with
+    NO folder_name at all, and the upload route then derived `Ben_Lin` from the
+    name and wrote the second person's recordings into the first person's
+    folder. Their own timeline and reports were empty, their clips showed as
+    the other person's, and finalize and recording-blocks skipped them silently
+    for want of a folder (prod, 2026-09-11..15, 18 sessions).
+
+    So a clash picks the next free name instead: `_2` .. `_9`, then the user id
+    prefix, which cannot clash with anyone. Same normalisation as
+    patch_member_folder and lambda_orchestrator.safe_name."""
+    base = re.sub(r'[<>:"/\\|?*\s]', '_', (name or "").strip())
+    if not base.strip("_"):
+        return None
+    candidates = [base] + [f"{base}_{n}" for n in range(2, 10)]
+    if user_id:
+        candidates.append(f"{base}_{str(user_id)[:8]}")
+    for folder in candidates:
+        clash = users.get_by_folder_name_global(conn, folder)
+        if clash is None or clash.get("cognito_sub") == sub:
+            return folder
+    return None
+
+
+def _enrol_folder_on_upload(conn, caller):
+    """The folder an upload from a login WITHOUT folder_name is written under.
+
+    Enrols one on the spot rather than refusing: this is the synchronous,
+    no-retry upload route, where an error strands the recording (BUG-43). And
+    never the bare name-derived folder, which may belong to someone else. A
+    failed enrolment still yields a folder unique to this user, and says so."""
+    name = f"{caller.get('first_name') or ''}_{caller.get('last_name') or ''}"
+    folder = _free_folder_name(conn, name, caller.get("cognito_sub"), caller.get("id"))
+    if folder:
+        try:
+            with conn.transaction():
+                users.set_folder_name(conn, caller["cognito_sub"], folder)
+            logger.warning("upload-url: user %s had no folder_name -- enrolled as %r",
+                           caller.get("id"), folder)
+            return folder
+        except Exception:
+            logger.exception("upload-url: could not enrol folder %r for user %s",
+                             folder, caller.get("id"))
+    fallback = f"{name}_{str(caller.get('id') or 'unknown')[:8]}"
+    logger.warning("upload-url: user %s has no folder_name -- writing under %r, "
+                   "which no user owns until an admin enrols it", caller.get("id"), fallback)
+    return fallback
+
+
 def patch_member_folder(conn, caller, target_sub, body):
     """Admin-only enrollment step: links a member's login (cognito_sub) to
     the recording-folder identity (folder_name) the orchestrator/app write
@@ -3147,13 +3199,12 @@ def backfill_member_folders(conn, caller, body=None):
     for row in rows:
         sub = row["cognito_sub"]
         name = " ".join(p for p in (row.get("first_name"), row.get("last_name")) if p)
-        fn = re.sub(r'[<>:"/\\|?*\s]', '_', name.strip())
-        if not fn:
+        if not name.strip():
             skipped.append({"sub": sub, "reason": "no name"})
             continue
-        clash = users.get_by_folder_name_global(conn, fn)
-        if clash and clash["cognito_sub"] != sub:
-            skipped.append({"sub": sub, "reason": "folder taken by another user"})
+        fn = _free_folder_name(conn, name, sub, row.get("id"))
+        if not fn:
+            skipped.append({"sub": sub, "reason": "no free folder name"})
             continue
         users.set_folder_name(conn, sub, fn)
         enrolled.append({"sub": sub, "folder_name": fn})
@@ -3260,13 +3311,12 @@ def create_member(conn, caller, body):
     # and patch_member_folder). Skip on collision — the global unique index (0012)
     # would otherwise 500; folder can still be set later via PATCH /members/{sub}/folder.
     if not user.get("folder_name"):
-        fn = re.sub(r'[<>:"/\\|?*\s]', '_', display_name.strip())
+        fn = _free_folder_name(conn, display_name, sub, user.get("id"))
         if fn:
-            clash = users.get_by_folder_name_global(conn, fn)
-            if clash is None or clash["cognito_sub"] == sub:
-                user = users.set_folder_name(conn, sub, fn) or user
-            else:
-                logger.info("create_member: folder_name %r taken, left unset for %s", fn, sub)
+            users.set_folder_name(conn, sub, fn)
+            user = {**user, "folder_name": fn}
+        else:
+            logger.warning("create_member: no free folder_name for %s -- left unset", sub)
     created = [memberships.ensure_membership(conn, user["id"], mem["site_id"],
                                              mem["role"]) for mem in wanted]
     return ok({"user": user, "memberships": created}, 201)

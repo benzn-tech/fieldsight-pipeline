@@ -624,7 +624,30 @@ def test_backfill_enrolls_unenrolled_login(wired):
     assert seen == {"sub": "sub-2", "folder_name": "Neil_Blunden"}
 
 
-def test_backfill_skips_collision(wired):
+def test_backfill_takes_the_next_free_name_when_the_first_is_taken(wired):
+    """A namesake used to be SKIPPED here and left with no folder at all, which
+    is how one prod login ended up writing into another person's folder for four
+    days. The next free name is a folder of their own instead."""
+    wired.setattr(org.users, "list_company_logins_unenrolled",
+                  lambda conn, cid: [
+                      {"id": "u-2", "cognito_sub": "sub-2", "first_name": "Neil", "last_name": "Blunden"}])
+    wired.setattr(org.users, "get_by_folder_name_global",
+                  lambda conn, folder: ({**CALLER, "cognito_sub": "sub-other", "folder_name": folder}
+                                        if folder == "Neil_Blunden" else None))
+    seen = {}
+    wired.setattr(org.users, "set_folder_name",
+                  lambda conn, sub, folder_name: seen.update(sub=sub, folder_name=folder_name))
+    res = org.lambda_handler(make_event("POST", "/api/org/members/enroll-backfill"), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["enrolled"] == [{"sub": "sub-2", "folder_name": "Neil_Blunden_2"}]
+    assert b["skipped"] == []
+    assert seen == {"sub": "sub-2", "folder_name": "Neil_Blunden_2"}
+
+
+def test_backfill_skips_when_no_name_is_free(wired):
+    """Every candidate taken: skipped with a reason, never a 500 on the unique
+    index and never another user's folder."""
     wired.setattr(org.users, "list_company_logins_unenrolled",
                   lambda conn, cid: [
                       {"id": "u-2", "cognito_sub": "sub-2", "first_name": "Neil", "last_name": "Blunden"}])
@@ -637,8 +660,8 @@ def test_backfill_skips_collision(wired):
     assert res["statusCode"] == 200
     b = body_of(res)
     assert b["enrolled"] == []
-    assert b["skipped"] == [{"sub": "sub-2", "reason": "folder taken by another user"}]
-    assert seen == {}  # collision -> set_folder_name never called, no 500
+    assert b["skipped"] == [{"sub": "sub-2", "reason": "no free folder name"}]
+    assert seen == {}
 
 
 def test_backfill_non_admin_403(wired):
