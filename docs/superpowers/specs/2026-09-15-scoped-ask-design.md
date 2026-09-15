@@ -143,6 +143,9 @@ After rag-search returns:
    instruction sentence; §6.3 measures whether one is needed.
 7. Empty retrieval with `pinned_topic` still answers from the pinned block. Empty retrieval with a
    day/site/author scope and no topic takes the existing no-answer path, with `applied_scope`.
+   A scoped ask (any surviving `site_id`/`author_folder`/`topic_row_id`, a gated body `date`, or
+   a returned `pinned_topic`) never consults the web — neither the empty-retrieval fallback nor
+   the pre-synthesis web check that runs when retrieval did return chunks.
 
 ### 4.3 rag-search — `lambda_rag_search._search`
 
