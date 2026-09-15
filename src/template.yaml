@@ -2150,6 +2150,17 @@ Resources:
                     # delete. The DB half commits regardless, which is why deleting has
                     # always LOOKED like it worked.
                     - redactions/*
+                    # In-app updates (GET /api/org/app/latest). Without this a stage with no
+                    # release yet answers AccessDenied instead of NoSuchKey, and the route
+                    # reports it -- correctly -- as 503 rather than "no update".
+                    - "app-releases/*"
+            - Effect: Allow
+              # In-app updates: the release manifest (app-releases/latest.json) and the APKs it
+              # names, which GET /api/org/app/latest presigns for signed-in devices. Read only;
+              # releases are published by the release script with the deployer role, never by
+              # this function.
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/app-releases/*
             - Effect: Allow
               # authority-flip Task 4 — /timeline reads daily_report.json
               # (and summary_report.json) verbatim from the lake bucket.
