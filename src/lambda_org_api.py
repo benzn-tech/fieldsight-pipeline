@@ -573,6 +573,8 @@ def dispatch(conn, event, method, route):
         return delete_keyframe_endpoint(conn, caller, parse_body(event))
     if route == "/reports/history" and method == "GET":
         return get_org_report_history(conn, caller, event)
+    if route == "/reports/regenerate" and method == "POST":
+        return regenerate_own_report(conn, caller, parse_body(event))
 
     if route == "/rollup/portfolio" and method == "GET":
         return list_portfolio_rollup(conn, caller, event)
@@ -661,6 +663,11 @@ def dispatch(conn, event, method, route):
     m_scl = re.match(r"^/sessions/([^/]+)/close$", route)
     if m_scl and method == "POST":
         return session_close(conn, caller, m_scl.group(1), parse_body(event))
+    # F2: an id that is not a session never reaches a handler that builds a key from it.
+    m_sk = _SESSION_KEYED_ROUTE_RE.match(route)
+    if m_sk and not session_scope.is_session_base(m_sk.group(1)):
+        return error("not a session id", 400)
+
     m_srp = re.match(r"^/sessions/([^/]+)/report/preview$", route)
     if m_srp and method == "POST":
         return session_report_preview(conn, caller, m_srp.group(1), event)
@@ -1189,6 +1196,51 @@ def _selected_topic_row_ids(body):
     return ids, None
 
 
+def _day_report_rows(conn, caller, folder, date):
+    """One (folder, date)'s extraction topic rows as the meeting picker and the
+    session report must see them -- including a multi-device meeting.
+
+    A merge writes ONE topic set under the LEAD's folder
+    (`extractions/{lead}/{date}/grp{id}.json`) and deletes each member's own.
+    Listing only `extractions/{folder}/{date}/` therefore hid the meeting from
+    every joiner: their picker was empty and its report was a 404, while the
+    lead worked by coincidence. `/timeline` and `/live-items` already union the
+    merged keys; this is the same rule for the two routes that did not.
+
+    The clip is `_render_timeline_for_user`'s, not a new one:
+
+      * own day -- a merged row may pass the site clip. The caller was in that
+        meeting, so the record is theirs even when the lead recorded on a site
+        they are not a member of;
+      * someone else's day -- merged rows stay inside the caller's site clip. A
+        merged meeting spans devices and therefore sites by definition, which is
+        the object the cross-user clip exists for.
+
+    "Own" is decided on the resolved folder, so an ALL-scope caller reading a
+    colleague's day gets the stricter side. The timeline lets that caller skip
+    the clip; here it can only ever lose a merged row, never gain one.
+
+    Membership is resolved for the person whose day this is, never the caller
+    (`_timeline_target_id`), and on its own line: `_merged_keys_for` returns []
+    on failure, and a lookup that raised inside an argument list would escape
+    that and 500 the read. With no merged keys the list call is exactly the one
+    both routes always made.
+    """
+    allowed = _allowed_site_ids(conn, caller)
+    merged = _merged_keys_for(conn, _timeline_target_id(conn, caller, folder), date)
+    prefix = f"extractions/{folder}/{date}/"
+    if merged:
+        rows = topics.list_topics_for_source_prefix(conn, prefix, merged_keys=list(merged))
+    else:
+        rows = topics.list_topics_for_source_prefix(conn, prefix)
+    own_day = bool(folder) and folder == (caller.get("folder_name") or "")
+    if own_day and merged:
+        merged_set = set(merged)
+        return [r for r in rows
+                if str(r["site_id"]) in allowed or r.get("source_s3_key") in merged_set]
+    return [r for r in rows if str(r["site_id"]) in allowed]
+
+
 def _assemble_session_report(conn, caller, session_id, event, selected=None):
     """Re-derive ONE session's scope + assemble its reviewed report content,
     server-side from (folder, date, session_id). The shared core of the T2
@@ -1207,9 +1259,7 @@ def _assemble_session_report(conn, caller, session_id, event, selected=None):
     if err is not None:
         return None, err
 
-    allowed = _allowed_site_ids(conn, caller)
-    rows = [r for r in topics.list_topics_for_source_prefix(conn, f"extractions/{folder}/{date}/")
-            if str(r["site_id"]) in allowed]
+    rows = _day_report_rows(conn, caller, folder, date)
     redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if rows else {}
     srows = []
     for r in rows:
@@ -1288,6 +1338,78 @@ def session_report_preview(conn, caller, session_id, event):
             "site": content["siteName"],
         },
     })
+
+
+_REGENERABLE_TYPES = ("daily", "weekly", "monthly")
+
+
+def regenerate_own_report(conn, caller, body):
+    """POST /api/org/reports/regenerate {report_type, date} -- queue the CALLER's
+    own report, and only it.
+
+    Owner rule (2026-09-15): each person regenerates only their own reports; no
+    role may regenerate another person's; nobody regenerates a summary by hand.
+    So the folder is caller.folder_name and nothing else. There is no scope field
+    in the body to trust or to reject, and anything that looks like one
+    (user/folder/users_filter) is simply never read.
+
+    org-api is in-VPC and cannot invoke the generator (BUG-36). It writes one
+    request artifact to report_requests/<folder>/<rid>.json; the non-VPC generator
+    is S3-triggered on that prefix and regenerates exactly that report or nothing.
+
+    `date` is the day for a daily and the END of the period for weekly/monthly:
+    history rows carry only the end date, so the period is derived here --
+    weekly = the seven days ending on it, monthly = the month up to it.
+    """
+    if not isinstance(body, dict):
+        return error("malformed JSON body", 400)
+    report_type = body.get("report_type")
+    if not isinstance(report_type, str) or report_type not in _REGENERABLE_TYPES:
+        return error("report_type must be daily, weekly or monthly", 400)
+    date = body.get("date")
+    if not isinstance(date, str) or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    try:
+        end = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        return error("date required (YYYY-MM-DD)", 400)
+
+    folder = (caller.get("folder_name") or "").strip()
+    if not folder:
+        return error("your account has no recording folder, so it has no reports "
+                     "to regenerate -- ask an admin to enrol it", 403)
+
+    if report_type == "daily":
+        # A day with nothing recorded would run the generator, write nothing, and
+        # leave the person waiting on a report that can never arrive.
+        listed = s3().list_objects_v2(Bucket=S3_BUCKET, Prefix=f"transcripts/{folder}/{date}/",
+                                      MaxKeys=1)
+        if not listed.get("KeyCount"):
+            return error("no recordings for that date", 404)
+
+    request_id = uuid.uuid4().hex
+    artifact = {
+        "requestId": request_id,
+        "report_type": report_type,
+        "user": folder,
+        "triggered_by": caller.get("email") or str(caller.get("id")),
+        "requestedBy": str(caller.get("id")),
+    }
+    if report_type == "daily":
+        artifact["date"] = date
+    elif report_type == "weekly":
+        artifact["start_date"] = (end - timedelta(days=6)).isoformat()
+        artifact["end_date"] = date
+    else:
+        artifact["start_date"] = end.replace(day=1).isoformat()
+        artifact["end_date"] = date
+
+    request_key = f"report_requests/{folder}/{request_id}.json"
+    s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
+                    Body=json.dumps(artifact, default=str),
+                    ContentType="application/json")
+    return ok({"status": "queued", "requestId": request_id,
+               "report_type": report_type, "folder": folder}, 202)
 
 
 def session_report_generate(conn, caller, session_id, event):
@@ -3261,6 +3383,10 @@ def get_asset_url(event):
 REPORT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # The same date, matched ANYWHERE in an S3 key (report-history rows).
 REPORT_DATE_IN_KEY_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+# The /sessions/{id}/… routes that build an S3 key or a scope from {id}.
+_SESSION_KEYED_ROUTE_RE = re.compile(
+    r"^/sessions/([^/]+)/(?:report/preview|report|report/status|rolling|brief)$")
 
 
 def list_org_observations(conn, caller, event):
@@ -6122,12 +6248,19 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             # This serializer is a fixed allowlist, so it dropped both fields on
             # the way out while every repository-level test stayed green. Found
             # only by invoking the deployed function and reading the JSON. Any
-            # future field the collapse adds has to be added here too.
+            # future field the collapse or the day reads add (edit_count -> version)
+            # has to be added here too.
             "action_items": [{"id": str(a["id"]), "action": a["text"], "responsible": a["responsible"],
                               "deadline": a["deadline_text"] or (str(a["deadline"]) if a["deadline"] else None),
                               "priority": a["priority"], "status": a["status"],
                               "mention_count": a.get("mention_count", 1),
                               "collapsed_ids": [str(x) for x in (a.get("collapsed_ids") or [])],
+                              # 1 + content_edits rows for this item (todo-card spec 3.4).
+                              # edit_count is stamped by the two day reads in
+                              # repositories/topics.py; get_topic_full (reindex) does not
+                              # count, so its rows are v1. The session-report preview reads
+                              # through list_topics_for_source_prefix and carries the count.
+                              "version": 1 + int(a.get("edit_count") or 0),
                               } for a in t["action_items"]],
             # The subject this topic belongs to, when a human has confirmed
             # one. FACTS ONLY -- how many days it was raised on, when last,
@@ -7000,9 +7133,7 @@ def get_org_sessions(conn, caller, event):
     if err is not None:
         return err
 
-    allowed = _allowed_site_ids(conn, caller)
-    rows = [r for r in topics.list_topics_for_source_prefix(conn, f"extractions/{folder}/{date}/")
-            if str(r["site_id"]) in allowed]
+    rows = _day_report_rows(conn, caller, folder, date)
     sessions, excluded = build_day_sessions(conn, caller, folder, date, rows)
     return ok({
         "date": date,
@@ -7606,6 +7737,7 @@ def _read_org_report_history(folder_scope, limit):
     than 404, so the failure would not even read as "missing"."""
     reports = []
     docx_sizes = {}
+    docx_times = {}
     try:
         paginator = s3().get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=LAKE_BUCKET, Prefix=REPORT_LAKE_PREFIX):
@@ -7613,6 +7745,7 @@ def _read_org_report_history(folder_scope, limit):
                 key = obj["Key"]
                 if key.endswith("_report.docx"):
                     docx_sizes[key] = obj["Size"]
+                    docx_times[key] = obj["LastModified"].isoformat()
                     continue
                 if not key.endswith("_report.json") or "_debug" in key:
                     continue
@@ -7645,6 +7778,12 @@ def _read_org_report_history(folder_scope, limit):
         if cand in docx_sizes:
             r["docx_key"] = cand
             r["docx_size"] = docx_sizes[cand]
+            # When the Word file itself was written. The generator saves the JSON
+            # first and the .docx after it, so a client following a regenerate
+            # that looks only at generated_at can stop between the two and show
+            # a new report beside the previous Word file. Same listing pass, no
+            # extra request.
+            r["docx_generated_at"] = docx_times[cand]
 
     reports.sort(key=lambda r: r["date"], reverse=True)
     return {"reports": reports[:limit]}

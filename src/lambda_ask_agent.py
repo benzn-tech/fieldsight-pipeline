@@ -1143,12 +1143,60 @@ def _rag_answer(body):
             logger.warning(f"  rag-search returned error: {result['error']}")
 
         if not chunks:
+            # Retrieval found nothing, which is already the verdict -- so this
+            # is the ONE place the web fallback matters most, and the first
+            # build had its hook below this return and never reached it. The
+            # owner hit it on the first question they tried.
+            #
+            # `error` marks the DEFECT paths (caller not provisioned, missing
+            # embedding); the empty-corpus paths carry no error key at all.
+            # Serving an identity failure a web answer would hide a defect
+            # behind working-looking output.
+            if body.get("mode") != "voice" and not result.get("error"):
+                import web_answer
+                empty_web = web_answer.answer(question, [])
+                if empty_web is not None and empty_web.get("answer"):
+                    return {
+                        "answer": empty_web["answer"],
+                        "citations": [],
+                        "model": llm_utils.active_model(),
+                        "grounded": False,
+                        "from_web": True,
+                        "web": empty_web,
+                        "basis": basis,
+                    }
             return {
                 "answer": "No relevant records found for this question.",
                 "citations": [],
                 # This return sits ABOVE the call_llm below: no model ran.
                 "model": None,
                 "grounded": True,
+                "basis": basis,
+            }
+
+        # The records may not answer this. Ask before spending a synthesis on
+        # them, not after: measured worst case, answering first and looking up
+        # second is 33.2s against API Gateway's 29s, while asking first fits
+        # either way (21.3s when it looks up, 16.5s when it does not).
+        #
+        # Screen path only. A worker holding a push-to-talk button cannot be
+        # made to wait for a web search, and the voice prompt forbids the URLs
+        # a sourced answer needs.
+        web = None
+        if body.get("mode") != "voice":
+            import web_answer
+            web = web_answer.answer(question, chunks)
+        if web is not None and web.get("answer"):
+            # Its own block, never merged into the grounded answer. A reader who
+            # cannot tell what came from their meetings from what came off the
+            # internet has no reason to suspect they need to check.
+            return {
+                "answer": web["answer"],
+                "citations": [],
+                "model": llm_utils.active_model(),
+                "grounded": False,
+                "from_web": True,
+                "web": web,
                 "basis": basis,
             }
 
@@ -1368,6 +1416,12 @@ def _voice_answer(body):
 
     caller_sub = body.get("caller_sub")
     fmt = body.get("format") or "m4a"
+    # Counted here rather than at the log line so an early return -- a silent
+    # clip, a retrieval failure -- still knows the turn count was present. The
+    # gateway has already capped and sanitised it; this side trusts nothing and
+    # only counts.
+    _h = body.get("history")
+    history_turns = len(_h) if isinstance(_h, list) else 0
     try:
         audio_bytes = _b64.b64decode(body.get("audio") or "", validate=True)
     except Exception:
@@ -1409,14 +1463,19 @@ def _voice_answer(body):
     # on the `qwen done:` line for the same request id, so subtracting gives
     # retrieval -- which nothing has ever reported separately. Both are named
     # here so the next reader does not have to know that.
+    # `history_turns` is RECEIVED, not used: step 2 of the continuity spec
+    # forwards the turns and retrieves with nothing, so this number is the only
+    # evidence of whether any real device sends them. Without it, "the device
+    # half shipped" and "the device half shipped and is silently sending
+    # nothing" look identical for as long as nobody looks.
     logger.info(
         "voice ask: stt=%.2fs rag=%.2fs tts=%.2fs total=%.2fs "
         "clip_bytes=%d transcript_words=%d answer_words=%d answer_chars=%d "
-        "audio_bytes=%d fmt=%s",
+        "audio_bytes=%d fmt=%s history_turns=%d",
         marks.get("stt", -1), marks.get("rag", -1), marks.get("tts", -1),
         _time.perf_counter() - t0, len(audio_bytes),
         len(transcript.split()), len(answer_text.split()), len(answer_text),
-        len(audio_out), fmt)
+        len(audio_out), fmt, history_turns)
 
     _invoke_voice_audit(caller_sub, transcript, answer_text)
     return {

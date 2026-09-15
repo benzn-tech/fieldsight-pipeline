@@ -248,7 +248,27 @@ def test_an_empty_section_is_dropped_rather_than_shown_empty():
 
 def test_safety_survives_when_there_is_something_to_say():
     r = _report(safety_observations=[{"observation": "Loose cable on level 2"}])
-    assert _by_title(rs.build(r), "Safety")["kind"] == "list"
+    sec = _by_title(rs.build(r), "Safety")
+    assert sec["kind"] == "table"
+    assert sec["rows"][0]["observation"] == "Loose cable on level 2"
+
+
+def test_safety_says_what_to_do_about_it():
+    """A list of observations is half a safety section. The prompt has always
+    asked for `recommended_action`, every real entry carries one, and this
+    section dropped it -- so a report said a digger was operating inside the
+    exclusion zone and did not say to stop it."""
+    r = _report(safety_observations=[{
+        "observation": "Entry into the falsework exclusion zone",
+        "risk_level": "high",
+        "location": "Cook Brothers adjoining site",
+        "recommended_action": "Start a joint coordination group",
+        "who_raised": "Ben",
+    }])
+    row = _by_title(rs.build(r), "Safety")["rows"][0]
+    assert row["action"] == "Start a joint coordination group"
+    assert row["risk"] == "high"
+    assert row["location"] == "Cook Brothers adjoining site"
 
 
 def test_section_order_is_fixed():

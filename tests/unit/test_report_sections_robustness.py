@@ -66,7 +66,7 @@ def test_a_report_that_is_not_a_report_still_returns_sections(report):
 
 def test_a_bare_string_of_safety_is_one_observation_not_nine_letters():
     sec = _by_title(rs.build(_report(safety_observations="Loose cable")), "Safety")
-    assert sec["items"] == ["Loose cable"]
+    assert [r["observation"] for r in sec["rows"]] == ["Loose cable"]
 
 
 # ---------------------------------------------------------------------------
@@ -160,13 +160,48 @@ def test_a_meeting_gets_no_on_site_panel_of_zeros():
     assert "On Site" not in _titles(rs.build(r))
 
 
-def test_the_dates_block_has_a_section():
-    """It is produced by the daily report and rendered in the Word document. For
-    a design whose first ranking key is the date, it would be odd for the one
-    section made of dates to vanish."""
+def test_the_dates_block_reads_the_keys_the_model_actually_writes():
+    """THE SHAPE THE PRODUCER WRITES, not one this test invented.
+
+    The daily prompt asks for `date_mentioned / context / who_mentioned /
+    urgency / type`. This section read `item|description|event|detail` and
+    `date|deadline` -- none of them -- so every real report produced an empty
+    Key Dates and `build` dropped the section entirely. Measured on a TEST
+    report from the deployed code: 17 entries in the field, zero readable, no
+    section.
+
+    The old test fed `{"item": ..., "date": ...}` and passed. A test that
+    supplies its own input can confirm any reading of it; the only thing that
+    settles which keys are real is the prompt that asks for them.
+    """
+    r = _report(critical_dates_and_deadlines=[
+        {"date_mentioned": "28th", "context": "Backfill Zone 1",
+         "who_mentioned": "Ben", "urgency": "high", "type": "deadline"},
+    ])
+    sec = _by_title(rs.build(r), "Key Dates")
+    assert sec["kind"] == "table"
+    assert sec["rows"][0] == {"when": "28th", "what": "Backfill Zone 1", "who": "Ben"}
+
+
+def test_the_older_key_names_still_read():
+    """The meeting path and pre-existing reports are free to use them, and a
+    reader is not helped by this being strict."""
     r = _report(critical_dates_and_deadlines=[
         {"item": "Crane off-hire", "date": "2026-09-20"}, "Slab pour Friday",
     ])
-    items = _by_title(rs.build(r), "Key Dates")["items"]
-    assert any("Crane off-hire" in i and "2026-09-20" in i for i in items)
-    assert "Slab pour Friday" in items
+    rows = _by_title(rs.build(r), "Key Dates")["rows"]
+    assert {"when": "2026-09-20", "what": "Crane off-hire", "who": ""} in rows
+    assert {"when": "", "what": "Slab pour Friday", "who": ""} in rows
+
+
+def test_key_dates_are_in_date_order():
+    """A list of dates that is not in date order is a list, not a schedule.
+    `date_mentioned` is free text, so the ones that cannot be read keep their
+    stated order at the end rather than sorting by first character."""
+    r = _report(report_date="2026-09-09", critical_dates_and_deadlines=[
+        {"date_mentioned": "next week", "context": "Later thing"},
+        {"date_mentioned": "when the crane arrives", "context": "Unreadable"},
+        {"date_mentioned": "tomorrow", "context": "Sooner thing"},
+    ])
+    rows = _by_title(rs.build(r), "Key Dates")["rows"]
+    assert [x["what"] for x in rows] == ["Sooner thing", "Later thing", "Unreadable"]

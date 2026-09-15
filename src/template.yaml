@@ -298,6 +298,22 @@ Parameters:
     Description: DashScope OpenAI-compatible base URL for Qwen chat completions
     Default: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 
+  EnableWebAnswer:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Answer from the open web when the retrieved excerpts do not answer the
+      question. Off by default on every stack, for the same reason
+      EnableExternalCorroboration is: it sends something derived from a
+      customer's meeting toward a search engine, and whether the pilot contracts
+      permit that is a commercial decision rather than a deploy-time default.
+
+      What actually leaves is narrower than corroboration's: gate-screened entity
+      NAMES taken from the QUESTION, at most three, with no claim text attached.
+      The question itself and the excerpts go only to the LLM provider, which
+      already receives them on every /ask.
+
   CorroborationApiKey:
     Type: String
     NoEcho: true
@@ -1822,6 +1838,9 @@ Resources:
           # parameter for why borrowing that one sends the wrong vendor's
           # credential on any DashScope-pointed stack.
           CORROBORATION_API_KEY: !Ref CorroborationApiKey
+          # Reads the same credential and the same vendor as corroboration; the
+          # separate flag is about the decision, not the plumbing.
+          ENABLE_WEB_ANSWER: !Ref EnableWebAnswer
       Layers:
         - !Ref DashScopeLayer
       Policies:
@@ -2215,6 +2234,13 @@ Resources:
               # valid if the role can GetObject the key).
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+            - Effect: Allow
+              # POST /api/org/reports/regenerate: the caller's own report, handed to
+              # the non-VPC ReportGeneratorFunction as report_requests/<folder>/<rid>.json
+              # (BUG-36), wired by hand in scripts/wire-s3-events.sh (BUG-33). Write
+              # only: the generator reads the request, org-api never does.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/report_requests/*
             # A speaker correction, handed OUTWARD across the VPC boundary the same way.
             # Write only, and no grant on voiceprint_results/: those go to the in-VPC
             # writer by direct invoke from the embedder, and a read grant here would be an
@@ -3183,6 +3209,10 @@ Resources:
           ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           GROUP_MERGE_CAP: !Ref GroupMergeCap
+          # item-writer reads this through lambda_ingest.AUTHORITY_FLIP. It was only
+          # ever given to IngestFunction, so the late-extraction rule in
+          # write_extraction_items could never see the flag on a deployed stack.
+          AUTHORITY_FLIP: !Ref AuthorityFlip
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
