@@ -976,7 +976,8 @@ def _validate_scope(body):
 
     raw = body.get("date")
     if raw is not None and raw != "":
-        ok = (isinstance(raw, str) and len(raw) == 10 and raw[4] == "-" and raw[7] == "-")
+        ok = (isinstance(raw, str) and raw.isascii() and len(raw) == 10
+              and raw[4] == "-" and raw[7] == "-")
         if ok:
             try:
                 _date.fromisoformat(raw)
@@ -1057,7 +1058,7 @@ def _applied_scope(result, scope_req, plan, scope_dropped):
     return out
 
 
-def _metric_answer(caller_sub, question, metric, date_from, date_to):
+def _metric_answer(caller_sub, question, metric, date_from, date_to, applied_scope=None):
     """A counting question, answered from SQL and written by a template.
 
     NO MODEL ON THIS PATH, and that is the whole reason it exists. Ask retrieves
@@ -1078,8 +1079,13 @@ def _metric_answer(caller_sub, question, metric, date_from, date_to):
     """
     import metric_render
 
+    # Scoped Ask: the metric route is only reached with no site/author/topic
+    # scope, so this carries at most the request's drops (never a site claim).
+    applied_scope = applied_scope if applied_scope is not None else {"dropped": []}
+
     if not RAG_SEARCH_FUNCTION:
-        return {"answer": "", "error": "rag-search not configured", "citations": []}
+        return {"answer": "", "error": "rag-search not configured", "citations": [],
+                "applied_scope": applied_scope}
 
     basis = {"from": date_from, "to": date_to, "widened": False}
     payload = {"mode": "metric", "metric": metric, "sub": caller_sub,
@@ -1096,7 +1102,8 @@ def _metric_answer(caller_sub, question, metric, date_from, date_to):
     if resp.get("FunctionError"):
         logger.error("  Ask metric FunctionError: %s", resp.get("FunctionError"))
         return {"answer": "Search service temporarily unavailable. Please try again.",
-                "error": "rag-search unavailable", "citations": [], "basis": basis}
+                "error": "rag-search unavailable", "citations": [], "basis": basis,
+                "applied_scope": applied_scope}
 
     result = json.loads(resp["Payload"].read().decode("utf-8"))
     if result.get("error"):
@@ -1115,6 +1122,7 @@ def _metric_answer(caller_sub, question, metric, date_from, date_to):
         "unit": result.get("unit"),
         "notes": result.get("notes") or {},
         "basis": basis,
+        "applied_scope": applied_scope,
     }
 
 
@@ -1168,7 +1176,18 @@ def _rag_answer(body):
     import answer_language
     import query_slots
     today = query_slots.resolve_today(body.get("tz"), now=_parse_now(body.get("now")))
-    date_from, date_to = query_slots.time_range(question, today)
+    q_from, q_to = query_slots.time_range(question, today)
+
+    # Scoped Ask (spec 2026-09-15 §4.2): what the client asked to be scoped to,
+    # validated, and the range that wins. Pure helpers that never raise, so
+    # computing them above the try adds no raw-500 path.
+    scope_req, scope_dropped = _validate_scope(body)
+    plan = _scope_range(scope_req, q_from, q_to)
+    scope_dropped = scope_dropped + plan["dropped"]
+    date_from, date_to = plan["from"], plan["to"]
+    narrowed = any(f in scope_req for f in ("site_id", "author_folder", "topic_row_id"))
+    # Until rag-search answers, only this hop's own drops are known.
+    applied_scope = {"dropped": list(scope_dropped)}
 
     try:
         # A counting question leaves here and never reaches the embedder or a
@@ -1192,10 +1211,16 @@ def _rag_answer(body):
         # window nobody asked for is the other wrong answer, so an undated
         # counting question goes back to doing what it did.
         import metric_slots
-        _metric = metric_slots.detect(question) if date_from else None
+        #
+        # SCOPED COUNTS DO NOT TAKE THIS ROUTE. The metric SQL knows nothing of a
+        # site, an author or a topic, so a scoped count answered here would be the
+        # unscoped number wearing the scope's label -- the silent-wrong case the
+        # scoped-Ask spec exists to remove. Retrieval answers it instead.
+        _metric = metric_slots.detect(question) if (q_from and not narrowed) else None
         if _metric:
-            logger.info("  Ask metric route: %s (%s..%s)", _metric, date_from, date_to)
-            return _metric_answer(caller_sub, question, _metric, date_from, date_to)
+            logger.info("  Ask metric route: %s (%s..%s)", _metric, q_from, q_to)
+            return _metric_answer(caller_sub, question, _metric, q_from, q_to,
+                                  applied_scope=applied_scope)
 
         query_vec = dashscope_utils.embed([question])[0]
 
@@ -1213,7 +1238,8 @@ def _rag_answer(body):
         fetch_k = RERANK_CANDIDATES if RERANK_ENABLED else k
         payload = {"sub": caller_sub, "query_embedding": query_vec, "k": fetch_k}
         if date_from or date_to:
-            # Added ONLY when a range was actually read. rag-search ignores
+            # Added ONLY when a range was actually chosen (the question's, a
+            # picked day, or none for a pinned topic). rag-search ignores
             # unknown keys and treats absent dates as "no filter", so a caller
             # with no time word sends the payload it has always sent -- key for
             # key. Always-present nulls would be a change to every caller,
@@ -1222,8 +1248,19 @@ def _rag_answer(body):
             payload["date_to"] = date_to
             # Nothing yesterday must not become an empty answer. rag-search
             # holds the connection and the ACL, so it is the only place that can
-            # find the nearest day the caller may actually see.
-            payload["widen_when_empty"] = True
+            # find the nearest day the caller may actually see. Only for a range
+            # the question named; a picked day or a topic's day is exactly that day.
+            if plan["widen"]:
+                payload["widen_when_empty"] = True
+
+        # Scope keys under rag-search's names, and only when they survived
+        # validation, so an unscoped Ask sends the payload it always has.
+        if "site_id" in scope_req:
+            payload["site"] = scope_req["site_id"]
+        if "author_folder" in scope_req:
+            payload["author"] = scope_req["author_folder"]
+        if "topic_row_id" in scope_req:
+            payload["topic_row_id"] = scope_req["topic_row_id"]
 
         resp = _get_lambda_client().invoke(
             FunctionName=RAG_SEARCH_FUNCTION,
@@ -1242,8 +1279,11 @@ def _rag_answer(body):
                 # No model was called. A name here would attribute a system
                 # message to something that never ran.
                 "model": None,
+                "applied_scope": applied_scope,
             }
         result = json.loads(resp["Payload"].read().decode("utf-8"))
+        pinned_topic = result.get("pinned_topic") or None  # noqa: F841 -- used by the Task 7 prompt block
+        applied_scope = _applied_scope(result, scope_req, plan, scope_dropped)
         chunks = result.get("chunks") or []
         # Reorder BEFORE _basis and before the empty check: the citation count and
         # the 'nothing found' branch must both describe what the answer was
@@ -1278,6 +1318,7 @@ def _rag_answer(body):
                         "from_web": True,
                         "web": empty_web,
                         "basis": basis,
+                        "applied_scope": applied_scope,
                     }
             return {
                 "answer": "No relevant records found for this question.",
@@ -1286,6 +1327,7 @@ def _rag_answer(body):
                 "model": None,
                 "grounded": True,
                 "basis": basis,
+                "applied_scope": applied_scope,
             }
 
         # The records may not answer this. Ask before spending a synthesis on
@@ -1312,6 +1354,7 @@ def _rag_answer(body):
                 "from_web": True,
                 "web": web,
                 "basis": basis,
+                "applied_scope": applied_scope,
             }
 
         prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
@@ -1391,6 +1434,7 @@ def _rag_answer(body):
                 "error": err,
                 "citations": [],
                 "model": None,
+                "applied_scope": applied_scope,
             }
 
         # CONTRACT: citations MUST stay in the same order as the prompt's [n]
@@ -1421,6 +1465,7 @@ def _rag_answer(body):
             "model": llm_utils.active_model(),
             "grounded": True,
             "basis": basis,
+            "applied_scope": applied_scope,
         }
     except Exception as e:
         logger.error(f"  RAG path failed: {e}")
@@ -1431,6 +1476,7 @@ def _rag_answer(body):
             # Reachable from either side of the model call, so there is nothing
             # honest to name.
             "model": None,
+            "applied_scope": applied_scope,
         }
 
 
