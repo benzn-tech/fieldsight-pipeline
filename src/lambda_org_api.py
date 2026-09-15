@@ -7721,6 +7721,7 @@ def _read_org_report_history(folder_scope, limit):
     than 404, so the failure would not even read as "missing"."""
     reports = []
     docx_sizes = {}
+    docx_times = {}
     try:
         paginator = s3().get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=LAKE_BUCKET, Prefix=REPORT_LAKE_PREFIX):
@@ -7728,6 +7729,7 @@ def _read_org_report_history(folder_scope, limit):
                 key = obj["Key"]
                 if key.endswith("_report.docx"):
                     docx_sizes[key] = obj["Size"]
+                    docx_times[key] = obj["LastModified"].isoformat()
                     continue
                 if not key.endswith("_report.json") or "_debug" in key:
                     continue
@@ -7760,6 +7762,12 @@ def _read_org_report_history(folder_scope, limit):
         if cand in docx_sizes:
             r["docx_key"] = cand
             r["docx_size"] = docx_sizes[cand]
+            # When the Word file itself was written. The generator saves the JSON
+            # first and the .docx after it, so a client following a regenerate
+            # that looks only at generated_at can stop between the two and show
+            # a new report beside the previous Word file. Same listing pass, no
+            # extra request.
+            r["docx_generated_at"] = docx_times[cand]
 
     reports.sort(key=lambda r: r["date"], reverse=True)
     return {"reports": reports[:limit]}
