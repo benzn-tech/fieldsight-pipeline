@@ -605,3 +605,26 @@ def test_the_non_date_fields_are_not_gated():
     req, _ = laa._validate_scope({"site_id": SITE_ID, "author_folder": "Ben_UCPK2",
                                   "topic_row_id": TOPIC_ID})
     assert req == {"site_id": SITE_ID, "author_folder": "Ben_UCPK2", "topic_row_id": TOPIC_ID}
+
+
+def test_a_legacy_topic_with_a_different_body_date_reports_no_override(monkeypatch):
+    """topic_row_id (visible, pinned) + date, WITHOUT `scoped`: the ungated date
+    must never reach `_scope_range`/`_applied_scope`, even though the pinned
+    topic's `report_date` genuinely differs from the body date. So this must
+    not surface as an `overridden_by_topic` drop, and the rag-search payload
+    must be identical to the same request with no `date` at all -- the body
+    date narrowing the search is exactly the bug the gate exists to prevent."""
+    out = []
+    for extra in ({"date": "2026-09-01"}, {}):
+        client, _ = wire(monkeypatch, responses=[{
+            "chunks": [CHUNK], "pinned_topic": PINNED,   # PINNED report_date: 2026-09-03
+            "applied": {"topic_row_id": TOPIC_ID, "topic_title": "Scaffold handover",
+                        "site_id": SITE_ID, "dropped": []}}])
+        res = ask(question="concrete issues", topic_row_id=TOPIC_ID, **extra)
+        out.append((client.calls[0], res))
+    (with_date, res_a), (without, res_b) = out
+
+    assert with_date == without
+    assert "date_from" not in with_date and "date_to" not in with_date
+    assert res_a["applied_scope"] == res_b["applied_scope"]
+    assert {"field": "date", "reason": "overridden_by_topic"} not in res_a["applied_scope"]["dropped"]

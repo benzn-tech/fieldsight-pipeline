@@ -12,8 +12,8 @@ Timeline meeting-topic tab, and the search palette. They send different bodies
 1. `POST /api/ask` → `lambda_fieldsight_api.ask_question` (`src/lambda_fieldsight_api.py:1213-1256`)
    always adds `caller_sub`.
 2. `lambda_ask_agent.lambda_handler` branches on `caller_sub` (`src/lambda_ask_agent.py:1621`)
-   before `date`/`scope`/`topic_id` are used, and goes to `_rag_answer` (`:1007`). The proxy's own
-   comment (~`:1233`) records that `date` is not read on this path.
+   before `date`/`scope`/`topic_id` are used, and goes to `_rag_answer` (`:1007`). Before this
+   change, the proxy's own comment (~`:1233`) recorded that `date` was not read on this path.
 3. `_rag_answer` derives a range only from words in the question
    (`query_slots.time_range(question, today)`) and calls rag-search (`:1100`) with `sub`, the
    embedding, `k`, that range and `widen_when_empty` (`:1112`). No site, no author, no topic.
@@ -120,9 +120,9 @@ In order, before the rag-search invoke:
    **not** retry: that answer used the request's other narrowing, and `topic_row_id: not_visible`
    is reported. The "topic pinned" row's range column means "sent no range because a topic was
    requested"; so a not-visible topic with a body `date` must still send `date..date`. Precisely:
-   send `date..date` whenever body `date` survived validation and the question has no range,
-   even when `topic_row_id` is present — rag-search overrides it with the topic's day when the
-   topic is visible.
+   send `date..date` whenever body `date` survived validation (which requires `scoped: true`)
+   and the question has no range, even when `topic_row_id` is present — rag-search overrides it
+   with the topic's day when the topic is visible.
 3. **Metric route** (`metric_slots.detect` runs only when a question range exists, `:1081`): when
    any of `site_id`, `author_folder`, `topic_row_id` survived validation, skip the metric route
    and answer from retrieval — a scoped count answered unscoped is the silent-wrong case this
@@ -211,8 +211,8 @@ rag-search:
 Ask Agent:
 
 7. Every row of the §4.2 precedence table: range sent, `widen_when_empty`, `dropped`.
-8. Malformed `topic_row_id` / `site_id` / `date` → `dropped invalid`, rag-search invoked without
-   them, no exception.
+8. Malformed `topic_row_id` / `site_id` / `date` (`date` sent with `scoped: true`, or it is
+   never validated at all) → `dropped invalid`, rag-search invoked without them, no exception.
 9. Any of site/author/topic present + a metric question with a time word → metric route not taken.
 10. `pinned_topic` → first fenced block in the prompt with the specified header.
 11. `applied_scope` present on each of the seven `_rag_answer` returns and the three
@@ -229,7 +229,7 @@ topic, a NULL-`user_id` topic, and a deleted-recording topic.
 ## 6. Verification on TEST (after deploy to `develop`)
 
 1. Same question — "Which actions are still open?" — as Ben_UCPK2:
-   (a) `date=2026-09-03, site_id=<UC PK>, author_folder=Ben_UCPK2`; (b) none.
+   (a) `scoped=true, date=2026-09-03, site_id=<UC PK>, author_folder=Ben_UCPK2`; (b) none.
    Citations in (a) are all 2026-09-03 / UC PK; (b) spans days.
 2. `topic_row_id=df023596…` + "Who is responsible for follow-ups?" → answer about the pinned
    topic; `applied_scope.topic_title` is that topic.
