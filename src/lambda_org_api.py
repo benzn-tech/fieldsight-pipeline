@@ -677,6 +677,14 @@ def dispatch(conn, event, method, route):
     m_srs = re.match(r"^/sessions/([^/]+)/report/status$", route)
     if m_srs and method == "GET":
         return session_report_status(conn, caller, m_srs.group(1), event)
+
+    m_drp = re.match(r"^/days/([^/]+)/report/preview$", route)
+    if m_drp and method == "POST":
+        return day_report_preview(conn, caller, m_drp.group(1), event)
+    m_drg = re.match(r"^/days/([^/]+)/report$", route)
+    if m_drg and method == "POST":
+        return day_report_generate(conn, caller, m_drg.group(1), event)
+
     m_sm = re.match(r"^/sessions/([^/]+)/speaker-match$", route)
     if m_sm and method == "POST":
         return speaker_match(conn, caller, m_sm.group(1), event)
@@ -1447,6 +1455,17 @@ def regenerate_own_report(conn, caller, body):
                "report_type": report_type, "folder": folder}, 202)
 
 
+def _delivery_from_body(body):
+    """(deliver, recipients, None) or (None, None, error) -- shared by both generate routes."""
+    deliver = body.get("deliver", "download")
+    if deliver not in ("download", "email"):
+        return None, None, error("deliver must be 'download' or 'email'", 400)
+    recipients = body.get("recipients") or []
+    if deliver == "email" and not recipients:
+        return None, None, error("recipients required when deliver='email'", 400)
+    return deliver, recipients, None
+
+
 def session_report_generate(conn, caller, session_id, event):
     """POST /api/org/sessions/{session_id}/report — Tier-2 T3
     (session-report-review-export spec §6). ENQUEUES an async generate job.
@@ -1461,12 +1480,9 @@ def session_report_generate(conn, caller, session_id, event):
     body = parse_body(event)
     if body is None:
         return error("malformed JSON body", 400)
-    deliver = body.get("deliver", "download")
-    if deliver not in ("download", "email"):
-        return error("deliver must be 'download' or 'email'", 400)
-    recipients = body.get("recipients") or []
-    if deliver == "email" and not recipients:
-        return error("recipients required when deliver='email'", 400)
+    deliver, recipients, err = _delivery_from_body(body)
+    if err is not None:
+        return err
 
     selected, err = _selected_topic_row_ids(body)
     if err is not None:
@@ -1518,6 +1534,141 @@ def session_report_generate(conn, caller, session_id, event):
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
     return ok({"status": "queued", "sessionId": session_id,
+               "requestId": request_id, "resultKey": result_key}, 202)
+
+
+def _assemble_day_report(conn, caller, date, event, selected=None):
+    """Every reportable topic of one (folder, date), across meetings. (content, None) or
+    (None, error). Scope comes from `_report_rows_in_scope` with no session, so every
+    exclusion a meeting report applies, a day report applies (spec 2026-09-15 §5.2)."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return None, error("date required (YYYY-MM-DD)", 400)
+    p = event.get("queryStringParameters") or {}
+    user = (p.get("user") or "").strip()
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="day report")
+    if err is not None:
+        return None, err
+    rows = _report_rows_in_scope(conn, caller, folder, date, session_id=None, selected=selected)
+    if not rows:
+        return None, error("nothing to report for that day", 404)
+
+    # Meetings in their authoritative start order (build_day_sessions), then topics by the
+    # parsed start of their time_range, unparseable last -- never the lexical sort of the
+    # free text, never created_at (spec §8.4 of the superseded draft).
+    sessions, _excluded = build_day_sessions(conn, caller, folder, date, rows)
+    rank = {}
+    for i, s in enumerate(sessions):
+        for tid in s.get("topic_row_ids") or []:
+            rank.setdefault(tid, i)
+
+    def order(r):
+        rng = parse_time_range(r.get("time_range"))
+        return (rank.get(str(r["id"]), len(sessions)), rng is None, rng[0] if rng else 0, str(r["id"]))
+
+    rows = sorted(rows, key=order)
+    session_ids = []
+    for r in rows:
+        sid = session_scope.session_id_from_source_key(r.get("source_s3_key"))
+        if sid and sid not in session_ids:
+            session_ids.append(sid)
+    mirror_folders = sorted({parsed[0] for parsed in
+                             (session_scope.parse_extraction_key(r.get("source_s3_key")) for r in rows)
+                             if parsed})
+    site_names = sorted({r["site_name"] for r in rows if r.get("site_name")})
+    starts = [s["started_at"] for s in sessions if s.get("started_at")]
+    shaped = render_report_shape(rows, {}, date, folder, conn)
+    position = {str(r["id"]): i for i, r in enumerate(rows)}
+    topics_out = sorted(shaped["topics"],
+                        key=lambda t: position.get(str(t.get("topic_row_id")), len(position)))
+    return {
+        "scope": "day",
+        "date": date,
+        "folder": folder,
+        "title": f"{date} · {', '.join(site_names)}" if site_names else date,
+        "siteNames": site_names,
+        "startedAt": min(starts) if starts else None,
+        "participants": _session_participants(rows),
+        "topics": topics_out,
+        "sessionIds": session_ids,
+        "mirrorFolders": mirror_folders,
+        "topic_row_ids": [str(r["id"]) for r in rows],
+    }, None
+
+
+def day_report_preview(conn, caller, date, event):
+    """POST /api/org/days/{date}/report/preview?user= — a whole day, read-only."""
+    selected, err = _selected_topic_row_ids(parse_body(event) or {})
+    if err is not None:
+        return err
+    content, err = _assemble_day_report(conn, caller, date, event, selected)
+    if err is not None:
+        return err
+    return ok({
+        "scope": "day",
+        "date": content["date"],
+        "title": content["title"],
+        "siteNames": content["siteNames"],
+        "startedAt": content["startedAt"],
+        "participants": content["participants"],
+        "topics": content["topics"],
+        "sessionIds": content["sessionIds"],
+        "fieldDefaults": {
+            "title": content["title"],
+            "attendees": content["participants"],
+            "date": content["date"],
+            "site": ", ".join(content["siteNames"]),
+        },
+    })
+
+
+def day_report_generate(conn, caller, date, event):
+    """POST /api/org/days/{date}/report?user= — enqueue a day report for the worker.
+
+    Same hand-off as the meeting report (in-VPC org-api writes an S3 request artifact,
+    the non-VPC worker renders it), under a `day/` key segment. The artifact names every
+    session and every folder in scope so the worker can check each against its deletion
+    mirror (Task 2)."""
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    deliver, recipients, err = _delivery_from_body(body)
+    if err is not None:
+        return err
+    selected, err = _selected_topic_row_ids(body)
+    if err is not None:
+        return err
+    content, err = _assemble_day_report(conn, caller, date, event, selected)
+    if err is not None:
+        return err
+
+    request_id = uuid.uuid4().hex
+    folder = content["folder"]
+    result_key = f"session_report_results/{folder}/{date}/day/{request_id}.json"
+    request_key = f"session_report_requests/{folder}/{date}/day/{request_id}.json"
+    artifact = {
+        "scope": "day",
+        "requestId": request_id,
+        "date": date,
+        "folder": folder,
+        "companyId": str(caller["company_id"]),
+        "requestedBy": str(caller["id"]),
+        "templateId": body.get("templateId"),
+        "requestedTopicRowIds": (sorted(selected) if selected else None),
+        "selectedTopicRowIds": content["topic_row_ids"],
+        "sessionIds": content["sessionIds"],
+        "mirrorFolders": content["mirrorFolders"],
+        "title": body.get("title") or content["title"],
+        "attendees": body.get("attendees") or content["participants"],
+        "fields": body.get("fields") or {},
+        "deliver": deliver,
+        "recipients": recipients,
+        "content": content,
+        "resultKey": result_key,
+    }
+    s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
+                    Body=json.dumps(artifact, default=str),
+                    ContentType="application/json")
+    return ok({"status": "queued", "scope": "day", "date": date,
                "requestId": request_id, "resultKey": result_key}, 202)
 
 
