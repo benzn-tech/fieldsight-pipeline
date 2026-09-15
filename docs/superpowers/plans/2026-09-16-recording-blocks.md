@@ -4,7 +4,7 @@
 
 **Goal:** `GET /api/org/sessions` returns a day's `recording_blocks` — runs of recorded audio split on silence, each with its topics — computed in the background from transcript object names and merged at read time.
 
-**Architecture:** A new in-VPC Lambda (`RecordingSegmentsFunction`) listens to `transcripts/` Object Created events, LISTs the day's transcript objects, derives one raw segment per object from its filename with `transcript_utils`, and upserts them monotonically into a new Aurora table `day_recording_segments` (debounced: a day computed < 30 s ago is only marked dirty, and a gated `rate(5 minutes)` trailing pass recomputes dirty days). org-api is the single reader of the two thresholds: `get_org_sessions` filters the stored segments against deletions and wholly-excluded sessions, merges them with a pure module `recording_blocks.py`, and places the surviving topics into each block.
+**Architecture:** A new in-VPC Lambda (`RecordingSegmentsFunction`) listens to `transcripts/` Object Created events, LISTs the day's transcript objects, derives one raw segment per object from its filename with `transcript_utils`, and upserts them monotonically into a new Aurora table `day_recording_segments` (debounced: a day computed < 30 s ago is only marked dirty, and a gated `rate(5 minutes)` trailing pass recomputes dirty days). org-api is the single reader of the two thresholds: `get_org_sessions` filters the stored segments against deletions and wholly-excluded sessions, merges them with a pure module `recording_blocks.py`, and places the surviving topics into each block. A deleted merged (multi-device) meeting's `grp` tombstone is expanded to its lead and member device sessions before filtering, and a Throttles alarm on the existing `AlertTopic` watches the function.
 
 **Tech Stack:** Python 3.11 Lambdas (psycopg 3 via `PsycopgLayer`, boto3), Aurora PostgreSQL Serverless v2, DynamoDB (existing items table, via `sweep_state`), AWS SAM (`src/template.yaml`), EventBridge rules and schedules, GitHub Actions (`deploy.yml` / `deploy-prod.yml`), pytest, cfn-lint 1.53.3 (pinned in CI).
 
@@ -30,13 +30,13 @@
 - Aurora auto-pause: `SecondsUntilAutoPause` is 600, and `tests/unit/test_sweep_cadence_vs_autopause.py` forbids a scheduled Aurora client more frequent than every 1200 s unless it gates its connection. The trailing pass therefore connects only when its `sweep_state` flag (`RECORDING_BLOCKS#{stage}`) is set, plus one hourly safety tick.
 - Unwired-toggle trap: every Parameter is wired in all three places (template Parameter → function env → both workflows' `--parameter-overrides`). After deploy, read the DEPLOYED function's env; do not trust the template.
 - S3: without `s3:ListBucket` a missing key answers 403, not 404. The compute function gets `s3:ListBucket` on the ingest bucket with `s3:prefix` `transcripts/*`, and no `GetObject`.
-- SQL: unit-test connection doubles never execute SQL. The repository's SQL is exercised by `tests/integration/test_day_recording_segments.py` against a real Postgres (CI). Locally it reports `7 skipped`, and **a skip is not a pass**.
+- SQL: unit-test connection doubles never execute SQL. The repository's SQL is exercised by `tests/integration/test_day_recording_segments.py` against a real Postgres (CI). Locally it reports `12 skipped`, and **a skip is not a pass**.
 - Every invocation of the compute function logs exactly what happened (`computed` / `debounced-dirty` / `skipped-unresolved` / `ignored` / `sweep skipped` / `swept N`). A guard that passes silently cannot be told from one that never ran.
 - `topics.time_range` format, `topics.occurred_at` and `photo_binding.parse_time_range` are not changed.
 - Merge-conflict minimisation: branch `feat/day-scoped-reports` also edits `src/lambda_org_api.py` and `tests/unit/test_org_api_sessions.py`. Do not edit `test_org_api_sessions.py`. The org-api change is two import lines, two new helpers, and ONE line inside `get_org_sessions`.
 - Line endings: every `.py` file in this checkout is CRLF; YAML files are LF (`.gitattributes`). Edits to `.py` files use the one-line anchors given.
 - Git: stage by path, never `git add -A`; commit messages via `git commit -F <file>`; English only; every message ends with the two trailer lines shown in each commit step. Tasks 1–5 never push; only Task 6 Step 2 pushes, and only with the owner's approval.
-- Test commands: `python -m pytest tests/unit/<file> -q`. The full unit suite (`python -m pytest tests/unit -q`) was 4848 passed, 2 skipped with this plan applied.
+- Test commands: `python -m pytest tests/unit/<file> -q`. The full unit suite (`python -m pytest tests/unit -q`) was 4855 passed, 2 skipped with this plan applied.
 
 ## Where the existing code amended the brief
 
@@ -50,6 +50,14 @@ Each point below was found by running the code, not by reading it. The plan enco
 6. **`test_the_code_defaults_match_the_template_defaults` reads only `lambda_extract_session.py`.** Its pattern does not fit, so a sibling test for the org-api pair is added instead.
 7. **`_day_report_rows` applies only the topic arm of deletion** (design §11.2). The blocks read therefore applies the source-prefix arm itself (`redactions.deleted_source_prefixes(conn, folder, date)`).
 8. **Transcripts under `transcripts/` feed three other consumers** (extract-session via S3 notification; rolling-summary and session-activity via EventBridge). Task 6 does not copy a real transcript onto itself to trigger the rule: that would touch sessions and re-drive extraction. It verifies with a direct invoke instead, plus an optional probe object whose name has no base time.
+9. **The Throttles alarm does not tie `TreatMissingData` to the enable switch** (owner decision 2026-09-16: build the alarm). The backlog-alarm lesson in `tests/unit/test_backlog_alarm_matches_its_sweep.py` makes `breaching` conditional on the switch that runs its publisher, because that series is written on EVERY run, so absence means the publisher died. `AWS/Lambda Throttles` has no datapoint in a period with no throttle, on any stack and with the switch on or off. Absence is never a fault there, and a real throttle is a datapoint ≥ 1 that `notBreaching` cannot hide. So it is `notBreaching` unconditionally, pinned by `test_missing_throttle_data_is_never_treated_as_a_fault`. The alarm follows the failure-alarm pattern exactly: `AlertTopic`, `AlertEmail` with the `none` sentinel (`ShouldCreateAlerts`), and `HasDb` added through a `ShouldAlarmRecordingSegments` condition, as `ShouldAlarmItemWriter` does.
+10. **A deleted merged meeting is tombstoned under the lead's folder only** (owner decision 2026-09-16: fix now). Read from the code:
+    - `delete_recordings_endpoint` → `_source_prefixes_for` writes exactly one tombstone, `extractions/{folder}/{date}/{sessionBase}`, which for a merged meeting is `grp{group_id}`.
+    - `group_id` has no prefix: it IS the lead device's 32-hex session id. It is the `session_group.group_id` primary key (0036), and each member's `meeting_session.group_id` (0031, written by `meeting_session.ensure_open`) holds the same value.
+    - The lead carries no `group_id` of its own, and its row may not exist.
+    - `redactions.deleted_source_prefixes(conn, folder, date)` narrows to `LIKE '%/{folder}/{date}/%'`, so a member on another folder never sees the tombstone.
+
+    The fix is a separate, session-id-keyed query, `day_recording_segments.deleted_group_session_ids(conn, session_ids)`. It matches a candidate that equals the group id (the lead, row or no row) or whose `meeting_session.group_id` does (a member), against active `grp` tombstones only. Its result is added to the excluded set before `filter_segments`.
 
 ## Out of scope
 
@@ -57,8 +65,7 @@ Each point below was found by running the code, not by reading it. The plan enco
 - UI picker rendering of blocks (`fieldsight-ui`).
 - Template storage and versioning (design §6), and report generation (§5.3).
 - Any change to `topics.occurred_at`, the `time_range` format, or `SESSION_GAP_MINUTES` / `gap_minutes`.
-- A CloudWatch alarm on the new function's `Throttles` metric (design §7 lists it as a mitigation). Not built here; Task 6 reads the metric by hand. Raised for the owner.
-- Deletion of a merged multi-device meeting: its tombstone is `extractions/{lead}/{date}/grp{id}`, which names no device `sid`, so member segments are not filtered by that tombstone. Recorded as an open question for the owner, not solved here.
+- A member device whose `meeting_session` row never received `group_id` (its `/open` never arrived) cannot be linked to its group, so its blocks stay visible after the merged meeting is deleted. The merge itself has the same blind spot; fixing group membership capture is not this plan's job.
 - Backfilling days recorded before the switch is enabled: a day gets a row only when a transcript lands after deploy.
 
 ## File map
@@ -66,15 +73,15 @@ Each point below was found by running the code, not by reading it. The plan enco
 | File | Change | Responsibility |
 |---|---|---|
 | `src/migrations/0056_day_recording_segments.sql` | Create | Table `day_recording_segments` + partial index on dirty rows |
-| `src/repositories/day_recording_segments.py` | Create | `get`, `upsert_monotonic`, `mark_dirty`, `list_dirty` |
+| `src/repositories/day_recording_segments.py` | Create | `get`, `upsert_monotonic`, `mark_dirty`, `list_dirty`, `deleted_group_session_ids` |
 | `src/recording_blocks.py` | Create | PURE: `merge_segments`, `filter_segments`, `topic_ids_in_block` |
 | `src/lambda_recording_segments.py` | Create | Compute function: parse keys, debounce, LIST, upsert, gated trailing pass |
-| `src/template.yaml` | Modify | 3 Parameters, 1 Condition, `RecordingSegmentsFunction`, 2 env vars on `OrgApiFunction` |
+| `src/template.yaml` | Modify | 3 Parameters, 2 Conditions, `RecordingSegmentsFunction`, `RecordingSegmentsThrottleAlarm`, 2 env vars on `OrgApiFunction` |
 | `.github/workflows/deploy.yml` | Modify | 3 `--parameter-overrides` lines (TEST) |
 | `.github/workflows/deploy-prod.yml` | Modify | 3 `--parameter-overrides` lines (prod) |
 | `src/lambda_org_api.py` | Modify | 2 import lines, `_block_thresholds`, `_recording_blocks_entry`, 1 line in `get_org_sessions` |
 | `tests/unit/test_migration_0056_day_recording_segments.py` | Create | Migration shape + unique version |
-| `tests/integration/test_day_recording_segments.py` | Create | Real SQL: monotonic upsert, dirty, list_dirty, FK |
+| `tests/integration/test_day_recording_segments.py` | Create | Real SQL: monotonic upsert, dirty, list_dirty, FK, deleted merged meetings |
 | `tests/unit/test_recording_blocks.py` | Create | Pure merge/filter/placement, 2026-09-02 fixture |
 | `tests/unit/test_recording_segments_compute.py` | Create | Segment derivation, debounce, gate, handler, seam |
 | `tests/unit/test_template_recording_segments.py` | Create | Resource shape, triggers, IAM, isolation from finalize |
@@ -96,12 +103,13 @@ Not modified: `src/session_activity.py`, `SessionActivityFunction`, `src/session
 - Test: `tests/integration/test_day_recording_segments.py`
 
 **Interfaces:**
-- Consumes: the `users(id)` table (FK); `psycopg.rows.dict_row`.
+- Consumes: the `users(id)` table (FK); `psycopg.rows.dict_row`; for the merged-meeting query, `redactions(target_type, scope, reverted_at, target_key)` and `meeting_session(session_id, group_id)` (0031; `group_id` = the lead device's 32-hex session id, NULL on the lead's own row).
 - Produces (module `repositories.day_recording_segments`; repositories never commit, the caller owns the transaction):
   - `get(conn, user_id, report_date) -> dict | None` — keys `user_id`, `report_date` (`datetime.date`), `folder_name`, `segments` (always a `list`), `source_object_count` (`int`), `dirty` (`bool`), `computed_at` (timezone-aware `datetime`).
   - `upsert_monotonic(conn, user_id, report_date, folder_name, segments: list[dict], source_object_count: int) -> bool` — `True` when written (and `dirty` cleared); `False` when the stored row was computed from more objects (then `dirty` is left as it was).
   - `mark_dirty(conn, user_id, report_date) -> bool` — `False` when there is no row.
   - `list_dirty(conn, limit=50) -> list[dict]` — keys `user_id`, `report_date`, `folder_name`; least recently computed first.
+  - `deleted_group_session_ids(conn, session_ids: list[str | None]) -> set[str]` — the subset of `session_ids` that belong to a merged meeting with an ACTIVE tombstone `…/grp{group_id}`: the lead (id equal to the group id, with or without a `meeting_session` row) and every member (`meeting_session.group_id` equal to it). Folder- and date-independent by design; reverted tombstones hide nothing; `set()` for no candidates.
   - Segment shape stored in `segments`: `{"start": float, "end": float, "session_id": "<32 hex>" | None, "key": "transcripts/{folder}/{date}/{file}"}` — seconds since midnight on the device wall clock.
 
 The version number 0056 is free: the highest existing migration is `0055_topic_open_questions.sql`. `src/db/migrate.py` orders by `(int(version), filename)`, and two collisions (0041, 0044) already exist, so the unit test pins that nothing else uses 0056.
@@ -254,6 +262,75 @@ def test_list_dirty_returns_only_dirty_rows_least_recently_computed_first(db):
 def test_a_row_cannot_name_a_user_that_does_not_exist(db):
     with pytest.raises(psycopg.errors.ForeignKeyViolation):
         drs.upsert_monotonic(db, uuid.uuid4(), DAY, "Nobody", SEGS, 1)
+
+
+# ---- deleted merged meetings -------------------------------------------------------
+#
+# A merged meeting's delete writes one tombstone on `extractions/{lead}/{date}/grp{lead_sid}`.
+# These run the real join against meeting_session and redactions: the unit tests of the
+# org-api read replace this function, so only here is the SQL itself checked.
+
+LEAD = "a" * 32
+MEMBER = "b" * 32
+OTHER_MEMBER = "c" * 32
+SOLO = "d" * 32
+
+
+def _group(db, *, lead_row=True):
+    """A company, a lead user and a member user on a DIFFERENT folder, one group, one solo."""
+    from repositories import meeting_session, redactions
+
+    cid = db.execute("INSERT INTO companies (name) VALUES ('G') RETURNING id").fetchone()[0]
+    lead_user = db.execute(
+        "INSERT INTO users (company_id, email, global_role, folder_name) "
+        "VALUES (%s, 'lead@example.test', 'worker', 'Grp_Lead') RETURNING id", (cid,)).fetchone()[0]
+    member_user = db.execute(
+        "INSERT INTO users (company_id, email, global_role, folder_name) "
+        "VALUES (%s, 'member@example.test', 'worker', 'Grp_Member') RETURNING id", (cid,)).fetchone()[0]
+    if lead_row:
+        meeting_session.ensure_open(db, LEAD, cid, lead_user, None, "audio", None)
+    meeting_session.ensure_open(db, MEMBER, cid, member_user, None, "audio", None, group_id=LEAD)
+    meeting_session.ensure_open(db, OTHER_MEMBER, cid, lead_user, None, "audio", None, group_id=LEAD)
+    meeting_session.ensure_open(db, SOLO, cid, member_user, None, "audio", None)
+    return cid, lead_user, redactions
+
+
+def test_a_deleted_group_hides_the_lead_and_every_member_on_any_folder(db):
+    cid, lead_user, redactions = _group(db)
+    redactions.create_recording_tombstone(
+        db, cid, f"extractions/Grp_Lead/2026-09-02/grp{LEAD}", "removed", lead_user, "admin")
+    assert drs.deleted_group_session_ids(db, [LEAD, MEMBER, OTHER_MEMBER, SOLO]) == {
+        LEAD, MEMBER, OTHER_MEMBER}
+    # a member's day asks only about its own session, and still gets the answer
+    assert drs.deleted_group_session_ids(db, [MEMBER]) == {MEMBER}
+
+
+def test_a_lead_with_no_session_row_is_still_matched_by_its_own_id(db):
+    cid, lead_user, redactions = _group(db, lead_row=False)
+    redactions.create_recording_tombstone(
+        db, cid, f"extractions/Grp_Lead/2026-09-02/grp{LEAD}", "removed", lead_user, "admin")
+    assert drs.deleted_group_session_ids(db, [LEAD]) == {LEAD}
+
+
+def test_a_reverted_group_tombstone_hides_nothing(db):
+    cid, lead_user, redactions = _group(db)
+    key = f"extractions/Grp_Lead/2026-09-02/grp{LEAD}"
+    redactions.create_recording_tombstone(db, cid, key, "removed", lead_user, "admin")
+    db.execute("UPDATE redactions SET reverted_at = now() WHERE target_key = %s", (key,))
+    assert drs.deleted_group_session_ids(db, [LEAD, MEMBER, OTHER_MEMBER]) == set()
+
+
+def test_a_solo_sid_tombstone_is_not_read_as_a_group(db):
+    cid, lead_user, redactions = _group(db)
+    redactions.create_recording_tombstone(
+        db, cid, f"extractions/Grp_Lead/2026-09-02/sid{LEAD}", "removed", lead_user, "admin")
+    # the sid arm belongs to filter_segments' prefix match; it must not fan out to members
+    assert drs.deleted_group_session_ids(db, [LEAD, MEMBER, OTHER_MEMBER]) == set()
+
+
+def test_no_candidates_asks_nothing(db):
+    assert drs.deleted_group_session_ids(db, []) == set()
+    assert drs.deleted_group_session_ids(db, [None, ""]) == set()
 ```
 
 - [ ] **Step 3: Run the unit test to verify it fails**
@@ -390,6 +467,42 @@ def list_dirty(conn, limit=50) -> list[dict]:
         "WHERE dirty ORDER BY computed_at, user_id LIMIT %s",
         (int(limit),),
     ).fetchall()
+
+
+def deleted_group_session_ids(conn, session_ids) -> set[str]:
+    """Which of these device session ids belong to a DELETED merged meeting.
+
+    Deleting a multi-device meeting writes ONE tombstone, on the merged artifact's prefix:
+    `extractions/{lead_folder}/{date}/grp{group_id}`. The group id IS the lead device's
+    session id (migration 0031/0036; lambda_finalize_claim.group_merged_key), and every
+    member's meeting_session row carries it in `group_id`. The lead carries no group_id of
+    its own, and its row may not exist at all (its /open is best-effort), so a candidate
+    equal to the group id is matched directly, without the join.
+
+    Keyed on session ids, NOT on folder or date, on purpose. The tombstone names the LEAD's
+    folder, so `deleted_source_prefixes(conn, folder, date)` -- narrowed to
+    `%/{folder}/{date}/%` -- never shows it to a member's day, and a member may be a
+    different person recording under a different folder. Device session ids are random
+    32-hex values, so an id match cannot reach another company's recording.
+
+    Reverted tombstones hide nothing. Returns a subset of `session_ids`.
+    """
+    ids = sorted({s for s in (session_ids or []) if s})
+    if not ids:
+        return set()
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "WITH dead AS ("
+        "  SELECT DISTINCT substring(target_key from '/grp([0-9a-f]{32})(\\.json)?$') AS gid "
+        "  FROM redactions "
+        "  WHERE target_type = 'recording' AND scope = 'deleted' "
+        "  AND reverted_at IS NULL AND target_key LIKE '%%/grp%%'"
+        ") "
+        "SELECT DISTINCT c.sid FROM unnest(%s::text[]) AS c(sid) "
+        "LEFT JOIN meeting_session m ON m.session_id = c.sid "
+        "JOIN dead d ON d.gid IS NOT NULL AND (d.gid = c.sid OR d.gid = m.group_id)",
+        (ids,),
+    ).fetchall()
+    return {r["sid"] for r in rows}
 ```
 
 - [ ] **Step 6: Run the unit test and the integration test**
@@ -401,7 +514,7 @@ python -m pytest tests/unit/test_migration_0056_day_recording_segments.py -q
 python -m pytest tests/integration/test_day_recording_segments.py -q
 ```
 
-Expected: `3 passed` for the unit test. The integration test reports `7 passed` where `TEST_DATABASE_URL` points at a Postgres with pgvector (CI), and `7 skipped` without it. A local skip is not a pass: confirm `7 passed` in the CI run of the PR before Task 6.
+Expected: `3 passed` for the unit test. The integration test reports `12 passed` where `TEST_DATABASE_URL` points at a Postgres with pgvector (CI), and `12 skipped` without it. A local skip is not a pass: confirm `12 passed` in the CI run of the PR before Task 6.
 
 - [ ] **Step 7: Commit**
 
@@ -415,7 +528,9 @@ feat(db): store a day's recorded segments for recording blocks
 Migration 0056 adds day_recording_segments: one row per (user, date) holding
 raw segments derived from transcript names (design 2026-09-15 F9), a
 monotonic source_object_count and the debounce's dirty flag (F4).
-The repository's SQL is exercised against real Postgres in
+It also answers which device sessions belong to a deleted merged meeting
+(a grp tombstone names only the lead's id and folder). The repository's SQL
+is exercised against real Postgres in
 tests/integration. Must not reach main before the recording-blocks step
 is ready: migrations on main run against prod.
 
@@ -1561,7 +1676,7 @@ Expected: one new commit whose `--stat` lists exactly: `src/lambda_recording_seg
 - Test (create): `tests/unit/test_template_recording_segments.py`
 - Test (modify): `tests/unit/test_template_workflow_parameter_wiring.py` (append after its last test)
 - Test (modify): `tests/unit/test_sweep_cadence_vs_autopause.py`
-- Modify: `src/template.yaml` (Parameters before `DeviceAnnouncementPatterns`; Conditions after `ShouldEnableFinalize`; new resource directly after `SessionActivityFunction`; `OrgApiFunction` env after `GRADED_ROLES`)
+- Modify: `src/template.yaml` (Parameters before `DeviceAnnouncementPatterns`; Conditions after `ShouldEnableFinalize` and after `ShouldAlarmItemWriter`; new resource directly after `SessionActivityFunction`; `OrgApiFunction` env after `GRADED_ROLES`; `RecordingSegmentsThrottleAlarm` directly before `DownloaderErrorAlarm`)
 - Modify: `.github/workflows/deploy.yml`, `.github/workflows/deploy-prod.yml` (after the `EvidenceFloorTokens=` line)
 - Modify: `tests/unit/test_template_pgdatabase.py` (count 18 → 19)
 
@@ -1570,8 +1685,11 @@ Expected: one new commit whose `--stat` lists exactly: `src/lambda_recording_seg
 - Produces:
   - Parameters `EnableRecordingBlocks` (`'false'`, boolean), `ReportBlockGapSeconds` (`'600'`), `ReportLongBlockSeconds` (`'5400'`); Condition `ShouldEnableRecordingBlocks`.
   - Resource `RecordingSegmentsFunction` (FunctionName `fieldsight-test-recording-segments` / `fieldsight-prod-recording-segments`) with events `TranscriptLanded` (EventBridgeRule) and `DirtyDaySweep` (Schedule `rate(5 minutes)`), both `State: !If [ShouldEnableRecordingBlocks, ENABLED, DISABLED]`.
+  - Condition `ShouldAlarmRecordingSegments` (`ShouldCreateAlerts` AND `HasDb`) and resource `RecordingSegmentsThrottleAlarm` (AlarmName `fieldsight-{stage}-recording-segments-throttles`; `AWS/Lambda` `Throttles` on `!Ref RecordingSegmentsFunction`, Sum ≥ 1 over 300 s, `TreatMissingData: notBreaching`, action `!Ref AlertTopic`).
   - `OrgApiFunction` env `REPORT_BLOCK_GAP_SECONDS: !Ref ReportBlockGapSeconds`, `REPORT_LONG_BLOCK_SECONDS: !Ref ReportLongBlockSeconds` (consumed by Task 5).
   - Repo variables read by the workflows: `TEST_ENABLE_RECORDING_BLOCKS`, `TEST_REPORT_BLOCK_GAP_SECONDS`, `TEST_REPORT_LONG_BLOCK_SECONDS`, and the `PROD_` equivalents.
+
+The Throttles alarm is declared exactly like the existing failure alarms. It uses `AlertTopic`, and it exists only when `AlertEmail` is a real address: the workflows send the sentinel `none`, and both `none` and `''` mean no alarms (`ShouldCreateAlerts`, already pinned by `test_the_failure_alarms_can_actually_be_switched_on`, `test_no_alerts_is_spelled_with_a_sentinel_the_cli_will_carry` and `test_both_spellings_of_no_alerts_are_inert`, which keep passing unchanged). It also needs `HasDb`, because an alarm on a function that does not exist fails the stack (the `ShouldAlarmItemWriter` precedent). `TreatMissingData` is `notBreaching` unconditionally; see "Where the existing code amended the brief", item 9.
 
 The boolean `EnableRecordingBlocks` is picked up automatically by the existing `test_every_boolean_toggle_is_reachable_from_a_repo_variable`. The template is LF, so its multi-line anchors are safe.
 
@@ -1674,6 +1792,39 @@ def test_the_finalize_path_function_is_untouched():
     code = "\n".join(ln for ln in block.splitlines() if not ln.strip().startswith("#"))
     assert "recording" not in code.lower()
     assert "Handler: session_activity.lambda_handler" in block
+
+
+def test_a_throttle_alarm_watches_the_function():
+    """Reserved concurrency 2 means throttles are expected under a burst, and a throttled
+    async invocation writes NO log line. This metric is the only place one shows."""
+    block = _function_block(_text(), "RecordingSegmentsThrottleAlarm")
+    assert "Type: AWS::CloudWatch::Alarm" in block
+    assert "Condition: ShouldAlarmRecordingSegments" in block
+    assert "Namespace: AWS/Lambda" in block and "MetricName: Throttles" in block
+    assert re.search(r"- Name: FunctionName\s*\n\s*Value: !Ref RecordingSegmentsFunction", block)
+    assert "Threshold: 1" in block and "ComparisonOperator: GreaterThanOrEqualToThreshold" in block
+    assert re.search(r"AlarmActions:\s*\n\s*- !Ref AlertTopic", block)
+
+
+def test_the_alarm_rides_the_same_no_alerts_switch_and_needs_the_database():
+    """Same sentinel as every failure alarm (AlertEmail 'none' or '' creates nothing),
+    and HasDb because the function it names only exists with a database -- an alarm on a
+    resource that does not exist fails the whole stack (ShouldAlarmItemWriter precedent)."""
+    cond = re.search(r"\n  ShouldAlarmRecordingSegments: !And\n((?:    - .*\n)+)", _text())
+    assert cond, "no ShouldAlarmRecordingSegments condition"
+    assert sorted(cond.group(1).split()) == sorted(
+        "- !Condition ShouldCreateAlerts - !Condition HasDb".split())
+
+
+def test_missing_throttle_data_is_never_treated_as_a_fault():
+    """notBreaching, unconditionally. Throttles has no datapoint in a period with no
+    throttle, on every stack, whether EnableRecordingBlocks is on or off -- so missing data
+    is never a fault here, and a real throttle is a datapoint >= 1 that notBreaching cannot
+    hide. The conditional `breaching` of ExtractionBacklogAlarm is for a series its function
+    publishes on EVERY run; applied here it would page every quiet period."""
+    block = _function_block(_text(), "RecordingSegmentsThrottleAlarm")
+    [line] = [ln.strip() for ln in block.splitlines() if ln.strip().startswith("TreatMissingData:")]
+    assert line == "TreatMissingData: notBreaching"
 
 
 def test_the_switch_is_a_boolean_parameter_behind_a_condition():
@@ -1807,7 +1958,7 @@ python -m pytest tests/unit/test_template_workflow_parameter_wiring.py -q
 python -m pytest tests/unit/test_sweep_cadence_vs_autopause.py -q
 ```
 
-Expected: `7 failed, 1 passed` (six `ValueError: substring not found` because the resource is absent, and the condition assertion; the finalize-isolation test already passes); `5 failed, 56 passed`; `6 passed` (the gate test reads Task 3's source, which already exists).
+Expected: `10 failed, 1 passed` (the function, the alarm and both conditions are absent; the finalize-isolation test already passes); `5 failed, 56 passed`; `6 passed` (the gate test reads Task 3's source, which already exists).
 
 - [ ] **Step 6: Add the three Parameters (template)**
 
@@ -1992,7 +2143,78 @@ Replace it with:
           REPORT_LONG_BLOCK_SECONDS: !Ref ReportLongBlockSeconds
 ```
 
-- [ ] **Step 10: Pass the three Parameters on TEST (`deploy.yml`)**
+- [ ] **Step 10: Add the alarm condition next to `ShouldAlarmItemWriter` (template)**
+
+In `src/template.yaml`, find this exact text (it occurs exactly once):
+
+```yaml
+  ShouldAlarmItemWriter: !And
+    - !Condition ShouldCreateAlerts
+    - !Condition HasDb
+```
+
+Replace it with:
+
+```yaml
+  ShouldAlarmItemWriter: !And
+    - !Condition ShouldCreateAlerts
+    - !Condition HasDb
+  # Same reason as ShouldAlarmItemWriter: RecordingSegmentsFunction is behind HasDb.
+  ShouldAlarmRecordingSegments: !And
+    - !Condition ShouldCreateAlerts
+    - !Condition HasDb
+```
+
+- [ ] **Step 11: Add `RecordingSegmentsThrottleAlarm` directly before `DownloaderErrorAlarm` (template)**
+
+In `src/template.yaml`, find this exact text (it occurs exactly once):
+
+```yaml
+  DownloaderErrorAlarm:
+```
+
+Replace it with:
+
+```yaml
+  # Recording blocks (design 2026-09-15 §7). RecordingSegmentsFunction runs with
+  # ReservedConcurrentExecutions 2, and a throttled ASYNC invocation writes no log line at
+  # all: Lambda retries it and, past MaximumEventAge, discards it silently, so a day's
+  # blocks stop updating with nothing in the logs. This metric is the only signal.
+  #
+  # TreatMissingData: notBreaching, unconditionally -- deliberately NOT tied to
+  # ShouldEnableRecordingBlocks the way ExtractionBacklogAlarm ties its policy to its sweep.
+  # That pattern is for a series the function publishes on EVERY run, where absence means
+  # the publisher died. Throttles has no datapoint in a period with no throttle, on every
+  # stack and with the switch on or off, so absence is never a fault here; a real throttle
+  # is a datapoint >= 1, which notBreaching cannot hide. `breaching` would page every quiet
+  # period.
+  RecordingSegmentsThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldAlarmRecordingSegments
+    Properties:
+      AlarmName: !Sub ["${P}-recording-segments-throttles", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        RecordingSegmentsFunction invocations are being throttled (reserved concurrency 2).
+        Throttled events write no log and are discarded past MaximumEventAge, so report-picker
+        recording blocks can go stale silently. Check dirty rows in day_recording_segments.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RecordingSegmentsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  DownloaderErrorAlarm:
+```
+
+- [ ] **Step 12: Pass the three Parameters on TEST (`deploy.yml`)**
 
 In `.github/workflows/deploy.yml`, find this exact text (it occurs exactly once):
 
@@ -2009,7 +2231,7 @@ Replace it with:
               "ReportLongBlockSeconds=${{ vars.TEST_REPORT_LONG_BLOCK_SECONDS || '5400' }}" \
 ```
 
-- [ ] **Step 11: Pass the three Parameters on prod (`deploy-prod.yml`)**
+- [ ] **Step 13: Pass the three Parameters on prod (`deploy-prod.yml`)**
 
 In `.github/workflows/deploy-prod.yml`, find this exact text (it occurs exactly once):
 
@@ -2026,7 +2248,7 @@ Replace it with:
               "ReportLongBlockSeconds=${{ vars.PROD_REPORT_LONG_BLOCK_SECONDS || '5400' }}" \
 ```
 
-- [ ] **Step 12: Record why the in-VPC function count moved (pgdatabase test comment)**
+- [ ] **Step 14: Record why the in-VPC function count moved (pgdatabase test comment)**
 
 This file has CRLF line endings in this Windows checkout (`core.autocrlf=true`). The anchor below is ONE line on purpose: use it verbatim as `old_string` with the Edit tool.
 
@@ -2043,7 +2265,7 @@ Replace it with:
     # 18 again, and for the opposite reason to last time:
 ```
 
-- [ ] **Step 13: Move the pinned count to 19 (pgdatabase test)**
+- [ ] **Step 15: Move the pinned count to 19 (pgdatabase test)**
 
 This file has CRLF line endings in this Windows checkout (`core.autocrlf=true`). The anchor below is ONE line on purpose: use it verbatim as `old_string` with the Edit tool.
 
@@ -2059,7 +2281,7 @@ Replace it with:
     assert guarded == 19, f"expected 19 guarded PGDATABASE, found {guarded}"
 ```
 
-- [ ] **Step 14: Run the tests, the guard suites and the pinned linter**
+- [ ] **Step 16: Run the tests, the guard suites and the pinned linter**
 
 Run (from `C:/Users/camil/Dropbox/fs-blocks`):
 
@@ -2070,9 +2292,9 @@ pip install 'cfn-lint==1.53.3'
 python -c "import sys; from cfnlint.runner import main; sys.argv=['cfn-lint','src/template.yaml']; main()"; echo "exit=$?"
 ```
 
-Expected: `8 passed`; `143 passed`; cfn-lint prints nothing and `exit=0` (the same result as on the untouched template). Use the pinned 1.53.3 — CI pins it because 1.54.0 rejects this template.
+Expected: `11 passed`; `143 passed`; cfn-lint prints nothing and `exit=0` (the same result as on the untouched template). Use the pinned 1.53.3 — CI pins it because 1.54.0 rejects this template.
 
-- [ ] **Step 15: Commit**
+- [ ] **Step 17: Commit**
 
 Stage by path only (never `git add -A` in this repo). The message goes through a file so no BOM or shell quoting reaches git.
 
@@ -2085,7 +2307,9 @@ New in-VPC RecordingSegmentsFunction: EventBridge rule on transcripts/
 Object Created plus a rate(5 minutes) trailing pass, both gated by the new
 EnableRecordingBlocks switch (TEST on, prod off by default). ListBucket on
 transcripts/* only, the items-table flag for the gated sweep, and
-ReservedConcurrentExecutions 2. ReportBlockGapSeconds (600) and
+ReservedConcurrentExecutions 2, with a Throttles alarm on the existing
+AlertTopic (notBreaching: a throttled call writes no log and has no
+missing-data failure mode). ReportBlockGapSeconds (600) and
 ReportLongBlockSeconds (5400) are wired in all three places and given to
 OrgApiFunction only (design 2026-09-15 §5.5, F9). Not on the finalize
 path: SessionActivityFunction is unchanged.
@@ -2116,7 +2340,7 @@ Expected: one new commit whose `--stat` lists exactly: `src/template.yaml`, `.gi
 
 **Interfaces:**
 - Consumes:
-  - Task 1: `day_recording_segments.get(conn, user_id, report_date) -> dict | None`.
+  - Task 1: `day_recording_segments.get(conn, user_id, report_date) -> dict | None`, `day_recording_segments.deleted_group_session_ids(conn, session_ids) -> set[str]`.
   - Task 2: `recording_blocks.filter_segments`, `merge_segments`, `topic_ids_in_block`.
   - Task 4: env `REPORT_BLOCK_GAP_SECONDS`, `REPORT_LONG_BLOCK_SECONDS` on `OrgApiFunction`.
   - Existing: `users.get_by_folder_name_global(conn, folder_name)`, `redactions.deleted_source_prefixes(conn, folder=None, date=None) -> list[str]`, `session_scope.session_ref(source_s3_key) -> (session_base, kind)`, `session_scope.device_session_id(session_base) -> str | None`, `session_scope.KIND_EXTRACTION`, and `build_day_sessions(conn, caller, folder, date, rows) -> (sessions, excluded)` whose sessions carry `session_id` (the base) and `topic_row_ids` (list of `str`).
@@ -2125,7 +2349,7 @@ Expected: one new commit whose `--stat` lists exactly: `src/template.yaml`, `.gi
   - `_block_thresholds() -> tuple[float, float]` — env read per request, with defaults `"600"` / `"5400"`.
   - `_recording_blocks_entry(conn, folder, date, rows, sessions) -> dict` — `{}` or `{"recording_blocks": [...]}`, spread into the envelope.
 
-The route tests live in a new file and copy `test_org_api_sessions.py`'s conventions (`FakeConn`, `make_event`, `_row`, the `wired` stubs) rather than editing that file, which another branch is changing. Chunk-session keys (`sid{hex}`) resolve start and end through `meeting_session.get`, so the fixture stubs it.
+The route tests live in a new file and copy `test_org_api_sessions.py`'s conventions (`FakeConn`, `make_event`, `_row`, the `wired` stubs) rather than editing that file, which another branch is changing. Chunk-session keys (`sid{hex}`) resolve start and end through `meeting_session.get`, so the fixture stubs it. It also replaces `deleted_group_session_ids` with a small in-memory model of groups and `grp` tombstones. The SQL itself runs in Task 1's integration test, and the route tests keep `deleted_source_prefixes` empty, to prove it is the expansion, not the prefix arm, that hides a merged meeting.
 
 - [ ] **Step 1: Write the failing route tests**
 
@@ -2231,8 +2455,20 @@ ROWS = [
 @pytest.fixture
 def wired(monkeypatch):
     """Caller resolved, no redactions, ALL-scope site reach, no stored segments yet."""
-    calls = {"owner_lookups": [], "segment_reads": [], "prefix_reads": []}
-    state = {"stored": None, "prefixes": [], "redacted": {}}
+    calls = {"owner_lookups": [], "segment_reads": [], "prefix_reads": [], "group_lookups": []}
+    # groups: {lead_sid: {member sids}}; grp_tombstones: [(target_key, reverted)]
+    state = {"stored": None, "prefixes": [], "redacted": {}, "groups": {}, "grp_tombstones": []}
+
+    def deleted_groups(conn, session_ids):
+        """Stands in for the SQL in repositories.day_recording_segments (run for real in
+        tests/integration): a session is hidden when an ACTIVE grp tombstone names its
+        group -- its own id if it is the lead, the lead's id if it is a member."""
+        calls["group_lookups"].append(sorted({s for s in session_ids if s}))
+        dead = {key.rsplit("/grp", 1)[1] for key, reverted in state["grp_tombstones"] if not reverted}
+        return {sid for sid in session_ids if sid and any(
+            sid == gid or sid in state["groups"].get(gid, ()) for gid in dead)}
+
+    monkeypatch.setattr(org.day_recording_segments, "deleted_group_session_ids", deleted_groups)
     monkeypatch.setattr(org, "get_connection", lambda *a, **k: FakeConn())
     monkeypatch.setattr(org.users, "get_user_by_sub",
                         lambda conn, sub: dict(CALLER) if sub == "sub-1" else None)
@@ -2369,6 +2605,68 @@ def test_an_unresolvable_owner_has_no_key(wired):
     assert "recording_blocks" not in body_of(_get(DAY))
 
 
+# ---- deleted merged (multi-device) meetings ------------------------------------------
+#
+# Deleting a merged meeting tombstones ONE prefix: extractions/{lead_folder}/{date}/grp{lead_sid}.
+# It names no device sid in the stored segments, so filter_segments' prefix arm alone never
+# hides them -- and for a member on another folder, deleted_source_prefixes(folder, date)
+# never even returns it. The stub above keeps prefixes empty to prove exactly that.
+
+MEMBER_B = "7a1b2c3d4e5f60718293a4b5c6d7e8f9"
+MEMBER_C = "90abcdef12345678901234567890abcd"
+
+
+def _segments_for(folder, rename):
+    out = []
+    for s in SEGMENTS:
+        sid = rename.get(s["session_id"], s["session_id"])
+        out.append(dict(s, session_id=sid,
+                        key=s["key"].replace("/Ada_L/", f"/{folder}/").replace(s["session_id"], sid)))
+    return out
+
+
+def test_deleting_a_merged_meeting_hides_the_leads_own_block(wired):
+    _wire_rows(wired, ROWS)
+    _store(wired)
+    wired["state"]["groups"] = {SID_B: {MEMBER_B}}
+    wired["state"]["grp_tombstones"] = [(f"extractions/Ada_L/{DATE}/grp{SID_B}", False)]
+    body = body_of(_get(DAY))
+    assert _spans(body) == [("10:55", "11:35"), ("17:57", "18:15")]
+    assert wired["calls"]["group_lookups"] == [sorted([SID_A, SID_B, SID_C])]
+    assert wired["calls"]["prefix_reads"] == [("Ada_L", DATE)]     # the prefix arm saw nothing
+
+
+def test_a_members_day_hides_its_block_when_the_leads_meeting_is_deleted(wired):
+    _wire_rows(wired, [])
+    _store(wired, _segments_for("Bob_K", {SID_B: MEMBER_B}))
+    wired["state"]["groups"] = {SID_B: {MEMBER_B}}
+    wired["state"]["grp_tombstones"] = [(f"extractions/Ada_L/{DATE}/grp{SID_B}", False)]
+    body = body_of(_get({"date": DATE, "user": "Bob_K"}))
+    assert _spans(body) == [("10:55", "11:35"), ("17:57", "18:15")]
+    assert wired["calls"]["prefix_reads"] == [("Bob_K", DATE)]
+
+
+def test_a_group_deleted_after_a_member_recorded_on_a_different_folder(wired):
+    # Cy_M joined Ada_L's 17:57 meeting (lead SID_C) from his own device and folder, and also
+    # recorded a solo session in the morning. Only the meeting goes.
+    _wire_rows(wired, [])
+    _store(wired, _segments_for("Cy_M", {SID_C: MEMBER_C}))
+    wired["state"]["groups"] = {SID_C: {MEMBER_C}}
+    wired["state"]["grp_tombstones"] = [(f"extractions/Ada_L/{DATE}/grp{SID_C}", False)]
+    body = body_of(_get({"date": DATE, "user": "Cy_M"}))
+    assert _spans(body) == [("10:55", "11:35"), ("17:14", "17:47")]
+    assert body["recording_blocks"][0]["session_ids"] == [SID_A]
+
+
+def test_a_reverted_group_tombstone_hides_nothing(wired):
+    _wire_rows(wired, ROWS)
+    _store(wired)
+    wired["state"]["groups"] = {SID_B: {MEMBER_B}}
+    wired["state"]["grp_tombstones"] = [(f"extractions/Ada_L/{DATE}/grp{SID_B}", True)]
+    body = body_of(_get(DAY))
+    assert _spans(body) == [("10:55", "11:35"), ("17:14", "17:47"), ("17:57", "18:15")]
+
+
 def test_a_failing_blocks_read_still_serves_the_sessions(wired):
     _wire_rows(wired, ROWS)
 
@@ -2421,7 +2719,7 @@ python -m pytest tests/unit/test_org_api_sessions_recording_blocks.py -q
 python -m pytest tests/unit/test_template_workflow_parameter_wiring.py -q
 ```
 
-Expected: `10 errors` — `AttributeError: module 'lambda_org_api' has no attribute 'day_recording_segments'`; then `1 failed, 61 passed` (the code-default test finds no `os.environ.get("REPORT_BLOCK_GAP_SECONDS", ...)` in org-api).
+Expected: `14 errors` — `AttributeError: module 'lambda_org_api' has no attribute 'day_recording_segments'`; then `1 failed, 61 passed` (the code-default test finds no `os.environ.get("REPORT_BLOCK_GAP_SECONDS", ...)` in org-api).
 
 - [ ] **Step 4: Import the repository**
 
@@ -2497,7 +2795,12 @@ def _recording_blocks_entry(conn, folder, date, rows, sessions):
         redacted or non_work) is not advertised. A session with audio and no topic rows
         at all -- extraction pending, or nothing extracted -- is kept: that untopic'd
         audio is what a whole-block window exists to cover (design §4.1);
-      * a recording tombstoned by source prefix is not advertised.
+      * a recording tombstoned by source prefix is not advertised;
+      * every device session of a deleted MERGED meeting is not advertised. That delete
+        writes one tombstone, `extractions/{lead_folder}/{date}/grp{lead_sid}`, which names
+        none of the device sids stored here and, for a member, not even this folder, so
+        the folder-narrowed prefix arm can never see it. It is expanded to the member
+        sessions it covers (day_recording_segments.deleted_group_session_ids).
     topic_row_ids only name topics that survived build_day_sessions.
 
     Any failure logs and returns {}: blocks are an enhancement to a picker that works
@@ -2517,6 +2820,8 @@ def _recording_blocks_entry(conn, folder, date, rows, sessions):
             if kind == session_scope.KIND_EXTRACTION:
                 with_topics.add(session_scope.device_session_id(base))
         excluded = (with_topics - listed) - {None}
+        excluded |= day_recording_segments.deleted_group_session_ids(
+            conn, [s.get("session_id") for s in stored["segments"]])
         kept = recording_blocks.filter_segments(
             stored["segments"], excluded,
             redactions.deleted_source_prefixes(conn, folder, date))
@@ -2563,7 +2868,7 @@ python -m pytest tests/unit/test_template_workflow_parameter_wiring.py tests/uni
 python -m pytest tests/unit -q
 ```
 
-Expected: `10 passed`; `144 passed` (the existing `test_org_api_sessions.py` is untouched and still green); full suite `4848 passed, 2 skipped` (about 2.5 minutes).
+Expected: `14 passed`; `144 passed` (the existing `test_org_api_sessions.py` is untouched and still green); full suite `4855 passed, 2 skipped` (about 2.5 minutes).
 
 - [ ] **Step 9: Prove the tests guard the change (revert check)**
 
@@ -2573,7 +2878,9 @@ Temporarily change the spread line back to only `        "excluded": excluded,` 
 python -m pytest tests/unit/test_org_api_sessions_recording_blocks.py -q
 ```
 
-Expected: `7 failed, 3 passed`. The seven tests that assert blocks (or the owner lookup) fail; the never-computed, unresolvable-owner and failing-read tests still pass, because they correctly expect the key to be absent. Restore the line exactly and re-run: `10 passed`. Do not commit the reverted state.
+Expected: `11 failed, 3 passed`. The eleven tests that assert blocks (or the owner lookup) fail; the never-computed, unresolvable-owner and failing-read tests still pass, because they correctly expect the key to be absent. Restore the line exactly and re-run: `14 passed`.
+
+Then remove ONLY the two-line expansion (`excluded |= day_recording_segments.deleted_group_session_ids(` and the argument line after it) and run the same command. Expected: `3 failed, 11 passed`. The failures are `test_deleting_a_merged_meeting_hides_the_leads_own_block`, `test_a_members_day_hides_its_block_when_the_leads_meeting_is_deleted` and `test_a_group_deleted_after_a_member_recorded_on_a_different_folder`; `test_a_reverted_group_tombstone_hides_nothing` still passes, as it must. Restore the two lines exactly and re-run: `14 passed`. Do not commit either reverted state.
 
 - [ ] **Step 10: Commit**
 
@@ -2588,7 +2895,9 @@ When a day's segments are stored, the sessions envelope gains
 recording_blocks: segments filtered at read time against source-prefix
 tombstones and sessions whose topics were all excluded (design 2026-09-15
 F1), merged with the configured thresholds (F9), each block listing the
-surviving topics it overlaps. The key is absent when no row exists or the
+surviving topics it overlaps. A deleted merged meeting's grp tombstone is
+expanded to its lead and member device sessions, on any folder. The key is
+absent when no row exists or the
 read fails; gap_minutes and SESSION_GAP_MINUTES are unchanged.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
@@ -2643,9 +2952,13 @@ aws iam simulate-principal-policy --policy-source-arn "$ROLE" \
 aws iam simulate-principal-policy --policy-source-arn "$ROLE" \
   --action-names iam:CreateRole iam:GetRole iam:PutRolePolicy iam:GetRolePolicy iam:AttachRolePolicy iam:DeleteRolePolicy iam:PassRole iam:TagRole \
   --resource-arns "$FN_ROLE_ARN" --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output table
+ALARM_ARN=arn:aws:cloudwatch:ap-southeast-2:509194952652:alarm:fieldsight-test-recording-segments-throttles
+aws iam simulate-principal-policy --policy-source-arn "$ROLE" \
+  --action-names cloudwatch:PutMetricAlarm cloudwatch:DescribeAlarms cloudwatch:DeleteAlarms cloudwatch:TagResource \
+  --resource-arns "$ALARM_ARN" --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output table
 ```
 
-Expected: none of the three `echo`ed ARNs is empty or `None`, and every row reads `allowed`. Any `implicitDeny` or `explicitDeny` means **stop — do not merge**: the stack would CREATE_FAILED and roll back. Report the action and ARN.
+Expected: none of the three `echo`ed ARNs is empty or `None`, and every row of all four tables reads `allowed`. Any `implicitDeny` or `explicitDeny` means **stop — do not merge**: the stack would CREATE_FAILED and roll back. Report the action and ARN.
 
 - [ ] **Step 2: With approval — push, open the PR to `develop`, confirm CI**
 
@@ -2655,7 +2968,7 @@ gh pr create --repo "$(git -C C:/Users/camil/Dropbox/fs-blocks remote get-url or
 gh pr checks --watch
 ```
 
-Expected: all checks green, and the CI log shows `tests/integration/test_day_recording_segments.py` with `7 passed` (not skipped). The base is `develop`, never `main`.
+Expected: all checks green, and the CI log shows `tests/integration/test_day_recording_segments.py` with `12 passed` (not skipped). The base is `develop`, never `main`.
 
 - [ ] **Step 3: With approval — merge to `develop` and watch the TEST deploy**
 
@@ -2683,6 +2996,15 @@ done
 ```
 
 Expected: org-api `gap` = `"600"`, `long` = `"5400"`. The recording-segments env shows `bucket` = `fieldsight-data-test-509194952652`, `table` = `fieldsight-test-items`, `stage` = `test`, `gap` = `null` (not given, by design), and a non-empty `vpc`. `ReservedConcurrentExecutions` is `2`. Exactly two rules, both `ENABLED`: one with `rate(5 minutes)`, one whose pattern contains `"prefix":"transcripts/"`.
+
+Then check the new alarm against a control alarm that already exists under the same `AlertEmail` switch:
+
+```bash
+aws cloudwatch describe-alarms --alarm-names fieldsight-test-recording-segments-throttles fieldsight-test-transcribe-throttles \
+  --query 'MetricAlarms[].{name:AlarmName,metric:MetricName,dim:Dimensions[0].Value,missing:TreatMissingData,actions:AlarmActions}'
+```
+
+Expected: both alarms or neither. Neither means TEST passes `AlertEmail=none`, which by design creates no failure alarm at all. When both exist, the new one shows `metric` `Throttles`, `dim` `fieldsight-test-recording-segments`, `missing` `notBreaching` and exactly one SNS topic in `actions`. Exactly one of the two is a defect: stop.
 
 - [ ] **Step 5: Simulate the function's own role WITH resource ARNs**
 
@@ -2795,9 +3117,11 @@ Paste the outputs of Steps 1 and 4–9 (and 10 if run) into the PR description u
 | §5.4 resolve folder with `get_by_folder_name_global`, skip unresolvable | Task 3 `handle_object_key`; `test_an_unresolvable_folder_is_skipped_without_listing_or_guessing` |
 | §5.4 `recording_blocks` absent when no row; `from`/`to`/`minutes`/`selectable_as_whole`/topic ids; `gap_minutes` untouched | Task 5 |
 | §5.5 three-place wiring, one reader | Task 4 (`_BLOCK_TUNABLES`), Task 5 code-default parity; Task 6 Step 4 |
-| §7 throttles log nothing; new resources roll back; inert threshold | Task 4 `ReservedConcurrentExecutions: 2`; Task 6 Steps 1, 4, 9 |
+| §7 throttles log nothing; new resources roll back; inert threshold | Task 4 `ReservedConcurrentExecutions: 2` and `RecordingSegmentsThrottleAlarm`; Task 6 Steps 1, 4, 9 |
 | §10 thresholds measured on one account | Kept as template Parameters so re-tuning is a repo-variable change, not a code deploy |
-| F1 read-time filtering (tombstones, all-excluded sessions) | Task 2 `filter_segments`; Task 5 `_recording_blocks_entry` and its tests |
+| F1 read-time filtering (tombstones, all-excluded sessions, deleted merged meetings) | Task 2 `filter_segments`; Task 1 `deleted_group_session_ids`; Task 5 `_recording_blocks_entry` and its tests |
 | F4 debounce + dirty + trailing pass + monotonic + reserved concurrency | Task 1 SQL (+ integration test); Task 3; Task 4 |
 | F8 simulate WITH resource ARNs | Task 6 Steps 1 and 5 |
 | F9 segments stored, merge at read | Task 1 schema test (`gap_seconds` / `blocks jsonb` absent); Task 5 |
+| Owner 2026-09-16: build the Throttles alarm | Task 4 `ShouldAlarmRecordingSegments` + `RecordingSegmentsThrottleAlarm`, 3 template tests; existing `AlertEmail` sentinel tests unchanged; Task 6 Steps 1 and 4 |
+| Owner 2026-09-16: deleting a merged meeting hides its member devices' blocks | Task 1 `deleted_group_session_ids` + 5 integration tests (lead, member on another folder, lead with no row, reverted, `sid` is not a group); Task 5 expansion + 4 route tests (lead's day, member's day, member on a different folder, reverted) + revert check |
