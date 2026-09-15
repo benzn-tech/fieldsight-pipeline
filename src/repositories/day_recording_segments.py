@@ -40,7 +40,15 @@ def upsert_monotonic(conn, user_id, report_date, folder_name, segments,
 
     Returns True when the row was written, False when an older, smaller listing was
     refused. A refused write leaves dirty/dirty_since as they were on purpose: clearing
-    them would drop the mark a newer transcript left.
+    them would drop the mark a newer transcript left -- EXCEPT (I1) that a refused
+    write whose own `listed_at` is fresh enough to have seen the mark still clears it
+    with a second statement below: the `WHERE` above means the whole UPDATE, CASE
+    clauses included, never runs when the write is refused, so without this second
+    statement a row that keeps losing the count race (SWEEP_LIMIT or more of them)
+    would stay dirty forever, sort first in `list_dirty` by its stale `computed_at`,
+    starve newer dirty days out of every sweep, and keep re-flagging the trailing
+    pass's own flag (SWEEP_LIMIT reached every tick), which keeps connecting to Aurora
+    every 5 minutes and defeats auto-pause.
     """
     row = conn.cursor(row_factory=dict_row).execute(
         "INSERT INTO day_recording_segments "
@@ -63,23 +71,54 @@ def upsert_monotonic(conn, user_id, report_date, folder_name, segments,
         (str(user_id), report_date, folder_name, json.dumps(segments),
          int(source_object_count), listed_at, listed_at),
     ).fetchone()
-    return row is not None
+    written = row is not None
+    if not written:
+        # I1: the write itself was refused (an older, smaller listing), but this call's
+        # `listed_at` still records when ITS view of the day started, independently of
+        # whether its segments landed. If that view is fresh enough to have seen
+        # whatever raised the current mark, clear the mark now -- segments, count and
+        # computed_at are left exactly as stored; only dirty/dirty_since move.
+        conn.execute(
+            "UPDATE day_recording_segments SET dirty = false, dirty_since = NULL "
+            "WHERE user_id = %s AND report_date = %s AND dirty AND dirty_since <= %s",
+            (str(user_id), report_date, listed_at),
+        )
+    return written
 
 
 def mark_dirty(conn, user_id, report_date) -> bool:
     """Flag an existing row for the trailing pass. False when there is no row to flag.
 
-    dirty_since keeps the EARLIEST mark since the row was last clean (COALESCE), so a
-    second mark before the trailing pass catches up does not push the timestamp later
-    and does not make a stale write look like it could have seen the mark.
+    dirty_since keeps the LATEST mark (I2, corrected from the original EARLIEST-mark
+    rule, which was backwards). upsert_monotonic's clearing test is "did this write's
+    `listed_at` (taken before its LIST started) happen at or after dirty_since" -- i.e.
+    could this write's view have seen whatever raised the mark. The mark that question
+    needs is the newest one: mark1 at t1, a LIST starting at t2 > t1, then mark2 at
+    t3 > t2 for an object written AFTER that LIST began. Keeping the earliest mark
+    (the old COALESCE(dirty_since, now()) rule) would leave dirty_since == t1, and the
+    write's listed_at == t2 >= t1 would clear the row -- losing mark2's transcript with
+    the row reading clean, even though this write's LIST could not have seen it.
+    Keeping the latest mark (t3 > t2) correctly leaves the row dirty for that write.
     """
     row = conn.cursor(row_factory=dict_row).execute(
         "UPDATE day_recording_segments SET dirty = true, "
-        "dirty_since = COALESCE(dirty_since, now()) "
+        "dirty_since = now() "
         "WHERE user_id = %s AND report_date = %s RETURNING user_id",
         (str(user_id), report_date),
     ).fetchone()
     return row is not None
+
+
+def db_now(conn):
+    """The database's own clock (M1). `listed_at` is compared against `dirty_since`,
+    which mark_dirty stamps with Aurora's `now()` -- comparing an Aurora timestamp
+    against the Lambda host's wall clock makes I1/I2's ordering only as reliable as
+    clock sync between the two machines. Taking `listed_at` from this same connection
+    instead (autocommit, so this is statement time, not a frozen transaction snapshot)
+    removes that dependency entirely. A small seam so tests can inject a clock without
+    a real connection.
+    """
+    return conn.execute("SELECT now()").fetchone()[0]
 
 
 def list_dirty(conn, limit=50) -> list[dict]:

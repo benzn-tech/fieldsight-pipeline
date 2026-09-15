@@ -75,12 +75,48 @@ def test_an_equal_or_larger_listing_replaces_the_day_and_clears_dirty(db):
     assert row["dirty_since"] is None
 
 
-def test_a_refused_write_leaves_the_dirty_mark_in_place(db):
+# ---- I1: a refused write still carries a `listed_at` and must not leave a fresh
+# LIST's day dirty forever, but must not clear a mark it could not have seen ---------
+
+def test_a_refused_write_with_a_fresh_list_clears_the_dirty_mark(db):
+    """I1: `ON CONFLICT ... WHERE count >=` refuses the whole UPDATE (CASE clauses
+    included) when the new listing is smaller, so without a second statement the row
+    would keep whatever dirty/dirty_since it had FOREVER once refused. A day stuck
+    dirty this way keeps its stale `computed_at` and sorts first in `list_dirty`,
+    starving newer dirty days once SWEEP_LIMIT of them pile up, and keeps re-flagging
+    the trailing pass's own flag every tick -- which keeps connecting to Aurora every
+    5 minutes and defeats auto-pause. A refused write whose OWN `listed_at` is fresh
+    enough to have seen the mark must still clear it."""
     uid = _user(db, "Blocks_T")
     drs.upsert_monotonic(db, uid, DAY, "Blocks_T", NEWER, 5, _now())
-    drs.mark_dirty(db, uid, DAY)
-    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 4, _now()) is False
-    assert drs.get(db, uid, DAY)["dirty"] is True
+    assert drs.mark_dirty(db, uid, DAY) is True
+    listed_at = _now()          # real wall clock: always later than the frozen db now()
+    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 4, listed_at) is False
+    row = drs.get(db, uid, DAY)
+    assert row["segments"] == NEWER and row["source_object_count"] == 5   # refused: unchanged
+    assert row["dirty"] is False
+    assert row["dirty_since"] is None
+
+
+def test_a_refused_write_with_a_mark_newer_than_the_list_keeps_dirty(db):
+    """I1, other half: a refused write whose `listed_at` predates the mark must NOT
+    clear it -- its view could not have seen whatever raised it."""
+    uid = _user(db, "Blocks_T")
+    drs.upsert_monotonic(db, uid, DAY, "Blocks_T", NEWER, 5, _now())
+    listed_at = _now()
+    assert drs.mark_dirty(db, uid, DAY) is True
+    # now() is frozen for the whole test transaction (see the file-level comment on
+    # `_now()` above), so the mark's dirty_since cannot naturally land after
+    # `listed_at` (captured mid-test on the real clock) -- push it forward explicitly,
+    # exactly like the accepted-write I1 tests below, to represent a mark genuinely
+    # raised after this write's LIST began.
+    db.execute("UPDATE day_recording_segments SET dirty_since = %s WHERE user_id = %s",
+              (listed_at + datetime.timedelta(seconds=1), uid))
+    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 4, listed_at) is False
+    row = drs.get(db, uid, DAY)
+    assert row["segments"] == NEWER and row["source_object_count"] == 5
+    assert row["dirty"] is True
+    assert row["dirty_since"] is not None
 
 
 # ---- I1: a write's LIST relative to when the mark it might be racing was raised ----
@@ -118,6 +154,48 @@ def test_a_mark_raised_before_the_writes_list_began_is_cleared(db):
     assert row["segments"] == NEWER
     assert row["dirty"] is False
     assert row["dirty_since"] is None
+
+
+# ---- I2: dirty_since must keep the LATEST mark, not the earliest --------------------
+
+def test_a_second_mark_overwrites_the_first_with_the_latest_timestamp(db):
+    """I2: a second call to mark_dirty must UPDATE dirty_since to the latest mark, not
+    keep the earliest (the pre-fix `COALESCE(dirty_since, now())` rule). now() is
+    frozen for the whole test transaction, so both marks share one SQL timestamp;
+    proving the fix means showing the second call overwrites an EARLIER dirty_since
+    rather than leaving it alone."""
+    uid = _user(db, "Blocks_T")
+    drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 5, _now())
+    assert drs.mark_dirty(db, uid, DAY) is True                    # mark1
+    frozen_now = drs.get(db, uid, DAY)["dirty_since"]
+    earlier = frozen_now - datetime.timedelta(minutes=5)
+    db.execute("UPDATE day_recording_segments SET dirty_since = %s WHERE user_id = %s",
+              (earlier, uid))                                       # simulate mark1 being old
+    assert drs.mark_dirty(db, uid, DAY) is True                    # mark2, the latest mark
+    new_mark = drs.get(db, uid, DAY)["dirty_since"]
+    # The old COALESCE rule would have left dirty_since == `earlier` untouched.
+    assert new_mark > earlier
+    assert new_mark == frozen_now
+
+
+def test_the_latest_of_two_marks_survives_a_write_whose_list_began_between_them(db):
+    """I2 + I1's clearing rule together: mark1, then a write's LIST begins, then mark2
+    for a transcript that lands AFTER that LIST started. The write must not clear
+    dirty -- its view (listed_at) predates mark2, even though it postdates mark1."""
+    uid = _user(db, "Blocks_T")
+    drs.upsert_monotonic(db, uid, DAY, "Blocks_T", SEGS, 5, _now())
+    assert drs.mark_dirty(db, uid, DAY) is True                     # mark1
+    listed_at = _now()                                               # this write's LIST begins after mark1
+    assert drs.mark_dirty(db, uid, DAY) is True                     # mark2 lands afterwards
+    # Both marks share one frozen transaction now(); push dirty_since forward past
+    # listed_at to represent mark2 genuinely landing after this write's LIST began.
+    db.execute("UPDATE day_recording_segments SET dirty_since = %s WHERE user_id = %s",
+              (listed_at + datetime.timedelta(seconds=1), uid))
+    assert drs.upsert_monotonic(db, uid, DAY, "Blocks_T", NEWER, 5, listed_at) is True
+    row = drs.get(db, uid, DAY)
+    assert row["segments"] == NEWER
+    assert row["dirty"] is True
+    assert row["dirty_since"] is not None
 
 
 def test_mark_dirty_without_a_row_creates_nothing(db):

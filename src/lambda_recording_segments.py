@@ -141,8 +141,13 @@ def compute_day(conn, s3, bucket, user_id, folder, date):
     of handle_object_key) so it marks the earliest moment this call's view of the day
     could be stale -- what upsert_monotonic compares against dirty_since to decide
     whether this write's LIST could have seen whatever raised the mark (I1).
+
+    It comes from the database's own clock (M1: `day_recording_segments.db_now`), not
+    this Lambda's, because dirty_since is stamped by Aurora's `now()` in mark_dirty --
+    comparing an Aurora timestamp against the Lambda host's wall clock would make I1/I2's
+    ordering only as reliable as clock sync between the two.
     """
-    listed_at = _utcnow()
+    listed_at = day_recording_segments.db_now(conn)
     keys = list_day_keys(s3, bucket, folder, date)
     segments = []
     skipped = 0
@@ -253,11 +258,21 @@ def lambda_handler(event, context):
         return {"outcomes": []}
     now = _utcnow()
     outcomes = []
+    # I3: an EventBridge "Object Created" invocation carries exactly ONE key. If that
+    # single key's processing raised, logging and returning normally would answer
+    # Lambda with a 200-equivalent result, so its async-invoke retries never fire --
+    # a transient failure on a day's only (or last) transcript is never retried and
+    # nothing marks the day dirty either. A multi-key invocation (an S3 notification
+    # batch) keeps the old behaviour: log, continue, and never fail the others for one
+    # bad key.
+    single_key = len(keys) == 1
     with get_connection(autocommit=True) as conn:
         for key in keys:
             try:
                 outcomes.append(handle_object_key(conn, s3, S3_BUCKET, key, now))
             except Exception:
                 logger.exception("recording_segments: failed for key=%s", key)
+                if single_key:
+                    raise
                 outcomes.append("failed")
     return {"outcomes": outcomes}

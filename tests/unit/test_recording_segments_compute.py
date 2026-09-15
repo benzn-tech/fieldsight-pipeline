@@ -123,8 +123,10 @@ def store(monkeypatch):
         if row is None:
             return False
         row["dirty"] = True
-        if row.get("dirty_since") is None:
-            row["dirty_since"] = rs._utcnow()
+        # I2: dirty_since keeps the LATEST mark, not the earliest -- a second mark
+        # must overwrite it (mirrors the SQL's `dirty_since = now()`, not the earlier
+        # `COALESCE(dirty_since, now())`).
+        row["dirty_since"] = rs._utcnow()
         return True
 
     def list_dirty(conn, limit=50):
@@ -133,10 +135,18 @@ def store(monkeypatch):
                  "folder_name": r["folder_name"]}
                 for r in state["rows"].values() if r["dirty"]][:limit]
 
+    def db_now(conn):
+        # M1 seam: the repository takes `listed_at` from the database's own clock via
+        # day_recording_segments.db_now(conn) rather than this Lambda's. The double
+        # routes it through the same rs._utcnow() the rest of this fixture and its
+        # tests already inject ticks through, so patching rs._utcnow keeps working.
+        return rs._utcnow()
+
     monkeypatch.setattr(rs.day_recording_segments, "get", get)
     monkeypatch.setattr(rs.day_recording_segments, "upsert_monotonic", upsert_monotonic)
     monkeypatch.setattr(rs.day_recording_segments, "mark_dirty", mark_dirty)
     monkeypatch.setattr(rs.day_recording_segments, "list_dirty", list_dirty)
+    monkeypatch.setattr(rs.day_recording_segments, "db_now", db_now)
     monkeypatch.setattr(rs.users, "get_by_folder_name_global",
                         lambda conn, folder: dict(USER) if folder == "Ben_UCPK2" else None)
     monkeypatch.setattr(rs.sweep_state, "mark_pending",
@@ -345,6 +355,66 @@ def test_two_concurrent_computes_do_not_clear_a_mark_raised_between_them(store, 
     assert row_after["dirty_since"] == dirty_since
 
 
+def test_a_mark_that_lands_while_the_list_is_running_survives_the_write(store, monkeypatch):
+    """I2 through the real handler functions: the row already carries an EARLY mark
+    (dirty_since well before `listed_at`); while the LIST is running a SECOND, LATER
+    mark lands for the same day. dirty_since must move to the latest mark, and the
+    write that follows -- whose `listed_at` predates that later mark -- must not clear
+    dirty.
+
+    Before the I2 fix (dirty_since keeping the EARLIEST mark, `COALESCE(dirty_since,
+    now())`) the second mark would have been a no-op: dirty_since would stay at the
+    early time, which predates `listed_at`, and this write would wrongly clear the row
+    -- losing the second mark's transcript with the row reading clean.
+    """
+    row = _dirty_row("2026-09-02", count=1)
+    row.update(dirty=True, dirty_since=NOW - timedelta(seconds=100), computed_at=NOW)
+    store["rows"][("u-ben", "2026-09-02")] = row
+
+    ticks = iter([
+        NOW - timedelta(seconds=10),   # listed_at: captured before the LIST starts
+        NOW - timedelta(seconds=5),    # the SECOND (latest) mark, landing while the LIST runs
+    ])
+    monkeypatch.setattr(rs, "_utcnow", lambda: next(ticks))
+
+    real_list = rs.list_day_keys
+
+    def list_that_races_a_later_mark(s3, bucket, folder, date):
+        # A transcript lands and debounces for the same day while this LIST runs --
+        # this is the LATEST mark, strictly after `listed_at` was captured.
+        rs.day_recording_segments.mark_dirty(None, "u-ben", "2026-09-02")
+        return real_list(s3, bucket, folder, date)
+
+    monkeypatch.setattr(rs, "list_day_keys", list_that_races_a_later_mark)
+
+    result = rs.compute_day(FakeConn(), FakeS3(DAY_KEYS), "bkt", "u-ben", "Ben_UCPK2", "2026-09-02")
+    assert result["written"] is True
+    row_after = store["rows"][("u-ben", "2026-09-02")]
+    assert row_after["dirty"] is True, "the mark that landed during the LIST must survive the write"
+    assert row_after["dirty_since"] == NOW - timedelta(seconds=5)
+
+
+def test_listed_at_comes_from_the_db_clock_and_is_captured_before_the_list(store, monkeypatch):
+    """M1: `listed_at` must come from `day_recording_segments.db_now`, taken BEFORE the
+    S3 LIST starts -- not this Lambda's own clock. Comparing an Aurora-stamped
+    dirty_since (mark_dirty uses SQL now()) against a Lambda-host clock would make
+    I1/I2's ordering only as reliable as clock sync between the two machines.
+    """
+    order = []
+    monkeypatch.setattr(rs.day_recording_segments, "db_now",
+                        lambda conn: order.append("db_now") or NOW)
+    real_list = rs.list_day_keys
+
+    def tracking_list(s3, bucket, folder, date):
+        order.append("list")
+        return real_list(s3, bucket, folder, date)
+
+    monkeypatch.setattr(rs, "list_day_keys", tracking_list)
+    rs.compute_day(FakeConn(), FakeS3(DAY_KEYS), "bkt", "u-ben", "Ben_UCPK2", "2026-09-02")
+    assert order == ["db_now", "list"]
+    assert store["upserts"][0]["listed_at"] == NOW
+
+
 # ---- sweep_dirty ---------------------------------------------------------------
 
 def test_the_trailing_pass_recomputes_every_dirty_day_and_clears_it(store, caplog):
@@ -453,6 +523,43 @@ def test_the_handler_computes_an_object_event(wired_handler, store):
 
 
 def test_one_failing_key_does_not_sink_the_rest(wired_handler, store, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    real = rs.handle_object_key
+
+    def flaky(conn, s3, bucket, key, now):
+        if "Broken" in key:
+            raise RuntimeError("boom")
+        return real(conn, s3, bucket, key, now)
+
+    monkeypatch.setattr(rs, "handle_object_key", flaky)
+    event = {"Records": [
+        {"s3": {"object": {"key": "transcripts/Broken/2026-09-02/a_2026-09-02_10-00-00.json"}}},
+        {"s3": {"object": {"key": REAL_KEY}}}]}
+    assert rs.lambda_handler(event, None) == {"outcomes": ["failed", "computed"]}
+    assert "failed for key=transcripts/Broken/" in caplog.text
+
+
+def test_a_single_key_failure_is_re_raised_for_lambda_to_retry(wired_handler, store, monkeypatch, caplog):
+    # I3: an EventBridge "Object Created" invocation carries exactly one key. Logging
+    # and returning normally (the multi-key behaviour) would answer Lambda with success,
+    # so its async-invoke retries never fire and a transient failure on a day's only
+    # (or last) transcript is never retried, and nothing marks the day dirty either.
+    caplog.set_level(logging.INFO)
+
+    def boom(conn, s3, bucket, key, now):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(rs, "handle_object_key", boom)
+    event = {"detail": {"object": {"key": REAL_KEY}}}
+    with pytest.raises(RuntimeError, match="boom"):
+        rs.lambda_handler(event, None)
+    assert f"failed for key={REAL_KEY}" in caplog.text
+
+
+def test_a_multi_key_failure_still_processes_the_others_and_returns(wired_handler, store, monkeypatch, caplog):
+    # I3, other half: a multi-key invocation (an S3 notification batch) must keep the
+    # old behaviour -- one bad key never fails the others, and the handler returns
+    # normally instead of raising.
     caplog.set_level(logging.INFO)
     real = rs.handle_object_key
 
