@@ -1221,10 +1221,9 @@ def ask_question(body, caller):
 
     if not question:
         return error('Missing question')
-    # `date` is forwarded and the RAG path does not read it -- it branches on
-    # caller_sub before `date` is ever looked at, so a comment here once
-    # claiming it was "soft context" described something that never happened.
-    # It stays for the legacy S3 path, which does read it.
+    # `date` is read on the RAG path since scoped Ask (2026-09-15): with no time
+    # word in the question it narrows retrieval to that day. The legacy S3 path
+    # reads it too.
     #
     # `tz` is what the RAG path reads: an IANA zone id, not a date. The zone is
     # sent instead of a computed date because NZ and AU are both on daylight
@@ -1254,6 +1253,12 @@ def ask_question(body, caller):
         payload['tz'] = body['tz']
     if topic_id is not None:
         payload['topic_id'] = topic_id
+
+    # Scoped Ask (spec 2026-09-15 §4.1): forwarded as sent, validated by the Ask
+    # Agent, enforced by rag-search. Absent stays absent -- never ''.
+    for field in ('site_id', 'author_folder', 'topic_row_id'):
+        if body.get(field) not in (None, ''):
+            payload[field] = body[field]
 
     try:
         resp = lambda_client.invoke(
