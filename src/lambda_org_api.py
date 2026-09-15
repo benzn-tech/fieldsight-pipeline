@@ -1241,6 +1241,55 @@ def _day_report_rows(conn, caller, folder, date):
     return [r for r in rows if str(r["site_id"]) in allowed]
 
 
+def _deleted_prefixes_for_rows(conn, rows, date):
+    """Recording tombstones (source arm) for every folder these rows come from.
+
+    Every folder, not only the requester's: a multi-device meeting's rows are written
+    under the LEAD's folder, and so is its tombstone. STRICT -- a failed lookup raises,
+    because this feeds a document; producing one that includes a deleted recording is
+    worse than producing none (the same trade `_session_was_removed` makes)."""
+    folders = sorted({parsed[0] for parsed in
+                      (session_scope.parse_extraction_key(r.get("source_s3_key")) for r in rows)
+                      if parsed})
+    prefixes = set()
+    for folder in folders:
+        for p in redactions.deleted_source_prefixes(conn, folder, date) or []:
+            if isinstance(p, str) and p:
+                prefixes.add(p)
+    return prefixes
+
+
+def _report_rows_in_scope(conn, caller, folder, date, session_id=None, selected=None):
+    """The topic rows a report may contain, for one session or (session_id=None) the day.
+
+    Scope integrity: rows come from `_day_report_rows` (ACL, site clip, joiners), then
+    lose extraction-less rows, non_work, both deletion arms (topic tombstones AND
+    recording tombstones on the source key -- `deleted_predicates.py`: both arms or
+    neither), and finally intersect with the caller's chosen ids. A selection can only
+    narrow."""
+    rows = _day_report_rows(conn, caller, folder, date)
+    if not rows:
+        return []
+    redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows])
+    deleted = _deleted_prefixes_for_rows(conn, rows, date)
+    kept = []
+    for r in rows:
+        sid, kind = session_scope.session_ref(r.get("source_s3_key"))
+        if kind != session_scope.KIND_EXTRACTION:
+            continue
+        if session_id is not None and sid != session_id:
+            continue
+        if r["id"] in redacted or r.get("work_class") == "non_work":
+            continue
+        key = r.get("source_s3_key") or ""
+        if any(key.startswith(p) for p in deleted):
+            continue
+        kept.append(r)
+    if selected is not None:
+        kept = [r for r in kept if str(r["id"]) in selected]
+    return kept
+
+
 def _assemble_session_report(conn, caller, session_id, event, selected=None):
     """Re-derive ONE session's scope + assemble its reviewed report content,
     server-side from (folder, date, session_id). The shared core of the T2
@@ -1259,22 +1308,8 @@ def _assemble_session_report(conn, caller, session_id, event, selected=None):
     if err is not None:
         return None, err
 
-    rows = _day_report_rows(conn, caller, folder, date)
-    redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if rows else {}
-    srows = []
-    for r in rows:
-        sid, kind = session_scope.session_ref(r.get("source_s3_key"))
-        if kind != session_scope.KIND_EXTRACTION or sid != session_id:
-            continue
-        if r["id"] in redacted or r.get("work_class") == "non_work":
-            continue
-        srows.append(r)
-    if selected is not None:
-        # INTERSECTION, never a lookup. The chosen ids are filtered against rows
-        # that already passed the site ACL, the redaction check and the non_work
-        # exclusion, so a chosen id cannot widen the scope by one row -- naming
-        # somebody else's topic simply matches nothing.
-        srows = [r for r in srows if str(r["id"]) in selected]
+    srows = _report_rows_in_scope(conn, caller, folder, date,
+                                  session_id=session_id, selected=selected)
 
     if not srows:
         # unknown session, all-excluded, wrong folder/date, or a selection that
