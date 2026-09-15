@@ -1,0 +1,1680 @@
+{
+ "version": "v1",
+ "description": "Frozen source transcripts for the retrieval evaluation. Hashes are of the exact bytes prod stored.",
+ "owner_folder": "Ben_UCPK2",
+ "source_bucket": "fieldsight-data-509194952652",
+ "lifecycle_warning": "Bucket rule DeleteOldTranscripts expires transcripts/ 90 days after creation. The frozen copy must live outside that prefix.",
+ "frozen_copy": null,
+ "days": [
+  {
+   "date": "2026-09-02",
+   "file_count": 46,
+   "bytes": 2249313,
+   "corpus_sha256": "d875ade9d3275d268924be3d889c4cc170c5a3934649107020546e4463623419",
+   "source_expires_from": "2026-11-30",
+   "source_expires_by": "2026-12-01",
+   "files": [
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_10-55-18_sid81a64d850bb34d8bbf01ec11fd2af02f_c0001_off0.0_to5.0_srcwav.json",
+     "bytes": 81,
+     "sha256": "6ebe30a978ed32055d50b032de6bfe1c35a952c09e30b8dc01ce2fe1b6db2d3c",
+     "s3_last_modified": "2026-09-01T22:58:39+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-01-37_sid81a64d850bb34d8bbf01ec11fd2af02f_c0002_off0.0_to30.0_srcwav.json",
+     "bytes": 11353,
+     "sha256": "181301a6e77999911ee5e2f9409045fc128c7f9f0c57158afbd4fd57b5d6632f",
+     "s3_last_modified": "2026-09-01T23:05:06+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-02-07_sid81a64d850bb34d8bbf01ec11fd2af02f_c0003_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 82467,
+     "sha256": "c1f8ea4b1e70d648d1c9bda0dc20c2fac8965a99dc3c15e27a36811b28ab2583",
+     "s3_last_modified": "2026-09-01T23:07:35+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-04-27_sid81a64d850bb34d8bbf01ec11fd2af02f_c0008_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 78759,
+     "sha256": "edc0f6970f5dc1e87771ee754e9e274647ed0efeabc3cc9d2800851e9318e788",
+     "s3_last_modified": "2026-09-01T23:09:26+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-06-19_sid81a64d850bb34d8bbf01ec11fd2af02f_c0012_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 61110,
+     "sha256": "3d1c9c0df6b5492b6b016b3e147565ae8cdb7ed555ba4ed28405019309c7d493",
+     "s3_last_modified": "2026-09-01T23:11:17+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-08-11_sid81a64d850bb34d8bbf01ec11fd2af02f_c0016_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 59764,
+     "sha256": "eee6ca908750e39c1bfcfdb6e25d1292eae340bc516ee1d775f38180dfff2dcc",
+     "s3_last_modified": "2026-09-01T23:13:07+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-10-03_sid81a64d850bb34d8bbf01ec11fd2af02f_c0020_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 75499,
+     "sha256": "2486dc533db68164adb22834ab34936fe576967d2deea5914439761fc92ff962",
+     "s3_last_modified": "2026-09-01T23:15:35+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-12-23_sid81a64d850bb34d8bbf01ec11fd2af02f_c0025_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 65966,
+     "sha256": "aa0b480c116140c211370aab80744c1c6d4f1e4a0c5e7029cc4d2b4f65952157",
+     "s3_last_modified": "2026-09-01T23:17:19+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-14-15_sid81a64d850bb34d8bbf01ec11fd2af02f_c0029_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 56161,
+     "sha256": "2a37d2345b10e360112c59758601130412b7fdce6828d1f77bba9885c2b70518",
+     "s3_last_modified": "2026-09-01T23:19:12+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-16-07_sid81a64d850bb34d8bbf01ec11fd2af02f_c0033_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 75371,
+     "sha256": "f1986035c3bd58f73bd424e100ba3e09c07a57d6394577a538a010f6649a9c3d",
+     "s3_last_modified": "2026-09-01T23:21:38+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-18-27_sid81a64d850bb34d8bbf01ec11fd2af02f_c0038_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 36072,
+     "sha256": "09109cd19082812ee752f2da35ede1aec3bc86d44ec43510f6b053d43d89b008",
+     "s3_last_modified": "2026-09-01T23:23:23+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-20-19_sid81a64d850bb34d8bbf01ec11fd2af02f_c0042_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 62057,
+     "sha256": "8b1214fa04d13c7e3cfc026e1dbf733f34619ab7ada4de3c7c2c528a8186313f",
+     "s3_last_modified": "2026-09-01T23:25:18+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-22-11_sid81a64d850bb34d8bbf01ec11fd2af02f_c0046_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 61112,
+     "sha256": "b3a54d62a377c97d1cf4e00db35570c80264b75e7283a9329e8128a4a095efaa",
+     "s3_last_modified": "2026-09-01T23:27:08+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-24-03_sid81a64d850bb34d8bbf01ec11fd2af02f_c0050_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 88142,
+     "sha256": "1ea8be12b278d85c63cd8e036dd4899112fe12289f1e375591b53ef15f48da36",
+     "s3_last_modified": "2026-09-01T23:29:30+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-26-23_sid81a64d850bb34d8bbf01ec11fd2af02f_c0055_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 65422,
+     "sha256": "043c08c58fc05f822a201d2bb3ff7962ccf49ffef4bb5d6df07f8aad1afd8608",
+     "s3_last_modified": "2026-09-01T23:31:22+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-28-15_sid81a64d850bb34d8bbf01ec11fd2af02f_c0059_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 61949,
+     "sha256": "9b1088d374ea8f9d2c7f9aef9a9120cbac1bdc1af7f1649dac458bc8f24ac95f",
+     "s3_last_modified": "2026-09-01T23:33:12+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-30-07_sid81a64d850bb34d8bbf01ec11fd2af02f_c0063_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 68887,
+     "sha256": "1ea3b8a543ce41e7988169e34e20ee901e9cbd0b8aceb40221f670e60a774427",
+     "s3_last_modified": "2026-09-01T23:35:34+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-32-27_sid81a64d850bb34d8bbf01ec11fd2af02f_c0068_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 66638,
+     "sha256": "f3d40dc0e6db1bc27ba77f0bc72f704695a33061f378b38334a27227f0f9b7ee",
+     "s3_last_modified": "2026-09-01T23:37:46+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_11-34-19_sid81a64d850bb34d8bbf01ec11fd2af02f_c0072_bn4_off0.0_to96.0_srcwav.json",
+     "bytes": 41911,
+     "sha256": "1446f2e89f97a346381dace6853ef2ac34734216ba75bc6d105b4780f531371c",
+     "s3_last_modified": "2026-09-01T23:38:44+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-14-47_sid81a64d850bb34d8bbf01ec11fd2af02f_c0076_bn3_off0.0_to86.0_srcwav.json",
+     "bytes": 40553,
+     "sha256": "a02dc43876716ccc3c978dd7fd7fc5a1d07e6fec69bd477444abf71a0c6797fd",
+     "s3_last_modified": "2026-09-02T05:19:18+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-16-13_sid81a64d850bb34d8bbf01ec11fd2af02f_c0079_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 52174,
+     "sha256": "ca6e74c35bbf4039ea1ea01534aa13f034749756df5890eb313c350e803fab24",
+     "s3_last_modified": "2026-09-02T05:21:12+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-18-05_sid81a64d850bb34d8bbf01ec11fd2af02f_c0083_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 75364,
+     "sha256": "1be72ded3f8f61bfa5012ebf33e8d452796b4570551757d58ba6aa8b54f29874",
+     "s3_last_modified": "2026-09-02T05:23:33+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-20-25_sid81a64d850bb34d8bbf01ec11fd2af02f_c0088_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 64258,
+     "sha256": "88395c9e1b8d4b4bb9c58fb4201b09ee7f4e7cf46f68bd1a757d50aed4dfe447",
+     "s3_last_modified": "2026-09-02T05:25:26+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-22-17_sid81a64d850bb34d8bbf01ec11fd2af02f_c0092_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 63279,
+     "sha256": "cf3318237bdd4d22fc670c6439877f105ff3b6616844565e488a19fed3178f04",
+     "s3_last_modified": "2026-09-02T05:27:16+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-24-09_sid81a64d850bb34d8bbf01ec11fd2af02f_c0096_bn3_off0.0_to86.0_srcwav.json",
+     "bytes": 34666,
+     "sha256": "d17d27364e646d832b8299ae0d06745fbd39af0977b0ff1cb944c5c00f386ddd",
+     "s3_last_modified": "2026-09-02T05:28:40+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-26-01_sid81a64d850bb34d8bbf01ec11fd2af02f_c0100_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 65396,
+     "sha256": "fa4ca02ad3c05e0401dec0ba2f8c17c919fea2d7589b4f0efeb1206dc80dd2ea",
+     "s3_last_modified": "2026-09-02T05:31:28+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-28-21_sid81a64d850bb34d8bbf01ec11fd2af02f_c0105_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 59201,
+     "sha256": "f1ee9d57ad4967ed576e2ffbe3be61981e1e02a48d8d8fe53e77ff38660b9919",
+     "s3_last_modified": "2026-09-02T05:33:20+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-30-13_sid81a64d850bb34d8bbf01ec11fd2af02f_c0109_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 49404,
+     "sha256": "034baacedf27b7ad0486bd061555363834d432f18d17c7ccc361508579b7ec16",
+     "s3_last_modified": "2026-09-02T05:35:12+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-32-05_sid81a64d850bb34d8bbf01ec11fd2af02f_c0113_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 75192,
+     "sha256": "8feb2f36470a48b657d1f3010bd0319129279d2b5c93478405cfecdf95d93fd4",
+     "s3_last_modified": "2026-09-02T05:37:34+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-34-25_sid81a64d850bb34d8bbf01ec11fd2af02f_c0118_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 53448,
+     "sha256": "65a4564eb34e84ac92548b8246ae0a0014318b5224527c81ca8e48399c8231dc",
+     "s3_last_modified": "2026-09-02T05:39:24+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-36-17_sid81a64d850bb34d8bbf01ec11fd2af02f_c0122_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 65937,
+     "sha256": "d948ba540227134d918147092f2e37a3262ce35ca186e09b41c13e189a3f976a",
+     "s3_last_modified": "2026-09-02T05:41:17+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-38-09_sid81a64d850bb34d8bbf01ec11fd2af02f_c0126_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 60593,
+     "sha256": "b291d508d7de73c80d8e23f27f504d94d4520063d44932277fccd1d276f8c7d8",
+     "s3_last_modified": "2026-09-02T05:43:10+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-40-01_sid81a64d850bb34d8bbf01ec11fd2af02f_c0130_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 81181,
+     "sha256": "16ac160aa0840207f8536641e36ca15508d2ed81bc2fffc1e1ac8c285d5ff25c",
+     "s3_last_modified": "2026-09-02T05:45:30+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-42-21_sid81a64d850bb34d8bbf01ec11fd2af02f_c0135_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 49751,
+     "sha256": "0f305c9c69e78e4232a761a075cc8637b32e380413a57ae408cfa75f4c99fc4a",
+     "s3_last_modified": "2026-09-02T05:47:19+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-44-13_sid81a64d850bb34d8bbf01ec11fd2af02f_c0139_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 52666,
+     "sha256": "b0fda121a6c0c86716f2df3c47aa6c81281599dad803d9eb938fab8ad4313b5a",
+     "s3_last_modified": "2026-09-02T05:49:45+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-46-05_sid81a64d850bb34d8bbf01ec11fd2af02f_c0143_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 13121,
+     "sha256": "0ce1178066b7271a6f2919e11402eaa07d03c1f2c3205633749ed80abd016279",
+     "s3_last_modified": "2026-09-02T05:50:40+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-57-17_sid81a64d850bb34d8bbf01ec11fd2af02f_c0167_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 8277,
+     "sha256": "9703a0606598927838f3e686b873c4023d615558950dd2319e53fd9a71a435a7",
+     "s3_last_modified": "2026-09-02T06:01:13+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_17-58-13_sid81a64d850bb34d8bbf01ec11fd2af02f_c0169_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 19998,
+     "sha256": "4fd189f4deb9f96c8cfb61ceb2ff6bee7a5175bdf0073a444d9a527a5082f39c",
+     "s3_last_modified": "2026-09-02T06:03:07+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_18-00-05_sid81a64d850bb34d8bbf01ec11fd2af02f_c0173_bn4_off0.0_to116.0_srcwav.json",
+     "bytes": 13671,
+     "sha256": "735c1f9b3156ef6fc3f0fbdd6fe6950c6f0580d16e8442dc919a1397a2630532",
+     "s3_last_modified": "2026-09-02T06:05:26+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_18-02-25_sid81a64d850bb34d8bbf01ec11fd2af02f_c0178_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 20806,
+     "sha256": "3aa37a5733d7ec443a795035555a0ff3e780970ed9f97f44c39e1c130010db35",
+     "s3_last_modified": "2026-09-02T06:07:20+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_18-04-17_sid81a64d850bb34d8bbf01ec11fd2af02f_c0182_bn3_off0.0_to88.0_srcwav.json",
+     "bytes": 7897,
+     "sha256": "ce977b47ed9368009eae8c38df2cbf727a76b483c1e8299c23e31cbbc49e31af",
+     "s3_last_modified": "2026-09-02T06:09:38+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_18-06-09_sid81a64d850bb34d8bbf01ec11fd2af02f_c0186_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 20937,
+     "sha256": "b04d9b30aa4614680674c5530ceba69472a16f2f02b9a58d894e440df35721cb",
+     "s3_last_modified": "2026-09-02T06:11:03+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_18-08-01_sid81a64d850bb34d8bbf01ec11fd2af02f_c0190_bn3_off0.0_to90.0_srcwav.json",
+     "bytes": 11341,
+     "sha256": "5f53168105e51299faab75baedabf107c0eb73dd4aa31bd5e9f6aeb07d2c8f85",
+     "s3_last_modified": "2026-09-02T06:13:21+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_18-10-21_sid81a64d850bb34d8bbf01ec11fd2af02f_c0195_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 19519,
+     "sha256": "19bf49011c0801a6bc0839b4f8133b4da20ff42e74a7401f8282448a26ee1666",
+     "s3_last_modified": "2026-09-02T06:15:17+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_18-12-13_sid81a64d850bb34d8bbf01ec11fd2af02f_c0199_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 22838,
+     "sha256": "6f98247233790e2e415466b70338d73a2eacbf25facc80ba9f66323890ae4f24",
+     "s3_last_modified": "2026-09-02T06:17:43+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-02/ben_ucpk2_2026-09-02_18-14-05_sid81a64d850bb34d8bbf01ec11fd2af02f_c0203_bn3_off0.0_to86.0_srcwav.json",
+     "bytes": 29124,
+     "sha256": "143f4488279c8b1053fdd5a57ad0a628e1199c0d32d9e0b61d2fdbd074590507",
+     "s3_last_modified": "2026-09-02T06:18:43+00:00"
+    }
+   ]
+  },
+  {
+   "date": "2026-09-10",
+   "file_count": 229,
+   "bytes": 10449139,
+   "corpus_sha256": "9691febc912f350ea04c2ea0159b125bdb915fc0a66f93f4ad2c2fed89ec3697",
+   "source_expires_from": "2026-12-08",
+   "source_expires_by": "2026-12-09",
+   "files": [
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-19-01_sidd22615c636eb472d92759eb00938e2e6_c0000_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 20559,
+     "sha256": "3c3a0f9055364310ec8f66420195da90b8c813be51491b24792c06dc728fb349",
+     "s3_last_modified": "2026-09-09T20:23:07+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-20-02_sidd22615c636eb472d92759eb00938e2e6_c0002_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 62673,
+     "sha256": "cbf55a4eb4ed1355e598a9c1591ebc75b0e15c8b4ee9fbee843d29aadb3067d5",
+     "s3_last_modified": "2026-09-09T20:25:32+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-22-22_sidd22615c636eb472d92759eb00938e2e6_c0007_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 38611,
+     "sha256": "b5d1905d962506ef5d8016fc41ccd43b7e403f41f9695414fcfbd12f97005ebc",
+     "s3_last_modified": "2026-09-09T20:27:22+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-24-14_sidd22615c636eb472d92759eb00938e2e6_c0011_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 53292,
+     "sha256": "e27b653b07e28a1f631a7c6d1a749ab63341983b6d6df53af84eac2d5a886bd7",
+     "s3_last_modified": "2026-09-09T20:29:17+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-26-06_sidd22615c636eb472d92759eb00938e2e6_c0015_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 79713,
+     "sha256": "e28a049fa4c2f53f5159d19e715b2bbdee41fc20eba34872ee2b331281d205a6",
+     "s3_last_modified": "2026-09-09T20:31:40+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-28-26_sidd22615c636eb472d92759eb00938e2e6_c0020_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 63283,
+     "sha256": "57183bfeba9b14ff27ebeafdddc536e8c2efaa7e41052d24fecf00918be65f86",
+     "s3_last_modified": "2026-09-09T20:33:26+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-30-18_sidd22615c636eb472d92759eb00938e2e6_c0024_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 69560,
+     "sha256": "683c4a6d9c34304198b511a674ae22a9f436f589a41fe5bf440a90a3dcbdc4b6",
+     "s3_last_modified": "2026-09-09T20:35:23+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-32-10_sidd22615c636eb472d92759eb00938e2e6_c0028_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 64675,
+     "sha256": "4c688648168fce4d21ced686a90bdfcf83056a68e4c4c17c582d4fa400315399",
+     "s3_last_modified": "2026-09-09T20:37:13+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-34-02_sidd22615c636eb472d92759eb00938e2e6_c0032_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 75346,
+     "sha256": "f616598f7131a42099853e454a5f7057b51141bf6e5c750529da86057492701f",
+     "s3_last_modified": "2026-09-09T20:39:32+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-36-22_sidd22615c636eb472d92759eb00938e2e6_c0037_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 60839,
+     "sha256": "1e87b57ed7221720ad616fcb9fc89bdcff4760f0ec7763f7c304d09cf3d5ade1",
+     "s3_last_modified": "2026-09-09T20:41:22+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-38-14_sidd22615c636eb472d92759eb00938e2e6_c0041_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 74935,
+     "sha256": "661160e230a09df8c622b90fb66d22e2016f869757c0aec883a855abc36c4c57",
+     "s3_last_modified": "2026-09-09T20:43:16+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-40-06_sidd22615c636eb472d92759eb00938e2e6_c0045_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 78810,
+     "sha256": "79e625eccef95450250a4238a5bddb4f8f040f146d429b75179b9d1802ce17b9",
+     "s3_last_modified": "2026-09-09T20:45:39+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-42-26_sidd22615c636eb472d92759eb00938e2e6_c0050_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 57137,
+     "sha256": "cf8156a6ace13aff31d603d35ba76de089b2f02aff7f35826eb2140a9480cda5",
+     "s3_last_modified": "2026-09-09T20:47:29+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-44-18_sidd22615c636eb472d92759eb00938e2e6_c0054_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 66614,
+     "sha256": "82a9399b38d5c2713c7fea549962b6d884a4644bcc41e481aba8d83882c0d002",
+     "s3_last_modified": "2026-09-09T20:49:20+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-46-10_sidd22615c636eb472d92759eb00938e2e6_c0058_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 60073,
+     "sha256": "e19085a07a9b29f95525d3e96f4728b1ddf07e18c84b80ff45fd90bbc8b98b98",
+     "s3_last_modified": "2026-09-09T20:51:12+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-48-02_sidd22615c636eb472d92759eb00938e2e6_c0062_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 82388,
+     "sha256": "7542082303132062c16d8654f259d25cb2de07e8c6e3b889049ae9deeacaac74",
+     "s3_last_modified": "2026-09-09T20:53:34+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-50-22_sidd22615c636eb472d92759eb00938e2e6_c0067_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 76975,
+     "sha256": "e2105e51a64520861d2f276450affcf5051582c19b7cac0e60684e8322af8cc3",
+     "s3_last_modified": "2026-09-09T20:55:25+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-52-14_sidd22615c636eb472d92759eb00938e2e6_c0071_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 70275,
+     "sha256": "f5712f6bd77156e46b8f425a6793dd05f1b99dd4c7dc6032d46fa193ecc90b77",
+     "s3_last_modified": "2026-09-09T20:57:16+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-54-06_sidd22615c636eb472d92759eb00938e2e6_c0075_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 70041,
+     "sha256": "c0c4fcdae3fd4ad5ec6b69a15588f513c56c4e4b8bf955e2477033e8f046009b",
+     "s3_last_modified": "2026-09-09T20:59:36+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-56-26_sidd22615c636eb472d92759eb00938e2e6_c0080_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 50051,
+     "sha256": "09b23bef781ec281eb3db675a4858aba7f837e319f49ba2fbd21870239f5aac5",
+     "s3_last_modified": "2026-09-09T21:01:29+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_08-58-18_sidd22615c636eb472d92759eb00938e2e6_c0084_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 62988,
+     "sha256": "acbed5b5e460d390011114a4ca2a6c88238f34ccca75b7e0dce495dd45614cd5",
+     "s3_last_modified": "2026-09-09T21:03:20+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-00-10_sidd22615c636eb472d92759eb00938e2e6_c0088_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 37764,
+     "sha256": "edab1f924e36c5c826b733e60c6e65ab333ae4cd8af4f16732c6e62bc7279a5f",
+     "s3_last_modified": "2026-09-09T21:05:11+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-02-02_sidd22615c636eb472d92759eb00938e2e6_c0092_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 53581,
+     "sha256": "f8a7dffdf6b3ef665dc493b19a2698739c28e8febc8eeaa18b2ec97a8d84f595",
+     "s3_last_modified": "2026-09-09T21:07:34+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-04-22_sidd22615c636eb472d92759eb00938e2e6_c0097_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 49018,
+     "sha256": "aa6cd7ee5ab8b89c1c59509af3ef339de883daeb121a6b01d59f6ca6569374da",
+     "s3_last_modified": "2026-09-09T21:09:22+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-06-14_sidd22615c636eb472d92759eb00938e2e6_c0101_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 55002,
+     "sha256": "1759909eb6516a19e4be13391c1cd3f776fee654df47cdfc1cd032ff768d696d",
+     "s3_last_modified": "2026-09-09T21:11:13+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-08-06_sidd22615c636eb472d92759eb00938e2e6_c0105_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 65635,
+     "sha256": "dd75072bad49bb3ecb287f5d885ab0eab70863a802f317bf37863239dbe4be4d",
+     "s3_last_modified": "2026-09-09T21:13:36+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-10-26_sidd22615c636eb472d92759eb00938e2e6_c0110_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 49231,
+     "sha256": "a5bf45e92e58b4b51c3d8ee25046c643719f0d0745b9685323a22e01177d5ddf",
+     "s3_last_modified": "2026-09-09T21:15:26+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-12-18_sidd22615c636eb472d92759eb00938e2e6_c0114_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 45562,
+     "sha256": "c1846920132f85e22a3c3cda51f27538d197b44662b36deb4bf46d7d2078ac19",
+     "s3_last_modified": "2026-09-09T21:17:19+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-14-10_sidd22615c636eb472d92759eb00938e2e6_c0118_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 52799,
+     "sha256": "00f54248dda747e941623db4981dbdbc9e65b6e6e8c65284572536175abfb525",
+     "s3_last_modified": "2026-09-09T21:19:10+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-16-02_sidd22615c636eb472d92759eb00938e2e6_c0122_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 53235,
+     "sha256": "8693dc677e06dedca3655e633055edc93702d3097587ae905ef7687d9e237d23",
+     "s3_last_modified": "2026-09-09T21:21:34+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-18-22_sidd22615c636eb472d92759eb00938e2e6_c0127_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 50380,
+     "sha256": "4a0674e880d1cd31d3f934171716d2cc96d7ecb36c7884e0375b38b0aacfb51f",
+     "s3_last_modified": "2026-09-09T21:23:23+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-20-14_sidd22615c636eb472d92759eb00938e2e6_c0131_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 58043,
+     "sha256": "063f8ef0631e436d3951c741e337a33d27c36a146bf0c0d366d379569ac632bf",
+     "s3_last_modified": "2026-09-09T21:25:15+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-22-06_sidd22615c636eb472d92759eb00938e2e6_c0135_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 68178,
+     "sha256": "83b1eaf773a6db2c8e53bc09201cbdc792d6eb2c472db48afc027578110012d6",
+     "s3_last_modified": "2026-09-09T21:27:38+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-24-26_sidd22615c636eb472d92759eb00938e2e6_c0140_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 60375,
+     "sha256": "95afd38fa5e786f96b60129e32000e9303d460b5d81e69cacb65edf5685d9d20",
+     "s3_last_modified": "2026-09-09T21:29:27+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-26-18_sidd22615c636eb472d92759eb00938e2e6_c0144_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 63096,
+     "sha256": "b98c07f39feeec85ab82772d8b459d1df6ba81c6c37af52089afc3239055092e",
+     "s3_last_modified": "2026-09-09T21:31:20+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-28-10_sidd22615c636eb472d92759eb00938e2e6_c0148_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 51022,
+     "sha256": "5e6a6ec19d1b6dddd11371a71ad37fbdbf1ea7aab9a76922568789fdbc6cbb63",
+     "s3_last_modified": "2026-09-09T21:33:08+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-30-02_sidd22615c636eb472d92759eb00938e2e6_c0152_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 77176,
+     "sha256": "8161e052c3b025c388e55562471006ba6bbfefbdde446271ac8e3c576610702e",
+     "s3_last_modified": "2026-09-09T21:35:34+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-32-22_sidd22615c636eb472d92759eb00938e2e6_c0157_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 58866,
+     "sha256": "d32fe199e3be6fad2653fc583663e744a8a720b20bd54b0c09f7586c7691c50c",
+     "s3_last_modified": "2026-09-09T21:37:22+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-34-14_sidd22615c636eb472d92759eb00938e2e6_c0161_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 51967,
+     "sha256": "d5db9cfabeedc66d0ab34faf492b09e6dffc81ab986e9cad6369c5fa7510df9a",
+     "s3_last_modified": "2026-09-09T21:39:13+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-36-06_sidd22615c636eb472d92759eb00938e2e6_c0165_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 73777,
+     "sha256": "cc0fed6232e57de7b7fe164fa7c4739fdf4600ef8ed76ffb17bdae2ffad93aba",
+     "s3_last_modified": "2026-09-09T21:41:38+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-38-26_sidd22615c636eb472d92759eb00938e2e6_c0170_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 65621,
+     "sha256": "3ab468af1f601c8ac5e1f6d16ed4f63313943e4be854e967f7560ac7fd79d271",
+     "s3_last_modified": "2026-09-09T21:43:26+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-40-18_sidd22615c636eb472d92759eb00938e2e6_c0174_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 33008,
+     "sha256": "1443dd9fd2a91abc1183f52cbc6391ea352ef8dd81802c322c3b03db9a5b45e0",
+     "s3_last_modified": "2026-09-09T21:45:17+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-42-10_sidd22615c636eb472d92759eb00938e2e6_c0178_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 60216,
+     "sha256": "24dfbcc21b835228a691634e55d9889a57880519a5a0026891526a667646a8c9",
+     "s3_last_modified": "2026-09-09T21:47:16+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-44-02_sidd22615c636eb472d92759eb00938e2e6_c0182_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 81353,
+     "sha256": "28583803d845549910d24adde7bf38d381df494459e56efae552ca9ae0bd3d8a",
+     "s3_last_modified": "2026-09-09T21:49:36+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-46-22_sidd22615c636eb472d92759eb00938e2e6_c0187_bn3_off0.0_to86.0_srcwav.json",
+     "bytes": 31458,
+     "sha256": "d9d73f2531eb836ce02b3990d50ea97c249ef48c1edf3fcfde29f7e321a056c3",
+     "s3_last_modified": "2026-09-09T21:50:43+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-48-42_sidd22615c636eb472d92759eb00938e2e6_c0192_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 859,
+     "sha256": "8d7a9f6e1dcd80f7c240b12c60fae8af96256d8c16f80de742de7f3d91e3a5a7",
+     "s3_last_modified": "2026-09-09T21:52:40+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-50-06_sidd22615c636eb472d92759eb00938e2e6_c0195_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 41270,
+     "sha256": "b792488f2ee61ce47f8c1bcf4bba05b7dbd6d22fce812f802667dc7d938f81b3",
+     "s3_last_modified": "2026-09-09T21:54:45+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-52-26_sidd22615c636eb472d92759eb00938e2e6_c0200_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 50029,
+     "sha256": "daa05c73ae664d68c21aa83fcf6367f17e11229e0acd37ba11e876860bd86884",
+     "s3_last_modified": "2026-09-09T21:57:26+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-54-18_sidd22615c636eb472d92759eb00938e2e6_c0204_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 32456,
+     "sha256": "2329055b71eb520fccab79e4f91fbc739a429acc600dade64b91b5acf302f30f",
+     "s3_last_modified": "2026-09-09T21:59:14+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-56-10_sidd22615c636eb472d92759eb00938e2e6_c0208_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 1515,
+     "sha256": "819ec03ae4dbc0a6641f738adf97c2acc524741ba406aa9c39628c2b1f0758d1",
+     "s3_last_modified": "2026-09-09T22:01:08+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_09-58-02_sidd22615c636eb472d92759eb00938e2e6_c0212_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 73671,
+     "sha256": "e508bc70ec909008d8c00dd4f36c404795394b10d7ebf58d0d60dea8153e9343",
+     "s3_last_modified": "2026-09-09T22:03:31+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-00-22_sidd22615c636eb472d92759eb00938e2e6_c0217_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 67661,
+     "sha256": "9e2c4e20606f886085aa26d8fc9bd1df8d5004e700f93c69e2e0079c84750d87",
+     "s3_last_modified": "2026-09-09T22:05:22+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-02-14_sidd22615c636eb472d92759eb00938e2e6_c0221_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 61337,
+     "sha256": "3485d31b7a70ca0970bccd2edcb13d504371289e6e846715a6b7ae7cbcda84ed",
+     "s3_last_modified": "2026-09-09T22:07:14+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-04-06_sidd22615c636eb472d92759eb00938e2e6_c0225_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 89165,
+     "sha256": "36c2dc309d1d7478afd38534879c3b57e8fe95e7ef2545474607405bc30ba147",
+     "s3_last_modified": "2026-09-09T22:09:36+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-06-26_sidd22615c636eb472d92759eb00938e2e6_c0230_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 62600,
+     "sha256": "03ab3162e494b91b700e94c0707d267146f10de08ab75bb39c03cfc65d052c4c",
+     "s3_last_modified": "2026-09-09T22:11:27+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-08-18_sidd22615c636eb472d92759eb00938e2e6_c0234_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 62451,
+     "sha256": "13680e3ebdbe2ff010811ab6c18e9d1077a8d04beceb627675fa4f87188f973f",
+     "s3_last_modified": "2026-09-09T22:13:21+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-10-10_sidd22615c636eb472d92759eb00938e2e6_c0238_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 69684,
+     "sha256": "722b755269422b48c8e478d1545e0c285846c1544e9bcb4ca10e71ea0f3652cc",
+     "s3_last_modified": "2026-09-09T22:15:14+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-12-02_sidd22615c636eb472d92759eb00938e2e6_c0242_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 90013,
+     "sha256": "2f2063021947595630bde76718ecc9afe0f6fe5b6050e95aef3b85c455b197ad",
+     "s3_last_modified": "2026-09-09T22:17:35+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-14-22_sidd22615c636eb472d92759eb00938e2e6_c0247_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 69950,
+     "sha256": "279f091f29dfe819a591bd6cc07010f2d31ece0ed821e89f19e1a7fcab8c43b6",
+     "s3_last_modified": "2026-09-09T22:19:24+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-16-14_sidd22615c636eb472d92759eb00938e2e6_c0251_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 58761,
+     "sha256": "de294f7f2bbfe11bc1bc5bb7e23869ac4beab4c96e5a1baedb87cd3ec45b3a3d",
+     "s3_last_modified": "2026-09-09T22:21:14+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-18-06_sidd22615c636eb472d92759eb00938e2e6_c0255_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 63713,
+     "sha256": "bdf76b18751288c06cb5e25096bd82da5a0c666ce624af3b12f85c77bbfee631",
+     "s3_last_modified": "2026-09-09T22:23:36+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-20-26_sidd22615c636eb472d92759eb00938e2e6_c0260_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 59921,
+     "sha256": "87490a506da2b7b090cc21576205a7359082b6a26322004ee5383357223d19e9",
+     "s3_last_modified": "2026-09-09T22:25:27+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-22-18_sidd22615c636eb472d92759eb00938e2e6_c0264_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 43790,
+     "sha256": "245b26ce8905c5400b6df7a1740f5f9bcf3013267ec2af7efdec3050f8d95902",
+     "s3_last_modified": "2026-09-09T22:27:16+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-24-10_sidd22615c636eb472d92759eb00938e2e6_c0268_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 60180,
+     "sha256": "84d02a8b9e51275f822eae67b3df7612ffe803490854ad9881038f7e927b2ef7",
+     "s3_last_modified": "2026-09-09T22:29:12+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-26-02_sidd22615c636eb472d92759eb00938e2e6_c0272_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 66095,
+     "sha256": "16b66b452103bfbd953a28b0a6ed35233f4ea8562a5939b48e23c774ab16bef0",
+     "s3_last_modified": "2026-09-09T22:31:35+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-28-22_sidd22615c636eb472d92759eb00938e2e6_c0277_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 50965,
+     "sha256": "ccb21c71a3919b9fb308e998e6d87125cd940e41d6973530ab73f14cb43b5f43",
+     "s3_last_modified": "2026-09-09T22:33:24+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-30-14_sidd22615c636eb472d92759eb00938e2e6_c0281_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 49891,
+     "sha256": "07b4b84ea04282cc2bf183fdb6ea765ca1f41f8fbcfeda6f03fac4aed3094a28",
+     "s3_last_modified": "2026-09-09T22:35:19+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-32-06_sidd22615c636eb472d92759eb00938e2e6_c0285_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 59558,
+     "sha256": "d17f24f82f991754d656fca95b2c177a2df944b4d98fd2266ae6288b121b3c0c",
+     "s3_last_modified": "2026-09-09T22:37:36+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-34-26_sidd22615c636eb472d92759eb00938e2e6_c0290_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 41721,
+     "sha256": "bb48d08445885c954addc0830435c2a29b24180c1d22b504c7b97719d9042c6d",
+     "s3_last_modified": "2026-09-09T22:39:26+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-36-18_sidd22615c636eb472d92759eb00938e2e6_c0294_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 59079,
+     "sha256": "84fc45d041a188e6a1c12748b799b1eb947c307d9e1c4663d402652ffd96e09f",
+     "s3_last_modified": "2026-09-09T22:41:23+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-38-10_sidd22615c636eb472d92759eb00938e2e6_c0298_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 56405,
+     "sha256": "2a4f86712fb67878ce0901f658b6f78f8fd8394db82b5c047e673f3cb14da8a9",
+     "s3_last_modified": "2026-09-09T22:43:12+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-40-02_sidd22615c636eb472d92759eb00938e2e6_c0302_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 68930,
+     "sha256": "92e5c7340bbaee1364efe69c236c9143efc496ab37ed3777ea40eb6fd1618c8f",
+     "s3_last_modified": "2026-09-09T22:45:32+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-42-22_sidd22615c636eb472d92759eb00938e2e6_c0307_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 63477,
+     "sha256": "a55912b4cc4e6f348f1465b05a92000f911286c9e52b2250d2ebb8e0d313f153",
+     "s3_last_modified": "2026-09-09T22:47:23+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-44-14_sidd22615c636eb472d92759eb00938e2e6_c0311_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 55419,
+     "sha256": "51fdeef882271e5c32c4f2fd0eda0bb44ff7fb6232a260ce121c76607f38ba84",
+     "s3_last_modified": "2026-09-09T22:49:14+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-46-06_sidd22615c636eb472d92759eb00938e2e6_c0315_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 69837,
+     "sha256": "b39554010bc0f7fb26429203bb93b1cfc06fdfe609684fa78db2f758b0c1f40c",
+     "s3_last_modified": "2026-09-09T22:51:38+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-48-26_sidd22615c636eb472d92759eb00938e2e6_c0320_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 53644,
+     "sha256": "366896ade40b8fb05237a04b1d5a1f8a5ebe748a2470a651eaead48e931c540f",
+     "s3_last_modified": "2026-09-09T22:53:28+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-50-18_sidd22615c636eb472d92759eb00938e2e6_c0324_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 44009,
+     "sha256": "711214974a11f62f39c0c329c0c7bee62838e8ab0100143f89582986351fb6f8",
+     "s3_last_modified": "2026-09-09T22:55:18+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-52-10_sidd22615c636eb472d92759eb00938e2e6_c0328_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 57008,
+     "sha256": "6c7c0825c3ab88d3984552162c02b52cbb96ebdaffef812c722991950e03451b",
+     "s3_last_modified": "2026-09-09T22:57:14+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-54-02_sidd22615c636eb472d92759eb00938e2e6_c0332_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 78311,
+     "sha256": "190ee458a40b7d28ccaedf93db7218734abf06d76baa970a16582affedfc54a1",
+     "s3_last_modified": "2026-09-09T22:59:35+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-56-22_sidd22615c636eb472d92759eb00938e2e6_c0337_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 33574,
+     "sha256": "e296a3e640544a741bcebfbf24cac1ab73142081da76f861e6c983283904c6a7",
+     "s3_last_modified": "2026-09-09T23:01:23+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_10-58-14_sidd22615c636eb472d92759eb00938e2e6_c0341_bn3_off0.0_to86.0_srcwav.json",
+     "bytes": 4421,
+     "sha256": "afda400c6c9a1aef7539f40cd427c007cf2269cc1b5332f0a8971afe36de3e4b",
+     "s3_last_modified": "2026-09-09T23:02:41+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-00-34_sidd22615c636eb472d92759eb00938e2e6_c0346_off0.0_to30.0_srcwav.json",
+     "bytes": 81,
+     "sha256": "6ebe30a978ed32055d50b032de6bfe1c35a952c09e30b8dc01ce2fe1b6db2d3c",
+     "s3_last_modified": "2026-09-09T23:04:39+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-05-14_sidd22615c636eb472d92759eb00938e2e6_c0356_off0.0_to30.0_srcwav.json",
+     "bytes": 1350,
+     "sha256": "617bcc5939a9dcfdb28128bc60f88266e4d81d6e1d649ce6a4103f71b3292685",
+     "s3_last_modified": "2026-09-09T23:08:39+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-14-06_sidd22615c636eb472d92759eb00938e2e6_c0375_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 13103,
+     "sha256": "4d05a2913b86013d5cc1e9d8e084d4edaeb300e4f4e24ddcba62f4e8c5724f81",
+     "s3_last_modified": "2026-09-09T23:18:02+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-17-22_sidd22615c636eb472d92759eb00938e2e6_c0382_off0.0_to30.0_srcwav.json",
+     "bytes": 81,
+     "sha256": "6ebe30a978ed32055d50b032de6bfe1c35a952c09e30b8dc01ce2fe1b6db2d3c",
+     "s3_last_modified": "2026-09-09T23:20:39+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-20-38_sidd22615c636eb472d92759eb00938e2e6_c0389_bn3_off0.0_to86.0_srcwav.json",
+     "bytes": 35656,
+     "sha256": "244241b01b4ecf5311532c20ec15226ce530789a032c4c68688b32dcae58af77",
+     "s3_last_modified": "2026-09-09T23:25:06+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-22-02_sidd22615c636eb472d92759eb00938e2e6_c0392_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 81615,
+     "sha256": "cb827754243dd151529841bb48f7445267d35673113a35e321024bdb6b266a2e",
+     "s3_last_modified": "2026-09-09T23:27:32+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-24-22_sidd22615c636eb472d92759eb00938e2e6_c0397_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 66367,
+     "sha256": "2fd6c0e57eac9b407666acefa87e39361b0dca0f4282833c3b41b02efe7fb9cc",
+     "s3_last_modified": "2026-09-09T23:29:21+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-26-14_sidd22615c636eb472d92759eb00938e2e6_c0401_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 62921,
+     "sha256": "f3fa3af31f9f0f5c40a346627d063d2459e4357c59d1ecdf6bf6a4ad6dc46b6f",
+     "s3_last_modified": "2026-09-09T23:31:15+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-28-06_sidd22615c636eb472d92759eb00938e2e6_c0405_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 73527,
+     "sha256": "c8044aaa3e9ed2ac4441a214ebc9e4212535ef70fa559a61a9b605d8d98b49bd",
+     "s3_last_modified": "2026-09-09T23:33:36+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-30-26_sidd22615c636eb472d92759eb00938e2e6_c0410_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 60510,
+     "sha256": "f780320c559aa149b564bf28fb7c0e45a7d502b71c28a010d45fdbbbd3605e31",
+     "s3_last_modified": "2026-09-09T23:35:30+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-32-18_sidd22615c636eb472d92759eb00938e2e6_c0414_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 61988,
+     "sha256": "fd82b8d97a0b7ed19e56c3ca8cdf8430e53763c8a5c2cb9b394d5501086391f4",
+     "s3_last_modified": "2026-09-09T23:37:49+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-34-10_sidd22615c636eb472d92759eb00938e2e6_c0418_bn3_off0.0_to86.0_srcwav.json",
+     "bytes": 34970,
+     "sha256": "d19ce96004c109457cff2aae89765eaac5bdf10787f07e63f489df6d91aebede",
+     "s3_last_modified": "2026-09-09T23:38:45+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-37-54_sidd22615c636eb472d92759eb00938e2e6_c0426_off0.0_to30.0_srcwav.json",
+     "bytes": 81,
+     "sha256": "6ebe30a978ed32055d50b032de6bfe1c35a952c09e30b8dc01ce2fe1b6db2d3c",
+     "s3_last_modified": "2026-09-09T23:41:23+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-40-14_sidd22615c636eb472d92759eb00938e2e6_c0431_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 37529,
+     "sha256": "70e80fe38ed03e92b0bb1ac5aebb9311b5d169d395f59eb0d4da2e6463fe4ffe",
+     "s3_last_modified": "2026-09-09T23:45:13+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-42-06_sidd22615c636eb472d92759eb00938e2e6_c0435_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 39125,
+     "sha256": "b3140a1bb17a2f14e91bc33669060fb32a3b6dd54baf1aa1007828c8d939df88",
+     "s3_last_modified": "2026-09-09T23:47:47+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-44-26_sidd22615c636eb472d92759eb00938e2e6_c0440_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 24613,
+     "sha256": "277d4b92c755faeaafd0d1a70cb2a5e06507f3d24f7cba6c06b4a1a859fcffb2",
+     "s3_last_modified": "2026-09-09T23:49:44+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-46-18_sidd22615c636eb472d92759eb00938e2e6_c0444_bn3_off0.0_to88.0_srcwav.json",
+     "bytes": 20920,
+     "sha256": "ebf3fa76e6cace256260db916ee0b941cd8e17d655f678f5b7e0e1c0316594dd",
+     "s3_last_modified": "2026-09-09T23:51:17+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-48-10_sidd22615c636eb472d92759eb00938e2e6_c0448_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 36997,
+     "sha256": "21e6208f2c091ceb60185c9a38a7e95f0437eada952cf177416a16abac28b326",
+     "s3_last_modified": "2026-09-09T23:53:45+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-50-02_sidd22615c636eb472d92759eb00938e2e6_c0452_bn3_off0.0_to86.0_srcwav.json",
+     "bytes": 18387,
+     "sha256": "2e07eebbeb02abd0e38d38c26f8ebdcdf631770b7e88a33f90f28d8750a3406a",
+     "s3_last_modified": "2026-09-09T23:54:32+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-53-46_sidd22615c636eb472d92759eb00938e2e6_c0460_off0.0_to30.0_srcwav.json",
+     "bytes": 8742,
+     "sha256": "15401ed799a93ad69da741ad5683693089eacff6cc65c5e8906eab8809d27d7f",
+     "s3_last_modified": "2026-09-09T23:57:42+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-54-14_sidd22615c636eb472d92759eb00938e2e6_c0461_off0.0_to30.0_srcwav.json",
+     "bytes": 12586,
+     "sha256": "24a3f365ac096d53776209f7683d8360ed2b12c9008f6e7f2e19b94c7e989de0",
+     "s3_last_modified": "2026-09-09T23:57:41+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_11-59-50_sidd22615c636eb472d92759eb00938e2e6_c0473_off0.0_to30.0_srcwav.json",
+     "bytes": 7419,
+     "sha256": "c88c216a081af0068f009b4069298ce7a863d7113f04f88ed92937cf9b26b1d8",
+     "s3_last_modified": "2026-09-10T00:03:20+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-00-18_sidd22615c636eb472d92759eb00938e2e6_c0474_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 38330,
+     "sha256": "1cf3c78fb229e7fce5c8f42d8198ae096d14aa9aef57eb1d037ca157449251fc",
+     "s3_last_modified": "2026-09-10T00:05:19+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-02-10_sidd22615c636eb472d92759eb00938e2e6_c0478_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 1520,
+     "sha256": "079ae1e068ac955a28ebb7af0748d7ce4ee86c8973cdc77c5aa8de9e7cc48a2a",
+     "s3_last_modified": "2026-09-10T00:07:05+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-04-02_sidd22615c636eb472d92759eb00938e2e6_c0482_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 71257,
+     "sha256": "c90af9608efdd1cf676c7d4b57ad632fb2ccb39cd4a2ca7eeb1e37be09368ba0",
+     "s3_last_modified": "2026-09-10T00:09:34+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-06-22_sidd22615c636eb472d92759eb00938e2e6_c0487_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 49411,
+     "sha256": "21716f1fa91432c7ec26f12b64978d8b9688b3345d9acb6b392bf28943892985",
+     "s3_last_modified": "2026-09-10T00:11:21+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-08-14_sidd22615c636eb472d92759eb00938e2e6_c0491_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 52516,
+     "sha256": "d0f827036038de90a994e34ec90943abc6cbe0e9069d51dd20db23ea242350df",
+     "s3_last_modified": "2026-09-10T00:13:12+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-10-06_sidd22615c636eb472d92759eb00938e2e6_c0495_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 73596,
+     "sha256": "bbeb0759d8e1d7ecc09c3ff9cb058ab973d147904e59e5b1461b01dc9a5039bf",
+     "s3_last_modified": "2026-09-10T00:15:37+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-12-26_sidd22615c636eb472d92759eb00938e2e6_c0500_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 55917,
+     "sha256": "b01d6259a3a158c9bad5d42377d06f91fd4fd0fafd89eaebd32203d5673dfda5",
+     "s3_last_modified": "2026-09-10T00:17:27+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-14-18_sidd22615c636eb472d92759eb00938e2e6_c0504_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 45895,
+     "sha256": "06b16948248631cbeb3fcfe5149e166809aa1b581e080f02c89de1c1884017da",
+     "s3_last_modified": "2026-09-10T00:19:19+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-16-10_sidd22615c636eb472d92759eb00938e2e6_c0508_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 57383,
+     "sha256": "026927a7c35c702ce3732773c404701ad2714c51f8f0b8ccad5aaa1ce8ca3ac6",
+     "s3_last_modified": "2026-09-10T00:21:08+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-18-02_sidd22615c636eb472d92759eb00938e2e6_c0512_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 73468,
+     "sha256": "dccac4ce974a50de4fbea2687bb15079af072244f6c857bf8aedbce8e0f0fae6",
+     "s3_last_modified": "2026-09-10T00:23:32+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-20-22_sidd22615c636eb472d92759eb00938e2e6_c0517_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 64216,
+     "sha256": "1d976f665a68fbdb7574be5bab5d22dded42481a564aa78db4a2066fd1dd2724",
+     "s3_last_modified": "2026-09-10T00:25:23+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-22-14_sidd22615c636eb472d92759eb00938e2e6_c0521_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 40170,
+     "sha256": "5e64ec0ae368d4727e6565145429c925fd5f056065aba069049afb671442d6a8",
+     "s3_last_modified": "2026-09-10T00:27:12+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-24-06_sidd22615c636eb472d92759eb00938e2e6_c0525_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 74966,
+     "sha256": "b0ff490960b76f5530fa41c3bd0013ef65f5a19ae0a466869210ac6bc7dff88a",
+     "s3_last_modified": "2026-09-10T00:29:36+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-26-26_sidd22615c636eb472d92759eb00938e2e6_c0530_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 60172,
+     "sha256": "97423613139bc1e6a6891a9cf3a52a5af5020e55a35e763ebd8fbb9d4f0c91a0",
+     "s3_last_modified": "2026-09-10T00:31:28+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-28-18_sidd22615c636eb472d92759eb00938e2e6_c0534_bn3_off0.0_to88.0_srcwav.json",
+     "bytes": 30816,
+     "sha256": "d1bcdceb10f3ee27eff4c0f8ac70aa099f2473b9a9ffa5d8e45f03fe08055420",
+     "s3_last_modified": "2026-09-10T00:33:12+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-30-10_sidd22615c636eb472d92759eb00938e2e6_c0538_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 61921,
+     "sha256": "b8ee2d9c4714134fa95a90556cc17471eb16568ade854a075d6d60760e7d41fe",
+     "s3_last_modified": "2026-09-10T00:35:09+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-32-02_sidd22615c636eb472d92759eb00938e2e6_c0542_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 55475,
+     "sha256": "c980408d25eb7d75e591ca08237bb41b9a1150a99cc43ba7c73fb91b8a441bd2",
+     "s3_last_modified": "2026-09-10T00:36:45+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-34-22_sidd22615c636eb472d92759eb00938e2e6_c0547_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 32621,
+     "sha256": "db1aa52060939e949bc6160cb9526b814d0f5a98495b5b7b933feb28c875afe4",
+     "s3_last_modified": "2026-09-10T00:39:20+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-36-14_sidd22615c636eb472d92759eb00938e2e6_c0551_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 41534,
+     "sha256": "bddd32ae882b1955263282189028a2f7bb7b9777efa4a058d905b7ed9b290c0c",
+     "s3_last_modified": "2026-09-10T00:41:10+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-38-06_sidd22615c636eb472d92759eb00938e2e6_c0555_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 57244,
+     "sha256": "47cd3010e0d680bba4af524ac8a031d6be4e25c9e20e693da27f328d51290531",
+     "s3_last_modified": "2026-09-10T00:43:34+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-40-26_sidd22615c636eb472d92759eb00938e2e6_c0560_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 49546,
+     "sha256": "f10699366e67d09602a5ed0ff4921bcd4673d3f6443118519c066188f3b2bd4a",
+     "s3_last_modified": "2026-09-10T00:45:30+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-42-18_sidd22615c636eb472d92759eb00938e2e6_c0564_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 44257,
+     "sha256": "44b947189868ec58e0eb0df839874ced7bf1f4ed443a3d92ff970966fc29a5b6",
+     "s3_last_modified": "2026-09-10T00:47:15+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-44-10_sidd22615c636eb472d92759eb00938e2e6_c0568_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 55920,
+     "sha256": "8319e166539390db11bf2688c7eebe7b4ee03a407f116f7ef049513dccfddb00",
+     "s3_last_modified": "2026-09-10T00:49:07+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-46-02_sidd22615c636eb472d92759eb00938e2e6_c0572_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 56425,
+     "sha256": "b9f1a17a8d39c42d9ca2b2f184ae5b090f14965f9ee75d62b5cd9e7952848b9f",
+     "s3_last_modified": "2026-09-10T00:51:47+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-48-22_sidd22615c636eb472d92759eb00938e2e6_c0577_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 49895,
+     "sha256": "ed865096c4eec22faa92446cafaa3f37ac438ca143f074e09cac8c797a960ef2",
+     "s3_last_modified": "2026-09-10T00:53:21+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-51-10_sidd22615c636eb472d92759eb00938e2e6_c0583_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 24702,
+     "sha256": "d6573f54d879ebe1b5c0a473f8f77a5a302bd8c488d0dad218e57f03e66b2c2b",
+     "s3_last_modified": "2026-09-10T00:55:10+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-52-06_sidd22615c636eb472d92759eb00938e2e6_c0585_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 85259,
+     "sha256": "4c0c04fa363fa240edf39bafec134fd3c4f45ee2cf6f66c2bbe954c9fcb6d26d",
+     "s3_last_modified": "2026-09-10T00:57:37+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-54-26_sidd22615c636eb472d92759eb00938e2e6_c0590_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 63965,
+     "sha256": "25035e35f75aefb965a5cb4a3aa3aff484b2101c732b4376345d25fb948dc54f",
+     "s3_last_modified": "2026-09-10T00:59:28+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-56-18_sidd22615c636eb472d92759eb00938e2e6_c0594_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 40750,
+     "sha256": "583bef0b995d93d68584322dab8d3d94de77523e6fc9b9b5cce67fbb52c45242",
+     "s3_last_modified": "2026-09-10T01:01:15+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_12-58-10_sidd22615c636eb472d92759eb00938e2e6_c0598_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 58361,
+     "sha256": "7f40d088f6af020b573aa44bb0b2d9d04e902ea52afd818d7d2225f348401afc",
+     "s3_last_modified": "2026-09-10T01:03:10+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-00-02_sidd22615c636eb472d92759eb00938e2e6_c0602_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 44767,
+     "sha256": "f63b7b741b4f71e2bb97718cafb250b5cf5c5514d264d4630228cce74d1bee67",
+     "s3_last_modified": "2026-09-10T01:05:33+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-02-22_sidd22615c636eb472d92759eb00938e2e6_c0607_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 34649,
+     "sha256": "2e1197c0934f9adeaf0a55fa8d69d3ea144296b7b2c3a65ba62972afeecf4407",
+     "s3_last_modified": "2026-09-10T01:07:22+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-04-14_sidd22615c636eb472d92759eb00938e2e6_c0611_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 48642,
+     "sha256": "7f582740f4250bde80a16c97a5eb5609e46b41aee41f2df6f0a7c01b59c24511",
+     "s3_last_modified": "2026-09-10T01:09:15+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-06-06_sidd22615c636eb472d92759eb00938e2e6_c0615_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 42752,
+     "sha256": "c33bf83e0a781cb511a6b19901a6986181c244bb0887ef6e09a8c048e62d16a1",
+     "s3_last_modified": "2026-09-10T01:11:37+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-08-26_sidd22615c636eb472d92759eb00938e2e6_c0620_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 29816,
+     "sha256": "de75d4cf051b7e6a8c0eac30f88b378d54349bf62731d78eae89853ca78a9436",
+     "s3_last_modified": "2026-09-10T01:13:24+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-10-18_sidd22615c636eb472d92759eb00938e2e6_c0624_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 63156,
+     "sha256": "6cd3a144a715e0a317e65b92731f1a649809f88f9704277256d2c98dcd3ea8fd",
+     "s3_last_modified": "2026-09-10T01:15:20+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-12-10_sidd22615c636eb472d92759eb00938e2e6_c0628_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 63678,
+     "sha256": "a7280ccc86780f6dcaf6f9d013b92216b223953794dc98bd724116c82663aa06",
+     "s3_last_modified": "2026-09-10T01:17:13+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-14-02_sidd22615c636eb472d92759eb00938e2e6_c0632_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 74959,
+     "sha256": "d40b0c65026d22a479963363f66fc16648b93a1f850012e9c4342c710d0122c9",
+     "s3_last_modified": "2026-09-10T01:19:35+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-16-22_sidd22615c636eb472d92759eb00938e2e6_c0637_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 53590,
+     "sha256": "813833ddc24a30e65db8e656333f37b92b74965863f3ea4236ae44abb4b5837b",
+     "s3_last_modified": "2026-09-10T01:21:23+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-18-14_sidd22615c636eb472d92759eb00938e2e6_c0641_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 47661,
+     "sha256": "5efb6d37c929568de72581a32174bd1f2e8c3a3591f8e9704dd204f58490b274",
+     "s3_last_modified": "2026-09-10T01:23:18+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-20-06_sidd22615c636eb472d92759eb00938e2e6_c0645_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 72404,
+     "sha256": "38bab616735aee8ae092e8fc1555424d2e6f61ce5ee765031f8f33df0187245b",
+     "s3_last_modified": "2026-09-10T01:25:40+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-22-26_sidd22615c636eb472d92759eb00938e2e6_c0650_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 34557,
+     "sha256": "79a40801ec01bde53d64a9195a5e54c96f9078ced3ce8009f048635587deaa27",
+     "s3_last_modified": "2026-09-10T01:27:26+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-24-18_sidd22615c636eb472d92759eb00938e2e6_c0654_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 19738,
+     "sha256": "bbe74ea63d8b58131e7c7d42a6d1904aa5ead94beb74770dce9d3d727ea77ee1",
+     "s3_last_modified": "2026-09-10T01:28:42+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-26-38_sidd22615c636eb472d92759eb00938e2e6_c0659_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 3781,
+     "sha256": "a2c338fb4c48dd56f59f0f72695b1fe35c4b35fee33c2de6b6a916a2e09853c1",
+     "s3_last_modified": "2026-09-10T01:30:40+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-31-18_sidd22615c636eb472d92759eb00938e2e6_c0669_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 22560,
+     "sha256": "36e20f7894aad78cf2f28ea908ac060bb04941493191fd03d03c06b9d295d7e1",
+     "s3_last_modified": "2026-09-10T01:35:18+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-32-14_sidd22615c636eb472d92759eb00938e2e6_c0671_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 56871,
+     "sha256": "52228b5b1a461a0cf22d2523aae29bf21bed49a7f958bd7a5ea02d0c95664bbf",
+     "s3_last_modified": "2026-09-10T01:37:12+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-34-06_sidd22615c636eb472d92759eb00938e2e6_c0675_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 91108,
+     "sha256": "0bf517e27c95d530326ee568461be2f0051a16401854e9a763d9fd4d95c442f9",
+     "s3_last_modified": "2026-09-10T01:39:38+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-36-26_sidd22615c636eb472d92759eb00938e2e6_c0680_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 46237,
+     "sha256": "2288d61de7f9e67a881a2d498791f2d80f7c2063d585dae0b316357763a8b2b1",
+     "s3_last_modified": "2026-09-10T01:41:25+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-38-18_sidd22615c636eb472d92759eb00938e2e6_c0684_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 37427,
+     "sha256": "c0fb5680b19534e88a78b8d815f68203253e29f2b04d06d9e83df215d2651ac1",
+     "s3_last_modified": "2026-09-10T01:43:15+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-40-10_sidd22615c636eb472d92759eb00938e2e6_c0688_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 26541,
+     "sha256": "7e42c2710591718ee69c2f1e8ea3b05b46ff67bf707036578feb92e28b2b1d8f",
+     "s3_last_modified": "2026-09-10T01:45:07+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-42-02_sidd22615c636eb472d92759eb00938e2e6_c0692_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 50516,
+     "sha256": "aff6a1cfa53634bf5eb94401e4973ed48dcb64a797ee28b7d0e43b8338a21344",
+     "s3_last_modified": "2026-09-10T01:46:46+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-44-22_sidd22615c636eb472d92759eb00938e2e6_c0697_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 40856,
+     "sha256": "2e4c91f6995a8446ab35d4cdd4a1b8168ba078268f9b39db2e5b7cfead0be822",
+     "s3_last_modified": "2026-09-10T01:49:20+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-46-14_sidd22615c636eb472d92759eb00938e2e6_c0701_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 63893,
+     "sha256": "cf3c28f52a4bbf9eb232ca484616156fc31755e2c099a4311e17de64edcccb03",
+     "s3_last_modified": "2026-09-10T01:51:14+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-48-06_sidd22615c636eb472d92759eb00938e2e6_c0705_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 55478,
+     "sha256": "518ecd9b6e8c139eaf2e0973c1fce573a876aee8629e8b06447ac60b39ff1c00",
+     "s3_last_modified": "2026-09-10T01:53:35+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-50-26_sidd22615c636eb472d92759eb00938e2e6_c0710_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 53573,
+     "sha256": "25c0079b4284a5a935daecd65f898a0dda9342bcd4df9ad65158f95c93db231c",
+     "s3_last_modified": "2026-09-10T01:55:24+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-52-18_sidd22615c636eb472d92759eb00938e2e6_c0714_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 38888,
+     "sha256": "7d4a36c5b5aba111a863e937b951a613f25638288bb29c169bd50be0c44ac62d",
+     "s3_last_modified": "2026-09-10T01:57:17+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-54-10_sidd22615c636eb472d92759eb00938e2e6_c0718_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 47999,
+     "sha256": "cd626c996f4d43dbd2798065512a4e4de87d981621b4a024a41162c3e57760fb",
+     "s3_last_modified": "2026-09-10T01:59:11+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-56-02_sidd22615c636eb472d92759eb00938e2e6_c0722_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 53264,
+     "sha256": "4bab5c2dc886c59a5709ea0e8eb07d70bb283cb1b6affc3d35d653580c63b30c",
+     "s3_last_modified": "2026-09-10T02:01:31+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_13-58-22_sidd22615c636eb472d92759eb00938e2e6_c0727_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 44129,
+     "sha256": "82b85b7254d9a677f8adcf027c835cb512b4641642200c57b53af0a17f5fdb18",
+     "s3_last_modified": "2026-09-10T02:03:20+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-00-14_sidd22615c636eb472d92759eb00938e2e6_c0731_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 35331,
+     "sha256": "1194a6bbcbf6d1d29b3753449cc908271ecebe2285588688c11854ec45d2a20b",
+     "s3_last_modified": "2026-09-10T02:05:13+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-02-06_sidd22615c636eb472d92759eb00938e2e6_c0735_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 56871,
+     "sha256": "2ef699d6708b45dd14e95d2e83f4387f20edd981294b03bcaf5659dbb87ef8ab",
+     "s3_last_modified": "2026-09-10T02:07:33+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-04-26_sidd22615c636eb472d92759eb00938e2e6_c0740_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 46152,
+     "sha256": "5fa266994e2080e43727bc1fdc51b6b2e4d8771dd2d56d6f9089ef9b6b5af2b7",
+     "s3_last_modified": "2026-09-10T02:09:24+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-06-18_sidd22615c636eb472d92759eb00938e2e6_c0744_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 41589,
+     "sha256": "622464aa71c0f99e0552a4c21de07474ebd283da0610bef3664d1519e80513e7",
+     "s3_last_modified": "2026-09-10T02:11:18+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-08-10_sidd22615c636eb472d92759eb00938e2e6_c0748_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 53422,
+     "sha256": "6b50e8526a8abaee02725e15d918dad5ede742836dfed908d02194aea5d08f1e",
+     "s3_last_modified": "2026-09-10T02:13:09+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-10-02_sidd22615c636eb472d92759eb00938e2e6_c0752_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 44130,
+     "sha256": "9864091a0bd5bed7fc845a872fd6e15f72ca1873f736b53495c93a2d3800bfdc",
+     "s3_last_modified": "2026-09-10T02:15:29+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-12-22_sidd22615c636eb472d92759eb00938e2e6_c0757_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 50369,
+     "sha256": "8cc14fa7d7c2e5617c24410e90ccccd352b54028fda680bb7b6f0fbaa020a14b",
+     "s3_last_modified": "2026-09-10T02:17:20+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-14-14_sidd22615c636eb472d92759eb00938e2e6_c0761_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 53357,
+     "sha256": "9a08a804e5b809bb925b5c64df6487bca48c021fee49ba2b9f30bbd33b1a1db7",
+     "s3_last_modified": "2026-09-10T02:19:16+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-16-06_sidd22615c636eb472d92759eb00938e2e6_c0765_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 61582,
+     "sha256": "933e91f67e1b9da1bf07d9d7fdfcf3bb7fadbab99d9d186ef589dfb7a2e5d552",
+     "s3_last_modified": "2026-09-10T02:21:36+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-18-26_sidd22615c636eb472d92759eb00938e2e6_c0770_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 36196,
+     "sha256": "ed16e7484167630102dd61856ad6d6c73b938bdecfed5e140f7fc563a5e74271",
+     "s3_last_modified": "2026-09-10T02:23:26+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-20-18_sidd22615c636eb472d92759eb00938e2e6_c0774_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 44609,
+     "sha256": "c8ef473431e0f73ece20fa92d7568c181bb229f6dce3b59746d1ed8ab9a31628",
+     "s3_last_modified": "2026-09-10T02:25:19+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-22-38_sidd22615c636eb472d92759eb00938e2e6_c0779_bn3_off0.0_to86.0_srcwav.json",
+     "bytes": 35565,
+     "sha256": "d4f7c4501a300e56eaf76405503971ab1b35e2344761e3f82caf206e45cf6289",
+     "s3_last_modified": "2026-09-10T02:27:08+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-24-02_sidd22615c636eb472d92759eb00938e2e6_c0782_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 87394,
+     "sha256": "8996382465bf0cdbc060975a5b57bd1d16535da622a89b1e6cf51df8b72ee0c3",
+     "s3_last_modified": "2026-09-10T02:29:35+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-26-22_sidd22615c636eb472d92759eb00938e2e6_c0787_bn3_off0.0_to88.0_srcwav.json",
+     "bytes": 29781,
+     "sha256": "60039f583c5c22a9cd7dd5132dd857314b0aa0f5ea68b32063f78c70dc01b75a",
+     "s3_last_modified": "2026-09-10T02:31:17+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-28-14_sidd22615c636eb472d92759eb00938e2e6_c0791_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 45610,
+     "sha256": "c09a5b73bf28d0bb3b8191640ab5768d7d48dde18e0c2c6605bba55003d1522b",
+     "s3_last_modified": "2026-09-10T02:33:44+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-30-06_sidd22615c636eb472d92759eb00938e2e6_c0795_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 6731,
+     "sha256": "44686098b34b4bd0794523db7691ad922731d3df04a4b881d686f158218cfc0f",
+     "s3_last_modified": "2026-09-10T02:34:04+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-32-54_sidd22615c636eb472d92759eb00938e2e6_c0801_bn3_off0.0_to86.0_srcwav.json",
+     "bytes": 25977,
+     "sha256": "c2de83cf04e32918f1520cf2b9a6d878c65401587f8302414a808233f71d010c",
+     "s3_last_modified": "2026-09-10T02:37:23+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-34-18_sidd22615c636eb472d92759eb00938e2e6_c0804_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 24611,
+     "sha256": "63994b3d632f249dadc66c61baa4f5d7084ec0041337203769695ee02233285b",
+     "s3_last_modified": "2026-09-10T02:39:43+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-36-10_sidd22615c636eb472d92759eb00938e2e6_c0808_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 8686,
+     "sha256": "29a893eb561c4babf1592abc23dd43bd2f9f8da070ccb975b6e28d298028cb92",
+     "s3_last_modified": "2026-09-10T02:40:08+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-38-58_sidd22615c636eb472d92759eb00938e2e6_c0814_bn3_off0.0_to86.0_srcwav.json",
+     "bytes": 28319,
+     "sha256": "2eb3865738c5ae6e046a73f247dfb2b2aca7c46dff1a479e31787f823c555d6f",
+     "s3_last_modified": "2026-09-10T02:43:24+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-40-22_sidd22615c636eb472d92759eb00938e2e6_c0817_bn3_off0.0_to88.0_srcwav.json",
+     "bytes": 39087,
+     "sha256": "c9b9e957684f5891514d8e96cfa15900957a6ce0acf284ecde055a1853025ab2",
+     "s3_last_modified": "2026-09-10T02:45:18+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-42-14_sidd22615c636eb472d92759eb00938e2e6_c0821_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 26208,
+     "sha256": "7a5b5cd4f3f9d1276ed9e11b12282f3cad0dc7c8c458640325aae00bb0a95b33",
+     "s3_last_modified": "2026-09-10T02:47:14+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-44-06_sidd22615c636eb472d92759eb00938e2e6_c0825_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 43559,
+     "sha256": "28c44a388ebf9cd892f7f01df558644461e290752f6639773d80b9194b69974d",
+     "s3_last_modified": "2026-09-10T02:49:35+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-46-26_sidd22615c636eb472d92759eb00938e2e6_c0830_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 36207,
+     "sha256": "10784e1cb118760edef51799ca01a845975e6840d5212aafe3128d1bcb341bf7",
+     "s3_last_modified": "2026-09-10T02:51:22+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-48-46_sidd22615c636eb472d92759eb00938e2e6_c0835_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 19503,
+     "sha256": "50d06c9af616be03900a1491790434e85128e40e4e250622b3e4437be8f083f9",
+     "s3_last_modified": "2026-09-10T02:52:41+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-50-10_sidd22615c636eb472d92759eb00938e2e6_c0838_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 35821,
+     "sha256": "81401d734223555bd59fca00ae66bdfe07f5dac0aa7d74c69a3e823f2916a256",
+     "s3_last_modified": "2026-09-10T02:55:05+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-52-02_sidd22615c636eb472d92759eb00938e2e6_c0842_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 44300,
+     "sha256": "945b63280535fc4b9ebbc10d81934132e75f9ec5e219657216577a71a4d0daa5",
+     "s3_last_modified": "2026-09-10T02:57:46+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-54-22_sidd22615c636eb472d92759eb00938e2e6_c0847_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 31246,
+     "sha256": "1f87b2aa70c0498bba9e3de5c54ca4bb72a52ba87dc309a9ed457c5241365b8e",
+     "s3_last_modified": "2026-09-10T02:59:44+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_14-56-14_sidd22615c636eb472d92759eb00938e2e6_c0851_off0.0_to30.0_srcwav.json",
+     "bytes": 10045,
+     "sha256": "5b54fc210cc83b5f31619e8fce5c3d7aa60e49651739d18d33e3dee216a0000e",
+     "s3_last_modified": "2026-09-10T02:59:42+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-02-18_sidd22615c636eb472d92759eb00938e2e6_c0864_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 44884,
+     "sha256": "4c899daf0ec4e7677fa98e7efdea5291365e99d05a916f1c6648a75ce5a404ac",
+     "s3_last_modified": "2026-09-10T03:07:16+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-04-10_sidd22615c636eb472d92759eb00938e2e6_c0868_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 49793,
+     "sha256": "d10e921ecf23ce0baeb79cb0f426f76b6635968c1691ab84b32d1e910348df3e",
+     "s3_last_modified": "2026-09-10T03:09:11+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-06-02_sidd22615c636eb472d92759eb00938e2e6_c0872_bn4_off0.0_to116.0_srcwav.json",
+     "bytes": 32755,
+     "sha256": "6c3f40e281f934e4b62f9ed9aef6bb9b54af0c0c3282e1c165abf4c130a799a2",
+     "s3_last_modified": "2026-09-10T03:11:45+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-08-22_sidd22615c636eb472d92759eb00938e2e6_c0877_off0.0_to30.0_srcwav.json",
+     "bytes": 1670,
+     "sha256": "b9e3da1d0da00294ca950ba4f3c0cf2c1eeec302c7b0e9eece3606c482f263bd",
+     "s3_last_modified": "2026-09-10T03:11:41+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-11-38_sidd22615c636eb472d92759eb00938e2e6_c0884_off0.0_to30.0_srcwav.json",
+     "bytes": 8342,
+     "sha256": "cd5840ca4b7274b434b09e409018f8c1a485e5be20809ab7ff562a52cf356d57",
+     "s3_last_modified": "2026-09-10T03:15:40+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-15-22_sidd22615c636eb472d92759eb00938e2e6_c0892_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 22803,
+     "sha256": "148f281c121697807591001bbab487c7325ae51047bc1754acf404c350fad5f8",
+     "s3_last_modified": "2026-09-10T03:19:42+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-16-18_sidd22615c636eb472d92759eb00938e2e6_c0894_bn3_off0.0_to86.0_srcwav.json",
+     "bytes": 40335,
+     "sha256": "b14db2c2238db36e8e7d239d5065c9cd0aa902a73a49d40a566310f6ed5c0d8d",
+     "s3_last_modified": "2026-09-10T03:20:44+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-36-22_sidd22615c636eb472d92759eb00938e2e6_c0937_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 43611,
+     "sha256": "c750a5000a6aa1eaf4d4ee2bd60852ce87cc3124f0087bafee433578b06f9ed6",
+     "s3_last_modified": "2026-09-10T03:41:20+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-38-14_sidd22615c636eb472d92759eb00938e2e6_c0941_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 43173,
+     "sha256": "8807a0e1df050389b07a46948530d38adc6853f19e0eb9927aeb9b6ba94c72bd",
+     "s3_last_modified": "2026-09-10T03:43:12+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-40-06_sidd22615c636eb472d92759eb00938e2e6_c0945_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 52511,
+     "sha256": "c962b14b8a9172412f2111a29a03b4996c47144398d0a07303c8d36492563991",
+     "s3_last_modified": "2026-09-10T03:45:32+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-42-26_sidd22615c636eb472d92759eb00938e2e6_c0950_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 42073,
+     "sha256": "b71207bec367f3143ff40769c1db99d8df1d8040e4eb4d0e89430a444b9e02ae",
+     "s3_last_modified": "2026-09-10T03:47:45+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-44-18_sidd22615c636eb472d92759eb00938e2e6_c0954_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 56407,
+     "sha256": "e55c99a5ec5455d5fc6988b7b2bed52df5b19ca22c434faf411bb4abf156651f",
+     "s3_last_modified": "2026-09-10T03:49:48+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-46-10_sidd22615c636eb472d92759eb00938e2e6_c0958_off0.0_to30.0_srcwav.json",
+     "bytes": 10629,
+     "sha256": "cdf1fcd240ee450657e30fc2ba024d6425e70856f5de465b2ac6bff4cf1dc947",
+     "s3_last_modified": "2026-09-10T03:49:43+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-49-54_sidd22615c636eb472d92759eb00938e2e6_c0966_off0.0_to30.0_srcwav.json",
+     "bytes": 14291,
+     "sha256": "d20ad0b36cea031787565fbb9917394fa3bd534aca8d16b0ac0cee19e0be15ad",
+     "s3_last_modified": "2026-09-10T03:53:40+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-50-22_sidd22615c636eb472d92759eb00938e2e6_c0967_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 24332,
+     "sha256": "d2154c7799f230ad43c7be6780c45005a3c11a543e0c0c802d63a16e9740bb03",
+     "s3_last_modified": "2026-09-10T03:54:21+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-52-14_sidd22615c636eb472d92759eb00938e2e6_c0971_bn3_off0.0_to88.0_srcwav.json",
+     "bytes": 10961,
+     "sha256": "01b44a113721638ce6bd77e1b302728b8678975cb4023434b71d006a75db266a",
+     "s3_last_modified": "2026-09-10T03:57:10+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-54-06_sidd22615c636eb472d92759eb00938e2e6_c0975_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 48335,
+     "sha256": "49632c06263bb24477f2076a575b64fe184ec00d23e5700e4dbeb535c311d97f",
+     "s3_last_modified": "2026-09-10T03:59:46+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-56-26_sidd22615c636eb472d92759eb00938e2e6_c0980_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 18953,
+     "sha256": "56eaed2cb4a457ba823b0a30b1fabaadd0002c43eff46e0df47a2dbddc9059b2",
+     "s3_last_modified": "2026-09-10T04:01:22+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_15-58-18_sidd22615c636eb472d92759eb00938e2e6_c0984_bn2_off0.0_to60.0_srcwav.json",
+     "bytes": 6518,
+     "sha256": "5bc06d92c8df5a8b8896efaa66e6e578f33e6f7df97bad98d6b83913438ff658",
+     "s3_last_modified": "2026-09-10T04:02:40+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-00-38_sidd22615c636eb472d92759eb00938e2e6_c0989_off0.0_to30.0_srcwav.json",
+     "bytes": 9719,
+     "sha256": "3f92428be15459b4c07182d00725e842b2acf9f480c3dc6bca4f6ce1442a1cea",
+     "s3_last_modified": "2026-09-10T04:04:06+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-02-30_sidd22615c636eb472d92759eb00938e2e6_c0993_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 19273,
+     "sha256": "267f9d4b2f3f3c32ac89c897a91fdac7a54472b89bc636d6916f22c46353ddac",
+     "s3_last_modified": "2026-09-10T04:07:25+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-05-18_sidd22615c636eb472d92759eb00938e2e6_c0999_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 6914,
+     "sha256": "37eaf1de68a7393f513c62d4efcea293d229c7a9b5ab09ff711460ff518a02de",
+     "s3_last_modified": "2026-09-10T04:09:16+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-06-14_sidd22615c636eb472d92759eb00938e2e6_c1001_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 35900,
+     "sha256": "54dc9751b4e7c14d448ed0f68a9b416b832f92e8dcecc6fadaca6e8f914b9b10",
+     "s3_last_modified": "2026-09-10T04:11:41+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-08-06_sidd22615c636eb472d92759eb00938e2e6_c1005_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 35510,
+     "sha256": "51faa40320b156c7067dc4a97f8fe9caa6f1dde33970d57036c7d0a57c40086e",
+     "s3_last_modified": "2026-09-10T04:12:47+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-10-54_sidd22615c636eb472d92759eb00938e2e6_c1011_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 14290,
+     "sha256": "9af389e61cdc07fc042f5c1af1d68a71af7589a1a795adc9d237c025cb9fc6ab",
+     "s3_last_modified": "2026-09-10T04:14:42+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-12-18_sidd22615c636eb472d92759eb00938e2e6_c1014_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 32583,
+     "sha256": "86e7abad8603d38b13aa910517ef49601bd233f10535f88b16d57a98182d3ec1",
+     "s3_last_modified": "2026-09-10T04:17:46+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-14-10_sidd22615c636eb472d92759eb00938e2e6_c1018_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 8648,
+     "sha256": "e916902d81bb1201dee81428357c3d4bec647af8ad3f6a794c8cad823fa22571",
+     "s3_last_modified": "2026-09-10T04:18:41+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-18-22_sidd22615c636eb472d92759eb00938e2e6_c1027_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 22882,
+     "sha256": "ee09d941fedaf98d723e1ce846b610ac15b8a38349007dabcf0caf8d830b22a6",
+     "s3_last_modified": "2026-09-10T04:23:17+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-20-14_sidd22615c636eb472d92759eb00938e2e6_c1031_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 35265,
+     "sha256": "ab1675a6761e36dce9068e3a10ee0a68db7a82d03aa4b8e6b970c8fd0295f7e3",
+     "s3_last_modified": "2026-09-10T04:25:41+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-22-06_sidd22615c636eb472d92759eb00938e2e6_c1035_bn4_off0.0_to116.0_srcwav.json",
+     "bytes": 6657,
+     "sha256": "9ef6944954750e50f221ab85b1535e11e253afe7e429b4d459905959b15d50b4",
+     "s3_last_modified": "2026-09-10T04:27:43+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-24-54_sidd22615c636eb472d92759eb00938e2e6_c1041_bn2_off0.0_to60.0_srcwav.json",
+     "bytes": 852,
+     "sha256": "4501cb3228ac0ea40f13ee9ddb43af7b4f1bbef9a0ddc36e142aeddd37e2a315",
+     "s3_last_modified": "2026-09-10T04:29:18+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-28-10_sidd22615c636eb472d92759eb00938e2e6_c1048_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 56765,
+     "sha256": "c521167608cb620a1624688521f69d9076982cfa4cd9000baed0cb7e55c4ebd4",
+     "s3_last_modified": "2026-09-10T04:33:11+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-30-02_sidd22615c636eb472d92759eb00938e2e6_c1052_bn5_off0.0_to142.0_srcwav.json",
+     "bytes": 59707,
+     "sha256": "7152155a848157b3edbb0e5d4138fac9fc8be86b8aad8e6c1adfe2ec1e5e0016",
+     "s3_last_modified": "2026-09-10T04:35:49+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-32-22_sidd22615c636eb472d92759eb00938e2e6_c1057_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 47817,
+     "sha256": "fd02ec223a045965318920b63f510fe4821935b99f3d86b4bd3e0db81ddd5cd4",
+     "s3_last_modified": "2026-09-10T04:37:48+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_16-34-14_sidd22615c636eb472d92759eb00938e2e6_c1061_off0.0_to30.0_srcwav.json",
+     "bytes": 81,
+     "sha256": "6ebe30a978ed32055d50b032de6bfe1c35a952c09e30b8dc01ce2fe1b6db2d3c",
+     "s3_last_modified": "2026-09-10T04:37:42+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_20-10-18_sidd22615c636eb472d92759eb00938e2e6_c1524_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 58638,
+     "sha256": "61eb37c91a01d963e0f2ce06ea4f13c8ce24a44721e6683a8f68a3008103b657",
+     "s3_last_modified": "2026-09-10T08:15:47+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_20-12-10_sidd22615c636eb472d92759eb00938e2e6_c1528_bn4_off0.0_to114.0_srcwav.json",
+     "bytes": 36010,
+     "sha256": "324a0a308ab06b72c81389cfc2844d1431fa7351ba715ad392fc7c3b7b60f41d",
+     "s3_last_modified": "2026-09-10T08:17:47+00:00"
+    },
+    {
+     "key": "transcripts/Ben_UCPK2/2026-09-10/ben_ucpk2_2026-09-10_22-40-34_sidd22615c636eb472d92759eb00938e2e6_c1846_bn2_off0.0_to58.0_srcwav.json",
+     "bytes": 857,
+     "sha256": "94d1d9ebb730c0c7bbd52ef44050bcc2db357a32d70b46bfca9a72da1bba1d43",
+     "s3_last_modified": "2026-09-10T10:44:41+00:00"
+    }
+   ]
+  }
+ ]
+}
