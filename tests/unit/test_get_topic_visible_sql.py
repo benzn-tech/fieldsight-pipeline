@@ -111,3 +111,15 @@ def test_not_found_returns_none_and_skips_the_children_query():
     conn = FakeConn(row=None)
     assert topics.get_topic_visible(conn, TOPIC_ID, [SITE_ID], None) is None
     assert len(conn.executed) == 1
+
+
+def test_an_empty_author_list_is_passed_through_as_empty_not_none():
+    """author_ids=[] means the caller's allow-set resolved to nobody -- it must stay `[]`
+    on the wire, never collapse to `None`. The SQL's `%(author_ids)s::uuid[] IS NULL` arm
+    treats None as "no restriction"; silently swapping [] for None here would turn a
+    fail-closed empty allow-set into an unfiltered read."""
+    conn = FakeConn(row=None)
+    topics.get_topic_visible(conn, TOPIC_ID, [SITE_ID], [])
+    params = conn.executed[0][1]
+    assert params["author_ids"] == []
+    assert params["author_ids"] is not None
