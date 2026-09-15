@@ -859,6 +859,83 @@ def get_topic_full(conn, topic_id) -> dict | None:
     return t
 
 
+# The pinned-topic read for scoped Ask (spec 2026-09-15 §4.3). NOT get_topic_full:
+# that one is `WHERE t.id=%s` with no visibility, company, redaction or non_work
+# exclusion, and reindex.py depends on it staying exactly that.
+#
+# One statement, so "unknown", "hidden" and "out of reach" are the same None.
+# Casts are explicit because Postgres cannot infer a type for `%s IS NULL`
+# (a CASE WHEN %s IS NULL once returned 500 in production with every test green).
+_TOPIC_VISIBLE_SQL = (
+    "SELECT t.id, t.title, t.summary, t.report_date, t.site_id, "
+    "       s.name AS site_name, t.user_id, t.time_range "
+    "FROM topics t LEFT JOIN sites s ON s.id = t.site_id "
+    "WHERE t.id = %(id)s::uuid "
+    "AND t.site_id = ANY(%(site_ids)s::uuid[]) "
+    "AND (%(author_ids)s::uuid[] IS NULL OR t.user_id = ANY(%(author_ids)s::uuid[])) "
+    f"AND {visible_topics_predicate('t')} "
+    "AND t.work_class IS DISTINCT FROM 'non_work' "
+    # Same rule as redactions.company_excluded_topic_ids: ANY active redaction,
+    # whatever its scope. The pinned block is stricter than retrieval on purpose
+    # (spec §4.4 records the asymmetry).
+    "AND NOT EXISTS (SELECT 1 FROM redactions ra WHERE ra.target_type = 'topic' "
+    "AND ra.target_id = t.id AND ra.reverted_at IS NULL)"
+)
+
+_TOPIC_VISIBLE_ACTION_ITEMS_SQL = (
+    "SELECT text, responsible, deadline, deadline_text, status FROM action_items "
+    "WHERE topic_id = %s AND "
+    + CHILD_OF_VISIBLE_TOPIC.format(alias="action_items")
+    + " ORDER BY created_at"
+)
+
+
+def get_topic_visible(conn, topic_id, site_ids, author_ids) -> dict | None:
+    """One topic the caller may see, shaped for the Ask prompt, or None.
+
+    `site_ids` / `author_ids` are the caller's ALREADY-RESOLVED ACL
+    (scope.visible_scope); `author_ids=None` means no author restriction. None is
+    returned for a malformed id, an unknown id, a topic outside the site or author
+    set, a non_work topic, an actively redacted topic and a deleted recording's
+    topic -- indistinguishable by design. Every value is JSON-safe (rag-search
+    returns this dict through the Lambda marshaller).
+    """
+    import uuid as _uuid
+    try:
+        tid = str(_uuid.UUID(str(topic_id)))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if topic_id is None or not site_ids:
+        return None
+    row = conn.cursor(row_factory=dict_row).execute(
+        _TOPIC_VISIBLE_SQL,
+        {"id": tid,
+         "site_ids": [str(s) for s in site_ids],
+         "author_ids": None if author_ids is None else [str(a) for a in author_ids]},
+    ).fetchone()
+    if not row:
+        return None
+    items = conn.cursor(row_factory=dict_row).execute(
+        _TOPIC_VISIBLE_ACTION_ITEMS_SQL, (tid,)).fetchall()
+    return {
+        "id": str(row["id"]),
+        "title": row["title"],
+        "summary": row["summary"],
+        "report_date": str(row["report_date"]),
+        "site_id": str(row["site_id"]),
+        "site_name": row["site_name"],
+        "user_id": str(row["user_id"]) if row["user_id"] is not None else None,
+        "time_range": str(row["time_range"]) if row["time_range"] is not None else None,
+        "action_items": [
+            {"text": a["text"], "responsible": a["responsible"],
+             "deadline": (str(a["deadline"]) if a["deadline"] is not None
+                          else a.get("deadline_text")),
+             "status": a["status"]}
+            for a in items
+        ],
+    }
+
+
 def add_topic_photo_if_absent(conn, topic_id, s3_key, caption_text):
     """Idempotent keyframe bind (video-keyframe plan): inserts only when no
     (topic_id, s3_key) row exists -- safe under S3-event retries and after
