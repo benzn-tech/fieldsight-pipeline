@@ -6205,12 +6205,19 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             # This serializer is a fixed allowlist, so it dropped both fields on
             # the way out while every repository-level test stayed green. Found
             # only by invoking the deployed function and reading the JSON. Any
-            # future field the collapse adds has to be added here too.
+            # future field the collapse or the day reads add (edit_count -> version)
+            # has to be added here too.
             "action_items": [{"id": str(a["id"]), "action": a["text"], "responsible": a["responsible"],
                               "deadline": a["deadline_text"] or (str(a["deadline"]) if a["deadline"] else None),
                               "priority": a["priority"], "status": a["status"],
                               "mention_count": a.get("mention_count", 1),
                               "collapsed_ids": [str(x) for x in (a.get("collapsed_ids") or [])],
+                              # 1 + content_edits rows for this item (todo-card spec 3.4).
+                              # edit_count is stamped by the two day reads in
+                              # repositories/topics.py; get_topic_full (reindex) does not
+                              # count, so its rows are v1. The session-report preview reads
+                              # through list_topics_for_source_prefix and carries the count.
+                              "version": 1 + int(a.get("edit_count") or 0),
                               } for a in t["action_items"]],
             # The subject this topic belongs to, when a human has confirmed
             # one. FACTS ONLY -- how many days it was raised on, when last,

@@ -7299,3 +7299,31 @@ def test_an_uncollapsed_row_still_says_it_was_mentioned_once():
     item = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"][0]
     assert item["mention_count"] == 1
     assert item["collapsed_ids"] == []
+
+
+def test_render_shape_carries_the_action_item_version():
+    """version = 1 + edit_count (todo-card spec 3.4). This serializer is a fixed
+    allowlist that has already dropped two repository fields on the way out
+    (mention_count, collapsed_ids) with every repository test green, so the
+    count is asserted HERE, on what the browser receives."""
+    row = _topic_row(action_items=[
+        {"id": "a-1", "text": "Order timber", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open", "edit_count": 3},
+        {"id": "a-2", "text": "Book pump", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open", "edit_count": 0},
+    ])
+    items = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"]
+    assert [i["version"] for i in items] == [4, 1]
+
+
+def test_a_row_that_was_never_counted_is_version_one():
+    """get_topic_full (reindex) does not count. Absent is v1, never missing."""
+    row = _topic_row(action_items=[
+        {"id": "a-1", "text": "Order timber", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open"},
+    ])
+    item = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"][0]
+    assert item["version"] == 1
