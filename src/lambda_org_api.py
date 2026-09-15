@@ -663,6 +663,11 @@ def dispatch(conn, event, method, route):
     m_scl = re.match(r"^/sessions/([^/]+)/close$", route)
     if m_scl and method == "POST":
         return session_close(conn, caller, m_scl.group(1), parse_body(event))
+    # F2: an id that is not a session never reaches a handler that builds a key from it.
+    m_sk = _SESSION_KEYED_ROUTE_RE.match(route)
+    if m_sk and not session_scope.is_session_base(m_sk.group(1)):
+        return error("not a session id", 400)
+
     m_srp = re.match(r"^/sessions/([^/]+)/report/preview$", route)
     if m_srp and method == "POST":
         return session_report_preview(conn, caller, m_srp.group(1), event)
@@ -3378,6 +3383,10 @@ def get_asset_url(event):
 REPORT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # The same date, matched ANYWHERE in an S3 key (report-history rows).
 REPORT_DATE_IN_KEY_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+# The /sessions/{id}/… routes that build an S3 key or a scope from {id}.
+_SESSION_KEYED_ROUTE_RE = re.compile(
+    r"^/sessions/([^/]+)/(?:report/preview|report|report/status|rolling|brief)$")
 
 
 def list_org_observations(conn, caller, event):
