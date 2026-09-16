@@ -9,7 +9,9 @@ import lambda_org_api as org
 SITE_ID = "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
 DATE = "2026-07-25"
 S1300 = "Benl1_2026-07-25_13-00-11"
+S1405 = "Benl1_2026-07-25_14-05-00"
 KEY_1300 = f"extractions/Ada_L/{DATE}/{S1300}.json"
+KEY_1405 = f"extractions/Ada_L/{DATE}/{S1405}.json"
 CALLER = {"id": "u-uuid-1", "cognito_sub": "sub-1", "company_id": "c-uuid-1",
           "email": "a@x.nz", "first_name": "Ada", "last_name": "L", "folder_name": "Ada_L",
           "avatar_s3_key": None, "global_role": "admin", "created_at": "2026-07-25"}
@@ -121,3 +123,99 @@ def test_a_request_without_a_template_is_still_the_old_assembled_report(day_gene
     put = day_generate({"deliver": "download"})
     artifact = json.loads(put["Body"])
     assert "generate" not in artifact
+
+
+# ----------------------------------------------------------
+# CRITICAL 1 — the deletion-tombstone arm.
+#
+# `_report_rows_in_scope` (which decides what a report may CONTAIN) drops a row
+# for four reasons: not an extraction key, wrong session, redacted-or-non_work,
+# or a source key under a deleted (tombstoned) prefix. `_excluded_topics_for`
+# (which decides what the worker is TOLD to cut) must name a row it drops for
+# ANY of the reasons that survive to it -- a "deleted" recording is a reversible
+# mask in this codebase, the audio is still in the bucket, so a topic dropped
+# only by a recording tombstone must still be named or its speech can reach
+# the model prompt unclipped.
+# ----------------------------------------------------------
+
+DELETED_PREFIX = f"extractions/Ada_L/{DATE}/{S1405}"
+
+
+def test_a_topic_hidden_only_by_a_deleted_recording_is_named_as_excluded(day):
+    mp, puts = day
+    rows = [
+        _row(id="t-kept", source_s3_key=KEY_1300, title="Slab pour", time_range="13:00 – 13:40"),
+        # Not redacted, not non_work -- the ONLY reason this drops out of the
+        # report is the recording tombstone on its session's source prefix.
+        _row(id="t-tombstoned", source_s3_key=KEY_1405, title="Deleted recording",
+             time_range="14:05 – 14:10"),
+    ]
+    mp.setattr(org.topics, "list_topics_for_source_prefix", lambda conn, prefix, **k: list(rows))
+    mp.setattr(org.redactions, "deleted_source_prefixes",
+              lambda conn, folder=None, date=None: [DELETED_PREFIX] if folder == "Ada_L" else [])
+    res, puts_out = _generate_raw((mp, puts), _body())
+    assert res["statusCode"] == 202
+    artifact = json.loads(puts_out[0]["Body"])
+    excluded_ids = {t["id"] for t in artifact["excludedTopics"]}
+    assert "t-tombstoned" in excluded_ids
+    assert "t-kept" not in excluded_ids
+    # the content the worker still renders never includes the tombstoned topic
+    assert {t["topic_title"] for t in artifact["content"]["topics"]} == {"Slab pour"}
+
+
+# ----------------------------------------------------------
+# IMPORTANT 2/3 — session-scoped generate: `session_report_generate` must get
+# the same `generate`/`window`/`excludedTopics` treatment as the day route,
+# and its `excludedTopics` must never name a topic from a DIFFERENT session.
+# ----------------------------------------------------------
+
+SESSION_ROWS = [
+    _row(id="t-1300-work", source_s3_key=KEY_1300, title="Slab pour", time_range="13:00 – 13:40"),
+    _row(id="t-1300-personal", source_s3_key=KEY_1300, title="Personal call",
+         time_range="13:40 – 13:45", work_class="non_work"),
+    # A different session's excluded topic -- must never leak into S1300's
+    # excludedTopics even though it fails the same exclusion rule.
+    _row(id="t-1405-personal", source_s3_key=KEY_1405, title="Other session's personal",
+         time_range="14:05 – 14:10", work_class="non_work"),
+]
+
+
+def _session_generate_raw(day_fixture, session_id, body):
+    mp, puts = day_fixture
+    mp.setattr(org.topics, "list_topics_for_source_prefix",
+              lambda conn, prefix, **k: list(SESSION_ROWS))
+    res = org.lambda_handler(_event("POST", f"/api/org/sessions/{session_id}/report",
+                                    {"date": DATE, "user": "Ada_L"}, body), None)
+    return res, puts
+
+
+def test_session_generate_reaches_the_worker_with_generate_and_window(day):
+    res, puts = _session_generate_raw(day, S1300, _body(**{"from": "09:00", "to": "11:30"}))
+    assert res["statusCode"] == 202, res
+    assert len(puts) == 1
+    artifact = json.loads(puts[0]["Body"])
+    assert artifact["generate"] == {"templateId": "personal-meeting", "templateVersion": 3}
+    assert artifact["window"] == {"from": "09:00", "to": "11:30"}
+
+
+def test_session_generate_without_a_template_is_still_the_old_assembled_report(day):
+    res, puts = _session_generate_raw(day, S1300, {"deliver": "download"})
+    assert res["statusCode"] == 202, res
+    artifact = json.loads(puts[0]["Body"])
+    assert "generate" not in artifact
+
+
+def test_session_generate_an_unknown_template_is_refused_before_anything_is_enqueued(day):
+    res, puts = _session_generate_raw(day, S1300, _body(templateId="does-not-exist"))
+    assert res["statusCode"] == 400
+    assert "template" in json.loads(res["body"])["error"].lower()
+    assert puts == []
+
+
+def test_session_generate_excluded_topics_are_scoped_to_the_session(day):
+    res, puts = _session_generate_raw(day, S1300, _body())
+    assert res["statusCode"] == 202, res
+    artifact = json.loads(puts[0]["Body"])
+    excluded_ids = {t["id"] for t in artifact["excludedTopics"]}
+    # this session's own excluded topic, never the 14:05 session's
+    assert excluded_ids == {"t-1300-personal"}

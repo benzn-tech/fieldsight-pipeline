@@ -1271,6 +1271,23 @@ def _deleted_prefixes_for_rows(conn, rows, date):
     return prefixes
 
 
+def _redacted_or_hidden(r, redacted, deleted):
+    """True when `r` must not appear in a report: an active redaction, a
+    non_work classification, or a source key under a deleted (tombstoned)
+    prefix. A "deleted" recording is a reversible mask in this codebase --
+    the audio is still in the bucket -- so this arm matters exactly as much
+    as the other two: without it a soft-deleted topic's speech is neither
+    shown NOR named as cut, and can still reach a generation prompt.
+
+    The one rule both `_report_rows_in_scope` (which drops these rows) and
+    `_excluded_topics_for` (which reports them) apply, so there is a single
+    place that defines "excluded" rather than two copies that can drift."""
+    if r["id"] in redacted or r.get("work_class") == "non_work":
+        return True
+    key = r.get("source_s3_key") or ""
+    return any(key.startswith(p) for p in deleted)
+
+
 def _report_rows_in_scope(conn, caller, folder, date, session_id=None, selected=None):
     """The topic rows a report may contain, for one session or (session_id=None) the day.
 
@@ -1291,10 +1308,7 @@ def _report_rows_in_scope(conn, caller, folder, date, session_id=None, selected=
             continue
         if session_id is not None and sid != session_id:
             continue
-        if r["id"] in redacted or r.get("work_class") == "non_work":
-            continue
-        key = r.get("source_s3_key") or ""
-        if any(key.startswith(p) for p in deleted):
+        if _redacted_or_hidden(r, redacted, deleted):
             continue
         kept.append(r)
     if selected is not None:
@@ -1529,7 +1543,8 @@ def session_report_generate(conn, caller, session_id, event):
         "resultKey": result_key,
         **({"generate": generate,
             "window": {"from": (body.get("from") or "00:00"), "to": (body.get("to") or "23:59")},
-            "excludedTopics": _excluded_topics_for(conn, caller, folder, date)} if generate else {}),
+            "excludedTopics": _excluded_topics_for(
+                conn, caller, folder, date, session_id=session_id)} if generate else {}),
     }
     # Lake bucket (like the reindex_requests/ chain): org-api is in-VPC and hands
     # off to the non-VPC session-report worker via an S3 request artifact (BUG-36).
@@ -1624,22 +1639,37 @@ def _generation_request(body):
     return {"templateId": template_id, "templateVersion": version}, None
 
 
-def _excluded_topics_for(conn, caller, folder, date):
-    """The day's topics the report scope refuses to show -- redacted or non-work --
-    with the time_range the worker needs to cut them out of the transcript. Only the
-    id and the range travel: the text of a hidden topic never leaves the database.
+def _excluded_topics_for(conn, caller, folder, date, session_id=None):
+    """The topics the report scope refuses to show -- redacted, non-work, or
+    under a deleted (tombstoned) source prefix -- with the time_range the
+    worker needs to cut them out of the transcript. Only the id and the
+    range travel: the text of a hidden topic never leaves the database, and
+    `time_range` travels as-is (fail closed: an empty/unparseable one is
+    still reported, never silently dropped).
 
-    Reads the day's topics via `_day_report_rows` (this file's existing "every topic
-    for one folder/date" call, wrapping `topics.list_topics_for_source_prefix`) and
-    applies the same exclusion rule `build_day_sessions` already uses: an ACTIVE
-    redaction, OR `work_class == 'non_work'`."""
+    Reads the day's topics via `_day_report_rows` (this file's existing "every
+    topic for one folder/date" call, wrapping `topics.list_topics_for_source_prefix`)
+    and applies `_redacted_or_hidden` -- the SAME rule `_report_rows_in_scope`
+    uses to drop a row, not a second hand-rolled copy of it, so the two can
+    never drift apart on what "excluded" means.
+
+    `session_id`, when given, restricts the set to that one session's topics
+    (mirroring `_report_rows_in_scope`'s own session_id filter) so a session
+    report's `excludedTopics` cannot name a topic from a different session."""
     rows = _day_report_rows(conn, caller, folder, date)
     if not rows:
         return []
     redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows])
-    return [{"id": str(r["id"]), "time_range": r.get("time_range")}
-            for r in rows
-            if r["id"] in redacted or r.get("work_class") == "non_work"]
+    deleted = _deleted_prefixes_for_rows(conn, rows, date)
+    out = []
+    for r in rows:
+        if session_id is not None:
+            sid, _kind = session_scope.session_ref(r.get("source_s3_key"))
+            if sid != session_id:
+                continue
+        if _redacted_or_hidden(r, redacted, deleted):
+            out.append({"id": str(r["id"]), "time_range": r.get("time_range")})
+    return out
 
 
 def day_report_preview(conn, caller, date, event):
