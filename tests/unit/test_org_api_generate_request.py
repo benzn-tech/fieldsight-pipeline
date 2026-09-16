@@ -126,6 +126,30 @@ def test_a_request_without_a_template_is_still_the_old_assembled_report(day_gene
 
 
 # ----------------------------------------------------------
+# IMPORTANT 3 — deliver="email" is refused for a generate request at the door.
+# The worker's generate branch always writes emailed: false and never sends, so
+# accepting the combination here would silently drop a report the caller
+# believes was emailed.
+# ----------------------------------------------------------
+
+def test_day_generate_with_email_delivery_is_refused_before_anything_is_enqueued(day_generate_raw):
+    res, puts = day_generate_raw(_body(deliver="email", recipients=["a@x.nz"]))
+    assert res["statusCode"] == 400
+    assert "download" in json.loads(res["body"])["error"].lower()
+    assert puts == [], "nothing may be enqueued for a template+email combination"
+
+
+def test_day_email_delivery_without_a_template_is_still_accepted(day_generate):
+    # Without a template, deliver="email" is the pre-existing assembled-report
+    # path, which the worker DOES send -- only a NAMED-TEMPLATE + email combo
+    # is refused.
+    put = day_generate({"deliver": "email", "recipients": ["a@x.nz"]})
+    artifact = json.loads(put["Body"])
+    assert "generate" not in artifact
+    assert artifact["deliver"] == "email"
+
+
+# ----------------------------------------------------------
 # CRITICAL 1 — the deletion-tombstone arm.
 #
 # `_report_rows_in_scope` (which decides what a report may CONTAIN) drops a row
@@ -161,6 +185,36 @@ def test_a_topic_hidden_only_by_a_deleted_recording_is_named_as_excluded(day):
     assert "t-kept" not in excluded_ids
     # the content the worker still renders never includes the tombstoned topic
     assert {t["topic_title"] for t in artifact["content"]["topics"]} == {"Slab pour"}
+
+
+# ----------------------------------------------------------
+# CRITICAL 1 (contributing cause) — a non-extraction row must never reach the
+# worker's exclusion list, the same cut `_report_rows_in_scope` makes. Such a
+# row could never correspond to a stretch of recorded speech, so an
+# unparseable time_range on it must not abort a generate request for a window
+# that could never have contained it.
+# ----------------------------------------------------------
+
+REPORT_KEY = f"reports/Ada_L/{DATE}.json"
+
+
+def test_a_non_extraction_row_never_becomes_an_excluded_topic(day):
+    mp, puts = day
+    rows = [
+        _row(id="t-kept", source_s3_key=KEY_1300, title="Slab pour", time_range="13:00 – 13:40"),
+        # A report-sourced row, marked non_work, with an unparseable time_range --
+        # if this reached the worker's excludedTopics it would abort every generate
+        # for this folder/date over a row that was never part of the transcript
+        # timeline in the first place.
+        _row(id="t-report-row", source_s3_key=REPORT_KEY, title="Whole day",
+             time_range="not a time", work_class="non_work"),
+    ]
+    mp.setattr(org.topics, "list_topics_for_source_prefix", lambda conn, prefix, **k: list(rows))
+    res, puts_out = _generate_raw((mp, puts), _body())
+    assert res["statusCode"] == 202
+    artifact = json.loads(puts_out[0]["Body"])
+    excluded_ids = {t["id"] for t in artifact["excludedTopics"]}
+    assert "t-report-row" not in excluded_ids
 
 
 # ----------------------------------------------------------
@@ -219,3 +273,11 @@ def test_session_generate_excluded_topics_are_scoped_to_the_session(day):
     excluded_ids = {t["id"] for t in artifact["excludedTopics"]}
     # this session's own excluded topic, never the 14:05 session's
     assert excluded_ids == {"t-1300-personal"}
+
+
+def test_session_generate_with_email_delivery_is_refused_before_anything_is_enqueued(day):
+    res, puts = _session_generate_raw(
+        day, S1300, _body(deliver="email", recipients=["a@x.nz"]))
+    assert res["statusCode"] == 400
+    assert "download" in json.loads(res["body"])["error"].lower()
+    assert puts == [], "nothing may be enqueued for a template+email combination"

@@ -37,3 +37,17 @@ def test_an_excluded_topic_with_no_usable_time_fails_closed():
 
 def test_no_exclusions_keeps_everything():
     assert tw.drop_spans([_turn(9, 0), _turn(10, 0)], []) == [_turn(9, 0), _turn(10, 0)]
+
+
+def test_a_turn_straddling_the_start_of_a_span_is_dropped():
+    """`drop_spans` used to check only a turn's `at`, so a turn that STARTS before
+    the excluded span but runs INTO it survived whole -- a sliver of hidden speech
+    reached the prompt. It must be dropped on overlap, not on start alone."""
+    spans = tw.excluded_spans(DATE, [{"id": "t1", "time_range": "10:00 - 10:20"}])
+    straddler = {"at": dt.datetime(2026, 9, 10, 9, 58),
+                "until": dt.datetime(2026, 9, 10, 10, 5),
+                "line": "[09:58:00] Ben: the private part starts mid-turn"}
+    before = _turn(9, 50)
+    kept = tw.drop_spans([before, straddler, _turn(10, 30)], spans)
+    assert straddler not in kept
+    assert before in kept

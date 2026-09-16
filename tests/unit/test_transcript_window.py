@@ -4,6 +4,8 @@ with no session at all."""
 import datetime as dt
 import json
 
+import pytest
+
 import transcript_window
 
 
@@ -72,3 +74,41 @@ def test_assemble_returns_timestamped_lines_in_order():
     turns = transcript_window.assemble(s3, "b", picked)
     assert turns and all("at" in t and "line" in t for t in turns)
     assert turns == sorted(turns, key=lambda t: t["at"])
+
+
+# ----------------------------------------------------------
+# CRITICAL 2 — select_keys/assemble ran unbounded before the model call's own
+# budget. `deadline` bounds the read phase itself: an oversized picked list is
+# refused before the first S3 read, and a deadline that has already passed
+# stops the loop mid-way, both with a "window too large" error rather than a
+# silent SIGKILL.
+# ----------------------------------------------------------
+
+def test_a_picked_list_over_the_object_cap_is_refused_before_any_read():
+    keys = [_k("Ben_UCPK2_2026-09-10_%02d-00-00_to60_vad.json" % h)
+           for h in range(transcript_window.MAX_TRANSCRIPT_OBJECTS + 1)]
+    s3 = FakeS3(keys)
+    picked = [(dt.datetime(2026, 9, 10, 0, 0), k) for k in keys]
+    with pytest.raises(transcript_window.WindowTooLarge, match="window too large"):
+        transcript_window.assemble(s3, "b", picked, deadline=999999999999.0)
+
+
+def test_a_deadline_already_passed_stops_the_read_phase():
+    s3 = FakeS3([KEY_0858, KEY_0930])
+    picked = transcript_window.select_keys(
+        s3, "b", "Ben_UCPK2", "2026-09-10",
+        dt.datetime(2026, 9, 10, 9, 0), dt.datetime(2026, 9, 10, 11, 30))
+    with pytest.raises(transcript_window.WindowTooLarge, match="window too large"):
+        transcript_window.assemble(s3, "b", picked, deadline=0.0)
+
+
+def test_no_deadline_means_no_cap_or_time_check():
+    """`deadline=None` (the pre-existing signature) must behave exactly as
+    before -- no caller that never asked for a bound gets a new failure mode."""
+    n = transcript_window.MAX_TRANSCRIPT_OBJECTS + 1
+    keys = [_k("Ben_UCPK2_2026-09-10_%02d-%02d-00_to60_vad.json" % (h % 24, h // 24))
+           for h in range(n)]
+    s3 = FakeS3(keys)
+    picked = [(dt.datetime(2026, 9, 10, 0, 0), k) for k in keys]
+    turns = transcript_window.assemble(s3, "b", picked)
+    assert len(turns) == len(keys)

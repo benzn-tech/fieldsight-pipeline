@@ -84,6 +84,85 @@ def test_an_unplaceable_exclusion_stops_the_report(wired):
     assert "cannot be placed" in written[0]["error"]
 
 
+def test_an_unplaceable_exclusion_outside_the_window_still_stops_the_report(wired):
+    """The window-scoping fix only excuses a topic whose time_range PARSES and
+    lies wholly outside the request's window. One that cannot be placed at all
+    cannot be proven to lie outside it either, so it must still fail closed --
+    window narrowing must never become a way to smuggle past this guard."""
+    _, written = wired
+    art = dict(ARTIFACT, excludedTopics=[{"id": "t9", "time_range": "all afternoon"}])
+    sr.process_request(art)
+    assert written[0]["status"] == "error"
+    assert "cannot be placed" in written[0]["error"]
+
+
+def test_an_excluded_topic_wholly_outside_the_window_does_not_abort_and_clips_nothing(
+        wired, monkeypatch):
+    """A day-scoped excludedTopics list can legitimately name a topic far outside
+    THIS request's narrow window (e.g. a redacted 16:00 topic on a 09:00-11:30
+    request). Its time_range parses fine, it just does not overlap the window, so
+    it must be dropped before the fail-closed check rather than aborting the
+    request -- and it must not clip anything either, since it never applied here.
+
+    The 16:05 turn stands in for the edge case that makes this an observable
+    behaviour, not just a request that happens to succeed either way: a picked
+    recording can straddle the window and still carry turns past it (assemble
+    does not itself clip to the window), so without the window-scoping fix the
+    16:00-16:20 exclusion would still reach `drop_spans` and cut it, even though
+    it has nothing to do with this request's window."""
+    calls, written = wired
+    turns = [{"at": dt.datetime(2026, 9, 10, 9, 5), "until": dt.datetime(2026, 9, 10, 9, 5),
+             "line": "[09:05:00] Ben: roofing"},
+             {"at": dt.datetime(2026, 9, 10, 16, 5), "until": dt.datetime(2026, 9, 10, 16, 5),
+             "line": "[16:05:00] Ben: unrelated afternoon remark"}]
+    monkeypatch.setattr(sr.transcript_window, "assemble", lambda *a, **k: list(turns))
+    art = dict(ARTIFACT, excludedTopics=[{"id": "t9", "time_range": "16:00 - 16:20"}])
+    sr.process_request(art)
+    assert written[0]["status"] == "done"
+    assert "roofing" in calls["prompt"]
+    assert "unrelated afternoon remark" in calls["prompt"]
+
+
+# ----------------------------------------------------------
+# CRITICAL 2 — only the model call was time-bounded; select_keys/assemble ran
+# unbounded before it. A fake Lambda context whose remaining time is nearly
+# exhausted must fail closed with a clear reason and must never reach the model.
+# ----------------------------------------------------------
+
+class _FakeContext:
+    def __init__(self, remaining_ms):
+        self._ms = remaining_ms
+
+    def get_remaining_time_in_millis(self):
+        return self._ms
+
+
+def test_a_nearly_exhausted_context_errors_out_before_calling_the_model(wired):
+    calls, written = wired
+    # 5s left on the invocation, and the reserve for render+write alone is 30s --
+    # there is nothing left for either the read phase or the model call.
+    sr.process_request(dict(ARTIFACT), _FakeContext(5000))
+    assert written[0]["status"] == "error"
+    assert "budget" in written[0]["error"]
+    assert "prompt" not in calls, "the model must never be called with an exhausted budget"
+
+
+def test_a_context_with_ample_time_still_generates(wired):
+    calls, written = wired
+    sr.process_request(dict(ARTIFACT), _FakeContext(120000))
+    assert written[0]["status"] == "done"
+    assert calls["kw"].get("deadline"), "the model call must still carry a bounded deadline"
+
+
+def test_without_a_context_the_fallback_budget_still_bounds_the_model_call(wired):
+    """No context (e.g. a direct unit-test call, or process_request's own default) --
+    falls back to the fixed GENERATION_BUDGET_SECONDS exactly as before."""
+    calls, written = wired
+    sr.process_request(dict(ARTIFACT))
+    assert written[0]["status"] == "done"
+    assert calls["kw"]["deadline"] == sr.GENERATION_BUDGET_SECONDS
+
+
 def test_a_request_without_generate_still_assembles_exactly_as_before(wired, monkeypatch):
     _, written = wired
     seen = {}

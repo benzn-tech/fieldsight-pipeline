@@ -98,7 +98,7 @@ def render_prompt(template, scope, action_items, transcript):
         "- Say only what the recording supports. Where a figure or date was spoken as\n"
         "  provisional, say so alongside it.\n"
         "- Report the work. Do not quote swearing or personal remarks about people.\n"
-        "\n## The recording\n{transcript}\n"
+        "\n## Transcript\n{transcript}\n"
     ).format(folder=scope["folder"], date=scope["date"], frm=scope["from"], to=scope["to"],
              n=scope["recordings"], sections="\n\n".join(sections), leave_out=leave_out,
              style=style, actions=actions, transcript=transcript)

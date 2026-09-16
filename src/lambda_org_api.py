@@ -1509,7 +1509,7 @@ def session_report_generate(conn, caller, session_id, event):
     if err is not None:
         return err
 
-    generate, gen_error = _generation_request(body)
+    generate, gen_error = _generation_request(body, deliver)
     if gen_error:
         return error(gen_error, 400)
 
@@ -1621,13 +1621,20 @@ def _assemble_day_report(conn, caller, date, event, selected=None):
     }, None
 
 
-def _generation_request(body):
+def _generation_request(body, deliver=None):
     """The template a report is written to, validated here so a bad name fails the
     request instead of the worker -- the caller is still on the line at this point.
-    Absent template = today's assembled report (spec 2026-09-15 §5.3)."""
+    Absent template = today's assembled report (spec 2026-09-15 §5.3).
+
+    `deliver` (optional): the worker's generate branch never emails -- it always
+    writes `emailed: false` -- so a request that names a template AND asks for
+    email delivery is refused HERE, at the door, rather than silently producing
+    a document nobody receives."""
     template_id = (body or {}).get("templateId")
     if not template_id:
         return None, None
+    if deliver == "email":
+        return None, "a generated report can only be downloaded for now"
     try:
         version = int((body or {}).get("templateVersion"))
     except (TypeError, ValueError):
@@ -1663,10 +1670,17 @@ def _excluded_topics_for(conn, caller, folder, date, session_id=None):
     deleted = _deleted_prefixes_for_rows(conn, rows, date)
     out = []
     for r in rows:
-        if session_id is not None:
-            sid, _kind = session_scope.session_ref(r.get("source_s3_key"))
-            if sid != session_id:
-                continue
+        # Same first cut `_report_rows_in_scope` makes: a row that is not a
+        # recorded-speech extraction (KIND_EXTRACTION) can never correspond to
+        # anything on the transcript timeline, so it must never reach the
+        # worker's exclusion list -- an unparseable time_range on one of these
+        # would abort a request over a topic that could not have appeared in
+        # the transcript regardless.
+        sid, kind = session_scope.session_ref(r.get("source_s3_key"))
+        if kind != session_scope.KIND_EXTRACTION:
+            continue
+        if session_id is not None and sid != session_id:
+            continue
         if _redacted_or_hidden(r, redacted, deleted):
             out.append({"id": str(r["id"]), "time_range": r.get("time_range")})
     return out
@@ -1718,7 +1732,7 @@ def day_report_generate(conn, caller, date, event):
     if err is not None:
         return err
 
-    generate, gen_error = _generation_request(body)
+    generate, gen_error = _generation_request(body, deliver)
     if gen_error:
         return error(gen_error, 400)
 

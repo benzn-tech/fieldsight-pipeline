@@ -64,6 +64,15 @@ def test_no_placeholder_survives_rendering():
     assert "{" not in head and "}" not in head
 
 
+def test_the_transcript_heading_is_not_a_second_the_recording():
+    """The prompt used to render '## The recording' twice -- once for the scope
+    header, once (wrongly) for the transcript itself. Only the scope header keeps
+    that name; the transcript gets its own heading."""
+    p = report_template.render_prompt(TEMPLATE, SCOPE, [], "[09:00:00] Ben: morning")
+    assert p.count("## The recording") == 1
+    assert "## Transcript\n[09:00:00] Ben: morning" in p
+
+
 def test_excluded_subjects_become_a_leave_out_instruction():
     tpl = dict(TEMPLATE, excluded_subjects=[{"label": "commercial", "covers": "rates, margin"}])
     p = report_template.render_prompt(tpl, SCOPE, [], "x")
