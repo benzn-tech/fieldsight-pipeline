@@ -57,6 +57,11 @@ def _quiet_tick(monkeypatch, *, swept=(), reconciled=(), groups=(), live=0):
     monkeypatch.setattr(fc, "sweep", lambda conn: list(swept))
     monkeypatch.setattr(fc, "reconcile", lambda conn, r: list(reconciled))
     monkeypatch.setattr(fc, "_sweep_groups_contained", lambda conn: list(groups))
+    # The email backstop reads `finalizing` rows; this file drives the handler
+    # with a bare connection double, which is the right pressure on every OTHER
+    # query it makes. Its own behaviour is nailed in
+    # test_the_email_waits_for_the_record.py.
+    monkeypatch.setattr(fc, "backstop", lambda conn, **kw: [])
     monkeypatch.setattr(fc.meeting_session, "count_live", lambda conn: live)
 
 
@@ -85,6 +90,7 @@ def test_gate_off_does_not_run_the_liveness_query(monkeypatch, wired):
     monkeypatch.setattr(fc, "sweep", lambda conn: [])
     monkeypatch.setattr(fc, "reconcile", lambda conn, r: [])
     monkeypatch.setattr(fc, "_sweep_groups_contained", lambda conn: [])
+    monkeypatch.setattr(fc, "backstop", lambda conn, **kw: [])
 
     def _explode(conn):
         raise AssertionError("count_live must not run while the gate is off")

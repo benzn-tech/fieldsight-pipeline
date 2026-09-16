@@ -18,7 +18,7 @@ _COLS = (
     "session_id, company_id, user_id, site_id, kind, status, version, "
     "opened_at, last_segment_at, closed_at, close_intent, rolling_summary, "
     "rolling_summary_version, segment_count, word_count, created_at, updated_at, "
-    "group_id, group_ended_at"
+    "group_id, group_ended_at, finalizing_at"
 )
 
 
@@ -241,8 +241,13 @@ def claim_finalize(conn, session_id, expected_version) -> dict | None:
     grace timer was scheduled against. Returns the row when claimed; returns None
     when a resume bumped the version (mis-touch) or the session already moved on —
     the scheduled finalize then simply no-ops. This is the idempotency guard."""
+    # `finalizing_at` is the anchor the confirmation email is waited from (0057).
+    # Deliberately its own column rather than `updated_at`: that happens to work
+    # today only because nothing else writes a `finalizing` row, and the next
+    # writer of it would silently move every deadline.
     return conn.cursor(row_factory=dict_row).execute(
-        f"UPDATE meeting_session SET status = 'finalizing', updated_at = now() "
+        f"UPDATE meeting_session SET status = 'finalizing', updated_at = now(), "
+        f"finalizing_at = now() "
         f"WHERE session_id = %s AND version = %s AND status = 'pending_close' "
         f"RETURNING {_COLS}",
         (session_id, expected_version),
@@ -287,9 +292,15 @@ def list_idle_open(conn, idle_seconds) -> list[dict]:
 def list_finalizing(conn) -> list[dict]:
     """Sessions the sweep has claimed (status='finalizing'). The reconcile pass moves
     each to sent/failed once the non-VPC send worker records its outcome (that worker
-    can't touch Aurora itself — CLAUDE.md BUG-36)."""
+    can't touch Aurora itself — CLAUDE.md BUG-36).
+
+    `finalizing_at` rides along for the email backstop, which needs to know how
+    long each has been waiting for its final extraction. Returned here rather
+    than queried separately because the backstop runs on the same tick, over the
+    same rows: a second query would be a second answer to one question."""
     return conn.cursor(row_factory=dict_row).execute(
-        "SELECT session_id, version FROM meeting_session WHERE status = 'finalizing'",
+        "SELECT session_id, version, user_id, site_id, opened_at, closed_at, "
+        "finalizing_at FROM meeting_session WHERE status = 'finalizing'",
     ).fetchall()
 
 

@@ -178,7 +178,7 @@ def test_finalize_says_when_a_session_has_no_recording_folder(monkeypatch, caplo
         fc.finalize_claim("CONN", "s1", 1,
                           resolve_context=lambda conn, row: {"recipient": "", "folder": None,
                                                              "date": "2026-09-15"},
-                          read_rolling=lambda *a: {}, enqueue=lambda a: None,
+                          read_rolling=lambda *a: {},
                           request_extraction=lambda *a: asked.append(a))
     assert asked == []                                   # unchanged: nothing to ask for
     assert any("no recording folder" in r.getMessage() for r in caplog.records)
