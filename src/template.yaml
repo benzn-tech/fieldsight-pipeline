@@ -1777,9 +1777,11 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/users/*/pictures/*
                 # The deletion mirror. `_session_was_deleted` reads it so a session
                 # removed between the enqueue and this run is neither rendered nor
-                # mailed. The read is LENIENT, so a missing grant does not fail --
-                # it answers "nothing was deleted" behind one WARNING line, which
-                # is a guard shipping dead. implicitDeny on both stages before
+                # mailed. Owner decision (2026-09-16): the read now FAILS CLOSED --
+                # a missing grant is no longer a silent dead guard behind one
+                # WARNING line, it raises, and `process_request` records the
+                # request as `status: "error"`, so every report for that day fails
+                # until the grant is restored. implicitDeny on both stages before
                 # this line existed.
                 - !Sub arn:aws:s3:::${IngestBucketName}/redactions/*
                 # The transcript objects a `generate` request reads to build its
@@ -1796,8 +1798,8 @@ Resources:
               # is not enough for the mirror: without ListBucket on the prefix S3
               # answers AccessDenied rather than NoSuchKey for a key that was
               # never written -- and a day with NO deletions has no mirror, which
-              # is the common case. The lenient reader would then log an exception
-              # on every report generated, forever (#627's family).
+              # is the common case. Without this, the now-strict reader would
+              # raise and fail every report request, forever (#627's family).
               # transcripts/* is listed here too: select_keys() lists the day's
               # transcript prefix before reading any key under it.
               Action: s3:ListBucket

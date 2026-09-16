@@ -55,12 +55,13 @@ MISSING_KEY_IS_NORMAL = [
     # is the common case, not the edge one, so the missing-key branch here is the branch
     # that runs almost every time.
     #
-    # These readers are LENIENT by design: an unreadable mirror answers "nothing was
-    # deleted" behind one WARNING rather than failing the report. That makes a missing grant
-    # WORSE here than in the strict readers above, not better -- it does not 500, it ships a
-    # guard that never guards, and the only trace is a log line nobody is reading. #648
-    # found exactly that on SessionReportFunction: implicitDeny on both stages, mailing a
-    # session the customer had removed, with the check in place and inert.
+    # Ask, ReportGenerator and SessionFinalize are LENIENT by design: an unreadable
+    # mirror answers "nothing was deleted" behind one WARNING rather than failing the
+    # report. That makes a missing grant WORSE here than in the strict readers above,
+    # not better -- it does not 500, it ships a guard that never guards, and the only
+    # trace is a log line nobody is reading. #648 found exactly that: implicitDeny on
+    # both stages, mailing a session the customer had removed, with the check in place
+    # and inert (at the time, on SessionReportFunction too -- see below).
     #
     # Swept against the live prod roles on 2026-08-31 rather than read off this file.
     ("AskAgentFunction", "redactions/*",
@@ -69,8 +70,14 @@ MISSING_KEY_IS_NORMAL = [
      "the nightly rebuild must not re-ingest a removed session"),
     ("SessionFinalizeFunction", "redactions/*",
      "_session_was_deleted gates the confirmation email"),
+    # SessionReportFunction is the exception to the paragraph above: owner decision
+    # (2026-09-16) made its reader FAIL CLOSED. A missing grant here no longer ships
+    # an inert guard -- `_session_was_deleted` raises, and every report request for
+    # that day is recorded as `status: "error"` instead of being rendered or mailed.
     ("SessionReportFunction", "redactions/*",
-     "_session_was_deleted gates rendering and mailing the on-demand report"),
+     "_session_was_deleted gates rendering and mailing the on-demand report -- "
+     "STRICT since 2026-09-16, a missing grant fails the request rather than "
+     "answering 'nothing was deleted'"),
 ]
 
 
