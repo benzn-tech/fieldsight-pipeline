@@ -674,8 +674,12 @@ def generate_prose_document(title, subtitle, sections, actions):
         p = doc.add_paragraph(subtitle)
         p.runs[0].italic = True
 
+    has_actions_section = False
     for section in sections or []:
-        doc.add_heading(section.get("title") or "", level=1)
+        section_title = section.get("title") or ""
+        if section_title.strip().lower() == "actions":
+            has_actions_section = True
+        doc.add_heading(section_title, level=1)
         for para in section.get("paragraphs") or []:
             text = (para or "").strip()
             if not text:
@@ -686,7 +690,11 @@ def generate_prose_document(title, subtitle, sections, actions):
                 doc.add_paragraph(text)
 
     if actions:
-        doc.add_heading("Actions", level=1)
+        # A prose section titled "Actions" already wrote this heading above; the
+        # table renders under it rather than duplicating the heading (a generated
+        # document from the built-in template asks the model for that section).
+        if not has_actions_section:
+            doc.add_heading("Actions", level=1)
         table = doc.add_table(rows=1, cols=3)
         table.style = "Table Grid"
         for cell, head in zip(table.rows[0].cells, ("Action", "Owner", "When")):
