@@ -203,7 +203,10 @@ def _session_was_deleted(artifact):
 
     `lambda_session_finalize._session_was_deleted` is a sibling that still has
     the old lenient posture -- this decision was scoped to the report worker,
-    not to that sibling.
+    not to that sibling. `lambda_org_api._session_was_removed` was already
+    strict, backing read endpoints where a failed check costs one reader one
+    refresh; this function now matches that posture for the same reason a
+    read endpoint does, even though the two are still separate functions.
 
     Both spellings are compared: the mirror carries whatever `sessionBase` the
     delete endpoint had, and this artifact's `sessionId` is bare hex.
