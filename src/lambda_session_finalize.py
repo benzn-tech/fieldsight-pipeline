@@ -32,6 +32,21 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "")
 SESSION_BRIEF = os.environ.get("SESSION_BRIEF", "false").lower() == "true"
 BRIEF_PREFIX = "session_brief/"
 FINALIZE_RESULTS_PREFIX = "session_finalize_results/"
+#: Request kinds that arrive WITH the rows the email should show, so this worker
+#: renders them as handed instead of summarising the session again.
+#:
+#:   final    the session's final extraction, enqueued by item-writer once those
+#:            rows are durable in Aurora -- the same account of the meeting the
+#:            website and the reports show
+#:   rolling  the backstop's rows, for a session whose final extraction never
+#:            arrived
+#:   updated  the ONE merged summary every member of a group must receive
+#:
+#: A request with NO kind is the path this function has always taken: re-derive a
+#: complete summary from the transcripts. That is a SECOND summariser over one
+#: meeting -- the reason the same commitment could be worded one way in the email
+#: and another way on the site -- and it is what the kinds above retire.
+RENDERED_KINDS = ("final", "rolling", "updated")
 
 
 def _clean_todos(open_todos):
@@ -363,13 +378,15 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
     if (already_sent if already_sent is not None else _already_sent)(result_id):
         logger.info("finalize: %s was already sent -- not sending again", result_id)
         return {"status": "skipped", "reason": "already sent", "sessionId": session_id}
-    # An `updated` request already carries the ONE merged summary every member
-    # must receive. Re-deriving would summarise this member's own SOLO
-    # transcripts (_complete_summary re-gathers `sid{sessionId}`), so the N
-    # members would each get a summary of what THEY heard under a subject saying
-    # the meeting was merged -- N different bodies, N LLM calls, and the one
-    # thing the merge promised quietly not delivered.
-    if not is_updated:
+    # A request of a RENDERED kind already carries the rows to show. For
+    # `updated` that has always been load-bearing: re-deriving would summarise
+    # this member's own SOLO transcripts (_complete_summary re-gathers
+    # `sid{sessionId}`), so the N members would each get a summary of what THEY
+    # heard under a subject saying the meeting was merged -- N different bodies,
+    # N LLM calls, and the one thing the merge promised quietly not delivered.
+    # `final` and `rolling` join it for the same reason, one meeting wide: the
+    # rows in the email should be the rows in the record.
+    if artifact.get("kind") not in RENDERED_KINDS:
         fresh = (complete_summary if complete_summary is not None else _complete_summary)(artifact)
         if fresh:
             summary, todos = fresh.get("summary", summary), fresh.get("open_todos", todos)
