@@ -389,6 +389,41 @@ Designed now, not built until the schema-constraint testing has a result.
   becomes real; templates held in `localStorage` are uploaded once, per browser,
   with a notice.
 
+### 6.1 The built-in default — `personal-meeting` v3 (owner, 2026-09-16)
+
+Committed beside this spec as `templates/personal-meeting.v3.json`, with the
+record it produced (`sample-personal-meeting-v3-2026-09-10-0900-1130.md`) and its
+fingerprint. Owner reviewed v1 → v2 → v3 over the same window (Ben_UCPK2,
+2026-09-10 09:00–11:30, 70 of 229 recordings, one call each) and adopted v3.
+
+- **A template is a section plan, not a format.** Each section carries a `title`
+  and a `purpose` sentence, and the prompt says outright that the purpose is "a
+  description of purpose, not a format and not a list of fields". This is what
+  keeps the prose readable; it is the difference the owner named between the
+  daily report they liked and the schema-constrained one they did not.
+- **New key `style`**: a list of house rules carried with the template, rendered
+  into the prompt under "House style". v3 uses: prose sections under ~350 words;
+  one sentence per item; **the action list is the exception and is complete
+  however long it gets**; never say the same thing twice; keep every spoken
+  figure, date and company name.
+- **Measured cost of brevity.** v2 (a flat ~500-word cap, no exception for
+  actions) came out at 266 words but dropped the commercial position, most of the
+  Sitewise detail and the CCC risk, and listed 4 actions with one duplicated.
+  v3 came out at 544 words with 21 actions and kept them. **A single word cap
+  applied to everything loses content silently; cap the prose, not the list.**
+- **`actions` section**: one line per action, `**Owner** - what - *when*`,
+  `**Me**` for the recorder, `*no date*` where no timing was spoken, never an
+  invented owner or date. On the 09:00–11:30 sample, 11 of 21 were `*no date*`
+  because none was spoken — that is the recording, not a gap in extraction.
+- **Where the actions come from, in the product**: not re-derived by the model
+  from the transcript, but the already-extracted action items, which carry owner
+  and due fields. The model words them; it does not decide them. This keeps a
+  report and the to-do page from stating two different things.
+- The daily report gets the same mechanism with a different template (its own
+  section list: overview, health & safety, design, programme, commercial and
+  procurement, quality, resourcing and next steps), so changing its shape is a
+  template edit rather than a code change.
+
 ## 7. What could go wrong
 
 | Risk | Mitigation |
@@ -403,6 +438,7 @@ Designed now, not built until the schema-constraint testing has a result.
 | Template placeholder copied into a customer report | post-render assertion that no `{`/`<` placeholder remains |
 | Photo budget (4 per topic, 12 MB) runs out across a day | return `photosDropped` and state it in the document |
 | Excluded-subject text still appears | review by sentence, not keyword; add the §4.2 exclusion case as a regression fixture |
+| A house-style word cap silently drops content | measured in §6.1: one cap over everything cost the commercial position and 17 of 21 actions; cap prose only, keep the action list exempt, and diff a tightened template against the previous version's output before adopting it |
 
 ## 8. Out of scope
 
