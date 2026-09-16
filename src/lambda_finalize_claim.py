@@ -47,6 +47,17 @@ BATCH_MAX_CHUNKS = int(os.environ.get("BATCH_MAX_CHUNKS", "4"))
 BATCH_SEAL_DEADLINE_SEC = int(os.environ.get("BATCH_SEAL_DEADLINE_SEC", "150"))
 TRANSCRIPT_TABLE = os.environ.get("TRANSCRIPT_TABLE", "fieldsight-transcripts")
 FINALIZE_REQUESTS_PREFIX = "session_finalize_requests/"
+# How long a claimed session waits for its FINAL extraction before it is emailed
+# from the rolling summary instead. The email should show the record -- the rows
+# item-writer commits to Aurora -- so this sweep no longer enqueues at claim
+# time; item-writer does, once those rows are durable. This is the promise that
+# the recorder still hears back when that never happens: no turns, no API key, a
+# raise that exhausted its S3 retries, a folder-less login.
+#
+# 300, not 240. The measured worst case from stop to the last extraction write
+# is ~250 s (prod, S3 object versions), and a backstop set at the measured worst
+# case races the thing it is backing up.
+FINALIZE_EMAIL_WAIT_SEC = int(os.environ.get("FINALIZE_EMAIL_WAIT_SEC", "300"))
 # Asks the (non-VPC) extraction lambda for this session's FINAL, thinking-mode
 # pass. Same artifact-on-S3 channel as FINALIZE_REQUESTS_PREFIX and for the same
 # reason: this sweep is in-VPC and cannot invoke another lambda (no NAT, no
@@ -100,15 +111,22 @@ SAFETY_SWEEP_MINUTE = int(os.environ.get("SAFETY_SWEEP_MINUTE", "7"))
 
 
 def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_rolling,
-                   enqueue, request_extraction=None):
-    """CAS-claim the session at expected_version, then gather + enqueue a finalize
-    request. Returns a small status dict:
+                   request_extraction=None):
+    """CAS-claim the session at expected_version and ask for its final extraction.
+    Returns a small status dict:
       noop         — claim failed (a resume bumped version, or it already moved on)
       no_recipient — claimed but the recorder has no email (session marked failed)
-      enqueued     — request written for the non-VPC send worker
+      waiting      — claimed; the confirmation email waits for the final extraction
+
+    THE EMAIL IS NO LONGER ENQUEUED HERE. It used to be, in the same breath as
+    requesting the extraction -- so it went out before that extraction existed
+    (prod: a 28-minute session emailed at +44 s, its final landing at +253 s) and
+    its rows came from a second summariser run only for the email. item-writer
+    enqueues it now, once the rows are durable in Aurora; `backstop` below covers
+    the sessions whose final never arrives.
+
     Collaborators are injected: resolve_context(conn, row) -> {recipient, folder,
-    date, siteName}; read_rolling(folder, date, session_id) -> {summary, open_todos};
-    enqueue(artifact)."""
+    date, siteName}; request_extraction(session_id, folder, date)."""
     row = meeting_session.claim_finalize(conn, session_id, expected_version)
     if row is None:
         return {"status": "noop", "sessionId": session_id}
@@ -143,20 +161,63 @@ def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_
                        "marking failed, no email sent", session_id, ctx.get("folder"))
         meeting_session.mark_failed(conn, session_id)
         return {"status": "no_recipient", "sessionId": session_id}
-    rolling = read_rolling(ctx.get("folder"), ctx.get("date"), session_id) or {}
-    artifact = {
-        "sessionId": session_id,
-        "version": expected_version,
-        "recipient": recipient,
-        "folder": ctx.get("folder"),
-        "date": ctx.get("date"),
-        "timeRange": ctx.get("timeRange"),
-        "siteName": ctx.get("siteName"),
-        "summary": rolling.get("summary", ""),
-        "openTodos": rolling.get("open_todos", []),
-    }
-    enqueue(artifact)
-    return {"status": "enqueued", "sessionId": session_id, "recipient": recipient}
+    return {"status": "waiting", "sessionId": session_id, "recipient": recipient}
+
+
+def backstop(conn, *, list_waiting, resolve_context, read_rolling, enqueue, now=None):
+    """Email the claimed sessions whose final extraction never arrived.
+
+    Anchored on `finalizing_at` -- when the sweep CLAIMED the session -- and not
+    on `closed_at`. An idle-inferred close stores the session's LAST ACTIVITY as
+    `closed_at` (infer_idle_closes marks pending_close at last_activity), which
+    is already SESSION_GAP_MINUTES old before anything claims it, so a deadline
+    measured from the close would fire on the very next tick, ahead of any
+    extraction -- for exactly the offline and crashed recordings this protects.
+
+    A row with no anchor (claimed before 0057 shipped) is left to reconcile
+    rather than given an invented deadline.
+
+    The enqueue is CONDITIONAL, so a session whose final lands in the same minute
+    keeps item-writer's email and this one writes nothing: two producers, one
+    key, first writer wins.
+
+    Returns the session ids this pass mailed."""
+    from datetime import datetime, timezone
+    now = now or datetime.now(timezone.utc)
+    mailed = []
+    for row in list_waiting(conn):
+        anchor = row.get("finalizing_at")
+        if anchor is None:
+            continue
+        if (now - anchor).total_seconds() < FINALIZE_EMAIL_WAIT_SEC:
+            continue
+        session_id = row["session_id"]
+        ctx = resolve_context(conn, row) or {}
+        recipient = (ctx.get("recipient") or "").strip()
+        if not recipient:
+            continue          # already marked failed and named at claim time
+        rolling = read_rolling(ctx.get("folder"), ctx.get("date"), session_id) or {}
+        # `rolling`, not `updated`: the subject rewrite and the `-updated` result
+        # key belong to the merge alone, and a result on that key is invisible to
+        # reconcile -- the session would sit in `finalizing` for good.
+        artifact = {
+            "kind": "rolling",
+            "sessionId": session_id,
+            "version": row.get("version"),
+            "recipient": recipient,
+            "folder": ctx.get("folder"),
+            "date": ctx.get("date"),
+            "timeRange": ctx.get("timeRange"),
+            "siteName": ctx.get("siteName"),
+            "summary": rolling.get("summary", ""),
+            "openTodos": rolling.get("open_todos", []),
+        }
+        if enqueue(artifact):
+            logger.info("finalize: %s waited %.0fs for its final extraction — "
+                        "emailing from the rolling summary",
+                        session_id, (now - anchor).total_seconds())
+            mailed.append(session_id)
+    return mailed
 
 
 # ----- real (Aurora + S3) collaborators the handler wires -----------------
@@ -227,12 +288,30 @@ def _read_rolling(folder, date, session_id):
 
 
 def _enqueue(artifact):
-    """Write the finalize request for the non-VPC send worker to pick up."""
+    """Write the finalize request for the non-VPC send worker to pick up.
+
+    Conditional: item-writer writes this same key when the session's final
+    extraction lands, and S3 notifies on every put INCLUDING an overwrite, so the
+    loser must not write at all or the recorder gets two emails. Checking first
+    is not the fix -- this role cannot read that prefix, and AccessDenied reads
+    as absent (403 != 404) -- so the put itself decides. Returns True when this
+    caller wrote it."""
     import boto3
+    from botocore.exceptions import ClientError
     key = f"{FINALIZE_REQUESTS_PREFIX}{artifact['sessionId']}.json"
-    boto3.client("s3").put_object(
-        Bucket=S3_BUCKET, Key=key,
-        Body=json.dumps(artifact, ensure_ascii=False), ContentType="application/json")
+    try:
+        boto3.client("s3").put_object(
+            Bucket=S3_BUCKET, Key=key,
+            Body=json.dumps(artifact, ensure_ascii=False),
+            ContentType="application/json", IfNoneMatch="*")
+        return True
+    except ClientError as e:
+        status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        code = e.response.get("Error", {}).get("Code", "")
+        if status == 412 or code in ("PreconditionFailed", "412"):
+            logger.info("finalize: %s already enqueued — not enqueueing again", key)
+            return False
+        raise
 
 
 def _request_extraction(session_id, folder, date):
@@ -685,7 +764,7 @@ def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None):
         _seal_tail_batches(row["session_id"])
         results.append(finalize_claim(
             conn, row["session_id"], row["version"],
-            resolve_context=_resolve_context, read_rolling=_read_rolling, enqueue=_enqueue,
+            resolve_context=_resolve_context, read_rolling=_read_rolling,
             request_extraction=_request_extraction))
     return results
 
@@ -775,6 +854,13 @@ def lambda_handler(event, context):
     with get_connection() as conn:
         swept = sweep(conn)
         reconciled = reconcile(conn, _read_result)
+        # AFTER reconcile: a session the worker has already settled this tick is
+        # no longer `finalizing`, so the backstop never looks at it.
+        mailed = backstop(conn,
+                          list_waiting=meeting_session.list_finalizing,
+                          resolve_context=_resolve_context,
+                          read_rolling=_read_rolling,
+                          enqueue=_enqueue)
         # AFTER reconcile, deliberately. reconcile is what moves a claimed
         # session to `sent`, and `sent` is what makes its group settled — so
         # running the group scan first would always be one tick behind.
