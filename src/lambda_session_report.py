@@ -11,16 +11,22 @@ polls for at the artifact's `resultKey`.
 
 Design: docs/superpowers/specs/2026-07-28-session-report-review-export-design.md §6.
 """
+import datetime
 import json
 import logging
 import os
+import time
 from io import BytesIO
 from urllib.parse import unquote_plus
 
 import boto3
 
-from lambda_meeting_minutes import generate_word_document
+import lambda_meeting_minutes
+import llm_utils
+import report_template
+import transcript_window
 from email_sender import get_sender
+from lambda_meeting_minutes import generate_word_document
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -228,6 +234,99 @@ def _session_was_deleted(artifact):
     return False
 
 
+# The function has Timeout: 300 and llm_utils retries up to four times at
+# LLM_HTTP_TIMEOUT each, so an unbounded ladder outlives the function and writes no
+# result at all -- the poller then spins forever. Bound it well inside the timeout.
+GENERATION_BUDGET_SECONDS = float(os.environ.get("GENERATION_BUDGET_SECONDS", "210"))
+
+
+def _clock(date, hhmm):
+    """A wall-clock time on the report's own date. No timezone conversion happens
+    anywhere on this path (spec 2026-09-15 global constraints)."""
+    return datetime.datetime.strptime("%s %s" % (date, hhmm), "%Y-%m-%d %H:%M")
+
+
+def _action_items_for_prompt(content):
+    """The actions the model is given: extraction's, not its own reading of the
+    transcript. Owner and date are already recorded against them."""
+    out = []
+    for topic in (content.get("topics") or []):
+        for a in (topic.get("action_items") or []):
+            out.append({"action": a.get("action") or a.get("text"),
+                        "owner": a.get("owner") or a.get("responsible"),
+                        "deadline": a.get("deadline")})
+    return out
+
+
+def _prose_sections(text):
+    """Split the model's markdown back into {title, paragraphs}. Anything before the
+    first heading is kept under an empty title rather than dropped."""
+    sections, current = [], {"title": "", "paragraphs": []}
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        if line.startswith("#"):
+            if current["title"] or current["paragraphs"]:
+                sections.append(current)
+            current = {"title": line.lstrip("#").strip(), "paragraphs": []}
+        elif line.strip():
+            current["paragraphs"].append(line.strip())
+    if current["title"] or current["paragraphs"]:
+        sections.append(current)
+    return [s for s in sections if s["title"] or s["paragraphs"]]
+
+
+def _put_document(artifact, buf):
+    """Puts a generated docx at the same address a topics-assembled one would use,
+    and returns its key -- mirrors the inline put in `process_request` below."""
+    doc_key = _doc_key(artifact)
+    s3().put_object(Bucket=S3_BUCKET, Key=doc_key,
+                    Body=buf.getvalue(), ContentType=DOCX_CONTENT_TYPE)
+    return doc_key
+
+
+def _generate_document(artifact):
+    """Returns (buffer, meta). Raises on anything that must not produce a document."""
+    gen = artifact["generate"]
+    template = report_template.load_template(gen["templateId"], int(gen["templateVersion"]))
+    content = artifact.get("content") or {}
+    date = artifact.get("date") or content.get("date")
+    window = artifact.get("window") or {}
+    win_from = _clock(date, window.get("from") or "00:00")
+    win_to = _clock(date, window.get("to") or "23:59")
+
+    spans = transcript_window.excluded_spans(date, artifact.get("excludedTopics") or [])
+    client = s3()
+    picked = transcript_window.select_keys(client, S3_BUCKET, artifact["folder"], date,
+                                           win_from, win_to)
+    turns = transcript_window.drop_spans(
+        transcript_window.assemble(client, S3_BUCKET, picked), spans)
+    if not turns:
+        raise RuntimeError("no recorded speech in this window after exclusions")
+
+    prompt = report_template.render_prompt(
+        template,
+        {"folder": artifact["folder"], "date": date,
+         "from": window.get("from") or "00:00", "to": window.get("to") or "23:59",
+         "recordings": len(picked)},
+        _action_items_for_prompt(content),
+        "\n".join(t["line"] for t in turns))
+
+    text, err = llm_utils.call_llm(prompt, max_tokens=8000,
+                                   deadline=time.time() + GENERATION_BUDGET_SECONDS)
+    if err or not (text or "").strip():
+        raise RuntimeError(err or "empty answer from model")
+
+    buf = lambda_meeting_minutes.generate_prose_document(
+        artifact.get("title") or template.get("name") or "Report",
+        "%s  %s - %s" % (date, window.get("from") or "00:00", window.get("to") or "23:59"),
+        _prose_sections(text),
+        _action_items_for_prompt(content))
+    meta = {"generated": True, "templateId": template["template_id"],
+            "templateVersion": template["version"], "model": llm_utils.active_model(),
+            "promptChars": len(prompt)}
+    return buf, meta
+
+
 def process_request(artifact):
     """Render one enqueued request → Word doc (+ optional email) → result JSON."""
     result_key = artifact["resultKey"]
@@ -257,6 +356,22 @@ def process_request(artifact):
         logger.info("report: %s was deleted -- not rendering, not sending", request_id)
         _write_result(result_key, {"status": "skipped", "requestId": request_id,
                                    "reason": "recording deleted", **scope_fields})
+        return
+
+    if artifact.get("generate"):
+        try:
+            buf, meta = _generate_document(artifact)
+        except Exception as exc:                      # noqa: BLE001 -- recorded, not retried
+            logger.exception("report: generation failed for %s", artifact.get("requestId"))
+            _write_result(artifact["resultKey"],
+                          dict({"status": "error", "requestId": artifact.get("requestId"),
+                                "error": str(exc)}, **_scope_result_fields(artifact)))
+            return
+        doc_key = _put_document(artifact, buf)
+        _write_result(artifact["resultKey"],
+                      dict({"status": "done", "requestId": artifact.get("requestId"),
+                            "docKey": doc_key, "emailed": False}, **meta,
+                           **_scope_result_fields(artifact)))
         return
 
     try:
