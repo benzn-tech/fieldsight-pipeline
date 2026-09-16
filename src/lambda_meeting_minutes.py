@@ -781,11 +781,16 @@ def generate_word_document(minutes_data, title):
                 doc.add_heading('Decisions', level=3)
                 for d in decisions:
                     if isinstance(d, str):
-                        doc.add_paragraph(d, style='List Bullet')
+                        doc.add_paragraph(_sanitize_speaker_label(d), style='List Bullet')
                     elif isinstance(d, dict):
-                        text = d.get('decision', '')
-                        rationale = d.get('rationale', '')
-                        decided_by = d.get('decided_by', '')
+                        text = _sanitize_speaker_label(d.get('decision', ''))
+                        rationale = _sanitize_speaker_label(d.get('rationale', ''))
+                        # A label-only `decided_by` collapses to "" like a
+                        # genuinely missing one already does: the `if
+                        # decided_by:` below already omits the "(by ...)"
+                        # clause for an empty value (same pattern as
+                        # who_raised/who_mentioned above).
+                        decided_by = _sanitize_speaker_label(d.get('decided_by', ''))
                         line = text
                         if rationale:
                             line += f" — Rationale: {rationale}"
@@ -949,10 +954,15 @@ def convert_to_daily_report_format(minutes, meeting_config, transcripts):
         flat_decisions = []
         for d in raw_decisions:
             if isinstance(d, str):
-                flat_decisions.append(d)
+                flat_decisions.append(_sanitize_speaker_label(d))
             elif isinstance(d, dict):
-                text = d.get('decision', '')
-                by = d.get('decided_by', '')
+                text = _sanitize_speaker_label(d.get('decision', ''))
+                # Baked into a plain string below, before report_sections.build()
+                # runs on this compat report -- once flattened, no downstream
+                # filter can reach it, so this is the only chance. A label-only
+                # `decided_by` collapses to "" like a missing one already does:
+                # the `if by:` below already omits the "(by ...)" clause.
+                by = _sanitize_speaker_label(d.get('decided_by', ''))
                 if by:
                     text += f" (by {by})"
                 flat_decisions.append(text)

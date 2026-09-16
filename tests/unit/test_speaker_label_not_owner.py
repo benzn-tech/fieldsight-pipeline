@@ -163,3 +163,123 @@ def test_action_items_for_prompt_keeps_real_owner():
         {"action": "Fix pipe", "owner": "Daniel", "deadline": "Mon"}]}]}
     out = _action_items_for_prompt(content)
     assert out[0]["owner"] == "Daniel"
+
+
+# ---------------------------------------------------------------------------
+# 4. generate_word_document's Key Decisions block -- sits a few lines above
+#    Action Items in the same function, missed by the original fix.
+# ---------------------------------------------------------------------------
+
+def test_assembled_minutes_decided_by_label_is_omitted_like_a_missing_one():
+    """The existing representation of a missing `decided_by` is to omit the
+    "(by ...)" clause entirely (`if decided_by:`). A label must collapse to
+    that same omission, not a new string."""
+    topic = {"topic_title": "Unit 11 plumbing", "category": "general",
+              "summary": "Discussed pipe leak.",
+              "key_decisions": [{"decision": "Replace the pipe", "decided_by": "spk_1"}]}
+    xml = _text(generate_word_document(_minutes([topic]), "Session report"))
+    assert "spk_1" not in xml.lower()
+    assert "by spk_1" not in xml.lower()
+    assert "Replace the pipe" in xml
+
+
+def test_assembled_minutes_real_decided_by_is_kept():
+    topic = {"topic_title": "Unit 11 plumbing", "category": "general",
+              "summary": "Discussed pipe leak.",
+              "key_decisions": [{"decision": "Replace the pipe", "decided_by": "Daniel"}]}
+    xml = _text(generate_word_document(_minutes([topic]), "Session report"))
+    assert "(by daniel)" in xml.lower()
+
+
+def test_assembled_minutes_decision_text_and_rationale_scrub_embedded_labels():
+    topic = {"topic_title": "Unit 11 plumbing", "category": "general",
+              "summary": "Discussed pipe leak.",
+              "key_decisions": [{
+                  "decision": "Ask spk_1 to replace the pipe",
+                  "rationale": "Confirmed with Chris Fellows, spk_1, Nick",
+                  "decided_by": "Daniel"}]}
+    xml = _text(generate_word_document(_minutes([topic]), "Session report"))
+    assert "spk_1" not in xml.lower()
+    assert "Ask someone to replace the pipe" in xml
+    assert "Confirmed with Chris Fellows, someone, Nick" in xml
+
+
+def test_assembled_minutes_bare_string_decision_scrubs_an_embedded_label():
+    topic = {"topic_title": "Unit 11 plumbing", "category": "general",
+              "summary": "Discussed pipe leak.",
+              "key_decisions": ["Ask spk_1 to replace the pipe"]}
+    xml = _text(generate_word_document(_minutes([topic]), "Session report"))
+    assert "spk_1" not in xml.lower()
+    assert "Ask someone to replace the pipe" in xml
+
+
+# ---------------------------------------------------------------------------
+# 5. convert_to_daily_report_format's decision flattening -- bakes
+#    decided_by into a string before report_sections.build() runs on this
+#    same compat report, so no downstream filter can reach it.
+# ---------------------------------------------------------------------------
+
+def _minutes_input(**kw):
+    base = {
+        "meeting_date": "2026-08-27",
+        "meeting_title": "Site meeting",
+        "attendees": ["Ben"],
+        "executive_summary": "A meeting happened.",
+        "topics": [],
+        "_report_metadata": {"version": "v1.1"},
+    }
+    base.update(kw)
+    return base
+
+
+def _convert(minutes):
+    report, _user = mm.convert_to_daily_report_format(
+        minutes, {"date": "2026-08-27", "user": "Ben_UCPK2"}, [])
+    return report
+
+
+def test_compat_decision_flattening_omits_a_label_only_decided_by():
+    topic = {"topic_id": 0, "time_range": "09:00", "topic_title": "Plumbing",
+              "category": "general", "summary": "Discussed pipe leak.",
+              "participants": ["Ben"],
+              "key_decisions": [{"decision": "Replace the pipe", "decided_by": "spk_1"}],
+              "action_items": [], "open_questions": []}
+    report = _convert(_minutes_input(topics=[topic]))
+    flat = report["topics"][0]["key_decisions"]
+    assert flat == ["Replace the pipe"]
+
+
+def test_compat_decision_flattening_keeps_a_real_decided_by():
+    topic = {"topic_id": 0, "time_range": "09:00", "topic_title": "Plumbing",
+              "category": "general", "summary": "Discussed pipe leak.",
+              "participants": ["Ben"],
+              "key_decisions": [{"decision": "Replace the pipe", "decided_by": "Daniel"}],
+              "action_items": [], "open_questions": []}
+    report = _convert(_minutes_input(topics=[topic]))
+    assert report["topics"][0]["key_decisions"] == ["Replace the pipe (by Daniel)"]
+
+
+def test_compat_decision_flattening_scrubs_an_embedded_label_in_decision_text():
+    topic = {"topic_id": 0, "time_range": "09:00", "topic_title": "Plumbing",
+              "category": "general", "summary": "Discussed pipe leak.",
+              "participants": ["Ben"],
+              "key_decisions": ["Ask spk_1 to replace the pipe"],
+              "action_items": [], "open_questions": []}
+    report = _convert(_minutes_input(topics=[topic]))
+    assert report["topics"][0]["key_decisions"] == ["Ask someone to replace the pipe"]
+
+
+def test_compat_decision_flattening_reaches_the_sections_the_frontend_reads():
+    """The point of fixing this here: `sections` is built from this same
+    flattened `topics` a few lines later in `convert_to_daily_report_format`,
+    and that is what the frontend actually renders."""
+    topic = {"topic_id": 0, "time_range": "09:00", "topic_title": "Plumbing",
+              "category": "general", "summary": "Discussed pipe leak.",
+              "participants": ["Ben"],
+              "key_decisions": [{"decision": "Replace the pipe", "decided_by": "spk_1"}],
+              "action_items": [], "open_questions": []}
+    report = _convert(_minutes_input(topics=[topic]))
+    decisions_section = next(
+        (s for s in report["sections"] if s["title"] == "Decisions"), None)
+    assert decisions_section is not None
+    assert "spk_1" not in " ".join(decisions_section["items"]).lower()
