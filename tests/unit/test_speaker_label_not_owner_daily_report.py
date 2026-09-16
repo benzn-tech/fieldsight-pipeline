@@ -114,6 +114,59 @@ def test_lookalike_words_in_action_text_are_untouched():
 
 
 # ---------------------------------------------------------------------------
+# report_sections._dates() -- Key Dates, two sections further down the same
+# report page _actions() is on.
+# ---------------------------------------------------------------------------
+
+def test_a_speaker_label_who_collapses_to_the_same_no_who_representation():
+    """A date with no name at all already renders "who": "" (see
+    test_the_older_key_names_still_read) -- a label must collapse to that
+    same representation, not a new string."""
+    r = _report(critical_dates_and_deadlines=[
+        {"date_mentioned": "28th", "context": "Backfill Zone 1",
+         "who_mentioned": "spk_1", "urgency": "high", "type": "deadline"},
+    ])
+    row = _by_title(rs.build(r), "Key Dates")["rows"][0]
+    assert row["who"] == ""
+
+
+def test_a_real_who_mentioned_is_untouched():
+    r = _report(critical_dates_and_deadlines=[
+        {"date_mentioned": "28th", "context": "Backfill Zone 1", "who_mentioned": "Ben"},
+    ])
+    row = _by_title(rs.build(r), "Key Dates")["rows"][0]
+    assert row["who"] == "Ben"
+
+
+def test_a_speaker_label_responsible_on_a_date_also_collapses():
+    """The older key name (`responsible`, not `who_mentioned`) reaches the
+    same field and must get the same treatment."""
+    r = _report(critical_dates_and_deadlines=[
+        {"item": "Crane off-hire", "date": "2026-09-20", "responsible": "spk_0"},
+    ])
+    row = _by_title(rs.build(r), "Key Dates")["rows"][0]
+    assert row["who"] == ""
+
+
+def test_an_embedded_label_in_a_dates_context_reads_someone():
+    r = _report(critical_dates_and_deadlines=[
+        {"date_mentioned": "28th",
+         "context": "Confirm with Chris Fellows, spk_1, Nick re: Unit 11 pipes"},
+    ])
+    row = _by_title(rs.build(r), "Key Dates")["rows"][0]
+    assert row["what"] == "Confirm with Chris Fellows, someone, Nick re: Unit 11 pipes"
+
+
+def test_an_embedded_label_in_a_bare_string_date_entry_reads_someone():
+    r = _report(critical_dates_and_deadlines=[
+        "Ask spk_1 to confirm the slab pour Friday",
+    ])
+    row = _by_title(rs.build(r), "Key Dates")["rows"][0]
+    assert row["what"] == "Ask someone to confirm the slab pour Friday"
+    assert row["who"] == ""
+
+
+# ---------------------------------------------------------------------------
 # report_template._action_lines() -- defence in depth
 # ---------------------------------------------------------------------------
 

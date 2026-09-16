@@ -329,18 +329,22 @@ def _dates(report):
     rows = []
     for entry in report.get("critical_dates_and_deadlines") or []:
         if isinstance(entry, str):
-            text = _clean(entry)
+            text = sanitize_speaker_label(_clean(entry))
             if text:
                 rows.append({"when": "", "what": text, "who": ""})
             continue
         if not isinstance(entry, dict):
             continue
-        what = _clean(entry.get("context") or entry.get("item")
+        what = sanitize_speaker_label(_clean(entry.get("context") or entry.get("item")
                       or entry.get("description") or entry.get("event")
-                      or entry.get("detail"))
+                      or entry.get("detail")))
         when = _clean(entry.get("date_mentioned") or entry.get("date")
                       or entry.get("deadline"))
-        who = _clean(entry.get("who_mentioned") or entry.get("responsible"))
+        # A speaker label alone is not a person: same treatment `_actions()`
+        # gives `responsible`, collapsing to "" -- this field's own existing
+        # representation of "nobody named" (the string-entry branch above
+        # already sets "who": "" when there is no name at all).
+        who = sanitize_speaker_label(_clean(entry.get("who_mentioned") or entry.get("responsible")))
         if not (what or when):
             continue
         rows.append({"when": when, "what": what, "who": who})
