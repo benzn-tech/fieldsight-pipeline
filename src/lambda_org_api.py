@@ -2559,6 +2559,20 @@ def _session_was_removed(session_id, folder, date) -> bool:
     return _is_removed_spelling(session_id, removed)
 
 
+def _generation_provenance(result):
+    """Echo the worker's generation provenance -- which template and model wrote
+    the document -- when the result carries it. `promptChars` is internal noise,
+    not provenance, and is deliberately left out.
+
+    The assembled path (no template named in the request) never sets `generated`,
+    so this returns {} and the caller's response gains no new keys -- today's
+    three-key shape for that path is unchanged."""
+    if not result.get("generated"):
+        return {}
+    return {k: result[k] for k in ("generated", "templateId", "templateVersion", "model")
+            if k in result}
+
+
 def session_report_status(conn, caller, session_id, event):
     """GET /api/org/sessions/{session_id}/report/status?date=&user=&requestId=
     — Tier-2 T3 poll. The worker (lambda_session_report) writes its result to
@@ -2600,7 +2614,8 @@ def session_report_status(conn, caller, session_id, event):
         url = s3().generate_presigned_url(
             "get_object", Params={"Bucket": LAKE_BUCKET, "Key": result["docKey"]},
             ExpiresIn=PRESIGNED_URL_EXPIRY)
-        return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed"))})
+        return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed")),
+                   **_generation_provenance(result)})
     if status == "error":
         return ok({"status": "error", "error": result.get("error")})
     return ok({"status": status or "pending"})
@@ -2653,7 +2668,8 @@ def day_report_status(conn, caller, date, event):
         url = s3().generate_presigned_url(
             "get_object", Params={"Bucket": LAKE_BUCKET, "Key": result["docKey"]},
             ExpiresIn=PRESIGNED_URL_EXPIRY)
-        return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed"))})
+        return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed")),
+                   **_generation_provenance(result)})
     if status == "error":
         return ok({"status": "error", "error": result.get("error")})
     return ok({"status": status or "pending"})
