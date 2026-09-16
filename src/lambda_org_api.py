@@ -134,6 +134,7 @@ import nz_time
 import reindex
 import recording_blocks
 import report_sections
+import report_template
 import session_scope
 import sweep_state
 from db.connection import get_connection
@@ -1494,6 +1495,10 @@ def session_report_generate(conn, caller, session_id, event):
     if err is not None:
         return err
 
+    generate, gen_error = _generation_request(body)
+    if gen_error:
+        return error(gen_error, 400)
+
     request_id = uuid.uuid4().hex
     folder, date = content["folder"], content["date"]
     result_key = f"session_report_results/{folder}/{date}/{session_id}/{request_id}.json"
@@ -1522,6 +1527,9 @@ def session_report_generate(conn, caller, session_id, event):
         "recipients": recipients,
         "content": content,
         "resultKey": result_key,
+        **({"generate": generate,
+            "window": {"from": (body.get("from") or "00:00"), "to": (body.get("to") or "23:59")},
+            "excludedTopics": _excluded_topics_for(conn, caller, folder, date)} if generate else {}),
     }
     # Lake bucket (like the reindex_requests/ chain): org-api is in-VPC and hands
     # off to the non-VPC session-report worker via an S3 request artifact (BUG-36).
@@ -1598,6 +1606,42 @@ def _assemble_day_report(conn, caller, date, event, selected=None):
     }, None
 
 
+def _generation_request(body):
+    """The template a report is written to, validated here so a bad name fails the
+    request instead of the worker -- the caller is still on the line at this point.
+    Absent template = today's assembled report (spec 2026-09-15 §5.3)."""
+    template_id = (body or {}).get("templateId")
+    if not template_id:
+        return None, None
+    try:
+        version = int((body or {}).get("templateVersion"))
+    except (TypeError, ValueError):
+        return None, "templateVersion must be a number"
+    try:
+        report_template.load_template(template_id, version)
+    except report_template.TemplateNotFound:
+        return None, "no such template: %s v%s" % (template_id, version)
+    return {"templateId": template_id, "templateVersion": version}, None
+
+
+def _excluded_topics_for(conn, caller, folder, date):
+    """The day's topics the report scope refuses to show -- redacted or non-work --
+    with the time_range the worker needs to cut them out of the transcript. Only the
+    id and the range travel: the text of a hidden topic never leaves the database.
+
+    Reads the day's topics via `_day_report_rows` (this file's existing "every topic
+    for one folder/date" call, wrapping `topics.list_topics_for_source_prefix`) and
+    applies the same exclusion rule `build_day_sessions` already uses: an ACTIVE
+    redaction, OR `work_class == 'non_work'`."""
+    rows = _day_report_rows(conn, caller, folder, date)
+    if not rows:
+        return []
+    redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows])
+    return [{"id": str(r["id"]), "time_range": r.get("time_range")}
+            for r in rows
+            if r["id"] in redacted or r.get("work_class") == "non_work"]
+
+
 def day_report_preview(conn, caller, date, event):
     """POST /api/org/days/{date}/report/preview?user= — a whole day, read-only."""
     selected, err = _selected_topic_row_ids(parse_body(event) or {})
@@ -1644,6 +1688,10 @@ def day_report_generate(conn, caller, date, event):
     if err is not None:
         return err
 
+    generate, gen_error = _generation_request(body)
+    if gen_error:
+        return error(gen_error, 400)
+
     request_id = uuid.uuid4().hex
     folder = content["folder"]
     result_key = f"session_report_results/{folder}/{date}/day/{request_id}.json"
@@ -1667,6 +1715,9 @@ def day_report_generate(conn, caller, date, event):
         "recipients": recipients,
         "content": content,
         "resultKey": result_key,
+        **({"generate": generate,
+            "window": {"from": (body.get("from") or "00:00"), "to": (body.get("to") or "23:59")},
+            "excludedTopics": _excluded_topics_for(conn, caller, folder, date)} if generate else {}),
     }
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
                     Body=json.dumps(artifact, default=str),
