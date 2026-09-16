@@ -11,16 +11,22 @@ polls for at the artifact's `resultKey`.
 
 Design: docs/superpowers/specs/2026-07-28-session-report-review-export-design.md §6.
 """
+import datetime
 import json
 import logging
 import os
+import time
 from io import BytesIO
 from urllib.parse import unquote_plus
 
 import boto3
 
-from lambda_meeting_minutes import generate_word_document
+import lambda_meeting_minutes
+import llm_utils
+import report_template
+import transcript_window
 from email_sender import get_sender
+from lambda_meeting_minutes import generate_word_document
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -228,8 +234,164 @@ def _session_was_deleted(artifact):
     return False
 
 
-def process_request(artifact):
-    """Render one enqueued request → Word doc (+ optional email) → result JSON."""
+# The function has Timeout: 300 and llm_utils retries up to four times at
+# LLM_HTTP_TIMEOUT each, so an unbounded ladder outlives the function and writes no
+# result at all -- the poller then spins forever. Bound it well inside the timeout.
+# Used only as a FALLBACK when the invocation carries no `context` (unit tests, or
+# any caller that never got one) -- `context.get_remaining_time_in_millis()` is the
+# authority whenever it is available (see `_model_budget_seconds`).
+GENERATION_BUDGET_SECONDS = float(os.environ.get("GENERATION_BUDGET_SECONDS", "210"))
+
+# Reserved out of whatever time is left for the docx render + the result write that
+# must still happen AFTER the model answers -- without this reserve the model call
+# could legitimately use every remaining millisecond and still get SIGKILLed one
+# step from finishing, which writes no result at all.
+RENDER_AND_WRITE_RESERVE_SECONDS = float(
+    os.environ.get("RENDER_AND_WRITE_RESERVE_SECONDS", "30"))
+
+
+def _remaining_seconds(context):
+    """Lambda's own account of what is left on this invocation, in seconds.
+    None when there is no context (a unit test calling process_request directly,
+    or any caller that never got one) or it does not offer the method."""
+    getter = getattr(context, "get_remaining_time_in_millis", None)
+    if getter is None:
+        return None
+    try:
+        return getter() / 1000.0
+    except Exception:
+        return None
+
+
+def _model_budget_seconds(context):
+    """Seconds available for whatever comes next (a read phase, or the model call),
+    reserving RENDER_AND_WRITE_RESERVE_SECONDS for what must still happen after the
+    model answers. Falls back to the fixed GENERATION_BUDGET_SECONDS when there is
+    no context to ask -- the authority this replaces whenever a real one exists.
+    Called again right before the model call so it reflects time the read phase
+    actually spent, not an estimate made before it ran."""
+    remaining = _remaining_seconds(context)
+    if remaining is None:
+        return GENERATION_BUDGET_SECONDS
+    return remaining - RENDER_AND_WRITE_RESERVE_SECONDS
+
+
+def _clock(date, hhmm):
+    """A wall-clock time on the report's own date. No timezone conversion happens
+    anywhere on this path (spec 2026-09-15 global constraints)."""
+    return datetime.datetime.strptime("%s %s" % (date, hhmm), "%Y-%m-%d %H:%M")
+
+
+def _action_items_for_prompt(content):
+    """The actions the model is given: extraction's, not its own reading of the
+    transcript. Owner and date are already recorded against them."""
+    out = []
+    for topic in (content.get("topics") or []):
+        for a in (topic.get("action_items") or []):
+            out.append({"action": a.get("action") or a.get("text"),
+                        "owner": a.get("owner") or a.get("responsible"),
+                        "deadline": a.get("deadline")})
+    return out
+
+
+def _prose_sections(text):
+    """Split the model's markdown back into {title, paragraphs}. Anything before the
+    first heading is kept under an empty title rather than dropped."""
+    sections, current = [], {"title": "", "paragraphs": []}
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        if line.startswith("#"):
+            if current["title"] or current["paragraphs"]:
+                sections.append(current)
+            current = {"title": line.lstrip("#").strip(), "paragraphs": []}
+        elif line.strip():
+            current["paragraphs"].append(line.strip())
+    if current["title"] or current["paragraphs"]:
+        sections.append(current)
+    return [s for s in sections if s["title"] or s["paragraphs"]]
+
+
+def _put_document(artifact, buf):
+    """Puts a generated docx at the same address a topics-assembled one would use,
+    and returns its key -- mirrors the inline put in `process_request` below."""
+    doc_key = _doc_key(artifact)
+    s3().put_object(Bucket=S3_BUCKET, Key=doc_key,
+                    Body=buf.getvalue(), ContentType=DOCX_CONTENT_TYPE)
+    return doc_key
+
+
+def _generate_document(artifact, context=None):
+    """Returns (buffer, meta). Raises on anything that must not produce a document."""
+    gen = artifact["generate"]
+    template = report_template.load_template(gen["templateId"], int(gen["templateVersion"]))
+    content = artifact.get("content") or {}
+    date = artifact.get("date") or content.get("date")
+    window = artifact.get("window") or {}
+    win_from = _clock(date, window.get("from") or "00:00")
+    win_to = _clock(date, window.get("to") or "23:59")
+
+    # An excluded topic wholly outside THIS window cannot appear in it and cannot
+    # be proven placeable-but-irrelevant unless its time_range actually parses --
+    # see transcript_window.excluded_spans for the fail-closed ruling on the
+    # unparseable case (that one still raises, window or no window).
+    spans = transcript_window.excluded_spans(date, artifact.get("excludedTopics") or [],
+                                             win_from, win_to)
+
+    read_budget = _model_budget_seconds(context)
+    if read_budget <= llm_utils.MIN_USEFUL_SECONDS:
+        raise RuntimeError(
+            "generation budget exhausted before reading the window: %.1fs left "
+            "after reserving %.1fs for the render and result write"
+            % (read_budget, RENDER_AND_WRITE_RESERVE_SECONDS))
+    read_deadline = time.time() + read_budget
+
+    client = s3()
+    picked = transcript_window.select_keys(client, S3_BUCKET, artifact["folder"], date,
+                                           win_from, win_to)
+    turns = transcript_window.drop_spans(
+        transcript_window.assemble(client, S3_BUCKET, picked, deadline=read_deadline), spans)
+    if not turns:
+        raise RuntimeError("no recorded speech in this window after exclusions")
+
+    prompt = report_template.render_prompt(
+        template,
+        {"folder": artifact["folder"], "date": date,
+         "from": window.get("from") or "00:00", "to": window.get("to") or "23:59",
+         "recordings": len(picked)},
+        _action_items_for_prompt(content),
+        "\n".join(t["line"] for t in turns))
+
+    # Recomputed from `context` (not reused from `read_budget`) because this is the
+    # actual authority on what is left after the read phase ran, not an estimate
+    # made before it did.
+    model_budget = _model_budget_seconds(context)
+    if model_budget <= llm_utils.MIN_USEFUL_SECONDS:
+        raise RuntimeError(
+            "generation budget exhausted before the model call: %.1fs left "
+            "after reserving %.1fs for the render and result write"
+            % (model_budget, RENDER_AND_WRITE_RESERVE_SECONDS))
+    text, err = llm_utils.call_llm(prompt, max_tokens=8000, deadline=model_budget)
+    if err or not (text or "").strip():
+        raise RuntimeError(err or "empty answer from model")
+
+    buf = lambda_meeting_minutes.generate_prose_document(
+        artifact.get("title") or template.get("name") or "Report",
+        "%s  %s - %s" % (date, window.get("from") or "00:00", window.get("to") or "23:59"),
+        _prose_sections(text),
+        _action_items_for_prompt(content))
+    meta = {"generated": True, "templateId": template["template_id"],
+            "templateVersion": template["version"], "model": llm_utils.active_model(),
+            "promptChars": len(prompt)}
+    return buf, meta
+
+
+def process_request(artifact, context=None):
+    """Render one enqueued request → Word doc (+ optional email) → result JSON.
+
+    `context` (optional): the Lambda invocation context, threaded through to the
+    generate path so it can bound itself against `get_remaining_time_in_millis()`
+    instead of a fixed budget guessed at the top of the function. None in tests
+    that call this directly, or in the non-generate path, which does not need it."""
     result_key = artifact["resultKey"]
     request_id = artifact.get("requestId")
 
@@ -257,6 +419,22 @@ def process_request(artifact):
         logger.info("report: %s was deleted -- not rendering, not sending", request_id)
         _write_result(result_key, {"status": "skipped", "requestId": request_id,
                                    "reason": "recording deleted", **scope_fields})
+        return
+
+    if artifact.get("generate"):
+        try:
+            buf, meta = _generate_document(artifact, context)
+        except Exception as exc:                      # noqa: BLE001 -- recorded, not retried
+            logger.exception("report: generation failed for %s", artifact.get("requestId"))
+            _write_result(artifact["resultKey"],
+                          dict({"status": "error", "requestId": artifact.get("requestId"),
+                                "error": str(exc)}, **_scope_result_fields(artifact)))
+            return
+        doc_key = _put_document(artifact, buf)
+        _write_result(artifact["resultKey"],
+                      dict({"status": "done", "requestId": artifact.get("requestId"),
+                            "docKey": doc_key, "emailed": False}, **meta,
+                           **_scope_result_fields(artifact)))
         return
 
     try:
@@ -292,5 +470,5 @@ def lambda_handler(event, context):
         key = unquote_plus(key)          # S3 notifications URL-encode the key
         obj = s3().get_object(Bucket=bucket, Key=key)
         artifact = json.loads(obj["Body"].read().decode("utf-8"))
-        process_request(artifact)
+        process_request(artifact, context)
     return {"ok": True}

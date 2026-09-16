@@ -134,6 +134,7 @@ import nz_time
 import reindex
 import recording_blocks
 import report_sections
+import report_template
 import session_scope
 import sweep_state
 from db.connection import get_connection
@@ -1270,6 +1271,23 @@ def _deleted_prefixes_for_rows(conn, rows, date):
     return prefixes
 
 
+def _redacted_or_hidden(r, redacted, deleted):
+    """True when `r` must not appear in a report: an active redaction, a
+    non_work classification, or a source key under a deleted (tombstoned)
+    prefix. A "deleted" recording is a reversible mask in this codebase --
+    the audio is still in the bucket -- so this arm matters exactly as much
+    as the other two: without it a soft-deleted topic's speech is neither
+    shown NOR named as cut, and can still reach a generation prompt.
+
+    The one rule both `_report_rows_in_scope` (which drops these rows) and
+    `_excluded_topics_for` (which reports them) apply, so there is a single
+    place that defines "excluded" rather than two copies that can drift."""
+    if r["id"] in redacted or r.get("work_class") == "non_work":
+        return True
+    key = r.get("source_s3_key") or ""
+    return any(key.startswith(p) for p in deleted)
+
+
 def _report_rows_in_scope(conn, caller, folder, date, session_id=None, selected=None):
     """The topic rows a report may contain, for one session or (session_id=None) the day.
 
@@ -1290,10 +1308,7 @@ def _report_rows_in_scope(conn, caller, folder, date, session_id=None, selected=
             continue
         if session_id is not None and sid != session_id:
             continue
-        if r["id"] in redacted or r.get("work_class") == "non_work":
-            continue
-        key = r.get("source_s3_key") or ""
-        if any(key.startswith(p) for p in deleted):
+        if _redacted_or_hidden(r, redacted, deleted):
             continue
         kept.append(r)
     if selected is not None:
@@ -1494,6 +1509,10 @@ def session_report_generate(conn, caller, session_id, event):
     if err is not None:
         return err
 
+    generate, gen_error = _generation_request(body, deliver)
+    if gen_error:
+        return error(gen_error, 400)
+
     request_id = uuid.uuid4().hex
     folder, date = content["folder"], content["date"]
     result_key = f"session_report_results/{folder}/{date}/{session_id}/{request_id}.json"
@@ -1522,6 +1541,10 @@ def session_report_generate(conn, caller, session_id, event):
         "recipients": recipients,
         "content": content,
         "resultKey": result_key,
+        **({"generate": generate,
+            "window": {"from": (body.get("from") or "00:00"), "to": (body.get("to") or "23:59")},
+            "excludedTopics": _excluded_topics_for(
+                conn, caller, folder, date, session_id=session_id)} if generate else {}),
     }
     # Lake bucket (like the reindex_requests/ chain): org-api is in-VPC and hands
     # off to the non-VPC session-report worker via an S3 request artifact (BUG-36).
@@ -1598,6 +1621,71 @@ def _assemble_day_report(conn, caller, date, event, selected=None):
     }, None
 
 
+def _generation_request(body, deliver=None):
+    """The template a report is written to, validated here so a bad name fails the
+    request instead of the worker -- the caller is still on the line at this point.
+    Absent template = today's assembled report (spec 2026-09-15 §5.3).
+
+    `deliver` (optional): the worker's generate branch never emails -- it always
+    writes `emailed: false` -- so a request that names a template AND asks for
+    email delivery is refused HERE, at the door, rather than silently producing
+    a document nobody receives."""
+    template_id = (body or {}).get("templateId")
+    if not template_id:
+        return None, None
+    if deliver == "email":
+        return None, "a generated report can only be downloaded for now"
+    try:
+        version = int((body or {}).get("templateVersion"))
+    except (TypeError, ValueError):
+        return None, "templateVersion must be a number"
+    try:
+        report_template.load_template(template_id, version)
+    except report_template.TemplateNotFound:
+        return None, "no such template: %s v%s" % (template_id, version)
+    return {"templateId": template_id, "templateVersion": version}, None
+
+
+def _excluded_topics_for(conn, caller, folder, date, session_id=None):
+    """The topics the report scope refuses to show -- redacted, non-work, or
+    under a deleted (tombstoned) source prefix -- with the time_range the
+    worker needs to cut them out of the transcript. Only the id and the
+    range travel: the text of a hidden topic never leaves the database, and
+    `time_range` travels as-is (fail closed: an empty/unparseable one is
+    still reported, never silently dropped).
+
+    Reads the day's topics via `_day_report_rows` (this file's existing "every
+    topic for one folder/date" call, wrapping `topics.list_topics_for_source_prefix`)
+    and applies `_redacted_or_hidden` -- the SAME rule `_report_rows_in_scope`
+    uses to drop a row, not a second hand-rolled copy of it, so the two can
+    never drift apart on what "excluded" means.
+
+    `session_id`, when given, restricts the set to that one session's topics
+    (mirroring `_report_rows_in_scope`'s own session_id filter) so a session
+    report's `excludedTopics` cannot name a topic from a different session."""
+    rows = _day_report_rows(conn, caller, folder, date)
+    if not rows:
+        return []
+    redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows])
+    deleted = _deleted_prefixes_for_rows(conn, rows, date)
+    out = []
+    for r in rows:
+        # Same first cut `_report_rows_in_scope` makes: a row that is not a
+        # recorded-speech extraction (KIND_EXTRACTION) can never correspond to
+        # anything on the transcript timeline, so it must never reach the
+        # worker's exclusion list -- an unparseable time_range on one of these
+        # would abort a request over a topic that could not have appeared in
+        # the transcript regardless.
+        sid, kind = session_scope.session_ref(r.get("source_s3_key"))
+        if kind != session_scope.KIND_EXTRACTION:
+            continue
+        if session_id is not None and sid != session_id:
+            continue
+        if _redacted_or_hidden(r, redacted, deleted):
+            out.append({"id": str(r["id"]), "time_range": r.get("time_range")})
+    return out
+
+
 def day_report_preview(conn, caller, date, event):
     """POST /api/org/days/{date}/report/preview?user= — a whole day, read-only."""
     selected, err = _selected_topic_row_ids(parse_body(event) or {})
@@ -1644,6 +1732,10 @@ def day_report_generate(conn, caller, date, event):
     if err is not None:
         return err
 
+    generate, gen_error = _generation_request(body, deliver)
+    if gen_error:
+        return error(gen_error, 400)
+
     request_id = uuid.uuid4().hex
     folder = content["folder"]
     result_key = f"session_report_results/{folder}/{date}/day/{request_id}.json"
@@ -1667,6 +1759,9 @@ def day_report_generate(conn, caller, date, event):
         "recipients": recipients,
         "content": content,
         "resultKey": result_key,
+        **({"generate": generate,
+            "window": {"from": (body.get("from") or "00:00"), "to": (body.get("to") or "23:59")},
+            "excludedTopics": _excluded_topics_for(conn, caller, folder, date)} if generate else {}),
     }
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
                     Body=json.dumps(artifact, default=str),

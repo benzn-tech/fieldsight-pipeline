@@ -1747,6 +1747,22 @@ Resources:
           # part of the DNS/SES work; flip to 'ses' + set SENDER_EMAIL then.
           EMAIL_SENDER: stub
           SENDER_EMAIL: ''
+          # Same keys ReportGeneratorFunction already carries, verbatim (its parameter
+          # names, not invented ones) — this worker now makes the one model call a
+          # `generate` request needs.
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          CLAUDE_MODEL: claude-sonnet-4-6
+          LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelPlus
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
+          QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
+          QWEN_ENABLE_THINKING: 'true'
+          # One attempt must fit inside Timeout: 300 with room for the docx render.
+          LLM_HTTP_TIMEOUT: '120'
+          GENERATION_BUDGET_SECONDS: '210'
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -1766,6 +1782,10 @@ Resources:
                 # is a guard shipping dead. implicitDeny on both stages before
                 # this line existed.
                 - !Sub arn:aws:s3:::${IngestBucketName}/redactions/*
+                # The transcript objects a `generate` request reads to build its
+                # prompt (transcript_window.select_keys/assemble). This worker had
+                # no read of transcripts/ at all before generation existed.
+                - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
@@ -1778,12 +1798,15 @@ Resources:
               # never written -- and a day with NO deletions has no mirror, which
               # is the common case. The lenient reader would then log an exception
               # on every report generated, forever (#627's family).
+              # transcripts/* is listed here too: select_keys() lists the day's
+              # transcript prefix before reading any key under it.
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
                 StringLike:
                   s3:prefix:
                     - redactions/*
+                    - transcripts/*
             - Effect: Allow
               # SES send for the 'email' delivery option — harmless while
               # EMAIL_SENDER=stub (the stub never calls SES). Verified-identity

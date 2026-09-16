@@ -657,6 +657,52 @@ def save_debug_record(bucket, target_date, meeting_title, prompt, raw_response,
 # Word Document Generation
 # ============================================================
 
+def generate_prose_document(title, subtitle, sections, actions):
+    """A record whose headings come from its template, not from this function.
+
+    `generate_word_document` below renders the fixed meeting-minutes layout and is
+    unchanged: a template-shaped record has its own sections, so it gets its own
+    renderer rather than another branch inside that one.
+    """
+    if not DOCX_AVAILABLE:
+        logger.warning("prose document requested but python-docx is unavailable")
+        return None
+
+    doc = Document()
+    doc.add_heading(title, level=0)
+    if subtitle:
+        p = doc.add_paragraph(subtitle)
+        p.runs[0].italic = True
+
+    for section in sections or []:
+        doc.add_heading(section.get("title") or "", level=1)
+        for para in section.get("paragraphs") or []:
+            text = (para or "").strip()
+            if not text:
+                continue
+            if text.startswith("- ") or text.startswith("* "):
+                doc.add_paragraph(text[2:].strip(), style="List Bullet")
+            else:
+                doc.add_paragraph(text)
+
+    if actions:
+        doc.add_heading("Actions", level=1)
+        table = doc.add_table(rows=1, cols=3)
+        table.style = "Table Grid"
+        for cell, head in zip(table.rows[0].cells, ("Action", "Owner", "When")):
+            cell.text = head
+        for a in actions:
+            row = table.add_row().cells
+            row[0].text = (a.get("action") or "").strip()
+            row[1].text = (a.get("owner") or "").strip() or "no owner recorded"
+            row[2].text = (a.get("deadline") or "").strip() or "no date"
+
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
 def generate_word_document(minutes_data, title):
     """Generate Word document from structured meeting minutes."""
     if not DOCX_AVAILABLE:
