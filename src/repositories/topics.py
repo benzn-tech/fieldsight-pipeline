@@ -90,7 +90,7 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
     distinction as evidence: absent means never captured, empty means asked and
     there were none.
 
-    decisions (migration 0057) are the decisions a topic recorded, stored as the
+    decisions (migration 0058) are the decisions a topic recorded, stored as the
     extractor's own {decision, rationale, decided_by} objects. The report path
     passes plain strings and both are accepted -- one column holds both shapes,
     and the narrowing to strings happens in lambda_org_api, at the payload

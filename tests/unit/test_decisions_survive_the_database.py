@@ -63,7 +63,7 @@ def _insert_sql():
 def test_the_column_exists_in_a_migration():
     import pathlib
     sql = (pathlib.Path(topics.__file__).parents[1] / "migrations"
-           / "0057_topic_decisions.sql").read_text(encoding="utf-8")
+           / "0058_topic_decisions.sql").read_text(encoding="utf-8")
     assert "ADD COLUMN IF NOT EXISTS decisions jsonb" in sql
 
 

@@ -86,7 +86,7 @@ def test_a_plain_string_decision_is_accepted_too(wired):
 
 def test_a_topic_with_no_decisions_writes_null_not_an_empty_list(wired):
     """NULL means "not captured"; `[]` would claim the model was asked and found
-    none. Every pre-0057 row is NULL and that is the honest value."""
+    none. Every pre-0058 row is NULL and that is the honest value."""
     captured = _capture(wired, [_topic()])
     assert captured[0]["decisions"] is None
 
