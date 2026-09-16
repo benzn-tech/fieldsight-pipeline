@@ -147,6 +147,39 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
 # Non-VPC send worker — S3-triggered on session_finalize_requests/
 # ============================================================
 
+def _already_sent(result_id):
+    """True when this session's confirmation email has already gone out.
+
+    The worker is S3-triggered, S3 notifies on EVERY put of the request key --
+    an overwrite included -- and this function sets no MaximumRetryAttempts, so
+    the Lambda async default of two retries applies on top. Anything that writes
+    the request a second time (a re-drive, a race between the two writers, a
+    hand-run `aws s3 cp`) was therefore a second email to the recorder, and
+    nothing here asked.
+
+    A read that FAILS answers False, deliberately. Losing a confirmation
+    permanently is worse than the double this guards, and the double has a
+    second guard (the conditional put on the request key). But it is logged:
+    the absent grant is exactly how this class of bug stays invisible, and
+    `NoSuchKey` -- the ordinary "not sent yet" -- is not logged at all.
+    """
+    import boto3
+    from botocore.exceptions import ClientError
+    key = f"{FINALIZE_RESULTS_PREFIX}{result_id}.json"
+    try:
+        obj = boto3.client("s3").get_object(Bucket=S3_BUCKET, Key=key)
+        return (json.loads(obj["Body"].read().decode("utf-8")) or {}).get("status") == "sent"
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return False
+        logger.warning("finalize: could not read %s (%s) -- sending rather than "
+                       "risk losing the confirmation", key, e)
+        return False
+    except Exception as e:
+        logger.warning("finalize: unreadable result %s (%s) -- sending anyway", key, e)
+        return False
+
+
 def _default_write_result(session_id, payload):
     """Record the send outcome the in-VPC sweep's reconcile pass reads."""
     import boto3
@@ -264,7 +297,8 @@ def _session_was_deleted(artifact):
     return sid in deleted or f"sid{sid}" in deleted
 
 
-def process_finalize_request(artifact, *, send=None, write_result=None, complete_summary=None):
+def process_finalize_request(artifact, *, send=None, write_result=None, complete_summary=None,
+                             already_sent=None):
     """Build + SES-send the recorder's confirmation email from one enqueued finalize
     request (the in-VPC claim step wrote it), then record the outcome to
     session_finalize_results/{sid}.json — the in-VPC sweep's reconcile pass reads it
@@ -321,6 +355,14 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
     # fall back to the rolling summary on any failure.
     summary, todos = artifact.get("summary"), artifact.get("openTodos")
     is_updated = artifact.get("kind") == "updated"
+    # Before the re-summary, so a duplicate event costs neither an email nor an
+    # LLM call. Keyed exactly as the result is WRITTEN below (the `-updated`
+    # suffix included), or a member's group email would be checked against the
+    # solo key and vice versa.
+    result_id = f"{artifact.get('sessionId')}-updated" if is_updated else artifact.get("sessionId")
+    if (already_sent if already_sent is not None else _already_sent)(result_id):
+        logger.info("finalize: %s was already sent -- not sending again", result_id)
+        return {"status": "skipped", "reason": "already sent", "sessionId": session_id}
     # An `updated` request already carries the ONE merged summary every member
     # must receive. Re-deriving would summarise this member's own SOLO
     # transcripts (_complete_summary re-gathers `sid{sessionId}`), so the N
