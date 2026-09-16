@@ -3093,6 +3093,13 @@ Resources:
                 # (CLAUDE.md: a guard that catches is not a feature that works).
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_brief/*
             - Effect: Allow
+              # Its OWN results, read back: `_already_sent` asks whether this
+              # session's email has gone out before sending another. The
+              # function could write this prefix and not read it.
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
+            - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
@@ -3100,6 +3107,12 @@ Resources:
                   s3:prefix:
                     - transcripts/*
                     - voice_ask/*
+                    # GetObject alone is not enough here either: the ORDINARY
+                    # case is a session that has not been sent yet, i.e. a key
+                    # that was never written, and without ListBucket S3 answers
+                    # AccessDenied instead of NoSuchKey. The lenient reader
+                    # would then log a warning on every single finalize.
+                    - session_finalize_results/*
                     # GetObject alone is not enough: without ListBucket on this
                     # prefix S3 answers AccessDenied rather than NoSuchKey for a
                     # key that was never written, and a day with NO deletions has
