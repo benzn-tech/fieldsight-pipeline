@@ -944,6 +944,16 @@ def write_extraction_items(date, user_folder, extraction_key):
                 open_questions=[q.get("question") if isinstance(q, dict) else q
                                 for q in (t.get("questions") or [])
                                 if (q.get("question") if isinstance(q, dict) else q)] or None,
+                # Kept whole, unlike `questions` above. The extraction schema's
+                # decision carries `rationale` and `decided_by` alongside the
+                # sentence, and v1 not SENDING them is not a reason to discard
+                # them on the way in -- a superseded session's transcript window
+                # may be gone by the time anyone wants them. The narrowing to
+                # plain strings happens in lambda_org_api, at the payload
+                # boundary, where React forces it. Blank-only entries are still
+                # dropped: they render as a bullet with nothing in it.
+                decisions=[d for d in (t.get("decisions") or [])
+                           if (d.get("decision") if isinstance(d, dict) else d)] or None,
                 work_class=_wc, work_confidence=_wconf, is_mixed=(t.get("is_mixed") is True),
                 evidence=_evidence_payload(t),
                 # video-keyframe plan (Task 4): re-bound synthetic keyframes

@@ -701,6 +701,10 @@ def ingest_report(date, user_folder, report_key):
                     # them, and without this line the Timeline loses a day's
                     # questions entirely.
                     open_questions=t.get("open_questions") or t.get("questions"),
+                    # The report path spells it `key_decisions` (plain strings,
+                    # what lambda_report_generator emits); the extraction schema
+                    # spells it `decisions` (objects). One column holds both.
+                    decisions=t.get("key_decisions") or t.get("decisions"),
                     photos=[{"s3_key": p["key"], "caption_text": None}
                             for p in photos_by_topic.get(i, [])],
                 )

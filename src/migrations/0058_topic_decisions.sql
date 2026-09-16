@@ -1,0 +1,46 @@
+-- A decision made in a meeting is not a summary, and not an action.
+--
+-- `lambda_extract_session`'s schema has asked the model for `decisions`
+-- ({decision, rationale, decided_by}) since it was written, and three of the
+-- five things it asks for reached the product. This was one of the two that did
+-- not: nothing stored it, so `lambda_org_api` sent a hardcoded
+-- `"key_decisions": []` and said so in a comment -- the empty list was a
+-- symptom, not the cause.
+--
+-- Measured over the 120 extraction artifacts in the prod lake on 2026-09-07:
+-- 81 of 274 topics (30 %) carried at least one, 91 items in total. Verbatim,
+-- unedited: "Door replacement will be completed in two phases: floors 1-3 by
+-- next Tuesday, remaining 3 floors the week after". That is a phased-delivery
+-- commitment with a date -- exactly what a daily report exists to record, and
+-- until now it was written to S3 and then discarded.
+--
+-- Nothing downstream needed building. report_sections._decisions already
+-- renders a Decisions section from `key_decisions`, chunking.py already folds
+-- that key into the RAG chunk text, and lambda_ask_agent already reads it. All
+-- three were being fed the hardcoded empty list, and on an authority-flip day
+-- render_report_shape IS the report, so that was the whole truth for most days.
+--
+-- jsonb, not text[]: same convention as `participants`, `evidence` and
+-- `open_questions` on this table. Here it earns its keep immediately rather
+-- than as future room -- the column stores the model's OBJECT, keeping
+-- `rationale` and `decided_by`, which v1 deliberately does not send because no
+-- renderer reads them. Re-extracting a superseded session to recover them later
+-- is not possible; the transcript window may be gone. The narrowing to plain
+-- strings happens at the payload boundary in lambda_org_api, because
+-- topic-card.js passes each entry straight to React as a child and an object
+-- there raises "Objects are not valid as a React child" -- which would break
+-- the very section this migration exists to fill.
+--
+-- NO status column and no row id in the payload, for the same reason 0055 has
+-- none: lambda_item_writer deletes and reinserts every child on each extraction
+-- pass, including the routine live->final pass over one session. A human edit
+-- would be reverted by that session's own final extraction, and an identifier
+-- that churns is not an identifier.
+--
+-- NULL means "this extraction predates the column or was never captured", which
+-- is not the same as `'[]'` -- asked and nothing was decided. Every existing row
+-- is NULL and that is the honest value for them.
+ALTER TABLE topics ADD COLUMN IF NOT EXISTS decisions jsonb;
+
+COMMENT ON COLUMN topics.decisions IS
+  'Decisions made in this topic, as the extractor''s {decision, rationale, decided_by} objects. NULL = not captured; [] = none made. Served to clients as plain strings.';

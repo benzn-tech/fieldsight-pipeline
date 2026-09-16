@@ -6638,7 +6638,19 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             "category": t["category"],
             "participants": t["participants"] or [],
             "summary": t["summary"],
-            "key_decisions": [],                    # D3: v1, decisions table deferred
+            # Decisions made in this topic (migration 0058). Stored as the
+            # extractor's {decision, rationale, decided_by} objects; served as
+            # plain strings, and this is the only place that narrowing happens.
+            # topic-card.js:283-287 maps each entry straight into an <li> as a
+            # React child -- an object raises "Objects are not valid as a React
+            # child" and the whole card stops rendering. Both other producers of
+            # this key (lambda_meeting_minutes, lambda_report_generator.py:182)
+            # emit strings, so strings is the contract, not a simplification.
+            # Until 0058 this was a hardcoded [] -- and report_sections,
+            # chunking and lambda_ask_agent were all already reading it.
+            "key_decisions": [d if isinstance(d, str) else d.get("decision")
+                              for d in (t.get("decisions") or [])
+                              if (d.get("decision") if isinstance(d, dict) else d)],
             # Questions raised and left unanswered (migration 0055). This
             # serializer is a fixed allowlist -- the same one that silently
             # dropped `mention_count` on the way out -- so a column that is not
