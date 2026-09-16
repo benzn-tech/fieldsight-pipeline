@@ -79,6 +79,7 @@ from transcript_utils import (
     extract_vad_metadata_from_filename as tu_extract_vad_info,
     read_meeting_manifest,
     elide_middle,
+    sanitize_speaker_label,
 )
 
 # Configure logging
@@ -671,7 +672,15 @@ def build_weekly_prompt(daily_reports, site_name, start_date, end_date,
             for f in flags:
                 topics_text += f"\n      {f.get('observation', '')} (risk: {f.get('risk_level', '?')})"
             for a in actions:
-                topics_text += f"\n      \u2610 {a.get('action', '')} \u2192 {a.get('responsible', '?')} by {a.get('deadline', '?')}"
+                # Same shape as the original bug: this text becomes part of
+                # the prompt sent to the model for the weekly/monthly rollup,
+                # so a raw speaker label handed to the model here is a label
+                # it can echo into rollup prose where nothing downstream
+                # filters it. `replacement='?'` matches this site's own
+                # existing representation of a missing `responsible`.
+                action_text = sanitize_speaker_label(a.get('action', ''))
+                responsible = sanitize_speaker_label(a.get('responsible', '?'), replacement='?')
+                topics_text += f"\n      \u2610 {action_text} \u2192 {responsible} by {a.get('deadline', '?')}"
         summaries.append(f"### {date} \u2014 {user}\n{exec_sum}{topics_text}")
 
     # A week's (or month's) summaries are chronological, so a head slice quietly drops the
@@ -1040,7 +1049,14 @@ def render_sections_into(doc, sections):
                 cells = table.add_row().cells
                 for i, field in enumerate(fields):
                     value = row.get(field, '')
-                    cells[i].text = '' if value is None else str(value)
+                    text = '' if value is None else str(value)
+                    # Defence in depth, same gap `report_template._action_lines`
+                    # had: `sections` here is built by `report_sections.build`,
+                    # which already sanitizes its own fields, but this loop has
+                    # no filter of its own for a caller that ever bypasses it.
+                    # Sanitizing the rendered text, not a particular field name,
+                    # covers every column this table ever gets.
+                    cells[i].text = sanitize_speaker_label(text)
 
 
 def generate_word_document(report_data, title):
@@ -1131,7 +1147,10 @@ def generate_word_document(report_data, title):
             run.bold = True
             if risk == 'HIGH':
                 run.font.color.rgb = RGBColor(192, 57, 43)
-            who = obs.get('who_raised', '')
+            # A label-only `who_raised` collapses to "" like a genuinely
+            # missing one already does: the `if who:` below already omits
+            # the "(raised by ...)" clause for an empty value.
+            who = sanitize_speaker_label(obs.get('who_raised', ''))
             location = obs.get('location', 'Unknown location')
             p.add_run(f"{obs.get('observation', '')} \u2014 {location}")
             if who:
@@ -1152,7 +1171,10 @@ def generate_word_document(report_data, title):
             if urgency == 'HIGH':
                 run.font.color.rgb = RGBColor(192, 57, 43)
             p.add_run(f"{cd.get('date_mentioned', '?')} \u2014 {cd.get('context', '')} ({dtype})")
-            who = cd.get('who_mentioned', '')
+            # Same treatment as `who_raised` above: a label-only value
+            # collapses to "", which the `if who:` already renders as
+            # "nobody mentioned".
+            who = sanitize_speaker_label(cd.get('who_mentioned', ''))
             if who:
                 p.add_run(f" \u2014 mentioned by {who}")
 
@@ -1177,8 +1199,12 @@ def generate_word_document(report_data, title):
                 doc.add_heading('Action Items', level=3)
                 for ai in actions:
                     priority = ai.get('priority', 'medium').upper()
-                    text = (f"[{priority}] {ai.get('action', '')} "
-                            f"\u2192 {ai.get('responsible', '?')} by {ai.get('deadline', '?')}")
+                    # `replacement='?'` matches this site's own existing
+                    # representation of a missing `responsible`.
+                    action_text = sanitize_speaker_label(ai.get('action', ''))
+                    responsible = sanitize_speaker_label(ai.get('responsible', '?'), replacement='?')
+                    text = (f"[{priority}] {action_text} "
+                            f"\u2192 {responsible} by {ai.get('deadline', '?')}")
                     doc.add_paragraph(text, style='List Bullet')
             flags = topic.get('safety_flags', [])
             if flags:
@@ -1216,7 +1242,16 @@ def generate_word_document(report_data, title):
                     if isinstance(item, str):
                         doc.add_paragraph(item, style='List Bullet')
                     elif isinstance(item, dict):
-                        text_parts = [f"{v}" for k, v in item.items() if v]
+                        # Sanitize the rendered VALUES, not particular key
+                        # names: this loop is generic across five section
+                        # shapes (outstanding_actions carries `responsible`
+                        # today; a future field is covered the same way
+                        # without this needing to know its name). A value
+                        # that is purely a speaker label sanitizes to "" and
+                        # is dropped, the same as an originally-missing one.
+                        text_parts = [t for t in
+                                      (sanitize_speaker_label(f"{v}") for k, v in item.items() if v)
+                                      if t]
                         doc.add_paragraph(' \u2014 '.join(text_parts), style='List Bullet')
 
     quality = report_data.get('quality_summary', '')
