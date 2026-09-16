@@ -67,7 +67,7 @@ from output_language import OUTPUT_LANGUAGE_RULE
 from transcript_utils import (
     normalize_transcript, format_turns_for_prompt, get_time_bounds,
     extract_device_from_filename, write_meeting_manifest,
-    elide_middle,
+    elide_middle, sanitize_speaker_label as _sanitize_speaker_label,
 )
 
 # Configure logging
@@ -657,36 +657,14 @@ def save_debug_record(bucket, target_date, meeting_title, prompt, raw_response,
 # Word Document Generation
 # ============================================================
 
-# A speaker-diarization label (spk_0, SPK_12, ...) is a per-call transcription
-# artefact, not an identity -- the same spk_1 in two different calls is
-# usually two different people. It must never be shown to a customer as the
-# name of a person (memory: a spk_1 label once reached a customer email as
-# "the responsible person"). This is the one place that recognizes the
-# pattern, so every renderer and every prompt-builder agrees on what counts
-# as a label.
-_SPEAKER_LABEL_TOKEN = re.compile(r"\bspk_\d+\b", re.IGNORECASE)
-
-
-def _sanitize_speaker_label(value, replacement=""):
-    """Strip speaker-diarization labels out of a value that may hold one.
-
-    Two calling shapes, same rule:
-    - An owner/responsible field: if the *entire* trimmed value is nothing
-      but a label, it is not a name at all -- replaced with `replacement`
-      (default: empty, so callers can fall back to "no owner recorded").
-    - Free text (an action's own sentence): a bare spk_N token embedded in
-      the sentence is swapped for the neutral word "someone", leaving the
-      rest of the sentence intact. Matches whole tokens only, so a real word
-      that merely contains those letters (e.g. "spkr", "speaker") is never
-      touched.
-    """
-    if not value:
-        return value
-    stripped = value.strip()
-    if _SPEAKER_LABEL_TOKEN.fullmatch(stripped):
-        return replacement
-    return _SPEAKER_LABEL_TOKEN.sub("someone", value)
-
+# _sanitize_speaker_label is transcript_utils.sanitize_speaker_label, imported
+# above under this module's existing internal name: a speaker-diarization
+# label (spk_0, SPK_12, ...) is a per-call transcription artefact, not an
+# identity, and must never be shown to a customer as the name of a person
+# (memory: a spk_1 label once reached a customer email as "the responsible
+# person"). It lives in transcript_utils.py, not here, because
+# report_sections.py needs the same rule and importing this module from
+# there would be a cycle (this module already imports report_sections).
 
 def generate_prose_document(title, subtitle, sections, actions):
     """A record whose headings come from its template, not from this function.

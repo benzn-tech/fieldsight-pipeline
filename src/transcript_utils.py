@@ -672,3 +672,43 @@ def elide_middle(lines, limit, head_share=DEFAULT_HEAD_SHARE, sep="\n"):
         "whole session.",
         len(text), len(lines), len(rendered), omitted, limit)
     return rendered, stats
+
+
+# ============================================================
+# Speaker labels are not identities
+# ============================================================
+# A speaker-diarization label (spk_0, SPK_12, ...) is a per-call transcription
+# artefact, not an identity -- the same spk_1 in two different calls is
+# usually two different people. It must never be shown to a customer as the
+# name of a person (this has shipped as a bug before: a spk_1 label once
+# reached a customer email as "the responsible person").
+#
+# Lives here, not in lambda_meeting_minutes.py or report_sections.py, because
+# both of those need it and this is the one shared module with no heavy
+# dependency (no boto3, no psycopg, no model call) that everything already
+# imports -- putting it in either renderer would make the other one import a
+# whole report-generation module just for one regex, or copy the pattern a
+# second time and let the two definitions drift.
+_SPEAKER_LABEL_TOKEN = re.compile(r"\bspk_\d+\b", re.IGNORECASE)
+
+
+def sanitize_speaker_label(value, replacement=""):
+    """Strip speaker-diarization labels out of a value that may hold one.
+
+    Two calling shapes, same rule:
+    - An owner/responsible field: if the *entire* trimmed value is nothing
+      but a label, it is not a name at all -- replaced with `replacement`
+      (default: empty, so callers can fall back to whatever they already
+      render for "no owner").
+    - Free text (an action's own sentence): a bare spk_N token embedded in
+      the sentence is swapped for the neutral word "someone", leaving the
+      rest of the sentence intact. Matches whole tokens only, so a real word
+      that merely contains those letters (e.g. "spkr", "speaker") is never
+      touched.
+    """
+    if not value:
+        return value
+    stripped = value.strip()
+    if _SPEAKER_LABEL_TOKEN.fullmatch(stripped):
+        return replacement
+    return _SPEAKER_LABEL_TOKEN.sub("someone", value)

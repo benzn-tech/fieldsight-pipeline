@@ -11,6 +11,8 @@ import json
 import os
 import re
 
+from transcript_utils import sanitize_speaker_label
+
 TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report_templates")
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
@@ -32,11 +34,17 @@ def load_template(template_id, version):
 
 
 def _action_lines(action_items):
+    # Defence in depth: today's only caller (lambda_session_report's
+    # _action_items_for_prompt) already sanitizes speaker labels before this
+    # runs, but this function builds its own "no owner recorded" fallback and
+    # would pass a raw spk_N straight into the model's prompt if some future
+    # caller ever skips that step.
     out = []
     for a in action_items or []:
-        owner = (a.get("owner") or "").strip() or "no owner recorded"
+        owner = sanitize_speaker_label((a.get("owner") or "").strip()) or "no owner recorded"
         due = (a.get("deadline") or "").strip() or "no date"
-        out.append("- %s | owner: %s | when: %s" % ((a.get("action") or "").strip(), owner, due))
+        action = sanitize_speaker_label((a.get("action") or "").strip())
+        out.append("- %s | owner: %s | when: %s" % (action, owner, due))
     return out
 
 

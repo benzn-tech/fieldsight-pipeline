@@ -38,6 +38,7 @@ still what gets displayed.
 """
 
 import due_dates
+from transcript_utils import sanitize_speaker_label
 
 #: The Library's section vocabulary (scripts/api/template-store.js). A kind
 #: outside this set has no renderer on the other side.
@@ -164,7 +165,11 @@ def _actions(topics, report_date=None):
                 continue
             # `_clean`, not `strip`: an action whose text is "N/A" or "TBD" is
             # not an action, and rendering it gives somebody a row to chase.
-            text = _clean(item.get("action"))
+            # `sanitize_speaker_label`: a bare spk_N token embedded in the
+            # sentence is a transcription artefact, not a name -- replace it
+            # with "someone" rather than print it (memory: a spk_1 label once
+            # reached a customer email as "the responsible person").
+            text = sanitize_speaker_label(_clean(item.get("action")))
             if not text:
                 continue
             key = _normalise(text)
@@ -173,7 +178,9 @@ def _actions(topics, report_date=None):
                 # A later mention fills a blank -- and where two topics name
                 # DIFFERENT owners for one action, both are named. Keeping only
                 # the first silently reassigns somebody else's job.
-                owner = _clean(item.get("responsible"))
+                # A speaker label alone is not a name: same treatment as
+                # a missing owner, not a new "no owner" string.
+                owner = sanitize_speaker_label(_clean(item.get("responsible")))
                 if owner and owner.lower() not in seen[key]["owner"].lower():
                     prior = seen[key]["owner"]
                     seen[key]["owner"] = (prior + ", " + owner) if prior else owner
@@ -189,7 +196,11 @@ def _actions(topics, report_date=None):
                 continue
             seen[key] = {
                 "action": text,
-                "owner": _clean(item.get("responsible")),
+                # Same rule as above: a value that is purely a speaker label
+                # is not an owner, so it collapses to "" -- this module's
+                # existing representation of "no owner recorded" for this
+                # field (see report_sections.py's own `_clean`).
+                "owner": sanitize_speaker_label(_clean(item.get("responsible"))),
                 "due": _clean(item.get("deadline")),
                 "priority": _clean(item.get("priority")).lower(),
                 "status": _clean(item.get("status")).lower() or "open",
