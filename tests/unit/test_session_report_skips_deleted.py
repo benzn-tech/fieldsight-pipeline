@@ -6,9 +6,10 @@ the POLL from serving a removed session, but this worker is S3-triggered: if the
 recording is deleted between org-api's enqueue and the worker running -- or on an
 S3 event redelivery hours later -- the DOCX is written and the email goes out.
 
-Same posture as finalize and for the same reason: LENIENT. An unreadable mirror
-must not cost a requester the report they asked for, and this worker records
-errors rather than retrying them.
+Owner decision (2026-09-16): a mirror-read failure on THIS path now fails
+closed rather than proceeding as if nothing was deleted -- a permission fault
+here must not risk mailing a removed recording. `lambda_session_finalize`
+keeps its lenient posture; this decision was scoped to the report worker.
 """
 import pytest
 
@@ -76,9 +77,12 @@ def test_no_deletions_renders_as_before(monkeypatch):
     assert written[0]["status"] == "done"
 
 
-def test_an_unreadable_mirror_still_renders(monkeypatch):
-    """LENIENT, like finalize. A failed check must not cost a requester the
-    report they asked for, and this worker records errors instead of retrying."""
-    sent, written, _ = _run(monkeypatch, deleted=set(), raises=True)
-    assert len(sent) == 1
-    assert written[0]["status"] == "done"
+def test_an_unreadable_mirror_fails_closed(monkeypatch):
+    """STRICT (owner decision 2026-09-16). The old lenient posture let an
+    unreadable mirror still render and mail -- risking a removed recording
+    reaching a document and an inbox. It must now abort: no doc, no email,
+    and a `status: error` result the requester's poll can see and retry."""
+    sent, written, put = _run(monkeypatch, deleted=set(), raises=True)
+    assert sent == [], "an unreadable mirror still sent the email"
+    assert put == [], "an unreadable mirror still wrote a DOCX"
+    assert written and written[0]["status"] == "error"

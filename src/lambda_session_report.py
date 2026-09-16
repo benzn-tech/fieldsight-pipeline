@@ -192,19 +192,23 @@ def _send_email(artifact):
 
 
 def _session_was_deleted(artifact):
-    """Is this session in the day's deletion mirror? Never raises.
+    """Is this session in the day's deletion mirror?
 
-    Sibling of `lambda_session_finalize._session_was_deleted`, and lenient for
-    the same reason: an unreadable mirror must not cost a requester the report
-    they asked for, and this worker RECORDS errors rather than retrying them.
-    The strict counterpart is `lambda_org_api._session_was_removed`, which backs
-    read endpoints where a failed check costs one reader one refresh -- see its
-    docstring for why the two postures are deliberate and must not be merged.
+    Owner decision (2026-09-16): a mirror-read failure now FAILS CLOSED. This
+    used to log and return False ("proceed as if nothing was deleted"), which
+    could put a removed recording into a document and an email; that lenient
+    posture is superseded for this path. On a read failure this raises, and
+    `process_request`'s existing exception handling records a `status: error`
+    result instead of rendering or mailing anything.
+
+    `lambda_session_finalize._session_was_deleted` is a sibling that still has
+    the old lenient posture -- this decision was scoped to the report worker,
+    not to that sibling.
 
     Both spellings are compared: the mirror carries whatever `sessionBase` the
     delete endpoint had, and this artifact's `sessionId` is bare hex.
 
-    Logged on failure, because a permission fault here looks exactly like
+    Logged before raising, because a permission fault here looks exactly like
     "nothing was deleted".
 
     A day request is deleted when ANY of its sessions is, in ANY of its folders'
@@ -223,10 +227,9 @@ def _session_was_deleted(artifact):
         for folder in folders:
             deleted |= set(deletion_mirror.deleted_sessions(client, S3_BUCKET, folder, date))
     except Exception:
-        logger.exception("report: deletion mirror unreadable for %s on %s -- proceeding as "
-                         "if nothing was deleted, which may mail a removed recording",
-                         folders, date)
-        return False
+        logger.exception("report: deletion mirror unreadable for %s on %s -- failing closed, "
+                         "not rendering or mailing", folders, date)
+        raise
     for sid in ids:
         bare = sid[3:] if sid.startswith("sid") else sid
         if sid in deleted or bare in deleted or f"sid{bare}" in deleted:
@@ -415,7 +418,20 @@ def process_request(artifact, context=None):
     # not leave. The outcome is RECORDED because the requester polls `resultKey`;
     # a silent skip leaves that poll spinning forever, which is a different bug
     # wearing this fix's clothes.
-    if _session_was_deleted(artifact):
+    # The mirror check itself must not escape uncaught: a read failure here used to
+    # be swallowed inside _session_was_deleted (return False), which this branch
+    # removed -- it now raises. That raise is caught HERE, not left to whichever
+    # downstream try happens to wrap this call, so it guards BOTH the `generate`
+    # path below and the legacy assemble-and-render path, not just one of them.
+    try:
+        deleted = _session_was_deleted(artifact)
+    except Exception as exc:                      # noqa: BLE001 -- recorded, not retried
+        logger.exception("report: deletion mirror check failed for %s", request_id)
+        _write_result(result_key,
+                      dict({"status": "error", "requestId": request_id,
+                            "error": str(exc)}, **scope_fields))
+        return
+    if deleted:
         logger.info("report: %s was deleted -- not rendering, not sending", request_id)
         _write_result(result_key, {"status": "skipped", "requestId": request_id,
                                    "reason": "recording deleted", **scope_fields})
