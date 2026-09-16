@@ -212,12 +212,31 @@ def test_a_question_asked_twice_is_listed_once():
 # The rest
 # ---------------------------------------------------------------------------
 
-def test_the_summary_is_one_narrative_not_a_list_of_fragments():
-    r = _report(executive_summary=["First thing happened.", "Then another."])
+def test_the_summary_keeps_the_points_the_model_wrote_apart():
+    """Joining them was measured on a real report and it reads as one breath.
+
+    The extractor is ASKED for an array -- `lambda_meeting_minutes`: "executive_summary
+    MUST be an array of bullet strings, NOT a single string" -- and on 2026-09-03 it
+    returned seven separate commitments (falsework breach, tanking by the 29th, the PC
+    certificate, the electrical PS4, Twizel, crane methodology, joinery). `" ".join`
+    turned them into one 90-word sentence whose only punctuation was inside the points
+    themselves, because muse does not end a bullet with a full stop. The reader loses
+    the boundaries the model drew, and nothing fails.
+    """
+    r = _report(executive_summary=["First thing happened", "Then another"])
+    sec = _by_title(rs.build(r), "Summary")
+    assert sec["kind"] == "list"
+    assert sec["items"] == ["First thing happened", "Then another"]
+
+
+def test_a_summary_that_arrives_as_one_string_stays_one_narrative():
+    """Older reports, and the paths that write prose, send a paragraph. It is not
+    split on punctuation: a sentence boundary is not a point boundary, and guessing
+    one would invent structure the model did not write."""
+    r = _report(executive_summary="A day on site. Two things went wrong.")
     sec = _by_title(rs.build(r), "Summary")
     assert sec["kind"] == "narrative"
-    assert isinstance(sec["body"], str)
-    assert "First thing happened." in sec["body"] and "Then another." in sec["body"]
+    assert sec["body"] == "A day on site. Two things went wrong."
 
 
 def test_decisions_from_every_topic_land_in_one_list():

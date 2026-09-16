@@ -126,17 +126,25 @@ def build(report):
 def _summary(report):
     """One narrative for the day.
 
-    `executive_summary` arrives as a string from some paths and a list of
-    sentences from others; both become one readable paragraph rather than
-    bullets, because this is the part somebody reads instead of the timeline
-    that used to be underneath it.
+    `executive_summary` arrives as a list of points from the extractor -- the
+    prompt demands it: "executive_summary MUST be an array of bullet strings,
+    NOT a single string" -- and as one string from older reports and the prose
+    paths. Each keeps its own shape.
+
+    A list was being joined with spaces. Measured on the real 2026-09-03 report:
+    seven separate commitments became one 90-word run-on whose only full stops
+    were inside the points, because this model does not end a bullet with
+    punctuation. Joining is not a rendering choice here, it is the loss of the
+    boundaries the model drew, and it fails silently -- the section is present,
+    full, and unreadable. A string is NOT split back into points: a sentence
+    boundary is not a point boundary, and splitting would invent structure.
     """
     value = report.get("executive_summary")
     if isinstance(value, (list, tuple)):
-        body = " ".join(str(v).strip() for v in value if str(v).strip())
-    else:
-        body = str(value or "").strip()
-    return {"title": "Summary", "kind": "narrative", "body": body}
+        items = [str(v).strip() for v in value if str(v).strip()]
+        return {"title": "Summary", "kind": "list", "items": items}
+    return {"title": "Summary", "kind": "narrative",
+            "body": str(value or "").strip()}
 
 
 # `_on_site` is gone. It restated `recording_session` -- recordings, duration,
