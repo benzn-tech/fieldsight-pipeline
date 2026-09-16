@@ -624,7 +624,30 @@ def test_backfill_enrolls_unenrolled_login(wired):
     assert seen == {"sub": "sub-2", "folder_name": "Neil_Blunden"}
 
 
-def test_backfill_skips_collision(wired):
+def test_backfill_takes_the_next_free_name_when_the_first_is_taken(wired):
+    """A namesake used to be SKIPPED here and left with no folder at all, which
+    is how one prod login ended up writing into another person's folder for four
+    days. The next free name is a folder of their own instead."""
+    wired.setattr(org.users, "list_company_logins_unenrolled",
+                  lambda conn, cid: [
+                      {"id": "u-2", "cognito_sub": "sub-2", "first_name": "Neil", "last_name": "Blunden"}])
+    wired.setattr(org.users, "get_by_folder_name_global",
+                  lambda conn, folder: ({**CALLER, "cognito_sub": "sub-other", "folder_name": folder}
+                                        if folder == "Neil_Blunden" else None))
+    seen = {}
+    wired.setattr(org.users, "set_folder_name",
+                  lambda conn, sub, folder_name: seen.update(sub=sub, folder_name=folder_name))
+    res = org.lambda_handler(make_event("POST", "/api/org/members/enroll-backfill"), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["enrolled"] == [{"sub": "sub-2", "folder_name": "Neil_Blunden_2"}]
+    assert b["skipped"] == []
+    assert seen == {"sub": "sub-2", "folder_name": "Neil_Blunden_2"}
+
+
+def test_backfill_skips_when_no_name_is_free(wired):
+    """Every candidate taken: skipped with a reason, never a 500 on the unique
+    index and never another user's folder."""
     wired.setattr(org.users, "list_company_logins_unenrolled",
                   lambda conn, cid: [
                       {"id": "u-2", "cognito_sub": "sub-2", "first_name": "Neil", "last_name": "Blunden"}])
@@ -637,8 +660,8 @@ def test_backfill_skips_collision(wired):
     assert res["statusCode"] == 200
     b = body_of(res)
     assert b["enrolled"] == []
-    assert b["skipped"] == [{"sub": "sub-2", "reason": "folder taken by another user"}]
-    assert seen == {}  # collision -> set_folder_name never called, no 500
+    assert b["skipped"] == [{"sub": "sub-2", "reason": "no free folder name"}]
+    assert seen == {}
 
 
 def test_backfill_non_admin_403(wired):
@@ -7299,3 +7322,31 @@ def test_an_uncollapsed_row_still_says_it_was_mentioned_once():
     item = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"][0]
     assert item["mention_count"] == 1
     assert item["collapsed_ids"] == []
+
+
+def test_render_shape_carries_the_action_item_version():
+    """version = 1 + edit_count (todo-card spec 3.4). This serializer is a fixed
+    allowlist that has already dropped two repository fields on the way out
+    (mention_count, collapsed_ids) with every repository test green, so the
+    count is asserted HERE, on what the browser receives."""
+    row = _topic_row(action_items=[
+        {"id": "a-1", "text": "Order timber", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open", "edit_count": 3},
+        {"id": "a-2", "text": "Book pump", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open", "edit_count": 0},
+    ])
+    items = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"]
+    assert [i["version"] for i in items] == [4, 1]
+
+
+def test_a_row_that_was_never_counted_is_version_one():
+    """get_topic_full (reindex) does not count. Absent is v1, never missing."""
+    row = _topic_row(action_items=[
+        {"id": "a-1", "text": "Order timber", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open"},
+    ])
+    item = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"][0]
+    assert item["version"] == 1

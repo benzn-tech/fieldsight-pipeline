@@ -352,6 +352,10 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
     try:
         send(recipient, subject, text, html)
     except Exception as e:
+        # Logged as well as recorded. The result file was the only trace, so 36
+        # prod rejections (SES sandbox: unverified recipient) looked like nothing
+        # at all in the logs.
+        logger.error("finalize: send failed for session %s: %s", session_id, e)
         write_result(session_id, {"status": "error", "sessionId": session_id, "error": str(e)})
         return {"status": "error", "recipient": recipient, "sessionId": session_id}
     write_result(session_id, {"status": "sent", "sessionId": session_id, "recipient": recipient})

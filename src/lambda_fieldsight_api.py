@@ -1197,23 +1197,15 @@ def get_report_history(params, caller):
 # ── POST /api/reports/generate ───────────────────────────────
 
 def trigger_report_generation(body, caller):
-    rtype = body.get('report_type', 'daily')
-    date = body.get('date', '')
-    force = body.get('force', False)
-    if not date:
-        date = (nz_time.nz_now() - timedelta(days=1)).strftime('%Y-%m-%d')
-    payload = {'report_type': rtype, 'date': date}
-    if caller['role'] == 'worker':
-        user = resolve_user_display_name(caller)
-        if user:
-            payload['users_filter'] = [user.replace('_', ' ')]
-    if force:
-        payload['force'] = True
-    try:
-        lambda_client.invoke(FunctionName=REPORT_FUNCTION, InvocationType='Event', Payload=json.dumps(payload))
-        return ok({'message': f'Report triggered for {date}', 'status': 'pending'}, 202)
-    except Exception as e:
-        return error(f'Failed: {e}', 500)
+    # CLOSED 2026-09-15. Its only caller was the frontend. It regenerated a whole day
+    # for every user -- the worker-only filter was sent as `users_filter`, a key the
+    # generator never reads, in a "First Last" form that matches no folder -- plus a
+    # seven-day backfill, and on 2026-09-14 one click rewrote four prod reports across
+    # two people. Owner rule: each person regenerates only their own reports, which is
+    # POST /api/org/reports/regenerate. The nightly schedule invokes the generator
+    # directly and never came through here.
+    return error('Gone: use POST /api/org/reports/regenerate, which regenerates '
+                 'only your own report', 410)
 
 
 # ── POST /api/ask ───────────────────────────────────────────
@@ -1229,10 +1221,11 @@ def ask_question(body, caller):
 
     if not question:
         return error('Missing question')
-    # `date` is forwarded and the RAG path does not read it -- it branches on
-    # caller_sub before `date` is ever looked at, so a comment here once
-    # claiming it was "soft context" described something that never happened.
-    # It stays for the legacy S3 path, which does read it.
+    # `date` is read on the RAG path since scoped Ask (2026-09-15), but ONLY when
+    # the body also carries `scoped: true`: with no time word in the question it
+    # then narrows retrieval to that day. Without `scoped` the RAG path ignores
+    # `date` exactly as before, because the deployed UI already sends it. The
+    # legacy S3 path reads it too.
     #
     # `tz` is what the RAG path reads: an IANA zone id, not a date. The zone is
     # sent instead of a computed date because NZ and AU are both on daylight
@@ -1262,6 +1255,16 @@ def ask_question(body, caller):
         payload['tz'] = body['tz']
     if topic_id is not None:
         payload['topic_id'] = topic_id
+
+    # Scoped Ask (spec 2026-09-15 §4.1): forwarded as sent, validated by the Ask
+    # Agent, enforced by rag-search. Absent stays absent -- never ''.
+    for field in ('site_id', 'author_folder', 'topic_row_id'):
+        if body.get(field) not in (None, ''):
+            payload[field] = body[field]
+    # The gate that makes the Ask Agent honour `date` (spec §3). Forwarded as
+    # sent when truthy; the Ask Agent accepts only JSON true.
+    if body.get('scoped'):
+        payload['scoped'] = body['scoped']
 
     try:
         resp = lambda_client.invoke(
@@ -1346,6 +1349,54 @@ def corroborate_answer(body, caller):
 # is generous headroom while still rejecting absurd payloads early.
 MAX_VOICE_AUDIO_B64 = 1_500_000
 
+# Conversation continuity, step 2: the gateway carries the previous turns and
+# the agent counts them. Nothing retrieves with them yet -- the device half and
+# the retrieval half land separately, and an inert forward can be observed in
+# production logs before either commits to a shape.
+#
+# Six turns because a follow-up refers to the last question, not to the start of
+# a shift, and 2000 chars because a spoken answer is two or three sentences --
+# the cap is for the pathological client, not the ordinary one. Their product is
+# the number that matters: 6 x 2000 x 2 fields = 24K, against a 6MB synchronous
+# invoke ceiling this body already fills with 1.5M chars of base64 audio.
+MAX_VOICE_HISTORY_TURNS = 6
+MAX_VOICE_HISTORY_CHARS = 2000
+
+
+def _clean_voice_history(raw):
+    """The forwardable turns in `raw`, most recent kept, or [] if there are none.
+
+    FAILS SOFT on purpose. A device that ships a serialisation bug must lose its
+    memory, not its voice: a 400 here would take hands-free Ask offline across a
+    whole app build to protect a feature that is not wired up yet. Bad turns are
+    dropped individually so one corrupted entry cannot erase a conversation that
+    is otherwise intact, and the caller logs how many went missing.
+
+    Only `question` and `answer` survive. This field ends up inside an LLM
+    prompt, and forwarding whatever else the device keeps locally -- ids,
+    timestamps, a `caller_sub` -- is how unreviewed client data gets there.
+    Identity in particular comes from the authorizer, never from the body.
+
+    The tail is kept, not the head: a follow-up refers to the last question, so
+    dropping recent turns would answer against the conversation from ten minutes
+    ago while looking like it worked.
+    """
+    if not isinstance(raw, list):
+        return []
+    kept = []
+    for turn in raw[-MAX_VOICE_HISTORY_TURNS:]:
+        if not isinstance(turn, dict):
+            continue
+        q, a = turn.get('question'), turn.get('answer')
+        if not isinstance(q, str) or not isinstance(a, str):
+            continue
+        q, a = q.strip(), a.strip()
+        if not q or not a:
+            continue
+        kept.append({'question': q[:MAX_VOICE_HISTORY_CHARS],
+                     'answer': a[:MAX_VOICE_HISTORY_CHARS]})
+    return kept
+
 
 def ask_voice(body, caller):
     """Hands-free voice ask (SP-Ask): forward the base64 clip to the Ask Agent,
@@ -1374,6 +1425,25 @@ def ask_voice(body, caller):
     }
     if body.get('tz'):
         payload['tz'] = body['tz']   # see ask_question: an IANA zone, not a date
+
+    # ABSENT, never an empty list. Every device in the field today sends no
+    # history, and "I have no history" is a different statement from "my
+    # conversation is empty" -- collapsing them would make the agent's
+    # history_turns count mean two things, and would break the sibling test that
+    # pins this payload to exactly four keys.
+    raw_history = body.get('history')
+    history = _clean_voice_history(raw_history)
+    if history:
+        payload['history'] = history
+    if isinstance(raw_history, list) and len(raw_history) != len(history):
+        # The only trace that a device is sending turns we cannot use. Silent
+        # dropping is correct behaviour and a terrible diagnostic.
+        logger.warning(
+            "voice ask: dropped %d of %d history turns",
+            len(raw_history) - len(history), len(raw_history))
+    elif raw_history is not None and not isinstance(raw_history, list):
+        logger.warning("voice ask: history was %s, not a list",
+                       type(raw_history).__name__)
     try:
         resp = lambda_client.invoke(
             FunctionName=ASK_AGENT_FUNCTION,

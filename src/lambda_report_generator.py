@@ -62,6 +62,7 @@ import json
 import nz_time
 import logging
 import re
+from urllib.parse import unquote_plus
 import boto3
 import urllib3
 import agent_turn_filter
@@ -1823,8 +1824,17 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
 # Generate Weekly / Monthly Report
 # ============================================================
 
-def generate_periodic_report(report_type, start_date, end_date):
-    logger.info(f"=== Generating {report_type.upper()} report: {start_date} to {end_date} ===")
+def generate_periodic_report(report_type, start_date, end_date, user=None, triggered_by='system'):
+    """`user` set = ONE person's own report, built only from that person's own dailies.
+
+    A regenerate request names exactly one folder (owner rule: each person regenerates
+    only their own reports). So with `user` set this never lists other people's
+    reports, never borrows the company-wide day summary for a day the person has no
+    daily -- that would put other people's content into "their own" report -- and
+    returns before the site and combined reports, which are not anyone's to regenerate.
+    """
+    logger.info(f"=== Generating {report_type.upper()} report: {start_date} to {end_date}"
+                f"{' -- user ' + user if user else ''} ===")
     load_prompt_templates(S3_BUCKET)
     site_name = os.environ.get('SITE_NAME', 'Construction Site')
     site_id_default = site_name.lower().replace(' ', '-')
@@ -1836,6 +1846,12 @@ def generate_periodic_report(report_type, start_date, end_date):
     reports_by_user = {}
 
     for date_str in dates_in_range(start_date, end_date):
+        if user is not None:
+            own = download_json_from_s3(S3_BUCKET, f"{REPORT_PREFIX}{date_str}/{user}/daily_report.json")
+            if own:
+                all_daily_reports.append(own)
+                reports_by_user.setdefault(user, []).append(own)
+            continue
         prefix = f"{REPORT_PREFIX}{date_str}/"
         found_per_user = False
         for obj in list_s3_objects(S3_BUCKET, prefix):
@@ -1869,7 +1885,7 @@ def generate_periodic_report(report_type, start_date, end_date):
         return {'report_type': report_type, 'status': 'no_data'}
 
     weekly_reports = []
-    if report_type == 'monthly':
+    if report_type == 'monthly' and user is None:
         for obj in list_s3_objects(S3_BUCKET, REPORT_PREFIX):
             if 'weekly_report.json' in obj['key']:
                 wr = download_json_from_s3(S3_BUCKET, obj['key'])
@@ -1910,7 +1926,7 @@ def generate_periodic_report(report_type, start_date, end_date):
             'site': user_site_name, 'site_id': user_site_id,
             **claude_output,
             '_report_metadata': {
-                'version': 'v3.5', 'generated_at': now_iso, 'generated_by': 'system',
+                'version': 'v3.5', 'generated_at': now_iso, 'generated_by': triggered_by,
                 'scope': 'user', 'daily_reports_used': len(user_reports), 'model': llm_utils.active_model(),
             }
         }
@@ -1935,6 +1951,17 @@ def generate_periodic_report(report_type, start_date, end_date):
             logger.error(f"  Word failed for {user_name}: {e}")
 
         per_user_results[user_name] = {'status': 'success', 'daily_reports': len(user_reports)}
+
+    if user is not None:
+        return {
+            'report_type': report_type,
+            'period': {'start': start_date, 'end': end_date},
+            'daily_reports_used': len(all_daily_reports),
+            'per_user': per_user_results,
+            'per_site': {},
+            'scope': 'user',
+            'status': 'success',
+        }
 
     # Per-site reports
     reports_by_site = {}
@@ -2065,6 +2092,59 @@ def generate_periodic_report(report_type, start_date, end_date):
 
 
 # ============================================================
+# Regenerate requests (report_requests/<folder>/<rid>.json)
+# ============================================================
+
+REGENERATE_REQUEST_KEY_RE = re.compile(r"^report_requests/([^/]+)/([^/]+)\.json$")
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def handle_regenerate_request(key):
+    """Regenerate exactly the report one request names, or nothing at all.
+
+    Owner rule: each person regenerates only their own reports. The request is
+    written by org-api, which takes the folder from the caller's identity, never
+    from a body. This side trusts nothing: anything unexpected is REJECTED and
+    generates nothing. It must never fall through to the schedule defaults below
+    (yesterday, every user, plus the seven-day backfill) -- on 2026-09-14 that
+    shape turned one click on one report into four rewritten reports.
+    """
+    m = REGENERATE_REQUEST_KEY_RE.match(key or "")
+    if not m:
+        return {'key': key, 'status': 'rejected', 'reason': 'not a regenerate request key'}
+    key_folder = m.group(1)
+    req = download_json_from_s3(S3_BUCKET, key)
+    if not isinstance(req, dict):
+        return {'key': key, 'status': 'rejected', 'reason': 'request unreadable'}
+
+    user = req.get('user')
+    if not isinstance(user, str) or not user.strip() or '/' in user or user != key_folder:
+        return {'key': key, 'status': 'rejected',
+                'reason': 'user must be one folder, equal to the request key folder'}
+    triggered_by = req.get('triggered_by') if isinstance(req.get('triggered_by'), str) else 'request'
+    report_type = req.get('report_type')
+
+    if report_type == 'daily':
+        date = req.get('date')
+        if not isinstance(date, str) or not _ISO_DATE_RE.match(date):
+            return {'key': key, 'status': 'rejected', 'reason': 'daily needs date YYYY-MM-DD'}
+        logger.info(f"Regenerate request {key}: daily {date} for {user}")
+        result = generate_daily_report(date, None, triggered_by,
+                                       users_filter=[user], force=True)
+        return {'key': key, 'status': 'done', 'result': result}
+
+    if report_type in ('weekly', 'monthly'):
+        start, end = req.get('start_date'), req.get('end_date')
+        if not all(isinstance(d, str) and _ISO_DATE_RE.match(d) for d in (start, end)) or start > end:
+            return {'key': key, 'status': 'rejected', 'reason': f'{report_type} needs start_date and end_date'}
+        logger.info(f"Regenerate request {key}: {report_type} {start}..{end} for {user}")
+        result = generate_periodic_report(report_type, start, end, user=user, triggered_by=triggered_by)
+        return {'key': key, 'status': 'done', 'result': result}
+
+    return {'key': key, 'status': 'rejected', 'reason': f'not regenerable: {report_type!r}'}
+
+
+# ============================================================
 # MAIN HANDLER
 # ============================================================
 
@@ -2097,6 +2177,14 @@ def lambda_handler(event, context):
     _user_mapping_cache = None
     global _prompt_templates_cache
     _prompt_templates_cache = None
+
+    if 'Records' in event:
+        # A regenerate request. Handled here and returned here, so no request --
+        # however malformed -- can reach the schedule defaults below.
+        outcomes = [handle_regenerate_request(unquote_plus(r.get('s3', {}).get('object', {}).get('key', '')))
+                    for r in (event.get('Records') or [])]
+        logger.info(f"Regenerate requests: {json.dumps(outcomes, default=str)[:2000]}")
+        return {'statusCode': 200, 'body': json.dumps(outcomes, default=str)}
 
     report_type = event.get('report_type', 'daily')
 

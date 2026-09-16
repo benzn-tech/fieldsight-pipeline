@@ -649,9 +649,21 @@ def write_extraction_items(date, user_folder, extraction_key):
             (report_source_key,),
         ).fetchone()
         if report_already_ingested is not None:
-            reason = "nightly report already ingested — late session extraction superseded"
-            logger.info("%s: %s", extraction_key, reason)
-            return {"skipped": True, "reason": reason}
+            if not lambda_ingest.AUTHORITY_FLIP:
+                reason = "nightly report already ingested — late session extraction superseded"
+                logger.info("%s: %s", extraction_key, reason)
+                return {"skipped": True, "reason": reason}
+            # Under the flip the extraction IS the item store, and a day that has one
+            # is by definition not a "zero-extraction fallback day" -- the only kind
+            # the comment above says report topics may exist for. Skipping here
+            # deadlocked with ingest, which defers only once extraction topics
+            # already exist: each waited for the other, and the day could never
+            # become session-scoped again. So the extraction wins. Only this
+            # (date, user)'s report rows go; its chunks survive (topic_id is ON
+            # DELETE SET NULL) and the next ingest of that report re-links them.
+            removed = topics.delete_topics_for_source(conn, report_source_key)
+            logger.info("%s: authority flip -- replaced %s report topic(s) from %s",
+                        extraction_key, removed, report_source_key)
 
         company = lambda_ingest.resolve_company(conn, user_folder)
         if company is None:

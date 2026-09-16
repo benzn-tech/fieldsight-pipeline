@@ -46,13 +46,45 @@ def s3():
     return _s3_client
 
 
+def _is_day(artifact):
+    return artifact.get("scope") == "day"
+
+
 def _doc_key(artifact):
     """The Word doc lives under a DEDICATED session_reports/ prefix — NOT the
     nightly meeting_minutes/ path — so this on-demand Delivery-C artifact never
     collides with the report-generator's manifest machinery (BUG-18 sidestepped;
-    authority-flip already de-dupes the nightly path)."""
+    authority-flip already de-dupes the nightly path). A day report takes the
+    literal `day` segment where a session report takes its session id; the session
+    routes refuse `day` as an id (spec 2026-09-15 F2)."""
+    segment = "day" if _is_day(artifact) else artifact["sessionId"]
     return (f"session_reports/{artifact['folder']}/{artifact['date']}/"
-            f"{artifact['sessionId']}/{artifact['requestId']}.docx")
+            f"{segment}/{artifact['requestId']}.docx")
+
+
+def _scope_ids_and_folders(artifact):
+    """(session ids in scope, folders whose deletion mirror must be read).
+
+    A day names every session it bundles, and every folder those sessions' topics
+    were written under -- a merged meeting's rows live under the LEAD's folder, and
+    so does its tombstone."""
+    folder = artifact.get("folder")
+    if _is_day(artifact):
+        ids = [str(s).strip() for s in (artifact.get("sessionIds") or []) if str(s).strip()]
+        folders = {f for f in (artifact.get("mirrorFolders") or []) if f}
+        if folder:
+            folders.add(folder)
+        return ids, sorted(folders)
+    sid = (artifact.get("sessionId") or "").strip()
+    return ([sid] if sid else []), ([folder] if folder else [])
+
+
+def _scope_result_fields(artifact):
+    """What a day result must carry so the status route can re-check it."""
+    if not _is_day(artifact):
+        return {}
+    ids, folders = _scope_ids_and_folders(artifact)
+    return {"scope": "day", "sessionIds": ids, "mirrorFolders": folders}
 
 
 def _humanize(key):
@@ -168,29 +200,45 @@ def _session_was_deleted(artifact):
 
     Logged on failure, because a permission fault here looks exactly like
     "nothing was deleted".
+
+    A day request is deleted when ANY of its sessions is, in ANY of its folders'
+    mirrors.
     """
-    folder, date = artifact.get("folder"), artifact.get("date")
-    sid = (artifact.get("sessionId") or "").strip()
-    if not (folder and date and sid):
+    date = artifact.get("date")
+    ids, folders = _scope_ids_and_folders(artifact)
+    if not (date and ids and folders):
         return False
     try:
         import boto3
 
         import deletion_mirror
-        deleted = deletion_mirror.deleted_sessions(
-            boto3.client("s3"), S3_BUCKET, folder, date)
+        client = boto3.client("s3")
+        deleted = set()
+        for folder in folders:
+            deleted |= set(deletion_mirror.deleted_sessions(client, S3_BUCKET, folder, date))
     except Exception:
-        logger.exception("report: deletion mirror unreadable for %s/%s -- proceeding as "
+        logger.exception("report: deletion mirror unreadable for %s on %s -- proceeding as "
                          "if nothing was deleted, which may mail a removed recording",
-                         folder, date)
+                         folders, date)
         return False
-    return sid in deleted or f"sid{sid}" in deleted
+    for sid in ids:
+        bare = sid[3:] if sid.startswith("sid") else sid
+        if sid in deleted or bare in deleted or f"sid{bare}" in deleted:
+            return True
+    return False
 
 
 def process_request(artifact):
     """Render one enqueued request → Word doc (+ optional email) → result JSON."""
     result_key = artifact["resultKey"]
     request_id = artifact.get("requestId")
+
+    scope_fields = _scope_result_fields(artifact)
+    if _is_day(artifact) and not scope_fields["sessionIds"]:
+        # A day with no sessions cannot be checked against any mirror, so it is not rendered.
+        _write_result(result_key, {"status": "error", "requestId": request_id,
+                                   "error": "day request carries no sessionIds"})
+        return
 
     # A session deleted before this request is rendered must not become a DOCX in
     # S3, and must not be emailed.
@@ -208,7 +256,7 @@ def process_request(artifact):
     if _session_was_deleted(artifact):
         logger.info("report: %s was deleted -- not rendering, not sending", request_id)
         _write_result(result_key, {"status": "skipped", "requestId": request_id,
-                                   "reason": "recording deleted"})
+                                   "reason": "recording deleted", **scope_fields})
         return
 
     try:
@@ -217,7 +265,7 @@ def process_request(artifact):
         if buf is None:
             # DOCX layer missing / disabled — record it, don't crash the trigger.
             _write_result(result_key, {"status": "error", "requestId": request_id,
-                                       "error": "document generation unavailable"})
+                                       "error": "document generation unavailable", **scope_fields})
             return
         doc_key = _doc_key(artifact)
         s3().put_object(Bucket=S3_BUCKET, Key=doc_key,
@@ -227,10 +275,11 @@ def process_request(artifact):
             _send_email(artifact)
             emailed = True
         _write_result(result_key, {"status": "done", "requestId": request_id,
-                                   "docKey": doc_key, "emailed": emailed})
+                                   "docKey": doc_key, "emailed": emailed, **scope_fields})
     except Exception as e:
         logger.exception("session report generation failed for %s", request_id)
-        _write_result(result_key, {"status": "error", "requestId": request_id, "error": str(e)})
+        _write_result(result_key, {"status": "error", "requestId": request_id, "error": str(e),
+                                   **scope_fields})
 
 
 def lambda_handler(event, context):

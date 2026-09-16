@@ -134,9 +134,10 @@ def test_dates_window_starts_on_the_nz_day_not_a_day_early(monkeypatch):
     assert "2026-09-01" in body["dates"]
 
 
-def test_report_generation_defaults_to_nz_yesterday(monkeypatch):
-    """Same wrong-day shape as the timeline: no ?date means "yesterday", and
-    the date it picks is what the report generator is asked to produce."""
+def test_report_generation_route_is_closed_and_picks_no_date(monkeypatch):
+    """This used to pin that "no ?date" meant NZ yesterday. The route is closed
+    (see test_a_person_regenerates_their_own_report.py): it must answer 410 and
+    ask the generator for nothing, on any clock."""
     monkeypatch.setattr(api.nz_time, "datetime", _Frozen)
     sent = {}
 
@@ -147,5 +148,5 @@ def test_report_generation_defaults_to_nz_yesterday(monkeypatch):
     monkeypatch.setattr(api, "lambda_client", _Lambda())
     resp = api.trigger_report_generation({}, {"role": "admin", "company_id": "c"})
 
-    assert sent["payload"]["date"] == "2026-09-05"        # +13 would say the 6th
-    assert "2026-09-05" in json.loads(resp["body"])["message"]
+    assert resp["statusCode"] == 410
+    assert sent == {}
