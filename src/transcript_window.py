@@ -11,6 +11,7 @@ import logging
 import re
 
 import batch_stitch
+import chunking
 import transcript_utils as tu
 
 logger = logging.getLogger()
@@ -79,3 +80,38 @@ def assemble(s3, bucket, picked):
             turns.append({"at": at, "line": line})
     turns.sort(key=lambda t: t["at"])
     return turns
+
+
+class UnplaceableExclusion(Exception):
+    """An excluded topic whose time_range cannot be parsed. The stretch it covers
+    cannot be cut out, so the request fails: generating from the unclipped
+    transcript would put hidden speech in a customer's report."""
+
+
+def excluded_spans(date, excluded_topics):
+    """Wall-clock spans to remove. `excluded_topics` are the day's topics that are
+    redacted or non-work -- the ones the report scope already refuses to show."""
+    day = dt.datetime.strptime(date, "%Y-%m-%d")
+    spans = []
+    for t in excluded_topics or []:
+        parsed = chunking.parse_time_range(t.get("time_range"))
+        if not parsed:
+            raise UnplaceableExclusion(
+                "topic %s is excluded but its time_range %r cannot be placed"
+                % (t.get("id"), t.get("time_range")))
+        start_s, end_s = parsed
+        spans.append((day + dt.timedelta(seconds=start_s), day + dt.timedelta(seconds=end_s)))
+    return spans
+
+
+def drop_spans(turns, spans):
+    """Every turn that starts inside an excluded span goes, boundaries included."""
+    if not spans:
+        return list(turns)
+    kept = []
+    for t in turns:
+        at = t["at"]
+        if any(s <= at <= e for s, e in spans):
+            continue
+        kept.append(t)
+    return kept
