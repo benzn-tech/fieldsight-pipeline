@@ -657,6 +657,37 @@ def save_debug_record(bucket, target_date, meeting_title, prompt, raw_response,
 # Word Document Generation
 # ============================================================
 
+# A speaker-diarization label (spk_0, SPK_12, ...) is a per-call transcription
+# artefact, not an identity -- the same spk_1 in two different calls is
+# usually two different people. It must never be shown to a customer as the
+# name of a person (memory: a spk_1 label once reached a customer email as
+# "the responsible person"). This is the one place that recognizes the
+# pattern, so every renderer and every prompt-builder agrees on what counts
+# as a label.
+_SPEAKER_LABEL_TOKEN = re.compile(r"\bspk_\d+\b", re.IGNORECASE)
+
+
+def _sanitize_speaker_label(value, replacement=""):
+    """Strip speaker-diarization labels out of a value that may hold one.
+
+    Two calling shapes, same rule:
+    - An owner/responsible field: if the *entire* trimmed value is nothing
+      but a label, it is not a name at all -- replaced with `replacement`
+      (default: empty, so callers can fall back to "no owner recorded").
+    - Free text (an action's own sentence): a bare spk_N token embedded in
+      the sentence is swapped for the neutral word "someone", leaving the
+      rest of the sentence intact. Matches whole tokens only, so a real word
+      that merely contains those letters (e.g. "spkr", "speaker") is never
+      touched.
+    """
+    if not value:
+        return value
+    stripped = value.strip()
+    if _SPEAKER_LABEL_TOKEN.fullmatch(stripped):
+        return replacement
+    return _SPEAKER_LABEL_TOKEN.sub("someone", value)
+
+
 def generate_prose_document(title, subtitle, sections, actions):
     """A record whose headings come from its template, not from this function.
 
@@ -693,8 +724,8 @@ def generate_prose_document(title, subtitle, sections, actions):
             cell.text = head
         for a in actions:
             row = table.add_row().cells
-            row[0].text = (a.get("action") or "").strip()
-            row[1].text = (a.get("owner") or "").strip() or "no owner recorded"
+            row[0].text = _sanitize_speaker_label((a.get("action") or "").strip())
+            row[1].text = _sanitize_speaker_label((a.get("owner") or "").strip()) or "no owner recorded"
             row[2].text = (a.get("deadline") or "").strip() or "no date"
 
     buf = BytesIO()
@@ -790,8 +821,13 @@ def generate_word_document(minutes_data, title):
                 doc.add_heading('Action Items', level=3)
                 for ai in actions:
                     priority = ai.get('priority', 'medium').upper()
-                    text = (f"[{priority}] {ai.get('action', '')} "
-                            f"→ {ai.get('owner', '?')} by {ai.get('deadline', '?')}")
+                    action_text = _sanitize_speaker_label(ai.get('action', ''))
+                    owner_raw = ai.get('owner', '') or ''
+                    owner = _sanitize_speaker_label(owner_raw)
+                    if not owner:
+                        owner = 'no owner recorded' if owner_raw.strip() else '?'
+                    text = (f"[{priority}] {action_text} "
+                            f"→ {owner} by {ai.get('deadline', '?')}")
                     p = doc.add_paragraph(text, style='List Bullet')
                     if priority == 'HIGH' and p.runs:
                         p.runs[0].font.color.rgb = RGBColor(192, 57, 43)
@@ -831,7 +867,12 @@ def generate_word_document(minutes_data, title):
         doc.add_heading('Follow-ups & Dependencies', level=1)
         for fu in follow_ups:
             priority = fu.get('priority', 'medium').upper()
-            text = f"[{priority}] {fu.get('item', '')} → {fu.get('owner', '?')} by {fu.get('deadline', '?')}"
+            item_text = _sanitize_speaker_label(fu.get('item', ''))
+            owner_raw = fu.get('owner', '') or ''
+            owner = _sanitize_speaker_label(owner_raw)
+            if not owner:
+                owner = 'no owner recorded' if owner_raw.strip() else '?'
+            text = f"[{priority}] {item_text} → {owner} by {fu.get('deadline', '?')}"
             depends = fu.get('depends_on', '')
             if depends:
                 text += f"\n  ⚠ Blocked by: {depends}"

@@ -26,7 +26,7 @@ import llm_utils
 import report_template
 import transcript_window
 from email_sender import get_sender
-from lambda_meeting_minutes import generate_word_document
+from lambda_meeting_minutes import generate_word_document, _sanitize_speaker_label
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -284,13 +284,23 @@ def _clock(date, hhmm):
 
 def _action_items_for_prompt(content):
     """The actions the model is given: extraction's, not its own reading of the
-    transcript. Owner and date are already recorded against them."""
+    transcript. Owner and date are already recorded against them.
+
+    Extraction can hold a raw speaker-diarization label (spk_0, spk_1, ...) in
+    either field -- that is a per-call transcription artefact, not an
+    identity, and must never reach the model: once it is in the prompt, no
+    later renderer-side filter can stop the model from echoing it into prose
+    (memory: a spk_1 label once reached a customer email as "the responsible
+    person"). Sanitize with the same helper the renderers use so this and the
+    renderers can't drift on what counts as a label.
+    """
     out = []
     for topic in (content.get("topics") or []):
         for a in (topic.get("action_items") or []):
-            out.append({"action": a.get("action") or a.get("text"),
-                        "owner": a.get("owner") or a.get("responsible"),
-                        "deadline": a.get("deadline")})
+            action = _sanitize_speaker_label(a.get("action") or a.get("text") or "")
+            owner_raw = a.get("owner") or a.get("responsible") or ""
+            owner = _sanitize_speaker_label(owner_raw)
+            out.append({"action": action, "owner": owner, "deadline": a.get("deadline")})
     return out
 
 
