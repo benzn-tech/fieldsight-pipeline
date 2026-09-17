@@ -288,3 +288,64 @@ def test_a_todo_without_a_reason_renders_exactly_as_before():
     lines = [ln for ln in text.splitlines() if ln.strip()]
     idx = next(i for i, ln in enumerate(lines) if "Chase the delivery" in ln)
     assert idx == len(lines) - 1 or not lines[idx + 1].startswith("      "), lines[idx:idx + 2]
+
+
+# --- B2: the owner's display name reaches the brief ---------------------------
+# Plumbing only (2026-09-17 plan, task B2): `folder` is already in hand at
+# `_complete_summary` (e.g. "Ben_Lin"); `_display_name` turns it into "Ben Lin"
+# and that name is bound into the brief branch only. The rolling branch (used
+# when SESSION_BRIEF is off) is untouched -- it stays a plain `summarize_turns`
+# call over turns alone, because that is the contract `brief_from_turns` was
+# built to be a drop-in for (session_brief.py module docstring).
+
+def test_the_owner_name_is_derived_from_the_folder():
+    assert fin._display_name("Ben_Lin") == "Ben Lin"
+    assert fin._display_name("Ben_UCPK2") == "Ben UCPK2"
+    assert fin._display_name("") is None
+
+
+def test_the_rolling_summariser_is_still_called_with_turns_alone(monkeypatch):
+    import lambda_extract_session as ex
+    import lambda_rolling_summary as rs
+
+    turns = [{"abs_start_str": "13:00:00", "speaker": "spk_0", "text": "hi"}]
+    monkeypatch.setattr(ex, "gather_session_segments", lambda *a, **k: ["k1"], raising=False)
+    monkeypatch.setattr(ex, "assemble_deduped_turns", lambda *a, **k: (turns, {}), raising=False)
+
+    calls = []
+
+    def spy(*a, **k):
+        calls.append((a, k))
+        return {"summary": "s", "open_todos": []}
+
+    monkeypatch.setattr(fin, "SESSION_BRIEF", False, raising=False)
+    monkeypatch.setattr(rs, "summarize_turns", spy, raising=False)
+
+    out = fin._complete_summary({"folder": "Ben_Lin", "date": "2026-08-19", "sessionId": "abc"})
+
+    assert out == {"summary": "s", "open_todos": []}
+    assert calls == [((turns,), {})]
+
+
+def test_the_brief_is_called_with_the_folders_display_name(monkeypatch):
+    import lambda_extract_session as ex
+    import session_brief as sb
+
+    turns = [{"abs_start_str": "13:00:00", "speaker": "spk_0", "text": "hi"}]
+    monkeypatch.setattr(ex, "gather_session_segments", lambda *a, **k: ["k1"], raising=False)
+    monkeypatch.setattr(ex, "assemble_deduped_turns", lambda *a, **k: (turns, {}), raising=False)
+
+    seen = {}
+
+    def spy(passed_turns, **k):
+        seen["turns"] = passed_turns
+        seen.update(k)
+        return {"summary": "s", "open_todos": []}
+
+    monkeypatch.setattr(fin, "SESSION_BRIEF", True, raising=False)
+    monkeypatch.setattr(sb, "brief_from_turns", spy, raising=False)
+
+    fin._complete_summary({"folder": "Ben_Lin", "date": "2026-08-19", "sessionId": "abc"})
+
+    assert seen["turns"] == turns
+    assert seen.get("owner_name") == "Ben Lin"

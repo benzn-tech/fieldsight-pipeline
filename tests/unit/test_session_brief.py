@@ -267,3 +267,22 @@ def test_the_prompt_tells_the_model_the_same_thing():
     prompt = sb.build_brief_prompt([{"abs_start_str": "11:00:00", "speaker": "spk_0",
                                      "text": "hello"}])
     assert "spk_0" in prompt and "NOT names" in prompt
+
+
+# --- B2: the owner's display name reaches the prompt --------------------------
+# Plumbing only (2026-09-17 plan, task B2): `build_brief_prompt` gains an
+# `owner_name` keyword-only parameter so the recording owner's name can reach
+# the model. What the prompt DOES with the name (the attribution rule) is
+# task B3 -- these only pin that the name is conveyed when known, and that
+# nothing about an owner leaks into the prompt when it is not.
+
+def test_the_prompt_names_the_owner_when_one_is_known():
+    prompt = sb.build_brief_prompt(_turns(), owner_name="Ben Lin")
+    assert "Ben Lin" in prompt
+
+
+def test_the_prompt_says_nothing_about_an_owner_when_none_is_known():
+    prompt = sb.build_brief_prompt(_turns(), owner_name=None)
+    assert "owner" not in prompt.lower()
+    assert "None" not in prompt
+    assert "{owner" not in prompt

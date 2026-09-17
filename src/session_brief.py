@@ -47,10 +47,16 @@ def render_turns(turns, limit=TRANSCRIPT_LIMIT):
     return text[:head] + "\n[... middle of the session elided to fit ...]\n" + text[-tail:]
 
 
-def build_brief_prompt(turns):
+def build_brief_prompt(turns, owner_name=None):
+    # Plumbing only (2026-09-17 plan, task B2): the recording owner's display
+    # name, when known, reaches the prompt so a later task can write attribution
+    # rules around it. What to DO with the name -- the "when a turn is plainly
+    # {owner} speaking, use their name" instruction -- is task B3; this commit
+    # only conveys the name, and conveys nothing when there is none to convey.
+    owner_line = f"\nThis recording belongs to {owner_name}.\n" if owner_name else ""
     return f"""You are briefing a senior colleague who was NOT in this meeting. They have a
 few minutes, and afterwards they have to be able to discuss any part of it.
-
+{owner_line}
 Below is the full transcript, one line per speaker turn as [HH:MM:SS] speaker: text.
 It comes from automatic speech recognition, so expect misheard words and filler.
 
@@ -348,13 +354,15 @@ def to_session_summary(brief):
     return {"summary": (brief.get("headline") or "").strip(), "open_todos": todos}
 
 
-def brief_from_turns(turns, call_llm=None):
+def brief_from_turns(turns, call_llm=None, *, owner_name=None):
     """Drop-in for lambda_rolling_summary.summarize_turns.
 
     Returns the brief WIDENED with `summary` and `open_todos`, or None on any
     failure so the caller falls back exactly as it does today. `call_llm` is
     injectable for tests; llm_utils is imported lazily so this module stays pure
-    at import.
+    at import. `owner_name` is keyword-only with a default so this stays a
+    drop-in for `summarize_turns(turns)` -- the contract this module was built
+    to honour (see the module docstring above).
     """
     if not turns:
         return None
@@ -368,7 +376,7 @@ def brief_from_turns(turns, call_llm=None):
     # a 70-minute session, and that is where its density comes from. Inheriting
     # the env would mean every number this was designed against was measured on
     # a configuration that never shipped.
-    raw, _err = call_llm(build_brief_prompt(turns), max_tokens=MAX_TOKENS,
+    raw, _err = call_llm(build_brief_prompt(turns, owner_name=owner_name), max_tokens=MAX_TOKENS,
                          force_json=True, enable_thinking=True)
     brief = parse_brief(raw)
     if not brief:

@@ -49,6 +49,15 @@ FINALIZE_RESULTS_PREFIX = "session_finalize_results/"
 RENDERED_KINDS = ("final", "rolling", "updated")
 
 
+def _display_name(folder):
+    """The recording owner's display name, derived from the S3 folder ("Ben_Lin"
+    -> "Ben Lin"). Plumbing only (2026-09-17 plan, task B2): this is what lets
+    the brief prompt name the owner (session_brief.build_brief_prompt) -- what
+    the prompt DOES with the name is a later task. Returns None for a blank
+    folder rather than an empty string, so a caller can `if owner_name:` it."""
+    return folder.replace("_", " ") if folder else None
+
+
 def _clean_todos(open_todos):
     """Keep only to-dos with real text; normalise responsible + due to a value or
     None. Each item carries {text, responsible, due, at} for the structured render.
@@ -211,8 +220,10 @@ def _complete_summary(artifact, summarize=None):
             return None
         if summarize is None:
             if SESSION_BRIEF:
+                import functools
                 import session_brief
-                summarize = session_brief.brief_from_turns
+                summarize = functools.partial(session_brief.brief_from_turns,
+                                              owner_name=_display_name(folder))
             else:
                 import lambda_rolling_summary as rs
                 summarize = rs.summarize_turns
