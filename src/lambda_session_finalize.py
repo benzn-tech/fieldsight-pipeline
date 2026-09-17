@@ -19,9 +19,20 @@ import html as _html
 import json
 import logging
 import os
+import re
+import time
 from urllib.parse import unquote_plus
 
 logger = logging.getLogger()
+# INFO, set HERE. The Lambda runtime leaves the root logger at WARNING, and this
+# module's decisions are all logged at INFO -- including which source a final
+# email's rows came from (brief or extraction). The level used to be raised only
+# as a side effect of importing email_sender, which happens at SEND time, i.e.
+# AFTER those decisions were logged; so on TEST (2026-09-18) the email went out
+# and the one line saying whether it used the brief was silently dropped, while
+# the "[email:ses] sent" line right after it printed. A decision nobody can see
+# is indistinguishable from one that never ran.
+logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 
@@ -32,6 +43,13 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "")
 SESSION_BRIEF = os.environ.get("SESSION_BRIEF", "false").lower() == "true"
 BRIEF_PREFIX = "session_brief/"
 FINALIZE_RESULTS_PREFIX = "session_finalize_results/"
+# handoff-sync plan §2.2: how long the FINAL email waits for the brief that
+# lambda_finalize_claim asked for CONCURRENTLY with the final extraction
+# (§2.1), and how often it checks. Both env-tunable so the wait can move
+# without a code change -- the same reasoning as every other timing constant
+# in this file.
+BRIEF_POLL_SECONDS = float(os.environ.get("BRIEF_POLL_SECONDS", "10"))
+BRIEF_WAIT_SECONDS = float(os.environ.get("BRIEF_WAIT_SECONDS", "90"))
 #: Request kinds that arrive WITH the rows the email should show, so this worker
 #: renders them as handed instead of summarising the session again.
 #:
@@ -73,12 +91,18 @@ def _clean_todos(open_todos):
     renders a per-item context line at all (see `build_confirmation_email` below),
     so there is nothing downstream for it to reach.
     """
+    # A speaker label is not a name, on EVERY row -- not only the brief's. The
+    # brief path already filtered it; the extraction path, which is the only one
+    # prod runs, did not, so the email showed "spk_0" where Preview & copy showed
+    # "—" for the same row. One filter, reused, so the two cannot drift:
+    # fieldsight-ui email-preview-modal.js `isSpeakerLabel` mirrors this pattern.
+    import session_brief
     out = []
     for t in (open_todos or []):
         text = (t.get("text") or "").strip()
         if text:
             out.append({"text": text,
-                        "responsible": (t.get("responsible") or None),
+                        "responsible": session_brief._real_name(t.get("responsible")),
                         "due": (t.get("due") or None),
                         "at": (t.get("at") or None),
                         # "action" (someone owes something) or "topic" (something
@@ -99,6 +123,25 @@ def _ordered_rows(todos):
     due date, and they sink below anything anyone actually owes."""
     return ([t for t in todos if t["kind"] != "topic"]
             + [t for t in todos if t["kind"] == "topic"])
+
+
+def _pipe_cell(value):
+    """A cell's text for the plain-text pipe table (plan §1.7), mirrored
+    BYTE-FOR-BYTE from the frontend's `cell()` in
+    `fieldsight-ui/scripts/composites/email-preview-modal.js` (`renderEmailText`)
+    -- that file is the other half of this contract, and a reader who gets one
+    surface's table cannot tell it apart from the other's. A `\\r?\\n` run
+    collapses to a single space (a wrapped sentence stays reachable rather than
+    breaking the row mid-table); a literal `|` is escaped so it can't be read
+    as a column boundary."""
+    return re.sub(r"\r?\n", " ", str(value)).replace("|", "\\|")
+
+
+def _pipe_row(cells):
+    """`| a | b | c |` -- mirrors the frontend's `pipe()` in the same file:
+    leading and trailing pipes, space-padded, so the two tables are identical
+    lines, not merely equivalent ones."""
+    return "| " + " | ".join(_pipe_cell(c) for c in cells) + " |"
 
 
 def build_confirmation_email(*, date=None, time_range=None, site_name=None,
@@ -135,14 +178,18 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
     if stamp:
         lines.append(f"Date: {stamp}")
     if todos:
-        lines += ["", "Items"]
+        # Plan §1.7: the plain-text flavour is a pipe table with the same three
+        # columns and a header separator -- leading AND trailing pipes, exactly
+        # as the frontend's Preview & copy renders it, not the old bulleted
+        # list. One table shape on both surfaces, one line format.
+        lines += ["", _pipe_row(("AGENDA ITEM", "ASSIGNED", "DUE DATE")), "| --- | --- | --- |"]
         for t in todos:
             if t["kind"] == "topic":
-                lines.append(f"  • {t['text']} — {na}")
-                continue
-            who = t["responsible"] or "Unassigned"
-            due = f" (due {t['due']})" if t["due"] else ""
-            lines.append(f"  • {t['text']} — {who}{due}")
+                who, due = na, na
+            else:
+                who = t["responsible"] or "—"
+                due = t["due"] or "—"
+            lines.append(_pipe_row((t["text"], who, due)))
     else:
         lines += ["", no_todos_note]
     body_text = "\n".join(lines).rstrip() + "\n"
@@ -176,13 +223,18 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
                     "</tr>")
 
         rows = "".join(_row(t) for t in todos)
+        # No <h3>Items</h3>: the header row below carries the table's title now
+        # (plan §2.4) -- one heading, not two.
         parts.append(
-            "<h3>Items</h3>"
             '<table role="presentation" cellspacing="0" cellpadding="0" '
             'style="border-collapse:collapse;width:100%;font-size:14px">'
             '<thead><tr style="text-align:left;border-bottom:2px solid #ccc">'
-            '<th style="padding:6px">Items</th><th style="padding:6px">Assignee</th>'
-            '<th style="padding:6px">Due</th></tr></thead>'
+            # Literal header text (plan §0/§1.1/§2.4): "AGENDA ITEM / ASSIGNED /
+            # DUE DATE" on BOTH surfaces -- the email and the frontend's Preview
+            # & copy render the same three words, or the two surfaces the plan
+            # exists to sync would drift on the very first thing a reader sees.
+            '<th style="padding:6px">AGENDA ITEM</th><th style="padding:6px">ASSIGNED</th>'
+            '<th style="padding:6px">DUE DATE</th></tr></thead>'
             f"<tbody>{rows}</tbody></table>")
     else:
         parts.append(f"<p>{esc(no_todos_note)}</p>")
@@ -347,8 +399,153 @@ def _session_was_deleted(artifact):
     return sid in deleted or f"sid{sid}" in deleted
 
 
+def _brief_key(folder, date, session_id):
+    return f"{BRIEF_PREFIX}{folder}/{date}/sid{session_id}/latest.json"
+
+
+def _read_brief(folder, date, session_id):
+    """The stored session brief, or None if it is not there YET.
+
+    Distinguishes "not written yet" (NoSuchKey/404 -- the ordinary, expected
+    answer on every poll but the last) from any OTHER read error. This repo
+    has repeatedly shipped a 403 read as "absent" (CLAUDE.md: S3 missing
+    ListBucket answers AccessDenied, not NoSuchKey, for a key that was never
+    written) -- and here that would mean every final email silently falls
+    back to the request's own rows while every test stays green, because a
+    permissions fault and "the brief just isn't ready" look identical unless
+    this tells them apart. A non-404 error is logged LOUDLY -- at ERROR, not
+    the quiet default -- naming the key, so a missing GetObject grant on
+    session_brief/* shows up on the very first poll instead of reading as
+    "brief never arrives"."""
+    import boto3
+    from botocore.exceptions import ClientError
+    key = _brief_key(folder, date, session_id)
+    try:
+        obj = boto3.client("s3").get_object(Bucket=S3_BUCKET, Key=key)
+        return json.loads(obj["Body"].read().decode("utf-8"))
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if code in ("NoSuchKey", "404") or status == 404:
+            return None
+        logger.error("finalize: could not read brief %s (%s, HTTP %s) -- this is a "
+                    "READ FAILURE, not 'not ready yet'. Check the deployed role's "
+                    "s3:GetObject (and ListBucket) grant on session_brief/*.",
+                    key, code or "unknown", status)
+        return None
+    except Exception as e:
+        logger.error("finalize: could not read brief %s (%s) -- treating as absent "
+                    "this poll", key, e)
+        return None
+
+
+def _poll_for_brief(folder, date, session_id, *, read_brief=None, sleep=None,
+                    poll_seconds=None, wait_seconds=None):
+    """Poll for the concurrently-enqueued session brief (§2.1) up to
+    BRIEF_WAIT_SECONDS, checking every BRIEF_POLL_SECONDS. Returns the brief
+    dict, or None if it never appeared within the budget.
+
+    `read_brief` and `sleep` are injectable so a test drives this without
+    a real clock or a real S3 call: a fake `read_brief` that returns None a
+    fixed number of times before a dict, and a no-op `sleep`, prove the
+    retry/give-up shape in milliseconds. Attempt count is computed from
+    poll/wait rather than a real deadline for the same reason -- deterministic
+    under an injected sleep, not dependent on wall-clock drift inside the
+    loop."""
+    read_brief = read_brief or _read_brief
+    sleep = sleep or time.sleep
+    poll = BRIEF_POLL_SECONDS if poll_seconds is None else poll_seconds
+    wait = BRIEF_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    attempts = max(1, int(wait // poll) + 1) if poll > 0 else 1
+    for i in range(attempts):
+        brief = read_brief(folder, date, session_id)
+        if brief is not None:
+            return brief
+        if i < attempts - 1:
+            sleep(poll)
+    return None
+
+
+def _rows_from_brief_or_request(artifact, request_todos, *, poll_brief=None):
+    """The `openTodos` a `kind == "final"` email actually renders (§2.2).
+
+    If SESSION_BRIEF is on and a brief with at least one USABLE task turns up
+    within the wait, its tasks become the ACTION rows (assignee mapped through
+    the same speaker-label filter session_brief already applies -- `spk_0` is
+    not a name); the request's own TOPIC rows are kept, because the brief
+    carries no per-topic breakdown. Otherwise the request's rows are used
+    unchanged. "Usable" is judged on the rows this function actually renders
+    (`brief["open_todos"]`, after `session_brief.to_session_summary` drops any
+    task whose text is blank), not on the raw `brief["tasks"]` count -- a
+    brief whose tasks are all blank-text must fall back exactly like a brief
+    with none at all: an empty table where the extraction had rows would read
+    as broken, not as "nothing to do" (plan §1.3).
+
+    Exactly one log line, naming which source was used and why -- the same
+    posture as every other silent-fallback point in this pipeline."""
+    session_id = artifact.get("sessionId")
+    if not SESSION_BRIEF:
+        logger.info("finalize: %s email rows from the request -- SESSION_BRIEF is off",
+                    session_id)
+        return request_todos
+    folder, date = artifact.get("folder"), artifact.get("date")
+    if not (folder and date and session_id):
+        logger.info("finalize: %s email rows from the request -- missing folder/date "
+                    "to look up a brief", session_id)
+        return request_todos
+    brief = (poll_brief or _poll_for_brief)(folder, date, session_id)
+    if brief is None:
+        logger.info("finalize: %s email rows from the request -- no brief within %ss",
+                    session_id, BRIEF_WAIT_SECONDS)
+        return request_todos
+    # Gate on the rows actually being RENDERED, not on raw brief["tasks"]:
+    # session_brief.to_session_summary builds open_todos by dropping any task
+    # whose text is blank after stripping. A brief whose tasks all have blank
+    # text would pass a `tasks`-non-empty gate and then render zero action
+    # rows, discarding the request's real ones -- exactly the "empty table
+    # where the extraction had rows" this function exists to prevent (§1.3).
+    action_rows = [dict(t, kind="action") for t in (brief.get("open_todos") or [])]
+    if not action_rows:
+        logger.info("finalize: %s email rows from the request -- brief has no usable "
+                    "action rows (%d raw task(s), 0 with non-blank text)",
+                    session_id, len(brief.get("tasks") or []))
+        return request_todos
+    topic_rows = [t for t in (request_todos or []) if t.get("kind") == "topic"]
+    logger.info("finalize: %s email action rows from the brief (%d row(s)), "
+                "%d topic row(s) kept from the request",
+                session_id, len(action_rows), len(topic_rows))
+    return action_rows + topic_rows
+
+
+def _process_brief_request(artifact, *, complete_summary=None):
+    """kind == "brief": produce and store the session's brief, and nothing else.
+
+    Enqueued by lambda_finalize_claim._request_extraction CONCURRENTLY with the
+    final extraction request (handoff-sync plan §2.1), so the brief has a head
+    start on the final email that will go looking for it (§2.2). None of the
+    delivery machinery applies here: no recipient is required, no email is
+    built or sent, no session_finalize_results/ is written (nothing for
+    reconcile to settle -- this request never puts a session into
+    `finalizing`), and no `_already_sent` check (that guards the recorder's
+    inbox, not a cache write). `_complete_summary` stores the brief itself
+    (via `_store_brief`) as a side effect; producing it IS this branch's job."""
+    session_id = artifact.get("sessionId")
+    if not SESSION_BRIEF:
+        logger.info("finalize: %s brief request skipped -- SESSION_BRIEF is off", session_id)
+        return {"status": "skipped", "reason": "SESSION_BRIEF off", "sessionId": session_id}
+    if _session_was_deleted(artifact):
+        logger.info("finalize: %s was deleted -- not building a brief", session_id)
+        return {"status": "skipped", "reason": "recording deleted", "sessionId": session_id}
+    result = (complete_summary if complete_summary is not None else _complete_summary)(artifact)
+    if result is None:
+        logger.info("finalize: %s brief request produced nothing (no turns, or the "
+                    "summariser failed) -- nothing stored", session_id)
+        return {"status": "skipped", "reason": "no brief produced", "sessionId": session_id}
+    return {"status": "ok", "sessionId": session_id}
+
+
 def process_finalize_request(artifact, *, send=None, write_result=None, complete_summary=None,
-                             already_sent=None):
+                             already_sent=None, poll_brief=None):
     """Build + SES-send the recorder's confirmation email from one enqueued finalize
     request (the in-VPC claim step wrote it), then record the outcome to
     session_finalize_results/{sid}.json — the in-VPC sweep's reconcile pass reads it
@@ -357,7 +554,12 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
     re-raised: re-raising would S3-retry the trigger and risk a double-send. `send` /
     `write_result` are injectable; they default to email_sender + an S3 write (both
     lazy so the module stays pure at import). A request with no recipient is skipped —
-    the claim step already marked that session failed."""
+    the claim step already marked that session failed.
+
+    kind == "brief" is handled FIRST, before the recipient check: it is not a
+    delivery at all (see `_process_brief_request`)."""
+    if artifact.get("kind") == "brief":
+        return _process_brief_request(artifact, complete_summary=complete_summary)
     recipient = (artifact.get("recipient") or "").strip()
     if not recipient:
         return {"status": "skipped", "reason": "no recipient"}
@@ -425,6 +627,8 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
         fresh = (complete_summary if complete_summary is not None else _complete_summary)(artifact)
         if fresh:
             summary, todos = fresh.get("summary", summary), fresh.get("open_todos", todos)
+    elif artifact.get("kind") == "final":
+        todos = _rows_from_brief_or_request(artifact, todos, poll_brief=poll_brief)
     subject, text, html = build_confirmation_email(
         date=artifact.get("date"), time_range=artifact.get("timeRange"),
         site_name=artifact.get("siteName"), summary=summary, open_todos=todos)

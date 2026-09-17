@@ -3159,6 +3159,14 @@ Resources:
                 # simulate-principal-policy returned implicitDeny on BOTH stages
                 # before this line existed.
                 - !Sub arn:aws:s3:::${IngestBucketName}/redactions/*
+                # handoff-sync plan §2.3: this function could PutObject here
+                # (below) but not read it back. The final email (kind == "final")
+                # polls this exact prefix for the brief lambda_finalize_claim
+                # asked for concurrently (§2.2) -- without GetObject the read is
+                # AccessDenied, which a lenient reader turns into "not ready yet",
+                # and every email would silently fall back to extraction rows
+                # while every test stayed green.
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_brief/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
@@ -3194,6 +3202,14 @@ Resources:
                     # no mirror -- which is the common case. The lenient reader
                     # would then log an exception on every finalize forever.
                     - redactions/*
+                    # Same reason, same trap: the final email's brief poll (§2.2)
+                    # almost always hits this BEFORE the concurrent brief request
+                    # (§2.1) has written it -- that is the ordinary "not ready
+                    # yet" case on every attempt but the last. Without
+                    # ListBucket that read is AccessDenied, not NoSuchKey, and
+                    # `_read_brief` would log it as a loud permissions failure on
+                    # every single poll of every single session.
+                    - session_brief/*
             - Effect: Allow
               Action:
                 - ses:SendEmail

@@ -364,6 +364,11 @@ def _final_email_context(conn, session_base, extraction, date):
     return {"kind": "final", "sessionId": sid,
             "recipient": ctx["recipient"], "date": ctx.get("date") or date,
             "timeRange": ctx.get("timeRange"), "siteName": ctx.get("siteName"),
+            # handoff-sync plan §2.2: the worker needs the folder to poll
+            # session_brief/<folder>/<date>/sid<sessionId>/latest.json. Not
+            # carried before this -- the only recipient of `ctx["folder"]` used
+            # to be the email itself, which never needed it.
+            "folder": ctx.get("folder"),
             # Zero rows is a real answer, not a reason to withhold the email:
             # most sessions produce none, and the renderer says so explicitly.
             # Withholding would send them down the backstop, which quotes the

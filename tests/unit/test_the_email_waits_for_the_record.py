@@ -22,6 +22,7 @@ an overwrite, so the loser must write nothing. The put itself decides
 absent, so a check-then-write would let both through.
 """
 import datetime
+import json
 
 import pytest
 
@@ -183,6 +184,74 @@ def test_any_other_put_failure_is_raised(monkeypatch):
     _with_s3(monkeypatch, _S3(error=_client_error("AccessDenied", 403)))
     with pytest.raises(Exception):
         fc._enqueue({"sessionId": SID})
+
+
+# ---- §2.1: the brief request rides alongside the final-extraction request --
+# lambda_finalize_claim._request_extraction now ALSO enqueues
+# session_finalize_requests/brief-<sessionId>.json, concurrently with the
+# final extraction request, on the same conditional-put contract as every
+# other producer of that prefix.
+
+def test_requesting_the_final_extraction_also_enqueues_a_brief_request(monkeypatch):
+    s3 = _S3()
+    _with_s3(monkeypatch, s3)
+    fc._request_extraction(SID, "Ben_Lin", "2026-09-16")
+    assert len(s3.calls) == 2
+    extraction_call, brief_call = s3.calls
+    assert extraction_call["Key"] == f"extraction_requests/{SID}.json"
+    assert brief_call["Key"] == f"session_finalize_requests/brief-{SID}.json"
+    body = json.loads(brief_call["Body"])
+    assert body == {"kind": "brief", "sessionId": SID, "folder": "Ben_Lin",
+                    "date": "2026-09-16"}
+    assert brief_call["IfNoneMatch"] == "*"
+
+
+def test_a_brief_request_already_enqueued_is_not_an_error(monkeypatch):
+    """A 412 means item-writer or an earlier tick already asked -- fine, must
+    not raise (the final extraction's own put already succeeded)."""
+    calls = []
+
+    class _MixedS3:
+        def put_object(self, **kw):
+            calls.append(kw)
+            if kw["Key"].startswith("session_finalize_requests/brief-"):
+                raise _client_error("PreconditionFailed", 412)
+
+    _with_s3(monkeypatch, _MixedS3())
+    fc._request_extraction(SID, "Ben_Lin", "2026-09-16")   # must not raise
+    assert len(calls) == 2
+
+
+def test_a_brief_request_failure_other_than_412_is_raised(monkeypatch):
+    class _MixedS3:
+        def put_object(self, **kw):
+            if kw["Key"].startswith("session_finalize_requests/brief-"):
+                raise _client_error("AccessDenied", 403)
+
+    _with_s3(monkeypatch, _MixedS3())
+    with pytest.raises(Exception):
+        fc._request_extraction(SID, "Ben_Lin", "2026-09-16")
+
+
+def test_a_failed_brief_request_does_not_block_finalize(monkeypatch, caplog):
+    """finalize_claim's own best-effort wrapper catches it -- proven here at the
+    level that matters: the session still ends up `waiting`, not stuck."""
+    monkeypatch.setattr(fc.meeting_session, "claim_finalize",
+                        lambda c, s, v: {"session_id": s, "user_id": "u1", "version": v})
+
+    class _BoomOnBrief:
+        def put_object(self, **kw):
+            if kw["Key"].startswith("session_finalize_requests/brief-"):
+                raise _client_error("AccessDenied", 403)
+
+    _with_s3(monkeypatch, _BoomOnBrief())
+    with caplog.at_level("ERROR"):
+        out = fc.finalize_claim(
+            "CONN", SID, 3,
+            resolve_context=lambda c, r: dict(CTX),
+            read_rolling=lambda *a: {},
+            request_extraction=fc._request_extraction)
+    assert out["status"] == "waiting"
 
 
 # ---- wiring ---------------------------------------------------------------
