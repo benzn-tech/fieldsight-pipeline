@@ -63,6 +63,14 @@ def test_THE_test_the_email_is_enqueued_when_the_record_lands(wired):
     assert [r["text"] for r in ctx["openTodos"]] == ["Re-inspect the cylinder"]
 
 
+def test_the_folder_rides_along_for_the_brief_poll(wired):
+    """handoff-sync plan §2.2: the worker needs the folder to poll
+    session_brief/<folder>/<date>/sid<sessionId>/latest.json -- nothing else in
+    the artifact carries it."""
+    ctx = iw._final_email_context("CONN", BASE, EXTRACTION, DATE)
+    assert ctx["folder"] == "Ben_UCPK2"
+
+
 def test_the_due_date_is_the_one_the_record_holds(wired):
     """Aurora stores the RESOLVED date; the email used to show the spoken text,
     so the same item read differently in the two places."""
