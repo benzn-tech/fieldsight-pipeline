@@ -104,3 +104,97 @@ empty-state note stay.
 - Frontend: render both paths in a real browser (minimal page, no Babel) and read the DOM.
 - Prod: untouched. `SESSION_BRIEF=false` there, so prod emails keep extraction rows, now in the new
   table shape.
+
+---
+
+# Part 2 — the brief and the extraction stop talking past each other
+
+Status: plan, 2026-09-18, after reading the first REAL email this produced
+(session `d740cd5f…`, 2026-09-11) against the extraction it replaced.
+
+## 5. What the real output showed
+
+Two defects, both consequences of §1.3 substituting brief tasks for extraction
+action items while topic rows were still decided by the extraction alone.
+
+**5.1 The same thing appears twice.** The brief wrote "Visit MPI site with
+DeAndre to see comprehensive open-space usage pattern." as a task; the extraction
+had no action item for that topic, so the topic ALSO sank to the bottom as
+"Ormiston College 360 Inspections — Speaker hopes to visit the MPI site with
+DeAndre." Three of the five topic rows in that email duplicate an action row.
+
+**5.2 A dated commitment the extraction caught was lost.** The extraction had
+"PS4 for the Port Com SR study to be signed by January next year" (deadline
+resolved). The brief has no such task, and because the brief won, the commitment
+is not in the email at all.
+
+## 6. Decisions (owner, 2026-09-18)
+
+| Question | Decision |
+|---|---|
+| 5.1 duplicates | **A topic that a brief task already covers is not a topic row.** Coverage is decided by TIME, not by text. |
+| 5.2 lost commitment | **Back-fill it.** An extraction action item that carries a due date and is not represented in the brief is appended to the action rows. |
+
+## 7. The rule, for both surfaces
+
+Both surfaces already build one table (§1). Part 2 changes only how the two
+sources are merged.
+
+1. **Coverage by time.** A topic is *covered* when at least one brief task's `at`
+   (HH:MM:SS) falls inside that topic's own time range, inclusive of both ends.
+   A topic with no parsable range is never covered. A brief task with no `at` covers nothing.
+2. **Topic rows** (§1.5) are emitted for topics that produced no action item
+   **and are not covered**.
+3. **Back-fill.** When action rows come from a session's brief, every extraction
+   action item of that session that (a) carries a non-empty due date and
+   (b) is not represented in the brief is appended after the brief's rows, in the
+   extraction's own order.
+4. **"Represented" is a deliberately conservative text test.** Lower-case both
+   texts, keep `[a-z0-9]+` tokens of 3+ characters, drop the stop list
+   (`the a an and or to of for on in at is are be by with from that this it as`),
+   and compute Jaccard overlap. **Represented iff overlap >= 0.30.** A tie or an
+   empty token set counts as NOT represented, so the bias is towards carrying a
+   commitment twice rather than losing it — losing one is the failure this plan
+   exists to prevent.
+5. The thresholds and the stop list are **one shared constant per surface, named
+   identically**, and both sides pin the same worked examples (§9).
+
+## 8. Backend: the request has to carry more than it does
+
+`session_finalize` sees only `{text, responsible, due, kind}` rows — no time
+ranges, no per-row provenance — so neither rule is computable there today.
+`lambda_item_writer._final_email_context` must send, per row:
+
+* action rows: `topic_range` (the topic's `time_range` string, unparsed) — needed
+  so a back-filled row can be attributed, and to keep the shapes uniform;
+* topic rows: `topic_range` likewise.
+
+Nothing else changes shape: `_topic_rows` / `_final_email_rows` keep their text
+rules (§1.5), and `_clean_todos` must carry the new key through rather than
+rebuild the row without it (it rebuilds each row from scratch — the same trap
+that lost `kind` once already).
+
+`_rows_from_brief_or_request` then applies §7 and logs, in its existing single
+line, how many topic rows were suppressed and how many items were back-filled.
+
+## 9. Worked examples both surfaces must agree on
+
+From the real 2026-09-11 session:
+
+* Brief task `at 13:40:43` + topic "Ormiston College 360 Inspections"
+  `13:40 – 13:41` → **covered** → no topic row.
+* Extraction item "PS4 for the Port Com SR study to be signed by January next
+  year", due `2027-01-31`, against the brief's five tasks → best overlap is with
+  the QA task ("port", "com") ≈ 0.1 → **not represented** → **back-filled**.
+* Extraction item "Concrete QA pour checks and report to be started three weeks
+  later after cure" vs brief "Start QA pour checks and create report on Port Com
+  concrete once 28-day cure ends in about three weeks" → overlap ≈ 0.5 →
+  **represented** → not back-filled.
+* An extraction item with NO due date and no match → **not** back-filled (§7.3a).
+
+## 10. Stated plainly: this can double
+
+The Jaccard test is a judgement, and at 0.30 it will sometimes carry an item the
+brief did already say in different words. That is the chosen direction: a
+duplicate is visible and annoying; a dropped commitment is invisible and is what
+the owner objected to. Any future tightening needs a real run behind it.
