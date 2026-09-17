@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from urllib.parse import unquote_plus
 
@@ -532,6 +533,20 @@ FINAL_REQUESTS_PREFIX = 'extraction_requests/'
 # which is exactly what this bounds.
 FINAL_RERUN_MAX_GENERATIONS = int(
     os.environ.get('FINAL_RERUN_MAX_GENERATIONS', '3'))
+# A final pass can start BEFORE the session's transcripts exist. The finalize
+# sweep requests it at claim time, and the claim and the tail batch's seal happen
+# in the same minute: on prod 2026-09-17 the final pass ran at 01:08:39, found
+# nothing, logged "No usable speaker turns -- skipping" and returned; the two
+# transcripts landed at 01:08:42. Nothing asks again after that, so the session
+# never got a final at all -- and the confirmation email now waits for one.
+#
+# So a final pass that finds NO transcripts waits and looks again, in-process.
+# Not a re-request through FINAL_REQUESTS_PREFIX: that S3 event fires at once
+# and would lose the same race. Bounded (4 x 20s = 80s) and only on this path;
+# an upload that is minutes late because the device is offline is out of reach
+# by design -- the sweep's email backstop covers it.
+FINAL_EMPTY_RETRY_ATTEMPTS = int(os.environ.get('FINAL_EMPTY_RETRY_ATTEMPTS', '4'))
+FINAL_EMPTY_RETRY_DELAY_S = float(os.environ.get('FINAL_EMPTY_RETRY_DELAY_S', '20'))
 
 _s3_client = None
 _sites_cache = None
@@ -1801,7 +1816,7 @@ def _supersedes(new_sources, prev):
 
 def extract_session(bucket, user_folder, date, session_base, final=False,
                     min_interval_s=MIN_REEXTRACT_INTERVAL_S, now=None,
-                    generation=0, speaker_names=None):
+                    generation=0, speaker_names=None, sleep=time.sleep):
     # M-5: a stack missing the secret must not retry-storm -- an S3 event
     # retries on a raised exception, and every retry would fail the exact
     # same way. Check upfront (before any S3 gather/Claude work) and bail
@@ -1840,10 +1855,23 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
     turns, source_filenames, announcement_stats = assemble_session_turns(
         bucket, keys)
 
+    # See FINAL_EMPTY_RETRY_ATTEMPTS: a final pass can outrun the transcripts.
+    waited = 0
+    while final and not turns and waited < FINAL_EMPTY_RETRY_ATTEMPTS:
+        waited += 1
+        logger.info("%s: final pass found no transcripts yet -- waiting %.0fs "
+                    "(attempt %d/%d)", session_base, FINAL_EMPTY_RETRY_DELAY_S,
+                    waited, FINAL_EMPTY_RETRY_ATTEMPTS)
+        sleep(FINAL_EMPTY_RETRY_DELAY_S)
+        keys = gather_session_segments(bucket, user_folder, date, session_base)
+        turns, source_filenames, announcement_stats = assemble_session_turns(
+            bucket, keys)
+
     # M-6: nothing usable to extract from -- skip quietly (no Claude call,
     # no write), same "don't retry-storm a dead end" reasoning as M-5.
     if not turns:
-        logger.warning(f"No usable speaker turns for session {session_base} -- skipping")
+        logger.warning(f"No usable speaker turns for session {session_base} -- skipping"
+                       + (f" after waiting {waited} time(s)" if waited else ""))
         return None
 
     n_segments = len(source_filenames)
