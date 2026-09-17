@@ -67,7 +67,12 @@ def test_a_session_whose_final_never_came_is_still_emailed():
                                 rolling={"summary": "S", "open_todos": [{"text": "t"}]})
     assert mailed == [SID]
     assert written[0]["kind"] == "rolling"
-    assert written[0]["openTodos"] == [{"text": "t"}]
+    # The rolling to-dos, plus the rolling summary as one topic row -- otherwise a
+    # backstopped session with no to-dos is an email that says nothing, and the
+    # two paths send visibly different emails for the same kind of recording.
+    assert written[0]["openTodos"] == [
+        {"text": "t"},
+        {"text": "S", "responsible": None, "due": None, "kind": "topic"}]
 
 
 def test_the_backstop_email_is_not_dressed_as_the_merged_one():

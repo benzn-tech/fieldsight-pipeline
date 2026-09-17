@@ -66,7 +66,9 @@ def test_action_items_render_task_assignee_and_due():
     _s, text, html = fin.build_confirmation_email(
         summary="x", open_todos=[{"text": "Order steel", "responsible": "Neil", "due": "Friday"}])
     assert "Order steel" in text and "Neil" in text and "Friday" in text
-    assert "Task" in html and "Assignee" in html and "Due" in html   # structured columns
+    # "Items", not "Task": one table now carries what is owed AND, below it, the
+    # topics nobody promised anything about (test_the_email_is_one_table_of_items).
+    assert "Items" in html and "Assignee" in html and "Due" in html   # structured columns
     assert "Order steel" in html and "Neil" in html and "Friday" in html
 
 
@@ -182,7 +184,9 @@ def test_a_recording_with_no_action_items_says_so_rather_than_sending_a_blank():
     a header and nothing else -- indistinguishable from a broken send."""
     _s, text, html = fin.build_confirmation_email(
         date="2026-07-25", summary="All done.", open_todos=[])
-    assert "No action items" in text and "No action items" in html
+    # Nothing AT ALL -- no tasks and no topics. A session with topics but no
+    # tasks now shows the topics rather than this note.
+    assert "Nothing was captured" in text and "Nothing was captured" in html
 
 
 # --- SESSION_BRIEF: which summariser the finalize re-summary uses ------------
