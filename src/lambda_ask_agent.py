@@ -1762,20 +1762,33 @@ def _voice_answer(body):
     # Voice needs it most -- there is no date picker to fall back on when the
     # question is spoken.
     t_rag = _time.perf_counter()
-    rag = _rag_answer({"question": transcript, "caller_sub": caller_sub,
-                       "mode": "voice", "k": body.get("k", 5),
-                       "tz": body.get("tz")})
+    rag_body = {"question": transcript, "caller_sub": caller_sub,
+                "mode": "voice", "k": body.get("k", 5),
+                "tz": body.get("tz")}
+    # Only added when the incoming body actually has a "history" key --
+    # _rag_answer cleans it (ask_history._clean_voice_history), so this side
+    # does not clean it again, and a device that sends none must still
+    # produce exactly today's inner body (absent, not `[]`, not `None`).
+    if "history" in body:
+        rag_body["history"] = body.get("history")
+    rag = _rag_answer(rag_body)
     marks["rag"] = _time.perf_counter() - t_rag
     answer_text = (rag.get("answer") or "").strip()
+    # Both error returns below sit AFTER the RAG call, so `rag` (and
+    # therefore `rag.get("asked")`) is already in hand -- carried for the
+    # same reason the success return carries it: this function builds its
+    # response from scratch, so anything not listed here is silently dropped.
     if rag.get("error") or not answer_text:
-        return {"error": rag.get("error") or "No answer", "transcript": transcript}
+        return {"error": rag.get("error") or "No answer", "transcript": transcript,
+                "asked": rag.get("asked")}
 
     t_tts = _time.perf_counter()
     try:
         audio_out = _tts(answer_text)
     except Exception as e:
         logger.error("  voice TTS failed: %s", e)
-        return {"error": "Speech synthesis failed", "transcript": transcript}
+        return {"error": "Speech synthesis failed", "transcript": transcript,
+                "asked": rag.get("asked")}
     marks["tts"] = _time.perf_counter() - t_tts
 
     # `rag` is retrieval AND the model. The model's own elapsed time is already
@@ -1807,6 +1820,7 @@ def _voice_answer(body):
         "answerText": answer_text,
         "audioBase64": _b64.b64encode(audio_out).decode("ascii"),
         "audioFormat": "wav",
+        "asked": rag.get("asked"),
     }
 
 
