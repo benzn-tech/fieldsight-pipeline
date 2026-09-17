@@ -298,6 +298,30 @@ Parameters:
     Description: DashScope OpenAI-compatible base URL for Qwen chat completions
     Default: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 
+  AskConversationMemory:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Rewrite a follow-up question into one that stands on its own, using the
+      previous turns. Off by default on every stack. The conversation reaches
+      the rewrite only and never the answering prompt, so a recording deleted
+      between turns cannot be quoted or cited -- see the design's 2.1.
+
+  AskRewriteBudget:
+    Type: String
+    Default: '4.0'
+    Description: >-
+      Seconds the follow-up rewrite (AskConversationMemory) may spend before
+      the agent gives up and answers the raw question instead.
+
+  AskDistanceGate:
+    Type: String
+    Default: '0.55'
+    Description: >-
+      Vector-distance cutoff for retrieved chunks used by Ask's retrieval
+      step. A Parameter so the gate can be recalibrated without a code change.
+
   EnableWebAnswer:
     Type: String
     Default: 'false'
@@ -1835,7 +1859,19 @@ Resources:
       FunctionName: !Sub ["${P}-ask-agent", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_ask_agent.lambda_handler
-      Timeout: 60
+      # Hard kill. At or below ApiFunction's Timeout (28, below), which is
+      # itself below API Gateway's fixed 29s integration timeout -- so the
+      # Lambda runtime is what stops an overrun, not a 504 with the model call
+      # still running and still billing. See test_the_ask_timeouts_descend.
+      #
+      # 28, not 27: two IN-CODE hard stops run INSIDE this function --
+      # corroboration.HARD_STOP_SECONDS and web_answer.HARD_STOP_SECONDS,
+      # both measured and deliberately sized to 27s (see those modules). At
+      # Timeout=27 the runtime kills the function at the exact moment those
+      # stops fire, leaving no time to return the shaped `timed_out` body
+      # they exist to produce -- found reviewing a later task, both features
+      # ON on TEST. See test_no_in_code_hard_stop_reaches_the_runtime_kill.
+      Timeout: 28
       MemorySize: 256
       Environment:
         Variables:
@@ -1843,7 +1879,21 @@ Resources:
           # before urllib3 raises and the `except` that exists for a slow LLM never
           # runs. `llm_utils` defaults it to 150 s and explains the ordering; three
           # functions here had it inverted, all by leaving it at that default.
-          LLM_HTTP_TIMEOUT: '45'
+          # One model call inside a request whose whole budget is
+          # ASK_DEADLINE_SECONDS below -- strictly less, or a single call can
+          # spend the entire request and leave nothing for retrieval, the
+          # rewrite or synthesis.
+          LLM_HTTP_TIMEOUT: '21'
+          # Voluntary deadline: the agent's whole-request budget. A ladder
+          # constant, not a switch -- kept a literal (not a Parameter) so one
+          # reader (_env_value) works for every number in the ladder; see
+          # ASK_INVOKE_TIMEOUT on ApiFunction for the rest of it.
+          ASK_DEADLINE_SECONDS: '24'
+          # Task 9: the three Ask flags, wired in three places each (Parameter,
+          # here, both workflows).
+          ASK_CONVERSATION_MEMORY: !Ref AskConversationMemory
+          ASK_REWRITE_BUDGET: !Ref AskRewriteBudget
+          ASK_DISTANCE_GATE: !Ref AskDistanceGate
           S3_BUCKET: !Ref DataBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           HAIKU_MODEL: claude-haiku-4-5-20251001
@@ -4373,7 +4423,11 @@ Resources:
       FunctionName: !Sub ["${P}-api", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_fieldsight_api.lambda_handler
-      Timeout: 30
+      # Hard kill. Must die before API Gateway's fixed 29s integration
+      # timeout, so this Lambda's own runtime is what reports the overrun --
+      # not a gateway 504 with AskAgentFunction still running and still
+      # billing. See test_the_ask_timeouts_descend.
+      Timeout: 28
       MemorySize: 256
       Environment:
         Variables:
@@ -4385,6 +4439,13 @@ Resources:
           USERS_TABLE: !Ref UsersTableName
           REPORT_FUNCTION: !Ref ReportGeneratorFunction
           ASK_AGENT_FUNCTION: !Ref AskAgentFunction
+          # How long this function waits for the Ask Agent. Below its own
+          # Timeout (above) so the invoke fails here, in code that can name
+          # it -- and above AskAgentFunction's ASK_DEADLINE_SECONDS (24), so
+          # this caller never abandons a callee that is still working
+          # correctly. Literal, not a Parameter -- see AskAgentFunction's
+          # ASK_DEADLINE_SECONDS for why.
+          ASK_INVOKE_TIMEOUT: '26'
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
