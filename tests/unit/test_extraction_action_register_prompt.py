@@ -36,10 +36,17 @@ def test_the_action_is_one_sentence_not_eight_words():
         "the word count is retired; an 8-word cap cannot carry the context")
     assert "handful of words" not in body, (
         "the word count is retired; an 8-word cap cannot carry the context")
-    assert "ONE SENTENCE" in body, (
+    # Updated in the B3 fix round: the literal used to be "ONE SENTENCE", which
+    # contradicted this prompt's own strongest Good example -- the user's
+    # register sample is TWO grammatical sentences ("Arborist report catching
+    # the cut and fill for link bridge. IA and Civix to catch up."). Models
+    # weight worked examples over prose, so the text was arguing with itself
+    # while probably getting the wanted behaviour anyway. The bound that does
+    # the real work is the upper one, and it is kept verbatim.
+    assert "ONE OR TWO SHORT CLAUSES" in body, (
         "the replacement requirement must be stated, not merely implied")
     assert "not a paragraph" in body, (
-        "one sentence is a bound in BOTH directions; without this the fix "
+        "length is a bound in BOTH directions; without this the fix "
         "trades an unreadable label for an unreadable essay")
 
 

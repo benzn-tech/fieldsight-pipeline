@@ -64,9 +64,11 @@ Measured, not assumed (2026-09-17):
 ### 3.1 The action item gets a sentence (`lambda_extract_session.py`)
 
 Replace the ≤8-word rule and the "cut rationale" instruction. The action text becomes **one
-sentence a reader who was in the room can act on**, carrying the subject, what is to happen,
-and the context that makes it make sense. Keep it to one sentence; this is not licence for a
-paragraph.
+or two short clauses a reader who was in the room can act on**, carrying the subject, what is to happen,
+and the context that makes it make sense. The upper bound is the half that does the work:
+this is not licence for a paragraph. (Corrected 2026-09-17: this line originally said "one sentence",
+which contradicted the register sample quoted in §0 — it is two grammatical sentences. The
+upper bound is the half that matters.)
 
 * Keep `responsible` / `deadline` as their own fields and keep **"do NOT guess"** — the user
   explicitly accepts blanks.

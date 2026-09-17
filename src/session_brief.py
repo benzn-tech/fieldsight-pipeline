@@ -53,7 +53,16 @@ def build_brief_prompt(turns, owner_name=None):
     # rules around it. What to DO with the name -- the "when a turn is plainly
     # {owner} speaking, use their name" instruction -- is task B3; this commit
     # only conveys the name, and conveys nothing when there is none to convey.
-    owner_line = f"\nThis recording belongs to {owner_name}.\n" if owner_name else ""
+    # B3 fix round (review I-1): "This recording belongs to {owner}" reads as
+    # "this is mainly their meeting" as readily as "this is their device", and
+    # the first reading is an anchor toward hanging every unclear turn on them.
+    # The line states only the fact the pipeline actually has -- which account
+    # the file arrived under -- and denies the inference outright.
+    owner_line = (
+        f"\nThis recording was made on {owner_name}'s device, under their account."
+        " That is all it tells you: it does not mean the meeting was theirs, and"
+        " it does not tell you who spoke on any line below.\n"
+    ) if owner_name else ""
     # Task B3: the name is only safe to hand over with the prohibition attached.
     # `_real_name` can still strip a speaker label out of `assignee` after the
     # fact; a name written into `text` has NO code-side backstop, so a wrong
@@ -100,7 +109,7 @@ Return ONLY JSON, no code fence and no commentary:
   ],
   "tasks": [
     {{
-      "text": "One sentence a reader who was in the room can act on: the subject, what is to happen, and the context that makes it make sense -- 'Modular drop ceiling 100mm, details to go to Ignite.' ONE sentence, not a paragraph. Never a speaker label (spk_0, Speaker 1) inside this sentence.",
+      "text": "One or two short clauses a reader who was in the room can act on: the subject, what is to happen, and the context that makes it make sense -- 'Modular drop ceiling 100mm, details to go to Ignite.' One or two short clauses, not a paragraph. Never a speaker label (spk_0, Speaker 1) inside this sentence.",
       "at": "HH:MM:SS",
       "assignee": "The name it was given to, or null. Do not guess. The speaker labels above (spk_0, Speaker 1) are NOT names -- they say which voice spoke, not who the task is for. If nobody was named, this is null.",
       "due": "When, in the words used, or null"
@@ -164,19 +173,31 @@ How to write it:
    the side chosen: a missed task is one the recorder still remembers, and a
    surplus one is meant to be dismissed in the UI rather than argued away here.
 
-7. **tasks: how the sentence reads.** Minutes, not a label. One sentence
-   carrying its own context, so somebody who was in the room knows what it is
+7. **tasks: how the sentence reads.** Minutes, not a label. One or two short
+   clauses carrying their own context, so somebody who was in the room knows what it is
    about without the recording: "Arborist report catching the cut and fill for
    link bridge, IA and Civix to catch up." NOT "Rainwater tank front position
    -- discuss with Paul Smith", which is rule 2's failure wearing a task's
    clothes.
 
+   **Never a speaker label (spk_0, Speaker 1) inside the sentence.** Those say
+   which voice spoke, not who anything is for. A label written here is not
+   corrected anywhere downstream -- it reaches the reader exactly as you typed
+   it, in minutes they forward to the people involved.
+
    **The verb carries how firm it is.** Something a person actually took on
    reads as a commitment -- "Ben confirmed the QA pour checks start once the
-   cure ends", "Ben will send the details to Ignite". Something you concluded
-   should happen, that nobody took on, reads as unsettled -- "... to be
-   confirmed" -- or carries no name at all. Never write a committed/inferred
-   label into the output: the verb is the only place that distinction appears.
+   cure ends", "Paul Smith confirmed the tank position is fixed before the slab
+   pour". Whoever the transcript shows making the commitment is the subject of
+   the sentence; it is as often somebody other than the person recording as it
+   is them. Something you concluded should happen, that nobody took on, reads
+   as unsettled -- "... to be confirmed" -- or carries no name at all. Never
+   write a committed/inferred label into the output: the verb is the only place
+   that distinction appears.
+
+   Do not hedge a commitment somebody plainly made: "to be confirmed" is for
+   work nobody took on, not a safer default. This is about the verb, never the
+   name -- when you cannot tell who spoke, the sentence still carries no name.
 {owner_rule}
 8. {OUTPUT_LANGUAGE_RULE}
 

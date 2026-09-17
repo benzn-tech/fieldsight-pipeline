@@ -1044,9 +1044,9 @@ def _instructions_block():
    can ever tick them, and they belong in the topic summary, not here. A discussion that reached no
    act produces NO action_items; the array is genuinely allowed to be empty, and two real tasks are
    worth more than six invented ones, because invented ones bury the real ones.
-   Then write each `action` as ONE SENTENCE a reader who was in the room can act on -- it carries
-   the subject, what is to happen, and the context that makes it make sense.
-   One sentence, not a paragraph, and never a bare label. It must still be read AT A GLANCE and
+   Then write each `action` as ONE OR TWO SHORT CLAUSES a reader who was in the room can act on --
+   it carries the subject, what is to happen, and the context that makes it make sense.
+   One or two short clauses, not a paragraph, and never a bare label. It must still be read AT A GLANCE and
    SURVIVE TRUNCATION: the first few words are all the UI shows on a card or a list row, so the
    FIRST 2-4 WORDS must carry the real SUBJECT/OUTCOME (what the task is ABOUT), never the activity
    type or the people.
