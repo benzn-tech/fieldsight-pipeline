@@ -49,9 +49,30 @@ FINALIZE_RESULTS_PREFIX = "session_finalize_results/"
 RENDERED_KINDS = ("final", "rolling", "updated")
 
 
+def _display_name(folder):
+    """The recording owner's display name, derived from the S3 folder ("Ben_Lin"
+    -> "Ben Lin"). Plumbing only (2026-09-17 plan, task B2): this is what lets
+    the brief prompt name the owner (session_brief.build_brief_prompt) -- what
+    the prompt DOES with the name is a later task. Returns None for a blank
+    folder rather than an empty string, so a caller can `if owner_name:` it.
+
+    Separators are collapsed rather than substituted one-for-one: a NULL
+    `last_name` produces the folder "Ben_UCPK_" (a shape this repo has seen),
+    and a literal replace turns that into "Ben UCPK " -- which reaches the brief
+    prompt as "...belongs to Ben UCPK ." A folder made only of separators has no
+    name in it, so it returns None like a blank one."""
+    return " ".join(folder.replace("_", " ").split()) or None if folder else None
+
+
 def _clean_todos(open_todos):
     """Keep only to-dos with real text; normalise responsible + due to a value or
-    None. Each item carries {text, responsible, due} for the structured render."""
+    None. Each item carries {text, responsible, due, at} for the structured render.
+
+    `why` is dropped here even when the caller's dict still carries one (2026-09-17,
+    "the code stops carrying `why` and `basis`"): the confirmation email no longer
+    renders a per-item context line at all (see `build_confirmation_email` below),
+    so there is nothing downstream for it to reach.
+    """
     out = []
     for t in (open_todos or []):
         text = (t.get("text") or "").strip()
@@ -59,11 +80,6 @@ def _clean_todos(open_todos):
             out.append({"text": text,
                         "responsible": (t.get("responsible") or None),
                         "due": (t.get("due") or None),
-                        # Absent from the rolling summariser and present in a brief. Kept
-                        # optional rather than required so the same cleaner serves both, and
-                        # so a brief whose model omitted it degrades to today's behaviour
-                        # instead of dropping the item.
-                        "why": (t.get("why") or None),
                         "at": (t.get("at") or None)})
     return out
 
@@ -102,13 +118,6 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
             who = t["responsible"] or "Unassigned"
             due = f" (due {t['due']})" if t["due"] else ""
             lines.append(f"  • {t['text']} — {who}{due}")
-            # The line that makes the list readable a day later. The title is written to
-            # survive truncation, so it identifies the task and cannot also say why it
-            # exists; without this the reader goes back to the timeline and opens the topic.
-            # Indented under its item rather than appended to it, so scanning the titles
-            # still works and the context is there when the eye stops.
-            if t.get("why"):
-                lines.append(f"      {t['why']}")
     else:
         lines += ["", no_todos_note]
     body_text = "\n".join(lines).rstrip() + "\n"
@@ -125,15 +134,9 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
         parts.append("<p>" + "<br>".join(meta) + "</p>")
     if todos:
         def _row(t):
-            # `why` under the title inside the SAME cell, not a fourth column. A column
-            # would be empty for every to-do the rolling summariser produces and for any
-            # brief whose model omitted it, and an empty column reads as missing data
-            # rather than as an absent explanation.
-            why = (f'<div style="color:#666;font-size:13px;padding-top:2px">'
-                   f'{esc(t["why"])}</div>') if t.get("why") else ""
             return ("<tr>"
                     f'<td style="padding:6px;border-bottom:1px solid #eee">'
-                    f'{esc(t["text"])}{why}</td>'
+                    f'{esc(t["text"])}</td>'
                     f'<td style="padding:6px;border-bottom:1px solid #eee;'
                     f'vertical-align:top">'
                     f'{esc(t["responsible"]) if t["responsible"] else "—"}</td>'
@@ -223,8 +226,10 @@ def _complete_summary(artifact, summarize=None):
             return None
         if summarize is None:
             if SESSION_BRIEF:
+                import functools
                 import session_brief
-                summarize = session_brief.brief_from_turns
+                summarize = functools.partial(session_brief.brief_from_turns,
+                                              owner_name=_display_name(folder))
             else:
                 import lambda_rolling_summary as rs
                 summarize = rs.summarize_turns

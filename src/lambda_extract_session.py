@@ -1044,16 +1044,25 @@ def _instructions_block():
    can ever tick them, and they belong in the topic summary, not here. A discussion that reached no
    act produces NO action_items; the array is genuinely allowed to be empty, and two real tasks are
    worth more than six invented ones, because invented ones bury the real ones.
-   Then write each `action` to be read AT A GLANCE and to SURVIVE TRUNCATION -- the UI
-   shows only the first few words of the title, so the FIRST 2-4 WORDS must carry the real
-   SUBJECT/OUTCOME (what the task is ABOUT), never the activity type or the people. Lead with that
-   key subject; the action verb and any names come AFTER it; keep the whole thing to a handful of
-   words (aim <= ~8). NEVER open with a generic word (Find / Continue / Identify / Consultation /
-   Meeting) that buries the subject; cut rationale/filler ("in order to...", "to discuss...", "to
-   ensure..."). Use only concrete details the speaker gave; never a vague placeholder ("the
-   outstanding task"). Put responsible/deadline in THEIR fields, not in the action text.
-   - Good: "Go-to-market strategy -- consult Xiao Han & Benny"
-   - Good: "Damaged doors -- replace, floors 1-3, PK building"
+   That test, and only that test, decides WHETHER an item exists. Everything below decides HOW it
+   is written. The register changed; the bar for admission did not. An act that belonged here when
+   these were written as short labels still belongs here now that they are written as clauses --
+   and a commitment with a date on it ("sign the PS4 by January") is an act, not a direction.
+   Then write each `action` as ONE OR TWO SHORT CLAUSES a reader who was in the room can act on --
+   it carries the subject, what is to happen, and the context that makes it make sense.
+   One or two short clauses, not a paragraph, and never a bare label. It must still be read AT A GLANCE and
+   SURVIVE TRUNCATION: the first few words are all the UI shows on a card or a list row, so the
+   FIRST 2-4 WORDS must carry the real SUBJECT/OUTCOME (what the task is ABOUT), never the activity
+   type or the people.
+   Lead with that key subject; what is to happen, and any names, come AFTER it. NEVER open with a
+   generic word (Find / Continue / Identify / Consultation / Meeting) that buries the subject. Use
+   only concrete details the speaker gave; never a vague placeholder ("the outstanding task").
+   Put responsible/deadline in THEIR fields, not in the action text, and do NOT guess either one --
+   leaving them blank is correct when the transcript does not say.
+   - Good: "Arborist report catching the cut and fill for link bridge. IA and Civix to catch up."
+   - Good: "Modular drop ceiling 100mm to send details to Ignite."
+   - Good: "PS4 for the Port Com SR study to be signed by January."  (dated commitment; tickable)
+   - Bad:  "Drop ceiling -- 100mm, details to Ignite"  (telegraphic; a label, not minutes a person could send)
    - Bad:  "Consultation with Xiao Han, Benny, and others about go-to-market strategy"  (buries the subject)
    - Bad:  "Identify and complete the unspecified outstanding task"  (vague)
    - Bad:  "Target market strategy -- focus high-hourly professionals"  (a direction; nothing to tick)
