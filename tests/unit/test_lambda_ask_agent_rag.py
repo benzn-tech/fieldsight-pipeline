@@ -465,3 +465,27 @@ def test_a_malformed_scope_still_answers(monkeypatch):
                            "tz": "Pacific/Auckland", "site_id": "not-a-uuid"})
     assert "error" not in out
     assert "invalid" in " ".join(d["reason"] for d in out["applied_scope"]["dropped"])
+
+
+def test_an_early_try_failure_hits_the_normal_error_handler_not_a_nameerror(monkeypatch):
+    """Review finding (controller-mandated fix): applied_scope is assigned
+    partway through the try, and the except handler at the bottom of
+    _rag_answer reads it. If something raises between `try:` and that real
+    assignment -- e.g. the in-try `import query_slots` failing, or here,
+    _validate_scope itself raising -- the handler must still return its
+    normal graceful error shape, not a NameError that masks the original
+    exception and escapes as a raw 500."""
+    wire(monkeypatch, chunks=[])
+
+    def boom(body):
+        raise RuntimeError("scope validation exploded")
+
+    monkeypatch.setattr(laa, "_validate_scope", boom)
+
+    out = laa._rag_answer({"question": "what happened?", "caller_sub": "sub-1",
+                           "tz": "Pacific/Auckland"})
+
+    assert out["error"] == "scope validation exploded"
+    assert out["applied_scope"] == {"dropped": []}
+    assert out["answer"] == ""
+    assert out["model"] is None

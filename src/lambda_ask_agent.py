@@ -1208,6 +1208,14 @@ def _rag_answer(body):
     k = int(body.get("k", 5))
 
     try:
+        # Safe default so the except handler below can always build its
+        # response: everything from here through the real assignment a few
+        # lines down (imports, query_slots, scope validation) is inside the
+        # try, so an exception raised before that assignment must not hit a
+        # NameError on applied_scope inside except -- that would mask the
+        # real error and still escape as a raw 500.
+        applied_scope = {"dropped": []}
+
         # The caller's own calendar day, and the range their question names.
         # `query_slots` is imported HERE for the same reason llm_utils is: the
         # legacy hand-built prod zips a fixed file list and does not carry it. That
