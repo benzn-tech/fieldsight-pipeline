@@ -239,3 +239,15 @@ def test_audio_segments_hide_chunks_a_listed_batch_covers(monkeypatch):
 def test_audio_segments_a_batch_without_a_readable_map_hides_nothing(monkeypatch):
     batch, members, after = _batched_listing(monkeypatch, with_map=False)
     assert _audio_names() == sorted([batch] + members + [after])
+
+
+def test_audio_segments_a_signing_failure_still_answers_200(monkeypatch):
+    _batched_listing(monkeypatch)
+
+    def _boom(self, _op, Params, ExpiresIn):
+        raise RuntimeError("signing failed")
+
+    monkeypatch.setattr(_BatchedS3, "generate_presigned_url", _boom)
+    res = fapi.get_audio_segments({"date": DATE, "user": FOLDER, "start": "", "end": ""},
+                                  ADMIN_CALLER)
+    assert res["statusCode"] == 200

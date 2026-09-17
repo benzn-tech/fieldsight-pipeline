@@ -933,24 +933,27 @@ def get_audio_segments(params, caller):
             kept.append((key, filename, abs_start, abs_end))
     except Exception as e:
         logger.error(f"Error listing audio segments: {e}")
-    # Same rule as org-api's _read_org_audio_segments: a chunk named in the map of a
-    # batch in this result is the same speech as that batch -- drop it. Members come
-    # from the map, never the filename; an unreadable map hides nothing.
-    covered = batch_cover.covered_chunk_keys(
-        lambda k: s3_client.get_object(Bucket=S3_BUCKET, Key=k)['Body'].read(),
-        [k for k, _f, _s, _e in kept])
     segments = []
-    for key, filename, abs_start, abs_end in kept:
-        if key in covered:
-            continue
-        url = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': key}, ExpiresIn=PRESIGNED_URL_EXPIRY)
-        ah, am, asec = int(abs_start)//3600, (int(abs_start)%3600)//60, int(abs_start)%60
-        segments.append({
-            'url': url, 'filename': filename,
-            'absolute_start': abs_start, 'absolute_end': abs_end,
-            'duration': round(abs_end - abs_start, 1),
-            'time_label': f"{ah:02d}:{am:02d}:{asec:02d}",
-        })
+    try:
+        # Same rule as org-api's _read_org_audio_segments: a chunk named in the map of a
+        # batch in this result is the same speech as that batch -- drop it. Members come
+        # from the map, never the filename; an unreadable map hides nothing.
+        covered = batch_cover.covered_chunk_keys(
+            lambda k: s3_client.get_object(Bucket=S3_BUCKET, Key=k)['Body'].read(),
+            [k for k, _f, _s, _e in kept])
+        for key, filename, abs_start, abs_end in kept:
+            if key in covered:
+                continue
+            url = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': key}, ExpiresIn=PRESIGNED_URL_EXPIRY)
+            ah, am, asec = int(abs_start)//3600, (int(abs_start)%3600)//60, int(abs_start)%60
+            segments.append({
+                'url': url, 'filename': filename,
+                'absolute_start': abs_start, 'absolute_end': abs_end,
+                'duration': round(abs_end - abs_start, 1),
+                'time_label': f"{ah:02d}:{am:02d}:{asec:02d}",
+            })
+    except Exception as e:
+        logger.error(f"Error listing audio segments: {e}")
     segments.sort(key=lambda s: s['absolute_start'])
     return ok({'segments': segments, 'count': len(segments)})
 
