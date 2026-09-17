@@ -210,7 +210,12 @@ def backstop(conn, *, list_waiting, resolve_context, read_rolling, enqueue, now=
             "timeRange": ctx.get("timeRange"),
             "siteName": ctx.get("siteName"),
             "summary": rolling.get("summary", ""),
-            "openTodos": rolling.get("open_todos", []),
+            # The rolling summary has no topics, so its narrative becomes one
+            # row of the same shape item-writer builds. Without it a backstopped
+            # session with no to-dos is an email that says nothing -- and the
+            # two paths would send visibly different emails for the same kind of
+            # recording, which is how a reader learns to distrust both.
+            "openTodos": (rolling.get("open_todos") or []) + _summary_row(rolling),
         }
         if enqueue(artifact):
             logger.info("finalize: %s waited %.0fs for its final extraction — "
@@ -287,6 +292,24 @@ def _read_rolling(folder, date, session_id):
         return {}
 
 
+#: Mirrors lambda_item_writer.TOPIC_ROW_MAX_CHARS -- the same table, the same
+#: cell, so the two producers must trim the same way.
+SUMMARY_ROW_MAX_CHARS = 180
+
+
+def _summary_row(rolling):
+    """The rolling summary as a single topic-shaped row, or [] if there is none."""
+    summary = " ".join((rolling.get("summary") or "").split())
+    if not summary:
+        return []
+    first = summary.split(". ")[0].strip()
+    if first and first != summary and not first.endswith("."):
+        first += "."
+    if len(first) > SUMMARY_ROW_MAX_CHARS:
+        first = first[:SUMMARY_ROW_MAX_CHARS - 1].rstrip() + "…"
+    return [{"text": first, "responsible": None, "due": None, "kind": "topic"}]
+
+
 def _enqueue(artifact):
     """Write the finalize request for the non-VPC send worker to pick up.
 
@@ -316,13 +339,20 @@ def _enqueue(artifact):
 
 def _request_extraction(session_id, folder, date):
     """Ask lambda_extract_session for this session's FINAL (thinking-mode,
-    unthrottled) pass now that the session has closed.
+    unthrottled) pass now that the session has closed, and -- in the same
+    breath -- ask for the session's brief (handoff-sync plan §2.1).
 
     Why the sweep owns this: the live passes that ran during recording are
     throttled, so the last window of transcripts can land INSIDE the throttle
     and never make it into an extraction. Only a close-driven pass can
     guarantee the published extraction covers the whole session. `sid`+
-    session_id is extract_session's grouping key (same as _read_rolling)."""
+    session_id is extract_session's grouping key (same as _read_rolling).
+
+    The brief request rides the SAME S3 prefix (session_finalize_requests/)
+    that already triggers SessionFinalizeFunction, under its own `brief-`
+    key -- no new trigger, and it runs CONCURRENTLY with the final
+    extraction rather than after it, so the email is not delayed by a
+    serial LLM call waiting on another one."""
     import boto3
     boto3.client("s3").put_object(
         Bucket=S3_BUCKET,
@@ -330,6 +360,35 @@ def _request_extraction(session_id, folder, date):
         Body=json.dumps({"userFolder": folder, "date": date,
                          "sessionBase": f"sid{session_id}"}),
         ContentType="application/json")
+    _enqueue_brief_request(session_id, folder, date)
+
+
+def _enqueue_brief_request(session_id, folder, date):
+    """Enqueue `session_finalize_requests/brief-<sessionId>.json`, conditional
+    on nothing else having written it yet.
+
+    Same shape as `_enqueue`'s conditional put, deliberately duplicated rather
+    than shared: `_enqueue` takes a whole artifact keyed by `artifact['sessionId']`
+    at the BARE key, and this one always writes the `brief-` key regardless of
+    what `artifact` the caller has in hand. A 412 (item-writer's re-run of the
+    same due session, or a re-drive) means the brief was already asked for --
+    fine, and must not raise."""
+    import boto3
+    from botocore.exceptions import ClientError
+    key = f"{FINALIZE_REQUESTS_PREFIX}brief-{session_id}.json"
+    try:
+        boto3.client("s3").put_object(
+            Bucket=S3_BUCKET, Key=key,
+            Body=json.dumps({"kind": "brief", "sessionId": session_id,
+                             "folder": folder, "date": date}, ensure_ascii=False),
+            ContentType="application/json", IfNoneMatch="*")
+    except ClientError as e:
+        status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        code = e.response.get("Error", {}).get("Code", "")
+        if status == 412 or code in ("PreconditionFailed", "412"):
+            logger.info("finalize: %s already enqueued -- not enqueueing again", key)
+            return
+        raise
 
 
 def group_merged_key(user_folder, date, group_id):

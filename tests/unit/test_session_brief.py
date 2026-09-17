@@ -117,6 +117,19 @@ def test_a_task_without_a_quote_is_anchored_by_its_rarest_words():
     assert brief["tasks"][0]["at"] == "09:40:00"
 
 
+def test_a_task_is_anchored_from_its_own_sentence():
+    # `why` must not participate in anchoring: a task whose rare words live only
+    # in `why` (never in `text`) must NOT be findable. If it were, that would mean
+    # `_snap_to_terms` is still being fed `why` -- the exact narrowing this repo's
+    # own `f"{task['text']} {task['why']}"` used to do at session_brief.py:292.
+    turns = [T("The sparkies need to isolate that distribution board first.", "09:40:00")]
+    brief = {"tasks": [{"text": "", "why": "isolate distribution board sparkies",
+                        "at": "08:00:00"}]}
+    stats = sb.reanchor(brief, turns)
+    assert brief["tasks"][0]["at"] == "08:00:00"   # unmoved -- an empty text anchors nothing
+    assert stats["unmatched"] == 1
+
+
 # --- drop-in compatibility --------------------------------------------------
 
 _BRIEF_JSON = """{"headline": "Procurement blocks the device; package it as a phone.",
@@ -145,8 +158,18 @@ def test_it_returns_the_two_keys_the_email_reads():
     out = sb.brief_from_turns(_turns(), call_llm=_llm(_BRIEF_JSON))
     assert out["summary"] == "Procurement blocks the device; package it as a phone."
     assert out["open_todos"] == [{"text": "Price the device as a company phone",
-                                  "why": "procurement", "at": "13:40:56",
+                                  "at": "13:40:56",
                                   "responsible": "Sam", "due": "Friday"}]
+
+
+def test_a_todo_carries_only_text_responsible_due_and_at():
+    # `to_session_summary` stops reading `why`: the code side of retiring the field
+    # (the prompt still asks for it -- that is a later task). A `why` key anywhere
+    # in a to-do means the old behaviour survived.
+    out = sb.brief_from_turns(_turns(), call_llm=_llm(_BRIEF_JSON))
+    assert out["open_todos"]
+    for todo in out["open_todos"]:
+        assert set(todo.keys()) == {"text", "responsible", "due", "at"}
 
 
 def test_it_also_returns_the_brief_itself():
@@ -244,3 +267,22 @@ def test_the_prompt_tells_the_model_the_same_thing():
     prompt = sb.build_brief_prompt([{"abs_start_str": "11:00:00", "speaker": "spk_0",
                                      "text": "hello"}])
     assert "spk_0" in prompt and "NOT names" in prompt
+
+
+# --- B2: the owner's display name reaches the prompt --------------------------
+# Plumbing only (2026-09-17 plan, task B2): `build_brief_prompt` gains an
+# `owner_name` keyword-only parameter so the recording owner's name can reach
+# the model. What the prompt DOES with the name (the attribution rule) is
+# task B3 -- these only pin that the name is conveyed when known, and that
+# nothing about an owner leaks into the prompt when it is not.
+
+def test_the_prompt_names_the_owner_when_one_is_known():
+    prompt = sb.build_brief_prompt(_turns(), owner_name="Ben Lin")
+    assert "Ben Lin" in prompt
+
+
+def test_the_prompt_says_nothing_about_an_owner_when_none_is_known():
+    prompt = sb.build_brief_prompt(_turns(), owner_name=None)
+    assert "owner" not in prompt.lower()
+    assert "None" not in prompt
+    assert "{owner" not in prompt

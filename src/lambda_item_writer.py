@@ -364,11 +364,16 @@ def _final_email_context(conn, session_base, extraction, date):
     return {"kind": "final", "sessionId": sid,
             "recipient": ctx["recipient"], "date": ctx.get("date") or date,
             "timeRange": ctx.get("timeRange"), "siteName": ctx.get("siteName"),
+            # handoff-sync plan §2.2: the worker needs the folder to poll
+            # session_brief/<folder>/<date>/sid<sessionId>/latest.json. Not
+            # carried before this -- the only recipient of `ctx["folder"]` used
+            # to be the email itself, which never needed it.
+            "folder": ctx.get("folder"),
             # Zero rows is a real answer, not a reason to withhold the email:
             # most sessions produce none, and the renderer says so explicitly.
             # Withholding would send them down the backstop, which quotes the
             # OTHER summariser -- the disagreement this whole change removes.
-            "openTodos": _final_email_rows(extraction, date)}
+            "openTodos": _final_email_rows(extraction, date) + _topic_rows(extraction)}
 
 
 def _enqueue_final_email(ctx, put=None):
@@ -446,6 +451,45 @@ def _final_email_rows(artifact, date):
                             "responsible": item.get("responsible") or None,
                             "due": item.get("deadline") or item.get("deadline_text") or None})
     return todo_collapse.collapse_if_enabled(out)
+
+
+#: How much of a topic's own summary rides in its row. Long enough for the
+#: point, short enough that the table still scans -- the row is context, not the
+#: report, and the report is one click away.
+TOPIC_ROW_MAX_CHARS = 180
+
+
+def _topic_rows(artifact):
+    """Topics that produced NO action item, as rows of their own.
+
+    A session where nobody promised anything is the ordinary case (11 of 16
+    measured on prod), and such a session used to be emailed as a header and one
+    line saying nothing was captured -- while the recording plainly had content.
+    The topic says what was discussed; the owner and due date are N/A because
+    there is no task here, which the renderer shows differently from an action
+    nobody has picked up yet.
+
+    Only topics with no action items: one that produced tasks is already in the
+    table through them, and listing it twice would pad the very table this is
+    trying to make worth reading."""
+    out = []
+    for topic in artifact.get("topics") or []:
+        if topic.get("action_items"):
+            continue
+        title = (topic.get("topic_title") or topic.get("title") or "").strip()
+        summary = " ".join((topic.get("summary") or "").split())
+        # The first sentence, not the whole summary: the rest repeats it at
+        # length, which is what pushed the old prose below the fold.
+        first = summary.split(". ")[0].strip()
+        if first and first != summary and not first.endswith("."):
+            first += "."
+        text = " — ".join(part for part in (title, first) if part)
+        if len(text) > TOPIC_ROW_MAX_CHARS:
+            text = text[:TOPIC_ROW_MAX_CHARS - 1].rstrip() + "…"
+        if text:
+            out.append({"text": text, "responsible": None, "due": None,
+                        "kind": "topic"})
+    return out
 
 
 def _todos_from_topics(artifact):

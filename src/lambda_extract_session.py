@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from urllib.parse import unquote_plus
 
@@ -532,6 +533,20 @@ FINAL_REQUESTS_PREFIX = 'extraction_requests/'
 # which is exactly what this bounds.
 FINAL_RERUN_MAX_GENERATIONS = int(
     os.environ.get('FINAL_RERUN_MAX_GENERATIONS', '3'))
+# A final pass can start BEFORE the session's transcripts exist. The finalize
+# sweep requests it at claim time, and the claim and the tail batch's seal happen
+# in the same minute: on prod 2026-09-17 the final pass ran at 01:08:39, found
+# nothing, logged "No usable speaker turns -- skipping" and returned; the two
+# transcripts landed at 01:08:42. Nothing asks again after that, so the session
+# never got a final at all -- and the confirmation email now waits for one.
+#
+# So a final pass that finds NO transcripts waits and looks again, in-process.
+# Not a re-request through FINAL_REQUESTS_PREFIX: that S3 event fires at once
+# and would lose the same race. Bounded (4 x 20s = 80s) and only on this path;
+# an upload that is minutes late because the device is offline is out of reach
+# by design -- the sweep's email backstop covers it.
+FINAL_EMPTY_RETRY_ATTEMPTS = int(os.environ.get('FINAL_EMPTY_RETRY_ATTEMPTS', '4'))
+FINAL_EMPTY_RETRY_DELAY_S = float(os.environ.get('FINAL_EMPTY_RETRY_DELAY_S', '20'))
 
 _s3_client = None
 _sites_cache = None
@@ -1044,16 +1059,25 @@ def _instructions_block():
    can ever tick them, and they belong in the topic summary, not here. A discussion that reached no
    act produces NO action_items; the array is genuinely allowed to be empty, and two real tasks are
    worth more than six invented ones, because invented ones bury the real ones.
-   Then write each `action` to be read AT A GLANCE and to SURVIVE TRUNCATION -- the UI
-   shows only the first few words of the title, so the FIRST 2-4 WORDS must carry the real
-   SUBJECT/OUTCOME (what the task is ABOUT), never the activity type or the people. Lead with that
-   key subject; the action verb and any names come AFTER it; keep the whole thing to a handful of
-   words (aim <= ~8). NEVER open with a generic word (Find / Continue / Identify / Consultation /
-   Meeting) that buries the subject; cut rationale/filler ("in order to...", "to discuss...", "to
-   ensure..."). Use only concrete details the speaker gave; never a vague placeholder ("the
-   outstanding task"). Put responsible/deadline in THEIR fields, not in the action text.
-   - Good: "Go-to-market strategy -- consult Xiao Han & Benny"
-   - Good: "Damaged doors -- replace, floors 1-3, PK building"
+   That test, and only that test, decides WHETHER an item exists. Everything below decides HOW it
+   is written. The register changed; the bar for admission did not. An act that belonged here when
+   these were written as short labels still belongs here now that they are written as clauses --
+   and a commitment with a date on it ("sign the PS4 by January") is an act, not a direction.
+   Then write each `action` as ONE OR TWO SHORT CLAUSES a reader who was in the room can act on --
+   it carries the subject, what is to happen, and the context that makes it make sense.
+   One or two short clauses, not a paragraph, and never a bare label. It must still be read AT A GLANCE and
+   SURVIVE TRUNCATION: the first few words are all the UI shows on a card or a list row, so the
+   FIRST 2-4 WORDS must carry the real SUBJECT/OUTCOME (what the task is ABOUT), never the activity
+   type or the people.
+   Lead with that key subject; what is to happen, and any names, come AFTER it. NEVER open with a
+   generic word (Find / Continue / Identify / Consultation / Meeting) that buries the subject. Use
+   only concrete details the speaker gave; never a vague placeholder ("the outstanding task").
+   Put responsible/deadline in THEIR fields, not in the action text, and do NOT guess either one --
+   leaving them blank is correct when the transcript does not say.
+   - Good: "Arborist report catching the cut and fill for link bridge. IA and Civix to catch up."
+   - Good: "Modular drop ceiling 100mm to send details to Ignite."
+   - Good: "PS4 for the Port Com SR study to be signed by January."  (dated commitment; tickable)
+   - Bad:  "Drop ceiling -- 100mm, details to Ignite"  (telegraphic; a label, not minutes a person could send)
    - Bad:  "Consultation with Xiao Han, Benny, and others about go-to-market strategy"  (buries the subject)
    - Bad:  "Identify and complete the unspecified outstanding task"  (vague)
    - Bad:  "Target market strategy -- focus high-hourly professionals"  (a direction; nothing to tick)
@@ -1792,7 +1816,7 @@ def _supersedes(new_sources, prev):
 
 def extract_session(bucket, user_folder, date, session_base, final=False,
                     min_interval_s=MIN_REEXTRACT_INTERVAL_S, now=None,
-                    generation=0, speaker_names=None):
+                    generation=0, speaker_names=None, sleep=time.sleep):
     # M-5: a stack missing the secret must not retry-storm -- an S3 event
     # retries on a raised exception, and every retry would fail the exact
     # same way. Check upfront (before any S3 gather/Claude work) and bail
@@ -1831,10 +1855,23 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
     turns, source_filenames, announcement_stats = assemble_session_turns(
         bucket, keys)
 
+    # See FINAL_EMPTY_RETRY_ATTEMPTS: a final pass can outrun the transcripts.
+    waited = 0
+    while final and not turns and waited < FINAL_EMPTY_RETRY_ATTEMPTS:
+        waited += 1
+        logger.info("%s: final pass found no transcripts yet -- waiting %.0fs "
+                    "(attempt %d/%d)", session_base, FINAL_EMPTY_RETRY_DELAY_S,
+                    waited, FINAL_EMPTY_RETRY_ATTEMPTS)
+        sleep(FINAL_EMPTY_RETRY_DELAY_S)
+        keys = gather_session_segments(bucket, user_folder, date, session_base)
+        turns, source_filenames, announcement_stats = assemble_session_turns(
+            bucket, keys)
+
     # M-6: nothing usable to extract from -- skip quietly (no Claude call,
     # no write), same "don't retry-storm a dead end" reasoning as M-5.
     if not turns:
-        logger.warning(f"No usable speaker turns for session {session_base} -- skipping")
+        logger.warning(f"No usable speaker turns for session {session_base} -- skipping"
+                       + (f" after waiting {waited} time(s)" if waited else ""))
         return None
 
     n_segments = len(source_filenames)

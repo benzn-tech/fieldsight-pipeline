@@ -2741,9 +2741,18 @@ def session_brief_read(conn, caller, session_id, event):
     and neither is an error.
 
     Returned whole rather than filtered. Every field in it was produced for a reader — the
-    quote is what makes a bullet checkable, `at` is what makes it findable in the transcript,
-    and `why` is the field the to-do list was missing. Trimming here would repeat the mistake
-    that made this endpoint necessary.
+    quote is what makes a bullet checkable, `at` is what makes it findable in the transcript.
+    As of 2026-09-17 a task is `{text, at, assignee, due}` and nothing else. `why` is GONE --
+    not moved, not kept for direct readers -- and `basis` with it: the per-item context line
+    was dropped by decision in favour of a `text` that carries its own context, and the basis
+    now only decides that sentence's verb (spec §3.1/§3.3, commits B1/B3).
+
+    An earlier version of this paragraph said `why` "still lives on this same artifact's raw
+    `tasks[]`". That was true for exactly one commit, between B1 and B3, and false afterwards.
+    It cost real work: it is the most authoritative-looking sentence in this file, and a client
+    author read it and built a fixture around a field the writer had stopped producing -- which
+    is invisible until the mock is switched off. A docstring that describes a shape is a
+    promise about the writer, so it is wrong the moment the writer changes.
     """
     p = event.get("queryStringParameters") or {}
     date, user = p.get("date"), (p.get("user") or "").strip()

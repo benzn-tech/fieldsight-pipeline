@@ -25,7 +25,17 @@ from output_language import OUTPUT_LANGUAGE_RULE
 
 logger = logging.getLogger()
 
-MAX_TOKENS = 8000
+# The ANSWER budget; llm_utils adds REASONING_HEADROOM_TOKENS on top before it
+# goes on the wire. 8000 was sized on a solo recording and silently failed the
+# case this summariser exists for. Measured on TEST 2026-09-17, the same
+# 70-minute multi-voice session three times: prompt=13712, reasoning=13870 /
+# 15331 / 14710, completion=16143 / 16047 / 16233 against a 16000 ceiling,
+# finish=length every time -- the reasoning ate the budget and the JSON was cut
+# mid-object, so `parse_brief` found no object and the session got NO brief at
+# all while the solo session (reasoning ~6000, finish=stop) looked fine. A long
+# meeting is precisely when a brief is worth having, so the budget is sized for
+# the reasoning this model actually spends on one, not for the easy case.
+MAX_TOKENS = 16000
 TRANSCRIPT_LIMIT = 300000     # matches lambda_extract_session's head+tail budget
 
 # Alias validation (see validate_aliases). A word list is a maintenance
@@ -47,10 +57,39 @@ def render_turns(turns, limit=TRANSCRIPT_LIMIT):
     return text[:head] + "\n[... middle of the session elided to fit ...]\n" + text[-tail:]
 
 
-def build_brief_prompt(turns):
+def build_brief_prompt(turns, owner_name=None):
+    # Plumbing only (2026-09-17 plan, task B2): the recording owner's display
+    # name, when known, reaches the prompt so a later task can write attribution
+    # rules around it. What to DO with the name -- the "when a turn is plainly
+    # {owner} speaking, use their name" instruction -- is task B3; this commit
+    # only conveys the name, and conveys nothing when there is none to convey.
+    # B3 fix round (review I-1): "This recording belongs to {owner}" reads as
+    # "this is mainly their meeting" as readily as "this is their device", and
+    # the first reading is an anchor toward hanging every unclear turn on them.
+    # The line states only the fact the pipeline actually has -- which account
+    # the file arrived under -- and denies the inference outright.
+    owner_line = (
+        f"\nThis recording was made on {owner_name}'s device, under their account."
+        " That is all it tells you: it does not mean the meeting was theirs, and"
+        " it does not tell you who spoke on any line below.\n"
+    ) if owner_name else ""
+    # Task B3: the name is only safe to hand over with the prohibition attached.
+    # `_real_name` can still strip a speaker label out of `assignee` after the
+    # fact; a name written into `text` has NO code-side backstop, so a wrong
+    # attribution there is permanent and reads to the recipient as fact. The
+    # negative half is stated last and in full because it is the half a model
+    # gets wrong -- given a name and a transcript of unlabelled voices, it hangs
+    # the name on whichever turn looks closest.
+    owner_rule = f"""
+   **Naming the owner.** When a turn is plainly {owner_name} speaking about what
+   they will do, use their name as the subject of the sentence: "{owner_name}
+   confirmed the QA pour checks start once the cure ends." When you cannot tell
+   who spoke, write the sentence without a name and never attribute it to
+   {owner_name}.
+""" if owner_name else ""
     return f"""You are briefing a senior colleague who was NOT in this meeting. They have a
 few minutes, and afterwards they have to be able to discuss any part of it.
-
+{owner_line}
 Below is the full transcript, one line per speaker turn as [HH:MM:SS] speaker: text.
 It comes from automatic speech recognition, so expect misheard words and filler.
 
@@ -80,12 +119,10 @@ Return ONLY JSON, no code fence and no commentary:
   ],
   "tasks": [
     {{
-      "text": "One sentence on what needs doing, written for whoever will do it.",
-      "why": "What happened in the meeting that produced this",
+      "text": "One or two short clauses a reader who was in the room can act on: the subject, what is to happen, and the context that makes it make sense -- 'Modular drop ceiling 100mm, details to go to Ignite.' One or two short clauses, not a paragraph. Never a speaker label (spk_0, Speaker 1) inside this sentence.",
       "at": "HH:MM:SS",
       "assignee": "The name it was given to, or null. Do not guess. The speaker labels above (spk_0, Speaker 1) are NOT names -- they say which voice spoke, not who the task is for. If nobody was named, this is null.",
-      "due": "When, in the words used, or null",
-      "basis": "committed if someone took it on; inferred if you concluded it should be done"
+      "due": "When, in the words used, or null"
     }}
   ],
   "open_points": [
@@ -146,7 +183,33 @@ How to write it:
    the side chosen: a missed task is one the recorder still remembers, and a
    surplus one is meant to be dismissed in the UI rather than argued away here.
 
-7. {OUTPUT_LANGUAGE_RULE}
+7. **tasks: how the sentence reads.** Minutes, not a label. One or two short
+   clauses carrying their own context, so somebody who was in the room knows what it is
+   about without the recording: "Arborist report catching the cut and fill for
+   link bridge, IA and Civix to catch up." NOT "Rainwater tank front position
+   -- discuss with Paul Smith", which is rule 2's failure wearing a task's
+   clothes.
+
+   **Never a speaker label (spk_0, Speaker 1) inside the sentence.** Those say
+   which voice spoke, not who anything is for. A label written here is not
+   corrected anywhere downstream -- it reaches the reader exactly as you typed
+   it, in minutes they forward to the people involved.
+
+   **The verb carries how firm it is.** Something a person actually took on
+   reads as a commitment -- "Ben confirmed the QA pour checks start once the
+   cure ends", "Paul Smith confirmed the tank position is fixed before the slab
+   pour". Whoever the transcript shows making the commitment is the subject of
+   the sentence; it is as often somebody other than the person recording as it
+   is them. Something you concluded should happen, that nobody took on, reads
+   as unsettled -- "... to be confirmed" -- or carries no name at all. Never
+   write a committed/inferred label into the output: the verb is the only place
+   that distinction appears.
+
+   Do not hedge a commitment somebody plainly made: "to be confirmed" is for
+   work nobody took on, not a safer default. This is about the verb, never the
+   name -- when you cannot tell who spoke, the sentence still carries no name.
+{owner_rule}
+8. {OUTPUT_LANGUAGE_RULE}
 
 ---
 
@@ -289,7 +352,7 @@ def reanchor(brief, turns):
                 b["at"] = at
                 fixed += 1
     for task in brief.get("tasks") or []:
-        at = _snap_to_terms(f"{task.get('text', '')} {task.get('why', '')}", turns, df)
+        at = _snap_to_terms(task.get("text", ""), turns, df)
         if at is None:
             missed += 1
         elif at != task.get("at"):
@@ -331,30 +394,37 @@ def to_session_summary(brief):
     `build_confirmation_email` and nothing downstream changes. `open_todos` takes
     the same {text, responsible, due} shape `_clean_todos` normalises.
     """
-    # `why` travels with the three the email already knew about. The model is asked for it
-    # ("What happened in the meeting that produced this") and it was being computed and
-    # dropped at this boundary — the whole brief reached S3 and only two keys reached the
-    # surfaces that read it.
+    # `why` is not carried here because it no longer exists anywhere (2026-09-17,
+    # docs/superpowers/plans/2026-09-17-minutes-that-read-like-minutes.md, tasks
+    # B1 then B3). A task is `{text, at, assignee, due}`: the owner's decision is
+    # that the per-item context line goes entirely, because the to-do's OWN
+    # sentence carries that context now (spec §3.1/§3.3), and `basis` survives
+    # only as the thing that picks that sentence's verb.
     #
-    # It is the field the owner asked for after finding the to-do list unusable for recall:
-    # a title tuned to survive truncation identifies the task and cannot also carry why it
-    # exists, so reading the list meant going back to the timeline and opening the topic.
+    # This comment used to say the model "is still asked for it" and that `why`
+    # "still lives on the raw `tasks[]`". Both were true for the single commit
+    # between B1 and B3 and false afterwards, and the twin of this paragraph in
+    # `lambda_org_api.py` cost real work: a client author built a fixture around
+    # `why` and `basis`, fields the writer had stopped producing -- drift that is
+    # invisible until the mock is switched off. A comment that describes a shape
+    # is a promise about the writer, so it is wrong the moment the writer moves.
     todos = [{"text": (t.get("text") or "").strip(),
               "responsible": _real_name(t.get("assignee")),
               "due": t.get("due") or None,
-              "why": (t.get("why") or "").strip() or None,
               "at": t.get("at") or None}
              for t in (brief.get("tasks") or []) if (t.get("text") or "").strip()]
     return {"summary": (brief.get("headline") or "").strip(), "open_todos": todos}
 
 
-def brief_from_turns(turns, call_llm=None):
+def brief_from_turns(turns, call_llm=None, *, owner_name=None):
     """Drop-in for lambda_rolling_summary.summarize_turns.
 
     Returns the brief WIDENED with `summary` and `open_todos`, or None on any
     failure so the caller falls back exactly as it does today. `call_llm` is
     injectable for tests; llm_utils is imported lazily so this module stays pure
-    at import.
+    at import. `owner_name` is keyword-only with a default so this stays a
+    drop-in for `summarize_turns(turns)` -- the contract this module was built
+    to honour (see the module docstring above).
     """
     if not turns:
         return None
@@ -368,7 +438,7 @@ def brief_from_turns(turns, call_llm=None):
     # a 70-minute session, and that is where its density comes from. Inheriting
     # the env would mean every number this was designed against was measured on
     # a configuration that never shipped.
-    raw, _err = call_llm(build_brief_prompt(turns), max_tokens=MAX_TOKENS,
+    raw, _err = call_llm(build_brief_prompt(turns, owner_name=owner_name), max_tokens=MAX_TOKENS,
                          force_json=True, enable_thinking=True)
     brief = parse_brief(raw)
     if not brief:
