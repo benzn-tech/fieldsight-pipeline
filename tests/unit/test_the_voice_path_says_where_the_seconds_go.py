@@ -85,10 +85,14 @@ def test_a_failed_stage_does_not_pretend_to_have_timings(voiced, caplog, monkeyp
 def test_measuring_did_not_change_the_response(voiced):
     """The whole point of this change is that it is inert. The device parses
     these keys; an extra one is a client-side surprise and a missing one is a
-    silent failure."""
+    silent failure.
+
+    `asked` was added later (conversation-memory Task 5): it is the one key
+    this test pins that is NOT from the measurement change -- listed here so
+    the response shape stays exhaustive."""
     res = aa._voice_answer(_body())
     assert set(res) == {"transcript", "basis", "answerText",
-                        "audioBase64", "audioFormat"}
+                        "audioBase64", "audioFormat", "asked"}
     assert res["audioFormat"] == "wav"
     assert res["transcript"] == "how is level three going"
 
@@ -122,11 +126,16 @@ def test_no_history_counts_zero_rather_than_omitting_the_field(voiced, caplog):
     assert "history_turns=0" in line, line
 
 
-def test_history_reaches_the_log_but_not_retrieval(voiced, caplog, monkeypatch):
-    """THE inert test, and the one that would catch step 4 being started by
-    accident. Retrieval must receive exactly what it received before: the
-    question, the caller, the mode, k and tz. A `history` key arriving here early
-    means the union-of-embeddings change went in without its measurement."""
+def test_history_reaches_the_log_and_retrieval(voiced, caplog, monkeypatch):
+    """Formerly "...but not retrieval": step 2 of the continuity spec was
+    deliberately inert (history counted and logged, never forwarded), so this
+    test pinned its ABSENCE from the retrieval body as the thing that must not
+    silently regress ahead of the real wiring.
+
+    Conversation-memory Task 5 is that wiring ("add it twice"): the body this
+    function builds for `_rag_answer` now carries `history` through
+    unmodified (it is cleaned on the far side, by
+    `ask_history._clean_voice_history`), same as the count already did."""
     seen = {}
 
     def _rag(req):
@@ -136,7 +145,7 @@ def test_history_reaches_the_log_but_not_retrieval(voiced, caplog, monkeypatch):
     monkeypatch.setattr(aa, "_rag_answer", _rag)
     with caplog.at_level(logging.INFO):
         aa._voice_answer(dict(_body(), history=[{"question": "q", "answer": "a"}]))
-    assert "history" not in seen, seen
+    assert seen["history"] == [{"question": "q", "answer": "a"}]
     line = [r.getMessage() for r in caplog.records if "voice ask:" in r.getMessage()][0]
     assert "history_turns=1" in line
 

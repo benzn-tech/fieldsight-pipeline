@@ -158,6 +158,22 @@ def wire(monkeypatch, keys=None):
     return fake
 
 
+# `get_dates` windows on `nz_time.nz_now() - timedelta(days=months * 30)`
+# (:561) compared against the fixture date `_TS` (2026-07-20) with `d >=
+# start_date`. That is real wall-clock distance from a FIXED fixture, so any
+# test that lets `nz_now()` read the real clock is a time bomb: it silently
+# expires the day `nz_now()` drifts more than `months*30` days past `_TS`,
+# which is exactly what happened by 2026-09-18. Freezing `nz_now()` at a
+# fixed offset from `_TS` (never the real clock) is the least invasive seam
+# -- it is the one function `get_dates` itself calls, so nothing else in the
+# module needs to change.
+_FROZEN_NOW = _TS + datetime.timedelta(days=10)
+
+
+def _freeze_now(monkeypatch, when=_FROZEN_NOW):
+    monkeypatch.setattr(fapi.nz_time, "nz_now", lambda: when)
+
+
 def body_of(res):
     return json.loads(res["body"])
 
@@ -442,7 +458,18 @@ def test_dates_site_filter_with_no_accessible_users_returns_empty(monkeypatch):
 
 
 def test_dates_admin_unfiltered_unchanged(monkeypatch):
-    """Blast radius: admin/gm keep the union-across-all-users behaviour."""
+    """Blast radius: admin/gm keep the union-across-all-users behaviour.
+
+    Pre-existing calendar-dependent time bomb (fix round on 3237e56, finding
+    3): this asserted the fixture date `_TS` (2026-07-20) falls inside
+    `get_dates`' `months=2` window measured from the REAL wall clock, which
+    is true only while `nz_time.nz_now()` stays within ~60 days of the
+    fixture -- it stopped being true by 2026-09-18 and would have failed
+    every PR from then on. `_freeze_now` pins `nz_now()` to a fixed offset
+    from the fixture instead, so this is deterministic forever regardless of
+    when the suite runs (see test_get_dates_window_is_immune_to_the_real_
+    systems_clock below for the proof)."""
+    _freeze_now(monkeypatch)
     wire(monkeypatch)
     dates = body_of(fapi.get_dates({"months": "2"}, ADMIN_CALLER))["dates"]
     assert "2026-07-20" in dates
@@ -466,10 +493,48 @@ def test_dates_worker_sees_only_own_dates(monkeypatch):
     empty set -- the test could not tell 'correctly scoped' from
     'totally broken'. Equality, so a scoped caller must actually RECEIVE
     its own date."""
+    _freeze_now(monkeypatch)
     wire(monkeypatch)
     dates = body_of(fapi.get_dates({"months": "2"}, WORKER_CALLER))["dates"]
     assert set(dates.keys()) == {"2026-07-20"}
     assert dates["2026-07-20"]["hasReport"] is True
+
+
+# ---------------------------------------------------------------
+# Pre-existing calendar time bomb, fixed alongside the above (fix round on
+# 3237e56, finding 3) -- NOT part of the handoff-sync feature.
+# ---------------------------------------------------------------
+
+def test_get_dates_window_is_immune_to_the_real_systems_clock(monkeypatch):
+    """Proves `_freeze_now` is the seam that decides the outcome, not the
+    real system clock -- by simulating the real clock reading a year ahead
+    of today (2026-09-18 -> 2027-09-18) via `nz_time`'s OWN `datetime`
+    reference (what `nz_now()` reads absent the test-level freeze) while
+    `_freeze_now` is also applied. If the assertion below held only because
+    the real clock happened to be recent, this simulated year-ahead real
+    clock would push the window past the fixture and the test would fail;
+    it does not, because `get_dates` never reads the real clock once
+    `nz_now` itself is replaced.
+
+    This is the same fix verified two ways: it passes when this suite
+    actually runs (today, whatever "today" is), and it passes even when the
+    underlying wall clock `nz_time` would otherwise read is a year further
+    ahead than that."""
+    import datetime as _dt_module
+
+    class _AYearAheadRealClock(_dt_module.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            real_now = _dt_module.datetime.now(tz)
+            return real_now.replace(year=real_now.year + 1)
+
+    # The layer BELOW nz_now(): if `_freeze_now` did not fully override the
+    # seam `get_dates` calls, this would leak through and expire the fixture.
+    monkeypatch.setattr(fapi.nz_time, "datetime", _AYearAheadRealClock)
+    _freeze_now(monkeypatch)
+    wire(monkeypatch)
+    dates = body_of(fapi.get_dates({"months": "2"}, ADMIN_CALLER))["dates"]
+    assert "2026-07-20" in dates
 
 
 def test_dates_admin_site_filter_with_no_mapped_users_returns_empty(monkeypatch):

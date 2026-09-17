@@ -123,7 +123,7 @@ def _excerpt_block(chunks, limit=5):
     return "\n".join(out)
 
 
-def answer(question, chunks, *, clock=time.monotonic):
+def answer(question, chunks, *, skip_verdict=False, clock=time.monotonic):
     """A web-answer block, or None to leave the grounded path alone.
 
     `chunks` may be empty: retrieval returning nothing IS the verdict, so that
@@ -131,6 +131,14 @@ def answer(question, chunks, *, clock=time.monotonic):
     empty set answered anything. That is the case the first build missed
     entirely -- it returned a fixed "no relevant records" string above this hook
     and never reached it.
+
+    `skip_verdict` skips ONLY the verdict model call -- a cheap distance gate
+    upstream (`lambda_ask_agent._rag_answer`) may already know the records
+    cannot answer this. `chunks` are still passed through unchanged and still
+    reach `question_admission.screen()` below: it derives two of its three
+    signals (site names, the account's own words) FROM `chunks`, so calling
+    `answer(question, [])` to skip the verdict would also disarm those checks.
+    Never do that -- this keyword exists so nobody has to.
 
     Never raises. Every failure returns either None or a body whose flags say
     which -- "we found nothing", "we may not ask" and "we did not look" are
@@ -144,7 +152,7 @@ def answer(question, chunks, *, clock=time.monotonic):
     def left():
         return HARD_STOP_SECONDS - (clock() - started)
 
-    if chunks:
+    if chunks and not skip_verdict:
         verdict, err = _verdict(question, chunks, min(VERDICT_BUDGET, left()))
         if err or verdict is None:
             # Fail closed. An unreadable verdict is not permission to search.
@@ -153,6 +161,8 @@ def answer(question, chunks, *, clock=time.monotonic):
         if verdict.get("answered") is True:
             logger.info("web answer: the records answer it; no lookup")
             return None
+    elif skip_verdict:
+        logger.info("web answer: distance gate skipped the verdict call")
     else:
         logger.info("web answer: nothing retrieved; the records cannot answer it")
 

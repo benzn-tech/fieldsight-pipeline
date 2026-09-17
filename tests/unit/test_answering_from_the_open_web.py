@@ -139,6 +139,28 @@ def test_the_flag_is_read_at_call_time(monkeypatch):
     assert web.answer(PUBLIC_Q, CHUNKS) is None
 
 
+def test_skipping_the_verdict_still_screens_against_the_chunks(monkeypatch):
+    """The whole point of `skip_verdict`: it must skip ONLY the verdict call,
+    never blind `question_admission`, which derives two of its three signals
+    (site names, the account's own words) FROM `chunks`. Calling
+    `answer(question, [])` to skip the verdict would also disarm those checks
+    -- this keyword exists so nobody has to."""
+    seen = {}
+    monkeypatch.setattr(web.question_admission, "screen",
+                        lambda q, c: seen.update(chunks=c) or None)
+    web.answer(PUBLIC_Q, CHUNKS, skip_verdict=True)
+    assert seen["chunks"] == CHUNKS, "chunks must still reach screen() unchanged"
+
+
+def test_skipping_the_verdict_skips_only_the_verdict(monkeypatch):
+    fake = FakeCall(reply(text="NZS 3604 covers it.", results=SOURCES))
+    monkeypatch.setattr(web.client, "call", fake)
+    out = web.answer(PUBLIC_Q, CHUNKS, skip_verdict=True)
+    assert out["answer"].startswith("NZS 3604")
+    assert len(fake.calls) == 1, "only the web lookup ran, not the verdict"
+    assert fake.web_prompt is not None
+
+
 # --------------------------------------------------- what it says when it fails
 
 def test_prose_about_a_search_that_never_ran_produces_no_answer(monkeypatch):

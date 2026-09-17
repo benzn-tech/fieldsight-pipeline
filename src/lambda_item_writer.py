@@ -364,6 +364,11 @@ def _final_email_context(conn, session_base, extraction, date):
     return {"kind": "final", "sessionId": sid,
             "recipient": ctx["recipient"], "date": ctx.get("date") or date,
             "timeRange": ctx.get("timeRange"), "siteName": ctx.get("siteName"),
+            # handoff-sync plan §2.2: the worker needs the folder to poll
+            # session_brief/<folder>/<date>/sid<sessionId>/latest.json. Not
+            # carried before this -- the only recipient of `ctx["folder"]` used
+            # to be the email itself, which never needed it.
+            "folder": ctx.get("folder"),
             # Zero rows is a real answer, not a reason to withhold the email:
             # most sessions produce none, and the renderer says so explicitly.
             # Withholding would send them down the backstop, which quotes the
@@ -436,7 +441,15 @@ def _final_email_rows(artifact, date):
     the date `lambda_ingest._map_action_items` resolves from it. The email and
     the record would disagree on the one cell a reader acts on, so this reuses
     that same mapping -- the spoken text remains, as the fallback for a deadline
-    nothing could resolve."""
+    nothing could resolve.
+
+    No longer carries a `topic_range` (handoff-sync plan §8 originally added
+    it, §7.1 as first written): that field existed only so
+    `lambda_session_finalize` could decide, by TIME, whether a brief task
+    already covered a row's topic. §7.1 is now decided by TEXT instead (see
+    `lambda_session_finalize._is_represented`), which reads a row's own
+    `text` -- already present here -- so nothing downstream reads this field
+    any more."""
     out = []
     for topic in artifact.get("topics") or []:
         for item in lambda_ingest._map_action_items(topic.get("action_items"), date):
@@ -466,7 +479,11 @@ def _topic_rows(artifact):
 
     Only topics with no action items: one that produced tasks is already in the
     table through them, and listing it twice would pad the very table this is
-    trying to make worth reading."""
+    trying to make worth reading.
+
+    No longer carries a `topic_range` -- same reason as `_final_email_rows`
+    above: `lambda_session_finalize` now decides §7.1 (does the brief already
+    cover this topic) from this row's own `text`, not from a time window."""
     out = []
     for topic in artifact.get("topics") or []:
         if topic.get("action_items"):

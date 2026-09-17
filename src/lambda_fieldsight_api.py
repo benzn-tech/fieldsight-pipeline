@@ -37,17 +37,47 @@ import json
 import logging
 import re
 import boto3
+import botocore.exceptions
+from botocore.config import Config
 from datetime import datetime, timedelta
 from urllib.parse import unquote_plus
 
 import deletion_mirror
 import nz_time
+# Pure module, no boto3 -- safe to import eagerly. Moved out of this file
+# (2026-09-17, ask-conversation-memory Task 3) so lambda_ask_agent can share
+# the same cleaner without importing this whole handler module. Re-exported
+# under the SAME names at module level: existing tests reference
+# fapi.MAX_VOICE_HISTORY_TURNS / fapi.MAX_VOICE_HISTORY_CHARS.
+from ask_history import (
+    _clean_voice_history, MAX_VOICE_HISTORY_TURNS, MAX_VOICE_HISTORY_CHARS,
+)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 s3_client = boto3.client('s3')
 lambda_client = boto3.client('lambda')
+# Task 8 review fix: this Config was originally applied to the SHARED
+# module-level `lambda_client` above, which regressed every other route that
+# reuses it -- corroborate_answer's target (src/corroboration.py
+# HARD_STOP_SECONDS, default 27s, its stage budgets re-cut from measurement to
+# fill exactly 27s) could finish between 26s and 27s and now got killed by
+# THIS read_timeout instead; ask_voice's _voice_answer (STT + RAG + TTS) has
+# no measured ceiling to check the claim against either. So this client is
+# used ONLY by ask_question, below -- read_timeout BELOW ApiFunction's own
+# Timeout (Task 7: ApiFunction=28, AskAgentFunction=27), so a hung Ask Agent
+# invoke fails HERE, in code that can name it, instead of the runtime killing
+# ApiFunction first and leaving a bare `Task timed out` as the only trace
+# (spec SS4.8). retries=0: a synchronous user-facing invoke must not silently
+# double the wait. corroborate_answer, ask_voice and search_topics keep using
+# the plain `lambda_client` above, unchanged from before this task.
+_LAMBDA_INVOKE_TIMEOUT = int(os.environ.get("ASK_INVOKE_TIMEOUT", "26"))
+ask_lambda_client = boto3.client('lambda', config=Config(
+    read_timeout=_LAMBDA_INVOKE_TIMEOUT,
+    connect_timeout=5,
+    retries={"max_attempts": 0},
+))
 dynamodb = boto3.resource('dynamodb')
 
 S3_BUCKET = os.environ.get('S3_BUCKET', 'fieldsight-data-509194952652')
@@ -1266,8 +1296,22 @@ def ask_question(body, caller):
     if body.get('scoped'):
         payload['scoped'] = body['scoped']
 
+    # Same cleaner as the voice route: one set of caps, one set of key names.
+    # ABSENT, never an empty list -- see ask_voice, and the agent's
+    # history_turns count, which would otherwise mean two things.
+    raw_history = body.get('history')
+    history = _clean_voice_history(raw_history)
+    if history:
+        payload['history'] = history
+    if isinstance(raw_history, list) and len(raw_history) != len(history):
+        logger.warning("ask: dropped %d of %d history turns",
+                       len(raw_history) - len(history), len(raw_history))
+    elif raw_history is not None and not isinstance(raw_history, list):
+        logger.warning("ask: history was %s, not a list",
+                       type(raw_history).__name__)
+
     try:
-        resp = lambda_client.invoke(
+        resp = ask_lambda_client.invoke(
             FunctionName=ASK_AGENT_FUNCTION,
             InvocationType='RequestResponse',
             Payload=json.dumps(payload)
@@ -1287,9 +1331,20 @@ def ask_question(body, caller):
             return result
         # Or direct invocation format
         return ok(result)
+    except botocore.exceptions.ReadTimeoutError:
+        # The gap this fixes (spec SS4.8): with no Config on lambda_client,
+        # botocore's default read timeout outlived ApiFunction's own Timeout,
+        # so the runtime killed this function before this except could run --
+        # the only trace was a bare `Task timed out`. Named here instead, and
+        # 504 (not 500/502) so a hung agent is distinguishable from every
+        # other invoke failure below. The body text is generic on purpose:
+        # the web client replaces every Ask failure with its own reassuring
+        # line regardless of status code (Task 11) -- this status is for us.
+        logger.error("ask agent read timeout after %ss", _LAMBDA_INVOKE_TIMEOUT)
+        return error('Ask temporarily unavailable', 504)
     except Exception as e:
         logger.error(f"Ask agent invocation failed: {e}")
-        return error(f'Ask agent error: {e}', 500)
+        return error('Ask temporarily unavailable', 502)
 
 
 # ── POST /api/ask/corroborate ─────────────────────
@@ -1348,54 +1403,6 @@ def corroborate_answer(body, caller):
 # ~15s of 128kbps AAC ≈ 240KB ≈ 320K base64 chars; 1.5M chars (~1.1MB decoded)
 # is generous headroom while still rejecting absurd payloads early.
 MAX_VOICE_AUDIO_B64 = 1_500_000
-
-# Conversation continuity, step 2: the gateway carries the previous turns and
-# the agent counts them. Nothing retrieves with them yet -- the device half and
-# the retrieval half land separately, and an inert forward can be observed in
-# production logs before either commits to a shape.
-#
-# Six turns because a follow-up refers to the last question, not to the start of
-# a shift, and 2000 chars because a spoken answer is two or three sentences --
-# the cap is for the pathological client, not the ordinary one. Their product is
-# the number that matters: 6 x 2000 x 2 fields = 24K, against a 6MB synchronous
-# invoke ceiling this body already fills with 1.5M chars of base64 audio.
-MAX_VOICE_HISTORY_TURNS = 6
-MAX_VOICE_HISTORY_CHARS = 2000
-
-
-def _clean_voice_history(raw):
-    """The forwardable turns in `raw`, most recent kept, or [] if there are none.
-
-    FAILS SOFT on purpose. A device that ships a serialisation bug must lose its
-    memory, not its voice: a 400 here would take hands-free Ask offline across a
-    whole app build to protect a feature that is not wired up yet. Bad turns are
-    dropped individually so one corrupted entry cannot erase a conversation that
-    is otherwise intact, and the caller logs how many went missing.
-
-    Only `question` and `answer` survive. This field ends up inside an LLM
-    prompt, and forwarding whatever else the device keeps locally -- ids,
-    timestamps, a `caller_sub` -- is how unreviewed client data gets there.
-    Identity in particular comes from the authorizer, never from the body.
-
-    The tail is kept, not the head: a follow-up refers to the last question, so
-    dropping recent turns would answer against the conversation from ten minutes
-    ago while looking like it worked.
-    """
-    if not isinstance(raw, list):
-        return []
-    kept = []
-    for turn in raw[-MAX_VOICE_HISTORY_TURNS:]:
-        if not isinstance(turn, dict):
-            continue
-        q, a = turn.get('question'), turn.get('answer')
-        if not isinstance(q, str) or not isinstance(a, str):
-            continue
-        q, a = q.strip(), a.strip()
-        if not q or not a:
-            continue
-        kept.append({'question': q[:MAX_VOICE_HISTORY_CHARS],
-                     'answer': a[:MAX_VOICE_HISTORY_CHARS]})
-    return kept
 
 
 def ask_voice(body, caller):
