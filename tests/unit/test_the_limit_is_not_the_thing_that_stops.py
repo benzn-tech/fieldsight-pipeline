@@ -145,3 +145,94 @@ def test_an_ask_transcript_under_the_limit_is_untouched(monkeypatch):
     out = aa.format_transcripts_for_prompt([{"any": "shape"}])
     assert out == "\n".join(lines)
     assert "omitted" not in out
+
+
+# ------------------------------------------------------------------
+# The timeout ladder descends (Task 7). Measured 2026-09-17 on prod: APIGW
+# 29s < ApiFunction 30s < AskAgentFunction 60s < LLM_HTTP_TIMEOUT 45s --
+# nothing enforced the budget the whole design is written against, so an
+# overrun surfaced as a gateway 504 with the model call still running and
+# still billing.
+# ------------------------------------------------------------------
+
+import io as _io
+import os as _os
+import re as _re
+
+import pytest as _pytest
+
+_yaml = _pytest.importorskip("yaml")
+
+_REPO = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+_TEMPLATE_PATH = _os.path.join(_REPO, "src", "template.yaml")
+
+
+class _AskLoader(_yaml.SafeLoader):
+    pass
+
+
+for _tag in ("!Sub", "!Ref", "!If", "!Not", "!Equals", "!GetAtt", "!FindInMap",
+             "!Join", "!Condition", "!Select", "!Split", "!ImportValue", "!And", "!Or"):
+    _AskLoader.add_constructor(_tag, lambda loader, node: getattr(node, "value", None))
+
+
+def _template():
+    return _yaml.load(_io.open(_TEMPLATE_PATH, encoding="utf-8").read(), Loader=_AskLoader)
+
+
+def _workflow(name):
+    path = _os.path.join(_REPO, ".github", "workflows", name)
+    return _io.open(path, encoding="utf-8").read()
+
+
+def _env_text(fn):
+    """The raw YAML of one function's Environment block, as written -- because
+    `!Ref X` is a YAML tag a plain loader will not resolve to a string, and
+    matching for `!Ref AskConversationMemory` needs the literal text."""
+    text = _io.open(_TEMPLATE_PATH, encoding="utf-8").read()
+    start = text.index(f"\n  {fn}:\n")
+    nxt = _re.search(r"\n  [A-Za-z]\w*:\n", text[start + 1:])
+    block = text[start:start + 1 + nxt.start()] if nxt else text[start:]
+    env_start = block.index("\n      Environment:\n")
+    rest = block[env_start + 1:]
+    m = _re.search(r"\n      [A-Za-z]\w*:\n", rest)
+    return rest[:m.start()] if m else rest
+
+
+def _env_value(fn, key):
+    """One literal env value, as a string -- reads from the parsed template so
+    it never sees the `!Ref` tag itself, only a plain scalar."""
+    t = _template()
+    return t["Resources"][fn]["Properties"]["Environment"]["Variables"][key]
+
+
+def _timeout(fn):
+    return _template()["Resources"][fn]["Properties"]["Timeout"]
+
+
+def test_the_ask_timeouts_descend():
+    """Each layer must give up before the one waiting on it."""
+    t = _template()
+    api = t["Resources"]["ApiFunction"]["Properties"]["Timeout"]
+    agent = t["Resources"]["AskAgentFunction"]["Properties"]["Timeout"]
+    http = int(t["Resources"]["AskAgentFunction"]["Properties"]
+                ["Environment"]["Variables"]["LLM_HTTP_TIMEOUT"])
+    assert api < 29, "API Gateway gives up at 29s; the Lambda must go first"
+    assert agent < api
+    assert http < agent
+
+
+def test_the_ask_deadlines_descend():
+    """The OTHER ladder (Task 9). All three are LITERALS in the env blocks --
+    deliberately, so one reader works for all of them: a !Ref would hide the
+    number in a parameter Default and need a second way to read it. They live in
+    two functions and two tasks, so nothing else notices when one is raised.
+
+    A waiter's budget must EXCEED the budget of what it waits on, or it abandons
+    a callee that is still working correctly."""
+    invoke   = int(_env_value("ApiFunction", "ASK_INVOKE_TIMEOUT"))
+    deadline = int(_env_value("AskAgentFunction", "ASK_DEADLINE_SECONDS"))
+    one_call = int(_env_value("AskAgentFunction", "LLM_HTTP_TIMEOUT"))
+    assert one_call < deadline, "one model call may not spend the whole request"
+    assert deadline < invoke, "the agent must finish before its caller stops waiting"
+    assert invoke < _timeout("ApiFunction"), "and the invoke before the runtime kills us"

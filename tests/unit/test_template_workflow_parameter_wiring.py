@@ -26,8 +26,11 @@ Two properties are pinned here:
    `UNWIRED_BY_DESIGN` below, which exists so the exceptions are a visible,
    deliberate list rather than an unexamined silence.
 """
+import io
 import os
 import re
+
+import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TEMPLATE = os.path.join(REPO, "src", "template.yaml")
@@ -35,6 +38,39 @@ WORKFLOWS = {
     "prod": os.path.join(REPO, ".github", "workflows", "deploy-prod.yml"),
     "test": os.path.join(REPO, ".github", "workflows", "deploy.yml"),
 }
+
+_yaml = pytest.importorskip("yaml")
+
+
+class _WiringLoader(_yaml.SafeLoader):
+    pass
+
+
+for _tag in ("!Sub", "!Ref", "!If", "!Not", "!Equals", "!GetAtt", "!FindInMap",
+             "!Join", "!Condition", "!Select", "!Split", "!ImportValue", "!And", "!Or"):
+    _WiringLoader.add_constructor(_tag, lambda loader, node: getattr(node, "value", None))
+
+
+def _template():
+    return _yaml.load(io.open(TEMPLATE, encoding="utf-8").read(), Loader=_WiringLoader)
+
+
+def _workflow(name):
+    return io.open(os.path.join(REPO, ".github", "workflows", name), encoding="utf-8").read()
+
+
+def _env_text(fn):
+    """The raw YAML of one function's Environment block, as written -- `!Ref X`
+    is a YAML tag a plain loader will not resolve to a string, and matching for
+    `!Ref AskConversationMemory` needs the literal text."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    start = text.index(f"\n  {fn}:\n")
+    nxt = re.search(r"\n  [A-Za-z]\w*:\n", text[start + 1:])
+    block = text[start:start + 1 + nxt.start()] if nxt else text[start:]
+    env_start = block.index("\n      Environment:\n")
+    rest = block[env_start + 1:]
+    m = re.search(r"\n      [A-Za-z]\w*:\n", rest)
+    return rest[:m.start()] if m else rest
 
 # Boolean Parameters deliberately not passed by a workflow, with the reason.
 # Adding to this list should be a decision, not a reflex: a toggle in here can
@@ -1085,3 +1121,17 @@ def test_the_block_code_defaults_match_the_template_defaults():
             rf"os\.environ\.get\([\"']{env}[\"'],\s*[\"']([^\"']+)[\"']\)", src).group(1)
         assert float(tpl_default) == float(code_default), (
             f"{env}: template default {tpl_default!r} != code default {code_default!r}")
+
+
+# ----------------------------------------------------------
+# Task 9: the three Ask flags, wired in three places each.
+# ----------------------------------------------------------
+
+@pytest.mark.parametrize("param", ["AskConversationMemory", "AskRewriteBudget",
+                                   "AskDistanceGate"])
+def test_the_flag_is_wired_in_all_three_places(param):
+    """A flag wired in two of three reads as its default and nothing fails."""
+    assert param in _template()["Parameters"]
+    assert f"!Ref {param}" in _env_text("AskAgentFunction")
+    for wf in ("deploy.yml", "deploy-prod.yml"):
+        assert f"{param}=" in _workflow(wf)
