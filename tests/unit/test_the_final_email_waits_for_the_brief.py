@@ -261,13 +261,19 @@ def test_a_brief_whose_tasks_are_all_blank_text_falls_back_like_zero_tasks(monke
     assert "Sam" not in text              # nothing rendered from the blank task
 
 
-def test_a_brief_with_tasks_replaces_the_action_rows_but_keeps_topics(monkeypatch):
+def test_a_brief_with_tasks_replaces_the_action_rows_and_extraction_topics(monkeypatch):
     """The request's own action row here carries NO due date, so handoff-sync
     plan §7.3's back-fill does not apply to it (§7.3a requires a non-empty
-    due) -- it is simply superseded by the brief, which is the Part 1 claim
-    this test still pins. A due-carrying, unmatched action row's fate (kept
-    via back-fill) is pinned separately in
-    tests/unit/test_the_brief_and_extraction_reconcile.py, §9."""
+    due) -- it is simply superseded by the brief. A due-carrying, unmatched
+    action row's fate (kept via back-fill) is pinned separately in
+    tests/unit/test_the_brief_and_extraction_reconcile.py, §9.
+
+    2026-09-18 ("the brief says where a task came from"): the request's own
+    TOPIC row is no longer kept either -- when a brief wins, the WHOLE table
+    comes from the brief, and its sections (none here) are what can produce a
+    sunk row now, not the extraction's topic rows. Mutation: this used to
+    assert "Site walk" IS in text -- that assertion is the exact behaviour
+    this spec retires."""
     monkeypatch.setattr(fin, "SESSION_BRIEF", True, raising=False)
     brief = {"tasks": [{"text": "Chase the delivery", "assignee": "Sam", "due": "Mon", "at": "09:10:00"}],
              "open_todos": [{"text": "Chase the delivery", "responsible": "Sam",
@@ -283,7 +289,9 @@ def test_a_brief_with_tasks_replaces_the_action_rows_but_keeps_topics(monkeypatc
     _to, _subj, text, _html = sent[0]
     assert "Chase the delivery" in text and "Sam" in text and "Mon" in text
     assert "Order steel" not in text                 # the request's action row is GONE
-    assert "Site walk" in text, "the request's TOPIC row is kept"
+    assert "Site walk" not in text, (
+        "the extraction's topic row is not rendered at all when a brief wins "
+        "-- only the brief's OWN sections can produce a sunk row now")
 
 
 def test_a_speaker_label_assignee_in_the_brief_renders_as_unassigned(monkeypatch):
