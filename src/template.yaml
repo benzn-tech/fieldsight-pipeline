@@ -3045,7 +3045,7 @@ Resources:
       # the invocation was hard-killed at exactly 120000 ms, three times, with no email sent.
       #
       # Sizing is against the OTHER full-transcript LLM caller rather than a guess:
-      # ExtractSessionFunction gets 600 s for the same class of work. 900 leaves the HTTP
+      # ExtractSessionFunction gets 900 s for the same class of work. 900 leaves the HTTP
       # timeout below room to lose its race (see LLM_HTTP_TIMEOUT), which 120 did not.
       Timeout: 900
       MemorySize: 256
