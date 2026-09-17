@@ -96,3 +96,34 @@ being present is not evidence the model obeyed it.
   That is a product change, not a bug — but it is the owner's call if it reads as thin.
 * Prod is unaffected until `SESSION_BRIEF` is turned on there; today prod renders the
   extraction path only.
+
+---
+
+## 11. Measured on TEST, and the owner's ruling (2026-09-18)
+
+Three real runs after deploy, two sessions:
+
+| run | sections | tasks | tasks naming a section that exists | hallucinated | sunk rows |
+|---|---|---|---|---|---|
+| solo, 1 | 4 | 7 | 7 | 0 | **0** |
+| solo, 2 | 4 | 6 | 6 | 0 | 1 |
+| multi, 1 | 7 | 6 | 6 | 0 | 3 |
+
+**The instruction is obeyed**: 19 of 19 tasks across three runs named a section that
+exists in their own brief; validation nulled nothing. So §4.3's first pass condition
+holds, and the render-time guessing is gone for good.
+
+**§5's first risk is real and was accepted anyway.** Sections are coarser than topics, so
+a section that produced ANY task is never sunk, and the discussion inside it is not shown.
+Solo run 1 is the extreme: every section was claimed, sunk rows were 0, and
+"Papakura is mid-program and progressing well" — a row the extraction path would have
+carried — appeared nowhere in the email.
+
+The alternative offered was bullet-level linkage (ask the model which BULLET each task came
+from, sink the unclaimed bullets), costing a longer table: roughly 6 rows to 11 on the
+measured session. **The owner chose to keep section granularity**, with the consequence
+above quoted back to them in those words. Do not "fix" this later as if it were an
+oversight; reopening it needs the owner, not a reviewer.
+
+What the table is, after this ruling: **what is owed, plus whatever the brief discussed and
+nobody took on**. Not a transcript of the day.
