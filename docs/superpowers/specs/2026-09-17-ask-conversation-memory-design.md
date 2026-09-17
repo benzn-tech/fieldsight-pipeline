@@ -280,13 +280,39 @@ repository:
 * **Shape validation before the result is used.** Reject and fall back if the
   reply is longer than 300 characters, contains a newline, or is empty. The
   rewrite's output goes on to be embedded and displayed; it is not free text.
-* **The cheap model, low effort, a hard budget.** `CORROBORATION_CHEAP_MODEL`
-  is already the established cheap lane (`web_answer.py:66`). Budget
-  `ASK_REWRITE_BUDGET`, default **4.0 s**.
-* **Reasoning is a completion cost.** `REASONING_HEADROOM_TOKENS` applies here
-  as everywhere else — a small `max_tokens` on a reasoning model returns HTTP
-  200 with `content=''` (CLAUDE.md BUG-16). Set `max_tokens` with headroom, not
-  to the length of a question.
+* **The transport is `corroboration_client.call`**, the established cheap lane
+  (`web_answer.py` uses it for the verdict). Settled here rather than left to
+  the implementer, because the two candidate clients differ in ways that matter
+  below. Budget `ASK_REWRITE_BUDGET`, default **4.0 s**.
+* **That lane does NOT add reasoning headroom, and this spec's first draft said
+  it did.** `llm_utils` adds `max_tokens + REASONING_HEADROOM_TOKENS`
+  (`llm_utils.py:447`) with the measurement attached — *"at max_tokens=1200
+  this model produced 1197 reasoning tokens and content=''"*.
+  `corroboration_client.call` sends `max_tokens` **raw** (`:216`, default 1024).
+  Since muse-class reasoning cannot be switched off and reasoning tokens are
+  spent before the answer, a rewrite asking for "enough tokens for one question"
+  would get HTTP 200 and an empty string — which `standalone_question` would
+  correctly treat as a failure and fall back from, so the feature would simply
+  never work while nothing failed. **Pass `max_tokens` sized for thinking plus a
+  question, not for a question.**
+* **The model default is `google/gemini-3.8-flash`, from
+  `CORROBORATION_MODEL` (`corroboration_client.py:73`).** Measured
+  2026-09-17: neither `CORROBORATION_MODEL` nor `CORROBORATION_CHEAP_MODEL` is
+  set on `fieldsight-prod-ask-agent` or `fieldsight-test-ask-agent`, so the
+  code default is what runs. (The first draft cited
+  `CORROBORATION_CHEAP_MODEL`; that variable exists in no deployed environment.)
+* **`timeout` below `MIN_USEFUL_TIMEOUT` (2.0 s) is refused by the client
+  itself** (`corroboration_client.py:78`, `:206`). So the deadline rule in §4.5
+  must skip the rewrite when fewer than 2.0 s remain, rather than call with a
+  sliver and receive an error it would then fall back from — same outcome, one
+  wasted round trip.
+* **The credential is the lane's own, `CORROBORATION_API_KEY`**
+  (`corroboration_client.py:199`), wired from `secrets.OPENROUTER_API_KEY`
+  through the `CorroborationApiKey` parameter in both workflows. Measured
+  2026-09-17: **set on both stacks.** It is named here because a missing key
+  does not raise — it returns `Reply(error=…)`, which this module turns into
+  the original question. The feature would be inert and silent, so §8 asserts
+  the key is readable rather than assuming it.
 
 Prompt, written so the model cannot editorialise:
 
@@ -604,7 +630,17 @@ Two separate changes, deliberately not shipped together (§9):
 
 ## 7. Tests
 
-Unit, `pytest`, doubles in the style of `tests/unit/test_lambda_ask_agent.py`.
+Unit, `pytest`. There is no `tests/unit/test_lambda_ask_agent.py` — the route's
+tests are split by path, and new cases join the matching file:
+`test_lambda_ask_agent_rag.py` (the `/ask` route), `test_lambda_ask_agent_voice.py`
+(the voice path), `test_lambda_fieldsight_api_ask.py` and
+`test_lambda_fieldsight_api_ask_voice.py` (the proxies). Follow the doubles
+those already use.
+
+Two existing files are the precedent for this work and should be read before
+writing a line: `test_ask_voice_forwards_history.py` (the deployed history
+contract, including absent-vs-empty) and `test_ask_tz_is_forwarded.py` (the
+backend half of step 0, **already pinned** — step 0 adds only the device side).
 
 **`ask_rewrite`**
 1. No history → original returned, `rewritten=False`, and the `call` double is
@@ -701,10 +737,13 @@ Each step names what to look at, and what a failure looks like.
 8. **Device.** From a device on the new build, ask *"what happened yesterday?"*
    and confirm the answer is about yesterday — `tz` arriving is what makes this
    possible at all.
-9. **The distance gate.** With `ENABLE_WEB_ANSWER=true` on TEST, ask a question
-   with no possible match ("Which NZ standard covers timber design?" against a
-   corpus with no such content) and confirm the log shows the lookup taken with
-   **no** verdict call.
+9. **The distance gate.** `ENABLE_WEB_ANSWER` is **already `'true'` on TEST** —
+   confirm by reading the deployed env back, do not set it. Ask a question with
+   no possible match ("Which NZ standard covers timber design?" against a corpus
+   with no such content) and confirm the log shows the lookup taken with **no**
+   verdict call. Then ask one the records DO answer and confirm the verdict call
+   still happens — a gate that never lets the verdict run is indistinguishable
+   from a gate that is always open, from the log alone.
 10. **Nothing changed for everyone else.** A body with no `history` returns the
     same answer and the same citations as before the deploy, for three
     questions recorded before it.
@@ -729,9 +768,18 @@ Then:
   deployed function's env back, not to read the template. `ASK_REWRITE_BUDGET`
   and `_DISTANCE_GATE` are wired the same way, in the same three places.
 * **The distance gate (§4.4) is not flagged separately**, because the branch it
-  sits on is already behind `ENABLE_WEB_ANSWER`, which is `'false'` on both
-  stacks (`deploy.yml`, `deploy-prod.yml`). With that flag off the gate cannot
-  execute at all. §4.4 says "if the flag is on" and means this one.
+  sits on is already behind `ENABLE_WEB_ANSWER`. Measured 2026-09-17, and it is
+  **not** what reading the workflow defaults suggests:
+
+  | stack | `ENABLE_WEB_ANSWER` on the deployed `ask-agent` |
+  |---|---|
+  | TEST | **`'true'` — the web-answer path is live there today** |
+  | prod | **absent, because the feature is not on `main` at all**: `origin/main` carries neither the template line nor `web_answer.py` nor `question_admission.py`. PR #832 is the promotion. |
+
+  So the gate is exercised on TEST from the moment it ships, and cannot execute
+  on prod until #832 lands. An absent variable here is the expected state, not
+  the unwired-toggle shape — checked, because those two look identical from the
+  outside.
 * The §4.5 timeout ladder is **not** behind any flag and is not part of the
   feature: it is a configuration defect fix. It may ship on its own.
 * Order: **device `tz`** → backend (inert, flag off) → web → device `history` →
