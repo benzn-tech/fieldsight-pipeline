@@ -441,15 +441,23 @@ def _final_email_rows(artifact, date):
     the date `lambda_ingest._map_action_items` resolves from it. The email and
     the record would disagree on the one cell a reader acts on, so this reuses
     that same mapping -- the spoken text remains, as the fallback for a deadline
-    nothing could resolve."""
+    nothing could resolve.
+
+    Carries `topic_range` (handoff-sync plan §8): the owning topic's raw,
+    unparsed `time_range` string. Needed by `lambda_session_finalize` to decide
+    whether a brief task already covers this row's topic (§7.1), and to
+    attribute a back-filled row -- the finalize worker sees only the flat rows
+    below, never the topics they came from."""
     out = []
     for topic in artifact.get("topics") or []:
+        topic_range = topic.get("time_range")
         for item in lambda_ingest._map_action_items(topic.get("action_items"), date):
             text = (item.get("text") or "").strip()
             if text:
                 out.append({"text": text,
                             "responsible": item.get("responsible") or None,
-                            "due": item.get("deadline") or item.get("deadline_text") or None})
+                            "due": item.get("deadline") or item.get("deadline_text") or None,
+                            "topic_range": topic_range})
     return todo_collapse.collapse_if_enabled(out)
 
 
@@ -471,11 +479,17 @@ def _topic_rows(artifact):
 
     Only topics with no action items: one that produced tasks is already in the
     table through them, and listing it twice would pad the very table this is
-    trying to make worth reading."""
+    trying to make worth reading.
+
+    Carries `topic_range` (handoff-sync plan §8), same reason as
+    `_final_email_rows`: `lambda_session_finalize` needs it to tell whether a
+    brief task already covers this topic (§7.1) before deciding to keep the
+    row at all."""
     out = []
     for topic in artifact.get("topics") or []:
         if topic.get("action_items"):
             continue
+        topic_range = topic.get("time_range")
         title = (topic.get("topic_title") or topic.get("title") or "").strip()
         summary = " ".join((topic.get("summary") or "").split())
         # The first sentence, not the whole summary: the rest repeats it at
@@ -488,7 +502,7 @@ def _topic_rows(artifact):
             text = text[:TOPIC_ROW_MAX_CHARS - 1].rstrip() + "…"
         if text:
             out.append({"text": text, "responsible": None, "due": None,
-                        "kind": "topic"})
+                        "kind": "topic", "topic_range": topic_range})
     return out
 
 
