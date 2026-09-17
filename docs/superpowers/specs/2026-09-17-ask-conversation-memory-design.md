@@ -22,7 +22,7 @@ reading each side rather than by reading the PR that describes them:
 | `fieldsight-ui` `ask-chat.js:696` | Keeps a chat log, and clears it when the scope changes. Used for rendering only; never posted. |
 | `GrandTime` `AskApiClient.kt:35` | `audio`, `format`, `mode`. **No history, no `tz`.** |
 | `lambda_fieldsight_api.py:1213` `ask_question` | Proxies the screen body. |
-| `lambda_fieldsight_api.py:1401` `ask_voice` | Proxies the voice body. |
+| `lambda_fieldsight_api.py:1401` `ask_voice` | **Already forwards `tz` AND `history`.** `_clean_voice_history` (`:1366`) keeps `{question, answer}` turns, caps at `MAX_VOICE_HISTORY_TURNS = 6` / `MAX_VOICE_HISTORY_CHARS = 2000`, drops bad turns individually and WARNs how many. Pinned by `tests/unit/test_ask_voice_forwards_history.py`. |
 | `lambda_ask_agent.py:1172` `_rag_answer` | Reads `question`, `caller_sub`, `k`, `tz`, `now`, scope fields. **`history` is not among them.** |
 | `lambda_ask_agent.py:1644` (voice) | Reads `body["history"]`, computes `history_turns`, **logs it and discards it.** |
 
@@ -69,10 +69,17 @@ relaxing it to 0.65 made every control question return 18–26 rows.
 1. **History reaches the rewrite step only. It never reaches the answering
    prompt.**
 2. **A distance gate runs before the web-answer verdict**, so the verdict model
-   call is not spent on questions the records obviously cannot answer.
-3. **Synchronous by default; only the overflow branch goes asynchronous**
-   (`202` + poll), reusing the shape report generation already has. The API
-   Gateway integration timeout is not raised.
+   call is not spent on questions the records obviously cannot answer. Its
+   threshold is **not yet measured** for this use (§4.4), so it may only save a
+   model call — it may never decide anything a reader sees.
+3. **Everything stays synchronous. The budget is enforced and the rewrite is
+   degradable**, rather than bet on. A carried deadline skips the rewrite when
+   too little time remains (its fallback is the user's own question, an already
+   tested path), the timeout ladder is made to descend, and the screen path
+   gains the timing line it has never had. The API Gateway integration timeout
+   is not raised. *(Revised 2026-09-17: the first draft proposed a `202` + poll
+   branch on arithmetic that belonged to an ordering this codebase discarded —
+   see §4.5.)*
 4. **`question_admission` is kept.** Its refusals become visible to the reader
    instead of being invisible.
 5. **Site-scoped use only for now.** History is cleared whenever the scope
@@ -149,28 +156,49 @@ turn rather than inherited from the last one.
   "site_id": "…",            // unchanged
   "scoped": true,            // unchanged
   "tz": "Pacific/Auckland",  // unchanged, already sent since 2026-08-30
-  "history": [               // NEW, optional
-    {"q": "what did James say about the ceiling grid?",
-     "a": "James said the grid on level 3 is …"}
+  "history": [               // NEW on this route, optional
+    {"question": "what did James say about the ceiling grid?",
+     "answer":   "James said the grid on level 3 is …"}
   ]
 }
 ```
 
-* `history` is **optional**. Absent or `[]` behaves exactly as today, byte for
-  byte. This is the same posture `date` has: a body without it produces an
-  identical rag-search payload.
-* **At most 2 turns**, oldest first. More is not better: the rewrite only needs
-  the referents, and every extra turn is prompt cost inside a 29 s budget.
-* Each turn is `{q, a}`, both strings. Anything else in the list is dropped
-  without an error — a malformed history must never fail an Ask that would
-  otherwise succeed.
-* `q` is capped at 300 characters and `a` at 1000, truncated (not refused) on
-  the server. The client's cap is advisory; the server's is the one that counts.
+* **The key names are `question` and `answer`, not `q`/`a`.** This is not a
+  choice: `_clean_voice_history` (`lambda_fieldsight_api.py:1391`) already reads
+  those names and `continue`s past anything else. A client sending `{q, a}`
+  loses **every** turn, silently, and arrives as `history_turns=0` — which §8
+  step 1 would read as "the client half did not ship". A shape mismatch that
+  produces the same observation as an unshipped client is the worst available
+  failure.
+* **`history` is optional, and absent is not `[]`.** A body with no history
+  sends **no key**; a user who cleared their chat also sends **no key**, and the
+  difference is carried in the log value, not on the wire. The deployed voice
+  proxy states the rule in place (`:1428`): *"ABSENT, never an empty list …
+  'I have no history' is a different statement from 'my conversation is empty'
+  — collapsing them would make the agent's `history_turns` count mean two
+  things."* §4.7 exists to keep that distinction; §3.1 must not undo it.
+* **Caps are the ones already deployed: 6 turns, 2000 characters per field.**
+  `MAX_VOICE_HISTORY_TURNS` and `MAX_VOICE_HISTORY_CHARS`
+  (`lambda_fieldsight_api.py:1362-1363`) carry a recorded rationale — six
+  because a follow-up refers to the last question, not to the start of a shift.
+  The screen path adopts the same numbers so one field does not have two caps
+  depending on which door it came through. **This spec does not change them.**
+* Anything else in the list is dropped **per turn**, without an error — a
+  malformed history must never fail an Ask that would otherwise succeed — and
+  the count of dropped turns is WARNed, as the voice path already does.
+* A body carrying no usable history produces a rag-search payload **key-for-key
+  identical** to today's. This is the same posture `date` has.
 
 ### 3.2 `POST /api/ask/voice` — the same field
 
-Identical shape. The device adds `history` and **`tz`**, which it has never
-sent.
+Identical shape — **and the backend half of this route is already built.**
+`ask_voice` forwards both `tz` and a cleaned `history` today, with caps, drop
+logging and a test. What is missing is only the **device**, which sends
+`audio`/`format`/`mode` and nothing else.
+
+That asymmetry sets the order in §9: the device's `tz` is a live defect fix
+against a field the backend has accepted for some time, and it is not part of
+this feature's flag.
 
 ### 3.3 Response — one new field
 
@@ -190,21 +218,41 @@ range is invisible — the answer looks fine and is about the wrong week.* Showi
 the rewritten question is what makes that failure visible without a measurement
 campaign.
 
+**And rendering it is the one place §2.1's containment is partial.** `asked` is
+built from the previous turn, so if the record behind that turn has since been
+deleted, the nouns it lifted — a person, a level, a topic title — are re-shown
+in the UI even though the answer below is built only from live retrieval. This
+is stated rather than hidden: the deleted content cannot be quoted, cited or
+answered from, but a fragment of it can appear in the line that says what was
+searched for. The mitigation is that `asked` is a single question the reader
+just took part in composing, not a passage of recovered content, and it is
+**never** sent onward to the web (§4.3). If that residue is judged unacceptable,
+the lever is to render `asked` only when the rewrite drew on no history — which
+also removes most of its value. §10 carries this as an open question rather
+than pretending it is settled.
+
 ---
 
 ## 4. Backend changes
 
-### 4.1 `lambda_fieldsight_api.py` — proxy both routes
+### 4.1 The four places a field has to be added
 
-`ask_question` (`:1213`) and `ask_voice` (`:1401`) each forward `history`, and
-`ask_voice` also forwards `tz`.
+`ask_voice` is **done** (see §0). The remaining edits, named individually
+because the "add it twice" trap in this file is about the *second* place, and
+naming only the gateway would repeat it:
 
-**Trap, stated because this file has already caused it once.** The voice body in
-`lambda_ask_agent` is **built, not passed through** — the comment at
-`lambda_ask_agent.py:1662` says so in place: *"anything the screen path gains is
-absent here until someone adds it twice."* `tz` is the standing proof. Every
-field in this spec is added in **two** places or it silently does not exist on
-one of the two paths.
+| # | File | Edit |
+|---|---|---|
+| 1 | `lambda_fieldsight_api.py:1213` `ask_question` | Forward `history` (screen path). Reuse `_clean_voice_history` — one cleaner, one set of caps. |
+| 2 | **`lambda_ask_agent.py:1667`** | `_voice_answer` builds `_rag_answer`'s body **from scratch**: `{"question", "caller_sub", "mode", "k", "tz"}`. Add `history` here or the voice path silently has none, however well the gateway forwards it. |
+| 3 | **`lambda_ask_agent.py:1702`** | `_voice_answer`'s **return** is hand-built too, so `asked` stops here unless listed. The file records that this already happened once to `basis`. |
+| 4 | `lambda_ask_agent.py:1172` `_rag_answer` | Read `history`; §4.3. |
+
+**The trap, in the file's own words** (`lambda_ask_agent.py:1662`): *"`tz` is
+listed explicitly because this body is BUILT, not passed through: anything the
+screen path gains is absent here until someone adds it twice."* Rows 2 and 3
+are that second place. A change that stops at the gateway ships a feature that
+works on the web and is inert on the device, with nothing failing.
 
 ### 4.2 New module `src/ask_rewrite.py`
 
@@ -256,7 +304,24 @@ Return only the question, on one line.
 
 ### 4.3 `lambda_ask_agent._rag_answer` — where the rewrite goes
 
-Insert between reading the body and embedding, at **`lambda_ask_agent.py:1268`**.
+**This is a restructuring of the function head, not a one-line insert.** The
+first draft of this spec said "insert at `:1268`" and drew a diagram with
+`time_range` below it. That diagram is unimplementable: `time_range` runs at
+**`:1222`**, forty-six lines *above* `:1268`, and above the `try` as well.
+
+The required edit is therefore:
+
+1. Move `resolve_today` / `time_range` / `_validate_scope` / `_scope_range`
+   **inside** the `try` block.
+2. Put the rewrite immediately above them.
+
+Step 1 is not cosmetic. The code says in place why those calls sit above the
+`try` (`:1225`): *"Pure helpers that never raise, so computing them above the
+try adds no raw-500 path"*, and `:1243` records that something was there once
+and was moved. `standalone_question` makes a network call, so leaving it above
+the `try` would reintroduce exactly the raw-500 path those comments exist to
+prevent. Moving the pure helpers down with it keeps one ordering and one
+guarded region.
 
 ```
 read body (+ history)
@@ -265,10 +330,17 @@ read body (+ history)
 ask_rewrite.standalone_question(question, history)      ← NEW
       │  asked = the rewritten text
       ▼
-query_slots.time_range(asked, today)                    ← asked, not question
+query_slots.time_range(question, today)                 ← the ORIGINAL first;
+      │                                                   only if it yields
+      │                                                   (None, None) recompute
+      │                                                   from `asked`. Never
+      │                                                   reopens the metric route.
       │
       ▼
-dashscope_utils.embed([asked])[0]                       ← line 1268
+dashscope_utils.embed([asked])[0]                       ← the embed call in
+                                                          `_rag_answer`, NOT the
+                                                          identical one in
+                                                          `_rag_search_list`
       │
       ▼
 rag-search invoke                          ← UNCHANGED, no edit to that lambda
@@ -278,14 +350,40 @@ build_rag_prompt(question, chunks, …)      ← the USER'S question, not `asked
                                              and NO history
 ```
 
-Two details in that diagram are load-bearing:
+Three details in that diagram are load-bearing:
 
-* **`time_range` reads the rewritten text.** That is what makes *"and what about
-  the day before?"* resolvable — the rewrite is the only place the missing date
-  word can come from.
 * **`build_rag_prompt` keeps receiving the user's original wording** and gains
   no `history` parameter at all. The reader asked a question; the answer should
   be to the question they asked, and the rewrite exists to fix *retrieval*.
+
+* **`time_range` reads the rewritten text ONLY when the original yielded
+  `(None, None)`.** This rule is narrow on purpose. `q_from` is not just a date
+  — it is a router, and three other branches read it:
+
+  * the **metric route** (`:1262`): `metric_slots.detect(question) if (q_from
+    and not narrowed)`. A rewrite that introduces a date word would flip an
+    undated question onto the counting route — and `detect()` and
+    `_metric_answer()` both still receive the **original** text, so the number
+    would answer a window the user never named. `:1249` records that this route
+    was deliberately restricted to questions that name a time.
+  * `_scope_range(scope_req, q_from, q_to)`, whose `has_q` decides `widen`,
+    `body_date_sent`, and whether a body `date` is dropped as
+    `overridden_by_question`.
+  * `scoped = narrowed or plan["body_date_sent"]` (`:1340`), which decides
+    whether the web fallback runs at all.
+
+  So a hallucinated date word does not merely shift a range; it silently
+  re-routes the request. Hence: **a rewrite may supply a missing time anchor, it
+  may never open the metric route.** Compute `q_from, q_to` from the original
+  first; only if both are `None` recompute from `asked`; and pass the ORIGINAL
+  `question` to `metric_slots.detect` with the original's `q_from`, so a rewrite
+  can never turn a non-counting question into a counted one.
+
+* **The web-answer branch is fed the ORIGINAL question, never `asked`.**
+  `asked` is assembled from the previous turn, which may quote a record that has
+  since been deleted; sending it to `question_admission.screen()` and on to a
+  third-party search engine would export exactly what §2.1 exists to contain.
+  The screening signals are computed from the retrieved chunks either way.
 
 **Trap, from this repository's own record.** The identical rag-search payload
 literal appears in `_rag_search_list` at **`lambda_ask_agent.py:887`** (the
@@ -310,38 +408,110 @@ nearest = min((c.get("distance") for c in chunks
 * `nearest is None` → **do not gate.** A missing distance must not be read as a
   far one. `_aggregate_topics` defaults absent distances to `1.0`, which is
   correct for ranking and would be a silent bug here.
-* `nearest > _NO_LEX_MAX_DIST` (0.55) → the records do not answer it. Skip the
-  verdict call and go straight to the lookup, if the flag is on.
+* `nearest > _DISTANCE_GATE` **and no chunk is lexical** → the records do not
+  answer it; skip the verdict call.
 * otherwise → the verdict call runs as it does today.
 
-The threshold is **reused, not re-derived**, and is not relaxed. The ruler
-measured what relaxing it does.
+**The verdict is skipped with a keyword, never by emptying `chunks`.**
+`web_answer.answer(question, chunks)` is one function, and `chunks` is also
+where `question_admission.screen()` derives two of its three signals from:
 
-### 4.5 The overflow branch is asynchronous
+```python
+corpus = "\n".join((c.get("chunk_text") or "") for c in (chunks or []))
+sites  = [str(c.get("site_name") or "") for c in (chunks or []) if c.get("site_name")]
+```
 
-Measured worst case in `web_answer.py:28`: retrieval 1.36 + synthesis 11.9 +
-verdict 3.2 + lookup 11.4 = **27.9 s** against the 29 s ceiling, *before
-anything goes wrong*. Adding a 4 s rewrite to that arithmetic does not fit, and
-the repository has been caught before computing a budget that was "just enough"
-from a sample too small to show the tail.
+So calling `answer(question, [])` to skip the verdict would **also disarm the
+site-name and own-records checks**, leaving only the length and commercial-term
+rules — sending client and site names to a search engine, which is the exact
+outcome §4.6 argues must not happen. The signature gains
+`answer(question, chunks, *, skip_verdict=False)` and the chunks are always
+passed. A test asserts `screen()` received a non-empty list on the gated path.
 
-So the branch, not the feature, changes shape:
+**The lexical arm is carried over, and this is why the number is re-derived,
+not reused.** In `_aggregate_topics` the 0.55 is applied to a *group* score
+after collapsing chunks by (date, site, topic), and always with an escape
+hatch: `rows = [r for r in rows if r["lexical"] or r["score"] <= _NO_LEX_MAX_DIST]`.
+Dropping that arm would declare a question that literally names a topic's title
+unanswerable and route it to the web — precisely the case the arm exists for.
+A per-chunk gate is a different measurement from a per-group filter, so
+**`_DISTANCE_GATE` is its own constant seeded at 0.55 and is not
+`_NO_LEX_MAX_DIST`.** It must be measured before the gate is trusted; until
+then it is a cost optimisation whose worst outcome is paying for a verdict call
+we could have skipped. `_NO_LEX_MAX_DIST` itself is **not** touched and **not**
+relaxed — the ruler measured what relaxing it does.
 
-| Path | Cost | Shape |
-|---|---|---|
-| Records answer it (the majority) | retrieval + synthesis ≈ 10–13 s | **synchronous**, unchanged |
-| Rewrite needed | + ≤ 4 s | **synchronous** |
-| Web lookup needed | + verdict + lookup | **`202` + poll** |
+**Interaction with `basis.widened`.** When retrieval widened to the nearest day
+with content, distances are against a day the user did not ask about. The gate
+does not run when `basis["widened"]` is true: otherwise an answer can report
+"based on 2026-09-16" while the same request is being sent to the open web.
+`lambda_rag_search.py:368` warns about this class in place — *"the day this one
+gains [a distance threshold], an unconditional flag would start lying with
+nothing to catch it."*
 
-`202` + poll is the shape `POST /api/org/reports/regenerate` already uses
-(#841), so no new machinery and no quota request. The API Gateway integration
-timeout is **not** raised: raising it makes everyone wait longer, while
-splitting keeps the common answer fast.
+### 4.5 The budget is enforced and degradable, not bet on
 
-**This section is a design commitment, not a measurement.** The arithmetic above
-is read off existing comments. Before the async branch ships, the whole path
-must be timed on TEST at least twice with the same configuration — the same rule
-that caught 93.5 % of a keyterms "improvement" being run-to-run jitter.
+The first draft of this spec proposed a `202` + poll branch, on the arithmetic
+`1.36 + 11.9 + 3.2 + 11.4 = 27.9 s`. **That number belongs to the arrangement
+this codebase discarded.** It sits under the heading *"Why the verdict runs
+BEFORE the grounded answer"*, and `lambda_ask_agent.py:1386` gives the figures
+for the ordering actually deployed: *"answering first and looking up second is
+33.2s … while asking first fits either way (21.3s when it looks up, 16.5s when
+it does not)."* The async branch was justified by a budget the code does not
+have.
+
+**Measured on prod, 2026-09-17, 14-day window:**
+
+| | value |
+|---|---|
+| LLM call (the dominant term), `qwen done:` | n=**27** · p50 8.1 s · p90 11.4 s · p99 = max = **17.9 s** |
+| `fieldsight-prod-ask-agent` whole invocation | p50 2.1 s · p90 9.1 s · p99 15.5 s · **max 19.1 s** |
+| Cold starts | 49 of 174 (28 %), **+0.57 s** avg, 0.67 s max |
+| Throttles / Errors, 14 d | **0 / 0** |
+| Language-retry (`Ask answer language leaked`), 30 d | **0** |
+
+So a 4 s rewrite fits: 19.1 + 4 = 23.1 against 29. **But it cannot be
+guaranteed, and the honest reason is the sample.** `p99 == max` is not a
+percentile; it is the largest of 27 observations wearing a percentile's name.
+The repository has already paid for budgets computed from samples too small to
+show the tail, and the comment's own 21.3 s **exceeds the 19.1 s maximum this
+window captured** — evidence that the real distribution reaches past what was
+measured here.
+
+So the design does not bet on the budget. It makes the budget enforceable and
+makes the rewrite the first thing sacrificed:
+
+1. **A deadline, carried.** `_rag_answer` records a monotonic start and passes
+   the remaining budget down. The rewrite runs only if at least
+   `ASK_REWRITE_BUDGET` remains; otherwise it is skipped and the original
+   question is used. Because `standalone_question` already falls back to the
+   original on every failure, a skipped rewrite is an existing, tested code
+   path — **the rewrite can never be the thing that blows the budget.**
+2. **A descending timeout ladder.** It currently ascends, which is why an
+   overrun surfaces as a gateway 504 with the model call still running and
+   still billing:
+
+   | | today | required |
+   |---|---|---|
+   | API Gateway integration | 29 s | 29 s (unchanged) |
+   | `ApiFunction` `Timeout` | **30 s** | < 29 s |
+   | `AskAgentFunction` `Timeout` | **60 s** | < ApiFunction |
+   | `LLM_HTTP_TIMEOUT` (ask-agent) | **45 s** | < AskAgentFunction |
+
+   `AskAgentFunction`'s 60 s is unreachable on the user path anyway — its
+   caller dies at 30 — so the ladder is documentation of an intent nothing
+   enforces.
+3. **A timing line on the screen path.** There is none today: the only
+   per-call timing on `/ask` is `llm_utils`'s `qwen done:`, which is why the
+   table above has n=27 for a route with 5115 gateway invocations. One
+   structured line (`retrieval`, `rewrite`, `verdict`, `synthesis`, `total`),
+   mirroring the voice path's, is a **prerequisite**: the tail has to be
+   measurable before anyone promises it.
+
+**The API Gateway timeout is not raised.** Raising it makes every reader wait
+longer for the benefit of the slowest branch. If measurement later shows the
+web-lookup branch genuinely overruns, an async branch becomes its own spec,
+with the timing run attached.
 
 ### 4.6 A refusal becomes visible
 
@@ -382,8 +552,12 @@ ambiguity #833 added the counter to remove on the device.
 
 ### 5.1 `fieldsight-ui`
 
-* `ask-chat.js:483` `requestBodyFor()` adds `history`: the last **2** turns of
-  the log it already keeps, as `{q, a}`, `a` truncated to 1000 characters.
+* `ask-chat.js:483` `requestBodyFor()` adds `history`: the last turns of the log
+  it already keeps, as `{question, answer}` — **those key names, not `q`/`a`;
+  the server drops anything else, per turn, silently.** Omit the key entirely
+  when there is nothing to send (§3.1: absent is not `[]`).
+* `tz` is **not** added here. `scripts/api/ask.js:83` already injects the
+  browser zone into every `/ask` body; `requestBodyFor` never sees it.
 * The existing clear-on-scope-change at `:696` is **kept and is load-bearing**.
   Carrying a conversation from one site to another would retrieve site B with
   site A's referents.
@@ -461,10 +635,32 @@ one change alone, watch the test go red, restore it. Not a plausible mutation �
 the real one. This repository has twice shipped a guard that hung on the very
 field a defect removed, so the assertion was skipped and the test passed.
 
-**Count the stubs.** Before merge, `grep -c` the number of tests that
-monkeypatch `ask_rewrite.standalone_question` against the number that call it
-for real. Twenty to zero is the defect, and it is visible without reading any
-code.
+**A seam, so the stub count can be non-zero.** Tests 8–16 drive `_rag_answer`,
+which reaches a live model through `standalone_question` — so every one of them
+must stub it, and a stub-count ratio would report twenty-to-zero as a defect
+when it is the design. The rule that actually applies here is *does any test
+call it for real*, and that needs a seam: `_rag_answer` takes the rewrite's
+transport the way `standalone_question` takes `call`, so tests 1–7 exercise the
+**real** `standalone_question` against a fake transport. Without that seam, the
+module's own rules are only ever asserted against a double of itself.
+
+**Added by review, each covering a way the rewrite changes control flow rather
+than text:**
+
+17. A rewrite that introduces a date word into a question that had none →
+    `metric_slots.detect` is **not** reached (the metric route stays closed).
+18. Same case → `plan["body_date_sent"]` and `scoped` are unchanged from the
+    no-rewrite run, so the web-fallback decision does not move.
+19. The original question already yields a range → `time_range` is **not**
+    recomputed from `asked`.
+20. The web-answer branch receives the **original** question, not `asked`.
+21. The gated path calls `web_answer.answer` with a **non-empty** `chunks` list
+    (so `question_admission.screen` keeps its site and own-records signals).
+22. `basis["widened"]` is true → the distance gate does not run.
+23. A history of `{q, a}` (the wrong key names) is dropped per turn and the
+    request still answers, with the drop count WARNed.
+24. `asked` survives `_voice_answer`'s hand-built return (`:1702`) — the field
+    exists on the voice response, not only on the screen one.
 
 ---
 
@@ -494,7 +690,7 @@ Each step names what to look at, and what a failure looks like.
    must carry no citation to it. This is §2.1 and is the single most important
    check here.
 7. **Scope change clears it.** Switch site mid-conversation and confirm the
-   next request carries `history: []`.
+   next request carries **no `history` key at all** — not an empty list (§3.1).
 8. **Device.** From a device on the new build, ask *"what happened yesterday?"*
    and confirm the answer is about yesterday — `tz` arriving is what makes this
    possible at all.
@@ -510,30 +706,52 @@ Each step names what to look at, and what a failure looks like.
 
 ## 9. Rollout
 
+**Step 0, ahead of everything and behind no flag: the device sends `tz`.**
+Without it `resolve_today` returns `None` and every spoken *"yesterday"*
+searches all of time. The backend has accepted the field for some time, so this
+is a one-field client change that fixes a live defect, and it depends on
+nothing in this spec. Shipping it first also starts the `history_turns`
+measurement that answers §10.3.
+
+Then:
+
 * `ASK_CONVERSATION_MEMORY` gates §4.2 and §4.3. Off on both stacks at merge.
   The flag must be wired in **all three places** — template parameter, both
   workflows, the function env — or it reads as its default and nothing fails
   loudly (`fieldsight-unwired-toggle-trap`). The verification is to read the
-  deployed function's env back, not to read the template.
-* The distance gate (§4.4) is **not** flagged. It only avoids a model call on
-  a branch that is itself behind `ENABLE_WEB_ANSWER`, which is off everywhere.
-* Order: backend first (inert, flag off) → web → device → flag on for TEST →
-  §8 → owner decides about prod.
+  deployed function's env back, not to read the template. `ASK_REWRITE_BUDGET`
+  and `_DISTANCE_GATE` are wired the same way, in the same three places.
+* **The distance gate (§4.4) is not flagged separately**, because the branch it
+  sits on is already behind `ENABLE_WEB_ANSWER`, which is `'false'` on both
+  stacks (`deploy.yml`, `deploy-prod.yml`). With that flag off the gate cannot
+  execute at all. §4.4 says "if the flag is on" and means this one.
+* The §4.5 timeout ladder is **not** behind any flag and is not part of the
+  feature: it is a configuration defect fix. It may ship on its own.
+* Order: **device `tz`** → backend (inert, flag off) → web → device `history` →
+  flag on for TEST → §8 → owner decides about prod.
 * Rollback is the flag, and the flag's off-path is the code that runs today.
 
 ---
 
 ## 10. Open questions
 
-1. **Two turns, or three?** 2 is chosen for budget, not measured. §8 step 4
-   produces the number that would justify changing it.
-2. **Should a rewritten question be editable by the reader** before it is used?
-   It would make the failure correctable instead of merely visible. Out of
-   scope here; it needs a UI decision.
+1. **Is the `asked` residue acceptable?** §3.3: a rendered `asked` can re-show
+   nouns lifted from a record deleted between turns. The alternative removes
+   most of the visibility this spec relies on. An owner decision, not a
+   technical one.
+2. **`_DISTANCE_GATE` has no measurement.** It is seeded at 0.55 because that
+   number was measured for a *different* comparison (a per-group filter with a
+   lexical escape hatch). Until it is measured per-chunk, the gate is a cost
+   optimisation whose worst case is paying for a verdict call we could have
+   skipped — it must never be allowed to decide anything a reader sees.
 3. **Does the device need history at all**, or only `tz`? `tz` fixes a live
    defect on its own; spoken follow-ups have never been possible, so there is
-   no measurement of whether people attempt them. Shipping `tz` first and
-   measuring `history_turns` for a fortnight would answer it.
-4. **The async overflow branch (§4.5) has no timing run yet.** The arithmetic
-   is read off existing comments; a whole-path measurement on TEST, twice, is a
-   prerequisite to building it.
+   no measurement of whether people attempt them. Step 0 of §9 ships `tz` and
+   starts that measurement; a fortnight of `history_turns` answers it.
+4. **Should a rewritten question be editable by the reader** before it is used?
+   It would make the failure correctable instead of merely visible. Out of
+   scope here; it needs a UI decision.
+5. **The screen path's timing line (§4.5.3) does not exist yet**, which is why
+   the prod table in §4.5 has n=27 for a route with 5115 gateway invocations.
+   Every latency claim in this document is therefore about a sample too small
+   to show a tail, and should be re-read once that line has run for a fortnight.
