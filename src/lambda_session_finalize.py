@@ -131,8 +131,16 @@ def _parse_hms(value):
     m = _HMS_RE.match((value or "").strip())
     if not m:
         return None
-    h, mi, s = m.groups()
-    return int(h) * 3600 + int(mi) * 60 + (int(s) if s else 0)
+    h, mi, s = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+    # SHAPE IS NOT A CLOCK. The regex accepts "25:00" and "09:99"; the plan
+    # (§7.1) says anything that is not two parsable clock times is unparsable
+    # and therefore never covers a topic. Without this the two surfaces
+    # disagreed: fieldsight-ui `parseClockSeconds` rejects these, so an
+    # out-of-range range from an upstream arithmetic slip would silently
+    # suppress a topic row in the email and keep it in Preview & copy.
+    if h > 23 or mi > 59 or s > 59:
+        return None
+    return h * 3600 + mi * 60 + s
 
 
 def _parse_hms_range(time_range):

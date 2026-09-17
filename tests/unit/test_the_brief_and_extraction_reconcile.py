@@ -280,3 +280,22 @@ def test_the_log_line_names_suppressed_and_backfilled_counts(monkeypatch, caplog
         "finalize: d740cd5f email action rows from the brief (2 row(s), 1 "
         "back-filled from the extraction), 0 topic row(s) kept from the "
         "request (1 suppressed as covered by a brief task)")
+
+
+def test_an_impossible_clock_is_unparsable_not_a_range():
+    """A shape like "25:00" or "09:99" is not a clock, so it is not a range.
+
+    Plan §7.1: anything that is not two parsable clock times never covers a
+    topic. The regex alone accepts these, and fieldsight-ui's
+    `parseClockSeconds` rejects them -- so without the bounds check the two
+    surfaces disagreed: an out-of-range `time_range` from an upstream
+    arithmetic slip would have suppressed a topic row in the email while
+    Preview & copy kept it. Found by executing both parsers on the same
+    inputs, not by reading them."""
+    import lambda_session_finalize as f
+    for bad in ("25:00", "09:99", "99:99", "12:00:60"):
+        assert f._parse_hms(bad) is None, bad
+    for good, secs in (("00:00", 0), ("23:59", 86340), ("13:41:07", 49267)):
+        assert f._parse_hms(good) == secs, good
+    assert f._parse_hms_range("25:00 – 26:00") is None
+    assert f._topic_covered("25:00 – 26:00", ["25:30"]) is False
