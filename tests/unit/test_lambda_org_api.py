@@ -4078,6 +4078,90 @@ def test_audio_segments_matches_chunk_session_key(presign_wired):
     assert seg["time_label"] == "14:13:58"
 
 
+# ----------------------------------------------------------
+# A batch wav is written beside the chunk wavs it was stitched from. Listing both
+# plays every stretch of speech twice. A chunk is dropped only when a batch in THIS
+# result names it in its map -- never by duration, never by filename arithmetic.
+# ----------------------------------------------------------
+
+_DEDUP_SID = "449c1bb3473c405985351aaa189049e6"
+
+
+def _dedup_chunk(i, clock):
+    return (f"ben_lin_2026-09-17_{clock}_sid{_DEDUP_SID}_c{i:04d}"
+            f"_off0.0_to30.0_srcwav.wav")
+
+
+def _dedup_batch(first, count, to):
+    return (f"ben_lin_2026-09-17_13-05-18_sid{_DEDUP_SID}_c{first:04d}_bn{count}"
+            f"_off0.0_to{to}_srcwav.wav")
+
+
+def _wire_listing(fake, folder, date, filenames, maps=None):
+    prefix = f"audio_segments/{folder}/{date}/"
+    fake.list_objects_response = {"Contents": [{"Key": prefix + f} for f in filenames]}
+    for f in filenames:
+        fake.objects[prefix + f] = b""
+    for batch_name, member_names in (maps or {}).items():
+        map_key = prefix + batch_name[: -len(".wav")] + "_batch_map.json"
+        fake.objects[map_key] = json.dumps({"schema": 1, "members": [
+            {"chunk_index": n, "chunk_key": prefix + m}
+            for n, m in enumerate(member_names)]}).encode()
+
+
+def _dedup_get(wired, date="2026-09-17"):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "site_manager",
+                                     "folder_name": "Ben_Lin_test2"})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/audio-segments",
+        params={"date": date, "start": "13:00:00", "end": "13:30:00"}), None)
+    assert res["statusCode"] == 200
+    return body_of(res)
+
+
+def test_audio_segments_hide_chunks_a_listed_batch_covers(presign_wired):
+    wired, fake = presign_wired
+    b = _dedup_batch(0, 2, "58.0")
+    c0, c1, c2 = (_dedup_chunk(0, "13-05-18"), _dedup_chunk(1, "13-05-50"),
+                  _dedup_chunk(2, "13-06-18"))
+    _wire_listing(fake, "Ben_Lin_test2", "2026-09-17", [b, c0, c1, c2], maps={b: [c0, c1]})
+    out = _dedup_get(wired)
+    assert sorted(s["filename"] for s in out["segments"]) == sorted([b, c2])
+    assert out["count"] == 2
+
+
+def test_audio_segments_members_come_from_the_map_not_the_filename(presign_wired):
+    # prod 2026-09-10 shape: c0035_bn4 holds 35, 36, 37, 39 -- 38 was VAD-rejected (no wav).
+    wired, fake = presign_wired
+    b = _dedup_batch(35, 4, "116.0")
+    members = [_dedup_chunk(35, "13-05-18"), _dedup_chunk(36, "13-05-48"),
+               _dedup_chunk(37, "13-06-16"), _dedup_chunk(39, "13-07-12")]
+    after = _dedup_chunk(40, "13-07-40")
+    _wire_listing(fake, "Ben_Lin_test2", "2026-09-17", [b] + members + [after],
+                  maps={b: members})
+    out = _dedup_get(wired)
+    assert sorted(s["filename"] for s in out["segments"]) == sorted([b, after])
+
+
+def test_audio_segments_a_day_without_batches_is_unchanged(presign_wired):
+    wired, fake = presign_wired
+    chunks = [_dedup_chunk(0, "13-05-18"), _dedup_chunk(1, "13-05-50"),
+              _dedup_chunk(2, "13-06-18")]
+    _wire_listing(fake, "Ben_Lin_test2", "2026-09-17", chunks)
+    out = _dedup_get(wired)
+    assert out["count"] == 3
+
+
+def test_audio_segments_a_batch_without_a_readable_map_hides_nothing(presign_wired):
+    wired, fake = presign_wired
+    b = _dedup_batch(0, 2, "58.0")
+    c0, c1 = _dedup_chunk(0, "13-05-18"), _dedup_chunk(1, "13-05-50")
+    _wire_listing(fake, "Ben_Lin_test2", "2026-09-17", [b, c0, c1])   # no map written
+    out = _dedup_get(wired)
+    assert out["count"] == 3
+
+
 def test_chunk_session_start_falls_back_to_meeting_session_opened_at_in_nz(monkeypatch):
     # A chunk session's base is `sid{hex}` (no timestamp) -> session_start can't
     # parse a time -> the picker showed "?". Fall back to meeting_session.opened_at,
