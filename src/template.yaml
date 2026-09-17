@@ -1469,7 +1469,7 @@ Resources:
         - HasTranscribeReserve
         - !Ref TranscribeReservedConcurrency
         - !Ref AWS::NoValue
-      Timeout: 300
+      Timeout: 900
       MemorySize: 128
       Environment:
         Variables:
@@ -1671,7 +1671,7 @@ Resources:
       FunctionName: !Sub ["${P}-transcribe-callback", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_transcribe_callback.lambda_handler
-      Timeout: 60
+      Timeout: 120
       MemorySize: 128
       Environment:
         Variables:
@@ -1710,7 +1710,7 @@ Resources:
       FunctionName: !Sub ["${P}-meeting-minutes", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_meeting_minutes.lambda_handler
-      Timeout: 600  # must exceed LLM_HTTP_TIMEOUT below, or the runtime kills this before urllib3 raises
+      Timeout: 900  # must exceed LLM_HTTP_TIMEOUT below, or the runtime kills this before urllib3 raises
       MemorySize: 512
       Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24) — on 3.11 Word generation silently disables
       Layers: !If
@@ -1757,7 +1757,7 @@ Resources:
       FunctionName: !Sub ["${P}-session-report", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_session_report.lambda_handler
-      Timeout: 300
+      Timeout: 900
       MemorySize: 512
       Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24)
       Layers: !If
@@ -1784,9 +1784,11 @@ Resources:
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
-          # One attempt must fit inside Timeout: 300 with room for the docx render.
-          LLM_HTTP_TIMEOUT: '120'
-          GENERATION_BUDGET_SECONDS: '210'
+          # One attempt must fit inside Timeout: 900 with room for the docx render.
+          LLM_HTTP_TIMEOUT: '300'
+          GENERATION_BUDGET_SECONDS: '600'
+          # Pre-check on transcript objects in one window (transcript_window.py).
+          MAX_TRANSCRIPT_OBJECTS: '2000'
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -2499,14 +2501,14 @@ Resources:
       FunctionName: !Sub ["${P}-extract-session", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_extract_session.lambda_handler
-      # 600s (was 180s): the FINAL pass runs the model in thinking mode, which
+      # 900s (was 180s): the FINAL pass runs the model in thinking mode, which
       # measured ~170s in prod on 2026-08-03 and therefore lost the race against
       # llm_utils.HTTP_TIMEOUT (150s) -> urllib3 timeout -> retry -> hard-killed
       # at the old 180s ceiling. 664 invocations died exactly this way in one
       # afternoon. LLM_HTTP_TIMEOUT below stays under the Lambda Timeout so a slow
       # call surfaces as a catchable error instead of a runtime kill.
       # The LIVE pass is unaffected: it runs thinking OFF and returns in seconds.
-      Timeout: 600
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
@@ -2638,7 +2640,7 @@ Resources:
       # effort): 37.3 s in the model, 47.3 s in the function. That fits inside
       # 120 -- but a day twice that size does not, and long days are exactly the
       # ones whose summary matters. The headroom is cheap; the cliff is not.
-      Timeout: 300
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
@@ -2717,7 +2719,7 @@ Resources:
       FunctionName: !Sub ["${P}-session-activity", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: session_activity.lambda_handler
-      Timeout: 60
+      Timeout: 120
       MemorySize: 256
       Layers:
         - !Ref PsycopgLayer
@@ -2806,7 +2808,7 @@ Resources:
       FunctionName: !Sub ["${P}-recording-segments", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_recording_segments.lambda_handler
-      Timeout: 60
+      Timeout: 120
       MemorySize: 256
       # Every transcript landing invokes this, and account concurrency is shared with
       # finalize. 2 bounds what a burst can take. A throttled async invocation is queued
@@ -2902,7 +2904,7 @@ Resources:
       FunctionName: !Sub ["${P}-nonwork-expiry", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_nonwork_expiry.lambda_handler
-      Timeout: 300
+      Timeout: 900
       MemorySize: 512
       Layers:
         - !Ref PsycopgLayer
@@ -3087,15 +3089,15 @@ Resources:
       FunctionName: !Sub ["${P}-session-finalize", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_session_finalize.lambda_handler
-      # 300, not 120. This function re-summarises the FULL transcript at finalize, and 120
+      # 900, not 120. This function re-summarises the FULL transcript at finalize, and 120
       # was sized for the rolling summariser it used to call -- whose input is already
       # compressed. Measured on a real 26-minute session (316 turns, 17 K chars rendered):
       # the invocation was hard-killed at exactly 120000 ms, three times, with no email sent.
       #
       # Sizing is against the OTHER full-transcript LLM caller rather than a guess:
-      # ExtractSessionFunction gets 600 s for the same class of work. 300 leaves the HTTP
+      # ExtractSessionFunction gets 900 s for the same class of work. 900 leaves the HTTP
       # timeout below room to lose its race (see LLM_HTTP_TIMEOUT), which 120 did not.
-      Timeout: 300
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
@@ -3364,7 +3366,7 @@ Resources:
       FunctionName: !Sub ["${P}-embed-report", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_embed_report.lambda_handler
-      Timeout: 300
+      Timeout: 900
       MemorySize: 512
       Layers:
         - !Ref PsycopgLayer
@@ -3541,7 +3543,7 @@ Resources:
       # N times) the decode+upload work won't fit 120s, and a mid-run timeout
       # commits zero DB bindings while leaving S3 uploads. Give generous
       # headroom (still well under the 900s Lambda ceiling).
-      Timeout: 600
+      Timeout: 900
       MemorySize: 1024
       # No Runtime override: inherits the python3.11 Global. The ffmpeg layer is
       # 3.11-compatible and PsycopgLayer is cp311-only, so both load on 3.11.
@@ -3643,11 +3645,11 @@ Resources:
       CodeUri: src/
       Handler: lambda_speaker_embed.lambda_handler
       Runtime: python3.12
-      # 600, not 120: this path is asynchronous (S3-triggered), so no API Gateway ceiling
+      # 900, not 120: this path is asynchronous (S3-triggered), so no API Gateway ceiling
       # applies, and propagation now embeds every turn of a session rather than one window.
       # Capping COVERAGE to fit a timeout would trade a visible promise for a number that
       # costs nothing to raise.
-      Timeout: 600
+      Timeout: 900
       MemorySize: 1769
       ReservedConcurrentExecutions: 5
       Layers:
@@ -3811,14 +3813,14 @@ Resources:
       FunctionName: !Sub ["${P}-programme-matcher", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_programme_matcher.lambda_handler
-      # 600s (bumped from 300 by the 2026-07-13 plan's Task 4): the impact
+      # 900s (bumped from 300 by the 2026-07-13 plan's Task 4): the impact
       # phase adds a SECOND `claude_utils.call_claude` per topic (each up to
       # claude_utils' 150s HTTP timeout), so a multi-topic artifact can now
       # need up to ~2x the sequential Claude time it used to. 300s left
       # headroom for one slow call per topic (Fable review IMPORTANT #4);
       # doubling that per-topic cost while keeping room for several topics
       # per invocation needs the doubled budget too.
-      Timeout: 600
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
@@ -3903,7 +3905,11 @@ Resources:
       FunctionName: !Sub ["${P}-rag-search", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_rag_search.lambda_handler
-      Timeout: 30
+      # Invoked synchronously by AskAgentFunction, so must give up before
+      # AskAgentFunction's Timeout (28) and before that function's
+      # ASK_DEADLINE_SECONDS (24) -- otherwise this callee can outlive
+      # the request it serves.
+      Timeout: 23
       MemorySize: 512
       Layers:
         - !Ref PsycopgLayer
@@ -3937,7 +3943,7 @@ Resources:
       FunctionName: !Sub ["${P}-voice-audit", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_voice_audit.lambda_handler
-      Timeout: 30
+      Timeout: 120
       MemorySize: 256
       Layers:
         - !Ref PsycopgLayer
@@ -3978,7 +3984,7 @@ Resources:
       FunctionName: !Sub ["${P}-voice-reaper", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_voice_reaper.lambda_handler
-      Timeout: 60
+      Timeout: 120
       MemorySize: 256
       Layers:
         - !Ref PsycopgLayer

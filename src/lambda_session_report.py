@@ -240,13 +240,13 @@ def _session_was_deleted(artifact):
     return False
 
 
-# The function has Timeout: 300 and llm_utils retries up to four times at
-# LLM_HTTP_TIMEOUT each, so an unbounded ladder outlives the function and writes no
-# result at all -- the poller then spins forever. Bound it well inside the timeout.
+# The function has Timeout: 900 and llm_utils retries up to four times at
+# LLM_HTTP_TIMEOUT (300) each, so an unbounded ladder outlives the function and writes
+# no result at all -- the poller then spins forever. Bound it well inside the timeout.
 # Used only as a FALLBACK when the invocation carries no `context` (unit tests, or
 # any caller that never got one) -- `context.get_remaining_time_in_millis()` is the
 # authority whenever it is available (see `_model_budget_seconds`).
-GENERATION_BUDGET_SECONDS = float(os.environ.get("GENERATION_BUDGET_SECONDS", "210"))
+GENERATION_BUDGET_SECONDS = float(os.environ.get("GENERATION_BUDGET_SECONDS", "600"))
 
 # Reserved out of whatever time is left for the docx render + the result write that
 # must still happen AFTER the model answers -- without this reserve the model call

@@ -112,3 +112,30 @@ def test_no_deadline_means_no_cap_or_time_check():
     picked = [(dt.datetime(2026, 9, 10, 0, 0), k) for k in keys]
     turns = transcript_window.assemble(s3, "b", picked)
     assert len(turns) == len(keys)
+
+
+# ----------------------------------------------------------
+# The object cap was a hardcoded 500 that no measurement supports. It is now read
+# from the environment (default 2000) so it can move without a code change. Kept
+# module-level: the cap tests above read transcript_window.MAX_TRANSCRIPT_OBJECTS
+# as the effective limit.
+# ----------------------------------------------------------
+
+import importlib
+
+
+def test_the_object_cap_defaults_to_two_thousand(monkeypatch):
+    monkeypatch.delenv("MAX_TRANSCRIPT_OBJECTS", raising=False)
+    try:
+        assert importlib.reload(transcript_window).MAX_TRANSCRIPT_OBJECTS == 2000
+    finally:
+        importlib.reload(transcript_window)
+
+
+def test_the_object_cap_is_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("MAX_TRANSCRIPT_OBJECTS", "7")
+    try:
+        assert importlib.reload(transcript_window).MAX_TRANSCRIPT_OBJECTS == 7
+    finally:
+        monkeypatch.delenv("MAX_TRANSCRIPT_OBJECTS")
+        importlib.reload(transcript_window)

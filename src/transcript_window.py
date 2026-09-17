@@ -8,6 +8,7 @@ non-VPC and must not import psycopg.
 import datetime as dt
 import json
 import logging
+import os
 import re
 import time
 
@@ -24,7 +25,14 @@ _DEFAULT_DURATION_SEC = 60.0
 # can itself outlast whatever time the caller has left, independent of how the
 # model call is bounded -- a request this large is refused before the first
 # read, not discovered mid-read. Named so the error can point at it.
-MAX_TRANSCRIPT_OBJECTS = 500
+#
+# It is a pre-check, not the guard: assemble() also checks its deadline between
+# objects. The first value, 500, had no measurement behind it and refused an owner's
+# ordinary day (1267 objects) in six seconds; the busiest prod day measured has 295.
+# 2000 keeps the pre-check for a structurally broken day while the Timeout (900 s)
+# and the per-object deadline carry the real bound. Env-read so it moves without a
+# code change.
+MAX_TRANSCRIPT_OBJECTS = int(os.environ.get("MAX_TRANSCRIPT_OBJECTS", "2000"))
 
 
 def _duration(name):
