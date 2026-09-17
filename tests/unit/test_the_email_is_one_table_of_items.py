@@ -69,13 +69,32 @@ def test_the_table_header_is_agenda_item_assigned_due_date():
 
 def test_the_text_table_escapes_pipes_and_collapses_newlines():
     """Plan §1.7: the plain-text flavour is a pipe table; a cell's own `|` or
-    embedded newline would otherwise be read as a column boundary / a new row."""
+    embedded newline would otherwise be read as a column boundary / a new row.
+    Leading/trailing pipes and the escaping shape are pinned byte-for-byte
+    against the frontend's `cell()`/`pipe()` in
+    fieldsight-ui/scripts/composites/email-preview-modal.js (fix round on
+    3237e56, finding 2) -- that file is the other half of this contract."""
     _subject, text, _html = _email(
         [{"text": "Cut 2400 | 1200 sheet\nsecond line", "responsible": "Sam\nSmith",
          "due": "Mon\nTue"}])
     row = next(ln for ln in text.splitlines() if "Cut 2400" in ln)
     assert "\n" not in row
-    assert row == r"Cut 2400 \| 1200 sheet second line | Sam Smith | Mon Tue"
+    assert row == r"| Cut 2400 \| 1200 sheet second line | Sam Smith | Mon Tue |"
+
+
+def test_the_text_table_header_and_separator_match_the_frontend_exactly():
+    """Pins the two fixed lines byte-for-byte against
+    fieldsight-ui/scripts/composites/email-preview-modal.js's `COLUMNS` +
+    `pipe(COLUMNS)` / `'| --- | --- | --- |'` (renderEmailText). If either
+    side's literal changes without the other, this goes red rather than the
+    two surfaces silently drifting -- exactly what the owner asked the two
+    repos to stay in sync on."""
+    _subject, text, _html = _email([ACTION])
+    lines = text.splitlines()
+    assert "| AGENDA ITEM | ASSIGNED | DUE DATE |" in lines
+    assert "| --- | --- | --- |" in lines
+    header_idx = lines.index("| AGENDA ITEM | ASSIGNED | DUE DATE |")
+    assert lines[header_idx + 1] == "| --- | --- | --- |"
 
 
 def test_an_empty_recording_still_says_so():

@@ -19,6 +19,7 @@ import html as _html
 import json
 import logging
 import os
+import re
 import time
 from urllib.parse import unquote_plus
 
@@ -110,11 +111,22 @@ def _ordered_rows(todos):
 
 
 def _pipe_cell(value):
-    """A cell's text for the plain-text pipe table (plan §1.7): newlines collapse
-    to a single space (a multi-line cell would otherwise break the table's row
-    structure), and a literal `|` is escaped so it can't be read as a column
-    boundary."""
-    return str(value).replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("|", "\\|")
+    """A cell's text for the plain-text pipe table (plan §1.7), mirrored
+    BYTE-FOR-BYTE from the frontend's `cell()` in
+    `fieldsight-ui/scripts/composites/email-preview-modal.js` (`renderEmailText`)
+    -- that file is the other half of this contract, and a reader who gets one
+    surface's table cannot tell it apart from the other's. A `\\r?\\n` run
+    collapses to a single space (a wrapped sentence stays reachable rather than
+    breaking the row mid-table); a literal `|` is escaped so it can't be read
+    as a column boundary."""
+    return re.sub(r"\r?\n", " ", str(value)).replace("|", "\\|")
+
+
+def _pipe_row(cells):
+    """`| a | b | c |` -- mirrors the frontend's `pipe()` in the same file:
+    leading and trailing pipes, space-padded, so the two tables are identical
+    lines, not merely equivalent ones."""
+    return "| " + " | ".join(_pipe_cell(c) for c in cells) + " |"
 
 
 def build_confirmation_email(*, date=None, time_range=None, site_name=None,
@@ -152,16 +164,17 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
         lines.append(f"Date: {stamp}")
     if todos:
         # Plan §1.7: the plain-text flavour is a pipe table with the same three
-        # columns and a header separator, not the old bulleted list -- one table
-        # shape on both surfaces (frontend mirrors this exactly).
-        lines += ["", "AGENDA ITEM | ASSIGNED | DUE DATE", "--- | --- | ---"]
+        # columns and a header separator -- leading AND trailing pipes, exactly
+        # as the frontend's Preview & copy renders it, not the old bulleted
+        # list. One table shape on both surfaces, one line format.
+        lines += ["", _pipe_row(("AGENDA ITEM", "ASSIGNED", "DUE DATE")), "| --- | --- | --- |"]
         for t in todos:
             if t["kind"] == "topic":
                 who, due = na, na
             else:
                 who = t["responsible"] or "—"
                 due = t["due"] or "—"
-            lines.append(f"{_pipe_cell(t['text'])} | {_pipe_cell(who)} | {_pipe_cell(due)}")
+            lines.append(_pipe_row((t["text"], who, due)))
     else:
         lines += ["", no_todos_note]
     body_text = "\n".join(lines).rstrip() + "\n"
@@ -441,14 +454,17 @@ def _poll_for_brief(folder, date, session_id, *, read_brief=None, sleep=None,
 def _rows_from_brief_or_request(artifact, request_todos, *, poll_brief=None):
     """The `openTodos` a `kind == "final"` email actually renders (§2.2).
 
-    If SESSION_BRIEF is on and a brief with at least one task turns up within
-    the wait, its tasks become the ACTION rows (assignee mapped through the
-    same speaker-label filter session_brief already applies -- `spk_0` is not
-    a name); the request's own TOPIC rows are kept, because the brief carries
-    no per-topic breakdown. Otherwise the request's rows are used unchanged.
-    A brief with zero tasks is treated as no brief at all: an empty table
-    where the extraction had rows would read as broken, not as "nothing to
-    do" (plan §1.3).
+    If SESSION_BRIEF is on and a brief with at least one USABLE task turns up
+    within the wait, its tasks become the ACTION rows (assignee mapped through
+    the same speaker-label filter session_brief already applies -- `spk_0` is
+    not a name); the request's own TOPIC rows are kept, because the brief
+    carries no per-topic breakdown. Otherwise the request's rows are used
+    unchanged. "Usable" is judged on the rows this function actually renders
+    (`brief["open_todos"]`, after `session_brief.to_session_summary` drops any
+    task whose text is blank), not on the raw `brief["tasks"]` count -- a
+    brief whose tasks are all blank-text must fall back exactly like a brief
+    with none at all: an empty table where the extraction had rows would read
+    as broken, not as "nothing to do" (plan §1.3).
 
     Exactly one log line, naming which source was used and why -- the same
     posture as every other silent-fallback point in this pipeline."""
@@ -463,20 +479,26 @@ def _rows_from_brief_or_request(artifact, request_todos, *, poll_brief=None):
                     "to look up a brief", session_id)
         return request_todos
     brief = (poll_brief or _poll_for_brief)(folder, date, session_id)
-    tasks = (brief or {}).get("tasks") or []
     if brief is None:
         logger.info("finalize: %s email rows from the request -- no brief within %ss",
                     session_id, BRIEF_WAIT_SECONDS)
         return request_todos
-    if not tasks:
-        logger.info("finalize: %s email rows from the request -- brief has zero tasks",
-                    session_id)
-        return request_todos
+    # Gate on the rows actually being RENDERED, not on raw brief["tasks"]:
+    # session_brief.to_session_summary builds open_todos by dropping any task
+    # whose text is blank after stripping. A brief whose tasks all have blank
+    # text would pass a `tasks`-non-empty gate and then render zero action
+    # rows, discarding the request's real ones -- exactly the "empty table
+    # where the extraction had rows" this function exists to prevent (§1.3).
     action_rows = [dict(t, kind="action") for t in (brief.get("open_todos") or [])]
+    if not action_rows:
+        logger.info("finalize: %s email rows from the request -- brief has no usable "
+                    "action rows (%d raw task(s), 0 with non-blank text)",
+                    session_id, len(brief.get("tasks") or []))
+        return request_todos
     topic_rows = [t for t in (request_todos or []) if t.get("kind") == "topic"]
-    logger.info("finalize: %s email action rows from the brief (%d task(s)), "
+    logger.info("finalize: %s email action rows from the brief (%d row(s)), "
                 "%d topic row(s) kept from the request",
-                session_id, len(tasks), len(topic_rows))
+                session_id, len(action_rows), len(topic_rows))
     return action_rows + topic_rows
 
 

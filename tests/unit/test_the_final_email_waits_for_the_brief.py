@@ -242,6 +242,25 @@ def test_a_brief_with_zero_tasks_is_treated_as_no_brief(monkeypatch):
     assert "Order steel" in text            # the request's action row survives
 
 
+def test_a_brief_whose_tasks_are_all_blank_text_falls_back_like_zero_tasks(monkeypatch):
+    """Fix round on 3237e56, finding 1: the gate used to read raw `tasks`
+    (non-empty) while the rows it RENDERED came from `open_todos`, which
+    session_brief.to_session_summary strips of any blank-text task. A brief
+    with one task whose text is blank/whitespace-only passed the old gate,
+    then rendered ZERO action rows -- discarding the request's real ones.
+    Mutation: put the `tasks`-non-empty gate back -> red."""
+    monkeypatch.setattr(fin, "SESSION_BRIEF", True, raising=False)
+    brief = {"tasks": [{"text": "   ", "assignee": "Sam", "due": "Mon"}],
+             "open_todos": []}          # to_session_summary already dropped it
+    sent = []
+    fin.process_finalize_request(
+        _final_artifact(), send=lambda *a: sent.append(a),
+        write_result=lambda *a: None, poll_brief=lambda *a: brief)
+    _to, _subj, text, _html = sent[0]
+    assert "Order steel" in text          # the request's real action row survives
+    assert "Sam" not in text              # nothing rendered from the blank task
+
+
 def test_a_brief_with_tasks_replaces_the_action_rows_but_keeps_topics(monkeypatch):
     monkeypatch.setattr(fin, "SESSION_BRIEF", True, raising=False)
     brief = {"tasks": [{"text": "Chase the delivery", "assignee": "Sam", "due": "Mon", "at": "09:10:00"}],
