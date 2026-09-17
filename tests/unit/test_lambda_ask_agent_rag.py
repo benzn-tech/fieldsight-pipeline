@@ -651,6 +651,38 @@ def test_the_web_answer_branch_receives_the_original_question(monkeypatch):
     assert seen and seen[0] == "when is he finishing it?"
 
 
+def test_a_rewritten_metric_route_answer_still_carries_asked(monkeypatch):
+    """Controller review finding: `return _metric_answer(...)` never carried
+    `asked`, and a rewrite can precede it -- the rewrite runs whenever there
+    is history and budget, independently of whether the ORIGINAL question
+    already names a date (the metric gate's only requirement). Without this,
+    a rewritten metric-route answer would silently show no "Searched for:
+    ..." -- the invisible-rewrite failure spec SS3.3 forbids."""
+    wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("how many photos did James take yesterday?", True))
+
+    out = laa._rag_answer(
+        {"question": "how many photos did I take yesterday?", "caller_sub": SUB,
+         "tz": "Pacific/Auckland", "history": ONE_TURN})
+
+    assert out["computed"] is True, "sanity: the metric route was actually taken"
+    assert out["asked"] == "how many photos did James take yesterday?"
+
+
+def test_a_no_rewrite_metric_route_answer_has_asked_none(monkeypatch):
+    wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: (q, False))
+
+    out = laa._rag_answer(
+        {"question": "how many photos did I take yesterday?", "caller_sub": SUB,
+         "tz": "Pacific/Auckland", "history": ONE_TURN})
+
+    assert out["computed"] is True, "sanity: the metric route was actually taken"
+    assert out["asked"] is None
+
+
 def test_ask_history_is_the_same_module_both_lambdas_import():
     """The move (Task 3): lambda_fieldsight_api and lambda_ask_agent both
     import the cleaner from `ask_history`, not from each other, and get

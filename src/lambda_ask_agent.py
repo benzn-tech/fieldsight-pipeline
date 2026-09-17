@@ -1341,8 +1341,16 @@ def _rag_answer(body):
         _metric = metric_slots.detect(question) if (orig_q_from and not narrowed) else None
         if _metric:
             logger.info("  Ask metric route: %s (%s..%s)", _metric, q_from, q_to)
-            return _metric_answer(caller_sub, question, _metric, q_from, q_to,
-                                  applied_scope=applied_scope)
+            # `asked` at the call site, not inside `_metric_answer`: a rewrite
+            # can still have run (history + budget), even though the metric
+            # gate itself only looks at the ORIGINAL question. Without this,
+            # a rewritten metric-route answer would silently render no
+            # "Searched for: ..." -- the invisible-rewrite failure spec §3.3
+            # exists to prevent.
+            _metric_result = _metric_answer(caller_sub, question, _metric, q_from, q_to,
+                                            applied_scope=applied_scope)
+            _metric_result["asked"] = asked if rewritten else None
+            return _metric_result
 
         # `asked` -- the rewritten text when a rewrite happened, else `asked
         # == question`. This is the ONE place the rewrite changes what
