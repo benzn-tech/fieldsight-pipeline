@@ -1207,32 +1207,34 @@ def _rag_answer(body):
     # on our corpus. rag-search clamps k to [1,32].
     k = int(body.get("k", 5))
 
-    # The caller's own calendar day, and the range their question names.
-    # `query_slots` is imported HERE for the same reason llm_utils is: the
-    # legacy hand-built prod zips a fixed file list and does not carry it. That
-    # deploy has no RAG_SEARCH_FUNCTION so it never reaches this line, but a
-    # top-level import would kill its S3 path too on the way past.
-    #
-    # `now` is a test seam. A client that sent one could only shift which day
-    # it calls today, inside an ACL it already passed -- there is nothing to
-    # gain by lying about it.
-    import answer_language
-    import query_slots
-    today = query_slots.resolve_today(body.get("tz"), now=_parse_now(body.get("now")))
-    q_from, q_to = query_slots.time_range(question, today)
-
-    # Scoped Ask (spec 2026-09-15 §4.2): what the client asked to be scoped to,
-    # validated, and the range that wins. Pure helpers that never raise, so
-    # computing them above the try adds no raw-500 path.
-    scope_req, scope_dropped = _validate_scope(body)
-    plan = _scope_range(scope_req, q_from, q_to)
-    scope_dropped = scope_dropped + plan["dropped"]
-    date_from, date_to = plan["from"], plan["to"]
-    narrowed = any(f in scope_req for f in ("site_id", "author_folder", "topic_row_id"))
-    # Until rag-search answers, only this hop's own drops are known.
-    applied_scope = {"dropped": list(scope_dropped)}
-
     try:
+        # The caller's own calendar day, and the range their question names.
+        # `query_slots` is imported HERE for the same reason llm_utils is: the
+        # legacy hand-built prod zips a fixed file list and does not carry it. That
+        # deploy has no RAG_SEARCH_FUNCTION so it never reaches this line, but a
+        # top-level import would kill its S3 path too on the way past.
+        #
+        # `now` is a test seam. A client that sent one could only shift which day
+        # it calls today, inside an ACL it already passed -- there is nothing to
+        # gain by lying about it.
+        import answer_language
+        import query_slots
+        today = query_slots.resolve_today(body.get("tz"), now=_parse_now(body.get("now")))
+        q_from, q_to = query_slots.time_range(question, today)
+
+        # Scoped Ask (spec 2026-09-15 §4.2): what the client asked to be scoped to,
+        # validated, and the range that wins. These are pure helpers that never
+        # raise on their own -- they now live inside the try because a following
+        # change (the question-rewrite network call) lands immediately before
+        # them, and that call must be guarded.
+        scope_req, scope_dropped = _validate_scope(body)
+        plan = _scope_range(scope_req, q_from, q_to)
+        scope_dropped = scope_dropped + plan["dropped"]
+        date_from, date_to = plan["from"], plan["to"]
+        narrowed = any(f in scope_req for f in ("site_id", "author_folder", "topic_row_id"))
+        # Until rag-search answers, only this hop's own drops are known.
+        applied_scope = {"dropped": list(scope_dropped)}
+
         # A counting question leaves here and never reaches the embedder or a
         # model. `metric_slots` is rules, so a MISS returns None and the question
         # falls through to exactly what it does today -- the miss costs nothing

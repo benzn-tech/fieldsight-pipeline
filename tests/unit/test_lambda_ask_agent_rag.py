@@ -447,3 +447,21 @@ def test_the_search_list_route_still_honours_its_own_k(monkeypatch):
     monkeypatch.setattr(laa, "RERANK_CANDIDATES", 32)
     laa.lambda_handler({"mode": "search", "question": "q", "caller_sub": "sub-1", "k": 7}, None)
     assert client.calls[0]["Payload"]["k"] == 7
+
+
+# --------------------------------------------------------------------------
+# Task 2 (2026-09-17 ask-conversation-memory): pin _rag_answer's behaviour
+# with a malformed scope field before the function head moves inside the
+# try. Adapted from the task brief to this file's own `wire`/`make_event`
+# conventions (no `wired` fixture or `SUB` constant exists here or in the
+# other Ask test files) -- see task-2-report.md for detail.
+# --------------------------------------------------------------------------
+
+def test_a_malformed_scope_still_answers(monkeypatch):
+    """Guards the move: today, q_from/q_to, scope_req and plan must keep
+    producing the same result whether computed above or inside the try."""
+    wire(monkeypatch, chunks=[])
+    out = laa._rag_answer({"question": "what happened?", "caller_sub": "sub-1",
+                           "tz": "Pacific/Auckland", "site_id": "not-a-uuid"})
+    assert "error" not in out
+    assert "invalid" in " ".join(d["reason"] for d in out["applied_scope"]["dropped"])
