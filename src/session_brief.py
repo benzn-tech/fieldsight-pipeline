@@ -54,6 +54,20 @@ def build_brief_prompt(turns, owner_name=None):
     # {owner} speaking, use their name" instruction -- is task B3; this commit
     # only conveys the name, and conveys nothing when there is none to convey.
     owner_line = f"\nThis recording belongs to {owner_name}.\n" if owner_name else ""
+    # Task B3: the name is only safe to hand over with the prohibition attached.
+    # `_real_name` can still strip a speaker label out of `assignee` after the
+    # fact; a name written into `text` has NO code-side backstop, so a wrong
+    # attribution there is permanent and reads to the recipient as fact. The
+    # negative half is stated last and in full because it is the half a model
+    # gets wrong -- given a name and a transcript of unlabelled voices, it hangs
+    # the name on whichever turn looks closest.
+    owner_rule = f"""
+   **Naming the owner.** When a turn is plainly {owner_name} speaking about what
+   they will do, use their name as the subject of the sentence: "{owner_name}
+   confirmed the QA pour checks start once the cure ends." When you cannot tell
+   who spoke, write the sentence without a name and never attribute it to
+   {owner_name}.
+""" if owner_name else ""
     return f"""You are briefing a senior colleague who was NOT in this meeting. They have a
 few minutes, and afterwards they have to be able to discuss any part of it.
 {owner_line}
@@ -86,12 +100,10 @@ Return ONLY JSON, no code fence and no commentary:
   ],
   "tasks": [
     {{
-      "text": "One sentence on what needs doing, written for whoever will do it.",
-      "why": "What happened in the meeting that produced this",
+      "text": "One sentence a reader who was in the room can act on: the subject, what is to happen, and the context that makes it make sense -- 'Modular drop ceiling 100mm, details to go to Ignite.' ONE sentence, not a paragraph. Never a speaker label (spk_0, Speaker 1) inside this sentence.",
       "at": "HH:MM:SS",
       "assignee": "The name it was given to, or null. Do not guess. The speaker labels above (spk_0, Speaker 1) are NOT names -- they say which voice spoke, not who the task is for. If nobody was named, this is null.",
-      "due": "When, in the words used, or null",
-      "basis": "committed if someone took it on; inferred if you concluded it should be done"
+      "due": "When, in the words used, or null"
     }}
   ],
   "open_points": [
@@ -152,7 +164,21 @@ How to write it:
    the side chosen: a missed task is one the recorder still remembers, and a
    surplus one is meant to be dismissed in the UI rather than argued away here.
 
-7. {OUTPUT_LANGUAGE_RULE}
+7. **tasks: how the sentence reads.** Minutes, not a label. One sentence
+   carrying its own context, so somebody who was in the room knows what it is
+   about without the recording: "Arborist report catching the cut and fill for
+   link bridge, IA and Civix to catch up." NOT "Rainwater tank front position
+   -- discuss with Paul Smith", which is rule 2's failure wearing a task's
+   clothes.
+
+   **The verb carries how firm it is.** Something a person actually took on
+   reads as a commitment -- "Ben confirmed the QA pour checks start once the
+   cure ends", "Ben will send the details to Ignite". Something you concluded
+   should happen, that nobody took on, reads as unsettled -- "... to be
+   confirmed" -- or carries no name at all. Never write a committed/inferred
+   label into the output: the verb is the only place that distinction appears.
+{owner_rule}
+8. {OUTPUT_LANGUAGE_RULE}
 
 ---
 
