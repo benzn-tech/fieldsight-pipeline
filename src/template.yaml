@@ -3905,7 +3905,11 @@ Resources:
       FunctionName: !Sub ["${P}-rag-search", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_rag_search.lambda_handler
-      Timeout: 30
+      # Invoked synchronously by AskAgentFunction, so must give up before
+      # AskAgentFunction's Timeout (28) and before that function's
+      # ASK_DEADLINE_SECONDS (24) -- otherwise this callee can outlive
+      # the request it serves.
+      Timeout: 23
       MemorySize: 512
       Layers:
         - !Ref PsycopgLayer
