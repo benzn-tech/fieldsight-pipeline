@@ -569,11 +569,18 @@ evidence. Local test results are the only evidence there.
 
 ### 5.2 `GrandTime`
 
-* `AskApiClient.kt:35` adds `tz` (the device's zone id) and `history`.
-* The device keeps the last 2 spoken turns in memory only, cleared when the
-  app is backgrounded.
-* `tz` alone is worth shipping on its own: without it, `resolve_today` returns
-  `None` and every spoken *"yesterday"* searches all of time.
+Two separate changes, deliberately not shipped together (§9):
+
+* **Step 0 — `AskApiClient.kt:35` adds `tz`** (the device's IANA zone id).
+  Behind no flag, depends on nothing else here: without it `resolve_today`
+  returns `None` and every spoken *"yesterday"* searches all of time. The
+  backend has accepted the field for some time.
+* **Later — the same body adds `history`**, as `{question, answer}` turns, kept
+  in memory only and cleared when the app is backgrounded. **The count is the
+  server's: up to `MAX_VOICE_HISTORY_TURNS` (6), each field truncated at
+  `MAX_VOICE_HISTORY_CHARS` (2000).** The device does not carry its own smaller
+  number — one field with two caps depending on which client sent it is how a
+  cap stops being a cap.
 
 ---
 
