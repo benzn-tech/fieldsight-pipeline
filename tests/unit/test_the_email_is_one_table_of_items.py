@@ -153,3 +153,24 @@ def test_the_backstop_email_says_what_the_session_was_about_too():
 
 def test_no_rolling_summary_means_no_row():
     assert fc._summary_row({}) == [] and fc._summary_row({"summary": "   "}) == []
+
+
+def test_a_speaker_label_is_blank_on_extraction_rows_too():
+    """`spk_0` is not a name on ANY row, not only the brief's.
+
+    The brief path already filtered speaker labels; the extraction path -- the
+    only one prod runs -- did not, so the email printed `spk_0` in ASSIGNED where
+    Preview & copy printed "—" for the same row. Found by rendering one fixture
+    through both surfaces and diffing the text tables. The frontend half of this
+    contract is fieldsight-ui scripts/composites/email-preview-modal.js
+    `isSpeakerLabel`, which uses the same pattern."""
+    import lambda_session_finalize as f
+    rows = [{"text": "Book inspection", "responsible": "spk_0", "due": "Fri"},
+            {"text": "Chase cert", "responsible": "Speaker 2", "due": None},
+            {"text": "Redo wall", "responsible": "John", "due": "Wed"}]
+    _, text, html = f.build_confirmation_email(open_todos=rows)
+    assert "| Book inspection | — | Fri |" in text
+    assert "| Chase cert | — | — |" in text
+    assert "| Redo wall | John | Wed |" in text
+    assert "spk_0" not in text and "spk_0" not in html
+    assert "Speaker 2" not in text and "Speaker 2" not in html

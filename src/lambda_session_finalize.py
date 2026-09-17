@@ -82,12 +82,18 @@ def _clean_todos(open_todos):
     renders a per-item context line at all (see `build_confirmation_email` below),
     so there is nothing downstream for it to reach.
     """
+    # A speaker label is not a name, on EVERY row -- not only the brief's. The
+    # brief path already filtered it; the extraction path, which is the only one
+    # prod runs, did not, so the email showed "spk_0" where Preview & copy showed
+    # "—" for the same row. One filter, reused, so the two cannot drift:
+    # fieldsight-ui email-preview-modal.js `isSpeakerLabel` mirrors this pattern.
+    import session_brief
     out = []
     for t in (open_todos or []):
         text = (t.get("text") or "").strip()
         if text:
             out.append({"text": text,
-                        "responsible": (t.get("responsible") or None),
+                        "responsible": session_brief._real_name(t.get("responsible")),
                         "due": (t.get("due") or None),
                         "at": (t.get("at") or None),
                         # "action" (someone owes something) or "topic" (something
