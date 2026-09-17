@@ -24,6 +24,15 @@ import time
 from urllib.parse import unquote_plus
 
 logger = logging.getLogger()
+# INFO, set HERE. The Lambda runtime leaves the root logger at WARNING, and this
+# module's decisions are all logged at INFO -- including which source a final
+# email's rows came from (brief or extraction). The level used to be raised only
+# as a side effect of importing email_sender, which happens at SEND time, i.e.
+# AFTER those decisions were logged; so on TEST (2026-09-18) the email went out
+# and the one line saying whether it used the brief was silently dropped, while
+# the "[email:ses] sent" line right after it printed. A decision nobody can see
+# is indistinguishable from one that never ran.
+logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 
