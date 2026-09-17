@@ -29,7 +29,7 @@ class Recorder:
 
 def test_scope_fields_are_forwarded_verbatim(monkeypatch):
     rec = Recorder()
-    monkeypatch.setattr(fsapi, "lambda_client", rec)
+    monkeypatch.setattr(fsapi, "ask_lambda_client", rec)
 
     fsapi.ask_question({"question": "open actions?", "date": "2026-09-03",
                         "site_id": "5c0e8d7a-1111-4222-8333-444455556666",
@@ -46,7 +46,7 @@ def test_scope_fields_are_forwarded_verbatim(monkeypatch):
 @pytest.mark.parametrize("value", [None, ""])
 def test_absent_or_blank_scope_fields_are_not_sent(monkeypatch, value):
     rec = Recorder()
-    monkeypatch.setattr(fsapi, "lambda_client", rec)
+    monkeypatch.setattr(fsapi, "ask_lambda_client", rec)
 
     body = {"question": "open actions?"}
     if value is not None:
@@ -59,7 +59,7 @@ def test_absent_or_blank_scope_fields_are_not_sent(monkeypatch, value):
 
 def test_scoped_is_forwarded_when_true(monkeypatch):
     rec = Recorder()
-    monkeypatch.setattr(fsapi, "lambda_client", rec)
+    monkeypatch.setattr(fsapi, "ask_lambda_client", rec)
     fsapi.ask_question({"question": "open actions?", "date": "2026-09-03",
                         "scoped": True}, CALLER)
     assert rec.sent[0]["scoped"] is True
@@ -69,7 +69,7 @@ def test_scoped_is_forwarded_when_true(monkeypatch):
 @pytest.mark.parametrize("value", [None, False, ""])
 def test_scoped_is_not_sent_when_absent_or_falsy(monkeypatch, value):
     rec = Recorder()
-    monkeypatch.setattr(fsapi, "lambda_client", rec)
+    monkeypatch.setattr(fsapi, "ask_lambda_client", rec)
     body = {"question": "open actions?", "date": "2026-09-03"}
     if value is not None:
         body["scoped"] = value

@@ -57,13 +57,23 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 s3_client = boto3.client('s3')
-# read_timeout BELOW ApiFunction's own Timeout (Task 7: ApiFunction=28,
-# AskAgentFunction=27), so a hung Ask Agent invoke fails HERE, in code that
-# can name it, instead of the runtime killing ApiFunction first and leaving a
-# bare `Task timed out` as the only trace (spec SS4.8). retries=0: a
-# synchronous user-facing invoke must not silently double the wait.
+lambda_client = boto3.client('lambda')
+# Task 8 review fix: this Config was originally applied to the SHARED
+# module-level `lambda_client` above, which regressed every other route that
+# reuses it -- corroborate_answer's target (src/corroboration.py
+# HARD_STOP_SECONDS, default 27s, its stage budgets re-cut from measurement to
+# fill exactly 27s) could finish between 26s and 27s and now got killed by
+# THIS read_timeout instead; ask_voice's _voice_answer (STT + RAG + TTS) has
+# no measured ceiling to check the claim against either. So this client is
+# used ONLY by ask_question, below -- read_timeout BELOW ApiFunction's own
+# Timeout (Task 7: ApiFunction=28, AskAgentFunction=27), so a hung Ask Agent
+# invoke fails HERE, in code that can name it, instead of the runtime killing
+# ApiFunction first and leaving a bare `Task timed out` as the only trace
+# (spec SS4.8). retries=0: a synchronous user-facing invoke must not silently
+# double the wait. corroborate_answer, ask_voice and search_topics keep using
+# the plain `lambda_client` above, unchanged from before this task.
 _LAMBDA_INVOKE_TIMEOUT = int(os.environ.get("ASK_INVOKE_TIMEOUT", "26"))
-lambda_client = boto3.client('lambda', config=Config(
+ask_lambda_client = boto3.client('lambda', config=Config(
     read_timeout=_LAMBDA_INVOKE_TIMEOUT,
     connect_timeout=5,
     retries={"max_attempts": 0},
@@ -1301,7 +1311,7 @@ def ask_question(body, caller):
                        type(raw_history).__name__)
 
     try:
-        resp = lambda_client.invoke(
+        resp = ask_lambda_client.invoke(
             FunctionName=ASK_AGENT_FUNCTION,
             InvocationType='RequestResponse',
             Payload=json.dumps(payload)

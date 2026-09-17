@@ -165,7 +165,11 @@ def test_the_screen_path_now_forwards_the_same_cleaned_history(monkeypatch):
     that gap: `ask_question` now reuses `_clean_voice_history` and its caps,
     same as `ask_voice`. See tests/unit/test_lambda_fieldsight_api_ask.py for
     the full coverage of ask_question's own history forwarding."""
-    fake = wire(monkeypatch)
+    # ask_question uses its own client (Task 8 review fix), not the shared
+    # one `wire()` patches for ask_voice -- see
+    # tests/unit/test_lambda_fieldsight_api_ask.py's own `wire()`.
+    fake = sibling.FakeLambdaClient()
+    monkeypatch.setattr(fapi, "ask_lambda_client", fake)
     fapi.ask_question({"question": "how is level three", "history": [TURN]},
                       WORKER_CALLER)
     assert _payload(fake)["history"] == [TURN]
