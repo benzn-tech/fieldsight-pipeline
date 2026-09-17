@@ -66,10 +66,10 @@ BRIEF_WAIT_SECONDS = float(os.environ.get("BRIEF_WAIT_SECONDS", "90"))
 #: and another way on the site -- and it is what the kinds above retire.
 RENDERED_KINDS = ("final", "rolling", "updated")
 
-# ---- handoff-sync plan §7.4 (originally back-fill only; §7.1 folded in
-# 2026-09-18, see below): is one piece of text already said, in different
-# words, by another? One shared constant, named identically to its
-# (independent) frontend counterpart, so neither side can drift without a
+# ---- handoff-sync plan §7.4, and its 2026-09-18 follow-up (see the docstring
+# of `_rows_from_brief_or_request` below): is one piece of text already said,
+# in different words, by another? One shared constant, named identically to
+# its (independent) frontend counterpart, so neither side can drift without a
 # renamed test failing to find it.
 #
 # Deliberately conservative and biased AWAY from dropping a commitment (§10):
@@ -78,29 +78,40 @@ RENDERED_KINDS = ("final", "rolling", "updated")
 # a duplicate is visible and annoying where a silently dropped commitment is
 # neither.
 #
-# THIS ONE FUNCTION NOW DRIVES BOTH DIRECTIONS of the brief/extraction merge:
-#   back-fill (§7.3)   an extraction action item is KEPT when it is NOT
-#                       represented in the brief's texts.
-#   suppression (§7.1) an extraction topic row is DROPPED when it IS
-#                       represented in the brief's texts.
-# Coverage used to be decided by TIME instead (a brief task's `at` falling
-# inside the topic's `time_range`), but that rule was measured, on a real
-# TEST session, to suppress unrelated content: a brief's 8 tasks carried only
-# three distinct `at` values, and three of the session's topics were
-# overlapping 2-minute windows around those values, so a task about meeting
-# KCD at the Icehouse office suppressed a topic row about Papakura -- nothing
-# in the email mentioned Papakura at all. Time cannot separate topics that
-# overlap in time when real conversation does; text can. Because suppression
-# now reads the SAME threshold the back-fill bias was built on, it inherits
-# that bias by construction: "unsure" reads as NOT represented, which for
-# back-fill means "keep the extraction row" and for suppression means
-# "keep the topic row" -- both directions resolve uncertainty the same way,
-# towards showing more rather than silently dropping something. A reader
-# comparing the two call sites below should not need to re-derive this; it is
-# the reason there is one function here instead of two.
+# USED FOR BACK-FILL ONLY NOW (§7.3): an extraction action item is KEPT (and
+# appended after the brief's own rows) when it carries a due date and is NOT
+# represented in the brief's task texts. That is the ONE safety net the
+# "the brief says where a task came from" spec (2026-09-18) keeps unchanged.
+#
+# It used to ALSO decide suppression (§7.1) -- an extraction TOPIC row dropped
+# when it WAS represented in the brief's texts -- first by TIME (a brief
+# task's `at` falling inside the topic's `time_range`, measured on a real TEST
+# session to suppress unrelated content: a brief's 8 tasks carried only three
+# distinct `at` values, and three of the session's topics were overlapping
+# 2-minute windows around those values, so a task about meeting KCD at the
+# Icehouse office suppressed a topic row about Papakura -- nothing in the
+# email mentioned Papakura at all), then by TEXT (this same function, applied
+# to a topic row's own text). Both were a GUESS about whether two documents,
+# written separately, meant the same thing. The 2026-09-18 spec removes the
+# guess: when a brief is used, the extraction's own topic rows are not
+# rendered AT ALL any more -- `_sunk_rows_from_brief` below builds the
+# "nobody promised anything" rows from the brief's OWN sections instead,
+# using the `section` field the brief itself attaches to each task, which the
+# model that wrote both halves in the same pass actually knows, and which
+# `session_brief.validate_task_sections` makes checkable (a title that does
+# not exist among this brief's own sections is rewritten to null there,
+# before this module ever sees it).
 BRIEF_MATCH_JACCARD_THRESHOLD = 0.30
 BRIEF_MATCH_STOP_WORDS = frozenset(
     "the a an and or to of for on in at is are be by with from that this it as".split())
+
+# Mirrors lambda_item_writer.TOPIC_ROW_MAX_CHARS exactly (180 codepoints, `…`)
+# -- not imported, because that module is in-VPC and pulls boto3/psycopg/db.*
+# at module scope, which this non-VPC worker must not carry. A local constant,
+# same value, same name pattern as `_pipe_cell`/`_pipe_row` mirroring the
+# frontend's `cell()`/`pipe()` byte-for-byte above: the truncation RULE is
+# shared, the code that runs it is not.
+TOPIC_ROW_MAX_CHARS = 180
 
 
 def _match_tokens(text):
@@ -118,9 +129,9 @@ def _is_represented(text, brief_texts):
     calls out by name ("a tie... counts as NOT represented"), so it is decided
     the same way as an empty token set -- towards keeping the row.
 
-    Used for BOTH back-fill and suppression (see the block comment above) --
-    the direction is entirely in what the caller does with the boolean, not
-    in anything this function decides."""
+    Used for back-fill only now (see the block comment above) -- kept general
+    on purpose, since it is a plain text-overlap test with no back-fill-
+    specific assumption baked in."""
     tokens = _match_tokens(text)
     if not tokens:
         return False
@@ -535,9 +546,45 @@ def _poll_for_brief(folder, date, session_id, *, read_brief=None, sleep=None,
     return None
 
 
+def _sunk_rows_from_brief(brief):
+    """The brief's own sections that produced NO task, as rows of their own --
+    the "the brief says where a task came from" spec's replacement for
+    suppressing the extraction's topic rows by text.
+
+    A section is COVERED -- and not sunk -- when at least one of the brief's
+    own tasks names it in `section`. `session_brief.validate_task_sections`
+    already ran (at brief-build time, before this was ever stored) and
+    rewrote any `section` that is not one of THIS brief's own section titles
+    to `null`, so a hallucinated title cannot accidentally cover a section it
+    does not name and cannot accidentally cover nothing when it should.
+
+    Row text is built exactly as `lambda_item_writer._topic_rows` builds a
+    topic row today -- `title — first bullet`, truncated to
+    TOPIC_ROW_MAX_CHARS codepoints with a trailing `…` -- so the one row shape
+    the two paths still share cannot drift between them. Here "first bullet"
+    is the section's first bullet's `text` (a brief section has bullets, not
+    the single `summary` string a topic has), whitespace-collapsed; a section
+    with no bullets renders its title alone, same as a topic with no summary
+    text does today."""
+    covered = {t.get("section") for t in (brief.get("tasks") or []) if t.get("section")}
+    out = []
+    for section in brief.get("sections") or []:
+        title = (section.get("title") or "").strip()
+        if not title or title in covered:
+            continue
+        bullets = section.get("bullets") or []
+        first = " ".join(((bullets[0].get("text") or "") if bullets else "").split())
+        text = " — ".join(part for part in (title, first) if part)
+        if len(text) > TOPIC_ROW_MAX_CHARS:
+            text = text[:TOPIC_ROW_MAX_CHARS - 1].rstrip() + "…"
+        if text:
+            out.append({"text": text, "responsible": None, "due": None, "kind": "topic"})
+    return out
+
+
 def _rows_from_brief_or_request(artifact, request_todos, *, poll_brief=None):
     """The `openTodos` a `kind == "final"` email actually renders (§2.2, then
-    merged per §7).
+    merged per §7 and, 2026-09-18, "the brief says where a task came from").
 
     If SESSION_BRIEF is on and a brief with at least one USABLE task turns up
     within the wait, its tasks become the ACTION rows (assignee mapped through
@@ -550,25 +597,26 @@ def _rows_from_brief_or_request(artifact, request_todos, *, poll_brief=None):
     empty table where the extraction had rows would read as broken, not as
     "nothing to do" (plan §1.3).
 
-    When the brief wins, two more things happen before the request's rows are
-    merged in (plan §6/§7), and both are the SAME `_is_represented` text test
-    (see the block comment above its definition) applied in opposite
-    directions:
+    When the brief wins, the WHOLE table comes from the brief:
 
-    * a TOPIC row is dropped when its own text IS represented in one of the
-      brief's rows (§7.1, text-based since 2026-09-18 -- see that block
-      comment for why the original time-based rule was replaced) -- the
-      brief already said it, so keeping the topic row too is the "same thing
-      appears twice" defect (§5.1) this plan exists to close;
+    * action rows = the brief's tasks, unchanged;
     * every extraction ACTION row that carries a non-empty `due` and is NOT
-      represented in the brief's rows is appended after the brief's own
-      rows, in the extraction's own order (§7.3) -- the "dated commitment
-      the brief missed" defect (§5.2).
+      represented (the same `_is_represented` text test, see the block
+      comment above its definition) in the brief's rows is appended after the
+      brief's own rows, in the extraction's own order (§7.3) -- the "dated
+      commitment the brief missed" defect (§5.2). This is the ONE safety net
+      that survives from the extraction into a brief-won table;
+    * sunk rows = the brief's OWN sections that produced no task
+      (`_sunk_rows_from_brief`, above). The extraction's own topic rows in
+      `request_todos` are not consulted at all here any more -- no
+      cross-document text matching decides what the meeting merely discussed,
+      because the model that wrote the brief already said so directly, in
+      `section`.
 
     Exactly one log line, naming which source was used and why, and (when the
-    brief wins) how many topic rows were suppressed and how many extraction
-    rows were back-filled -- the same posture as every other silent-fallback
-    point in this pipeline."""
+    brief wins) how many extraction rows were back-filled and how many sunk
+    rows the brief's own sections produced -- the same posture as every other
+    silent-fallback point in this pipeline."""
     session_id = artifact.get("sessionId")
     if not SESSION_BRIEF:
         logger.info("finalize: %s email rows from the request -- SESSION_BRIEF is off",
@@ -598,22 +646,20 @@ def _rows_from_brief_or_request(artifact, request_todos, *, poll_brief=None):
         return request_todos
 
     brief_texts = [r.get("text") for r in action_rows]
-    all_topic_rows = [t for t in (request_todos or []) if t.get("kind") == "topic"]
-    topic_rows = [t for t in all_topic_rows
-                 if not _is_represented(t.get("text"), brief_texts)]
-    suppressed = len(all_topic_rows) - len(topic_rows)
-
     extraction_action_rows = [t for t in (request_todos or []) if t.get("kind") != "topic"]
     backfilled = [t for t in extraction_action_rows
                  if (t.get("due") or "").strip()
                  and not _is_represented(t.get("text"), brief_texts)]
 
+    sunk_rows = _sunk_rows_from_brief(brief)
+
     logger.info("finalize: %s email action rows from the brief (%d row(s), %d "
-                "back-filled from the extraction), %d topic row(s) kept from the "
-                "request (%d suppressed as covered by a brief task)",
+                "back-filled from the extraction), %d sunk row(s) from the "
+                "brief's own sections with no task (the extraction's topic "
+                "rows are not rendered when a brief is used)",
                 session_id, len(action_rows) + len(backfilled), len(backfilled),
-                len(topic_rows), suppressed)
-    return action_rows + backfilled + topic_rows
+                len(sunk_rows))
+    return action_rows + backfilled + sunk_rows
 
 
 def _process_brief_request(artifact, *, complete_summary=None):

@@ -122,7 +122,8 @@ Return ONLY JSON, no code fence and no commentary:
       "text": "One or two short clauses a reader who was in the room can act on: the subject, what is to happen, and the context that makes it make sense -- 'Modular drop ceiling 100mm, details to go to Ignite.' One or two short clauses, not a paragraph. Never a speaker label (spk_0, Speaker 1) inside this sentence.",
       "at": "HH:MM:SS",
       "assignee": "The name it was given to, or null. Do not guess. The speaker labels above (spk_0, Speaker 1) are NOT names -- they say which voice spoke, not who the task is for. If nobody was named, this is null.",
-      "due": "When, in the words used, or null"
+      "due": "When, in the words used, or null",
+      "section": "The exact title of the section above this task came from, copied verbatim -- character for character -- from the `title` of one of the sections you just wrote. null when this task does not belong to any section."
     }}
   ],
   "open_points": [
@@ -209,7 +210,11 @@ How to write it:
    work nobody took on, not a safer default. This is about the verb, never the
    name -- when you cannot tell who spoke, the sentence still carries no name.
 {owner_rule}
-8. {OUTPUT_LANGUAGE_RULE}
+8. **tasks: section.** Copy the exact title of the section above this task
+   came from into `section`, verbatim -- character for character, not
+   paraphrased and not shortened. If this task does not belong to any
+   section, `section` is null.
+9. {OUTPUT_LANGUAGE_RULE}
 
 ---
 
@@ -361,6 +366,34 @@ def reanchor(brief, turns):
     return {"reanchored": fixed, "unmatched": missed}
 
 
+def validate_task_sections(brief):
+    """A task's `section` survives only if it is a string that EXACTLY matches
+    the `title` of one of this same brief's own `sections`; anything else -- a
+    title that does not exist, a paraphrase, a truncation, a non-string -- is
+    overwritten to `null` in place.
+
+    Validation lives in CODE, not the prompt (the spec's own ruling, 2026-09-18
+    the-brief-says-where-a-task-came-from): the prompt asks the model to copy a
+    title verbatim, but an instruction cannot be relied on and this can. A
+    hallucinated linkage is exactly the failure mode this catches -- it is the
+    thing that makes the linkage checkable rather than merely asserted.
+
+    Mutates `brief["tasks"]` in place (mirrors `validate_aliases`'s posture:
+    the model's own output is being corrected, not replaced) and returns the
+    count of tasks that kept a valid section, so a prompt regression -- the
+    model inventing titles, or dropping the field entirely -- shows up as a
+    number in `stats` without anyone opening an artifact by hand."""
+    titles = {s.get("title") for s in (brief.get("sections") or []) if s.get("title")}
+    valid = 0
+    for task in brief.get("tasks") or []:
+        section = task.get("section")
+        if isinstance(section, str) and section in titles:
+            valid += 1
+        else:
+            task["section"] = None
+    return valid
+
+
 # spk_0, Speaker 1, SPEAKER_02 — the diarisation label, which is what the transcript hands
 # the model when nobody in the room said a name.
 _SPEAKER_LABEL = re.compile(r"^\s*(spk|speaker)[\s_-]*\d+\s*$", re.I)
@@ -411,7 +444,14 @@ def to_session_summary(brief):
     todos = [{"text": (t.get("text") or "").strip(),
               "responsible": _real_name(t.get("assignee")),
               "due": t.get("due") or None,
-              "at": t.get("at") or None}
+              "at": t.get("at") or None,
+              # Copied straight through, already validated (validate_task_sections
+              # rewrote anything that was not one of this brief's own section
+              # titles to None before this function ever runs) -- the same trap
+              # that dropped `kind`, and later `topic_range`, in this repo: a
+              # function that rebuilds each row from scratch drops whatever
+              # its own dict literal does not name.
+              "section": t.get("section") or None}
              for t in (brief.get("tasks") or []) if (t.get("text") or "").strip()]
     return {"summary": (brief.get("headline") or "").strip(), "open_todos": todos}
 
@@ -447,6 +487,16 @@ def brief_from_turns(turns, call_llm=None, *, owner_name=None):
     brief["entities"] = entities
     anchor_stats = reanchor(brief, turns)
     brief["stats"] = dict(anchor_stats, aliases_rejected=len(rejected))
+    n_tasks = len(brief.get("tasks") or [])
+    valid_sections = validate_task_sections(brief)
+    brief["stats"]["tasks_with_valid_section"] = valid_sections
+    # Logged unconditionally, including at 0/0 (a session with no tasks is
+    # normal): "the model never puts a section here" and "there were no tasks
+    # to attach one to" are different failures and must not collapse into the
+    # same silence -- the same reasoning as the open-points 0-is-still-logged
+    # line below.
+    logger.info("session_brief: %d of %d task(s) carried a section that "
+                "exists in this brief's own sections", valid_sections, n_tasks)
     if rejected:
         logger.info("session_brief: rejected %d alias guess(es): %s",
                     len(rejected), "; ".join(f"{r['name']}<-{r['alias']} ({r['reason']})"

@@ -1,27 +1,38 @@
-"""handoff-sync plan Part 2 (§5-§10): the brief and the extraction stop
-talking past each other.
+"""handoff-sync plan Part 2 (§5-§10), then superseded on §5.1/§7.1 by the
+2026-09-18 spec "the brief says where a task came from".
 
 Two real defects, both from the same email (session `d740cd5f...`,
-2026-09-11), fixed by ONE rule applied in two directions:
+2026-09-11):
 
   §5.1 the same commitment appeared twice -- once as a brief action row, once
   again as a topic row, because topic rows were decided from the extraction
-  ALONE, blind to what the brief had already said. Originally fixed by
-  coverage-by-TIME (§7.1/§7.2 as first written): a topic a brief task's `at`
-  fell inside was not emitted as a topic row. That rule was itself replaced
-  by coverage-by-TEXT (2026-09-18, this file's current form) after a second
-  real session showed time cannot separate topics that overlap in time --
-  see the module docstring note in `lambda_session_finalize` and §7.1 of the
-  plan for the measured Papakura case that forced the change.
+  ALONE, blind to what the brief had already said. Fixed twice: first by
+  coverage-by-TIME (a brief task's `at` falling inside a topic's
+  `time_range`), which was measured on a real TEST session to suppress
+  UNRELATED content (the Papakura case -- see the module docstring note in
+  `lambda_session_finalize`); then by coverage-by-TEXT (`_is_represented`
+  applied to a topic row's own text). Both were a GUESS about whether two
+  documents, written separately, meant the same thing. **This file's §5.1
+  section now tests the FINAL fix (2026-09-18)**: the extraction's topic
+  rows are not consulted for this at all any more. When a brief is used, its
+  own sections that produced no task become the "nobody promised anything"
+  rows directly -- `_sunk_rows_from_brief`, keyed on the `section` field the
+  brief itself attaches to each task. No cross-document text matching is
+  needed because the model that wrote both halves in one pass already knows
+  the answer, and `session_brief.validate_task_sections` makes a wrong answer
+  (a hallucinated title) checkable.
 
   §5.2 a dated commitment the extraction caught ("PS4 for the Port Com SR
   study...") was silently dropped because the brief won outright and had no
-  such task. Fixed by §7.3/§7.4: back-fill every due-dated extraction action
-  item that is not textually represented in the brief, appended after the
-  brief's own rows.
+  such task. Fixed by §7.3/§7.4 and UNCHANGED by the 2026-09-18 spec, which
+  explicitly keeps this safety net: back-fill every due-dated extraction
+  action item that is not textually represented in the brief, appended after
+  the brief's own rows.
 
-§9's worked examples are pinned verbatim below, against the real
-2026-09-11 and 2026-09-18 sessions' actual text.
+§9's worked examples 2-4 (back-fill) are pinned verbatim below, against the
+real 2026-09-11 session's actual text. Worked example 1 (§5.1, coverage) is
+now tested against `_sunk_rows_from_brief` instead of against
+`request_todos`' topic rows, which are no longer rendered when a brief wins.
 """
 import pytest
 
@@ -33,10 +44,12 @@ SID = "d740cd5f"
 
 # ---- §7.4: the Jaccard "represented" test -----------------------------------
 #
-# This is now the ONLY text-similarity primitive in the module: it decides
-# both back-fill (an extraction action item not said by the brief -> kept)
-# and suppression (a topic row already said by the brief -> dropped). One
-# function, one threshold, both directions -- see `_rows_from_brief_or_request`.
+# The ONLY text-similarity primitive left in the module, and it decides only
+# back-fill now (an extraction action item not said by the brief -> kept,
+# appended after the brief's own rows). It used to also decide suppression (a
+# topic row already said by the brief -> dropped); that direction is retired
+# by the 2026-09-18 spec in favour of `_sunk_rows_from_brief` reading the
+# brief's own `section` link -- see `_rows_from_brief_or_request`.
 
 def test_the_jaccard_threshold_and_stop_list_are_one_named_constant():
     """Not inlined twice: `_is_represented` must actually consult the module
@@ -83,7 +96,7 @@ def test_exactly_030_by_a_second_independent_construction_is_not_represented():
     assert fin._is_represented(text, [brief_text]) is False
 
 
-# ---- §9 worked example 1 (superseded 2026-09-18): suppression by TEXT ------
+# ---- §9 worked example 1 (superseded 2026-09-18): coverage by SECTION ------
 #
 # The original coverage-by-time rule suppressed a topic whenever a brief
 # task's `at` fell inside the topic's `time_range`. Measured on TEST
@@ -93,66 +106,66 @@ def test_exactly_030_by_a_second_independent_construction_is_not_represented():
 # mid-program and progressing well" was suppressed by a task about meeting
 # KCD at the Icehouse office, though nothing in the email mentioned Papakura.
 # Time cannot separate topics that overlap in time when real conversation
-# does. Suppression is now decided the same way back-fill always was: by
-# `_is_represented` on the row's own text against the brief's task texts.
+# does. A same-day text-matching fix (`_is_represented` on a topic row's own
+# text) replaced it, and was itself replaced by THIS file's current form: the
+# extraction's topic rows are not consulted for coverage at all any more --
+# `_sunk_rows_from_brief` reads the brief's own `section`/`sections` link
+# directly, which the model that wrote both halves in one pass actually
+# knows, rather than re-guessing it from two documents afterwards.
 
-# Eight representative brief task texts from that session's shape (module
-# docstring: KCD Meeting, Ormiston College, Papakura -- three 2-minute topic
-# windows sharing only three distinct `at` values across 8 tasks). None of
-# these mentions Papakura in any form.
-EIGHT_BRIEF_TASK_TEXTS = [
-    "Meet KCD at the Icehouse office to review the current programme sequence.",
-    "Confirm KCD meeting agenda items before the site walk on Friday.",
-    "Visit MPI site with DeAndre to review open-space usage pattern after "
-    "Ormiston College 360 inspections.",
-    "Follow up with KCD on the revised construction timeline.",
-    "Order additional steel reinforcement for the northern block.",
-    "Chase the electrical subcontractor for updated wiring diagrams.",
-    "Schedule a follow-up call with the client project manager.",
-    "Confirm delivery dates for the precast panels with the supplier.",
-]
-
-PAPAKURA_TOPIC_TEXT = ("Papakura Progress and Modulars — Papakura is mid-program with "
-                       "good positioning and progressing well.")
-ORMISTON_TOPIC_TEXT = ("Ormiston College 360 Inspections — Speaker hopes to visit the "
-                       "MPI site with DeAndre.")
-ORMISTON_BRIEF_TEXT = ("Visit MPI site with DeAndre to review open-space usage pattern "
-                       "after Ormiston College 360 inspections.")
+PAPAKURA_SECTION = {"title": "Papakura Progress and Modulars", "bullets": [
+    {"text": "Papakura is mid-program with good positioning and progressing well."}]}
+ORMISTON_SECTION = {"title": "Ormiston College 360 Inspections", "bullets": [
+    {"text": "Speaker hopes to visit the MPI site with DeAndre."}]}
+ORMISTON_TASK_TEXT = ("Visit MPI site with DeAndre to review open-space usage pattern "
+                      "after Ormiston College 360 inspections.")
 
 
-def test_papakura_topic_not_represented_in_any_of_the_eight_tasks_is_kept():
-    """The measured false-suppression this change exists to fix: nothing in
-    the 8 real-shaped brief tasks textually says Papakura, so the topic row
-    must survive."""
-    assert fin._is_represented(PAPAKURA_TOPIC_TEXT, EIGHT_BRIEF_TASK_TEXTS) is False
+def test_a_section_with_no_covering_task_is_sunk():
+    brief = {"sections": [PAPAKURA_SECTION], "tasks": []}
+    rows = fin._sunk_rows_from_brief(brief)
+    assert [r["text"] for r in rows] == [
+        "Papakura Progress and Modulars — Papakura is mid-program with good "
+        "positioning and progressing well."]
 
 
-def test_ormiston_topic_represented_by_its_matching_task_is_suppressed():
-    """The case the rule SHOULD still catch: a brief task that does say the
-    same thing, in different words, still suppresses the topic row."""
-    assert fin._is_represented(ORMISTON_TOPIC_TEXT, [ORMISTON_BRIEF_TEXT]) is True
+def test_a_section_named_by_a_task_is_not_sunk():
+    brief = {"sections": [ORMISTON_SECTION],
+             "tasks": [{"text": ORMISTON_TASK_TEXT,
+                       "section": "Ormiston College 360 Inspections"}]}
+    assert fin._sunk_rows_from_brief(brief) == []
 
 
-def test_worked_example_1_papakura_topic_is_kept_ormiston_topic_is_dropped(monkeypatch):
-    """End-to-end through `_rows_from_brief_or_request`: the brief's action
-    rows come from the 8-task session; the request's topic rows are Papakura
-    (must survive) and Ormiston (must be dropped, represented by the brief's
-    own MPI/DeAndre task)."""
+def test_worked_example_1_papakura_is_sunk_ormiston_is_not(monkeypatch):
+    """End-to-end through `_rows_from_brief_or_request`, replaying the same
+    real-session shape the original worked example used: Papakura produced no
+    task and must appear as a sunk row; Ormiston produced the MPI/DeAndre
+    task and must NOT appear twice."""
     monkeypatch.setattr(fin, "SESSION_BRIEF", True, raising=False)
-    brief_action_rows = [{"text": t, "responsible": None, "due": None, "at": "13:40:43"}
-                         for t in EIGHT_BRIEF_TASK_TEXTS]
+    brief = {
+        "sections": [PAPAKURA_SECTION, ORMISTON_SECTION],
+        "tasks": [{"text": ORMISTON_TASK_TEXT, "at": "13:40:43",
+                  "section": "Ormiston College 360 Inspections"}],
+        "open_todos": [{"text": ORMISTON_TASK_TEXT, "responsible": None, "due": None,
+                        "at": "13:40:43", "section": "Ormiston College 360 Inspections"}],
+    }
     request_todos = [
         {"text": "Order steel", "responsible": "Neil", "due": None, "kind": "action"},
-        {"text": PAPAKURA_TOPIC_TEXT, "responsible": None, "due": None, "kind": "topic"},
-        {"text": ORMISTON_TOPIC_TEXT, "responsible": None, "due": None, "kind": "topic"},
     ]
     out = fin._rows_from_brief_or_request(
         {"kind": "final", "sessionId": SID, "folder": "F", "date": "D"}, request_todos,
-        poll_brief=lambda *a: {"tasks": [1], "open_todos": brief_action_rows})
+        poll_brief=lambda *a: brief)
     texts = [r["text"] for r in out]
-    assert PAPAKURA_TOPIC_TEXT in texts, "not represented in any brief task -- must be kept"
-    assert ORMISTON_TOPIC_TEXT not in texts, "represented by the brief's own MPI/DeAndre task"
+    assert any(t.startswith("Papakura Progress and Modulars — ") for t in texts), (
+        "Papakura's section produced no task -- it must survive as a sunk row")
+    assert not any(t.startswith("Ormiston College 360 Inspections — ") for t in texts), (
+        "Ormiston's section is covered by the brief's own MPI/DeAndre task -- "
+        "it must not ALSO appear as a sunk row")
     assert any("MPI site" in t for t in texts)   # the brief's own row still there
+    assert "Order steel" not in texts, (
+        "the request's own topic/action rows play no part in coverage any "
+        "more -- only back-fill (below) can bring an extraction row back, and "
+        "this one has no due date")
 
 
 # ---- §9 worked example 2: PS4 dated commitment is back-filled -------------
@@ -175,7 +188,7 @@ def test_worked_example_2_ps4_is_not_represented_and_gets_backfilled(monkeypatch
     ]
     out = fin._rows_from_brief_or_request(
         {"kind": "final", "sessionId": SID, "folder": "F", "date": "D"}, request_todos,
-        poll_brief=lambda *a: {"tasks": [1], "open_todos": brief_action_rows})
+        poll_brief=lambda *a: {"tasks": [], "open_todos": brief_action_rows})
     texts = [r["text"] for r in out]
     assert QA_TASK_TEXT in texts
     assert PS4_ITEM_TEXT in texts, "a due-dated, unmatched extraction item must be back-filled"
@@ -201,7 +214,7 @@ def test_worked_example_3_the_paraphrase_is_represented_and_not_backfilled(monke
     ]
     out = fin._rows_from_brief_or_request(
         {"kind": "final", "sessionId": SID, "folder": "F", "date": "D"}, request_todos,
-        poll_brief=lambda *a: {"tasks": [1], "open_todos": brief_action_rows})
+        poll_brief=lambda *a: {"tasks": [], "open_todos": brief_action_rows})
     texts = [r["text"] for r in out]
     assert CONCRETE_EXTRACTION_TEXT not in texts, (
         "already said, in different words, by the brief -- must NOT double up")
@@ -219,31 +232,34 @@ def test_worked_example_4_an_undated_unmatched_item_is_not_backfilled(monkeypatc
     ]
     out = fin._rows_from_brief_or_request(
         {"kind": "final", "sessionId": SID, "folder": "F", "date": "D"}, request_todos,
-        poll_brief=lambda *a: {"tasks": [1], "open_todos": brief_action_rows})
+        poll_brief=lambda *a: {"tasks": [], "open_todos": brief_action_rows})
     texts = [r["text"] for r in out]
     assert "Someone should tidy the site office" not in texts
 
 
 # ---- the log line stays ONE line and names both new numbers --------------
 
-def test_the_log_line_names_suppressed_and_backfilled_counts(monkeypatch, caplog):
+def test_the_log_line_names_backfilled_and_sunk_counts(monkeypatch, caplog):
     monkeypatch.setattr(fin, "SESSION_BRIEF", True, raising=False)
-    brief_action_rows = [
-        {"text": QA_TASK_TEXT, "responsible": "Sam", "due": "Mon", "at": "09:10:00"}]
+    brief = {
+        "sections": [PAPAKURA_SECTION],   # produced no task -> 1 sunk row
+        "tasks": [{"text": QA_TASK_TEXT, "section": None}],
+        "open_todos": [
+            {"text": QA_TASK_TEXT, "responsible": "Sam", "due": "Mon", "at": "09:10:00"}],
+    }
     request_todos = [
-        # represented by QA_TASK_TEXT (paraphrase) -> suppressed
-        {"text": CONCRETE_EXTRACTION_TEXT, "responsible": None, "due": None, "kind": "topic"},
         {"text": PS4_ITEM_TEXT, "responsible": None, "due": "2027-01-31",
          "kind": "action"},  # unmatched, dated -> back-filled
     ]
     with caplog.at_level("INFO"):
         fin._rows_from_brief_or_request(
             {"kind": "final", "sessionId": SID, "folder": "F", "date": "D"}, request_todos,
-            poll_brief=lambda *a: {"tasks": [1], "open_todos": brief_action_rows})
+            poll_brief=lambda *a: brief)
     lines = [r.message for r in caplog.records if "email action rows from the brief" in r.message]
     assert len(lines) == 1, "exactly one log line"
     line = lines[0]
     assert line == (
         "finalize: d740cd5f email action rows from the brief (2 row(s), 1 "
-        "back-filled from the extraction), 0 topic row(s) kept from the "
-        "request (1 suppressed as covered by a brief task)")
+        "back-filled from the extraction), 1 sunk row(s) from the brief's own "
+        "sections with no task (the extraction's topic rows are not rendered "
+        "when a brief is used)")
