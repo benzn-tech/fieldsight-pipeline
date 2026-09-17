@@ -304,6 +304,22 @@ def test_the_owner_name_is_derived_from_the_folder():
     assert fin._display_name("") is None
 
 
+def test_a_missing_surname_does_not_leave_a_trailing_space():
+    """A NULL `last_name` produces the folder "Ben_UCPK_" -- a real shape in this
+    repo (the display-name trailing-space defect). Passed through unchanged it
+    reaches the brief prompt as "...belongs to Ben UCPK ." with a space before
+    the full stop, which reads to the model as a name that is still being typed.
+
+    Mutation: drop the whitespace collapse in `_display_name` -> red."""
+    assert fin._display_name("Ben_UCPK_") == "Ben UCPK"
+    assert fin._display_name("_Ben_Lin") == "Ben Lin"
+    assert fin._display_name("Ben__Lin") == "Ben Lin"
+    # A folder that is nothing but separators has no name in it at all, and a
+    # caller's `if owner_name:` must not be handed an empty string to print.
+    assert fin._display_name("_") is None
+    assert fin._display_name("   ") is None
+
+
 def test_the_rolling_summariser_is_still_called_with_turns_alone(monkeypatch):
     import lambda_extract_session as ex
     import lambda_rolling_summary as rs

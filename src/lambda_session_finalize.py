@@ -54,8 +54,14 @@ def _display_name(folder):
     -> "Ben Lin"). Plumbing only (2026-09-17 plan, task B2): this is what lets
     the brief prompt name the owner (session_brief.build_brief_prompt) -- what
     the prompt DOES with the name is a later task. Returns None for a blank
-    folder rather than an empty string, so a caller can `if owner_name:` it."""
-    return folder.replace("_", " ") if folder else None
+    folder rather than an empty string, so a caller can `if owner_name:` it.
+
+    Separators are collapsed rather than substituted one-for-one: a NULL
+    `last_name` produces the folder "Ben_UCPK_" (a shape this repo has seen),
+    and a literal replace turns that into "Ben UCPK " -- which reaches the brief
+    prompt as "...belongs to Ben UCPK ." A folder made only of separators has no
+    name in it, so it returns None like a blank one."""
+    return " ".join(folder.replace("_", " ").split()) or None if folder else None
 
 
 def _clean_todos(open_todos):
