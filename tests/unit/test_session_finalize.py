@@ -66,14 +66,19 @@ def test_action_items_render_task_assignee_and_due():
     _s, text, html = fin.build_confirmation_email(
         summary="x", open_todos=[{"text": "Order steel", "responsible": "Neil", "due": "Friday"}])
     assert "Order steel" in text and "Neil" in text and "Friday" in text
-    assert "Task" in html and "Assignee" in html and "Due" in html   # structured columns
+    # AGENDA ITEM / ASSIGNED / DUE DATE, not Items/Assignee/Due (handoff-sync
+    # plan §2.4): one table now carries what is owed AND, below it, the topics
+    # nobody promised anything about (test_the_email_is_one_table_of_items).
+    assert "AGENDA ITEM" in html and "ASSIGNED" in html and "DUE DATE" in html
     assert "Order steel" in html and "Neil" in html and "Friday" in html
 
 
 def test_action_item_missing_assignee_or_due_shows_placeholders():
     _s, text, html = fin.build_confirmation_email(
         summary="x", open_todos=[{"text": "Do it", "responsible": None, "due": None}])
-    assert "Do it" in text and "Unassigned" in text   # text: assignee falls back to Unassigned
+    # No "Unassigned" any more (plan §2.4): a blank action cell is an em dash on
+    # both surfaces, same as the HTML always rendered.
+    assert "Do it" in text and "Unassigned" not in text and "—" in text
     assert "—" in html                                # html: em-dash for missing assignee/due
 
 
@@ -182,7 +187,9 @@ def test_a_recording_with_no_action_items_says_so_rather_than_sending_a_blank():
     a header and nothing else -- indistinguishable from a broken send."""
     _s, text, html = fin.build_confirmation_email(
         date="2026-07-25", summary="All done.", open_todos=[])
-    assert "No action items" in text and "No action items" in html
+    # Nothing AT ALL -- no tasks and no topics. A session with topics but no
+    # tasks now shows the topics rather than this note.
+    assert "Nothing was captured" in text and "Nothing was captured" in html
 
 
 # --- SESSION_BRIEF: which summariser the finalize re-summary uses ------------
@@ -238,18 +245,24 @@ def test_store_brief_swallows_its_own_failure():
     fin._store_brief("Ben_Test", "2026-08-19", "abc", {"headline": "x", "sections": []})
 
 
-def test_the_reason_a_todo_exists_reaches_both_halves_of_the_email():
-    """`why` crosses three boundaries — the brief's own summary shape, `_clean_todos`, and
-    the two renderers — and it was being dropped at the first two.
+# test_the_reason_a_todo_exists_reaches_both_halves_of_the_email was deleted here
+# (2026-09-17, "the code stops carrying `why` and `basis`" task). It pinned the
+# per-item context line under an Action items row, in both the text and HTML
+# halves of the confirmation email. The owner decided on 2026-09-17 that this
+# email loses that line too -- the same day, and the same ruling, that drops
+# `why` from the extraction/brief output entirely (spec §3.3, plan ruling 2 in
+# docs/superpowers/plans/2026-09-17-minutes-that-read-like-minutes.md). Deleting
+# the test is the deliberate removal of shipped behaviour, not a cleanup: the
+# context line it pinned no longer renders, by decision, and
+# test_the_email_renders_no_context_line_under_an_item below now pins its
+# absence instead.
 
-    The whole brief reached S3 and only `{text, responsible, due}` reached the surfaces that
-    read it, so the to-do list stayed exactly as unusable for recall as before. The owner's
-    words for the symptom: reading the list did not bring the day back, and the timeline had
-    to be opened topic by topic.
 
-    Asserted in BOTH renderers because they are separate code with separate escaping, and a
-    field that reaches one of them is a field half the readers never see.
-    """
+def test_the_email_renders_no_context_line_under_an_item():
+    """Both halves of `build_confirmation_email` stop rendering a context line under
+    an Action items row. A to-do that still carries a `why` key (an old-shaped
+    artifact, or a caller that has not been updated) must not leak it into either
+    renderer -- the field is retired at the render boundary, not just at the source."""
     import lambda_session_finalize as sf
 
     _subj, text, html = sf.build_confirmation_email(
@@ -262,14 +275,15 @@ def test_the_reason_a_todo_exists_reaches_both_halves_of_the_email():
 
     for where, body in (("text", text), ("html", html)):
         assert "Price the device as a company phone" in body, where
-        assert "procurement will not sign off on a per-seat licence" in body, (
-            f"the {where} email dropped the reason the to-do exists")
+        assert "procurement will not sign off on a per-seat licence" not in body, (
+            f"the {where} email still renders the retired context line")
 
 
 def test_a_todo_without_a_reason_renders_exactly_as_before():
-    """The rolling summariser produces no `why`, and a brief whose model omitted it produces
-    none either. Neither may gain an empty line, a dash, or an empty table cell — an absent
-    explanation must look absent, not missing."""
+    """The rolling summariser produces no `why`, and (as of this task) neither does
+    a brief. This test now describes every to-do, not just the ones without a
+    reason: no item may gain an empty line, a dash, or an empty table cell under
+    it -- there is no per-item context line left to render, for any to-do."""
     import lambda_session_finalize as sf
 
     _, text, html = sf.build_confirmation_email(
@@ -281,3 +295,80 @@ def test_a_todo_without_a_reason_renders_exactly_as_before():
     lines = [ln for ln in text.splitlines() if ln.strip()]
     idx = next(i for i, ln in enumerate(lines) if "Chase the delivery" in ln)
     assert idx == len(lines) - 1 or not lines[idx + 1].startswith("      "), lines[idx:idx + 2]
+
+
+# --- B2: the owner's display name reaches the brief ---------------------------
+# Plumbing only (2026-09-17 plan, task B2): `folder` is already in hand at
+# `_complete_summary` (e.g. "Ben_Lin"); `_display_name` turns it into "Ben Lin"
+# and that name is bound into the brief branch only. The rolling branch (used
+# when SESSION_BRIEF is off) is untouched -- it stays a plain `summarize_turns`
+# call over turns alone, because that is the contract `brief_from_turns` was
+# built to be a drop-in for (session_brief.py module docstring).
+
+def test_the_owner_name_is_derived_from_the_folder():
+    assert fin._display_name("Ben_Lin") == "Ben Lin"
+    assert fin._display_name("Ben_UCPK2") == "Ben UCPK2"
+    assert fin._display_name("") is None
+
+
+def test_a_missing_surname_does_not_leave_a_trailing_space():
+    """A NULL `last_name` produces the folder "Ben_UCPK_" -- a real shape in this
+    repo (the display-name trailing-space defect). Passed through unchanged it
+    reaches the brief prompt as "...belongs to Ben UCPK ." with a space before
+    the full stop, which reads to the model as a name that is still being typed.
+
+    Mutation: drop the whitespace collapse in `_display_name` -> red."""
+    assert fin._display_name("Ben_UCPK_") == "Ben UCPK"
+    assert fin._display_name("_Ben_Lin") == "Ben Lin"
+    assert fin._display_name("Ben__Lin") == "Ben Lin"
+    # A folder that is nothing but separators has no name in it at all, and a
+    # caller's `if owner_name:` must not be handed an empty string to print.
+    assert fin._display_name("_") is None
+    assert fin._display_name("   ") is None
+
+
+def test_the_rolling_summariser_is_still_called_with_turns_alone(monkeypatch):
+    import lambda_extract_session as ex
+    import lambda_rolling_summary as rs
+
+    turns = [{"abs_start_str": "13:00:00", "speaker": "spk_0", "text": "hi"}]
+    monkeypatch.setattr(ex, "gather_session_segments", lambda *a, **k: ["k1"], raising=False)
+    monkeypatch.setattr(ex, "assemble_deduped_turns", lambda *a, **k: (turns, {}), raising=False)
+
+    calls = []
+
+    def spy(*a, **k):
+        calls.append((a, k))
+        return {"summary": "s", "open_todos": []}
+
+    monkeypatch.setattr(fin, "SESSION_BRIEF", False, raising=False)
+    monkeypatch.setattr(rs, "summarize_turns", spy, raising=False)
+
+    out = fin._complete_summary({"folder": "Ben_Lin", "date": "2026-08-19", "sessionId": "abc"})
+
+    assert out == {"summary": "s", "open_todos": []}
+    assert calls == [((turns,), {})]
+
+
+def test_the_brief_is_called_with_the_folders_display_name(monkeypatch):
+    import lambda_extract_session as ex
+    import session_brief as sb
+
+    turns = [{"abs_start_str": "13:00:00", "speaker": "spk_0", "text": "hi"}]
+    monkeypatch.setattr(ex, "gather_session_segments", lambda *a, **k: ["k1"], raising=False)
+    monkeypatch.setattr(ex, "assemble_deduped_turns", lambda *a, **k: (turns, {}), raising=False)
+
+    seen = {}
+
+    def spy(passed_turns, **k):
+        seen["turns"] = passed_turns
+        seen.update(k)
+        return {"summary": "s", "open_todos": []}
+
+    monkeypatch.setattr(fin, "SESSION_BRIEF", True, raising=False)
+    monkeypatch.setattr(sb, "brief_from_turns", spy, raising=False)
+
+    fin._complete_summary({"folder": "Ben_Lin", "date": "2026-08-19", "sessionId": "abc"})
+
+    assert seen["turns"] == turns
+    assert seen.get("owner_name") == "Ben Lin"

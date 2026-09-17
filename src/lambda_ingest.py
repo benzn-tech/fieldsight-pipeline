@@ -306,6 +306,16 @@ def _occurred_at_seconds(occurred_at):
     doubles / any future text representation). None/unparseable -> None."""
     if occurred_at is None:
         return None
+    # An AWARE value is an instant, not a wall clock. psycopg returns timestamptz
+    # in the connection's zone (UTC here), while the report's time_range is the
+    # DEVICE's wall clock -- 12-13h apart in New Zealand. Taking .hour off it
+    # would turn "no signal" into a confident wrong pairing that beats every
+    # title match, and that pairing decides which topic Ask cites. No writer sets
+    # topics.occurred_at today, so this matcher has only ever run on titles in
+    # production; refusing instants keeps it there until a conversion through
+    # the zone that stamped the clock exists and has been measured.
+    if getattr(occurred_at, "tzinfo", None) is not None and             occurred_at.utcoffset() is not None:
+        return None
     if hasattr(occurred_at, "hour") and hasattr(occurred_at, "minute"):
         return (occurred_at.hour * 3600 + occurred_at.minute * 60
                 + getattr(occurred_at, "second", 0))
@@ -691,6 +701,10 @@ def ingest_report(date, user_folder, report_key):
                     # them, and without this line the Timeline loses a day's
                     # questions entirely.
                     open_questions=t.get("open_questions") or t.get("questions"),
+                    # The report path spells it `key_decisions` (plain strings,
+                    # what lambda_report_generator emits); the extraction schema
+                    # spells it `decisions` (objects). One column holds both.
+                    decisions=t.get("key_decisions") or t.get("decisions"),
                     photos=[{"s3_key": p["key"], "caption_text": None}
                             for p in photos_by_topic.get(i, [])],
                 )

@@ -298,6 +298,46 @@ Parameters:
     Description: DashScope OpenAI-compatible base URL for Qwen chat completions
     Default: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 
+  AskConversationMemory:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Rewrite a follow-up question into one that stands on its own, using the
+      previous turns. Off by default on every stack. The conversation reaches
+      the rewrite only and never the answering prompt, so a recording deleted
+      between turns cannot be quoted or cited -- see the design's 2.1.
+
+  AskRewriteBudget:
+    Type: String
+    Default: '4.0'
+    Description: >-
+      Seconds the follow-up rewrite (AskConversationMemory) may spend before
+      the agent gives up and answers the raw question instead.
+
+  AskDistanceGate:
+    Type: String
+    Default: '0.55'
+    Description: >-
+      Vector-distance cutoff for retrieved chunks used by Ask's retrieval
+      step. A Parameter so the gate can be recalibrated without a code change.
+
+  EnableWebAnswer:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Answer from the open web when the retrieved excerpts do not answer the
+      question. Off by default on every stack, for the same reason
+      EnableExternalCorroboration is: it sends something derived from a
+      customer's meeting toward a search engine, and whether the pilot contracts
+      permit that is a commercial decision rather than a deploy-time default.
+
+      What actually leaves is narrower than corroboration's: gate-screened entity
+      NAMES taken from the QUESTION, at most three, with no claim text attached.
+      The question itself and the excerpts go only to the LLM provider, which
+      already receives them on every /ask.
+
   CorroborationApiKey:
     Type: String
     NoEcho: true
@@ -1024,6 +1064,37 @@ Parameters:
       script (CJK at ~2 chars per token) so a fully specific Chinese quote is
       not capped at `weak` for having no spaces in it.
 
+  EnableRecordingBlocks:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether RecordingSegmentsFunction keeps day_recording_segments current: its
+      transcripts/ Object Created rule and its rate(5 minutes) trailing pass both
+      take their State from this. Off means both rules are DISABLED, no row is
+      ever written, and GET /api/org/sessions carries no recording_blocks key, so
+      the picker renders sessions exactly as before. Never on the finalize/email
+      path (design D5): the only coupling to email latency is account
+      concurrency, which the function caps at 2.
+
+  ReportBlockGapSeconds:
+    Type: String
+    Default: '600'
+    Description: >-
+      Silence, in seconds, that splits a day's recorded segments into separate
+      recording blocks in the report picker (design D2). Read by org-api only,
+      per request, against the raw segments stored per day, so a change reaches
+      every day including finished ones (review finding F9). Separate from
+      session_scope.SESSION_GAP_MINUTES, which this does not touch (D4).
+
+  ReportLongBlockSeconds:
+    Type: String
+    Default: '5400'
+    Description: >-
+      A recording block longer than this many seconds is not selectable as a
+      whole; its topics are the unit instead (design D1/D2, 90 minutes). Read by
+      org-api only, for the same single-reader reason as ReportBlockGapSeconds.
+
   DeviceAnnouncementPatterns:
     Type: String
     Default: ''
@@ -1199,6 +1270,7 @@ Conditions:
   HasVoiceprintSpreadOverride: !Not [!Equals [!Ref VoiceprintMaxFrameSpread, 'default']]
   ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
   ShouldEnableFinalize: !Equals [!Ref EnableFinalize, 'true']
+  ShouldEnableRecordingBlocks: !Equals [!Ref EnableRecordingBlocks, 'true']
   ShouldEnableSweepPendingGate: !Equals [!Ref EnableSweepPendingGate, 'true']
   ShouldEnableNonWorkExpiry: !Equals [!Ref EnableNonWorkExpiry, 'true']
   ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
@@ -1213,6 +1285,10 @@ Conditions:
   # behind HasDb, so its alarm needs BOTH conditions or the stack fails to
   # create in a no-database configuration.
   ShouldAlarmItemWriter: !And
+    - !Condition ShouldCreateAlerts
+    - !Condition HasDb
+  # Same reason as ShouldAlarmItemWriter: RecordingSegmentsFunction is behind HasDb.
+  ShouldAlarmRecordingSegments: !And
     - !Condition ShouldCreateAlerts
     - !Condition HasDb
   HasTranscribeReserve: !Not [!Equals [!Ref TranscribeReservedConcurrency, '0']]
@@ -1393,7 +1469,7 @@ Resources:
         - HasTranscribeReserve
         - !Ref TranscribeReservedConcurrency
         - !Ref AWS::NoValue
-      Timeout: 300
+      Timeout: 900
       MemorySize: 128
       Environment:
         Variables:
@@ -1595,7 +1671,7 @@ Resources:
       FunctionName: !Sub ["${P}-transcribe-callback", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_transcribe_callback.lambda_handler
-      Timeout: 60
+      Timeout: 120
       MemorySize: 128
       Environment:
         Variables:
@@ -1634,7 +1710,7 @@ Resources:
       FunctionName: !Sub ["${P}-meeting-minutes", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_meeting_minutes.lambda_handler
-      Timeout: 600  # must exceed LLM_HTTP_TIMEOUT below, or the runtime kills this before urllib3 raises
+      Timeout: 900  # must exceed LLM_HTTP_TIMEOUT below, or the runtime kills this before urllib3 raises
       MemorySize: 512
       Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24) — on 3.11 Word generation silently disables
       Layers: !If
@@ -1681,7 +1757,7 @@ Resources:
       FunctionName: !Sub ["${P}-session-report", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_session_report.lambda_handler
-      Timeout: 300
+      Timeout: 900
       MemorySize: 512
       Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24)
       Layers: !If
@@ -1695,6 +1771,24 @@ Resources:
           # part of the DNS/SES work; flip to 'ses' + set SENDER_EMAIL then.
           EMAIL_SENDER: stub
           SENDER_EMAIL: ''
+          # Same keys ReportGeneratorFunction already carries, verbatim (its parameter
+          # names, not invented ones) — this worker now makes the one model call a
+          # `generate` request needs.
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          CLAUDE_MODEL: claude-sonnet-4-6
+          LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelPlus
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
+          QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
+          QWEN_ENABLE_THINKING: 'true'
+          # One attempt must fit inside Timeout: 900 with room for the docx render.
+          LLM_HTTP_TIMEOUT: '300'
+          GENERATION_BUDGET_SECONDS: '600'
+          # Pre-check on transcript objects in one window (transcript_window.py).
+          MAX_TRANSCRIPT_OBJECTS: '2000'
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -1709,11 +1803,17 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/users/*/pictures/*
                 # The deletion mirror. `_session_was_deleted` reads it so a session
                 # removed between the enqueue and this run is neither rendered nor
-                # mailed. The read is LENIENT, so a missing grant does not fail --
-                # it answers "nothing was deleted" behind one WARNING line, which
-                # is a guard shipping dead. implicitDeny on both stages before
+                # mailed. Owner decision (2026-09-16): the read now FAILS CLOSED --
+                # a missing grant is no longer a silent dead guard behind one
+                # WARNING line, it raises, and `process_request` records the
+                # request as `status: "error"`, so every report for that day fails
+                # until the grant is restored. implicitDeny on both stages before
                 # this line existed.
                 - !Sub arn:aws:s3:::${IngestBucketName}/redactions/*
+                # The transcript objects a `generate` request reads to build its
+                # prompt (transcript_window.select_keys/assemble). This worker had
+                # no read of transcripts/ at all before generation existed.
+                - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
@@ -1724,14 +1824,17 @@ Resources:
               # is not enough for the mirror: without ListBucket on the prefix S3
               # answers AccessDenied rather than NoSuchKey for a key that was
               # never written -- and a day with NO deletions has no mirror, which
-              # is the common case. The lenient reader would then log an exception
-              # on every report generated, forever (#627's family).
+              # is the common case. Without this, the now-strict reader would
+              # raise and fail every report request, forever (#627's family).
+              # transcripts/* is listed here too: select_keys() lists the day's
+              # transcript prefix before reading any key under it.
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
                 StringLike:
                   s3:prefix:
                     - redactions/*
+                    - transcripts/*
             - Effect: Allow
               # SES send for the 'email' delivery option — harmless while
               # EMAIL_SENDER=stub (the stub never calls SES). Verified-identity
@@ -1758,7 +1861,19 @@ Resources:
       FunctionName: !Sub ["${P}-ask-agent", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_ask_agent.lambda_handler
-      Timeout: 60
+      # Hard kill. At or below ApiFunction's Timeout (28, below), which is
+      # itself below API Gateway's fixed 29s integration timeout -- so the
+      # Lambda runtime is what stops an overrun, not a 504 with the model call
+      # still running and still billing. See test_the_ask_timeouts_descend.
+      #
+      # 28, not 27: two IN-CODE hard stops run INSIDE this function --
+      # corroboration.HARD_STOP_SECONDS and web_answer.HARD_STOP_SECONDS,
+      # both measured and deliberately sized to 27s (see those modules). At
+      # Timeout=27 the runtime kills the function at the exact moment those
+      # stops fire, leaving no time to return the shaped `timed_out` body
+      # they exist to produce -- found reviewing a later task, both features
+      # ON on TEST. See test_no_in_code_hard_stop_reaches_the_runtime_kill.
+      Timeout: 28
       MemorySize: 256
       Environment:
         Variables:
@@ -1766,7 +1881,21 @@ Resources:
           # before urllib3 raises and the `except` that exists for a slow LLM never
           # runs. `llm_utils` defaults it to 150 s and explains the ordering; three
           # functions here had it inverted, all by leaving it at that default.
-          LLM_HTTP_TIMEOUT: '45'
+          # One model call inside a request whose whole budget is
+          # ASK_DEADLINE_SECONDS below -- strictly less, or a single call can
+          # spend the entire request and leave nothing for retrieval, the
+          # rewrite or synthesis.
+          LLM_HTTP_TIMEOUT: '21'
+          # Voluntary deadline: the agent's whole-request budget. A ladder
+          # constant, not a switch -- kept a literal (not a Parameter) so one
+          # reader (_env_value) works for every number in the ladder; see
+          # ASK_INVOKE_TIMEOUT on ApiFunction for the rest of it.
+          ASK_DEADLINE_SECONDS: '24'
+          # Task 9: the three Ask flags, wired in three places each (Parameter,
+          # here, both workflows).
+          ASK_CONVERSATION_MEMORY: !Ref AskConversationMemory
+          ASK_REWRITE_BUDGET: !Ref AskRewriteBudget
+          ASK_DISTANCE_GATE: !Ref AskDistanceGate
           S3_BUCKET: !Ref DataBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           HAIKU_MODEL: claude-haiku-4-5-20251001
@@ -1822,6 +1951,9 @@ Resources:
           # parameter for why borrowing that one sends the wrong vendor's
           # credential on any DashScope-pointed stack.
           CORROBORATION_API_KEY: !Ref CorroborationApiKey
+          # Reads the same credential and the same vendor as corroboration; the
+          # separate flag is about the decision, not the plumbing.
+          ENABLE_WEB_ANSWER: !Ref EnableWebAnswer
       Layers:
         - !Ref DashScopeLayer
       Policies:
@@ -1973,6 +2105,10 @@ Resources:
           # AUTHORITY_FLIP (IngestFunction, above): Parameter default 'false',
           # driven per-environment by a repo variable in the deploy workflows.
           GRADED_ROLES: !Ref GradedRoles
+          # Recording-block thresholds (design 2026-09-15 §5.5 as amended by F9). org-api
+          # is the ONLY function given these: it merges stored segments at read time.
+          REPORT_BLOCK_GAP_SECONDS: !Ref ReportBlockGapSeconds
+          REPORT_LONG_BLOCK_SECONDS: !Ref ReportLongBlockSeconds
           # Does `complete` verify the bytes arrived before stamping
           # uploaded_at? See the UploadVerifyMode parameter.
           ENABLE_USER_DELETION: !Ref EnableUserDeletion
@@ -2215,6 +2351,13 @@ Resources:
               # valid if the role can GetObject the key).
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+            - Effect: Allow
+              # POST /api/org/reports/regenerate: the caller's own report, handed to
+              # the non-VPC ReportGeneratorFunction as report_requests/<folder>/<rid>.json
+              # (BUG-36), wired by hand in scripts/wire-s3-events.sh (BUG-33). Write
+              # only: the generator reads the request, org-api never does.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/report_requests/*
             # A speaker correction, handed OUTWARD across the VPC boundary the same way.
             # Write only, and no grant on voiceprint_results/: those go to the in-VPC
             # writer by direct invoke from the embedder, and a read grant here would be an
@@ -2358,14 +2501,14 @@ Resources:
       FunctionName: !Sub ["${P}-extract-session", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_extract_session.lambda_handler
-      # 600s (was 180s): the FINAL pass runs the model in thinking mode, which
+      # 900s (was 180s): the FINAL pass runs the model in thinking mode, which
       # measured ~170s in prod on 2026-08-03 and therefore lost the race against
       # llm_utils.HTTP_TIMEOUT (150s) -> urllib3 timeout -> retry -> hard-killed
       # at the old 180s ceiling. 664 invocations died exactly this way in one
       # afternoon. LLM_HTTP_TIMEOUT below stays under the Lambda Timeout so a slow
       # call surfaces as a catchable error instead of a runtime kill.
       # The LIVE pass is unaffected: it runs thinking OFF and returns in seconds.
-      Timeout: 600
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
@@ -2497,7 +2640,7 @@ Resources:
       # effort): 37.3 s in the model, 47.3 s in the function. That fits inside
       # 120 -- but a day twice that size does not, and long days are exactly the
       # ones whose summary matters. The headroom is cheap; the cliff is not.
-      Timeout: 300
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
@@ -2576,7 +2719,7 @@ Resources:
       FunctionName: !Sub ["${P}-session-activity", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: session_activity.lambda_handler
-      Timeout: 60
+      Timeout: 120
       MemorySize: 256
       Layers:
         - !Ref PsycopgLayer
@@ -2650,6 +2793,97 @@ Resources:
                     - suffix: _vad_metadata.json
 
   # ----------------------------------------------------------
+  # Recording blocks (design 2026-09-15 §5.4, review F1/F4/F8/F9). Keeps
+  # day_recording_segments current from the transcript stream so the report
+  # picker can offer "10:55-11:35" as one stretch. In-VPC for Aurora; its other
+  # calls are S3 ListObjectsV2 and one DynamoDB flag, both through the VPC's
+  # existing gateway endpoints (BUG-36: nothing else is reachable from here).
+  # Deliberately NOT folded into SessionActivityFunction above: that function
+  # feeds finalize, and this one must never sit on the email path (D5).
+  # ----------------------------------------------------------
+  RecordingSegmentsFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-recording-segments", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_recording_segments.lambda_handler
+      Timeout: 120
+      MemorySize: 256
+      # Every transcript landing invokes this, and account concurrency is shared with
+      # finalize. 2 bounds what a burst can take. A throttled async invocation is queued
+      # and retried by Lambda and logs NOTHING while it waits -- the Throttles metric is
+      # the only signal. The rate(5 minutes) pass below heals any day left dirty.
+      ReservedConcurrentExecutions: 2
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          S3_BUCKET: !Ref IngestBucketName
+          # The trailing pass's "any dirty day?" flag -- its own item in the items table
+          # (sweep_state key RECORDING_BLOCKS#{stage}), so an idle tick skips Aurora and
+          # the cluster can still auto-pause (test_sweep_cadence_vs_autopause).
+          SWEEP_STATE_TABLE: !Ref ItemsTableName
+          STAGE: !Ref Stage
+          # No REPORT_BLOCK_* here, on purpose: this function stores raw segments and
+          # org-api is the single reader of both thresholds (F9).
+      Policies:
+        - VPCAccessPolicy: {}
+        # In-VPC, but DynamoDB is reachable through the existing gateway endpoint
+        # (vpce-01233d5b756ffefcb) -- no NAT, no new paid endpoint. The same grant
+        # SessionActivityFunction carries for the finalize flag.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTableName
+        # Names only. Without ListBucket a missing key answers 403, not 404; this function
+        # never GETs, so it is granted nothing else under transcripts/.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - transcripts/*
+      Events:
+        # Template-declared EventBridge rule, the SessionActivityFunction pattern -- not
+        # a bucket notification (BUG-33: SAM cannot attach S3 events to an external bucket).
+        TranscriptLanded:
+          Type: EventBridgeRule
+          Properties:
+            State: !If [ShouldEnableRecordingBlocks, ENABLED, DISABLED]
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - Object Created
+              detail:
+                bucket:
+                  name:
+                    - !Ref IngestBucketName
+                object:
+                  key:
+                    - prefix: transcripts/
+        # The trailing pass (F4): recomputes every day the debounce marked dirty. Connects
+        # to Aurora only when its flag is set, plus one hourly safety tick.
+        DirtyDaySweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Recording blocks trailing pass - recomputes days the debounce marked dirty.
+            State: !If [ShouldEnableRecordingBlocks, ENABLED, DISABLED]
+
+  # ----------------------------------------------------------
   # Tier-0 finalize — grace SWEEP (in-VPC) + send WORKER (non-VPC).
   # session_close records pending_close + version + close_intent (in-VPC, Aurora)
   # but can't reach the EventBridge Scheduler API to arm a one-shot (BUG-36), so a
@@ -2670,7 +2904,7 @@ Resources:
       FunctionName: !Sub ["${P}-nonwork-expiry", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_nonwork_expiry.lambda_handler
-      Timeout: 300
+      Timeout: 900
       MemorySize: 512
       Layers:
         - !Ref PsycopgLayer
@@ -2855,15 +3089,15 @@ Resources:
       FunctionName: !Sub ["${P}-session-finalize", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_session_finalize.lambda_handler
-      # 300, not 120. This function re-summarises the FULL transcript at finalize, and 120
+      # 900, not 120. This function re-summarises the FULL transcript at finalize, and 120
       # was sized for the rolling summariser it used to call -- whose input is already
       # compressed. Measured on a real 26-minute session (316 turns, 17 K chars rendered):
       # the invocation was hard-killed at exactly 120000 ms, three times, with no email sent.
       #
       # Sizing is against the OTHER full-transcript LLM caller rather than a guess:
-      # ExtractSessionFunction gets 600 s for the same class of work. 300 leaves the HTTP
+      # ExtractSessionFunction gets 900 s for the same class of work. 900 leaves the HTTP
       # timeout below room to lose its race (see LLM_HTTP_TIMEOUT), which 120 did not.
-      Timeout: 300
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
@@ -2927,6 +3161,14 @@ Resources:
                 # simulate-principal-policy returned implicitDeny on BOTH stages
                 # before this line existed.
                 - !Sub arn:aws:s3:::${IngestBucketName}/redactions/*
+                # handoff-sync plan §2.3: this function could PutObject here
+                # (below) but not read it back. The final email (kind == "final")
+                # polls this exact prefix for the brief lambda_finalize_claim
+                # asked for concurrently (§2.2) -- without GetObject the read is
+                # AccessDenied, which a lenient reader turns into "not ready yet",
+                # and every email would silently fall back to extraction rows
+                # while every test stayed green.
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_brief/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
@@ -2936,6 +3178,13 @@ Resources:
                 # (CLAUDE.md: a guard that catches is not a feature that works).
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_brief/*
             - Effect: Allow
+              # Its OWN results, read back: `_already_sent` asks whether this
+              # session's email has gone out before sending another. The
+              # function could write this prefix and not read it.
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
+            - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
@@ -2943,12 +3192,26 @@ Resources:
                   s3:prefix:
                     - transcripts/*
                     - voice_ask/*
+                    # GetObject alone is not enough here either: the ORDINARY
+                    # case is a session that has not been sent yet, i.e. a key
+                    # that was never written, and without ListBucket S3 answers
+                    # AccessDenied instead of NoSuchKey. The lenient reader
+                    # would then log a warning on every single finalize.
+                    - session_finalize_results/*
                     # GetObject alone is not enough: without ListBucket on this
                     # prefix S3 answers AccessDenied rather than NoSuchKey for a
                     # key that was never written, and a day with NO deletions has
                     # no mirror -- which is the common case. The lenient reader
                     # would then log an exception on every finalize forever.
                     - redactions/*
+                    # Same reason, same trap: the final email's brief poll (§2.2)
+                    # almost always hits this BEFORE the concurrent brief request
+                    # (§2.1) has written it -- that is the ordinary "not ready
+                    # yet" case on every attempt but the last. Without
+                    # ListBucket that read is AccessDenied, not NoSuchKey, and
+                    # `_read_brief` would log it as a loud permissions failure on
+                    # every single poll of every single session.
+                    - session_brief/*
             - Effect: Allow
               Action:
                 - ses:SendEmail
@@ -3103,7 +3366,7 @@ Resources:
       FunctionName: !Sub ["${P}-embed-report", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_embed_report.lambda_handler
-      Timeout: 300
+      Timeout: 900
       MemorySize: 512
       Layers:
         - !Ref PsycopgLayer
@@ -3183,6 +3446,10 @@ Resources:
           ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           GROUP_MERGE_CAP: !Ref GroupMergeCap
+          # item-writer reads this through lambda_ingest.AUTHORITY_FLIP. It was only
+          # ever given to IngestFunction, so the late-extraction rule in
+          # write_extraction_items could never see the flag on a deployed stack.
+          AUTHORITY_FLIP: !Ref AuthorityFlip
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -3276,7 +3543,7 @@ Resources:
       # N times) the decode+upload work won't fit 120s, and a mid-run timeout
       # commits zero DB bindings while leaving S3 uploads. Give generous
       # headroom (still well under the 900s Lambda ceiling).
-      Timeout: 600
+      Timeout: 900
       MemorySize: 1024
       # No Runtime override: inherits the python3.11 Global. The ffmpeg layer is
       # 3.11-compatible and PsycopgLayer is cp311-only, so both load on 3.11.
@@ -3378,11 +3645,11 @@ Resources:
       CodeUri: src/
       Handler: lambda_speaker_embed.lambda_handler
       Runtime: python3.12
-      # 600, not 120: this path is asynchronous (S3-triggered), so no API Gateway ceiling
+      # 900, not 120: this path is asynchronous (S3-triggered), so no API Gateway ceiling
       # applies, and propagation now embeds every turn of a session rather than one window.
       # Capping COVERAGE to fit a timeout would trade a visible promise for a number that
       # costs nothing to raise.
-      Timeout: 600
+      Timeout: 900
       MemorySize: 1769
       ReservedConcurrentExecutions: 5
       Layers:
@@ -3546,14 +3813,14 @@ Resources:
       FunctionName: !Sub ["${P}-programme-matcher", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_programme_matcher.lambda_handler
-      # 600s (bumped from 300 by the 2026-07-13 plan's Task 4): the impact
+      # 900s (bumped from 300 by the 2026-07-13 plan's Task 4): the impact
       # phase adds a SECOND `claude_utils.call_claude` per topic (each up to
       # claude_utils' 150s HTTP timeout), so a multi-topic artifact can now
       # need up to ~2x the sequential Claude time it used to. 300s left
       # headroom for one slow call per topic (Fable review IMPORTANT #4);
       # doubling that per-topic cost while keeping room for several topics
       # per invocation needs the doubled budget too.
-      Timeout: 600
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
@@ -3638,7 +3905,11 @@ Resources:
       FunctionName: !Sub ["${P}-rag-search", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_rag_search.lambda_handler
-      Timeout: 30
+      # Invoked synchronously by AskAgentFunction, so must give up before
+      # AskAgentFunction's Timeout (28) and before that function's
+      # ASK_DEADLINE_SECONDS (24) -- otherwise this callee can outlive
+      # the request it serves.
+      Timeout: 23
       MemorySize: 512
       Layers:
         - !Ref PsycopgLayer
@@ -3672,7 +3943,7 @@ Resources:
       FunctionName: !Sub ["${P}-voice-audit", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_voice_audit.lambda_handler
-      Timeout: 30
+      Timeout: 120
       MemorySize: 256
       Layers:
         - !Ref PsycopgLayer
@@ -3713,7 +3984,7 @@ Resources:
       FunctionName: !Sub ["${P}-voice-reaper", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_voice_reaper.lambda_handler
-      Timeout: 60
+      Timeout: 120
       MemorySize: 256
       Layers:
         - !Ref PsycopgLayer
@@ -4158,7 +4429,11 @@ Resources:
       FunctionName: !Sub ["${P}-api", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_fieldsight_api.lambda_handler
-      Timeout: 30
+      # Hard kill. Must die before API Gateway's fixed 29s integration
+      # timeout, so this Lambda's own runtime is what reports the overrun --
+      # not a gateway 504 with AskAgentFunction still running and still
+      # billing. See test_the_ask_timeouts_descend.
+      Timeout: 28
       MemorySize: 256
       Environment:
         Variables:
@@ -4170,6 +4445,13 @@ Resources:
           USERS_TABLE: !Ref UsersTableName
           REPORT_FUNCTION: !Ref ReportGeneratorFunction
           ASK_AGENT_FUNCTION: !Ref AskAgentFunction
+          # How long this function waits for the Ask Agent. Below its own
+          # Timeout (above) so the invoke fails here, in code that can name
+          # it -- and above AskAgentFunction's ASK_DEADLINE_SECONDS (24), so
+          # this caller never abandons a callee that is still working
+          # correctly. Literal, not a Parameter -- see AskAgentFunction's
+          # ASK_DEADLINE_SECONDS for why.
+          ASK_INVOKE_TIMEOUT: '26'
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
@@ -4633,6 +4915,41 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: !Ref TranscribeFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # Recording blocks (design 2026-09-15 §7). RecordingSegmentsFunction runs with
+  # ReservedConcurrentExecutions 2, and a throttled ASYNC invocation writes no log line at
+  # all: Lambda retries it and, past MaximumEventAge, discards it silently, so a day's
+  # blocks stop updating with nothing in the logs. This metric is the only signal.
+  #
+  # TreatMissingData: notBreaching, unconditionally -- deliberately NOT tied to
+  # ShouldEnableRecordingBlocks the way ExtractionBacklogAlarm ties its policy to its sweep.
+  # That pattern is for a series the function publishes on EVERY run, where absence means
+  # the publisher died. Throttles has no datapoint in a period with no throttle, on every
+  # stack and with the switch on or off, so absence is never a fault here; a real throttle
+  # is a datapoint >= 1, which notBreaching cannot hide. `breaching` would page every quiet
+  # period.
+  RecordingSegmentsThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldAlarmRecordingSegments
+    Properties:
+      AlarmName: !Sub ["${P}-recording-segments-throttles", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        RecordingSegmentsFunction invocations are being throttled (reserved concurrency 2).
+        Throttled events write no log and are discarded past MaximumEventAge, so report-picker
+        recording blocks can go stale silently. Check dirty rows in day_recording_segments.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RecordingSegmentsFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1

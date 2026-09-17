@@ -13,8 +13,11 @@ CRITICAL: this lambda NEVER embeds text and NEVER calls Claude/DashScope.
 It runs in-VPC with no NAT / no internet egress (BUG-36) — it only accepts
 an already-computed query_embedding and searches Aurora/pgvector with it.
 
-Event:  {"sub": "<cognito sub>", "query_embedding": [1024 floats], "k": 8}
-Result: {"chunks": [...], "site_count": N}
+Event:  {"sub": "<cognito sub>", "query_embedding": [1024 floats], "k": 8,
+         optional "date_from"/"date_to", "widen_when_empty", "site",
+         "author" (folder name), "topic_row_id"}
+Result: {"chunks": [...], "site_count": N, "basis": {...}, "applied": {...},
+         "pinned_topic": {...} only when topic_row_id was visible}
         or, on a soft failure, {"chunks": [], "error": "..."} — this
         function never raises so ask-agent can degrade gracefully instead
         of surfacing a 500 to the UI.
@@ -228,6 +231,14 @@ def _search(event, context):
     # widening a filtered LIST would show rows outside the filter they set.
     widen = bool(event.get("widen_when_empty"))
 
+    # Scoped Ask (spec 2026-09-15 §4.3). Requests, never grants: each one only
+    # narrows inside the ACL resolved below, and `applied` reports what was
+    # enforced. `dropped` lists what was requested and not enforced.
+    requested_topic = event.get("topic_row_id") or None
+    author_filter = event.get("author") or None
+    applied = {"dropped": []}
+    pinned = None
+
     # What the answer will be based on. Carried on EVERY return below, empty
     # search included: a caller reading `result.get("basis")` and finding None
     # cannot tell "this search matched nothing" from "this deploy predates the
@@ -240,7 +251,8 @@ def _search(event, context):
     basis = {"from": date_from, "to": date_to, "widened": False}
 
     if not sub or not qv:
-        return {"chunks": [], "error": "missing sub or query_embedding", "basis": basis}
+        return {"chunks": [], "error": "missing sub or query_embedding", "basis": basis,
+                "applied": applied}
 
     # Reuse a module-level connection across warm invokes — reconnecting to
     # Aurora cost ~1-2s per call and dominated search latency. Read-only path,
@@ -249,7 +261,8 @@ def _search(event, context):
     caller = users.get_user_by_sub(conn, sub)
     if caller is None:
         logger.info("rag-search: caller not provisioned for sub=%s", sub)
-        return {"chunks": [], "error": "caller not provisioned", "basis": basis}
+        return {"chunks": [], "error": "caller not provisioned", "basis": basis,
+                "applied": applied}
 
     # Fail-safe: ALWAYS scope through the dashboard's ACL primitive (per-author
     # graded visibility). No GRADED_ROLES gate here — rag-search is a new
@@ -259,6 +272,33 @@ def _search(event, context):
     site_ids = [str(s) for s in sc["site_ids"]]
     author_ids = ([str(a) for a in sc["author_ids"]]
                   if sc["author_ids"] is not None else None)
+
+    # A pinned topic defines the site, the day and (when known) the author. It
+    # is read through the caller's ACL; anything it cannot see is the same None.
+    # A requested `site`/`author` alongside a visible topic is not applied --
+    # the topic defines them -- and each is reported dropped (controller
+    # ruling, spec §4.3.1, commit 1e21006).
+    if requested_topic:
+        pinned = topics.get_topic_visible(conn, requested_topic, site_ids, author_ids)
+        if pinned:
+            if site_filter:
+                applied["dropped"].append({"field": "site_id", "reason": "overridden_by_topic"})
+            if author_filter:
+                applied["dropped"].append({"field": "author_folder", "reason": "overridden_by_topic"})
+            site_ids = [str(pinned["site_id"])]
+            # A NULL author must not become ANY(ARRAY[NULL]), which matches nothing.
+            if pinned.get("user_id") is not None:
+                author_ids = [str(pinned["user_id"])]
+            date_from = date_to = str(pinned["report_date"])
+            widen = False              # the topic's day, never a neighbour of it
+            site_filter = None         # the topic defines the site ...
+            author_filter = None       # ... and the author
+            basis = {"from": date_from, "to": date_to, "widened": False}
+            applied.update({"topic_row_id": pinned["id"], "topic_title": pinned.get("title"),
+                            "site_id": site_ids[0], "date": date_from})
+        else:
+            applied["dropped"].append({"field": "topic_row_id", "reason": "not_visible"})
+            logger.info("rag-search: topic_row_id not visible to caller")
 
     # Project-scoped search: `site_filter` is normally the site UUID (what the
     # UI's top-bar selector actually sends), so check it against the caller's
@@ -276,8 +316,30 @@ def _search(event, context):
             matched_id = matched["id"] if matched else None
             site_ids = [s for s in site_ids if str(s) == str(matched_id)]
 
+        if site_ids:
+            applied["site_id"] = str(site_ids[0])
+        else:
+            applied["dropped"].append({"field": "site_id", "reason": "not_visible"})
+
+    # A named author narrows INSIDE the ACL and never falls back to the
+    # unnarrowed set: unresolved, or outside author_ids, means no rows. Company-
+    # pinned lookup unless the caller is cross-company (users.py:69-82).
+    if author_filter:
+        if sc.get("cross_company"):
+            target = users.get_by_folder_name_global(conn, author_filter)
+        else:
+            target = users.get_by_folder_name(conn, caller["company_id"], author_filter)
+        target_id = str(target["id"]) if target else None
+        if target_id and (author_ids is None or target_id in author_ids):
+            author_ids = [target_id]
+            applied["author_folder"] = author_filter
+        else:
+            applied["dropped"].append({"field": "author_folder", "reason": "not_visible"})
+            return {"chunks": [], "site_count": len(site_ids), "basis": basis,
+                    "applied": applied}
+
     if not site_ids:
-        return {"chunks": [], "site_count": 0, "basis": basis}
+        return {"chunks": [], "site_count": 0, "basis": basis, "applied": applied}
 
     rows = chunks.search_chunks(conn, qv, site_ids, k=k, author_ids=author_ids,
                                 date_from=date_from, date_to=date_to)
@@ -326,4 +388,7 @@ def _search(event, context):
     # and report_date is datetime.date -- Lambda's JSON marshaller can't
     # serialize either. Coerce to plain strings before returning.
     rows = json.loads(json.dumps(rows, default=str))
-    return {"chunks": rows, "site_count": len(site_ids), "basis": basis}
+    out = {"chunks": rows, "site_count": len(site_ids), "basis": basis, "applied": applied}
+    if pinned:
+        out["pinned_topic"] = pinned
+    return out

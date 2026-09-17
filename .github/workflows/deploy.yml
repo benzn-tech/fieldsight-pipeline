@@ -225,6 +225,10 @@ jobs:
               "EnableUserDeletion=${{ vars.TEST_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.TEST_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \
+              "EnableWebAnswer=${{ vars.TEST_ENABLE_WEB_ANSWER || 'false' }}" \
+              "AskConversationMemory=${{ vars.TEST_ASK_CONVERSATION_MEMORY || 'false' }}" \
+              "AskRewriteBudget=${{ vars.TEST_ASK_REWRITE_BUDGET || '4.0' }}" \
+              "AskDistanceGate=${{ vars.TEST_ASK_DISTANCE_GATE || '0.55' }}" \
               "UploadVerifyMode=${{ vars.TEST_UPLOAD_VERIFY_MODE || 'observe' }}" \
               "SpeakerIdentityMode=${{ vars.TEST_SPEAKER_IDENTITY_MODE || 'off' }}" \
               "EnrolOnCorrection=${{ vars.TEST_ENROL_ON_CORRECTION || 'false' }}" \
@@ -252,6 +256,9 @@ jobs:
               "EvidenceWindowSec=${{ vars.TEST_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.TEST_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
               "EvidenceFloorTokens=${{ vars.TEST_EVIDENCE_FLOOR_TOKENS || '5' }}" \
+              "EnableRecordingBlocks=${{ vars.TEST_ENABLE_RECORDING_BLOCKS || 'true' }}" \
+              "ReportBlockGapSeconds=${{ vars.TEST_REPORT_BLOCK_GAP_SECONDS || '600' }}" \
+              "ReportLongBlockSeconds=${{ vars.TEST_REPORT_LONG_BLOCK_SECONDS || '5400' }}" \
               "LlmTemperature=${{ vars.TEST_LLM_TEMPERATURE || '0' }}" \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \

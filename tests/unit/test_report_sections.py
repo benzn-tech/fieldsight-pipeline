@@ -212,12 +212,31 @@ def test_a_question_asked_twice_is_listed_once():
 # The rest
 # ---------------------------------------------------------------------------
 
-def test_the_summary_is_one_narrative_not_a_list_of_fragments():
-    r = _report(executive_summary=["First thing happened.", "Then another."])
+def test_the_summary_keeps_the_points_the_model_wrote_apart():
+    """Joining them was measured on a real report and it reads as one breath.
+
+    The extractor is ASKED for an array -- `lambda_meeting_minutes`: "executive_summary
+    MUST be an array of bullet strings, NOT a single string" -- and on 2026-09-03 it
+    returned seven separate commitments (falsework breach, tanking by the 29th, the PC
+    certificate, the electrical PS4, Twizel, crane methodology, joinery). `" ".join`
+    turned them into one 90-word sentence whose only punctuation was inside the points
+    themselves, because muse does not end a bullet with a full stop. The reader loses
+    the boundaries the model drew, and nothing fails.
+    """
+    r = _report(executive_summary=["First thing happened", "Then another"])
+    sec = _by_title(rs.build(r), "Summary")
+    assert sec["kind"] == "list"
+    assert sec["items"] == ["First thing happened", "Then another"]
+
+
+def test_a_summary_that_arrives_as_one_string_stays_one_narrative():
+    """Older reports, and the paths that write prose, send a paragraph. It is not
+    split on punctuation: a sentence boundary is not a point boundary, and guessing
+    one would invent structure the model did not write."""
+    r = _report(executive_summary="A day on site. Two things went wrong.")
     sec = _by_title(rs.build(r), "Summary")
     assert sec["kind"] == "narrative"
-    assert isinstance(sec["body"], str)
-    assert "First thing happened." in sec["body"] and "Then another." in sec["body"]
+    assert sec["body"] == "A day on site. Two things went wrong."
 
 
 def test_decisions_from_every_topic_land_in_one_list():
@@ -229,14 +248,18 @@ def test_decisions_from_every_topic_land_in_one_list():
     assert len(items) == 2
 
 
-def test_on_site_carries_the_numbers_not_the_filenames():
-    """`per_recording` is a list of S3 filenames. It is plumbing, and it was
-    being rendered."""
-    sec = _by_title(rs.build(_report()), "On Site")
-    assert sec["kind"] == "kpi"
-    blob = str(sec)
-    assert ".wav" not in blob and ".mp4" not in blob
-
+def test_the_recording_counts_are_not_a_section():
+    """They were, and they restated `recording_session` -- which the viewer
+    already renders as header facts -- so the same three numbers were on one
+    screen twice and disagreed about zero. The report's owner then asked for
+    the counts to go entirely: a day is described by what was decided and what
+    is owed, not by how many files it took to record it."""
+    r = _report(recording_session={"recordings": 3, "total_duration_display": "2m",
+                                   "photos": 6, "total_words": 150537})
+    titles = _titles(rs.build(r))
+    assert "On Site" not in titles
+    for s_ in rs.build(r):
+        assert s_["kind"] != "kpi", "no section restates the session counts"
 
 def test_an_empty_section_is_dropped_rather_than_shown_empty():
     """A report for a quiet day should not be five headings over nothing."""
@@ -248,7 +271,44 @@ def test_an_empty_section_is_dropped_rather_than_shown_empty():
 
 def test_safety_survives_when_there_is_something_to_say():
     r = _report(safety_observations=[{"observation": "Loose cable on level 2"}])
-    assert _by_title(rs.build(r), "Safety")["kind"] == "list"
+    sec = _by_title(rs.build(r), "Safety")
+    assert sec["kind"] == "entries"
+    assert sec["items"][0]["title"] == "Loose cable on level 2"
+
+
+def test_safety_says_what_to_do_about_it():
+    """A list of observations is half a safety section. The prompt has always
+    asked for `recommended_action`, every real entry carries one, and this
+    section dropped it -- so a report said a digger was operating inside the
+    exclusion zone and did not say to stop it."""
+    r = _report(safety_observations=[{
+        "observation": "Entry into the falsework exclusion zone",
+        "risk_level": "high",
+        "location": "Cook Brothers adjoining site",
+        "recommended_action": "Start a joint coordination group",
+        "who_raised": "Ben",
+    }])
+    item = _by_title(rs.build(r), "Safety")["items"][0]
+    assert item["status"] == "high"
+    assert "Start a joint coordination group" in item["note"]
+    assert "Cook Brothers adjoining site" in item["note"]
+
+
+def test_safety_and_quality_are_the_same_shape():
+    """Asked for directly: "我不关心你是用列表还是表格，我希望和上面统一". Two
+    sections that both describe an observation, its state and one line about it
+    must not be rendered by two different mechanisms."""
+    r = _report(
+        safety_observations=[{"observation": "Loose cable", "risk_level": "low",
+                              "recommended_action": "Tape it"}],
+        quality_and_compliance=[{"item": "PS4 outstanding", "status": "concern",
+                                 "details": "Chase the engineer"}],
+    )
+    built = rs.build(r)
+    safety = _by_title(built, "Safety")
+    quality = _by_title(built, "Issues & Quality")
+    assert safety["kind"] == quality["kind"] == "entries"
+    assert set(safety["items"][0]) == set(quality["items"][0]) == {"title", "status", "note"}
 
 
 def test_section_order_is_fixed():
@@ -261,7 +321,7 @@ def test_section_order_is_fixed():
         safety_observations=[{"observation": "Cable"}],
     )
     assert _titles(rs.build(r)) == [
-        "Summary", "On Site", "Actions", "Open Questions",
+        "Summary", "Actions", "Open Questions",
         "Decisions", "Issues & Quality", "Safety",
     ]
 

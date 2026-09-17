@@ -447,3 +447,515 @@ def test_the_search_list_route_still_honours_its_own_k(monkeypatch):
     monkeypatch.setattr(laa, "RERANK_CANDIDATES", 32)
     laa.lambda_handler({"mode": "search", "question": "q", "caller_sub": "sub-1", "k": 7}, None)
     assert client.calls[0]["Payload"]["k"] == 7
+
+
+# --------------------------------------------------------------------------
+# Task 2 (2026-09-17 ask-conversation-memory): pin _rag_answer's behaviour
+# with a malformed scope field before the function head moves inside the
+# try. Adapted from the task brief to this file's own `wire`/`make_event`
+# conventions (no `wired` fixture or `SUB` constant exists here or in the
+# other Ask test files) -- see task-2-report.md for detail.
+# --------------------------------------------------------------------------
+
+def test_a_malformed_scope_still_answers(monkeypatch):
+    """Guards the move: today, q_from/q_to, scope_req and plan must keep
+    producing the same result whether computed above or inside the try."""
+    wire(monkeypatch, chunks=[])
+    out = laa._rag_answer({"question": "what happened?", "caller_sub": "sub-1",
+                           "tz": "Pacific/Auckland", "site_id": "not-a-uuid"})
+    assert "error" not in out
+    assert "invalid" in " ".join(d["reason"] for d in out["applied_scope"]["dropped"])
+
+
+def test_an_early_try_failure_hits_the_normal_error_handler_not_a_nameerror(monkeypatch):
+    """Review finding (controller-mandated fix): applied_scope is assigned
+    partway through the try, and the except handler at the bottom of
+    _rag_answer reads it. If something raises between `try:` and that real
+    assignment -- e.g. the in-try `import query_slots` failing, or here,
+    _validate_scope itself raising -- the handler must still return its
+    normal graceful error shape, not a NameError that masks the original
+    exception and escapes as a raw 500."""
+    wire(monkeypatch, chunks=[])
+
+    def boom(body):
+        raise RuntimeError("scope validation exploded")
+
+    monkeypatch.setattr(laa, "_validate_scope", boom)
+
+    out = laa._rag_answer({"question": "what happened?", "caller_sub": "sub-1",
+                           "tz": "Pacific/Auckland"})
+
+    assert out["error"] == "scope validation exploded"
+    assert out["applied_scope"] == {"dropped": []}
+    assert out["answer"] == ""
+    assert out["model"] is None
+
+
+# --------------------------------------------------------------------------
+# Task 3 (2026-09-17 ask-conversation-memory): _rag_answer rewrites a
+# follow-up question into a standalone one before it embeds. Spec sections
+# 2, 3.1-3.3, 4.3. `ask_rewrite`, `query_slots` and `metric_slots` are all
+# imported INSIDE _rag_answer, so they are not attributes of `laa` -- patch
+# the real module objects (they are singletons in sys.modules, so patching
+# the module object here reaches the lazy `import X` inside the function).
+# --------------------------------------------------------------------------
+
+import ask_rewrite  # noqa: E402
+import ask_history  # noqa: E402
+import query_slots  # noqa: E402
+import metric_slots  # noqa: E402
+
+SUB = "sub-1"
+
+ONE_TURN = [{"question": "what did James say about the ceiling grid?",
+            "answer": "James said the grid on level 3 is behind schedule."}]
+
+
+def test_the_rewritten_text_is_what_gets_embedded(monkeypatch):
+    """SS3.1/4.3: the embed call uses `asked`, the rewritten text -- not the
+    caller's original wording."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
+    wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("when is James finishing the grid?", True))
+
+    seen = {}
+    real_embed = dashscope_utils.embed
+    def spy_embed(texts, dim=None):
+        seen["texts"] = texts
+        return real_embed(texts, dim=dim)
+    monkeypatch.setattr(dashscope_utils, "embed", spy_embed)
+
+    laa._rag_answer({"question": "when is he finishing it?", "caller_sub": SUB,
+                     "history": ONE_TURN})
+    assert seen["texts"] == ["when is James finishing the grid?"]
+
+
+def test_the_answering_prompt_gets_the_original_and_no_history(monkeypatch):
+    """SS2's whole claim. Assert the ABSENCE explicitly: no history text reaches
+    build_rag_prompt, and it is called with the caller's original question."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
+    wire(monkeypatch, chunks=[{"chunk_text": "level 3 grid note", "id": "c-1",
+                               "topic_id": "t-1", "source_s3_key": "x",
+                               "report_date": "2026-09-17"}])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("rewritten", True))
+
+    prompts = []
+    real_build = laa.build_rag_prompt
+    def spy_build(question, chunks, **kw):
+        prompts.append((question, kw))
+        return real_build(question, chunks, **kw)
+    monkeypatch.setattr(laa, "build_rag_prompt", spy_build)
+
+    laa._rag_answer({"question": "when is he finishing it?", "caller_sub": SUB,
+                     "history": [{"question": "ceiling grid?",
+                                  "answer": "level 3 is behind"}]})
+
+    asked_with, kwargs = prompts[0]
+    assert asked_with == "when is he finishing it?"
+    assert "history" not in kwargs
+    assert "level 3 is behind" not in str(kwargs)
+
+
+def test_a_body_without_history_sends_the_payload_it_sends_today(monkeypatch):
+    """SS3.1: absent and empty history must retrieve identically, and with no
+    history the payload is unchanged from before this feature."""
+    fake1 = wire(monkeypatch, chunks=[])
+    laa._rag_answer({"question": "what happened?", "caller_sub": SUB})
+    before = dict(fake1.calls[0]["Payload"])
+
+    fake2 = wire(monkeypatch, chunks=[])
+    laa._rag_answer({"question": "what happened?", "caller_sub": SUB, "history": []})
+    after = dict(fake2.calls[0]["Payload"])
+
+    assert after == before, "absent and empty must retrieve identically"
+
+
+def test_an_original_that_names_a_date_is_not_recomputed(monkeypatch):
+    """SS4.3: when the ORIGINAL question already resolves a range, the rewrite
+    must not cause a second, different resolution from `asked`."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
+    wire(monkeypatch, chunks=[])
+    ranges = []
+    real_time_range = query_slots.time_range
+    def spy_time_range(q, t):
+        ranges.append(q)
+        return real_time_range(q, t)
+    monkeypatch.setattr(query_slots, "time_range", spy_time_range)
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("rewritten with no date", True))
+
+    laa._rag_answer({"question": "what happened yesterday?", "caller_sub": SUB,
+                     "tz": "Pacific/Auckland", "history": ONE_TURN})
+
+    assert ranges == ["what happened yesterday?"], "the original resolved; do not re-ask"
+
+
+def test_a_rewritten_date_word_does_not_open_the_metric_route(monkeypatch):
+    """Added by review (#17): a rewrite that INTRODUCES a date word into a
+    question that had none must not flip the request onto the metric route --
+    metric_slots.detect must never be called for this question."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
+    wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("how many photos yesterday?", True))
+
+    calls = []
+    real_detect = metric_slots.detect
+    def spy_detect(q):
+        calls.append(q)
+        return real_detect(q)
+    monkeypatch.setattr(metric_slots, "detect", spy_detect)
+
+    laa._rag_answer({"question": "how many photos did I take", "caller_sub": SUB,
+                     "tz": "Pacific/Auckland", "history": ONE_TURN})
+
+    assert calls == [], "metric_slots.detect must not run for an undated original"
+
+
+def test_a_rewritten_date_word_leaves_the_scope_decision_unchanged(monkeypatch):
+    """Added by review (#18): same scenario as #17 -- plan["body_date_sent"] /
+    the `scoped` decision (read here via applied_scope) must be identical to
+    the no-rewrite run, so the web-fallback decision does not move."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
+    fake_no_rewrite = wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: (q, False))
+    out_no_rewrite = laa._rag_answer(
+        {"question": "how many photos did I take", "caller_sub": SUB,
+         "tz": "Pacific/Auckland"})
+
+    fake_rewrite = wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("how many photos yesterday?", True))
+    out_rewrite = laa._rag_answer(
+        {"question": "how many photos did I take", "caller_sub": SUB,
+         "tz": "Pacific/Auckland", "history": ONE_TURN})
+
+    assert out_rewrite["applied_scope"] == out_no_rewrite["applied_scope"]
+
+
+def test_the_web_answer_branch_receives_the_original_question(monkeypatch):
+    """Added by review (#20): the web-answer branch is fed the ORIGINAL
+    question, never `asked` -- `asked` may quote a record deleted since the
+    previous turn (spec SS2.1/SS4.3)."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
+    import web_answer
+    wire(monkeypatch, chunks=[{"chunk_text": "note", "id": "c-1", "topic_id": "t-1",
+                               "source_s3_key": "x", "report_date": "2026-09-17"}])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("rewritten question", True))
+
+    seen = []
+    monkeypatch.setattr(web_answer, "answer",
+                        lambda question, chunks, **kw: seen.append(question) or None)
+
+    laa._rag_answer({"question": "when is he finishing it?", "caller_sub": SUB,
+                     "history": ONE_TURN})
+
+    assert seen and seen[0] == "when is he finishing it?"
+
+
+def test_a_rewritten_metric_route_answer_still_carries_asked(monkeypatch):
+    """Controller review finding: `return _metric_answer(...)` never carried
+    `asked`, and a rewrite can precede it -- the rewrite runs whenever there
+    is history and budget, independently of whether the ORIGINAL question
+    already names a date (the metric gate's only requirement). Without this,
+    a rewritten metric-route answer would silently show no "Searched for:
+    ..." -- the invisible-rewrite failure spec SS3.3 forbids."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
+    wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("how many photos did James take yesterday?", True))
+
+    out = laa._rag_answer(
+        {"question": "how many photos did I take yesterday?", "caller_sub": SUB,
+         "tz": "Pacific/Auckland", "history": ONE_TURN})
+
+    assert out["computed"] is True, "sanity: the metric route was actually taken"
+    assert out["asked"] == "how many photos did James take yesterday?"
+
+
+def test_a_no_rewrite_metric_route_answer_has_asked_none(monkeypatch):
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
+    wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: (q, False))
+
+    out = laa._rag_answer(
+        {"question": "how many photos did I take yesterday?", "caller_sub": SUB,
+         "tz": "Pacific/Auckland", "history": ONE_TURN})
+
+    assert out["computed"] is True, "sanity: the metric route was actually taken"
+    assert out["asked"] is None
+
+
+# --------------------------------------------------------------------------
+# Task 10 (2026-09-17 ask-conversation-memory): the rewrite only runs when
+# ASK_CONVERSATION_MEMORY is "true". Off (unset, "false", or anything else)
+# must reproduce EXACTLY today's behaviour: standalone_question is never
+# called, `asked` is None, the embed call gets the caller's original text,
+# and a body with history retrieves identically to one without.
+# --------------------------------------------------------------------------
+
+def _counting_standalone_question(monkeypatch):
+    calls = []
+
+    def fake(q, h, **kw):
+        calls.append((q, h))
+        return ("rewritten by the gate test", True)
+
+    monkeypatch.setattr(ask_rewrite, "standalone_question", fake)
+    return calls
+
+
+@pytest.mark.parametrize("env_value", [None, "false"])
+def test_the_rewrite_is_not_called_when_the_flag_is_off(monkeypatch, env_value):
+    if env_value is None:
+        monkeypatch.delenv("ASK_CONVERSATION_MEMORY", raising=False)
+    else:
+        monkeypatch.setenv("ASK_CONVERSATION_MEMORY", env_value)
+    calls = _counting_standalone_question(monkeypatch)
+    wire(monkeypatch, chunks=[])
+
+    seen = {}
+    real_embed = dashscope_utils.embed
+    def spy_embed(texts, dim=None):
+        seen["texts"] = texts
+        return real_embed(texts, dim=dim)
+    monkeypatch.setattr(dashscope_utils, "embed", spy_embed)
+
+    out = laa._rag_answer({"question": "when is he finishing it?", "caller_sub": SUB,
+                           "history": ONE_TURN})
+
+    assert calls == [], "standalone_question must never be called with the flag off"
+    assert out["asked"] is None
+    assert seen["texts"] == ["when is he finishing it?"], \
+        "the embed call must get the ORIGINAL question, not a rewrite"
+
+
+def test_the_rewrite_runs_when_the_flag_is_on(monkeypatch):
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")
+    calls = _counting_standalone_question(monkeypatch)
+    wire(monkeypatch, chunks=[])
+
+    seen = {}
+    real_embed = dashscope_utils.embed
+    def spy_embed(texts, dim=None):
+        seen["texts"] = texts
+        return real_embed(texts, dim=dim)
+    monkeypatch.setattr(dashscope_utils, "embed", spy_embed)
+
+    out = laa._rag_answer({"question": "when is he finishing it?", "caller_sub": SUB,
+                           "history": ONE_TURN})
+
+    assert len(calls) == 1, "standalone_question must be called exactly once with the flag on"
+    assert out["asked"] == "rewritten by the gate test"
+    assert seen["texts"] == ["rewritten by the gate test"]
+
+
+def test_the_flag_off_payload_is_identical_with_and_without_history(monkeypatch):
+    """SS3.1-style parity, but for the flag-off path specifically: real
+    history sent alongside the flag being off must retrieve exactly like no
+    history at all -- the rewrite never runs, so history cannot move the
+    rag-search payload."""
+    monkeypatch.delenv("ASK_CONVERSATION_MEMORY", raising=False)
+    _counting_standalone_question(monkeypatch)
+
+    fake_no_history = wire(monkeypatch, chunks=[])
+    laa._rag_answer({"question": "what happened?", "caller_sub": SUB})
+    without_history = dict(fake_no_history.calls[0]["Payload"])
+
+    fake_with_history = wire(monkeypatch, chunks=[])
+    laa._rag_answer({"question": "what happened?", "caller_sub": SUB, "history": ONE_TURN})
+    with_history = dict(fake_with_history.calls[0]["Payload"])
+
+    assert with_history == without_history, \
+        "flag off: a real history payload must retrieve identically to no history"
+
+
+# --------------------------------------------------------------------------
+# Task 6: the distance gate skips the verdict call when retrieval obviously
+# cannot answer, without weakening question_admission's guard (spec SS4.4).
+# `web_answer._verdict` is monkeypatched (not `web_answer.answer`) so the real
+# `answer()` body runs -- including its own `enabled()` check -- and the gate
+# computed in `_rag_answer` is what decides whether `_verdict` is reached.
+# --------------------------------------------------------------------------
+
+def _gate_chunk(distance=None, topic_title="Door Inspection", chunk_text="note"):
+    c = {"chunk_text": chunk_text, "id": "c-1", "topic_id": "t-1",
+         "source_s3_key": "x", "report_date": "2026-09-17",
+         "topic_title": topic_title}
+    if distance is not None:
+        c["distance"] = distance
+    return c
+
+
+@pytest.fixture
+def enable_web_answer(monkeypatch):
+    monkeypatch.setenv("ENABLE_WEB_ANSWER", "true")
+
+
+def _spy_verdict(monkeypatch):
+    import web_answer
+    called = []
+    monkeypatch.setattr(web_answer, "_verdict",
+                        lambda *a, **kw: (called.append(1), ({"answered": True}, None))[1])
+    return called
+
+
+def test_a_far_nearest_distance_skips_the_verdict(monkeypatch, enable_web_answer):
+    wire(monkeypatch, chunks=[_gate_chunk(distance=0.61)])
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what happened on site", "caller_sub": SUB})
+
+    assert called == [], "nearest distance 0.61 with no lexical match must skip the verdict"
+
+
+def test_a_near_distance_still_asks_the_verdict(monkeypatch, enable_web_answer):
+    wire(monkeypatch, chunks=[_gate_chunk(distance=0.40)])
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what happened on site", "caller_sub": SUB})
+
+    assert called == [1], "nearest distance 0.40 is within the gate; the verdict must run"
+
+
+def test_an_absent_distance_does_not_gate(monkeypatch, enable_web_answer):
+    """A chunk with no `distance` key must NOT count as far -- absent != far."""
+    wire(monkeypatch, chunks=[_gate_chunk(distance=None)])
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what happened on site", "caller_sub": SUB})
+
+    assert called == [1], "a missing distance must not gate the verdict"
+
+
+def test_a_widened_basis_does_not_gate(monkeypatch, enable_web_answer):
+    """basis.widened means the distances are against a day the user did not
+    ask about -- the gate must not fire, or an answer could report a widened
+    date while the same request is sent to the open web (spec SS4.4)."""
+    fake_client = wire(monkeypatch, chunks=[_gate_chunk(distance=0.61)])
+    fake_client.response_payload["basis"] = {"widened": True}
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what happened on site", "caller_sub": SUB})
+
+    assert called == [1], "a widened basis must not gate the verdict"
+
+
+def test_a_lexical_chunk_beats_the_distance(monkeypatch, enable_web_answer):
+    """The lexical escape hatch is carried over: a title that literally names
+    what was asked must not be declared unanswerable on distance alone."""
+    wire(monkeypatch, chunks=[_gate_chunk(distance=0.61, topic_title="Scaffold Inspection")])
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what does the scaffold report say", "caller_sub": SUB})
+
+    assert called == [1], "a lexical title match must not gate the verdict"
+
+
+def test_the_lexical_match_is_title_only_not_chunk_text(monkeypatch, enable_web_answer):
+    """Pins the title-only rule (mirrors _aggregate_topics, :845-849): the
+    retrieved chunk text is semantically near the query almost by definition,
+    so matching against chunk_text would make the lexical arm true for nearly
+    everything and the gate would never fire."""
+    wire(monkeypatch, chunks=[_gate_chunk(
+        distance=0.61, topic_title="Door Inspection",
+        chunk_text="The scaffold was checked and signed off.")])
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what does the scaffold report say", "caller_sub": SUB})
+
+    assert called == [], "a term present only in chunk_text must not defeat the gate"
+
+
+# --------------------------------------------------------------------------
+# Task 8 (spec SS4.5.3 / SS4.8): one structured timing line per answer,
+# mirroring the voice path's `voice ask:` line (lambda_ask_agent.py:1847-1854)
+# -- the only per-call timing on the screen path today is llm_utils' `qwen
+# done:`, which is why a 14-day prod window showed n=27 for a route with 5115
+# gateway invocations. Emitted via try/finally so it fires on every return
+# path, not only the success one.
+# --------------------------------------------------------------------------
+
+def test_the_ask_logs_its_stages(monkeypatch, caplog):
+    wire(monkeypatch, chunks=[{"chunk_text": "note", "id": "c-1", "topic_id": "t-1",
+                               "source_s3_key": "x", "report_date": "2026-09-17"}])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: (q, False))
+
+    with caplog.at_level("INFO"):
+        laa._rag_answer({"question": "q", "caller_sub": SUB})
+
+    line = [r for r in caplog.records if "ask timing:" in r.message]
+    assert line, "one structured line per answer, like the voice path's"
+    for field in ("rewrite=", "retrieval=", "synthesis=", "total=", "history_turns="):
+        assert field in line[0].getMessage()
+
+
+def test_the_ask_logs_its_stages_on_a_no_records_early_return(monkeypatch, caplog):
+    """The line must fire on the early no-records return too -- there is no
+    synthesis stage on this path (missing stages log -1, like the voice
+    line), but rewrite/retrieval/total/history_turns must still be there."""
+    wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: (q, False))
+
+    with caplog.at_level("INFO"):
+        out = laa._rag_answer({"question": "q", "caller_sub": SUB})
+
+    assert out["answer"] == "No relevant records found for this question."
+    line = [r for r in caplog.records if "ask timing:" in r.message]
+    assert line, "the timing line must be emitted on the early no-records return too"
+    msg = line[0].getMessage()
+    for field in ("rewrite=", "retrieval=", "synthesis=", "total=", "history_turns="):
+        assert field in msg
+    assert "synthesis=-1" in msg, "no model ran on this path"
+
+
+def test_ask_history_is_the_same_module_both_lambdas_import():
+    """The move (Task 3): lambda_fieldsight_api and lambda_ask_agent both
+    import the cleaner from `ask_history`, not from each other, and get
+    identical behaviour."""
+    import lambda_fieldsight_api as fapi
+    assert fapi._clean_voice_history is ask_history._clean_voice_history
+    assert fapi.MAX_VOICE_HISTORY_TURNS == ask_history.MAX_VOICE_HISTORY_TURNS
+    assert fapi.MAX_VOICE_HISTORY_CHARS == ask_history.MAX_VOICE_HISTORY_CHARS
+
+    raw = [{"question": "q", "answer": "a"}, {"question": "bad"}]
+    assert fapi._clean_voice_history(raw) == ask_history._clean_voice_history(raw)
+
+
+def test_the_verdict_and_the_gate_both_read_the_rewritten_question(monkeypatch):
+    """Retrieval used `asked`, so the two things that judge retrieval have to
+    read `asked` too. Measured on TEST 2026-09-18 before this fix: the verdict
+    was handed "When does it have to be finished?", said the records do not
+    answer it, and a web answer about New Zealand's two-year consent rule
+    replaced a records answer that said Friday."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")
+    monkeypatch.setenv("ENABLE_WEB_ANSWER", "true")
+    wire(monkeypatch, chunks=[{"chunk_text": "backfill to gravel raft",
+                               "id": "c-1", "topic_id": "t-1",
+                               "source_s3_key": "x", "distance": 0.9,
+                               "topic_title": "Unit 11 backfill",
+                               "report_date": "2026-09-17"}])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("when must the Unit 11 backfill finish?", True))
+
+    import web_answer
+    seen = {}
+    monkeypatch.setattr(web_answer, "answer",
+                        lambda q, chunks, **kw: seen.update(q=q, kw=kw) or None)
+
+    laa._rag_answer({"question": "when does it have to be finished?",
+                     "caller_sub": SUB, "history": ONE_TURN})
+
+    assert seen["kw"]["verdict_question"] == "when must the Unit 11 backfill finish?"
+    assert seen["q"] == "when does it have to be finished?", "the lookup keeps the asker's words"
+    # The chunk sits at 0.9, far past the 0.55 gate: only the rewritten text
+    # shares a term with the title, so reading `question` would open the gate
+    # on exactly the turn the rewrite just made answerable.
+    assert seen["kw"]["skip_verdict"] is False

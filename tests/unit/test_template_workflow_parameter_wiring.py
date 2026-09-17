@@ -26,8 +26,11 @@ Two properties are pinned here:
    `UNWIRED_BY_DESIGN` below, which exists so the exceptions are a visible,
    deliberate list rather than an unexamined silence.
 """
+import io
 import os
 import re
+
+import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TEMPLATE = os.path.join(REPO, "src", "template.yaml")
@@ -35,6 +38,39 @@ WORKFLOWS = {
     "prod": os.path.join(REPO, ".github", "workflows", "deploy-prod.yml"),
     "test": os.path.join(REPO, ".github", "workflows", "deploy.yml"),
 }
+
+_yaml = pytest.importorskip("yaml")
+
+
+class _WiringLoader(_yaml.SafeLoader):
+    pass
+
+
+for _tag in ("!Sub", "!Ref", "!If", "!Not", "!Equals", "!GetAtt", "!FindInMap",
+             "!Join", "!Condition", "!Select", "!Split", "!ImportValue", "!And", "!Or"):
+    _WiringLoader.add_constructor(_tag, lambda loader, node: getattr(node, "value", None))
+
+
+def _template():
+    return _yaml.load(io.open(TEMPLATE, encoding="utf-8").read(), Loader=_WiringLoader)
+
+
+def _workflow(name):
+    return io.open(os.path.join(REPO, ".github", "workflows", name), encoding="utf-8").read()
+
+
+def _env_text(fn):
+    """The raw YAML of one function's Environment block, as written -- `!Ref X`
+    is a YAML tag a plain loader will not resolve to a string, and matching for
+    `!Ref AskConversationMemory` needs the literal text."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    start = text.index(f"\n  {fn}:\n")
+    nxt = re.search(r"\n  [A-Za-z]\w*:\n", text[start + 1:])
+    block = text[start:start + 1 + nxt.start()] if nxt else text[start:]
+    env_start = block.index("\n      Environment:\n")
+    rest = block[env_start + 1:]
+    m = re.search(r"\n      [A-Za-z]\w*:\n", rest)
+    return rest[:m.start()] if m else rest
 
 # Boolean Parameters deliberately not passed by a workflow, with the reason.
 # Adding to this list should be a decision, not a reflex: a toggle in here can
@@ -1018,3 +1054,84 @@ def test_todo_collapse_reaches_every_function_that_reads_action_items():
         assert "'false'" in line[0], (
             f"{wf} must fall back to false, or a missing repo variable turns the "
             "collapse ON for that stage")
+
+
+# ---- the recording-block thresholds ------------------------------------
+#
+# Design 2026-09-15 §5.5 as amended by review finding F9: the compute function
+# stores raw segments and org-api merges them at read time, so org-api is the
+# ONLY reader. A second reader is the GROUP_MERGE_CAP hazard above one step
+# worse -- two functions drawing different blocks would log nothing at all.
+
+_BLOCK_TUNABLES = {
+    # env var                   : (template Parameter, functions that read it)
+    "REPORT_BLOCK_GAP_SECONDS":  ("ReportBlockGapSeconds", ("OrgApiFunction",)),
+    "REPORT_LONG_BLOCK_SECONDS": ("ReportLongBlockSeconds", ("OrgApiFunction",)),
+}
+
+
+def test_the_block_tunables_exist_as_template_parameters():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for env, (param, _) in _BLOCK_TUNABLES.items():
+        assert re.search(rf"\n  {param}:\n", text), \
+            f"{env} has no {param} Parameter — it can only ever hold its code default"
+
+
+def test_every_function_that_reads_a_block_tunable_is_given_it():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for env, (param, fns) in _BLOCK_TUNABLES.items():
+        for fn in fns:
+            assert f"{env}: !Ref {param}" in _function_block(text, fn), \
+                f"{fn} reads {env} but is not given it"
+
+
+def test_both_workflows_pass_the_block_tunables():
+    for env_name in ("prod", "test"):
+        for _, (param, _) in _BLOCK_TUNABLES.items():
+            assert param in _overrides(WORKFLOWS[env_name]), \
+                (f"{env_name} does not pass {param}; the Parameter holds its "
+                 f"default forever and a re-tuned threshold cannot be applied")
+
+
+def test_org_api_is_the_only_function_given_a_block_tunable():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for env, (param, _) in _BLOCK_TUNABLES.items():
+        assert text.count(f"{env}: !Ref {param}") == 1, (
+            f"{env} is given to more than one function; org-api must be the single reader")
+
+
+def test_recording_blocks_default_off_on_prod_and_on_on_test():
+    for env_name, fallback in (("prod", "'false'"), ("test", "'true'")):
+        text = open(WORKFLOWS[env_name], encoding="utf-8").read()
+        line = [ln for ln in text.splitlines() if "EnableRecordingBlocks=" in ln]
+        assert len(line) == 1, f"{env_name}: expected one line, found {len(line)}"
+        assert fallback in line[0], (
+            f"{env_name} must fall back to {fallback} for EnableRecordingBlocks")
+
+
+def test_the_block_code_defaults_match_the_template_defaults():
+    """When they disagree the environment wins silently, and the number in the source
+    reads like the one in force -- the same hazard as the evidence tunables above."""
+    tpl = open(TEMPLATE, encoding="utf-8").read()
+    src = open(os.path.join(REPO, "src", "lambda_org_api.py"), encoding="utf-8").read()
+    for env, (param, _) in _BLOCK_TUNABLES.items():
+        block = re.search(rf"\n  {param}:\n(.*?)(?=\n  \w+:\n)", tpl, re.S).group(1)
+        tpl_default = re.search(r"Default:\s*'([^']+)'", block).group(1)
+        code_default = re.search(
+            rf"os\.environ\.get\([\"']{env}[\"'],\s*[\"']([^\"']+)[\"']\)", src).group(1)
+        assert float(tpl_default) == float(code_default), (
+            f"{env}: template default {tpl_default!r} != code default {code_default!r}")
+
+
+# ----------------------------------------------------------
+# Task 9: the three Ask flags, wired in three places each.
+# ----------------------------------------------------------
+
+@pytest.mark.parametrize("param", ["AskConversationMemory", "AskRewriteBudget",
+                                   "AskDistanceGate"])
+def test_the_flag_is_wired_in_all_three_places(param):
+    """A flag wired in two of three reads as its default and nothing fails."""
+    assert param in _template()["Parameters"]
+    assert f"!Ref {param}" in _env_text("AskAgentFunction")
+    for wf in ("deploy.yml", "deploy-prod.yml"):
+        assert f"{param}=" in _workflow(wf)

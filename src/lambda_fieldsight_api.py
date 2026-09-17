@@ -37,17 +37,48 @@ import json
 import logging
 import re
 import boto3
+import botocore.exceptions
+from botocore.config import Config
 from datetime import datetime, timedelta
 from urllib.parse import unquote_plus
 
 import deletion_mirror
+import batch_cover
 import nz_time
+# Pure module, no boto3 -- safe to import eagerly. Moved out of this file
+# (2026-09-17, ask-conversation-memory Task 3) so lambda_ask_agent can share
+# the same cleaner without importing this whole handler module. Re-exported
+# under the SAME names at module level: existing tests reference
+# fapi.MAX_VOICE_HISTORY_TURNS / fapi.MAX_VOICE_HISTORY_CHARS.
+from ask_history import (
+    _clean_voice_history, MAX_VOICE_HISTORY_TURNS, MAX_VOICE_HISTORY_CHARS,
+)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 s3_client = boto3.client('s3')
 lambda_client = boto3.client('lambda')
+# Task 8 review fix: this Config was originally applied to the SHARED
+# module-level `lambda_client` above, which regressed every other route that
+# reuses it -- corroborate_answer's target (src/corroboration.py
+# HARD_STOP_SECONDS, default 27s, its stage budgets re-cut from measurement to
+# fill exactly 27s) could finish between 26s and 27s and now got killed by
+# THIS read_timeout instead; ask_voice's _voice_answer (STT + RAG + TTS) has
+# no measured ceiling to check the claim against either. So this client is
+# used ONLY by ask_question, below -- read_timeout BELOW ApiFunction's own
+# Timeout (Task 7: ApiFunction=28, AskAgentFunction=27), so a hung Ask Agent
+# invoke fails HERE, in code that can name it, instead of the runtime killing
+# ApiFunction first and leaving a bare `Task timed out` as the only trace
+# (spec SS4.8). retries=0: a synchronous user-facing invoke must not silently
+# double the wait. corroborate_answer, ask_voice and search_topics keep using
+# the plain `lambda_client` above, unchanged from before this task.
+_LAMBDA_INVOKE_TIMEOUT = int(os.environ.get("ASK_INVOKE_TIMEOUT", "26"))
+ask_lambda_client = boto3.client('lambda', config=Config(
+    read_timeout=_LAMBDA_INVOKE_TIMEOUT,
+    connect_timeout=5,
+    retries={"max_attempts": 0},
+))
 dynamodb = boto3.resource('dynamodb')
 
 S3_BUCKET = os.environ.get('S3_BUCKET', 'fieldsight-data-509194952652')
@@ -905,7 +936,7 @@ def get_audio_segments(params, caller):
 
     prefix = f"audio_segments/{user_folder}/{date}/"
     deleted = _deleted_bases(user_folder, date)
-    segments = []
+    kept = []
     try:
         resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
         for obj in resp.get('Contents', []):
@@ -928,6 +959,20 @@ def get_audio_segments(params, caller):
             abs_start = base_sec + float(off_match.group(1))
             abs_end = base_sec + float(off_match.group(2))
             if abs_end < start_sec or abs_start > end_sec:
+                continue
+            kept.append((key, filename, abs_start, abs_end))
+    except Exception as e:
+        logger.error(f"Error listing audio segments: {e}")
+    segments = []
+    try:
+        # Same rule as org-api's _read_org_audio_segments: a chunk named in the map of a
+        # batch in this result is the same speech as that batch -- drop it. Members come
+        # from the map, never the filename; an unreadable map hides nothing.
+        covered = batch_cover.covered_chunk_keys(
+            lambda k: s3_client.get_object(Bucket=S3_BUCKET, Key=k)['Body'].read(),
+            [k for k, _f, _s, _e in kept])
+        for key, filename, abs_start, abs_end in kept:
+            if key in covered:
                 continue
             url = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': key}, ExpiresIn=PRESIGNED_URL_EXPIRY)
             ah, am, asec = int(abs_start)//3600, (int(abs_start)%3600)//60, int(abs_start)%60
@@ -1197,23 +1242,15 @@ def get_report_history(params, caller):
 # ── POST /api/reports/generate ───────────────────────────────
 
 def trigger_report_generation(body, caller):
-    rtype = body.get('report_type', 'daily')
-    date = body.get('date', '')
-    force = body.get('force', False)
-    if not date:
-        date = (nz_time.nz_now() - timedelta(days=1)).strftime('%Y-%m-%d')
-    payload = {'report_type': rtype, 'date': date}
-    if caller['role'] == 'worker':
-        user = resolve_user_display_name(caller)
-        if user:
-            payload['users_filter'] = [user.replace('_', ' ')]
-    if force:
-        payload['force'] = True
-    try:
-        lambda_client.invoke(FunctionName=REPORT_FUNCTION, InvocationType='Event', Payload=json.dumps(payload))
-        return ok({'message': f'Report triggered for {date}', 'status': 'pending'}, 202)
-    except Exception as e:
-        return error(f'Failed: {e}', 500)
+    # CLOSED 2026-09-15. Its only caller was the frontend. It regenerated a whole day
+    # for every user -- the worker-only filter was sent as `users_filter`, a key the
+    # generator never reads, in a "First Last" form that matches no folder -- plus a
+    # seven-day backfill, and on 2026-09-14 one click rewrote four prod reports across
+    # two people. Owner rule: each person regenerates only their own reports, which is
+    # POST /api/org/reports/regenerate. The nightly schedule invokes the generator
+    # directly and never came through here.
+    return error('Gone: use POST /api/org/reports/regenerate, which regenerates '
+                 'only your own report', 410)
 
 
 # ── POST /api/ask ───────────────────────────────────────────
@@ -1229,10 +1266,11 @@ def ask_question(body, caller):
 
     if not question:
         return error('Missing question')
-    # `date` is forwarded and the RAG path does not read it -- it branches on
-    # caller_sub before `date` is ever looked at, so a comment here once
-    # claiming it was "soft context" described something that never happened.
-    # It stays for the legacy S3 path, which does read it.
+    # `date` is read on the RAG path since scoped Ask (2026-09-15), but ONLY when
+    # the body also carries `scoped: true`: with no time word in the question it
+    # then narrows retrieval to that day. Without `scoped` the RAG path ignores
+    # `date` exactly as before, because the deployed UI already sends it. The
+    # legacy S3 path reads it too.
     #
     # `tz` is what the RAG path reads: an IANA zone id, not a date. The zone is
     # sent instead of a computed date because NZ and AU are both on daylight
@@ -1263,8 +1301,32 @@ def ask_question(body, caller):
     if topic_id is not None:
         payload['topic_id'] = topic_id
 
+    # Scoped Ask (spec 2026-09-15 §4.1): forwarded as sent, validated by the Ask
+    # Agent, enforced by rag-search. Absent stays absent -- never ''.
+    for field in ('site_id', 'author_folder', 'topic_row_id'):
+        if body.get(field) not in (None, ''):
+            payload[field] = body[field]
+    # The gate that makes the Ask Agent honour `date` (spec §3). Forwarded as
+    # sent when truthy; the Ask Agent accepts only JSON true.
+    if body.get('scoped'):
+        payload['scoped'] = body['scoped']
+
+    # Same cleaner as the voice route: one set of caps, one set of key names.
+    # ABSENT, never an empty list -- see ask_voice, and the agent's
+    # history_turns count, which would otherwise mean two things.
+    raw_history = body.get('history')
+    history = _clean_voice_history(raw_history)
+    if history:
+        payload['history'] = history
+    if isinstance(raw_history, list) and len(raw_history) != len(history):
+        logger.warning("ask: dropped %d of %d history turns",
+                       len(raw_history) - len(history), len(raw_history))
+    elif raw_history is not None and not isinstance(raw_history, list):
+        logger.warning("ask: history was %s, not a list",
+                       type(raw_history).__name__)
+
     try:
-        resp = lambda_client.invoke(
+        resp = ask_lambda_client.invoke(
             FunctionName=ASK_AGENT_FUNCTION,
             InvocationType='RequestResponse',
             Payload=json.dumps(payload)
@@ -1284,9 +1346,20 @@ def ask_question(body, caller):
             return result
         # Or direct invocation format
         return ok(result)
+    except botocore.exceptions.ReadTimeoutError:
+        # The gap this fixes (spec SS4.8): with no Config on lambda_client,
+        # botocore's default read timeout outlived ApiFunction's own Timeout,
+        # so the runtime killed this function before this except could run --
+        # the only trace was a bare `Task timed out`. Named here instead, and
+        # 504 (not 500/502) so a hung agent is distinguishable from every
+        # other invoke failure below. The body text is generic on purpose:
+        # the web client replaces every Ask failure with its own reassuring
+        # line regardless of status code (Task 11) -- this status is for us.
+        logger.error("ask agent read timeout after %ss", _LAMBDA_INVOKE_TIMEOUT)
+        return error('Ask temporarily unavailable', 504)
     except Exception as e:
         logger.error(f"Ask agent invocation failed: {e}")
-        return error(f'Ask agent error: {e}', 500)
+        return error('Ask temporarily unavailable', 502)
 
 
 # ── POST /api/ask/corroborate ─────────────────────
@@ -1374,6 +1447,25 @@ def ask_voice(body, caller):
     }
     if body.get('tz'):
         payload['tz'] = body['tz']   # see ask_question: an IANA zone, not a date
+
+    # ABSENT, never an empty list. Every device in the field today sends no
+    # history, and "I have no history" is a different statement from "my
+    # conversation is empty" -- collapsing them would make the agent's
+    # history_turns count mean two things, and would break the sibling test that
+    # pins this payload to exactly four keys.
+    raw_history = body.get('history')
+    history = _clean_voice_history(raw_history)
+    if history:
+        payload['history'] = history
+    if isinstance(raw_history, list) and len(raw_history) != len(history):
+        # The only trace that a device is sending turns we cannot use. Silent
+        # dropping is correct behaviour and a terrible diagnostic.
+        logger.warning(
+            "voice ask: dropped %d of %d history turns",
+            len(raw_history) - len(history), len(raw_history))
+    elif raw_history is not None and not isinstance(raw_history, list):
+        logger.warning("voice ask: history was %s, not a list",
+                       type(raw_history).__name__)
     try:
         resp = lambda_client.invoke(
             FunctionName=ASK_AGENT_FUNCTION,

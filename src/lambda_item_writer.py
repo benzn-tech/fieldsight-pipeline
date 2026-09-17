@@ -339,6 +339,50 @@ def _enqueue_updated_emails(artifact, contexts, put=None):
              "openTodos": todos})
 
 
+def _final_email_context(conn, session_base, extraction, date):
+    """What the recorder's confirmation email needs, or None if it must not be
+    sent from here.
+
+    None means the sweep's backstop owns this session -- which is the honest
+    answer for every case below, and each says which one it was, because a
+    silent skip here is indistinguishable from a trigger that never fired."""
+    sid = _device_session_id(session_base)
+    if not sid:
+        return None                      # a whole-file base, not a device session
+    row = meeting_session.get(conn, sid)
+    status = (row or {}).get("status")
+    if status != "finalizing":
+        logger.info("session %s: final extraction written, status is %s -- no email "
+                    "from here", sid, status or "unknown")
+        return None
+    from lambda_finalize_claim import _resolve_context
+    ctx = _resolve_context(conn, row) or {}
+    if not (ctx.get("recipient") or "").strip():
+        # The claim step already marked this session failed and said whose
+        # email is missing; repeating it here would only double the noise.
+        return None
+    return {"kind": "final", "sessionId": sid,
+            "recipient": ctx["recipient"], "date": ctx.get("date") or date,
+            "timeRange": ctx.get("timeRange"), "siteName": ctx.get("siteName"),
+            # handoff-sync plan §2.2: the worker needs the folder to poll
+            # session_brief/<folder>/<date>/sid<sessionId>/latest.json. Not
+            # carried before this -- the only recipient of `ctx["folder"]` used
+            # to be the email itself, which never needed it.
+            "folder": ctx.get("folder"),
+            # Zero rows is a real answer, not a reason to withhold the email:
+            # most sessions produce none, and the renderer says so explicitly.
+            # Withholding would send them down the backstop, which quotes the
+            # OTHER summariser -- the disagreement this whole change removes.
+            "openTodos": _final_email_rows(extraction, date) + _topic_rows(extraction)}
+
+
+def _enqueue_final_email(ctx, put=None):
+    """One confirmation email per session, whoever gets there first."""
+    put = put or _put_finalize_request
+    return put(f"session_finalize_requests/{ctx['sessionId']}.json", ctx,
+               only_if_absent=True)
+
+
 def _evidence_payload(topic):
     """The citations plus the topic's rolled-up status, as one jsonb object.
 
@@ -387,6 +431,77 @@ def _summary_from_topics(artifact):
         elif title or body:
             parts.append(title or body)
     return "\n".join(parts)
+
+
+def _final_email_rows(artifact, date):
+    """The session's action items in the shape the email renderer wants, with
+    the due date RESOLVED.
+
+    `_todos_from_topics` sends the spoken text ("Tomorrow 08:00"); Aurora stores
+    the date `lambda_ingest._map_action_items` resolves from it. The email and
+    the record would disagree on the one cell a reader acts on, so this reuses
+    that same mapping -- the spoken text remains, as the fallback for a deadline
+    nothing could resolve.
+
+    No longer carries a `topic_range` (handoff-sync plan §8 originally added
+    it, §7.1 as first written): that field existed only so
+    `lambda_session_finalize` could decide, by TIME, whether a brief task
+    already covered a row's topic. §7.1 is now decided by TEXT instead (see
+    `lambda_session_finalize._is_represented`), which reads a row's own
+    `text` -- already present here -- so nothing downstream reads this field
+    any more."""
+    out = []
+    for topic in artifact.get("topics") or []:
+        for item in lambda_ingest._map_action_items(topic.get("action_items"), date):
+            text = (item.get("text") or "").strip()
+            if text:
+                out.append({"text": text,
+                            "responsible": item.get("responsible") or None,
+                            "due": item.get("deadline") or item.get("deadline_text") or None})
+    return todo_collapse.collapse_if_enabled(out)
+
+
+#: How much of a topic's own summary rides in its row. Long enough for the
+#: point, short enough that the table still scans -- the row is context, not the
+#: report, and the report is one click away.
+TOPIC_ROW_MAX_CHARS = 180
+
+
+def _topic_rows(artifact):
+    """Topics that produced NO action item, as rows of their own.
+
+    A session where nobody promised anything is the ordinary case (11 of 16
+    measured on prod), and such a session used to be emailed as a header and one
+    line saying nothing was captured -- while the recording plainly had content.
+    The topic says what was discussed; the owner and due date are N/A because
+    there is no task here, which the renderer shows differently from an action
+    nobody has picked up yet.
+
+    Only topics with no action items: one that produced tasks is already in the
+    table through them, and listing it twice would pad the very table this is
+    trying to make worth reading.
+
+    No longer carries a `topic_range` -- same reason as `_final_email_rows`
+    above: `lambda_session_finalize` now decides §7.1 (does the brief already
+    cover this topic) from this row's own `text`, not from a time window."""
+    out = []
+    for topic in artifact.get("topics") or []:
+        if topic.get("action_items"):
+            continue
+        title = (topic.get("topic_title") or topic.get("title") or "").strip()
+        summary = " ".join((topic.get("summary") or "").split())
+        # The first sentence, not the whole summary: the rest repeats it at
+        # length, which is what pushed the old prose below the fold.
+        first = summary.split(". ")[0].strip()
+        if first and first != summary and not first.endswith("."):
+            first += "."
+        text = " — ".join(part for part in (title, first) if part)
+        if len(text) > TOPIC_ROW_MAX_CHARS:
+            text = text[:TOPIC_ROW_MAX_CHARS - 1].rstrip() + "…"
+        if text:
+            out.append({"text": text, "responsible": None, "due": None,
+                        "kind": "topic"})
+    return out
 
 
 def _todos_from_topics(artifact):
@@ -466,12 +581,35 @@ def _request_rebind(company_id, session_base, artifact, put=None):
     return True
 
 
-def _put_finalize_request(key, body):
+def _put_finalize_request(key, body, only_if_absent=False):
+    """Write one finalize request.
+
+    `only_if_absent` makes the key a SINGLE-WRITER key: `IfNoneMatch="*"` fails
+    with 412 if anything is already there, and the loser simply stops. Two
+    producers can write this key -- this lambda, once the record is durable, and
+    the sweep's backstop when no final extraction arrived -- and S3 notifies on
+    every put INCLUDING an overwrite, so without this the recorder gets two
+    emails. Checking first is not the fix: this role cannot read the prefix, and
+    AccessDenied reads as "absent" (403 != 404, eight recurrences), so both
+    writers would pass the check. Same idiom as lambda_orchestrator's claim.
+
+    Returns True when this caller wrote it."""
     import boto3
-    boto3.client("s3").put_object(
-        Bucket=S3_BUCKET, Key=key,
-        Body=json.dumps(body, ensure_ascii=False),
-        ContentType="application/json")
+    from botocore.exceptions import ClientError
+    extra = {"IfNoneMatch": "*"} if only_if_absent else {}
+    try:
+        boto3.client("s3").put_object(
+            Bucket=S3_BUCKET, Key=key,
+            Body=json.dumps(body, ensure_ascii=False),
+            ContentType="application/json", **extra)
+        return True
+    except ClientError as e:
+        status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        code = e.response.get("Error", {}).get("Code", "")
+        if only_if_absent and (status == 412 or code in ("PreconditionFailed", "412")):
+            logger.info("finalize request %s already enqueued by someone else", key)
+            return False
+        raise
 
 
 # ----------------------------------------------------------
@@ -649,9 +787,21 @@ def write_extraction_items(date, user_folder, extraction_key):
             (report_source_key,),
         ).fetchone()
         if report_already_ingested is not None:
-            reason = "nightly report already ingested — late session extraction superseded"
-            logger.info("%s: %s", extraction_key, reason)
-            return {"skipped": True, "reason": reason}
+            if not lambda_ingest.AUTHORITY_FLIP:
+                reason = "nightly report already ingested — late session extraction superseded"
+                logger.info("%s: %s", extraction_key, reason)
+                return {"skipped": True, "reason": reason}
+            # Under the flip the extraction IS the item store, and a day that has one
+            # is by definition not a "zero-extraction fallback day" -- the only kind
+            # the comment above says report topics may exist for. Skipping here
+            # deadlocked with ingest, which defers only once extraction topics
+            # already exist: each waited for the other, and the day could never
+            # become session-scoped again. So the extraction wins. Only this
+            # (date, user)'s report rows go; its chunks survive (topic_id is ON
+            # DELETE SET NULL) and the next ingest of that report re-links them.
+            removed = topics.delete_topics_for_source(conn, report_source_key)
+            logger.info("%s: authority flip -- replaced %s report topic(s) from %s",
+                        extraction_key, removed, report_source_key)
 
         company = lambda_ingest.resolve_company(conn, user_folder)
         if company is None:
@@ -850,6 +1000,16 @@ def write_extraction_items(date, user_folder, extraction_key):
                 open_questions=[q.get("question") if isinstance(q, dict) else q
                                 for q in (t.get("questions") or [])
                                 if (q.get("question") if isinstance(q, dict) else q)] or None,
+                # Kept whole, unlike `questions` above. The extraction schema's
+                # decision carries `rationale` and `decided_by` alongside the
+                # sentence, and v1 not SENDING them is not a reason to discard
+                # them on the way in -- a superseded session's transcript window
+                # may be gone by the time anyone wants them. The narrowing to
+                # plain strings happens in lambda_org_api, at the payload
+                # boundary, where React forces it. Blank-only entries are still
+                # dropped: they render as a bullet with nothing in it.
+                decisions=[d for d in (t.get("decisions") or [])
+                           if (d.get("decision") if isinstance(d, dict) else d)] or None,
                 work_class=_wc, work_confidence=_wconf, is_mixed=(t.get("is_mixed") is True),
                 evidence=_evidence_payload(t),
                 # video-keyframe plan (Task 4): re-bound synthetic keyframes
@@ -921,6 +1081,25 @@ def write_extraction_items(date, user_folder, extraction_key):
         # stayed NULL with merged_at set, which is exactly the signature the
         # stuck-group recovery looks for: every successful merge would have been
         # re-merged and re-emailed.
+        # The recorder's own confirmation email. Resolved HERE (the connection
+        # dies with this block) and enqueued AFTER it, for the same reason the
+        # merged email is: the rows must be durable before anyone is told to
+        # look at them.
+        #
+        # Enqueued by this step rather than at the sweep's claim, because the
+        # email should show the record -- and only the step that LANDS the
+        # record knows it landed. The sweep enqueued at claim time, so the email
+        # routinely went out before the final extraction existed and had to be
+        # built from a second summariser.
+        #
+        # tier alone is not enough. A final is written again by the re-run chain
+        # (up to FINAL_RERUN_MAX_GENERATIONS) and by org-api's regenerate, months
+        # later, for a session that was sent long ago -- each would mail the
+        # recorder about an old meeting. The session must be WAITING for it.
+        final_email_ctx = None
+        if extraction.get("tier") == "final":
+            final_email_ctx = _final_email_context(conn, session_base, extraction, date)
+
         if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
             session_group.mark_result(conn, extraction["groupId"], "merged")
             # Resolved HERE because the connection dies with the block below,
@@ -938,6 +1117,15 @@ def write_extraction_items(date, user_folder, extraction_key):
     # the merged record, and only the step that LANDS the result knows it
     # landed. This lambda is in-VPC and cannot invoke another (BUG-36), so the
     # request rides the same S3 channel as everything else crossing that line.
+    if final_email_ctx:
+        try:
+            _enqueue_final_email(final_email_ctx)
+        except Exception:
+            # The rows are already durable; failing to announce them must not
+            # undo them. The sweep's backstop still mails this session.
+            logger.exception("session %s: topics written but the confirmation "
+                             "email could not be enqueued", final_email_ctx.get("sessionId"))
+
     if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
         try:
             _enqueue_updated_emails(extraction, member_contexts)

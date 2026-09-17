@@ -624,7 +624,30 @@ def test_backfill_enrolls_unenrolled_login(wired):
     assert seen == {"sub": "sub-2", "folder_name": "Neil_Blunden"}
 
 
-def test_backfill_skips_collision(wired):
+def test_backfill_takes_the_next_free_name_when_the_first_is_taken(wired):
+    """A namesake used to be SKIPPED here and left with no folder at all, which
+    is how one prod login ended up writing into another person's folder for four
+    days. The next free name is a folder of their own instead."""
+    wired.setattr(org.users, "list_company_logins_unenrolled",
+                  lambda conn, cid: [
+                      {"id": "u-2", "cognito_sub": "sub-2", "first_name": "Neil", "last_name": "Blunden"}])
+    wired.setattr(org.users, "get_by_folder_name_global",
+                  lambda conn, folder: ({**CALLER, "cognito_sub": "sub-other", "folder_name": folder}
+                                        if folder == "Neil_Blunden" else None))
+    seen = {}
+    wired.setattr(org.users, "set_folder_name",
+                  lambda conn, sub, folder_name: seen.update(sub=sub, folder_name=folder_name))
+    res = org.lambda_handler(make_event("POST", "/api/org/members/enroll-backfill"), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["enrolled"] == [{"sub": "sub-2", "folder_name": "Neil_Blunden_2"}]
+    assert b["skipped"] == []
+    assert seen == {"sub": "sub-2", "folder_name": "Neil_Blunden_2"}
+
+
+def test_backfill_skips_when_no_name_is_free(wired):
+    """Every candidate taken: skipped with a reason, never a 500 on the unique
+    index and never another user's folder."""
     wired.setattr(org.users, "list_company_logins_unenrolled",
                   lambda conn, cid: [
                       {"id": "u-2", "cognito_sub": "sub-2", "first_name": "Neil", "last_name": "Blunden"}])
@@ -637,8 +660,8 @@ def test_backfill_skips_collision(wired):
     assert res["statusCode"] == 200
     b = body_of(res)
     assert b["enrolled"] == []
-    assert b["skipped"] == [{"sub": "sub-2", "reason": "folder taken by another user"}]
-    assert seen == {}  # collision -> set_folder_name never called, no 500
+    assert b["skipped"] == [{"sub": "sub-2", "reason": "no free folder name"}]
+    assert seen == {}
 
 
 def test_backfill_non_admin_403(wired):
@@ -4055,6 +4078,90 @@ def test_audio_segments_matches_chunk_session_key(presign_wired):
     assert seg["time_label"] == "14:13:58"
 
 
+# ----------------------------------------------------------
+# A batch wav is written beside the chunk wavs it was stitched from. Listing both
+# plays every stretch of speech twice. A chunk is dropped only when a batch in THIS
+# result names it in its map -- never by duration, never by filename arithmetic.
+# ----------------------------------------------------------
+
+_DEDUP_SID = "449c1bb3473c405985351aaa189049e6"
+
+
+def _dedup_chunk(i, clock):
+    return (f"ben_lin_2026-09-17_{clock}_sid{_DEDUP_SID}_c{i:04d}"
+            f"_off0.0_to30.0_srcwav.wav")
+
+
+def _dedup_batch(first, count, to):
+    return (f"ben_lin_2026-09-17_13-05-18_sid{_DEDUP_SID}_c{first:04d}_bn{count}"
+            f"_off0.0_to{to}_srcwav.wav")
+
+
+def _wire_listing(fake, folder, date, filenames, maps=None):
+    prefix = f"audio_segments/{folder}/{date}/"
+    fake.list_objects_response = {"Contents": [{"Key": prefix + f} for f in filenames]}
+    for f in filenames:
+        fake.objects[prefix + f] = b""
+    for batch_name, member_names in (maps or {}).items():
+        map_key = prefix + batch_name[: -len(".wav")] + "_batch_map.json"
+        fake.objects[map_key] = json.dumps({"schema": 1, "members": [
+            {"chunk_index": n, "chunk_key": prefix + m}
+            for n, m in enumerate(member_names)]}).encode()
+
+
+def _dedup_get(wired, date="2026-09-17"):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "site_manager",
+                                     "folder_name": "Ben_Lin_test2"})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/audio-segments",
+        params={"date": date, "start": "13:00:00", "end": "13:30:00"}), None)
+    assert res["statusCode"] == 200
+    return body_of(res)
+
+
+def test_audio_segments_hide_chunks_a_listed_batch_covers(presign_wired):
+    wired, fake = presign_wired
+    b = _dedup_batch(0, 2, "58.0")
+    c0, c1, c2 = (_dedup_chunk(0, "13-05-18"), _dedup_chunk(1, "13-05-50"),
+                  _dedup_chunk(2, "13-06-18"))
+    _wire_listing(fake, "Ben_Lin_test2", "2026-09-17", [b, c0, c1, c2], maps={b: [c0, c1]})
+    out = _dedup_get(wired)
+    assert sorted(s["filename"] for s in out["segments"]) == sorted([b, c2])
+    assert out["count"] == 2
+
+
+def test_audio_segments_members_come_from_the_map_not_the_filename(presign_wired):
+    # prod 2026-09-10 shape: c0035_bn4 holds 35, 36, 37, 39 -- 38 was VAD-rejected (no wav).
+    wired, fake = presign_wired
+    b = _dedup_batch(35, 4, "116.0")
+    members = [_dedup_chunk(35, "13-05-18"), _dedup_chunk(36, "13-05-48"),
+               _dedup_chunk(37, "13-06-16"), _dedup_chunk(39, "13-07-12")]
+    after = _dedup_chunk(40, "13-07-40")
+    _wire_listing(fake, "Ben_Lin_test2", "2026-09-17", [b] + members + [after],
+                  maps={b: members})
+    out = _dedup_get(wired)
+    assert sorted(s["filename"] for s in out["segments"]) == sorted([b, after])
+
+
+def test_audio_segments_a_day_without_batches_is_unchanged(presign_wired):
+    wired, fake = presign_wired
+    chunks = [_dedup_chunk(0, "13-05-18"), _dedup_chunk(1, "13-05-50"),
+              _dedup_chunk(2, "13-06-18")]
+    _wire_listing(fake, "Ben_Lin_test2", "2026-09-17", chunks)
+    out = _dedup_get(wired)
+    assert out["count"] == 3
+
+
+def test_audio_segments_a_batch_without_a_readable_map_hides_nothing(presign_wired):
+    wired, fake = presign_wired
+    b = _dedup_batch(0, 2, "58.0")
+    c0, c1 = _dedup_chunk(0, "13-05-18"), _dedup_chunk(1, "13-05-50")
+    _wire_listing(fake, "Ben_Lin_test2", "2026-09-17", [b, c0, c1])   # no map written
+    out = _dedup_get(wired)
+    assert out["count"] == 3
+
+
 def test_chunk_session_start_falls_back_to_meeting_session_opened_at_in_nz(monkeypatch):
     # A chunk session's base is `sid{hex}` (no timestamp) -> session_start can't
     # parse a time -> the picker showed "?". Fall back to meeting_session.opened_at,
@@ -7299,3 +7406,31 @@ def test_an_uncollapsed_row_still_says_it_was_mentioned_once():
     item = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"][0]
     assert item["mention_count"] == 1
     assert item["collapsed_ids"] == []
+
+
+def test_render_shape_carries_the_action_item_version():
+    """version = 1 + edit_count (todo-card spec 3.4). This serializer is a fixed
+    allowlist that has already dropped two repository fields on the way out
+    (mention_count, collapsed_ids) with every repository test green, so the
+    count is asserted HERE, on what the browser receives."""
+    row = _topic_row(action_items=[
+        {"id": "a-1", "text": "Order timber", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open", "edit_count": 3},
+        {"id": "a-2", "text": "Book pump", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open", "edit_count": 0},
+    ])
+    items = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"]
+    assert [i["version"] for i in items] == [4, 1]
+
+
+def test_a_row_that_was_never_counted_is_version_one():
+    """get_topic_full (reindex) does not count. Absent is v1, never missing."""
+    row = _topic_row(action_items=[
+        {"id": "a-1", "text": "Order timber", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open"},
+    ])
+    item = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"][0]
+    assert item["version"] == 1

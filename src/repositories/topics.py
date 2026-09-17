@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 
 _TOPIC_COLS = ("id, site_id, user_id, source_s3_key, report_date, occurred_at, "
                "category, title, summary, time_range, participants, source, created_at, "
-               "work_class, work_confidence, is_mixed, thread_id, evidence, open_questions")
+               "work_class, work_confidence, is_mixed, thread_id, evidence, open_questions, "
+               "decisions")
 
 # Phase F (D8 retirement, spec §8): severity -> risk_level, for reshaping
 # safety-domain findings into the legacy safety_observations row shape.
@@ -61,7 +62,7 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
                  action_items=None, safety=None, photos=None,
                  time_range=None, participants=None,
                  work_class=None, work_confidence=None, is_mixed=False,
-                 evidence=None, open_questions=None) -> dict:
+                 evidence=None, open_questions=None, decisions=None) -> dict:
     """Insert a topic with its children. NOTE: currently insert-only —
     no ON CONFLICT dedup. Dedup is instead handled by callers running
     delete_topics_for_scope() first to clear the (site_id, report_date, user_id)
@@ -87,20 +88,28 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
     stopped doing that, this table was where they were lost, because it had a
     column for everything a topic produces except a question. Same NULL-vs-[]
     distinction as evidence: absent means never captured, empty means asked and
-    there were none."""
+    there were none.
+
+    decisions (migration 0058) are the decisions a topic recorded, stored as the
+    extractor's own {decision, rationale, decided_by} objects. The report path
+    passes plain strings and both are accepted -- one column holds both shapes,
+    and the narrowing to strings happens in lambda_org_api, at the payload
+    boundary, because that is the only place the shape is forced. Same
+    NULL-vs-[] distinction again."""
     cur = conn.cursor(row_factory=dict_row)
     topic = cur.execute(
         f"INSERT INTO topics (site_id, user_id, source_s3_key, report_date, occurred_at, "
         f"category, title, summary, time_range, participants, "
-        f"work_class, work_confidence, is_mixed, evidence, open_questions) "
-        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_TOPIC_COLS}",
+        f"work_class, work_confidence, is_mixed, evidence, open_questions, decisions) "
+        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_TOPIC_COLS}",
         (site_id, user_id, source_s3_key, report_date, occurred_at, category, title, summary,
          time_range, Jsonb(participants) if participants is not None else None,
          work_class, work_confidence, is_mixed,
          # NULL, not '[]', when there is nothing: absent means "never measured",
          # an empty array would mean "measured and cited nothing".
          Jsonb(evidence) if evidence is not None else None,
-         Jsonb(open_questions) if open_questions is not None else None),
+         Jsonb(open_questions) if open_questions is not None else None,
+         Jsonb(decisions) if decisions is not None else None),
     ).fetchone()
     tid = topic["id"]
     for a in (action_items or []):
@@ -352,8 +361,35 @@ def list_extraction_topics_for_day(conn, site_id, user_id, report_date) -> list[
 _TOPIC_COLS_JOINED = (
     "t.id, t.site_id, t.user_id, t.source_s3_key, t.report_date, t.occurred_at, "
     "t.category, t.title, t.summary, t.time_range, t.participants, t.source, t.created_at, "
-    "t.work_class, t.work_confidence, t.is_mixed, t.thread_id, t.open_questions"
+    "t.work_class, t.work_confidence, t.is_mixed, t.thread_id, t.open_questions, "
+    "t.decisions"
 )
+
+
+# One count per day read, over the action items that survived the collapse.
+# `version = 1 + edit_count` is what Today's to-do chip shows (todo-card spec
+# §3.4), and it has to agree with GET /content/action_items/{id}/history, which
+# lists content_edits by row_id -- so collapsed_ids are NOT counted, and there is
+# no company predicate: every writer stamps the row's own company and history
+# filters on the row's company, so the unscoped count is the same number.
+# `::uuid[]` is required: the ids are passed as str, and uuid = text has no
+# operator. Served by idx_content_edits_row (migration 0019).
+_EDIT_COUNT_SQL = (
+    "SELECT row_id, count(*) AS n FROM content_edits "
+    "WHERE table_name = 'action_items' AND row_id = ANY(%s::uuid[]) "
+    "GROUP BY row_id"
+)
+
+
+def _stamp_edit_counts(conn, items):
+    if not items:
+        return items
+    ids = [str(a["id"]) for a in items]
+    counts = {str(r["row_id"]): int(r["n"]) for r in conn.cursor(row_factory=dict_row)
+              .execute(_EDIT_COUNT_SQL, (ids,)).fetchall()}
+    for a in items:
+        a["edit_count"] = counts.get(str(a["id"]), 0)
+    return items
 
 
 def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
@@ -482,7 +518,7 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
     # implementation a first reading reaches for. The survivor keeps its own
     # topic_id and lands on its own topic; the rows it stands for simply do not
     # appear. Off unless ENABLE_TODO_COLLAPSE says otherwise.
-    for a in todo_collapse.collapse_if_enabled(_all_items):
+    for a in _stamp_edit_counts(conn, todo_collapse.collapse_if_enabled(_all_items)):
         action_items_by_topic.setdefault(a["topic_id"], []).append(a)
 
     safety_by_topic = {}
@@ -729,7 +765,7 @@ def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None) -> l
     # Same collapse as list_topics_for_date, and for the same reason: this is
     # the authority-flip timeline shim, i.e. the read path a prod customer's
     # Today and Timeline actually go through.
-    for a in todo_collapse.collapse_if_enabled(_all_items):
+    for a in _stamp_edit_counts(conn, todo_collapse.collapse_if_enabled(_all_items)):
         action_items_by_topic.setdefault(a["topic_id"], []).append(a)
 
     safety_by_topic = {}
@@ -831,6 +867,83 @@ def get_topic_full(conn, topic_id) -> dict | None:
         + CHILD_OF_VISIBLE_TOPIC.format(alias="topic_photos")
         + " ORDER BY created_at", (tids,)).fetchall()
     return t
+
+
+# The pinned-topic read for scoped Ask (spec 2026-09-15 §4.3). NOT get_topic_full:
+# that one is `WHERE t.id=%s` with no visibility, company, redaction or non_work
+# exclusion, and reindex.py depends on it staying exactly that.
+#
+# One statement, so "unknown", "hidden" and "out of reach" are the same None.
+# Casts are explicit because Postgres cannot infer a type for `%s IS NULL`
+# (a CASE WHEN %s IS NULL once returned 500 in production with every test green).
+_TOPIC_VISIBLE_SQL = (
+    "SELECT t.id, t.title, t.summary, t.report_date, t.site_id, "
+    "       s.name AS site_name, t.user_id, t.time_range "
+    "FROM topics t LEFT JOIN sites s ON s.id = t.site_id "
+    "WHERE t.id = %(id)s::uuid "
+    "AND t.site_id = ANY(%(site_ids)s::uuid[]) "
+    "AND (%(author_ids)s::uuid[] IS NULL OR t.user_id = ANY(%(author_ids)s::uuid[])) "
+    f"AND {visible_topics_predicate('t')} "
+    "AND t.work_class IS DISTINCT FROM 'non_work' "
+    # Same rule as redactions.company_excluded_topic_ids: ANY active redaction,
+    # whatever its scope. The pinned block is stricter than retrieval on purpose
+    # (spec §4.4 records the asymmetry).
+    "AND NOT EXISTS (SELECT 1 FROM redactions ra WHERE ra.target_type = 'topic' "
+    "AND ra.target_id = t.id AND ra.reverted_at IS NULL)"
+)
+
+_TOPIC_VISIBLE_ACTION_ITEMS_SQL = (
+    "SELECT text, responsible, deadline, deadline_text, status FROM action_items "
+    "WHERE topic_id = %s AND "
+    + CHILD_OF_VISIBLE_TOPIC.format(alias="action_items")
+    + " ORDER BY created_at"
+)
+
+
+def get_topic_visible(conn, topic_id, site_ids, author_ids) -> dict | None:
+    """One topic the caller may see, shaped for the Ask prompt, or None.
+
+    `site_ids` / `author_ids` are the caller's ALREADY-RESOLVED ACL
+    (scope.visible_scope); `author_ids=None` means no author restriction. None is
+    returned for a malformed id, an unknown id, a topic outside the site or author
+    set, a non_work topic, an actively redacted topic and a deleted recording's
+    topic -- indistinguishable by design. Every value is JSON-safe (rag-search
+    returns this dict through the Lambda marshaller).
+    """
+    import uuid as _uuid
+    try:
+        tid = str(_uuid.UUID(str(topic_id)))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if topic_id is None or not site_ids:
+        return None
+    row = conn.cursor(row_factory=dict_row).execute(
+        _TOPIC_VISIBLE_SQL,
+        {"id": tid,
+         "site_ids": [str(s) for s in site_ids],
+         "author_ids": None if author_ids is None else [str(a) for a in author_ids]},
+    ).fetchone()
+    if not row:
+        return None
+    items = conn.cursor(row_factory=dict_row).execute(
+        _TOPIC_VISIBLE_ACTION_ITEMS_SQL, (tid,)).fetchall()
+    return {
+        "id": str(row["id"]),
+        "title": row["title"],
+        "summary": row["summary"],
+        "report_date": str(row["report_date"]),
+        "site_id": str(row["site_id"]),
+        "site_name": row["site_name"],
+        "user_id": str(row["user_id"]) if row["user_id"] is not None else None,
+        "time_range": str(row["time_range"]) if row["time_range"] is not None else None,
+        "action_items": [
+            {"text": a["text"], "responsible": a["responsible"],
+             "deadline": (str(a["deadline"]) if a["deadline"] is not None
+                          else a.get("deadline_text")),
+             "status": a["status"]}
+            for a in items
+        ],
+    }
 
 
 def add_topic_photo_if_absent(conn, topic_id, s3_key, caption_text):

@@ -250,12 +250,19 @@ jobs:
               "EvidenceWindowSec=${{ vars.PROD_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.PROD_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
               "EvidenceFloorTokens=${{ vars.PROD_EVIDENCE_FLOOR_TOKENS || '5' }}" \
+              "EnableRecordingBlocks=${{ vars.PROD_ENABLE_RECORDING_BLOCKS || 'false' }}" \
+              "ReportBlockGapSeconds=${{ vars.PROD_REPORT_BLOCK_GAP_SECONDS || '600' }}" \
+              "ReportLongBlockSeconds=${{ vars.PROD_REPORT_LONG_BLOCK_SECONDS || '5400' }}" \
               $LLM_TEMP_PARAM \
               "AuthorityFlip=${{ vars.PROD_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.PROD_GRADED_ROLES || 'false' }}" \
               "EnableUserDeletion=${{ vars.PROD_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.PROD_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \
+              "EnableWebAnswer=${{ vars.PROD_ENABLE_WEB_ANSWER || 'false' }}" \
+              "AskConversationMemory=${{ vars.PROD_ASK_CONVERSATION_MEMORY || 'false' }}" \
+              "AskRewriteBudget=${{ vars.PROD_ASK_REWRITE_BUDGET || '4.0' }}" \
+              "AskDistanceGate=${{ vars.PROD_ASK_DISTANCE_GATE || '0.55' }}" \
               "UploadVerifyMode=${{ vars.PROD_UPLOAD_VERIFY_MODE || 'observe' }}" \
               "SpeakerIdentityMode=${{ vars.PROD_SPEAKER_IDENTITY_MODE || 'off' }}" \
               "EnrolOnCorrection=${{ vars.PROD_ENROL_ON_CORRECTION || 'false' }}" \

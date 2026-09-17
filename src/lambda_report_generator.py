@@ -62,6 +62,7 @@ import json
 import nz_time
 import logging
 import re
+from urllib.parse import unquote_plus
 import boto3
 import urllib3
 import agent_turn_filter
@@ -906,6 +907,62 @@ def site_name_for(user_site_info):
     return user_site_info.get('name') or ''
 
 
+def _add_photos_to_document(doc, items, max_photos=None):
+    """The photographs themselves, not a list of their filenames.
+
+    This wrote `', '.join(filenames)` -- a comma-separated run of
+    `ben_ucpk2_20260903_101500.jpg` in a customer's report, which tells a
+    reader that a photograph exists and nothing else. Asked why photos are not
+    in the report, that was the answer.
+
+    Every failure here degrades to the filename rather than losing the entry:
+    a missing object, a permission the role does not have, an image python-docx
+    cannot decode. A report with one photo it could not fetch is still a
+    report; an exception inside document generation is no report at all, and
+    Word generation already disables itself silently often enough (BUG-24).
+
+    `max_photos` is a ceiling, not a preference. Each embedded image is held in
+    memory while the document is assembled, and a day with two hundred site
+    photographs would rebuild the OOM that BUG-04 fixed elsewhere.
+    """
+    try:
+        limit = int(os.environ.get('REPORT_MAX_EMBEDDED_PHOTOS', '40'))
+    except ValueError:
+        limit = 40
+    if max_photos is not None:
+        limit = max_photos
+
+    shown = 0
+    for item in items:
+        if isinstance(item, dict):
+            name = str(item.get('name') or '').strip()
+            key = str(item.get('key') or '').strip()
+        else:
+            name, key = str(item).strip(), ''
+        if not (name or key):
+            continue
+        if shown >= limit or not key:
+            doc.add_paragraph(name or key, style='List Bullet')
+            continue
+        try:
+            obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+            stream = BytesIO(obj['Body'].read())
+            doc.add_picture(stream, width=Inches(5.5))
+            caption = doc.add_paragraph(name)
+            caption.style = doc.styles['Caption'] if 'Caption' in [
+                st.name for st in doc.styles] else caption.style
+            shown += 1
+        except Exception as exc:                      # noqa: BLE001 - see above
+            logger.warning("photo not embedded, listing name instead: %s (%s)",
+                           key, exc)
+            doc.add_paragraph(name or key, style='List Bullet')
+
+    remaining = len(items) - shown
+    if shown and remaining > 0:
+        doc.add_paragraph("%d further photo%s listed above by name."
+                          % (remaining, "" if remaining == 1 else "s"))
+
+
 def render_sections_into(doc, sections):
     """Write the reader's sections into a Word document.
 
@@ -938,12 +995,33 @@ def render_sections_into(doc, sections):
             doc.add_heading(title, level=1)
             for item in items:
                 doc.add_paragraph(str(item), style='List Bullet')
+        elif kind == 'entries':
+            # A thing, its state, and one line about it. Not a table: four
+            # columns of prose read as a spreadsheet of paragraphs, and the
+            # columns do not line up anyway because `note` is a sentence and
+            # `status` is a word.
+            items = [i for i in (sec.get('items') or []) if isinstance(i, dict)]
+            if not items:
+                continue
+            doc.add_heading(title, level=1)
+            for item in items:
+                head = str(item.get('title') or '').strip()
+                if not head:
+                    continue
+                para = doc.add_paragraph()
+                para.add_run(head).bold = True
+                state = str(item.get('status') or '').strip()
+                if state:
+                    para.add_run('   ' + state.replace('_', ' '))
+                note = str(item.get('note') or '').strip()
+                if note:
+                    doc.add_paragraph(note)
         elif kind == 'photos':
             items = sec.get('items') or []
             if not items:
                 continue
             doc.add_heading(title, level=1)
-            doc.add_paragraph(', '.join(str(i) for i in items))
+            _add_photos_to_document(doc, items)
         elif kind == 'table':
             rows = sec.get('rows') or []
             if not rows:
@@ -1746,8 +1824,17 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
 # Generate Weekly / Monthly Report
 # ============================================================
 
-def generate_periodic_report(report_type, start_date, end_date):
-    logger.info(f"=== Generating {report_type.upper()} report: {start_date} to {end_date} ===")
+def generate_periodic_report(report_type, start_date, end_date, user=None, triggered_by='system'):
+    """`user` set = ONE person's own report, built only from that person's own dailies.
+
+    A regenerate request names exactly one folder (owner rule: each person regenerates
+    only their own reports). So with `user` set this never lists other people's
+    reports, never borrows the company-wide day summary for a day the person has no
+    daily -- that would put other people's content into "their own" report -- and
+    returns before the site and combined reports, which are not anyone's to regenerate.
+    """
+    logger.info(f"=== Generating {report_type.upper()} report: {start_date} to {end_date}"
+                f"{' -- user ' + user if user else ''} ===")
     load_prompt_templates(S3_BUCKET)
     site_name = os.environ.get('SITE_NAME', 'Construction Site')
     site_id_default = site_name.lower().replace(' ', '-')
@@ -1759,6 +1846,12 @@ def generate_periodic_report(report_type, start_date, end_date):
     reports_by_user = {}
 
     for date_str in dates_in_range(start_date, end_date):
+        if user is not None:
+            own = download_json_from_s3(S3_BUCKET, f"{REPORT_PREFIX}{date_str}/{user}/daily_report.json")
+            if own:
+                all_daily_reports.append(own)
+                reports_by_user.setdefault(user, []).append(own)
+            continue
         prefix = f"{REPORT_PREFIX}{date_str}/"
         found_per_user = False
         for obj in list_s3_objects(S3_BUCKET, prefix):
@@ -1792,7 +1885,7 @@ def generate_periodic_report(report_type, start_date, end_date):
         return {'report_type': report_type, 'status': 'no_data'}
 
     weekly_reports = []
-    if report_type == 'monthly':
+    if report_type == 'monthly' and user is None:
         for obj in list_s3_objects(S3_BUCKET, REPORT_PREFIX):
             if 'weekly_report.json' in obj['key']:
                 wr = download_json_from_s3(S3_BUCKET, obj['key'])
@@ -1833,7 +1926,7 @@ def generate_periodic_report(report_type, start_date, end_date):
             'site': user_site_name, 'site_id': user_site_id,
             **claude_output,
             '_report_metadata': {
-                'version': 'v3.5', 'generated_at': now_iso, 'generated_by': 'system',
+                'version': 'v3.5', 'generated_at': now_iso, 'generated_by': triggered_by,
                 'scope': 'user', 'daily_reports_used': len(user_reports), 'model': llm_utils.active_model(),
             }
         }
@@ -1858,6 +1951,17 @@ def generate_periodic_report(report_type, start_date, end_date):
             logger.error(f"  Word failed for {user_name}: {e}")
 
         per_user_results[user_name] = {'status': 'success', 'daily_reports': len(user_reports)}
+
+    if user is not None:
+        return {
+            'report_type': report_type,
+            'period': {'start': start_date, 'end': end_date},
+            'daily_reports_used': len(all_daily_reports),
+            'per_user': per_user_results,
+            'per_site': {},
+            'scope': 'user',
+            'status': 'success',
+        }
 
     # Per-site reports
     reports_by_site = {}
@@ -1988,6 +2092,59 @@ def generate_periodic_report(report_type, start_date, end_date):
 
 
 # ============================================================
+# Regenerate requests (report_requests/<folder>/<rid>.json)
+# ============================================================
+
+REGENERATE_REQUEST_KEY_RE = re.compile(r"^report_requests/([^/]+)/([^/]+)\.json$")
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def handle_regenerate_request(key):
+    """Regenerate exactly the report one request names, or nothing at all.
+
+    Owner rule: each person regenerates only their own reports. The request is
+    written by org-api, which takes the folder from the caller's identity, never
+    from a body. This side trusts nothing: anything unexpected is REJECTED and
+    generates nothing. It must never fall through to the schedule defaults below
+    (yesterday, every user, plus the seven-day backfill) -- on 2026-09-14 that
+    shape turned one click on one report into four rewritten reports.
+    """
+    m = REGENERATE_REQUEST_KEY_RE.match(key or "")
+    if not m:
+        return {'key': key, 'status': 'rejected', 'reason': 'not a regenerate request key'}
+    key_folder = m.group(1)
+    req = download_json_from_s3(S3_BUCKET, key)
+    if not isinstance(req, dict):
+        return {'key': key, 'status': 'rejected', 'reason': 'request unreadable'}
+
+    user = req.get('user')
+    if not isinstance(user, str) or not user.strip() or '/' in user or user != key_folder:
+        return {'key': key, 'status': 'rejected',
+                'reason': 'user must be one folder, equal to the request key folder'}
+    triggered_by = req.get('triggered_by') if isinstance(req.get('triggered_by'), str) else 'request'
+    report_type = req.get('report_type')
+
+    if report_type == 'daily':
+        date = req.get('date')
+        if not isinstance(date, str) or not _ISO_DATE_RE.match(date):
+            return {'key': key, 'status': 'rejected', 'reason': 'daily needs date YYYY-MM-DD'}
+        logger.info(f"Regenerate request {key}: daily {date} for {user}")
+        result = generate_daily_report(date, None, triggered_by,
+                                       users_filter=[user], force=True)
+        return {'key': key, 'status': 'done', 'result': result}
+
+    if report_type in ('weekly', 'monthly'):
+        start, end = req.get('start_date'), req.get('end_date')
+        if not all(isinstance(d, str) and _ISO_DATE_RE.match(d) for d in (start, end)) or start > end:
+            return {'key': key, 'status': 'rejected', 'reason': f'{report_type} needs start_date and end_date'}
+        logger.info(f"Regenerate request {key}: {report_type} {start}..{end} for {user}")
+        result = generate_periodic_report(report_type, start, end, user=user, triggered_by=triggered_by)
+        return {'key': key, 'status': 'done', 'result': result}
+
+    return {'key': key, 'status': 'rejected', 'reason': f'not regenerable: {report_type!r}'}
+
+
+# ============================================================
 # MAIN HANDLER
 # ============================================================
 
@@ -2020,6 +2177,14 @@ def lambda_handler(event, context):
     _user_mapping_cache = None
     global _prompt_templates_cache
     _prompt_templates_cache = None
+
+    if 'Records' in event:
+        # A regenerate request. Handled here and returned here, so no request --
+        # however malformed -- can reach the schedule defaults below.
+        outcomes = [handle_regenerate_request(unquote_plus(r.get('s3', {}).get('object', {}).get('key', '')))
+                    for r in (event.get('Records') or [])]
+        logger.info(f"Regenerate requests: {json.dumps(outcomes, default=str)[:2000]}")
+        return {'statusCode': 200, 'body': json.dumps(outcomes, default=str)}
 
     report_type = event.get('report_type', 'daily')
 

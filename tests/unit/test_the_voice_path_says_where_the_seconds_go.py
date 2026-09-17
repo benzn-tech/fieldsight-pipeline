@@ -85,9 +85,79 @@ def test_a_failed_stage_does_not_pretend_to_have_timings(voiced, caplog, monkeyp
 def test_measuring_did_not_change_the_response(voiced):
     """The whole point of this change is that it is inert. The device parses
     these keys; an extra one is a client-side surprise and a missing one is a
-    silent failure."""
+    silent failure.
+
+    `asked` was added later (conversation-memory Task 5): it is the one key
+    this test pins that is NOT from the measurement change -- listed here so
+    the response shape stays exhaustive."""
     res = aa._voice_answer(_body())
     assert set(res) == {"transcript", "basis", "answerText",
-                        "audioBase64", "audioFormat"}
+                        "audioBase64", "audioFormat", "asked"}
     assert res["audioFormat"] == "wav"
     assert res["transcript"] == "how is level three going"
+
+
+# ── continuity step 2: received and counted, used for nothing ────────────────
+#
+# The whole value of an inert step is that it can be observed in production
+# before the retrieval half exists. These three tests are what makes the
+# observation trustworthy: the count is real, it does not leak into retrieval,
+# and it survives a client that sends garbage.
+
+
+def test_the_turn_count_is_reported(voiced, caplog):
+    """The only evidence of whether any real device sends history. Without this
+    number, "the device half shipped" and "the device half shipped and is
+    sending nothing" look identical for as long as nobody looks."""
+    with caplog.at_level(logging.INFO):
+        aa._voice_answer(dict(_body(), history=[
+            {"question": "q1", "answer": "a1"},
+            {"question": "q2", "answer": "a2"}]))
+    line = [r.getMessage() for r in caplog.records if "voice ask:" in r.getMessage()][0]
+    assert "history_turns=2" in line, line
+
+
+def test_no_history_counts_zero_rather_than_omitting_the_field(voiced, caplog):
+    """A field that disappears when it is zero cannot be aggregated. The whole
+    point of this line is a CloudWatch query over many requests."""
+    with caplog.at_level(logging.INFO):
+        aa._voice_answer(_body())
+    line = [r.getMessage() for r in caplog.records if "voice ask:" in r.getMessage()][0]
+    assert "history_turns=0" in line, line
+
+
+def test_history_reaches_the_log_and_retrieval(voiced, caplog, monkeypatch):
+    """Formerly "...but not retrieval": step 2 of the continuity spec was
+    deliberately inert (history counted and logged, never forwarded), so this
+    test pinned its ABSENCE from the retrieval body as the thing that must not
+    silently regress ahead of the real wiring.
+
+    Conversation-memory Task 5 is that wiring ("add it twice"): the body this
+    function builds for `_rag_answer` now carries `history` through
+    unmodified (it is cleaned on the far side, by
+    `ask_history._clean_voice_history`), same as the count already did."""
+    seen = {}
+
+    def _rag(req):
+        seen.update(req)
+        return {"answer": "Level three is on programme.", "basis": {"k": 5}}
+
+    monkeypatch.setattr(aa, "_rag_answer", _rag)
+    with caplog.at_level(logging.INFO):
+        aa._voice_answer(dict(_body(), history=[{"question": "q", "answer": "a"}]))
+    assert seen["history"] == [{"question": "q", "answer": "a"}]
+    line = [r.getMessage() for r in caplog.records if "voice ask:" in r.getMessage()][0]
+    assert "history_turns=1" in line
+
+
+def test_a_history_the_agent_cannot_count_is_zero_not_a_crash(voiced, caplog):
+    """The gateway sanitises, but this function is also invoked directly -- by
+    the other three call sites in the API lambda, by scripts, and by anyone
+    testing. It counts and trusts nothing."""
+    for bad in ("two turns", 7, {"question": "q"}, None):
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            res = aa._voice_answer(dict(_body(), history=bad))
+        assert "error" not in res, (bad, res)
+        line = [r.getMessage() for r in caplog.records if "voice ask:" in r.getMessage()][0]
+        assert "history_turns=0" in line, (bad, line)

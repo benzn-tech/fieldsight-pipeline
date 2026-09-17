@@ -815,3 +815,65 @@ def test_prompt_asks_to_split_by_subject_and_write_scannable_titles():
     # action_items: subject-first, glanceable, survive truncation, no generic openers
     assert "AT A GLANCE" in prompt and "SURVIVE TRUNCATION" in prompt
     assert "SUBJECT/OUTCOME" in prompt and "generic word" in prompt
+
+
+# ---------------------------------------------------------------------------
+# A final pass that outruns the transcripts waits for them (prod 2026-09-17:
+# the final ran at 01:08:39, the transcripts landed at 01:08:42, and the
+# session never got a final at all).
+# ---------------------------------------------------------------------------
+
+def test_a_final_pass_that_finds_nothing_yet_waits_and_extracts(monkeypatch):
+    fake_s3 = FakeS3({})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(llm_utils, "call_llm",
+                        _fake_call_llm_returning({"topics": [], "declared_site": None}))
+    slept = []
+
+    def _sleep(seconds):
+        slept.append(seconds)
+        # The transcript lands while the pass is waiting.
+        fake_s3.objects[SEG1_KEY] = json.dumps(make_transcribe_json("hello world"))
+
+    out = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                              final=True, sleep=_sleep)
+    assert slept == [les.FINAL_EMPTY_RETRY_DELAY_S]
+    assert out is not None and out["tier"] == les.TIER_FINAL
+    assert [c["Key"] for c in fake_s3.put_calls] == [OUT_KEY]
+
+
+def test_the_wait_is_bounded(monkeypatch):
+    fake_s3 = FakeS3({})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("no transcripts ever arrived; nothing to extract")
+
+    monkeypatch.setattr(llm_utils, "call_llm", fail_if_called)
+    slept = []
+    out = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                              final=True, sleep=slept.append)
+    assert out is None and fake_s3.put_calls == []
+    assert len(slept) == les.FINAL_EMPTY_RETRY_ATTEMPTS
+
+
+def test_a_live_pass_never_waits(monkeypatch):
+    """Live passes are triggered BY a transcript landing; waiting there would
+    only hold a concurrency slot."""
+    fake_s3 = FakeS3({})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    slept = []
+    assert les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                               sleep=slept.append) is None
+    assert slept == []
+
+
+def test_a_final_pass_with_transcripts_does_not_wait(monkeypatch):
+    fake_s3 = _s3_with_one_segment()
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(llm_utils, "call_llm",
+                        _fake_call_llm_returning({"topics": [], "declared_site": None}))
+    slept = []
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                        final=True, sleep=slept.append)
+    assert slept == []
