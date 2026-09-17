@@ -25,7 +25,17 @@ from output_language import OUTPUT_LANGUAGE_RULE
 
 logger = logging.getLogger()
 
-MAX_TOKENS = 8000
+# The ANSWER budget; llm_utils adds REASONING_HEADROOM_TOKENS on top before it
+# goes on the wire. 8000 was sized on a solo recording and silently failed the
+# case this summariser exists for. Measured on TEST 2026-09-17, the same
+# 70-minute multi-voice session three times: prompt=13712, reasoning=13870 /
+# 15331 / 14710, completion=16143 / 16047 / 16233 against a 16000 ceiling,
+# finish=length every time -- the reasoning ate the budget and the JSON was cut
+# mid-object, so `parse_brief` found no object and the session got NO brief at
+# all while the solo session (reasoning ~6000, finish=stop) looked fine. A long
+# meeting is precisely when a brief is worth having, so the budget is sized for
+# the reasoning this model actually spends on one, not for the easy case.
+MAX_TOKENS = 16000
 TRANSCRIPT_LIMIT = 300000     # matches lambda_extract_session's head+tail budget
 
 # Alias validation (see validate_aliases). A word list is a maintenance
