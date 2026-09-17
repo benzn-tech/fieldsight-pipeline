@@ -262,13 +262,23 @@ def test_a_brief_whose_tasks_are_all_blank_text_falls_back_like_zero_tasks(monke
 
 
 def test_a_brief_with_tasks_replaces_the_action_rows_but_keeps_topics(monkeypatch):
+    """The request's own action row here carries NO due date, so handoff-sync
+    plan §7.3's back-fill does not apply to it (§7.3a requires a non-empty
+    due) -- it is simply superseded by the brief, which is the Part 1 claim
+    this test still pins. A due-carrying, unmatched action row's fate (kept
+    via back-fill) is pinned separately in
+    tests/unit/test_the_brief_and_extraction_reconcile.py, §9."""
     monkeypatch.setattr(fin, "SESSION_BRIEF", True, raising=False)
     brief = {"tasks": [{"text": "Chase the delivery", "assignee": "Sam", "due": "Mon", "at": "09:10:00"}],
              "open_todos": [{"text": "Chase the delivery", "responsible": "Sam",
                              "due": "Mon", "at": "09:10:00"}]}
     sent = []
     fin.process_finalize_request(
-        _final_artifact(), send=lambda *a: sent.append(a),
+        _final_artifact(openTodos=[
+            {"text": "Order steel", "responsible": "Neil", "due": None, "kind": "action"},
+            {"text": "Site walk — poured the slab.", "responsible": None, "due": None,
+             "kind": "topic"}]),
+        send=lambda *a: sent.append(a),
         write_result=lambda *a: None, poll_brief=lambda *a: brief)
     _to, _subj, text, _html = sent[0]
     assert "Chase the delivery" in text and "Sam" in text and "Mon" in text

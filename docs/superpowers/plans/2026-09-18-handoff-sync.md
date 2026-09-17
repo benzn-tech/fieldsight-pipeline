@@ -152,10 +152,11 @@ sources are merged.
 4. **"Represented" is a deliberately conservative text test.** Lower-case both
    texts, keep `[a-z0-9]+` tokens of 3+ characters, drop the stop list
    (`the a an and or to of for on in at is are be by with from that this it as`),
-   and compute Jaccard overlap. **Represented iff overlap >= 0.30.** A tie or an
-   empty token set counts as NOT represented, so the bias is towards carrying a
-   commitment twice rather than losing it — losing one is the failure this plan
-   exists to prevent.
+   and compute Jaccard overlap. **Represented iff overlap is strictly > 0.30**
+   (ruling, 2026-09-18 — the earlier "`>= 0.30`" here contradicted the next
+   sentence). A tie at exactly 0.30, or an empty token set, counts as NOT
+   represented, so the bias is towards carrying a commitment twice rather than
+   losing it — losing one is the failure this plan exists to prevent.
 5. The thresholds and the stop list are **one shared constant per surface, named
    identically**, and both sides pin the same worked examples (§9).
 
