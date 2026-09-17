@@ -239,6 +239,42 @@ def test_history_not_a_list_warns(monkeypatch, caplog):
     assert "ask:" in caplog.text
 
 
+def test_a_hung_agent_is_described_rather_than_killed(monkeypatch, caplog):
+    """Task 8 (spec SS4.8): today the runtime kills ApiFunction (no Config on
+    lambda_client -> botocore's default read timeout outlives ApiFunction's
+    own Timeout) BEFORE this except runs, so the only trace in prod would be a
+    bare `Task timed out`. Force the botocore timeout directly and assert the
+    invoke fails inside our own code, where it can be named and turned into a
+    504 -- not a 500/502, so the client and any alerting can tell a hung
+    agent apart from every other invoke failure."""
+    import botocore.exceptions
+
+    def _boom(**kw):
+        raise botocore.exceptions.ReadTimeoutError(endpoint_url="lambda")
+    monkeypatch.setattr(fapi.lambda_client, "invoke", _boom)
+
+    with caplog.at_level("ERROR"):
+        res = fapi.ask_question({"question": "q"}, ADMIN_CALLER)
+
+    assert res["statusCode"] == 504
+    assert "ask agent read timeout" in caplog.text.lower()
+
+
+def test_a_non_timeout_invoke_exception_is_502(monkeypatch, caplog):
+    """Any OTHER invoke exception (throttle, network error, etc.) is a
+    different failure class from a hung agent and must not be confused with
+    it in the log or the status code."""
+    def _boom(**kw):
+        raise RuntimeError("some other invoke failure")
+    monkeypatch.setattr(fapi.lambda_client, "invoke", _boom)
+
+    with caplog.at_level("ERROR"):
+        res = fapi.ask_question({"question": "q"}, ADMIN_CALLER)
+
+    assert res["statusCode"] == 502
+    assert "ask agent invocation failed" in caplog.text.lower()
+
+
 def test_function_error_returns_500_without_stack_trace_leak(monkeypatch):
     """I1: if the Ask Agent lambda itself raised an unhandled exception,
     boto3 reports it via resp['FunctionError'] with a Payload containing

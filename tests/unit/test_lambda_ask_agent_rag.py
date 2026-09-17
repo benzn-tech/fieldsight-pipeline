@@ -780,6 +780,50 @@ def test_the_lexical_match_is_title_only_not_chunk_text(monkeypatch, enable_web_
     assert called == [], "a term present only in chunk_text must not defeat the gate"
 
 
+# --------------------------------------------------------------------------
+# Task 8 (spec SS4.5.3 / SS4.8): one structured timing line per answer,
+# mirroring the voice path's `voice ask:` line (lambda_ask_agent.py:1847-1854)
+# -- the only per-call timing on the screen path today is llm_utils' `qwen
+# done:`, which is why a 14-day prod window showed n=27 for a route with 5115
+# gateway invocations. Emitted via try/finally so it fires on every return
+# path, not only the success one.
+# --------------------------------------------------------------------------
+
+def test_the_ask_logs_its_stages(monkeypatch, caplog):
+    wire(monkeypatch, chunks=[{"chunk_text": "note", "id": "c-1", "topic_id": "t-1",
+                               "source_s3_key": "x", "report_date": "2026-09-17"}])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: (q, False))
+
+    with caplog.at_level("INFO"):
+        laa._rag_answer({"question": "q", "caller_sub": SUB})
+
+    line = [r for r in caplog.records if "ask timing:" in r.message]
+    assert line, "one structured line per answer, like the voice path's"
+    for field in ("rewrite=", "retrieval=", "synthesis=", "total=", "history_turns="):
+        assert field in line[0].getMessage()
+
+
+def test_the_ask_logs_its_stages_on_a_no_records_early_return(monkeypatch, caplog):
+    """The line must fire on the early no-records return too -- there is no
+    synthesis stage on this path (missing stages log -1, like the voice
+    line), but rewrite/retrieval/total/history_turns must still be there."""
+    wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: (q, False))
+
+    with caplog.at_level("INFO"):
+        out = laa._rag_answer({"question": "q", "caller_sub": SUB})
+
+    assert out["answer"] == "No relevant records found for this question."
+    line = [r for r in caplog.records if "ask timing:" in r.message]
+    assert line, "the timing line must be emitted on the early no-records return too"
+    msg = line[0].getMessage()
+    for field in ("rewrite=", "retrieval=", "synthesis=", "total=", "history_turns="):
+        assert field in msg
+    assert "synthesis=-1" in msg, "no model ran on this path"
+
+
 def test_ask_history_is_the_same_module_both_lambdas_import():
     """The move (Task 3): lambda_fieldsight_api and lambda_ask_agent both
     import the cleaner from `ask_history`, not from each other, and get

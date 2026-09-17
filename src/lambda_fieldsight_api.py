@@ -37,6 +37,8 @@ import json
 import logging
 import re
 import boto3
+import botocore.exceptions
+from botocore.config import Config
 from datetime import datetime, timedelta
 from urllib.parse import unquote_plus
 
@@ -55,7 +57,17 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 s3_client = boto3.client('s3')
-lambda_client = boto3.client('lambda')
+# read_timeout BELOW ApiFunction's own Timeout (Task 7: ApiFunction=28,
+# AskAgentFunction=27), so a hung Ask Agent invoke fails HERE, in code that
+# can name it, instead of the runtime killing ApiFunction first and leaving a
+# bare `Task timed out` as the only trace (spec SS4.8). retries=0: a
+# synchronous user-facing invoke must not silently double the wait.
+_LAMBDA_INVOKE_TIMEOUT = int(os.environ.get("ASK_INVOKE_TIMEOUT", "26"))
+lambda_client = boto3.client('lambda', config=Config(
+    read_timeout=_LAMBDA_INVOKE_TIMEOUT,
+    connect_timeout=5,
+    retries={"max_attempts": 0},
+))
 dynamodb = boto3.resource('dynamodb')
 
 S3_BUCKET = os.environ.get('S3_BUCKET', 'fieldsight-data-509194952652')
@@ -1309,9 +1321,20 @@ def ask_question(body, caller):
             return result
         # Or direct invocation format
         return ok(result)
+    except botocore.exceptions.ReadTimeoutError:
+        # The gap this fixes (spec SS4.8): with no Config on lambda_client,
+        # botocore's default read timeout outlived ApiFunction's own Timeout,
+        # so the runtime killed this function before this except could run --
+        # the only trace was a bare `Task timed out`. Named here instead, and
+        # 504 (not 500/502) so a hung agent is distinguishable from every
+        # other invoke failure below. The body text is generic on purpose:
+        # the web client replaces every Ask failure with its own reassuring
+        # line regardless of status code (Task 11) -- this status is for us.
+        logger.error("ask agent read timeout after %ss", _LAMBDA_INVOKE_TIMEOUT)
+        return error('Ask temporarily unavailable', 504)
     except Exception as e:
         logger.error(f"Ask agent invocation failed: {e}")
-        return error(f'Ask agent error: {e}', 500)
+        return error('Ask temporarily unavailable', 502)
 
 
 # ── POST /api/ask/corroborate ─────────────────────

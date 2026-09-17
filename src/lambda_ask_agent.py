@@ -1217,6 +1217,18 @@ def _rag_answer(body):
     import llm_utils
     import dashscope_utils
 
+    # WHERE THE SECONDS GO on the screen path (spec SS4.5.3/SS4.8), mirroring
+    # `_voice_answer`'s `marks`/timing line: the only per-call timing on
+    # `/ask` before this was `llm_utils`' `qwen done:`, which is why a 14-day
+    # prod window showed n=27 for a route with 5115 gateway invocations.
+    # Logged from a try/finally below so it fires on EVERY return path in
+    # this function -- the early no-records / metric-route / rag-search-error
+    # returns included -- not only the success one. `history_turns` is
+    # counted before the try so an exception raised before the real
+    # assignment still logs a real count, not a NameError.
+    marks = {}
+    history_turns = 0
+
     question = (body.get("question") or "").strip()
     caller_sub = body.get("caller_sub")
     # k=5 default: fewer chunks -> shorter synthesis prompt -> faster answer.
@@ -1267,10 +1279,12 @@ def _rag_answer(body):
         # an existing, tested path -- so the rewrite can never be the thing
         # that blows the budget.
         deadline_left = ASK_DEADLINE_SECONDS - (time.monotonic() - _started)
+        _t_rewrite = time.monotonic()
         asked, rewritten = ask_rewrite.standalone_question(
             question, history,
             call=corroboration_client.call,
             timeout=min(ASK_REWRITE_BUDGET, deadline_left))
+        marks["rewrite"] = time.monotonic() - _t_rewrite
         logger.info("  Ask rewrite: history_turns=%d rewritten=%s",
                     history_turns, rewritten)
 
@@ -1365,6 +1379,7 @@ def _rag_answer(body):
         # == question`. This is the ONE place the rewrite changes what
         # retrieval does; build_rag_prompt below and the web branch further
         # down both keep reading `question` (spec SS4.3).
+        _t_retrieval = time.monotonic()
         query_vec = dashscope_utils.embed([asked])[0]
 
         # WIDEN ONLY WHEN SOMETHING WILL NARROW IT AGAIN. With reranking on we
@@ -1410,6 +1425,10 @@ def _rag_answer(body):
             InvocationType="RequestResponse",
             Payload=json.dumps(payload),
         )
+        # Retrieval = embed + the rag-search round trip. Marked here, right
+        # after the invoke returns, so it is set on the FunctionError branch
+        # below too -- not only the success path a few lines further down.
+        marks["retrieval"] = time.monotonic() - _t_retrieval
         # A crashed rag-search (DB down — e.g. rotated password) comes back as a
         # 200 with FunctionError set. Never let that masquerade as "no records"
         # (mirrors _rag_search_list) -- surface a clear service error instead.
@@ -1582,6 +1601,7 @@ def _rag_answer(body):
         voice_model = os.environ.get("ASK_VOICE_MODEL", "").strip()
         if voice_model.lower() in ("", "none"):
             voice_model = None
+        _t_synthesis = time.monotonic()
         if voice and voice_model:
             answer, err = llm_utils.call_llm(
                 prompt, max_tokens=MAX_ANSWER_TOKENS, force_json=False,
@@ -1589,6 +1609,10 @@ def _rag_answer(body):
         else:
             answer, err = llm_utils.call_llm(prompt, max_tokens=MAX_ANSWER_TOKENS,
                                              force_json=False)
+        # The primary synthesis call only -- the language-leak retry a few
+        # lines below is a distinct, rare cost and would otherwise inflate
+        # this stage's usual number for the one turn in ~13 that needs it.
+        marks["synthesis"] = time.monotonic() - _t_synthesis
 
         # READ WHAT CAME BACK, do not trust that the rule was followed. The
         # rule existed for months at the top of the system context and still
@@ -1681,6 +1705,20 @@ def _rag_answer(body):
             "applied_scope": applied_scope,
             "asked": asked if rewritten else None,
         }
+    finally:
+        # ONE line, EVERY return path (success, the early no-records /
+        # metric-route / rag-search-error returns, and the outer except
+        # above) -- a `finally` runs before every one of those `return`s.
+        # Missing stages log -1, same as `_voice_answer`'s `marks.get(...,
+        # -1)`: a stage that never ran (no synthesis on a no-records answer,
+        # no retrieval on the metric route) is a fact worth keeping visible,
+        # not zero-filled into looking like it ran instantly.
+        logger.info(
+            "ask timing: rewrite=%.2fs retrieval=%.2fs synthesis=%.2fs "
+            "total=%.2fs history_turns=%d",
+            marks.get("rewrite", -1), marks.get("retrieval", -1),
+            marks.get("synthesis", -1), time.monotonic() - _started,
+            history_turns)
 
 
 # ============================================================
