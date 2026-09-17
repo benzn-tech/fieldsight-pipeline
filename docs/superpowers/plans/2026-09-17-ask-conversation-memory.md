@@ -768,10 +768,10 @@ def test_the_ask_deadlines_descend():
 
 - [ ] **Step 2: Run, watch it fail** with the real numbers (30, 60, 45).
 
-- [ ] **Step 3: Set** `ApiFunction` 28, `AskAgentFunction` 26, `LLM_HTTP_TIMEOUT` **16**, each with a comment naming the layer above it.
+- [ ] **Step 3: Set** `ApiFunction` 28, `AskAgentFunction` 27, `LLM_HTTP_TIMEOUT` **21**, each with a comment naming the layer above it.
 
-16, not 24: `LLM_HTTP_TIMEOUT` is one model call inside a request whose whole
-budget is `ASK_DEADLINE_SECONDS` (20, Task 9). Setting it equal to — or above —
+21, not 16: prod measured a single model call at 17.9 s (14 days, n=27), so 16 would fail answers that succeed today. `LLM_HTTP_TIMEOUT` is one model call inside a request whose whole
+budget is `ASK_DEADLINE_SECONDS` (24, Task 9). Setting it equal to — or above —
 that budget lets one call spend everything and leaves nothing for retrieval, the
 rewrite or synthesis. See Task 9 for both ladders; this task owns only the hard
 kills plus this one env value.
@@ -862,7 +862,7 @@ from botocore.config import Config
 # fails HERE, in code that can name it, instead of the runtime killing this
 # function first and leaving a bare `Task timed out` as the only trace.
 # retries=0: a synchronous user-facing invoke must not silently double the wait.
-_LAMBDA_INVOKE_TIMEOUT = int(os.environ.get("ASK_INVOKE_TIMEOUT", "24"))
+_LAMBDA_INVOKE_TIMEOUT = int(os.environ.get("ASK_INVOKE_TIMEOUT", "26"))
 lambda_client = boto3.client('lambda', config=Config(
     read_timeout=_LAMBDA_INVOKE_TIMEOUT,
     connect_timeout=5,
@@ -960,7 +960,7 @@ def test_the_flag_is_wired_in_all_three_places(param):
           ASK_DISTANCE_GATE: !Ref AskDistanceGate
           # Literal, beside LLM_HTTP_TIMEOUT: '45' two lines away. A ladder
           # constant, not a switch -- see the note above.
-          ASK_DEADLINE_SECONDS: '20'
+          ASK_DEADLINE_SECONDS: '24'
 ```
 
 and on **`ApiFunction`**, whose `Environment.Variables` currently ends with
@@ -969,7 +969,7 @@ and on **`ApiFunction`**, whose `Environment.Variables` currently ends with
 ```yaml
           # How long this function waits for the Ask Agent. Below its own
           # Timeout (Task 7) so the invoke fails here, in code that can name it.
-          ASK_INVOKE_TIMEOUT: '24'
+          ASK_INVOKE_TIMEOUT: '26'
 ```
 
 All four, in both workflows — `deploy.yml` with `TEST_`, `deploy-prod.yml` with
@@ -989,7 +989,7 @@ of this section got the direction backwards.
 so the outer layer is still alive to report what happened:
 
 ```
-API Gateway 29  >  ApiFunction 28  >  AskAgentFunction 26
+API Gateway 29  >  ApiFunction 28  >  AskAgentFunction 27
 ```
 
 **Voluntary deadlines — also outside in, and all BELOW the kills.** A waiter's
@@ -997,9 +997,9 @@ budget must be LARGER than the budget of the thing it waits on, or the caller
 abandons a callee that is still working correctly:
 
 ```
-ASK_INVOKE_TIMEOUT 24   (ApiFunction's wait on the agent)
-      >  ASK_DEADLINE_SECONDS 20   (the agent's whole-request budget)
-            >  LLM_HTTP_TIMEOUT 16 (one model call)
+ASK_INVOKE_TIMEOUT 26   (ApiFunction's wait on the agent)
+      >  ASK_DEADLINE_SECONDS 24   (the agent's whole-request budget)
+            >  LLM_HTTP_TIMEOUT 21 (one model call)
 ```
 
 `LLM_HTTP_TIMEOUT` must be strictly below `ASK_DEADLINE_SECONDS`, not equal to
@@ -1007,8 +1007,8 @@ it: a single model call permitted to consume the entire request budget leaves
 nothing for retrieval, the rewrite or synthesis, and the request dies having
 done one thing.
 
-`ASK_DEADLINE_SECONDS` (20) sits below `AskAgentFunction`'s Timeout from Task 7
-(26), which is itself below `ApiFunction`'s (28). A deadline above the timeout
+`ASK_DEADLINE_SECONDS` (24) sits below `AskAgentFunction`'s Timeout from Task 7
+(27), which is itself below `ApiFunction`'s (28). A deadline above the timeout
 that kills it is not a deadline — it is a number nothing ever reaches.
 
 - [ ] **Step 4: Run suite. Commit.**
