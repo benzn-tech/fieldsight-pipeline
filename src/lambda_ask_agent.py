@@ -1258,35 +1258,52 @@ def _rag_answer(body):
         # `asked` (SS2: a chat history is a copy taken before a deletion and
         # must never be the thing retrieval or the web branch acts on).
         #
-        # `ask_history`/`ask_rewrite`/`corroboration_client` are imported HERE
-        # for the same reason `query_slots` is below: the legacy hand-built
-        # prod zips a fixed file list and carries none of them, and this
-        # branch never reaches it (no RAG_SEARCH_FUNCTION there) -- but a
-        # top-level import would still break its S3 path on the way past.
+        # `ask_history` is imported HERE for the same reason `query_slots` is
+        # below: the legacy hand-built prod zips a fixed file list and
+        # carries none of them, and this branch never reaches it (no
+        # RAG_SEARCH_FUNCTION there) -- but a top-level import would still
+        # break its S3 path on the way past.
         import ask_history
-        import ask_rewrite
-        import corroboration_client
         # `_clean_voice_history` re-runs here (not only at the gateway)
         # because `_rag_answer` is invoked directly -- in tests and by the
         # legacy S3 path -- not only through the proxy that already cleaned
         # it once. Same caps, same key names, one cleaner either way.
         history = ask_history._clean_voice_history(body.get("history"))
+        # This count is what CLIENTS SENT, not what the rewrite used -- it is
+        # logged below (history_turns=) even when the flag is off, on
+        # purpose: it measures client behaviour, independent of whether the
+        # rewrite is enabled.
         history_turns = len(history)
-        # The budget is enforced, not bet on (SS4.5): a deadline carried from
-        # this function's own start, shrunk to whatever remains. A carried
-        # deadline below the client's own MIN_USEFUL_TIMEOUT floor makes
-        # `standalone_question` skip the call and fall back to `question` --
-        # an existing, tested path -- so the rewrite can never be the thing
-        # that blows the budget.
-        deadline_left = ASK_DEADLINE_SECONDS - (time.monotonic() - _started)
-        _t_rewrite = time.monotonic()
-        asked, rewritten = ask_rewrite.standalone_question(
-            question, history,
-            call=corroboration_client.call,
-            timeout=min(ASK_REWRITE_BUDGET, deadline_left))
-        marks["rewrite"] = time.monotonic() - _t_rewrite
-        logger.info("  Ask rewrite: history_turns=%d rewritten=%s",
-                    history_turns, rewritten)
+
+        # Read at call time, never at import: a flag captured at import
+        # survives a warm container after the stack is redeployed with it
+        # off (same reason as web_answer.enabled()). Off (unset, "false", or
+        # anything else) must reproduce exactly today's behaviour --
+        # `standalone_question` is never called, `asked`/`rewritten` keep
+        # the safe defaults set above, and history plays no further part in
+        # this call.
+        if os.environ.get("ASK_CONVERSATION_MEMORY", "false").lower() == "true":
+            # `ask_rewrite`/`corroboration_client` are imported HERE for the
+            # same reason `ask_history` is above: the legacy hand-built prod
+            # zip carries neither, and a top-level import would still break
+            # its S3 path on the way past.
+            import ask_rewrite
+            import corroboration_client
+            # The budget is enforced, not bet on (SS4.5): a deadline carried
+            # from this function's own start, shrunk to whatever remains. A
+            # carried deadline below the client's own MIN_USEFUL_TIMEOUT
+            # floor makes `standalone_question` skip the call and fall back
+            # to `question` -- an existing, tested path -- so the rewrite
+            # can never be the thing that blows the budget.
+            deadline_left = ASK_DEADLINE_SECONDS - (time.monotonic() - _started)
+            _t_rewrite = time.monotonic()
+            asked, rewritten = ask_rewrite.standalone_question(
+                question, history,
+                call=corroboration_client.call,
+                timeout=min(ASK_REWRITE_BUDGET, deadline_left))
+            marks["rewrite"] = time.monotonic() - _t_rewrite
+            logger.info("  Ask rewrite: history_turns=%d rewritten=%s",
+                        history_turns, rewritten)
 
         # The caller's own calendar day, and the range their question names.
         # `query_slots` is imported HERE for the same reason llm_utils is: the

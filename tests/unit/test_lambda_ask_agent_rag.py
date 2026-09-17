@@ -514,6 +514,7 @@ ONE_TURN = [{"question": "what did James say about the ceiling grid?",
 def test_the_rewritten_text_is_what_gets_embedded(monkeypatch):
     """SS3.1/4.3: the embed call uses `asked`, the rewritten text -- not the
     caller's original wording."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
     wire(monkeypatch, chunks=[])
     monkeypatch.setattr(ask_rewrite, "standalone_question",
                         lambda q, h, **kw: ("when is James finishing the grid?", True))
@@ -533,6 +534,7 @@ def test_the_rewritten_text_is_what_gets_embedded(monkeypatch):
 def test_the_answering_prompt_gets_the_original_and_no_history(monkeypatch):
     """SS2's whole claim. Assert the ABSENCE explicitly: no history text reaches
     build_rag_prompt, and it is called with the caller's original question."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
     wire(monkeypatch, chunks=[{"chunk_text": "level 3 grid note", "id": "c-1",
                                "topic_id": "t-1", "source_s3_key": "x",
                                "report_date": "2026-09-17"}])
@@ -573,6 +575,7 @@ def test_a_body_without_history_sends_the_payload_it_sends_today(monkeypatch):
 def test_an_original_that_names_a_date_is_not_recomputed(monkeypatch):
     """SS4.3: when the ORIGINAL question already resolves a range, the rewrite
     must not cause a second, different resolution from `asked`."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
     wire(monkeypatch, chunks=[])
     ranges = []
     real_time_range = query_slots.time_range
@@ -593,6 +596,7 @@ def test_a_rewritten_date_word_does_not_open_the_metric_route(monkeypatch):
     """Added by review (#17): a rewrite that INTRODUCES a date word into a
     question that had none must not flip the request onto the metric route --
     metric_slots.detect must never be called for this question."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
     wire(monkeypatch, chunks=[])
     monkeypatch.setattr(ask_rewrite, "standalone_question",
                         lambda q, h, **kw: ("how many photos yesterday?", True))
@@ -614,6 +618,7 @@ def test_a_rewritten_date_word_leaves_the_scope_decision_unchanged(monkeypatch):
     """Added by review (#18): same scenario as #17 -- plan["body_date_sent"] /
     the `scoped` decision (read here via applied_scope) must be identical to
     the no-rewrite run, so the web-fallback decision does not move."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
     fake_no_rewrite = wire(monkeypatch, chunks=[])
     monkeypatch.setattr(ask_rewrite, "standalone_question",
                         lambda q, h, **kw: (q, False))
@@ -635,6 +640,7 @@ def test_the_web_answer_branch_receives_the_original_question(monkeypatch):
     """Added by review (#20): the web-answer branch is fed the ORIGINAL
     question, never `asked` -- `asked` may quote a record deleted since the
     previous turn (spec SS2.1/SS4.3)."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
     import web_answer
     wire(monkeypatch, chunks=[{"chunk_text": "note", "id": "c-1", "topic_id": "t-1",
                                "source_s3_key": "x", "report_date": "2026-09-17"}])
@@ -658,6 +664,7 @@ def test_a_rewritten_metric_route_answer_still_carries_asked(monkeypatch):
     already names a date (the metric gate's only requirement). Without this,
     a rewritten metric-route answer would silently show no "Searched for:
     ..." -- the invisible-rewrite failure spec SS3.3 forbids."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
     wire(monkeypatch, chunks=[])
     monkeypatch.setattr(ask_rewrite, "standalone_question",
                         lambda q, h, **kw: ("how many photos did James take yesterday?", True))
@@ -671,6 +678,7 @@ def test_a_rewritten_metric_route_answer_still_carries_asked(monkeypatch):
 
 
 def test_a_no_rewrite_metric_route_answer_has_asked_none(monkeypatch):
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
     wire(monkeypatch, chunks=[])
     monkeypatch.setattr(ask_rewrite, "standalone_question",
                         lambda q, h, **kw: (q, False))
@@ -681,6 +689,90 @@ def test_a_no_rewrite_metric_route_answer_has_asked_none(monkeypatch):
 
     assert out["computed"] is True, "sanity: the metric route was actually taken"
     assert out["asked"] is None
+
+
+# --------------------------------------------------------------------------
+# Task 10 (2026-09-17 ask-conversation-memory): the rewrite only runs when
+# ASK_CONVERSATION_MEMORY is "true". Off (unset, "false", or anything else)
+# must reproduce EXACTLY today's behaviour: standalone_question is never
+# called, `asked` is None, the embed call gets the caller's original text,
+# and a body with history retrieves identically to one without.
+# --------------------------------------------------------------------------
+
+def _counting_standalone_question(monkeypatch):
+    calls = []
+
+    def fake(q, h, **kw):
+        calls.append((q, h))
+        return ("rewritten by the gate test", True)
+
+    monkeypatch.setattr(ask_rewrite, "standalone_question", fake)
+    return calls
+
+
+@pytest.mark.parametrize("env_value", [None, "false"])
+def test_the_rewrite_is_not_called_when_the_flag_is_off(monkeypatch, env_value):
+    if env_value is None:
+        monkeypatch.delenv("ASK_CONVERSATION_MEMORY", raising=False)
+    else:
+        monkeypatch.setenv("ASK_CONVERSATION_MEMORY", env_value)
+    calls = _counting_standalone_question(monkeypatch)
+    wire(monkeypatch, chunks=[])
+
+    seen = {}
+    real_embed = dashscope_utils.embed
+    def spy_embed(texts, dim=None):
+        seen["texts"] = texts
+        return real_embed(texts, dim=dim)
+    monkeypatch.setattr(dashscope_utils, "embed", spy_embed)
+
+    out = laa._rag_answer({"question": "when is he finishing it?", "caller_sub": SUB,
+                           "history": ONE_TURN})
+
+    assert calls == [], "standalone_question must never be called with the flag off"
+    assert out["asked"] is None
+    assert seen["texts"] == ["when is he finishing it?"], \
+        "the embed call must get the ORIGINAL question, not a rewrite"
+
+
+def test_the_rewrite_runs_when_the_flag_is_on(monkeypatch):
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")
+    calls = _counting_standalone_question(monkeypatch)
+    wire(monkeypatch, chunks=[])
+
+    seen = {}
+    real_embed = dashscope_utils.embed
+    def spy_embed(texts, dim=None):
+        seen["texts"] = texts
+        return real_embed(texts, dim=dim)
+    monkeypatch.setattr(dashscope_utils, "embed", spy_embed)
+
+    out = laa._rag_answer({"question": "when is he finishing it?", "caller_sub": SUB,
+                           "history": ONE_TURN})
+
+    assert len(calls) == 1, "standalone_question must be called exactly once with the flag on"
+    assert out["asked"] == "rewritten by the gate test"
+    assert seen["texts"] == ["rewritten by the gate test"]
+
+
+def test_the_flag_off_payload_is_identical_with_and_without_history(monkeypatch):
+    """SS3.1-style parity, but for the flag-off path specifically: real
+    history sent alongside the flag being off must retrieve exactly like no
+    history at all -- the rewrite never runs, so history cannot move the
+    rag-search payload."""
+    monkeypatch.delenv("ASK_CONVERSATION_MEMORY", raising=False)
+    _counting_standalone_question(monkeypatch)
+
+    fake_no_history = wire(monkeypatch, chunks=[])
+    laa._rag_answer({"question": "what happened?", "caller_sub": SUB})
+    without_history = dict(fake_no_history.calls[0]["Payload"])
+
+    fake_with_history = wire(monkeypatch, chunks=[])
+    laa._rag_answer({"question": "what happened?", "caller_sub": SUB, "history": ONE_TURN})
+    with_history = dict(fake_with_history.calls[0]["Payload"])
+
+    assert with_history == without_history, \
+        "flag off: a real history payload must retrieve identically to no history"
 
 
 # --------------------------------------------------------------------------
