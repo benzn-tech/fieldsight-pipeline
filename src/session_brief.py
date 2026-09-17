@@ -394,15 +394,20 @@ def to_session_summary(brief):
     `build_confirmation_email` and nothing downstream changes. `open_todos` takes
     the same {text, responsible, due} shape `_clean_todos` normalises.
     """
-    # `why` is NOT carried here (2026-09-17, "the code stops carrying `why` and
-    # `basis`" -- docs/superpowers/plans/2026-09-17-minutes-that-read-like-minutes.md
-    # task B1). The model is still asked for it (`build_brief_prompt` above; that
-    # ask is removed separately, task B3) but this boundary stops reading it: the
-    # owner's decision is that the confirmation email drops the per-item context
-    # line entirely rather than keep it, because the to-do's OWN sentence is meant
-    # to carry that context now (spec §3.1/§3.3). `why` still lives on the raw
-    # `tasks[]` this function returns alongside `open_todos` (see `brief.update`
-    # below), for anyone reading the stored artifact directly.
+    # `why` is not carried here because it no longer exists anywhere (2026-09-17,
+    # docs/superpowers/plans/2026-09-17-minutes-that-read-like-minutes.md, tasks
+    # B1 then B3). A task is `{text, at, assignee, due}`: the owner's decision is
+    # that the per-item context line goes entirely, because the to-do's OWN
+    # sentence carries that context now (spec §3.1/§3.3), and `basis` survives
+    # only as the thing that picks that sentence's verb.
+    #
+    # This comment used to say the model "is still asked for it" and that `why`
+    # "still lives on the raw `tasks[]`". Both were true for the single commit
+    # between B1 and B3 and false afterwards, and the twin of this paragraph in
+    # `lambda_org_api.py` cost real work: a client author built a fixture around
+    # `why` and `basis`, fields the writer had stopped producing -- drift that is
+    # invisible until the mock is switched off. A comment that describes a shape
+    # is a promise about the writer, so it is wrong the moment the writer moves.
     todos = [{"text": (t.get("text") or "").strip(),
               "responsible": _real_name(t.get("assignee")),
               "due": t.get("due") or None,
