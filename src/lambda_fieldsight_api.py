@@ -1266,6 +1266,20 @@ def ask_question(body, caller):
     if body.get('scoped'):
         payload['scoped'] = body['scoped']
 
+    # Same cleaner as the voice route: one set of caps, one set of key names.
+    # ABSENT, never an empty list -- see ask_voice, and the agent's
+    # history_turns count, which would otherwise mean two things.
+    raw_history = body.get('history')
+    history = _clean_voice_history(raw_history)
+    if history:
+        payload['history'] = history
+    if isinstance(raw_history, list) and len(raw_history) != len(history):
+        logger.warning("ask: dropped %d of %d history turns",
+                       len(raw_history) - len(history), len(raw_history))
+    elif raw_history is not None and not isinstance(raw_history, list):
+        logger.warning("ask: history was %s, not a list",
+                       type(raw_history).__name__)
+
     try:
         resp = lambda_client.invoke(
             FunctionName=ASK_AGENT_FUNCTION,

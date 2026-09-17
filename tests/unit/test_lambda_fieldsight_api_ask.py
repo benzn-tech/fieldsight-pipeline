@@ -182,6 +182,63 @@ def test_ask_global_no_user_not_400(monkeypatch):
     assert fake_client.calls[0]["Payload"]["caller_sub"] == "sub-ucpk"
 
 
+def test_history_is_forwarded_cleaned(monkeypatch):
+    """Task 4: the screen proxy now forwards a cleaned `history`, exactly as
+    the voice proxy already does (same cleaner, same caps, same key names)."""
+    fake_client = wire(monkeypatch)
+
+    fapi.ask_question({"question": "q", "history": [
+        {"question": "a?", "answer": "b"}]}, ADMIN_CALLER)
+
+    assert fake_client.calls[0]["Payload"]["history"] == [
+        {"question": "a?", "answer": "b"}]
+
+
+def test_the_wrong_key_names_are_dropped_per_turn_and_the_ask_still_answers(monkeypatch, caplog):
+    fake_client = wire(monkeypatch)
+
+    with caplog.at_level("WARNING"):
+        res = fapi.ask_question({"question": "q", "history": [
+            {"q": "a?", "a": "b"}, {"question": "real?", "answer": "yes"}]},
+            ADMIN_CALLER)
+
+    assert res["statusCode"] == 200
+    assert fake_client.calls[0]["Payload"]["history"] == [
+        {"question": "real?", "answer": "yes"}]
+    assert "dropped 1 of 2" in caplog.text
+    assert "ask:" in caplog.text
+
+
+def test_no_usable_history_sends_no_key(monkeypatch):
+    """Absent is not `[]` -- see ask_voice, and the agent's history_turns
+    count, which would otherwise mean two things."""
+    fake_client = wire(monkeypatch)
+
+    fapi.ask_question({"question": "q", "history": []}, ADMIN_CALLER)
+
+    assert "history" not in fake_client.calls[0]["Payload"]
+
+
+def test_no_history_key_at_all_sends_no_key(monkeypatch):
+    fake_client = wire(monkeypatch)
+
+    fapi.ask_question({"question": "q"}, ADMIN_CALLER)
+
+    assert "history" not in fake_client.calls[0]["Payload"]
+
+
+def test_history_not_a_list_warns(monkeypatch, caplog):
+    fake_client = wire(monkeypatch)
+
+    with caplog.at_level("WARNING"):
+        res = fapi.ask_question({"question": "q", "history": "oops"}, ADMIN_CALLER)
+
+    assert res["statusCode"] == 200
+    assert "history" not in fake_client.calls[0]["Payload"]
+    assert "history was str, not a list" in caplog.text
+    assert "ask:" in caplog.text
+
+
 def test_function_error_returns_500_without_stack_trace_leak(monkeypatch):
     """I1: if the Ask Agent lambda itself raised an unhandled exception,
     boto3 reports it via resp['FunctionError'] with a Payload containing

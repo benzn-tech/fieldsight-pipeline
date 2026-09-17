@@ -158,15 +158,17 @@ def test_a_history_of_nothing_but_junk_sends_no_key(monkeypatch):
     assert "history" not in _payload(fake)
 
 
-def test_the_screen_path_does_not_gain_history(monkeypatch):
-    """Out of scope by the spec, and asserted because fixing one of two
-    implementations is this repo's oldest failure. The screen Ask has its own
-    payload builder; continuity there is a separate decision with a visible
-    transcript already on the page."""
+def test_the_screen_path_now_forwards_the_same_cleaned_history(monkeypatch):
+    """UPDATED (Task 4): the screen path was out of scope by the spec (§8) when
+    this file was written, and asserted here for exactly that reason -- fixing
+    one of two implementations is this repo's oldest failure. Task 4 closes
+    that gap: `ask_question` now reuses `_clean_voice_history` and its caps,
+    same as `ask_voice`. See tests/unit/test_lambda_fieldsight_api_ask.py for
+    the full coverage of ask_question's own history forwarding."""
     fake = wire(monkeypatch)
     fapi.ask_question({"question": "how is level three", "history": [TURN]},
                       WORKER_CALLER)
-    assert "history" not in _payload(fake)
+    assert _payload(fake)["history"] == [TURN]
 
 
 def test_history_cannot_smuggle_a_caller(monkeypatch):
