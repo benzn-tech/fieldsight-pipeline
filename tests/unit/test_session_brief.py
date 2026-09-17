@@ -117,6 +117,19 @@ def test_a_task_without_a_quote_is_anchored_by_its_rarest_words():
     assert brief["tasks"][0]["at"] == "09:40:00"
 
 
+def test_a_task_is_anchored_from_its_own_sentence():
+    # `why` must not participate in anchoring: a task whose rare words live only
+    # in `why` (never in `text`) must NOT be findable. If it were, that would mean
+    # `_snap_to_terms` is still being fed `why` -- the exact narrowing this repo's
+    # own `f"{task['text']} {task['why']}"` used to do at session_brief.py:292.
+    turns = [T("The sparkies need to isolate that distribution board first.", "09:40:00")]
+    brief = {"tasks": [{"text": "", "why": "isolate distribution board sparkies",
+                        "at": "08:00:00"}]}
+    stats = sb.reanchor(brief, turns)
+    assert brief["tasks"][0]["at"] == "08:00:00"   # unmoved -- an empty text anchors nothing
+    assert stats["unmatched"] == 1
+
+
 # --- drop-in compatibility --------------------------------------------------
 
 _BRIEF_JSON = """{"headline": "Procurement blocks the device; package it as a phone.",
@@ -145,8 +158,18 @@ def test_it_returns_the_two_keys_the_email_reads():
     out = sb.brief_from_turns(_turns(), call_llm=_llm(_BRIEF_JSON))
     assert out["summary"] == "Procurement blocks the device; package it as a phone."
     assert out["open_todos"] == [{"text": "Price the device as a company phone",
-                                  "why": "procurement", "at": "13:40:56",
+                                  "at": "13:40:56",
                                   "responsible": "Sam", "due": "Friday"}]
+
+
+def test_a_todo_carries_only_text_responsible_due_and_at():
+    # `to_session_summary` stops reading `why`: the code side of retiring the field
+    # (the prompt still asks for it -- that is a later task). A `why` key anywhere
+    # in a to-do means the old behaviour survived.
+    out = sb.brief_from_turns(_turns(), call_llm=_llm(_BRIEF_JSON))
+    assert out["open_todos"]
+    for todo in out["open_todos"]:
+        assert set(todo.keys()) == {"text", "responsible", "due", "at"}
 
 
 def test_it_also_returns_the_brief_itself():

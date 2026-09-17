@@ -2741,9 +2741,13 @@ def session_brief_read(conn, caller, session_id, event):
     and neither is an error.
 
     Returned whole rather than filtered. Every field in it was produced for a reader — the
-    quote is what makes a bullet checkable, `at` is what makes it findable in the transcript,
-    and `why` is the field the to-do list was missing. Trimming here would repeat the mistake
-    that made this endpoint necessary.
+    quote is what makes a bullet checkable, `at` is what makes it findable in the transcript.
+    As of 2026-09-17 (`session_brief.to_session_summary`) `why` no longer reaches `open_todos`
+    -- the confirmation email's to-do list dropped its per-item context line by decision, in
+    favour of a task `text` that carries its own context (spec §3.1/§3.3). `why` still lives on
+    this same artifact's raw `tasks[]`, for anyone reading the brief directly rather than
+    through the email's shape. Trimming here would repeat the mistake that made this endpoint
+    necessary.
     """
     p = event.get("queryStringParameters") or {}
     date, user = p.get("date"), (p.get("user") or "").strip()

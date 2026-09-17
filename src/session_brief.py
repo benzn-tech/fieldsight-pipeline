@@ -289,7 +289,7 @@ def reanchor(brief, turns):
                 b["at"] = at
                 fixed += 1
     for task in brief.get("tasks") or []:
-        at = _snap_to_terms(f"{task.get('text', '')} {task.get('why', '')}", turns, df)
+        at = _snap_to_terms(task.get("text", ""), turns, df)
         if at is None:
             missed += 1
         elif at != task.get("at"):
@@ -331,18 +331,18 @@ def to_session_summary(brief):
     `build_confirmation_email` and nothing downstream changes. `open_todos` takes
     the same {text, responsible, due} shape `_clean_todos` normalises.
     """
-    # `why` travels with the three the email already knew about. The model is asked for it
-    # ("What happened in the meeting that produced this") and it was being computed and
-    # dropped at this boundary — the whole brief reached S3 and only two keys reached the
-    # surfaces that read it.
-    #
-    # It is the field the owner asked for after finding the to-do list unusable for recall:
-    # a title tuned to survive truncation identifies the task and cannot also carry why it
-    # exists, so reading the list meant going back to the timeline and opening the topic.
+    # `why` is NOT carried here (2026-09-17, "the code stops carrying `why` and
+    # `basis`" -- docs/superpowers/plans/2026-09-17-minutes-that-read-like-minutes.md
+    # task B1). The model is still asked for it (`build_brief_prompt` above; that
+    # ask is removed separately, task B3) but this boundary stops reading it: the
+    # owner's decision is that the confirmation email drops the per-item context
+    # line entirely rather than keep it, because the to-do's OWN sentence is meant
+    # to carry that context now (spec §3.1/§3.3). `why` still lives on the raw
+    # `tasks[]` this function returns alongside `open_todos` (see `brief.update`
+    # below), for anyone reading the stored artifact directly.
     todos = [{"text": (t.get("text") or "").strip(),
               "responsible": _real_name(t.get("assignee")),
               "due": t.get("due") or None,
-              "why": (t.get("why") or "").strip() or None,
               "at": t.get("at") or None}
              for t in (brief.get("tasks") or []) if (t.get("text") or "").strip()]
     return {"summary": (brief.get("headline") or "").strip(), "open_todos": todos}

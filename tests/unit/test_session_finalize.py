@@ -238,18 +238,24 @@ def test_store_brief_swallows_its_own_failure():
     fin._store_brief("Ben_Test", "2026-08-19", "abc", {"headline": "x", "sections": []})
 
 
-def test_the_reason_a_todo_exists_reaches_both_halves_of_the_email():
-    """`why` crosses three boundaries — the brief's own summary shape, `_clean_todos`, and
-    the two renderers — and it was being dropped at the first two.
+# test_the_reason_a_todo_exists_reaches_both_halves_of_the_email was deleted here
+# (2026-09-17, "the code stops carrying `why` and `basis`" task). It pinned the
+# per-item context line under an Action items row, in both the text and HTML
+# halves of the confirmation email. The owner decided on 2026-09-17 that this
+# email loses that line too -- the same day, and the same ruling, that drops
+# `why` from the extraction/brief output entirely (spec §3.3, plan ruling 2 in
+# docs/superpowers/plans/2026-09-17-minutes-that-read-like-minutes.md). Deleting
+# the test is the deliberate removal of shipped behaviour, not a cleanup: the
+# context line it pinned no longer renders, by decision, and
+# test_the_email_renders_no_context_line_under_an_item below now pins its
+# absence instead.
 
-    The whole brief reached S3 and only `{text, responsible, due}` reached the surfaces that
-    read it, so the to-do list stayed exactly as unusable for recall as before. The owner's
-    words for the symptom: reading the list did not bring the day back, and the timeline had
-    to be opened topic by topic.
 
-    Asserted in BOTH renderers because they are separate code with separate escaping, and a
-    field that reaches one of them is a field half the readers never see.
-    """
+def test_the_email_renders_no_context_line_under_an_item():
+    """Both halves of `build_confirmation_email` stop rendering a context line under
+    an Action items row. A to-do that still carries a `why` key (an old-shaped
+    artifact, or a caller that has not been updated) must not leak it into either
+    renderer -- the field is retired at the render boundary, not just at the source."""
     import lambda_session_finalize as sf
 
     _subj, text, html = sf.build_confirmation_email(
@@ -262,14 +268,15 @@ def test_the_reason_a_todo_exists_reaches_both_halves_of_the_email():
 
     for where, body in (("text", text), ("html", html)):
         assert "Price the device as a company phone" in body, where
-        assert "procurement will not sign off on a per-seat licence" in body, (
-            f"the {where} email dropped the reason the to-do exists")
+        assert "procurement will not sign off on a per-seat licence" not in body, (
+            f"the {where} email still renders the retired context line")
 
 
 def test_a_todo_without_a_reason_renders_exactly_as_before():
-    """The rolling summariser produces no `why`, and a brief whose model omitted it produces
-    none either. Neither may gain an empty line, a dash, or an empty table cell — an absent
-    explanation must look absent, not missing."""
+    """The rolling summariser produces no `why`, and (as of this task) neither does
+    a brief. This test now describes every to-do, not just the ones without a
+    reason: no item may gain an empty line, a dash, or an empty table cell under
+    it -- there is no per-item context line left to render, for any to-do."""
     import lambda_session_finalize as sf
 
     _, text, html = sf.build_confirmation_email(
