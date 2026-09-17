@@ -210,7 +210,12 @@ def backstop(conn, *, list_waiting, resolve_context, read_rolling, enqueue, now=
             "timeRange": ctx.get("timeRange"),
             "siteName": ctx.get("siteName"),
             "summary": rolling.get("summary", ""),
-            "openTodos": rolling.get("open_todos", []),
+            # The rolling summary has no topics, so its narrative becomes one
+            # row of the same shape item-writer builds. Without it a backstopped
+            # session with no to-dos is an email that says nothing -- and the
+            # two paths would send visibly different emails for the same kind of
+            # recording, which is how a reader learns to distrust both.
+            "openTodos": (rolling.get("open_todos") or []) + _summary_row(rolling),
         }
         if enqueue(artifact):
             logger.info("finalize: %s waited %.0fs for its final extraction — "
@@ -285,6 +290,24 @@ def _read_rolling(folder, date, session_id):
         return json.loads(obj["Body"].read().decode("utf-8"))
     except Exception:
         return {}
+
+
+#: Mirrors lambda_item_writer.TOPIC_ROW_MAX_CHARS -- the same table, the same
+#: cell, so the two producers must trim the same way.
+SUMMARY_ROW_MAX_CHARS = 180
+
+
+def _summary_row(rolling):
+    """The rolling summary as a single topic-shaped row, or [] if there is none."""
+    summary = " ".join((rolling.get("summary") or "").split())
+    if not summary:
+        return []
+    first = summary.split(". ")[0].strip()
+    if first and first != summary and not first.endswith("."):
+        first += "."
+    if len(first) > SUMMARY_ROW_MAX_CHARS:
+        first = first[:SUMMARY_ROW_MAX_CHARS - 1].rstrip() + "…"
+    return [{"text": first, "responsible": None, "due": None, "kind": "topic"}]
 
 
 def _enqueue(artifact):
