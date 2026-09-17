@@ -158,6 +158,7 @@ from text_normalize import diff_candidates, first_match_span, normalize, occurre
 # frame's structural signal is reconstructed from the still-live topic row.
 from keyframe_selection import keyframe_seconds
 from photo_binding import parse_time_range
+import batch_cover
 import batch_stitch
 import deletion_mirror
 import turn_name_overlay
@@ -8594,7 +8595,7 @@ def _read_org_audio_segments(date, folder, start_time, end_time, conn=None):
     _read_org_transcripts: the modern frontend never hands a spaced name)."""
     start_sec, end_sec = _org_media_window(start_time, end_time)
     prefix = f"audio_segments/{folder}/{date}/"
-    segments = []
+    kept = []
     for obj in _list_media_objects(prefix, "audio-segments"):
         key = obj["Key"]
         if not key.endswith(".wav"):
@@ -8616,7 +8617,22 @@ def _read_org_audio_segments(date, folder, start_time, end_time, conn=None):
         abs_end = base_sec + float(off_match.group(2))
         if abs_end < start_sec or abs_start > end_sec:
             continue
-        url = s3().generate_presigned_url(
+        kept.append((key, filename, abs_start, abs_end))
+    client = s3()
+    # A batch wav is the same speech as the chunk wavs it was stitched from, written
+    # beside them -- listing both plays every stretch twice. Drop a chunk only when a
+    # batch IN THIS RESULT names it in its map: never by duration (a day before
+    # batching is all 30 s chunks) and never by filename arithmetic (a VAD-rejected
+    # chunk is bridged, so c1035_bn4 holds 1035, 1036, 1037, 1039). An unreadable map
+    # hides nothing.
+    covered = batch_cover.covered_chunk_keys(
+        lambda k: client.get_object(Bucket=S3_BUCKET, Key=k)["Body"].read(),
+        [k for k, _f, _s, _e in kept])
+    segments = []
+    for key, filename, abs_start, abs_end in kept:
+        if key in covered:
+            continue
+        url = client.generate_presigned_url(
             "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
             ExpiresIn=PRESIGNED_URL_EXPIRY)
         ah, am, asec = (int(abs_start) // 3600, (int(abs_start) % 3600) // 60,

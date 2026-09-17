@@ -43,6 +43,7 @@ from datetime import datetime, timedelta
 from urllib.parse import unquote_plus
 
 import deletion_mirror
+import batch_cover
 import nz_time
 # Pure module, no boto3 -- safe to import eagerly. Moved out of this file
 # (2026-09-17, ask-conversation-memory Task 3) so lambda_ask_agent can share
@@ -935,7 +936,7 @@ def get_audio_segments(params, caller):
 
     prefix = f"audio_segments/{user_folder}/{date}/"
     deleted = _deleted_bases(user_folder, date)
-    segments = []
+    kept = []
     try:
         resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
         for obj in resp.get('Contents', []):
@@ -958,6 +959,20 @@ def get_audio_segments(params, caller):
             abs_start = base_sec + float(off_match.group(1))
             abs_end = base_sec + float(off_match.group(2))
             if abs_end < start_sec or abs_start > end_sec:
+                continue
+            kept.append((key, filename, abs_start, abs_end))
+    except Exception as e:
+        logger.error(f"Error listing audio segments: {e}")
+    segments = []
+    try:
+        # Same rule as org-api's _read_org_audio_segments: a chunk named in the map of a
+        # batch in this result is the same speech as that batch -- drop it. Members come
+        # from the map, never the filename; an unreadable map hides nothing.
+        covered = batch_cover.covered_chunk_keys(
+            lambda k: s3_client.get_object(Bucket=S3_BUCKET, Key=k)['Body'].read(),
+            [k for k, _f, _s, _e in kept])
+        for key, filename, abs_start, abs_end in kept:
+            if key in covered:
                 continue
             url = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': key}, ExpiresIn=PRESIGNED_URL_EXPIRY)
             ah, am, asec = int(abs_start)//3600, (int(abs_start)%3600)//60, int(abs_start)%60
