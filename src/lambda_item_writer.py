@@ -443,21 +443,21 @@ def _final_email_rows(artifact, date):
     that same mapping -- the spoken text remains, as the fallback for a deadline
     nothing could resolve.
 
-    Carries `topic_range` (handoff-sync plan §8): the owning topic's raw,
-    unparsed `time_range` string. Needed by `lambda_session_finalize` to decide
-    whether a brief task already covers this row's topic (§7.1), and to
-    attribute a back-filled row -- the finalize worker sees only the flat rows
-    below, never the topics they came from."""
+    No longer carries a `topic_range` (handoff-sync plan §8 originally added
+    it, §7.1 as first written): that field existed only so
+    `lambda_session_finalize` could decide, by TIME, whether a brief task
+    already covered a row's topic. §7.1 is now decided by TEXT instead (see
+    `lambda_session_finalize._is_represented`), which reads a row's own
+    `text` -- already present here -- so nothing downstream reads this field
+    any more."""
     out = []
     for topic in artifact.get("topics") or []:
-        topic_range = topic.get("time_range")
         for item in lambda_ingest._map_action_items(topic.get("action_items"), date):
             text = (item.get("text") or "").strip()
             if text:
                 out.append({"text": text,
                             "responsible": item.get("responsible") or None,
-                            "due": item.get("deadline") or item.get("deadline_text") or None,
-                            "topic_range": topic_range})
+                            "due": item.get("deadline") or item.get("deadline_text") or None})
     return todo_collapse.collapse_if_enabled(out)
 
 
@@ -481,15 +481,13 @@ def _topic_rows(artifact):
     table through them, and listing it twice would pad the very table this is
     trying to make worth reading.
 
-    Carries `topic_range` (handoff-sync plan §8), same reason as
-    `_final_email_rows`: `lambda_session_finalize` needs it to tell whether a
-    brief task already covers this topic (§7.1) before deciding to keep the
-    row at all."""
+    No longer carries a `topic_range` -- same reason as `_final_email_rows`
+    above: `lambda_session_finalize` now decides §7.1 (does the brief already
+    cover this topic) from this row's own `text`, not from a time window."""
     out = []
     for topic in artifact.get("topics") or []:
         if topic.get("action_items"):
             continue
-        topic_range = topic.get("time_range")
         title = (topic.get("topic_title") or topic.get("title") or "").strip()
         summary = " ".join((topic.get("summary") or "").split())
         # The first sentence, not the whole summary: the rest repeats it at
@@ -502,7 +500,7 @@ def _topic_rows(artifact):
             text = text[:TOPIC_ROW_MAX_CHARS - 1].rstrip() + "…"
         if text:
             out.append({"text": text, "responsible": None, "due": None,
-                        "kind": "topic", "topic_range": topic_range})
+                        "kind": "topic"})
     return out
 
 
