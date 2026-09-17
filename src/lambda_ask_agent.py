@@ -33,6 +33,7 @@ import os
 import json
 import logging
 import re
+import time
 import boto3
 import urllib3
 import urllib.parse as _urlparse
@@ -95,6 +96,13 @@ def _get_lambda_client():
 MAX_TRANSCRIPT_CHARS = int(os.environ.get('ASK_TRANSCRIPT_CHARS', '300000'))
 MAX_REPORT_CHARS = int(os.environ.get('ASK_REPORT_CHARS', '60000'))
 MAX_ANSWER_TOKENS = int(os.environ.get('ASK_ANSWER_TOKENS', '8000'))
+
+# Ask conversation memory (spec 2026-09-17 SS4.5): the whole-request budget
+# _rag_answer carries from its own start, and the slice of it the question
+# rewrite may spend. Kept below the API Gateway/ApiFunction ceiling so this
+# function gives up while its caller is still listening.
+ASK_DEADLINE_SECONDS = float(os.environ.get('ASK_DEADLINE_SECONDS', '24'))
+ASK_REWRITE_BUDGET = float(os.environ.get('ASK_REWRITE_BUDGET', '4.0'))
 
 
 # ============================================================
@@ -781,6 +789,17 @@ def _lexical_terms(question):
     return terms
 
 
+def _derived_title(c):
+    """The title `_aggregate_topics` groups/deep-links by, and the same text
+    the distance gate in `_rag_answer` matches lexical terms against: a NULL
+    topic_id (defer-day rows) yields NULL topic_title, so fall back to
+    metadata.title then the first 60 chars of chunk_text. One definition of
+    "the title" so the gate and the Search list cannot drift apart."""
+    md = c.get("metadata") if isinstance(c.get("metadata"), dict) else {}
+    return (c.get("topic_title") or md.get("title")
+            or (c.get("chunk_text") or "")[:60])
+
+
 def _aggregate_topics(chunks, question=""):
     """Collapse retrieved chunks into distinct topic rows for the Search list.
     chunk_type=='topic' chunks are kept even when topic_id is NULL
@@ -810,9 +829,7 @@ def _aggregate_topics(chunks, question=""):
             continue
         # Title: report_chunks JOINs topics for topic_title; a NULL topic_id
         # yields NULL topic_title, so fall back to metadata.title then chunk_text.
-        md = c.get("metadata") if isinstance(c.get("metadata"), dict) else {}
-        derived_title = (c.get("topic_title") or md.get("title")
-                         or (c.get("chunk_text") or "")[:60])
+        derived_title = _derived_title(c)
         date = str(c.get("report_date", "") or "")
         site_id = str(c.get("site_id", "") or "")
         # Group key: UUID when present, else the derived title (defer-day rows).
@@ -1196,8 +1213,21 @@ def _rag_answer(body):
     propagate out of lambda_handler as a raw Lambda error (stack trace and
     all) instead of a clean HTTP-shaped response.
     """
+    _started = time.monotonic()
     import llm_utils
     import dashscope_utils
+
+    # WHERE THE SECONDS GO on the screen path (spec SS4.5.3/SS4.8), mirroring
+    # `_voice_answer`'s `marks`/timing line: the only per-call timing on
+    # `/ask` before this was `llm_utils`' `qwen done:`, which is why a 14-day
+    # prod window showed n=27 for a route with 5115 gateway invocations.
+    # Logged from a try/finally below so it fires on EVERY return path in
+    # this function -- the early no-records / metric-route / rag-search-error
+    # returns included -- not only the success one. `history_turns` is
+    # counted before the try so an exception raised before the real
+    # assignment still logs a real count, not a NameError.
+    marks = {}
+    history_turns = 0
 
     question = (body.get("question") or "").strip()
     caller_sub = body.get("caller_sub")
@@ -1207,32 +1237,118 @@ def _rag_answer(body):
     # on our corpus. rag-search clamps k to [1,32].
     k = int(body.get("k", 5))
 
-    # The caller's own calendar day, and the range their question names.
-    # `query_slots` is imported HERE for the same reason llm_utils is: the
-    # legacy hand-built prod zips a fixed file list and does not carry it. That
-    # deploy has no RAG_SEARCH_FUNCTION so it never reaches this line, but a
-    # top-level import would kill its S3 path too on the way past.
-    #
-    # `now` is a test seam. A client that sent one could only shift which day
-    # it calls today, inside an ACL it already passed -- there is nothing to
-    # gain by lying about it.
-    import answer_language
-    import query_slots
-    today = query_slots.resolve_today(body.get("tz"), now=_parse_now(body.get("now")))
-    q_from, q_to = query_slots.time_range(question, today)
-
-    # Scoped Ask (spec 2026-09-15 §4.2): what the client asked to be scoped to,
-    # validated, and the range that wins. Pure helpers that never raise, so
-    # computing them above the try adds no raw-500 path.
-    scope_req, scope_dropped = _validate_scope(body)
-    plan = _scope_range(scope_req, q_from, q_to)
-    scope_dropped = scope_dropped + plan["dropped"]
-    date_from, date_to = plan["from"], plan["to"]
-    narrowed = any(f in scope_req for f in ("site_id", "author_folder", "topic_row_id"))
-    # Until rag-search answers, only this hop's own drops are known.
-    applied_scope = {"dropped": list(scope_dropped)}
-
     try:
+        # Safe default so the except handler below can always build its
+        # response: everything from here through the real assignment a few
+        # lines down (imports, query_slots, scope validation) is inside the
+        # try, so an exception raised before that assignment must not hit a
+        # NameError on applied_scope inside except -- that would mask the
+        # real error and still escape as a raw 500.
+        applied_scope = {"dropped": []}
+        # Same NameError guard as applied_scope above: the except handler
+        # also reports `asked`, so it must exist even if the rewrite call
+        # below never runs. `rewritten=False` means "answer as asked".
+        asked, rewritten = question, False
+
+        # Ask conversation memory (spec 2026-09-17 SS2, SS3.1-3.3, SS4.3): a
+        # follow-up such as "when is he finishing it?" embeds to nothing
+        # useful and parses no date. Spend the history HERE, on producing one
+        # standalone question to retrieve with, and nowhere else -- the
+        # answering prompt below still gets the caller's own `question`, not
+        # `asked` (SS2: a chat history is a copy taken before a deletion and
+        # must never be the thing retrieval or the web branch acts on).
+        #
+        # `ask_history` is imported HERE for the same reason `query_slots` is
+        # below: the legacy hand-built prod zips a fixed file list and
+        # carries none of them, and this branch never reaches it (no
+        # RAG_SEARCH_FUNCTION there) -- but a top-level import would still
+        # break its S3 path on the way past.
+        import ask_history
+        # `_clean_voice_history` re-runs here (not only at the gateway)
+        # because `_rag_answer` is invoked directly -- in tests and by the
+        # legacy S3 path -- not only through the proxy that already cleaned
+        # it once. Same caps, same key names, one cleaner either way.
+        history = ask_history._clean_voice_history(body.get("history"))
+        # This count is what CLIENTS SENT, not what the rewrite used -- it is
+        # logged below (history_turns=) even when the flag is off, on
+        # purpose: it measures client behaviour, independent of whether the
+        # rewrite is enabled.
+        history_turns = len(history)
+
+        # Read at call time, never at import: a flag captured at import
+        # survives a warm container after the stack is redeployed with it
+        # off (same reason as web_answer.enabled()). Off (unset, "false", or
+        # anything else) must reproduce exactly today's behaviour --
+        # `standalone_question` is never called, `asked`/`rewritten` keep
+        # the safe defaults set above, and history plays no further part in
+        # this call.
+        if os.environ.get("ASK_CONVERSATION_MEMORY", "false").lower() == "true":
+            # `ask_rewrite`/`corroboration_client` are imported HERE for the
+            # same reason `ask_history` is above: the legacy hand-built prod
+            # zip carries neither, and a top-level import would still break
+            # its S3 path on the way past.
+            import ask_rewrite
+            import corroboration_client
+            # The budget is enforced, not bet on (SS4.5): a deadline carried
+            # from this function's own start, shrunk to whatever remains. A
+            # carried deadline below the client's own MIN_USEFUL_TIMEOUT
+            # floor makes `standalone_question` skip the call and fall back
+            # to `question` -- an existing, tested path -- so the rewrite
+            # can never be the thing that blows the budget.
+            deadline_left = ASK_DEADLINE_SECONDS - (time.monotonic() - _started)
+            _t_rewrite = time.monotonic()
+            asked, rewritten = ask_rewrite.standalone_question(
+                question, history,
+                call=corroboration_client.call,
+                timeout=min(ASK_REWRITE_BUDGET, deadline_left))
+            marks["rewrite"] = time.monotonic() - _t_rewrite
+            logger.info("  Ask rewrite: history_turns=%d rewritten=%s",
+                        history_turns, rewritten)
+
+        # The caller's own calendar day, and the range their question names.
+        # `query_slots` is imported HERE for the same reason llm_utils is: the
+        # legacy hand-built prod zips a fixed file list and does not carry it. That
+        # deploy has no RAG_SEARCH_FUNCTION so it never reaches this line, but a
+        # top-level import would kill its S3 path too on the way past.
+        #
+        # `now` is a test seam. A client that sent one could only shift which day
+        # it calls today, inside an ACL it already passed -- there is nothing to
+        # gain by lying about it.
+        import answer_language
+        import query_slots
+        today = query_slots.resolve_today(body.get("tz"), now=_parse_now(body.get("now")))
+        # ALWAYS from the ORIGINAL question first -- `asked` is read only as a
+        # fallback below, and never to move an anchor the caller already gave.
+        q_from, q_to = query_slots.time_range(question, today)
+        # Kept aside, unmodified, for the metric gate below. `q_from`/`q_to`
+        # themselves MAY still be widened from `asked` a few lines down --
+        # that widening is for retrieval (date_from/date_to, _scope_range).
+        # The metric gate must not see it: a rewrite that hands an undated
+        # question a date must never turn it into a counted one.
+        orig_q_from, orig_q_to = q_from, q_to
+        if rewritten and q_from is None and q_to is None:
+            # A rewrite may SUPPLY a missing anchor for RETRIEVAL. It may
+            # never move one the caller gave (guarded by the None/None check
+            # above), and it may never open the metric route below:
+            # `metric_slots.detect` is gated on `orig_q_from`, not this
+            # recomputed `q_from`, and reads the ORIGINAL `question` -- so a
+            # date word the rewrite invented cannot turn an uncounted
+            # question into a counted one (spec SS4.3, third bullet).
+            q_from, q_to = query_slots.time_range(asked, today)
+
+        # Scoped Ask (spec 2026-09-15 §4.2): what the client asked to be scoped to,
+        # validated, and the range that wins. These are pure helpers that never
+        # raise on their own -- they now live inside the try because a following
+        # change (the question-rewrite network call) lands immediately before
+        # them, and that call must be guarded.
+        scope_req, scope_dropped = _validate_scope(body)
+        plan = _scope_range(scope_req, q_from, q_to)
+        scope_dropped = scope_dropped + plan["dropped"]
+        date_from, date_to = plan["from"], plan["to"]
+        narrowed = any(f in scope_req for f in ("site_id", "author_folder", "topic_row_id"))
+        # Until rag-search answers, only this hop's own drops are known.
+        applied_scope = {"dropped": list(scope_dropped)}
+
         # A counting question leaves here and never reaches the embedder or a
         # model. `metric_slots` is rules, so a MISS returns None and the question
         # falls through to exactly what it does today -- the miss costs nothing
@@ -1259,13 +1375,29 @@ def _rag_answer(body):
         # site, an author or a topic, so a scoped count answered here would be the
         # unscoped number wearing the scope's label -- the silent-wrong case the
         # scoped-Ask spec exists to remove. Retrieval answers it instead.
-        _metric = metric_slots.detect(question) if (q_from and not narrowed) else None
+        # Gated on `orig_q_from`, NOT `q_from`: when they differ, `q_from` was
+        # supplied by the rewrite and must not open this route (see the
+        # comment where `orig_q_from` is set, above).
+        _metric = metric_slots.detect(question) if (orig_q_from and not narrowed) else None
         if _metric:
             logger.info("  Ask metric route: %s (%s..%s)", _metric, q_from, q_to)
-            return _metric_answer(caller_sub, question, _metric, q_from, q_to,
-                                  applied_scope=applied_scope)
+            # `asked` at the call site, not inside `_metric_answer`: a rewrite
+            # can still have run (history + budget), even though the metric
+            # gate itself only looks at the ORIGINAL question. Without this,
+            # a rewritten metric-route answer would silently render no
+            # "Searched for: ..." -- the invisible-rewrite failure spec §3.3
+            # exists to prevent.
+            _metric_result = _metric_answer(caller_sub, question, _metric, q_from, q_to,
+                                            applied_scope=applied_scope)
+            _metric_result["asked"] = asked if rewritten else None
+            return _metric_result
 
-        query_vec = dashscope_utils.embed([question])[0]
+        # `asked` -- the rewritten text when a rewrite happened, else `asked
+        # == question`. This is the ONE place the rewrite changes what
+        # retrieval does; build_rag_prompt below and the web branch further
+        # down both keep reading `question` (spec SS4.3).
+        _t_retrieval = time.monotonic()
+        query_vec = dashscope_utils.embed([asked])[0]
 
         # WIDEN ONLY WHEN SOMETHING WILL NARROW IT AGAIN. With reranking on we
         # fetch candidates, not context: the reranker picks the `k` that reach the
@@ -1310,6 +1442,10 @@ def _rag_answer(body):
             InvocationType="RequestResponse",
             Payload=json.dumps(payload),
         )
+        # Retrieval = embed + the rag-search round trip. Marked here, right
+        # after the invoke returns, so it is set on the FunctionError branch
+        # below too -- not only the success path a few lines further down.
+        marks["retrieval"] = time.monotonic() - _t_retrieval
         # A crashed rag-search (DB down — e.g. rotated password) comes back as a
         # 200 with FunctionError set. Never let that masquerade as "no records"
         # (mirrors _rag_search_list) -- surface a clear service error instead.
@@ -1323,6 +1459,7 @@ def _rag_answer(body):
                 # message to something that never ran.
                 "model": None,
                 "applied_scope": applied_scope,
+                "asked": asked if rewritten else None,
             }
         result = json.loads(resp["Payload"].read().decode("utf-8"))
         pinned_topic = result.get("pinned_topic") or None
@@ -1372,6 +1509,7 @@ def _rag_answer(body):
                         "web": empty_web,
                         "basis": basis,
                         "applied_scope": applied_scope,
+                        "asked": asked if rewritten else None,
                     }
             return {
                 "answer": "No relevant records found for this question.",
@@ -1381,6 +1519,7 @@ def _rag_answer(body):
                 "grounded": True,
                 "basis": basis,
                 "applied_scope": applied_scope,
+                "asked": asked if rewritten else None,
             }
 
         # The records may not answer this. Ask before spending a synthesis on
@@ -1402,7 +1541,42 @@ def _rag_answer(body):
         # returned a web block with no citations instead of the topic.
         if body.get("mode") != "voice" and chunks and not scoped and not pinned_topic:
             import web_answer
-            web = web_answer.answer(question, chunks)
+
+            # Seeded at 0.55 because that is the number measured for
+            # _aggregate_topics' per-GROUP filter -- which is a different
+            # comparison, and always with a lexical escape hatch. This is a
+            # per-CHUNK gate, so it gets its own constant and is unmeasured
+            # until it is measured: its worst case must stay "we paid for a
+            # verdict call we could have skipped", never a wrong answer. Read
+            # at call time, not at import, same reason as web_answer.enabled().
+            _DISTANCE_GATE = float(os.environ.get("ASK_DISTANCE_GATE", "0.55"))
+
+            _dists = [c["distance"] for c in chunks if c.get("distance") is not None]
+
+            # `lexical` is NOT a field on a chunk -- `_aggregate_topics`
+            # computes it for its own rows and nothing upstream ever sets it,
+            # so `c.get("lexical")` would be None for every chunk and this arm
+            # would be dead code wearing the shape of a guard. Match against
+            # the TITLE ONLY, never chunk_text (see _aggregate_topics' own
+            # comment at its `hay = derived_title.lower()` line): the
+            # retrieved chunks are semantically near the query so their text
+            # usually contains a term anyway, which would make this arm true
+            # for nearly everything -- a lexical arm that is always true is a
+            # gate that never fires. `_derived_title` mirrors
+            # _aggregate_topics' own fallback chain so one definition of "the
+            # title" exists.
+            _terms = _lexical_terms(question)
+            _lexical = any(
+                any(t in _derived_title(c).lower() for t in _terms)
+                for c in chunks
+            )
+
+            # Absent is not far: _aggregate_topics defaults a missing distance
+            # to 1.0, which is right for ranking and would silently route
+            # every chunk to the web here.
+            _skip = (bool(_dists) and not _lexical and not basis.get("widened")
+                     and min(_dists) > _DISTANCE_GATE)
+            web = web_answer.answer(question, chunks, skip_verdict=_skip)
         if web is not None and web.get("answer"):
             # Its own block, never merged into the grounded answer. A reader who
             # cannot tell what came from their meetings from what came off the
@@ -1416,6 +1590,7 @@ def _rag_answer(body):
                 "web": web,
                 "basis": basis,
                 "applied_scope": applied_scope,
+                "asked": asked if rewritten else None,
             }
 
         prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
@@ -1443,6 +1618,7 @@ def _rag_answer(body):
         voice_model = os.environ.get("ASK_VOICE_MODEL", "").strip()
         if voice_model.lower() in ("", "none"):
             voice_model = None
+        _t_synthesis = time.monotonic()
         if voice and voice_model:
             answer, err = llm_utils.call_llm(
                 prompt, max_tokens=MAX_ANSWER_TOKENS, force_json=False,
@@ -1450,6 +1626,10 @@ def _rag_answer(body):
         else:
             answer, err = llm_utils.call_llm(prompt, max_tokens=MAX_ANSWER_TOKENS,
                                              force_json=False)
+        # The primary synthesis call only -- the language-leak retry a few
+        # lines below is a distinct, rare cost and would otherwise inflate
+        # this stage's usual number for the one turn in ~13 that needs it.
+        marks["synthesis"] = time.monotonic() - _t_synthesis
 
         # READ WHAT CAME BACK, do not trust that the rule was followed. The
         # rule existed for months at the top of the system context and still
@@ -1496,6 +1676,7 @@ def _rag_answer(body):
                 "citations": [],
                 "model": None,
                 "applied_scope": applied_scope,
+                "asked": asked if rewritten else None,
             }
 
         # CONTRACT: citations MUST stay in the same order as the prompt's [n]
@@ -1527,6 +1708,7 @@ def _rag_answer(body):
             "grounded": True,
             "basis": basis,
             "applied_scope": applied_scope,
+            "asked": asked if rewritten else None,
         }
     except Exception as e:
         logger.error(f"  RAG path failed: {e}")
@@ -1538,7 +1720,22 @@ def _rag_answer(body):
             # honest to name.
             "model": None,
             "applied_scope": applied_scope,
+            "asked": asked if rewritten else None,
         }
+    finally:
+        # ONE line, EVERY return path (success, the early no-records /
+        # metric-route / rag-search-error returns, and the outer except
+        # above) -- a `finally` runs before every one of those `return`s.
+        # Missing stages log -1, same as `_voice_answer`'s `marks.get(...,
+        # -1)`: a stage that never ran (no synthesis on a no-records answer,
+        # no retrieval on the metric route) is a fact worth keeping visible,
+        # not zero-filled into looking like it ran instantly.
+        logger.info(
+            "ask timing: rewrite=%.2fs retrieval=%.2fs synthesis=%.2fs "
+            "total=%.2fs history_turns=%d",
+            marks.get("rewrite", -1), marks.get("retrieval", -1),
+            marks.get("synthesis", -1), time.monotonic() - _started,
+            history_turns)
 
 
 # ============================================================
@@ -1664,20 +1861,33 @@ def _voice_answer(body):
     # Voice needs it most -- there is no date picker to fall back on when the
     # question is spoken.
     t_rag = _time.perf_counter()
-    rag = _rag_answer({"question": transcript, "caller_sub": caller_sub,
-                       "mode": "voice", "k": body.get("k", 5),
-                       "tz": body.get("tz")})
+    rag_body = {"question": transcript, "caller_sub": caller_sub,
+                "mode": "voice", "k": body.get("k", 5),
+                "tz": body.get("tz")}
+    # Only added when the incoming body actually has a "history" key --
+    # _rag_answer cleans it (ask_history._clean_voice_history), so this side
+    # does not clean it again, and a device that sends none must still
+    # produce exactly today's inner body (absent, not `[]`, not `None`).
+    if "history" in body:
+        rag_body["history"] = body.get("history")
+    rag = _rag_answer(rag_body)
     marks["rag"] = _time.perf_counter() - t_rag
     answer_text = (rag.get("answer") or "").strip()
+    # Both error returns below sit AFTER the RAG call, so `rag` (and
+    # therefore `rag.get("asked")`) is already in hand -- carried for the
+    # same reason the success return carries it: this function builds its
+    # response from scratch, so anything not listed here is silently dropped.
     if rag.get("error") or not answer_text:
-        return {"error": rag.get("error") or "No answer", "transcript": transcript}
+        return {"error": rag.get("error") or "No answer", "transcript": transcript,
+                "asked": rag.get("asked")}
 
     t_tts = _time.perf_counter()
     try:
         audio_out = _tts(answer_text)
     except Exception as e:
         logger.error("  voice TTS failed: %s", e)
-        return {"error": "Speech synthesis failed", "transcript": transcript}
+        return {"error": "Speech synthesis failed", "transcript": transcript,
+                "asked": rag.get("asked")}
     marks["tts"] = _time.perf_counter() - t_tts
 
     # `rag` is retrieval AND the model. The model's own elapsed time is already
@@ -1709,6 +1919,7 @@ def _voice_answer(body):
         "answerText": answer_text,
         "audioBase64": _b64.b64encode(audio_out).decode("ascii"),
         "audioFormat": "wav",
+        "asked": rag.get("asked"),
     }
 
 
