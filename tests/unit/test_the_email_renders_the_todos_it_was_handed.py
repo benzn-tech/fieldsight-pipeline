@@ -101,4 +101,7 @@ def test_a_final_with_no_rows_says_so_rather_than_showing_an_empty_table():
     an email, and it says why it is empty."""
     _out, (_subject, text), _key, summarised = _run({**BASE, "kind": "final", "openTodos": []})
     assert not summarised
-    assert "No action items" in text
+    # A session with neither tasks nor topics says so. (A session with topics but
+    # no tasks now shows the topics instead -- see
+    # test_the_email_is_one_table_of_items.py.)
+    assert "Nothing was captured" in text

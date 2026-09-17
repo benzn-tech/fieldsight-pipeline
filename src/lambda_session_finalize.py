@@ -80,8 +80,25 @@ def _clean_todos(open_todos):
             out.append({"text": text,
                         "responsible": (t.get("responsible") or None),
                         "due": (t.get("due") or None),
-                        "at": (t.get("at") or None)})
+                        "at": (t.get("at") or None),
+                        # "action" (someone owes something) or "topic" (something
+                        # was discussed and nobody promised anything). Dropping it
+                        # here would have cost the distinction the table is built
+                        # on, since this function rebuilds each row from scratch.
+                        "kind": ("topic" if t.get("kind") == "topic" else "action")})
     return out
+
+
+def _ordered_rows(todos):
+    """Actions first, topics last.
+
+    ONE table, not two. A session that produced no action item is the common
+    case -- 11 of 16 measured -- and it used to be emailed as a header and one
+    sentence saying nothing was captured, while the recording plainly had
+    content. Its topics now appear as rows of their own, with no owner and no
+    due date, and they sink below anything anyone actually owes."""
+    return ([t for t in todos if t["kind"] != "topic"]
+            + [t for t in todos if t["kind"] == "topic"])
 
 
 def build_confirmation_email(*, date=None, time_range=None, site_name=None,
@@ -103,8 +120,13 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
     nothing else, which reads as a broken send."""
     stamp = " ".join(p for p in (date, time_range) if p)
     subject = "FieldSight — your site notes" + (f" ({stamp})" if stamp else "")
-    todos = _clean_todos(open_todos)
-    no_todos_note = "No action items were captured for this recording."
+    todos = _ordered_rows(_clean_todos(open_todos))
+    no_todos_note = "Nothing was captured for this recording."
+    # A topic row is not a task: nobody owes it, so its owner and due date are
+    # N/A rather than the em dash an UNASSIGNED action carries. The two mean
+    # different things and the table has to keep them apart -- "—" invites
+    # someone to pick the task up; "N/A" says there is no task here.
+    na = "N/A"
 
     lines = ["Here's what we captured from your recording — reply or open FieldSight "
              "to correct anything before you leave site.", ""]
@@ -113,8 +135,11 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
     if stamp:
         lines.append(f"Date: {stamp}")
     if todos:
-        lines += ["", "Action items"]
+        lines += ["", "Items"]
         for t in todos:
+            if t["kind"] == "topic":
+                lines.append(f"  • {t['text']} — {na}")
+                continue
             who = t["responsible"] or "Unassigned"
             due = f" (due {t['due']})" if t["due"] else ""
             lines.append(f"  • {t['text']} — {who}{due}")
@@ -134,24 +159,29 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
         parts.append("<p>" + "<br>".join(meta) + "</p>")
     if todos:
         def _row(t):
+            topic = t["kind"] == "topic"
+            who = na if topic else (esc(t["responsible"]) if t["responsible"] else "—")
+            when = na if topic else (esc(t["due"]) if t["due"] else "—")
+            # Greyed, so a reader scanning for what they owe can stop at the last
+            # black row; the context is still there for a reader who wants it. No
+            # per-item line under the title: `why` stopped being carried (#864).
+            tone = ';color:#666' if topic else ''
             return ("<tr>"
-                    f'<td style="padding:6px;border-bottom:1px solid #eee">'
+                    f'<td style="padding:6px;border-bottom:1px solid #eee{tone}">'
                     f'{esc(t["text"])}</td>'
                     f'<td style="padding:6px;border-bottom:1px solid #eee;'
-                    f'vertical-align:top">'
-                    f'{esc(t["responsible"]) if t["responsible"] else "—"}</td>'
+                    f'vertical-align:top{tone}">{who}</td>'
                     f'<td style="padding:6px;border-bottom:1px solid #eee;'
-                    f'vertical-align:top">'
-                    f'{esc(t["due"]) if t["due"] else "—"}</td>'
+                    f'vertical-align:top{tone}">{when}</td>'
                     "</tr>")
 
         rows = "".join(_row(t) for t in todos)
         parts.append(
-            "<h3>Action items</h3>"
+            "<h3>Items</h3>"
             '<table role="presentation" cellspacing="0" cellpadding="0" '
             'style="border-collapse:collapse;width:100%;font-size:14px">'
             '<thead><tr style="text-align:left;border-bottom:2px solid #ccc">'
-            '<th style="padding:6px">Task</th><th style="padding:6px">Assignee</th>'
+            '<th style="padding:6px">Items</th><th style="padding:6px">Assignee</th>'
             '<th style="padding:6px">Due</th></tr></thead>'
             f"<tbody>{rows}</tbody></table>")
     else:
