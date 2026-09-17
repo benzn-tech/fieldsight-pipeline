@@ -218,7 +218,12 @@ def test_the_ask_timeouts_descend():
     http = int(t["Resources"]["AskAgentFunction"]["Properties"]
                 ["Environment"]["Variables"]["LLM_HTTP_TIMEOUT"])
     assert api < 29, "API Gateway gives up at 29s; the Lambda must go first"
-    assert agent < api
+    # <=, not <: AskAgentFunction's own Timeout is pinned to 28 -- equal to
+    # ApiFunction's -- because two IN-CODE hard stops run inside it
+    # (corroboration.HARD_STOP_SECONDS, web_answer.HARD_STOP_SECONDS, both
+    # 27s) and need room to return their shaped body before the runtime
+    # kills the function. See test_no_in_code_hard_stop_reaches_the_runtime_kill.
+    assert agent <= api
     assert http < agent
 
 
@@ -236,3 +241,29 @@ def test_the_ask_deadlines_descend():
     assert one_call < deadline, "one model call may not spend the whole request"
     assert deadline < invoke, "the agent must finish before its caller stops waiting"
     assert invoke < _timeout("ApiFunction"), "and the invoke before the runtime kills us"
+
+
+def test_no_in_code_hard_stop_reaches_the_runtime_kill():
+    """The defect this guards: AskAgentFunction's Timeout was set to 27, equal
+    to TWO in-code hard stops that run inside that same function --
+    corroboration.py and web_answer.py each default their own
+    HARD_STOP_SECONDS to 27 (measured, stage budgets deliberately fill it).
+    At Timeout=27 the runtime kills the function at the exact instant those
+    stops are designed to fire, leaving no time to return the shaped
+    `timed_out` body -- silently, because the template-only tests above
+    check numbers, not what runs inside the function they bound.
+
+    Both features are ON on TEST, so this is not a hypothetical ladder rung.
+    """
+    import corroboration
+    import web_answer
+
+    agent_timeout = _timeout("AskAgentFunction")
+    assert corroboration.HARD_STOP_SECONDS < agent_timeout, (
+        f"corroboration.HARD_STOP_SECONDS ({corroboration.HARD_STOP_SECONDS}) must be "
+        f"strictly below AskAgentFunction's Timeout ({agent_timeout}), or the runtime "
+        f"kills the function before its own hard stop can return a shaped body")
+    assert web_answer.HARD_STOP_SECONDS < agent_timeout, (
+        f"web_answer.HARD_STOP_SECONDS ({web_answer.HARD_STOP_SECONDS}) must be "
+        f"strictly below AskAgentFunction's Timeout ({agent_timeout}), or the runtime "
+        f"kills the function before its own hard stop can return a shaped body")
