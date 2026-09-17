@@ -726,6 +726,18 @@ web = web_answer.answer(question, chunks, skip_verdict=_skip)
 - [ ] **Step 1: Write the failing test**
 
 ```python
+# Three helpers this task ADDS to the module. `_template()` and `_workflow()`
+# already exist there; these do not, and both tests below are unrunnable until
+# they do. `_env_text` returns the raw YAML of a function's Environment block
+# (raw, because `!Ref X` is a YAML tag a plain loader will not resolve to a
+# string); `_env_value` returns one LITERAL value from it; `_timeout` returns a
+# function's Timeout property.
+#
+#   def _env_text(fn): ...          # the block as written, for `!Ref` matching
+#   def _env_value(fn, key): ...    # one literal env value, as a string
+#   def _timeout(fn): ...           # Resources[fn].Properties.Timeout
+
+
 def test_the_ask_timeouts_descend():
     """Each layer must give up before the one waiting on it."""
     t = _template()
@@ -736,17 +748,81 @@ def test_the_ask_timeouts_descend():
     assert api < 29, "API Gateway gives up at 29s; the Lambda must go first"
     assert agent < api
     assert http < agent
+
+
+def test_the_ask_deadlines_descend():
+    """The OTHER ladder (Task 9). All three are LITERALS in the env blocks --
+    deliberately, so one reader works for all of them: a !Ref would hide the
+    number in a parameter Default and need a second way to read it. They live in
+    two functions and two tasks, so nothing else notices when one is raised.
+
+    A waiter's budget must EXCEED the budget of what it waits on, or it abandons
+    a callee that is still working correctly."""
+    invoke   = int(_env_value("ApiFunction", "ASK_INVOKE_TIMEOUT"))
+    deadline = int(_env_value("AskAgentFunction", "ASK_DEADLINE_SECONDS"))
+    one_call = int(_env_value("AskAgentFunction", "LLM_HTTP_TIMEOUT"))
+    assert one_call < deadline, "one model call may not spend the whole request"
+    assert deadline < invoke, "the agent must finish before its caller stops waiting"
+    assert invoke < _timeout("ApiFunction"), "and the invoke before the runtime kills us"
 ```
 
 - [ ] **Step 2: Run, watch it fail** with the real numbers (30, 60, 45).
 
-- [ ] **Step 3: Set** `ApiFunction` 28, `AskAgentFunction` 26, `LLM_HTTP_TIMEOUT` 24, each with a comment naming the layer above it.
+- [ ] **Step 3: Set** `ApiFunction` 28, `AskAgentFunction` 26, `LLM_HTTP_TIMEOUT` **16**, each with a comment naming the layer above it.
+
+16, not 24: `LLM_HTTP_TIMEOUT` is one model call inside a request whose whole
+budget is `ASK_DEADLINE_SECONDS` (20, Task 9). Setting it equal to — or above —
+that budget lets one call spend everything and leaves nothing for retrieval, the
+rewrite or synthesis. See Task 9 for both ladders; this task owns only the hard
+kills plus this one env value.
 
 - [ ] **Step 4: Run suite. Commit.**
 
 ---
 
-### Task 8: The screen path gets a timing line
+### Task 8: The screen path gets a timing line, and a failure gets a reason
+
+**Two halves of spec §4.8, in one task because they are one log line.**
+
+The second half fixes a gap that is currently invisible: `lambda_fieldsight_api.py:50`
+builds `lambda_client = boto3.client('lambda')` with **no `Config`**, so
+botocore's default read timeout outlives `ApiFunction`'s own 30 s. A hung Ask
+Agent therefore kills `ApiFunction` from the runtime **before** its `except`
+runs — `logger.error("Ask agent invocation failed: …")` never executes and the
+only trace is a bare `Task timed out`. Add a
+`botocore.config.Config(read_timeout=…, connect_timeout=…, retries={"max_attempts": 0})`
+whose `read_timeout` sits below `ApiFunction`'s Timeout (Task 7), so the invoke
+fails **inside our code**, where it can be named.
+
+Measured 2026-09-17 on prod over 30 days: zero `Task timed out`, zero
+`Ask agent invocation failed`, zero `FunctionError`, max duration 19.1 s. This
+path has **never run in production**, so it cannot be validated by waiting —
+the test must force it.
+
+**Files (both halves):**
+- Modify: `src/lambda_fieldsight_api.py:50` — the `boto3.client('lambda')` construction
+- Modify: `src/lambda_fieldsight_api.py` — `ask_question`'s `except`
+- Modify: `src/lambda_ask_agent.py` — `_rag_answer`'s timing line
+- Test: `tests/unit/test_lambda_fieldsight_api_ask.py`, `tests/unit/test_lambda_ask_agent_rag.py`
+
+- [ ] **Step 1: Write the failing test for the failure reason**
+
+```python
+def test_a_hung_agent_is_described_rather_than_killed(monkeypatch, caplog):
+    """Today the runtime kills ApiFunction before this except runs, so the
+    only trace is `Task timed out`. Force the botocore timeout instead."""
+    import botocore.exceptions
+
+    def _boom(**kw):
+        raise botocore.exceptions.ReadTimeoutError(endpoint_url="lambda")
+    monkeypatch.setattr(api.lambda_client, "invoke", _boom)
+
+    resp = api.ask_question({"question": "q"}, {"sub": SUB})
+    assert resp["statusCode"] == 504
+    assert "ask agent read timeout" in caplog.text.lower()
+```
+
+
 
 **Files:**
 - Modify: `src/lambda_ask_agent.py` (`_rag_answer`)
@@ -754,7 +830,7 @@ def test_the_ask_timeouts_descend():
 
 The only per-call timing on `/ask` today is `llm_utils`'s `qwen done:` — which is why a 14-day prod window yields n=27 for a route with 5115 gateway invocations. The tail cannot be promised until it can be seen.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 2: Write the failing test for the timing line**
 
 ```python
 def test_the_ask_logs_its_stages(wired, caplog):
@@ -765,14 +841,87 @@ def test_the_ask_logs_its_stages(wired, caplog):
         assert field in line[0].getMessage()
 ```
 
-- [ ] **Step 2–5:** run → fail → add the line mirroring `lambda_ask_agent.py:1695`'s shape → pass → commit.
+- [ ] **Step 3: Run both, watch both fail**
+
+Run: `python -m pytest tests/unit/test_lambda_fieldsight_api_ask.py::test_a_hung_agent_is_described_rather_than_killed tests/unit/test_lambda_ask_agent_rag.py::test_the_ask_logs_its_stages -q`
+
+Expected, and they must fail for **different** reasons: the first because
+`ask_question` returns 500 with no "read timeout" in the log, the second because
+no `ask timing:` line exists at all.
+
+- [ ] **Step 4: Give the invoke a deadline inside our own process**
+
+```python
+# src/lambda_fieldsight_api.py, replacing the bare boto3.client('lambda').
+# BOTH imports are new: the module imports os and boto3 today (:35, :39) and
+# does not mention botocore anywhere, so the except clause below needs its own.
+import botocore.exceptions
+from botocore.config import Config
+
+# read_timeout BELOW ApiFunction's own Timeout (Task 7), so a hung Ask Agent
+# fails HERE, in code that can name it, instead of the runtime killing this
+# function first and leaving a bare `Task timed out` as the only trace.
+# retries=0: a synchronous user-facing invoke must not silently double the wait.
+_LAMBDA_INVOKE_TIMEOUT = int(os.environ.get("ASK_INVOKE_TIMEOUT", "24"))
+lambda_client = boto3.client('lambda', config=Config(
+    read_timeout=_LAMBDA_INVOKE_TIMEOUT,
+    connect_timeout=5,
+    retries={"max_attempts": 0},
+))
+```
+
+and in `ask_question`'s `except`, name the class rather than the exception:
+
+```python
+    except botocore.exceptions.ReadTimeoutError:
+        logger.error("ask agent read timeout after %ss", _LAMBDA_INVOKE_TIMEOUT)
+        return error('Ask temporarily unavailable', 504)
+    except Exception as e:
+        logger.error(f"Ask agent invocation failed: {e}")
+        return error('Ask temporarily unavailable', 502)
+```
+
+The response body is **not** what the reader sees — the frontend replaces every
+failure with the one reassuring line (Task 11). The status code is for us.
+
+- [ ] **Step 5: Add the timing line**
+
+Mirror `lambda_ask_agent.py:1695`'s shape — one structured line, all stages,
+emitted on every answer including the early returns.
+
+- [ ] **Step 6: Run both, watch both pass. Run the whole suite.**
+
+- [ ] **Step 7: Prove each guards its own half**
+
+Revert the `Config(...)` alone → the read-timeout test goes red. Restore.
+Revert the timing line alone → the timing test goes red. Restore. Two halves,
+two independent reverts: a single revert that reddens both would mean one of
+these tests is not testing what it claims.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/lambda_fieldsight_api.py src/lambda_ask_agent.py tests/unit/test_lambda_fieldsight_api_ask.py tests/unit/test_lambda_ask_agent_rag.py
+git commit -m "A slow Ask is described in the log instead of vanishing"
+```
 
 ---
 
 ### Task 9: The three flags, wired in three places each
 
 **Files:**
-- Modify: `src/template.yaml` (parameters near `:301`; env on `AskAgentFunction` near `:1904`)
+- Modify: `src/template.yaml` — three parameters near `:301`, env on `AskAgentFunction` near `:1904`
+- Modify: `src/template.yaml` — `ASK_DEADLINE_SECONDS` as a **literal** on `AskAgentFunction`, beside the existing `LLM_HTTP_TIMEOUT: '45'` (`:1846`); `ASK_INVOKE_TIMEOUT` as a **literal** on **`ApiFunction`**, whose `Environment.Variables` ends with `ASK_AGENT_FUNCTION` (`:4372`). The invoke timeout belongs to the function that *makes* the invoke, not the one that receives it.
+
+**Why two of the five numbers are NOT parameters.** `LLM_HTTP_TIMEOUT` is
+already a literal on this very function, and there is no `LlmHttpTimeout`
+parameter. Making the two new ladder numbers `!Ref`s would put three sibling
+timeouts in two different homes — two readable only from a parameter `Default`,
+one only from the env block — and any test covering the ladder would need two
+ways to read one thing. They are ladder constants, not product switches: the
+cost is that changing one needs a template edit, which for a number that must
+stay ordered against four others is the correct cost. Same trade the spec
+records for `FINALIZE_EMAIL_WAIT_SEC`.
 - Modify: `.github/workflows/deploy.yml:228`, `.github/workflows/deploy-prod.yml:262`
 - Test: `tests/unit/test_template_workflow_parameter_wiring.py` (extend)
 
@@ -780,11 +929,11 @@ def test_the_ask_logs_its_stages(wired, caplog):
 
 ```python
 @pytest.mark.parametrize("param", ["AskConversationMemory", "AskRewriteBudget",
-                                   "AskDistanceGate", "AskDeadlineSeconds"])
+                                   "AskDistanceGate"])
 def test_the_flag_is_wired_in_all_three_places(param):
     """A flag wired in two of three reads as its default and nothing fails."""
     assert param in _template()["Parameters"]
-    assert f"!Ref {param}" in _ask_agent_env_text()
+    assert f"!Ref {param}" in _env_text("AskAgentFunction")
     for wf in ("deploy.yml", "deploy-prod.yml"):
         assert f"{param}=" in _workflow(wf)
 ```
@@ -809,7 +958,18 @@ def test_the_flag_is_wired_in_all_three_places(param):
           ASK_CONVERSATION_MEMORY: !Ref AskConversationMemory
           ASK_REWRITE_BUDGET: !Ref AskRewriteBudget
           ASK_DISTANCE_GATE: !Ref AskDistanceGate
-          ASK_DEADLINE_SECONDS: !Ref AskDeadlineSeconds
+          # Literal, beside LLM_HTTP_TIMEOUT: '45' two lines away. A ladder
+          # constant, not a switch -- see the note above.
+          ASK_DEADLINE_SECONDS: '20'
+```
+
+and on **`ApiFunction`**, whose `Environment.Variables` currently ends with
+`ASK_AGENT_FUNCTION`:
+
+```yaml
+          # How long this function waits for the Ask Agent. Below its own
+          # Timeout (Task 7) so the invoke fails here, in code that can name it.
+          ASK_INVOKE_TIMEOUT: '24'
 ```
 
 All four, in both workflows — `deploy.yml` with `TEST_`, `deploy-prod.yml` with
@@ -819,12 +979,37 @@ All four, in both workflows — `deploy.yml` with `TEST_`, `deploy-prod.yml` wit
               "AskConversationMemory=${{ vars.TEST_ASK_CONVERSATION_MEMORY || 'false' }}" \
               "AskRewriteBudget=${{ vars.TEST_ASK_REWRITE_BUDGET || '4.0' }}" \
               "AskDistanceGate=${{ vars.TEST_ASK_DISTANCE_GATE || '0.55' }}" \
-              "AskDeadlineSeconds=${{ vars.TEST_ASK_DEADLINE_SECONDS || '24' }}" \
 ```
 
-`AskDeadlineSeconds` defaults below `AskAgentFunction`'s Timeout from Task 7,
-which is itself below `ApiFunction`'s. A deadline above the function timeout is
-not a deadline.
+Three flags above, two literals beside them, and **two different ladders** the
+numbers have to satisfy (Task 7). Conflating the ladders is how the first draft
+of this section got the direction backwards.
+
+**Hard kills — outside in.** Each layer must die before the one waiting on it,
+so the outer layer is still alive to report what happened:
+
+```
+API Gateway 29  >  ApiFunction 28  >  AskAgentFunction 26
+```
+
+**Voluntary deadlines — also outside in, and all BELOW the kills.** A waiter's
+budget must be LARGER than the budget of the thing it waits on, or the caller
+abandons a callee that is still working correctly:
+
+```
+ASK_INVOKE_TIMEOUT 24   (ApiFunction's wait on the agent)
+      >  ASK_DEADLINE_SECONDS 20   (the agent's whole-request budget)
+            >  LLM_HTTP_TIMEOUT 16 (one model call)
+```
+
+`LLM_HTTP_TIMEOUT` must be strictly below `ASK_DEADLINE_SECONDS`, not equal to
+it: a single model call permitted to consume the entire request budget leaves
+nothing for retrieval, the rewrite or synthesis, and the request dies having
+done one thing.
+
+`ASK_DEADLINE_SECONDS` (20) sits below `AskAgentFunction`'s Timeout from Task 7
+(26), which is itself below `ApiFunction`'s (28). A deadline above the timeout
+that kills it is not a deadline — it is a number nothing ever reaches.
 
 - [ ] **Step 4: Run suite. Commit.**
 
@@ -848,6 +1033,13 @@ not a deadline.
 - [ ] Keep the clear-on-scope-change at `:696`. Add a test that pins it: carrying a conversation across a site switch would retrieve site B with site A's referents.
 - [ ] Render `asked` when present and different from what was typed ("Searched for: …").
 - [ ] Render `web.refused` when present — `question_admission` already returns the sentence; nothing shows it, so a guard reads as an outage.
+- [ ] **Collapse the two failure messages into one reassuring line** (spec §4.8). `ask-chat.js:928` currently branches on `err.timeout` to say either *"The agent took too long to answer…"* or *"Could not reach the agent…"*. Both go. The replacement, for every failure class:
+
+      FieldSight is busy at the moment. Your question has not been lost —
+      please try again shortly. If it keeps happening, contact the
+      FieldSight team.
+
+- [ ] **Keep the branch, drop the display.** `err.timeout` (`_fetch.js:117`) and `err.status` (`:248`) still exist and still decide what is *reported*; they no longer decide what is *shown*. A test pins that a timeout and a 504 render identical text — otherwise the next person "helpfully" re-adds the distinction to the screen.
 - [ ] Run the local suite; record the count in the PR.
 
 ---

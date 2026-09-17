@@ -534,10 +534,22 @@ makes the rewrite the first thing sacrificed:
    mirroring the voice path's, is a **prerequisite**: the tail has to be
    measurable before anyone promises it.
 
-**The API Gateway timeout is not raised.** Raising it makes every reader wait
-longer for the benefit of the slowest branch. If measurement later shows the
-web-lookup branch genuinely overruns, an async branch becomes its own spec,
-with the timing run attached.
+**The API Gateway timeout is not raised — a choice, not a limit.** The 29 s is
+often described as a hard AWS ceiling. Measured in this account 2026-09-17, it
+is not:
+
+| | |
+|---|---|
+| `L-E5AE38E3` *Maximum integration timeout in milliseconds* | **29000 ms, `Adjustable: true`** — and the current value IS the AWS default, so no increase has ever been requested |
+| AWS Lambda's own maximum | **15 minutes**, nowhere near either number |
+| `ApiFunction` `Timeout: 30` | **ours**, set in `template.yaml`, and today unreachable because the gateway gives up at 29 first |
+
+So the honest statement is: *the gateway's 29 s is a quota we could ask to
+raise; Lambda imposes nothing here; the 30 s is our own.* It stays where it is
+because raising it makes **every** reader wait longer for the benefit of the
+slowest branch, while §4.5's deadline keeps the common answer fast. That is a
+product decision and it can be revisited — with one thing checked first, see
+§10.6.
 
 ### 4.6 A refusal becomes visible
 
@@ -572,6 +584,55 @@ same field. Without it, *"the web client does not send history"* and *"it sends
 an empty list"* are the same observation on the web — which is the exact
 ambiguity #833 added the counter to remove on the device.
 
+### 4.8 A failure tells the reader nothing and tells us everything
+
+**Owner decision, 2026-09-17.** The two halves are deliberately asymmetric.
+
+**What the reader sees: one reassuring line, whatever went wrong.** No cause, no
+timing, no mention of speed — *"they do not care"*. The same text for a timeout,
+a 504, a 502 and an unreachable agent, because a reader on a site cannot act on
+the difference and a technical distinction only invites them to diagnose it:
+
+> **FieldSight is busy at the moment.** Your question has not been lost — please
+> try again shortly. If it keeps happening, contact the FieldSight team.
+
+This **replaces** today's two messages, which name the cause:
+*"The agent took too long to answer. It may still be working — try asking
+again."* and *"Could not reach the agent. …"*. Those were a deliberate
+improvement in their time (`ask-chat.js:928` records why: *"a timeout is not an
+unreachable agent, and saying so sent the reader at the backend while it was
+answering correctly"*) — the distinction was right, and the place to spend it is
+the log, not the screen.
+
+**What we see: the distinction, in full.** The client already separates the
+cases and must keep doing so — `_fetch.js:117` sets `e.timeout = true` on an
+abort and `:248` sets `err.status` for an HTTP failure. Nothing about that
+changes except where it is spent. The backend records, on one structured line:
+
+* which stage the budget went to (§4.5.3: `rewrite`, `retrieval`, `verdict`,
+  `synthesis`, `total`)
+* the failure class: client abort / gateway 504 / agent `FunctionError` /
+  invoke exception
+* `history_turns`, `rewritten`, and whether the distance gate fired
+
+**A gap this exposes, and it is not hypothetical only by luck.**
+`lambda_fieldsight_api.py:50` builds `lambda_client = boto3.client('lambda')`
+with no `Config`, so botocore's default read timeout governs the
+`RequestResponse` invoke of the Ask Agent — and that default is longer than
+`ApiFunction`'s own 30 s. When the agent hangs, `ApiFunction` is killed by the
+runtime **before** its `except` runs, so the handler's
+`logger.error("Ask agent invocation failed: …")` never executes and the only
+trace is a bare `Task timed out`. The fix is a `botocore.config.Config` whose
+`read_timeout` sits **below** `ApiFunction`'s timeout, so the invoke fails
+inside our code where it can be described.
+
+Measured 2026-09-17, prod, 30 days: **zero** `Task timed out`, **zero**
+`Ask agent invocation failed`, **zero** `FunctionError`, and a maximum
+`ApiFunction` duration of 19.1 s against its 30 s. **This path has never
+executed in production.** It is being hardened before it is needed, which is
+also why nothing here can be validated by waiting for it to happen — §8 forces
+it instead.
+
 ---
 
 ## 5. Client changes
@@ -589,6 +650,9 @@ ambiguity #833 added the counter to remove on the device.
   site A's referents.
 * Render `asked` when it is present and differs from what was typed
   ("Searched for: …"), and render `web.refused` when present.
+* **Replace both failure messages with the single reassuring line in §4.8.**
+  Keep `err.timeout` / `err.status` in the code — they still decide what is
+  reported, just not what is shown. One `catch`, one message, no cause.
 
 `fieldsight-ui` **has no CI** — an empty check list on that repo is not
 evidence. Local test results are the only evidence there.
@@ -747,6 +811,19 @@ Each step names what to look at, and what a failure looks like.
 10. **Nothing changed for everyone else.** A body with no `history` returns the
     same answer and the same citations as before the deploy, for three
     questions recorded before it.
+11. **Force a failure — it will not happen on its own.** Zero timeouts, zero
+    invoke failures and zero `FunctionError` in 30 days of prod (§4.8), so this
+    path can only be verified deliberately. On TEST, make the Ask Agent hang
+    past `ApiFunction`'s timeout (a temporary sleep, or point
+    `ASK_AGENT_FUNCTION` at a function that does), then check **both halves**:
+    * **The reader** sees the single reassuring line from §4.8 — *"FieldSight is
+      busy at the moment…"* — with **no** mention of timeouts, speed, or the
+      agent. Repeat with the agent returning a 502 and confirm the text is
+      **identical**; a difference the reader can see is the defect.
+    * **We** see one structured backend line naming the failure class and the
+      stage the budget went to. If the only trace is a bare `Task timed out`,
+      the `botocore` `Config` from §4.8 is missing or its `read_timeout` is not
+      below `ApiFunction`'s — the invoke is still outliving the handler.
 
 ---
 
@@ -810,3 +887,12 @@ Then:
    the prod table in §4.5 has n=27 for a route with 5115 gateway invocations.
    Every latency claim in this document is therefore about a sample too small
    to show a tail, and should be re-read once that line has run for a fortnight.
+6. **Can this account's 29 s actually be raised, and should it?** The quota is
+   `Adjustable: true` (§4.5), but the prod gateway `fieldsight-prod`
+   (`ys94qy2tk0`) and the TEST gateway are both **EDGE**-optimised endpoints,
+   while only the idle `fieldsight-api` (`khfj3p1fkb`) is REGIONAL. Whether a
+   raised integration timeout applies to an edge-optimised endpoint is **not
+   established here and was deliberately not guessed** — the cost of guessing
+   is a support case that is granted and then does nothing. Confirm with AWS
+   before raising it, and note that §4.5 declines to raise it on product
+   grounds regardless of the answer.
