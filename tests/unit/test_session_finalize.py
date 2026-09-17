@@ -66,16 +66,19 @@ def test_action_items_render_task_assignee_and_due():
     _s, text, html = fin.build_confirmation_email(
         summary="x", open_todos=[{"text": "Order steel", "responsible": "Neil", "due": "Friday"}])
     assert "Order steel" in text and "Neil" in text and "Friday" in text
-    # "Items", not "Task": one table now carries what is owed AND, below it, the
-    # topics nobody promised anything about (test_the_email_is_one_table_of_items).
-    assert "Items" in html and "Assignee" in html and "Due" in html   # structured columns
+    # AGENDA ITEM / ASSIGNED / DUE DATE, not Items/Assignee/Due (handoff-sync
+    # plan §2.4): one table now carries what is owed AND, below it, the topics
+    # nobody promised anything about (test_the_email_is_one_table_of_items).
+    assert "AGENDA ITEM" in html and "ASSIGNED" in html and "DUE DATE" in html
     assert "Order steel" in html and "Neil" in html and "Friday" in html
 
 
 def test_action_item_missing_assignee_or_due_shows_placeholders():
     _s, text, html = fin.build_confirmation_email(
         summary="x", open_todos=[{"text": "Do it", "responsible": None, "due": None}])
-    assert "Do it" in text and "Unassigned" in text   # text: assignee falls back to Unassigned
+    # No "Unassigned" any more (plan §2.4): a blank action cell is an em dash on
+    # both surfaces, same as the HTML always rendered.
+    assert "Do it" in text and "Unassigned" not in text and "—" in text
     assert "—" in html                                # html: em-dash for missing assignee/due
 
 

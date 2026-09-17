@@ -165,6 +165,27 @@ def test_a_firm_commitment_must_not_be_hedged_out_of_caution():
             "spoke, the sentence still carries no name.") in prompt
 
 
+# --- 2026-09-18: "the brief says where a task came from" --------------------
+
+def test_the_schema_asks_for_a_section_copied_verbatim():
+    """Mutation: delete the `"section":` line from the tasks schema -> red."""
+    prompt = _flat(sb.build_brief_prompt(_turns()))
+    assert '"section":' in prompt
+    assert "copied verbatim" in prompt
+    assert "null when this task does not belong to any section" in prompt
+
+
+def test_the_instructions_state_the_section_rule_in_those_words():
+    """Mutation: delete rule 8 (tasks: section) -> red. The spec requires the
+    prompt to say, in prose, that the title must be copied verbatim from the
+    sections the model just wrote -- not only in the schema's field
+    description."""
+    prompt = _flat(sb.build_brief_prompt(_turns()))
+    assert ("Copy the exact title of the section above this task came from "
+            "into `section`, verbatim") in prompt
+    assert "not paraphrased and not shortened" in prompt
+
+
 def test_the_telegraphic_style_is_still_called_a_failure():
     """Mutation: delete rule 2 -> red.
 

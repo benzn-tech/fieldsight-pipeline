@@ -78,6 +78,17 @@ MISSING_KEY_IS_NORMAL = [
      "_session_was_deleted gates rendering and mailing the on-demand report -- "
      "STRICT since 2026-09-16, a missing grant fails the request rather than "
      "answering 'nothing was deleted'"),
+    # handoff-sync plan §2.2/§2.3: the FINAL email polls session_brief/ for the
+    # brief its sibling `kind:"brief"` request asked for concurrently, and on
+    # every attempt but the last (almost always) the key is not there yet --
+    # that is the ordinary case, not the edge one. Without ListBucket here that
+    # read is AccessDenied, `_read_brief` would log it as a loud permissions
+    # failure on every single poll, and (worse) the plan's own "distinguish
+    # 403 from 404" requirement would be untestable against the deployed role.
+    ("SessionFinalizeFunction", "session_brief/*",
+     "_read_brief polls for the concurrently-requested brief; 'not written yet' "
+     "must read as NoSuchKey, not AccessDenied, or every final email silently "
+     "falls back to the request's own rows"),
 ]
 
 

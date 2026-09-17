@@ -260,6 +260,9 @@ jobs:
               "EnableExternalCorroboration=${{ vars.PROD_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \
               "EnableWebAnswer=${{ vars.PROD_ENABLE_WEB_ANSWER || 'false' }}" \
+              "AskConversationMemory=${{ vars.PROD_ASK_CONVERSATION_MEMORY || 'false' }}" \
+              "AskRewriteBudget=${{ vars.PROD_ASK_REWRITE_BUDGET || '4.0' }}" \
+              "AskDistanceGate=${{ vars.PROD_ASK_DISTANCE_GATE || '0.55' }}" \
               "UploadVerifyMode=${{ vars.PROD_UPLOAD_VERIFY_MODE || 'observe' }}" \
               "SpeakerIdentityMode=${{ vars.PROD_SPEAKER_IDENTITY_MODE || 'off' }}" \
               "EnrolOnCorrection=${{ vars.PROD_ENROL_ON_CORRECTION || 'false' }}" \

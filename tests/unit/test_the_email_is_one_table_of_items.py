@@ -8,8 +8,10 @@ recording the owner made on 2026-09-17 was one of them.
 
 The owner's shape, chosen over the two-table alternative: keep ONE table, put the
 topics that produced no task into it as rows, sink them below the real tasks, and
-show their owner and due date as N/A. The header becomes "Items", because a row
-is now either something someone owes or something the meeting covered.
+show their owner and due date as N/A. The columns are AGENDA ITEM / ASSIGNED /
+DUE DATE (handoff-sync plan §2.4), because a row is now either something someone
+owes or something the meeting covered, and there is no separate "Items" heading
+above the table any more -- the header row carries it.
 
 N/A IS NOT THE EM DASH. An unassigned action shows "—" and means "nobody has
 picked this up yet"; a topic row shows "N/A" and means "there is no task here".
@@ -57,11 +59,42 @@ def test_a_topic_is_N_A_and_an_unowned_task_is_a_dash():
     assert "—" in unowned
 
 
-def test_the_table_is_called_items():
+def test_the_table_header_is_agenda_item_assigned_due_date():
     _subject, text, html = _email([ACTION])
-    assert "Items" in text and "<h3>Items</h3>" in html
-    assert ">Items</th>" in html
+    assert "AGENDA ITEM | ASSIGNED | DUE DATE" in text
+    assert "<h3>Items</h3>" not in html, "the header row carries the title now"
+    assert ">AGENDA ITEM</th>" in html and ">ASSIGNED</th>" in html and ">DUE DATE</th>" in html
     assert "Action items" not in text and "Action items" not in html
+
+
+def test_the_text_table_escapes_pipes_and_collapses_newlines():
+    """Plan §1.7: the plain-text flavour is a pipe table; a cell's own `|` or
+    embedded newline would otherwise be read as a column boundary / a new row.
+    Leading/trailing pipes and the escaping shape are pinned byte-for-byte
+    against the frontend's `cell()`/`pipe()` in
+    fieldsight-ui/scripts/composites/email-preview-modal.js (fix round on
+    3237e56, finding 2) -- that file is the other half of this contract."""
+    _subject, text, _html = _email(
+        [{"text": "Cut 2400 | 1200 sheet\nsecond line", "responsible": "Sam\nSmith",
+         "due": "Mon\nTue"}])
+    row = next(ln for ln in text.splitlines() if "Cut 2400" in ln)
+    assert "\n" not in row
+    assert row == r"| Cut 2400 \| 1200 sheet second line | Sam Smith | Mon Tue |"
+
+
+def test_the_text_table_header_and_separator_match_the_frontend_exactly():
+    """Pins the two fixed lines byte-for-byte against
+    fieldsight-ui/scripts/composites/email-preview-modal.js's `COLUMNS` +
+    `pipe(COLUMNS)` / `'| --- | --- | --- |'` (renderEmailText). If either
+    side's literal changes without the other, this goes red rather than the
+    two surfaces silently drifting -- exactly what the owner asked the two
+    repos to stay in sync on."""
+    _subject, text, _html = _email([ACTION])
+    lines = text.splitlines()
+    assert "| AGENDA ITEM | ASSIGNED | DUE DATE |" in lines
+    assert "| --- | --- | --- |" in lines
+    header_idx = lines.index("| AGENDA ITEM | ASSIGNED | DUE DATE |")
+    assert lines[header_idx + 1] == "| --- | --- | --- |"
 
 
 def test_an_empty_recording_still_says_so():
@@ -74,7 +107,7 @@ def test_a_row_with_no_kind_is_a_task():
     """Everything already in flight -- the rolling summariser's to-dos, a brief's,
     a group's -- carries no `kind`, and must keep rendering as a task."""
     _subject, text, _html = _email([{"text": "Fix rebar", "responsible": "Sam"}])
-    assert "Fix rebar — Sam" in text and "N/A" not in text
+    assert "Fix rebar | Sam | —" in text and "N/A" not in text
 
 
 # ---- who builds the rows --------------------------------------------------
@@ -120,3 +153,24 @@ def test_the_backstop_email_says_what_the_session_was_about_too():
 
 def test_no_rolling_summary_means_no_row():
     assert fc._summary_row({}) == [] and fc._summary_row({"summary": "   "}) == []
+
+
+def test_a_speaker_label_is_blank_on_extraction_rows_too():
+    """`spk_0` is not a name on ANY row, not only the brief's.
+
+    The brief path already filtered speaker labels; the extraction path -- the
+    only one prod runs -- did not, so the email printed `spk_0` in ASSIGNED where
+    Preview & copy printed "—" for the same row. Found by rendering one fixture
+    through both surfaces and diffing the text tables. The frontend half of this
+    contract is fieldsight-ui scripts/composites/email-preview-modal.js
+    `isSpeakerLabel`, which uses the same pattern."""
+    import lambda_session_finalize as f
+    rows = [{"text": "Book inspection", "responsible": "spk_0", "due": "Fri"},
+            {"text": "Chase cert", "responsible": "Speaker 2", "due": None},
+            {"text": "Redo wall", "responsible": "John", "due": "Wed"}]
+    _, text, html = f.build_confirmation_email(open_todos=rows)
+    assert "| Book inspection | — | Fri |" in text
+    assert "| Chase cert | — | — |" in text
+    assert "| Redo wall | John | Wed |" in text
+    assert "spk_0" not in text and "spk_0" not in html
+    assert "Speaker 2" not in text and "Speaker 2" not in html
