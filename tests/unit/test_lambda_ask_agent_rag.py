@@ -489,3 +489,176 @@ def test_an_early_try_failure_hits_the_normal_error_handler_not_a_nameerror(monk
     assert out["applied_scope"] == {"dropped": []}
     assert out["answer"] == ""
     assert out["model"] is None
+
+
+# --------------------------------------------------------------------------
+# Task 3 (2026-09-17 ask-conversation-memory): _rag_answer rewrites a
+# follow-up question into a standalone one before it embeds. Spec sections
+# 2, 3.1-3.3, 4.3. `ask_rewrite`, `query_slots` and `metric_slots` are all
+# imported INSIDE _rag_answer, so they are not attributes of `laa` -- patch
+# the real module objects (they are singletons in sys.modules, so patching
+# the module object here reaches the lazy `import X` inside the function).
+# --------------------------------------------------------------------------
+
+import ask_rewrite  # noqa: E402
+import ask_history  # noqa: E402
+import query_slots  # noqa: E402
+import metric_slots  # noqa: E402
+
+SUB = "sub-1"
+
+ONE_TURN = [{"question": "what did James say about the ceiling grid?",
+            "answer": "James said the grid on level 3 is behind schedule."}]
+
+
+def test_the_rewritten_text_is_what_gets_embedded(monkeypatch):
+    """SS3.1/4.3: the embed call uses `asked`, the rewritten text -- not the
+    caller's original wording."""
+    wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("when is James finishing the grid?", True))
+
+    seen = {}
+    real_embed = dashscope_utils.embed
+    def spy_embed(texts, dim=None):
+        seen["texts"] = texts
+        return real_embed(texts, dim=dim)
+    monkeypatch.setattr(dashscope_utils, "embed", spy_embed)
+
+    laa._rag_answer({"question": "when is he finishing it?", "caller_sub": SUB,
+                     "history": ONE_TURN})
+    assert seen["texts"] == ["when is James finishing the grid?"]
+
+
+def test_the_answering_prompt_gets_the_original_and_no_history(monkeypatch):
+    """SS2's whole claim. Assert the ABSENCE explicitly: no history text reaches
+    build_rag_prompt, and it is called with the caller's original question."""
+    wire(monkeypatch, chunks=[{"chunk_text": "level 3 grid note", "id": "c-1",
+                               "topic_id": "t-1", "source_s3_key": "x",
+                               "report_date": "2026-09-17"}])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("rewritten", True))
+
+    prompts = []
+    real_build = laa.build_rag_prompt
+    def spy_build(question, chunks, **kw):
+        prompts.append((question, kw))
+        return real_build(question, chunks, **kw)
+    monkeypatch.setattr(laa, "build_rag_prompt", spy_build)
+
+    laa._rag_answer({"question": "when is he finishing it?", "caller_sub": SUB,
+                     "history": [{"question": "ceiling grid?",
+                                  "answer": "level 3 is behind"}]})
+
+    asked_with, kwargs = prompts[0]
+    assert asked_with == "when is he finishing it?"
+    assert "history" not in kwargs
+    assert "level 3 is behind" not in str(kwargs)
+
+
+def test_a_body_without_history_sends_the_payload_it_sends_today(monkeypatch):
+    """SS3.1: absent and empty history must retrieve identically, and with no
+    history the payload is unchanged from before this feature."""
+    fake1 = wire(monkeypatch, chunks=[])
+    laa._rag_answer({"question": "what happened?", "caller_sub": SUB})
+    before = dict(fake1.calls[0]["Payload"])
+
+    fake2 = wire(monkeypatch, chunks=[])
+    laa._rag_answer({"question": "what happened?", "caller_sub": SUB, "history": []})
+    after = dict(fake2.calls[0]["Payload"])
+
+    assert after == before, "absent and empty must retrieve identically"
+
+
+def test_an_original_that_names_a_date_is_not_recomputed(monkeypatch):
+    """SS4.3: when the ORIGINAL question already resolves a range, the rewrite
+    must not cause a second, different resolution from `asked`."""
+    wire(monkeypatch, chunks=[])
+    ranges = []
+    real_time_range = query_slots.time_range
+    def spy_time_range(q, t):
+        ranges.append(q)
+        return real_time_range(q, t)
+    monkeypatch.setattr(query_slots, "time_range", spy_time_range)
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("rewritten with no date", True))
+
+    laa._rag_answer({"question": "what happened yesterday?", "caller_sub": SUB,
+                     "tz": "Pacific/Auckland", "history": ONE_TURN})
+
+    assert ranges == ["what happened yesterday?"], "the original resolved; do not re-ask"
+
+
+def test_a_rewritten_date_word_does_not_open_the_metric_route(monkeypatch):
+    """Added by review (#17): a rewrite that INTRODUCES a date word into a
+    question that had none must not flip the request onto the metric route --
+    metric_slots.detect must never be called for this question."""
+    wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("how many photos yesterday?", True))
+
+    calls = []
+    real_detect = metric_slots.detect
+    def spy_detect(q):
+        calls.append(q)
+        return real_detect(q)
+    monkeypatch.setattr(metric_slots, "detect", spy_detect)
+
+    laa._rag_answer({"question": "how many photos did I take", "caller_sub": SUB,
+                     "tz": "Pacific/Auckland", "history": ONE_TURN})
+
+    assert calls == [], "metric_slots.detect must not run for an undated original"
+
+
+def test_a_rewritten_date_word_leaves_the_scope_decision_unchanged(monkeypatch):
+    """Added by review (#18): same scenario as #17 -- plan["body_date_sent"] /
+    the `scoped` decision (read here via applied_scope) must be identical to
+    the no-rewrite run, so the web-fallback decision does not move."""
+    fake_no_rewrite = wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: (q, False))
+    out_no_rewrite = laa._rag_answer(
+        {"question": "how many photos did I take", "caller_sub": SUB,
+         "tz": "Pacific/Auckland"})
+
+    fake_rewrite = wire(monkeypatch, chunks=[])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("how many photos yesterday?", True))
+    out_rewrite = laa._rag_answer(
+        {"question": "how many photos did I take", "caller_sub": SUB,
+         "tz": "Pacific/Auckland", "history": ONE_TURN})
+
+    assert out_rewrite["applied_scope"] == out_no_rewrite["applied_scope"]
+
+
+def test_the_web_answer_branch_receives_the_original_question(monkeypatch):
+    """Added by review (#20): the web-answer branch is fed the ORIGINAL
+    question, never `asked` -- `asked` may quote a record deleted since the
+    previous turn (spec SS2.1/SS4.3)."""
+    import web_answer
+    wire(monkeypatch, chunks=[{"chunk_text": "note", "id": "c-1", "topic_id": "t-1",
+                               "source_s3_key": "x", "report_date": "2026-09-17"}])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("rewritten question", True))
+
+    seen = []
+    monkeypatch.setattr(web_answer, "answer",
+                        lambda question, chunks, **kw: seen.append(question) or None)
+
+    laa._rag_answer({"question": "when is he finishing it?", "caller_sub": SUB,
+                     "history": ONE_TURN})
+
+    assert seen and seen[0] == "when is he finishing it?"
+
+
+def test_ask_history_is_the_same_module_both_lambdas_import():
+    """The move (Task 3): lambda_fieldsight_api and lambda_ask_agent both
+    import the cleaner from `ask_history`, not from each other, and get
+    identical behaviour."""
+    import lambda_fieldsight_api as fapi
+    assert fapi._clean_voice_history is ask_history._clean_voice_history
+    assert fapi.MAX_VOICE_HISTORY_TURNS == ask_history.MAX_VOICE_HISTORY_TURNS
+    assert fapi.MAX_VOICE_HISTORY_CHARS == ask_history.MAX_VOICE_HISTORY_CHARS
+
+    raw = [{"question": "q", "answer": "a"}, {"question": "bad"}]
+    assert fapi._clean_voice_history(raw) == ask_history._clean_voice_history(raw)
