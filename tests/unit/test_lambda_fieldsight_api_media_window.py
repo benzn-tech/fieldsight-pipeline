@@ -191,3 +191,51 @@ def test_transcripts_and_audio_segments_select_the_same_chunks(s3, start, end):
 def test_transcripts_window_uses_the_chunks_real_length_not_a_600s_assumption(s3):
     """A 30s chunk that ended 12:05:51 is not in a 12:07 topic."""
     assert "12-05-21" not in transcript_clocks("12:07:00", "12:07:00")
+
+
+# ---------------------------------------------------------------
+# A batch wav is written beside the chunk wavs it was stitched from; listing both
+# plays the same speech twice. Members come from the batch map, never from the
+# filename: prod 2026-09-10's c1035_bn4 holds 1035, 1036, 1037 and 1039.
+# ---------------------------------------------------------------
+
+class _BatchedS3(FakeS3):
+    def __init__(self, keys, bodies):
+        self.keys = keys
+        self.bodies = bodies
+
+    def get_object(self, Bucket=None, Key=None):
+        return {"Body": io.BytesIO(self.bodies[Key])}
+
+
+def _batched_listing(monkeypatch, with_map=True):
+    prefix = f"audio_segments/{FOLDER}/{DATE}/"
+    batch = f"ben_ucpk2_{DATE}_12-05-21_{SID}_c0035_bn4_off0.0_to116.0_srcwav.wav"
+    members = [f"ben_ucpk2_{DATE}_{clock}_{SID}_c{i:04d}_off0.0_to30.0_srcwav.wav"
+               for i, clock in ((35, "12-05-21"), (36, "12-05-49"), (37, "12-06-17"),
+                                (39, "12-07-13"))]
+    after = f"ben_ucpk2_{DATE}_12-07-41_{SID}_c0040_off0.0_to30.0_srcwav.wav"
+    bodies = {}
+    if with_map:
+        bodies[prefix + batch[: -len(".wav")] + "_batch_map.json"] = json.dumps(
+            {"schema": 1, "members": [{"chunk_key": prefix + m} for m in members]}).encode()
+    monkeypatch.setattr(fapi, "s3_client",
+                        _BatchedS3([prefix + n for n in [batch] + members + [after]], bodies))
+    return batch, members, after
+
+
+def _audio_names():
+    res = fapi.get_audio_segments({"date": DATE, "user": FOLDER, "start": "", "end": ""},
+                                  ADMIN_CALLER)
+    assert res["statusCode"] == 200, res["body"]
+    return sorted(s["filename"] for s in json.loads(res["body"])["segments"])
+
+
+def test_audio_segments_hide_chunks_a_listed_batch_covers(monkeypatch):
+    batch, members, after = _batched_listing(monkeypatch)
+    assert _audio_names() == sorted([batch, after])
+
+
+def test_audio_segments_a_batch_without_a_readable_map_hides_nothing(monkeypatch):
+    batch, members, after = _batched_listing(monkeypatch, with_map=False)
+    assert _audio_names() == sorted([batch] + members + [after])
