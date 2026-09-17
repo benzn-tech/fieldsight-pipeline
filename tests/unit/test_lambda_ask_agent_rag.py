@@ -683,6 +683,103 @@ def test_a_no_rewrite_metric_route_answer_has_asked_none(monkeypatch):
     assert out["asked"] is None
 
 
+# --------------------------------------------------------------------------
+# Task 6: the distance gate skips the verdict call when retrieval obviously
+# cannot answer, without weakening question_admission's guard (spec SS4.4).
+# `web_answer._verdict` is monkeypatched (not `web_answer.answer`) so the real
+# `answer()` body runs -- including its own `enabled()` check -- and the gate
+# computed in `_rag_answer` is what decides whether `_verdict` is reached.
+# --------------------------------------------------------------------------
+
+def _gate_chunk(distance=None, topic_title="Door Inspection", chunk_text="note"):
+    c = {"chunk_text": chunk_text, "id": "c-1", "topic_id": "t-1",
+         "source_s3_key": "x", "report_date": "2026-09-17",
+         "topic_title": topic_title}
+    if distance is not None:
+        c["distance"] = distance
+    return c
+
+
+@pytest.fixture
+def enable_web_answer(monkeypatch):
+    monkeypatch.setenv("ENABLE_WEB_ANSWER", "true")
+
+
+def _spy_verdict(monkeypatch):
+    import web_answer
+    called = []
+    monkeypatch.setattr(web_answer, "_verdict",
+                        lambda *a, **kw: (called.append(1), ({"answered": True}, None))[1])
+    return called
+
+
+def test_a_far_nearest_distance_skips_the_verdict(monkeypatch, enable_web_answer):
+    wire(monkeypatch, chunks=[_gate_chunk(distance=0.61)])
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what happened on site", "caller_sub": SUB})
+
+    assert called == [], "nearest distance 0.61 with no lexical match must skip the verdict"
+
+
+def test_a_near_distance_still_asks_the_verdict(monkeypatch, enable_web_answer):
+    wire(monkeypatch, chunks=[_gate_chunk(distance=0.40)])
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what happened on site", "caller_sub": SUB})
+
+    assert called == [1], "nearest distance 0.40 is within the gate; the verdict must run"
+
+
+def test_an_absent_distance_does_not_gate(monkeypatch, enable_web_answer):
+    """A chunk with no `distance` key must NOT count as far -- absent != far."""
+    wire(monkeypatch, chunks=[_gate_chunk(distance=None)])
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what happened on site", "caller_sub": SUB})
+
+    assert called == [1], "a missing distance must not gate the verdict"
+
+
+def test_a_widened_basis_does_not_gate(monkeypatch, enable_web_answer):
+    """basis.widened means the distances are against a day the user did not
+    ask about -- the gate must not fire, or an answer could report a widened
+    date while the same request is sent to the open web (spec SS4.4)."""
+    fake_client = wire(monkeypatch, chunks=[_gate_chunk(distance=0.61)])
+    fake_client.response_payload["basis"] = {"widened": True}
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what happened on site", "caller_sub": SUB})
+
+    assert called == [1], "a widened basis must not gate the verdict"
+
+
+def test_a_lexical_chunk_beats_the_distance(monkeypatch, enable_web_answer):
+    """The lexical escape hatch is carried over: a title that literally names
+    what was asked must not be declared unanswerable on distance alone."""
+    wire(monkeypatch, chunks=[_gate_chunk(distance=0.61, topic_title="Scaffold Inspection")])
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what does the scaffold report say", "caller_sub": SUB})
+
+    assert called == [1], "a lexical title match must not gate the verdict"
+
+
+def test_the_lexical_match_is_title_only_not_chunk_text(monkeypatch, enable_web_answer):
+    """Pins the title-only rule (mirrors _aggregate_topics, :845-849): the
+    retrieved chunk text is semantically near the query almost by definition,
+    so matching against chunk_text would make the lexical arm true for nearly
+    everything and the gate would never fire."""
+    wire(monkeypatch, chunks=[_gate_chunk(
+        distance=0.61, topic_title="Door Inspection",
+        chunk_text="The scaffold was checked and signed off.")])
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what does the scaffold report say", "caller_sub": SUB})
+
+    assert called == [], "a term present only in chunk_text must not defeat the gate"
+
+
 def test_ask_history_is_the_same_module_both_lambdas_import():
     """The move (Task 3): lambda_fieldsight_api and lambda_ask_agent both
     import the cleaner from `ask_history`, not from each other, and get

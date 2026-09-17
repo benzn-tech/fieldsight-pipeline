@@ -789,6 +789,17 @@ def _lexical_terms(question):
     return terms
 
 
+def _derived_title(c):
+    """The title `_aggregate_topics` groups/deep-links by, and the same text
+    the distance gate in `_rag_answer` matches lexical terms against: a NULL
+    topic_id (defer-day rows) yields NULL topic_title, so fall back to
+    metadata.title then the first 60 chars of chunk_text. One definition of
+    "the title" so the gate and the Search list cannot drift apart."""
+    md = c.get("metadata") if isinstance(c.get("metadata"), dict) else {}
+    return (c.get("topic_title") or md.get("title")
+            or (c.get("chunk_text") or "")[:60])
+
+
 def _aggregate_topics(chunks, question=""):
     """Collapse retrieved chunks into distinct topic rows for the Search list.
     chunk_type=='topic' chunks are kept even when topic_id is NULL
@@ -818,9 +829,7 @@ def _aggregate_topics(chunks, question=""):
             continue
         # Title: report_chunks JOINs topics for topic_title; a NULL topic_id
         # yields NULL topic_title, so fall back to metadata.title then chunk_text.
-        md = c.get("metadata") if isinstance(c.get("metadata"), dict) else {}
-        derived_title = (c.get("topic_title") or md.get("title")
-                         or (c.get("chunk_text") or "")[:60])
+        derived_title = _derived_title(c)
         date = str(c.get("report_date", "") or "")
         site_id = str(c.get("site_id", "") or "")
         # Group key: UUID when present, else the derived title (defer-day rows).
@@ -1496,7 +1505,42 @@ def _rag_answer(body):
         # returned a web block with no citations instead of the topic.
         if body.get("mode") != "voice" and chunks and not scoped and not pinned_topic:
             import web_answer
-            web = web_answer.answer(question, chunks)
+
+            # Seeded at 0.55 because that is the number measured for
+            # _aggregate_topics' per-GROUP filter -- which is a different
+            # comparison, and always with a lexical escape hatch. This is a
+            # per-CHUNK gate, so it gets its own constant and is unmeasured
+            # until it is measured: its worst case must stay "we paid for a
+            # verdict call we could have skipped", never a wrong answer. Read
+            # at call time, not at import, same reason as web_answer.enabled().
+            _DISTANCE_GATE = float(os.environ.get("ASK_DISTANCE_GATE", "0.55"))
+
+            _dists = [c["distance"] for c in chunks if c.get("distance") is not None]
+
+            # `lexical` is NOT a field on a chunk -- `_aggregate_topics`
+            # computes it for its own rows and nothing upstream ever sets it,
+            # so `c.get("lexical")` would be None for every chunk and this arm
+            # would be dead code wearing the shape of a guard. Match against
+            # the TITLE ONLY, never chunk_text (see _aggregate_topics' own
+            # comment at its `hay = derived_title.lower()` line): the
+            # retrieved chunks are semantically near the query so their text
+            # usually contains a term anyway, which would make this arm true
+            # for nearly everything -- a lexical arm that is always true is a
+            # gate that never fires. `_derived_title` mirrors
+            # _aggregate_topics' own fallback chain so one definition of "the
+            # title" exists.
+            _terms = _lexical_terms(question)
+            _lexical = any(
+                any(t in _derived_title(c).lower() for t in _terms)
+                for c in chunks
+            )
+
+            # Absent is not far: _aggregate_topics defaults a missing distance
+            # to 1.0, which is right for ranking and would silently route
+            # every chunk to the web here.
+            _skip = (bool(_dists) and not _lexical and not basis.get("widened")
+                     and min(_dists) > _DISTANCE_GATE)
+            web = web_answer.answer(question, chunks, skip_verdict=_skip)
         if web is not None and web.get("answer"):
             # Its own block, never merged into the grounded answer. A reader who
             # cannot tell what came from their meetings from what came off the
