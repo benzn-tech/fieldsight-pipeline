@@ -1733,7 +1733,7 @@ Resources:
       FunctionName: !Sub ["${P}-session-report", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_session_report.lambda_handler
-      Timeout: 300
+      Timeout: 900
       MemorySize: 512
       Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24)
       Layers: !If
@@ -1760,9 +1760,11 @@ Resources:
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
-          # One attempt must fit inside Timeout: 300 with room for the docx render.
-          LLM_HTTP_TIMEOUT: '120'
-          GENERATION_BUDGET_SECONDS: '210'
+          # One attempt must fit inside Timeout: 900 with room for the docx render.
+          LLM_HTTP_TIMEOUT: '300'
+          GENERATION_BUDGET_SECONDS: '600'
+          # Pre-check on transcript objects in one window (transcript_window.py).
+          MAX_TRANSCRIPT_OBJECTS: '2000'
       Policies:
         - Version: '2012-10-17'
           Statement:
