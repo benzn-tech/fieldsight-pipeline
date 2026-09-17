@@ -8,7 +8,8 @@ numbers below are not pinned; the relationships are:
 
 1. No Timeout exceeds the Lambda maximum (900 s).
 2. LLM_HTTP_TIMEOUT and GENERATION_BUDGET_SECONDS are strictly below Timeout.
-3. A handler behind API Gateway is at or under 30 s: the gateway cuts at 29 s.
+3. A REST or WebSocket API Gateway handler or authorizer is at or under 30 s: the
+   gateway cuts at 29 s.
 4. A function on a rate() schedule is shorter than its interval -- otherwise runs
    stack -- unless listed in OVERLAP_ACCEPTED with its exact value and a reason.
 5. A function invoked synchronously by another is no longer than its caller.
@@ -81,6 +82,17 @@ def _functions():
             "rates_sec": rates,
             "api": api,
         }
+    # WebSocket routes are wired through raw AWS::ApiGatewayV2::Integration /
+    # ::Authorizer resources that reference the function by ARN (e.g.
+    # "${WsConnectFunction.Arn}" inside a !Sub), not through a Serverless::Function
+    # Events block -- so the loop above never sees them as API-fronted. Sweep those
+    # resource blocks separately and OR the flag in.
+    for block in blocks:
+        if not re.search(r"(?m)^    Type:\s*AWS::ApiGatewayV2::(Integration|Authorizer)\s*$", block):
+            continue
+        for name in re.findall(r"\$\{(\w+)\.Arn\}", block):
+            if name in out:
+                out[name]["api"] = True
     return out
 
 
@@ -94,6 +106,12 @@ def test_the_parser_sees_the_whole_template():
     assert fns["OrgApiFunction"]["api"] is True
     assert fns["FinalizeSweepFunction"]["rates_sec"] == [60]
     assert fns["ExtractSessionFunction"]["llm_http_timeout"] is not None
+    # WebSocket routes/authorizer wired via raw ApiGatewayV2::Integration/Authorizer
+    # resources, not a Serverless::Function Events block -- pinned so detection
+    # cannot silently regress into treating them as non-API functions.
+    for name in ("WsConnectFunction", "WsDisconnectFunction", "WsSendVoiceFunction",
+                 "VoiceWsAuthorizerFunction"):
+        assert fns[name]["api"] is True, name
 
 
 def test_no_timeout_exceeds_the_lambda_maximum():
