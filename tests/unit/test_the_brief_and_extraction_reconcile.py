@@ -6,9 +6,13 @@ Two real defects, both from the same email (session `d740cd5f...`,
 
   §5.1 the same commitment appeared twice -- once as a brief action row, once
   again as a topic row, because topic rows were decided from the extraction
-  ALONE, blind to what the brief had already said. Fixed by §7.1/§7.2:
-  coverage by TIME, not text -- a topic a brief task's `at` falls inside is
-  not emitted as a topic row.
+  ALONE, blind to what the brief had already said. Originally fixed by
+  coverage-by-TIME (§7.1/§7.2 as first written): a topic a brief task's `at`
+  fell inside was not emitted as a topic row. That rule was itself replaced
+  by coverage-by-TEXT (2026-09-18, this file's current form) after a second
+  real session showed time cannot separate topics that overlap in time --
+  see the module docstring note in `lambda_session_finalize` and §7.1 of the
+  plan for the measured Papakura case that forced the change.
 
   §5.2 a dated commitment the extraction caught ("PS4 for the Port Com SR
   study...") was silently dropped because the brief won outright and had no
@@ -16,8 +20,8 @@ Two real defects, both from the same email (session `d740cd5f...`,
   item that is not textually represented in the brief, appended after the
   brief's own rows.
 
-§9's four worked examples are pinned verbatim below, against the real
-2026-09-11 session's actual text.
+§9's worked examples are pinned verbatim below, against the real
+2026-09-11 and 2026-09-18 sessions' actual text.
 """
 import pytest
 
@@ -27,44 +31,12 @@ iw = pytest.importorskip("lambda_item_writer", reason="requires psycopg (install
 SID = "d740cd5f"
 
 
-# ---- §7.1/§7.2: coverage by time --------------------------------------------
-
-def test_a_topic_covered_by_an_at_inside_its_range_gets_no_topic_row():
-    assert fin._topic_covered("13:40 – 13:41", ["13:40:43"]) is True
-
-
-def test_an_at_exactly_at_the_range_start_covers_it():
-    """Both ends inclusive (§7.1) -- the start boundary."""
-    assert fin._topic_covered("13:40 – 13:41", ["13:40:00"]) is True
-
-
-def test_an_at_exactly_at_the_range_end_covers_it():
-    """Both ends inclusive (§7.1) -- the end boundary."""
-    assert fin._topic_covered("13:40 – 13:41", ["13:41:00"]) is True
-
-
-def test_an_at_one_second_past_the_end_does_not_cover_it():
-    assert fin._topic_covered("13:40 – 13:41", ["13:41:01"]) is False
-
-
-def test_an_at_one_second_before_the_start_does_not_cover_it():
-    assert fin._topic_covered("13:40 – 13:41", ["13:39:59"]) is False
-
-
-def test_an_unparsable_range_is_never_covered():
-    for bad in ("", None, "garbage", "not a time"):
-        assert fin._topic_covered(bad, ["13:40:43"]) is False
-
-
-def test_a_brief_task_with_no_at_covers_nothing():
-    assert fin._topic_covered("13:40 – 13:41", [None, ""]) is False
-
-
-def test_only_one_of_several_brief_tasks_needs_to_land_inside():
-    assert fin._topic_covered("09:00 – 09:20", ["08:00:00", "09:05:00", "20:00:00"]) is True
-
-
 # ---- §7.4: the Jaccard "represented" test -----------------------------------
+#
+# This is now the ONLY text-similarity primitive in the module: it decides
+# both back-fill (an extraction action item not said by the brief -> kept)
+# and suppression (a topic row already said by the brief -> dropped). One
+# function, one threshold, both directions -- see `_rows_from_brief_or_request`.
 
 def test_the_jaccard_threshold_and_stop_list_are_one_named_constant():
     """Not inlined twice: `_is_represented` must actually consult the module
@@ -111,49 +83,75 @@ def test_exactly_030_by_a_second_independent_construction_is_not_represented():
     assert fin._is_represented(text, [brief_text]) is False
 
 
-# ---- range parsing: en dash / em dash / plain hyphen, HH:MM means :00 ------
+# ---- §9 worked example 1 (superseded 2026-09-18): suppression by TEXT ------
+#
+# The original coverage-by-time rule suppressed a topic whenever a brief
+# task's `at` fell inside the topic's `time_range`. Measured on TEST
+# (2026-09-18) that rule ate content it should not have: a real brief's 8
+# tasks carried only THREE distinct `at` values, and the extraction's topics
+# were 2-minute windows that overlapped those three values -- so "Papakura is
+# mid-program and progressing well" was suppressed by a task about meeting
+# KCD at the Icehouse office, though nothing in the email mentioned Papakura.
+# Time cannot separate topics that overlap in time when real conversation
+# does. Suppression is now decided the same way back-fill always was: by
+# `_is_represented` on the row's own text against the brief's task texts.
 
-def test_an_em_dash_range_separator_is_accepted():
-    """Parity ruling point 1 (acceptance set): en dash, em dash or a plain
-    hyphen, with or without surrounding spaces."""
-    assert fin._parse_hms_range("13:40—13:41") == (49200, 49260)   # en dash
-    assert fin._parse_hms_range("13:40—13:41") == fin._parse_hms_range("13:40—13:41")
-    assert fin._parse_hms_range("13:40 — 13:41") == (49200, 49260)      # em dash
-    assert fin._parse_hms_range("13:40 - 13:41") == (49200, 49260)      # plain hyphen
+# Eight representative brief task texts from that session's shape (module
+# docstring: KCD Meeting, Ormiston College, Papakura -- three 2-minute topic
+# windows sharing only three distinct `at` values across 8 tasks). None of
+# these mentions Papakura in any form.
+EIGHT_BRIEF_TASK_TEXTS = [
+    "Meet KCD at the Icehouse office to review the current programme sequence.",
+    "Confirm KCD meeting agenda items before the site walk on Friday.",
+    "Visit MPI site with DeAndre to review open-space usage pattern after "
+    "Ormiston College 360 inspections.",
+    "Follow up with KCD on the revised construction timeline.",
+    "Order additional steel reinforcement for the northern block.",
+    "Chase the electrical subcontractor for updated wiring diagrams.",
+    "Schedule a follow-up call with the client project manager.",
+    "Confirm delivery dates for the precast panels with the supplier.",
+]
+
+PAPAKURA_TOPIC_TEXT = ("Papakura Progress and Modulars — Papakura is mid-program with "
+                       "good positioning and progressing well.")
+ORMISTON_TOPIC_TEXT = ("Ormiston College 360 Inspections — Speaker hopes to visit the "
+                       "MPI site with DeAndre.")
+ORMISTON_BRIEF_TEXT = ("Visit MPI site with DeAndre to review open-space usage pattern "
+                       "after Ormiston College 360 inspections.")
 
 
-def test_an_hh_mm_endpoint_means_hh_mm_00_not_hh_mm_59():
-    """Parity ruling point 2: no invented seconds."""
-    assert fin._parse_hms("13:41") == 13 * 3600 + 41 * 60
-    assert fin._parse_hms_range("13:40 – 13:41") == (13 * 3600 + 40 * 60, 13 * 3600 + 41 * 60)
+def test_papakura_topic_not_represented_in_any_of_the_eight_tasks_is_kept():
+    """The measured false-suppression this change exists to fix: nothing in
+    the 8 real-shaped brief tasks textually says Papakura, so the topic row
+    must survive."""
+    assert fin._is_represented(PAPAKURA_TOPIC_TEXT, EIGHT_BRIEF_TASK_TEXTS) is False
 
 
-def test_a_range_with_a_nonstandard_separator_is_unparsable():
-    assert fin._parse_hms_range("13:40 to 13:41") is None
-    assert fin._parse_hms_range("13:40..13:41") is None
-    assert fin._parse_hms_range("garbage") is None
-    assert fin._parse_hms_range("") is None
-    assert fin._parse_hms_range(None) is None
+def test_ormiston_topic_represented_by_its_matching_task_is_suppressed():
+    """The case the rule SHOULD still catch: a brief task that does say the
+    same thing, in different words, still suppresses the topic row."""
+    assert fin._is_represented(ORMISTON_TOPIC_TEXT, [ORMISTON_BRIEF_TEXT]) is True
 
 
-# ---- §9 worked example 1: coverage suppresses a duplicated topic row -------
-
-def test_worked_example_1_ormiston_topic_is_covered_and_dropped(monkeypatch):
+def test_worked_example_1_papakura_topic_is_kept_ormiston_topic_is_dropped(monkeypatch):
+    """End-to-end through `_rows_from_brief_or_request`: the brief's action
+    rows come from the 8-task session; the request's topic rows are Papakura
+    (must survive) and Ormiston (must be dropped, represented by the brief's
+    own MPI/DeAndre task)."""
     monkeypatch.setattr(fin, "SESSION_BRIEF", True, raising=False)
-    brief_action_rows = [
-        {"text": "Visit MPI site with DeAndre to see comprehensive open-space "
-                 "usage pattern.", "responsible": None, "due": None, "at": "13:40:43"}]
+    brief_action_rows = [{"text": t, "responsible": None, "due": None, "at": "13:40:43"}
+                         for t in EIGHT_BRIEF_TASK_TEXTS]
     request_todos = [
         {"text": "Order steel", "responsible": "Neil", "due": None, "kind": "action"},
-        {"text": "Ormiston College 360 Inspections — Speaker hopes to visit the "
-                 "MPI site with DeAndre.", "responsible": None, "due": None,
-         "kind": "topic", "topic_range": "13:40 – 13:41"},
+        {"text": PAPAKURA_TOPIC_TEXT, "responsible": None, "due": None, "kind": "topic"},
+        {"text": ORMISTON_TOPIC_TEXT, "responsible": None, "due": None, "kind": "topic"},
     ]
     out = fin._rows_from_brief_or_request(
         {"kind": "final", "sessionId": SID, "folder": "F", "date": "D"}, request_todos,
         poll_brief=lambda *a: {"tasks": [1], "open_todos": brief_action_rows})
     texts = [r["text"] for r in out]
-    assert "Ormiston College 360 Inspections" not in " ".join(texts)
+    assert PAPAKURA_TOPIC_TEXT in texts, "not represented in any brief task -- must be kept"
+    assert ORMISTON_TOPIC_TEXT not in texts, "represented by the brief's own MPI/DeAndre task"
     assert any("MPI site" in t for t in texts)   # the brief's own row still there
 
 
@@ -173,8 +171,7 @@ def test_worked_example_2_ps4_is_not_represented_and_gets_backfilled(monkeypatch
     brief_action_rows = [
         {"text": QA_TASK_TEXT, "responsible": "Sam", "due": "Mon", "at": "09:10:00"}]
     request_todos = [
-        {"text": PS4_ITEM_TEXT, "responsible": None, "due": "2027-01-31",
-         "kind": "action", "topic_range": "10:00 – 10:05"},
+        {"text": PS4_ITEM_TEXT, "responsible": None, "due": "2027-01-31", "kind": "action"},
     ]
     out = fin._rows_from_brief_or_request(
         {"kind": "final", "sessionId": SID, "folder": "F", "date": "D"}, request_todos,
@@ -200,7 +197,7 @@ def test_worked_example_3_the_paraphrase_is_represented_and_not_backfilled(monke
         {"text": QA_TASK_TEXT, "responsible": "Sam", "due": "Mon", "at": "09:10:00"}]
     request_todos = [
         {"text": CONCRETE_EXTRACTION_TEXT, "responsible": None, "due": "2026-10-09",
-         "kind": "action", "topic_range": "10:00 – 10:05"},
+         "kind": "action"},
     ]
     out = fin._rows_from_brief_or_request(
         {"kind": "final", "sessionId": SID, "folder": "F", "date": "D"}, request_todos,
@@ -218,43 +215,13 @@ def test_worked_example_4_an_undated_unmatched_item_is_not_backfilled(monkeypatc
         {"text": QA_TASK_TEXT, "responsible": "Sam", "due": "Mon", "at": "09:10:00"}]
     request_todos = [
         {"text": "Someone should tidy the site office", "responsible": None, "due": None,
-         "kind": "action", "topic_range": "10:00 – 10:05"},
+         "kind": "action"},
     ]
     out = fin._rows_from_brief_or_request(
         {"kind": "final", "sessionId": SID, "folder": "F", "date": "D"}, request_todos,
         poll_brief=lambda *a: {"tasks": [1], "open_todos": brief_action_rows})
     texts = [r["text"] for r in out]
     assert "Someone should tidy the site office" not in texts
-
-
-# ---- §8: topic_range is carried by the item-writer's row builders --------
-
-def test_final_email_rows_carry_the_topic_range():
-    art = {"topics": [{"time_range": "09:00 – 09:20",
-                       "action_items": [{"action": "Order steel", "responsible": "Neil"}]}]}
-    rows = iw._final_email_rows(art, "2026-09-18")
-    assert rows[0]["topic_range"] == "09:00 – 09:20"
-
-
-def test_topic_rows_carry_the_topic_range():
-    art = {"topics": [{"topic_title": "Site walk", "summary": "Poured the slab.",
-                       "time_range": "10:00 – 10:05", "action_items": []}]}
-    rows = iw._topic_rows(art)
-    assert rows[0]["topic_range"] == "10:00 – 10:05"
-
-
-def test_clean_todos_carries_topic_range_through_the_rebuild():
-    """The exact trap that once dropped `kind` (module docstring): `_clean_todos`
-    rebuilds every row from scratch, so a new key that isn't explicitly copied
-    is silently lost."""
-    out = fin._clean_todos([{"text": "x", "responsible": None, "due": None,
-                             "kind": "topic", "topic_range": "09:00 – 09:20"}])
-    assert out[0]["topic_range"] == "09:00 – 09:20"
-
-
-def test_clean_todos_defaults_a_missing_topic_range_to_none():
-    out = fin._clean_todos([{"text": "x", "responsible": None, "due": None}])
-    assert out[0]["topic_range"] is None
 
 
 # ---- the log line stays ONE line and names both new numbers --------------
@@ -264,10 +231,10 @@ def test_the_log_line_names_suppressed_and_backfilled_counts(monkeypatch, caplog
     brief_action_rows = [
         {"text": QA_TASK_TEXT, "responsible": "Sam", "due": "Mon", "at": "09:10:00"}]
     request_todos = [
-        {"text": "Site walk — poured the slab.", "responsible": None, "due": None,
-         "kind": "topic", "topic_range": "09:05 – 09:15"},   # covered by 09:10:00 -> suppressed
+        # represented by QA_TASK_TEXT (paraphrase) -> suppressed
+        {"text": CONCRETE_EXTRACTION_TEXT, "responsible": None, "due": None, "kind": "topic"},
         {"text": PS4_ITEM_TEXT, "responsible": None, "due": "2027-01-31",
-         "kind": "action", "topic_range": "10:00 – 10:05"},  # unmatched, dated -> back-filled
+         "kind": "action"},  # unmatched, dated -> back-filled
     ]
     with caplog.at_level("INFO"):
         fin._rows_from_brief_or_request(
@@ -280,22 +247,3 @@ def test_the_log_line_names_suppressed_and_backfilled_counts(monkeypatch, caplog
         "finalize: d740cd5f email action rows from the brief (2 row(s), 1 "
         "back-filled from the extraction), 0 topic row(s) kept from the "
         "request (1 suppressed as covered by a brief task)")
-
-
-def test_an_impossible_clock_is_unparsable_not_a_range():
-    """A shape like "25:00" or "09:99" is not a clock, so it is not a range.
-
-    Plan §7.1: anything that is not two parsable clock times never covers a
-    topic. The regex alone accepts these, and fieldsight-ui's
-    `parseClockSeconds` rejects them -- so without the bounds check the two
-    surfaces disagreed: an out-of-range `time_range` from an upstream
-    arithmetic slip would have suppressed a topic row in the email while
-    Preview & copy kept it. Found by executing both parsers on the same
-    inputs, not by reading them."""
-    import lambda_session_finalize as f
-    for bad in ("25:00", "09:99", "99:99", "12:00:60"):
-        assert f._parse_hms(bad) is None, bad
-    for good, secs in (("00:00", 0), ("23:59", 86340), ("13:41:07", 49267)):
-        assert f._parse_hms(good) == secs, good
-    assert f._parse_hms_range("25:00 – 26:00") is None
-    assert f._topic_covered("25:00 – 26:00", ["25:30"]) is False

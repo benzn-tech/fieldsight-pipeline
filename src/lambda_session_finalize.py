@@ -66,9 +66,10 @@ BRIEF_WAIT_SECONDS = float(os.environ.get("BRIEF_WAIT_SECONDS", "90"))
 #: and another way on the site -- and it is what the kinds above retire.
 RENDERED_KINDS = ("final", "rolling", "updated")
 
-# ---- handoff-sync plan §7.4: is an extraction action item already said, in
-# different words, by a brief task? One shared constant, named identically to
-# its (independent) frontend counterpart, so neither side can drift without a
+# ---- handoff-sync plan §7.4 (originally back-fill only; §7.1 folded in
+# 2026-09-18, see below): is one piece of text already said, in different
+# words, by another? One shared constant, named identically to its
+# (independent) frontend counterpart, so neither side can drift without a
 # renamed test failing to find it.
 #
 # Deliberately conservative and biased AWAY from dropping a commitment (§10):
@@ -76,6 +77,27 @@ RENDERED_KINDS = ("final", "rolling", "updated")
 # NOT represented -- the cost of that bias is an occasional duplicate row, and
 # a duplicate is visible and annoying where a silently dropped commitment is
 # neither.
+#
+# THIS ONE FUNCTION NOW DRIVES BOTH DIRECTIONS of the brief/extraction merge:
+#   back-fill (§7.3)   an extraction action item is KEPT when it is NOT
+#                       represented in the brief's texts.
+#   suppression (§7.1) an extraction topic row is DROPPED when it IS
+#                       represented in the brief's texts.
+# Coverage used to be decided by TIME instead (a brief task's `at` falling
+# inside the topic's `time_range`), but that rule was measured, on a real
+# TEST session, to suppress unrelated content: a brief's 8 tasks carried only
+# three distinct `at` values, and three of the session's topics were
+# overlapping 2-minute windows around those values, so a task about meeting
+# KCD at the Icehouse office suppressed a topic row about Papakura -- nothing
+# in the email mentioned Papakura at all. Time cannot separate topics that
+# overlap in time when real conversation does; text can. Because suppression
+# now reads the SAME threshold the back-fill bias was built on, it inherits
+# that bias by construction: "unsure" reads as NOT represented, which for
+# back-fill means "keep the extraction row" and for suppression means
+# "keep the topic row" -- both directions resolve uncertainty the same way,
+# towards showing more rather than silently dropping something. A reader
+# comparing the two call sites below should not need to re-derive this; it is
+# the reason there is one function here instead of two.
 BRIEF_MATCH_JACCARD_THRESHOLD = 0.30
 BRIEF_MATCH_STOP_WORDS = frozenset(
     "the a an and or to of for on in at is are be by with from that this it as".split())
@@ -94,7 +116,11 @@ def _is_represented(text, brief_texts):
 
     Strictly, not `>=`: a tie at the threshold is the boundary case plan §7.4
     calls out by name ("a tie... counts as NOT represented"), so it is decided
-    the same way as an empty token set -- towards keeping the row."""
+    the same way as an empty token set -- towards keeping the row.
+
+    Used for BOTH back-fill and suppression (see the block comment above) --
+    the direction is entirely in what the caller does with the boolean, not
+    in anything this function decides."""
     tokens = _match_tokens(text)
     if not tokens:
         return False
@@ -108,80 +134,6 @@ def _is_represented(text, brief_texts):
         if overlap > best:
             best = overlap
     return best > BRIEF_MATCH_JACCARD_THRESHOLD
-
-
-#: Coverage-rule time parsing (plan §7.1), kept local rather than reused from
-#: `chunking.parse_time_range`: the frontend's parallel implementation (same
-#: plan, §7) accepts en dash, em dash OR a plain hyphen as the range
-#: separator, and `chunking.parse_time_range` only normalises the en dash --
-#: it is tuned for real lake `time_range` data, not for parity with a sibling
-#: repo. Getting this ONE acceptance set wrong would make an otherwise-good
-#: topic_range read as unparsable on one surface and not the other, which is
-#: exactly the silent drift plan §7.5 exists to prevent.
-_RANGE_SEP_RE = re.compile(r"\s*[–—-]\s*")   # en dash / em dash / hyphen
-_HMS_RE = re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$")
-
-
-def _parse_hms(value):
-    """'HH:MM' or 'HH:MM:SS' -> seconds-of-day, or None if unparsable.
-
-    'HH:MM' means HH:MM:00 -- no invented seconds (parity ruling, 2026-09-18):
-    a topic whose range ends '13:41' covers a brief task at 13:41:00, not one
-    at 13:41:59."""
-    m = _HMS_RE.match((value or "").strip())
-    if not m:
-        return None
-    h, mi, s = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
-    # SHAPE IS NOT A CLOCK. The regex accepts "25:00" and "09:99"; the plan
-    # (§7.1) says anything that is not two parsable clock times is unparsable
-    # and therefore never covers a topic. Without this the two surfaces
-    # disagreed: fieldsight-ui `parseClockSeconds` rejects these, so an
-    # out-of-range range from an upstream arithmetic slip would silently
-    # suppress a topic row in the email and keep it in Preview & copy.
-    if h > 23 or mi > 59 or s > 59:
-        return None
-    return h * 3600 + mi * 60 + s
-
-
-def _parse_hms_range(time_range):
-    """A topic's raw `time_range` -> (start_sec, end_sec), or None.
-
-    Anything that isn't exactly two `HH:MM`/`HH:MM:SS` sides joined by one
-    separator is unparsable -- and unparsable means never covered (§7.1), not
-    a window guessed wide open."""
-    if not isinstance(time_range, str):
-        return None
-    parts = _RANGE_SEP_RE.split(time_range.strip())
-    if len(parts) != 2:
-        return None
-    start, end = _parse_hms(parts[0]), _parse_hms(parts[1])
-    if start is None or end is None:
-        return None
-    return start, end
-
-
-def _topic_covered(topic_range, brief_ats):
-    """Plan §7.1: a topic is covered when at least one brief task's `at` falls
-    inside the topic's own `time_range`, both ends inclusive.
-
-    An unparsable `time_range` is never covered. A brief task with no `at`
-    covers nothing: `_parse_hms(None)` returns None, so it is skipped by the
-    same check with no special-casing needed. Judged only against the SAME
-    session's own brief tasks -- this function, and the `final` email it
-    serves, are already scoped to one session's artifact and one session's
-    polled brief, so there is no cross-session set to accidentally draw from
-    (parity ruling, 2026-09-18, point 4)."""
-    window = _parse_hms_range(topic_range)
-    if window is None:
-        return False
-    start, end = window
-    for at in brief_ats:
-        at_sec = _parse_hms(at)
-        if at_sec is None:
-            continue
-        if start <= at_sec <= end:
-            return True
-    return False
 
 
 def _display_name(folder):
@@ -226,13 +178,7 @@ def _clean_todos(open_todos):
                         # was discussed and nobody promised anything). Dropping it
                         # here would have cost the distinction the table is built
                         # on, since this function rebuilds each row from scratch.
-                        "kind": ("topic" if t.get("kind") == "topic" else "action"),
-                        # handoff-sync plan §8: the owning topic's raw time_range,
-                        # carried through for the same reason as `kind` above --
-                        # this function rebuilds each row from scratch, and the
-                        # trap that once dropped `kind` here is exactly what a new
-                        # key silently missed would repeat.
-                        "topic_range": (t.get("topic_range") or None)})
+                        "kind": ("topic" if t.get("kind") == "topic" else "action")})
     return out
 
 
@@ -605,21 +551,24 @@ def _rows_from_brief_or_request(artifact, request_todos, *, poll_brief=None):
     "nothing to do" (plan §1.3).
 
     When the brief wins, two more things happen before the request's rows are
-    merged in (plan §6/§7):
+    merged in (plan §6/§7), and both are the SAME `_is_represented` text test
+    (see the block comment above its definition) applied in opposite
+    directions:
 
-    * a TOPIC row is dropped when a brief task's `at` falls inside that
-      topic's own `time_range` (§7.1/§7.2) -- the brief already covers it, so
-      keeping the topic row too is the "same thing appears twice" defect
-      (§5.1) this plan exists to close;
-    * every extraction ACTION row that carries a non-empty `due` and is not
-      textually represented in the brief's rows is appended after the
-      brief's own rows, in the extraction's own order (§7.3) -- the "dated
-      commitment the brief missed" defect (§5.2).
+    * a TOPIC row is dropped when its own text IS represented in one of the
+      brief's rows (§7.1, text-based since 2026-09-18 -- see that block
+      comment for why the original time-based rule was replaced) -- the
+      brief already said it, so keeping the topic row too is the "same thing
+      appears twice" defect (§5.1) this plan exists to close;
+    * every extraction ACTION row that carries a non-empty `due` and is NOT
+      represented in the brief's rows is appended after the brief's own
+      rows, in the extraction's own order (§7.3) -- the "dated commitment
+      the brief missed" defect (§5.2).
 
     Exactly one log line, naming which source was used and why, and (when the
-    brief wins) how many topic rows were suppressed as covered and how many
-    extraction rows were back-filled -- the same posture as every other
-    silent-fallback point in this pipeline."""
+    brief wins) how many topic rows were suppressed and how many extraction
+    rows were back-filled -- the same posture as every other silent-fallback
+    point in this pipeline."""
     session_id = artifact.get("sessionId")
     if not SESSION_BRIEF:
         logger.info("finalize: %s email rows from the request -- SESSION_BRIEF is off",
@@ -648,13 +597,12 @@ def _rows_from_brief_or_request(artifact, request_todos, *, poll_brief=None):
                     session_id, len(brief.get("tasks") or []))
         return request_todos
 
-    brief_ats = [r.get("at") for r in action_rows]
+    brief_texts = [r.get("text") for r in action_rows]
     all_topic_rows = [t for t in (request_todos or []) if t.get("kind") == "topic"]
     topic_rows = [t for t in all_topic_rows
-                 if not _topic_covered(t.get("topic_range"), brief_ats)]
+                 if not _is_represented(t.get("text"), brief_texts)]
     suppressed = len(all_topic_rows) - len(topic_rows)
 
-    brief_texts = [r.get("text") for r in action_rows]
     extraction_action_rows = [t for t in (request_todos or []) if t.get("kind") != "topic"]
     backfilled = [t for t in extraction_action_rows
                  if (t.get("due") or "").strip()

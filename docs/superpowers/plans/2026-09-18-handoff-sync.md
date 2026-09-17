@@ -140,11 +140,14 @@ is not in the email at all.
 Both surfaces already build one table (§1). Part 2 changes only how the two
 sources are merged.
 
-1. **Coverage by time.** A topic is *covered* when at least one brief task's `at`
-   (HH:MM:SS) falls inside that topic's own time range, inclusive of both ends.
-   A topic with no parsable range is never covered. A brief task with no `at` covers nothing.
+1. **Coverage by TEXT, not time (revised 2026-09-18, see §7.1a).** A topic row
+   is *covered* — and dropped — when its own row text is represented in one of
+   the brief's task texts, using the exact same test as back-fill (§7.4 below,
+   `_is_represented`). One function, both directions: suppression asks "is
+   this topic row already said by the brief?" the same way back-fill asks "is
+   this extraction item already said by the brief?".
 2. **Topic rows** (§1.5) are emitted for topics that produced no action item
-   **and are not covered**.
+   **and are not represented** in the brief's task texts.
 3. **Back-fill.** When action rows come from a session's brief, every extraction
    action item of that session that (a) carries a non-empty due date and
    (b) is not represented in the brief is appended after the brief's rows, in the
@@ -157,33 +160,61 @@ sources are merged.
    sentence). A tie at exactly 0.30, or an empty token set, counts as NOT
    represented, so the bias is towards carrying a commitment twice rather than
    losing it — losing one is the failure this plan exists to prevent.
-5. The thresholds and the stop list are **one shared constant per surface, named
+   **Suppression inherits this bias by construction**, since it reads the same
+   threshold: "unsure" means below the threshold means NOT represented, which
+   for a topic row means KEPT — the same direction back-fill resolves
+   uncertainty in, just read from the other side of the same call.
+5. The threshold and the stop list are **one shared constant per surface, named
    identically**, and both sides pin the same worked examples (§9).
 
-## 8. Backend: the request has to carry more than it does
+### 7.1a Why coverage moved from time to text (2026-09-18)
 
-`session_finalize` sees only `{text, responsible, due, kind}` rows — no time
-ranges, no per-row provenance — so neither rule is computable there today.
-`lambda_item_writer._final_email_context` must send, per row:
+The rule as first written (§7.1, superseded) suppressed a topic row when a
+brief task's `at` fell inside the topic's `time_range`. Measured on a real
+TEST session the same day this was written, that rule ate content it should
+not have:
 
-* action rows: `topic_range` (the topic's `time_range` string, unparsed) — needed
-  so a back-filled row can be attributed, and to keep the shapes uniform;
-* topic rows: `topic_range` likewise.
+* the brief's 8 tasks carried only **three** distinct `at` values
+  (13:40:43, 13:42:06, 13:44:33) — the brief's own anchor granularity is
+  coarse, coarser than the topics it was being asked to gate;
+* the extraction's topics were **2-minute windows** that overlapped those
+  three anchors: `KCD Meeting 13:40–13:42`, `Ormiston College 13:40–13:42`,
+  `Papakura Progress and Modulars 13:40–13:42`;
+* so the topic row "Papakura Progress and Modulars — Papakura is mid-program
+  with good positioning and progressing well" was suppressed by a brief task
+  about meeting KCD at the Icehouse office — an unrelated topic that merely
+  shared a time window. Nothing in the email mentioned Papakura at all.
 
-Nothing else changes shape: `_topic_rows` / `_final_email_rows` keep their text
-rules (§1.5), and `_clean_todos` must carry the new key through rather than
-rebuild the row without it (it rebuilds each row from scratch — the same trap
-that lost `kind` once already).
+Time cannot separate topics that overlap in time, and in real conversation
+they routinely do — three unrelated topics inside the same 2-minute window is
+the ordinary case, not an edge case. Text can separate them, because it asks
+the question that actually matters: did the brief say this, or not? Coverage
+is now decided by `_is_represented` — the SAME function and threshold §7.4
+already used for back-fill — applied to a topic row's own text against the
+brief's task texts. The time machinery (`_topic_covered`, `_parse_hms`,
+`_parse_hms_range` and the two acceptance-set regexes) is deleted, along with
+the `topic_range` field that existed only to carry a topic's raw time window
+across the request boundary for that machinery to consume.
 
-`_rows_from_brief_or_request` then applies §7 and logs, in its existing single
+## 8. Backend: the request carries only what the text rule needs
+
+`session_finalize` sees only `{text, responsible, due, kind}` rows — no
+per-row provenance — which is now sufficient: both directions of §7 read a
+row's own `text`, already present, against the brief's task texts. (The
+`topic_range` field this section originally specified, so the time-based rule
+could attribute a window to a row, is gone along with that rule — see §7.1a.)
+
+`_topic_rows` / `_final_email_rows` (`lambda_item_writer.py`) keep their
+existing text rules (§1.5) and no longer add `topic_range`; `_clean_todos`
+(`lambda_session_finalize.py`) no longer carries it through either.
+
+`_rows_from_brief_or_request` applies §7 and logs, in its existing single
 line, how many topic rows were suppressed and how many items were back-filled.
 
 ## 9. Worked examples both surfaces must agree on
 
 From the real 2026-09-11 session:
 
-* Brief task `at 13:40:43` + topic "Ormiston College 360 Inspections"
-  `13:40 – 13:41` → **covered** → no topic row.
 * Extraction item "PS4 for the Port Com SR study to be signed by January next
   year", due `2027-01-31`, against the brief's five tasks → best overlap is with
   the QA task ("port", "com") ≈ 0.1 → **not represented** → **back-filled**.
@@ -192,6 +223,19 @@ From the real 2026-09-11 session:
   concrete once 28-day cure ends in about three weeks" → overlap ≈ 0.5 →
   **represented** → not back-filled.
 * An extraction item with NO due date and no match → **not** back-filled (§7.3a).
+
+From the real 2026-09-18 session that forced §7.1a:
+
+* Topic row "Ormiston College 360 Inspections — Speaker hopes to visit the MPI
+  site with DeAndre." against the brief task "Visit MPI site with DeAndre to
+  review open-space usage pattern after Ormiston College 360 inspections." →
+  overlap = 0.5 → **represented** → **suppressed** (same topic, said by the
+  brief in different words — this is the case coverage is FOR).
+* Topic row "Papakura Progress and Modulars — Papakura is mid-program with
+  good positioning and progressing well." against all 8 of that session's
+  brief task texts → zero overlap with every one of them → **not
+  represented** → **kept** (this is the case that broke under the time rule,
+  §7.1a).
 
 ## 10. Stated plainly: this can double
 
