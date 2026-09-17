@@ -196,3 +196,53 @@ def test_the_budgets_fit_under_the_stop_and_the_gateway():
     total = web.VERDICT_BUDGET + web.WEB_BUDGET
     assert total + client.MIN_USEFUL_TIMEOUT <= web.HARD_STOP_SECONDS
     assert web.HARD_STOP_SECONDS < 29, "the gateway ceiling is not ours to raise"
+
+
+# ------------------------------------------- the verdict judges what was searched
+
+FOLLOW_UP = "When does it have to be finished?"
+STANDALONE = "When does the Unit 11 backfill have to be finished?"
+
+
+def test_the_verdict_judges_the_rewritten_question(monkeypatch):
+    """Conversation memory retrieves with the standalone rewrite, so the
+    verdict has to judge the excerpts against THAT. Judged against the pronoun
+    version the model says no -- measured on TEST 2026-09-18, two rewritten
+    follow-ups routed to the web, one of them answering with New Zealand's
+    two-year consent rule while the records said Friday."""
+    fake = FakeCall(verdict(True))
+    monkeypatch.setattr(web.client, "call", fake)
+
+    out = web.answer(FOLLOW_UP, CHUNKS, verdict_question=STANDALONE)
+
+    assert out is None, "the records answer it; no lookup"
+    assert STANDALONE in fake.calls[0]["prompt"]
+    assert FOLLOW_UP not in fake.calls[0]["prompt"]
+
+
+def test_the_rewrite_never_reaches_the_web_or_the_screen(monkeypatch):
+    """The rewrite is derived from conversation history, and a history is a
+    copy taken before a deletion. It may inform the verdict, which stays
+    inside the account; the lookup and the admission screen see only what the
+    asker typed."""
+    seen = {}
+    monkeypatch.setattr(web.question_admission, "screen",
+                        lambda q, c: seen.update(question=q) or None)
+    fake = FakeCall(verdict(False), reply(text="Two years.", results=SOURCES))
+    monkeypatch.setattr(web.client, "call", fake)
+
+    web.answer(FOLLOW_UP, CHUNKS, verdict_question=STANDALONE)
+
+    assert seen["question"] == FOLLOW_UP
+    assert STANDALONE not in fake.web_prompt
+    assert FOLLOW_UP in fake.web_prompt
+
+
+def test_no_rewrite_means_the_verdict_sees_the_question_as_asked(monkeypatch):
+    """Absent, empty and whitespace all mean "there was nothing to resolve" --
+    every caller that predates conversation memory keeps its old behaviour."""
+    for arg in (None, "", "   "):
+        fake = FakeCall(verdict(True))
+        monkeypatch.setattr(web.client, "call", fake)
+        assert web.answer(PUBLIC_Q, CHUNKS, verdict_question=arg) is None
+        assert PUBLIC_Q in fake.calls[0]["prompt"]

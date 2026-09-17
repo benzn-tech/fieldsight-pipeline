@@ -927,3 +927,35 @@ def test_ask_history_is_the_same_module_both_lambdas_import():
 
     raw = [{"question": "q", "answer": "a"}, {"question": "bad"}]
     assert fapi._clean_voice_history(raw) == ask_history._clean_voice_history(raw)
+
+
+def test_the_verdict_and_the_gate_both_read_the_rewritten_question(monkeypatch):
+    """Retrieval used `asked`, so the two things that judge retrieval have to
+    read `asked` too. Measured on TEST 2026-09-18 before this fix: the verdict
+    was handed "When does it have to be finished?", said the records do not
+    answer it, and a web answer about New Zealand's two-year consent rule
+    replaced a records answer that said Friday."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")
+    monkeypatch.setenv("ENABLE_WEB_ANSWER", "true")
+    wire(monkeypatch, chunks=[{"chunk_text": "backfill to gravel raft",
+                               "id": "c-1", "topic_id": "t-1",
+                               "source_s3_key": "x", "distance": 0.9,
+                               "topic_title": "Unit 11 backfill",
+                               "report_date": "2026-09-17"}])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("when must the Unit 11 backfill finish?", True))
+
+    import web_answer
+    seen = {}
+    monkeypatch.setattr(web_answer, "answer",
+                        lambda q, chunks, **kw: seen.update(q=q, kw=kw) or None)
+
+    laa._rag_answer({"question": "when does it have to be finished?",
+                     "caller_sub": SUB, "history": ONE_TURN})
+
+    assert seen["kw"]["verdict_question"] == "when must the Unit 11 backfill finish?"
+    assert seen["q"] == "when does it have to be finished?", "the lookup keeps the asker's words"
+    # The chunk sits at 0.9, far past the 0.55 gate: only the rewritten text
+    # shares a term with the title, so reading `question` would open the gate
+    # on exactly the turn the rewrite just made answerable.
+    assert seen["kw"]["skip_verdict"] is False

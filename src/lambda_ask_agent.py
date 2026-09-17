@@ -1565,7 +1565,14 @@ def _rag_answer(body):
             # gate that never fires. `_derived_title` mirrors
             # _aggregate_topics' own fallback chain so one definition of "the
             # title" exists.
-            _terms = _lexical_terms(question)
+            # `asked`, not `question`: these chunks came back from an embedding
+            # of `asked`, so the gate's "is anything here lexically close?" arm
+            # has to read the same text the retrieval used. A rewritten
+            # follow-up is exactly where the two diverge -- "When does it have
+            # to be finished?" carries no term that any title can match, so the
+            # arm would be false for every chunk and the gate would open on the
+            # very turns the rewrite just made answerable.
+            _terms = _lexical_terms(asked)
             _lexical = any(
                 any(t in _derived_title(c).lower() for t in _terms)
                 for c in chunks
@@ -1576,7 +1583,12 @@ def _rag_answer(body):
             # every chunk to the web here.
             _skip = (bool(_dists) and not _lexical and not basis.get("widened")
                      and min(_dists) > _DISTANCE_GATE)
-            web = web_answer.answer(question, chunks, skip_verdict=_skip)
+            # The verdict judges `asked` (what retrieval actually searched for);
+            # the lookup and the admission screen still see the asker's own
+            # `question`, so nothing history-derived leaves the account. See
+            # web_answer.answer's docstring for the measurement behind this.
+            web = web_answer.answer(question, chunks, skip_verdict=_skip,
+                                    verdict_question=asked)
         if web is not None and web.get("answer"):
             # Its own block, never merged into the grounded answer. A reader who
             # cannot tell what came from their meetings from what came off the

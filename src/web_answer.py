@@ -123,7 +123,8 @@ def _excerpt_block(chunks, limit=5):
     return "\n".join(out)
 
 
-def answer(question, chunks, *, skip_verdict=False, clock=time.monotonic):
+def answer(question, chunks, *, skip_verdict=False, verdict_question=None,
+           clock=time.monotonic):
     """A web-answer block, or None to leave the grounded path alone.
 
     `chunks` may be empty: retrieval returning nothing IS the verdict, so that
@@ -140,6 +141,23 @@ def answer(question, chunks, *, skip_verdict=False, clock=time.monotonic):
     `answer(question, [])` to skip the verdict would also disarm those checks.
     Never do that -- this keyword exists so nobody has to.
 
+    `verdict_question` is the question the VERDICT judges, when that differs
+    from the one the asker typed. Conversation memory rewrites a follow-up into
+    a standalone question ("When does it have to be finished?" -> "When does
+    the Unit 11 backfill have to be finished?") and retrieves with THAT, so
+    judging the excerpts against the pronoun version asks the model whether
+    records answer a question that names nothing -- it says no, and a records
+    answer that exists gets replaced by a web answer. Measured on TEST
+    2026-09-18: two rewritten follow-ups, both routed to the web, one of them
+    answering "when must the backfill be finished" with New Zealand's two-year
+    building-consent rule while the records said Friday.
+
+    It reaches the verdict and NOTHING else. The lookup below still sends the
+    asker's own `question`, and `question_admission.screen` still screens that
+    same text, so a rewrite -- which is derived from conversation history, and
+    history is a copy taken before a deletion -- never widens what leaves the
+    account. That boundary is the whole reason history stops at the rewrite.
+
     Never raises. Every failure returns either None or a body whose flags say
     which -- "we found nothing", "we may not ask" and "we did not look" are
     three different sentences and only one of them is about the world.
@@ -153,7 +171,8 @@ def answer(question, chunks, *, skip_verdict=False, clock=time.monotonic):
         return HARD_STOP_SECONDS - (clock() - started)
 
     if chunks and not skip_verdict:
-        verdict, err = _verdict(question, chunks, min(VERDICT_BUDGET, left()))
+        judged = (verdict_question or "").strip() or question
+        verdict, err = _verdict(judged, chunks, min(VERDICT_BUDGET, left()))
         if err or verdict is None:
             # Fail closed. An unreadable verdict is not permission to search.
             logger.warning("web answer: verdict failed: %s", err)
