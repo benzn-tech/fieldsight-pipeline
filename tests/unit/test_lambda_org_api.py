@@ -5541,6 +5541,42 @@ def test_timeline_no_aurora_topics_stays_verbatim(wired, monkeypatch):
     assert body["topics"][0]["topic_title"] == "verbatim"
 
 
+def test_timeline_verbatim_fallback_strips_the_model_name(wired, monkeypatch):
+    """2026-09-20: this branch is `return ok(doc)` -- the ONE place the report
+    generator's `_report_metadata.model` rides straight through to a
+    customer's browser, because it serves the stored S3 object byte-for-byte
+    on every other field. Everything else must stay byte-identical (that is
+    the whole point of this fallback); only `model` is stripped."""
+    stored = {"_report_metadata": {"source": "nightly",
+                                    "model": "meta/muse-spark-1.3-contributor",
+                                    "recordings_processed": 3},
+              "topics": [{"topic_title": "verbatim"}]}
+    monkeypatch.setattr(org.topics, "has_topics_for_source_prefix",
+                        lambda conn, prefix: False)
+    monkeypatch.setattr(org, "_get_lake_json", lambda key: stored)
+    res = org._render_timeline_for_user(FakeConn(), CALLER, "2026-07-10", "Ada_L")
+    body = body_of(res)
+    assert "model" not in body["_report_metadata"]
+    assert body["_report_metadata"]["source"] == "nightly"
+    assert body["_report_metadata"]["recordings_processed"] == 3
+    assert body["topics"][0]["topic_title"] == "verbatim"
+    # The stored object itself must be untouched -- this is a redaction on
+    # the way OUT, not a scrub of the internal record.
+    assert stored["_report_metadata"]["model"] == "meta/muse-spark-1.3-contributor"
+
+
+def test_without_vendor_metadata_leaves_docs_with_no_model_alone():
+    """A doc with no `_report_metadata`, or one with no `model` key, is
+    returned as the SAME object (not a needless copy) -- this is the common
+    case (live-extraction's own `_report_metadata` never has a `model` key)
+    and must cost nothing."""
+    no_meta = {"topics": []}
+    assert org._without_vendor_metadata(no_meta) is no_meta
+
+    no_model = {"_report_metadata": {"source": "live_extraction"}}
+    assert org._without_vendor_metadata(no_model) is no_model
+
+
 def _wire_content(monkeypatch, row, *, cross=False):
     monkeypatch.setattr(org.content, "get_content_row", lambda conn, tbl, rid: dict(row))
     monkeypatch.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-1"})

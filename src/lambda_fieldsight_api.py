@@ -111,6 +111,29 @@ def error(message, status=400):
     return ok({'error': message}, status)
 
 
+def _without_vendor_metadata(doc):
+    """A copy of a report/minutes JSON with `_report_metadata['model']`
+    removed, if present.
+
+    This legacy gateway serves `daily_report.json` / `summary_report.json`
+    to the customer-facing site byte-for-byte (see get_timeline,
+    find_any_report). `_report_metadata.model` is an internal provenance
+    field -- it belongs in the S3 object and the debug record beside it, so
+    a bad answer can still be traced to the model that wrote it -- but it
+    must never reach a customer's browser. Strip just that one key on the
+    way out; the stored S3 object is untouched."""
+    if not isinstance(doc, dict):
+        return doc
+    meta = doc.get('_report_metadata')
+    if not isinstance(meta, dict) or 'model' not in meta:
+        return doc
+    doc = dict(doc)
+    meta = dict(meta)
+    meta.pop('model', None)
+    doc['_report_metadata'] = meta
+    return doc
+
+
 def get_caller_identity(event):
     claims = event.get('requestContext', {}).get('authorizer', {}).get('claims', {})
     email = claims.get('email', '')
@@ -478,7 +501,7 @@ def get_timeline(params, caller):
                 if _any_folder_deleted_on(date):
                     return find_any_report(date, caller)
                 obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
-                return ok(json.loads(obj['Body'].read().decode('utf-8')))
+                return ok(_without_vendor_metadata(json.loads(obj['Body'].read().decode('utf-8'))))
             except s3_client.exceptions.NoSuchKey:
                 return find_any_report(date, caller)
         else:
@@ -500,7 +523,7 @@ def get_timeline(params, caller):
         key = f"{REPORT_PREFIX}{date}/{name_variant}/daily_report.json"
         try:
             obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
-            return ok(json.loads(obj['Body'].read().decode('utf-8')))
+            return ok(_without_vendor_metadata(json.loads(obj['Body'].read().decode('utf-8'))))
         except s3_client.exceptions.NoSuchKey:
             continue
     return ok({'message': f'No report for {user} on {date}', 'date': date}, 404)
@@ -578,7 +601,7 @@ def find_any_report(date, caller=None):
     if len(reports) == 1:
         try:
             obj = s3_client.get_object(Bucket=S3_BUCKET, Key=reports[0]['key'])
-            return ok(json.loads(obj['Body'].read().decode('utf-8')))
+            return ok(_without_vendor_metadata(json.loads(obj['Body'].read().decode('utf-8'))))
         except Exception:
             pass
     return ok({'date': date, 'available_users': [r['user'] for r in reports]})
