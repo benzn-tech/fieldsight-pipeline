@@ -551,6 +551,38 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 This is the exact wiring point the spec calls out (§5): a row that arrives *only* through the SQL keyword arm has `distance=None` (placeholder), which is `> 0.55` under any comparison, so it MUST be admitted by the `r["lexical"]` branch of `r["lexical"] or r["score"] <= _NO_LEX_MAX_DIST` (`:882`), not silently dropped by the distance check.
 
+**CONTROLLER AMENDMENT (2026-09-20, after Task 3's fix round) — this task has a SECOND downstream.**
+
+The pre-flight scan named only `_aggregate_topics`. That is the search-box path. The Ask **answering**
+path never touches `_aggregate_topics`, and it is the one that feeds the model:
+
+`_rag_answer` -> `_rerank_chunks(question, chunks, k)` (`:1470`), whose first line (`:735`) is
+`if not RERANK_ENABLED or len(chunks) <= keep: return chunks[:keep]`. `RERANK_ENABLED` reads
+`ENABLE_RERANK`, which appears nowhere in `template.yaml` or anywhere else in `src/` — an unwired
+toggle, false in every environment. So `_rerank_chunks` never re-ranks; it truncates in arrival order.
+
+After Task 3's fix the outer `ORDER BY lexical_hit ASC, distance ASC NULLS LAST` puts all vector rows
+first, so `chunks[:k]` keeps exactly the k rows Ask received before this plan — no regression — and
+discards every keyword-only row. **The keyword arm is therefore invisible to the answering path until
+this task also addresses it.** A Task 4 that only fixes `_aggregate_topics` ships a keyword arm that
+improves the search-box list and changes nothing about the answers Ask actually writes.
+
+Measured caveat, from the Task 3 fix round: the "keyword rows are entirely truncated away" property
+holds only when the vector arm is SATURATED at k. If the caller's scope contains fewer than k eligible
+chunks, keyword-only rows already fill the remaining slots today.
+
+Two naming traps in this exact code, both easy to conflate:
+  * `_aggregate_topics` already has a local field `lexical` (`:876`) = `any(t in hay for t in terms)`
+    where `hay = derived_title.lower()` — a **title-only** heuristic. The new SQL column is
+    `lexical_hit` and is about **chunk_text**. One word apart, different meanings, same function.
+  * `dist = float(dist) if dist is not None else 1.0` (`:839`) turns the lex arm's NULL into 1.0,
+    which is past `_NO_LEX_MAX_DIST = 0.55`. That is the mechanism of the drop — not a crash, a
+    silent loss.
+
+Deciding HOW a keyword-only row earns a place ahead of a semantic one is this task's call to make and
+to defend; Task 3 deliberately appended rather than interleaved so that the policy is decided here,
+in the open, and not smuggled into the plumbing.
+
 - [ ] **Step 1: Write the failing test**
 
 Add to `tests/unit/test_lambda_ask_agent_search.py`, near the existing `_NO_LEX_MAX_DIST` / hybrid-ranking tests:
