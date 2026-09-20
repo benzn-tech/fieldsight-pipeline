@@ -154,6 +154,14 @@ who saw the original content in their own chat before deletion; already shown
 to them) applies identically whether `asked` sits in a UI line or inside a
 prompt fenced the same way `question` already is.
 
+**Settled by the owner on 2026-09-20: the residue is acceptable.** That closes
+question 1 of the parent spec's §10 — not only for this surface but as the
+answer to the question it posed. The consequence worth stating once: had the
+answer been *not* acceptable, the honest response would have been to remove the
+rendered `Searched for:` line as well, since that is where the residue is
+actually shown to a person; keeping the line while refusing the prompt would
+have been a distinction without a protection.
+
 **Verdict: acceptable, on the same terms §3.3 already accepted, and no
 wider.** The reasoning does not generalize past `asked` — it does not license
 sending history, prior answers, or anything not already computed and already

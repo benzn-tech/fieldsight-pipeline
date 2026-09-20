@@ -12,6 +12,15 @@
 
 ## Global Constraints
 
+- **TEST only. This work does not go to production in this pass.** Owner decision,
+  2026-09-20: the three changes ship together, and they stop at TEST. The final task's PR
+  targets `develop` and nothing in this plan opens, approves or requests a promotion to
+  `main`. Anyone executing this plan who reaches a step that would touch prod has
+  misread it — stop and ask. The one prod-touching action anywhere in scope is
+  read-only: reading a deployed Lambda's configuration to confirm a value.
+  Practical consequence for verification: prod runs `SPEAKER_IDENTITY_MODE=shadow` with
+  zero stored voiceprints, so prod could not exercise this code even if it were promoted;
+  TEST is where the behaviour is observable at all.
 - **One row per enrolment contribution stays.** `speaker_voiceprint_samples` never stores an averaged vector — withdrawal depends on removing exactly one contribution's effect (migration 0038; spec §2.4, §6 Rejected Alternatives). Mean pooling is a match-time reduction over currently-unwithdrawn rows, computed fresh on every match. No task in this plan touches the samples table's write shape.
 - **Consent gates unchanged.** `profiles_for_matching`'s `consent_at IS NOT NULL` and `status <> 'withdrawn'` filters are not touched by any task here. The floor is an additional check layered on top of, never instead of, those filters.
 - **The floor is never a constant in source.** No task may hardcode a percentile value or a minimum-sample-count value as the shipped behaviour beyond a clearly-labelled placeholder awaiting real multi-company data, matching the module docstring's existing stance on `DEFAULT_MIN_MARGIN`.

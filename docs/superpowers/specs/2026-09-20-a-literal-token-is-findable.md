@@ -76,11 +76,11 @@ recurrence is the entire reason a site team is searching for it. These tokens sy
 lose the top-*k* race against topically-similar chunks, which is the opposite of what a
 search box is for.
 
-## 3. Controller's ruling
+## 3. The decision
 
 **Run a keyword arm on every query, unioned with the vector arm before the `k` cap — not
-gated behind a "query looks short" heuristic.** This is a ruling, not the only option; the
-owner can overturn it, but the reasoning is:
+gated behind a "query looks short" heuristic.** Proposed as a controller's ruling and
+**confirmed by the owner on 2026-09-20** ("所有" — all queries). The reasoning:
 
 1. **Rarity, not length, is the variable that loses the race.** "PS4" is 3 characters and
    already passes `_lexical_terms`'s length gate; the problem was never that it's short, it's
