@@ -353,6 +353,36 @@ def _match_names(event):
     return {"written": written, "declined": declined, "inherited": inherited}
 
 
+def _recompute_floors(event):
+    """Rebuild every company's rejection floor from its own human-asserted corrections.
+
+    Scheduled, not triggered by a match or a correction -- the floor must not move
+    mid-decision because one turn happened to land during recomputation (spec S1.3).
+
+    **One invocation, an internal loop over every company** -- the shape ExtractionBacklog
+    Function uses (a single sweep over the whole dataset on its own schedule, with no
+    per-item fan-out), not an external loop invoking this once per company. The choice is
+    forced by the trigger: an EventBridge Schedule invokes with a fixed event (no payload
+    naming a company), so a per-company `company_id` on `event` would need something else
+    to produce one invocation per company, which nothing in this stack does and which this
+    task does not invent. `event.get("company_id")` is still honoured when present -- an
+    operator or a test recomputing a single company on demand, e.g. right after a batch
+    of corrections -- but the schedule always calls this with neither key set, so it
+    always takes the all-companies path.
+    """
+    single = event.get("company_id")
+    with get_connection() as conn:
+        companies = [{"id": single}] if single else list_companies(conn)
+        results = []
+        for c in companies:
+            result = recompute_company_floor(conn, c["id"])
+            results.append(result or {"company_id": c["id"], "floor": None})
+    written = sum(1 for r in results if r.get("floor") is not None)
+    logger.info("floor recompute: %d/%d compan%s now have a floor",
+                written, len(results), "y" if len(results) == 1 else "ies")
+    return {"companies": len(results), "floors_written": written, "results": results}
+
+
 def _inherit_labels(conn, company_id, session_base, label_map):
     """Spread settled names across the transcriber's own speaker groups.
 
@@ -437,5 +467,7 @@ def lambda_handler(event, context):
         return _profiles(event)
     if op == "match_names":
         return _match_names(event)
-    raise ValueError(f"unknown op {op!r} — expected 'propagation', 'enrol', 'profiles' or "
-                     f"'match_names'")
+    if op == "recompute_floors":
+        return _recompute_floors(event)
+    raise ValueError(f"unknown op {op!r} — expected 'propagation', 'enrol', 'profiles', "
+                     f"'match_names' or 'recompute_floors'")

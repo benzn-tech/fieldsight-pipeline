@@ -361,6 +361,60 @@ def test_fetching_profiles_hands_the_companys_floor_to_the_embedder(monkeypatch)
     assert out["company_floor"] == 0.42
 
 
+# ---- the scheduled floor recompute ----------------------------------------
+#
+# rate(6 hours), not triggered by a match or a correction (spec S1.3): the floor must not
+# move mid-decision because one turn happened to land during recomputation. The
+# EventBridge Schedule event carries no company_id -- it invokes with a fixed event, not
+# one per company -- so the handler loops over every company itself, matching
+# ExtractionBacklogFunction's single-sweep shape rather than an external per-company
+# fan-out this stack has no mechanism to drive.
+
+
+def test_recompute_floors_sweeps_every_company(monkeypatch):
+    companies = [{"id": "co-1"}, {"id": "co-2"}, {"id": "co-3"}]
+    seen = []
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: companies)
+    monkeypatch.setattr(vw, "recompute_company_floor",
+                        lambda conn, company_id, **kw:
+                        seen.append(company_id) or {"company_id": company_id,
+                                                    "floor": 0.3, "sample_count": 20})
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    assert seen == ["co-1", "co-2", "co-3"], (
+        "the schedule's event carries no company_id, so every company must be swept in "
+        "one invocation")
+    assert out["companies"] == 3 and out["floors_written"] == 3
+
+
+def test_recompute_floors_reports_companies_still_below_the_minimum(monkeypatch):
+    """`recompute_company_floor` returns None below the minimum sample count -- that must
+    show up as a company swept but not written, not vanish from the count."""
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: [{"id": "co-1"}])
+    monkeypatch.setattr(vw, "recompute_company_floor",
+                        lambda conn, company_id, **kw: None)
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    assert out["companies"] == 1 and out["floors_written"] == 0
+
+
+def test_recompute_floors_can_target_one_company_on_demand(monkeypatch):
+    """Honoured when present (an operator or a test recomputing one company right after a
+    batch of corrections), but the schedule itself never sets this key."""
+    seen = []
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies",
+                        lambda conn: (_ for _ in ()).throw(
+                            AssertionError("list_companies must not run when a single "
+                                          "company_id was given")))
+    monkeypatch.setattr(vw, "recompute_company_floor",
+                        lambda conn, company_id, **kw: seen.append(company_id) or
+                        {"company_id": company_id, "floor": 0.3, "sample_count": 20})
+    out = vw.lambda_handler({"op": "recompute_floors", "company_id": CO}, None)
+    assert seen == [CO]
+    assert out["companies"] == 1
+
+
 # ---- a declined write is not a write --------------------------------------
 
 
