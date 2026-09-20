@@ -859,11 +859,21 @@ def test_a_lexical_chunk_beats_the_distance(monkeypatch, enable_web_answer):
     assert called == [1], "a lexical title match must not gate the verdict"
 
 
-def test_the_lexical_match_is_title_only_not_chunk_text(monkeypatch, enable_web_answer):
-    """Pins the title-only rule (mirrors _aggregate_topics, :845-849): the
-    retrieved chunk text is semantically near the query almost by definition,
-    so matching against chunk_text would make the lexical arm true for nearly
-    everything and the gate would never fire."""
+def test_the_title_heuristic_ignores_raw_chunk_text(monkeypatch, enable_web_answer):
+    """Pins the TITLE HEURISTIC's own rule, which is one of two lexical signals
+    the gate now reads -- not the whole gate. The retrieved chunk text is
+    semantically near the query almost by definition, so letting the heuristic
+    match against raw chunk_text would make it true for nearly everything and
+    the gate would never fire.
+
+    The other signal, `lexical_hit`, DOES come from a chunk_text match, and it
+    does defeat the gate -- but it is the SQL keyword arm's considered verdict
+    (a tsvector match on the indexed expression), not a substring scan done
+    here. This chunk deliberately sets no `lexical_hit`, so only the heuristic
+    is under test. Renamed 2026-09-21: the old name claimed the gate as a whole
+    was title-only, which stopped being true when Task 4 wired `lexical_hit` in,
+    and a guard whose name states the wrong rule teaches it to the next reader.
+    """
     wire(monkeypatch, chunks=[_gate_chunk(
         distance=0.61, topic_title="Door Inspection",
         chunk_text="The scaffold was checked and signed off.")])
