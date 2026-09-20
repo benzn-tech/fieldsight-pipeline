@@ -347,6 +347,39 @@ def test_recompute_reads_only_source_correction_scores():
         assert "label_inheritance" not in sql
 
 
+def test_recompute_excludes_corrections_from_before_the_mean_pooling_cutover():
+    """Spec S7: a correction's stored `best` score was computed under whichever pooling was
+    live when it was written. Mixing pre-cutover (max-pooled) and post-cutover (mean-pooled)
+    scores in one calibration set describes neither distribution -- discard and rebuild from
+    post-cutover corrections only."""
+    conn = FakeConn([[{"n": 1}], [{"score": 0.30}]])
+    voiceprints.recompute_company_floor(conn, CO, min_samples=1)
+    count_sql = conn.calls[0]["sql"]
+    score_sql = conn.calls[1]["sql"]
+    assert "created_at >=" in count_sql or "created_at > " in count_sql, (
+        "the calibration query must exclude rows written before the mean-pooling cutover")
+    # The count query alone proves nothing about what the floor is actually built from
+    # (test_recompute_reads_only_source_correction_scores makes exactly this point about the
+    # source='correction' filter) -- so the cutover filter is checked on the SCORE query too.
+    assert "created_at >=" in score_sql or "created_at > " in score_sql, (
+        "the SCORE query -- the one whose rows become the floor -- must itself exclude "
+        "pre-cutover rows, not just the count query used for the min-samples gate")
+    # And the pre-existing correction-only filter must still compose with this one: the
+    # cutover exclusion must not have replaced it.
+    assert "source = 'correction'" in score_sql
+
+
+def test_the_cutover_can_be_overridden_for_a_future_pooling_change():
+    """The next arithmetic change to aggregate_scores will need the same discard-and-rebuild
+    -- `since` must be a parameter, not a hardcoded date, or this becomes a one-time hack
+    that has to be reinvented."""
+    import datetime
+    custom = datetime.datetime(2027, 1, 1, tzinfo=datetime.timezone.utc)
+    conn = FakeConn([[{"n": 1}], [{"score": 0.30}]])
+    voiceprints.recompute_company_floor(conn, CO, min_samples=1, since=custom)
+    assert custom in conn.calls[0]["params"]
+
+
 def test_a_voiceprint_match_row_cannot_enter_the_calibration_set():
     """Direct proof, not just an SQL-text assertion: a company whose ONLY qualifying rows
     are voiceprint_match scores has TOO FEW source='correction' rows and gets no floor at

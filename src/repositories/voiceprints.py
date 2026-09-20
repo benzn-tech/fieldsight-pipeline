@@ -27,6 +27,7 @@ Two of those queries have failure modes that are invisible in production:
   "nothing", and here that would match one company's voice against another's profiles. A
   missing company id raises.
 """
+import datetime
 import logging
 
 from psycopg.rows import dict_row
@@ -620,9 +621,20 @@ def confirmations_count(conn, company_id, voiceprint_id) -> int:
 DEFAULT_FLOOR_PERCENTILE = 5
 DEFAULT_FLOOR_MIN_SAMPLES = 20
 
+#: When aggregate_scores switched from max to mean pooling (Task 1 of this plan). Every
+#: source='correction' row written before this carries a `best` score computed under the
+#: OLD pooling -- mixing it with post-cutover scores in one calibration set would describe
+#: neither distribution, since mean pooling systematically shifts `best` (spec S7).
+#: recompute_company_floor discards anything before this and rebuilds from post-cutover
+#: corrections only; a company with too few of those simply returns to the S1.5 no-floor
+#: fallback until enough accumulate -- a safe, already-specified state, not a new one
+#: invented for this cutover.
+MEAN_POOLING_CUTOVER = datetime.datetime(2026, 9, 20, tzinfo=datetime.timezone.utc)
+
 
 def recompute_company_floor(conn, company_id, percentile=DEFAULT_FLOOR_PERCENTILE,
-                            min_samples=DEFAULT_FLOOR_MIN_SAMPLES) -> dict | None:
+                            min_samples=DEFAULT_FLOOR_MIN_SAMPLES,
+                            since=MEAN_POOLING_CUTOVER) -> dict | None:
     """Rebuild one company's rejection floor from its OWN human-asserted corrections.
 
     **Only `source='correction'` rows enter this.** The alternative -- calibrating from
@@ -646,22 +658,34 @@ def recompute_company_floor(conn, company_id, percentile=DEFAULT_FLOOR_PERCENTIL
     Returns `None` and writes nothing below `min_samples` qualifying rows -- a floor
     calibrated from too few points is noise, and no floor (today's margin-only behaviour)
     is safer than a wrong one (spec S1.5).
+
+    `since` excludes any `source='correction'` row written before it (default
+    `MEAN_POOLING_CUTOVER`). A row written before the cutover has a `best` score computed
+    under the OLD (max) pooling; re-scoring it under the new (mean) pooling would require
+    re-running match arithmetic against embeddings that may since have been withdrawn -- a
+    clean discard-and-rebuild is cheaper and costs only a longer stay in the no-floor
+    fallback (S1.5), which is already the safe state for a company with too little evidence.
+    A company whose corrections are ALL pre-cutover therefore has zero qualifying rows here
+    and gets `None` -- never a floor computed from too few post-cutover rows, and never one
+    built from a mix of the two scales.
     """
     _require_company(company_id)
     cur = conn.cursor(row_factory=dict_row)
     count_row = cur.execute(
         "SELECT count(*) AS n FROM speaker_turn_names "
         "WHERE company_id = %s AND source = 'correction' "
-        "  AND score IS NOT NULL AND superseded_at IS NULL",
-        (company_id,)).fetchone()
+        "  AND score IS NOT NULL AND superseded_at IS NULL "
+        "  AND created_at >= %s",
+        (company_id, since)).fetchone()
     n = int((count_row or {}).get("n") or 0)
     if n < min_samples:
         return None
     rows = cur.execute(
         "SELECT score FROM speaker_turn_names "
         "WHERE company_id = %s AND source = 'correction' "
-        "  AND score IS NOT NULL AND superseded_at IS NULL",
-        (company_id,)).fetchall()
+        "  AND score IS NOT NULL AND superseded_at IS NULL "
+        "  AND created_at >= %s",
+        (company_id, since)).fetchall()
     import numpy as np
     scores = np.array([float(r["score"]) for r in rows], dtype=np.float64)
     floor = float(np.percentile(scores, percentile))
