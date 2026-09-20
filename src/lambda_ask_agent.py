@@ -1252,10 +1252,13 @@ def _rag_answer(body):
         # Ask conversation memory (spec 2026-09-17 SS2, SS3.1-3.3, SS4.3): a
         # follow-up such as "when is he finishing it?" embeds to nothing
         # useful and parses no date. Spend the history HERE, on producing one
-        # standalone question to retrieve with, and nowhere else -- the
-        # answering prompt below still gets the caller's own `question`, not
-        # `asked` (SS2: a chat history is a copy taken before a deletion and
-        # must never be the thing retrieval or the web branch acts on).
+        # standalone question to retrieve with, and nowhere else -- `history`
+        # itself never reaches the answering prompt below or the web branch
+        # (SS2: a chat history is a copy taken before a deletion and must
+        # never be the thing retrieval or the web branch acts on). As of
+        # spec 2026-09-20, `asked` -- the rewrite's own output, not the
+        # history -- does reach the answering prompt when a rewrite ran; see
+        # the comment at :1600.
         #
         # `ask_history` is imported HERE for the same reason `query_slots` is
         # below: the legacy hand-built prod zips a fixed file list and
