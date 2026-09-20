@@ -725,6 +725,46 @@ def _diversify(chunks, cap):
     return out
 
 
+def _admit_one_lexical_hit(chunks, keep):
+    """Truncate to `keep`, reserving exactly one slot for the strongest
+    keyword-only row (lexical_hit=True, distance=None) that arrival order
+    would otherwise cut.
+
+    Policy (Task 4, CONTROLLER AMENDMENT, this task's call to make and
+    defend -- Task 3 deliberately appended rather than interleaved so this
+    decision would not be smuggled into the SQL): `build_search_sql()`
+    appends keyword-only rows AFTER every vector row (never interleaved), so
+    when the vector arm is saturated at `keep`, a plain `chunks[:keep]` -- the
+    old, safe behaviour when reranking is off and arrival order WAS pure
+    cosine order -- now silently discards every keyword-only row. That is
+    this plan's whole motivating bug (spec §1), reproduced one hop later on
+    the path that actually feeds the model.
+
+    The rule: if none of the first `keep` rows is a keyword-only hit, swap
+    the single WEAKEST vector row in that window (the last one, since the
+    window is cosine-ordered) for the first keyword-only row beyond the cut.
+    Cost when the keyword hit is a false positive (the literal token appears
+    in an unrelated document): exactly one semantic match is displaced from
+    context -- the weakest one in the window, chosen precisely because it is
+    the one the answer can most afford to lose. This is bounded and it is
+    NOT a wholesale swap: a strong semantic match at position 0 can never be
+    displaced by this rule, and only one slot is ever given up, however many
+    keyword-only rows exist beyond the cut (a real but accepted residual gap
+    -- widening the reservation trades away more of the vector list for a
+    case the spec's own motivating example, a single distinctive identifier,
+    does not need).
+    """
+    if len(chunks) <= keep:
+        return chunks[:keep]
+    head = chunks[:keep]
+    if any(c.get("lexical_hit") for c in head):
+        return head  # already represented within the window; nothing to admit
+    tail_hit = next((c for c in chunks[keep:] if c.get("lexical_hit")), None)
+    if tail_hit is None:
+        return head
+    return head[:-1] + [tail_hit]
+
+
 def _rerank_chunks(question, chunks, keep):
     """Reorder by relevance and keep the best `keep`.
 
@@ -733,7 +773,12 @@ def _rerank_chunks(question, chunks, keep):
     be the reason a question goes unanswered -- `dashscope_utils.rerank`
     returns None rather than raising, and this returns the cosine order.
     """
-    if not RERANK_ENABLED or len(chunks) <= keep:
+    if not RERANK_ENABLED:
+        # Arrival order is no longer pure cosine order (Task 3 appends
+        # keyword-only rows after it) -- see _admit_one_lexical_hit's
+        # docstring for why a plain chunks[:keep] is no longer safe here.
+        return _admit_one_lexical_hit(chunks, keep)
+    if len(chunks) <= keep:
         return chunks[:keep]
     # Imported here, not at module scope, for the reason the three other
     # dashscope_utils call sites in this file give: the legacy hand-built prod
@@ -864,6 +909,15 @@ def _aggregate_topics(chunks, question=""):
         # "safety" appear everywhere), which would make the lexical flag true
         # for nearly everything. The concise title is the clean signal.
         hay = derived_title.lower()
+        # Two independent lexical signals, ORed: the title-substring check
+        # above (existing; drives the Search list's own reordering) and
+        # lexical_hit from build_search_sql's keyword arm (2026-09-20 spec),
+        # which found a literal match in chunk_text that never reached the
+        # title. A row the SQL keyword arm found has no real cosine distance
+        # (it was never scored against the query embedding, hence the `1.0`
+        # placeholder just above) -- it MUST be admitted here via `lexical`,
+        # or _NO_LEX_MAX_DIST drops it one hop downstream of the SQL fix,
+        # reproducing the original bug with extra steps.
         groups[key] = {
             "report_date": date,
             "site_name": c.get("site_name"),
@@ -873,7 +927,7 @@ def _aggregate_topics(chunks, question=""):
             "chunk_type": c.get("chunk_type"),
             "route": route,
             "score": dist,
-            "lexical": any(t in hay for t in terms),
+            "lexical": bool(c.get("lexical_hit")) or any(t in hay for t in terms),
         }
     rows = list(groups.values())
     # threshold: drop non-lexical topics whose semantic distance is poor, so a

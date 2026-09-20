@@ -220,6 +220,33 @@ def test_search_keeps_nonlexical_within_threshold(monkeypatch):
     assert out["results"][0]["lexical"] is False
 
 
+def test_a_keyword_only_row_with_no_distance_survives_the_gate(monkeypatch):
+    """The exact reintroduction risk the spec names (§5): a row that only the
+    SQL keyword arm found has no real cosine distance. If lexical_hit isn't
+    threaded into the `lexical` field, _NO_LEX_MAX_DIST drops it one hop
+    downstream of the SQL fix and the user sees nothing again. Title
+    deliberately does NOT contain "PS4" -- only chunk_text does -- so the
+    pre-existing title-substring check cannot accidentally save this row."""
+    c = chunk("t-ps4", "2026-09-03", None, "Electrical hold-up",
+              text="Provide PS4 for light poles")
+    c["distance"] = None          # placeholder from the lex CTE, not 1.0
+    c["lexical_hit"] = True       # SQL says this row matched the tsvector expression, not the title
+    wire(monkeypatch, [c])
+    out = run(ev(question="PS4"))
+    assert out["count"] == 1, "a keyword-only match with no distance must not be dropped"
+    assert out["results"][0]["lexical"] is True
+
+
+def test_lexical_hit_true_but_title_has_no_term_is_still_lexical(monkeypatch):
+    """The chunk_text matched (e.g. a body mention), not the title -- the SQL
+    signal must not be silently overridden by the narrower title-only check."""
+    c = chunk("t-y", "2026-09-03", 0.3, "Site walkthrough notes", text="RFI-0231 variance signed")
+    c["lexical_hit"] = True
+    wire(monkeypatch, [c])
+    out = run(ev(question="RFI-0231"))
+    assert out["results"][0]["lexical"] is True
+
+
 def test_search_mode_forwards_site_to_rag_search(monkeypatch):
     fc = wire(monkeypatch, [])
     run(ev(site="s-abc"))
