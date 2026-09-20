@@ -871,6 +871,15 @@ Then:
    nouns lifted from a record deleted between turns. The alternative removes
    most of the visibility this spec relies on. An owner decision, not a
    technical one.
+
+   **Answered 2026-09-20, by the owner: yes, the residue is acceptable.**
+   The reasoning now lives in
+   `docs/superpowers/specs/2026-09-20-ask-answer-sees-the-searched-question.md`
+   §2. What was weighed: had the answer been no, the honest fix would have
+   been to also remove the rendered `Searched for:` line, since that line —
+   not the answering prompt — is where the residue actually reaches a
+   person. Keeping that line while merely withholding `asked` from the
+   prompt would have been a distinction without a protection.
 2. **`_DISTANCE_GATE` has no measurement.** It is seeded at 0.55 because that
    number was measured for a *different* comparison (a per-group filter with a
    lexical escape hatch). Until it is measured per-chunk, the gate is a cost
