@@ -1660,25 +1660,27 @@ def _rag_answer(body):
             _terms = _lexical_terms(asked)
             _lexical = any(
                 any(t in _derived_title(c).lower() for t in _terms)
+                or c.get("lexical_hit")
                 for c in chunks
             )
-            # KNOWN GAP (Task 4 review, 2026-09-20, Important #4 -- left
-            # unresolved on purpose this round): this is a THIRD consumer of
-            # "is this lexical", after _aggregate_topics' `lexical` field and
-            # _admit_one_lexical_hit's `lexical_hit` check, and it only ever
-            # looks at the derived title -- never at `lexical_hit` (the
-            # keyword arm's chunk_text match from build_search_sql). A chunk
-            # that matched the literal token only in its text, not its title,
-            # is invisible to `_lexical` here even though the other two
-            # consumers would treat it as lexical. Widening this to also OR
-            # in `c.get("lexical_hit")` would make `_lexical` True in more
-            # cases, which flips `_skip` toward False more often, which means
-            # MORE web-search verdict calls (cost), not fewer. Left alone
-            # deliberately: nobody's scope named this consumer, and changing
-            # it changes when we pay for a web lookup, which the spec and
-            # plan never analysed. See this task's final report for the full
-            # tri-state (_skip True/False) writeup for the controller to rule
-            # on.
+            # This is the third consumer of "is this lexical", after
+            # _aggregate_topics' `lexical` field and _admit_one_lexical_hit's
+            # `lexical_hit` check (Task 4 review, 2026-09-20, Important #4;
+            # ruled on 2026-09-21). It ORs in `lexical_hit` -- the keyword
+            # arm's chunk_text match from build_search_sql -- alongside the
+            # title-only heuristic above, the same additive OR used in
+            # _aggregate_topics. Ruling and reasoning: `lexical_hit` means the
+            # literal token the user typed IS present in the retrieved
+            # records' text. Treating that as "nothing here is relevant" and
+            # sending the question straight to the web is exactly the
+            # complaint this plan exists to fix, one consumer further along.
+            # ORing it in makes `_lexical` True more often, which makes
+            # `_skip` False more often, routing more questions through
+            # verdict-first -- the case most likely to end with "the records
+            # already answer this" and therefore NO web call at all. So the
+            # expected direction is toward correctness and probably toward
+            # less spend, not more. No existing True becomes False: this is a
+            # pure OR against the prior title-only check.
             #
             # Absent is not far: _aggregate_topics defaults a missing distance
             # to 1.0, which is right for ranking and would silently route

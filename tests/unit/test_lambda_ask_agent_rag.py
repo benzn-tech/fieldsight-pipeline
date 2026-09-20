@@ -874,6 +874,24 @@ def test_the_lexical_match_is_title_only_not_chunk_text(monkeypatch, enable_web_
     assert called == [], "a term present only in chunk_text must not defeat the gate"
 
 
+def test_a_lexical_hit_row_beats_the_distance_even_with_a_cold_title(monkeypatch, enable_web_answer):
+    """Ruling (2026-09-21, Task 4 review Important #4): `lexical_hit` -- the
+    keyword arm's chunk_text match from build_search_sql -- must be ORed into
+    the gate's lexical check alongside the title-only heuristic. A chunk
+    whose title carries no query term but whose text matched the literal
+    token is exactly the case this plan exists to stop sending to the web
+    unverified."""
+    chunk = _gate_chunk(distance=0.61, topic_title="Door Inspection",
+                         chunk_text="The scaffold was checked and signed off.")
+    chunk["lexical_hit"] = True
+    wire(monkeypatch, chunks=[chunk])
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what does the scaffold report say", "caller_sub": SUB})
+
+    assert called == [1], "a lexical_hit row must not let a cold title gate the verdict"
+
+
 # --------------------------------------------------------------------------
 # Task 8 (spec SS4.5.3 / SS4.8): one structured timing line per answer,
 # mirroring the voice path's `voice ask:` line (lambda_ask_agent.py:1847-1854)
