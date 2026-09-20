@@ -150,13 +150,53 @@ Two candidates, compared on this schema (`report_chunks.chunk_text text NOT NULL
   one-time check against a handful of real identifiers from the corpus (not just PS4) before
   shipping, not an assumption.
 
-**Recommendation: `tsvector` + GIN + `websearch_to_tsquery`.** Word-boundary correctness is
-the deciding factor — `ILIKE`'s substring matching would make "PS4" match "PS40," which is
-the wrong side to be wrong on for a feature whose whole point is precise identifiers. The
-cost is one migration (new nullable/generated column + index) and the same backfill
-discipline this repo already applies to embeddings; both are one-time and mechanical, not
-research questions. `websearch_to_tsquery` also degrades gracefully on natural-language
-input (handles quoted phrases, `-exclude`, `OR`) without needing app-side query parsing.
+**A third candidate, found after the first two were written, and the one this spec adopts:
+a GIN index on the EXPRESSION, with no column at all.**
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_report_chunks_tsv
+  ON report_chunks USING gin (to_tsvector('english', chunk_text));
+```
+
+It keeps every advantage claimed for the stored column — same tokenizer, same
+`websearch_to_tsquery` semantics, same word-boundary correctness — and removes the two costs
+that made the stored column awkward:
+
+- **No table rewrite.** `ALTER TABLE … ADD COLUMN … GENERATED ALWAYS … STORED` rewrites every
+  row under an `ACCESS EXCLUSIVE` lock, blocking reads *and* writes for a duration
+  proportional to the table's size. That duration is a number nobody can obtain before
+  shipping: this repo has no read-only SQL path to count `report_chunks` on prod (`scripts/`
+  holds schema verifiers, not query helpers; the migrate Lambda applies files and does not run
+  ad-hoc SQL). A plan step that says "measure the ALTER cost against prod size" cannot be
+  executed, so it would have shipped as a judgment call made blind. `CREATE INDEX` takes a
+  `SHARE` lock instead: it blocks writes while it builds, not reads.
+- **Nothing to keep in sync.** The sole advantage claimed above for `GENERATED ALWAYS` was
+  that Postgres maintains it on every future write with no writer to remember. An expression
+  index has no stored value at all, so that obligation does not exist rather than being
+  discharged. The paragraph above arguing the `tsvector` column "inherits the identical
+  backfill obligation" for a future tokenizer change applies here too and no more strongly:
+  changing `'english'` to something else means rebuilding an index either way.
+
+`CREATE INDEX CONCURRENTLY` — which would not block writes at all — **cannot be used inside a
+migration**: `src/db/migrate.py:46` wraps each file in `with conn.transaction()` ("atomic:
+file DDL + version row commit together") and Postgres refuses `CONCURRENTLY` inside a
+transaction block. No migration in this repo has ever used it. It remains available as a
+deliberate operational step run outside the migration runner, with the migration's
+`IF NOT EXISTS` making the later migration a no-op; the implementation plan records that as a
+documented escape hatch rather than the default path.
+
+**The one new obligation the expression index creates** is that the query must repeat the
+index's expression character for character — `to_tsvector('english', c.chunk_text)` — or the
+planner silently falls back to a sequential scan. Silently: the results stay correct and the
+search merely gets slow, which is the kind of regression nobody notices until a customer does.
+The plan pins it with a test that reads the literal expression out of the migration file and
+asserts `build_search_sql()` contains it verbatim.
+
+**Rejected: `ILIKE` + `pg_trgm`,** for the word-boundary reason above — "PS4" matching "PS40"
+is the wrong side to be wrong on for a feature whose whole point is precise identifiers.
+**Rejected: the `tsvector` stored column,** for the rewrite-lock reason above.
+`websearch_to_tsquery` is retained in both surviving candidates: it degrades gracefully on
+natural-language input (quoted phrases, `-exclude`, `OR`) without app-side query parsing.
 
 ## 5. How the two arms combine
 
@@ -175,7 +215,9 @@ lex AS (
   SELECT c.*, 1.0 AS distance, true AS lexical_hit   -- no cosine meaning; see below
   FROM report_chunks c
   WHERE <site/author/date/visibility predicates>
-    AND c.chunk_tsv @@ websearch_to_tsquery('english', %(q)s)
+    AND to_tsvector('english', c.chunk_text) @@ websearch_to_tsquery('english', %(q)s)
+    -- character-for-character the expression the index was built on (§4), or the
+    -- planner silently drops to a sequential scan
   LIMIT %(k)s
 )
 SELECT DISTINCT ON (id) * FROM (SELECT * FROM vec UNION ALL SELECT * FROM lex) u
@@ -337,6 +379,7 @@ is already the field to key it off; this spec does not add one.
 | Lexical-only row gets a fabricated "good" distance and silently outranks true semantic top-1 | Search results feel wrong/untrustworthy for queries with an incidental identifier substring | §5's placeholder-distance handling; a test with a mixed result set asserting vector-arm rows keep their real distance and rank accordingly |
 | Lexical-only row is admitted by SQL but then dropped by `_aggregate_topics`'s `_NO_LEX_MAX_DIST` filter because `lexical` wasn't threaded through | Bug reproduces one hop downstream — SQL "fixed" but user still sees nothing | §9.4's unit test on the filter boundary |
 | `to_tsvector('english', ...)` stems or mangles an identifier class not yet checked (only PS4 was tested) | Some other identifier shape (e.g., a drawing number with punctuation) still doesn't match even after the fix ships | A pre-ship check against a handful of real identifiers pulled from the corpus (drawing numbers, RFI numbers, product codes), not just PS4, before considering the fix complete |
-| Backfill of the generated `tsvector` column is expensive/slow on a large `report_chunks` table, or blocks writes during the `ALTER TABLE` | Migration downtime or a stalled deploy | Test the `ALTER TABLE ADD COLUMN ... GENERATED ALWAYS AS (...) STORED` migration against a copy of the largest known `report_chunks` table size before running it in prod; this repo's existing backfill runbooks (`docs/superpowers/runbooks/2026-07-31-backfill-topic-id.md`) are the pattern to follow for a staged rollout if the single-statement backfill proves too slow |
+| Building the GIN index takes a `SHARE` lock and blocks writes for as long as the build runs, on a table whose row count cannot be measured beforehand | A deploy that appears to hang, and ingest writes queueing behind it | The index build is not a table rewrite, so the window is far shorter than the rejected `ALTER TABLE` would have been; if it still proves too long, build it once with `CREATE INDEX CONCURRENTLY` outside the migration runner (§4) and let the migration's `IF NOT EXISTS` no-op |
+| The query's expression drifts from the index's expression — a stray space, a different config literal, a well-meant refactor | The index is silently ignored, every search falls to a sequential scan, results stay correct and nobody notices until it is slow in production | A test that reads the literal expression out of the migration file and asserts `build_search_sql()` contains it verbatim |
 | Union pushes total candidate volume up and interacts with the `_NO_LEX_MAX_DIST=0.55` ruler-measured threshold in a way nobody re-measured | Silent regression back toward the "18-26 rows per control question" failure the ruler already caught once | §9.3 — locate or reconstruct the ruler and re-run it against the combined-arm SQL before shipping |
-| `websearch_to_tsquery` on a purely non-English/CJK query yields zero lexical terms while the vector arm's own Chinese-handling comment (`lambda_ask_agent.py:759-761`) shows this codebase has been burned by asymmetric language handling before | Chinese literal-token queries (e.g., a Chinese product name) still don't benefit from the new arm even though English ones do | Confirm whether `chunk_tsv`'s `'english'` text-search config tokenizes CJK at all (it likely does not meaningfully segment it); if not, note this as a known gap rather than silently shipping asymmetric coverage, and consider whether the existing `_UNSPACED_RUN` shingling logic needs a SQL-side equivalent in a follow-up |
+| `websearch_to_tsquery` on a purely non-English/CJK query yields zero lexical terms while the vector arm's own Chinese-handling comment (`lambda_ask_agent.py:759-761`) shows this codebase has been burned by asymmetric language handling before | Chinese literal-token queries (e.g., a Chinese product name) still don't benefit from the new arm even though English ones do | Confirm whether the `'english'` text-search config tokenizes CJK at all (it likely does not meaningfully segment it); if not, note this as a known gap rather than silently shipping asymmetric coverage, and consider whether the existing `_UNSPACED_RUN` shingling logic needs a SQL-side equivalent in a follow-up |
