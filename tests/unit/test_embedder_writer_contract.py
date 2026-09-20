@@ -320,11 +320,32 @@ def test_no_field_crosses_this_seam_unread_in_either_direction():
         assert read, f"the embedder sends {key!r} and the writer never reads it"
 
     # --- writer -> embedder: every key returned must be read ---------------
-    returned = set()
+    # Exemptions are scoped to the specific function that returns the key, not to the key
+    # name globally. A name-based exemption (`returned - {"results", ...}`) would silence
+    # this guard for *any* function that happens to return a key called `results`, which is
+    # exactly the defect shape this test exists to catch. So each `return {...}` is attributed
+    # to its enclosing `def`, and only that function's own documented exception set is
+    # subtracted from its own keys.
+    func_starts = [(m.start(), m.group(1)) for m in re.finditer(r'^def (\w+)\(', wr, re.M)]
+
+    def _enclosing_func(pos):
+        name = None
+        for start, fname in func_starts:
+            if start <= pos:
+                name = fname
+            else:
+                break
+        return name
+
+    returned_by_func = {}
     for m in re.finditer(r'return \{("(?:\w+)":[^}]*)\}', wr):
-        returned |= set(re.findall(r'"(\w+)":', m.group(1)))
+        keys = set(re.findall(r'"(\w+)":', m.group(1)))
+        fname = _enclosing_func(m.start())
+        returned_by_func.setdefault(fname, set()).update(keys)
+
     callers = emb + open("src/lambda_org_api.py", encoding="utf-8").read()
-    # `stored` and `reason` belong to the writer's `enrol` op, which has no production
+
+    # `stored` and `reason` belong to the writer's `_enrol` op, which has no production
     # caller — recorded in its own docstring. Reading them would mean wiring that op.
     #
     # `companies`, `floors_written`, `failed` and `results` belong to `_recompute_floors`,
@@ -337,7 +358,13 @@ def test_no_field_crosses_this_seam_unread_in_either_direction():
     # beside this return (`"floor recompute: %d/%d compan%s now have a floor (%d failed)"`)
     # — the number exists somewhere a human can see it even though the return value it also
     # lives in is thrown away.
-    for key in returned - {"stored", "reason", "companies", "floors_written", "failed",
-                            "results"}:
-        read = re.search(r'\.get\("%s"|\["%s"\]' % (key, key), callers) is not None
-        assert read, f"the writer returns {key!r} and no caller reads it"
+    exempt_by_func = {
+        "_enrol": {"stored", "reason"},
+        "_recompute_floors": {"companies", "floors_written", "failed", "results"},
+    }
+    for fname, keys in returned_by_func.items():
+        exempt = exempt_by_func.get(fname, set())
+        for key in keys - exempt:
+            read = re.search(r'\.get\("%s"|\["%s"\]' % (key, key), callers) is not None
+            assert read, (
+                f"the writer's {fname} returns {key!r} and no caller reads it")
