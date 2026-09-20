@@ -44,6 +44,21 @@ DEFAULT_MIN_TURN_S = 3.0
 # much more stable quantity, and it is still provisional until held-out material exists.
 DEFAULT_MIN_MARGIN = 0.15
 
+# How many candidate profiles `profiles_for_matching` can return before the runner-up's
+# expected closeness to the winner starts moving mostly because the pool grew, not because
+# matching got worse. Like DEFAULT_FLOOR_MIN_SAMPLES on the other side of this codebase,
+# this is the SHAPE of a fallback boundary, not a fitted number: six enrolled voices across
+# four dates cannot support fitting a scaling curve (spec S4), so below this threshold the
+# margin is exactly DEFAULT_MIN_MARGIN, unchanged.
+DEFAULT_MARGIN_SCALE_THRESHOLD = 10
+
+# How much wider the margin grows per profile once the pool exceeds the threshold. NOT
+# measured against real multi-company data -- a placeholder shape (linear, small slope)
+# that keeps the margin from becoming impossible at very large pools while explicitly
+# leaving the curve itself for whoever calibrates against live confirmed-match volume
+# across many companies, per spec S4's own refusal to invent one.
+DEFAULT_MARGIN_SCALE_STEP = 0.01
+
 # How far apart two frames of one window may be before the window is treated as holding
 # more than one voice (v2 §6). Cosine distance, i.e. 1 - similarity.
 DEFAULT_MAX_FRAME_SPREAD = 0.35
@@ -103,9 +118,28 @@ def aggregate_scores(rows) -> dict:
     return {key: sums[key] / counts[key] for key in sums}
 
 
+def effective_margin(pool_size: int, base_margin: float = DEFAULT_MIN_MARGIN,
+                     scale_threshold: int = DEFAULT_MARGIN_SCALE_THRESHOLD,
+                     scale_step: float = DEFAULT_MARGIN_SCALE_STEP) -> float:
+    """The margin `decide_name` should require, given how many candidates it was drawn from.
+
+    `profiles_for_matching` returns every consented profile for a company, unlimited — the
+    runner-up decide_name compares against is the maximum over however many rows that is,
+    so the expected gap between winner and runner-up shrinks as the pool grows for reasons
+    that have nothing to do with matching quality (docstring at `profiles_for_matching`,
+    "the size of this result, not the number of people in the room, is what the margin has
+    to survive"). Below `scale_threshold` this returns `base_margin` unchanged — every
+    company today, and every company that narrows its matching by `site_id`, stays exactly
+    where it is.
+    """
+    if pool_size <= scale_threshold:
+        return base_margin
+    return base_margin + scale_step * (pool_size - scale_threshold)
+
+
 def decide_name(scores, duration_s: float,
                 min_turn_s: float = DEFAULT_MIN_TURN_S,
-                min_margin: float = DEFAULT_MIN_MARGIN,
+                min_margin: float | None = None,
                 floor: float | None = None) -> Decision:
     """Who this turn belongs to, or an honest refusal.
 
@@ -113,6 +147,12 @@ def decide_name(scores, duration_s: float,
     is the point: duration first, so that no score — however emphatic — can name a turn too
     short to carry the evidence; margin second, nearest-profile with a required gap; the
     per-company floor last, and only as a DEMOTION.
+
+    `min_margin`, when given explicitly, overrides the pool-size-aware default entirely —
+    an explicit choice by the caller is never second-guessed by the scaling mechanism.
+    Left as `None` (the default), the margin required is `effective_margin(len(scores))`:
+    unchanged for the small pools every company runs today, wider once a company's
+    consented, non-withdrawn profile count grows past `DEFAULT_MARGIN_SCALE_THRESHOLD`.
 
     `floor` is this company's own calibrated rejection floor (`repositories.voiceprints.
     company_floor`), a low percentile of that company's `source='correction'` scores, or
@@ -137,11 +177,12 @@ def decide_name(scores, duration_s: float,
         return Decision("tentative", best_name, None,
                         "only one enrolled profile, so there is no runner-up to beat")
 
+    required_margin = min_margin if min_margin is not None else effective_margin(len(scores))
     margin = best - ranked[1][1]
-    if margin < min_margin:
+    if margin < required_margin:
         return Decision("tentative", best_name, margin,
-                        f"only {margin:.3f} clear of {ranked[1][0]}; below the {min_margin} "
-                        f"margin this is a lean, not an identification")
+                        f"only {margin:.3f} clear of {ranked[1][0]}; below the "
+                        f"{required_margin:.3f} margin this is a lean, not an identification")
 
     # The floor: a company-calibrated final check, and a DEMOTION only. A turn with no
     # enrolled speaker present still produces a winner — the least-dissimilar profile in

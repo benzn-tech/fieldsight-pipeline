@@ -161,6 +161,72 @@ def test_the_floor_never_produces_unknown():
     assert d.status != "unknown"
 
 
+# ----------------------------------------------------------
+# Margin scaling with the candidate pool (2026-09-20 spec S4). profiles_for_matching
+# returns every consented profile for a company, unlimited -- decide_name's runner-up is
+# drawn from a POOL whose size, not the number of people actually in the room, is what the
+# margin has to survive. A fixed margin comfortable at 6 profiles becomes a harder bar at
+# 60 for reasons that have nothing to do with matching getting worse.
+#
+# No curve is fit here -- six enrolled voices across four dates cannot support one without
+# repeating the +0.262 overfitting mistake this module's own docstring already warns
+# against. What ships is the SHAPE: a pool-size-aware lookup, with today's fixed margin as
+# the fallback below a size threshold, exactly as the floor falls back to "no floor" below
+# its own minimum (S1.5) -- the same shape, twice, for the same reason.
+# ----------------------------------------------------------
+
+
+def test_below_the_scale_threshold_the_margin_is_unchanged():
+    """The pool sizes every existing test in this file was written against (2-3 profiles)
+    must reproduce today's DEFAULT_MIN_MARGIN exactly -- this task must not silently
+    change any decision already pinned above."""
+    assert vp.effective_margin(pool_size=3) == vp.DEFAULT_MIN_MARGIN
+    assert vp.effective_margin(pool_size=vp.DEFAULT_MARGIN_SCALE_THRESHOLD) == vp.DEFAULT_MIN_MARGIN
+
+
+def test_an_explicit_min_margin_override_is_never_replaced_by_the_scaled_value():
+    """Existing callers pass min_margin explicitly (e.g. the fitted-cut test). An explicit
+    override is a caller's deliberate choice and the scaling mechanism must not second-guess
+    it -- only the DEFAULT is pool-size-aware."""
+    d = vp.decide_name({"Ben": 0.5, "Zoe": 0.2}, duration_s=6.0, min_margin=0.9)
+    assert d.status == "tentative"
+
+
+def test_decide_name_still_defaults_correctly_at_small_pool_sizes():
+    """Every pre-existing decide_name test above this block used 1-3 profiles and no
+    min_margin override -- this pins that Task 3 did not move their outcomes."""
+    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0)
+    assert d.status == "confirmed" and d.name == "Ben"
+
+
+def test_a_large_pool_uses_a_wider_effective_margin_by_default():
+    """The mechanism, not a fitted number: a pool past the threshold must not silently keep
+    using the same constant a 6-profile company gets, or DEFAULT_MIN_MARGIN would already be
+    "the curve" in disguise."""
+    small_margin = vp.effective_margin(pool_size=3)
+    large_margin = vp.effective_margin(pool_size=vp.DEFAULT_MARGIN_SCALE_THRESHOLD * 5)
+    assert large_margin >= small_margin
+    assert large_margin > vp.DEFAULT_MIN_MARGIN, (
+        "a pool well past the threshold that still gets exactly today's constant means "
+        "nothing about scale actually changed the bar")
+
+
+def test_decide_name_uses_pool_size_for_its_default_margin():
+    """A margin that would confirm at a small pool size may no longer clear at a large one,
+    with nothing else about the scores changed -- the mechanism reaching decide_name, not
+    just existing as a standalone function."""
+    scores_small_pool = {"Ben": 0.40, "Zoe": 0.24}   # margin 0.16, clears 0.15
+    d_small = vp.decide_name(scores_small_pool, duration_s=6.0)
+    assert d_small.status == "confirmed"
+
+    huge_pool = {"Ben": 0.40, "Zoe": 0.24}
+    huge_pool.update({f"stranger_{i}": 0.10 for i in range(vp.DEFAULT_MARGIN_SCALE_THRESHOLD * 5)})
+    d_large = vp.decide_name(huge_pool, duration_s=6.0)
+    assert d_large.status == "tentative", (
+        "the same 0.16 margin over the SAME runner-up must be judged against a wider "
+        "effective margin once the pool is large, or pool size never actually mattered")
+
+
 # ---- the enrolment contamination guard (v2 §6) ----
 
 def test_a_window_containing_two_voices_is_refused_for_enrolment():
