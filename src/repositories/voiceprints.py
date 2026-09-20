@@ -579,6 +579,84 @@ def confirmations_count(conn, company_id, voiceprint_id) -> int:
     return int((row or {}).get("n") or 0)
 
 
+#: Tuning knobs, not settings anyone should trust yet (spec S1.3, S1.5). Six enrolled
+#: voices across four dates cannot fit a percentile or a minimum sample count without
+#: repeating the exact overfitting mistake DEFAULT_MIN_MARGIN's docstring warns against.
+#: Both are here, named, so the eventual calibration against real per-company correction
+#: volume changes one number in one place rather than a magic literal buried in a query.
+DEFAULT_FLOOR_PERCENTILE = 5
+DEFAULT_FLOOR_MIN_SAMPLES = 20
+
+
+def recompute_company_floor(conn, company_id, percentile=DEFAULT_FLOOR_PERCENTILE,
+                            min_samples=DEFAULT_FLOOR_MIN_SAMPLES) -> dict | None:
+    """Rebuild one company's rejection floor from its OWN human-asserted corrections.
+
+    **Only `source='correction'` rows enter this.** The alternative -- calibrating from
+    everything `decide_name` confirms -- is circular and already named as the mistake to
+    avoid: on 2026-09-10 the existing margin-only chain confirmed a stranger at
+    `best=0.445`, and a distribution that already contains 0.445 has a low percentile at
+    or below 0.445, so the floor could never again reject that exact class of error. Every
+    wrong confirmation would lower the bar for the next one. `source='correction_
+    propagation'` (one human assertion spread by the model's own similarity judgment,
+    lambda_voiceprint_writer.py:116 — "only `source='correction'` counts"),
+    `source='voiceprint_match'` (the system's own guess, lambda_voiceprint_writer.py:308 —
+    "`source='voiceprint_match'`, never `'correction'`"), and `source='label_inheritance'`
+    (inherited from a transcriber label, not independently asserted) are excluded for the
+    same reason, one level removed each.
+
+    `best` here is the score `decide_name` ranked first for the turn a correction landed
+    on -- `speaker_turn_names.score`, stamped at write time by whichever caller recorded
+    the correction. A turn with no stored score (an older row, or one written before
+    scoring existed) cannot be measured and is excluded rather than treated as zero.
+
+    Returns `None` and writes nothing below `min_samples` qualifying rows -- a floor
+    calibrated from too few points is noise, and no floor (today's margin-only behaviour)
+    is safer than a wrong one (spec S1.5).
+    """
+    _require_company(company_id)
+    cur = conn.cursor(row_factory=dict_row)
+    count_row = cur.execute(
+        "SELECT count(*) AS n FROM speaker_turn_names "
+        "WHERE company_id = %s AND source = 'correction' "
+        "  AND score IS NOT NULL AND superseded_at IS NULL",
+        (company_id,)).fetchone()
+    n = int((count_row or {}).get("n") or 0)
+    if n < min_samples:
+        return None
+    rows = cur.execute(
+        "SELECT score FROM speaker_turn_names "
+        "WHERE company_id = %s AND source = 'correction' "
+        "  AND score IS NOT NULL AND superseded_at IS NULL",
+        (company_id,)).fetchall()
+    import numpy as np
+    scores = np.array([float(r["score"]) for r in rows], dtype=np.float64)
+    floor = float(np.percentile(scores, percentile))
+    cur.execute(
+        "INSERT INTO speaker_voiceprint_company_floors "
+        "(company_id, floor, sample_count, computed_at) "
+        "VALUES (%s, %s, %s, now()) "
+        "ON CONFLICT (company_id) DO UPDATE "
+        "  SET floor = EXCLUDED.floor, sample_count = EXCLUDED.sample_count, "
+        "      computed_at = now()",
+        (company_id, floor, n))
+    return {"company_id": company_id, "floor": floor, "sample_count": n}
+
+
+def company_floor(conn, company_id) -> float | None:
+    """This company's current rejection floor, or None if it has none.
+
+    None covers two cases the caller must treat identically: nobody has run the recompute
+    job yet, and the company has too few `source='correction'` rows to calibrate
+    responsibly (spec S1.5). Both mean "apply no floor", never a borrowed default.
+    """
+    _require_company(company_id)
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT floor FROM speaker_voiceprint_company_floors WHERE company_id = %s",
+        (company_id,)).fetchone()
+    return float(row["floor"]) if row else None
+
+
 def record_turn_name(conn, company_id, session_base, turn_ref, state, source,
                      correction_ref=None, cluster_ref=None, cluster_threshold=None,
                      voiceprint_id=None, score=None, margin=None,

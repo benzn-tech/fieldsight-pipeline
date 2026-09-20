@@ -106,6 +106,61 @@ def test_the_margin_is_configurable_but_its_default_is_not_the_fitted_cut():
     assert d.status == "tentative"
 
 
+# ----------------------------------------------------------
+# The rejection floor (2026-09-20 spec S1). A NEW, FINAL check, after the margin, before
+# returning confirmed. It can only ever demote confirmed -> tentative, never produce
+# unknown by itself (duration and "no profiles" already own that path) and never promote.
+# Absent (floor=None, today's default) it is a no-op -- every existing test above this
+# block must keep passing unchanged.
+# ----------------------------------------------------------
+
+
+def test_a_would_be_confirmation_below_the_floor_is_downgraded_to_tentative():
+    """The 09-10 shape: a clear margin, but the winning score itself is not plausible for
+    this company's own corrected history."""
+    d = vp.decide_name({"Mike": 0.445, "Leo": 0.177}, duration_s=6.0, floor=0.50)
+    assert d.status == "tentative"
+    assert d.name == "Mike", "the lean is still shown -- a demotion is not a withholding"
+    assert "floor" in d.reason.lower()
+
+
+def test_a_would_be_confirmation_above_the_floor_stays_confirmed():
+    d = vp.decide_name({"Ben": 0.65, "Zoe": 0.20}, duration_s=6.0, floor=0.50)
+    assert d.status == "confirmed" and d.name == "Ben"
+
+
+def test_no_floor_is_a_no_op_exactly_as_today():
+    """Every company runs margin-only until it calibrates one (S1.5). floor=None, the
+    default, must reproduce every pre-floor test in this file with no other change."""
+    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0)
+    assert d.status == "confirmed" and d.name == "Ben"
+
+
+def test_the_floor_never_turns_a_tentative_result_into_a_confirmation():
+    """The floor is a final, demotion-only check. It has nothing to promote from a
+    tentative margin outcome, and this pins that it never tries."""
+    d = vp.decide_name({"Ben": 0.30, "Zoe": 0.26}, duration_s=8.0, floor=0.0)
+    assert d.status == "tentative", (
+        "a floor of 0.0 (trivially cleared) must not rescue a result the margin already "
+        "downgraded")
+
+
+def test_the_floor_never_fires_on_a_single_profile_result():
+    """Single-profile decisions are already tentative (no runner-up to beat) and stay
+    tentative -- the floor has nothing to demote and must not raise or change the reason
+    in a way that hides the real one."""
+    d = vp.decide_name({"Ben": 0.9}, duration_s=10.0, floor=0.99)
+    assert d.status == "tentative" and d.name == "Ben"
+    assert "runner-up" in d.reason.lower()
+
+
+def test_the_floor_never_produces_unknown():
+    """Failing the floor is a lean, not a refusal -- unknown stays owned by duration and
+    'no profiles', per S1.4."""
+    d = vp.decide_name({"Mike": 0.10, "Leo": -0.05}, duration_s=6.0, floor=0.9)
+    assert d.status != "unknown"
+
+
 # ---- the enrolment contamination guard (v2 §6) ----
 
 def test_a_window_containing_two_voices_is_refused_for_enrolment():

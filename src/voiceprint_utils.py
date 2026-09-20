@@ -105,12 +105,22 @@ def aggregate_scores(rows) -> dict:
 
 def decide_name(scores, duration_s: float,
                 min_turn_s: float = DEFAULT_MIN_TURN_S,
-                min_margin: float = DEFAULT_MIN_MARGIN) -> Decision:
+                min_margin: float = DEFAULT_MIN_MARGIN,
+                floor: float | None = None) -> Decision:
     """Who this turn belongs to, or an honest refusal.
 
     `scores` maps a profile name to its similarity with this turn. The order of the checks
     is the point: duration first, so that no score — however emphatic — can name a turn too
-    short to carry the evidence.
+    short to carry the evidence; margin second, nearest-profile with a required gap; the
+    per-company floor last, and only as a DEMOTION.
+
+    `floor` is this company's own calibrated rejection floor (`repositories.voiceprints.
+    company_floor`), a low percentile of that company's `source='correction'` scores, or
+    `None` when the company has not calibrated one yet (spec S1.5) — `None` is a no-op,
+    reproducing today's margin-only behaviour exactly. It never promotes: a turn the margin
+    already sent to `tentative` (or `unknown`) is untouched by this check, because the
+    floor answers "is the winner's score itself plausible", which only matters once
+    something has already tried to be a winner.
     """
     if duration_s is None or duration_s < min_turn_s:
         return Decision("unknown", None, None,
@@ -128,12 +138,23 @@ def decide_name(scores, duration_s: float,
                         "only one enrolled profile, so there is no runner-up to beat")
 
     margin = best - ranked[1][1]
-    if margin >= min_margin:
-        return Decision("confirmed", best_name, margin,
-                        f"clear of the runner-up by {margin:.3f}")
-    return Decision("tentative", best_name, margin,
-                    f"only {margin:.3f} clear of {ranked[1][0]}; below the {min_margin} "
-                    f"margin this is a lean, not an identification")
+    if margin < min_margin:
+        return Decision("tentative", best_name, margin,
+                        f"only {margin:.3f} clear of {ranked[1][0]}; below the {min_margin} "
+                        f"margin this is a lean, not an identification")
+
+    # The floor: a company-calibrated final check, and a DEMOTION only. A turn with no
+    # enrolled speaker present still produces a winner — the least-dissimilar profile in
+    # the list — and a wide margin over the runner-up does not mean that winner is a
+    # plausible match, only that it is less implausible than the rest (spec S1.1: measured
+    # 2026-09-10, best=0.445, margin=0.268, confirmed by margin alone).
+    if floor is not None and best < floor:
+        return Decision("tentative", best_name, margin,
+                        f"clear of the runner-up by {margin:.3f}, but {best:.3f} is below "
+                        f"this company's calibrated floor of {floor:.3f} — a wide margin "
+                        f"over weak candidates is not the same as a plausible match")
+    return Decision("confirmed", best_name, margin,
+                    f"clear of the runner-up by {margin:.3f}")
 
 
 def window_is_homogeneous(frame_embeddings,

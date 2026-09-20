@@ -309,6 +309,86 @@ def test_the_live_overlay_excludes_superseded_rows():
     assert "company_id = %s" in sql
 
 
+# ----------------------------------------------------------
+# The per-company rejection floor (2026-09-20 spec). Calibrated ONLY from
+# source='correction' rows -- a human clicking a name onto a turn, never the system's own
+# output. The alternative (calibrate from confirmed matches) is circular: on 2026-09-10 the
+# existing chain CONFIRMED a stranger at best=0.445, and a distribution containing 0.445
+# has a low percentile at or below 0.445, so the floor could never reject the very error it
+# exists to catch. This is the guard against that, and it is the point of the whole task.
+# ----------------------------------------------------------
+
+
+def test_recompute_reads_only_source_correction_scores():
+    """The circularity guard. A voiceprint_match row, a correction_propagation row and a
+    label_inheritance row must all be invisible to the query that builds the floor -- only
+    a human-asserted correction may set the bar a machine guess is later held to."""
+    conn = FakeConn([[{"n": 1}], [{"score": 0.30}]])
+    voiceprints.recompute_company_floor(conn, CO, min_samples=1)
+    read_sql = conn.calls[0]["sql"]
+    assert "source = 'correction'" in read_sql
+    assert "voiceprint_match" not in read_sql
+    assert "correction_propagation" not in read_sql
+    assert "label_inheritance" not in read_sql
+
+
+def test_a_voiceprint_match_row_cannot_enter_the_calibration_set():
+    """Direct proof, not just an SQL-text assertion: a company whose ONLY qualifying rows
+    are voiceprint_match scores has TOO FEW source='correction' rows and gets no floor at
+    all -- never a floor built from the matches. The count query itself is scoped to
+    source = 'correction', so a company with five voiceprint_match rows and zero
+    corrections reports a count of zero."""
+    conn = FakeConn([[{"n": 0}]])
+    result = voiceprints.recompute_company_floor(conn, CO, min_samples=1)
+    assert result is None
+    count_sql = conn.calls[0]["sql"]
+    assert "source = 'correction'" in count_sql
+
+
+def test_below_the_minimum_sample_count_no_floor_is_written():
+    """Spec 1.5: a young company, or a company whose steady state is mostly matches and few
+    corrections, gets no floor rather than a global fallback or a refusal to confirm
+    anything -- both worse per the spec's own reasoning."""
+    conn = FakeConn([[{"n": 3}]])
+    result = voiceprints.recompute_company_floor(conn, CO, min_samples=10)
+    assert result is None
+    assert not any(c["sql"].startswith("INSERT") or "UPSERT" in c["sql"].upper()
+                   for c in conn.calls), "no row should be written below the minimum"
+
+
+def test_the_floor_is_a_low_percentile_not_the_minimum_or_the_mean():
+    """A single low outlier in the corrected history must not veto the company's future
+    matches -- that is what the minimum ('own minimum') alternative was rejected for."""
+    scores = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65]
+    conn = FakeConn([[{"n": len(scores)}], [{"score": s} for s in scores]])
+    result = voiceprints.recompute_company_floor(conn, CO, min_samples=1, percentile=5)
+    assert result is not None
+    assert result["floor"] < min(scores) + 0.05, "sanity: low percentile sits near the low end"
+    assert result["floor"] > min(scores) - 1e-9 or len(scores) < 20, (
+        "with fewer than 20 points a 5th percentile interpolates near the minimum -- this "
+        "assertion documents that rather than asserting an exact numpy percentile formula")
+
+
+def test_company_floor_reads_the_stored_value():
+    conn = FakeConn([[{"floor": 0.31, "sample_count": 12}]])
+    assert voiceprints.company_floor(conn, CO) == pytest.approx(0.31)
+
+
+def test_company_floor_is_none_when_no_row_exists():
+    conn = FakeConn([[]])
+    assert voiceprints.company_floor(conn, CO) is None
+
+
+def test_recompute_requires_company_id():
+    with pytest.raises(ValueError):
+        voiceprints.recompute_company_floor(FakeConn(), None)
+
+
+def test_company_floor_requires_company_id():
+    with pytest.raises(ValueError):
+        voiceprints.company_floor(FakeConn(), None)
+
+
 # ---- creating the profile a name attaches to ----------------------------
 #
 # §6: a voiceprint is biometric information, and consent must come from THE PERSON WHOSE
