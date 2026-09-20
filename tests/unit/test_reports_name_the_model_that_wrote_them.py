@@ -200,6 +200,78 @@ def test_the_monthly_prompt_reads_bullets_the_same_way_from_either_source():
     assert "['Day point one'" not in from_daily
 
 
+# ------------- 2026-09-20: the customer-facing footer must not name the model
+
+def test_the_daily_report_word_footer_does_not_name_the_model():
+    """`_finish_document`'s footer is the customer-facing artifact -- the Word
+    file a customer opens. It must not say which LLM vendor/model wrote the
+    report, even though the JSON `_report_metadata` this footer reads from
+    still carries `model` (that field is the internal record, kept
+    deliberately -- see test_the_debug_record_names_the_model_that_ran and
+    test_report_metadata_json_still_carries_the_model below)."""
+    docx = pytest.importorskip("docx", reason="python-docx ships as a Lambda layer")
+    report_data = {
+        "executive_summary": ["A day happened."],
+        "_report_metadata": {
+            "generated_at": "2026-09-20T00:00:00Z",
+            "model": "meta/muse-spark-1.3-contributor",
+            "recordings_processed": 4,
+            "version": "v3.5",
+        },
+    }
+    buf = rg.generate_word_document(report_data, "T")
+    assert buf is not None
+    buf.seek(0)
+    full_text = "\n".join(p.text for p in docx.Document(buf).paragraphs)
+    assert "meta/muse-spark-1.3-contributor" not in full_text
+    assert "Model" not in full_text
+    # The rest of the footer is unchanged -- this is a redaction, not a deletion.
+    assert "Recordings: 4" in full_text
+    assert "Version: v3.5" in full_text
+
+
+def test_the_meeting_minutes_word_footer_does_not_name_the_model():
+    """The second copy of the footer (lambda_meeting_minutes.generate_word_document,
+    also used by lambda_session_report's T3 render). Same rule, same reason the
+    two copies existed in the first place: miss one and it drifts."""
+    docx = pytest.importorskip("docx", reason="python-docx ships as a Lambda layer")
+    minutes_data = {
+        "_report_metadata": {
+            "generated_at": "2026-09-20T00:00:00Z",
+            "model": "meta/muse-spark-1.3-contributor",
+            "recordings_processed": 2,
+            "version": "v1.1",
+        },
+    }
+    buf = mm.generate_word_document(minutes_data, "T")
+    assert buf is not None
+    buf.seek(0)
+    full_text = "\n".join(p.text for p in docx.Document(buf).paragraphs)
+    assert "meta/muse-spark-1.3-contributor" not in full_text
+    assert "Model" not in full_text
+    assert "Recordings: 2" in full_text
+    assert "Version: v1.1" in full_text
+
+
+def test_report_metadata_json_still_carries_the_model():
+    """Pinning the OTHER half of the requirement: the footer is redacted, but
+    the JSON `_report_metadata` block the footer is built from -- the internal
+    record, written to S3 alongside the debug record -- must still carry
+    `model`. A later "cleanup" that notices the footer never uses it and
+    deletes the field would quietly remove the only trace of which model
+    wrote a bad report."""
+    report_data = {
+        "executive_summary": [],
+        "_report_metadata": {"model": "meta/muse-spark-1.3-contributor"},
+    }
+    # The footer function reads report_data['_report_metadata'] but never
+    # mutates it -- confirmed by calling it and re-reading the same dict.
+    docx = pytest.importorskip("docx", reason="python-docx ships as a Lambda layer")
+    doc = docx.Document()
+    rg._finish_document(doc, report_data)
+    assert report_data["_report_metadata"]["model"] == "meta/muse-spark-1.3-contributor"
+
+
 # --------------------------------------- an empty array is not a missing one
 
 def test_an_empty_bullet_array_still_says_something_under_the_heading():
@@ -215,16 +287,22 @@ def test_an_empty_bullet_array_still_says_something_under_the_heading():
 # ------------------------------------- every label, in every spelling
 
 @pytest.mark.parametrize("path", [
-    "src/lambda_ask_agent.py",
     "src/lambda_report_generator.py",
     "src/lambda_meeting_minutes.py",
 ])
-def test_a_model_label_is_the_active_model_or_nothing(path):
-    """The previous version of this sweep named ONE constant, `CLAUDE_MODEL`,
-    and `lambda_ask_agent.py`'s legacy S3 path was labelling answers with a
-    second one, `HAIKU_MODEL`, the whole time. Naming the forbidden spellings
-    is a losing game: there is always another constant. State the property
-    instead -- a `model` field is either the model that ran, or None.
+def test_the_internal_metadata_model_label_is_the_active_model_or_nothing(path):
+    """report_generator/meeting_minutes still stamp `_report_metadata.model` --
+    an internal provenance field, kept in the debug record and the stored S3
+    JSON so a bad answer can still be traced to the model that wrote it. That
+    label must still be the model that actually ran, or None; the previous
+    version of this sweep named ONE constant, `CLAUDE_MODEL`, which was wrong
+    on a qwen deploy. State the property instead of the forbidden spellings --
+    there is always another constant.
+
+    `lambda_ask_agent.py` is deliberately NOT in this list any more: as of
+    2026-09-20 its response is customer-facing and must carry no `model`
+    label at all (see test_no_ask_response_names_a_model_at_all in
+    test_ask_reports_the_model_that_answered.py) -- not even "None".
     """
     import pathlib
     import re

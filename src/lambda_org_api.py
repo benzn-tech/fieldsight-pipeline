@@ -2560,17 +2560,39 @@ def _session_was_removed(session_id, folder, date) -> bool:
     return _is_removed_spelling(session_id, removed)
 
 
+def _without_vendor_metadata(doc):
+    """A copy of `doc` with `_report_metadata['model']` removed, if present.
+
+    Used only at the point a report/minutes JSON is about to leave the
+    building verbatim (the `/timeline` byte-identical S3 fallback). The
+    stored S3 object -- and the debug record beside it -- keep the model
+    name; only the copy handed to the HTTP response loses it."""
+    meta = doc.get("_report_metadata")
+    if not isinstance(meta, dict) or "model" not in meta:
+        return doc
+    doc = dict(doc)
+    meta = dict(meta)
+    meta.pop("model", None)
+    doc["_report_metadata"] = meta
+    return doc
+
+
 def _generation_provenance(result):
-    """Echo the worker's generation provenance -- which template and model wrote
-    the document -- when the result carries it. `promptChars` is internal noise,
-    not provenance, and is deliberately left out.
+    """Echo the worker's generation provenance -- which template wrote the
+    document -- when the result carries it. `promptChars` is internal noise,
+    not provenance, and is deliberately left out. So is `model`: the worker's
+    result JSON (an internal record, same as the report/minutes debug record)
+    carries which LLM wrote the document, but this endpoint is a customer-
+    facing API response, and a customer-facing surface must not name the
+    vendor or model. The template fields stay -- they are ours, not a
+    vendor's.
 
     The assembled path (no template named in the request) never sets `generated`,
     so this returns {} and the caller's response gains no new keys -- today's
     three-key shape for that path is unchanged."""
     if not result.get("generated"):
         return {}
-    return {k: result[k] for k in ("generated", "templateId", "templateVersion", "model")
+    return {k: result[k] for k in ("generated", "templateId", "templateVersion")
             if k in result}
 
 
@@ -7002,7 +7024,13 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
                    "date": date, "user": user}, 404)
     doc = _get_lake_json(f"reports/{date}/{user}/daily_report.json")
     if doc is not None:
-        return ok(doc)                              # VERBATIM (byte-identical history)
+        # VERBATIM (byte-identical history) -- EXCEPT the model name. This is
+        # the one place the report generator's own `_report_metadata.model`
+        # (an internal provenance field, never meant to leave the building)
+        # would otherwise ride straight through to a customer's browser,
+        # because this branch serves the S3 object byte-for-byte. Strip just
+        # that one key on the way out; the stored S3 object is untouched.
+        return ok(_without_vendor_metadata(doc))
     # `user` is the folder as a FIELD. It was only ever in the human-readable
     # message, and the client needs it to build the photo key -- leaving it
     # there would have made a UI parse an English sentence for an identifier.
@@ -8730,7 +8758,14 @@ def get_org_video_segments(conn, caller, event):
                                        p.get("end") or "", conn=conn))
 
 
-_ORG_MEDIA_PRESIGN_PREFIXES = ("users/", "audio_segments/", "transcripts/",
+# 2026-09-20: 'transcripts/' deliberately removed -- see the matching note in
+# lambda_fieldsight_api.get_presigned_url. The raw ASR transcript JSON's own
+# shape (AWS Transcribe: {"jobName", "accountId", "status", "results"};
+# ElevenLabs' adapted shape: none of those keys) names the vendor by which
+# fields exist, and for the AWS path also leaks our real AWS account id.
+# Nothing customer-facing presigns this prefix -- GET /api/org/transcripts
+# already serves every field the transcript viewer reads.
+_ORG_MEDIA_PRESIGN_PREFIXES = ("users/", "audio_segments/",
                                "reports/", "web_video/")
 
 

@@ -2,11 +2,19 @@
 carries it, and must not change the response shape when it doesn't.
 
 Found on TEST: a genuinely generated day report came back as
-`{"status": "done", "docUrl": ..., "emailed": false}` -- `generated`, `templateId`,
-`templateVersion` and `model` were all absent, so a caller could not tell a
-generated report from an assembled one, and the template/model that wrote a
-document was lost at the read side. `promptChars` is internal noise, not
-provenance, and must stay out of the response.
+`{"status": "done", "docUrl": ..., "emailed": false}` -- `generated`, `templateId`
+and `templateVersion` were all absent, so a caller could not tell a generated
+report from an assembled one, and the template that wrote a document was lost
+at the read side. `promptChars` is internal noise, not provenance, and must
+stay out of the response.
+
+2026-09-20: `model` joined `promptChars` as a field that must stay out of the
+response, for a different reason -- it is not noise, it is exactly the
+provenance this endpoint exists to echo, but this endpoint is a customer-facing
+API response and a customer-facing surface must not name which LLM vendor or
+model wrote the document. The worker's own result JSON (an internal record,
+read by `s3().get_object` in `_wire` below) still carries `model` -- only the
+copy this handler returns to the HTTP caller drops it.
 """
 import json
 
@@ -70,8 +78,8 @@ def test_session_report_status_echoes_provenance_when_present(monkeypatch):
     assert body == {
         "status": "done", "docUrl": "https://signed.example/doc.docx", "emailed": True,
         "generated": True, "templateId": "tmpl-1", "templateVersion": 3,
-        "model": "claude-sonnet-5",
     }
+    assert "model" not in body, "a customer-facing status response must not name the model"
 
 
 def test_session_report_status_is_unchanged_when_provenance_absent(monkeypatch):
@@ -89,8 +97,8 @@ def test_day_report_status_echoes_provenance_when_present(monkeypatch):
     assert body == {
         "status": "done", "docUrl": "https://signed.example/doc.docx", "emailed": True,
         "generated": True, "templateId": "tmpl-1", "templateVersion": 3,
-        "model": "claude-sonnet-5",
     }
+    assert "model" not in body, "a customer-facing status response must not name the model"
 
 
 def test_day_report_status_is_unchanged_when_provenance_absent(monkeypatch):
@@ -100,3 +108,15 @@ def test_day_report_status_is_unchanged_when_provenance_absent(monkeypatch):
     assert body == {
         "status": "done", "docUrl": "https://signed.example/doc.docx", "emailed": False,
     }
+
+
+def test_generation_provenance_drops_model_without_touching_the_input():
+    """The internal record (the worker's own result dict, read straight off S3)
+    must not be mutated on its way through this filter -- only the copy handed
+    back to the HTTP caller loses `model`. If this ever mutated `result` in
+    place, a caller holding the same dict (or a second read of the same
+    object) would lose the provenance too."""
+    result = dict(GENERATED)
+    provenance = oa._generation_provenance(result)
+    assert provenance == {"generated": True, "templateId": "tmpl-1", "templateVersion": 3}
+    assert result["model"] == "claude-sonnet-5", "the internal record must not be scrubbed"

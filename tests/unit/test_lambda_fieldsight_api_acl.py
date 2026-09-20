@@ -442,6 +442,24 @@ def test_presign_disallowed_prefix_still_403(monkeypatch):
         {"key": "config/user_mapping.json"}, ADMIN_CALLER)["statusCode"] == 403
 
 
+def test_presign_transcripts_prefix_denied_even_for_own_recording(monkeypatch):
+    """2026-09-20: 'transcripts/' dropped from the allowlist. The raw stored
+    JSON there is the ASR vendor's own output shape -- AWS Transcribe writes
+    top-level jobName/accountId/status, ElevenLabs' adapted shape carries
+    none of those keys -- so signing that object handed a customer the
+    vendor's fingerprint with no vendor string anywhere in the bytes, and
+    for the AWS path our real AWS account id besides. Denied even for the
+    caller's OWN recording: GET /api/transcripts already serves every field
+    scripts/composites/transcript-list.js reads, so nothing customer-facing
+    loses anything."""
+    fake = wire(monkeypatch)
+    res = fapi.get_presigned_url(
+        {"key": "transcripts/Ben_Test/2026-09-20/Ben_Test_2026-09-20_08-00-00.json"},
+        WORKER_CALLER)
+    assert res["statusCode"] == 403
+    assert fake.presigned == []
+
+
 # ---------------------------------------------------------------
 # S-3: get_dates -- same falsy-empty-list idiom at :331 and :350.
 # ---------------------------------------------------------------

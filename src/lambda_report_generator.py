@@ -1229,14 +1229,20 @@ def generate_word_document(report_data, title):
 
 def _finish_document(doc, report_data):
     """The provenance footer and the bytes. Shared by both renderings, because
-    two copies of a footer is how one of them loses the model name."""
+    two copies of a footer is how one of them drifts from the other.
+
+    The model that wrote this document is deliberately NOT in this footer --
+    a customer-facing Word export must not name which LLM vendor/model
+    produced it. The name still lives in `_report_metadata['model']` on the
+    JSON this footer is built from, and in the debug record beside it in S3,
+    so a bad answer can still be traced to the model that wrote it; it just
+    never leaves the building on the document a customer opens."""
     meta = report_data.get('_report_metadata', {})
     if meta:
         doc.add_paragraph('')
         p = doc.add_paragraph()
         run = p.add_run(
             f"Generated: {meta.get('generated_at', '?')} | "
-            f"Model: {meta.get('model', '?')} | "
             f"Recordings: {meta.get('recordings_processed', '?')} | "
             f"Version: {meta.get('version', '?')}"
         )

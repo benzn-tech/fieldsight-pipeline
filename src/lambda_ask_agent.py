@@ -1174,7 +1174,6 @@ def _metric_answer(caller_sub, question, metric, date_from, date_to, applied_sco
     return {
         "answer": metric_render.render(question, result),
         "citations": [],
-        "model": None,
         "grounded": True,
         "computed": True,
         "metric": metric,
@@ -1455,9 +1454,6 @@ def _rag_answer(body):
                 "answer": "Search service temporarily unavailable. Please try again.",
                 "error": "rag-search unavailable",
                 "citations": [],
-                # No model was called. A name here would attribute a system
-                # message to something that never ran.
-                "model": None,
                 "applied_scope": applied_scope,
                 "asked": asked if rewritten else None,
             }
@@ -1503,7 +1499,6 @@ def _rag_answer(body):
                     return {
                         "answer": empty_web["answer"],
                         "citations": [],
-                        "model": llm_utils.active_model(),
                         "grounded": False,
                         "from_web": True,
                         "web": empty_web,
@@ -1514,8 +1509,6 @@ def _rag_answer(body):
             return {
                 "answer": "No relevant records found for this question.",
                 "citations": [],
-                # This return sits ABOVE the call_llm below: no model ran.
-                "model": None,
                 "grounded": True,
                 "basis": basis,
                 "applied_scope": applied_scope,
@@ -1596,7 +1589,6 @@ def _rag_answer(body):
             return {
                 "answer": web["answer"],
                 "citations": [],
-                "model": llm_utils.active_model(),
                 "grounded": False,
                 "from_web": True,
                 "web": web,
@@ -1686,7 +1678,6 @@ def _rag_answer(body):
                 "answer": "",
                 "error": err,
                 "citations": [],
-                "model": None,
                 "applied_scope": applied_scope,
                 "asked": asked if rewritten else None,
             }
@@ -1713,10 +1704,11 @@ def _rag_answer(body):
             "answer": answer,
             "answer_language": answer_language.policy(),
             "citations": citations,
-            # The only branch where a model produced the text, so the only one
-            # that names one -- and it names the one that ran, not the constant
-            # for a provider this deploy may not be using.
-            "model": llm_utils.active_model(),
+            # No "model" field: a customer-facing Ask response must not name
+            # which LLM vendor/model wrote the answer. The model that ran is
+            # still on the `qwen call: model=...` / `anthropic call: ...` log
+            # line for this request, which is what traces a bad answer back
+            # to the model that wrote it -- it just never reaches the client.
             "grounded": True,
             "basis": basis,
             "applied_scope": applied_scope,
@@ -1728,9 +1720,6 @@ def _rag_answer(body):
             "answer": "",
             "error": str(e),
             "citations": [],
-            # Reachable from either side of the model call, so there is nothing
-            # honest to name.
-            "model": None,
             "applied_scope": applied_scope,
             "asked": asked if rewritten else None,
         }
@@ -2157,7 +2146,6 @@ def lambda_handler(event, context):
     logger.info("Ask Agent v1.0 - Complete")
     logger.info("=" * 50)
 
-    import llm_utils
     return ok({
         'answer': answer,
         'grounded': True,
@@ -2165,10 +2153,10 @@ def lambda_handler(event, context):
         'user': user,
         'scope': scope,
         'topic_id': topic_id,
-        # `call_claude` above dispatches on LLM_PROVIDER, so on a qwen deploy
-        # this answer was NOT written by HAIKU_MODEL. Third site of the same
-        # mislabel; a sweep that named `CLAUDE_MODEL` walked straight past it.
-        'model': llm_utils.active_model(),
+        # No "model" field here either: this legacy path used to name a
+        # provider (first `HAIKU_MODEL`, later `CLAUDE_MODEL`) that on a
+        # qwen deploy never wrote the answer -- and either way, a
+        # customer-facing response must not name the vendor at all.
         'data_sources': {
             'report': bool(report_text),
             'report_type': report_type,

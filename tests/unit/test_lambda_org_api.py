@@ -4499,6 +4499,26 @@ def test_media_presign_missing_key_400(wired):
     assert res["statusCode"] == 400
 
 
+def test_media_presign_transcripts_prefix_denied(presign_wired):
+    """2026-09-20: 'transcripts/' was removed from _ORG_MEDIA_PRESIGN_PREFIXES.
+    The raw stored JSON at that prefix is the ASR vendor's own output shape
+    (AWS Transcribe: top-level jobName/accountId/status; ElevenLabs' adapted
+    shape has none of those keys), so a presigned URL straight to the object
+    would let a customer download the vendor's fingerprint even though no
+    field anywhere says "AWS" or "ElevenLabs". Nothing customer-facing ever
+    needed this: GET /api/org/transcripts already serves every field
+    scripts/composites/transcript-list.js reads."""
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ben_UCPK"})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "transcripts/Ben_UCPK/2026-09-20/Ben_UCPK_2026-09-20_08-00-00.json"}),
+        None)
+    assert res["statusCode"] == 403
+    assert not hasattr(fake, "last")     # never even reached the signer
+
+
 def test_media_presign_reports_key_owner_extraction(presign_wired):
     # reports/{date}/{user}/... -- owner folder is path segment 3 (legacy
     # get_presigned_url :394-398 parity).
@@ -5539,6 +5559,42 @@ def test_timeline_no_aurora_topics_stays_verbatim(wired, monkeypatch):
     body = body_of(res)
     assert body["_report_metadata"]["source"] == "nightly"   # byte-verbatim
     assert body["topics"][0]["topic_title"] == "verbatim"
+
+
+def test_timeline_verbatim_fallback_strips_the_model_name(wired, monkeypatch):
+    """2026-09-20: this branch is `return ok(doc)` -- the ONE place the report
+    generator's `_report_metadata.model` rides straight through to a
+    customer's browser, because it serves the stored S3 object byte-for-byte
+    on every other field. Everything else must stay byte-identical (that is
+    the whole point of this fallback); only `model` is stripped."""
+    stored = {"_report_metadata": {"source": "nightly",
+                                    "model": "meta/muse-spark-1.3-contributor",
+                                    "recordings_processed": 3},
+              "topics": [{"topic_title": "verbatim"}]}
+    monkeypatch.setattr(org.topics, "has_topics_for_source_prefix",
+                        lambda conn, prefix: False)
+    monkeypatch.setattr(org, "_get_lake_json", lambda key: stored)
+    res = org._render_timeline_for_user(FakeConn(), CALLER, "2026-07-10", "Ada_L")
+    body = body_of(res)
+    assert "model" not in body["_report_metadata"]
+    assert body["_report_metadata"]["source"] == "nightly"
+    assert body["_report_metadata"]["recordings_processed"] == 3
+    assert body["topics"][0]["topic_title"] == "verbatim"
+    # The stored object itself must be untouched -- this is a redaction on
+    # the way OUT, not a scrub of the internal record.
+    assert stored["_report_metadata"]["model"] == "meta/muse-spark-1.3-contributor"
+
+
+def test_without_vendor_metadata_leaves_docs_with_no_model_alone():
+    """A doc with no `_report_metadata`, or one with no `model` key, is
+    returned as the SAME object (not a needless copy) -- this is the common
+    case (live-extraction's own `_report_metadata` never has a `model` key)
+    and must cost nothing."""
+    no_meta = {"topics": []}
+    assert org._without_vendor_metadata(no_meta) is no_meta
+
+    no_model = {"_report_metadata": {"source": "live_extraction"}}
+    assert org._without_vendor_metadata(no_model) is no_model
 
 
 def _wire_content(monkeypatch, row, *, cross=False):
