@@ -77,20 +77,30 @@ def aggregate_scores(rows) -> dict:
     That is also why Phase 0's 31 of 32 is a NEAREST-PROFILE figure and not what this rule
     confirms. Aggregation has to happen before the margin means anything.
 
-    **Max, not mean.** Max is what "nearest profile" already did implicitly, and a mean
-    would dilute a genuinely matching sample against a weak one — the enrolment that fits
-    this turn is the evidence, and averaging it with an unrelated one throws that away.
+    **Mean, not max (2026-09-20).** Max was what "nearest profile" did implicitly, and it
+    protects a person's one bad enrolment sample from dragging down every future match — but
+    it is exactly the mechanism that turned pooled multi-occasion enrolment into a liability:
+    adding a site-condition sample to a profile gives max a sample most likely to spike
+    against a stranger's turn recorded in the SAME acoustic conditions, not because the
+    person is present. Measured on 2026-09-10 (nobody in the enrolment library attended):
+    pooled max put a stranger's nearest profile top of the list at +0.054/+0.055; pooled
+    mean kept the true negatives negative. The cost mean re-introduces — one bad enrolment
+    sample now always contributes its bad score, rather than only being ignored when a
+    better sample exists — is accepted deliberately: it costs a missed confirmation
+    (`tentative`, not a wrong name), the cheaper of this design's two error directions
+    (module docstring above, "a wrong confident name costs much more than a missing one").
 
     `person_key` is supplied by the caller and must be an identity, never a display name:
     two people share a first name in this data already.
     """
-    out: dict = {}
+    sums: dict = {}
+    counts: dict = {}
     for row in rows or []:
         key = row["person_key"]
         score = float(row["score"])
-        if key not in out or score > out[key]:
-            out[key] = score
-    return out
+        sums[key] = sums.get(key, 0.0) + score
+        counts[key] = counts.get(key, 0) + 1
+    return {key: sums[key] / counts[key] for key in sums}
 
 
 def decide_name(scores, duration_s: float,

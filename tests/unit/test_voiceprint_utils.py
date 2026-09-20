@@ -143,17 +143,8 @@ def test_no_frames_at_all_is_not_a_pass():
 # ----------------------------------------------------------
 
 
-def test_two_samples_of_one_person_collapse_to_their_best():
-    rows = [
-        {"person_key": "ben", "score": 0.31},
-        {"person_key": "ben", "score": 0.43},
-        {"person_key": "zoe", "score": 0.08},
-    ]
-    assert vp.aggregate_scores(rows) == {"ben": 0.43, "zoe": 0.08}
-
-
 def test_a_person_with_two_profiles_no_longer_beats_himself():
-    """The Phase 0 case, with its measured numbers rather than invented ones.
+    """The Phase 0 case, restated with its measured numbers.
 
     Ben's own two profiles sit ~0.08 apart and the nearest other voice is far below both.
     Ungrouped they are each other's runner-up and the margin never clears 0.15."""
@@ -169,6 +160,57 @@ def test_a_person_with_two_profiles_no_longer_beats_himself():
     decision = vp.decide_name(vp.aggregate_scores(rows), duration_s=5.0)
     assert decision.status == "confirmed"
     assert decision.name == "ben"
+
+
+# ----------------------------------------------------------
+# Mean, not max (2026-09-20). A profile pooled across recording conditions (a clean
+# read-aloud sample plus a site-condition sample) spikes under max whenever one sample's
+# ACOUSTIC CONDITIONS match a stranger's turn, not because the person is present -- measured
+# on 09-10, where a pooled-MAX profile put a person who was never in the room top of the
+# list at +0.054/+0.055. Mean absorbs that spike into an average across conditions.
+# ----------------------------------------------------------
+
+
+def test_two_samples_of_one_person_collapse_to_their_mean_not_their_max():
+    rows = [
+        {"person_key": "ben", "score": 0.31},
+        {"person_key": "ben", "score": 0.43},
+        {"person_key": "zoe", "score": 0.08},
+    ]
+    assert vp.aggregate_scores(rows) == pytest.approx({"ben": 0.37, "zoe": 0.08})
+
+
+def test_a_stray_high_sample_no_longer_wins_on_its_own():
+    """The exact failure mode mean pooling exists to remove: one sample scoring high for
+    reasons that have nothing to do with the turn's speaker (matching acoustic conditions,
+    not matching voice) used to carry the whole profile under max. Under mean it is pulled
+    back toward the profile's other, more representative samples."""
+    rows = [
+        {"person_key": "ben", "score": 0.05},
+        {"person_key": "ben", "score": 0.06},
+        {"person_key": "ben", "score": 0.62},  # a site-condition spike, not a real match
+        {"person_key": "mike", "score": 0.10},
+    ]
+    scores = vp.aggregate_scores(rows)
+    assert scores["ben"] == pytest.approx((0.05 + 0.06 + 0.62) / 3)
+    assert scores["ben"] < 0.62, (
+        "max pooling would have reported 0.62 here -- the whole point of this change is "
+        "that a single spiking sample no longer speaks for the profile")
+
+
+def test_a_person_with_two_profiles_no_longer_beats_himself_under_mean():
+    """The Phase 0 case restated under mean pooling. Aggregation still has to happen before
+    the margin means anything -- mean pooling does not remove the need for `person_key`
+    grouping, it only changes what happens once rows are grouped."""
+    rows = [
+        {"person_key": "ben", "score": 0.425},
+        {"person_key": "ben", "score": 0.505},
+        {"person_key": "zoe", "score": 0.078},
+    ]
+    decision = vp.decide_name(vp.aggregate_scores(rows), duration_s=5.0)
+    assert decision.status == "confirmed"
+    assert decision.name == "ben"
+    assert decision.margin == pytest.approx((0.425 + 0.505) / 2 - 0.078)
 
 
 def test_profiles_without_a_user_do_not_collide():
