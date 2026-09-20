@@ -122,7 +122,7 @@ def writer_db(monkeypatch):
         def __exit__(self, *a):
             return False
 
-    calls = {"turns": [], "samples": [], "attempts": []}
+    calls = {"turns": [], "samples": [], "attempts": [], "floor_by_company": {}}
     monkeypatch.setattr(vw, "get_connection", lambda: Conn())
     monkeypatch.setattr(vw, "record_turn_name",
                         lambda conn, co, **kw: calls["turns"].append(kw) or {"id": "t"})
@@ -134,6 +134,13 @@ def writer_db(monkeypatch):
     monkeypatch.setattr(vw, "live_turn_names", lambda conn, co, sb: [])
     monkeypatch.setattr(vw, "rejected_names", lambda conn, co, sb: set())
     monkeypatch.setattr(vw, "profiles_for_matching", lambda conn, co, site_id=None: [])
+    # `_profiles` reads the company's calibrated floor alongside its profiles (Task 2)
+    # over the same `conn` this fixture's fake `Conn` does not serve. Defaults to the
+    # no-floor case -- nobody has run the recompute job, or the company is below the
+    # minimum sample count (spec S1.5) -- and `floor_by_company` lets a test opt a
+    # specific company into having one without building a real cursor.
+    monkeypatch.setattr(vw, "company_floor",
+                        lambda conn, co: calls["floor_by_company"].get(co))
     return calls
 
 
@@ -163,6 +170,19 @@ def test_every_payload_the_embedder_sends_is_one_the_writer_understands(
         # Raises on an unknown op, a missing key, or a shape the writer cannot read — which
         # is exactly what happened in production, twice, while every unit test was green.
         vw.lambda_handler(payload, None)
+
+
+def test_a_companys_floor_reaches_the_profiles_payload(captured, writer_db, monkeypatch):
+    """The no-floor case above proves the seam does not crash. This proves it also carries
+    a real value through: a company with a calibrated floor must see it on the same
+    `profiles` op the no-floor company sees as `None`, not just avoid raising."""
+    writer_db["floor_by_company"][CO] = 0.42
+    _run_embedder(monkeypatch, _artifact(op="match", mode="on", site_id="st-1"))
+    profiles_payloads = [p for p in captured if p.get("op") == "profiles"]
+    assert profiles_payloads, "match run sent no profiles request; this proves nothing"
+    for payload in profiles_payloads:
+        result = vw.lambda_handler(payload, None)
+        assert result["company_floor"] == 0.42
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
@@ -306,6 +326,18 @@ def test_no_field_crosses_this_seam_unread_in_either_direction():
     callers = emb + open("src/lambda_org_api.py", encoding="utf-8").read()
     # `stored` and `reason` belong to the writer's `enrol` op, which has no production
     # caller — recorded in its own docstring. Reading them would mean wiring that op.
-    for key in returned - {"stored", "reason"}:
+    #
+    # `companies`, `floors_written`, `failed` and `results` belong to `_recompute_floors`,
+    # whose only caller is an EventBridge Schedule (`FloorRecomputeFunction`'s own docstring
+    # names the shape: one sweep, on its own schedule, with no per-item fan-out). Lambda
+    # discards what an event-driven invocation returns, so there is no code path in this
+    # repo that could read them — not a gap the way `stored`/`reason` are a gap, but the
+    # same structural fact: a value with nowhere to be read is not read. `floors_written`
+    # is the one operators actually need, so it is also written to the INFO log line right
+    # beside this return (`"floor recompute: %d/%d compan%s now have a floor (%d failed)"`)
+    # — the number exists somewhere a human can see it even though the return value it also
+    # lives in is thrown away.
+    for key in returned - {"stored", "reason", "companies", "floors_written", "failed",
+                            "results"}:
         read = re.search(r'\.get\("%s"|\["%s"\]' % (key, key), callers) is not None
         assert read, f"the writer returns {key!r} and no caller reads it"

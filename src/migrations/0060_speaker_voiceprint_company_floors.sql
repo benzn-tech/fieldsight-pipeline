@@ -24,7 +24,7 @@
 -- reader, and only one of them is enforced by "SELECT ... WHERE company_id = %s
 -- returning nothing" -- a NULL floor is a value a future bug could compare against.
 CREATE TABLE IF NOT EXISTS speaker_voiceprint_company_floors (
-    company_id    uuid PRIMARY KEY,
+    company_id    uuid NOT NULL PRIMARY KEY,
     floor         double precision NOT NULL,
     sample_count  integer NOT NULL,
     computed_at   timestamptz NOT NULL DEFAULT now()
