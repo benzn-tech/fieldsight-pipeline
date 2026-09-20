@@ -85,6 +85,36 @@ def test_a_keyword_only_row_already_inside_k_is_left_alone(monkeypatch):
     assert out == chunks
 
 
+def test_keep_zero_admits_nothing(monkeypatch):
+    """Critical #3 (2026-09-20 review): `keep=0` reaches this function via
+    `k=int(body.get("k", 5))`, which has no floor. The old
+    `head[:-1] + [tail_hit]` computed `[] + [tail_hit]` at keep=0 -- one row
+    despite `keep == 0`, violating "never return more than `keep` rows".
+    There is no slot to reserve and nothing to swap into at keep=0."""
+    monkeypatch.setattr(agent, "RERANK_ENABLED", False)
+    vector_rows = [_chunk("v%d" % i, "vkey%d" % i) for i in range(3)]
+    lex_row = _lex_chunk("ps4-mention", "lexkey")
+    out = agent._rerank_chunks("PS4", vector_rows + [lex_row], 0)
+    assert out == []
+
+
+def test_keep_one_never_displaces_the_top_semantic_match(monkeypatch):
+    """Critical #2 (2026-09-20 review): the docstring claimed "a strong
+    semantic match at position 0 can never be displaced by this rule", but at
+    keep=1, head[-1] IS head[0] -- the old code swapped it out for the
+    keyword-only row anyway. `k=1` is client-reachable the same way `k=0` is.
+    Chosen behaviour: at keep=1 there is only one slot and it is also
+    position 0, so the guarantee wins -- no admission happens and the
+    semantic top match is returned unchanged. (Accepted cost: at keep=1 a
+    keyword-only hit beyond the cut is never admitted -- there is no second,
+    less valuable slot to give up instead.)"""
+    monkeypatch.setattr(agent, "RERANK_ENABLED", False)
+    v0 = _chunk("v0", "vkey0")
+    lex_row = _lex_chunk("ps4-mention", "lexkey")
+    out = agent._rerank_chunks("PS4", [v0, lex_row], 1)
+    assert out == [v0]
+
+
 def test_reservation_never_touches_more_than_one_vector_row(monkeypatch):
     """Multiple keyword-only rows beyond k: only one is admitted, capping the
     cost at exactly one displaced vector row -- a residual gap, accepted on

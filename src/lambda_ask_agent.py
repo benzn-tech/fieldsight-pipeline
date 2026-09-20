@@ -728,7 +728,8 @@ def _diversify(chunks, cap):
 def _admit_one_lexical_hit(chunks, keep):
     """Truncate to `keep`, reserving exactly one slot for the strongest
     keyword-only row (lexical_hit=True, distance=None) that arrival order
-    would otherwise cut.
+    would otherwise cut. Total over `keep`, including `keep<=0`: never
+    returns more than `keep` rows.
 
     Policy (Task 4, CONTROLLER AMENDMENT, this task's call to make and
     defend -- Task 3 deliberately appended rather than interleaved so this
@@ -747,13 +748,31 @@ def _admit_one_lexical_hit(chunks, keep):
     in an unrelated document): exactly one semantic match is displaced from
     context -- the weakest one in the window, chosen precisely because it is
     the one the answer can most afford to lose. This is bounded and it is
-    NOT a wholesale swap: a strong semantic match at position 0 can never be
-    displaced by this rule, and only one slot is ever given up, however many
+    NOT a wholesale swap: only one slot is ever given up, however many
     keyword-only rows exist beyond the cut (a real but accepted residual gap
     -- widening the reservation trades away more of the vector list for a
     case the spec's own motivating example, a single distinctive identifier,
     does not need).
+
+    Edge cases in `keep`, both client-reachable (`k=int(body.get("k", 5))`
+    has no floor) and both found false against an earlier draft of the
+    guarantee above (Task 4 review, 2026-09-20, Criticals #2 and #3):
+
+    - `keep <= 0`: there is no slot to reserve or to swap into, so nothing
+      is admitted -- return `[]`, not `head[:-1] + [tail_hit]`, which used
+      to return exactly one row (`[] + [tail_hit]`) despite `keep == 0`.
+    - `keep == 1`: `head[-1]` IS `head[0]` -- the window's only slot is also
+      its top semantic match. The "weakest row in the window" and "the
+      match at position 0" are the same row, so swapping it out to admit a
+      keyword hit would displace position 0. Rather than caveat that away,
+      this function refuses the swap at `keep == 1` and keeps the semantic
+      top match: a strong semantic match at position 0 is never displaced,
+      full stop, for every `keep` this function can be called with. The
+      accepted cost is that at `keep == 1` a keyword-only hit is never
+      admitted (there is no second slot to give up instead).
     """
+    if keep <= 0:
+        return []
     if len(chunks) <= keep:
         return chunks[:keep]
     head = chunks[:keep]
@@ -762,6 +781,8 @@ def _admit_one_lexical_hit(chunks, keep):
     tail_hit = next((c for c in chunks[keep:] if c.get("lexical_hit")), None)
     if tail_hit is None:
         return head
+    if keep == 1:
+        return head  # the only slot is position 0's match; never displaced
     return head[:-1] + [tail_hit]
 
 
@@ -883,8 +904,37 @@ def _aggregate_topics(chunks, question=""):
         dist = c.get("distance")
         dist = float(dist) if dist is not None else 1.0
         cur = groups.get(key)
+        # Lexical match is checked against the TOPIC TITLE only, NOT the raw
+        # chunk_text: the retrieved chunks are semantically near the query so
+        # their text usually contains a term anyway (and common words like
+        # "safety" appear everywhere), which would make the lexical flag true
+        # for nearly everything. The concise title is the clean signal.
+        hay = derived_title.lower()
+        # Two independent lexical signals, ORed: the title-substring check
+        # above (existing; drives the Search list's own reordering) and
+        # lexical_hit from build_search_sql's keyword arm (2026-09-20 spec),
+        # which found a literal match in chunk_text that never reached the
+        # title. A row the SQL keyword arm found has no real cosine distance
+        # (it was never scored against the query embedding, hence the `1.0`
+        # placeholder just above) -- it MUST be admitted here via `lexical`,
+        # or _NO_LEX_MAX_DIST drops it one hop downstream of the SQL fix,
+        # reproducing the original bug with extra steps.
+        row_lexical = bool(c.get("lexical_hit")) or any(t in hay for t in terms)
+        # A topic long enough to be chunked more than once has multiple rows
+        # sharing this key, and only the best-distance row survives as the
+        # group's representative below. A keyword-only row (distance=None ->
+        # 1.0) almost never wins that comparison against any vector row for
+        # the SAME topic, so if `lexical` were read off the winning row alone,
+        # the keyword signal a sibling chunk found would be silently thrown
+        # away -- reproducing this task's own motivating bug one layer up
+        # (Critical #1, 2026-09-20 review). The fix: `lexical` is the OR of
+        # every row seen for this key, tracked independently of which row
+        # wins on distance/snippet/route below.
         if cur is not None and dist >= cur["score"]:
+            if row_lexical:
+                cur["lexical"] = True
             continue
+        prior_lexical = cur["lexical"] if cur is not None else False
         folder = _folder_from_source(c.get("source_s3_key"))
         title = derived_title
         route = "/timeline?date=" + _q(date)
@@ -903,21 +953,6 @@ def _aggregate_topics(chunks, question=""):
         _slug = c.get("site_slug")
         if _slug:
             route += "&site=" + _q(str(_slug))
-        # Lexical match is checked against the TOPIC TITLE only, NOT the raw
-        # chunk_text: the retrieved chunks are semantically near the query so
-        # their text usually contains a term anyway (and common words like
-        # "safety" appear everywhere), which would make the lexical flag true
-        # for nearly everything. The concise title is the clean signal.
-        hay = derived_title.lower()
-        # Two independent lexical signals, ORed: the title-substring check
-        # above (existing; drives the Search list's own reordering) and
-        # lexical_hit from build_search_sql's keyword arm (2026-09-20 spec),
-        # which found a literal match in chunk_text that never reached the
-        # title. A row the SQL keyword arm found has no real cosine distance
-        # (it was never scored against the query embedding, hence the `1.0`
-        # placeholder just above) -- it MUST be admitted here via `lexical`,
-        # or _NO_LEX_MAX_DIST drops it one hop downstream of the SQL fix,
-        # reproducing the original bug with extra steps.
         groups[key] = {
             "report_date": date,
             "site_name": c.get("site_name"),
@@ -927,7 +962,7 @@ def _aggregate_topics(chunks, question=""):
             "chunk_type": c.get("chunk_type"),
             "route": route,
             "score": dist,
-            "lexical": bool(c.get("lexical_hit")) or any(t in hay for t in terms),
+            "lexical": row_lexical or prior_lexical,
         }
     rows = list(groups.values())
     # threshold: drop non-lexical topics whose semantic distance is poor, so a
@@ -1627,7 +1662,24 @@ def _rag_answer(body):
                 any(t in _derived_title(c).lower() for t in _terms)
                 for c in chunks
             )
-
+            # KNOWN GAP (Task 4 review, 2026-09-20, Important #4 -- left
+            # unresolved on purpose this round): this is a THIRD consumer of
+            # "is this lexical", after _aggregate_topics' `lexical` field and
+            # _admit_one_lexical_hit's `lexical_hit` check, and it only ever
+            # looks at the derived title -- never at `lexical_hit` (the
+            # keyword arm's chunk_text match from build_search_sql). A chunk
+            # that matched the literal token only in its text, not its title,
+            # is invisible to `_lexical` here even though the other two
+            # consumers would treat it as lexical. Widening this to also OR
+            # in `c.get("lexical_hit")` would make `_lexical` True in more
+            # cases, which flips `_skip` toward False more often, which means
+            # MORE web-search verdict calls (cost), not fewer. Left alone
+            # deliberately: nobody's scope named this consumer, and changing
+            # it changes when we pay for a web lookup, which the spec and
+            # plan never analysed. See this task's final report for the full
+            # tri-state (_skip True/False) writeup for the controller to rule
+            # on.
+            #
             # Absent is not far: _aggregate_topics defaults a missing distance
             # to 1.0, which is right for ranking and would silently route
             # every chunk to the web here.

@@ -247,6 +247,35 @@ def test_lexical_hit_true_but_title_has_no_term_is_still_lexical(monkeypatch):
     assert out["results"][0]["lexical"] is True
 
 
+def test_a_lexical_only_row_survives_a_multi_chunk_topic(monkeypatch):
+    """Critical #1 (2026-09-20 review): a topic long enough to be chunked more
+    than once is the normal case, not an edge case -- both prior tests in
+    this file (test_a_keyword_only_row_with_no_distance_survives_the_gate,
+    test_lexical_hit_true_but_title_has_no_term_is_still_lexical) use exactly
+    one chunk per topic, so neither caught this. `_aggregate_topics` groups
+    by (date, site_id, topic_id) and keeps only the best-distance ROW per
+    key; if `lexical` were read off that winning row alone, a second chunk
+    of the SAME topic that only the SQL keyword arm matched (distance=None,
+    lexical_hit=True) would lose the distance comparison to any vector row
+    (None -> 1.0 always loses) and its lexical signal would be discarded
+    with it -- reproducing this plan's own motivating bug one layer up.
+    Neither chunk's title contains the query term, so the pre-existing
+    title-substring check cannot accidentally save this."""
+    vector_row = chunk("t-1", "2026-09-03", 0.8, "Electrical hold-up",
+                        text="unrelated site notes")
+    lex_row = chunk("t-1", "2026-09-03", None, "Electrical hold-up",
+                     text="Provide PS4 for light poles")
+    lex_row["distance"] = None       # placeholder from the lex CTE, not 1.0
+    lex_row["lexical_hit"] = True    # SQL matched chunk_text, not the title
+    wire(monkeypatch, [vector_row, lex_row])
+    out = run(ev(question="PS4"))
+    assert out["count"] == 1, \
+        "the lexical signal from a losing row in the same topic group must not be dropped"
+    r = out["results"][0]
+    assert r["lexical"] is True
+    assert r["score"] == 0.8   # the winning row's distance is still the group's score
+
+
 def test_search_mode_forwards_site_to_rag_search(monkeypatch):
     fc = wire(monkeypatch, [])
     run(ev(site="s-abc"))
