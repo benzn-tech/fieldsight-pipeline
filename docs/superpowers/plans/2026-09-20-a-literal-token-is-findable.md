@@ -558,8 +558,18 @@ path never touches `_aggregate_topics`, and it is the one that feeds the model:
 
 `_rag_answer` -> `_rerank_chunks(question, chunks, k)` (`:1470`), whose first line (`:735`) is
 `if not RERANK_ENABLED or len(chunks) <= keep: return chunks[:keep]`. `RERANK_ENABLED` reads
-`ENABLE_RERANK`, which appears nowhere in `template.yaml` or anywhere else in `src/` — an unwired
-toggle, false in every environment. So `_rerank_chunks` never re-ranks; it truncates in arrival order.
+`ENABLE_RERANK`. That toggle IS fully wired — `src/template.yaml:434` declares the `EnableRerank`
+parameter, `:1923` passes it into the function, and both deploy workflows supply it from a repo
+variable (`.github/workflows/deploy-prod.yml:298`, `deploy.yml:281`) defaulting to `'false'`. What
+makes it false today is that NO `PROD_ENABLE_RERANK` / `TEST_ENABLE_RERANK` repo variable is set
+(`gh variable list` shows none), so both environments take the default. So `_rerank_chunks` does not
+re-rank today; it truncates in arrival order.
+
+(Controller correction, 2026-09-21: an earlier version of this paragraph said the toggle was unwired
+and that the env var existed nowhere. That was wrong — it came from grepping `template.yaml`, a path
+that does not exist, instead of `src/template.yaml`; grep returns nothing for a missing path and the
+empty result was read as absence. The conclusion below is unchanged, because the value really is
+`false` in both environments, but for a different reason than first written.)
 
 After Task 3's fix the outer `ORDER BY lexical_hit ASC, distance ASC NULLS LAST` puts all vector rows
 first, so `chunks[:k]` keeps exactly the k rows Ask received before this plan — no regression — and

@@ -60,10 +60,15 @@ def build_search_sql() -> str:
     #     (lexical-first, then distance) itself, so row order arriving from
     #     here was never load-bearing for it;
     #   - Ask (_rag_answer -> _rerank_chunks, lambda_ask_agent.py) does NOT
-    #     re-sort. ENABLE_RERANK is unwired (no such env var exists anywhere
-    #     in template.yaml or src/), so RERANK_ENABLED is false in every
-    #     environment and _rerank_chunks's first line returns chunks[:keep]
-    #     in the order it received them. Before this branch, that order was
+    #     re-sort while reranking is off, and it is off. ENABLE_RERANK IS
+    #     wired (src/template.yaml:434 declares the EnableRerank parameter,
+    #     :1923 passes it through, and both deploy workflows set it from a
+    #     repo variable defaulting to 'false'), but no PROD_ENABLE_RERANK or
+    #     TEST_ENABLE_RERANK variable is set, so it resolves to 'false' in
+    #     both environments and _rerank_chunks's first line returns
+    #     chunks[:keep] in the order it received them. If reranking is ever
+    #     turned on, _rerank_chunks reorders explicitly and stops depending
+    #     on arrival order -- the ordering below is correct either way. Before this branch, that order was
     #     the vec CTE's cosine order, because there was only one arm. Now
     #     that DISTINCT ON forces an ORDER BY id first, the dedup subquery's
     #     row order is by UUID -- arrival order at the caller becomes
@@ -104,6 +109,12 @@ def build_search_sql() -> str:
         "  LEFT JOIN sites s ON s.id = c.site_id "
         "  WHERE " + scope + " "
         "  AND to_tsvector('english', c.chunk_text) @@ websearch_to_tsquery('english', %(q_text)s) "
+        # NOTE: this LIMIT has no ORDER BY, so when a term matches more than k
+        # rows Postgres returns a plan-dependent subset, not the top k by
+        # ts_rank. Acceptable for the case this arm exists to serve -- a rare
+        # identifier matching more than k chunks is not the failure being fixed
+        # -- and left undecided here on purpose: ranking policy for the keyword
+        # arm belongs to Task 4, which is where a ts_rank order would go.
         "  LIMIT %(k)s"
         ") "
         "SELECT id, chunk_text, chunk_type, topic_id, source_s3_key, "
