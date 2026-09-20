@@ -345,8 +345,20 @@ def test_fetching_profiles_is_company_scoped(monkeypatch):
     monkeypatch.setattr(vw, "profiles_for_matching",
                         lambda conn, company_id, site_id=None:
                         seen.update({"co": company_id}) or [])
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
     vw.lambda_handler({"op": "profiles", "company_id": CO}, None)
     assert seen["co"] == CO, "one company's voice would be matched against another's"
+
+
+def test_fetching_profiles_hands_the_companys_floor_to_the_embedder(monkeypatch):
+    """A calibrated floor sits in speaker_voiceprint_company_floors doing nothing unless
+    it travels with the vectors to the non-VPC embedder, which cannot read it itself."""
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None: [])
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: 0.42)
+    out = vw.lambda_handler({"op": "profiles", "company_id": CO}, None)
+    assert out["company_floor"] == 0.42
 
 
 # ---- a declined write is not a write --------------------------------------

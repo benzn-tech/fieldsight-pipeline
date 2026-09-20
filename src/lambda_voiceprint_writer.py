@@ -46,9 +46,11 @@ import logging
 
 from db.connection import get_connection
 from repositories import speaker_label_groups
+from repositories.companies import list_companies
 from repositories.voiceprints import (EnrolmentBelongsToSomebodyElse, add_sample,
-                                      live_turn_names, profiles_for_matching,
-                                      record_attempt, record_turn_name,
+                                      company_floor, live_turn_names,
+                                      profiles_for_matching, record_attempt,
+                                      record_turn_name, recompute_company_floor,
                                       rejected_names)
 from turn_name_overlay import _SOURCE_RANK
 
@@ -296,10 +298,15 @@ def _profiles(event):
     company_id = _require(event, "company_id")
     with get_connection() as conn:
         rows = profiles_for_matching(conn, company_id, site_id=event.get("site_id"))
+        # Read once per invocation, not once per turn: the floor is derived/materialized
+        # state (recomputed on a schedule, spec S1.3) and must not move mid-decision
+        # because one turn happened to land during a recompute.
+        floor = company_floor(conn, company_id)
     return {"profiles": [{"person_key": str(r["id"]),
                           "display_name": r["display_name"],
                           "status": r["status"],
-                          "embedding": r["embedding"]} for r in rows]}
+                          "embedding": r["embedding"]} for r in rows],
+            "company_floor": floor}
 
 
 def _match_names(event):
