@@ -402,6 +402,39 @@ def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, windo
     One row per event rather than an averaged vector per person: §6's withdrawal needs each
     contribution individually removable, and an average cannot be un-poisoned.
 
+    **Multi-occasion enrolment (2026-09-20 spec §3) is this function, called more than
+    once, from more than one recording session.** A profile built from a single recording
+    condition carries that condition's channel and room characteristics baked into the
+    vector — the cross-session measurement found enrolments from one session do not
+    recognise the same speaker in a different session's audio. There is no separate API:
+    a clean read-aloud sample and a site-condition sample are both just calls to this
+    function, distinguished only by `s3_key`/`window` pointing at different recordings and
+    by `source` (both are `'correction'` when a human vouched for the window, whatever
+    recording it came from).
+
+    A site-condition sample cannot be manufactured; the practical source is a turn already
+    `confirmed` for this profile under `decide_name`, with high margin and duration well
+    over `DEFAULT_MIN_TURN_S`, offered back to this function as an ordinary enrolment. This
+    is consent-compatible only when the underlying recording already carries consent for
+    voiceprint use from that person — this function's own agreement guard and
+    `upsert_profile`'s consent preconditions are not relaxed for this path.
+
+    The homogeneity guard (`window_is_homogeneous`, called by the embedder before this
+    function ever sees a window) is not loosened to admit a noisy-but-real target-
+    environment chunk — it cannot tell "more background noise than its neighbours" from
+    "two voices", and both look like a wider spread. The correct practice, not a code
+    change: enrol from the chunks of a target-environment recording that pass the guard,
+    and accept losing the ones that do not. A multi-occasion profile needs one homogeneous
+    window from the new condition, not every chunk of it.
+
+    NOTE: multi-occasion enrolment as a widespread practice is a HYPOTHESIS from the spec,
+    not a result measured in this codebase. What IS measured (Phase 0, cross-session): same-
+    person cosine similarity across sessions landed in the 0.12-0.45 range, overlapping the
+    different-person range — which is why voiceprint identification is currently OFF in
+    prod, and why mean pooling, the calibrated floor, and margin scaling (Tasks 1-3) had to
+    land first. Whether pooling several single-condition samples across occasions actually
+    closes that gap is expected, not demonstrated, and nothing here claims otherwise.
+
     `admitted_max_spread` is the homogeneity limit this window got past, and it is stored
     only when it was NOT the compiled-in default. NULL therefore means "the ordinary guard",
     and the non-NULL rows are exactly the ones worth re-examining if the loosened limit turns
