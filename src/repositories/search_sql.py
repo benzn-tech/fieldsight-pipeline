@@ -50,13 +50,34 @@ def build_search_sql() -> str:
     # lambda_ask_agent.py) must admit a lexical_hit=True row past its distance
     # gate rather than dropping it one hop downstream of this fix.
     #
-    # DISTINCT ON (id): a row found by BOTH arms is one row. ORDER BY id,
-    # lexical_hit ASC keeps that row's vector-arm copy (lexical_hit=false,
-    # with a real distance) over the keyword copy's NULL when both exist. The
-    # outer query has no further ORDER BY guaranteeing final rank beyond the
-    # dedup -- _aggregate_topics already does the caller-visible ranking
-    # (lexical-first, then distance); this SQL's job ends at which rows
-    # survive.
+    # DISTINCT ON (id): a row found by BOTH arms is one row. Its own
+    # ORDER BY id, lexical_hit ASC, distance ASC NULLS LAST keeps that row's
+    # vector-arm copy (lexical_hit=false, with a real distance) over the
+    # keyword copy's NULL when both exist -- unchanged tiebreak.
+    #
+    # This SQL has TWO consumers, not one, and they need different things:
+    #   - the search box goes through _aggregate_topics, which re-sorts by
+    #     (lexical-first, then distance) itself, so row order arriving from
+    #     here was never load-bearing for it;
+    #   - Ask (_rag_answer -> _rerank_chunks, lambda_ask_agent.py) does NOT
+    #     re-sort. ENABLE_RERANK is unwired (no such env var exists anywhere
+    #     in template.yaml or src/), so RERANK_ENABLED is false in every
+    #     environment and _rerank_chunks's first line returns chunks[:keep]
+    #     in the order it received them. Before this branch, that order was
+    #     the vec CTE's cosine order, because there was only one arm. Now
+    #     that DISTINCT ON forces an ORDER BY id first, the dedup subquery's
+    #     row order is by UUID -- arrival order at the caller becomes
+    #     effectively random with respect to relevance -- unless something
+    #     outside the DISTINCT ON re-imposes it.
+    #
+    # So the outer SELECT re-sorts the deduped rows by lexical_hit ASC,
+    # distance ASC NULLS LAST. Since lexical_hit=false sorts before true and
+    # the vec CTE is unchanged, this reproduces the pre-this-branch vec-only
+    # order EXACTLY for the vector rows, then appends keyword-only rows
+    # after all of them (never interleaved). It does not decide how a
+    # keyword-only row should rank against a semantic one -- that ranking
+    # policy is deliberately left to the caller (Task 4's job), not smuggled
+    # in here.
     scope = _scope_predicate("c")
     return (
         "WITH vec AS ("
@@ -85,11 +106,17 @@ def build_search_sql() -> str:
         "  AND to_tsvector('english', c.chunk_text) @@ websearch_to_tsquery('english', %(q_text)s) "
         "  LIMIT %(k)s"
         ") "
-        "SELECT DISTINCT ON (id) id, chunk_text, chunk_type, topic_id, source_s3_key, "
+        "SELECT id, chunk_text, chunk_type, topic_id, source_s3_key, "
         "       metadata, report_date, site_id, site_name, site_slug, "
         "       topic_title, topic_summary, distance, lexical_hit "
-        "FROM (SELECT * FROM vec UNION ALL SELECT * FROM lex) u "
-        "ORDER BY id, lexical_hit ASC, distance ASC NULLS LAST "
+        "FROM ("
+        "  SELECT DISTINCT ON (id) id, chunk_text, chunk_type, topic_id, source_s3_key, "
+        "         metadata, report_date, site_id, site_name, site_slug, "
+        "         topic_title, topic_summary, distance, lexical_hit "
+        "  FROM (SELECT * FROM vec UNION ALL SELECT * FROM lex) u "
+        "  ORDER BY id, lexical_hit ASC, distance ASC NULLS LAST"
+        ") deduped "
+        "ORDER BY lexical_hit ASC, distance ASC NULLS LAST "
         "LIMIT %(k)s * 2"
     )
 

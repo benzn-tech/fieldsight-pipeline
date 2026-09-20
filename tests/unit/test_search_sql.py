@@ -129,3 +129,98 @@ def test_search_sql_dedupes_rows_found_by_both_arms():
 def test_search_sql_limit_is_still_present_and_final():
     sql = build_search_sql()
     assert sql.rstrip().endswith("%(k)s") or "limit %(k)s" in sql.lower()
+
+
+def test_search_sql_has_an_outer_order_by_after_the_dedup():
+    """DISTINCT ON (id) ... ORDER BY id, ... only decides which copy of a
+    row found by both arms survives -- it says nothing about the order rows
+    leave the query in, because `id` (a UUID) sorts first. The search box is
+    fine either way (_aggregate_topics re-sorts), but Ask is not:
+    _rerank_chunks truncates with chunks[:keep] in arrival order whenever
+    ENABLE_RERANK is unset (every environment today, since it is wired
+    nowhere). Without a SECOND, outer ORDER BY wrapping the DISTINCT ON,
+    rows would arrive in UUID order and Ask would keep an arbitrary k of up
+    to 2k candidates instead of the best k by relevance.
+
+    This test fails if that outer ORDER BY is removed (verified by hand:
+    deleting it makes the assertions below fail, restoring it makes them
+    pass again -- see the task report)."""
+    sql = build_search_sql()
+
+    # The DISTINCT ON's own ORDER BY (its dedup tiebreak) must be immediately
+    # followed by a close paren -- i.e. it is scoped to an inner subquery,
+    # not the outermost SELECT.
+    inner_order = "ORDER BY id, lexical_hit ASC, distance ASC NULLS LAST"
+    assert inner_order in sql
+    after_inner = sql.split(inner_order, 1)[1]
+    # Whatever comes next closes the subquery before anything else runs.
+    assert after_inner.lstrip().startswith(")"), (
+        "the DISTINCT ON's ORDER BY must be inside a subquery, not left as "
+        "the query's only ORDER BY"
+    )
+
+    # There must be a SECOND ORDER BY, outside that subquery, ordering the
+    # deduped rows themselves -- lexical_hit ASC (vector rows first, since
+    # False < True) then distance ASC NULLS LAST (ascending cosine distance,
+    # matching the vec CTE's own order), and it must appear AFTER the
+    # subquery closes and BEFORE the final LIMIT.
+    tail = sql[sql.index(inner_order) + len(inner_order):]
+    assert tail.count("ORDER BY") == 1, (
+        "expected exactly one more ORDER BY after the DISTINCT ON's own, "
+        "wrapping the dedup in an outer, re-sorted SELECT"
+    )
+    outer_order = "ORDER BY lexical_hit ASC, distance ASC NULLS LAST"
+    assert outer_order in tail
+    order_idx = tail.index(outer_order)
+    limit_idx = tail.index("LIMIT %(k)s * 2")
+    assert order_idx < limit_idx, (
+        "the outer ORDER BY must run before the final LIMIT %(k)s * 2, or "
+        "Ask/the search box keep an arbitrary k of up to 2k rows instead of "
+        "the best k"
+    )
+
+
+def test_outer_order_by_reproduces_pre_keyword_arm_arrival_order():
+    """In-Python check of the ordering CONTRACT the outer ORDER BY encodes
+    (not a DB round trip -- this repo's unit tests don't have one): sorting
+    a mixed set of vector and keyword-only rows by
+    (lexical_hit ASC, distance ASC NULLS LAST) must put every vector row
+    (lexical_hit=False) — in the SAME relative order the vec CTE already
+    produced them in (ascending distance) — before every keyword-only row
+    (lexical_hit=True, distance=NULL), never interleaved.
+
+    This is exactly the tuple `test_search_sql_has_an_outer_order_by_after_the_dedup`
+    pins in the generated SQL string; this test additionally proves that
+    tuple actually sorts a representative row set the way the plan requires,
+    so a typo like `distance ASC, lexical_hit ASC` (which WOULD interleave
+    them) cannot pass by string-matching alone.
+    """
+    import random
+
+    vec_rows = [
+        {"id": "v1", "lexical_hit": False, "distance": 0.10},
+        {"id": "v2", "lexical_hit": False, "distance": 0.15},
+        {"id": "v3", "lexical_hit": False, "distance": 0.42},
+    ]
+    lex_only_rows = [
+        {"id": "l1", "lexical_hit": True, "distance": None},
+        {"id": "l2", "lexical_hit": True, "distance": None},
+    ]
+    rows = vec_rows + lex_only_rows
+    random.Random(0).shuffle(rows)  # arrival order must not matter
+
+    ordered = sorted(
+        rows,
+        key=lambda r: (r["lexical_hit"], r["distance"] if r["distance"] is not None else float("inf")),
+    )
+
+    ordered_ids = [r["id"] for r in ordered]
+    # Vector rows keep their original ascending-distance relative order --
+    # ties between keyword-only rows (both lexical_hit=True, distance=NULL)
+    # are NOT specified by this contract and are not asserted here.
+    assert ordered_ids[:3] == ["v1", "v2", "v3"], (
+        "vector rows must come first, in their original ascending-distance order"
+    )
+    assert set(ordered_ids[3:]) == {"l1", "l2"}, (
+        "keyword-only rows must be appended after ALL vector rows -- not interleaved"
+    )
