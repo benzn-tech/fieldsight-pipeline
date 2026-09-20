@@ -322,14 +322,29 @@ def test_the_live_overlay_excludes_superseded_rows():
 def test_recompute_reads_only_source_correction_scores():
     """The circularity guard. A voiceprint_match row, a correction_propagation row and a
     label_inheritance row must all be invisible to the query that builds the floor -- only
-    a human-asserted correction may set the bar a machine guess is later held to."""
+    a human-asserted correction may set the bar a machine guess is later held to.
+
+    `recompute_company_floor` issues TWO statements: calls[0] is the `count(*)` gate that
+    decides whether to write anything at all; calls[1] is the `SELECT score` whose ROWS
+    actually become the percentile -- the one that is the real calibration set. Checking
+    only calls[0] would let calls[1] drift (e.g. "optimised" to also pull propagated
+    names) while this test stayed green, because the two clauses happen to be identical
+    today. So both are asserted, with calls[1] -- the score query -- checked explicitly
+    rather than only incidentally, so nobody has to infer this was deliberate from the
+    count query passing alone."""
     conn = FakeConn([[{"n": 1}], [{"score": 0.30}]])
     voiceprints.recompute_company_floor(conn, CO, min_samples=1)
-    read_sql = conn.calls[0]["sql"]
-    assert "source = 'correction'" in read_sql
-    assert "voiceprint_match" not in read_sql
-    assert "correction_propagation" not in read_sql
-    assert "label_inheritance" not in read_sql
+    count_sql = conn.calls[0]["sql"]
+    score_sql = conn.calls[1]["sql"]
+    assert "source = 'correction'" in count_sql
+    assert "source = 'correction'" in score_sql, (
+        "the SCORE query -- the one whose rows become the floor -- must itself exclude "
+        "everything but human corrections; the count query alone proves nothing about "
+        "what the floor is actually built from")
+    for sql in (count_sql, score_sql):
+        assert "voiceprint_match" not in sql
+        assert "correction_propagation" not in sql
+        assert "label_inheritance" not in sql
 
 
 def test_a_voiceprint_match_row_cannot_enter_the_calibration_set():
