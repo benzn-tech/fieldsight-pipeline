@@ -902,7 +902,7 @@ def _rag_search_list(body):
 
     try:
         query_vec = dashscope_utils.embed([question])[0]
-        payload = {"sub": caller_sub, "query_embedding": query_vec, "k": k}
+        payload = {"sub": caller_sub, "query_embedding": query_vec, "question": question, "k": k}
         if date_from:
             payload["date_from"] = date_from
         if date_to:
@@ -1410,7 +1410,10 @@ def _rag_answer(body):
         # could not run on the path it was built for, and every test stayed green
         # because they all drove the helper instead of the route.
         fetch_k = RERANK_CANDIDATES if RERANK_ENABLED else k
-        payload = {"sub": caller_sub, "query_embedding": query_vec, "k": fetch_k}
+        # "asked", not "question": the keyword arm must search on the SAME
+        # text that was embedded into query_vec above (the rewrite, when one
+        # happened), or the two arms would be answering different questions.
+        payload = {"sub": caller_sub, "query_embedding": query_vec, "question": asked, "k": fetch_k}
         if date_from or date_to:
             # Added ONLY when a range was actually chosen (the question's, a
             # picked day, or none for a pinned topic). rag-search ignores

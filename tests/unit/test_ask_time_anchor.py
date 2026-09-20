@@ -111,13 +111,16 @@ def test_the_zone_is_the_callers_not_the_servers(monkeypatch):
     {"question": "昨天发生了什么", "tz": "Mars/Olympus"},             # unusable zone
 ])
 def test_without_a_resolvable_range_the_payload_is_byte_identical(monkeypatch, body):
-    """No range means no keys -- not null keys. Every existing caller, the voice
-    one included, must see the payload it has always seen."""
+    """No range means no NEW keys -- not null keys. Every existing caller, the
+    voice one included, must see the payload it has always seen for date/scope
+    keys. "question" joined the always-present base set in Task 3 (2026-09-20
+    plan): the keyword search arm needs the caller's raw text on every call,
+    not only when a date range was resolved."""
     client, _ = wire(monkeypatch, [{"chunks": [CHUNK]}])
 
     ask(now=NOW, **body)
 
-    assert set(client.calls[0]) == {"sub", "query_embedding", "k"}
+    assert set(client.calls[0]) == {"sub", "query_embedding", "question", "k"}
 
 
 def test_a_narrowed_search_asks_rag_search_to_widen_when_it_finds_nothing(monkeypatch):

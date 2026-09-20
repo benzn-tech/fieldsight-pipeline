@@ -29,19 +29,68 @@ def build_search_sql() -> str:
     # report_date/site_id/site_name. Optional inclusive report_date range
     # (both NULL => no date filtering, so the Ask path stays byte-identical
     # when it passes no dates).
+    #
+    # TWO arms, unioned before the final LIMIT (2026-09-20 spec: "a literal
+    # token is findable"). A rare identifier like "PS4" or an RFI number
+    # carries almost no embedding signal and systematically loses the top-k
+    # cosine race against topically-similar prose -- the chunk that contains
+    # the exact string a user typed can lose to forty unrelated chunks. The
+    # keyword arm runs to_tsvector('english', c.chunk_text) @@
+    # websearch_to_tsquery on the SAME scope predicate as the vector arm
+    # (never a looser one -- see _scope_predicate's own docstring on why that
+    # would resurrect a closed deleted-recording leak). The expression here
+    # MUST match idx_report_chunks_tsv's definition (0059 migration) character
+    # for character or Postgres silently falls back to a sequential scan --
+    # test_keyword_arm_expression_matches_the_index_exactly pins this.
+    #
+    # The keyword arm's rows carry NO meaningful cosine distance (never scored
+    # against the query embedding) -- NULL, not a fabricated "good" number, so
+    # a keyword hit cannot silently outrank a true semantic top-1. lexical_hit
+    # distinguishes the two arms; downstream ranking (_aggregate_topics in
+    # lambda_ask_agent.py) must admit a lexical_hit=True row past its distance
+    # gate rather than dropping it one hop downstream of this fix.
+    #
+    # DISTINCT ON (id): a row found by BOTH arms is one row. ORDER BY id,
+    # lexical_hit ASC keeps that row's vector-arm copy (lexical_hit=false,
+    # with a real distance) over the keyword copy's NULL when both exist. The
+    # outer query has no further ORDER BY guaranteeing final rank beyond the
+    # dedup -- _aggregate_topics already does the caller-visible ranking
+    # (lexical-first, then distance); this SQL's job ends at which rows
+    # survive.
     scope = _scope_predicate("c")
     return (
-        "SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_key, "
-        "       c.metadata, c.report_date, c.site_id, s.name AS site_name, "
-        "       s.slug AS site_slug, "
-        "       t.title AS topic_title, t.summary AS topic_summary, "
-        "       c.embedding <=> %(q)s::vector AS distance "
-        "FROM report_chunks c "
-        "LEFT JOIN topics t ON t.id = c.topic_id "
-        "LEFT JOIN sites s ON s.id = c.site_id "
-        "WHERE " + scope + " "
-        "ORDER BY c.embedding <=> %(q)s::vector "
-        "LIMIT %(k)s"
+        "WITH vec AS ("
+        "  SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_key, "
+        "         c.metadata, c.report_date, c.site_id, s.name AS site_name, "
+        "         s.slug AS site_slug, "
+        "         t.title AS topic_title, t.summary AS topic_summary, "
+        "         c.embedding <=> %(q)s::vector AS distance, false AS lexical_hit "
+        "  FROM report_chunks c "
+        "  LEFT JOIN topics t ON t.id = c.topic_id "
+        "  LEFT JOIN sites s ON s.id = c.site_id "
+        "  WHERE " + scope + " "
+        "  ORDER BY c.embedding <=> %(q)s::vector "
+        "  LIMIT %(k)s"
+        "), "
+        "lex AS ("
+        "  SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_key, "
+        "         c.metadata, c.report_date, c.site_id, s.name AS site_name, "
+        "         s.slug AS site_slug, "
+        "         t.title AS topic_title, t.summary AS topic_summary, "
+        "         NULL::float8 AS distance, true AS lexical_hit "
+        "  FROM report_chunks c "
+        "  LEFT JOIN topics t ON t.id = c.topic_id "
+        "  LEFT JOIN sites s ON s.id = c.site_id "
+        "  WHERE " + scope + " "
+        "  AND to_tsvector('english', c.chunk_text) @@ websearch_to_tsquery('english', %(q_text)s) "
+        "  LIMIT %(k)s"
+        ") "
+        "SELECT DISTINCT ON (id) id, chunk_text, chunk_type, topic_id, source_s3_key, "
+        "       metadata, report_date, site_id, site_name, site_slug, "
+        "       topic_title, topic_summary, distance, lexical_hit "
+        "FROM (SELECT * FROM vec UNION ALL SELECT * FROM lex) u "
+        "ORDER BY id, lexical_hit ASC, distance ASC NULLS LAST "
+        "LIMIT %(k)s * 2"
     )
 
 

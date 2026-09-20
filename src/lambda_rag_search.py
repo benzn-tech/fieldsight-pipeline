@@ -14,7 +14,9 @@ It runs in-VPC with no NAT / no internet egress (BUG-36) — it only accepts
 an already-computed query_embedding and searches Aurora/pgvector with it.
 
 Event:  {"sub": "<cognito sub>", "query_embedding": [1024 floats], "k": 8,
-         optional "date_from"/"date_to", "widen_when_empty", "site",
+         optional "question" (raw text for the keyword arm, Task 3 of the
+         2026-09-20 "a literal token is findable" plan -- defaults to "" and
+         matches nothing), "date_from"/"date_to", "widen_when_empty", "site",
          "author" (folder name), "topic_row_id"}
 Result: {"chunks": [...], "site_count": N, "basis": {...}, "applied": {...},
          "pinned_topic": {...} only when topic_row_id was visible}
@@ -223,6 +225,12 @@ def _search(event, context):
         k = 8
     k = max(1, min(k, 32))
     qv = event.get("query_embedding")
+    # The keyword arm (Task 3, 2026-09-20 spec) needs the caller's raw text,
+    # not just its embedding. ask-agent sends the question (or its rewrite,
+    # "asked") alongside query_embedding; absent it defaults to "" and the
+    # keyword arm's websearch_to_tsquery('english', '') matches nothing --
+    # never everything.
+    query_text = event.get("question") or ""
     date_from = event.get("date_from") or None
     date_to = event.get("date_to") or None
     site_filter = event.get("site") or None  # scope search to ONE project (within ACL)
@@ -342,7 +350,7 @@ def _search(event, context):
         return {"chunks": [], "site_count": 0, "basis": basis, "applied": applied}
 
     rows = chunks.search_chunks(conn, qv, site_ids, k=k, author_ids=author_ids,
-                                date_from=date_from, date_to=date_to)
+                                date_from=date_from, date_to=date_to, query_text=query_text)
 
     # "Nothing yesterday" must not become an empty answer. Retry on the nearest
     # day this caller can actually see, at or BEFORE the range they asked
@@ -362,7 +370,8 @@ def _search(event, context):
         if latest:
             widened_rows = chunks.search_chunks(conn, qv, site_ids, k=k,
                                                 author_ids=author_ids,
-                                                date_from=latest, date_to=latest)
+                                                date_from=latest, date_to=latest,
+                                                query_text=query_text)
             # Claimed ONLY if the retry actually returned something. Setting it
             # unconditionally reports "based on 2026-07-18" over zero excerpts --
             # a statement about a day nothing was read from. It cannot happen

@@ -264,7 +264,10 @@ def test_body_date_alone_narrows_and_never_widens(monkeypatch):
 def test_nothing_requested_keeps_the_payload_byte_identical(monkeypatch):
     client, _ = wire(monkeypatch)
     out = ask(question="concrete issues")
-    assert set(client.calls[0]) == {"sub", "query_embedding", "k"}
+    # "question" joined the always-present base set in Task 3 (2026-09-20
+    # plan): the keyword search arm needs the caller's raw text on every
+    # call, not only when a scope key was resolved.
+    assert set(client.calls[0]) == {"sub", "query_embedding", "question", "k"}
     assert out["applied_scope"] == {"dropped": []}
 
 
