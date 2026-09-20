@@ -1597,7 +1597,19 @@ def _rag_answer(body):
                 "asked": asked if rewritten else None,
             }
 
-        prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
+        # Spec 2026-09-20 (amends the 2026-09-17 SS2 comment above): the
+        # answering prompt must see what retrieval actually searched for. A
+        # rewrite that resolved "it" to "PS4" for the embed at :1400 and the
+        # web verdict at :1590 must resolve it here too, or the model has no
+        # antecedent for the pronoun the rewrite already solved -- measured
+        # UCPK2 2026-09-20, turn 2 of 3: "why do we talk it? who requested?"
+        # retrieved the right chunks and then answered "the excerpts do not
+        # contain enough context to identify what 'it' refers to." `question`
+        # only when `rewritten` is False (SS3.1): byte-identical to today for
+        # every first-turn question. Still no `history` parameter here --
+        # that boundary (spec 2026-09-17 SS2) is unchanged.
+        prompt = build_rag_prompt(asked if rewritten else question, chunks,
+                                  mode=body.get("mode"),
                                   today=today, basis=basis, pinned_topic=pinned_topic)
         # A spoken answer and a screen answer are the same question asked of two
         # different products, so they may reach two different models. Measured
