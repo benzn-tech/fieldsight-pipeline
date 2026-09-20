@@ -49,3 +49,18 @@ def test_search_sql_has_author_filter_with_null_guard():
         "AND (%(author_ids)s::uuid[] IS NULL OR c.user_id = ANY(%(author_ids)s::uuid[]))"
         in sql
     )
+
+
+def test_scope_predicate_is_shared_by_construction():
+    """The vector and keyword arms must use the SAME predicate string, not two
+    calls that happen to look alike today and can drift apart tomorrow."""
+    import repositories.search_sql as search_sql
+    assert hasattr(search_sql, "_scope_predicate"), \
+        "build_search_sql must factor its WHERE clause into one shared builder"
+    p1 = search_sql._scope_predicate("c")
+    p2 = search_sql._scope_predicate("c")
+    assert p1 == p2
+    # Both arms of the final SQL must contain this exact string.
+    sql = search_sql.build_search_sql()
+    assert sql.count(p1) == 2, \
+        "the scope predicate must appear once per CTE (vector arm + keyword arm), verbatim"

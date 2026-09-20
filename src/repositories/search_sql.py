@@ -2,12 +2,34 @@
 from deleted_predicates import visible_chunks_predicate
 
 
+def _scope_predicate(alias: str = "c") -> str:
+    """The WHERE clause every read of report_chunks must carry: deny-by-default
+    site ACL, optional per-author narrowing, optional inclusive date range, and
+    both tombstone arms. Used verbatim by the vector arm of build_search_sql()
+    today; Task 3 of this plan wires the same string into the keyword arm it
+    adds, so the two arms cannot drift apart.
+
+    A recording the customer deleted must not come back through the search box or
+    through Ask -- both run this predicate. This was missing when the delete endpoint
+    was first written, which meant every other surface hid the content and the two
+    the customer is most likely to try still returned it verbatim.
+    """
+    return (
+        f"{alias}.site_id = ANY(%(site_ids)s) "
+        f"AND (%(author_ids)s::uuid[] IS NULL OR {alias}.user_id = ANY(%(author_ids)s::uuid[])) "
+        f"AND (%(date_from)s::date IS NULL OR {alias}.report_date >= %(date_from)s::date) "
+        f"AND (%(date_to)s::date IS NULL OR {alias}.report_date <= %(date_to)s::date) "
+        f"AND " + visible_chunks_predicate(alias)
+    )
+
+
 def build_search_sql() -> str:
     # Deny-by-default: ALWAYS filter by the caller's accessible site ids.
     # small-to-big: parent topic title/summary via LEFT JOIN. Citations need
     # report_date/site_id/site_name. Optional inclusive report_date range
     # (both NULL => no date filtering, so the Ask path stays byte-identical
     # when it passes no dates).
+    scope = _scope_predicate("c")
     return (
         "SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_key, "
         "       c.metadata, c.report_date, c.site_id, s.name AS site_name, "
@@ -17,15 +39,7 @@ def build_search_sql() -> str:
         "FROM report_chunks c "
         "LEFT JOIN topics t ON t.id = c.topic_id "
         "LEFT JOIN sites s ON s.id = c.site_id "
-        "WHERE c.site_id = ANY(%(site_ids)s) "
-        "AND (%(author_ids)s::uuid[] IS NULL OR c.user_id = ANY(%(author_ids)s::uuid[])) "
-        "AND (%(date_from)s::date IS NULL OR c.report_date >= %(date_from)s::date) "
-        "AND (%(date_to)s::date IS NULL OR c.report_date <= %(date_to)s::date) "
-        # A recording the customer deleted must not come back through the search box or
-        # through Ask -- both run this one query. This was missing when the delete endpoint
-        # was first written, which meant every other surface hid the content and the two
-        # the customer is most likely to try still returned it verbatim.
-        "AND " + visible_chunks_predicate("c") + " "
+        "WHERE " + scope + " "
         "ORDER BY c.embedding <=> %(q)s::vector "
         "LIMIT %(k)s"
     )
