@@ -731,7 +731,63 @@ Record the output. The spec already predicts this likely yields no meaningful se
 
 No commit for this task (no files change) — carry the six recorded query outputs and the pass/fail verdicts from Steps 1-3 into Task 7's PR body as a "Pre-ship parser checks" section.
 
-**Result (2026-09-21, implementer session on `feat/a-literal-token-is-findable`, worktree `literal-token`): Steps 1-3 were NOT measured.** No real Postgres was reachable from this environment: `TEST_DATABASE_URL` was unset, no `psql` client was on `PATH`, no local or Docker Postgres was running (`docker` itself is not installed), and neither the system Python nor the repo's `.venv` has `psycopg2` installed to connect any other way. No substitute reasoning about tokenizer behavior was recorded in its place — the six query outputs and the PS4-vs-PS40 word-boundary verdict remain genuinely unmeasured and must be run by whoever next has DB access before Task 7's PR body claims them. What *was* run for real in this session: the two pre-existing Chinese unit tests named in Step 3 (`test_a_chinese_question_still_ranks_a_word_match_first`, `test_a_chinese_question_no_longer_loses_a_distant_match`), via `python -m pytest tests/unit/test_lambda_ask_agent_search.py -k chinese -v` — both PASSED, unchanged. Note these are unit tests against a fake/recording connection (per project memory, a fake connection records SQL but never parses or executes it against a real tokenizer), so they confirm the Python-side ranking/shingling behavior around CJK queries is unchanged, but they do **not** substitute for the real-Postgres `to_tsvector`/`websearch_to_tsquery` CJK segmentation check in Step 3 — that check is still outstanding. The full unit suite was also run (`python -m pytest tests/unit -q`): 5441 passed, 2 skipped (`test_lambda_ws_authorizer.py` — requires PyJWT; `test_voiceprint_onnx_parity.py` — missing fixture), 0 failed, both skips pre-existing and unrelated to this feature.
+**Result (2026-09-21). MEASURED against a real PostgreSQL 16.2.**
+
+The implementer session correctly reported these as unmeasured — `TEST_DATABASE_URL` unset, no `psql`,
+no Docker, no `psycopg2`, nothing on :5432 — and recorded that rather than writing predicted tokenizer
+output as fact. The controller then reached a real Postgres by a route that session had not tried:
+`uv run --with pgserver`, which fetches and runs an embedded PostgreSQL locally. Tokenization under the
+`'english'` configuration is a property of the configuration, not of the data or the deployment, so
+measuring it on a local 16.2 answers the same question Aurora would. **Caveat recorded deliberately:
+this is PostgreSQL 16.2 on Windows, not the TEST/prod Aurora instance; if Aurora's text-search
+configuration has ever been altered from the stock `'english'`, these numbers would not carry over.
+Nobody has checked that, and it is not checked here.**
+
+| Check | Measured result |
+|---|---|
+| `'Light pole PS4 installed'` | `'instal':4 'light':1 'pole':2 'ps4':3` — **`PS4` survives as its own lexeme** |
+| `'RFI-1042 raised today'` | `'-1042':2 'rais':3 'rfi':1 'today':4` — the hyphenated id splits into two lexemes |
+| `websearch_to_tsquery('RFI-1042')` | `'rfi' <-> '-1042'` — a phrase query, so order is enforced |
+| `'drawing A-101 rev C'` | `'-101':3 'c':5 'draw':1 'rev':4` — same split shape |
+| **`PS4` query vs `PS40` document** | **`f`** — no match |
+| **`PS40` query vs `PS4` document** | **`f`** — no match |
+| `PS4` query vs `PS4` document | `t` |
+| `RFI-1042` query vs `RFI-1042` document | `t` |
+| **`1042` query vs `RFI-1042` document** | **`f`** — the bare number does NOT find the hyphenated id |
+| `RFI-1042` query vs `RFI-1043` document | `f` — adjacent numbers do not collide |
+
+**The word-boundary question is answered well: `PS4` and `PS40` do not match each other in either
+direction.** That was the main risk to this feature's precision and it is not present.
+
+**The finding that must reach users of this feature: searching the bare number does not find the
+hyphenated identifier.** Someone who types `1042` will not reach `RFI-1042` through the keyword arm.
+They still get the vector arm, so nothing regresses — but the keyword arm does not help them, and
+anyone told "you can now search for an RFI number" will reasonably type the number alone. This is a
+real limitation of the feature as shipped, not a bug in the implementation.
+
+**CJK, measured rather than predicted — and the measurement was validated before it was believed.**
+The console rendered the Chinese text as mojibake, so the first result could have been an encoding
+accident rather than a tokenizer verdict. Re-run computing `char_length` INSIDE Postgres: the document
+arrived as 10 characters and the term as 3, i.e. intact. On that basis:
+
+- `length(to_tsvector('english', '脚手架已经检查并签字'))` = **1**. The entire ten-character string
+  becomes a SINGLE lexeme; the `'english'` parser does not segment CJK because it has no notion of
+  word boundaries without whitespace.
+- Querying the three-character word `脚手架` against it: **`f`**. It does not match.
+- Querying the entire identical string against it: `t` — true, and useless in practice.
+
+So the plan's prediction is CONFIRMED by measurement: **the keyword arm does nothing for Chinese.**
+It does not regress anything — the vector arm still runs, and `lambda_ask_agent.py`'s existing
+`_UNSPACED_RUN` shingling still provides CJK lexical ranking downstream of retrieval — but it adds
+nothing either, and no one should be told otherwise.
+
+Also run for real this session: the two pre-existing Chinese unit tests
+(`test_a_chinese_question_still_ranks_a_word_match_first`,
+`test_a_chinese_question_no_longer_loses_a_distant_match`) both PASS unchanged — though note they use
+a fake connection that records SQL without executing it, so they attest to the Python-side ranking, not
+to the tokenizer. The tokenizer question is answered by the table above instead. Full unit suite:
+`python -m pytest tests/unit -q` -> 5441 passed, 2 skipped (`test_lambda_ws_authorizer.py` needs PyJWT;
+`test_voiceprint_onnx_parity.py` missing a fixture), 0 failed; both skips pre-existing and unrelated.
 
 ---
 
