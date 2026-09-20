@@ -24,6 +24,7 @@ CO = "11111111-1111-1111-1111-111111111111"
 class FakeConn:
     def __init__(self):
         self.committed = False
+        self.savepoints = 0
 
     def __enter__(self):
         return self
@@ -31,6 +32,24 @@ class FakeConn:
     def __exit__(self, *a):
         self.committed = a[0] is None
         return False
+
+    def transaction(self):
+        """Just enough psycopg surface for `with conn.transaction():` -- a real
+        savepoint, in production, rolls back only the block it wraps and leaves the
+        connection usable; here there is nothing to actually roll back, so the fake
+        only has to let an exception propagate out (so the caller's try/except sees
+        it) without swallowing it or aborting anything else."""
+        outer = self
+
+        class _Tx:
+            def __enter__(self):
+                outer.savepoints += 1
+                return outer
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Tx()
 
 
 @pytest.fixture
@@ -413,6 +432,38 @@ def test_recompute_floors_can_target_one_company_on_demand(monkeypatch):
     out = vw.lambda_handler({"op": "recompute_floors", "company_id": CO}, None)
     assert seen == [CO]
     assert out["companies"] == 1
+
+
+def test_one_companys_failure_does_not_cost_the_others_their_floor(monkeypatch):
+    """The whole sweep runs inside ONE get_connection() block, which rolls back the
+    ENTIRE connection on an uncaught exception (db/connection.py). Without a per-company
+    savepoint, company 2 raising would silently discard company 1's already-computed
+    floor too, not just skip company 2 and the ones after it -- and it would do so every
+    6 hours, indefinitely, with nothing to show for it but a floor that never moves."""
+    companies = [{"id": "co-1"}, {"id": "co-2"}, {"id": "co-3"}]
+    seen = []
+
+    def recompute(conn, company_id, **kw):
+        seen.append(company_id)
+        if company_id == "co-2":
+            raise ValueError("malformed score data")
+        return {"company_id": company_id, "floor": 0.3, "sample_count": 20}
+
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: companies)
+    monkeypatch.setattr(vw, "recompute_company_floor", recompute)
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    assert seen == ["co-1", "co-2", "co-3"], (
+        "co-2 raising must not stop co-3 from being attempted")
+    assert out["companies"] == 3
+    assert out["failed"] == 1
+    assert out["floors_written"] == 2, (
+        "co-1 and co-3 succeeded and must both be counted -- co-2's failure must not "
+        "silently zero out the whole sweep's result")
+    by_company = {r["company_id"]: r for r in out["results"]}
+    assert by_company["co-1"]["floor"] == 0.3
+    assert by_company["co-3"]["floor"] == 0.3
+    assert by_company["co-2"]["floor"] is None and by_company["co-2"].get("error")
 
 
 # ---- a declined write is not a write --------------------------------------

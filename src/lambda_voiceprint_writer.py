@@ -369,18 +369,48 @@ def _recompute_floors(event):
     operator or a test recomputing a single company on demand, e.g. right after a batch
     of corrections -- but the schedule always calls this with neither key set, so it
     always takes the all-companies path.
+
+    **Every company's recompute is isolated in its own SAVEPOINT.** The whole loop runs
+    inside ONE `get_connection()` block, which commits on clean exit and rolls back the
+    ENTIRE connection on an uncaught exception (db/connection.py's own docstring: "a bare
+    get_connection() + close() ROLLS BACK writes"). Without a per-company savepoint, one
+    company with malformed score data raising out of `recompute_company_floor` would
+    silently discard every OTHER company's already-computed floor in the same invocation
+    too -- not just the tail of the loop -- because the exception would propagate past the
+    `with get_connection()` block and roll back the whole thing. `with conn.transaction():`
+    around each call opens a SAVEPOINT (the same pattern already used in
+    `repositories/topics.py::add_topic_photo_if_absent` and `lambda_finalize_claim.py`'s
+    group sweep): an exception there rolls back only that company's writes and leaves the
+    connection itself usable for the next iteration, so the outer `with get_connection()`
+    still exits cleanly and commits everyone else's floor.
     """
     single = event.get("company_id")
     with get_connection() as conn:
         companies = [{"id": single}] if single else list_companies(conn)
         results = []
+        failed = 0
         for c in companies:
-            result = recompute_company_floor(conn, c["id"])
+            try:
+                with conn.transaction():
+                    result = recompute_company_floor(conn, c["id"])
+            except Exception:
+                failed += 1
+                # Not re-raised: one poisoned company must not cost every other
+                # company's floor. Loud rather than silent -- a company stuck failing
+                # every 6 hours is otherwise indistinguishable from one that simply
+                # never crossed the minimum sample count, and both currently produce
+                # the same "no floor" result with no alarm attached to either.
+                logger.exception(
+                    "floor recompute failed for company %s -- its floor is left "
+                    "unchanged and the sweep continues with the next company", c["id"])
+                results.append({"company_id": c["id"], "floor": None, "error": True})
+                continue
             results.append(result or {"company_id": c["id"], "floor": None})
     written = sum(1 for r in results if r.get("floor") is not None)
-    logger.info("floor recompute: %d/%d compan%s now have a floor",
-                written, len(results), "y" if len(results) == 1 else "ies")
-    return {"companies": len(results), "floors_written": written, "results": results}
+    logger.info("floor recompute: %d/%d compan%s now have a floor (%d failed)",
+                written, len(results), "y" if len(results) == 1 else "ies", failed)
+    return {"companies": len(results), "floors_written": written, "failed": failed,
+            "results": results}
 
 
 def _inherit_labels(conn, company_id, session_base, label_map):
