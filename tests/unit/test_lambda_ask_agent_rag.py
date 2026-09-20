@@ -167,9 +167,10 @@ def test_no_chunks_returns_not_found_empty_citations(monkeypatch):
     assert result["grounded"] is True
     assert "no relevant records" in result["answer"].lower()  # English-only user-facing string
     # This test installs `fail_if_called` above, so it has already proved no
-    # model ran -- and then used to assert a model was named. Naming one put a
-    # model's name under a sentence no model wrote, and the UI renders it.
-    assert result["model"] is None
+    # model ran -- and used to assert `model is None`. As of 2026-09-20 a
+    # customer-facing Ask response must not carry a "model" key at all, run
+    # or not -- not even a None.
+    assert "model" not in result
 
 
 def test_prompt_contains_numbered_chunks(monkeypatch):
@@ -355,8 +356,9 @@ def test_embed_failure_returns_graceful_error_not_raise(monkeypatch):
     assert result["answer"] == ""
     assert result["error"] == "dashscope upstream 503"
     assert result["citations"] == []
-    # Embedding failed, so the question never reached a model.
-    assert result["model"] is None
+    # Embedding failed, so the question never reached a model -- and either
+    # way a customer-facing response must carry no "model" key.
+    assert "model" not in result
 
 
 def test_ask_rag_search_function_error_is_service_error_not_no_records(monkeypatch):
@@ -488,7 +490,7 @@ def test_an_early_try_failure_hits_the_normal_error_handler_not_a_nameerror(monk
     assert out["error"] == "scope validation exploded"
     assert out["applied_scope"] == {"dropped": []}
     assert out["answer"] == ""
-    assert out["model"] is None
+    assert "model" not in out
 
 
 # --------------------------------------------------------------------------

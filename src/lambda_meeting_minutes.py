@@ -859,14 +859,19 @@ def generate_word_document(minutes_data, title):
         for item in parking:
             doc.add_paragraph(f"• {item}")
 
-    # Metadata footer
+    # Metadata footer. The model that wrote this document is deliberately NOT
+    # named here -- a customer-facing Word export must not name which LLM
+    # vendor/model produced it. `_report_metadata['model']` (and the debug
+    # record beside it in S3) still carry the name, so a bad answer can still
+    # be traced; it just never leaves the building on this document. This is
+    # the second copy of the footer lambda_report_generator._finish_document
+    # writes -- the same change has to land in both or one of them drifts.
     meta = minutes_data.get('_report_metadata', {})
     if meta:
         doc.add_paragraph('')
         p = doc.add_paragraph()
         run = p.add_run(
             f"Generated: {meta.get('generated_at', '?')} | "
-            f"Model: {meta.get('model', '?')} | "
             f"Recordings: {meta.get('recordings_processed', '?')} | "
             f"Version: {meta.get('version', '?')}"
         )

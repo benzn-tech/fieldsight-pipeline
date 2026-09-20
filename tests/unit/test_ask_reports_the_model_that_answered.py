@@ -1,15 +1,20 @@
-"""The name under an answer must be the model that wrote it.
+"""A customer-facing Ask answer must NOT name which model wrote it.
 
-Found on live prod: `LLM_PROVIDER=qwen`, so every Ask answer was written by
-`qwen3.6-flash` -- and every response reported `claude-haiku-4-5-20251001`,
-which the UI renders under the answer. Three of the five reporting sites were
-worse than wrong: they sat on paths where **no model ran at all**, including the
-no-results short-circuit, which returns above the `call_llm` below it.
+This inverts the rule this file used to pin. Before 2026-09-20 the requirement
+was the opposite: name the model that ran, because a mismatch (LLM_PROVIDER=qwen
+answering, `claude-haiku-4-5-20251001` reported) sent a reader at the wrong
+model when tracing a bad answer. That defect is real and the fix (route the
+label through `llm_utils.active_model()` rather than a provider-specific
+constant) is still correct internally.
 
-The rule these tests pin: **name a model only where a model produced the text,
-and name the one that ran.** It is the same rule the metric route already
-follows by returning `model: None` -- a number computed by SQL has no model to
-name, and neither does a system message.
+The owner's new instruction changes what happens at the boundary: nothing that
+reaches a customer -- a Word report, a meeting-minutes document, or an API
+response the web app receives -- may name the vendor or model at all, right or
+wrong. `_rag_answer` is exactly such an API response (it goes straight into
+`ok(...)` in `lambda_handler`), so it must carry no "model" key on any path.
+Tracing a bad answer to the model that produced it still works: `llm_utils.
+call_llm` logs `qwen call: model=...` / `anthropic call: model=...` for the
+same request, so the internal record is the log line, not the response body.
 """
 import os
 
@@ -24,6 +29,11 @@ agent = pytest.importorskip("lambda_ask_agent", reason="requires boto3")
 
 
 # ------------------------------------------------------ which model is running
+#
+# active_model() itself is unchanged: report_generator/meeting_minutes still
+# use it to stamp the INTERNAL `_report_metadata.model` / debug record, and
+# that provenance must still name the model that actually ran, not a
+# provider-specific constant that may not match the active provider.
 
 def test_active_model_follows_the_provider(monkeypatch):
     """Reading `CLAUDE_MODEL` directly answers a different question from the one
@@ -43,7 +53,7 @@ def test_an_unknown_provider_names_nothing(monkeypatch):
     assert llm_utils.active_model() is None
 
 
-# --------------------------------------------- no model ran, so nothing is named
+# --------------------------------------- no path may report a model, ever now
 
 class FakeLambdaClient:
     """Mirrors tests/unit/test_lambda_ask_agent_rag.py."""
@@ -71,8 +81,10 @@ def wire(monkeypatch, *, chunks=None, function_error=None, answer=("an answer", 
 
 
 def test_no_results_names_no_model(monkeypatch):
-    """This return sits above `call_llm`. It used to carry a model name, so the
-    UI printed one under a sentence no model had written."""
+    """This return sits above `call_llm`. It used to carry a model name (`None`),
+    which at least admitted no model ran; the customer-facing contract now goes
+    further and drops the key entirely, on every path, whether a model ran or
+    not."""
     wire(monkeypatch, chunks=[])
     # Not just "the label is absent" -- the model must not run at all. Without
     # this the test would still pass if the branch moved below the call.
@@ -80,14 +92,14 @@ def test_no_results_names_no_model(monkeypatch):
                         lambda *a, **k: pytest.fail("a model was called"))
     out = agent._rag_answer({"question": "q", "caller_sub": "s"})
     assert out["answer"].startswith("No relevant records")
-    assert out["model"] is None
+    assert "model" not in out
 
 
 def test_a_search_outage_names_no_model(monkeypatch):
     wire(monkeypatch, function_error="Unhandled")
     out = agent._rag_answer({"question": "q", "caller_sub": "s"})
     assert out["error"] == "rag-search unavailable"
-    assert out["model"] is None
+    assert "model" not in out
 
 
 def test_a_model_error_names_no_model(monkeypatch):
@@ -96,12 +108,17 @@ def test_a_model_error_names_no_model(monkeypatch):
          answer=(None, "upstream timeout"))
     out = agent._rag_answer({"question": "q", "caller_sub": "s"})
     assert out.get("error") == "upstream timeout"
-    assert out["model"] is None
+    assert "model" not in out
 
 
-# ------------------------------------------- a model ran, so the right one is named
+# ------------------------------------- a model ran, but the customer never sees which one
 
-def test_the_answered_path_names_the_model_that_ran(monkeypatch):
+def test_the_answered_path_still_names_no_model(monkeypatch):
+    """Before this change, a model DID run here and the response named it -- that
+    was the whole point of the file this test used to live in. The model still
+    runs (the answer is still produced by it), but the response handed to
+    `ok(...)` -- and from there straight to the web app -- must not say which
+    model that was."""
     monkeypatch.setattr(llm_utils, "LLM_PROVIDER", "qwen")
     monkeypatch.setattr(llm_utils, "QWEN_MODEL", "qwen3.6-flash")
     monkeypatch.setattr(llm_utils, "CLAUDE_MODEL", "claude-haiku-4-5-20251001")
@@ -109,7 +126,7 @@ def test_the_answered_path_names_the_model_that_ran(monkeypatch):
          answer=("an answer", None))
     out = agent._rag_answer({"question": "q", "caller_sub": "s"})
     assert out["answer"] == "an answer"
-    assert out["model"] == "qwen3.6-flash",         "the label named a provider this deploy is not using"
+    assert "model" not in out, "a customer-facing Ask response must not name the model"
 
 
 # ------------------------------------------------------------- the property
@@ -120,3 +137,18 @@ def test_no_reporting_site_reads_the_provider_constant_directly():
     import inspect
     source = inspect.getsource(agent)
     assert "llm_utils.CLAUDE_MODEL" not in source
+
+
+def test_no_ask_response_names_a_model_at_all():
+    """The old rule ("name the model that ran, or None") lived in
+    `lambda_ask_agent.py` as literal `"model": ...` / `'model': ...` labels.
+    That whole category of label must be gone from the file: a customer-facing
+    surface has nothing honest to say here, not even "None" -- the field
+    itself does not belong on the response.
+    """
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parents[2]
+    source = (root / "src/lambda_ask_agent.py").read_text(encoding="utf-8")
+    labels = re.findall(r"""['"]model['"]\s*:\s*([^,\n]+)""", source)
+    assert labels == [], "lambda_ask_agent.py must not label any response with a model: %r" % labels
