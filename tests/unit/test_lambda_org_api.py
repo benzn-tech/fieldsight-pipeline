@@ -4499,6 +4499,26 @@ def test_media_presign_missing_key_400(wired):
     assert res["statusCode"] == 400
 
 
+def test_media_presign_transcripts_prefix_denied(presign_wired):
+    """2026-09-20: 'transcripts/' was removed from _ORG_MEDIA_PRESIGN_PREFIXES.
+    The raw stored JSON at that prefix is the ASR vendor's own output shape
+    (AWS Transcribe: top-level jobName/accountId/status; ElevenLabs' adapted
+    shape has none of those keys), so a presigned URL straight to the object
+    would let a customer download the vendor's fingerprint even though no
+    field anywhere says "AWS" or "ElevenLabs". Nothing customer-facing ever
+    needed this: GET /api/org/transcripts already serves every field
+    scripts/composites/transcript-list.js reads."""
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ben_UCPK"})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "transcripts/Ben_UCPK/2026-09-20/Ben_UCPK_2026-09-20_08-00-00.json"}),
+        None)
+    assert res["statusCode"] == 403
+    assert not hasattr(fake, "last")     # never even reached the signer
+
+
 def test_media_presign_reports_key_owner_extraction(presign_wired):
     # reports/{date}/{user}/... -- owner folder is path segment 3 (legacy
     # get_presigned_url :394-398 parity).

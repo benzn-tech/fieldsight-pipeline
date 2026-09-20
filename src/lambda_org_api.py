@@ -8758,7 +8758,14 @@ def get_org_video_segments(conn, caller, event):
                                        p.get("end") or "", conn=conn))
 
 
-_ORG_MEDIA_PRESIGN_PREFIXES = ("users/", "audio_segments/", "transcripts/",
+# 2026-09-20: 'transcripts/' deliberately removed -- see the matching note in
+# lambda_fieldsight_api.get_presigned_url. The raw ASR transcript JSON's own
+# shape (AWS Transcribe: {"jobName", "accountId", "status", "results"};
+# ElevenLabs' adapted shape: none of those keys) names the vendor by which
+# fields exist, and for the AWS path also leaks our real AWS account id.
+# Nothing customer-facing presigns this prefix -- GET /api/org/transcripts
+# already serves every field the transcript viewer reads.
+_ORG_MEDIA_PRESIGN_PREFIXES = ("users/", "audio_segments/",
                                "reports/", "web_video/")
 
 

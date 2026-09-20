@@ -720,7 +720,18 @@ def get_presigned_url(params, caller=None):
     s3_key = unquote_plus(params.get('key', ''))
     if not s3_key:
         return error('Missing key')
-    allowed = ['users/', 'audio_segments/', 'transcripts/', 'reports/', 'web_video/']
+    # 2026-09-20: 'transcripts/' deliberately removed. The raw JSON at that
+    # prefix is the ASR vendor's own output shape -- for AWS Transcribe it is
+    # literally {"jobName", "accountId" (our real AWS account number),
+    # "status", "results": {...}}, and ElevenLabs' adapted shape omits those
+    # keys entirely, so which fields are present names the vendor even with
+    # no vendor string anywhere in the bytes. Nothing customer-facing ever
+    # requested this prefix (scripts/api/media.js's comment listed it, but no
+    # caller built a transcripts/ key) -- the reshaped GET /api/transcripts
+    # already serves everything the transcript viewer reads. Closing the
+    # door here rather than trying to redact a presigned URL, which points
+    # straight at S3 and cannot be selectively rewritten.
+    allowed = ['users/', 'audio_segments/', 'reports/', 'web_video/']
     if not any(s3_key.startswith(p) for p in allowed):
         return error('Access denied', 403)
 
