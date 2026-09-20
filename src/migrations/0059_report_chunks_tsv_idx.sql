@@ -1,0 +1,45 @@
+-- A literal token in chunk_text is unreachable through search today unless the
+-- chunk that contains it also lands in the top ~30 by cosine distance (spec
+-- 2026-09-20-a-literal-token-is-findable.md). Vector similarity has almost no
+-- signal for an opaque identifier like "PS4" or an RFI number, so a rare literal
+-- systematically loses the top-k race against topically-similar prose.
+--
+-- An index on the BARE EXPRESSION, not a GENERATED STORED column:
+--   * ILIKE + pg_trgm is rejected in the spec (word-boundary blind: "PS4"
+--     would match inside "PS40" or "GPS4x", which is exactly wrong for
+--     identifier search).
+--   * A GENERATED ALWAYS ... STORED column was the first design, but this
+--     repo's migration runner (src/db/migrate.py) wraps every file in
+--     conn.transaction(), and CREATE INDEX CONCURRENTLY cannot run inside a
+--     transaction block. A stored column's ALTER TABLE rewrites the whole
+--     table under an ACCESS EXCLUSIVE lock with no way to run it
+--     concurrently from inside a migration, and there is no read-only path
+--     in this repo to measure report_chunks' prod size before shipping to
+--     know how long that lock would be held.
+--   * This index needs no new column, no table rewrite, and (unlike the
+--     rejected stored column, and unlike the embedding pipeline's manual
+--     reindex-vectors backfill) NOTHING to keep in sync on future writes --
+--     there is no stored value to go stale; Postgres maintains an
+--     expression index like any other index, on every write, automatically.
+--   * Cost: build_search_sql() (repositories/search_sql.py) MUST repeat this
+--     exact expression, to_tsvector('english', chunk_text), for the planner
+--     to use this index rather than a sequential scan. Enforced by
+--     tests/unit/test_search_sql.py's expression-match test, not convention.
+--
+-- Plain CREATE INDEX (no CONCURRENTLY): takes a SHARE lock (blocks writes,
+-- not reads) while it builds -- a materially smaller blast radius than the
+-- rejected column's ACCESS EXCLUSIVE, and it is what this migration runner
+-- can actually execute inside a transaction. If this lock proves too costly
+-- on prod's real table size, build the index CONCURRENTLY manually first
+-- (outside this runner, in autocommit mode -- CONCURRENTLY cannot run in
+-- any transaction block, migration-runner or otherwise); IF NOT EXISTS below
+-- then makes this file's own CREATE INDEX a no-op against that pre-built
+-- index, and schema_migrations still records 0059 as applied.
+--
+-- 'english' will stem "electrical" -> "electr", which is fine for prose but
+-- must not mangle alphanumeric identifiers. Postgres's default parser classes
+-- shapes like "ps4", "a-101" as asciiword/numword and passes them through
+-- largely intact -- verified against real corpus identifiers, not just PS4,
+-- in tests/integration/test_literal_token_search_sql.py before this shipped.
+CREATE INDEX IF NOT EXISTS idx_report_chunks_tsv
+  ON report_chunks USING gin (to_tsvector('english', chunk_text));
