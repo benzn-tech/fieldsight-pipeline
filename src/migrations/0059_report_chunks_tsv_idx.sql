@@ -23,8 +23,12 @@
 --     expression index like any other index, on every write, automatically.
 --   * Cost: build_search_sql() (repositories/search_sql.py) MUST repeat this
 --     exact expression, to_tsvector('english', chunk_text), for the planner
---     to use this index rather than a sequential scan. Enforced by
---     tests/unit/test_search_sql.py's expression-match test, not convention.
+--     to use this index rather than a sequential scan. Not yet enforced by a
+--     test as of this migration -- Task 3 of this plan adds the keyword arm
+--     to build_search_sql() together with a test that greps this expression
+--     out of this file and asserts it appears verbatim in the generated SQL,
+--     so a future edit to either side that breaks the match fails a test
+--     immediately rather than silently degrading to a sequential scan.
 --
 -- Plain CREATE INDEX (no CONCURRENTLY): takes a SHARE lock (blocks writes,
 -- not reads) while it builds -- a materially smaller blast radius than the
@@ -37,9 +41,15 @@
 -- index, and schema_migrations still records 0059 as applied.
 --
 -- 'english' will stem "electrical" -> "electr", which is fine for prose but
--- must not mangle alphanumeric identifiers. Postgres's default parser classes
--- shapes like "ps4", "a-101" as asciiword/numword and passes them through
--- largely intact -- verified against real corpus identifiers, not just PS4,
--- in tests/integration/test_literal_token_search_sql.py before this shipped.
+-- must not mangle alphanumeric identifiers. The one check actually run before
+-- this shipped: EXPLAIN'ing to_tsvector('english', chunk_text) @@
+-- websearch_to_tsquery('english', 'PS4') against a table seeded with a "Light
+-- pole PS4" chunk showed the token survive intact as ''ps4''' (case-folded,
+-- not split or stemmed away) and the planner chose idx_report_chunks_tsv.
+-- Other identifier shapes -- drawing numbers with punctuation (e.g. "A-101"),
+-- RFI numbers, and CJK text, which the spec flags as an open question -- are
+-- NOT yet verified against this parser config. Task 5 of this plan is the
+-- pre-ship check that covers those shapes; do not treat this migration as
+-- having already answered that question.
 CREATE INDEX IF NOT EXISTS idx_report_chunks_tsv
   ON report_chunks USING gin (to_tsvector('english', chunk_text));
