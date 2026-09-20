@@ -1673,7 +1673,11 @@ def _rag_answer(body):
                         answer_language.cjk_ratio(answer))
         if not err and answer_language.violates(answer):
             logger.warning("  Ask answer language leaked; retrying once")
-            retry_prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
+            # Same substitution as the primary prompt above and for the same
+            # reason: the retry must not silently revert to pronoun-blind
+            # answering on the 1-in-13 turns that need it.
+            retry_prompt = build_rag_prompt(asked if rewritten else question, chunks,
+                                            mode=body.get("mode"),
                                             today=today, basis=basis,
                                             insist_language=True, pinned_topic=pinned_topic)
             retried, retry_err = llm_utils.call_llm(retry_prompt, max_tokens=MAX_ANSWER_TOKENS,

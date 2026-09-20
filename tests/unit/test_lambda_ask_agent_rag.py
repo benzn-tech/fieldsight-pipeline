@@ -583,6 +583,40 @@ def test_the_answering_prompt_gets_the_original_when_not_rewritten(monkeypatch):
     assert "history" not in kwargs
 
 
+def test_the_retry_prompt_also_gets_asked_when_rewritten(monkeypatch):
+    """Spec 2026-09-20: the 1-in-13 language-leak retry must not regress to
+    pronoun-blind answering just because it rebuilds the prompt at a second
+    call site (src/lambda_ask_agent.py:1672)."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
+    wire(monkeypatch, chunks=[{"chunk_text": "level 3 grid note", "id": "c-1",
+                               "topic_id": "t-1", "source_s3_key": "x",
+                               "report_date": "2026-09-17"}])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("rewritten", True))
+    # `answer_language` is imported inside _rag_answer, so it is NOT an
+    # attribute of `laa` -- patch the module object the function-local import
+    # resolves to. See Step 1.
+    import answer_language
+    monkeypatch.setattr(answer_language, "violates",
+                        lambda answer: True)  # force the retry every time
+
+    prompts = []
+    real_build = laa.build_rag_prompt
+    def spy_build(question, chunks, **kw):
+        prompts.append((question, kw))
+        return real_build(question, chunks, **kw)
+    monkeypatch.setattr(laa, "build_rag_prompt", spy_build)
+
+    laa._rag_answer({"question": "when is he finishing it?", "caller_sub": SUB,
+                     "history": [{"question": "ceiling grid?",
+                                  "answer": "level 3 is behind"}]})
+
+    assert len(prompts) == 2, "expected the primary prompt and the retry prompt"
+    for asked_with, kwargs in prompts:
+        assert asked_with == "rewritten"
+        assert "history" not in kwargs
+
+
 def test_a_body_without_history_sends_the_payload_it_sends_today(monkeypatch):
     """SS3.1: absent and empty history must retrieve identically, and with no
     history the payload is unchanged from before this feature."""
