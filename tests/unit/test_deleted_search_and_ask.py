@@ -36,8 +36,14 @@ def test_search_sql_carries_both_arms():
     sql = search_sql.build_search_sql()
     assert "r.target_id = c.topic_id" in sql, "the topic arm is missing or keyed on c.id"
     assert "c.source_s3_key LIKE r.target_key" in sql, "the source arm is missing"
-    assert sql.count("scope = 'deleted'") == 2
-    assert sql.count("reverted_at IS NULL") == 2
+    # Task 3 (2026-09-20 plan) unioned a keyword arm into build_search_sql,
+    # built from the SAME _scope_predicate as the vector arm -- so each of the
+    # two tombstone sub-predicates (topic, source) now appears once per SQL
+    # arm: 2 arms x 2 sub-predicates = 4, not 2. The thing this test protects
+    # (both tombstone arms present, on EVERY read arm) is unchanged; only the
+    # count of arms in the query grew.
+    assert sql.count("scope = 'deleted'") == 4
+    assert sql.count("reverted_at IS NULL") == 4
 
 
 def test_the_chunk_predicate_is_keyed_on_topic_id_not_id():

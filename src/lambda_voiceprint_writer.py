@@ -46,9 +46,11 @@ import logging
 
 from db.connection import get_connection
 from repositories import speaker_label_groups
+from repositories.companies import list_companies
 from repositories.voiceprints import (EnrolmentBelongsToSomebodyElse, add_sample,
-                                      live_turn_names, profiles_for_matching,
-                                      record_attempt, record_turn_name,
+                                      company_floor, live_turn_names,
+                                      profiles_for_matching, record_attempt,
+                                      record_turn_name, recompute_company_floor,
                                       rejected_names)
 from turn_name_overlay import _SOURCE_RANK
 
@@ -296,10 +298,15 @@ def _profiles(event):
     company_id = _require(event, "company_id")
     with get_connection() as conn:
         rows = profiles_for_matching(conn, company_id, site_id=event.get("site_id"))
+        # Read once per invocation, not once per turn: the floor is derived/materialized
+        # state (recomputed on a schedule, spec S1.3) and must not move mid-decision
+        # because one turn happened to land during a recompute.
+        floor = company_floor(conn, company_id)
     return {"profiles": [{"person_key": str(r["id"]),
                           "display_name": r["display_name"],
                           "status": r["status"],
-                          "embedding": r["embedding"]} for r in rows]}
+                          "embedding": r["embedding"]} for r in rows],
+            "company_floor": floor}
 
 
 def _match_names(event):
@@ -344,6 +351,73 @@ def _match_names(event):
     logger.info("match: %d names for %s (%d declined to a stronger source)",
                 written, session_base, declined)
     return {"written": written, "declined": declined, "inherited": inherited}
+
+
+def _recompute_floors(event):
+    """Rebuild every company's rejection floor from its own human-asserted corrections.
+
+    Scheduled, not triggered by a match or a correction -- the floor must not move
+    mid-decision because one turn happened to land during recomputation (spec S1.3).
+
+    **One invocation, an internal loop over every company** -- the shape ExtractionBacklog
+    Function uses (a single sweep over the whole dataset on its own schedule, with no
+    per-item fan-out), not an external loop invoking this once per company. The choice is
+    forced by the trigger: an EventBridge Schedule invokes with a fixed event (no payload
+    naming a company), so a per-company `company_id` on `event` would need something else
+    to produce one invocation per company, which nothing in this stack does and which this
+    task does not invent. `event.get("company_id")` is still honoured when present -- an
+    operator or a test recomputing a single company on demand, e.g. right after a batch
+    of corrections -- but the schedule always calls this with neither key set, so it
+    always takes the all-companies path.
+
+    **Every company's recompute is isolated in its own SAVEPOINT.** The whole loop runs
+    inside ONE `get_connection()` block, which commits on clean exit and rolls back the
+    ENTIRE connection on an uncaught exception (db/connection.py's own docstring: "a bare
+    get_connection() + close() ROLLS BACK writes"). Without a per-company savepoint, one
+    company with malformed score data raising out of `recompute_company_floor` would
+    silently discard every OTHER company's already-computed floor in the same invocation
+    too -- not just the tail of the loop -- because the exception would propagate past the
+    `with get_connection()` block and roll back the whole thing. `with conn.transaction():`
+    around each call opens a SAVEPOINT (the same pattern already used in
+    `repositories/topics.py::add_topic_photo_if_absent` and `lambda_finalize_claim.py`'s
+    group sweep): an exception there rolls back only that company's writes and leaves the
+    connection itself usable for the next iteration, so the outer `with get_connection()`
+    still exits cleanly and commits everyone else's floor.
+    """
+    single = event.get("company_id")
+    with get_connection() as conn:
+        companies = [{"id": single}] if single else list_companies(conn)
+        results = []
+        failed = 0
+        for c in companies:
+            try:
+                with conn.transaction():
+                    result = recompute_company_floor(conn, c["id"])
+            except Exception:
+                failed += 1
+                # Not re-raised: one poisoned company must not cost every other
+                # company's floor. Loud rather than silent -- a company stuck failing
+                # every 6 hours is otherwise indistinguishable from one that simply
+                # never crossed the minimum sample count, and both currently produce
+                # the same "no floor" result with no alarm attached to either.
+                logger.exception(
+                    "floor recompute failed for company %s -- its floor is left "
+                    "unchanged and the sweep continues with the next company", c["id"])
+                results.append({"company_id": str(c["id"]), "floor": None, "error": True})
+                continue
+            # str() the id before it enters the response: psycopg hands back
+            # uuid.UUID for a uuid column, and the Lambda runtime marshals this
+            # return value with json.dumps, which cannot serialise one. The unit
+            # fakes pass string ids, so the whole suite stayed green while the
+            # deployed function raised Runtime.MarshalError on every real run.
+            row = result or {"company_id": c["id"], "floor": None}
+            row["company_id"] = str(row["company_id"])
+            results.append(row)
+    written = sum(1 for r in results if r.get("floor") is not None)
+    logger.info("floor recompute: %d/%d compan%s now have a floor (%d failed)",
+                written, len(results), "y" if len(results) == 1 else "ies", failed)
+    return {"companies": len(results), "floors_written": written, "failed": failed,
+            "results": results}
 
 
 def _inherit_labels(conn, company_id, session_base, label_map):
@@ -430,5 +504,7 @@ def lambda_handler(event, context):
         return _profiles(event)
     if op == "match_names":
         return _match_names(event)
-    raise ValueError(f"unknown op {op!r} — expected 'propagation', 'enrol', 'profiles' or "
-                     f"'match_names'")
+    if op == "recompute_floors":
+        return _recompute_floors(event)
+    raise ValueError(f"unknown op {op!r} — expected 'propagation', 'enrol', 'profiles', "
+                     f"'match_names' or 'recompute_floors'")

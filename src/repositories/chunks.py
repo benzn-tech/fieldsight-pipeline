@@ -60,10 +60,22 @@ def insert_chunk(conn, site_id, report_date, chunk_type, chunk_text, embedding, 
 
 
 def search_chunks(conn, query_embedding, accessible_site_ids, k=5,
-                  date_from=None, date_to=None, author_ids=None) -> list[dict]:
+                  date_from=None, date_to=None, author_ids=None, query_text="") -> list[dict]:
+    """Vector + keyword search, unioned (Task 3, 2026-09-20 spec: "a literal
+    token is findable"). Every returned row now carries `lexical_hit: bool` --
+    True for a row the keyword arm found (its `distance` is NULL, never a
+    fabricated real-looking number), False for a row the vector arm found (a
+    real cosine distance). A row found by both arms is returned once, keeping
+    the vector arm's real distance (build_search_sql's DISTINCT ON).
+
+    `query_text` defaults to "" so every existing caller that does not pass it
+    keeps working: `websearch_to_tsquery('english', '')` returns an empty
+    tsquery that matches nothing, which is correct for "no text was given to
+    search on" (never matches everything).
+    """
     return conn.cursor(row_factory=dict_row).execute(
         build_search_sql(),
-        {"q": query_embedding, "site_ids": list(accessible_site_ids), "k": k,
+        {"q": query_embedding, "q_text": query_text, "site_ids": list(accessible_site_ids), "k": k,
          "date_from": date_from, "date_to": date_to,
          "author_ids": list(author_ids) if author_ids is not None else None},
     ).fetchall()

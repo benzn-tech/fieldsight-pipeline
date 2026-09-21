@@ -24,6 +24,7 @@ CO = "11111111-1111-1111-1111-111111111111"
 class FakeConn:
     def __init__(self):
         self.committed = False
+        self.savepoints = 0
 
     def __enter__(self):
         return self
@@ -31,6 +32,24 @@ class FakeConn:
     def __exit__(self, *a):
         self.committed = a[0] is None
         return False
+
+    def transaction(self):
+        """Just enough psycopg surface for `with conn.transaction():` -- a real
+        savepoint, in production, rolls back only the block it wraps and leaves the
+        connection usable; here there is nothing to actually roll back, so the fake
+        only has to let an exception propagate out (so the caller's try/except sees
+        it) without swallowing it or aborting anything else."""
+        outer = self
+
+        class _Tx:
+            def __enter__(self):
+                outer.savepoints += 1
+                return outer
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Tx()
 
 
 @pytest.fixture
@@ -345,8 +364,152 @@ def test_fetching_profiles_is_company_scoped(monkeypatch):
     monkeypatch.setattr(vw, "profiles_for_matching",
                         lambda conn, company_id, site_id=None:
                         seen.update({"co": company_id}) or [])
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
     vw.lambda_handler({"op": "profiles", "company_id": CO}, None)
     assert seen["co"] == CO, "one company's voice would be matched against another's"
+
+
+def test_fetching_profiles_hands_the_companys_floor_to_the_embedder(monkeypatch):
+    """A calibrated floor sits in speaker_voiceprint_company_floors doing nothing unless
+    it travels with the vectors to the non-VPC embedder, which cannot read it itself."""
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None: [])
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: 0.42)
+    out = vw.lambda_handler({"op": "profiles", "company_id": CO}, None)
+    assert out["company_floor"] == 0.42
+
+
+# ---- the scheduled floor recompute ----------------------------------------
+#
+# rate(6 hours), not triggered by a match or a correction (spec S1.3): the floor must not
+# move mid-decision because one turn happened to land during recomputation. The
+# EventBridge Schedule event carries no company_id -- it invokes with a fixed event, not
+# one per company -- so the handler loops over every company itself, matching
+# ExtractionBacklogFunction's single-sweep shape rather than an external per-company
+# fan-out this stack has no mechanism to drive.
+
+
+def test_recompute_floors_sweeps_every_company(monkeypatch):
+    companies = [{"id": "co-1"}, {"id": "co-2"}, {"id": "co-3"}]
+    seen = []
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: companies)
+    monkeypatch.setattr(vw, "recompute_company_floor",
+                        lambda conn, company_id, **kw:
+                        seen.append(company_id) or {"company_id": company_id,
+                                                    "floor": 0.3, "sample_count": 20})
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    assert seen == ["co-1", "co-2", "co-3"], (
+        "the schedule's event carries no company_id, so every company must be swept in "
+        "one invocation")
+    assert out["companies"] == 3 and out["floors_written"] == 3
+
+
+def test_recompute_floors_reports_companies_still_below_the_minimum(monkeypatch):
+    """`recompute_company_floor` returns None below the minimum sample count -- that must
+    show up as a company swept but not written, not vanish from the count."""
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: [{"id": "co-1"}])
+    monkeypatch.setattr(vw, "recompute_company_floor",
+                        lambda conn, company_id, **kw: None)
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    assert out["companies"] == 1 and out["floors_written"] == 0
+
+
+def test_the_sweeps_response_survives_the_lambda_runtime_json_marshal(monkeypatch):
+    """The fakes in this file hand `list_companies` string ids; a real psycopg connection
+    hands back `uuid.UUID` for a uuid column. The Lambda runtime marshals the handler's
+    return value with json.dumps, which cannot serialise a UUID -- so every test here
+    passed while the deployed TEST function raised
+
+        Runtime.MarshalError: Object of type UUID is not JSON serializable
+
+    on its first real invocation, AFTER the sweep had already committed and logged
+    "floor recompute: 0/4 companies now have a floor (0 failed)". The work succeeded and
+    the invocation was still recorded as a failure.
+
+    This test uses real UUID objects for that reason. json.dumps IS the assertion.
+    """
+    import json
+    import uuid
+    cid = uuid.uuid4()
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: [{"id": cid}])
+    monkeypatch.setattr(vw, "recompute_company_floor",
+                        lambda conn, company_id, **kw: {"company_id": company_id,
+                                                        "floor": 0.3, "sample_count": 20})
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    json.dumps(out)
+    assert out["results"][0]["company_id"] == str(cid)
+
+
+def test_a_failing_companys_row_is_also_json_safe(monkeypatch):
+    """The error path builds its own row from c["id"] rather than from the repository's
+    return, so it needs the same treatment -- and it is the path most likely to run
+    unattended for weeks before anyone looks."""
+    import json
+    import uuid
+    cid = uuid.uuid4()
+
+    def boom(conn, company_id, **kw):
+        raise RuntimeError("no")
+
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: [{"id": cid}])
+    monkeypatch.setattr(vw, "recompute_company_floor", boom)
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    json.dumps(out)
+    assert out["failed"] == 1 and out["results"][0]["company_id"] == str(cid)
+
+
+def test_recompute_floors_can_target_one_company_on_demand(monkeypatch):
+    """Honoured when present (an operator or a test recomputing one company right after a
+    batch of corrections), but the schedule itself never sets this key."""
+    seen = []
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies",
+                        lambda conn: (_ for _ in ()).throw(
+                            AssertionError("list_companies must not run when a single "
+                                          "company_id was given")))
+    monkeypatch.setattr(vw, "recompute_company_floor",
+                        lambda conn, company_id, **kw: seen.append(company_id) or
+                        {"company_id": company_id, "floor": 0.3, "sample_count": 20})
+    out = vw.lambda_handler({"op": "recompute_floors", "company_id": CO}, None)
+    assert seen == [CO]
+    assert out["companies"] == 1
+
+
+def test_one_companys_failure_does_not_cost_the_others_their_floor(monkeypatch):
+    """The whole sweep runs inside ONE get_connection() block, which rolls back the
+    ENTIRE connection on an uncaught exception (db/connection.py). Without a per-company
+    savepoint, company 2 raising would silently discard company 1's already-computed
+    floor too, not just skip company 2 and the ones after it -- and it would do so every
+    6 hours, indefinitely, with nothing to show for it but a floor that never moves."""
+    companies = [{"id": "co-1"}, {"id": "co-2"}, {"id": "co-3"}]
+    seen = []
+
+    def recompute(conn, company_id, **kw):
+        seen.append(company_id)
+        if company_id == "co-2":
+            raise ValueError("malformed score data")
+        return {"company_id": company_id, "floor": 0.3, "sample_count": 20}
+
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: companies)
+    monkeypatch.setattr(vw, "recompute_company_floor", recompute)
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    assert seen == ["co-1", "co-2", "co-3"], (
+        "co-2 raising must not stop co-3 from being attempted")
+    assert out["companies"] == 3
+    assert out["failed"] == 1
+    assert out["floors_written"] == 2, (
+        "co-1 and co-3 succeeded and must both be counted -- co-2's failure must not "
+        "silently zero out the whole sweep's result")
+    by_company = {r["company_id"]: r for r in out["results"]}
+    assert by_company["co-1"]["floor"] == 0.3
+    assert by_company["co-3"]["floor"] == 0.3
+    assert by_company["co-2"]["floor"] is None and by_company["co-2"].get("error")
 
 
 # ---- a declined write is not a write --------------------------------------

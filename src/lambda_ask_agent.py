@@ -725,6 +725,67 @@ def _diversify(chunks, cap):
     return out
 
 
+def _admit_one_lexical_hit(chunks, keep):
+    """Truncate to `keep`, reserving exactly one slot for the strongest
+    keyword-only row (lexical_hit=True, distance=None) that arrival order
+    would otherwise cut. Total over `keep`, including `keep<=0`: never
+    returns more than `keep` rows.
+
+    Policy (Task 4, CONTROLLER AMENDMENT, this task's call to make and
+    defend -- Task 3 deliberately appended rather than interleaved so this
+    decision would not be smuggled into the SQL): `build_search_sql()`
+    appends keyword-only rows AFTER every vector row (never interleaved), so
+    when the vector arm is saturated at `keep`, a plain `chunks[:keep]` -- the
+    old, safe behaviour when reranking is off and arrival order WAS pure
+    cosine order -- now silently discards every keyword-only row. That is
+    this plan's whole motivating bug (spec §1), reproduced one hop later on
+    the path that actually feeds the model.
+
+    The rule: if none of the first `keep` rows is a keyword-only hit, swap
+    the single WEAKEST vector row in that window (the last one, since the
+    window is cosine-ordered) for the first keyword-only row beyond the cut.
+    Cost when the keyword hit is a false positive (the literal token appears
+    in an unrelated document): exactly one semantic match is displaced from
+    context -- the weakest one in the window, chosen precisely because it is
+    the one the answer can most afford to lose. This is bounded and it is
+    NOT a wholesale swap: only one slot is ever given up, however many
+    keyword-only rows exist beyond the cut (a real but accepted residual gap
+    -- widening the reservation trades away more of the vector list for a
+    case the spec's own motivating example, a single distinctive identifier,
+    does not need).
+
+    Edge cases in `keep`, both client-reachable (`k=int(body.get("k", 5))`
+    has no floor) and both found false against an earlier draft of the
+    guarantee above (Task 4 review, 2026-09-20, Criticals #2 and #3):
+
+    - `keep <= 0`: there is no slot to reserve or to swap into, so nothing
+      is admitted -- return `[]`, not `head[:-1] + [tail_hit]`, which used
+      to return exactly one row (`[] + [tail_hit]`) despite `keep == 0`.
+    - `keep == 1`: `head[-1]` IS `head[0]` -- the window's only slot is also
+      its top semantic match. The "weakest row in the window" and "the
+      match at position 0" are the same row, so swapping it out to admit a
+      keyword hit would displace position 0. Rather than caveat that away,
+      this function refuses the swap at `keep == 1` and keeps the semantic
+      top match: a strong semantic match at position 0 is never displaced,
+      full stop, for every `keep` this function can be called with. The
+      accepted cost is that at `keep == 1` a keyword-only hit is never
+      admitted (there is no second slot to give up instead).
+    """
+    if keep <= 0:
+        return []
+    if len(chunks) <= keep:
+        return chunks[:keep]
+    head = chunks[:keep]
+    if any(c.get("lexical_hit") for c in head):
+        return head  # already represented within the window; nothing to admit
+    tail_hit = next((c for c in chunks[keep:] if c.get("lexical_hit")), None)
+    if tail_hit is None:
+        return head
+    if keep == 1:
+        return head  # the only slot is position 0's match; never displaced
+    return head[:-1] + [tail_hit]
+
+
 def _rerank_chunks(question, chunks, keep):
     """Reorder by relevance and keep the best `keep`.
 
@@ -733,7 +794,12 @@ def _rerank_chunks(question, chunks, keep):
     be the reason a question goes unanswered -- `dashscope_utils.rerank`
     returns None rather than raising, and this returns the cosine order.
     """
-    if not RERANK_ENABLED or len(chunks) <= keep:
+    if not RERANK_ENABLED:
+        # Arrival order is no longer pure cosine order (Task 3 appends
+        # keyword-only rows after it) -- see _admit_one_lexical_hit's
+        # docstring for why a plain chunks[:keep] is no longer safe here.
+        return _admit_one_lexical_hit(chunks, keep)
+    if len(chunks) <= keep:
         return chunks[:keep]
     # Imported here, not at module scope, for the reason the three other
     # dashscope_utils call sites in this file give: the legacy hand-built prod
@@ -838,8 +904,37 @@ def _aggregate_topics(chunks, question=""):
         dist = c.get("distance")
         dist = float(dist) if dist is not None else 1.0
         cur = groups.get(key)
+        # Lexical match is checked against the TOPIC TITLE only, NOT the raw
+        # chunk_text: the retrieved chunks are semantically near the query so
+        # their text usually contains a term anyway (and common words like
+        # "safety" appear everywhere), which would make the lexical flag true
+        # for nearly everything. The concise title is the clean signal.
+        hay = derived_title.lower()
+        # Two independent lexical signals, ORed: the title-substring check
+        # above (existing; drives the Search list's own reordering) and
+        # lexical_hit from build_search_sql's keyword arm (2026-09-20 spec),
+        # which found a literal match in chunk_text that never reached the
+        # title. A row the SQL keyword arm found has no real cosine distance
+        # (it was never scored against the query embedding, hence the `1.0`
+        # placeholder just above) -- it MUST be admitted here via `lexical`,
+        # or _NO_LEX_MAX_DIST drops it one hop downstream of the SQL fix,
+        # reproducing the original bug with extra steps.
+        row_lexical = bool(c.get("lexical_hit")) or any(t in hay for t in terms)
+        # A topic long enough to be chunked more than once has multiple rows
+        # sharing this key, and only the best-distance row survives as the
+        # group's representative below. A keyword-only row (distance=None ->
+        # 1.0) almost never wins that comparison against any vector row for
+        # the SAME topic, so if `lexical` were read off the winning row alone,
+        # the keyword signal a sibling chunk found would be silently thrown
+        # away -- reproducing this task's own motivating bug one layer up
+        # (Critical #1, 2026-09-20 review). The fix: `lexical` is the OR of
+        # every row seen for this key, tracked independently of which row
+        # wins on distance/snippet/route below.
         if cur is not None and dist >= cur["score"]:
+            if row_lexical:
+                cur["lexical"] = True
             continue
+        prior_lexical = cur["lexical"] if cur is not None else False
         folder = _folder_from_source(c.get("source_s3_key"))
         title = derived_title
         route = "/timeline?date=" + _q(date)
@@ -858,12 +953,6 @@ def _aggregate_topics(chunks, question=""):
         _slug = c.get("site_slug")
         if _slug:
             route += "&site=" + _q(str(_slug))
-        # Lexical match is checked against the TOPIC TITLE only, NOT the raw
-        # chunk_text: the retrieved chunks are semantically near the query so
-        # their text usually contains a term anyway (and common words like
-        # "safety" appear everywhere), which would make the lexical flag true
-        # for nearly everything. The concise title is the clean signal.
-        hay = derived_title.lower()
         groups[key] = {
             "report_date": date,
             "site_name": c.get("site_name"),
@@ -873,7 +962,7 @@ def _aggregate_topics(chunks, question=""):
             "chunk_type": c.get("chunk_type"),
             "route": route,
             "score": dist,
-            "lexical": any(t in hay for t in terms),
+            "lexical": row_lexical or prior_lexical,
         }
     rows = list(groups.values())
     # threshold: drop non-lexical topics whose semantic distance is poor, so a
@@ -902,7 +991,7 @@ def _rag_search_list(body):
 
     try:
         query_vec = dashscope_utils.embed([question])[0]
-        payload = {"sub": caller_sub, "query_embedding": query_vec, "k": k}
+        payload = {"sub": caller_sub, "query_embedding": query_vec, "question": question, "k": k}
         if date_from:
             payload["date_from"] = date_from
         if date_to:
@@ -1252,10 +1341,13 @@ def _rag_answer(body):
         # Ask conversation memory (spec 2026-09-17 SS2, SS3.1-3.3, SS4.3): a
         # follow-up such as "when is he finishing it?" embeds to nothing
         # useful and parses no date. Spend the history HERE, on producing one
-        # standalone question to retrieve with, and nowhere else -- the
-        # answering prompt below still gets the caller's own `question`, not
-        # `asked` (SS2: a chat history is a copy taken before a deletion and
-        # must never be the thing retrieval or the web branch acts on).
+        # standalone question to retrieve with, and nowhere else -- `history`
+        # itself never reaches the answering prompt below or the web branch
+        # (SS2: a chat history is a copy taken before a deletion and must
+        # never be the thing retrieval or the web branch acts on). As of
+        # spec 2026-09-20, `asked` -- the rewrite's own output, not the
+        # history -- does reach the answering prompt when a rewrite ran; see
+        # the comment at :1600.
         #
         # `ask_history` is imported HERE for the same reason `query_slots` is
         # below: the legacy hand-built prod zips a fixed file list and
@@ -1410,7 +1502,10 @@ def _rag_answer(body):
         # could not run on the path it was built for, and every test stayed green
         # because they all drove the helper instead of the route.
         fetch_k = RERANK_CANDIDATES if RERANK_ENABLED else k
-        payload = {"sub": caller_sub, "query_embedding": query_vec, "k": fetch_k}
+        # "asked", not "question": the keyword arm must search on the SAME
+        # text that was embedded into query_vec above (the rewrite, when one
+        # happened), or the two arms would be answering different questions.
+        payload = {"sub": caller_sub, "query_embedding": query_vec, "question": asked, "k": fetch_k}
         if date_from or date_to:
             # Added ONLY when a range was actually chosen (the question's, a
             # picked day, or none for a pinned topic). rag-search ignores
@@ -1568,9 +1663,28 @@ def _rag_answer(body):
             _terms = _lexical_terms(asked)
             _lexical = any(
                 any(t in _derived_title(c).lower() for t in _terms)
+                or c.get("lexical_hit")
                 for c in chunks
             )
-
+            # This is the third consumer of "is this lexical", after
+            # _aggregate_topics' `lexical` field and _admit_one_lexical_hit's
+            # `lexical_hit` check (Task 4 review, 2026-09-20, Important #4;
+            # ruled on 2026-09-21). It ORs in `lexical_hit` -- the keyword
+            # arm's chunk_text match from build_search_sql -- alongside the
+            # title-only heuristic above, the same additive OR used in
+            # _aggregate_topics. Ruling and reasoning: `lexical_hit` means the
+            # literal token the user typed IS present in the retrieved
+            # records' text. Treating that as "nothing here is relevant" and
+            # sending the question straight to the web is exactly the
+            # complaint this plan exists to fix, one consumer further along.
+            # ORing it in makes `_lexical` True more often, which makes
+            # `_skip` False more often, routing more questions through
+            # verdict-first -- the case most likely to end with "the records
+            # already answer this" and therefore NO web call at all. So the
+            # expected direction is toward correctness and probably toward
+            # less spend, not more. No existing True becomes False: this is a
+            # pure OR against the prior title-only check.
+            #
             # Absent is not far: _aggregate_topics defaults a missing distance
             # to 1.0, which is right for ranking and would silently route
             # every chunk to the web here.
@@ -1597,7 +1711,19 @@ def _rag_answer(body):
                 "asked": asked if rewritten else None,
             }
 
-        prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
+        # Spec 2026-09-20 (amends the 2026-09-17 SS2 comment above): the
+        # answering prompt must see what retrieval actually searched for. A
+        # rewrite that resolved "it" to "PS4" for the embed at :1400 and the
+        # web verdict at :1590 must resolve it here too, or the model has no
+        # antecedent for the pronoun the rewrite already solved -- measured
+        # UCPK2 2026-09-20, turn 2 of 3: "why do we talk it? who requested?"
+        # retrieved the right chunks and then answered "the excerpts do not
+        # contain enough context to identify what 'it' refers to." `question`
+        # only when `rewritten` is False (SS3.1): byte-identical to today for
+        # every first-turn question. Still no `history` parameter here --
+        # that boundary (spec 2026-09-17 SS2) is unchanged.
+        prompt = build_rag_prompt(asked if rewritten else question, chunks,
+                                  mode=body.get("mode"),
                                   today=today, basis=basis, pinned_topic=pinned_topic)
         # A spoken answer and a screen answer are the same question asked of two
         # different products, so they may reach two different models. Measured
@@ -1661,7 +1787,11 @@ def _rag_answer(body):
                         answer_language.cjk_ratio(answer))
         if not err and answer_language.violates(answer):
             logger.warning("  Ask answer language leaked; retrying once")
-            retry_prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
+            # Same substitution as the primary prompt above and for the same
+            # reason: the retry must not silently revert to pronoun-blind
+            # answering on the 1-in-13 turns that need it.
+            retry_prompt = build_rag_prompt(asked if rewritten else question, chunks,
+                                            mode=body.get("mode"),
                                             today=today, basis=basis,
                                             insist_language=True, pinned_topic=pinned_topic)
             retried, retry_err = llm_utils.call_llm(retry_prompt, max_tokens=MAX_ANSWER_TOKENS,

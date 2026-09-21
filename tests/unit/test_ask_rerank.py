@@ -39,6 +39,95 @@ def test_disabled_is_byte_for_byte_the_old_behaviour(monkeypatch):
     assert agent._rerank_chunks("q", CHUNKS, 5) == CHUNKS[:5]
 
 
+# --------------------------------------------------------------------------
+# Task 4, second downstream (CONTROLLER AMENDMENT, 2026-09-20/21): with
+# reranking off (both environments today -- see src/repositories/search_sql.py
+# and lambda_ask_agent.py's own comment above RERANK_ENABLED), build_search_sql
+# now APPENDS keyword-only rows (lexical_hit=True, distance=None) after every
+# vector row. `chunks[:keep]` alone silently discards all of them whenever the
+# vector arm is saturated at `keep` -- Ask's answering path would then never
+# see the literal token this whole plan exists to surface, even though the
+# search box (via _aggregate_topics) does. These tests pin the chosen policy:
+# reserve exactly ONE slot in the kept window for the first keyword-only row
+# arrival order would otherwise cut, at the cost of the single weakest
+# (last) vector-arm row in that window -- never a wholesale swap.
+# --------------------------------------------------------------------------
+
+def _lex_chunk(text, key):
+    c = _chunk(text, key)
+    c["lexical_hit"] = True
+    c["distance"] = None
+    return c
+
+
+def test_a_keyword_only_row_beyond_k_is_admitted_when_vector_arm_saturates_k(monkeypatch):
+    """The exact CONTROLLER AMENDMENT scenario: k vector rows fill the window,
+    one keyword-only row (distance=None) arrives after all of them (Task 3's
+    append-only ordering). Naive chunks[:keep] would drop it -- the fix must
+    reserve a slot for it."""
+    monkeypatch.setattr(agent, "RERANK_ENABLED", False)
+    vector_rows = [_chunk("v%d" % i, "vkey%d" % i) for i in range(5)]
+    lex_row = _lex_chunk("ps4-mention", "lexkey")
+    out = agent._rerank_chunks("PS4", vector_rows + [lex_row], 5)
+    assert len(out) == 5
+    assert any(c is lex_row for c in out), \
+        "a keyword-only row past the k cut must not be silently discarded"
+    # Only the single weakest (last) vector row is displaced -- never all of them.
+    assert [c["chunk_text"] for c in out] == ["v0", "v1", "v2", "v3", "ps4-mention"]
+
+
+def test_a_keyword_only_row_already_inside_k_is_left_alone(monkeypatch):
+    """No truncation needed to admit it -- nothing should be reordered."""
+    monkeypatch.setattr(agent, "RERANK_ENABLED", False)
+    lex_row = _lex_chunk("ps4-mention", "lexkey")
+    chunks = [_chunk("v0", "k0"), lex_row, _chunk("v1", "k1")]
+    out = agent._rerank_chunks("PS4", chunks, 5)
+    assert out == chunks
+
+
+def test_keep_zero_admits_nothing(monkeypatch):
+    """Critical #3 (2026-09-20 review): `keep=0` reaches this function via
+    `k=int(body.get("k", 5))`, which has no floor. The old
+    `head[:-1] + [tail_hit]` computed `[] + [tail_hit]` at keep=0 -- one row
+    despite `keep == 0`, violating "never return more than `keep` rows".
+    There is no slot to reserve and nothing to swap into at keep=0."""
+    monkeypatch.setattr(agent, "RERANK_ENABLED", False)
+    vector_rows = [_chunk("v%d" % i, "vkey%d" % i) for i in range(3)]
+    lex_row = _lex_chunk("ps4-mention", "lexkey")
+    out = agent._rerank_chunks("PS4", vector_rows + [lex_row], 0)
+    assert out == []
+
+
+def test_keep_one_never_displaces_the_top_semantic_match(monkeypatch):
+    """Critical #2 (2026-09-20 review): the docstring claimed "a strong
+    semantic match at position 0 can never be displaced by this rule", but at
+    keep=1, head[-1] IS head[0] -- the old code swapped it out for the
+    keyword-only row anyway. `k=1` is client-reachable the same way `k=0` is.
+    Chosen behaviour: at keep=1 there is only one slot and it is also
+    position 0, so the guarantee wins -- no admission happens and the
+    semantic top match is returned unchanged. (Accepted cost: at keep=1 a
+    keyword-only hit beyond the cut is never admitted -- there is no second,
+    less valuable slot to give up instead.)"""
+    monkeypatch.setattr(agent, "RERANK_ENABLED", False)
+    v0 = _chunk("v0", "vkey0")
+    lex_row = _lex_chunk("ps4-mention", "lexkey")
+    out = agent._rerank_chunks("PS4", [v0, lex_row], 1)
+    assert out == [v0]
+
+
+def test_reservation_never_touches_more_than_one_vector_row(monkeypatch):
+    """Multiple keyword-only rows beyond k: only one is admitted, capping the
+    cost at exactly one displaced vector row -- a residual gap, accepted on
+    purpose (see the policy note above _rerank_chunks)."""
+    monkeypatch.setattr(agent, "RERANK_ENABLED", False)
+    vector_rows = [_chunk("v%d" % i, "vkey%d" % i) for i in range(5)]
+    lex_rows = [_lex_chunk("lex-a", "lexkeyA"), _lex_chunk("lex-b", "lexkeyB")]
+    out = agent._rerank_chunks("q", vector_rows + lex_rows, 5)
+    assert len(out) == 5
+    assert sum(1 for c in out if c.get("lexical_hit")) == 1
+    assert [c["chunk_text"] for c in out] == ["v0", "v1", "v2", "v3", "lex-a"]
+
+
 @pytest.mark.parametrize("outcome", [None, []])
 def test_a_reranker_that_cannot_answer_costs_nothing(monkeypatch, outcome):
     """`rerank` returns None on timeout, non-200, a bad shape, or a missing
