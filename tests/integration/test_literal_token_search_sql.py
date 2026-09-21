@@ -259,11 +259,18 @@ def test_ps40_does_not_match_ps4_word_boundary(db):
 def test_the_gin_expression_index_is_actually_used_by_the_planner(db):
     """Task 1 Step 5's check, run for real: on a table with enough rows that a
     sequential scan is not simply cheaper, the planner must choose
-    idx_report_chunks_tsv for the keyword arm's own predicate, not a Seq Scan.
-    If this ever goes red, the expression in build_search_sql() no longer
-    matches the index's expression character-for-character -- the exact
-    silent-fallback failure test_keyword_arm_expression_matches_the_index_exactly
-    (unit suite) exists to catch before it reaches here."""
+    idx_report_chunks_tsv_multi_config (migration 0061, 2026-09-22 fix: "the
+    keyword arm can actually fire") for the keyword arm's own predicate, not
+    a Seq Scan. If this ever goes red, the expression in build_search_sql()
+    no longer matches the index's expression character-for-character -- the
+    exact silent-fallback failure
+    test_keyword_arm_expression_matches_the_index_exactly (unit suite)
+    exists to catch before it reaches here.
+
+    The EXPLAIN'd predicate below is the combined-vector expression + the
+    'simple'-config query side, not the old 'english'-only one -- migration
+    0061 DROPs idx_report_chunks_tsv, so the old expression would now have
+    nothing to match and would legitimately Seq Scan."""
     site = _site(db)
     for i in range(3000):
         _insert(db, site["id"], f"Unrelated electrical hold-up note number {i}", seed=i)
@@ -271,9 +278,99 @@ def test_the_gin_expression_index_is_actually_used_by_the_planner(db):
 
     plan = "\n".join(r[0] for r in db.execute(
         "EXPLAIN SELECT id FROM report_chunks WHERE "
-        "to_tsvector('english', chunk_text) @@ websearch_to_tsquery('english', 'PS4')"
+        "(to_tsvector('english', chunk_text) || to_tsvector('simple', "
+        "regexp_replace(chunk_text, '[^a-zA-Z0-9]+', ' ', 'g'))) "
+        "@@ websearch_to_tsquery('simple', 'PS4')"
     ).fetchall())
-    assert "idx_report_chunks_tsv" in plan, (
+    assert "idx_report_chunks_tsv_multi_config" in plan, (
         "the planner did not choose the GIN expression index on a "
         f"3000-row table -- got:\n{plan}")
     assert "Seq Scan" not in plan, f"planner fell back to a sequential scan:\n{plan}"
+
+
+def test_the_dropped_idx_report_chunks_tsv_is_actually_gone(db):
+    """Migration 0061 DROP INDEXes idx_report_chunks_tsv (0059) because its
+    'english'-only expression no longer appears anywhere in
+    build_search_sql()'s output -- the planner would never choose it again,
+    so it would only keep costing writes to maintain. This is the one place
+    that runs the migration against a real Postgres and checks the drop
+    actually took, rather than trusting the migration file's own comment."""
+    row = db.execute(
+        "SELECT 1 FROM pg_indexes WHERE indexname = 'idx_report_chunks_tsv'"
+    ).fetchone()
+    assert row is None, "idx_report_chunks_tsv should have been dropped by migration 0061"
+
+    row = db.execute(
+        "SELECT 1 FROM pg_indexes WHERE indexname = 'idx_report_chunks_tsv_multi_config'"
+    ).fetchone()
+    assert row is not None, "idx_report_chunks_tsv_multi_config should exist after migration 0061"
+
+
+# ---------------------------------------------------------------------------
+# The six acceptance cases from the 2026-09-22 fix ("the keyword arm can
+# actually fire"), run through chunks.search_chunks -- the actual code path,
+# not a hand-written EXPLAIN -- with query_text already OR-ready (a single
+# bare term), mirroring what lambda_rag_search.py now sends after
+# lexical_terms.or_query(lexical_terms.lexical_terms(question)).
+# ---------------------------------------------------------------------------
+
+def test_ps4_finds_a_chunk_where_ps4_touches_punctuation(db):
+    """The motivating case (Cause B): the owner's real data has 'PS4/light
+    pole issues', where PS4 touches a slash rather than whitespace. Under
+    'english' alone, to_tsvector('english', 'pricing and PS4/light pole
+    issues') yields the single lexeme 'ps4/light' -- a bare 'PS4' query never
+    matched it, even after Cause A (the AND-vs-OR fix) is fixed. This is the
+    case that only migration 0061's 'simple' + regexp_replace vector fixes."""
+    site = _site(db)
+    target = _insert(db, site["id"], "pricing and PS4/light pole issues", seed=13)
+    _fill_with_closer_unrelated_chunks(db, site["id"], query_seed=14)
+
+    rows = chunks.search_chunks(db, _flat_embedding(14), [site["id"]], k=30, query_text="PS4")
+    ids = {str(r["id"]) for r in rows}
+    assert str(target["id"]) in ids, \
+        "PS4 must find 'PS4/light' after the punctuation split -- this is the owner's own case"
+    hit = next(r for r in rows if str(r["id"]) == str(target["id"]))
+    assert hit["lexical_hit"] is True
+
+
+def test_bare_1042_finds_rfi_1042(db):
+    """A bare numeric identifier must find it inside a hyphenated compound
+    ('RFI-1042') the same way PS4 must find 'PS4/light' -- the same
+    Cause B fix, a different punctuation character."""
+    site = _site(db)
+    target = _insert(db, site["id"], "RFI-1042 raised today", seed=15)
+    _fill_with_closer_unrelated_chunks(db, site["id"], query_seed=16)
+
+    rows = chunks.search_chunks(db, _flat_embedding(16), [site["id"]], k=30, query_text="1042")
+    ids = {str(r["id"]) for r in rows}
+    assert str(target["id"]) in ids, "bare 1042 must find RFI-1042 after the punctuation split"
+    hit = next(r for r in rows if str(r["id"]) == str(target["id"]))
+    assert hit["lexical_hit"] is True
+
+
+def test_1042_does_not_match_rfi_1043(db):
+    """The word-boundary property (same reasoning as PS4/PS40) applied to a
+    numeric identifier: 1042 must not match a chunk that only contains 1043."""
+    site = _site(db)
+    decoy = _insert(db, site["id"], "RFI-1043 raised today", seed=17)
+    _fill_with_closer_unrelated_chunks(db, site["id"], query_seed=18)
+
+    rows = chunks.search_chunks(db, _flat_embedding(18), [site["id"]], k=30, query_text="1042")
+    assert str(decoy["id"]) not in {str(r["id"]) for r in rows}, \
+        "1042 must not match a chunk containing only 1043"
+
+
+def test_exact_rfi_1042_still_matches(db):
+    """The full identifier, hyphen and all, typed exactly as it appears in
+    the text, must still be found -- the punctuation split must not break the
+    exact-match case it is meant to widen."""
+    site = _site(db)
+    target = _insert(db, site["id"], "RFI-1042 raised today", seed=19)
+    _fill_with_closer_unrelated_chunks(db, site["id"], query_seed=20)
+
+    rows = chunks.search_chunks(db, _flat_embedding(20), [site["id"]], k=30,
+                                query_text="RFI-1042")
+    ids = {str(r["id"]) for r in rows}
+    assert str(target["id"]) in ids, "the exact identifier 'RFI-1042' must still be found"
+    hit = next(r for r in rows if str(r["id"]) == str(target["id"]))
+    assert hit["lexical_hit"] is True

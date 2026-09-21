@@ -14,9 +14,12 @@ It runs in-VPC with no NAT / no internet egress (BUG-36) — it only accepts
 an already-computed query_embedding and searches Aurora/pgvector with it.
 
 Event:  {"sub": "<cognito sub>", "query_embedding": [1024 floats], "k": 8,
-         optional "question" (raw text for the keyword arm, Task 3 of the
-         2026-09-20 "a literal token is findable" plan -- defaults to "" and
-         matches nothing), "date_from"/"date_to", "widen_when_empty", "site",
+         optional "question" (raw text; this function extracts its literal
+         terms via lexical_terms.lexical_terms and OR-joins them for the
+         keyword arm -- Task 3 of the 2026-09-20 "a literal token is
+         findable" plan, fixed for real 2026-09-22 -- absent or with no
+         literal terms, the keyword arm matches nothing, never everything),
+         "date_from"/"date_to", "widen_when_empty", "site",
          "author" (folder name), "topic_row_id"}
 Result: {"chunks": [...], "site_count": N, "basis": {...}, "applied": {...},
          "pinned_topic": {...} only when topic_row_id was visible}
@@ -38,6 +41,7 @@ import json
 import logging
 
 from db.connection import close_cached_connection, get_cached_connection
+from lexical_terms import lexical_terms, or_query
 from repositories import (aliases, chunks, findings, recordings, redactions, scope,
                          sites, topics, users)
 import text_normalize
@@ -227,10 +231,28 @@ def _search(event, context):
     qv = event.get("query_embedding")
     # The keyword arm (Task 3, 2026-09-20 spec) needs the caller's raw text,
     # not just its embedding. ask-agent sends the question (or its rewrite,
-    # "asked") alongside query_embedding; absent it defaults to "" and the
-    # keyword arm's websearch_to_tsquery('english', '') matches nothing --
-    # never everything.
-    query_text = event.get("question") or ""
+    # "asked") alongside query_embedding.
+    #
+    # 2026-09-22 fix ("the keyword arm can actually fire", Cause A): binding
+    # the WHOLE question as build_search_sql's %(q_text)s made
+    # websearch_to_tsquery AND every non-stopword term together, which a
+    # natural-language question essentially never satisfies -- the arm only
+    # ever fired when a user happened to type bare terms that all appeared
+    # verbatim in the same chunk. `lexical_terms` extracts the
+    # distinctive/identifier-shaped terms (same extraction
+    # `_aggregate_topics` in lambda_ask_agent.py uses for its own lexical
+    # ranking) and `or_query` joins them with the literal word "or", which
+    # `websearch_to_tsquery` parses as an OR, not an AND -- measured:
+    # `websearch_to_tsquery('simple', 'ps4 or light or pole')` ->
+    # `'ps4' | 'light' | 'pole'`.
+    #
+    # A question with no literal terms (e.g. "what safety issues came up
+    # this week", once stopwords/short words are stripped, can still leave
+    # SOME terms, but a purely conceptual question can leave none) yields
+    # `or_query([])` == "" -> `websearch_to_tsquery('simple', '')` is an
+    # empty tsquery that matches NOTHING -- the arm goes inert, never
+    # match-all, exactly as the "" default always meant.
+    query_text = or_query(lexical_terms(event.get("question") or ""))
     date_from = event.get("date_from") or None
     date_to = event.get("date_to") or None
     site_filter = event.get("site") or None  # scope search to ONE project (within ACL)

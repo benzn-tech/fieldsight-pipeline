@@ -68,8 +68,17 @@ def test_scope_predicate_is_shared_by_construction():
 
 def test_search_sql_has_a_keyword_arm():
     sql = build_search_sql().lower()
-    assert "to_tsvector('english', c.chunk_text) @@ websearch_to_tsquery" in sql, \
+    # 2026-09-22 fix ("the keyword arm can actually fire"): the keyword arm's
+    # indexed expression is now the 'english' vector OR'd with a 'simple'
+    # (non-stemming) vector over punctuation-split text -- see migration 0061
+    # and test_keyword_arm_expression_matches_the_index_exactly for the exact
+    # expression pinned character-for-character. The query side matches it
+    # with the 'simple' config (not 'english' any more).
+    assert "to_tsvector('english', c.chunk_text) || to_tsvector('simple'," in sql, \
         "no lexical arm: a literal token can still only be found by cosine luck"
+    assert "@@ websearch_to_tsquery('simple', %(q_text)s)" in sql, \
+        "keyword arm must query the 'simple' config, or an identifier split " \
+        "by punctuation (e.g. 'PS4/light') never matches a bare term again"
     assert "union all" in sql
 
 
@@ -82,32 +91,51 @@ def test_search_sql_keyword_arm_shares_the_scope_predicate():
 
 
 def test_keyword_arm_expression_matches_the_index_exactly():
-    """The migration (0059_report_chunks_tsv_idx.sql) creates a GIN index on
-    to_tsvector('english', chunk_text). Postgres only uses an expression index
-    when the query repeats that expression character-for-character (modulo the
-    table alias) -- a query that spells it even slightly differently (extra
-    space, different config literal) silently falls back to a sequential scan
+    """The migration (0061_report_chunks_tsv_multi_config_idx.sql) creates a
+    GIN index on (to_tsvector('english', chunk_text) || to_tsvector('simple',
+    regexp_replace(chunk_text, '[^a-zA-Z0-9]+', ' ', 'g'))). Postgres only
+    uses an expression index when the query repeats that expression
+    character-for-character (modulo the table alias) -- a query that spells
+    it even slightly differently (extra space, different config literal,
+    respelled regexp_replace args) silently falls back to a sequential scan
     with no error. This test is the thing that catches that drift, not a
-    convention or a comment."""
+    convention or a comment.
+
+    The expression is read out of the migration's own raw text (never
+    hard-coded a second time here) and pinned as ONE literal substring, not a
+    "both tokens appear somewhere" check -- deleting `|| to_tsvector('simple',
+    ...)` from build_search_sql fails this test, and so does a
+    logically-equivalent respelling like
+    `to_tsvector('simple', regexp_replace(c.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g')) || to_tsvector('english', c.chunk_text)`
+    (operands swapped) -- both were hand-verified to fail before this
+    migration shipped."""
     import os
     import repositories.search_sql as search_sql
 
     migrations_dir = os.path.join(
         os.path.dirname(os.path.dirname(search_sql.__file__)), "migrations")
-    with open(os.path.join(migrations_dir, "0059_report_chunks_tsv_idx.sql"),
+    with open(os.path.join(migrations_dir,
+                           "0061_report_chunks_tsv_multi_config_idx.sql"),
               encoding="utf-8") as fh:
         migration_sql = fh.read()
-    assert "to_tsvector('english', chunk_text)" in migration_sql, \
+    expected = (
+        "(to_tsvector('english', chunk_text) || to_tsvector('simple', "
+        "regexp_replace(chunk_text, '[^a-zA-Z0-9]+', ' ', 'g')))"
+    )
+    assert expected in migration_sql, \
         "the migration's own expression changed -- update this test's expectation deliberately"
 
     sql = build_search_sql()
-    # The query's alias is "c", the migration's bare column has no alias --
-    # the expression itself (function name, language literal, quoting) must
-    # still match exactly.
-    assert "to_tsvector('english', c.chunk_text)" in sql, \
-        "build_search_sql's keyword arm must spell the tsvector expression " \
-        "IDENTICALLY to idx_report_chunks_tsv's definition, or the planner " \
-        "silently falls back to a sequential scan"
+    # The query's alias is "c", the migration's bare columns have no alias --
+    # the expression itself (function names, language literals, quoting,
+    # operand order) must still match exactly. Substituting the alias onto
+    # BOTH `chunk_text` occurrences (not just the first) is what makes this a
+    # faithful re-derivation rather than a second hand-typed copy.
+    aliased = expected.replace("chunk_text", "c.chunk_text")
+    assert aliased in sql, \
+        "build_search_sql's keyword arm must spell the combined tsvector " \
+        "expression IDENTICALLY to idx_report_chunks_tsv_multi_config's " \
+        "definition, or the planner silently falls back to a sequential scan"
 
 
 def test_search_sql_keyword_arm_never_fabricates_a_good_distance():
